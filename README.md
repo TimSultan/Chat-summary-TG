@@ -95,15 +95,23 @@ Output is saved to `output/<chat title>[_user]_<date(s)>.md`.
 Run `python listener.py` and leave it running (a terminal, `screen`/`tmux` session, or a
 background service). While it's running, anyone who **@mentions you** (or replies to one
 of your messages) in a chat you're in, with a message containing a trigger keyword
-(default `summary`), gets a themed summary reply — sent as **you**, in that chat:
+(default `summary`), gets a themed summary reply — sent as **you**, in that chat. **You**
+can trigger it the same way yourself, just by typing a message containing the trigger
+keyword — no need to @mention your own account:
 
 ```
 @sultan_kembayev summary что обсуждали сегодня
-  -> replies with today's chat topics, in Russian
+  -> (from someone else) replies with today's chat topics, in Russian
 
 summary сообщения @some_user за сегодня
-  -> replies with what @some_user talked about today
+  -> (from someone else) replies with what @some_user talked about today
+
+summary what did we cover this week
+  -> (typed by you, no @mention needed) replies in that chat
 ```
+
+The listener never re-triggers on its own generated replies (tracked by message ID),
+even though a reply's text will often contain the trigger keyword itself.
 
 The request text is parsed by the LLM (mixed languages, relative dates like "сегодня" /
 "вчера" / "last week", and an optional target user are all handled), so there's no fixed
@@ -156,6 +164,37 @@ pass matches that name against the chat's actual participants (handles misspelli
 nicknames, and script transliteration, e.g. "Anzhelika" for a Cyrillic "Анжелика") and
 scopes the summary to topics that person was involved in, including ones others
 discussed *about* them without them posting.
+
+## Deploying the listener to Railway
+
+Only `listener.py` runs on a server -- `gui.py` needs a display, and `main.py` is a
+one-off you'd normally run locally. Railway can't do interactive phone/code logins, so
+generate a portable session first:
+
+1. **Locally**, with `.env` filled in: `python generate_session_string.py`. Log in
+   interactively (once); it prints a session string.
+2. Push this repo to GitHub (or use the Railway CLI to deploy without GitHub -- see
+   below), then in Railway: **New Project → Deploy from GitHub repo** (or run
+   `railway init && railway up` from this directory with the [Railway
+   CLI](https://docs.railway.app/guides/cli)). Railway will pick up the `Dockerfile`
+   automatically (`railway.json` pins it explicitly).
+3. In the Railway service's **Variables** tab, set everything from `.env.example`:
+   `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_STRING` (the string from
+   step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
+   `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
+   warning above), `LISTENER_TRIGGER_KEYWORDS`, `LISTENER_COOLDOWN_SECONDS`.
+4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
+   running.
+
+**Persistence:** without a Railway [Volume](https://docs.railway.app/reference/volumes)
+mounted at e.g. `/app/cache` and `/app/history`, the transcript cache and Q&A history
+reset on every redeploy/restart -- the listener still works fine, it just loses those
+across deploys. Attach a Volume there if you want them to survive. The session itself
+doesn't need a volume at all, since `TELEGRAM_SESSION_STRING` is just an env var.
+
+**Cost note:** this is a long-running worker (not a request-driven web service), so it
+runs continuously and bills for uptime accordingly -- check Railway's current pricing
+before leaving it deployed indefinitely.
 
 ## Notes
 
