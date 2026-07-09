@@ -148,9 +148,19 @@ def parse_summary_request(
 
 
 RESOLVE_SYSTEM_PROMPT = """\
-You match a person's name (possibly misspelled, abbreviated, a nickname, or written in a \
-different script/transliteration -- e.g. "Anzhelika" for a Cyrillic "Анжелика") against a list \
-of actual chat participant names/usernames, and return which one it refers to.
+You match a person's name against a list of actual chat participant names/usernames, and return \
+which one it refers to.
+
+Check in this order:
+1. An exact or near-exact literal match first -- if one candidate IS (or is a trivial variant of) \
+the reference text, even written in a script you might not expect (e.g. a Korean-script nickname \
+someone actually uses in that chat), pick that one. Do not overrule a close literal match with a \
+"more familiar-sounding" guess.
+2. Only if nothing closely matches the literal text, consider it might be misspelled, abbreviated, \
+or transliterated from another script/language (e.g. "Anzhelika" for a Cyrillic "Анжелика") and \
+pick the best phonetic match.
+Never guess a candidate just because it's a common/plausible name if it doesn't actually resemble \
+the reference text either literally or phonetically -- prefer {"match": null} over a weak guess.
 
 Return ONLY a JSON object: {"match": "<exact candidate string, copied verbatim>"} if you're \
 reasonably confident one candidate is who's meant, or {"match": null} if none plausibly match.

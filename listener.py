@@ -111,7 +111,13 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], l
     from_explicit_mention = bool(focus_user)
     name_hint = intent.get("target_name_hint")
     if intent["scope"] == "user" and not focus_user and name_hint:
-        candidates = sorted({m.sender_username or m.sender_name for m in messages})
+        # Include BOTH each sender's @username and display name as separate candidates --
+        # someone's actual nickname (what people call them, e.g. a chosen display name in
+        # a different script) is often not their @username, and picking only one per
+        # person can silently drop the exact string the request actually used.
+        candidates = sorted({c for m in messages for c in (m.sender_username, m.sender_name) if c})
+        shown = candidates if len(candidates) <= 30 else candidates[:30] + [f"... +{len(candidates) - 30} more"]
+        log(f"[listener] resolving name hint '{name_hint}' against {len(candidates)} candidates: {shown}")
         try:
             focus_user = resolve_name_hint(cfg.openai_api_key, cfg.openai_model, name_hint, candidates)
         except ChatSummaryError as e:
