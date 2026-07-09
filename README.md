@@ -136,20 +136,30 @@ trust, risky in a large/public one.
 
 A second trigger keyword (default `прожарь меня`, `ROAST_TRIGGER_KEYWORDS` in `.env`)
 roasts whoever sends it, in Russian, using **their own** messages from the last
-`ROAST_LOOKBACK_DAYS` days (default 30):
+`ROAST_LOOKBACK_DAYS` days (default 30). It's a two-step, confirm-then-react flow rather
+than an immediate reply:
 
 ```
 прожарь меня
+  -> bot replies "Ты точно хочешь прожарку? поставь реакцию для подтверждения"
+
+(you react to that prompt with any emoji)
   -> pulls your own messages from the last 30 days (across each day's cached
-     transcript), sends them to OpenAI, and replies in the chat with a no-holds-barred
-     5-point roast (Russian, swearing allowed) plus a punchline
+     transcript), sends them to OpenAI, and replies with a no-holds-barred 5-point
+     roast (Russian, swearing allowed) plus a punchline
 ```
 
+Only a reaction from the **same person who was asked** counts -- someone else reacting
+to your confirmation prompt does nothing. If you send `прожарь меня` again while your
+previous request is still awaiting a reaction or already generating, the bot doesn't
+send another prompt -- it just reacts to your new message with ⏳ to show one's already
+in flight.
+
 It reuses the same per-day transcript cache as `/summary` (see caching below), so
-roasting doesn't re-fetch days already pulled for other requests. Same allowlist,
-cooldown, and self-deleting-reply behavior as the summary trigger. If you have no
-messages in that window, it replies with a short "nothing to roast" notice instead of
-calling OpenAI.
+roasting doesn't re-fetch days already pulled for other requests. Same allowlist and
+cooldown as the summary trigger (applies to the initial confirmation prompt); the final
+roast reply self-deletes the same way summaries do. If you have no messages in that
+window, it replies with a short "nothing to roast" notice instead of calling OpenAI.
 
 ## Model choice
 

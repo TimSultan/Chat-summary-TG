@@ -20,9 +20,11 @@ import math
 import re
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils as tl_utils
+from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendReactionRequest
+from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 import history
 from config import build_session, load_config
@@ -48,7 +50,12 @@ MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 DAY_LIMIT_MESSAGE = "Сводка выдается Только за 1 конкретный день и юзера"
 
 # "прожарь меня" roasts the requester using their own messages from the last
-# ROAST_LOOKBACK_DAYS days (config.py, ROAST_LOOKBACK_DAYS env var, default 30).
+# ROAST_LOOKBACK_DAYS days (config.py, ROAST_LOOKBACK_DAYS env var, default 30). It's a
+# two-step flow: the trigger message gets a confirmation prompt, and only an actual
+# *reaction* from that same person on that prompt (any emoji) starts generation -- see
+# roast_pending/roast_in_progress in run_listener.
+ROAST_CONFIRM_TEXT = "Ты точно хочешь прожарку? поставь реакцию для подтверждения"
+ROAST_BUSY_EMOJI = "⏳"
 NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих сообщений тут не нашлось -- нечем прожаривать."
 
 SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
@@ -79,14 +86,18 @@ def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
     return result.strip()
 
 
-async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) -> list[int]:
+async def send_long_message(
+    client, chat, text: str, reply_to: int | None = None, sent_ids: set[int] | None = None
+) -> list[int]:
+    """Sends `text` to `chat` as one or more messages (Telegram's ~4096 char limit),
+    replying to `reply_to` for the first chunk only -- later chunks are plain follow-ups,
+    same as event.reply() + event.respond() do."""
     sent_message_ids = []
     for i in range(0, len(text), MAX_REPLY_CHARS):
         chunk = text[i : i + MAX_REPLY_CHARS]
-        if i == 0:
-            sent = await event.reply(chunk, parse_mode="md", link_preview=False)
-        else:
-            sent = await event.respond(chunk, parse_mode="md", link_preview=False)
+        sent = await client.send_message(
+            chat, chunk, reply_to=reply_to if i == 0 else None, parse_mode="md", link_preview=False
+        )
         if sent is not None:
             sent_message_ids.append(sent.id)
             # Track our own generated messages so the listener never re-triggers on them
@@ -95,6 +106,11 @@ async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) ->
             if sent_ids is not None:
                 sent_ids.add(sent.id)
     return sent_message_ids
+
+
+async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) -> list[int]:
+    chat = await event.get_chat()
+    return await send_long_message(event.client, chat, text, reply_to=event.message.id, sent_ids=sent_ids)
 
 
 async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], schedule_delete, log=print):
@@ -208,33 +224,40 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     await respond(summary, delete_after=SUMMARY_DELETE_AFTER)
 
 
-async def handle_roast_request(event, cfg, tz, sent_ids: set[int], schedule_delete, log=print):
-    """"прожарь меня" -- roasts whoever sent the trigger message, using their own
-    messages from the last cfg.roast_lookback_days days (reusing the same per-day
-    transcript cache as the summary path)."""
-    msg = event.message
-    text = msg.raw_text or ""
-
-    chat = await event.get_chat()
+async def run_roast(
+    client,
+    chat,
+    target_user,
+    confirm_msg_id: int,
+    original_text: str,
+    cfg,
+    tz,
+    sent_ids: set[int],
+    schedule_delete,
+    log=print,
+):
+    """Actually generates and sends the roast, once the target user has confirmed by
+    reacting to the ROAST_CONFIRM_TEXT prompt. Uses their own messages from the last
+    cfg.roast_lookback_days days (reusing the same per-day transcript cache as the
+    summary path)."""
     chat_title_for_history = getattr(chat, "title", None) or "Unknown chat"
-    sender = await event.get_sender()
-    requester = sender_display_name(sender)
+    requester = sender_display_name(target_user)
 
     async def respond(answer: str, delete_after: int | None = None, record: bool = True):
-        message_ids = await send_long_reply(event, answer, sent_ids=sent_ids)
+        message_ids = await send_long_message(client, chat, answer, reply_to=confirm_msg_id, sent_ids=sent_ids)
         if record:
             try:
-                history.record(chat_title_for_history, requester, text, answer)
+                history.record(chat_title_for_history, requester, original_text, answer)
             except Exception as e:
                 log(f"[listener] failed to record history: {e}")
         if delete_after and message_ids:
-            schedule_delete(event.client, chat.id, message_ids, delete_after)
+            schedule_delete(client, chat.id, message_ids, delete_after)
 
-    end_date = msg.date.astimezone(tz).date()
+    end_date = datetime.now(tz).date()
     start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
 
     _, messages = await fetch_range_messages_cached(
-        client=event.client,
+        client=client,
         chat_ref=chat,
         start_day=start_date,
         end_day=end_date,
@@ -242,10 +265,10 @@ async def handle_roast_request(event, cfg, tz, sent_ids: set[int], schedule_dele
         log=log,
     )
 
-    target_id = getattr(sender, "id", None)
+    target_id = getattr(target_user, "id", None)
     own_messages = [m for m in messages if m.sender_id == target_id] if target_id is not None else []
     if not own_messages:
-        username = getattr(sender, "username", None)
+        username = getattr(target_user, "username", None)
         if username:
             own_messages = [m for m in messages if sender_matches(m, username)]
 
@@ -312,6 +335,16 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
     sent_message_ids: set[int] = set()
     background_tasks: set[asyncio.Task] = set()
 
+    # Roast confirm/react flow state, keyed by (chat_id, target_user_id):
+    # - roast_pending: confirmation prompt sent, awaiting a reaction from that user.
+    #   Value is (confirmation_message_id, original_trigger_text).
+    # - roast_in_progress: they reacted, generation is under way (until the reply is sent
+    #   or it errors out).
+    # Re-triggering "прожарь меня" while either is true doesn't restart anything -- it
+    # just reacts to the new message with ROAST_BUSY_EMOJI.
+    roast_pending: dict[tuple[int, int], tuple[int, str]] = {}
+    roast_in_progress: set[tuple[int, int]] = set()
+
     def is_chat_allowed(chat) -> bool:
         if not allowed_chats:
             return True
@@ -334,6 +367,19 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         task = asyncio.create_task(_do())
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
+
+    async def react_busy(chat_id, msg_id):
+        try:
+            await client(
+                SendReactionRequest(
+                    peer=chat_id,
+                    msg_id=msg_id,
+                    reaction=[ReactionEmoji(emoticon=ROAST_BUSY_EMOJI)],
+                    add_to_recent=True,
+                )
+            )
+        except Exception as e:
+            log(f"[listener] failed to react with busy emoji: {e}")
 
     # No incoming=True filter: watching outgoing messages too is what lets *you*
     # trigger a summary by typing "summary ..." yourself, not just other people
@@ -361,6 +407,14 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         if not is_chat_allowed(chat):
             return
 
+        sender = await event.get_sender()
+        if has_roast_keyword:
+            roast_key = (event.chat_id, sender.id)
+            if roast_key in roast_pending or roast_key in roast_in_progress:
+                log(f"[listener] roast already pending/in-progress for {roast_key}, reacting instead of re-asking")
+                await react_busy(event.chat_id, msg.id)
+                return
+
         chat_key = event.chat_id
         now = time.monotonic()
         elapsed = now - last_trigger.get(chat_key, 0)
@@ -380,7 +434,11 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         log(f"[listener] handling request in '{getattr(chat, 'title', chat_key)}': {text!r}")
         try:
             if has_roast_keyword:
-                await handle_roast_request(event, cfg, tz, sent_message_ids, schedule_delete, log=log)
+                confirm = await event.reply(ROAST_CONFIRM_TEXT)
+                if confirm is not None:
+                    sent_message_ids.add(confirm.id)
+                    roast_pending[(event.chat_id, sender.id)] = (confirm.id, text)
+                    log(f"[listener] sent roast confirmation to {sender_display_name(sender)} (msg {confirm.id})")
             else:
                 await handle_request(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
         except Exception as e:
@@ -391,6 +449,82 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                     sent_message_ids.add(sent.id)
             except Exception:
                 pass
+
+    # Reactions from a *user* account (not a bot) arrive as this raw update, carrying the
+    # message's full new reaction state (not a per-reaction delta) -- used here only to
+    # confirm the roast flow: did the specific person who was asked "точно хочешь
+    # прожарку?" react to that exact prompt.
+    @client.on(events.Raw(types=UpdateMessageReactions))
+    async def on_reaction(update):
+        try:
+            chat_id = tl_utils.get_peer_id(update.peer)
+        except Exception:
+            return
+
+        key = next(
+            (k for k, (mid, _) in roast_pending.items() if k[0] == chat_id and mid == update.msg_id), None
+        )
+        if key is None:
+            return  # not a reaction on a pending roast-confirmation message
+
+        _, target_user_id = key
+
+        reactor_ids = set()
+        for r in update.reactions.recent_reactions or []:
+            try:
+                reactor_ids.add(tl_utils.get_peer_id(r.peer_id))
+            except Exception:
+                continue
+
+        if target_user_id not in reactor_ids:
+            # recent_reactions isn't always populated (depends on chat size/settings) --
+            # fall back to explicitly listing this message's reactors.
+            try:
+                result = await client(GetMessageReactionsListRequest(peer=chat_id, id=update.msg_id, limit=100))
+                reactor_ids = {tl_utils.get_peer_id(r.peer_id) for r in result.reactions}
+            except Exception as e:
+                log(f"[listener] failed to fetch reactor list for msg {update.msg_id}: {e}")
+                return
+
+        if target_user_id not in reactor_ids:
+            return  # someone else reacted -- not the person who was actually asked
+
+        confirm_msg_id, original_text = roast_pending.pop(key)
+        roast_in_progress.add(key)
+        log(f"[listener] roast confirmed via reaction: chat={chat_id} user={target_user_id}")
+
+        async def _run():
+            try:
+                chat_entity = await client.get_entity(chat_id)
+                target_user = await client.get_entity(target_user_id)
+                await run_roast(
+                    client,
+                    chat_entity,
+                    target_user,
+                    confirm_msg_id,
+                    original_text,
+                    cfg,
+                    tz,
+                    sent_message_ids,
+                    schedule_delete,
+                    log=log,
+                )
+            except Exception as e:
+                log(f"[listener] error generating confirmed roast: {e}")
+                try:
+                    sent = await client.send_message(
+                        chat_id, "Something went wrong generating that roast.", reply_to=confirm_msg_id
+                    )
+                    if sent is not None:
+                        sent_message_ids.add(sent.id)
+                except Exception:
+                    pass
+            finally:
+                roast_in_progress.discard(key)
+
+        task = asyncio.create_task(_run())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
