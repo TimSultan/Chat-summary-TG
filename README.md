@@ -171,13 +171,18 @@ Only `listener.py` runs on a server -- `gui.py` needs a display, and `main.py` i
 one-off you'd normally run locally. Railway can't do interactive phone/code logins, so
 generate a portable session first:
 
-1. **Locally**, with `.env` filled in: `python generate_session_string.py`. Log in
-   interactively (once); it prints a session string.
+1. **Locally**, with `.env` filled in: `python generate_session_string.py` (log in
+   interactively, once) -- or if you already have a working local session file
+   (`tg_summary_session.session` from an earlier `main.py`/`gui.py` login),
+   `python convert_existing_session.py` instead, which skips the phone/code step
+   entirely. Either way it prints a session string. (`debug_login.py` exists to
+   diagnose a "no code received" problem, if that happens.)
 2. Push this repo to GitHub (or use the Railway CLI to deploy without GitHub -- see
-   below), then in Railway: **New Project → Deploy from GitHub repo** (or run
-   `railway init && railway up` from this directory with the [Railway
-   CLI](https://docs.railway.app/guides/cli)). Railway will pick up the `Dockerfile`
-   automatically (`railway.json` pins it explicitly).
+   below), then in Railway: **New Project → Deploy from GitHub repo** (or **Empty
+   Project**, then `railway login && railway link && railway up` from this directory
+   with the [Railway CLI](https://docs.railway.app/guides/cli), if you don't want to use
+   GitHub). Railway will pick up the `Dockerfile` automatically (`railway.json` pins it
+   explicitly).
 3. In the Railway service's **Variables** tab, set everything from `.env.example`:
    `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_STRING` (the string from
    step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
@@ -186,11 +191,13 @@ generate a portable session first:
 4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
    running.
 
-**Persistence:** without a Railway [Volume](https://docs.railway.app/reference/volumes)
-mounted at e.g. `/app/cache` and `/app/history`, the transcript cache and Q&A history
-reset on every redeploy/restart -- the listener still works fine, it just loses those
-across deploys. Attach a Volume there if you want them to survive. The session itself
-doesn't need a volume at all, since `TELEGRAM_SESSION_STRING` is just an env var.
+**Persistence is optional -- the listener works fine without it.** Without any
+persistent disk, the transcript cache and Q&A history just reset to empty on every
+redeploy/restart (a minor efficiency loss, not a functional break); the Telegram session
+itself never needs one, since `TELEGRAM_SESSION_STRING` is just an env var. If you want
+the cache/history to survive restarts: add a Railway **Volume** (not a Bucket -- a Bucket
+is S3-style object storage and this app just writes plain files, so it doesn't apply),
+mount it at any path (e.g. `/data`), and set `DATA_DIR=/data` in the service's Variables.
 
 **Cost note:** this is a long-running worker (not a request-driven web service), so it
 runs continuously and bills for uptime accordingly -- check Railway's current pricing

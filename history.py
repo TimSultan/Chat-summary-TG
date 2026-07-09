@@ -5,12 +5,15 @@ inline.
 """
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-HISTORY_DIR = Path("history")
+# See transcript_cache.py's DATA_DIR comment -- same optional persistent-disk hook.
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+HISTORY_DIR = DATA_DIR / "history"
 INDEX_PATH = HISTORY_DIR / "index.json"
 
 

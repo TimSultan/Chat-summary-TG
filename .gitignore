@@ -8,3 +8,5 @@ cache/
 history/
 .venv/
 *.log
+*.session_string*
+session_string_output.txt

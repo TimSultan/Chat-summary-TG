@@ -10,10 +10,16 @@ if fetched less than TODAY_TTL_SECONDS ago, re-fetched (and the file updated) on
 """
 
 import json
+import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-CACHE_DIR = Path("cache") / "transcripts"
+# DATA_DIR defaults to the current directory (local use). On a host with no persistent
+# disk by default (Railway, etc.), set DATA_DIR to a mounted Volume's path so the cache
+# survives restarts/redeploys instead of resetting each time -- entirely optional, the
+# app works fine without it, just re-fetching from Telegram after every restart.
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+CACHE_DIR = DATA_DIR / "cache" / "transcripts"
 TODAY_TTL_SECONDS = 30 * 60
 
 
