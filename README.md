@@ -106,7 +106,7 @@ keyword — no need to @mention your own account:
 summary сообщения @some_user за сегодня
   -> (from someone else) replies with what @some_user talked about today
 
-summary what did we cover this week
+summary what did we cover yesterday
   -> (typed by you, no @mention needed) replies in that chat
 ```
 
@@ -114,15 +114,27 @@ The listener never re-triggers on its own generated replies (tracked by message 
 even though a reply's text will often contain the trigger keyword itself.
 
 The request text is parsed by the LLM (mixed languages, relative dates like "сегодня" /
-"вчера" / "last week", and an optional target user are all handled), so there's no fixed
-command syntax — phrase it naturally.
+"вчера", and an optional target user are all handled), so there's no fixed command
+syntax — phrase it naturally.
+
+**Anti-spam behavior:**
+- **One specific day only** — a request spanning more than one day (e.g. "this week",
+  "last 7 days") is refused with a short notice ("Сводка выдается Только за 1 конкретный
+  день и юзера") instead of being processed, regardless of whether it's a whole-chat or
+  per-user question. This applies to the listener only -- `main.py`/`gui.py` still
+  support date ranges for your own generated reports.
+- **Replies self-delete** — a successful summary is removed from the chat automatically
+  after 3 minutes, so the chat doesn't accumulate long bot replies over time.
+- **Cooldown with a reply, not silence** — `LISTENER_COOLDOWN_SECONDS` (default 180 = 3
+  minutes) limits how often the listener will answer in the same chat. Asking again
+  before that gets "Спросите через X минут" instead of no response, and that notice
+  (like the day-limit one) auto-deletes after 10 seconds.
 
 **Before running this against real chats**, set `LISTENER_ALLOWED_CHATS` in `.env` to a
 comma-separated allowlist of chats (by `@username`, exact title, or numeric ID). Without
 it, the listener will respond to *anyone* who mentions you in *any* chat you're in,
 spending your OpenAI budget on their requests — fine for a private group with people you
-trust, risky in a large/public one. `LISTENER_COOLDOWN_SECONDS` (default 30) throttles
-repeated triggers per chat.
+trust, risky in a large/public one.
 
 ## Model choice
 

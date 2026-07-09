@@ -70,7 +70,7 @@ def load_config() -> Config:
     except ValueError:
         raise ChatSummaryError(f"TELEGRAM_API_ID must be a number, got '{api_id}'.")
 
-    cooldown_raw = os.getenv("LISTENER_COOLDOWN_SECONDS", "30")
+    cooldown_raw = os.getenv("LISTENER_COOLDOWN_SECONDS", "180")
     try:
         cooldown_seconds = int(cooldown_raw)
     except ValueError:
