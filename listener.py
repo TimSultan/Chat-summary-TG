@@ -60,6 +60,7 @@ NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих со�
 
 SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
+ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 
 
 def _ru_minutes(n: int) -> str:
@@ -298,9 +299,7 @@ async def run_roast(
         lines=lines,
     )
 
-    # Unlike /summary, the roast itself is meant to stick around in the chat -- no
-    # delete_after here.
-    await respond(roast)
+    await respond(roast, delete_after=ROAST_DELETE_AFTER)
 
 
 def build_client(cfg) -> TelegramClient:
