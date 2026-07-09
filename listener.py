@@ -161,7 +161,18 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], l
 
 
 def build_client(cfg) -> TelegramClient:
-    return TelegramClient(build_session(cfg), cfg.api_id, cfg.api_hash)
+    try:
+        return TelegramClient(build_session(cfg), cfg.api_id, cfg.api_hash)
+    except Exception as e:
+        if not cfg.session_string:
+            raise ChatSummaryError(
+                "Could not create a session file, and TELEGRAM_SESSION_STRING is not set. "
+                "On a host with no writable/persistent disk for a session file (Railway, "
+                "etc.), you must set TELEGRAM_SESSION_STRING instead -- see "
+                "generate_session_string.py or convert_existing_session.py. "
+                f"Underlying error: {e}"
+            ) from e
+        raise
 
 
 async def run_listener(client: TelegramClient, cfg, tz, log=print):
