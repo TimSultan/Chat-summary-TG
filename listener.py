@@ -268,6 +268,15 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 async def main():
     cfg = load_config()
     tz = resolve_tz(None)
+
+    # Diagnostic only -- never prints the secret itself, just whether the process
+    # actually received it, to distinguish "not set on this host" from "set but wrong"
+    # without needing to inspect the deployment platform's UI by eye.
+    if cfg.session_string:
+        print(f"[listener] TELEGRAM_SESSION_STRING: set ({len(cfg.session_string)} chars)")
+    else:
+        print("[listener] TELEGRAM_SESSION_STRING: NOT SET in this process's environment")
+
     client = build_client(cfg)
 
     await client.start()
