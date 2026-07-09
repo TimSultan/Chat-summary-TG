@@ -69,12 +69,15 @@ were discussed in this period."
 """
 
 REPLY_STYLE_RULES = """\
-This will be sent directly as a Telegram chat message reply, not saved as a document, so:
-- Do NOT use "## " headings. For each topic write one short paragraph starting with a **bold** \
-title (Telethon markdown: **bold**, __italic__, `code`), e.g. "**Topic title** — summary sentence(s). \
-Conclusion: ...".
-- Keep the ENTIRE reply well under 3500 characters. If there are many topics, keep only the most \
-substantial ones and drop minor ones rather than writing something too long.
+This will be sent directly as a Telegram chat message reply, not saved as a document, so DEFAULT \
+TO CONCISE -- this is a quick chat answer, not a report, unless the user explicitly asked for more \
+detail (see below):
+- Do NOT use "## " headings. For each topic write ONE sentence: **bold** title, then the gist and \
+the conclusion (if any) together, e.g. "**Topic title** — what happened and how it was resolved.". \
+Don't pad with extra clauses or detail nobody asked for.
+- Cover at most the 3-4 most substantial topics. Drop minor ones rather than listing everything --
+a shorter reply covering what matters beats a longer one covering everything.
+- Keep the ENTIRE reply under roughly 700 characters by default.
 - No preamble ("Here's a summary..."), no closing remarks.
 - Reply in this language: {reply_language}.
 - If, after filtering, there is nothing substantive to report, say so briefly in that language \
