@@ -79,7 +79,7 @@ def load_config() -> Config:
         raise ChatSummaryError(f"LISTENER_COOLDOWN_SECONDS must be >= 0, got {cooldown_seconds}.")
 
     allowed_chats_raw = os.getenv("LISTENER_ALLOWED_CHATS", "")
-    trigger_keywords_raw = os.getenv("LISTENER_TRIGGER_KEYWORDS", "summary")
+    trigger_keywords_raw = os.getenv("LISTENER_TRIGGER_KEYWORDS", "/summary")
     trigger_keywords = [k.strip().lower() for k in trigger_keywords_raw.split(",") if k.strip()]
     if not trigger_keywords:
         raise ChatSummaryError("LISTENER_TRIGGER_KEYWORDS must contain at least one keyword.")

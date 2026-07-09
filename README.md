@@ -90,32 +90,28 @@ python main.py --chat "My Group" --date last7days --user @some_user
 
 Output is saved to `output/<chat title>[_user]_<date(s)>.md`.
 
-## Usage: live mention-triggered replies (`listener.py`)
+## Usage: live command-triggered replies (`listener.py`)
 
 Run `python listener.py` and leave it running (a terminal, `screen`/`tmux` session, or a
-background service). While it's running, anyone who **@mentions you** (or replies to one
-of your messages) in a chat you're in, with a message containing a trigger keyword
-(default `summary`), gets a themed summary reply — sent as **you**, in that chat. **You**
-can trigger it the same way yourself, just by typing a message containing the trigger
-keyword — no need to @mention your own account:
+background service). While it's running, any message in an allowed chat containing the
+trigger keyword (default `/summary`) gets a themed summary reply — sent as **you**, in
+that chat. Works like a slash-command: no @mention or reply-to-you needed, from anyone,
+including yourself:
 
 ```
-@sultan_kembayev summary что обсуждали сегодня
-  -> (from someone else) replies with today's chat topics, in Russian
+/summary что обсуждали сегодня
+  -> replies with today's chat topics, in Russian
 
-summary сообщения @some_user за сегодня
-  -> (from someone else) replies with what @some_user talked about today
-
-summary what did we cover yesterday
-  -> (typed by you, no @mention needed) replies in that chat
+/summary сообщения @some_user за сегодня
+  -> replies with what @some_user talked about today
 ```
 
 The listener never re-triggers on its own generated replies (tracked by message ID),
 even though a reply's text will often contain the trigger keyword itself.
 
-The request text is parsed by the LLM (mixed languages, relative dates like "сегодня" /
-"вчера", and an optional target user are all handled), so there's no fixed command
-syntax — phrase it naturally.
+The rest of the request text is parsed by the LLM (mixed languages, relative dates like
+"сегодня" / "вчера", and an optional target user are all handled), so past the trigger
+keyword itself there's no fixed syntax — phrase it naturally.
 
 **Anti-spam behavior:**
 - **One specific day only** — a request spanning more than one day (e.g. "this week",
@@ -169,7 +165,7 @@ refresh.
 
 ## Asking about a specific person, even if you don't @mention them
 
-`@you summary situation with Anzhelika` (no `@mention` of Anzhelika, possibly misspelled
+`/summary situation with Anzhelika` (no `@mention` of Anzhelika, possibly misspelled
 or transliterated) still works: the LLM first notes it's a person-reference it couldn't
 resolve to an exact username, then -- once the day's transcript is in hand -- a second
 pass matches that name against the chat's actual participants (handles misspellings,
@@ -224,8 +220,9 @@ before leaving it deployed indefinitely.
   `[Photo]` so they factor into topic detection, but their content isn't analyzed.
 - Anonymous/admin-posted messages are attributed to the channel/group name Telegram gives
   them, since Telegram doesn't expose the real sender in that case.
-- The listener needs a Telegram `@username` set on your account (so people can `@mention`
-  you); replies to your messages also trigger it even without a mention.
+- The listener doesn't require a Telegram `@username` on your account -- triggering
+  doesn't need @mentions at all anymore. Without one, it just logs a warning and skips a
+  couple of minor "never target myself" safety checks in name resolution.
 - Every question the listener answers (and its full answer) is recorded under `history/`
   (`history.py`) -- one small index file plus one file per answer. The GUI's History tab
   reads this; it's also there if you'd rather grep the files directly.

@@ -1,11 +1,12 @@
-"""Live listener: when someone @mentions you (or replies to one of your messages) in a chat
-you're in, with a request containing a trigger keyword (default "summary"), it parses what
-they're asking for -- the whole chat's topics, or one participant's -- for whatever date/range
-they meant, and replies in that chat (as you, via your own Telegram session) with the summary.
+"""Live listener: works like a slash-command -- any message in a chat you're in that
+contains a trigger keyword (default "/summary") is treated as a summary request, from
+anyone, no @mention or reply-to-you needed. It parses what's being asked for -- the whole
+chat's topics, or one participant's -- for one specific day, and replies in that chat (as
+you, via your own Telegram session) with the summary.
 
 Examples it understands (mixed languages are fine):
-    "@sultan_kembayev summary что обсуждали сегодня"   -> whole-chat summary, today
-    "summary сообщения @some_user за сегодня"          -> @some_user's topics, today
+    "/summary что обсуждали сегодня"          -> whole-chat summary, today
+    "/summary сообщения @some_user за сегодня" -> @some_user's topics, today
 
 Run with: python listener.py
 Stop with Ctrl+C.
@@ -45,9 +46,7 @@ MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 DAY_LIMIT_MESSAGE = "Сводка выдается Только за 1 конкретный день и юзера"
 
 SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
-SUMMARY_COUNTDOWN_INTERVAL = 60  # ...and the countdown shown in the message ticks every 1 min
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
-ERROR_COUNTDOWN_INTERVAL = 3  # ...and their countdown ticks every 3 sec
 
 
 def _ru_minutes(n: int) -> str:
@@ -58,19 +57,6 @@ def _ru_minutes(n: int) -> str:
     return f"{n} минут"
 
 
-def _ru_seconds(n: int) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return f"{n} секунду"
-    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
-        return f"{n} секунды"
-    return f"{n} секунд"
-
-
-def _countdown_suffix(remaining_seconds: int) -> str:
-    text = _ru_minutes(round(remaining_seconds / 60)) if remaining_seconds >= 60 else _ru_seconds(remaining_seconds)
-    return f"\n\n_(удалится через {text})_"
-
-
 def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     names = {m.group(1) for m in MENTION_RE.finditer(text or "")}
     if exclude:
@@ -78,11 +64,8 @@ def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     return sorted(names)
 
 
-async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) -> list[tuple[int, str]]:
-    """Returns [(message_id, that_message's_own_text), ...] -- the text is kept per
-    message so a later countdown edit can rebuild "original text + new countdown"
-    instead of stacking countdowns on top of each other."""
-    sent_parts: list[tuple[int, str]] = []
+async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) -> list[int]:
+    sent_message_ids = []
     for i in range(0, len(text), MAX_REPLY_CHARS):
         chunk = text[i : i + MAX_REPLY_CHARS]
         if i == 0:
@@ -90,13 +73,13 @@ async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) ->
         else:
             sent = await event.respond(chunk, parse_mode="md", link_preview=False)
         if sent is not None:
-            sent_parts.append((sent.id, chunk))
+            sent_message_ids.append(sent.id)
             # Track our own generated messages so the listener never re-triggers on them
             # -- matters once outgoing messages are watched too (see run_listener), since
             # a summary reply can easily contain the trigger keyword itself.
             if sent_ids is not None:
                 sent_ids.add(sent.id)
-    return sent_parts
+    return sent_message_ids
 
 
 async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], schedule_delete, log=print):
@@ -108,15 +91,15 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     sender = await event.get_sender()
     requester = sender_display_name(sender)
 
-    async def respond(answer: str, delete_after: int | None = None, record: bool = True, countdown_interval: int | None = None):
-        sent_parts = await send_long_reply(event, answer, sent_ids=sent_ids)
+    async def respond(answer: str, delete_after: int | None = None, record: bool = True):
+        message_ids = await send_long_reply(event, answer, sent_ids=sent_ids)
         if record:
             try:
                 history.record(chat_title_for_history, requester, text, answer)
             except Exception as e:
                 log(f"[listener] failed to record history: {e}")
-        if delete_after and sent_parts:
-            schedule_delete(event.client, chat.id, sent_parts, delete_after, countdown_interval)
+        if delete_after and message_ids:
+            schedule_delete(event.client, chat.id, message_ids, delete_after)
 
     mentioned = extract_mentioned_usernames(text, exclude=my_username)
     ref_date = msg.date.astimezone(tz).date()
@@ -140,7 +123,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
 
     if start_date != end_date:
         log(f"[listener] rejected multi-day request ({start_date}..{end_date})")
-        await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False, countdown_interval=ERROR_COUNTDOWN_INTERVAL)
+        await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
         return
 
     # The raw transcript is cached per day (see transcript_cache.py) so repeated or
@@ -205,7 +188,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         length_hint=intent.get("length_hint"),
     )
 
-    await respond(summary, delete_after=SUMMARY_DELETE_AFTER, countdown_interval=SUMMARY_COUNTDOWN_INTERVAL)
+    await respond(summary, delete_after=SUMMARY_DELETE_AFTER)
 
 
 def build_client(cfg) -> TelegramClient:
@@ -232,9 +215,13 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
     my_username = me.username
 
     if not my_username:
-        raise ChatSummaryError(
-            "Your Telegram account has no @username set, so people can't @mention you. "
-            "Set one in Telegram settings, or rely on replies to your messages instead."
+        # Not fatal -- triggering no longer needs an @mention of this account, just the
+        # keyword itself. Only a couple of minor safety checks (excluding your own
+        # username from name resolution) are skipped without one.
+        log(
+            "[listener] WARNING: your Telegram account has no @username set. The "
+            "trigger keyword still works fine; only the 'never target myself' name "
+            "safety checks are skipped."
         )
 
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
@@ -259,31 +246,12 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         chat_id = str(getattr(chat, "id", ""))
         return username in allowed_chats or title in allowed_chats or chat_id in allowed_chats
 
-    def schedule_delete(delete_client, chat_id, sent_parts, delay_seconds, countdown_interval=None):
-        """Fire-and-forget: deletes the messages in `sent_parts` (list of
-        (message_id, that_message's_text)) after `delay_seconds`, without blocking
-        whatever's currently handling the request. If `countdown_interval` is given,
-        each message is periodically edited with a "(deletes in X)" countdown appended
-        to its own original text until it's removed."""
-        message_ids = [mid for mid, _ in sent_parts]
+    def schedule_delete(delete_client, chat_id, message_ids, delay_seconds):
+        """Fire-and-forget: deletes `message_ids` after `delay_seconds`, without
+        blocking whatever's currently handling the request."""
 
         async def _do():
-            remaining = delay_seconds
-            if countdown_interval:
-                while remaining > countdown_interval:
-                    await asyncio.sleep(countdown_interval)
-                    remaining -= countdown_interval
-                    suffix = _countdown_suffix(remaining)
-                    for mid, base_text in sent_parts:
-                        try:
-                            await delete_client.edit_message(
-                                chat_id, mid, base_text + suffix, parse_mode="md", link_preview=False
-                            )
-                        except Exception as e:
-                            log(f"[listener] countdown edit failed: {e}")
-                await asyncio.sleep(remaining)
-            else:
-                await asyncio.sleep(delay_seconds)
+            await asyncio.sleep(delay_seconds)
             try:
                 await delete_client.delete_messages(chat_id, message_ids)
             except Exception as e:
@@ -306,16 +274,11 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         text = msg.raw_text or ""
         text_lower = text.lower()
 
+        # The trigger keyword (default "/summary") is the invocation itself, like a
+        # slash-command -- no need to also @mention or reply to you. Works the same
+        # whether you type it yourself or someone else does, in any allowed chat.
         has_keyword = any(k in text_lower for k in cfg.listener_trigger_keywords)
         if not has_keyword:
-            return
-
-        if event.out:
-            # You typing it yourself always counts, no @mention/reply needed.
-            addressed_to_me = True
-        else:
-            addressed_to_me = bool(msg.mentioned) or f"@{my_username.lower()}" in text_lower
-        if not addressed_to_me:
             return
 
         chat = await event.get_chat()
@@ -329,13 +292,10 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
             log(f"[listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")
             try:
-                cooldown_text = f"Спросите через {_ru_minutes(remaining_minutes)}"
-                sent = await event.reply(cooldown_text)
+                sent = await event.reply(f"Спросите через {_ru_minutes(remaining_minutes)}")
                 if sent is not None:
                     sent_message_ids.add(sent.id)
-                    schedule_delete(
-                        event.client, chat_key, [(sent.id, cooldown_text)], ERROR_DELETE_AFTER, ERROR_COUNTDOWN_INTERVAL
-                    )
+                    schedule_delete(event.client, chat_key, [sent.id], ERROR_DELETE_AFTER)
             except Exception:
                 pass
             return
@@ -354,7 +314,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                 pass
 
     log(
-        f"[listener] logged in as @{my_username}. Watching for mentions containing "
+        f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords}. Ctrl+C to stop."
     )
     await client.run_until_disconnected()
