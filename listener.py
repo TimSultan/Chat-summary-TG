@@ -277,6 +277,19 @@ async def run_roast(
         await respond(NO_ROAST_MATERIAL_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
         return
 
+    if len(own_messages) > cfg.roast_max_messages:
+        # A very active poster can have thousands of messages in the lookback window --
+        # roast_person map-reduces the transcript into 6000-token chunks with one
+        # *sequential* OpenAI call per chunk, so an uncapped input can mean dozens of
+        # blocking calls (minutes of silence before anything is sent). Capping to the
+        # most recent N keeps generation fast; a roast doesn't need the whole month, just
+        # enough material.
+        log(
+            f"[listener] capping roast input for {requester}: {len(own_messages)} -> "
+            f"{cfg.roast_max_messages} most recent messages"
+        )
+        own_messages = own_messages[-cfg.roast_max_messages :]
+
     lines = format_transcript_lines(own_messages, include_date=True)
     roast = roast_person(
         api_key=cfg.openai_api_key,
@@ -285,7 +298,9 @@ async def run_roast(
         lines=lines,
     )
 
-    await respond(roast, delete_after=SUMMARY_DELETE_AFTER)
+    # Unlike /summary, the roast itself is meant to stick around in the chat -- no
+    # delete_after here.
+    await respond(roast)
 
 
 def build_client(cfg) -> TelegramClient:

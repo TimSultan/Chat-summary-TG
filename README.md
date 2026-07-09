@@ -157,9 +157,17 @@ in flight.
 
 It reuses the same per-day transcript cache as `/summary` (see caching below), so
 roasting doesn't re-fetch days already pulled for other requests. Same allowlist and
-cooldown as the summary trigger (applies to the initial confirmation prompt); the final
-roast reply self-deletes the same way summaries do. If you have no messages in that
-window, it replies with a short "nothing to roast" notice instead of calling OpenAI.
+cooldown as the summary trigger (applies to the initial confirmation prompt). Unlike
+`/summary`, **the roast itself does not self-delete** -- it stays in the chat. If you
+have no messages in that window, it replies with a short "nothing to roast" notice
+instead of calling OpenAI.
+
+**On an active chat, generation itself can take a while.** Roasting map-reduces the
+transcript into ~6000-token chunks with one *sequential* OpenAI call per chunk, so an
+uncapped month of messages from a chatty poster can mean dozens of blocking calls before
+anything is sent -- with no "generating..." message in between, that looks like the bot
+hung. `ROAST_MAX_MESSAGES` (default 400) caps input to the requester's most recent N
+messages to keep this bounded; lower it for faster/cheaper roasts.
 
 ## Model choice
 

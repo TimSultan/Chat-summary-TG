@@ -35,6 +35,7 @@ class Config:
     listener_cooldown_seconds: int
     roast_trigger_keywords: list[str]
     roast_lookback_days: int
+    roast_max_messages: int
 
 
 def build_session(cfg: "Config"):
@@ -99,6 +100,14 @@ def load_config() -> Config:
     if roast_lookback_days < 1:
         raise ChatSummaryError(f"ROAST_LOOKBACK_DAYS must be >= 1, got {roast_lookback_days}.")
 
+    roast_max_messages_raw = os.getenv("ROAST_MAX_MESSAGES", "400")
+    try:
+        roast_max_messages = int(roast_max_messages_raw)
+    except ValueError:
+        raise ChatSummaryError(f"ROAST_MAX_MESSAGES must be a number, got '{roast_max_messages_raw}'.")
+    if roast_max_messages < 1:
+        raise ChatSummaryError(f"ROAST_MAX_MESSAGES must be >= 1, got {roast_max_messages}.")
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -111,4 +120,5 @@ def load_config() -> Config:
         listener_cooldown_seconds=cooldown_seconds,
         roast_trigger_keywords=roast_trigger_keywords,
         roast_lookback_days=roast_lookback_days,
+        roast_max_messages=roast_max_messages,
     )
