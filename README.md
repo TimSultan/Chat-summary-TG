@@ -1,0 +1,173 @@
+# Chat Summary TG
+
+Reads all messages from a specific Telegram chat you're a member of, for a specific day,
+and produces a markdown digest of the main topics discussed that day — grouping a whole
+back-and-forth (even if 20 people piled on) into one entry with its key points and
+conclusion, if the conversation reached one. Small talk, spam, and low-content threads
+are filtered out.
+
+Logs into Telegram as **you** (via [Telethon](https://docs.telethon.dev)), not a bot, so it
+can read history of any chat you're already in — including messages from before the tool
+existed.
+
+## Setup
+
+1. Install dependencies:
+
+   ```
+   pip install -r requirements.txt
+   ```
+
+2. Get Telegram API credentials from https://my.telegram.org/apps (log in with your phone
+   number, create an app, copy the `api_id` and `api_hash`).
+
+3. Get an OpenAI API key from https://platform.openai.com/api-keys.
+
+4. Copy `.env.example` to `.env` and fill in `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and
+   `OPENAI_API_KEY`.
+
+## First run / login
+
+The first time you run the tool it will ask for your phone number, then a login code sent
+to your Telegram app, and your 2FA password if you have one set. This creates a local
+session file (named by `TELEGRAM_SESSION` in `.env`, default `tg_summary_session.session`)
+so you won't have to log in again. **Keep that file private** — it's equivalent to being
+logged into your account.
+
+## Usage: desktop window (`gui.py`)
+
+```
+python gui.py
+```
+
+A small window with a model picker on top and three tabs:
+- **Model** dropdown — pick from `RECOMMENDED_MODELS` in `config.py` (editable, so you
+  can type any future model string too). Applies to both tabs below.
+- **Generate Summary** — fill in chat / date / optional user filter / optional timezone,
+  click Generate. Progress and errors show in the log pane at the bottom; "Open Output
+  Folder" opens the saved `.md` once it's done.
+- **Live Listener** — Start/Stop the mention-triggered auto-reply bot (see below) without
+  a terminal.
+- **History** — every question the listener has answered: who asked, in which chat,
+  when, and a preview of the question. Double-click a row (or "Open Answer") to open the
+  full answer in its own file rather than cramming it into the list. Refreshes every 5
+  seconds while the window is open.
+
+First use pops up plain dialog boxes for the phone number / login code / 2FA password
+instead of a terminal prompt. The Generate Summary and Listener tabs share one Telegram
+session, so only one can run at a time.
+
+## Usage: CLI digest (`main.py`)
+
+```
+python main.py --chat "My Group" --date 2026-07-08
+python main.py --chat @some_channel --date yesterday
+python main.py --chat -1001234567890 --date today --tz Europe/Istanbul
+
+# date ranges
+python main.py --chat "My Group" --date 2026-07-01:2026-07-08
+python main.py --chat "My Group" --date last7days
+
+# what did one person talk about?
+python main.py --chat "My Group" --date last7days --user @some_user
+```
+
+- `--chat` — the chat's `@username`, numeric ID, or a substring of its title (if
+  ambiguous, the tool lists all matching chat titles so you can be more specific).
+- `--date` — `YYYY-MM-DD`, a `YYYY-MM-DD:YYYY-MM-DD` range, `today`, `yesterday`,
+  `last7days`, or `last30days` (default: `today`).
+- `--user` — restrict the summary to what one participant discussed (matched by
+  `@username` or a substring of their display name). The full transcript is still used
+  for context, but the summary only covers topics that person raised or actively took
+  part in.
+- `--tz` — IANA timezone for defining calendar days, e.g. `Europe/Istanbul` (default:
+  your system's local timezone).
+- `--model` — override the model from `.env` for this run (e.g. `gpt-5.4-mini`,
+  `gpt-5.5`, `gpt-5.4-nano` -- see model choice below).
+- `--output-dir` — where to write the markdown file (default: `output/`).
+- `--force` — ignore the cached transcript and re-fetch every day fresh from Telegram
+  -- see caching below.
+
+Output is saved to `output/<chat title>[_user]_<date(s)>.md`.
+
+## Usage: live mention-triggered replies (`listener.py`)
+
+Run `python listener.py` and leave it running (a terminal, `screen`/`tmux` session, or a
+background service). While it's running, anyone who **@mentions you** (or replies to one
+of your messages) in a chat you're in, with a message containing a trigger keyword
+(default `summary`), gets a themed summary reply — sent as **you**, in that chat:
+
+```
+@sultan_kembayev summary что обсуждали сегодня
+  -> replies with today's chat topics, in Russian
+
+summary сообщения @some_user за сегодня
+  -> replies with what @some_user talked about today
+```
+
+The request text is parsed by the LLM (mixed languages, relative dates like "сегодня" /
+"вчера" / "last week", and an optional target user are all handled), so there's no fixed
+command syntax — phrase it naturally.
+
+**Before running this against real chats**, set `LISTENER_ALLOWED_CHATS` in `.env` to a
+comma-separated allowlist of chats (by `@username`, exact title, or numeric ID). Without
+it, the listener will respond to *anyone* who mentions you in *any* chat you're in,
+spending your OpenAI budget on their requests — fine for a private group with people you
+trust, risky in a large/public one. `LISTENER_COOLDOWN_SECONDS` (default 30) throttles
+repeated triggers per chat.
+
+## Model choice
+
+`config.py` defines `RECOMMENDED_MODELS`, curated as of July 2026: `gpt-5.4-mini`
+(default -- fast, cheap, a big step up from the old `gpt-4o-mini`), `gpt-5.5` (flagship,
+best quality, similar latency to 5.4), `gpt-5.4-nano` (fastest/cheapest, fine for quiet
+chats), plus `gpt-5`/`gpt-5-mini`/`gpt-5-nano` and the legacy `gpt-4o`/`gpt-4o-mini`.
+Set `OPENAI_MODEL` in `.env`, pass `--model` on the CLI, or pick from the GUI's dropdown
+(which also accepts typing in anything not on the list, for whenever this list goes
+stale).
+
+## Caching: the raw transcript, not the answer
+
+What's expensive and reusable is *reading the chat* -- what's cheap and always-fresh is
+*answering a specific question about it*. So the tool caches per calendar day, per chat,
+the raw fetched transcript (under `cache/transcripts/`), not the generated summary:
+
+- A day that's fully in the past can't gain new messages, so once fetched it's cached
+  indefinitely.
+- Today (the day still in progress) is cached for 30 minutes (`transcript_cache.py`'s
+  `TODAY_TTL_SECONDS`). A request within that window reuses the saved transcript; past
+  it, the day is re-fetched and the file updated before answering.
+- Every request -- "summary of today", "what did Anzhelika talk about today", asked five
+  minutes apart by different people -- always gets its own fresh OpenAI call, just
+  against a transcript that's often already on disk instead of freshly pulled from
+  Telegram.
+
+`--force` (CLI) / "Force refresh" (GUI checkbox) bypasses the cache and re-fetches every
+day in the requested range regardless of freshness. The listener always uses the cache
+when available; delete files under `cache/transcripts/` to force specific days to
+refresh.
+
+## Asking about a specific person, even if you don't @mention them
+
+`@you summary situation with Anzhelika` (no `@mention` of Anzhelika, possibly misspelled
+or transliterated) still works: the LLM first notes it's a person-reference it couldn't
+resolve to an exact username, then -- once the day's transcript is in hand -- a second
+pass matches that name against the chat's actual participants (handles misspellings,
+nicknames, and script transliteration, e.g. "Anzhelika" for a Cyrillic "Анжелика") and
+scopes the summary to topics that person was involved in, including ones others
+discussed *about* them without them posting.
+
+## Notes
+
+- Very active chats/ranges are automatically split into chunks, pre-summarized in parts,
+  then merged into one final themed summary so topics that span chunks still get combined
+  into a single entry.
+- Media messages (photos, videos, stickers, voice notes, etc.) are included as tags like
+  `[Photo]` so they factor into topic detection, but their content isn't analyzed.
+- Anonymous/admin-posted messages are attributed to the channel/group name Telegram gives
+  them, since Telegram doesn't expose the real sender in that case.
+- The listener needs a Telegram `@username` set on your account (so people can `@mention`
+  you); replies to your messages also trigger it even without a mention.
+- Every question the listener answers (and its full answer) is recorded under `history/`
+  (`history.py`) -- one small index file plus one file per answer. The GUI's History tab
+  reads this; it's also there if you'd rather grep the files directly.

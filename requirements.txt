@@ -1,0 +1,6 @@
+telethon>=1.36
+openai>=1.30
+python-dotenv>=1.0
+tiktoken>=0.7
+tzlocal>=5.2
+tzdata>=2024.1 ; sys_platform == 'win32'
