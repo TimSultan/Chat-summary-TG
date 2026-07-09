@@ -40,6 +40,24 @@ concluded. Ignore discussions {focus_user} had no real connection to. If nothing
 substantively involves {focus_user}, say so briefly instead of inventing content.
 """
 
+TOPIC_ONLY_RULES = """\
+IMPORTANT: the user asked about ONE specific topic/event, not a general summary: {topic_hint}
+Ignore the "cover every topic" instructions below -- ONLY find and describe that specific topic/\
+event. If it happened more than once in this transcript, describe the most recent occurrence \
+unless the request clearly asked for something else (e.g. "the first time" or "every time"). \
+Give: what happened, who was involved, and the outcome/conclusion if there was one. Do not \
+mention, list, or summarize any other unrelated topic from the transcript -- a one-topic question \
+gets a one-topic answer, nothing padded on. If nothing in this transcript matches what was asked \
+about, say so in one short sentence instead of describing something else.
+"""
+
+LENGTH_HINT_RULE = """\
+The user explicitly asked for this length/level of detail: "{length_hint}". Follow that over any \
+other length guidance above -- e.g. if they asked for something short/brief/quick/one sentence, \
+answer in 1-2 sentences with no heading or title, even if that means dropping detail; if they \
+asked for more detail, expand beyond the usual limit.
+"""
+
 FILE_STYLE_RULES = """\
 Order topics chronologically by when they started, and mention the rough time (and date, if the \
 transcript spans multiple days) they started.
@@ -99,15 +117,23 @@ Topic notes from each part:
 """
 
 
-def _build_system_prompt(style: str, focus_user: str | None, reply_language: str | None) -> str:
+def _build_system_prompt(
+    style: str,
+    focus_user: str | None,
+    reply_language: str | None,
+    topic_hint: str | None = None,
+    length_hint: str | None = None,
+) -> str:
     assert style in VALID_STYLES, f"internal bug: unknown style {style!r}, expected one of {VALID_STYLES}"
-    parts = [BASE_RULES]
+    parts = [TOPIC_ONLY_RULES.format(topic_hint=topic_hint) if topic_hint else BASE_RULES]
     if focus_user:
         parts.append(FOCUS_USER_RULES.format(focus_user=focus_user))
     if style == "reply":
         parts.append(REPLY_STYLE_RULES.format(reply_language=reply_language or "the request's language"))
     else:
         parts.append(FILE_STYLE_RULES)
+    if length_hint:
+        parts.append(LENGTH_HINT_RULE.format(length_hint=length_hint))
     return "\n".join(parts)
 
 
@@ -183,6 +209,8 @@ def summarize_transcript(
     focus_user: str | None = None,
     style: str = "file",
     reply_language: str | None = None,
+    topic_hint: str | None = None,
+    length_hint: str | None = None,
     max_chunk_tokens: int = 6000,
 ) -> str:
     if style not in VALID_STYLES:
@@ -201,7 +229,7 @@ def summarize_transcript(
         return no_content_msg
 
     client = OpenAI(api_key=api_key)
-    system_prompt = _build_system_prompt(style, focus_user, reply_language)
+    system_prompt = _build_system_prompt(style, focus_user, reply_language, topic_hint, length_hint)
     chunks = chunk_transcript(lines, max_chunk_tokens, model)
 
     if len(chunks) == 1:
@@ -210,7 +238,11 @@ def summarize_transcript(
         )
         return _chat(client, model, system_prompt, prompt)
 
-    focus_note = f"\nOnly keep notes relevant to {focus_user}.\n" if focus_user else ""
+    focus_note = ""
+    if focus_user:
+        focus_note += f"\nOnly keep notes relevant to {focus_user}.\n"
+    if topic_hint:
+        focus_note += f"\nOnly keep notes relevant to this specific topic/event: {topic_hint}\n"
     notes_parts = []
     for i, chunk in enumerate(chunks, start=1):
         prompt = MAP_PROMPT.format(part=i, total=len(chunks), transcript=chunk, focus_note=focus_note)

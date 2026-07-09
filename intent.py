@@ -25,9 +25,18 @@ names a person that way.
 instead of (or in addition to) an @mention -- possibly misspelled, abbreviated, or transliterated \
 from another script/language (e.g. "Anzhelika" for a Cyrillic "Анжелика") -- put that literal name \
 text here exactly as written in the request. Else null.
+- "topic_hint": if the request is about ONE specific topic/event/situation rather than a general \
+"what did everyone discuss" summary -- e.g. "the last conflict", "the argument about the venue", \
+"what got decided about the trip", "the drama earlier" -- put a short description of that topic \
+here (your own paraphrase is fine). This can be combined with a person (e.g. "the conflict with \
+Anzhelika"). Else null. Do NOT set this for a plain "what happened today"/"summarize the chat" \
+request -- that should get every notable topic, not just one.
 - "start_date": ISO date (YYYY-MM-DD) the summary period starts.
 - "end_date": ISO date (YYYY-MM-DD) the summary period ends (inclusive). Equal to start_date for \
 a single day.
+- "length_hint": if the request explicitly asks for a particular length or level of detail (e.g. \
+"very short", "brief", "one sentence", "just the highlights", "in detail", "подробнее"), put that \
+instruction here (verbatim or paraphrased). Else null.
 - "reply_language": your best-guess ISO 639-1 language code for how the reply should be written, \
 based on the language of the request message (e.g. "ru", "en").
 
@@ -97,6 +106,14 @@ def parse_summary_request(
     if scope == "user" and not target_username and not target_name_hint:
         scope = "chat"  # nothing to focus on, fall back to whole-chat summary
 
+    topic_hint = (data.get("topic_hint") or None)
+    if isinstance(topic_hint, str):
+        topic_hint = topic_hint.strip() or None
+
+    length_hint = (data.get("length_hint") or None)
+    if isinstance(length_hint, str):
+        length_hint = length_hint.strip() or None
+
     def _parse(value, fallback):
         try:
             return date.fromisoformat(value)
@@ -112,6 +129,8 @@ def parse_summary_request(
         "scope": scope,
         "target_username": target_username,
         "target_name_hint": target_name_hint,
+        "topic_hint": topic_hint,
+        "length_hint": length_hint,
         "start_date": start_date,
         "end_date": end_date,
         "reply_language": data.get("reply_language") or "en",

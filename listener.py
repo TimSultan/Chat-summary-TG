@@ -150,6 +150,8 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], l
         focus_user=focus_user,
         style="reply",
         reply_language=intent["reply_language"],
+        topic_hint=intent.get("topic_hint"),
+        length_hint=intent.get("length_hint"),
     )
 
     await respond(summary)
