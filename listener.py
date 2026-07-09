@@ -45,10 +45,6 @@ def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     return sorted(names)
 
 
-def strip_mentions(text: str) -> str:
-    return MENTION_RE.sub("", text or "").strip()
-
-
 async def send_long_reply(event, text: str, sent_ids: set[int] | None = None):
     for i in range(0, len(text), MAX_REPLY_CHARS):
         chunk = text[i : i + MAX_REPLY_CHARS]
@@ -86,7 +82,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], l
         intent = parse_summary_request(
             api_key=cfg.openai_api_key,
             model=cfg.openai_model,
-            text=strip_mentions(text),
+            text=text,
             reference_date=ref_date,
             mentioned_usernames=mentioned,
         )
