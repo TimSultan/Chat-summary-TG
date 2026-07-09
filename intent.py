@@ -20,7 +20,9 @@ Return ONLY a JSON object with these fields:
 drama/topic involving them (e.g. "the situation with Anzhelika", "what happened with @bob").
 - "target_username": the username (without @) to focus on if scope is "user" and the person was \
 referenced with an @mention, else null. Prefer one of the given mentioned_usernames if the request \
-names a person that way.
+names a person that way. NEVER set this to the bot's own username given below -- a message often \
+*starts* with "@thatusername" just to address/invoke the bot, which is not the subject of the \
+question. Look at the rest of the message for who is actually being asked about.
 - "target_name_hint": if scope is "user" but the person was referenced by a plain name/nickname \
 instead of (or in addition to) an @mention -- possibly misspelled, abbreviated, or transliterated \
 from another script/language (e.g. "Anzhelika" for a Cyrillic "Анжелика") -- put that literal name \
@@ -47,7 +49,9 @@ to just the reference date (today).
 
 USER_PROMPT_TEMPLATE = """\
 Reference date: {reference_date}
-Mentioned usernames in the message (excluding whoever is being asked to summarize): {mentioned}
+Bot's own username (being addressed/invoked by this message -- NEVER the subject of the question, \
+even though it often appears as a leading @mention): {my_username}
+Mentioned usernames in the message (excluding the bot's own): {mentioned}
 Request message: {text}
 """
 
@@ -58,6 +62,7 @@ def parse_summary_request(
     text: str,
     reference_date: date,
     mentioned_usernames: list[str],
+    my_username: str | None = None,
 ) -> dict:
     if not text or not text.strip():
         raise ChatSummaryError("Cannot parse an empty summary request.")
@@ -66,6 +71,7 @@ def parse_summary_request(
     client = OpenAI(api_key=api_key)
     prompt = USER_PROMPT_TEMPLATE.format(
         reference_date=reference_date.isoformat(),
+        my_username=my_username or "(unknown)",
         mentioned=", ".join(mentioned_usernames) or "(none)",
         text=text,
     )
@@ -96,6 +102,10 @@ def parse_summary_request(
     target_username = (data.get("target_username") or None)
     if target_username:
         target_username = target_username.lstrip("@")
+    # Deterministic safeguard: the bot's own username is never a valid target, no matter
+    # what the model returned -- it just means the bot was addressed, not asked about.
+    if target_username and my_username and target_username.lower() == my_username.lower():
+        target_username = None
     if scope == "user" and not target_username and len(mentioned_usernames) == 1:
         target_username = mentioned_usernames[0]
 

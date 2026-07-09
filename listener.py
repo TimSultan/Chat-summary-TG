@@ -85,6 +85,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], l
             text=text,
             reference_date=ref_date,
             mentioned_usernames=mentioned,
+            my_username=my_username,
         )
     except Exception as e:
         log(f"[listener] intent parse failed: {e}")
