@@ -16,8 +16,10 @@ a target user. You are given today's reference date and any usernames mentioned 
 
 Return ONLY a JSON object with these fields:
 - "scope": "chat" if it's asking to summarize the whole conversation/what everyone discussed, or \
-"user" if it's specifically asking about one particular person -- what they said, or a situation/\
-drama/topic involving them (e.g. "the situation with Anzhelika", "what happened with @bob").
+"user" if it's specifically asking about one particular person -- what they said, a situation/\
+drama/topic involving them, OR who they are/what's known about them from the chat (e.g. "the \
+situation with Anzhelika", "what happened with @bob", "кто такой Степан" / "who is Stepan", "tell \
+me about @bob"). Identity/biography-style questions about a specific person still count as "user".
 - "target_username": the username (without @) to focus on if scope is "user" and the person was \
 referenced with an @mention, else null. Prefer one of the given mentioned_usernames if the request \
 names a person that way. NEVER set this to the bot's own username given below -- a message often \

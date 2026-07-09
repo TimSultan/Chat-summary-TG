@@ -58,6 +58,15 @@ answer in 1-2 sentences with no heading or title, even if that means dropping de
 asked for more detail, expand beyond the usual limit.
 """
 
+DIRECT_QUESTION_RULE = """\
+The user's exact original message was: "{original_question}"
+If that is phrased as a direct question (who/what/when/why/how/did-we/etc.) rather than a generic \
+"summarize everything" request, answer THAT question directly and naturally, in your own words, \
+using the transcript as your source of truth -- don't force your answer into the generic topic-by-\
+topic format just because that's the default style. If the transcript doesn't contain enough to \
+answer it, say so plainly instead of guessing or padding with unrelated information.
+"""
+
 FILE_STYLE_RULES = """\
 Order topics chronologically by when they started, and mention the rough time (and date, if the \
 transcript spans multiple days) they started.
@@ -126,6 +135,7 @@ def _build_system_prompt(
     reply_language: str | None,
     topic_hint: str | None = None,
     length_hint: str | None = None,
+    original_question: str | None = None,
 ) -> str:
     assert style in VALID_STYLES, f"internal bug: unknown style {style!r}, expected one of {VALID_STYLES}"
     parts = [TOPIC_ONLY_RULES.format(topic_hint=topic_hint) if topic_hint else BASE_RULES]
@@ -137,6 +147,8 @@ def _build_system_prompt(
         parts.append(FILE_STYLE_RULES)
     if length_hint:
         parts.append(LENGTH_HINT_RULE.format(length_hint=length_hint))
+    if original_question:
+        parts.append(DIRECT_QUESTION_RULE.format(original_question=original_question))
     return "\n".join(parts)
 
 
@@ -214,6 +226,7 @@ def summarize_transcript(
     reply_language: str | None = None,
     topic_hint: str | None = None,
     length_hint: str | None = None,
+    original_question: str | None = None,
     max_chunk_tokens: int = 6000,
 ) -> str:
     if style not in VALID_STYLES:
@@ -232,7 +245,7 @@ def summarize_transcript(
         return no_content_msg
 
     client = OpenAI(api_key=api_key)
-    system_prompt = _build_system_prompt(style, focus_user, reply_language, topic_hint, length_hint)
+    system_prompt = _build_system_prompt(style, focus_user, reply_language, topic_hint, length_hint, original_question)
     chunks = chunk_transcript(lines, max_chunk_tokens, model)
 
     if len(chunks) == 1:
@@ -246,6 +259,8 @@ def summarize_transcript(
         focus_note += f"\nOnly keep notes relevant to {focus_user}.\n"
     if topic_hint:
         focus_note += f"\nOnly keep notes relevant to this specific topic/event: {topic_hint}\n"
+    if original_question:
+        focus_note += f"\nThe user's actual question was: \"{original_question}\" -- keep any details that help answer it.\n"
     notes_parts = []
     for i, chunk in enumerate(chunks, start=1):
         prompt = MAP_PROMPT.format(part=i, total=len(chunks), transcript=chunk, focus_note=focus_note)

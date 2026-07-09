@@ -64,6 +64,15 @@ def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     return sorted(names)
 
 
+def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
+    """Removes the trigger keyword(s) (e.g. "/summary") from the request text, so the
+    LLM sees the actual question ("кто такой Степан") rather than the invocation itself."""
+    result = text
+    for kw in keywords:
+        result = re.sub(re.escape(kw), "", result, flags=re.IGNORECASE)
+    return result.strip()
+
+
 async def send_long_reply(event, text: str, sent_ids: set[int] | None = None) -> list[int]:
     sent_message_ids = []
     for i in range(0, len(text), MAX_REPLY_CHARS):
@@ -174,6 +183,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
 
     lines = format_transcript_lines(messages, include_date=(start_date != end_date))
     label = period_label(start_date, end_date)
+    original_question = strip_trigger_keywords(text, cfg.listener_trigger_keywords)
 
     summary = summarize_transcript(
         api_key=cfg.openai_api_key,
@@ -186,6 +196,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         reply_language=intent["reply_language"],
         topic_hint=intent.get("topic_hint"),
         length_hint=intent.get("length_hint"),
+        original_question=original_question,
     )
 
     await respond(summary, delete_after=SUMMARY_DELETE_AFTER)
