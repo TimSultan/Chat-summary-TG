@@ -132,6 +132,25 @@ it, the listener will respond to *anyone* who mentions you in *any* chat you're 
 spending your OpenAI budget on their requests — fine for a private group with people you
 trust, risky in a large/public one.
 
+### Roasting (`прожарь меня`)
+
+A second trigger keyword (default `прожарь меня`, `ROAST_TRIGGER_KEYWORDS` in `.env`)
+roasts whoever sends it, in Russian, using **their own** messages from the last
+`ROAST_LOOKBACK_DAYS` days (default 30):
+
+```
+прожарь меня
+  -> pulls your own messages from the last 30 days (across each day's cached
+     transcript), sends them to OpenAI, and replies in the chat with a no-holds-barred
+     5-point roast (Russian, swearing allowed) plus a punchline
+```
+
+It reuses the same per-day transcript cache as `/summary` (see caching below), so
+roasting doesn't re-fetch days already pulled for other requests. Same allowlist,
+cooldown, and self-deleting-reply behavior as the summary trigger. If you have no
+messages in that window, it replies with a short "nothing to roast" notice instead of
+calling OpenAI.
+
 ## Model choice
 
 `config.py` defines `RECOMMENDED_MODELS`, curated as of July 2026: `gpt-5.4-mini`
@@ -195,7 +214,8 @@ generate a portable session first:
    `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_STRING` (the string from
    step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
-   warning above), `LISTENER_TRIGGER_KEYWORDS`, `LISTENER_COOLDOWN_SECONDS`.
+   warning above), `LISTENER_TRIGGER_KEYWORDS`, `LISTENER_COOLDOWN_SECONDS`,
+   `ROAST_TRIGGER_KEYWORDS`, `ROAST_LOOKBACK_DAYS`.
 4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
    running.
 

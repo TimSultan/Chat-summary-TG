@@ -33,6 +33,8 @@ class Config:
     listener_allowed_chats: list[str]
     listener_trigger_keywords: list[str]
     listener_cooldown_seconds: int
+    roast_trigger_keywords: list[str]
+    roast_lookback_days: int
 
 
 def build_session(cfg: "Config"):
@@ -84,6 +86,19 @@ def load_config() -> Config:
     if not trigger_keywords:
         raise ChatSummaryError("LISTENER_TRIGGER_KEYWORDS must contain at least one keyword.")
 
+    roast_trigger_keywords_raw = os.getenv("ROAST_TRIGGER_KEYWORDS", "прожарь меня")
+    roast_trigger_keywords = [k.strip().lower() for k in roast_trigger_keywords_raw.split(",") if k.strip()]
+    if not roast_trigger_keywords:
+        raise ChatSummaryError("ROAST_TRIGGER_KEYWORDS must contain at least one keyword.")
+
+    roast_lookback_raw = os.getenv("ROAST_LOOKBACK_DAYS", "30")
+    try:
+        roast_lookback_days = int(roast_lookback_raw)
+    except ValueError:
+        raise ChatSummaryError(f"ROAST_LOOKBACK_DAYS must be a number, got '{roast_lookback_raw}'.")
+    if roast_lookback_days < 1:
+        raise ChatSummaryError(f"ROAST_LOOKBACK_DAYS must be >= 1, got {roast_lookback_days}.")
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -94,4 +109,6 @@ def load_config() -> Config:
         listener_allowed_chats=[c.strip() for c in allowed_chats_raw.split(",") if c.strip()],
         listener_trigger_keywords=trigger_keywords,
         listener_cooldown_seconds=cooldown_seconds,
+        roast_trigger_keywords=roast_trigger_keywords,
+        roast_lookback_days=roast_lookback_days,
     )

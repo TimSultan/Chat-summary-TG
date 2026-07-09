@@ -20,6 +20,7 @@ import math
 import re
 import sys
 import time
+from datetime import timedelta
 
 from telethon import TelegramClient, events
 
@@ -28,6 +29,7 @@ from config import build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
 from main import period_label, resolve_tz
+from roast import roast_person
 from summarizer import summarize_transcript
 from telegram_fetch import (
     fetch_range_messages_cached,
@@ -44,6 +46,10 @@ MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 # from getting a wall of text. Applies regardless of whether it's a whole-chat or
 # per-user request.
 DAY_LIMIT_MESSAGE = "Сводка выдается Только за 1 конкретный день и юзера"
+
+# "прожарь меня" roasts the requester using their own messages from the last
+# ROAST_LOOKBACK_DAYS days (config.py, ROAST_LOOKBACK_DAYS env var, default 30).
+NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих сообщений тут не нашлось -- нечем прожаривать."
 
 SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
@@ -202,6 +208,63 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     await respond(summary, delete_after=SUMMARY_DELETE_AFTER)
 
 
+async def handle_roast_request(event, cfg, tz, sent_ids: set[int], schedule_delete, log=print):
+    """"прожарь меня" -- roasts whoever sent the trigger message, using their own
+    messages from the last cfg.roast_lookback_days days (reusing the same per-day
+    transcript cache as the summary path)."""
+    msg = event.message
+    text = msg.raw_text or ""
+
+    chat = await event.get_chat()
+    chat_title_for_history = getattr(chat, "title", None) or "Unknown chat"
+    sender = await event.get_sender()
+    requester = sender_display_name(sender)
+
+    async def respond(answer: str, delete_after: int | None = None, record: bool = True):
+        message_ids = await send_long_reply(event, answer, sent_ids=sent_ids)
+        if record:
+            try:
+                history.record(chat_title_for_history, requester, text, answer)
+            except Exception as e:
+                log(f"[listener] failed to record history: {e}")
+        if delete_after and message_ids:
+            schedule_delete(event.client, chat.id, message_ids, delete_after)
+
+    end_date = msg.date.astimezone(tz).date()
+    start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
+
+    _, messages = await fetch_range_messages_cached(
+        client=event.client,
+        chat_ref=chat,
+        start_day=start_date,
+        end_day=end_date,
+        tz=tz,
+        log=log,
+    )
+
+    target_id = getattr(sender, "id", None)
+    own_messages = [m for m in messages if m.sender_id == target_id] if target_id is not None else []
+    if not own_messages:
+        username = getattr(sender, "username", None)
+        if username:
+            own_messages = [m for m in messages if sender_matches(m, username)]
+
+    log(f"[listener] roast target={requester} matched={len(own_messages)}/{len(messages)}")
+    if not own_messages:
+        await respond(NO_ROAST_MATERIAL_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
+        return
+
+    lines = format_transcript_lines(own_messages, include_date=True)
+    roast = roast_person(
+        api_key=cfg.openai_api_key,
+        model=cfg.openai_model,
+        target_name=requester,
+        lines=lines,
+    )
+
+    await respond(roast, delete_after=SUMMARY_DELETE_AFTER)
+
+
 def build_client(cfg) -> TelegramClient:
     try:
         return TelegramClient(build_session(cfg), cfg.api_id, cfg.api_hash)
@@ -288,8 +351,10 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         # The trigger keyword (default "/summary") is the invocation itself, like a
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
-        has_keyword = any(k in text_lower for k in cfg.listener_trigger_keywords)
-        if not has_keyword:
+        # "прожарь меня" is a second, separate trigger for the roast command.
+        has_summary_keyword = any(k in text_lower for k in cfg.listener_trigger_keywords)
+        has_roast_keyword = any(k in text_lower for k in cfg.roast_trigger_keywords)
+        if not has_summary_keyword and not has_roast_keyword:
             return
 
         chat = await event.get_chat()
@@ -314,7 +379,10 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
         log(f"[listener] handling request in '{getattr(chat, 'title', chat_key)}': {text!r}")
         try:
-            await handle_request(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
+            if has_roast_keyword:
+                await handle_roast_request(event, cfg, tz, sent_message_ids, schedule_delete, log=log)
+            else:
+                await handle_request(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
         except Exception as e:
             log(f"[listener] error handling request: {e}")
             try:
@@ -326,7 +394,8 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
-        f"{cfg.listener_trigger_keywords}. Ctrl+C to stop."
+        f"{cfg.listener_trigger_keywords} (summary) or {cfg.roast_trigger_keywords} (roast). "
+        "Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 
