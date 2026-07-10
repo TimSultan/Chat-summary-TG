@@ -36,6 +36,8 @@ class Config:
     roast_trigger_keywords: list[str]
     roast_lookback_days: int
     roast_max_messages: int
+    save_trigger_keyword: str
+    save_channel: str | None
 
 
 def build_session(cfg: "Config"):
@@ -108,6 +110,12 @@ def load_config() -> Config:
     if roast_max_messages < 1:
         raise ChatSummaryError(f"ROAST_MAX_MESSAGES must be >= 1, got {roast_max_messages}.")
 
+    save_trigger_keyword = os.getenv("SAVE_TRIGGER_KEYWORD", "сохрани").strip().lower()
+    if not save_trigger_keyword:
+        raise ChatSummaryError("SAVE_TRIGGER_KEYWORD cannot be empty.")
+
+    save_channel = os.getenv("SAVE_CHANNEL", "papka_pokrasa").strip() or None
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -121,4 +129,6 @@ def load_config() -> Config:
         roast_trigger_keywords=roast_trigger_keywords,
         roast_lookback_days=roast_lookback_days,
         roast_max_messages=roast_max_messages,
+        save_trigger_keyword=save_trigger_keyword,
+        save_channel=save_channel,
     )

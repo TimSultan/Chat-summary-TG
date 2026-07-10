@@ -36,6 +36,7 @@ from summarizer import summarize_transcript
 from telegram_fetch import (
     fetch_range_messages_cached,
     format_transcript_lines,
+    resolve_chat,
     sender_display_name,
     sender_matches,
 )
@@ -82,6 +83,20 @@ SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 
+# "сохрани" (config.py, SAVE_TRIGGER_KEYWORD env var), sent by you as a reply to any
+# message, asks (via a confirmation prompt + reaction, like the roast flow) whether to
+# repost that message -- photo, video, any media, or just text -- to your save channel
+# (SAVE_CHANNEL), with any text after the trigger word appended as a caption. Your own
+# trigger message is deleted immediately (it's always yours -- see msg.out check in
+# on_message); the confirmation prompt gets a tick reaction and self-deletes once
+# confirmed, or self-deletes unconfirmed after SAVE_CONFIRM_TIMEOUT. Unlike
+# summary/roast, this ignores LISTENER_ALLOWED_CHATS entirely, since it never touches
+# the OpenAI budget.
+SAVE_CONFIRM_TEXT = "Сохранить в t.me/papka_pokrasa?\nреакция для подтверждения."
+SAVE_TICK_EMOJI = "✅"
+SAVE_CONFIRM_TIMEOUT = 3  # seconds to wait for a confirming reaction before cancelling
+SAVE_CONFIRM_DELETE_AFTER = 3  # seconds after a tick reaction before the prompt is deleted
+
 
 def _ru_minutes(n: int) -> str:
     if n % 10 == 1 and n % 100 != 11:
@@ -105,6 +120,25 @@ def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
     for kw in keywords:
         result = re.sub(re.escape(kw), "", result, flags=re.IGNORECASE)
     return result.strip()
+
+
+async def repost_saved_message(client, channel, replied_msg, added_text: str) -> None:
+    """Reposts `replied_msg` (whatever it contains -- photo, video, any other media, or
+    just text) to `channel` as a fresh message, not a forward (no "Forwarded from" tag).
+    `added_text` (the text typed after the save trigger word, may be empty) is appended
+    below whatever text/caption the original message already had."""
+    original_text = replied_msg.raw_text or ""
+    caption = "\n\n".join(p for p in (original_text, added_text) if p) or None
+
+    if replied_msg.media:
+        # Passing the original media object straight through re-uses Telegram's existing
+        # file server-side (no download/re-upload through us), same as a forward would,
+        # but as a brand-new message so it doesn't carry a "Forwarded from" tag.
+        await client.send_file(channel, file=replied_msg.media, caption=caption)
+    elif caption:
+        await client.send_message(channel, caption)
+    else:
+        raise ChatSummaryError("The message you replied to has no text or media to save.")
 
 
 async def send_long_message(
@@ -397,6 +431,19 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             "on their behalf. Set LISTENER_ALLOWED_CHATS in .env to restrict this."
         )
 
+    save_channel_entity = None
+    if cfg.save_channel:
+        try:
+            save_channel_entity = await resolve_chat(client, cfg.save_channel)
+            log(f"[listener] save channel resolved: {getattr(save_channel_entity, 'title', cfg.save_channel)}")
+        except Exception as e:
+            log(
+                f"[listener] WARNING: could not resolve save channel '{cfg.save_channel}': {e}. "
+                f"\"{cfg.save_trigger_keyword}\" trigger will fail until this is fixed."
+            )
+    else:
+        log("[listener] SAVE_CHANNEL is not set -- the save trigger is disabled.")
+
     last_trigger: dict[int, float] = {}
     sent_message_ids: set[int] = set()
     background_tasks: set[asyncio.Task] = set()
@@ -410,6 +457,12 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
     # just reacts to the new message with ROAST_BUSY_EMOJI.
     roast_pending: dict[tuple[int, int], tuple[int, str]] = {}
     roast_in_progress: set[tuple[int, int]] = set()
+
+    # Save confirm/react flow state, keyed by (chat_id, confirm_message_id) -- unlike
+    # roast_pending, keyed directly by the confirmation message itself since a save
+    # only ever needs one pending confirmation per prompt (no "already pending for this
+    # user" concept to track). Value carries what to repost once/if confirmed.
+    save_pending: dict[tuple[int, int], dict] = {}
 
     def is_chat_allowed(chat) -> bool:
         if not allowed_chats:
@@ -459,6 +512,56 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
         text = msg.raw_text or ""
         text_lower = text.lower()
+
+        # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
+        # confirmation before reposting whatever you replied to into your save channel
+        # -- see save_pending handling in on_reaction below. Only ever fires for your
+        # own messages (msg.out), and doesn't touch LISTENER_ALLOWED_CHATS/cooldown
+        # since it never calls OpenAI.
+        if msg.out and msg.is_reply and text_lower.startswith(cfg.save_trigger_keyword):
+            added_text = text[len(cfg.save_trigger_keyword) :].strip(" :,-–—\t\n")
+            try:
+                if save_channel_entity is None:
+                    raise ChatSummaryError(f"Save channel '{cfg.save_channel}' isn't set up -- check SAVE_CHANNEL.")
+                replied = await msg.get_reply_message()
+                if replied is None:
+                    raise ChatSummaryError("Couldn't find the message you replied to.")
+
+                confirm = await client.send_message(event.chat_id, SAVE_CONFIRM_TEXT, reply_to=replied.id)
+                if confirm is not None:
+                    sent_message_ids.add(confirm.id)
+                    key = (event.chat_id, confirm.id)
+                    save_pending[key] = {"replied": replied, "added_text": added_text}
+                    log(f"[listener] sent save confirmation for message {replied.id} (confirm msg {confirm.id})")
+
+                    async def _expire_save_confirm(key=key, confirm_id=confirm.id):
+                        await asyncio.sleep(SAVE_CONFIRM_TIMEOUT)
+                        if save_pending.pop(key, None) is not None:
+                            try:
+                                await client.delete_messages(event.chat_id, [confirm_id])
+                            except Exception as e:
+                                log(f"[listener] failed to delete unconfirmed save prompt: {e}")
+
+                    task = asyncio.create_task(_expire_save_confirm())
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
+            except Exception as e:
+                log(f"[listener] failed to start save flow: {e}")
+                try:
+                    sent = await event.reply(f"Couldn't save that: {e}")
+                    if sent is not None:
+                        sent_message_ids.add(sent.id)
+                        schedule_delete(event.client, event.chat_id, [sent.id], ERROR_DELETE_AFTER)
+                except Exception:
+                    pass
+            finally:
+                # Always yours (msg.out) -- clean it up now, its job is done once the
+                # confirmation prompt (or error notice) is out.
+                try:
+                    await event.client.delete_messages(event.chat_id, [msg.id])
+                except Exception as e:
+                    log(f"[listener] failed to delete save trigger message: {e}")
+            return
 
         # The trigger keyword (default "/summary") is the invocation itself, like a
         # slash-command -- no need to also @mention or reply to you. Works the same
@@ -531,15 +634,62 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             except Exception:
                 pass
 
+    async def _reactor_ids(chat_id, update):
+        reactor_ids = set()
+        for r in update.reactions.recent_reactions or []:
+            try:
+                reactor_ids.add(tl_utils.get_peer_id(r.peer_id))
+            except Exception:
+                continue
+        if reactor_ids:
+            return reactor_ids
+        # recent_reactions isn't always populated (depends on chat size/settings) --
+        # fall back to explicitly listing this message's reactors.
+        try:
+            result = await client(GetMessageReactionsListRequest(peer=chat_id, id=update.msg_id, limit=100))
+            return {tl_utils.get_peer_id(r.peer_id) for r in result.reactions}
+        except Exception as e:
+            log(f"[listener] failed to fetch reactor list for msg {update.msg_id}: {e}")
+            return set()
+
     # Reactions from a *user* account (not a bot) arrive as this raw update, carrying the
-    # message's full new reaction state (not a per-reaction delta) -- used here only to
-    # confirm the roast flow: did the specific person who was asked "точно хочешь
-    # прожарку?" react to that exact prompt.
+    # message's full new reaction state (not a per-reaction delta) -- used to confirm
+    # both the roast flow (did the person asked "точно хочешь прожарку?" react to that
+    # exact prompt) and the save flow (did *you* react to your own save confirmation).
     @client.on(events.Raw(types=UpdateMessageReactions))
     async def on_reaction(update):
         try:
             chat_id = tl_utils.get_peer_id(update.peer)
         except Exception:
+            return
+
+        save_key = (chat_id, update.msg_id)
+        if save_key in save_pending:
+            reactor_ids = await _reactor_ids(chat_id, update)
+            if me.id not in reactor_ids:
+                return  # not confirmed yet (or the confirming account itself didn't react)
+
+            pending = save_pending.pop(save_key, None)
+            if pending is None:
+                return  # already handled (race with the unconfirmed-timeout cleanup)
+
+            log(f"[listener] save confirmed via reaction: chat={chat_id} confirm_msg={update.msg_id}")
+
+            async def _run_save():
+                try:
+                    await repost_saved_message(
+                        client, save_channel_entity, pending["replied"], pending["added_text"]
+                    )
+                    log(f"[listener] saved message {pending['replied'].id} from chat {chat_id} to '{cfg.save_channel}'")
+                    await react_emoji(chat_id, update.msg_id, SAVE_TICK_EMOJI)
+                except Exception as e:
+                    log(f"[listener] failed to save message: {e}")
+                finally:
+                    schedule_delete(client, chat_id, [update.msg_id], SAVE_CONFIRM_DELETE_AFTER)
+
+            task = asyncio.create_task(_run_save())
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
             return
 
         key = next(
@@ -549,24 +699,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             return  # not a reaction on a pending roast-confirmation message
 
         _, target_user_id = key
-
-        reactor_ids = set()
-        for r in update.reactions.recent_reactions or []:
-            try:
-                reactor_ids.add(tl_utils.get_peer_id(r.peer_id))
-            except Exception:
-                continue
-
-        if target_user_id not in reactor_ids:
-            # recent_reactions isn't always populated (depends on chat size/settings) --
-            # fall back to explicitly listing this message's reactors.
-            try:
-                result = await client(GetMessageReactionsListRequest(peer=chat_id, id=update.msg_id, limit=100))
-                reactor_ids = {tl_utils.get_peer_id(r.peer_id) for r in result.reactions}
-            except Exception as e:
-                log(f"[listener] failed to fetch reactor list for msg {update.msg_id}: {e}")
-                return
-
+        reactor_ids = await _reactor_ids(chat_id, update)
         if target_user_id not in reactor_ids:
             return  # someone else reacted -- not the person who was actually asked
 
@@ -609,7 +742,8 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
-        f"{cfg.listener_trigger_keywords} (summary) or {cfg.roast_trigger_keywords} (roast). "
+        f"{cfg.listener_trigger_keywords} (summary) or {cfg.roast_trigger_keywords} (roast), "
+        f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
         "Ctrl+C to stop."
     )
     await client.run_until_disconnected()
