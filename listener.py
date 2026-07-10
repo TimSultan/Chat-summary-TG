@@ -43,6 +43,11 @@ from telegram_fetch import (
 MENTION_RE = re.compile(r"@(\w{4,32})")
 MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 
+# Appended to every successful summary/roast reply so people re-discover the available
+# commands without having to ask -- not shown on rejection/error/cooldown notices, which
+# already explain themselves and self-delete fast.
+COMMANDS_FOOTER = "Список команд - прожарь меня, summary + время или юзер"
+
 # Only ever answer about one specific day at a time -- multi-day ranges (a whole week,
 # etc.) are refused outright rather than processed, to keep replies cheap and the chat
 # from getting a wall of text. Applies regardless of whether it's a whole-chat or
@@ -262,7 +267,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         original_question=original_question,
     )
 
-    await respond(summary, delete_after=SUMMARY_DELETE_AFTER)
+    await respond(f"{summary}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
 
 
 async def run_roast(
@@ -339,7 +344,7 @@ async def run_roast(
         lines=lines,
     )
 
-    await respond(roast, delete_after=ROAST_DELETE_AFTER)
+    await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
 
 
 def build_client(cfg) -> TelegramClient:
