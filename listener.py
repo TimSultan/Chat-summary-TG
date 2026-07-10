@@ -94,7 +94,7 @@ ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 # the OpenAI budget.
 SAVE_CONFIRM_TEXT = "Сохранить в t.me/papka_pokrasa?\nреакция для подтверждения."
 SAVE_TICK_EMOJI = "✅"
-SAVE_CONFIRM_TIMEOUT = 3  # seconds to wait for a confirming reaction before cancelling
+SAVE_CONFIRM_TIMEOUT = 5  # seconds to wait for a confirming reaction before cancelling
 SAVE_CONFIRM_DELETE_AFTER = 3  # seconds after a tick reaction before the prompt is deleted
 
 
