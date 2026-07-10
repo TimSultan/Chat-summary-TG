@@ -38,6 +38,13 @@ request -- that should get every notable topic, not just one.
 - "start_date": ISO date (YYYY-MM-DD) the summary period starts.
 - "end_date": ISO date (YYYY-MM-DD) the summary period ends (inclusive). Equal to start_date for \
 a single day.
+- "lookback_hours": if the request explicitly asks for a rolling window of the last N hours (or \
+minutes, converted to hours, e.g. "last 90 minutes" -> 1.5) rather than a calendar day -- e.g. \
+"last 10 hours", "за последние 3 часа", "past couple hours" -- put that number of hours here \
+(int or float). This takes priority over start_date/end_date, which are computed precisely from \
+the exact request time in code, not by you -- so still fill start_date/end_date with your best \
+guess (usually the reference date) but they'll be overridden. Else null. Do NOT set this for \
+"today"/"yesterday"/other calendar-day phrasing.
 - "length_hint": if the request explicitly asks for a particular length or level of detail (e.g. \
 "very short", "brief", "one sentence", "just the highlights", "in detail", "подробнее"), put that \
 instruction here (verbatim or paraphrased). Else null.
@@ -126,6 +133,12 @@ def parse_summary_request(
     if isinstance(length_hint, str):
         length_hint = length_hint.strip() or None
 
+    lookback_hours = data.get("lookback_hours")
+    if isinstance(lookback_hours, bool) or not isinstance(lookback_hours, (int, float)):
+        lookback_hours = None
+    elif lookback_hours <= 0:
+        lookback_hours = None
+
     def _parse(value, fallback):
         try:
             return date.fromisoformat(value)
@@ -143,6 +156,7 @@ def parse_summary_request(
         "target_name_hint": target_name_hint,
         "topic_hint": topic_hint,
         "length_hint": length_hint,
+        "lookback_hours": lookback_hours,
         "start_date": start_date,
         "end_date": end_date,
         "reply_language": data.get("reply_language") or "en",

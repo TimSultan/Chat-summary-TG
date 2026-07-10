@@ -49,6 +49,16 @@ MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 # per-user request.
 DAY_LIMIT_MESSAGE = "Сводка выдается Только за 1 конкретный день и юзера"
 
+# Caps a "last N hours" request (see lookback_hours in intent.py) to roughly the same
+# amount of history the single-calendar-day limit above already allows, even though the
+# window is anchored to the request time rather than midnight.
+MAX_LOOKBACK_HOURS = 24
+
+
+def _format_hours(n: float) -> str:
+    return str(int(n)) if float(n).is_integer() else f"{n:g}"
+
+
 # "прожарь меня" roasts the requester using their own messages from the last
 # ROAST_LOOKBACK_DAYS days (config.py, ROAST_LOOKBACK_DAYS env var, default 30). It's a
 # two-step flow: the trigger message gets a confirmation prompt, and only an actual
@@ -57,6 +67,11 @@ DAY_LIMIT_MESSAGE = "Сводка выдается Только за 1 конк�
 ROAST_CONFIRM_TEXT = "Ты точно хочешь прожарку? поставь реакцию для подтверждения"
 ROAST_BUSY_EMOJI = "⏳"
 NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих сообщений тут не нашлось -- нечем прожаривать."
+
+# Reacted onto the triggering message itself as soon as a summary request is accepted,
+# so the requester gets instant feedback that it was picked up while the LLM calls
+# (which can take a few seconds) run.
+SUMMARY_ACK_EMOJI = "✍"
 
 SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
@@ -153,7 +168,23 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     focus_user = intent["target_username"] if intent["scope"] == "user" else None
     start_date, end_date = intent["start_date"], intent["end_date"]
 
-    if start_date != end_date:
+    # "last N hours" is a rolling window anchored to the exact moment the request was
+    # sent, not a calendar day -- e.g. asked at 1am for "the last 10 hours" needs
+    # messages back to 3pm *yesterday*, which a same-day-only range would miss
+    # entirely. Computed here (not by the LLM) so it's exact, and allowed to span two
+    # calendar days without tripping the single-day limit below, since it's still
+    # bounded to at most MAX_LOOKBACK_HOURS regardless of where midnight falls.
+    lookback_hours = intent.get("lookback_hours")
+    window_start_dt = window_end_dt = None
+    if lookback_hours:
+        if lookback_hours > MAX_LOOKBACK_HOURS:
+            log(f"[listener] clamping requested lookback of {lookback_hours}h to {MAX_LOOKBACK_HOURS}h")
+            lookback_hours = MAX_LOOKBACK_HOURS
+        window_end_dt = msg.date.astimezone(tz)
+        window_start_dt = window_end_dt - timedelta(hours=lookback_hours)
+        start_date, end_date = window_start_dt.date(), window_end_dt.date()
+        log(f"[listener] lookback window: {window_start_dt} to {window_end_dt}")
+    elif start_date != end_date:
         log(f"[listener] rejected multi-day request ({start_date}..{end_date})")
         await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
         return
@@ -170,6 +201,9 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         tz=tz,
         log=log,
     )
+
+    if window_start_dt is not None:
+        messages = [m for m in messages if window_start_dt <= m.dt_local <= window_end_dt]
 
     from_explicit_mention = bool(focus_user)
     name_hint = intent.get("target_name_hint")
@@ -205,7 +239,13 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
             return
 
     lines = format_transcript_lines(messages, include_date=(start_date != end_date))
-    label = period_label(start_date, end_date)
+    if window_start_dt is not None:
+        label = (
+            f"last {_format_hours(lookback_hours)} hours "
+            f"({window_start_dt.strftime('%Y-%m-%d %H:%M')} to {window_end_dt.strftime('%Y-%m-%d %H:%M')})"
+        )
+    else:
+        label = period_label(start_date, end_date)
     original_question = strip_trigger_keywords(text, cfg.listener_trigger_keywords)
 
     summary = summarize_transcript(
@@ -324,6 +364,13 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
     me = await client.get_me()
     my_username = me.username
+    # Lets people trigger a summary without the exact keyword, either by naming you
+    # directly (e.g. "sultan summary" in one message) or by replying to one of your
+    # messages and saying "summary" -- see the two extra checks in on_message below.
+    # Require a few characters so a short/generic first name doesn't match constantly.
+    my_first_name = (me.first_name or "").strip().lower()
+    if len(my_first_name) < 3:
+        my_first_name = ""
 
     if not my_username:
         # Not fatal -- triggering no longer needs an @mention of this account, just the
@@ -382,18 +429,18 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
-    async def react_busy(chat_id, msg_id):
+    async def react_emoji(chat_id, msg_id, emoji):
         try:
             await client(
                 SendReactionRequest(
                     peer=chat_id,
                     msg_id=msg_id,
-                    reaction=[ReactionEmoji(emoticon=ROAST_BUSY_EMOJI)],
+                    reaction=[ReactionEmoji(emoticon=emoji)],
                     add_to_recent=True,
                 )
             )
         except Exception as e:
-            log(f"[listener] failed to react with busy emoji: {e}")
+            log(f"[listener] failed to react with emoji: {e}")
 
     # No incoming=True filter: watching outgoing messages too is what lets *you*
     # trigger a summary by typing "summary ..." yourself, not just other people
@@ -414,6 +461,20 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         # "прожарь меня" is a second, separate trigger for the roast command.
         has_summary_keyword = any(k in text_lower for k in cfg.listener_trigger_keywords)
         has_roast_keyword = any(k in text_lower for k in cfg.roast_trigger_keywords)
+
+        # Two more ways to ask for a summary without the exact trigger keyword: naming
+        # you by first name alongside the word "summary" in one message, or replying to
+        # one of your own messages and saying "summary". Both checks are gated on the
+        # bare word "summary" being present at all, so plain chat never pays for the
+        # extra (async, for the reply case) checks below.
+        if not has_summary_keyword and not has_roast_keyword and "summary" in text_lower:
+            if my_first_name and my_first_name in text_lower:
+                has_summary_keyword = True
+            elif msg.is_reply:
+                replied = await msg.get_reply_message()
+                if replied is not None and replied.sender_id == me.id:
+                    has_summary_keyword = True
+
         if not has_summary_keyword and not has_roast_keyword:
             return
 
@@ -426,7 +487,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             roast_key = (event.chat_id, sender.id)
             if roast_key in roast_pending or roast_key in roast_in_progress:
                 log(f"[listener] roast already pending/in-progress for {roast_key}, reacting instead of re-asking")
-                await react_busy(event.chat_id, msg.id)
+                await react_emoji(event.chat_id, msg.id, ROAST_BUSY_EMOJI)
                 return
 
         chat_key = event.chat_id
@@ -454,6 +515,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                     roast_pending[(event.chat_id, sender.id)] = (confirm.id, text)
                     log(f"[listener] sent roast confirmation to {sender_display_name(sender)} (msg {confirm.id})")
             else:
+                await react_emoji(event.chat_id, msg.id, SUMMARY_ACK_EMOJI)
                 await handle_request(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
         except Exception as e:
             log(f"[listener] error handling request: {e}")
