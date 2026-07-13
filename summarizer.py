@@ -60,11 +60,15 @@ asked for more detail, expand beyond the usual limit.
 
 DIRECT_QUESTION_RULE = """\
 The user's exact original message was: "{original_question}"
-If that is phrased as a direct question (who/what/when/why/how/did-we/etc.) rather than a generic \
-"summarize everything" request, answer THAT question directly and naturally, in your own words, \
-using the transcript as your source of truth -- don't force your answer into the generic topic-by-\
-topic format just because that's the default style. If the transcript doesn't contain enough to \
-answer it, say so plainly instead of guessing or padding with unrelated information.
+Decide which shape fits this request better, based on what was actually asked:
+- If it's phrased as a direct question (who/what/when/why/how/did-we/etc.) about something specific, \
+answer THAT question directly and naturally, in your own words, using the transcript as your source \
+of truth -- don't force it into the generic topic-by-topic format just because that's the default style.
+- If it's a generic "summarize everything"/"what happened" request, or the question is broad enough \
+that a topic-by-topic breakdown of the main themes discussed IS the natural answer, use the default \
+topic-by-topic format instead.
+Either way, if the transcript doesn't contain enough to answer it, say so plainly instead of guessing \
+or padding with unrelated information.
 """
 
 FILE_STYLE_RULES = """\
