@@ -17,10 +17,12 @@ client and a log callback that writes into the GUI's log pane instead of stdout.
 
 import asyncio
 import math
+import random
 import re
 import sys
 import time
 import traceback
+from collections import deque
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events, utils as tl_utils
@@ -32,6 +34,7 @@ from config import build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
 from intent_v2 import route_request
+from joke import generate_joke
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
 from roast import roast_person
@@ -547,9 +550,14 @@ def build_client(cfg) -> TelegramClient:
         raise
 
 
-async def run_listener(client: TelegramClient, cfg, tz, log=print):
+async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "asyncio.Queue | None" = None):
     """Registers the mention-trigger handler on an already-connected & authorized
-    `client` and blocks until it disconnects (call `client.disconnect()` to stop it)."""
+    `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
+
+    `joke_queue`, if given, is where a generated joke (see joke.py) is put once the
+    activity trigger fires -- bot_listener.py's run_bot_listener consumes it and sends the
+    joke via the bot account, same as every other reply once a bot token is configured.
+    Passed in (not created here) so main() can share one queue between both tasks."""
     assert cfg.listener_cooldown_seconds >= 0, "internal bug: cooldown should have been validated by config"
 
     me = await client.get_me()
@@ -608,6 +616,21 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
     sent_message_ids: set[int] = set()
     background_tasks: set[asyncio.Task] = set()
 
+    # "joke" (joke.py) is the one feature nobody asks for -- it's fired autonomously off
+    # recent chat activity instead of a keyword. Kept off unless explicitly enabled AND a
+    # bot account is available to actually post it (jokes always go out via the bot, never
+    # this personal account, matching how summary/roast were moved over), AND at least one
+    # chat is named in LISTENER_ALLOWED_CHATS -- unlike summary's "empty = respond
+    # anywhere" fallback, something nobody asked for should never default to "everywhere".
+    joke_enabled = joke_queue is not None and cfg.joke_enabled and bool(cfg.listener_allowed_chats)
+    if cfg.joke_enabled and not joke_enabled:
+        log(
+            "[listener] JOKE_ENABLED is set but jokes need both TELEGRAM_BOT_TOKEN and a "
+            "non-empty LISTENER_ALLOWED_CHATS -- jokes are off."
+        )
+    joke_activity: dict[int, deque] = {}
+    last_joke: dict[int, float] = {}
+
     # Roast confirm/react flow state, keyed by (chat_id, target_user_id):
     # - roast_pending: confirmation prompt sent, awaiting a reaction from that user.
     #   Value is (confirmation_message_id, original_trigger_text).
@@ -631,6 +654,21 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         title = (getattr(chat, "title", "") or "").lower()
         chat_id = str(getattr(chat, "id", ""))
         return username in allowed_chats or title in allowed_chats or chat_id in allowed_chats
+
+    def matched_allowed_chat(chat) -> str | None:
+        """Like is_chat_allowed, but returns the actual LISTENER_ALLOWED_CHATS entry
+        (original casing) that matched, instead of a bool -- this is the key jokes are
+        queued under, so bot_listener.py's consumer can look up the matching Bot-API
+        chat_id. Jokes only ever consider chats explicitly named here, never
+        is_chat_allowed's "empty list = allow everywhere" fallback."""
+        username = (getattr(chat, "username", "") or "").lower()
+        title = (getattr(chat, "title", "") or "").lower()
+        chat_id = str(getattr(chat, "id", ""))
+        for entry in cfg.listener_allowed_chats:
+            e = entry.lower().lstrip("@")
+            if e in (username, title, chat_id):
+                return entry
+        return None
 
     def schedule_delete(delete_client, chat_id, message_ids, delay_seconds):
         """Fire-and-forget: deletes `message_ids` after `delay_seconds`, without
@@ -660,6 +698,70 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         except Exception as e:
             log(f"[listener] failed to react with emoji: {e}")
 
+    async def maybe_joke(event, msg, text):
+        """Tracks this message toward the joke activity window for its chat and, if the
+        trigger conditions are met, kicks off (in the background) generating and queuing
+        one. Called for every plain-text message in an allowed chat, not just ones
+        containing a keyword -- this is the only way jokes get their "is the chat active
+        right now" signal.
+
+        Conditions, all required: enough qualifying messages within the trailing
+        JOKE_ACTIVITY_WINDOW_SECONDS window (this is what makes a silent/sleeping chat
+        structurally unable to ever trigger this -- there's no clock-based firing at all,
+        only reactive-to-actual-recent-volume), the per-chat cooldown has elapsed, and a
+        random roll under JOKE_FIRE_PROBABILITY passes (so it doesn't fire like clockwork
+        the instant the threshold is crossed). The cooldown slot is claimed immediately
+        once conditions pass -- before the OpenAI call -- both to stop a burst of
+        concurrent qualifying messages from each independently trying to fire, and so a
+        SKIP verdict (see joke.py) still costs a full cooldown, not just an instant retry,
+        which matters during a long busy-but-not-joke-appropriate stretch (e.g. an actual
+        argument) that would otherwise re-roll on every single message."""
+        chat = await event.get_chat()
+        entry = matched_allowed_chat(chat)
+        if entry is None:
+            return
+        sender = await event.get_sender()
+        if getattr(sender, "bot", False):
+            return  # never let either account's own messages (incl. past jokes) count as activity
+
+        now = time.monotonic()
+        chat_key = event.chat_id
+        bucket = joke_activity.setdefault(chat_key, deque())
+        bucket.append((now, msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
+
+        cutoff = now - cfg.joke_activity_window_seconds
+        while bucket and bucket[0][0] < cutoff:
+            bucket.popleft()
+
+        if len(bucket) < cfg.joke_activity_min_messages:
+            return
+
+        elapsed = now - last_joke.get(chat_key, float("-inf"))
+        if elapsed < cfg.joke_cooldown_seconds:
+            return
+
+        if random.random() >= cfg.joke_fire_probability:
+            return
+
+        last_joke[chat_key] = now
+        lines = [f"[{hhmm}] {name}: {t}" for _, hhmm, name, t in list(bucket)[-cfg.joke_context_max_messages :]]
+        log(f"[listener] joke conditions met in '{getattr(chat, 'title', chat_key)}' ({len(bucket)} recent msgs) -- generating")
+
+        async def _run():
+            try:
+                joke_text = await asyncio.to_thread(generate_joke, cfg.openai_api_key, cfg.openai_model, lines)
+                if joke_text:
+                    await joke_queue.put((entry, joke_text))
+                    log(f"[listener] queued joke for '{entry}': {joke_text!r}")
+                else:
+                    log(f"[listener] joke generation skipped itself for '{entry}' (not a good moment)")
+            except Exception:
+                log(f"[listener] error generating joke:\n{traceback.format_exc()}")
+
+        task = asyncio.create_task(_run())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     # No incoming=True filter: watching outgoing messages too is what lets *you*
     # trigger a summary by typing "summary ..." yourself, not just other people
     # @mentioning you. The sent_message_ids/addressed_to_me logic below keeps this
@@ -672,6 +774,9 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
         text = msg.raw_text or ""
         text_lower = text.lower()
+
+        if joke_enabled and text:
+            await maybe_joke(event, msg, text)
 
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
         # confirmation before reposting whatever you replied to into your save channel
@@ -909,11 +1014,17 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
+    joke_status = (
+        f"on ({cfg.joke_activity_min_messages}+ msgs/{cfg.joke_activity_window_seconds}s, "
+        f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_seconds}s cooldown)"
+        if joke_enabled
+        else "off"
+    )
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
-        "Ctrl+C to stop."
+        f"Joke: {joke_status}. Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 
@@ -941,9 +1052,14 @@ async def main():
         import bot_listener
 
         print("[listener] TELEGRAM_BOT_TOKEN is set -- also starting bot_listener.py for /summary.")
+        # Shared between the two tasks purely to hand off generated jokes (see maybe_joke
+        # in run_listener) from this Telethon session, which is the only one that sees
+        # every plain-text message, to the bot account, which is the only one that should
+        # ever post one.
+        joke_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
-            run_listener(client, cfg, tz),
-            bot_listener.run_bot_listener(cfg.telegram_bot_token, cfg, tz, client),
+            run_listener(client, cfg, tz, joke_queue=joke_queue),
+            bot_listener.run_bot_listener(cfg.telegram_bot_token, cfg, tz, client, joke_queue=joke_queue),
         )
     else:
         await run_listener(client, cfg, tz)

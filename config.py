@@ -40,6 +40,12 @@ class Config:
     save_channel: str | None
     summary_pipeline_version: str
     telegram_bot_token: str | None
+    joke_enabled: bool
+    joke_activity_window_seconds: int
+    joke_activity_min_messages: int
+    joke_cooldown_seconds: int
+    joke_fire_probability: float
+    joke_context_max_messages: int
 
 
 def build_session(cfg: "Config"):
@@ -126,6 +132,48 @@ def load_config() -> Config:
 
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
 
+    joke_enabled = os.getenv("JOKE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+    joke_window_raw = os.getenv("JOKE_ACTIVITY_WINDOW_SECONDS", "300")
+    try:
+        joke_activity_window_seconds = int(joke_window_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_ACTIVITY_WINDOW_SECONDS must be a number, got '{joke_window_raw}'.")
+    if joke_activity_window_seconds < 1:
+        raise ChatSummaryError(f"JOKE_ACTIVITY_WINDOW_SECONDS must be >= 1, got {joke_activity_window_seconds}.")
+
+    joke_min_messages_raw = os.getenv("JOKE_ACTIVITY_MIN_MESSAGES", "8")
+    try:
+        joke_activity_min_messages = int(joke_min_messages_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_ACTIVITY_MIN_MESSAGES must be a number, got '{joke_min_messages_raw}'.")
+    if joke_activity_min_messages < 1:
+        raise ChatSummaryError(f"JOKE_ACTIVITY_MIN_MESSAGES must be >= 1, got {joke_activity_min_messages}.")
+
+    joke_cooldown_raw = os.getenv("JOKE_COOLDOWN_SECONDS", "3600")
+    try:
+        joke_cooldown_seconds = int(joke_cooldown_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_COOLDOWN_SECONDS must be a number, got '{joke_cooldown_raw}'.")
+    if joke_cooldown_seconds < 0:
+        raise ChatSummaryError(f"JOKE_COOLDOWN_SECONDS must be >= 0, got {joke_cooldown_seconds}.")
+
+    joke_probability_raw = os.getenv("JOKE_FIRE_PROBABILITY", "0.35")
+    try:
+        joke_fire_probability = float(joke_probability_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_FIRE_PROBABILITY must be a number, got '{joke_probability_raw}'.")
+    if not (0.0 <= joke_fire_probability <= 1.0):
+        raise ChatSummaryError(f"JOKE_FIRE_PROBABILITY must be between 0 and 1, got {joke_fire_probability}.")
+
+    joke_context_max_raw = os.getenv("JOKE_CONTEXT_MAX_MESSAGES", "30")
+    try:
+        joke_context_max_messages = int(joke_context_max_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_CONTEXT_MAX_MESSAGES must be a number, got '{joke_context_max_raw}'.")
+    if joke_context_max_messages < 1:
+        raise ChatSummaryError(f"JOKE_CONTEXT_MAX_MESSAGES must be >= 1, got {joke_context_max_messages}.")
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -143,4 +191,10 @@ def load_config() -> Config:
         save_channel=save_channel,
         summary_pipeline_version=summary_pipeline_version,
         telegram_bot_token=telegram_bot_token,
+        joke_enabled=joke_enabled,
+        joke_activity_window_seconds=joke_activity_window_seconds,
+        joke_activity_min_messages=joke_activity_min_messages,
+        joke_cooldown_seconds=joke_cooldown_seconds,
+        joke_fire_probability=joke_fire_probability,
+        joke_context_max_messages=joke_context_max_messages,
     )

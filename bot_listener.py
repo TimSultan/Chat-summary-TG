@@ -106,6 +106,23 @@ def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
     return username in allowed_chats or title in allowed_chats or chat_id in allowed_chats
 
 
+def _match_allowed_chat(chat: dict, allowed_chats_original: list[str]) -> str | None:
+    """Like _is_chat_allowed, but returns the actual LISTENER_ALLOWED_CHATS entry
+    (original casing) that matched a group chat, instead of a bool -- used to key
+    known_chat_ids (see run_bot_listener) so a joke queued by listener.py under that same
+    entry string can be resolved back to this Bot-API chat_id. Deliberately does NOT
+    special-case private chats the way _is_chat_allowed does: a DM isn't a postable
+    target for a joke."""
+    username = (chat.get("username") or "").lower()
+    title = (chat.get("title") or "").lower()
+    chat_id = str(chat.get("id", ""))
+    for entry in allowed_chats_original:
+        e = entry.lower().lstrip("@")
+        if e in (username, title, chat_id):
+            return entry
+    return None
+
+
 def _home_chat_ref(cfg) -> str | None:
     """The one group chat a DM with the bot should be treated as being about, since a DM
     has no group history of its own to fetch. Only well-defined when LISTENER_ALLOWED_CHATS
@@ -422,6 +439,7 @@ async def _dispatch_update(
     roast_in_progress: set,
     background_tasks: set,
     home_chat_ref: str | None,
+    known_chat_ids: dict[str, int],
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -444,23 +462,26 @@ async def _dispatch_update(
     if not message or "text" not in message:
         return
 
+    # Learned regardless of whether this message is a trigger -- this is how
+    # known_chat_ids (see run_bot_listener's joke queue consumer) finds out the Bot-API
+    # chat_id for a chat named in LISTENER_ALLOWED_CHATS, since there's no way to look
+    # that up on demand (getChat needs an id/username we don't have yet either). Placed
+    # before the has_summary/has_roast early-return so it also learns from ordinary chat
+    # messages whenever the bot's privacy mode is off, not just from /summary requests.
+    chat = message["chat"]
+    matched_entry = _match_allowed_chat(chat, cfg.listener_allowed_chats)
+    if matched_entry is not None:
+        known_chat_ids[matched_entry] = chat["id"]
+
     text_lower = message["text"].lower()
     has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
     # Roast ("прожарь меня") is turned off -- forced False rather than removing the
     # surrounding roast_pending/callback machinery below, so it stays a one-line revert
     # if it's ever turned back on.
     has_roast = False
-    # Convenience trigger: naming the bot directly (@its_username) alongside the bare
-    # word "summary" also counts, so "/summary" isn't the only way to ask -- e.g.
-    # "@echhchat_bot summary как дела". Mirrors listener.py's "first name + summary"
-    # heuristic for the personal account.
-    if not has_summary and not has_roast and "summary" in text_lower:
-        if bot_username and f"@{bot_username.lower()}" in text_lower:
-            has_summary = True
     if not has_summary and not has_roast:
         return
 
-    chat = message["chat"]
     if not _is_chat_allowed(allowed_chats, chat):
         return
 
@@ -552,13 +573,23 @@ async def _dispatch_update(
     task.add_done_callback(background_tasks.discard)
 
 
-async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
+async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print, joke_queue: "asyncio.Queue | None" = None):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
-    message fetching."""
+    message fetching.
+
+    `joke_queue`, if given, carries (allowed_chats entry, joke text) pairs put there by
+    listener.py's activity trigger (see maybe_joke) -- this function drains it in a task
+    running alongside the usual getUpdates poll loop and sends each one via `api`, the
+    same account everything else replies from. Left None when run standalone (this
+    module's own main()), which just means jokes never fire, matching that listener.py
+    isn't running its activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     last_trigger: dict[int, float] = {}
+    # Populated by _dispatch_update as it observes chats -- see the comment there. Maps a
+    # LISTENER_ALLOWED_CHATS entry to the Bot-API chat_id it corresponds to, once seen.
+    known_chat_ids: dict[str, int] = {}
 
     # Roast confirm/button flow state, keyed by (chat_id, target_user_id) -- mirrors
     # listener.py's roast_pending/roast_in_progress. Value: {"confirm_msg_id",
@@ -585,27 +616,47 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
             f"{cfg.listener_trigger_keywords} (summary; roast is off)."
         )
 
-        offset = None
-        while True:
-            try:
-                updates = await api.get_updates(offset=offset, timeout=POLL_TIMEOUT_SECONDS)
-            except ChatSummaryError as e:
-                log(f"[bot_listener] getUpdates failed, retrying in 5s: {e}")
-                await asyncio.sleep(5)
-                continue
-
-            for update in updates:
-                # Offset must advance before processing, not after: if handling this
-                # update throws, Telegram should still consider it delivered on the next
-                # getUpdates call rather than resending the same update forever.
-                offset = update["update_id"] + 1
+        async def _poll_loop():
+            offset = None
+            while True:
                 try:
-                    await _dispatch_update(
-                        update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
-                        last_trigger, roast_pending, roast_in_progress, background_tasks, home_chat_ref, log=log,
-                    )
+                    updates = await api.get_updates(offset=offset, timeout=POLL_TIMEOUT_SECONDS)
+                except ChatSummaryError as e:
+                    log(f"[bot_listener] getUpdates failed, retrying in 5s: {e}")
+                    await asyncio.sleep(5)
+                    continue
+
+                for update in updates:
+                    # Offset must advance before processing, not after: if handling this
+                    # update throws, Telegram should still consider it delivered on the
+                    # next getUpdates call rather than resending the same update forever.
+                    offset = update["update_id"] + 1
+                    try:
+                        await _dispatch_update(
+                            update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
+                            last_trigger, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
+                            known_chat_ids, log=log,
+                        )
+                    except Exception:
+                        log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
+
+        async def _consume_jokes():
+            while True:
+                entry, joke_text = await joke_queue.get()
+                chat_id = known_chat_ids.get(entry)
+                if chat_id is None:
+                    log(f"[bot_listener] dropping joke for '{entry}': no known chat_id yet (bot hasn't seen a message there)")
+                    continue
+                try:
+                    await api.send_message(chat_id, joke_text)
+                    log(f"[bot_listener] sent joke to '{entry}': {joke_text!r}")
                 except Exception:
-                    log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
+                    log(f"[bot_listener] failed to send joke:\n{traceback.format_exc()}")
+
+        tasks = [_poll_loop()]
+        if joke_queue is not None:
+            tasks.append(_consume_jokes())
+        await asyncio.gather(*tasks)
 
 
 async def main():

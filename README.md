@@ -119,8 +119,6 @@ keyword itself there's no fixed syntax — phrase it naturally.
   день и юзера") instead of being processed, regardless of whether it's a whole-chat or
   per-user question. This applies to the listener only -- `main.py`/`gui.py` still
   support date ranges for your own generated reports.
-- **Replies self-delete** — a successful summary is removed from the chat automatically
-  after 3 minutes, so the chat doesn't accumulate long bot replies over time.
 - **Cooldown with a reply, not silence** — `LISTENER_COOLDOWN_SECONDS` (default 180 = 3
   minutes) limits how often the listener will answer in the same chat. Asking again
   before that gets "Спросите через X минут" instead of no response, and that notice
@@ -172,6 +170,31 @@ uncapped month of messages from a chatty poster can mean dozens of blocking call
 anything is sent -- with no "generating..." message in between, that looks like the bot
 hung. `ROAST_MAX_MESSAGES` (default 400) caps input to the requester's most recent N
 messages to keep this bounded; lower it for faster/cheaper roasts.
+
+### Jokes -- off by default
+
+Unlike everything else in this project, `JOKE_ENABLED=true` (`.env`) adds one thing
+nobody has to ask for: an occasional short, in-context joke or remark, dropped into the
+chat while it's actually active. Requires a bot account (`TELEGRAM_BOT_TOKEN`) and a
+non-empty `LISTENER_ALLOWED_CHATS` -- it never defaults to "everywhere" the way
+`/summary` does, and always posts as the bot, never your personal account.
+
+It only fires off real, recent activity, not a timer: `JOKE_ACTIVITY_MIN_MESSAGES`
+(default 8) messages have to land within the trailing `JOKE_ACTIVITY_WINDOW_SECONDS`
+(default 300 = 5 min). A quiet or sleeping chat can't cross that on its own, so there's no
+clock-based firing at all -- it's structurally impossible for this to go off in a dead
+chat. Once that's true, `JOKE_COOLDOWN_SECONDS` (default 1 hour) since the last one still
+has to have passed, *and* a random roll under `JOKE_FIRE_PROBABILITY` (default 0.35) has
+to hit, so it doesn't fire like clockwork the instant the threshold is crossed.
+
+On top of all of that, nothing reviews a joke before it posts, so the model itself
+(`joke.py`) is instructed to back off (respond with a `SKIP` sentinel, which is silently
+dropped -- nothing gets sent) for anything that isn't actually a good moment: an active
+argument, a heavy or personal topic (appearance, health, money, relationships, grief),
+protected-characteristic territory, or anything it would otherwise have to invent instead
+of drawing from what was actually said. Verified against real chat transcripts -- an
+active public accusation/conflict and a body-image conversation were both correctly
+skipped, while ordinary banter got a short, specific, on-topic joke.
 
 ## Model choice
 
@@ -237,7 +260,10 @@ generate a portable session first:
    step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
    warning above), `LISTENER_TRIGGER_KEYWORDS`, `LISTENER_COOLDOWN_SECONDS`,
-   `ROAST_TRIGGER_KEYWORDS`, `ROAST_LOOKBACK_DAYS`.
+   `ROAST_TRIGGER_KEYWORDS`, `ROAST_LOOKBACK_DAYS`, `TELEGRAM_BOT_TOKEN` (if replies
+   should come from a bot account instead of this one -- see above), `JOKE_ENABLED` and
+   the other `JOKE_*` vars if you also want the occasional unprompted joke (off by
+   default; see Jokes above).
 4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
    running.
 
