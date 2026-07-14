@@ -132,7 +132,11 @@ it, the listener will respond to *anyone* who mentions you in *any* chat you're 
 spending your OpenAI budget on their requests — fine for a private group with people you
 trust, risky in a large/public one.
 
-### Roasting (`прожарь меня`)
+### Roasting (`прожарь меня`) -- currently disabled
+
+The trigger is switched off (forced to never match, in both `listener.py` and
+`bot_listener.py`) rather than removed, so turning it back on is a one-line revert. The
+rest of this section describes how it behaves when enabled.
 
 A second trigger keyword (default `прожарь меня`, `ROAST_TRIGGER_KEYWORDS` in `.env`)
 roasts whoever sends it, in Russian, using **their own** messages from the last

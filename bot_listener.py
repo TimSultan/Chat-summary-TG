@@ -1,8 +1,8 @@
-"""Long-polls the Telegram Bot HTTP API for /summary and roast ("прожарь меня") requests
-in the same chats listener.py's Telethon-based listener watches, and answers them as the
-bot account instead of your personal account.
+"""Long-polls the Telegram Bot HTTP API for /summary requests in the same chats
+listener.py's Telethon-based listener watches, and answers them as the bot account
+instead of your personal account.
 
-Why this exists alongside listener.py: a bot account lets people trigger these without it
+Why this exists alongside listener.py: a bot account lets people trigger this without it
 coming from (or being confused with) your own account. The tradeoff is that the Bot API
 gives a bot no retroactive access to chat history at all -- it only ever sees messages
 sent after it's added to a chat. So message fetching here still goes through the already-
@@ -10,15 +10,17 @@ connected Telethon `client` passed into run_bot_listener() (same
 fetch_range_messages_cached() listener.py itself uses); only trigger detection and
 replying happen over the bot's HTTP API.
 
-Roast confirmation uses an inline-keyboard button + callback_query instead of the "react
-to confirm" flow listener.py uses for the same command: receiving *other users'*
-reactions via getUpdates (message_reaction updates) requires the bot to be a chat admin,
-while callback_query from the bot's own inline keyboard needs no special rights.
+Roast ("прожарь меня") is turned off -- see `has_roast` in _dispatch_update, forced False
+rather than deleted, along with the rest of the roast_pending/callback_query confirmation
+machinery below it (an inline-keyboard button + callback_query, instead of listener.py's
+"react to confirm" flow, since receiving *other users'* reactions via getUpdates requires
+the bot to be a chat admin while callback_query from its own inline keyboard doesn't).
+Left in place rather than removed so re-enabling it later is a one-line change.
 
 Save ("сохрани") is NOT handled here -- it only makes sense as *your own* account
 reposting to your own channel. See listener.py's on_message: it stops handling /summary
-and roast itself once TELEGRAM_BOT_TOKEN is set, so only one of the two ever replies to a
-given request.
+itself once TELEGRAM_BOT_TOKEN is set, so only one of the two ever replies to a given
+request.
 
 A private chat (DM) with the bot is always accepted as a trigger source too, regardless
 of LISTENER_ALLOWED_CHATS -- but since a DM has no group history of its own, data
@@ -432,7 +434,10 @@ async def _dispatch_update(
 
     text_lower = message["text"].lower()
     has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
-    has_roast = any(k in text_lower for k in cfg.roast_trigger_keywords)
+    # Roast ("прожарь меня") is turned off -- forced False rather than removing the
+    # surrounding roast_pending/callback machinery below, so it stays a one-line revert
+    # if it's ever turned back on.
+    has_roast = False
     # Convenience trigger: naming the bot directly (@its_username) alongside the bare
     # word "summary" also counts, so "/summary" isn't the only way to ask -- e.g.
     # "@echhchat_bot summary как дела". Mirrors listener.py's "first name + summary"
@@ -565,7 +570,7 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
         bot_username = me.get("username")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
-            f"{cfg.listener_trigger_keywords} (summary) and {cfg.roast_trigger_keywords} (roast)."
+            f"{cfg.listener_trigger_keywords} (summary; roast is off)."
         )
 
         offset = None

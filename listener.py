@@ -46,10 +46,10 @@ from telegram_fetch import (
 MENTION_RE = re.compile(r"@(\w{4,32})")
 MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 
-# Appended to every successful summary/roast reply so people re-discover the available
-# commands without having to ask -- not shown on rejection/error/cooldown notices, which
-# already explain themselves and self-delete fast.
-COMMANDS_FOOTER = "Список команд - прожарь меня, summary + время или юзер"
+# Appended to every successful summary reply so people re-discover the available commands
+# without having to ask -- not shown on rejection/error/cooldown notices, which already
+# explain themselves and self-delete fast.
+COMMANDS_FOOTER = "Список команд - summary + время или юзер"
 
 # Only ever answer about one specific day at a time -- multi-day ranges (a whole week,
 # etc.) are refused outright rather than processed, to keep replies cheap and the chat
@@ -560,13 +560,14 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             "safety checks are skipped."
         )
 
-    # When a bot account (bot_listener.py) is configured, it takes over /summary AND
-    # roast ("прожарь меня") entirely -- this Telethon listener would otherwise also see
-    # and answer the same trigger message, producing two replies. Save is unaffected: it
-    # only ever makes sense as *your own* account reposting to your own channel.
+    # When a bot account (bot_listener.py) is configured, it takes over /summary entirely
+    # -- this Telethon listener would otherwise also see and answer the same trigger
+    # message, producing two replies. Save is unaffected: it only ever makes sense as
+    # *your own* account reposting to your own channel. Roast is off everywhere (see
+    # has_roast_keyword below), so it's not part of this handoff.
     bot_takeover = bool(cfg.telegram_bot_token)
     if bot_takeover:
-        log("[listener] TELEGRAM_BOT_TOKEN is set -- /summary and roast are handled by bot_listener.py instead of this account.")
+        log("[listener] TELEGRAM_BOT_TOKEN is set -- /summary is handled by bot_listener.py instead of this account.")
 
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     if allowed_chats:
@@ -713,9 +714,11 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         # The trigger keyword (default "/summary") is the invocation itself, like a
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
-        # "прожарь меня" is a second, separate trigger for the roast command.
         has_summary_keyword = not bot_takeover and any(k in text_lower for k in cfg.listener_trigger_keywords)
-        has_roast_keyword = not bot_takeover and any(k in text_lower for k in cfg.roast_trigger_keywords)
+        # Roast ("прожарь меня") is turned off -- forced False rather than removing the
+        # surrounding roast_pending/on_reaction machinery below, so it stays a one-line
+        # revert if it's ever turned back on.
+        has_roast_keyword = False
 
         # Two more ways to ask for a summary without the exact trigger keyword: naming
         # you by first name alongside the word "summary" in one message, or replying to
@@ -896,9 +899,9 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
-        f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}) or "
-        f"{cfg.roast_trigger_keywords} (roast), and your own '{cfg.save_trigger_keyword}' replies "
-        f"(save to {cfg.save_channel or 'disabled'}). Ctrl+C to stop."
+        f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
+        f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
+        "Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 
