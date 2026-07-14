@@ -30,7 +30,9 @@ import history
 from config import build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
+from intent_v2 import route_request
 from main import period_label, resolve_tz
+from responder_v2 import answer_request
 from roast import roast_person
 from summarizer import summarize_transcript
 from telegram_fetch import (
@@ -63,6 +65,39 @@ MAX_LOOKBACK_HOURS = 24
 
 def _format_hours(n: float) -> str:
     return str(int(n)) if float(n).is_integer() else f"{n:g}"
+
+
+class DayLimitExceeded(Exception):
+    """Raised by resolve_time_window when a multi-day range was requested without an
+    explicit lookback-hours window -- see DAY_LIMIT_MESSAGE."""
+
+
+def resolve_time_window(start_date, end_date, lookback_hours, request_dt, tz, log=print):
+    """Turns a parsed date range plus optional lookback_hours into what should actually
+    be fetched, enforcing the single-day / MAX_LOOKBACK_HOURS safety caps shared by both
+    the v1 and v2 request pipelines. Returns (start_date, end_date, window_start_dt,
+    window_end_dt, lookback_hours) -- the last two are None unless lookback_hours was
+    given, and lookback_hours is returned back out already clamped (if it was).
+
+    "last N hours" is a rolling window anchored to the exact moment the request was sent,
+    not a calendar day -- e.g. asked at 1am for "the last 10 hours" needs messages back to
+    3pm *yesterday*, which a same-day-only range would miss entirely. Computed here (not
+    by the LLM) so it's exact, and allowed to span two calendar days without tripping the
+    single-day limit below, since it's still bounded to at most MAX_LOOKBACK_HOURS
+    regardless of where midnight falls."""
+    window_start_dt = window_end_dt = None
+    if lookback_hours:
+        if lookback_hours > MAX_LOOKBACK_HOURS:
+            log(f"[listener] clamping requested lookback of {lookback_hours}h to {MAX_LOOKBACK_HOURS}h")
+            lookback_hours = MAX_LOOKBACK_HOURS
+        window_end_dt = request_dt.astimezone(tz)
+        window_start_dt = window_end_dt - timedelta(hours=lookback_hours)
+        start_date, end_date = window_start_dt.date(), window_end_dt.date()
+        log(f"[listener] lookback window: {window_start_dt} to {window_end_dt}")
+    elif start_date != end_date:
+        log(f"[listener] rejected multi-day request ({start_date}..{end_date})")
+        raise DayLimitExceeded()
+    return start_date, end_date, window_start_dt, window_end_dt, lookback_hours
 
 
 # "прожарь меня" roasts the requester using their own messages from the last
@@ -207,24 +242,11 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     focus_user = intent["target_username"] if intent["scope"] == "user" else None
     start_date, end_date = intent["start_date"], intent["end_date"]
 
-    # "last N hours" is a rolling window anchored to the exact moment the request was
-    # sent, not a calendar day -- e.g. asked at 1am for "the last 10 hours" needs
-    # messages back to 3pm *yesterday*, which a same-day-only range would miss
-    # entirely. Computed here (not by the LLM) so it's exact, and allowed to span two
-    # calendar days without tripping the single-day limit below, since it's still
-    # bounded to at most MAX_LOOKBACK_HOURS regardless of where midnight falls.
-    lookback_hours = intent.get("lookback_hours")
-    window_start_dt = window_end_dt = None
-    if lookback_hours:
-        if lookback_hours > MAX_LOOKBACK_HOURS:
-            log(f"[listener] clamping requested lookback of {lookback_hours}h to {MAX_LOOKBACK_HOURS}h")
-            lookback_hours = MAX_LOOKBACK_HOURS
-        window_end_dt = msg.date.astimezone(tz)
-        window_start_dt = window_end_dt - timedelta(hours=lookback_hours)
-        start_date, end_date = window_start_dt.date(), window_end_dt.date()
-        log(f"[listener] lookback window: {window_start_dt} to {window_end_dt}")
-    elif start_date != end_date:
-        log(f"[listener] rejected multi-day request ({start_date}..{end_date})")
+    try:
+        start_date, end_date, window_start_dt, window_end_dt, lookback_hours = resolve_time_window(
+            start_date, end_date, intent.get("lookback_hours"), msg.date, tz, log
+        )
+    except DayLimitExceeded:
         await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
         return
 
@@ -302,6 +324,123 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     )
 
     await respond(f"{summary}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
+
+
+async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int], schedule_delete, log=print):
+    """v2 pipeline: intent_v2.route_request extracts only a date range/lookback window
+    and an optional focus username, plus a cleaned-up restatement of the question.
+    responder_v2.answer_request then answers that question against the fetched
+    transcript in one freeform step -- no separate topic/length-hint extraction, the
+    model decides the answer's shape itself. See intent_v2.py / responder_v2.py."""
+    msg = event.message
+    text = msg.raw_text or ""
+
+    chat = await event.get_chat()
+    chat_title_for_history = getattr(chat, "title", None) or "Unknown chat"
+    sender = await event.get_sender()
+    requester = sender_display_name(sender)
+
+    async def respond(answer: str, delete_after: int | None = None, record: bool = True):
+        message_ids = await send_long_reply(event, answer, sent_ids=sent_ids)
+        if record:
+            try:
+                history.record(chat_title_for_history, requester, text, answer)
+            except Exception as e:
+                log(f"[listener] failed to record history: {e}")
+        if delete_after and message_ids:
+            schedule_delete(event.client, chat.id, message_ids, delete_after)
+
+    mentioned = extract_mentioned_usernames(text, exclude=my_username)
+    ref_date = msg.date.astimezone(tz).date()
+
+    try:
+        routed = route_request(
+            api_key=cfg.openai_api_key,
+            model=cfg.openai_model,
+            text=text,
+            reference_date=ref_date,
+            mentioned_usernames=mentioned,
+            my_username=my_username,
+        )
+    except Exception as e:
+        log(f"[listener] intent_v2 routing failed: {e}")
+        await respond("Не удалось разобрать запрос.")
+        return
+
+    try:
+        start_date, end_date, window_start_dt, window_end_dt, lookback_hours = resolve_time_window(
+            routed["start_date"], routed["end_date"], routed["lookback_hours"], msg.date, tz, log
+        )
+    except DayLimitExceeded:
+        await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
+        return
+
+    chat_title, messages = await fetch_range_messages_cached(
+        client=event.client,
+        chat_ref=chat,
+        start_day=start_date,
+        end_day=end_date,
+        tz=tz,
+        log=log,
+    )
+
+    if window_start_dt is not None:
+        messages = [m for m in messages if window_start_dt <= m.dt_local <= window_end_dt]
+
+    focus_user = None
+    username_hint = routed["username"]
+    if username_hint:
+        # An exact match against an @mention actually present in the message is a
+        # literal request about that account's own messages -- safe (and cheap) to bail
+        # out early if they posted nothing at all. Anything else is a plain name/nickname
+        # that needs resolving against actual participants (same as v1's name-hint path),
+        # since it can be about a topic others discussed without that person posting
+        # (e.g. "the situation with Anzhelika").
+        from_explicit_mention = any(username_hint.lower() == m.lower() for m in mentioned)
+        if from_explicit_mention:
+            focus_user = username_hint
+            matched = sum(1 for m in messages if sender_matches(m, focus_user))
+            log(f"[listener] v2 focus_user(explicit)={focus_user} matched={matched}/{len(messages)}")
+            if matched == 0:
+                await respond(f"Сообщений от @{focus_user} за этот период не найдено.")
+                return
+        else:
+            candidates = sorted({c for m in messages for c in (m.sender_username, m.sender_name) if c})
+            shown = candidates if len(candidates) <= 30 else candidates[:30] + [f"... +{len(candidates) - 30} more"]
+            log(f"[listener] v2 resolving name hint '{username_hint}' against {len(candidates)} candidates: {shown}")
+            try:
+                focus_user = resolve_name_hint(cfg.openai_api_key, cfg.openai_model, username_hint, candidates)
+            except ChatSummaryError as e:
+                log(f"[listener] v2 name resolution failed: {e}")
+                focus_user = None
+            if focus_user:
+                log(f"[listener] v2 resolved name hint '{username_hint}' -> '{focus_user}'")
+            else:
+                log(f"[listener] v2 could not resolve name hint '{username_hint}' among participants")
+                await respond(f"Не понял, о ком речь: \"{username_hint}\".")
+                return
+
+    lines = format_transcript_lines(messages, include_date=(start_date != end_date))
+    if window_start_dt is not None:
+        label = (
+            f"last {_format_hours(lookback_hours)} hours "
+            f"({window_start_dt.strftime('%Y-%m-%d %H:%M')} to {window_end_dt.strftime('%Y-%m-%d %H:%M')})"
+        )
+    else:
+        label = period_label(start_date, end_date)
+
+    answer = answer_request(
+        api_key=cfg.openai_api_key,
+        model=cfg.openai_model,
+        chat_title=chat_title,
+        period_label=label,
+        lines=lines,
+        question=routed["cleaned_question"],
+        focus_user=focus_user,
+        style="reply",
+    )
+
+    await respond(f"{answer}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
 
 
 async def run_roast(
@@ -420,6 +559,15 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             "trigger keyword still works fine; only the 'never target myself' name "
             "safety checks are skipped."
         )
+
+    # When a bot account (bot_listener.py) is configured, it takes over /summary
+    # entirely -- this Telethon listener would otherwise also see and answer the same
+    # trigger message, producing two replies. Roast and save are unaffected: roast isn't
+    # a slash command (a privacy-mode bot never sees it unmentioned) and save only makes
+    # sense from your own account.
+    bot_handles_summary = bool(cfg.telegram_bot_token)
+    if bot_handles_summary:
+        log("[listener] TELEGRAM_BOT_TOKEN is set -- /summary is handled by bot_listener.py instead of this account.")
 
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     if allowed_chats:
@@ -548,7 +696,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             except Exception as e:
                 log(f"[listener] failed to start save flow: {e}")
                 try:
-                    sent = await event.reply(f"Couldn't save that: {e}")
+                    sent = await event.reply(f"Не удалось сохранить: {e}")
                     if sent is not None:
                         sent_message_ids.add(sent.id)
                         schedule_delete(event.client, event.chat_id, [sent.id], ERROR_DELETE_AFTER)
@@ -567,15 +715,16 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
         # "прожарь меня" is a second, separate trigger for the roast command.
-        has_summary_keyword = any(k in text_lower for k in cfg.listener_trigger_keywords)
+        has_summary_keyword = not bot_handles_summary and any(k in text_lower for k in cfg.listener_trigger_keywords)
         has_roast_keyword = any(k in text_lower for k in cfg.roast_trigger_keywords)
 
         # Two more ways to ask for a summary without the exact trigger keyword: naming
         # you by first name alongside the word "summary" in one message, or replying to
         # one of your own messages and saying "summary". Both checks are gated on the
         # bare word "summary" being present at all, so plain chat never pays for the
-        # extra (async, for the reply case) checks below.
-        if not has_summary_keyword and not has_roast_keyword and "summary" in text_lower:
+        # extra (async, for the reply case) checks below. Skipped entirely once the bot
+        # account has taken over /summary (see bot_handles_summary above).
+        if not bot_handles_summary and not has_summary_keyword and not has_roast_keyword and "summary" in text_lower:
             if my_first_name and my_first_name in text_lower:
                 has_summary_keyword = True
             elif msg.is_reply:
@@ -624,11 +773,12 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                     log(f"[listener] sent roast confirmation to {sender_display_name(sender)} (msg {confirm.id})")
             else:
                 await react_emoji(event.chat_id, msg.id, SUMMARY_ACK_EMOJI)
-                await handle_request(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
+                handler = handle_request_v2 if cfg.summary_pipeline_version == "v2" else handle_request
+                await handler(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
         except Exception as e:
             log(f"[listener] error handling request: {e}")
             try:
-                sent = await event.reply("Something went wrong generating that summary.")
+                sent = await event.reply("Что-то пошло не так при генерации сводки.")
                 if sent is not None:
                     sent_message_ids.add(sent.id)
             except Exception:
@@ -727,7 +877,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                 log(f"[listener] error generating confirmed roast: {e}")
                 try:
                     sent = await client.send_message(
-                        chat_id, "Something went wrong generating that roast.", reply_to=confirm_msg_id
+                        chat_id, "Что-то пошло не так при генерации прожарки.", reply_to=confirm_msg_id
                     )
                     if sent is not None:
                         sent_message_ids.add(sent.id)
@@ -742,9 +892,9 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
-        f"{cfg.listener_trigger_keywords} (summary) or {cfg.roast_trigger_keywords} (roast), "
-        f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
-        "Ctrl+C to stop."
+        f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}) or "
+        f"{cfg.roast_trigger_keywords} (roast), and your own '{cfg.save_trigger_keyword}' replies "
+        f"(save to {cfg.save_channel or 'disabled'}). Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 
@@ -762,9 +912,22 @@ async def main():
         print("[listener] TELEGRAM_SESSION_STRING: NOT SET in this process's environment")
 
     client = build_client(cfg)
-
     await client.start()
-    await run_listener(client, cfg, tz)
+
+    if cfg.telegram_bot_token:
+        # Local import: bot_listener.py imports several helpers back from this module
+        # (resolve_time_window, DayLimitExceeded, etc.), so importing it at module level
+        # here would be a circular import. By the time main() runs, this module has
+        # already finished executing top-level code, so the cycle resolves fine.
+        import bot_listener
+
+        print("[listener] TELEGRAM_BOT_TOKEN is set -- also starting bot_listener.py for /summary.")
+        await asyncio.gather(
+            run_listener(client, cfg, tz),
+            bot_listener.run_bot_listener(cfg.telegram_bot_token, cfg, tz, client),
+        )
+    else:
+        await run_listener(client, cfg, tz)
 
 
 if __name__ == "__main__":

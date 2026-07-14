@@ -38,6 +38,8 @@ class Config:
     roast_max_messages: int
     save_trigger_keyword: str
     save_channel: str | None
+    summary_pipeline_version: str
+    telegram_bot_token: str | None
 
 
 def build_session(cfg: "Config"):
@@ -116,6 +118,14 @@ def load_config() -> Config:
 
     save_channel = os.getenv("SAVE_CHANNEL", "papka_pokrasa").strip() or None
 
+    summary_pipeline_version = os.getenv("SUMMARY_PIPELINE_VERSION", "v2").strip().lower()
+    if summary_pipeline_version not in ("v1", "v2"):
+        raise ChatSummaryError(
+            f"SUMMARY_PIPELINE_VERSION must be 'v1' or 'v2', got '{summary_pipeline_version}'."
+        )
+
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -131,4 +141,6 @@ def load_config() -> Config:
         roast_max_messages=roast_max_messages,
         save_trigger_keyword=save_trigger_keyword,
         save_channel=save_channel,
+        summary_pipeline_version=summary_pipeline_version,
+        telegram_bot_token=telegram_bot_token,
     )
