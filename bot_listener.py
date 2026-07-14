@@ -413,6 +413,13 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                 text_lower = message["text"].lower()
                 has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
                 has_roast = any(k in text_lower for k in cfg.roast_trigger_keywords)
+                # Convenience trigger: naming the bot directly (@its_username) alongside
+                # the bare word "summary" also counts, so "/summary" isn't the only way
+                # to ask -- e.g. "@echhchat_bot summary как дела". Mirrors listener.py's
+                # "first name + summary" heuristic for the personal account.
+                if not has_summary and not has_roast and "summary" in text_lower:
+                    if bot_username and f"@{bot_username.lower()}" in text_lower:
+                        has_summary = True
                 if not has_summary and not has_roast:
                     continue
 
@@ -432,7 +439,10 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                         continue
 
                 now = time.monotonic()
-                elapsed = now - last_trigger.get(chat_key, 0)
+                # See listener.py's identical comment: 0 is an unsafe "never triggered"
+                # sentinel against time.monotonic() -- use -inf so a fresh process never
+                # spuriously treats its first request in a chat as already in cooldown.
+                elapsed = now - last_trigger.get(chat_key, float("-inf"))
                 if elapsed < cfg.listener_cooldown_seconds:
                     remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
                     log(f"[bot_listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")

@@ -748,7 +748,12 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
 
         chat_key = event.chat_id
         now = time.monotonic()
-        elapsed = now - last_trigger.get(chat_key, 0)
+        # Sentinel for "never triggered in this chat" must be -inf, not 0: time.monotonic()
+        # is only guaranteed non-decreasing, NOT guaranteed to start from a huge number --
+        # on a freshly started process/container it can be a small value (tens to low
+        # hundreds of seconds), which a 0 sentinel would make look like a recent trigger,
+        # spuriously putting the very first request of a fresh run into cooldown.
+        elapsed = now - last_trigger.get(chat_key, float("-inf"))
         if elapsed < cfg.listener_cooldown_seconds:
             remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
             log(f"[listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")
