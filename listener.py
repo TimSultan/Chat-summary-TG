@@ -20,6 +20,7 @@ import math
 import re
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events, utils as tl_utils
@@ -114,7 +115,6 @@ NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих со�
 # (which can take a few seconds) run.
 SUMMARY_ACK_EMOJI = "✍"
 
-SUMMARY_DELETE_AFTER = 180  # successful replies self-delete after 3 minutes
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 
@@ -330,7 +330,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         original_question=original_question,
     )
 
-    await respond(f"{summary}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
+    await respond(f"{summary}\n\n{COMMANDS_FOOTER}")
 
 
 async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int], schedule_delete, log=print):
@@ -451,7 +451,7 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
         style="reply",
     )
 
-    await respond(f"{answer}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
+    await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
 
 
 async def run_roast(
@@ -794,8 +794,8 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                 await react_emoji(event.chat_id, msg.id, SUMMARY_ACK_EMOJI)
                 handler = handle_request_v2 if cfg.summary_pipeline_version == "v2" else handle_request
                 await handler(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
-        except Exception as e:
-            log(f"[listener] error handling request: {e}")
+        except Exception:
+            log(f"[listener] error handling request:\n{traceback.format_exc()}")
             try:
                 sent = await event.reply("Что-то пошло не так при генерации сводки.")
                 if sent is not None:
@@ -892,8 +892,8 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
                     schedule_delete,
                     log=log,
                 )
-            except Exception as e:
-                log(f"[listener] error generating confirmed roast: {e}")
+            except Exception:
+                log(f"[listener] error generating confirmed roast:\n{traceback.format_exc()}")
                 try:
                     sent = await client.send_message(
                         chat_id, "Что-то пошло не так при генерации прожарки.", reply_to=confirm_msg_id

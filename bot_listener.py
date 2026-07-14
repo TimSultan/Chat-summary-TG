@@ -42,6 +42,7 @@ import asyncio
 import math
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -60,7 +61,6 @@ from listener import (
     ROAST_BUSY_EMOJI,
     ROAST_DELETE_AFTER,
     SUMMARY_ACK_EMOJI,
-    SUMMARY_DELETE_AFTER,
     DayLimitExceeded,
     _format_hours,
     _ru_minutes,
@@ -256,8 +256,8 @@ async def handle_bot_roast_callback(
                 api, telethon_client, cfg, tz, chat_id, pending["chat_ref"], clicker,
                 pending["confirm_msg_id"], pending["original_text"], background_tasks, log=log,
             )
-        except Exception as e:
-            log(f"[bot_listener] error generating confirmed roast: {e}")
+        except Exception:
+            log(f"[bot_listener] error generating confirmed roast:\n{traceback.format_exc()}")
             try:
                 await api.send_message(
                     chat_id, "Что-то пошло не так при генерации прожарки.",
@@ -406,7 +406,7 @@ async def handle_bot_summary_request(
         style="reply",
     )
 
-    await respond(f"{answer}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
+    await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
 
 
 async def _dispatch_update(
@@ -537,8 +537,8 @@ async def _dispatch_update(
             await handle_bot_summary_request(
                 api, telethon_client, cfg, tz, bot_username, message, background_tasks, home_chat_ref, log=log
             )
-        except Exception as e:
-            log(f"[bot_listener] error handling request: {e}")
+        except Exception:
+            log(f"[bot_listener] error handling request:\n{traceback.format_exc()}")
             try:
                 await api.send_message(
                     message["chat"]["id"], "Что-то пошло не так при генерации сводки.",
@@ -604,8 +604,8 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                         update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
                         last_trigger, roast_pending, roast_in_progress, background_tasks, home_chat_ref, log=log,
                     )
-                except Exception as e:
-                    log(f"[bot_listener] unhandled error processing update {update.get('update_id')}: {e}")
+                except Exception:
+                    log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
 
 
 async def main():
