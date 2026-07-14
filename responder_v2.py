@@ -156,7 +156,16 @@ def answer_request(
     question: str,
     focus_user: str | None = None,
     style: str = "reply",
-    max_chunk_tokens: int = 6000,
+    # gpt-5.4-mini has a 400k-token context window (verified against OpenAI's docs, July
+    # 2026) -- 200k comfortably covers even this chat's busiest observed real day
+    # (~167k tokens) as a SINGLE chunk, skipping map-reduce entirely rather than just
+    # shrinking it, while leaving well over half the window free for the system prompt,
+    # output, and headroom as the chat grows. Raising this doesn't cost more tokens on a
+    # quiet day (the ceiling only matters once a day's content exceeds it) and actually
+    # costs FEWER tokens overall on a busy one: each extra chunk under the old 6000-token
+    # default paid for another full copy of the system prompt plus a "notes" step that
+    # then got fed back in as input to the final call.
+    max_chunk_tokens: int = 200_000,
 ) -> str:
     if style not in VALID_STYLES:
         raise ChatSummaryError(f"Unknown summary style '{style}', expected one of {VALID_STYLES}.")
