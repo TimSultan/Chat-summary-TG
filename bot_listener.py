@@ -20,6 +20,13 @@ reposting to your own channel. See listener.py's on_message: it stops handling /
 and roast itself once TELEGRAM_BOT_TOKEN is set, so only one of the two ever replies to a
 given request.
 
+A private chat (DM) with the bot is always accepted as a trigger source too, regardless
+of LISTENER_ALLOWED_CHATS -- but since a DM has no group history of its own, data
+fetching for a DM-originated request is redirected to a single "home" chat instead (see
+_home_chat_ref): whichever chat LISTENER_ALLOWED_CHATS names, IF it names exactly one.
+With zero or multiple entries there's no unambiguous default, and a DM request gets told
+to ask in the group instead of guessing which one you meant.
+
 Always uses the v2 pipeline (intent_v2 + responder_v2) regardless of
 SUMMARY_PIPELINE_VERSION, which only governs the older Telethon-listener code path kept
 for rollback/comparison -- see intent_v2.py's module docstring.
@@ -84,12 +91,26 @@ def _display_name(user: dict | None) -> str:
 
 
 def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
+    # A private chat (DM) with the bot itself is always a legitimate input channel,
+    # regardless of the group allowlist -- see _home_chat_ref: it's how you ask about the
+    # group without posting in it.
+    if chat.get("type") == "private":
+        return True
     if not allowed_chats:
         return True
     username = (chat.get("username") or "").lower()
     title = (chat.get("title") or "").lower()
     chat_id = str(chat.get("id", ""))
     return username in allowed_chats or title in allowed_chats or chat_id in allowed_chats
+
+
+def _home_chat_ref(cfg) -> str | None:
+    """The one group chat a DM with the bot should be treated as being about, since a DM
+    has no group history of its own to fetch. Only well-defined when LISTENER_ALLOWED_CHATS
+    names exactly one chat -- with zero or multiple entries there's no unambiguous default."""
+    if len(cfg.listener_allowed_chats) == 1:
+        return cfg.listener_allowed_chats[0]
+    return None
 
 
 async def send_long_bot_message(api: TelegramBotAPI, chat_id, text: str, reply_to_message_id: int | None) -> list[int]:
@@ -256,6 +277,7 @@ async def handle_bot_summary_request(
     bot_username: str,
     message: dict,
     background_tasks: set,
+    home_chat_ref: str | None,
     log=print,
 ):
     chat = message["chat"]
@@ -275,6 +297,17 @@ async def handle_bot_summary_request(
                 log(f"[bot_listener] failed to record history: {e}")
         if delete_after and sent_ids:
             schedule_bot_delete(api, chat_id, sent_ids, delete_after, log, background_tasks)
+
+    # A DM has no group history of its own -- redirect data fetching to the configured
+    # home group, but keep replying/recording history against the DM itself (chat_id,
+    # requester above are untouched). See _home_chat_ref.
+    if chat.get("type") == "private":
+        if not home_chat_ref:
+            await respond("Не настроен основной чат для личных сообщений -- обратитесь в группе.")
+            return
+        data_chat_ref = home_chat_ref
+    else:
+        data_chat_ref = chat.get("username") or chat_title_for_history
 
     mentioned = extract_mentioned_usernames(text, exclude=bot_username)
     ref_date = request_dt.astimezone(tz).date()
@@ -303,7 +336,7 @@ async def handle_bot_summary_request(
 
     chat_title, messages = await fetch_range_messages_cached(
         client=telethon_client,
-        chat_ref=chat.get("username") or chat_title_for_history,
+        chat_ref=data_chat_ref,
         start_day=start_date,
         end_day=end_date,
         tz=tz,
@@ -374,6 +407,7 @@ async def _dispatch_update(
     roast_pending: dict,
     roast_in_progress: set,
     background_tasks: set,
+    home_chat_ref: str | None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -443,6 +477,20 @@ async def _dispatch_update(
         return
     last_trigger[chat_key] = now
 
+    is_private = chat.get("type") == "private"
+    if is_private and not home_chat_ref:
+        # A DM has no group history of its own -- without exactly one chat configured in
+        # LISTENER_ALLOWED_CHATS there's no unambiguous default to pull from (see
+        # _home_chat_ref), so say so instead of guessing or silently failing later.
+        try:
+            await api.send_message(
+                chat_key, "Не настроен основной чат для личных сообщений -- обратитесь в группе.",
+                reply_to_message_id=message["message_id"],
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to send home-chat-not-configured notice: {e}")
+        return
+
     if has_roast:
         log(f"[bot_listener] sending roast confirmation in '{chat.get('title', chat_key)}' to {_display_name(sender)}")
         try:
@@ -458,7 +506,7 @@ async def _dispatch_update(
                 roast_pending[(chat_key, sender_id)] = {
                     "confirm_msg_id": sent["message_id"],
                     "original_text": message["text"],
-                    "chat_ref": chat.get("username") or chat.get("title") or str(chat_key),
+                    "chat_ref": home_chat_ref if is_private else (chat.get("username") or chat.get("title") or str(chat_key)),
                 }
         except Exception as e:
             log(f"[bot_listener] failed to send roast confirmation: {e}")
@@ -470,7 +518,7 @@ async def _dispatch_update(
     async def _run(message=message):
         try:
             await handle_bot_summary_request(
-                api, telethon_client, cfg, tz, bot_username, message, background_tasks, log=log
+                api, telethon_client, cfg, tz, bot_username, message, background_tasks, home_chat_ref, log=log
             )
         except Exception as e:
             log(f"[bot_listener] error handling request: {e}")
@@ -502,6 +550,15 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
     roast_pending: dict[tuple[int, int], dict] = {}
     roast_in_progress: set[tuple[int, int]] = set()
 
+    home_chat_ref = _home_chat_ref(cfg)
+    if home_chat_ref:
+        log(f"[bot_listener] home chat for DM requests: '{home_chat_ref}'")
+    else:
+        log(
+            "[bot_listener] no single home chat configured (LISTENER_ALLOWED_CHATS doesn't "
+            "name exactly one chat) -- DM requests to this bot will be told to ask in the group instead."
+        )
+
     async with aiohttp.ClientSession() as session:
         api = TelegramBotAPI(bot_token, session)
         me = await api.get_me()
@@ -528,7 +585,7 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                 try:
                     await _dispatch_update(
                         update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
-                        last_trigger, roast_pending, roast_in_progress, background_tasks, log=log,
+                        last_trigger, roast_pending, roast_in_progress, background_tasks, home_chat_ref, log=log,
                     )
                 except Exception as e:
                     log(f"[bot_listener] unhandled error processing update {update.get('update_id')}: {e}")
