@@ -2,7 +2,12 @@
 -- used by bot_listener.py to run a bot account alongside the Telethon user session that
 listener.py drives. Deliberately minimal: just the handful of methods bot_listener.py
 needs (getMe, getUpdates via long polling, sendMessage, deleteMessage,
-setMessageReaction), not a full SDK.
+setMessageReaction, answerCallbackQuery), not a full SDK.
+
+Roast confirmation uses an inline-keyboard button + callback_query rather than reactions
+(like the Telethon listener uses): receiving *other users'* reactions via getUpdates
+(message_reaction updates) requires the bot to be a chat admin, while callback_query from
+the bot's own inline keyboard requires no special rights at all.
 """
 
 import aiohttp
@@ -45,15 +50,18 @@ class TelegramBotAPI:
             _http_timeout=timeout + 10,
             offset=offset,
             timeout=timeout,
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
         )
 
-    async def send_message(self, chat_id, text: str, reply_to_message_id: int | None = None) -> dict:
+    async def send_message(
+        self, chat_id, text: str, reply_to_message_id: int | None = None, reply_markup: dict | None = None
+    ) -> dict:
         params = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown",
             "link_preview_options": {"is_disabled": True},
+            "reply_markup": reply_markup,
         }
         if reply_to_message_id is not None:
             params["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
@@ -73,3 +81,9 @@ class TelegramBotAPI:
             )
         except ChatSummaryError:
             pass  # best-effort ack -- never worth failing the request over
+
+    async def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        try:
+            await self._call("answerCallbackQuery", callback_query_id=callback_query_id, text=text)
+        except ChatSummaryError:
+            pass  # best-effort: just stops the client-side loading spinner

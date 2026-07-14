@@ -1,21 +1,24 @@
-"""Long-polls the Telegram Bot HTTP API for /summary requests in the same chats
-listener.py's Telethon-based listener watches, and answers them as the bot account
-instead of your personal account.
+"""Long-polls the Telegram Bot HTTP API for /summary and roast ("прожарь меня") requests
+in the same chats listener.py's Telethon-based listener watches, and answers them as the
+bot account instead of your personal account.
 
-Why this exists alongside listener.py: a bot account lets people trigger a summary
-without it coming from (or being confused with) your own account. The tradeoff is that
-the Bot API gives a bot no retroactive access to chat history at all -- it only ever sees
-messages sent after it's added to a chat. So message fetching here still goes through the
-already-connected Telethon `client` passed into run_bot_listener() (same
+Why this exists alongside listener.py: a bot account lets people trigger these without it
+coming from (or being confused with) your own account. The tradeoff is that the Bot API
+gives a bot no retroactive access to chat history at all -- it only ever sees messages
+sent after it's added to a chat. So message fetching here still goes through the already-
+connected Telethon `client` passed into run_bot_listener() (same
 fetch_range_messages_cached() listener.py itself uses); only trigger detection and
 replying happen over the bot's HTTP API.
 
-Only the /summary trigger is handled here, not roast ("прожарь меня") or save
-("сохрани"): roast isn't a slash command, so with privacy mode left on (the default,
-recommended in .env.example) a group bot never sees it unless directly @mentioned/replied
-to, and save only makes sense as *your own* account reposting to your own channel. See
-listener.py's on_message: it stops handling /summary itself once TELEGRAM_BOT_TOKEN is
-set, so only one of the two ever replies to a given request.
+Roast confirmation uses an inline-keyboard button + callback_query instead of the "react
+to confirm" flow listener.py uses for the same command: receiving *other users'*
+reactions via getUpdates (message_reaction updates) requires the bot to be a chat admin,
+while callback_query from the bot's own inline keyboard needs no special rights.
+
+Save ("сохрани") is NOT handled here -- it only makes sense as *your own* account
+reposting to your own channel. See listener.py's on_message: it stops handling /summary
+and roast itself once TELEGRAM_BOT_TOKEN is set, so only one of the two ever replies to a
+given request.
 
 Always uses the v2 pipeline (intent_v2 + responder_v2) regardless of
 SUMMARY_PIPELINE_VERSION, which only governs the older Telethon-listener code path kept
@@ -30,7 +33,7 @@ import asyncio
 import math
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
@@ -44,6 +47,9 @@ from listener import (
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
     ERROR_DELETE_AFTER,
+    NO_ROAST_MATERIAL_MESSAGE,
+    ROAST_BUSY_EMOJI,
+    ROAST_DELETE_AFTER,
     SUMMARY_ACK_EMOJI,
     SUMMARY_DELETE_AFTER,
     DayLimitExceeded,
@@ -54,10 +60,15 @@ from listener import (
 )
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
+from roast import roast_person
 from telegram_fetch import fetch_range_messages_cached, format_transcript_lines, sender_matches
 
 MAX_REPLY_CHARS = 4000
 POLL_TIMEOUT_SECONDS = 30
+
+BOT_ROAST_CONFIRM_TEXT = "Ты точно хочешь прожарку? Нажми кнопку, чтобы подтвердить."
+ROAST_BUTTON_TEXT = "🔥 Жги"
+ROAST_CALLBACK_PREFIX = "roast"
 
 
 def _display_name(user: dict | None) -> str:
@@ -98,6 +109,141 @@ def schedule_bot_delete(api: TelegramBotAPI, chat_id, message_ids: list[int], de
             await api.delete_message(chat_id, mid)
 
     task = asyncio.create_task(_do())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+def _roast_callback_data(chat_id, user_id) -> str:
+    return f"{ROAST_CALLBACK_PREFIX}:{chat_id}:{user_id}"
+
+
+def _parse_roast_callback(data: str) -> tuple[int, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != ROAST_CALLBACK_PREFIX:
+        return None
+    try:
+        return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+async def run_bot_roast(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    chat_id,
+    chat_ref: str,
+    target_user: dict,
+    confirm_msg_id: int,
+    original_text: str,
+    background_tasks: set,
+    log=print,
+):
+    """Actually generates and sends the roast, once the target user has confirmed by
+    tapping the inline button on BOT_ROAST_CONFIRM_TEXT. Mirrors listener.py's run_roast,
+    but message fetching goes through `chat_ref` (a username/title string, NOT `chat_id`
+    -- the Bot API's chat id numbering differs from Telethon's, e.g. supergroups use a
+    "-100" prefix over the Bot API, so only a resolvable name/username is safe to hand to
+    the Telethon session)."""
+    target_user_id = target_user.get("id")
+    requester = _display_name(target_user)
+    chat_title_for_history = chat_ref
+
+    async def respond(answer: str, delete_after: int | None = None, record: bool = True):
+        sent_ids = await send_long_bot_message(api, chat_id, answer, reply_to_message_id=confirm_msg_id)
+        if record:
+            try:
+                history.record(chat_title_for_history, requester, original_text, answer)
+            except Exception as e:
+                log(f"[bot_listener] failed to record history: {e}")
+        if delete_after and sent_ids:
+            schedule_bot_delete(api, chat_id, sent_ids, delete_after, log, background_tasks)
+
+    end_date = datetime.now(tz).date()
+    start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
+
+    chat_title, messages = await fetch_range_messages_cached(
+        client=telethon_client, chat_ref=chat_ref, start_day=start_date, end_day=end_date, tz=tz, log=log,
+    )
+    if chat_title:
+        chat_title_for_history = chat_title
+
+    own_messages = [m for m in messages if m.sender_id == target_user_id]
+    if not own_messages:
+        username = target_user.get("username")
+        if username:
+            own_messages = [m for m in messages if sender_matches(m, username)]
+
+    log(f"[bot_listener] roast target={requester} matched={len(own_messages)}/{len(messages)}")
+    if not own_messages:
+        await respond(NO_ROAST_MATERIAL_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
+        return
+
+    if len(own_messages) > cfg.roast_max_messages:
+        log(
+            f"[bot_listener] capping roast input for {requester}: {len(own_messages)} -> "
+            f"{cfg.roast_max_messages} most recent messages"
+        )
+        own_messages = own_messages[-cfg.roast_max_messages :]
+
+    lines = format_transcript_lines(own_messages, include_date=True)
+    roast = roast_person(api_key=cfg.openai_api_key, model=cfg.openai_model, target_name=requester, lines=lines)
+
+    await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
+
+
+async def handle_bot_roast_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    roast_pending: dict,
+    roast_in_progress: set,
+    background_tasks: set,
+    log=print,
+):
+    parsed = _parse_roast_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    chat_id, target_user_id = parsed
+
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+
+    key = (chat_id, target_user_id)
+    pending = roast_pending.pop(key, None)
+    if pending is None:
+        await api.answer_callback_query(callback["id"])
+        return  # already confirmed or this callback is stale -- ignore a stray second tap
+
+    await api.answer_callback_query(callback["id"], text="Жарим...")
+    roast_in_progress.add(key)
+    log(f"[bot_listener] roast confirmed via button: chat={chat_id} user={target_user_id}")
+
+    async def _run():
+        try:
+            await run_bot_roast(
+                api, telethon_client, cfg, tz, chat_id, pending["chat_ref"], clicker,
+                pending["confirm_msg_id"], pending["original_text"], background_tasks, log=log,
+            )
+        except Exception as e:
+            log(f"[bot_listener] error generating confirmed roast: {e}")
+            try:
+                await api.send_message(
+                    chat_id, "Что-то пошло не так при генерации прожарки.",
+                    reply_to_message_id=pending["confirm_msg_id"],
+                )
+            except Exception:
+                pass
+        finally:
+            roast_in_progress.discard(key)
+
+    task = asyncio.create_task(_run())
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
 
@@ -224,11 +370,21 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
     background_tasks: set[asyncio.Task] = set()
     last_trigger: dict[int, float] = {}
 
+    # Roast confirm/button flow state, keyed by (chat_id, target_user_id) -- mirrors
+    # listener.py's roast_pending/roast_in_progress. Value: {"confirm_msg_id",
+    # "original_text", "chat_ref"} -- chat_ref is a username/title string usable by the
+    # Telethon session, since chat_id here is the Bot API's own numbering.
+    roast_pending: dict[tuple[int, int], dict] = {}
+    roast_in_progress: set[tuple[int, int]] = set()
+
     async with aiohttp.ClientSession() as session:
         api = TelegramBotAPI(bot_token, session)
         me = await api.get_me()
         bot_username = me.get("username")
-        log(f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for {cfg.listener_trigger_keywords}.")
+        log(
+            f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
+            f"{cfg.listener_trigger_keywords} (summary) and {cfg.roast_trigger_keywords} (roast)."
+        )
 
         offset = None
         while True:
@@ -241,12 +397,23 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
 
             for update in updates:
                 offset = update["update_id"] + 1
+
+                callback = update.get("callback_query")
+                if callback is not None:
+                    await handle_bot_roast_callback(
+                        api, telethon_client, cfg, tz, callback, roast_pending, roast_in_progress,
+                        background_tasks, log=log,
+                    )
+                    continue
+
                 message = update.get("message")
                 if not message or "text" not in message:
                     continue
 
                 text_lower = message["text"].lower()
-                if not any(k in text_lower for k in cfg.listener_trigger_keywords):
+                has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
+                has_roast = any(k in text_lower for k in cfg.roast_trigger_keywords)
+                if not has_summary and not has_roast:
                     continue
 
                 chat = message["chat"]
@@ -254,6 +421,16 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                     continue
 
                 chat_key = chat["id"]
+                sender = message.get("from") or {}
+                sender_id = sender.get("id")
+
+                if has_roast:
+                    roast_key = (chat_key, sender_id)
+                    if roast_key in roast_pending or roast_key in roast_in_progress:
+                        log(f"[bot_listener] roast already pending/in-progress for {roast_key}, reacting instead")
+                        await api.set_message_reaction(chat_key, message["message_id"], ROAST_BUSY_EMOJI)
+                        continue
+
                 now = time.monotonic()
                 elapsed = now - last_trigger.get(chat_key, 0)
                 if elapsed < cfg.listener_cooldown_seconds:
@@ -267,6 +444,24 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                         schedule_bot_delete(api, chat_key, [sent["message_id"]], ERROR_DELETE_AFTER, log, background_tasks)
                     continue
                 last_trigger[chat_key] = now
+
+                if has_roast:
+                    log(f"[bot_listener] sending roast confirmation in '{chat.get('title', chat_key)}' to {_display_name(sender)}")
+                    sent = await api.send_message(
+                        chat_key, BOT_ROAST_CONFIRM_TEXT, reply_to_message_id=message["message_id"],
+                        reply_markup={
+                            "inline_keyboard": [[
+                                {"text": ROAST_BUTTON_TEXT, "callback_data": _roast_callback_data(chat_key, sender_id)}
+                            ]]
+                        },
+                    )
+                    if sent and "message_id" in sent:
+                        roast_pending[(chat_key, sender_id)] = {
+                            "confirm_msg_id": sent["message_id"],
+                            "original_text": message["text"],
+                            "chat_ref": chat.get("username") or chat.get("title") or str(chat_key),
+                        }
+                    continue
 
                 log(f"[bot_listener] handling request in '{chat.get('title', chat_key)}': {message['text']!r}")
                 await api.set_message_reaction(chat_key, message["message_id"], SUMMARY_ACK_EMOJI)

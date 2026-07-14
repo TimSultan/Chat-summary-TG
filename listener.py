@@ -560,14 +560,13 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
             "safety checks are skipped."
         )
 
-    # When a bot account (bot_listener.py) is configured, it takes over /summary
-    # entirely -- this Telethon listener would otherwise also see and answer the same
-    # trigger message, producing two replies. Roast and save are unaffected: roast isn't
-    # a slash command (a privacy-mode bot never sees it unmentioned) and save only makes
-    # sense from your own account.
-    bot_handles_summary = bool(cfg.telegram_bot_token)
-    if bot_handles_summary:
-        log("[listener] TELEGRAM_BOT_TOKEN is set -- /summary is handled by bot_listener.py instead of this account.")
+    # When a bot account (bot_listener.py) is configured, it takes over /summary AND
+    # roast ("прожарь меня") entirely -- this Telethon listener would otherwise also see
+    # and answer the same trigger message, producing two replies. Save is unaffected: it
+    # only ever makes sense as *your own* account reposting to your own channel.
+    bot_takeover = bool(cfg.telegram_bot_token)
+    if bot_takeover:
+        log("[listener] TELEGRAM_BOT_TOKEN is set -- /summary and roast are handled by bot_listener.py instead of this account.")
 
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     if allowed_chats:
@@ -715,16 +714,16 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print):
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
         # "прожарь меня" is a second, separate trigger for the roast command.
-        has_summary_keyword = not bot_handles_summary and any(k in text_lower for k in cfg.listener_trigger_keywords)
-        has_roast_keyword = any(k in text_lower for k in cfg.roast_trigger_keywords)
+        has_summary_keyword = not bot_takeover and any(k in text_lower for k in cfg.listener_trigger_keywords)
+        has_roast_keyword = not bot_takeover and any(k in text_lower for k in cfg.roast_trigger_keywords)
 
         # Two more ways to ask for a summary without the exact trigger keyword: naming
         # you by first name alongside the word "summary" in one message, or replying to
         # one of your own messages and saying "summary". Both checks are gated on the
         # bare word "summary" being present at all, so plain chat never pays for the
         # extra (async, for the reply case) checks below. Skipped entirely once the bot
-        # account has taken over /summary (see bot_handles_summary above).
-        if not bot_handles_summary and not has_summary_keyword and not has_roast_keyword and "summary" in text_lower:
+        # account has taken over (see bot_takeover above).
+        if not bot_takeover and not has_summary_keyword and not has_roast_keyword and "summary" in text_lower:
             if my_first_name and my_first_name in text_lower:
                 has_summary_keyword = True
             elif msg.is_reply:
