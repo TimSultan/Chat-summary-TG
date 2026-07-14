@@ -362,6 +362,131 @@ async def handle_bot_summary_request(
     await respond(f"{answer}\n\n{COMMANDS_FOOTER}", delete_after=SUMMARY_DELETE_AFTER)
 
 
+async def _dispatch_update(
+    update: dict,
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    bot_username: str | None,
+    allowed_chats: set[str],
+    last_trigger: dict[int, float],
+    roast_pending: dict,
+    roast_in_progress: set,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """Handles one update. Must never let an exception escape to the caller: an unhandled
+    error here would crash the whole polling loop (see run_bot_listener), and since
+    `offset` only lives in memory, a crash-restart would make Telegram redeliver this same
+    still-unconfirmed update to the fresh process -- risking a crash/resend loop that
+    looks like the bot spamming the same reply over and over. Every reply sent directly
+    in this function is therefore individually try/except-guarded too (matching
+    listener.py's pattern), so one failed send (rate limit, transient network error)
+    can't take the rest of the process down with it -- run_bot_listener's own try/except
+    around this call is strictly a last-resort backstop, not the primary safety net."""
+    callback = update.get("callback_query")
+    if callback is not None:
+        await handle_bot_roast_callback(
+            api, telethon_client, cfg, tz, callback, roast_pending, roast_in_progress, background_tasks, log=log,
+        )
+        return
+
+    message = update.get("message")
+    if not message or "text" not in message:
+        return
+
+    text_lower = message["text"].lower()
+    has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
+    has_roast = any(k in text_lower for k in cfg.roast_trigger_keywords)
+    # Convenience trigger: naming the bot directly (@its_username) alongside the bare
+    # word "summary" also counts, so "/summary" isn't the only way to ask -- e.g.
+    # "@echhchat_bot summary как дела". Mirrors listener.py's "first name + summary"
+    # heuristic for the personal account.
+    if not has_summary and not has_roast and "summary" in text_lower:
+        if bot_username and f"@{bot_username.lower()}" in text_lower:
+            has_summary = True
+    if not has_summary and not has_roast:
+        return
+
+    chat = message["chat"]
+    if not _is_chat_allowed(allowed_chats, chat):
+        return
+
+    chat_key = chat["id"]
+    sender = message.get("from") or {}
+    sender_id = sender.get("id")
+
+    if has_roast:
+        roast_key = (chat_key, sender_id)
+        if roast_key in roast_pending or roast_key in roast_in_progress:
+            log(f"[bot_listener] roast already pending/in-progress for {roast_key}, reacting instead")
+            await api.set_message_reaction(chat_key, message["message_id"], ROAST_BUSY_EMOJI)
+            return
+
+    now = time.monotonic()
+    # 0 is an unsafe "never triggered" sentinel against time.monotonic() -- use -inf so a
+    # fresh process never spuriously treats its first request in a chat as in cooldown.
+    elapsed = now - last_trigger.get(chat_key, float("-inf"))
+    if elapsed < cfg.listener_cooldown_seconds:
+        remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
+        log(f"[bot_listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")
+        try:
+            sent = await api.send_message(
+                chat_key, f"Спросите через {_ru_minutes(remaining_minutes)}",
+                reply_to_message_id=message["message_id"],
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(api, chat_key, [sent["message_id"]], ERROR_DELETE_AFTER, log, background_tasks)
+        except Exception as e:
+            log(f"[bot_listener] failed to send cooldown notice: {e}")
+        return
+    last_trigger[chat_key] = now
+
+    if has_roast:
+        log(f"[bot_listener] sending roast confirmation in '{chat.get('title', chat_key)}' to {_display_name(sender)}")
+        try:
+            sent = await api.send_message(
+                chat_key, BOT_ROAST_CONFIRM_TEXT, reply_to_message_id=message["message_id"],
+                reply_markup={
+                    "inline_keyboard": [[
+                        {"text": ROAST_BUTTON_TEXT, "callback_data": _roast_callback_data(chat_key, sender_id)}
+                    ]]
+                },
+            )
+            if sent and "message_id" in sent:
+                roast_pending[(chat_key, sender_id)] = {
+                    "confirm_msg_id": sent["message_id"],
+                    "original_text": message["text"],
+                    "chat_ref": chat.get("username") or chat.get("title") or str(chat_key),
+                }
+        except Exception as e:
+            log(f"[bot_listener] failed to send roast confirmation: {e}")
+        return
+
+    log(f"[bot_listener] handling request in '{chat.get('title', chat_key)}': {message['text']!r}")
+    await api.set_message_reaction(chat_key, message["message_id"], SUMMARY_ACK_EMOJI)
+
+    async def _run(message=message):
+        try:
+            await handle_bot_summary_request(
+                api, telethon_client, cfg, tz, bot_username, message, background_tasks, log=log
+            )
+        except Exception as e:
+            log(f"[bot_listener] error handling request: {e}")
+            try:
+                await api.send_message(
+                    message["chat"]["id"], "Что-то пошло не так при генерации сводки.",
+                    reply_to_message_id=message["message_id"],
+                )
+            except Exception:
+                pass
+
+    task = asyncio.create_task(_run())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
 async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -396,104 +521,17 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print):
                 continue
 
             for update in updates:
+                # Offset must advance before processing, not after: if handling this
+                # update throws, Telegram should still consider it delivered on the next
+                # getUpdates call rather than resending the same update forever.
                 offset = update["update_id"] + 1
-
-                callback = update.get("callback_query")
-                if callback is not None:
-                    await handle_bot_roast_callback(
-                        api, telethon_client, cfg, tz, callback, roast_pending, roast_in_progress,
-                        background_tasks, log=log,
+                try:
+                    await _dispatch_update(
+                        update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
+                        last_trigger, roast_pending, roast_in_progress, background_tasks, log=log,
                     )
-                    continue
-
-                message = update.get("message")
-                if not message or "text" not in message:
-                    continue
-
-                text_lower = message["text"].lower()
-                has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
-                has_roast = any(k in text_lower for k in cfg.roast_trigger_keywords)
-                # Convenience trigger: naming the bot directly (@its_username) alongside
-                # the bare word "summary" also counts, so "/summary" isn't the only way
-                # to ask -- e.g. "@echhchat_bot summary как дела". Mirrors listener.py's
-                # "first name + summary" heuristic for the personal account.
-                if not has_summary and not has_roast and "summary" in text_lower:
-                    if bot_username and f"@{bot_username.lower()}" in text_lower:
-                        has_summary = True
-                if not has_summary and not has_roast:
-                    continue
-
-                chat = message["chat"]
-                if not _is_chat_allowed(allowed_chats, chat):
-                    continue
-
-                chat_key = chat["id"]
-                sender = message.get("from") or {}
-                sender_id = sender.get("id")
-
-                if has_roast:
-                    roast_key = (chat_key, sender_id)
-                    if roast_key in roast_pending or roast_key in roast_in_progress:
-                        log(f"[bot_listener] roast already pending/in-progress for {roast_key}, reacting instead")
-                        await api.set_message_reaction(chat_key, message["message_id"], ROAST_BUSY_EMOJI)
-                        continue
-
-                now = time.monotonic()
-                # See listener.py's identical comment: 0 is an unsafe "never triggered"
-                # sentinel against time.monotonic() -- use -inf so a fresh process never
-                # spuriously treats its first request in a chat as already in cooldown.
-                elapsed = now - last_trigger.get(chat_key, float("-inf"))
-                if elapsed < cfg.listener_cooldown_seconds:
-                    remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
-                    log(f"[bot_listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")
-                    sent = await api.send_message(
-                        chat_key, f"Спросите через {_ru_minutes(remaining_minutes)}",
-                        reply_to_message_id=message["message_id"],
-                    )
-                    if sent and "message_id" in sent:
-                        schedule_bot_delete(api, chat_key, [sent["message_id"]], ERROR_DELETE_AFTER, log, background_tasks)
-                    continue
-                last_trigger[chat_key] = now
-
-                if has_roast:
-                    log(f"[bot_listener] sending roast confirmation in '{chat.get('title', chat_key)}' to {_display_name(sender)}")
-                    sent = await api.send_message(
-                        chat_key, BOT_ROAST_CONFIRM_TEXT, reply_to_message_id=message["message_id"],
-                        reply_markup={
-                            "inline_keyboard": [[
-                                {"text": ROAST_BUTTON_TEXT, "callback_data": _roast_callback_data(chat_key, sender_id)}
-                            ]]
-                        },
-                    )
-                    if sent and "message_id" in sent:
-                        roast_pending[(chat_key, sender_id)] = {
-                            "confirm_msg_id": sent["message_id"],
-                            "original_text": message["text"],
-                            "chat_ref": chat.get("username") or chat.get("title") or str(chat_key),
-                        }
-                    continue
-
-                log(f"[bot_listener] handling request in '{chat.get('title', chat_key)}': {message['text']!r}")
-                await api.set_message_reaction(chat_key, message["message_id"], SUMMARY_ACK_EMOJI)
-
-                async def _run(message=message):
-                    try:
-                        await handle_bot_summary_request(
-                            api, telethon_client, cfg, tz, bot_username, message, background_tasks, log=log
-                        )
-                    except Exception as e:
-                        log(f"[bot_listener] error handling request: {e}")
-                        try:
-                            await api.send_message(
-                                message["chat"]["id"], "Что-то пошло не так при генерации сводки.",
-                                reply_to_message_id=message["message_id"],
-                            )
-                        except Exception:
-                            pass
-
-                task = asyncio.create_task(_run())
-                background_tasks.add(task)
-                task.add_done_callback(background_tasks.discard)
+                except Exception as e:
+                    log(f"[bot_listener] unhandled error processing update {update.get('update_id')}: {e}")
 
 
 async def main():
