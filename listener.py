@@ -226,7 +226,11 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
     ref_date = msg.date.astimezone(tz).date()
 
     try:
-        intent = parse_summary_request(
+        # to_thread: these OpenAI helpers use the synchronous client, which would
+        # otherwise block this whole process's event loop (shared with bot_listener.py's
+        # poll loop when a bot token is configured) for the entire network round trip.
+        intent = await asyncio.to_thread(
+            parse_summary_request,
             api_key=cfg.openai_api_key,
             model=cfg.openai_model,
             text=text,
@@ -277,7 +281,9 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         shown = candidates if len(candidates) <= 30 else candidates[:30] + [f"... +{len(candidates) - 30} more"]
         log(f"[listener] resolving name hint '{name_hint}' against {len(candidates)} candidates: {shown}")
         try:
-            focus_user = resolve_name_hint(cfg.openai_api_key, cfg.openai_model, name_hint, candidates)
+            focus_user = await asyncio.to_thread(
+                resolve_name_hint, cfg.openai_api_key, cfg.openai_model, name_hint, candidates
+            )
         except ChatSummaryError as e:
             log(f"[listener] name resolution failed: {e}")
             focus_user = None
@@ -309,7 +315,8 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         label = period_label(start_date, end_date)
     original_question = strip_trigger_keywords(text, cfg.listener_trigger_keywords)
 
-    summary = summarize_transcript(
+    summary = await asyncio.to_thread(
+        summarize_transcript,
         api_key=cfg.openai_api_key,
         model=cfg.openai_model,
         chat_title=chat_title,
@@ -354,7 +361,8 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
     ref_date = msg.date.astimezone(tz).date()
 
     try:
-        routed = route_request(
+        routed = await asyncio.to_thread(
+            route_request,
             api_key=cfg.openai_api_key,
             model=cfg.openai_model,
             text=text,
@@ -409,7 +417,9 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
             shown = candidates if len(candidates) <= 30 else candidates[:30] + [f"... +{len(candidates) - 30} more"]
             log(f"[listener] v2 resolving name hint '{username_hint}' against {len(candidates)} candidates: {shown}")
             try:
-                focus_user = resolve_name_hint(cfg.openai_api_key, cfg.openai_model, username_hint, candidates)
+                focus_user = await asyncio.to_thread(
+                    resolve_name_hint, cfg.openai_api_key, cfg.openai_model, username_hint, candidates
+                )
             except ChatSummaryError as e:
                 log(f"[listener] v2 name resolution failed: {e}")
                 focus_user = None
@@ -429,7 +439,8 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
     else:
         label = period_label(start_date, end_date)
 
-    answer = answer_request(
+    answer = await asyncio.to_thread(
+        answer_request,
         api_key=cfg.openai_api_key,
         model=cfg.openai_model,
         chat_title=chat_title,
@@ -510,7 +521,8 @@ async def run_roast(
         own_messages = own_messages[-cfg.roast_max_messages :]
 
     lines = format_transcript_lines(own_messages, include_date=True)
-    roast = roast_person(
+    roast = await asyncio.to_thread(
+        roast_person,
         api_key=cfg.openai_api_key,
         model=cfg.openai_model,
         target_name=requester,

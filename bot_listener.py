@@ -211,7 +211,9 @@ async def run_bot_roast(
         own_messages = own_messages[-cfg.roast_max_messages :]
 
     lines = format_transcript_lines(own_messages, include_date=True)
-    roast = roast_person(api_key=cfg.openai_api_key, model=cfg.openai_model, target_name=requester, lines=lines)
+    roast = await asyncio.to_thread(
+        roast_person, api_key=cfg.openai_api_key, model=cfg.openai_model, target_name=requester, lines=lines
+    )
 
     await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
 
@@ -315,7 +317,11 @@ async def handle_bot_summary_request(
     ref_date = request_dt.astimezone(tz).date()
 
     try:
-        routed = route_request(
+        # to_thread: route_request uses the synchronous OpenAI client, which would
+        # otherwise block this whole process's event loop (both this poll loop AND
+        # listener.py's Telethon connection share it) for the entire network round trip.
+        routed = await asyncio.to_thread(
+            route_request,
             api_key=cfg.openai_api_key,
             model=cfg.openai_model,
             text=text,
@@ -363,7 +369,9 @@ async def handle_bot_summary_request(
             candidates = sorted({c for m in messages for c in (m.sender_username, m.sender_name) if c})
             log(f"[bot_listener] resolving name hint '{username_hint}' against {len(candidates)} candidates")
             try:
-                focus_user = resolve_name_hint(cfg.openai_api_key, cfg.openai_model, username_hint, candidates)
+                focus_user = await asyncio.to_thread(
+                    resolve_name_hint, cfg.openai_api_key, cfg.openai_model, username_hint, candidates
+                )
             except ChatSummaryError as e:
                 log(f"[bot_listener] name resolution failed: {e}")
                 focus_user = None
@@ -383,7 +391,11 @@ async def handle_bot_summary_request(
     else:
         label = period_label(start_date, end_date)
 
-    answer = answer_request(
+    # to_thread: answer_request can make several SEQUENTIAL blocking OpenAI calls for a
+    # long transcript (map-reduce chunking) -- without offloading, each one would freeze
+    # the whole process for its entire duration, one after another.
+    answer = await asyncio.to_thread(
+        answer_request,
         api_key=cfg.openai_api_key,
         model=cfg.openai_model,
         chat_title=chat_title,
