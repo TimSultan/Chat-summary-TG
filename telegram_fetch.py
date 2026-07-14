@@ -147,6 +147,10 @@ async def fetch_range_messages(
                 continue  # service message (join/leave/pin/etc.)
 
             sender = await msg.get_sender()
+            if getattr(sender, "bot", False):
+                continue  # a bot's own reply (e.g. bot_listener.py's) isn't chat content --
+                # caching it would feed a summary its own earlier output as if it were a topic
+
             name = sender_display_name(sender)
             username = getattr(sender, "username", None)
             sender_id = getattr(sender, "id", None)
@@ -198,6 +202,9 @@ async def fetch_new_messages(client: TelegramClient, chat_ref, tz, min_id: int):
                 continue  # service message (join/leave/pin/etc.)
 
             sender = await msg.get_sender()
+            if getattr(sender, "bot", False):
+                continue  # see fetch_range_messages -- a bot's own reply isn't chat content
+
             name = sender_display_name(sender)
             username = getattr(sender, "username", None)
             sender_id = getattr(sender, "id", None)
