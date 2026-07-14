@@ -6,11 +6,16 @@ shared transcript; only the fetch is deduplicated.
 
 A day strictly before today (in the relevant timezone) is closed and can't gain new
 messages, so it's cached indefinitely. Today itself is cached with a short TTL: reused
-if fetched less than TODAY_TTL_SECONDS ago, re-fetched (and the file updated) once stale.
+if fetched less than TODAY_TTL_SECONDS ago. Once stale, the caller (see
+telegram_fetch.fetch_range_messages_cached) doesn't discard and re-fetch it wholesale --
+it fetches only what's new since and appends -- so `load` always hands back whatever
+messages exist on disk, tagged with whether they're still within the TTL, rather than
+returning None outright once they're not.
 """
 
 import json
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -33,20 +38,28 @@ def _path(chat_id: int, day: date) -> Path:
     return CACHE_DIR / f"{chat_id}_{day.isoformat()}.json"
 
 
-def load(chat_id: int, day: date, is_final: bool) -> list[dict] | None:
-    """Returns the cached list of message dicts for this (chat, day), or None if
-    there's no cache entry, or (for a non-final day) it's older than the TTL."""
+@dataclass
+class CachedDay:
+    messages: list[dict]
+    is_fresh: bool  # always True for a final day; for today, whether it's within the TTL
+
+
+def load(chat_id: int, day: date, is_final: bool) -> CachedDay | None:
+    """Returns the cached messages for this (chat, day) plus whether they're still
+    fresh, or None if there's no cache entry at all. Unlike a straight cache miss (None),
+    a *stale* entry still returns its messages -- see the module docstring -- so the
+    caller can extend them instead of discarding and re-fetching everything."""
     path = _path(chat_id, day)
     if not path.exists():
         return None
 
     payload = json.loads(path.read_text(encoding="utf-8"))
+    is_fresh = True
     if not is_final:
         fetched_at = datetime.fromisoformat(payload["fetched_at"])
         age_seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
-        if age_seconds > TODAY_TTL_SECONDS:
-            return None
-    return payload["messages"]
+        is_fresh = age_seconds <= TODAY_TTL_SECONDS
+    return CachedDay(messages=payload["messages"], is_fresh=is_fresh)
 
 
 def save(chat_id: int, day: date, messages: list[dict]) -> None:
