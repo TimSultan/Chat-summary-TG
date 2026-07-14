@@ -179,13 +179,22 @@ chat while it's actually active. Requires a bot account (`TELEGRAM_BOT_TOKEN`) a
 non-empty `LISTENER_ALLOWED_CHATS` -- it never defaults to "everywhere" the way
 `/summary` does, and always posts as the bot, never your personal account.
 
-It only fires off real, recent activity, not a timer: `JOKE_ACTIVITY_MIN_MESSAGES`
-(default 8) messages have to land within the trailing `JOKE_ACTIVITY_WINDOW_SECONDS`
-(default 300 = 5 min). A quiet or sleeping chat can't cross that on its own, so there's no
-clock-based firing at all -- it's structurally impossible for this to go off in a dead
-chat. Once that's true, `JOKE_COOLDOWN_SECONDS` (default 1 hour) since the last one still
-has to have passed, *and* a random roll under `JOKE_FIRE_PROBABILITY` (default 0.35) has
-to hit, so it doesn't fire like clockwork the instant the threshold is crossed.
+It only fires off real message volume, not a timer: `JOKE_ACTIVITY_MIN_MESSAGES` (default
+20) qualifying messages have to land in a rolling per-chat buffer before it's even
+considered -- a quiet or sleeping chat simply never fills that buffer, so it's
+structurally impossible for this to go off in a dead chat, no matter how long it waits.
+Once the buffer's full, it fires if the chat's cooldown has passed and a random roll under
+`JOKE_FIRE_PROBABILITY` (default 0.35) hits; a miss doesn't reset the buffer, so the very
+next message tries again rather than needing a whole new batch of 20.
+
+Cooldown only ever kicks in after an actual joke gets sent -- `JOKE_COOLDOWN_MIN_SECONDS`/
+`JOKE_COOLDOWN_MAX_SECONDS` (default 30-60 min, picked randomly each time so it's not a
+flat interval). If the model declines instead (see below), there's no cooldown at all --
+it just costs another full buffer of messages, not a timer, so one tense stretch of chat
+can't suppress jokes for an hour once things lighten back up. A joke that lands well gets
+rewarded: if it picks up `JOKE_REACTION_THRESHOLD` (default 3) reactions, that chat's
+cooldown is pulled in to `JOKE_REACTION_COOLDOWN_SECONDS` (default 30 min) from when it
+was posted, whichever is sooner.
 
 On top of all of that, nothing reviews a joke before it posts, so the model itself
 (`joke.py`) is instructed to back off (respond with a `SKIP` sentinel, which is silently

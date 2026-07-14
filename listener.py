@@ -550,14 +550,27 @@ def build_client(cfg) -> TelegramClient:
         raise
 
 
-async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "asyncio.Queue | None" = None):
+async def run_listener(
+    client: TelegramClient,
+    cfg,
+    tz,
+    log=print,
+    joke_queue: "asyncio.Queue | None" = None,
+    joke_posted_queue: "asyncio.Queue | None" = None,
+):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
 
     `joke_queue`, if given, is where a generated joke (see joke.py) is put once the
     activity trigger fires -- bot_listener.py's run_bot_listener consumes it and sends the
     joke via the bot account, same as every other reply once a bot token is configured.
-    Passed in (not created here) so main() can share one queue between both tasks."""
+    `joke_posted_queue` carries the reply the other way: bot_listener.py puts
+    (allowed_chats entry, sent message_id) on it once a queued joke is actually sent, so
+    this process can start the post-send cooldown and watch that specific message for
+    reactions (see the reaction-count cooldown reduction in on_reaction below) -- reactions
+    can only be reliably observed from this Telethon session, not the bot account (which
+    would need admin rights to see other users' reactions via the Bot API). Both queues
+    are passed in (not created here) so main() can share them between both tasks."""
     assert cfg.listener_cooldown_seconds >= 0, "internal bug: cooldown should have been validated by config"
 
     me = await client.get_me()
@@ -628,8 +641,22 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "
             "[listener] JOKE_ENABLED is set but jokes need both TELEGRAM_BOT_TOKEN and a "
             "non-empty LISTENER_ALLOWED_CHATS -- jokes are off."
         )
+    # Per chat: a fixed-size ring buffer of the last cfg.joke_activity_min_messages
+    # qualifying messages -- once it's full, a joke attempt is considered (see
+    # maybe_joke). Using maxlen means this can never grow unbounded even if a chat stays
+    # busy through an entire cooldown, and "full" is exactly the trigger condition, with
+    # no separate counter to keep in sync.
     joke_activity: dict[int, deque] = {}
-    last_joke: dict[int, float] = {}
+    # Monotonic deadline before which a chat won't be considered again -- only set after
+    # an actual joke is sent (never after a SKIP, see maybe_joke), so a decline just costs
+    # another full buffer of messages, not a timer. May be pulled earlier by a reaction
+    # burst on that joke (see on_reaction).
+    joke_cooldown_until: dict[int, float] = {}
+    # Lets the joke_posted_queue consumer (below) and on_reaction map a
+    # LISTENER_ALLOWED_CHATS entry / a (chat, message) pair back to state kept here,
+    # since the actual send happens over in bot_listener.py.
+    joke_entry_to_chat: dict[str, int] = {}
+    joke_reaction_watch: dict[tuple[int, int], float] = {}
 
     # Roast confirm/react flow state, keyed by (chat_id, target_user_id):
     # - roast_pending: confirmation prompt sent, awaiting a reaction from that user.
@@ -699,23 +726,27 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "
             log(f"[listener] failed to react with emoji: {e}")
 
     async def maybe_joke(event, msg, text):
-        """Tracks this message toward the joke activity window for its chat and, if the
-        trigger conditions are met, kicks off (in the background) generating and queuing
-        one. Called for every plain-text message in an allowed chat, not just ones
-        containing a keyword -- this is the only way jokes get their "is the chat active
-        right now" signal.
+        """Tracks this message in its chat's joke_activity ring buffer and, once that
+        buffer is full, considers firing. Called for every plain-text message in an
+        allowed chat, not just ones containing a keyword -- this is the only way jokes get
+        their "is the chat active right now" signal, and it's pure message count, not a
+        time window: a silent/sleeping chat simply never fills the buffer, so this can
+        never fire there, no matter how long it waits.
 
-        Conditions, all required: enough qualifying messages within the trailing
-        JOKE_ACTIVITY_WINDOW_SECONDS window (this is what makes a silent/sleeping chat
-        structurally unable to ever trigger this -- there's no clock-based firing at all,
-        only reactive-to-actual-recent-volume), the per-chat cooldown has elapsed, and a
-        random roll under JOKE_FIRE_PROBABILITY passes (so it doesn't fire like clockwork
-        the instant the threshold is crossed). The cooldown slot is claimed immediately
-        once conditions pass -- before the OpenAI call -- both to stop a burst of
-        concurrent qualifying messages from each independently trying to fire, and so a
-        SKIP verdict (see joke.py) still costs a full cooldown, not just an instant retry,
-        which matters during a long busy-but-not-joke-appropriate stretch (e.g. an actual
-        argument) that would otherwise re-roll on every single message."""
+        Once full (cfg.joke_activity_min_messages messages), a fire is considered if the
+        per-chat cooldown (joke_cooldown_until, unset until the first joke is ever sent)
+        has passed and a random roll under JOKE_FIRE_PROBABILITY hits. The buffer is only
+        cleared on an actual attempt (roll passed, OpenAI gets called) -- a roll *miss*
+        leaves it full so the very next qualifying message re-rolls immediately, instead of
+        waiting for another whole buffer's worth. Everything from the buffer-full check
+        through clearing it happens in one synchronous stretch with no `await` in between
+        (the two awaits below, for chat/sender, already happened by this point), so two
+        messages arriving close together can't both pass the check and double-fire.
+
+        If the model then declines (SKIP, see joke.py), that's it for this attempt -- no
+        cooldown is set, so it costs exactly "wait for another full buffer", not a timer.
+        Only an actual sent joke sets joke_cooldown_until (via the joke_posted_queue
+        consumer below), which a reaction burst on that joke can later pull earlier."""
         chat = await event.get_chat()
         entry = matched_allowed_chat(chat)
         if entry is None:
@@ -726,26 +757,20 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "
 
         now = time.monotonic()
         chat_key = event.chat_id
-        bucket = joke_activity.setdefault(chat_key, deque())
-        bucket.append((now, msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
-
-        cutoff = now - cfg.joke_activity_window_seconds
-        while bucket and bucket[0][0] < cutoff:
-            bucket.popleft()
+        joke_entry_to_chat[entry] = chat_key
+        bucket = joke_activity.setdefault(chat_key, deque(maxlen=cfg.joke_activity_min_messages))
+        bucket.append((msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
 
         if len(bucket) < cfg.joke_activity_min_messages:
             return
-
-        elapsed = now - last_joke.get(chat_key, float("-inf"))
-        if elapsed < cfg.joke_cooldown_seconds:
+        if now < joke_cooldown_until.get(chat_key, float("-inf")):
             return
-
         if random.random() >= cfg.joke_fire_probability:
             return
 
-        last_joke[chat_key] = now
-        lines = [f"[{hhmm}] {name}: {t}" for _, hhmm, name, t in list(bucket)[-cfg.joke_context_max_messages :]]
-        log(f"[listener] joke conditions met in '{getattr(chat, 'title', chat_key)}' ({len(bucket)} recent msgs) -- generating")
+        lines = [f"[{hhmm}] {name}: {t}" for hhmm, name, t in bucket]
+        bucket.clear()
+        log(f"[listener] joke conditions met in '{getattr(chat, 'title', chat_key)}' ({len(lines)} msgs) -- generating")
 
         async def _run():
             try:
@@ -754,7 +779,7 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "
                     await joke_queue.put((entry, joke_text))
                     log(f"[listener] queued joke for '{entry}': {joke_text!r}")
                 else:
-                    log(f"[listener] joke generation skipped itself for '{entry}' (not a good moment)")
+                    log(f"[listener] joke generation skipped itself for '{entry}' (not a good moment) -- next attempt after another {cfg.joke_activity_min_messages} messages")
             except Exception:
                 log(f"[listener] error generating joke:\n{traceback.format_exc()}")
 
@@ -966,6 +991,27 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "
             task.add_done_callback(background_tasks.discard)
             return
 
+        joke_watch_key = (chat_id, update.msg_id)
+        if joke_watch_key in joke_reaction_watch:
+            # Keyed by the exact (chat, message) pair, so this can never fire off
+            # reactions to some other/older message -- and it's popped the instant it
+            # crosses the threshold, so a message that keeps collecting reactions after
+            # that (or this handler firing again for the same message, which it will, since
+            # every additional reaction re-sends the full state) can't re-trigger the
+            # reduction a second time.
+            posted_at = joke_reaction_watch[joke_watch_key]
+            reactor_ids = await _reactor_ids(chat_id, update)
+            if len(reactor_ids) >= cfg.joke_reaction_threshold:
+                del joke_reaction_watch[joke_watch_key]
+                reduced_until = posted_at + cfg.joke_reaction_cooldown_seconds
+                if reduced_until < joke_cooldown_until.get(chat_id, float("inf")):
+                    joke_cooldown_until[chat_id] = reduced_until
+                    log(
+                        f"[listener] joke in chat {chat_id} (msg {update.msg_id}) got "
+                        f"{len(reactor_ids)} reactions -- cooldown reduced"
+                    )
+            return
+
         key = next(
             (k for k, (mid, _) in roast_pending.items() if k[0] == chat_id and mid == update.msg_id), None
         )
@@ -1014,9 +1060,38 @@ async def run_listener(client: TelegramClient, cfg, tz, log=print, joke_queue: "
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
+    if joke_enabled:
+        # Drains joke_posted_queue for the life of the process: bot_listener.py puts
+        # (allowed_chats entry, sent message_id) here once a queued joke is actually sent,
+        # which is this process's only way to learn that -- it's what starts the post-send
+        # cooldown and what makes that specific message eligible for the reaction-count
+        # cooldown reduction in on_reaction above.
+        async def _consume_joke_posted():
+            while True:
+                entry, message_id = await joke_posted_queue.get()
+                chat_key = joke_entry_to_chat.get(entry)
+                if chat_key is None:
+                    log(f"[listener] joke was posted for '{entry}' but its chat_id isn't known here -- skipping cooldown/reaction tracking")
+                    continue
+                now = time.monotonic()
+                joke_cooldown_until[chat_key] = now + random.uniform(
+                    cfg.joke_cooldown_min_seconds, cfg.joke_cooldown_max_seconds
+                )
+                # Lazy GC: an entry only leaves this dict early if it actually crosses the
+                # reaction threshold (see on_reaction) -- anything that never does would
+                # otherwise sit here forever, so drop anything old enough that it's no
+                # longer worth watching (well past any realistic cooldown).
+                stale_cutoff = now - 4 * cfg.joke_cooldown_max_seconds
+                for k in [k for k, posted_at in joke_reaction_watch.items() if posted_at < stale_cutoff]:
+                    del joke_reaction_watch[k]
+                joke_reaction_watch[(chat_key, message_id)] = now
+
+        asyncio.create_task(_consume_joke_posted())
+
     joke_status = (
-        f"on ({cfg.joke_activity_min_messages}+ msgs/{cfg.joke_activity_window_seconds}s, "
-        f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_seconds}s cooldown)"
+        f"on ({cfg.joke_activity_min_messages} msgs to fill the buffer, "
+        f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_min_seconds}-{cfg.joke_cooldown_max_seconds}s "
+        f"cooldown, reduced to {cfg.joke_reaction_cooldown_seconds}s on {cfg.joke_reaction_threshold}+ reactions)"
         if joke_enabled
         else "off"
     )
@@ -1052,14 +1127,20 @@ async def main():
         import bot_listener
 
         print("[listener] TELEGRAM_BOT_TOKEN is set -- also starting bot_listener.py for /summary.")
-        # Shared between the two tasks purely to hand off generated jokes (see maybe_joke
-        # in run_listener) from this Telethon session, which is the only one that sees
-        # every plain-text message, to the bot account, which is the only one that should
-        # ever post one.
+        # joke_queue hands a generated joke (see maybe_joke in run_listener) from this
+        # Telethon session, which is the only one that sees every plain-text message, to
+        # the bot account, which is the only one that should ever post one.
+        # joke_posted_queue carries the reply the other way: the sent message_id, once
+        # bot_listener.py actually posts it, so this session can start its cooldown and
+        # watch that message for reactions (only this session can reliably see other
+        # users' reactions without the bot needing admin rights).
         joke_queue: asyncio.Queue = asyncio.Queue()
+        joke_posted_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
-            run_listener(client, cfg, tz, joke_queue=joke_queue),
-            bot_listener.run_bot_listener(cfg.telegram_bot_token, cfg, tz, client, joke_queue=joke_queue),
+            run_listener(client, cfg, tz, joke_queue=joke_queue, joke_posted_queue=joke_posted_queue),
+            bot_listener.run_bot_listener(
+                cfg.telegram_bot_token, cfg, tz, client, joke_queue=joke_queue, joke_posted_queue=joke_posted_queue
+            ),
         )
     else:
         await run_listener(client, cfg, tz)

@@ -573,7 +573,15 @@ async def _dispatch_update(
     task.add_done_callback(background_tasks.discard)
 
 
-async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print, joke_queue: "asyncio.Queue | None" = None):
+async def run_bot_listener(
+    bot_token: str,
+    cfg,
+    tz,
+    telethon_client,
+    log=print,
+    joke_queue: "asyncio.Queue | None" = None,
+    joke_posted_queue: "asyncio.Queue | None" = None,
+):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
     message fetching.
@@ -581,9 +589,12 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print, 
     `joke_queue`, if given, carries (allowed_chats entry, joke text) pairs put there by
     listener.py's activity trigger (see maybe_joke) -- this function drains it in a task
     running alongside the usual getUpdates poll loop and sends each one via `api`, the
-    same account everything else replies from. Left None when run standalone (this
-    module's own main()), which just means jokes never fire, matching that listener.py
-    isn't running its activity tracking either in that mode."""
+    same account everything else replies from. `joke_posted_queue`, if given, is where
+    (entry, sent message_id) goes right after a successful send, so listener.py -- the
+    only side that can reliably watch reactions -- knows to start that chat's cooldown and
+    watch that specific message. Both left None when run standalone (this module's own
+    main()), which just means jokes never fire, matching that listener.py isn't running
+    its activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     last_trigger: dict[int, float] = {}
@@ -648,8 +659,10 @@ async def run_bot_listener(bot_token: str, cfg, tz, telethon_client, log=print, 
                     log(f"[bot_listener] dropping joke for '{entry}': no known chat_id yet (bot hasn't seen a message there)")
                     continue
                 try:
-                    await api.send_message(chat_id, joke_text)
+                    sent = await api.send_message(chat_id, joke_text)
                     log(f"[bot_listener] sent joke to '{entry}': {joke_text!r}")
+                    if joke_posted_queue is not None and sent and "message_id" in sent:
+                        await joke_posted_queue.put((entry, sent["message_id"]))
                 except Exception:
                     log(f"[bot_listener] failed to send joke:\n{traceback.format_exc()}")
 
