@@ -39,7 +39,6 @@ alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
 """
 
 import asyncio
-import math
 import sys
 import time
 import traceback
@@ -68,7 +67,6 @@ from listener import (
     SUMMARY_ACK_EMOJI,
     DayLimitExceeded,
     _format_hours,
-    _ru_minutes,
     extract_mentioned_usernames,
     resolve_time_window,
 )
@@ -648,7 +646,7 @@ async def _dispatch_update(
     tz,
     bot_username: str | None,
     allowed_chats: set[str],
-    last_trigger: dict[int, float],
+    summary_queue: asyncio.Queue,
     roast_pending: dict,
     roast_in_progress: set,
     background_tasks: set,
@@ -717,7 +715,7 @@ async def _dispatch_update(
     text_lower = message["text"].lower()
 
     # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
-    # already-computed daily files, no OpenAI/cooldown involved. Reuses matched_entry
+    # already-computed daily files, so they bypass the OpenAI summary queue. Reuses matched_entry
     # from the known_chat_ids learning above rather than re-matching the chat.
     if cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
         chat_key = chat["id"]
@@ -798,25 +796,6 @@ async def _dispatch_update(
             await api.set_message_reaction(chat_key, message["message_id"], ROAST_BUSY_EMOJI)
             return
 
-    now = time.monotonic()
-    # 0 is an unsafe "never triggered" sentinel against time.monotonic() -- use -inf so a
-    # fresh process never spuriously treats its first request in a chat as in cooldown.
-    elapsed = now - last_trigger.get(chat_key, float("-inf"))
-    if elapsed < cfg.listener_cooldown_seconds:
-        remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
-        log(f"[bot_listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")
-        try:
-            sent = await api.send_message(
-                chat_key, f"Спросите через {_ru_minutes(remaining_minutes)}",
-                reply_to_message_id=message["message_id"],
-            )
-            if sent and "message_id" in sent:
-                schedule_bot_delete(api, chat_key, [sent["message_id"]], ERROR_DELETE_AFTER, log, background_tasks)
-        except Exception as e:
-            log(f"[bot_listener] failed to send cooldown notice: {e}")
-        return
-    last_trigger[chat_key] = now
-
     is_private = chat.get("type") == "private"
     if is_private and not home_chat_ref:
         # A DM has no group history of its own -- without exactly one chat configured in
@@ -852,28 +831,12 @@ async def _dispatch_update(
             log(f"[bot_listener] failed to send roast confirmation: {e}")
         return
 
-    log(f"[bot_listener] handling request in '{chat.get('title', chat_key)}': {message['text']!r}")
     await api.set_message_reaction(chat_key, message["message_id"], SUMMARY_ACK_EMOJI)
-
-    async def _run(message=message):
-        try:
-            await handle_bot_summary_request(
-                api, telethon_client, cfg, tz, bot_username, message, background_tasks, home_chat_ref,
-                bot_response_queue, log=log,
-            )
-        except Exception:
-            log(f"[bot_listener] error handling request:\n{traceback.format_exc()}")
-            try:
-                await api.send_message(
-                    message["chat"]["id"], "Что-то пошло не так при генерации сводки.",
-                    reply_to_message_id=message["message_id"],
-                )
-            except Exception:
-                pass
-
-    task = asyncio.create_task(_run())
-    background_tasks.add(task)
-    task.add_done_callback(background_tasks.discard)
+    await summary_queue.put(message)
+    log(
+        f"[bot_listener] queued request #{summary_queue.qsize()} from "
+        f"'{chat.get('title', chat_key)}': {message['text']!r}"
+    )
 
 
 async def run_bot_listener(
@@ -915,7 +878,7 @@ async def run_bot_listener(
     activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
-    last_trigger: dict[int, float] = {}
+    summary_queue: asyncio.Queue = asyncio.Queue()
     # Maps a LISTENER_ALLOWED_CHATS entry to the Bot-API chat_id it corresponds to.
     # Populated passively by _dispatch_update as it observes live updates from that chat
     # (see the comment there) and, on a miss, actively by _resolve_chat_id via the
@@ -947,7 +910,8 @@ async def run_bot_listener(
         bot_username = me.get("username")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
-            f"{cfg.listener_trigger_keywords} (summary; roast is off). Timezone: {tz}."
+            f"{cfg.listener_trigger_keywords} (summary; roast is off). FIFO queue delay: "
+            f"{cfg.summary_queue_delay_seconds}s. Timezone: {tz}."
         )
 
         async def _poll_loop():
@@ -968,11 +932,50 @@ async def run_bot_listener(
                     try:
                         await _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
-                            last_trigger, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
+                            summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
                             known_chat_ids, joke_preview_pending, joke_posted_queue, bot_response_queue, log=log,
                         )
                     except Exception:
                         log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
+
+        async def _consume_summaries():
+            """Processes every accepted summary enquiry in FIFO order. The queue is
+            intentionally unbounded: bursts are delayed, never rejected or dropped."""
+            last_finished_at: float | None = None
+            while True:
+                message = await summary_queue.get()
+                try:
+                    if last_finished_at is not None:
+                        elapsed = time.monotonic() - last_finished_at
+                        wait_for = max(0.0, cfg.summary_queue_delay_seconds - elapsed)
+                        if wait_for:
+                            log(
+                                f"[bot_listener] waiting {wait_for:.1f}s before next queued request "
+                                f"({summary_queue.qsize()} still waiting)"
+                            )
+                            await asyncio.sleep(wait_for)
+                    chat = message["chat"]
+                    log(
+                        f"[bot_listener] handling queued request in "
+                        f"'{chat.get('title', chat['id'])}': {message['text']!r}"
+                    )
+                    try:
+                        await handle_bot_summary_request(
+                            api, telethon_client, cfg, tz, bot_username, message,
+                            background_tasks, home_chat_ref, bot_response_queue, log=log,
+                        )
+                    except Exception:
+                        log(f"[bot_listener] error handling queued request:\n{traceback.format_exc()}")
+                        try:
+                            await api.send_message(
+                                chat["id"], "Что-то пошло не так при генерации сводки.",
+                                reply_to_message_id=message["message_id"],
+                            )
+                        except Exception:
+                            pass
+                finally:
+                    last_finished_at = time.monotonic()
+                    summary_queue.task_done()
 
         async def _consume_jokes():
             while True:
@@ -1001,7 +1004,7 @@ async def run_bot_listener(
                 except Exception:
                     log(f"[bot_listener] failed to send follow-up reply:\n{traceback.format_exc()}")
 
-        tasks = [_poll_loop()]
+        tasks = [_poll_loop(), _consume_summaries()]
         if joke_queue is not None:
             tasks.append(_consume_jokes())
         if followup_queue is not None:

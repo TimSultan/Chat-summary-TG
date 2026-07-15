@@ -119,10 +119,10 @@ keyword itself there's no fixed syntax — phrase it naturally.
   день и юзера") instead of being processed, regardless of whether it's a whole-chat or
   per-user question. This applies to the listener only -- `main.py`/`gui.py` still
   support date ranges for your own generated reports.
-- **Cooldown with a reply, not silence** — `LISTENER_COOLDOWN_SECONDS` (default 180 = 3
-  minutes) limits how often the listener will answer in the same chat. Asking again
-  before that gets "Спросите через X минут" instead of no response, and that notice
-  (like the day-limit one) auto-deletes after 10 seconds.
+- **FIFO queue instead of cooldown rejection** — every accepted summary enquiry is
+  retained and answered in arrival order. The first starts immediately; after one
+  enquiry finishes, the worker waits `SUMMARY_QUEUE_DELAY_SECONDS` (default 20) before
+  starting the next. Bursts are delayed rather than discarded.
 
 **Before running this against real chats**, set `LISTENER_ALLOWED_CHATS` in `.env` to a
 comma-separated allowlist of chats (by `@username`, exact title, or numeric ID). Without
@@ -158,8 +158,8 @@ send another prompt -- it just reacts to your new message with ⏳ to show one's
 in flight.
 
 It reuses the same per-day transcript cache as `/summary` (see caching below), so
-roasting doesn't re-fetch days already pulled for other requests. Same allowlist and
-cooldown as the summary trigger (applies to the initial confirmation prompt). Unlike
+roasting doesn't re-fetch days already pulled for other requests. The same allowlist
+applies to its initial confirmation prompt. Unlike
 `/summary`, **the roast itself does not self-delete** -- it stays in the chat. If you
 have no messages in that window, it replies with a short "nothing to roast" notice
 instead of calling OpenAI.
@@ -294,7 +294,7 @@ generate a portable session first:
    `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_STRING` (the string from
    step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
-   warning above), `LISTENER_TRIGGER_KEYWORDS`, `LISTENER_COOLDOWN_SECONDS`,
+   warning above), `LISTENER_TRIGGER_KEYWORDS`, `SUMMARY_QUEUE_DELAY_SECONDS`,
    `ROAST_TRIGGER_KEYWORDS`, `ROAST_LOOKBACK_DAYS`, `TELEGRAM_BOT_TOKEN` (if replies
    should come from a bot account instead of this one -- see above), `JOKE_ENABLED` and
    the other `JOKE_*` vars if you also want the occasional unprompted joke (off by

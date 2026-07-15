@@ -32,7 +32,7 @@ class Config:
     openai_model: str
     listener_allowed_chats: list[str]
     listener_trigger_keywords: list[str]
-    listener_cooldown_seconds: int
+    summary_queue_delay_seconds: int
     roast_trigger_keywords: list[str]
     roast_lookback_days: int
     roast_max_messages: int
@@ -95,13 +95,15 @@ def load_config() -> Config:
     except ValueError:
         raise ChatSummaryError(f"TELEGRAM_API_ID must be a number, got '{api_id}'.")
 
-    cooldown_raw = os.getenv("LISTENER_COOLDOWN_SECONDS", "180")
+    queue_delay_raw = os.getenv("SUMMARY_QUEUE_DELAY_SECONDS", "20")
     try:
-        cooldown_seconds = int(cooldown_raw)
+        summary_queue_delay_seconds = int(queue_delay_raw)
     except ValueError:
-        raise ChatSummaryError(f"LISTENER_COOLDOWN_SECONDS must be a number, got '{cooldown_raw}'.")
-    if cooldown_seconds < 0:
-        raise ChatSummaryError(f"LISTENER_COOLDOWN_SECONDS must be >= 0, got {cooldown_seconds}.")
+        raise ChatSummaryError(f"SUMMARY_QUEUE_DELAY_SECONDS must be a number, got '{queue_delay_raw}'.")
+    if summary_queue_delay_seconds < 0:
+        raise ChatSummaryError(
+            f"SUMMARY_QUEUE_DELAY_SECONDS must be >= 0, got {summary_queue_delay_seconds}."
+        )
 
     allowed_chats_raw = os.getenv("LISTENER_ALLOWED_CHATS", "")
     trigger_keywords_raw = os.getenv("LISTENER_TRIGGER_KEYWORDS", "/summary")
@@ -278,7 +280,7 @@ def load_config() -> Config:
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
         listener_allowed_chats=[c.strip() for c in allowed_chats_raw.split(",") if c.strip()],
         listener_trigger_keywords=trigger_keywords,
-        listener_cooldown_seconds=cooldown_seconds,
+        summary_queue_delay_seconds=summary_queue_delay_seconds,
         roast_trigger_keywords=roast_trigger_keywords,
         roast_lookback_days=roast_lookback_days,
         roast_max_messages=roast_max_messages,

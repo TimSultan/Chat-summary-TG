@@ -16,7 +16,6 @@ client and a log callback that writes into the GUI's log pane instead of stdout.
 """
 
 import asyncio
-import math
 import random
 import re
 import sys
@@ -54,7 +53,7 @@ MENTION_RE = re.compile(r"@(\w{4,32})")
 MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
 
 # Appended to every successful summary reply so people re-discover the available commands
-# without having to ask -- not shown on rejection/error/cooldown notices, which already
+# without having to ask -- not shown on short rejection/error notices, which already
 # explain themselves and self-delete fast.
 COMMANDS_FOOTER = "Список команд - summary + время или юзер"
 
@@ -121,7 +120,7 @@ NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих со�
 # (which can take a few seconds) run.
 SUMMARY_ACK_EMOJI = "✍"
 
-ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
+ERROR_DELETE_AFTER = 10  # short rejection notices (such as day limit) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 STATS_DELETE_AFTER = 300  # /top and /stat replies (incl. their own errors) self-delete after 5 minutes
 
@@ -138,14 +137,6 @@ SAVE_CONFIRM_TEXT = "Сохранить в t.me/papka_pokrasa?\nреакция �
 SAVE_TICK_EMOJI = "✅"
 SAVE_CONFIRM_TIMEOUT = 10  # seconds to wait for a confirming reaction before cancelling
 SAVE_CONFIRM_DELETE_AFTER = 3  # seconds after a tick reaction before the prompt is deleted
-
-
-def _ru_minutes(n: int) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return f"{n} минуту"
-    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
-        return f"{n} минуты"
-    return f"{n} минут"
 
 
 def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
@@ -656,7 +647,7 @@ async def run_listener(
     `followup_queue` for bot_listener.py to send, same bot-account-only rule as
     everything else. All four queues are passed in (not created here) so main() can
     share them between both tasks."""
-    assert cfg.listener_cooldown_seconds >= 0, "internal bug: cooldown should have been validated by config"
+    assert cfg.summary_queue_delay_seconds >= 0, "internal bug: queue delay should have been validated by config"
 
     me = await client.get_me()
     my_username = me.username
@@ -710,7 +701,7 @@ async def run_listener(
     else:
         log("[listener] SAVE_CHANNEL is not set -- the save trigger is disabled.")
 
-    last_trigger: dict[int, float] = {}
+    summary_queue: asyncio.Queue = asyncio.Queue()
     sent_message_ids: set[int] = set()
     background_tasks: set[asyncio.Task] = set()
 
@@ -829,6 +820,42 @@ async def run_listener(
             )
         except Exception as e:
             log(f"[listener] failed to react with emoji: {e}")
+
+    async def _consume_summaries():
+        """Processes accepted summary enquiries in FIFO order without dropping bursts."""
+        last_finished_at: float | None = None
+        while True:
+            event, chat, text = await summary_queue.get()
+            try:
+                if last_finished_at is not None:
+                    elapsed = time.monotonic() - last_finished_at
+                    wait_for = max(0.0, cfg.summary_queue_delay_seconds - elapsed)
+                    if wait_for:
+                        log(
+                            f"[listener] waiting {wait_for:.1f}s before next queued request "
+                            f"({summary_queue.qsize()} still waiting)"
+                        )
+                        await asyncio.sleep(wait_for)
+                chat_key = event.chat_id
+                log(f"[listener] handling queued request in '{getattr(chat, 'title', chat_key)}': {text!r}")
+                try:
+                    handler = handle_request_v2 if cfg.summary_pipeline_version == "v2" else handle_request
+                    await handler(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
+                except Exception:
+                    log(f"[listener] error handling queued request:\n{traceback.format_exc()}")
+                    try:
+                        sent = await event.reply("Что-то пошло не так при генерации сводки.")
+                        if sent is not None:
+                            sent_message_ids.add(sent.id)
+                    except Exception:
+                        pass
+            finally:
+                last_finished_at = time.monotonic()
+                summary_queue.task_done()
+
+    summary_worker = asyncio.create_task(_consume_summaries())
+    background_tasks.add(summary_worker)
+    summary_worker.add_done_callback(background_tasks.discard)
 
     async def maybe_joke(event, msg, text):
         """Tracks this message in its chat's joke_activity ring buffer and, once that
@@ -1002,7 +1029,7 @@ async def run_listener(
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
         # confirmation before reposting whatever you replied to into your save channel
         # -- see save_pending handling in on_reaction below. Only ever fires for your
-        # own messages (msg.out), and doesn't touch LISTENER_ALLOWED_CHATS/cooldown
+        # own messages (msg.out), and doesn't touch LISTENER_ALLOWED_CHATS/the summary queue
         # since it never calls OpenAI.
         if msg.out and msg.is_reply and text_lower.startswith(cfg.save_trigger_keyword):
             added_text = text[len(cfg.save_trigger_keyword) :].strip(" :,-–—\t\n")
@@ -1050,8 +1077,8 @@ async def run_listener(
             return
 
         # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
-        # already-computed daily files, no OpenAI/cooldown involved, so these always work
-        # immediately regardless of the summary cooldown. Skipped once a bot account has
+        # already-computed daily files, with no OpenAI summary generation involved, so
+        # these always work immediately rather than entering the summary queue. Skipped once a bot account has
         # taken over (bot_takeover), same as /summary -- bot_listener.py handles both
         # there instead, to avoid two replies to the same command.
         if not bot_takeover and cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
@@ -1136,28 +1163,6 @@ async def run_listener(
                 await react_emoji(event.chat_id, msg.id, ROAST_BUSY_EMOJI)
                 return
 
-        chat_key = event.chat_id
-        now = time.monotonic()
-        # Sentinel for "never triggered in this chat" must be -inf, not 0: time.monotonic()
-        # is only guaranteed non-decreasing, NOT guaranteed to start from a huge number --
-        # on a freshly started process/container it can be a small value (tens to low
-        # hundreds of seconds), which a 0 sentinel would make look like a recent trigger,
-        # spuriously putting the very first request of a fresh run into cooldown.
-        elapsed = now - last_trigger.get(chat_key, float("-inf"))
-        if elapsed < cfg.listener_cooldown_seconds:
-            remaining_minutes = max(1, math.ceil((cfg.listener_cooldown_seconds - elapsed) / 60))
-            log(f"[listener] cooldown active for chat {chat_key}, {remaining_minutes} min remaining")
-            try:
-                sent = await event.reply(f"Спросите через {_ru_minutes(remaining_minutes)}")
-                if sent is not None:
-                    sent_message_ids.add(sent.id)
-                    schedule_delete(event.client, chat_key, [sent.id], ERROR_DELETE_AFTER)
-            except Exception:
-                pass
-            return
-        last_trigger[chat_key] = now
-
-        log(f"[listener] handling request in '{getattr(chat, 'title', chat_key)}': {text!r}")
         try:
             if has_roast_keyword:
                 confirm = await event.reply(ROAST_CONFIRM_TEXT)
@@ -1167,8 +1172,11 @@ async def run_listener(
                     log(f"[listener] sent roast confirmation to {sender_display_name(sender)} (msg {confirm.id})")
             else:
                 await react_emoji(event.chat_id, msg.id, SUMMARY_ACK_EMOJI)
-                handler = handle_request_v2 if cfg.summary_pipeline_version == "v2" else handle_request
-                await handler(event, cfg, tz, my_username, sent_message_ids, schedule_delete, log=log)
+                await summary_queue.put((event, chat, text))
+                log(
+                    f"[listener] queued request #{summary_queue.qsize()} from "
+                    f"'{getattr(chat, 'title', event.chat_id)}': {text!r}"
+                )
         except Exception:
             log(f"[listener] error handling request:\n{traceback.format_exc()}")
             try:
@@ -1379,6 +1387,7 @@ async def run_listener(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
+        f"Summary queue: FIFO, {cfg.summary_queue_delay_seconds}s between completed jobs. "
         f"Joke: {joke_status}. Follow-up reactions: {followup_status}. Stats (/top, /stat): {stats_status}. "
         f"Timezone: {tz}. Ctrl+C to stop."
     )
