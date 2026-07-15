@@ -1059,13 +1059,18 @@ async def run_listener(
             if entry is None:
                 await event.reply("Статистика недоступна в этом чате.")
                 return
+            # Strips a same-account "@my_username" mention Telegram tacks onto the
+            # command with no space (e.g. "/stat@Trash_Modelist") before parsing the
+            # period/username argument, so that alone means bare "/stat", not a lookup
+            # for a user literally named after the bot -- see strip_command_bot_mention.
+            stats_text = stats.strip_command_bot_mention(text, my_username)
             try:
                 if text_lower.startswith("/top"):
-                    period = stats.parse_top_command(text)
+                    period = stats.parse_top_command(stats_text)
                     reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                 else:
                     sender = await event.get_sender()
-                    arg = text[len("/stat") :].strip()
+                    arg = stats_text[len("/stat") :].strip()
                     user = await stats.resolve_stat_target(
                         client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
                     )

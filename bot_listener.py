@@ -723,19 +723,24 @@ async def _dispatch_update(
         if matched_entry is None:
             try:
                 await api.send_message(
-                    chat_key, "Статистика недоступна в этом чате.", reply_to_message_id=message["message_id"]
+                    chat_key, "Статистика недоступна в этом чате.",
+                    reply_to_message_id=message["message_id"], parse_mode=None,
                 )
             except Exception:
                 pass
             return
+        # Strips a same-account "@bot_username" mention Telegram tacks onto the command
+        # with no space (e.g. "/stat@Trash_Modelist") before parsing the period/username
+        # argument -- see strip_command_bot_mention in stats.py.
+        stats_text = stats.strip_command_bot_mention(message["text"], bot_username)
         try:
             if text_lower.startswith("/top"):
-                period = stats.parse_top_command(message["text"])
+                period = stats.parse_top_command(stats_text)
                 reply_text = await stats.format_top(
                     telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
                 )
             else:
-                arg = message["text"][len("/stat") :].strip()
+                arg = stats_text[len("/stat") :].strip()
                 from_user = message.get("from") or {}
                 user = await stats.resolve_stat_target(
                     telethon_client, matched_entry, matched_entry, arg,
@@ -744,12 +749,17 @@ async def _dispatch_update(
                 reply_text = (
                     stats.format_stat(user) if user else "Статистика не найдена -- пользователь ещё не отслеживается."
                 )
-            await api.send_message(chat_key, reply_text, reply_to_message_id=message["message_id"])
+            # parse_mode=None: reply_text can embed a raw display name (leaderboard
+            # entries, /stat's "Имя:" line) -- Telegram's Markdown mode would reject the
+            # whole message if that name has an unbalanced _/*/`/[ (a real username with
+            # a single underscore is enough), so these are always sent as plain text.
+            await api.send_message(chat_key, reply_text, reply_to_message_id=message["message_id"], parse_mode=None)
         except Exception:
             log(f"[bot_listener] error handling stats command:\n{traceback.format_exc()}")
             try:
                 await api.send_message(
-                    chat_key, "Не удалось получить статистику.", reply_to_message_id=message["message_id"]
+                    chat_key, "Не удалось получить статистику.",
+                    reply_to_message_id=message["message_id"], parse_mode=None,
                 )
             except Exception:
                 pass

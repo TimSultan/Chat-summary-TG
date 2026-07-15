@@ -54,12 +54,23 @@ class TelegramBotAPI:
         )
 
     async def send_message(
-        self, chat_id, text: str, reply_to_message_id: int | None = None, reply_markup: dict | None = None
+        self,
+        chat_id,
+        text: str,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = "Markdown",
     ) -> dict:
+        # parse_mode=None (plain text) is for callers echoing uncontrolled text (e.g.
+        # someone's display name) straight into the message -- Telegram's legacy
+        # Markdown mode rejects the WHOLE message outright if _/*/`/[ don't balance
+        # (e.g. exactly one underscore in a name), which a real username can easily
+        # trigger by accident. Nothing about that text is meant as formatting, so there's
+        # no reason to risk the parse at all for those callers.
         params = {
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": parse_mode,
             "link_preview_options": {"is_disabled": True},
             "reply_markup": reply_markup,
         }

@@ -37,6 +37,7 @@ so changing the point values later doesn't require re-processing any history.
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -264,6 +265,23 @@ def resolve_period_window(period: str, tz) -> tuple[date, date]:
         raise ValueError(f"unknown period '{period}' (expected one of {VALID_PERIODS})")
     today = datetime.now(tz).date()
     return today - timedelta(days=PERIOD_LOOKBACK_DAYS[period]), today
+
+
+def strip_command_bot_mention(text: str, bot_username: str | None) -> str:
+    """Telegram's own convention: "/command@botusername" with NO space before the "@" is
+    how a command explicitly targets one bot -- typically auto-appended by the Telegram
+    client when several bots in the same group share a command name -- the "@botusername"
+    part is never meant as the command's actual argument. Strips exactly that (case-
+    insensitive, and only if it matches THIS bot's own username) off the front of `text`,
+    leaving whatever follows (the real argument, if there is one) untouched -- so
+    "/stat@Trash_Modelist" alone becomes bare "/stat" (self-lookup), while
+    "/stat@Trash_Modelist Someone" becomes "/stat Someone". A "/stat @Someone" with a
+    space, or "/stat@Someone" where Someone isn't this bot, are both left alone entirely,
+    since those are legitimate lookups for a different person, not a bot mention."""
+    if not bot_username:
+        return text
+    pattern = re.compile(r"^(/\w+)@" + re.escape(bot_username) + r"\b", re.IGNORECASE)
+    return pattern.sub(r"\1", text, count=1)
 
 
 def parse_top_command(text: str) -> str:
