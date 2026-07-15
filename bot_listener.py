@@ -356,7 +356,7 @@ async def handle_bot_summary_request(
     chat_title_for_history = chat.get("title") or chat.get("first_name") or "Unknown chat"
     request_dt = datetime.fromtimestamp(message["date"], tz=timezone.utc)
 
-    async def respond(answer: str, delete_after: int | None = None, record: bool = True):
+    async def respond(answer: str, delete_after: int | None = None, record: bool = True) -> list[int]:
         sent_ids = await send_long_bot_message(api, chat_id, answer, reply_to_message_id=message_id)
         if record:
             try:
@@ -365,6 +365,7 @@ async def handle_bot_summary_request(
                 log(f"[bot_listener] failed to record history: {e}")
         if delete_after and sent_ids:
             schedule_bot_delete(api, chat_id, sent_ids, delete_after, log, background_tasks)
+        return sent_ids
 
     # A DM has no group history of its own -- redirect data fetching to the configured
     # home group, but keep replying/recording history against the DM itself (chat_id,
@@ -470,12 +471,15 @@ async def handle_bot_summary_request(
         style="reply",
     )
 
-    await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
+    sent_ids = await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
 
     if bot_response_queue is not None and chat.get("type") != "private":
         # A DM reply has no group commentary to watch -- only a group-posted answer is a
-        # candidate for the follow-up feature (see followup.py).
-        await bot_response_queue.put((chat_id, "summary", answer))
+        # candidate for the follow-up feature (see followup.py). sent_ids (plural: a long
+        # summary can be split across several Telegram messages) lets listener.py
+        # recognize a direct reply to ANY of those chunks as certainly being about this
+        # response, not just plain chat commentary it has to guess at.
+        await bot_response_queue.put((chat_id, sent_ids, "summary", answer))
 
 
 def _joke_preview_callback_data(dm_chat_id) -> str:
@@ -588,7 +592,8 @@ async def handle_manual_joke(
     if joke_posted_queue is not None and sent and "message_id" in sent:
         await joke_posted_queue.put((entry, sent["message_id"]))
     if bot_response_queue is not None:
-        await bot_response_queue.put((chat_id, "joke", joke_text))
+        sent_ids = [sent["message_id"]] if sent and "message_id" in sent else []
+        await bot_response_queue.put((chat_id, sent_ids, "joke", joke_text))
 
 
 async def handle_joke_preview_callback(
@@ -626,7 +631,8 @@ async def handle_joke_preview_callback(
         if joke_posted_queue is not None and sent and "message_id" in sent:
             await joke_posted_queue.put((entry, sent["message_id"]))
         if bot_response_queue is not None:
-            await bot_response_queue.put((chat_id, "joke", joke_text))
+            sent_ids = [sent["message_id"]] if sent and "message_id" in sent else []
+            await bot_response_queue.put((chat_id, sent_ids, "joke", joke_text))
     except Exception:
         log(f"[bot_listener] failed to send previewed joke:\n{traceback.format_exc()}")
         await api.answer_callback_query(callback["id"], text="Не удалось отправить.")
@@ -831,12 +837,15 @@ async def run_bot_listener(
     watch that specific message.
 
     `bot_response_queue`/`followup_queue`, if given, are the same shape of hand-off for a
-    different feature (see followup.py): (chat_id, kind, response_text) is put on
-    `bot_response_queue` right after ANY summary answer or joke is posted to a group chat
-    (kind is "summary" or "joke"), so listener.py can watch the next few messages for chat
-    commentary about it -- praise or criticism, not necessarily a reply/mention. If it
-    decides someone's actually reacting, the clap-back it generates comes back on
-    `followup_queue` for this function to send, same as every other reply.
+    different feature (see followup.py): (chat_id, sent_message_ids, kind, response_text)
+    is put on `bot_response_queue` right after ANY summary answer or joke is posted to a
+    group chat (kind is "summary" or "joke"; sent_message_ids is a list since a long
+    summary can be split across several Telegram messages), so listener.py can watch the
+    next few messages for chat commentary about it -- praise or criticism, not
+    necessarily a reply/mention, though a direct Telegram reply to one of
+    sent_message_ids is recognized with certainty rather than left for the model to
+    guess. If it decides someone's actually reacting, the clap-back it generates comes
+    back on `followup_queue` for this function to send, same as every other reply.
 
     All four queues are left None when run standalone (this module's own main()), which
     just means jokes/follow-ups never fire, matching that listener.py isn't running its
@@ -915,7 +924,8 @@ async def run_bot_listener(
                     if joke_posted_queue is not None and sent and "message_id" in sent:
                         await joke_posted_queue.put((entry, sent["message_id"]))
                     if bot_response_queue is not None:
-                        await bot_response_queue.put((chat_id, "joke", joke_text))
+                        sent_ids = [sent["message_id"]] if sent and "message_id" in sent else []
+                        await bot_response_queue.put((chat_id, sent_ids, "joke", joke_text))
                 except Exception:
                     log(f"[bot_listener] failed to send joke:\n{traceback.format_exc()}")
 

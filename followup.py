@@ -30,7 +30,9 @@ FOLLOWUP_SYSTEM_PROMPT = """\
 Ниже -- несколько сообщений, которые люди написали в чате СРАЗУ ПОСЛЕ этого. Они не \
 обязаны отвечать тебе напрямую, упоминать тебя по имени или отвечать реплаем именно на \
 твоё сообщение -- иногда это просто реплика в общем потоке ("бот жжёт", "опять эта \
-дичь", "ору с этого") -- и это тоже считается комментарием о тебе.
+дичь", "ору с этого") -- и это тоже считается комментарием о тебе. Если сообщение помечено \
+"(ответ на сообщение бота)" -- это точно прямой ответ на твоё сообщение через функцию \
+"ответить" в Telegram, тут гадать не нужно, оно 100% про тебя.
 
 Определи, комментируют ли тебя / твоё сообщение в этих репликах -- пусть даже косвенно.
 
@@ -79,8 +81,12 @@ def generate_followup_reply(
     response was otherwise empty. `response_kind` is "joke" or "summary" -- whatever the
     bot itself just sent -- `response_text` is its actual content (so the comeback stays
     grounded in what was actually said, not generic), and `lines` are the chat messages
-    that followed it, formatted like telegram_fetch.format_transcript_lines.
-    `flavor_profile` (see chat_profile.py), if given, is the same cached chat-humor
+    that followed it, formatted like telegram_fetch.format_transcript_lines except a
+    message that's a direct Telegram reply to the bot's own sent message is tagged
+    "(ответ на сообщение бота)" instead of the generic "(reply)" -- see maybe_followup in
+    listener.py -- so the model can treat those as certainly about this response rather
+    than having to infer it from plain text. `flavor_profile` (see chat_profile.py), if
+    given, is the same cached chat-humor
     profile joke.py uses, so the comeback sounds like the same in-the-room persona."""
     if not api_key or not api_key.strip():
         raise ChatSummaryError("OpenAI API key is missing.")
