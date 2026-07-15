@@ -345,6 +345,7 @@ async def handle_bot_summary_request(
     message: dict,
     background_tasks: set,
     home_chat_ref: str | None,
+    bot_response_queue,
     log=print,
 ):
     chat = message["chat"]
@@ -471,6 +472,11 @@ async def handle_bot_summary_request(
 
     await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
 
+    if bot_response_queue is not None and chat.get("type") != "private":
+        # A DM reply has no group commentary to watch -- only a group-posted answer is a
+        # candidate for the follow-up feature (see followup.py).
+        await bot_response_queue.put((chat_id, "summary", answer))
+
 
 def _joke_preview_callback_data(dm_chat_id) -> str:
     return f"{JOKE_PREVIEW_CALLBACK_PREFIX}:{dm_chat_id}"
@@ -497,6 +503,7 @@ async def handle_manual_joke(
     known_chat_ids: dict[str, int],
     joke_preview_pending: dict[int, dict],
     joke_posted_queue,
+    bot_response_queue,
     log=print,
 ):
     """Handles a manual "пошути"/"пошути превью" DM (see the JOKE_PREVIEW_* constants
@@ -580,6 +587,8 @@ async def handle_manual_joke(
     log(f"[bot_listener] manual joke sent to '{entry}': {joke_text!r}")
     if joke_posted_queue is not None and sent and "message_id" in sent:
         await joke_posted_queue.put((entry, sent["message_id"]))
+    if bot_response_queue is not None:
+        await bot_response_queue.put((chat_id, "joke", joke_text))
 
 
 async def handle_joke_preview_callback(
@@ -589,6 +598,7 @@ async def handle_joke_preview_callback(
     joke_preview_pending: dict[int, dict],
     known_chat_ids: dict[str, int],
     joke_posted_queue,
+    bot_response_queue,
     log=print,
 ):
     parsed = _parse_joke_preview_callback(callback.get("data"))
@@ -615,6 +625,8 @@ async def handle_joke_preview_callback(
         log(f"[bot_listener] manual joke (previewed) sent to '{entry}': {joke_text!r}")
         if joke_posted_queue is not None and sent and "message_id" in sent:
             await joke_posted_queue.put((entry, sent["message_id"]))
+        if bot_response_queue is not None:
+            await bot_response_queue.put((chat_id, "joke", joke_text))
     except Exception:
         log(f"[bot_listener] failed to send previewed joke:\n{traceback.format_exc()}")
         await api.answer_callback_query(callback["id"], text="Не удалось отправить.")
@@ -636,6 +648,7 @@ async def _dispatch_update(
     known_chat_ids: dict[str, int],
     joke_preview_pending: dict[int, dict],
     joke_posted_queue,
+    bot_response_queue,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -651,7 +664,8 @@ async def _dispatch_update(
     if callback is not None:
         if (callback.get("data") or "").startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(
-                api, telethon_client, callback, joke_preview_pending, known_chat_ids, joke_posted_queue, log=log,
+                api, telethon_client, callback, joke_preview_pending, known_chat_ids,
+                joke_posted_queue, bot_response_queue, log=log,
             )
         else:
             await handle_bot_roast_callback(
@@ -685,7 +699,7 @@ async def _dispatch_update(
             task = asyncio.create_task(
                 handle_manual_joke(
                     api, telethon_client, cfg, tz, message, preview, home_chat_ref,
-                    known_chat_ids, joke_preview_pending, joke_posted_queue, log=log,
+                    known_chat_ids, joke_preview_pending, joke_posted_queue, bot_response_queue, log=log,
                 )
             )
             background_tasks.add(task)
@@ -775,7 +789,8 @@ async def _dispatch_update(
     async def _run(message=message):
         try:
             await handle_bot_summary_request(
-                api, telethon_client, cfg, tz, bot_username, message, background_tasks, home_chat_ref, log=log
+                api, telethon_client, cfg, tz, bot_username, message, background_tasks, home_chat_ref,
+                bot_response_queue, log=log,
             )
         except Exception:
             log(f"[bot_listener] error handling request:\n{traceback.format_exc()}")
@@ -800,6 +815,8 @@ async def run_bot_listener(
     log=print,
     joke_queue: "asyncio.Queue | None" = None,
     joke_posted_queue: "asyncio.Queue | None" = None,
+    bot_response_queue: "asyncio.Queue | None" = None,
+    followup_queue: "asyncio.Queue | None" = None,
 ):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -811,9 +828,19 @@ async def run_bot_listener(
     same account everything else replies from. `joke_posted_queue`, if given, is where
     (entry, sent message_id) goes right after a successful send, so listener.py -- the
     only side that can reliably watch reactions -- knows to start that chat's cooldown and
-    watch that specific message. Both left None when run standalone (this module's own
-    main()), which just means jokes never fire, matching that listener.py isn't running
-    its activity tracking either in that mode."""
+    watch that specific message.
+
+    `bot_response_queue`/`followup_queue`, if given, are the same shape of hand-off for a
+    different feature (see followup.py): (chat_id, kind, response_text) is put on
+    `bot_response_queue` right after ANY summary answer or joke is posted to a group chat
+    (kind is "summary" or "joke"), so listener.py can watch the next few messages for chat
+    commentary about it -- praise or criticism, not necessarily a reply/mention. If it
+    decides someone's actually reacting, the clap-back it generates comes back on
+    `followup_queue` for this function to send, same as every other reply.
+
+    All four queues are left None when run standalone (this module's own main()), which
+    just means jokes/follow-ups never fire, matching that listener.py isn't running its
+    activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     last_trigger: dict[int, float] = {}
@@ -870,7 +897,7 @@ async def run_bot_listener(
                         await _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, allowed_chats,
                             last_trigger, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
-                            known_chat_ids, joke_preview_pending, joke_posted_queue, log=log,
+                            known_chat_ids, joke_preview_pending, joke_posted_queue, bot_response_queue, log=log,
                         )
                     except Exception:
                         log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
@@ -887,12 +914,25 @@ async def run_bot_listener(
                     log(f"[bot_listener] sent joke to '{entry}': {joke_text!r}")
                     if joke_posted_queue is not None and sent and "message_id" in sent:
                         await joke_posted_queue.put((entry, sent["message_id"]))
+                    if bot_response_queue is not None:
+                        await bot_response_queue.put((chat_id, "joke", joke_text))
                 except Exception:
                     log(f"[bot_listener] failed to send joke:\n{traceback.format_exc()}")
+
+        async def _consume_followups():
+            while True:
+                chat_id, reply_text = await followup_queue.get()
+                try:
+                    await api.send_message(chat_id, reply_text)
+                    log(f"[bot_listener] sent follow-up reply to chat {chat_id}: {reply_text!r}")
+                except Exception:
+                    log(f"[bot_listener] failed to send follow-up reply:\n{traceback.format_exc()}")
 
         tasks = [_poll_loop()]
         if joke_queue is not None:
             tasks.append(_consume_jokes())
+        if followup_queue is not None:
+            tasks.append(_consume_followups())
         await asyncio.gather(*tasks)
 
 

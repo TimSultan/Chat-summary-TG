@@ -33,6 +33,7 @@ import chat_profile
 import history
 from config import build_session, load_config
 from errors import ChatSummaryError
+from followup import generate_followup_reply
 from intent import parse_summary_request, resolve_name_hint
 from intent_v2 import route_request
 from joke import generate_joke
@@ -558,6 +559,8 @@ async def run_listener(
     log=print,
     joke_queue: "asyncio.Queue | None" = None,
     joke_posted_queue: "asyncio.Queue | None" = None,
+    bot_response_queue: "asyncio.Queue | None" = None,
+    followup_queue: "asyncio.Queue | None" = None,
 ):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
@@ -570,8 +573,17 @@ async def run_listener(
     this process can start the post-send cooldown and watch that specific message for
     reactions (see the reaction-count cooldown reduction in on_reaction below) -- reactions
     can only be reliably observed from this Telethon session, not the bot account (which
-    would need admin rights to see other users' reactions via the Bot API). Both queues
-    are passed in (not created here) so main() can share them between both tasks."""
+    would need admin rights to see other users' reactions via the Bot API).
+
+    `bot_response_queue`/`followup_queue` are the same kind of hand-off, for a different
+    feature (see followup.py): bot_listener.py puts (chat_id, kind, response_text) on
+    `bot_response_queue` right after it posts ANY summary answer or joke to a group chat,
+    which starts a per-chat watch here (see maybe_followup) over the next
+    cfg.followup_window_messages messages for chat commentary about that response --
+    praise or criticism, not necessarily a reply/mention. If the model decides someone's
+    actually reacting, the generated clap-back is put on `followup_queue` for
+    bot_listener.py to send, same bot-account-only rule as everything else. All four
+    queues are passed in (not created here) so main() can share them between both tasks."""
     assert cfg.listener_cooldown_seconds >= 0, "internal bug: cooldown should have been validated by config"
 
     me = await client.get_me()
@@ -674,6 +686,26 @@ async def run_listener(
     # only ever needs one pending confirmation per prompt (no "already pending for this
     # user" concept to track). Value carries what to repost once/if confirmed.
     save_pending: dict[tuple[int, int], dict] = {}
+
+    # "follow-up" (followup.py) reacts to chat commentary about the bot's OWN last
+    # response (a summary answer or a joke) -- see maybe_followup below. Needs both
+    # queues (they're only created in main() alongside a bot token) since, like every
+    # other reply, the actual send has to go out via the bot account, never this personal
+    # one -- this process only watches and decides.
+    followup_enabled = (
+        bot_response_queue is not None and followup_queue is not None and cfg.followup_enabled
+    )
+    if cfg.followup_enabled and not followup_enabled:
+        log("[listener] FOLLOWUP_ENABLED is set but reacting to chat feedback needs TELEGRAM_BOT_TOKEN -- it's off.")
+    # Per chat: at most one active watch, keyed by chat_id (the SAME numbering Telethon's
+    # event.chat_id and the Bot API's chat.id already share -- see bot_listener.py's
+    # _resolve_chat_id docstring). Set (and any previous entry for that chat replaced
+    # wholesale) by the bot_response_queue consumer below whenever bot_listener.py posts a
+    # summary answer or joke; cleared by maybe_followup once it either fires or the
+    # window (cfg.followup_window_messages messages) runs out with nothing to react to.
+    # "in_flight" guards against two messages arriving back to back both launching their
+    # own classification call for the same watch (see maybe_followup).
+    followup_watch: dict[int, dict] = {}
 
     def is_chat_allowed(chat) -> bool:
         if not allowed_chats:
@@ -795,6 +827,67 @@ async def run_listener(
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
+    async def maybe_followup(event, msg, text):
+        """Feeds this message into its chat's active follow-up watch (if any -- see
+        followup_watch, populated by the bot_response_queue consumer below whenever
+        bot_listener.py posts a summary answer or a joke) and, once there's something to
+        check, runs exactly one classification pass over the buffer collected so far.
+
+        Mirrors maybe_joke's care around not double-firing: the only await before the
+        synchronous append + in-flight check is get_sender (already true by the time
+        that block runs), so two messages arriving back to back can't both slip past the
+        in-flight guard and launch overlapping checks for the same watch. Unlike
+        maybe_joke's buffer, this doesn't wait for the window to fill before checking --
+        a reaction is only worth reacting to while it's still fresh, so every new message
+        (up to cfg.followup_window_messages of them) gets its own check, and the watch
+        closes the moment one actually fires or the window runs out with nothing found."""
+        chat_key = event.chat_id
+        watch = followup_watch.get(chat_key)
+        if watch is None:
+            return
+        sender = await event.get_sender()
+        if getattr(sender, "bot", False):
+            return  # never count either account's own messages (incl. a just-sent reply) as chat commentary
+
+        if len(watch["buffer"]) < cfg.followup_window_messages:
+            watch["buffer"].append((msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
+        if watch["in_flight"]:
+            return  # a check is already running for this watch -- this message will be in its buffer next round
+        watch["in_flight"] = True
+        lines = [f"[{hhmm}] {name}: {t}" for hhmm, name, t in watch["buffer"]]
+
+        async def _run():
+            try:
+                chat = await event.get_chat()
+                entry = matched_allowed_chat(chat)
+                profile = chat_profile.load_cached_profile(entry) if entry else None
+                reply = await asyncio.to_thread(
+                    generate_followup_reply,
+                    cfg.openai_api_key, cfg.openai_model, watch["kind"], watch["response_text"], lines, profile,
+                )
+                if followup_watch.get(chat_key) is not watch:
+                    return  # superseded by a newer bot response while this check was running
+                if reply:
+                    await followup_queue.put((chat_key, reply))
+                    log(f"[listener] queued follow-up reply for chat {chat_key}: {reply!r}")
+                    followup_watch.pop(chat_key, None)
+                elif len(watch["buffer"]) >= cfg.followup_window_messages:
+                    log(f"[listener] no reaction to its last {watch['kind']} found in chat {chat_key} within the watch window -- giving up")
+                    followup_watch.pop(chat_key, None)
+                else:
+                    watch["in_flight"] = False
+            except Exception:
+                log(f"[listener] error generating follow-up reply:\n{traceback.format_exc()}")
+                if followup_watch.get(chat_key) is watch:
+                    if len(watch["buffer"]) >= cfg.followup_window_messages:
+                        followup_watch.pop(chat_key, None)
+                    else:
+                        watch["in_flight"] = False
+
+        task = asyncio.create_task(_run())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     # No incoming=True filter: watching outgoing messages too is what lets *you*
     # trigger a summary by typing "summary ..." yourself, not just other people
     # @mentioning you. The sent_message_ids/addressed_to_me logic below keeps this
@@ -810,6 +903,8 @@ async def run_listener(
 
         if joke_enabled and text:
             await maybe_joke(event, msg, text)
+        if followup_enabled and text:
+            await maybe_followup(event, msg, text)
 
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
         # confirmation before reposting whatever you replied to into your save channel
@@ -1096,6 +1191,28 @@ async def run_listener(
 
         asyncio.create_task(_consume_joke_posted())
 
+    if followup_enabled:
+        # Drains bot_response_queue for the life of the process: bot_listener.py puts
+        # (chat_id, kind, response_text) here right after it posts a summary answer or a
+        # joke to a group chat. Replaces any watch already active for that chat wholesale
+        # -- only the most recent bot response is worth reacting to, so a still-open
+        # window from an earlier one is simply abandoned.
+        async def _consume_bot_responses():
+            while True:
+                chat_id, kind, response_text = await bot_response_queue.get()
+                followup_watch[chat_id] = {
+                    "kind": kind,
+                    "response_text": response_text,
+                    "buffer": [],
+                    "in_flight": False,
+                }
+                log(
+                    f"[listener] watching chat {chat_id} for reactions to its last {kind} "
+                    f"(window: {cfg.followup_window_messages} messages)"
+                )
+
+        asyncio.create_task(_consume_bot_responses())
+
     joke_status = (
         f"on ({cfg.joke_activity_min_messages} msgs to fill the buffer, "
         f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_min_seconds}-{cfg.joke_cooldown_max_seconds}s "
@@ -1103,11 +1220,12 @@ async def run_listener(
         if joke_enabled
         else "off"
     )
+    followup_status = f"on (window: {cfg.followup_window_messages} messages)" if followup_enabled else "off"
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
-        f"Joke: {joke_status}. Ctrl+C to stop."
+        f"Joke: {joke_status}. Follow-up reactions: {followup_status}. Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 
@@ -1144,10 +1262,24 @@ async def main():
         # users' reactions without the bot needing admin rights).
         joke_queue: asyncio.Queue = asyncio.Queue()
         joke_posted_queue: asyncio.Queue = asyncio.Queue()
+        # bot_response_queue/followup_queue are the same hand-off shape for a different
+        # feature (see followup.py): bot_listener.py puts (chat_id, kind, response_text)
+        # on bot_response_queue right after ANY summary answer or joke is posted to a
+        # group chat, so this session can watch the next few messages for chat commentary
+        # about it; followup_queue carries a generated clap-back back to bot_listener.py
+        # to actually send, same bot-account-only rule as every other reply.
+        bot_response_queue: asyncio.Queue = asyncio.Queue()
+        followup_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
-            run_listener(client, cfg, tz, joke_queue=joke_queue, joke_posted_queue=joke_posted_queue),
+            run_listener(
+                client, cfg, tz,
+                joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
+                bot_response_queue=bot_response_queue, followup_queue=followup_queue,
+            ),
             bot_listener.run_bot_listener(
-                cfg.telegram_bot_token, cfg, tz, client, joke_queue=joke_queue, joke_posted_queue=joke_posted_queue
+                cfg.telegram_bot_token, cfg, tz, client,
+                joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
+                bot_response_queue=bot_response_queue, followup_queue=followup_queue,
             ),
         )
     else:
