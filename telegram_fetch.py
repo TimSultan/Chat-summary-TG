@@ -251,7 +251,7 @@ async def ensure_day_finalized(client: TelegramClient, chat_ref, day: date, tz, 
     bound on id, so if this runs even a few seconds after midnight, it would otherwise
     also pull in anything posted in the new day before this job got around to running."""
     entity = chat_ref if not isinstance(chat_ref, str) else await resolve_chat(client, chat_ref)
-    cached = transcript_cache.load(entity.id, day, is_final=True)
+    cached = transcript_cache.load(entity.id, day, is_final=True, tz=tz)
     if cached is None or not _has_message_ids(cached.messages):
         return
     last_id = max(d["message_id"] for d in cached.messages)
@@ -260,7 +260,7 @@ async def ensure_day_finalized(client: TelegramClient, chat_ref, day: date, tz, 
     if not new_messages:
         return
     merged = cached.messages + [_message_to_dict(m) for m in new_messages]
-    transcript_cache.save(entity.id, day, merged)
+    transcript_cache.save(entity.id, day, merged, tz=tz)
     log(f"[cache] finalized {day}: appended {len(new_messages)} trailing message(s) before day-close")
 
 
@@ -329,7 +329,7 @@ async def fetch_range_messages_cached(
     day = start_day
     while day <= end_day:
         is_final = transcript_cache.day_is_final(day, tz)
-        cached = None if force_refresh else transcript_cache.load(entity.id, day, is_final)
+        cached = None if force_refresh else transcript_cache.load(entity.id, day, is_final, tz=tz)
 
         if cached is not None and cached.is_fresh:
             log(f"[cache] using saved transcript for {day}")
@@ -341,7 +341,7 @@ async def fetch_range_messages_cached(
             if title:
                 chat_title = title
             merged = cached.messages + [_message_to_dict(m) for m in new_messages]
-            transcript_cache.save(entity.id, day, merged)
+            transcript_cache.save(entity.id, day, merged, tz=tz)
             all_messages.extend(_message_from_dict(d) for d in merged)
             log(f"[cache] appended {len(new_messages)} new message(s) for {day} ({len(merged)} total)")
         else:
@@ -352,7 +352,7 @@ async def fetch_range_messages_cached(
             title, day_messages = await fetch_range_messages(client, entity, day, day, tz)
             if title:
                 chat_title = title
-            transcript_cache.save(entity.id, day, [_message_to_dict(m) for m in day_messages])
+            transcript_cache.save(entity.id, day, [_message_to_dict(m) for m in day_messages], tz=tz)
             all_messages.extend(day_messages)
         day += timedelta(days=1)
 
@@ -378,14 +378,14 @@ async def fetch_recent_messages_fresh(
     chat_title = getattr(entity, "title", None) or sender_display_name(entity)
     today = datetime.now(tz).date()
 
-    cached = transcript_cache.load(entity.id, today, is_final=False)
+    cached = transcript_cache.load(entity.id, today, is_final=False, tz=tz)
     if cached is not None and _has_message_ids(cached.messages):
         last_id = max(d["message_id"] for d in cached.messages)
         title, new_messages = await fetch_new_messages(client, entity, tz, min_id=last_id)
         if title:
             chat_title = title
         merged = cached.messages + [_message_to_dict(m) for m in new_messages]
-        transcript_cache.save(entity.id, today, merged)
+        transcript_cache.save(entity.id, today, merged, tz=tz)
         messages = [_message_from_dict(d) for d in merged]
         log(f"[cache] fresh-fetched {len(new_messages)} new message(s) for today ({len(merged)} total)")
     else:
@@ -393,7 +393,7 @@ async def fetch_recent_messages_fresh(
         title, messages = await fetch_range_messages(client, entity, today, today, tz)
         if title:
             chat_title = title
-        transcript_cache.save(entity.id, today, [_message_to_dict(m) for m in messages])
+        transcript_cache.save(entity.id, today, [_message_to_dict(m) for m in messages], tz=tz)
 
     return chat_title, messages[-limit:]
 

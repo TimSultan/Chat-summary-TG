@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from app_time import cache_namespace, now as app_now
+
 # DATA_DIR defaults to the current directory (local use). On a host with no persistent
 # disk by default (Railway, etc.), set DATA_DIR to a mounted Volume's path so the cache
 # survives restarts/redeploys instead of resetting each time -- entirely optional, the
@@ -34,8 +36,8 @@ def day_is_final(day: date, tz) -> bool:
     return day < datetime.now(tz).date()
 
 
-def _path(chat_id: int, day: date) -> Path:
-    return CACHE_DIR / f"{chat_id}_{day.isoformat()}.json"
+def _path(chat_id: int, day: date, tz) -> Path:
+    return CACHE_DIR / cache_namespace(tz) / f"{chat_id}_{day.isoformat()}.json"
 
 
 @dataclass
@@ -44,12 +46,13 @@ class CachedDay:
     is_fresh: bool  # always True for a final day; for today, whether it's within the TTL
 
 
-def load(chat_id: int, day: date, is_final: bool) -> CachedDay | None:
+def load(chat_id: int, day: date, is_final: bool, tz) -> CachedDay | None:
     """Returns the cached messages for this (chat, day) plus whether they're still
     fresh, or None if there's no cache entry at all. Unlike a straight cache miss (None),
     a *stale* entry still returns its messages -- see the module docstring -- so the
-    caller can extend them instead of discarding and re-fetching everything."""
-    path = _path(chat_id, day)
+    caller can extend them instead of discarding and re-fetching everything. The
+    timezone namespace deliberately leaves legacy, un-namespaced cache files alone."""
+    path = _path(chat_id, day, tz)
     if not path.exists():
         return None
 
@@ -62,10 +65,11 @@ def load(chat_id: int, day: date, is_final: bool) -> CachedDay | None:
     return CachedDay(messages=payload["messages"], is_fresh=is_fresh)
 
 
-def save(chat_id: int, day: date, messages: list[dict]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def save(chat_id: int, day: date, messages: list[dict], tz) -> None:
+    path = _path(chat_id, day, tz)
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": app_now(tz).isoformat(),
         "messages": messages,
     }
-    _path(chat_id, day).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

@@ -13,22 +13,21 @@ import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
 from telethon import TelegramClient
 
+from app_time import DEFAULT_TIMEZONE_NAME, resolve_timezone
 from config import build_session, load_config
 from errors import ChatSummaryError
 from summarizer import summarize_transcript
 from telegram_fetch import fetch_range_messages_cached, format_transcript_lines, sender_matches
 
 
-def parse_date_range(value: str) -> tuple[date, date]:
+def parse_date_range(value: str, tz=None) -> tuple[date, date]:
     if not value or not value.strip():
         raise ChatSummaryError("--date cannot be empty.")
 
     v = value.strip().lower()
-    today = date.today()
+    today = datetime.now(tz or resolve_timezone()).date()
     if v == "today":
         return today, today
     if v == "yesterday":
@@ -59,17 +58,7 @@ def parse_date_range(value: str) -> tuple[date, date]:
 
 
 def resolve_tz(tz_name: str | None):
-    if tz_name:
-        try:
-            return ZoneInfo(tz_name)
-        except Exception as e:
-            raise ChatSummaryError(f"Unknown timezone '{tz_name}': {e}") from e
-    try:
-        from tzlocal import get_localzone
-
-        return get_localzone()
-    except Exception:
-        return datetime.now().astimezone().tzinfo
+    return resolve_timezone(tz_name)
 
 
 def safe_filename(name: str) -> str:
@@ -87,7 +76,7 @@ async def run(args) -> Path:
 
     cfg = load_config()
     tz = resolve_tz(args.tz)
-    start_day, end_day = parse_date_range(args.date)
+    start_day, end_day = parse_date_range(args.date, tz)
     label = period_label(start_day, end_day)
     user = args.user or None
 
@@ -150,7 +139,11 @@ def main():
         default=None,
         help="Restrict the summary to what this participant discussed (username or display name substring)",
     )
-    parser.add_argument("--tz", default=None, help="IANA timezone, e.g. Europe/Istanbul (default: system local)")
+    parser.add_argument(
+        "--tz",
+        default=None,
+        help=f"IANA timezone (default: APP_TIMEZONE or {DEFAULT_TIMEZONE_NAME})",
+    )
     parser.add_argument(
         "--model",
         default=None,

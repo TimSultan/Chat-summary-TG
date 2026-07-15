@@ -1380,7 +1380,7 @@ async def run_listener(
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
         f"Joke: {joke_status}. Follow-up reactions: {followup_status}. Stats (/top, /stat): {stats_status}. "
-        f"Ctrl+C to stop."
+        f"Timezone: {tz}. Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 

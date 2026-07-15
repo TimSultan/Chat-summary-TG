@@ -76,7 +76,7 @@ class App:
         self.chat_var = tk.StringVar()
         self.date_var = tk.StringVar(value="today")
         self.user_var = tk.StringVar()
-        self.tz_var = tk.StringVar()
+        self.tz_var = tk.StringVar(value="Europe/Moscow")
 
         self._labeled_entry(summary_tab, "Chat (@username, ID, or title):", self.chat_var, 0)
         self._labeled_entry(
@@ -86,7 +86,7 @@ class App:
             1,
         )
         self._labeled_entry(summary_tab, "User filter (optional, @username):", self.user_var, 2)
-        self._labeled_entry(summary_tab, "Timezone (optional, e.g. Europe/Istanbul):", self.tz_var, 3)
+        self._labeled_entry(summary_tab, "Timezone (default: Europe/Moscow):", self.tz_var, 3)
         summary_tab.columnconfigure(1, weight=1)
 
         self.force_var = tk.BooleanVar(value=False)
@@ -238,8 +238,8 @@ class App:
         # Validate eagerly, on the main thread, so typos show up immediately as a
         # dialog instead of only surfacing after a background round trip.
         try:
-            parse_date_range(date_str)
-            resolve_tz(tz_str or None)
+            tz = resolve_tz(tz_str or None)
+            parse_date_range(date_str, tz)
             load_config()
         except ChatSummaryError as e:
             messagebox.showerror("Invalid input", str(e))
@@ -280,7 +280,7 @@ class App:
         cfg = load_config()
         cfg.openai_model = self.model_var.get().strip() or cfg.openai_model
         tz = resolve_tz(tz_name.strip() or None)
-        start_day, end_day = parse_date_range(date_str.strip() or "today")
+        start_day, end_day = parse_date_range(date_str.strip() or "today", tz)
         label = period_label(start_day, end_day)
         user = user.strip() or None
 

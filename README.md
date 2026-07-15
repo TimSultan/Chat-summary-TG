@@ -237,6 +237,12 @@ stale).
 
 ## Caching: the raw transcript, not the answer
 
+The application timezone comes from `APP_TIMEZONE` and defaults to `Europe/Moscow`,
+independently of the host machine's timezone. New caches are stored below a
+timezone-specific subdirectory (for example `cache/transcripts/Europe_Moscow/`), so
+pre-existing caches made with London calendar-day boundaries are not overwritten or
+mixed into Moscow days.
+
 What's expensive and reusable is *reading the chat* -- what's cheap and always-fresh is
 *answering a specific question about it*. So the tool caches per calendar day, per chat,
 the raw fetched transcript (under `cache/transcripts/`), not the generated summary:

@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+ENV TZ=Europe/Moscow \
+    APP_TIMEZONE=Europe/Moscow
+
 WORKDIR /app
 
 COPY requirements.txt .

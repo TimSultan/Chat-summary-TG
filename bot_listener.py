@@ -947,7 +947,7 @@ async def run_bot_listener(
         bot_username = me.get("username")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
-            f"{cfg.listener_trigger_keywords} (summary; roast is off)."
+            f"{cfg.listener_trigger_keywords} (summary; roast is off). Timezone: {tz}."
         )
 
         async def _poll_loop():

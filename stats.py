@@ -13,7 +13,7 @@ merges in a freshly-computed, never-persisted snapshot of today on top of whatev
 already recorded for earlier days, so "/top today" and "/stat" both reflect activity as
 it happens rather than only ever showing yesterday-and-earlier.
 
-Storage: one JSON file per (chat, day) under DATA_DIR/cache/stats/, keyed by a hash of
+Storage: one JSON file per (chat, day) under DATA_DIR/cache/stats/<timezone>/, keyed by a hash of
 the LISTENER_ALLOWED_CHATS entry string -- same keying scheme chat_profile.py already
 uses for its own per-chat cache, chosen for the same reason: it sidesteps Telegram's two
 different chat-id numbering schemes (Telethon's own vs. the Bot API's) entirely, since
@@ -39,13 +39,18 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import telegram_fetch
+from app_time import cache_namespace, now as app_now, resolve_timezone
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 STATS_DIR = DATA_DIR / "cache" / "stats"
+
+
+def _stats_dir() -> Path:
+    return STATS_DIR / cache_namespace(resolve_timezone())
 
 POINTS_PER_MESSAGE = 1
 POINTS_PER_MEDIA_MESSAGE = 1
@@ -73,7 +78,7 @@ def _cache_key(entry: str) -> str:
 
 
 def _path(entry: str, day: date) -> Path:
-    return STATS_DIR / f"{_cache_key(entry)}_{day.isoformat()}.json"
+    return _stats_dir() / f"{_cache_key(entry)}_{day.isoformat()}.json"
 
 
 def is_recorded(entry: str, day: date) -> bool:
@@ -141,12 +146,12 @@ def record_day(entry: str, day: date, messages: list, log=print) -> bool:
     it twice. Returns True once it actually records the day."""
     if is_recorded(entry, day):
         return False
-    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    _stats_dir().mkdir(parents=True, exist_ok=True)
     users = compute_day_stats(messages)
     payload = {
         "entry": entry,
         "day": day.isoformat(),
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "recorded_at": app_now().isoformat(),
         "users": users,
     }
     _path(entry, day).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -248,10 +253,11 @@ def aggregate_all_time(entry: str) -> dict[str, UserStats]:
     rather than walking a bounded date range) -- used by /stat, which reports a person's
     whole tracked history, not a fixed window."""
     combined: dict[str, UserStats] = {}
-    if not STATS_DIR.exists():
+    stats_dir = _stats_dir()
+    if not stats_dir.exists():
         return combined
     prefix = _cache_key(entry)
-    for path in sorted(STATS_DIR.glob(f"{prefix}_*.json")):
+    for path in sorted(stats_dir.glob(f"{prefix}_*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):

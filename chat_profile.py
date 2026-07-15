@@ -21,10 +21,15 @@ from pathlib import Path
 
 from openai import OpenAI, OpenAIError
 
+from app_time import cache_namespace, now as app_now, resolve_timezone
 from errors import ChatSummaryError
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 PROFILE_DIR = DATA_DIR / "cache" / "chat_profile"
+
+
+def _profile_dir() -> Path:
+    return PROFILE_DIR / cache_namespace(resolve_timezone())
 
 PROFILE_SYSTEM_PROMPT = """\
 Ты анализируешь историю сообщений группового чата, чтобы составить компактную \
@@ -53,7 +58,7 @@ def _cache_key(entry: str) -> str:
 
 
 def _path(entry: str) -> Path:
-    return PROFILE_DIR / f"{_cache_key(entry)}.json"
+    return _profile_dir() / f"{_cache_key(entry)}.json"
 
 
 def is_stale(entry: str, ttl_seconds: int) -> bool:
@@ -105,8 +110,8 @@ def generate_and_cache_profile(api_key: str, model: str, chat_title: str, entry:
     if not content:
         return None
 
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "profile": content}
+    _profile_dir().mkdir(parents=True, exist_ok=True)
+    payload = {"generated_at": app_now().isoformat(), "profile": content}
     _path(entry).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return content
 

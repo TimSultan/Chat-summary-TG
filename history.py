@@ -8,8 +8,9 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
+
+from app_time import now as app_now
 
 # See transcript_cache.py's DATA_DIR comment -- same optional persistent-disk hook.
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
@@ -33,7 +34,7 @@ def _safe(value: str) -> str:
 
 def record(chat_title: str, requester: str, question: str, answer: str) -> HistoryEntry:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
+    now = app_now()
 
     stamp = now.strftime("%Y%m%d_%H%M%S_%f")
     answer_path = HISTORY_DIR / f"{stamp}_{_safe(chat_title)}_{_safe(requester)}.md"
