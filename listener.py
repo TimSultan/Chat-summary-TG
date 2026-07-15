@@ -580,10 +580,12 @@ async def run_listener(
     `bot_response_queue` right after it posts ANY summary answer or joke to a group chat,
     which starts a per-chat watch here (see maybe_followup) over the next
     cfg.followup_window_messages messages for chat commentary about that response --
-    praise or criticism, not necessarily a reply/mention. If the model decides someone's
-    actually reacting, the generated clap-back is put on `followup_queue` for
-    bot_listener.py to send, same bot-account-only rule as everything else. All four
-    queues are passed in (not created here) so main() can share them between both tasks."""
+    praise or criticism, not necessarily a reply/mention -- re-checked every
+    cfg.followup_check_every_messages messages rather than on every single one, to keep
+    the OpenAI call count down. If the model decides someone's actually reacting, the
+    generated clap-back is put on `followup_queue` for bot_listener.py to send, same
+    bot-account-only rule as everything else. All four queues are passed in (not created
+    here) so main() can share them between both tasks."""
     assert cfg.listener_cooldown_seconds >= 0, "internal bug: cooldown should have been validated by config"
 
     me = await client.get_me()
@@ -830,17 +832,23 @@ async def run_listener(
     async def maybe_followup(event, msg, text):
         """Feeds this message into its chat's active follow-up watch (if any -- see
         followup_watch, populated by the bot_response_queue consumer below whenever
-        bot_listener.py posts a summary answer or a joke) and, once there's something to
-        check, runs exactly one classification pass over the buffer collected so far.
+        bot_listener.py posts a summary answer or a joke) and, every
+        cfg.followup_check_every_messages messages (or right at the window boundary,
+        whichever comes first), runs one classification pass over the buffer collected
+        so far.
 
         Mirrors maybe_joke's care around not double-firing: the only await before the
         synchronous append + in-flight check is get_sender (already true by the time
         that block runs), so two messages arriving back to back can't both slip past the
         in-flight guard and launch overlapping checks for the same watch. Unlike
-        maybe_joke's buffer, this doesn't wait for the window to fill before checking --
-        a reaction is only worth reacting to while it's still fresh, so every new message
-        (up to cfg.followup_window_messages of them) gets its own check, and the watch
-        closes the moment one actually fires or the window runs out with nothing found."""
+        maybe_joke's buffer, this doesn't wait for the full window to fill before the
+        FIRST check -- a reaction is only worth reacting to while it's still fresh -- but
+        it also doesn't check on literally every message, to keep the OpenAI call count
+        down: cfg.followup_check_every_messages (default 5) messages have to land between
+        checks, except the window boundary itself (cfg.followup_window_messages, default
+        15) is always evaluated regardless of where that falls, so "gave up, nothing
+        found" is still decided off the full window, not a partial one. The watch closes
+        the moment a check actually fires or the window runs out with nothing found."""
         chat_key = event.chat_id
         watch = followup_watch.get(chat_key)
         if watch is None:
@@ -851,8 +859,11 @@ async def run_listener(
 
         if len(watch["buffer"]) < cfg.followup_window_messages:
             watch["buffer"].append((msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
-        if watch["in_flight"]:
-            return  # a check is already running for this watch -- this message will be in its buffer next round
+        buffer_len = len(watch["buffer"])
+        window_full = buffer_len >= cfg.followup_window_messages
+        at_checkpoint = buffer_len % cfg.followup_check_every_messages == 0
+        if watch["in_flight"] or not (at_checkpoint or window_full):
+            return  # not a check checkpoint yet, or a check for this watch is already running
         watch["in_flight"] = True
         lines = [f"[{hhmm}] {name}: {t}" for hhmm, name, t in watch["buffer"]]
 
@@ -1220,7 +1231,11 @@ async def run_listener(
         if joke_enabled
         else "off"
     )
-    followup_status = f"on (window: {cfg.followup_window_messages} messages)" if followup_enabled else "off"
+    followup_status = (
+        f"on (window: {cfg.followup_window_messages} messages, checked every {cfg.followup_check_every_messages})"
+        if followup_enabled
+        else "off"
+    )
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "

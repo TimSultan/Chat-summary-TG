@@ -54,6 +54,7 @@ class Config:
     joke_profile_max_messages: int
     followup_enabled: bool
     followup_window_messages: int
+    followup_check_every_messages: int
 
 
 def build_session(cfg: "Config"):
@@ -239,6 +240,14 @@ def load_config() -> Config:
     if followup_window_messages < 1:
         raise ChatSummaryError(f"FOLLOWUP_WINDOW_MESSAGES must be >= 1, got {followup_window_messages}.")
 
+    followup_check_every_raw = os.getenv("FOLLOWUP_CHECK_EVERY_MESSAGES", "5")
+    try:
+        followup_check_every_messages = int(followup_check_every_raw)
+    except ValueError:
+        raise ChatSummaryError(f"FOLLOWUP_CHECK_EVERY_MESSAGES must be a number, got '{followup_check_every_raw}'.")
+    if followup_check_every_messages < 1:
+        raise ChatSummaryError(f"FOLLOWUP_CHECK_EVERY_MESSAGES must be >= 1, got {followup_check_every_messages}.")
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -270,4 +279,5 @@ def load_config() -> Config:
         joke_profile_max_messages=joke_profile_max_messages,
         followup_enabled=followup_enabled,
         followup_window_messages=followup_window_messages,
+        followup_check_every_messages=followup_check_every_messages,
     )
