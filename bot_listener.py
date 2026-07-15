@@ -715,7 +715,7 @@ async def _dispatch_update(
 
     text_lower = message["text"].lower()
 
-    # "/top today|week|month" and "/stat [username]" (stats.py) -- plain lookups over
+    # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
     # already-computed daily files, no OpenAI/cooldown involved. Reuses matched_entry
     # from the known_chat_ids learning above rather than re-matching the chat.
     if cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):

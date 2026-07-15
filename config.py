@@ -253,7 +253,7 @@ def load_config() -> Config:
 
     stats_enabled = os.getenv("STATS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
-    stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "5")
+    stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "10")
     try:
         stats_top_limit = int(stats_top_limit_raw)
     except ValueError:

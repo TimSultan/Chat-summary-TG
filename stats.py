@@ -2,7 +2,7 @@
 media/reply counts, active days, and an hourly activity histogram, computed once per
 calendar day from the SAME per-day transcript cache telegram_fetch.py already maintains
 (see finalize_and_record, called by listener.py's midnight rollover job). Powers "/top
-today|week|month" (a simple points leaderboard) and "/stat [username]" (one person's
+today|week|month|all" (a simple points leaderboard) and "/stat [username]" (one person's
 tracked history).
 
 The daily rollover only ever permanently records a day once it's actually over (closed
@@ -57,11 +57,13 @@ POINTS_PER_ACTIVE_DAY = 5
 # describe_media tags those too.
 MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
 
-VALID_PERIODS = ("today", "week", "month")
-# Days back from today (inclusive of today) each period covers -- rolling windows, not
-# calendar-aligned (a "week" is always the last 7 days, not necessarily Mon-Sun) so
-# /top week and /top month are never thin just because it happens to be early in a
-# calendar week/month.
+VALID_PERIODS = ("today", "week", "month", "all")
+# Days back from today (inclusive of today) each bounded period covers -- rolling
+# windows, not calendar-aligned (a "week" is always the last 7 days, not necessarily
+# Mon-Sun) so /top week and /top month are never thin just because it happens to be
+# early in a calendar week/month. "all" isn't a bounded window at all -- format_top
+# special-cases it to aggregate_all_time_live instead of a start/end range, so it has no
+# entry here.
 PERIOD_LOOKBACK_DAYS = {"today": 0, "week": 6, "month": 29}
 
 
@@ -315,12 +317,12 @@ async def aggregate_all_time_live(client, chat_ref, entry: str, tz, log=print) -
 
 
 async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, log=print) -> str:
-    start, end = resolve_period_window(period, tz)
-    ranked = sorted(
-        (await aggregate_live(client, chat_ref, entry, start, end, tz, log=log)).values(),
-        key=lambda s: s.score,
-        reverse=True,
-    )[:top_n]
+    if period == "all":
+        combined = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
+    else:
+        start, end = resolve_period_window(period, tz)
+        combined = await aggregate_live(client, chat_ref, entry, start, end, tz, log=log)
+    ranked = sorted(combined.values(), key=lambda s: s.score, reverse=True)[:top_n]
     if not ranked:
         return "Пока нет данных за этот период."
     lines = ["🏆 Топ активистов:", ""]

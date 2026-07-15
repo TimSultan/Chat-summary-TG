@@ -163,19 +163,43 @@ def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
     return result.strip()
 
 
+async def _fetch_album(client, chat_id: int, message) -> list:
+    """Returns every message that's part of the same Telegram album (multiple
+    photos/videos sent together as one grouped post) as `message`, in original order --
+    just `[message]` if it isn't grouped at all. Albums are capped at 10 items by
+    Telegram and always contiguous in message id, so a window of the 9 ids on either
+    side is enough to find every sibling regardless of which one in the group was
+    replied to."""
+    if not message.grouped_id:
+        return [message]
+    ids = [i for i in range(message.id - 9, message.id + 10) if i > 0]
+    fetched = await client.get_messages(chat_id, ids=ids)
+    album = [m for m in fetched if m is not None and m.grouped_id == message.grouped_id]
+    album.sort(key=lambda m: m.id)
+    return album
+
+
 async def repost_saved_message(client, channel, replied_msg, added_text: str) -> None:
-    """Reposts `replied_msg` (whatever it contains -- photo, video, any other media, or
-    just text) to `channel` as a fresh message, not a forward (no "Forwarded from" tag).
-    `added_text` (the text typed after the save trigger word, may be empty) is appended
-    below whatever text/caption the original message already had."""
-    original_text = replied_msg.raw_text or ""
+    """Reposts `replied_msg` to `channel` as a fresh message, not a forward (no
+    "Forwarded from" tag). If it's part of a Telegram album (see _fetch_album), the
+    WHOLE album is reposted together, not just the one message that was replied to --
+    fixes a bug where only the single replied-to photo/video went out instead of the
+    full multi-photo/video post. `added_text` (the text typed after the save trigger
+    word, may be empty) is appended below whatever caption the original post already
+    had."""
+    album = await _fetch_album(client, replied_msg.chat_id, replied_msg)
+    original_text = next((m.raw_text for m in album if m.raw_text), "")
     caption = "\n\n".join(p for p in (original_text, added_text) if p) or None
 
-    if replied_msg.media:
-        # Passing the original media object straight through re-uses Telegram's existing
-        # file server-side (no download/re-upload through us), same as a forward would,
-        # but as a brand-new message so it doesn't carry a "Forwarded from" tag.
-        await client.send_file(channel, file=replied_msg.media, caption=caption)
+    media_items = [m.media for m in album if m.media]
+    if media_items:
+        # Passing the original media objects straight through re-uses Telegram's existing
+        # files server-side (no download/re-upload through us), same as a forward would,
+        # but as brand-new message(s) so it doesn't carry a "Forwarded from" tag. More
+        # than one item is sent as a single new album, same shape as the original post.
+        await client.send_file(
+            channel, file=media_items if len(media_items) > 1 else media_items[0], caption=caption
+        )
     elif caption:
         await client.send_message(channel, caption)
     else:
@@ -1024,7 +1048,7 @@ async def run_listener(
                     log(f"[listener] failed to delete save trigger message: {e}")
             return
 
-        # "/top today|week|month" and "/stat [username]" (stats.py) -- plain lookups over
+        # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
         # already-computed daily files, no OpenAI/cooldown involved, so these always work
         # immediately regardless of the summary cooldown. Skipped once a bot account has
         # taken over (bot_takeover), same as /summary -- bot_listener.py handles both
