@@ -39,6 +39,8 @@ alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
 """
 
 import asyncio
+import html
+import re
 import sys
 import time
 import traceback
@@ -178,11 +180,27 @@ def _home_chat_ref(cfg) -> str | None:
     return None
 
 
+def _telegram_html(text: str) -> str:
+    """Escapes arbitrary model output for Telegram HTML, then restores the one bit of
+    formatting the summary prompt deliberately asks for: **bold topic headings**.
+
+    Escaping first means usernames containing underscores and literal <, >, or & can
+    never become malformed Telegram entities. Any unmatched ** remains harmless text.
+    """
+    escaped = html.escape(text, quote=False)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+
+
 async def send_long_bot_message(api: TelegramBotAPI, chat_id, text: str, reply_to_message_id: int | None) -> list[int]:
     sent_ids = []
     for i in range(0, len(text), MAX_REPLY_CHARS):
         chunk = text[i : i + MAX_REPLY_CHARS]
-        sent = await api.send_message(chat_id, chunk, reply_to_message_id=reply_to_message_id if i == 0 else None)
+        sent = await api.send_message(
+            chat_id,
+            _telegram_html(chunk),
+            reply_to_message_id=reply_to_message_id if i == 0 else None,
+            parse_mode="HTML",
+        )
         if sent and "message_id" in sent:
             sent_ids.append(sent["message_id"])
     return sent_ids

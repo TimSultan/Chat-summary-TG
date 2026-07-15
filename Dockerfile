@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 ENV TZ=Europe/Moscow \
-    APP_TIMEZONE=Europe/Moscow
+    APP_TIMEZONE=Europe/Moscow \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
