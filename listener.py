@@ -22,7 +22,7 @@ import sys
 import time
 import traceback
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from telethon import TelegramClient, events, utils as tl_utils
 from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendReactionRequest
@@ -51,6 +51,14 @@ from telegram_fetch import (
 
 MENTION_RE = re.compile(r"@(\w{4,32})")
 MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
+IMPRESSION_MIN_TODAY_MESSAGES = 15
+IMPRESSION_RE = re.compile(r"\bвпечатлен\w*", re.IGNORECASE)
+EXPLICIT_TIME_RE = re.compile(
+    r"\b(?:сегодня|вчера|позавчера|today|yesterday|последн\w*|last\s+\d+|"
+    r"за\s+(?:\d+\s+)?(?:час\w*|дн\w*|день|сут\w*|недел\w*|месяц\w*))\b|"
+    r"\b\d{4}-\d{2}-\d{2}\b",
+    re.IGNORECASE,
+)
 
 # Appended to every successful summary reply so people re-discover the available commands
 # without having to ask -- not shown on short rejection/error notices, which already
@@ -153,6 +161,66 @@ def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
     for kw in keywords:
         result = re.sub(re.escape(kw), "", result, flags=re.IGNORECASE)
     return result.strip()
+
+
+def _is_default_impression_request(text: str, routed: dict, ref_date: date) -> bool:
+    """Whether this is a person-impression request with no explicit time period."""
+    return (
+        bool(routed.get("username"))
+        and bool(IMPRESSION_RE.search(text or ""))
+        and not EXPLICIT_TIME_RE.search(text or "")
+        and routed.get("lookback_hours") is None
+        and routed.get("start_date") == ref_date
+        and routed.get("end_date") == ref_date
+    )
+
+
+async def _expand_sparse_impression_history(
+    client,
+    chat_ref,
+    tz,
+    text: str,
+    routed: dict,
+    ref_date: date,
+    current_start_date: date,
+    messages: list,
+    log=print,
+    log_prefix: str = "[listener]",
+) -> tuple[date, list]:
+    """Prepends yesterday when today's target activity is below the impression floor.
+
+    Explicit dates remain authoritative. The fallback only expands the otherwise-default
+    current-day window, and stops after one additional Moscow calendar day.
+    """
+    if not _is_default_impression_request(text, routed, ref_date):
+        return current_start_date, messages
+
+    username_hint = routed["username"]
+    today_count = sum(1 for message in messages if sender_matches(message, username_hint))
+    if today_count >= IMPRESSION_MIN_TODAY_MESSAGES:
+        log(
+            f"{log_prefix} impression target '{username_hint}' has {today_count} message(s) "
+            f"today; using today only"
+        )
+        return current_start_date, messages
+
+    previous_day = ref_date - timedelta(days=1)
+    _, previous_messages = await fetch_range_messages_cached(
+        client=client,
+        chat_ref=chat_ref,
+        start_day=previous_day,
+        end_day=previous_day,
+        tz=tz,
+        log=log,
+    )
+    combined = previous_messages + messages
+    combined_count = sum(1 for message in combined if sender_matches(message, username_hint))
+    log(
+        f"{log_prefix} impression target '{username_hint}' has only {today_count} message(s) "
+        f"today (<{IMPRESSION_MIN_TODAY_MESSAGES}); added {previous_day} "
+        f"({combined_count} target message(s) across both days)"
+    )
+    return previous_day, combined
 
 
 async def _fetch_album(client, chat_id: int, message) -> list:
@@ -416,6 +484,18 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
 
     if window_start_dt is not None:
         messages = [m for m in messages if window_start_dt <= m.dt_local <= window_end_dt]
+
+    start_date, messages = await _expand_sparse_impression_history(
+        client=event.client,
+        chat_ref=chat,
+        tz=tz,
+        text=text,
+        routed=routed,
+        ref_date=ref_date,
+        current_start_date=start_date,
+        messages=messages,
+        log=log,
+    )
 
     focus_user = None
     username_hint = routed["username"]

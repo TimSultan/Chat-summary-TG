@@ -123,6 +123,10 @@ keyword itself there's no fixed syntax — phrase it naturally.
   retained and answered in arrival order. The first starts immediately; after one
   enquiry finishes, the worker waits `SUMMARY_QUEUE_DELAY_SECONDS` (default 20) before
   starting the next. Bursts are delayed rather than discarded.
+- **Impression fallback** — a request containing `впечатление` about one person, with no
+  explicit date, starts with today. If that person has fewer than 15 matching messages
+  today, yesterday is prepended and the impression uses both Moscow calendar days.
+  Explicit periods such as `сегодня` or `за вчера` are always respected as written.
 
 **Before running this against real chats**, set `LISTENER_ALLOWED_CHATS` in `.env` to a
 comma-separated allowlist of chats (by `@username`, exact title, or numeric ID). Without
