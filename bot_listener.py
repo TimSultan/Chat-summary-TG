@@ -50,6 +50,7 @@ from telethon import utils as tl_utils
 
 import chat_profile
 import history
+import stats
 from bot_api import TelegramBotAPI
 from config import build_session, load_config
 from errors import ChatSummaryError
@@ -713,6 +714,47 @@ async def _dispatch_update(
             return
 
     text_lower = message["text"].lower()
+
+    # "/top today|week|month" and "/stat [username]" (stats.py) -- plain lookups over
+    # already-computed daily files, no OpenAI/cooldown involved. Reuses matched_entry
+    # from the known_chat_ids learning above rather than re-matching the chat.
+    if cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
+        chat_key = chat["id"]
+        if matched_entry is None:
+            try:
+                await api.send_message(
+                    chat_key, "Статистика недоступна в этом чате.", reply_to_message_id=message["message_id"]
+                )
+            except Exception:
+                pass
+            return
+        try:
+            if text_lower.startswith("/top"):
+                period = stats.parse_top_command(message["text"])
+                reply_text = await stats.format_top(
+                    telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
+                )
+            else:
+                arg = message["text"][len("/stat") :].strip()
+                from_user = message.get("from") or {}
+                user = await stats.resolve_stat_target(
+                    telethon_client, matched_entry, matched_entry, arg,
+                    from_user.get("username"), _display_name(from_user), tz, log=log,
+                )
+                reply_text = (
+                    stats.format_stat(user) if user else "Статистика не найдена -- пользователь ещё не отслеживается."
+                )
+            await api.send_message(chat_key, reply_text, reply_to_message_id=message["message_id"])
+        except Exception:
+            log(f"[bot_listener] error handling stats command:\n{traceback.format_exc()}")
+            try:
+                await api.send_message(
+                    chat_key, "Не удалось получить статистику.", reply_to_message_id=message["message_id"]
+                )
+            except Exception:
+                pass
+        return
+
     has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
     # Roast ("прожарь меня") is turned off -- forced False rather than removing the
     # surrounding roast_pending/callback machinery below, so it stays a one-line revert

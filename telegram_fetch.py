@@ -232,6 +232,38 @@ async def fetch_new_messages(client: TelegramClient, chat_ref, tz, min_id: int):
     return chat_title, messages
 
 
+async def ensure_day_finalized(client: TelegramClient, chat_ref, day: date, tz, log=print) -> None:
+    """Called once, right as `day` is about to become historically closed (see
+    transcript_cache.day_is_final) -- by stats.py's midnight rollover job in listener.py
+    -- to do one last incremental catch-up fetch and persist it, so nothing from the tail
+    end of the day is missed once its cache becomes immutable. This matters because a
+    "final" day's cache is trusted as-is forever afterwards (see transcript_cache.load) --
+    it is never re-checked for staleness once closed, so anything posted after the last
+    on-demand refresh (e.g. the last /summary of that day) and before this runs would
+    otherwise be silently missing from that day's cache permanently.
+
+    A no-op if there's no cache at all yet for `day` (nothing to append to --
+    fetch_range_messages_cached's own bootstrap path handles that case with a full fetch
+    when the day is next actually requested) or the cache predates message_id tracking
+    (old format, nothing trustworthy to resume from either).
+
+    Filters the fetch to messages actually dated `day`: fetch_new_messages has no upper
+    bound on id, so if this runs even a few seconds after midnight, it would otherwise
+    also pull in anything posted in the new day before this job got around to running."""
+    entity = chat_ref if not isinstance(chat_ref, str) else await resolve_chat(client, chat_ref)
+    cached = transcript_cache.load(entity.id, day, is_final=True)
+    if cached is None or not _has_message_ids(cached.messages):
+        return
+    last_id = max(d["message_id"] for d in cached.messages)
+    _, new_messages = await fetch_new_messages(client, entity, tz, min_id=last_id)
+    new_messages = [m for m in new_messages if m.dt_local.date() == day]
+    if not new_messages:
+        return
+    merged = cached.messages + [_message_to_dict(m) for m in new_messages]
+    transcript_cache.save(entity.id, day, merged)
+    log(f"[cache] finalized {day}: appended {len(new_messages)} trailing message(s) before day-close")
+
+
 def _message_to_dict(m: ChatMessage) -> dict:
     return {
         "message_id": m.message_id,

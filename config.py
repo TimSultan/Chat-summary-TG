@@ -55,6 +55,9 @@ class Config:
     followup_enabled: bool
     followup_window_messages: int
     followup_check_every_messages: int
+    stats_enabled: bool
+    stats_top_limit: int
+    stats_catchup_days: int
 
 
 def build_session(cfg: "Config"):
@@ -248,6 +251,24 @@ def load_config() -> Config:
     if followup_check_every_messages < 1:
         raise ChatSummaryError(f"FOLLOWUP_CHECK_EVERY_MESSAGES must be >= 1, got {followup_check_every_messages}.")
 
+    stats_enabled = os.getenv("STATS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+    stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "5")
+    try:
+        stats_top_limit = int(stats_top_limit_raw)
+    except ValueError:
+        raise ChatSummaryError(f"STATS_TOP_LIMIT must be a number, got '{stats_top_limit_raw}'.")
+    if stats_top_limit < 1:
+        raise ChatSummaryError(f"STATS_TOP_LIMIT must be >= 1, got {stats_top_limit}.")
+
+    stats_catchup_days_raw = os.getenv("STATS_CATCHUP_DAYS", "7")
+    try:
+        stats_catchup_days = int(stats_catchup_days_raw)
+    except ValueError:
+        raise ChatSummaryError(f"STATS_CATCHUP_DAYS must be a number, got '{stats_catchup_days_raw}'.")
+    if stats_catchup_days < 1:
+        raise ChatSummaryError(f"STATS_CATCHUP_DAYS must be >= 1, got {stats_catchup_days}.")
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -280,4 +301,7 @@ def load_config() -> Config:
         followup_enabled=followup_enabled,
         followup_window_messages=followup_window_messages,
         followup_check_every_messages=followup_check_every_messages,
+        stats_enabled=stats_enabled,
+        stats_top_limit=stats_top_limit,
+        stats_catchup_days=stats_catchup_days,
     )

@@ -31,6 +31,7 @@ from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 import chat_profile
 import history
+import stats
 from config import build_session, load_config
 from errors import ChatSummaryError
 from followup import generate_followup_reply
@@ -537,6 +538,48 @@ async def run_roast(
     await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
 
 
+async def _stats_catch_up(client, cfg, tz, log=print) -> None:
+    """For each chat in cfg.listener_allowed_chats, closes out every day in the last
+    cfg.stats_catchup_days that isn't recorded yet (see stats.finalize_and_record) --
+    oldest first. Cheap to call repeatedly: stats.finalize_and_record's own idempotency
+    check (stats.is_recorded) means any day already recorded costs nothing but a file
+    existence check, no Telegram calls -- so this covers both the very first run (backfill
+    up to stats_catchup_days of history) and every subsequent midnight (where only the
+    single just-closed day is actually new work) with the same code path."""
+    today = datetime.now(tz).date()
+    for entry in cfg.listener_allowed_chats:
+        try:
+            chat_entity = await resolve_chat(client, entry)
+        except Exception as e:
+            log(f"[stats] could not resolve '{entry}' for catch-up: {e}")
+            continue
+        for delta in range(cfg.stats_catchup_days, 0, -1):
+            day = today - timedelta(days=delta)
+            try:
+                await stats.finalize_and_record(client, chat_entity, entry, day, tz, log=log)
+            except Exception:
+                log(f"[stats] failed to catch up '{entry}' for {day}:\n{traceback.format_exc()}")
+
+
+async def run_stats_rollover(client, cfg, tz, log=print) -> None:
+    """Keeps stats.py's per-day-per-chat files up to date for every chat named in
+    LISTENER_ALLOWED_CHATS (stats tracking, like jokes, needs specific chats named --
+    there's no "everywhere" fallback): runs _stats_catch_up once immediately (covers a
+    restart that missed one or more midnights while down), then sleeps until the next
+    local midnight and runs it again, forever. A few seconds of buffer after :00 avoids
+    any edge-case race right at the rollover instant."""
+    if not cfg.listener_allowed_chats:
+        log("[stats] STATS_ENABLED is set but LISTENER_ALLOWED_CHATS is empty -- stats tracking needs specific chats named, so it's off.")
+        return
+
+    await _stats_catch_up(client, cfg, tz, log=log)
+    while True:
+        now = datetime.now(tz)
+        next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        await asyncio.sleep((next_run - now).total_seconds())
+        await _stats_catch_up(client, cfg, tz, log=log)
+
+
 def build_client(cfg) -> TelegramClient:
     try:
         return TelegramClient(build_session(cfg), cfg.api_id, cfg.api_hash)
@@ -981,6 +1024,39 @@ async def run_listener(
                     log(f"[listener] failed to delete save trigger message: {e}")
             return
 
+        # "/top today|week|month" and "/stat [username]" (stats.py) -- plain lookups over
+        # already-computed daily files, no OpenAI/cooldown involved, so these always work
+        # immediately regardless of the summary cooldown. Skipped once a bot account has
+        # taken over (bot_takeover), same as /summary -- bot_listener.py handles both
+        # there instead, to avoid two replies to the same command.
+        if not bot_takeover and cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
+            chat = await event.get_chat()
+            entry = matched_allowed_chat(chat)
+            if entry is None:
+                await event.reply("Статистика недоступна в этом чате.")
+                return
+            try:
+                if text_lower.startswith("/top"):
+                    period = stats.parse_top_command(text)
+                    reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
+                else:
+                    sender = await event.get_sender()
+                    arg = text[len("/stat") :].strip()
+                    user = await stats.resolve_stat_target(
+                        client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
+                    )
+                    reply_text = (
+                        stats.format_stat(user) if user else "Статистика не найдена -- пользователь ещё не отслеживается."
+                    )
+                await event.reply(reply_text)
+            except Exception:
+                log(f"[listener] error handling stats command:\n{traceback.format_exc()}")
+                try:
+                    await event.reply("Не удалось получить статистику.")
+                except Exception:
+                    pass
+            return
+
         # The trigger keyword (default "/summary") is the invocation itself, like a
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
@@ -1239,6 +1315,12 @@ async def run_listener(
 
         asyncio.create_task(_consume_bot_responses())
 
+    if cfg.stats_enabled:
+        # run_stats_rollover itself no-ops (with its own log line) if
+        # LISTENER_ALLOWED_CHATS is empty -- stats tracking, like jokes, needs specific
+        # chats named rather than defaulting to "everywhere".
+        asyncio.create_task(run_stats_rollover(client, cfg, tz, log=log))
+
     joke_status = (
         f"on ({cfg.joke_activity_min_messages} msgs to fill the buffer, "
         f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_min_seconds}-{cfg.joke_cooldown_max_seconds}s "
@@ -1251,11 +1333,13 @@ async def run_listener(
         if followup_enabled
         else "off"
     )
+    stats_status = "on" if (cfg.stats_enabled and cfg.listener_allowed_chats) else "off"
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
-        f"Joke: {joke_status}. Follow-up reactions: {followup_status}. Ctrl+C to stop."
+        f"Joke: {joke_status}. Follow-up reactions: {followup_status}. Stats (/top, /stat): {stats_status}. "
+        f"Ctrl+C to stop."
     )
     await client.run_until_disconnected()
 
