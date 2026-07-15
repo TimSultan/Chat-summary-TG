@@ -123,6 +123,7 @@ SUMMARY_ACK_EMOJI = "✍"
 
 ERROR_DELETE_AFTER = 10  # rejection notices (day limit, cooldown) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
+STATS_DELETE_AFTER = 300  # /top and /stat replies (incl. their own errors) self-delete after 5 minutes
 
 # "сохрани" (config.py, SAVE_TRIGGER_KEYWORD env var), sent by you as a reply to any
 # message, asks (via a confirmation prompt + reaction, like the roast flow) whether to
@@ -1057,7 +1058,10 @@ async def run_listener(
             chat = await event.get_chat()
             entry = matched_allowed_chat(chat)
             if entry is None:
-                await event.reply("Статистика недоступна в этом чате.")
+                sent = await event.reply("Статистика недоступна в этом чате.")
+                if sent is not None:
+                    sent_message_ids.add(sent.id)
+                    schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
                 return
             # Strips a same-account "@my_username" mention Telegram tacks onto the
             # command with no space (e.g. "/stat@Trash_Modelist") before parsing the
@@ -1077,11 +1081,17 @@ async def run_listener(
                     reply_text = (
                         stats.format_stat(user) if user else "Статистика не найдена -- пользователь ещё не отслеживается."
                     )
-                await event.reply(reply_text)
+                sent = await event.reply(reply_text)
+                if sent is not None:
+                    sent_message_ids.add(sent.id)
+                    schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
             except Exception:
                 log(f"[listener] error handling stats command:\n{traceback.format_exc()}")
                 try:
-                    await event.reply("Не удалось получить статистику.")
+                    sent = await event.reply("Не удалось получить статистику.")
+                    if sent is not None:
+                        sent_message_ids.add(sent.id)
+                        schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
                 except Exception:
                     pass
             return

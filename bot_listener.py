@@ -64,6 +64,7 @@ from listener import (
     NO_ROAST_MATERIAL_MESSAGE,
     ROAST_BUSY_EMOJI,
     ROAST_DELETE_AFTER,
+    STATS_DELETE_AFTER,
     SUMMARY_ACK_EMOJI,
     DayLimitExceeded,
     _format_hours,
@@ -722,10 +723,12 @@ async def _dispatch_update(
         chat_key = chat["id"]
         if matched_entry is None:
             try:
-                await api.send_message(
+                sent = await api.send_message(
                     chat_key, "Статистика недоступна в этом чате.",
                     reply_to_message_id=message["message_id"], parse_mode=None,
                 )
+                if sent and "message_id" in sent:
+                    schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
             except Exception:
                 pass
             return
@@ -753,14 +756,20 @@ async def _dispatch_update(
             # entries, /stat's "Имя:" line) -- Telegram's Markdown mode would reject the
             # whole message if that name has an unbalanced _/*/`/[ (a real username with
             # a single underscore is enough), so these are always sent as plain text.
-            await api.send_message(chat_key, reply_text, reply_to_message_id=message["message_id"], parse_mode=None)
+            sent = await api.send_message(
+                chat_key, reply_text, reply_to_message_id=message["message_id"], parse_mode=None
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
         except Exception:
             log(f"[bot_listener] error handling stats command:\n{traceback.format_exc()}")
             try:
-                await api.send_message(
+                sent = await api.send_message(
                     chat_key, "Не удалось получить статистику.",
                     reply_to_message_id=message["message_id"], parse_mode=None,
                 )
+                if sent and "message_id" in sent:
+                    schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
             except Exception:
                 pass
         return
