@@ -327,6 +327,45 @@ async def fetch_range_messages_cached(
     return chat_title, all_messages
 
 
+async def fetch_recent_messages_fresh(
+    client: TelegramClient, chat_ref, tz, limit: int, log=print
+) -> tuple[str, list[ChatMessage]]:
+    """Returns the most recent `limit` messages for `chat_ref`, always incorporating
+    anything sent since the last fetch -- unlike fetch_range_messages_cached, this never
+    reuses today's cache purely because it's still within transcript_cache.TODAY_TTL_SECONDS.
+    Used where "as of a few minutes ago" isn't good enough -- e.g. a manually-triggered
+    joke is supposed to react to what's happening right now, not a slightly-stale
+    snapshot, which is exactly what repeatedly asking within the same TTL window would
+    otherwise return unchanged.
+
+    Still cheap: if today is already cached, this only fetches messages newer than the
+    last cached one (fetch_new_messages) rather than re-fetching the whole day, and the
+    merged result is saved back to the cache so a /summary asked right after doesn't pay
+    for the same fetch again."""
+    entity = chat_ref if not isinstance(chat_ref, str) else await resolve_chat(client, chat_ref)
+    chat_title = getattr(entity, "title", None) or sender_display_name(entity)
+    today = datetime.now(tz).date()
+
+    cached = transcript_cache.load(entity.id, today, is_final=False)
+    if cached is not None and _has_message_ids(cached.messages):
+        last_id = max(d["message_id"] for d in cached.messages)
+        title, new_messages = await fetch_new_messages(client, entity, tz, min_id=last_id)
+        if title:
+            chat_title = title
+        merged = cached.messages + [_message_to_dict(m) for m in new_messages]
+        transcript_cache.save(entity.id, today, merged)
+        messages = [_message_from_dict(d) for d in merged]
+        log(f"[cache] fresh-fetched {len(new_messages)} new message(s) for today ({len(merged)} total)")
+    else:
+        log("[cache] fetching today from Telegram (no usable cache to resume from)...")
+        title, messages = await fetch_range_messages(client, entity, today, today, tz)
+        if title:
+            chat_title = title
+        transcript_cache.save(entity.id, today, [_message_to_dict(m) for m in messages])
+
+    return chat_title, messages[-limit:]
+
+
 def sender_matches(message: ChatMessage, user_filter: str) -> bool:
     """Case-insensitive match of a `--user`/target filter against a message's
     sender, by exact @username or substring of their display name."""

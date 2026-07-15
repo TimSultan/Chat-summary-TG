@@ -46,6 +46,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+from telethon import utils as tl_utils
 
 import chat_profile
 import history
@@ -72,7 +73,13 @@ from listener import (
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
 from roast import roast_person
-from telegram_fetch import fetch_range_messages_cached, format_transcript_lines, sender_matches
+from telegram_fetch import (
+    fetch_range_messages_cached,
+    fetch_recent_messages_fresh,
+    format_transcript_lines,
+    resolve_chat,
+    sender_matches,
+)
 
 MAX_REPLY_CHARS = 4000
 POLL_TIMEOUT_SECONDS = 30
@@ -134,6 +141,32 @@ def _match_allowed_chat(chat: dict, allowed_chats_original: list[str]) -> str | 
         if e in (username, title, chat_id):
             return entry
     return None
+
+
+async def _resolve_chat_id(telethon_client, entry: str, known_chat_ids: dict[str, int], log=print) -> int | None:
+    """Bot-API chat_id for `entry` (a LISTENER_ALLOWED_CHATS string). known_chat_ids
+    (learned passively as _dispatch_update observes live updates from that chat -- see
+    the comment there) is checked first since it's free; on a miss, this actively resolves
+    `entry` via the Telethon session instead of waiting for a future update to teach it.
+
+    This works because Telethon's default "marked" peer ids (telethon.utils.get_peer_id,
+    what event.chat_id etc. already use throughout this project) use exactly the same
+    numbering the Bot API uses for chat_id -- -100<channel_id> for supergroups/channels,
+    -chat_id for basic groups -- a stable, documented Telegram-wide convention, not
+    something specific to this bot. Without this fallback, a chat the bot hasn't
+    happened to see a live message from yet (e.g. right after a restart, or one whose
+    only traffic is manual "пошути" DMs) would be permanently unreachable by chat_id."""
+    chat_id = known_chat_ids.get(entry)
+    if chat_id is not None:
+        return chat_id
+    try:
+        entity = await resolve_chat(telethon_client, entry)
+        chat_id = tl_utils.get_peer_id(entity)
+    except Exception:
+        log(f"[bot_listener] failed to resolve chat_id for '{entry}':\n{traceback.format_exc()}")
+        return None
+    known_chat_ids[entry] = chat_id
+    return chat_id
 
 
 def _home_chat_ref(cfg) -> str | None:
@@ -489,11 +522,14 @@ async def handle_manual_joke(
     entry = home_chat_ref
 
     try:
-        today = datetime.now(tz).date()
-        chat_title, recent_messages = await fetch_range_messages_cached(
-            client=telethon_client, chat_ref=home_chat_ref, start_day=today, end_day=today, tz=tz, log=log,
+        # fetch_recent_messages_fresh, not fetch_range_messages_cached: a manual "пошути"
+        # is a deliberate, in-the-moment ask, so it needs to see whatever was *just*
+        # typed -- fetch_range_messages_cached would happily reuse today's cache as-is
+        # for up to TODAY_TTL_SECONDS (30 min), which is exactly why repeated tests
+        # within that window kept getting the same joke off the same stale tail.
+        chat_title, recent_messages = await fetch_recent_messages_fresh(
+            client=telethon_client, chat_ref=home_chat_ref, tz=tz, limit=30, log=log,
         )
-        recent_messages = recent_messages[-30:]
         lines = format_transcript_lines(recent_messages, include_date=False)
         if not lines:
             await api.send_message(
@@ -532,10 +568,10 @@ async def handle_manual_joke(
         )
         return
 
-    chat_id = known_chat_ids.get(entry)
+    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
     if chat_id is None:
         await api.send_message(
-            dm_chat_id, "Бот пока не видел ни одного сообщения в целевом чате -- не знаю, куда слать.",
+            dm_chat_id, f"Не удалось найти чат '{entry}' -- проверь LISTENER_ALLOWED_CHATS.",
             reply_to_message_id=message_id,
         )
         return
@@ -548,6 +584,7 @@ async def handle_manual_joke(
 
 async def handle_joke_preview_callback(
     api: TelegramBotAPI,
+    telethon_client,
     callback: dict,
     joke_preview_pending: dict[int, dict],
     known_chat_ids: dict[str, int],
@@ -567,9 +604,9 @@ async def handle_joke_preview_callback(
 
     entry = pending["entry"]
     joke_text = pending["joke_text"]
-    chat_id = known_chat_ids.get(entry)
+    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
     if chat_id is None:
-        await api.answer_callback_query(callback["id"], text="Не знаю, куда слать -- бот ещё не видел сообщений в этом чате.")
+        await api.answer_callback_query(callback["id"], text="Не удалось найти чат -- проверь LISTENER_ALLOWED_CHATS.")
         return
 
     try:
@@ -614,7 +651,7 @@ async def _dispatch_update(
     if callback is not None:
         if (callback.get("data") or "").startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(
-                api, callback, joke_preview_pending, known_chat_ids, joke_posted_queue, log=log,
+                api, telethon_client, callback, joke_preview_pending, known_chat_ids, joke_posted_queue, log=log,
             )
         else:
             await handle_bot_roast_callback(
@@ -780,8 +817,10 @@ async def run_bot_listener(
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     last_trigger: dict[int, float] = {}
-    # Populated by _dispatch_update as it observes chats -- see the comment there. Maps a
-    # LISTENER_ALLOWED_CHATS entry to the Bot-API chat_id it corresponds to, once seen.
+    # Maps a LISTENER_ALLOWED_CHATS entry to the Bot-API chat_id it corresponds to.
+    # Populated passively by _dispatch_update as it observes live updates from that chat
+    # (see the comment there) and, on a miss, actively by _resolve_chat_id via the
+    # Telethon session -- see that function's docstring for why that's safe to do.
     known_chat_ids: dict[str, int] = {}
     # "пошути превью" confirm-button state, keyed by the DM's own chat_id (see
     # handle_manual_joke) -- value: {"entry", "joke_text"}.
@@ -839,9 +878,9 @@ async def run_bot_listener(
         async def _consume_jokes():
             while True:
                 entry, joke_text = await joke_queue.get()
-                chat_id = known_chat_ids.get(entry)
+                chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
                 if chat_id is None:
-                    log(f"[bot_listener] dropping joke for '{entry}': no known chat_id yet (bot hasn't seen a message there)")
+                    log(f"[bot_listener] dropping joke for '{entry}': could not resolve a chat_id for it")
                     continue
                 try:
                     sent = await api.send_message(chat_id, joke_text)
