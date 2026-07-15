@@ -745,12 +745,14 @@ async def _dispatch_update(
             else:
                 arg = stats_text[len("/stat") :].strip()
                 from_user = message.get("from") or {}
-                user = await stats.resolve_stat_target(
+                user, rank, total = await stats.resolve_stat_target(
                     telethon_client, matched_entry, matched_entry, arg,
                     from_user.get("username"), _display_name(from_user), tz, log=log,
                 )
                 reply_text = (
-                    stats.format_stat(user) if user else "Статистика не найдена -- пользователь ещё не отслеживается."
+                    stats.format_stat(user, rank, total)
+                    if user
+                    else "Статистика не найдена -- пользователь ещё не отслеживается."
                 )
             # parse_mode=None: reply_text can embed a raw display name (leaderboard
             # entries, /stat's "Имя:" line) -- Telegram's Markdown mode would reject the

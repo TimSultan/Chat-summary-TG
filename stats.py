@@ -356,14 +356,16 @@ def _favorite_hour_label(hours: dict) -> str:
     return f"{best_hour:02d}:00–{(best_hour + 1) % 24:02d}:00"
 
 
-def format_stat(user: UserStats) -> str:
+def format_stat(user: UserStats, rank: int, total: int) -> str:
     avg = user.messages / user.active_days if user.active_days else 0.0
     last_seen = "нет данных"
     if user.last_message_at:
         last_seen = datetime.fromisoformat(user.last_message_at).strftime("%Y-%m-%d %H:%M")
     return (
-        "Статистика пользователя:\n\n"
+        "📊 Статистика пользователя:\n\n"
         f"Имя: {user.display_name}\n"
+        f"🏆 Очки: {user.score}\n"
+        f"📈 Место в рейтинге: {rank} из {total}\n"
         f"Сообщений: {user.messages}\n"
         f"Среднее сообщений в день: {avg:.1f}\n"
         f"Активность: {_ru_days(user.active_days)}\n"
@@ -390,17 +392,29 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
 
 async def resolve_stat_target(
     client, chat_ref, entry: str, arg: str, requester_username: str | None, requester_display_name: str, tz, log=print
-) -> UserStats | None:
+) -> tuple[UserStats | None, int | None, int]:
     """Resolves who a /stat command is asking about: an explicit argument (@username or
     a name fragment) if given, otherwise the requester's own tracked stats -- tried first
     by @username (exact), falling back to their display name (substring). Fetches the
     all-time-plus-today-live aggregate exactly once regardless of how many of those three
-    lookups it takes, rather than once per attempt."""
+    lookups it takes, rather than once per attempt.
+
+    Returns (user, rank, total): `rank` is the person's 1-based position by score among
+    everyone ever tracked for this chat (ties broken by dict iteration order, which is
+    stable but arbitrary -- fine for a gamified leaderboard, not meant to be exact), and
+    `total` is how many people that's out of. `rank` is None (with user) if no match was
+    found; `total` is still meaningful in that case (could be used for a "N people
+    tracked" message even without a match, though callers currently don't)."""
     all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
+    total = len(all_time)
     if arg:
-        return _find_user(all_time, arg)
-    if requester_username:
-        found = _find_user(all_time, requester_username)
-        if found is not None:
-            return found
-    return _find_user(all_time, requester_display_name)
+        user = _find_user(all_time, arg)
+    else:
+        user = _find_user(all_time, requester_username) if requester_username else None
+        if user is None:
+            user = _find_user(all_time, requester_display_name)
+    if user is None:
+        return None, None, total
+    ranked = sorted(all_time.values(), key=lambda s: s.score, reverse=True)
+    rank = next(i for i, s in enumerate(ranked, start=1) if s.user_id == user.user_id)
+    return user, rank, total

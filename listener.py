@@ -1075,11 +1075,13 @@ async def run_listener(
                 else:
                     sender = await event.get_sender()
                     arg = stats_text[len("/stat") :].strip()
-                    user = await stats.resolve_stat_target(
+                    user, rank, total = await stats.resolve_stat_target(
                         client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
                     )
                     reply_text = (
-                        stats.format_stat(user) if user else "Статистика не найдена -- пользователь ещё не отслеживается."
+                        stats.format_stat(user, rank, total)
+                        if user
+                        else "Статистика не найдена -- пользователь ещё не отслеживается."
                     )
                 sent = await event.reply(reply_text)
                 if sent is not None:
