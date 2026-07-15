@@ -126,7 +126,9 @@ keyword itself there's no fixed syntax — phrase it naturally.
 - **Impression fallback** — a request containing `впечатление` about one person, with no
   explicit date, starts with today. If that person has fewer than 15 matching messages
   today, yesterday is prepended and the impression uses both Moscow calendar days.
-  Explicit periods such as `сегодня` or `за вчера` are always respected as written.
+  If the combined two-day total is still below 15, the bot replies that the user was not
+  active during those days instead of asking the model to invent an impression. Explicit
+  periods such as `сегодня` or `за вчера` are always respected as written.
 
 **Before running this against real chats**, set `LISTENER_ALLOWED_CHATS` in `.env` to a
 comma-separated allowlist of chats (by `@username`, exact title, or numeric ID). Without

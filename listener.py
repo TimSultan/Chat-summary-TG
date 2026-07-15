@@ -51,7 +51,7 @@ from telegram_fetch import (
 
 MENTION_RE = re.compile(r"@(\w{4,32})")
 MAX_REPLY_CHARS = 4000  # stay under Telegram's ~4096 message limit
-IMPRESSION_MIN_TODAY_MESSAGES = 15
+IMPRESSION_MIN_MESSAGES = 15
 IMPRESSION_RE = re.compile(r"\bвпечатлен\w*", re.IGNORECASE)
 EXPLICIT_TIME_RE = re.compile(
     r"\b(?:сегодня|вчера|позавчера|today|yesterday|последн\w*|last\s+\d+|"
@@ -186,23 +186,23 @@ async def _expand_sparse_impression_history(
     messages: list,
     log=print,
     log_prefix: str = "[listener]",
-) -> tuple[date, list]:
+) -> tuple[date, list, bool]:
     """Prepends yesterday when today's target activity is below the impression floor.
 
     Explicit dates remain authoritative. The fallback only expands the otherwise-default
     current-day window, and stops after one additional Moscow calendar day.
     """
     if not _is_default_impression_request(text, routed, ref_date):
-        return current_start_date, messages
+        return current_start_date, messages, False
 
     username_hint = routed["username"]
     today_count = sum(1 for message in messages if sender_matches(message, username_hint))
-    if today_count >= IMPRESSION_MIN_TODAY_MESSAGES:
+    if today_count >= IMPRESSION_MIN_MESSAGES:
         log(
             f"{log_prefix} impression target '{username_hint}' has {today_count} message(s) "
             f"today; using today only"
         )
-        return current_start_date, messages
+        return current_start_date, messages, False
 
     previous_day = ref_date - timedelta(days=1)
     _, previous_messages = await fetch_range_messages_cached(
@@ -217,10 +217,10 @@ async def _expand_sparse_impression_history(
     combined_count = sum(1 for message in combined if sender_matches(message, username_hint))
     log(
         f"{log_prefix} impression target '{username_hint}' has only {today_count} message(s) "
-        f"today (<{IMPRESSION_MIN_TODAY_MESSAGES}); added {previous_day} "
+        f"today (<{IMPRESSION_MIN_MESSAGES}); added {previous_day} "
         f"({combined_count} target message(s) across both days)"
     )
-    return previous_day, combined
+    return previous_day, combined, combined_count < IMPRESSION_MIN_MESSAGES
 
 
 async def _fetch_album(client, chat_id: int, message) -> list:
@@ -485,7 +485,7 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
     if window_start_dt is not None:
         messages = [m for m in messages if window_start_dt <= m.dt_local <= window_end_dt]
 
-    start_date, messages = await _expand_sparse_impression_history(
+    start_date, messages, impression_inactive = await _expand_sparse_impression_history(
         client=event.client,
         chat_ref=chat,
         tz=tz,
@@ -496,6 +496,10 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
         messages=messages,
         log=log,
     )
+
+    if impression_inactive:
+        await respond(f"@{routed['username']} не был активным эти дни")
+        return
 
     focus_user = None
     username_hint = routed["username"]

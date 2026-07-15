@@ -438,7 +438,7 @@ async def handle_bot_summary_request(
     if window_start_dt is not None:
         messages = [m for m in messages if window_start_dt <= m.dt_local <= window_end_dt]
 
-    start_date, messages = await _expand_sparse_impression_history(
+    start_date, messages, impression_inactive = await _expand_sparse_impression_history(
         client=telethon_client,
         chat_ref=data_chat_ref,
         tz=tz,
@@ -450,6 +450,10 @@ async def handle_bot_summary_request(
         log=log,
         log_prefix="[bot_listener]",
     )
+
+    if impression_inactive:
+        await respond(f"@{routed['username']} не был активным эти дни")
+        return
 
     focus_user = None
     username_hint = routed["username"]
