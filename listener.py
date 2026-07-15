@@ -29,6 +29,7 @@ from telethon import TelegramClient, events, utils as tl_utils
 from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
+import chat_profile
 import history
 from config import build_session, load_config
 from errors import ChatSummaryError
@@ -774,7 +775,14 @@ async def run_listener(
 
         async def _run():
             try:
-                joke_text = await asyncio.to_thread(generate_joke, cfg.openai_api_key, cfg.openai_model, lines)
+                profile = await chat_profile.ensure_profile(
+                    client, chat, entry, cfg.openai_api_key, cfg.openai_model, tz,
+                    cfg.joke_profile_ttl_seconds, cfg.joke_profile_lookback_days, cfg.joke_profile_max_messages,
+                    log=log,
+                )
+                joke_text = await asyncio.to_thread(
+                    generate_joke, cfg.openai_api_key, cfg.openai_model, lines, profile
+                )
                 if joke_text:
                     await joke_queue.put((entry, joke_text))
                     log(f"[listener] queued joke for '{entry}': {joke_text!r}")

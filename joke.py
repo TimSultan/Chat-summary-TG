@@ -10,6 +10,11 @@ Because nothing reviews this before it posts, the model is explicitly given a wa
 decline (SKIP_SENTINEL) for moments that aren't actually appropriate to joke about --
 real arguments, heavy/personal topics, etc. -- rather than being forced to always produce
 something.
+
+Optionally takes a `flavor_profile` (see chat_profile.py) -- a compact, periodically
+refreshed description of the chat's own humor style and running jokes, built from several
+days of history -- so jokes read like they came from someone who's actually been in the
+room, not a generic bystander reacting only to the last few messages.
 """
 
 from openai import OpenAI, OpenAIError
@@ -40,18 +45,23 @@ JOKE_SYSTEM_PROMPT = """\
 больше: """ + SKIP_SENTINEL
 
 JOKE_USER_PROMPT = """\
-Последние сообщения в чате (формат "[HH:MM] Имя: текст"):
+{profile_section}Последние сообщения в чате (формат "[HH:MM] Имя: текст"):
 {transcript}
 
 Если момент подходящий -- напиши одну короткую смешную реплику по мотивам этого \
 разговора. Если нет -- ответь {skip}.
 """
 
+PROFILE_SECTION_TEMPLATE = "Атмосфера и юмор этого чата (используй как контекст, не пересказывай дословно):\n{profile}\n\n"
 
-def generate_joke(api_key: str, model: str, lines: list[str]) -> str | None:
+
+def generate_joke(api_key: str, model: str, lines: list[str], flavor_profile: str | None = None) -> str | None:
     """Returns a short joke string, or None if the model decided this isn't a good moment
     to joke (see SKIP_SENTINEL) or the response was otherwise empty. `lines` should be
-    recent chat messages formatted like telegram_fetch.format_transcript_lines."""
+    recent chat messages formatted like telegram_fetch.format_transcript_lines.
+    `flavor_profile`, if given (see chat_profile.py), is a compact description of the
+    chat's humor style/running jokes/regulars built from several days of history -- gives
+    the joke a sense of the room instead of judging purely off the live snippet."""
     if not api_key or not api_key.strip():
         raise ChatSummaryError("OpenAI API key is missing.")
     if not model or not model.strip():
@@ -60,7 +70,8 @@ def generate_joke(api_key: str, model: str, lines: list[str]) -> str | None:
         return None
 
     client = OpenAI(api_key=api_key)
-    prompt = JOKE_USER_PROMPT.format(transcript="\n".join(lines), skip=SKIP_SENTINEL)
+    profile_section = PROFILE_SECTION_TEMPLATE.format(profile=flavor_profile) if flavor_profile else ""
+    prompt = JOKE_USER_PROMPT.format(profile_section=profile_section, transcript="\n".join(lines), skip=SKIP_SENTINEL)
 
     try:
         response = client.chat.completions.create(

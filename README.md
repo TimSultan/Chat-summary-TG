@@ -205,6 +205,26 @@ of drawing from what was actually said. Verified against real chat transcripts -
 active public accusation/conflict and a body-image conversation were both correctly
 skipped, while ordinary banter got a short, specific, on-topic joke.
 
+**Feeling the room (`chat_profile.py`).** Every joke -- automatic or manual -- gets a
+compact "flavor profile" of the chat alongside whatever prompted it: recurring
+jokes/phrases, notable regulars and their vibe, general humor tone, built from a few days
+of the already-cached transcript (`JOKE_PROFILE_LOOKBACK_DAYS`, default 3). This is one
+OpenAI call, cached and reused for `JOKE_PROFILE_TTL_SECONDS` (default 24h) rather than
+regenerated per joke, so it stays cheap. Tested against a real (~2600-message) day: the
+generated profile correctly picked out recurring in-chat phrases, who the regular
+voices were and how they come across, and the chat's general tone -- without needing to
+be told any of that.
+
+**Manual trigger.** DM the bot `пошути` (`JOKE_MANUAL_TRIGGER_KEYWORD`) to fire a joke into
+the home chat right now, bypassing the buffer/cooldown/random-roll gates above -- it's an
+explicit ask. The model can still decline, and a joke that does go out still starts the
+normal cooldown, so this can't be used to dodge it. DM `пошути превью`
+(`JOKE_MANUAL_PREVIEW_KEYWORD`) instead to see the joke in the DM first, with a button to
+actually send it to the chat -- useful for trying the feature out without risking a dud
+landing in front of everyone. Both need `LISTENER_ALLOWED_CHATS` to name exactly one chat
+(same requirement as DM `/summary`), and work independently of `JOKE_ENABLED` -- a manual
+ask doesn't carry the "unprompted" risk that setting is guarding against.
+
 ## Model choice
 
 `config.py` defines `RECOMMENDED_MODELS`, curated as of July 2026: `gpt-5.4-mini`

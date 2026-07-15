@@ -47,6 +47,11 @@ class Config:
     joke_cooldown_max_seconds: int
     joke_reaction_threshold: int
     joke_reaction_cooldown_seconds: int
+    joke_manual_trigger_keyword: str
+    joke_manual_preview_keyword: str
+    joke_profile_lookback_days: int
+    joke_profile_ttl_seconds: int
+    joke_profile_max_messages: int
 
 
 def build_session(cfg: "Config"):
@@ -190,6 +195,38 @@ def load_config() -> Config:
             f"JOKE_REACTION_COOLDOWN_SECONDS must be >= 0, got {joke_reaction_cooldown_seconds}."
         )
 
+    joke_manual_trigger_keyword = os.getenv("JOKE_MANUAL_TRIGGER_KEYWORD", "пошути").strip().lower()
+    if not joke_manual_trigger_keyword:
+        raise ChatSummaryError("JOKE_MANUAL_TRIGGER_KEYWORD cannot be empty.")
+
+    joke_manual_preview_keyword = os.getenv("JOKE_MANUAL_PREVIEW_KEYWORD", "пошути превью").strip().lower()
+    if not joke_manual_preview_keyword:
+        raise ChatSummaryError("JOKE_MANUAL_PREVIEW_KEYWORD cannot be empty.")
+
+    joke_profile_lookback_raw = os.getenv("JOKE_PROFILE_LOOKBACK_DAYS", "3")
+    try:
+        joke_profile_lookback_days = int(joke_profile_lookback_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_PROFILE_LOOKBACK_DAYS must be a number, got '{joke_profile_lookback_raw}'.")
+    if joke_profile_lookback_days < 1:
+        raise ChatSummaryError(f"JOKE_PROFILE_LOOKBACK_DAYS must be >= 1, got {joke_profile_lookback_days}.")
+
+    joke_profile_ttl_raw = os.getenv("JOKE_PROFILE_TTL_SECONDS", "86400")
+    try:
+        joke_profile_ttl_seconds = int(joke_profile_ttl_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_PROFILE_TTL_SECONDS must be a number, got '{joke_profile_ttl_raw}'.")
+    if joke_profile_ttl_seconds < 1:
+        raise ChatSummaryError(f"JOKE_PROFILE_TTL_SECONDS must be >= 1, got {joke_profile_ttl_seconds}.")
+
+    joke_profile_max_raw = os.getenv("JOKE_PROFILE_MAX_MESSAGES", "1000")
+    try:
+        joke_profile_max_messages = int(joke_profile_max_raw)
+    except ValueError:
+        raise ChatSummaryError(f"JOKE_PROFILE_MAX_MESSAGES must be a number, got '{joke_profile_max_raw}'.")
+    if joke_profile_max_messages < 1:
+        raise ChatSummaryError(f"JOKE_PROFILE_MAX_MESSAGES must be >= 1, got {joke_profile_max_messages}.")
+
     return Config(
         api_id=api_id_int,
         api_hash=api_hash,
@@ -214,4 +251,9 @@ def load_config() -> Config:
         joke_cooldown_max_seconds=joke_cooldown_max_seconds,
         joke_reaction_threshold=joke_reaction_threshold,
         joke_reaction_cooldown_seconds=joke_reaction_cooldown_seconds,
+        joke_manual_trigger_keyword=joke_manual_trigger_keyword,
+        joke_manual_preview_keyword=joke_manual_preview_keyword,
+        joke_profile_lookback_days=joke_profile_lookback_days,
+        joke_profile_ttl_seconds=joke_profile_ttl_seconds,
+        joke_profile_max_messages=joke_profile_max_messages,
     )
