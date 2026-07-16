@@ -36,7 +36,7 @@ from errors import ChatSummaryError
 from followup import generate_followup_reply
 from intent import parse_summary_request, resolve_name_hint
 from intent_v2 import route_request
-from joke import generate_joke
+from joke import CONTEXT_MESSAGE_COUNT, generate_joke
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
 from roast import roast_person
@@ -801,11 +801,10 @@ async def run_listener(
             "[listener] JOKE_ENABLED is set but jokes need both TELEGRAM_BOT_TOKEN and a "
             "non-empty LISTENER_ALLOWED_CHATS -- jokes are off."
         )
-    # Per chat: a fixed-size ring buffer of the last cfg.joke_activity_min_messages
-    # qualifying messages -- once it's full, a joke attempt is considered (see
-    # maybe_joke). Using maxlen means this can never grow unbounded even if a chat stays
-    # busy through an entire cooldown, and "full" is exactly the trigger condition, with
-    # no separate counter to keep in sync.
+    # Per chat: a fixed-size activity ring buffer. It always holds at least the 20 live
+    # messages generate_joke needs for context. If the configured activity threshold is
+    # higher, only the newest 20 are sent to the model. Using maxlen keeps this bounded.
+    joke_buffer_size = max(cfg.joke_activity_min_messages, CONTEXT_MESSAGE_COUNT)
     joke_activity: dict[int, deque] = {}
     # Monotonic deadline before which a chat won't be considered again -- only set after
     # an actual joke is sent (never after a SKIP, see maybe_joke), so a decline just costs
@@ -949,7 +948,7 @@ async def run_listener(
         time window: a silent/sleeping chat simply never fills the buffer, so this can
         never fire there, no matter how long it waits.
 
-        Once full (cfg.joke_activity_min_messages messages), a fire is considered if the
+        Once full (joke_buffer_size messages), a fire is considered if the
         per-chat cooldown (joke_cooldown_until, unset until the first joke is ever sent)
         has passed and a random roll under JOKE_FIRE_PROBABILITY hits. The buffer is only
         cleared on an actual attempt (roll passed, OpenAI gets called) -- a roll *miss*
@@ -974,17 +973,17 @@ async def run_listener(
         now = time.monotonic()
         chat_key = event.chat_id
         joke_entry_to_chat[entry] = chat_key
-        bucket = joke_activity.setdefault(chat_key, deque(maxlen=cfg.joke_activity_min_messages))
+        bucket = joke_activity.setdefault(chat_key, deque(maxlen=joke_buffer_size))
         bucket.append((msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
 
-        if len(bucket) < cfg.joke_activity_min_messages:
+        if len(bucket) < joke_buffer_size:
             return
         if now < joke_cooldown_until.get(chat_key, float("-inf")):
             return
         if random.random() >= cfg.joke_fire_probability:
             return
 
-        lines = [f"[{hhmm}] {name}: {t}" for hhmm, name, t in bucket]
+        lines = [f"[{hhmm}] {name}: {t}" for hhmm, name, t in list(bucket)[-CONTEXT_MESSAGE_COUNT:]]
         bucket.clear()
         log(f"[listener] joke conditions met in '{getattr(chat, 'title', chat_key)}' ({len(lines)} msgs) -- generating")
 
@@ -1002,7 +1001,7 @@ async def run_listener(
                     await joke_queue.put((entry, joke_text))
                     log(f"[listener] queued joke for '{entry}': {joke_text!r}")
                 else:
-                    log(f"[listener] joke generation skipped itself for '{entry}' (not a good moment) -- next attempt after another {cfg.joke_activity_min_messages} messages")
+                    log(f"[listener] chat remark generation skipped itself for '{entry}' -- next attempt after another {joke_buffer_size} messages")
             except Exception:
                 log(f"[listener] error generating joke:\n{traceback.format_exc()}")
 
@@ -1455,7 +1454,7 @@ async def run_listener(
         asyncio.create_task(run_stats_rollover(client, cfg, tz, log=log))
 
     joke_status = (
-        f"on ({cfg.joke_activity_min_messages} msgs to fill the buffer, "
+        f"on ({joke_buffer_size} msgs to fill the buffer, "
         f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_min_seconds}-{cfg.joke_cooldown_max_seconds}s "
         f"cooldown, reduced to {cfg.joke_reaction_cooldown_seconds}s on {cfg.joke_reaction_threshold}+ reactions)"
         if joke_enabled

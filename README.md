@@ -213,13 +213,19 @@ moment where adding a message would feel forced.
 
 **Feeling the room (`chat_profile.py`).** Every remark -- automatic or manual -- gets a
 compact "flavor profile" of the chat alongside whatever prompted it: language mixing,
-typical message length and structure, casing, punctuation, slang, emoji habits,
-conversational rhythm, recurring context, and humor only where relevant, built from a few days
+typical message length and structure, casing, punctuation, slang, conversational rhythm,
+recurring context, and tone, built from a few days
 of the already-cached transcript (`JOKE_PROFILE_LOOKBACK_DAYS`, default 3). This is one
 OpenAI call, cached and reused for `JOKE_PROFILE_TTL_SECONDS` (default 24h) rather than
-regenerated per remark, so it stays cheap. Tested against a real (~2600-message) day: the
-The profile format is versioned, so changing these instructions invalidates an older
-humor-focused cache immediately instead of waiting for its normal TTL.
+regenerated per remark, so it stays cheap. The profile format is versioned, so changing
+these instructions invalidates an older cached profile immediately instead of waiting
+for its normal TTL.
+
+For each actual remark, the model gets exactly the newest 20 live chat messages. The
+first 15 are labelled as background context; the final 5 are labelled as the active
+conversation it must answer. Manual preview uses the same 20-message window. The model
+may add something useful, funny, serious, sarcastic, or simply conversational, but is
+never asked to produce a joke and is told not to use emoji.
 
 **Manual trigger.** DM the bot `пошути` (`JOKE_MANUAL_TRIGGER_KEYWORD`) to generate a remark in
 the home chat right now, bypassing the buffer/cooldown/random-roll gates above -- it's an

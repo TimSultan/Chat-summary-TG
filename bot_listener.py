@@ -57,7 +57,7 @@ from config import build_session, load_config
 from errors import ChatSummaryError
 from intent import resolve_name_hint
 from intent_v2 import route_request
-from joke import generate_joke
+from joke import CONTEXT_MESSAGE_COUNT, generate_joke
 from listener import (
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
@@ -562,7 +562,7 @@ async def handle_manual_joke(
 
     if not home_chat_ref:
         await api.send_message(
-            dm_chat_id, "Не настроен основной чат (LISTENER_ALLOWED_CHATS) -- некому шутить.",
+            dm_chat_id, "Не настроен основной чат (LISTENER_ALLOWED_CHATS) -- некуда отправить сообщение.",
             reply_to_message_id=message_id,
         )
         return
@@ -575,12 +575,12 @@ async def handle_manual_joke(
         # for up to TODAY_TTL_SECONDS (30 min), which is exactly why repeated tests
         # within that window kept getting the same joke off the same stale tail.
         chat_title, recent_messages = await fetch_recent_messages_fresh(
-            client=telethon_client, chat_ref=home_chat_ref, tz=tz, limit=30, log=log,
+            client=telethon_client, chat_ref=home_chat_ref, tz=tz, limit=CONTEXT_MESSAGE_COUNT, log=log,
         )
         lines = format_transcript_lines(recent_messages, include_date=False)
         if not lines:
             await api.send_message(
-                dm_chat_id, "Пока не о чем шутить -- в чате сегодня было пусто.", reply_to_message_id=message_id
+                dm_chat_id, "Пока нет контекста -- в чате сегодня было пусто.", reply_to_message_id=message_id
             )
             return
 
@@ -591,12 +591,12 @@ async def handle_manual_joke(
         joke_text = await asyncio.to_thread(generate_joke, cfg.openai_api_key, cfg.openai_model, lines, profile)
     except Exception:
         log(f"[bot_listener] error generating manual joke:\n{traceback.format_exc()}")
-        await api.send_message(dm_chat_id, "Что-то пошло не так при генерации шутки.", reply_to_message_id=message_id)
+        await api.send_message(dm_chat_id, "Что-то пошло не так при генерации сообщения.", reply_to_message_id=message_id)
         return
 
     if not joke_text:
         await api.send_message(
-            dm_chat_id, "Не придумалось ничего уместного прямо сейчас -- момент неподходящий.",
+            dm_chat_id, "Сейчас нечего естественно добавить к разговору.",
             reply_to_message_id=message_id,
         )
         return
