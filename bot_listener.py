@@ -371,7 +371,8 @@ async def handle_bot_summary_request(
     chat_id = chat["id"]
     message_id = message["message_id"]
     text = message.get("text") or ""
-    requester = _display_name(message.get("from"))
+    sender = message.get("from") or {}
+    requester = _display_name(sender)
     chat_title_for_history = chat.get("title") or chat.get("first_name") or "Unknown chat"
     request_dt = datetime.fromtimestamp(message["date"], tz=timezone.utc)
 
@@ -412,6 +413,8 @@ async def handle_bot_summary_request(
             reference_date=ref_date,
             mentioned_usernames=mentioned,
             my_username=bot_username,
+            requester_username=sender.get("username"),
+            requester_name=requester,
         )
     except Exception as e:
         log(f"[bot_listener] intent_v2 routing failed: {e}")
@@ -457,7 +460,17 @@ async def handle_bot_summary_request(
 
     focus_user = None
     username_hint = routed["username"]
-    if username_hint:
+    if routed.get("requester_is_target"):
+        # The transcript is labelled with display names; sender_id below guarantees this
+        # is the actual requester even if another participant has a similar name.
+        focus_user = requester
+        requester_id = sender.get("id")
+        matched = sum(1 for m in messages if requester_id is not None and m.sender_id == requester_id)
+        log(f"[bot_listener] focus_user(requester)={focus_user} matched={matched}/{len(messages)}")
+        if matched == 0:
+            await respond(f"Сообщений от {requester} за этот период не найдено.")
+            return
+    elif username_hint:
         from_explicit_mention = any(username_hint.lower() == m.lower() for m in mentioned)
         if from_explicit_mention:
             focus_user = username_hint

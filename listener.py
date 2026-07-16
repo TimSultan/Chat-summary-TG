@@ -459,6 +459,8 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
             reference_date=ref_date,
             mentioned_usernames=mentioned,
             my_username=my_username,
+            requester_username=getattr(sender, "username", None),
+            requester_name=requester,
         )
     except Exception as e:
         log(f"[listener] intent_v2 routing failed: {e}")
@@ -503,7 +505,17 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
 
     focus_user = None
     username_hint = routed["username"]
-    if username_hint:
+    if routed.get("requester_is_target"):
+        # The formatted transcript contains display names, so use the requester's exact
+        # display name for the answer prompt; use Telegram sender_id for precise matching.
+        focus_user = requester
+        requester_id = getattr(sender, "id", None)
+        matched = sum(1 for m in messages if requester_id is not None and m.sender_id == requester_id)
+        log(f"[listener] v2 focus_user(requester)={focus_user} matched={matched}/{len(messages)}")
+        if matched == 0:
+            await respond(f"Сообщений от {requester} за этот период не найдено.")
+            return
+    elif username_hint:
         # An exact match against an @mention actually present in the message is a
         # literal request about that account's own messages -- safe (and cheap) to bail
         # out early if they posted nothing at all. Anything else is a plain name/nickname

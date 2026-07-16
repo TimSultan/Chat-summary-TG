@@ -16,18 +16,35 @@ written in -- see responder_v2.py -- so there is no reply_language field here.
 """
 
 import json
+import re
 from datetime import date
 
 from openai import OpenAI, OpenAIError
 
 from errors import ChatSummaryError
 
+SELF_REFERENCE_RE = re.compile(
+    r"\b(?:"
+    r"обо?\s+мне|про\s+меня|насч[её]т\s+меня|по\s+мне|"
+    r"кто\s+я|како(?:й|ая)\s+я|что\s+я\s+(?:писал|писала|говорил|говорила|обсуждал|обсуждала)|"
+    r"мо(?:й|я|ё|е|и|ю|его|ей|их|им|ими|ём|ем)\b|"
+    r"about\s+me|who\s+am\s+i|my\b|what\s+(?:did|do|have)\s+i\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_self_referential_request(text: str) -> bool:
+    """True for an explicit request about the author, not merely a phrase such as
+    "расскажи мне про Бориса" where "мне" is only the indirect object."""
+    return bool(SELF_REFERENCE_RE.search(text or ""))
+
 SYSTEM_PROMPT = """\
 Ты превращаешь короткое сообщение из чата в структурированный запрос на выборку истории \
 переписки Telegram, плюс очищенную формулировку вопроса для второго ИИ-шага, который на него \
 ответит. Сообщение может быть на смеси языков (например, русский и английский) и может как \
-называть конкретного человека, так и не называть. Тебе даны сегодняшняя опорная дата и все \
-@username, упомянутые в сообщении.
+называть конкретного человека, так и не называть. Тебе даны сегодняшняя опорная дата, все \
+@username, упомянутые в сообщении, и точная личность автора запроса.
 
 Верни ТОЛЬКО JSON-объект с этими полями:
 - "start_date": дата в формате ISO (YYYY-MM-DD), с которой начинается запрошенный период.
@@ -48,7 +65,9 @@ SYSTEM_PROMPT = """\
 оно написано в запросе (без ведущей @; оно может быть с опечаткой, сокращено или транслитерировано \
 с другого алфавита). НИКОГДА не указывай сюда собственный username бота (дан ниже) -- сообщение \
 часто *начинается* с "@такойюзернейм" просто чтобы обратиться к боту/вызвать его, а не потому что \
-вопрос про него. Иначе null, если запрос про чат/переписку в целом, а не про конкретного человека.
+вопрос про него. Если автор говорит о себе (например, "обо мне", "про меня", "мои сообщения", \
+"what did I say", "about me"), укажи username автора запроса, данный ниже, или его отображаемое \
+имя, если username нет. Иначе null, если запрос про чат/переписку в целом, а не про конкретного человека.
 - "cleaned_question": запрос пользователя, переформулированный в один ясный, самодостаточный \
 вопрос или инструкцию на ТОМ ЖЕ языке, с удалённым триггерным словом и любым обращением к боту -- \
 второй ИИ-шаг увидит ТОЛЬКО этот текст плюс переписку, без остального контекста, так что он \
@@ -61,6 +80,8 @@ USER_PROMPT_TEMPLATE = """\
 Опорная дата: {reference_date}
 Собственный username бота (к нему обращаются/его вызывают этим сообщением -- НИКОГДА не тема \
 вопроса, даже если он часто встречается как ведущее упоминание @username): {my_username}
+Автор запроса: {requester_name}
+Username автора запроса: {requester_username}
 Упомянутые в сообщении username (кроме бота): {mentioned}
 Текст запроса: {text}
 """
@@ -73,15 +94,26 @@ def route_request(
     reference_date: date,
     mentioned_usernames: list[str],
     my_username: str | None = None,
+    requester_username: str | None = None,
+    requester_name: str | None = None,
 ) -> dict:
     if not text or not text.strip():
         raise ChatSummaryError("Cannot parse an empty summary request.")
     assert isinstance(mentioned_usernames, list), "internal bug: mentioned_usernames must be a list"
 
+    requester_target = (requester_username or requester_name or "").strip().lstrip("@") or None
+    # Explicit @mentions of somebody else remain authoritative. This avoids treating a
+    # mixed request such as "что @bob писал обо мне" as a simple one-person self summary.
+    requester_is_target = bool(
+        requester_target and not mentioned_usernames and is_self_referential_request(text)
+    )
+
     client = OpenAI(api_key=api_key)
     prompt = USER_PROMPT_TEMPLATE.format(
         reference_date=reference_date.isoformat(),
         my_username=my_username or "(unknown)",
+        requester_name=requester_name or "(unknown)",
+        requester_username=requester_username or "(none)",
         mentioned=", ".join(mentioned_usernames) or "(none)",
         text=text,
     )
@@ -115,6 +147,10 @@ def route_request(
     # what the model returned -- it just means the bot was addressed, not asked about.
     if username and my_username and username.lower() == my_username.lower():
         username = None
+    # First-person pronouns have a deterministic meaning; never let the model bind them
+    # to a similarly named or recently discussed chat participant.
+    if requester_is_target:
+        username = requester_target
 
     def _parse(value, fallback):
         try:
@@ -138,6 +174,12 @@ def route_request(
         cleaned_question = cleaned_question.strip() or None
     if not cleaned_question:
         cleaned_question = text.strip()  # fall back to the raw request rather than nothing
+    if requester_is_target:
+        requester_label = (requester_name or requester_target).strip()
+        cleaned_question = (
+            f"{cleaned_question}\nПод первым лицом (я/мне/меня/мой) имеется в виду автор "
+            f"запроса: {requester_label}."
+        )
 
     return {
         "start_date": start_date,
@@ -145,4 +187,5 @@ def route_request(
         "lookback_hours": lookback_hours,
         "username": username,
         "cleaned_question": cleaned_question,
+        "requester_is_target": requester_is_target,
     }
