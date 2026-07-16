@@ -177,11 +177,13 @@ anything is sent -- with no "generating..." message in between, that looks like 
 hung. `ROAST_MAX_MESSAGES` (default 400) caps input to the requester's most recent N
 messages to keep this bounded; lower it for faster/cheaper roasts.
 
-### Jokes -- off by default
+### Natural chat remarks -- off by default
 
 Unlike everything else in this project, `JOKE_ENABLED=true` (`.env`) adds one thing
-nobody has to ask for: an occasional short, in-context joke or remark, dropped into the
-chat while it's actually active. Requires a bot account (`TELEGRAM_BOT_TOKEN`) and a
+nobody has to ask for: an occasional short, in-context remark, dropped into the chat
+while it's actually active. Despite the legacy `JOKE_*` setting names, the prompt does
+not ask the bot to make a joke; it asks for an ordinary continuation in the room's own
+style, with a short sarcastic reaction only when that naturally fits. Requires a bot account (`TELEGRAM_BOT_TOKEN`) and a
 non-empty `LISTENER_ALLOWED_CHATS` -- it never defaults to "everywhere" the way
 `/summary` does, and always posts as the bot, never your personal account.
 
@@ -193,39 +195,37 @@ Once the buffer's full, it fires if the chat's cooldown has passed and a random 
 `JOKE_FIRE_PROBABILITY` (default 0.35) hits; a miss doesn't reset the buffer, so the very
 next message tries again rather than needing a whole new batch of 20.
 
-Cooldown only ever kicks in after an actual joke gets sent -- `JOKE_COOLDOWN_MIN_SECONDS`/
+Cooldown only ever kicks in after an actual remark gets sent -- `JOKE_COOLDOWN_MIN_SECONDS`/
 `JOKE_COOLDOWN_MAX_SECONDS` (default 30-60 min, picked randomly each time so it's not a
 flat interval). If the model declines instead (see below), there's no cooldown at all --
 it just costs another full buffer of messages, not a timer, so one tense stretch of chat
-can't suppress jokes for an hour once things lighten back up. A joke that lands well gets
+can't suppress remarks for an hour once things lighten back up. A remark that lands well gets
 rewarded: if it picks up `JOKE_REACTION_THRESHOLD` (default 3) reactions, that chat's
 cooldown is pulled in to `JOKE_REACTION_COOLDOWN_SECONDS` (default 30 min) from when it
 was posted, whichever is sooner.
 
-On top of all of that, nothing reviews a joke before it posts, so the model itself
+On top of all of that, nothing reviews a remark before it posts, so the model itself
 (`joke.py`) is instructed to back off (respond with a `SKIP` sentinel, which is silently
 dropped -- nothing gets sent) for anything that isn't actually a good moment: an active
 argument, a heavy or personal topic (appearance, health, money, relationships, grief),
-protected-characteristic territory, or anything it would otherwise have to invent instead
-of drawing from what was actually said. Verified against real chat transcripts -- an
-active public accusation/conflict and a body-image conversation were both correctly
-skipped, while ordinary banter got a short, specific, on-topic joke.
+protected-characteristic territory, anything it would otherwise have to invent, or a
+moment where adding a message would feel forced.
 
-**Feeling the room (`chat_profile.py`).** Every joke -- automatic or manual -- gets a
-compact "flavor profile" of the chat alongside whatever prompted it: recurring
-jokes/phrases, notable regulars and their vibe, general humor tone, built from a few days
+**Feeling the room (`chat_profile.py`).** Every remark -- automatic or manual -- gets a
+compact "flavor profile" of the chat alongside whatever prompted it: language mixing,
+typical message length and structure, casing, punctuation, slang, emoji habits,
+conversational rhythm, recurring context, and humor only where relevant, built from a few days
 of the already-cached transcript (`JOKE_PROFILE_LOOKBACK_DAYS`, default 3). This is one
 OpenAI call, cached and reused for `JOKE_PROFILE_TTL_SECONDS` (default 24h) rather than
-regenerated per joke, so it stays cheap. Tested against a real (~2600-message) day: the
-generated profile correctly picked out recurring in-chat phrases, who the regular
-voices were and how they come across, and the chat's general tone -- without needing to
-be told any of that.
+regenerated per remark, so it stays cheap. Tested against a real (~2600-message) day: the
+The profile format is versioned, so changing these instructions invalidates an older
+humor-focused cache immediately instead of waiting for its normal TTL.
 
-**Manual trigger.** DM the bot `пошути` (`JOKE_MANUAL_TRIGGER_KEYWORD`) to fire a joke into
+**Manual trigger.** DM the bot `пошути` (`JOKE_MANUAL_TRIGGER_KEYWORD`) to generate a remark in
 the home chat right now, bypassing the buffer/cooldown/random-roll gates above -- it's an
-explicit ask. The model can still decline, and a joke that does go out still starts the
+explicit ask. The model can still decline, and a remark that does go out still starts the
 normal cooldown, so this can't be used to dodge it. DM `пошути превью`
-(`JOKE_MANUAL_PREVIEW_KEYWORD`) instead to see the joke in the DM first, with a button to
+(`JOKE_MANUAL_PREVIEW_KEYWORD`) instead to see the remark in the DM first, with a button to
 actually send it to the chat -- useful for trying the feature out without risking a dud
 landing in front of everyone. Both need `LISTENER_ALLOWED_CHATS` to name exactly one chat
 (same requirement as DM `/summary`), and work independently of `JOKE_ENABLED` -- a manual
@@ -303,7 +303,7 @@ generate a portable session first:
    warning above), `LISTENER_TRIGGER_KEYWORDS`, `SUMMARY_QUEUE_DELAY_SECONDS`,
    `ROAST_TRIGGER_KEYWORDS`, `ROAST_LOOKBACK_DAYS`, `TELEGRAM_BOT_TOKEN` (if replies
    should come from a bot account instead of this one -- see above), `JOKE_ENABLED` and
-   the other `JOKE_*` vars if you also want the occasional unprompted joke (off by
+   the other `JOKE_*` vars if you also want the occasional unprompted remark (off by
    default; see Jokes above).
 4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
    running.
