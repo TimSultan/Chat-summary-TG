@@ -460,16 +460,18 @@ async def handle_bot_summary_request(
 
     focus_user = None
     username_hint = routed["username"]
-    if routed.get("requester_is_target"):
-        # The transcript is labelled with display names; sender_id below guarantees this
-        # is the actual requester even if another participant has a similar name.
+    requester_aliases = {
+        value.strip().lstrip("@").lower()
+        for value in (requester, sender.get("username"))
+        if value and value.strip()
+    }
+    if username_hint and username_hint.strip().lstrip("@").lower() in requester_aliases:
+        # The router interpreted the original request as being about its author. Use the
+        # transcript's display name and verify the identity with Telegram sender_id.
         focus_user = requester
         requester_id = sender.get("id")
         matched = sum(1 for m in messages if requester_id is not None and m.sender_id == requester_id)
         log(f"[bot_listener] focus_user(requester)={focus_user} matched={matched}/{len(messages)}")
-        if matched == 0:
-            await respond(f"Сообщений от {requester} за этот период не найдено.")
-            return
     elif username_hint:
         from_explicit_mention = any(username_hint.lower() == m.lower() for m in mentioned)
         if from_explicit_mention:
@@ -493,8 +495,9 @@ async def handle_bot_summary_request(
                 log(f"[bot_listener] resolved name hint '{username_hint}' -> '{focus_user}'")
             else:
                 log(f"[bot_listener] could not resolve name hint '{username_hint}' among participants")
-                await respond(f"Не понял, о ком речь: \"{username_hint}\".")
-                return
+                # The final responder sees the original request and requester identity;
+                # let it decide rather than stopping on an uncertain name match.
+                focus_user = None
 
     lines = format_transcript_lines(messages, include_date=(start_date != end_date))
     if window_start_dt is not None:
@@ -518,6 +521,8 @@ async def handle_bot_summary_request(
         question=routed["cleaned_question"],
         focus_user=focus_user,
         style="reply",
+        original_request=text,
+        requester_name=requester,
     )
 
     sent_ids = await respond(f"{answer}\n\n{COMMANDS_FOOTER}")

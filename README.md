@@ -284,11 +284,12 @@ nicknames, and script transliteration, e.g. "Anzhelika" for a Cyrillic "Анже
 scopes the summary to topics that person was involved in, including ones others
 discussed *about* them without them posting.
 
-First-person requests such as `/summary расскажи обо мне`, `/summary про меня`,
-`/summary мои сообщения`, and `/summary about me` are bound directly to the Telegram
-account that sent the request. The router receives the requester's username and display
-name, and the listener verifies the target using Telegram's numeric sender ID, so the
-model cannot accidentally resolve "me" to another participant with a similar name.
+The router receives the requester's username and display name, which lets it understand
+first-person requests such as `/summary расскажи обо мне` without a rigid phrase list.
+The final answering model also receives the exact original Telegram message—not only the
+router's cleaned interpretation—and is told to prioritize the user's actual wording and
+treat first-person pronouns relative to that sender. When the router selects the
+requester, the listener confirms that identity using Telegram's numeric sender ID.
 
 ## Deploying the listener to Railway
 

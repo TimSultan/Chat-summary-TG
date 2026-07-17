@@ -1,6 +1,6 @@
-"""v2 answering step: given a transcript and the user's already-cleaned question
-(intent_v2.route_request's `cleaned_question`), produces one direct answer in a single
-prompt -- no separate topic-shape/length-hint rule stack like summarizer.py's
+"""v2 answering step: given a transcript, the user's original request, and the router's
+cleaned interpretation, produces one direct answer in a single prompt -- no separate
+topic-shape/length-hint rule stack like summarizer.py's
 TOPIC_ONLY_RULES/LENGTH_HINT_RULE/DIRECT_QUESTION_RULE; the model decides the right shape
 itself (direct answer vs. topic-by-topic rundown) based on what's actually being asked.
 
@@ -51,12 +51,34 @@ SYSTEM_PROMPT_BASE = """\
 """
 
 FOCUS_USER_RULE = """\
-Сосредоточься конкретно на {focus_user}: что он(а) писал(а), в каких темах активно участвовал(а), \
+Маршрутизатор предположил, что вероятный фокус вопроса -- {focus_user}. Используй это как подсказку, \
+если она согласуется с исходным сообщением пользователя. Если исходное сообщение указывает на \
+другого человека или ставит вопрос иначе, игнорируй эту подсказку и следуй исходному сообщению. \
+Когда подсказка верна, сосредоточься на том, что {focus_user} писал(а), в каких темах участвовал(а), \
 или темах, которые касались его/её по существу, даже если он(а) сам(а) не писал(а) (например, вопрос \
 "что там за ситуация с {focus_user}" означает драму/событие/решение, связанное с этим человеком, а \
 не только его/её собственные сообщения). Игнорируй обсуждения, к которым он(а) не имеет реального \
 отношения. Если в переписке нет ничего существенного про этого человека, коротко скажи об этом \
 вместо того, чтобы выдумывать содержимое.
+"""
+
+REQUESTER_RULE = """\
+Автор исходного запроса -- {requester_name}. Учитывай, кто задал вопрос: местоимения первого \
+лица ("я", "мне", "меня", "мой", "I", "me", "my") в исходном сообщении относятся к этому \
+человеку. Отвечай именно на вопрос автора, сохраняя его смысл и акценты.
+"""
+
+REQUEST_CONTEXT_TEMPLATE = """\
+Автор запроса: {requester_name}
+Исходное сообщение пользователя (главный источник смысла вопроса):
+---
+{original_request}
+---
+Очищенная интерпретация маршрутизатора (только вспомогательная подсказка):
+---
+{question}
+---
+Если интерпретация потеряла нюанс или расходится с исходным сообщением, следуй исходному сообщению.
 """
 
 REPLY_STYLE_RULE = """\
@@ -91,7 +113,7 @@ FILE_STYLE_RULE = """\
 MAP_PROMPT = """\
 Ниже -- ЧАСТЬ {part} из {total} переписки чата (в хронологическом порядке, формат \
 "[HH:MM] Имя: текст" или "[YYYY-MM-DD HH:MM] Имя: текст").
-Вопрос, на который в итоге нужно будет ответить с помощью этой переписки: "{question}"
+{request_context}
 Выпиши из этой части черновые заметки, релевантные для ответа на этот вопрос -- примерное время/\
 дату, кто участвовал, и ключевые тезисы/позиции. Отбрось явный чистый спам, однословные реакции и \
 приветствия, но в остальном сохрани достаточно деталей, чтобы на следующем шаге можно было оценить \
@@ -104,7 +126,7 @@ MAP_PROMPT = """\
 FINAL_FROM_TRANSCRIPT_PROMPT = """\
 Чат: {chat_title}
 Период: {period_label}
-Вопрос: {question}
+{request_context}
 
 Полная переписка за этот период (в хронологическом порядке, формат "[HH:MM] Имя: текст" или \
 "[YYYY-MM-DD HH:MM] Имя: текст"):
@@ -114,7 +136,7 @@ FINAL_FROM_TRANSCRIPT_PROMPT = """\
 FINAL_FROM_NOTES_PROMPT = """\
 Чат: {chat_title}
 Период: {period_label}
-Вопрос: {question}
+{request_context}
 
 Переписка оказалась слишком длинной для одного прохода, поэтому её разбили на {total} частей, и \
 по каждой части ниже сделаны черновые заметки. Некоторые темы могут продолжаться в нескольких \
@@ -125,9 +147,11 @@ FINAL_FROM_NOTES_PROMPT = """\
 """
 
 
-def _build_system_prompt(style: str, focus_user: str | None) -> str:
+def _build_system_prompt(style: str, focus_user: str | None, requester_name: str | None = None) -> str:
     assert style in VALID_STYLES, f"internal bug: unknown style {style!r}, expected one of {VALID_STYLES}"
     parts = [SYSTEM_PROMPT_BASE]
+    if requester_name:
+        parts.append(REQUESTER_RULE.format(requester_name=requester_name))
     if focus_user:
         parts.append(FOCUS_USER_RULE.format(focus_user=focus_user))
     parts.append(REPLY_STYLE_RULE if style == "reply" else FILE_STYLE_RULE)
@@ -172,6 +196,8 @@ def answer_request(
     # default paid for another full copy of the system prompt plus a "notes" step that
     # then got fed back in as input to the final call.
     max_chunk_tokens: int = 200_000,
+    original_request: str | None = None,
+    requester_name: str | None = None,
 ) -> str:
     if style not in VALID_STYLES:
         raise ChatSummaryError(f"Unknown summary style '{style}', expected one of {VALID_STYLES}.")
@@ -191,20 +217,40 @@ def answer_request(
         return no_content_msg
 
     client = OpenAI(api_key=api_key)
-    system_prompt = _build_system_prompt(style, focus_user)
+    original_request = (original_request or question).strip()
+    requester_label = (requester_name or "неизвестный пользователь").strip()
+    request_context = REQUEST_CONTEXT_TEMPLATE.format(
+        requester_name=requester_label,
+        original_request=original_request,
+        question=question.strip(),
+    )
+
+    system_prompt = _build_system_prompt(style, focus_user, requester_name)
     chunks = chunk_transcript(lines, max_chunk_tokens, model)
 
     if len(chunks) == 1:
         prompt = FINAL_FROM_TRANSCRIPT_PROMPT.format(
-            chat_title=chat_title, period_label=period_label, question=question, transcript=chunks[0]
+            chat_title=chat_title,
+            period_label=period_label,
+            request_context=request_context,
+            transcript=chunks[0],
         )
         return _chat(client, model, system_prompt, prompt)
 
-    focus_note = f"\nОставляй только заметки, релевантные для {focus_user}.\n" if focus_user else ""
+    focus_note = (
+        f"\nПредполагаемый фокус -- {focus_user}; используй его только если он согласуется "
+        "с исходным сообщением пользователя.\n"
+        if focus_user
+        else ""
+    )
     notes_parts = []
     for i, chunk in enumerate(chunks, start=1):
         prompt = MAP_PROMPT.format(
-            part=i, total=len(chunks), question=question, transcript=chunk, focus_note=focus_note
+            part=i,
+            total=len(chunks),
+            request_context=request_context,
+            transcript=chunk,
+            focus_note=focus_note,
         )
         notes = _chat(client, model, system_prompt, prompt)
         notes_parts.append(f"--- Заметки по части {i} ---\n{notes}")
@@ -213,7 +259,7 @@ def answer_request(
     final_prompt = FINAL_FROM_NOTES_PROMPT.format(
         chat_title=chat_title,
         period_label=period_label,
-        question=question,
+        request_context=request_context,
         total=len(chunks),
         notes=combined_notes,
     )

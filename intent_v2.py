@@ -6,8 +6,8 @@ request is about -- plus a cleaned-up restatement of the question itself.
 Unlike intent.py (v1), this does NOT try to extract scope/topic_hint/length_hint as
 separate structured fields. Everything beyond "which messages do we need" (what's being
 asked, how it should be phrased/shaped) is left to responder_v2.py's single freeform
-answering step, which gets the transcript plus `cleaned_question` and decides the rest
-itself. Username resolution against actual chat participants (for a plain name/nickname
+answering step, which gets the transcript, the original request, the requester's identity,
+and `cleaned_question`, then decides the rest itself. Username resolution against actual chat participants (for a plain name/nickname
 rather than an exact @mention) still reuses intent.py's resolve_name_hint -- that's a
 generic name-matching helper, not part of the v1 response-shaping logic being replaced.
 
@@ -16,28 +16,11 @@ written in -- see responder_v2.py -- so there is no reply_language field here.
 """
 
 import json
-import re
 from datetime import date
 
 from openai import OpenAI, OpenAIError
 
 from errors import ChatSummaryError
-
-SELF_REFERENCE_RE = re.compile(
-    r"\b(?:"
-    r"обо?\s+мне|про\s+меня|насч[её]т\s+меня|по\s+мне|"
-    r"кто\s+я|како(?:й|ая)\s+я|что\s+я\s+(?:писал|писала|говорил|говорила|обсуждал|обсуждала)|"
-    r"мо(?:й|я|ё|е|и|ю|его|ей|их|им|ими|ём|ем)\b|"
-    r"about\s+me|who\s+am\s+i|my\b|what\s+(?:did|do|have)\s+i\b"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def is_self_referential_request(text: str) -> bool:
-    """True for an explicit request about the author, not merely a phrase such as
-    "расскажи мне про Бориса" where "мне" is only the indirect object."""
-    return bool(SELF_REFERENCE_RE.search(text or ""))
 
 SYSTEM_PROMPT = """\
 Ты превращаешь короткое сообщение из чата в структурированный запрос на выборку истории \
@@ -101,13 +84,6 @@ def route_request(
         raise ChatSummaryError("Cannot parse an empty summary request.")
     assert isinstance(mentioned_usernames, list), "internal bug: mentioned_usernames must be a list"
 
-    requester_target = (requester_username or requester_name or "").strip().lstrip("@") or None
-    # Explicit @mentions of somebody else remain authoritative. This avoids treating a
-    # mixed request such as "что @bob писал обо мне" as a simple one-person self summary.
-    requester_is_target = bool(
-        requester_target and not mentioned_usernames and is_self_referential_request(text)
-    )
-
     client = OpenAI(api_key=api_key)
     prompt = USER_PROMPT_TEMPLATE.format(
         reference_date=reference_date.isoformat(),
@@ -147,10 +123,6 @@ def route_request(
     # what the model returned -- it just means the bot was addressed, not asked about.
     if username and my_username and username.lower() == my_username.lower():
         username = None
-    # First-person pronouns have a deterministic meaning; never let the model bind them
-    # to a similarly named or recently discussed chat participant.
-    if requester_is_target:
-        username = requester_target
 
     def _parse(value, fallback):
         try:
@@ -174,12 +146,6 @@ def route_request(
         cleaned_question = cleaned_question.strip() or None
     if not cleaned_question:
         cleaned_question = text.strip()  # fall back to the raw request rather than nothing
-    if requester_is_target:
-        requester_label = (requester_name or requester_target).strip()
-        cleaned_question = (
-            f"{cleaned_question}\nПод первым лицом (я/мне/меня/мой) имеется в виду автор "
-            f"запроса: {requester_label}."
-        )
 
     return {
         "start_date": start_date,
@@ -187,5 +153,4 @@ def route_request(
         "lookback_hours": lookback_hours,
         "username": username,
         "cleaned_question": cleaned_question,
-        "requester_is_target": requester_is_target,
     }

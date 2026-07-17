@@ -505,16 +505,18 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
 
     focus_user = None
     username_hint = routed["username"]
-    if routed.get("requester_is_target"):
-        # The formatted transcript contains display names, so use the requester's exact
-        # display name for the answer prompt; use Telegram sender_id for precise matching.
+    requester_aliases = {
+        value.strip().lstrip("@").lower()
+        for value in (requester, getattr(sender, "username", None))
+        if value and value.strip()
+    }
+    if username_hint and username_hint.strip().lstrip("@").lower() in requester_aliases:
+        # The router interpreted the original request as being about its author. Use the
+        # transcript's display name and verify the identity with Telegram sender_id.
         focus_user = requester
         requester_id = getattr(sender, "id", None)
         matched = sum(1 for m in messages if requester_id is not None and m.sender_id == requester_id)
         log(f"[listener] v2 focus_user(requester)={focus_user} matched={matched}/{len(messages)}")
-        if matched == 0:
-            await respond(f"Сообщений от {requester} за этот период не найдено.")
-            return
     elif username_hint:
         # An exact match against an @mention actually present in the message is a
         # literal request about that account's own messages -- safe (and cheap) to bail
@@ -545,8 +547,9 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
                 log(f"[listener] v2 resolved name hint '{username_hint}' -> '{focus_user}'")
             else:
                 log(f"[listener] v2 could not resolve name hint '{username_hint}' among participants")
-                await respond(f"Не понял, о ком речь: \"{username_hint}\".")
-                return
+                # The final responder has the untouched original request and requester
+                # identity, so let it interpret the question instead of rejecting here.
+                focus_user = None
 
     lines = format_transcript_lines(messages, include_date=(start_date != end_date))
     if window_start_dt is not None:
@@ -567,6 +570,8 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
         question=routed["cleaned_question"],
         focus_user=focus_user,
         style="reply",
+        original_request=text,
+        requester_name=requester,
     )
 
     await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
