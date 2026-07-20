@@ -913,6 +913,7 @@ async def run_bot_listener(
     bot_response_queue: "asyncio.Queue | None" = None,
     followup_queue: "asyncio.Queue | None" = None,
     figurine_ack_queue: "asyncio.Queue | None" = None,
+    stats_digest_queue: "asyncio.Queue | None" = None,
 ):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -942,9 +943,14 @@ async def run_bot_listener(
     bumps the counter (stats.record_figurine_live) -- only the reaction itself is done
     here, via the bot account, same bot-account-only rule as every other reply.
 
+    `stats_digest_queue`, if given, carries (allowed_chats entry, text) pairs put there
+    once daily by listener.py's run_stats_rollover -- the "Топ покрастинаторов" call-out
+    (see stats.format_procrastinators) -- sent here as a plain message, same account as
+    everything else.
+
     All queues are left None when run standalone (this module's own main()), which
-    just means jokes/follow-ups/figurine reactions never fire, matching that listener.py
-    isn't running its activity tracking either in that mode."""
+    just means jokes/follow-ups/figurine reactions/digests never fire, matching that
+    listener.py isn't running its activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     summary_queue: asyncio.Queue = asyncio.Queue()
@@ -1082,6 +1088,22 @@ async def run_bot_listener(
                     continue
                 await api.set_message_reaction(chat_id, message_id, FIGURINE_ACK_EMOJI)
 
+        async def _consume_stats_digests():
+            while True:
+                entry, text = await stats_digest_queue.get()
+                chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                if chat_id is None:
+                    log(f"[bot_listener] dropping stats digest for '{entry}': could not resolve a chat_id for it")
+                    continue
+                try:
+                    # parse_mode=None: the digest embeds raw display names, same reasoning
+                    # as every other stats reply -- see the send_message call in the
+                    # /top and /stat handling above.
+                    await api.send_message(chat_id, text, parse_mode=None)
+                    log(f"[bot_listener] sent procrastinator digest to '{entry}'")
+                except Exception:
+                    log(f"[bot_listener] failed to send stats digest:\n{traceback.format_exc()}")
+
         tasks = [_poll_loop(), _consume_summaries()]
         if joke_queue is not None:
             tasks.append(_consume_jokes())
@@ -1089,6 +1111,8 @@ async def run_bot_listener(
             tasks.append(_consume_followups())
         if figurine_ack_queue is not None:
             tasks.append(_consume_figurine_acks())
+        if stats_digest_queue is not None:
+            tasks.append(_consume_stats_digests())
         await asyncio.gather(*tasks)
 
 

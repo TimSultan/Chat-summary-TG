@@ -77,6 +77,12 @@ MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
 # people don't reliably type Cyrillic hashtags in one consistent case.
 FIGURINE_HASHTAG = "#япокрасил"
 
+# "Топ покрастинаторов": once a day (see run_stats_rollover), calls out whoever's in the
+# top PROCRASTINATOR_TOP_N all-time scorers but hasn't posted a #япокрасил+photo in the
+# last PROCRASTINATOR_INACTIVE_DAYS days -- see format_procrastinators.
+PROCRASTINATOR_TOP_N = 30
+PROCRASTINATOR_INACTIVE_DAYS = 7
+
 VALID_PERIODS = ("today", "week", "month", "year", "all")
 # "day" isn't a distinct window -- it's just the word people actually type for "today".
 # Normalized away by _normalize_period before anything looks at VALID_PERIODS.
@@ -102,6 +108,24 @@ def is_recorded(entry: str, day: date) -> bool:
     """Cheap and synchronous -- just a file existence check, no parsing. This is the
     idempotency guard record_day/finalize_and_record rely on."""
     return _path(entry, day).exists()
+
+
+def _procrastinator_bootstrap_marker(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_procrastinator_bootstrap_sent"
+
+
+def procrastinator_digest_bootstrapped(entry: str) -> bool:
+    """Whether the one-time "just shipped this feature" digest (see
+    run_stats_rollover's startup call in listener.py) has already gone out for `entry` --
+    a plain marker file, no content, checked once at process startup so a later restart
+    doesn't re-send it. Every day AFTER that goes out unconditionally from the midnight
+    loop instead, same as every other daily rollover job."""
+    return _procrastinator_bootstrap_marker(entry).exists()
+
+
+def mark_procrastinator_digest_bootstrapped(entry: str) -> None:
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _procrastinator_bootstrap_marker(entry).touch()
 
 
 def is_figurine_caption(text: str) -> bool:
@@ -362,13 +386,17 @@ def aggregate(entry: str, start_day: date, end_day: date) -> dict[str, UserStats
 def aggregate_all_time(entry: str) -> dict[str, UserStats]:
     """Like aggregate, but over every day ever recorded for this chat (globs STATS_DIR
     rather than walking a bounded date range) -- used by /stat, which reports a person's
-    whole tracked history, not a fixed window."""
+    whole tracked history, not a fixed window. The glob is deliberately narrowed to the
+    exact "<prefix>_YYYY-MM-DD.json" shape `_path` writes, NOT a loose "<prefix>_*.json"
+    -- the stats dir also holds other <prefix>_-prefixed auxiliary files for this entry
+    (the live figurine counter, `_live_figurines_path`; the procrastinator-digest
+    bootstrap marker) that must never be mistaken for a recorded day."""
     combined: dict[str, UserStats] = {}
     stats_dir = _stats_dir()
     if not stats_dir.exists():
         return combined
     prefix = _cache_key(entry)
-    for path in sorted(stats_dir.glob(f"{prefix}_*.json")):
+    for path in sorted(stats_dir.glob(f"{prefix}_????-??-??.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -515,6 +543,43 @@ async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, 
     for i, s in enumerate(ranked, start=1):
         lines.append(f"{i}. {s.display_name} — {s.score} очков")
     return "\n".join(lines)
+
+
+def format_procrastinators(
+    entry: str, tz, top_n: int = PROCRASTINATOR_TOP_N, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS
+) -> str | None:
+    """The daily "Топ покрастинаторов" call-out: among the top `top_n` all-time scorers
+    for `entry` (same ranking /top all uses -- "active users"), whoever hasn't posted a
+    #япокрасил+photo within the last `inactive_days` days. Includes people who have
+    NEVER posted one at all, not just people who used to and stopped -- both count as
+    "hasn't sent new work in a week" -- shown with a distinct line since there's no
+    "last time" to count days from for them.
+
+    Deliberately synchronous and reading ONLY persisted per-day files (aggregate_all_time,
+    no live-today overlay): meant to run once daily, right after the day that just ended
+    has been recorded (see run_stats_rollover), by which point it's already part of the
+    historical record -- no Telegram fetch needed.
+
+    Returns None if there's nobody to call out (empty top_n, or everyone in it already
+    posted within the window) -- callers should simply not send anything in that case."""
+    combined = aggregate_all_time(entry)
+    ranked = sorted(combined.values(), key=lambda s: s.score, reverse=True)[:top_n]
+    today = datetime.now(tz).date()
+    # (sort_key, line) pairs -- sort_key is days-since-last-post, with a large sentinel
+    # for "never posted" so those sort to the top (the most overdue, in spirit) without
+    # needing a fabricated day count.
+    entries: list[tuple[int, str]] = []
+    for s in ranked:
+        if not s.last_figurine_at:
+            entries.append((10**9, f"{s.display_name} — ещё ни разу не скидывал(а) работы"))
+            continue
+        days_since = (today - datetime.fromisoformat(s.last_figurine_at).date()).days
+        if days_since >= inactive_days:
+            entries.append((days_since, f"{s.display_name} — не скидывал работы {_ru_days(days_since)}"))
+    if not entries:
+        return None
+    entries.sort(key=lambda pair: pair[0], reverse=True)
+    return "🐌 Топ покрастинаторов:\n\n" + "\n".join(line for _, line in entries)
 
 
 def _favorite_hour_label(hours: dict) -> str:
