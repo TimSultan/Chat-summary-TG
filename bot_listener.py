@@ -62,6 +62,7 @@ from listener import (
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
     ERROR_DELETE_AFTER,
+    FIGURINE_ACK_EMOJI,
     NO_ROAST_MATERIAL_MESSAGE,
     ROAST_BUSY_EMOJI,
     ROAST_DELETE_AFTER,
@@ -909,6 +910,7 @@ async def run_bot_listener(
     joke_posted_queue: "asyncio.Queue | None" = None,
     bot_response_queue: "asyncio.Queue | None" = None,
     followup_queue: "asyncio.Queue | None" = None,
+    figurine_ack_queue: "asyncio.Queue | None" = None,
 ):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -933,9 +935,14 @@ async def run_bot_listener(
     guess. If it decides someone's actually reacting, the clap-back it generates comes
     back on `followup_queue` for this function to send, same as every other reply.
 
-    All four queues are left None when run standalone (this module's own main()), which
-    just means jokes/follow-ups never fire, matching that listener.py isn't running its
-    activity tracking either in that mode."""
+    `figurine_ack_queue`, if given, carries (allowed_chats entry, message_id) pairs put
+    there by listener.py's on_message the instant it sees a #япокрасил+photo post and
+    bumps the counter (stats.record_figurine_live) -- only the reaction itself is done
+    here, via the bot account, same bot-account-only rule as every other reply.
+
+    All queues are left None when run standalone (this module's own main()), which
+    just means jokes/follow-ups/figurine reactions never fire, matching that listener.py
+    isn't running its activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     summary_queue: asyncio.Queue = asyncio.Queue()
@@ -1064,11 +1071,22 @@ async def run_bot_listener(
                 except Exception:
                     log(f"[bot_listener] failed to send follow-up reply:\n{traceback.format_exc()}")
 
+        async def _consume_figurine_acks():
+            while True:
+                entry, message_id = await figurine_ack_queue.get()
+                chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                if chat_id is None:
+                    log(f"[bot_listener] dropping figurine reaction for '{entry}': could not resolve a chat_id for it")
+                    continue
+                await api.set_message_reaction(chat_id, message_id, FIGURINE_ACK_EMOJI)
+
         tasks = [_poll_loop(), _consume_summaries()]
         if joke_queue is not None:
             tasks.append(_consume_jokes())
         if followup_queue is not None:
             tasks.append(_consume_followups())
+        if figurine_ack_queue is not None:
+            tasks.append(_consume_figurine_acks())
         await asyncio.gather(*tasks)
 
 

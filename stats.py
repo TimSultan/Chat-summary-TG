@@ -104,6 +104,68 @@ def is_recorded(entry: str, day: date) -> bool:
     return _path(entry, day).exists()
 
 
+def is_figurine_caption(text: str) -> bool:
+    """Whether `text` (a raw caption/message text, NOT the "[Photo] ..." tagged form
+    compute_day_stats works with) carries the #япокрасил hashtag. Callers still have to
+    check for an attached photo themselves -- what that looks like differs by API
+    (Telethon's `msg.photo` vs. the Bot API's "photo" key), so there's no one shared
+    check for that half."""
+    return FIGURINE_HASHTAG in (text or "").lower()
+
+
+def _live_figurines_path(entry: str, day: date) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_{day.isoformat()}_live_figurines.json"
+
+
+def record_figurine_live(
+    entry: str, day: date, user_id, username: str | None, display_name: str, log=print
+) -> int:
+    """Bumps one user's figurine-painted count for `day` the instant a qualifying
+    message is seen live (listener.py's on_message, which sees every message as it
+    arrives) -- a plain local read-modify-write, no Telegram call involved, so /stat and
+    /top reflect it immediately rather than waiting on the transcript cache's own TTL
+    (see _live_today_users, which overlays this on top of that cache for "today").
+    Returns the user's new total for `day`, for logging.
+
+    Kept in a file separate from the per-day file `_path` writes (record_day's finalized,
+    immutable snapshot of a CLOSED day) -- writing here must never be mistaken by
+    is_recorded for that day already being finalized. Cleared by record_day once `day`
+    actually closes, since the finalized file then carries the authoritative count."""
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    path = _live_figurines_path(entry, day)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    key = str(user_id)
+    u = data.setdefault(key, {"username": None, "display_name": display_name, "count": 0})
+    if username:
+        u["username"] = username
+    if display_name:
+        u["display_name"] = display_name
+    u["count"] += 1
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    log(f"[stats] figurine recorded live for '{entry}' user {key}: {u['count']} today")
+    return u["count"]
+
+
+def _load_live_figurines(entry: str, day: date) -> dict:
+    path = _live_figurines_path(entry, day)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _clear_live_figurines(entry: str, day: date) -> None:
+    try:
+        _live_figurines_path(entry, day).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _ru_days(n: int) -> str:
     if n % 10 == 1 and n % 100 != 11:
         return f"{n} день"
@@ -147,7 +209,7 @@ def compute_day_stats(messages: list) -> dict:
         u["chars"] += len(m.text)
         if m.text.startswith(MEDIA_TAG_PREFIXES):
             u["media"] += 1
-        if m.text.startswith("[Photo]") and FIGURINE_HASHTAG in m.text.lower():
+        if m.text.startswith("[Photo]") and is_figurine_caption(m.text):
             u["figurines"] += 1
         if m.is_reply:
             u["replies"] += 1
@@ -176,6 +238,10 @@ def record_day(entry: str, day: date, messages: list, log=print) -> bool:
     }
     _path(entry, day).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     log(f"[stats] recorded {day} for '{entry}': {len(messages)} message(s), {len(users)} user(s)")
+    # The just-finalized payload above now carries the authoritative figurine count for
+    # `day` (recomputed from the full transcript) -- the live counter's job (see
+    # record_figurine_live) was only ever to cover today before that existed.
+    _clear_live_figurines(entry, day)
     return True
 
 
@@ -346,7 +412,7 @@ def parse_stat_period(arg: str) -> str | None:
     return _normalize_period(arg)
 
 
-async def _live_today_users(client, chat_ref, tz, log=print) -> dict:
+async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict:
     """Computes (but does NOT persist -- see record_day) today's per-user stats fresh, by
     fetching today's current transcript same as /summary would (reusing the same
     30-minute-TTL per-day cache, so this doesn't add Telegram load beyond what querying
@@ -354,12 +420,34 @@ async def _live_today_users(client, chat_ref, tz, log=print) -> dict:
     today"/"week"/"month" and "/stat" reflect today's activity as it happens, rather than
     only ever showing data through yesterday -- today itself only gets permanently
     recorded once, by the midnight rollover, once it's actually over (see record_day);
-    until then, every query recomputes it fresh instead of reading a persisted file."""
+    until then, every query recomputes it fresh instead of reading a persisted file.
+
+    Figurine counts are the one exception to "fresh from the transcript cache": that
+    cache can lag up to transcript_cache.TODAY_TTL_SECONDS behind, but record_figurine_live
+    updates the instant a qualifying message is seen, so its count for today is overlaid
+    here (taking the max of the two -- the live count could itself be momentarily behind
+    right after a restart, if the transcript cache already picked up a qualifying message
+    from while this process was down) rather than waiting on the next transcript refresh."""
     today = datetime.now(tz).date()
     _, messages = await telegram_fetch.fetch_range_messages_cached(
         client=client, chat_ref=chat_ref, start_day=today, end_day=today, tz=tz, log=log,
     )
-    return compute_day_stats(messages)
+    users = compute_day_stats(messages)
+    for key, live in _load_live_figurines(entry, today).items():
+        u = users.setdefault(
+            key,
+            {
+                "username": None, "display_name": live.get("display_name", "Unknown"),
+                "messages": 0, "chars": 0, "media": 0, "replies": 0, "figurines": 0,
+                "hours": {}, "last_message_at": None,
+            },
+        )
+        u["figurines"] = max(u.get("figurines", 0), live.get("count", 0))
+        if live.get("username"):
+            u["username"] = live["username"]
+        if live.get("display_name"):
+            u["display_name"] = live["display_name"]
+    return users
 
 
 async def aggregate_live(
@@ -374,7 +462,7 @@ async def aggregate_live(
     historical_end = min(end_day, today - timedelta(days=1))
     combined = aggregate(entry, start_day, historical_end) if start_day <= historical_end else {}
     if start_day <= today <= end_day:
-        _merge_day(combined, {"users": await _live_today_users(client, chat_ref, tz, log=log)})
+        _merge_day(combined, {"users": await _live_today_users(client, chat_ref, entry, tz, log=log)})
     return combined
 
 
@@ -383,7 +471,7 @@ async def aggregate_all_time_live(client, chat_ref, entry: str, tz, log=print) -
     aggregate_live's same reasoning. Used by /stat, and by resolve_stat_target so someone
     who has only ever posted today (no recorded day yet at all) is still found."""
     combined = aggregate_all_time(entry)
-    _merge_day(combined, {"users": await _live_today_users(client, chat_ref, tz, log=log)})
+    _merge_day(combined, {"users": await _live_today_users(client, chat_ref, entry, tz, log=log)})
     return combined
 
 

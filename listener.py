@@ -128,6 +128,10 @@ NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих со�
 # (which can take a few seconds) run.
 SUMMARY_ACK_EMOJI = "✍"
 
+# Reacted onto a #япокрасил post (with a photo attached) the instant it's seen -- see
+# on_message's figurine-detection block and stats.record_figurine_live.
+FIGURINE_ACK_EMOJI = "🎨"
+
 ERROR_DELETE_AFTER = 10  # short rejection notices (such as day limit) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 STATS_DELETE_AFTER = 300  # /top and /stat replies (incl. their own errors) self-delete after 5 minutes
@@ -721,6 +725,7 @@ async def run_listener(
     joke_posted_queue: "asyncio.Queue | None" = None,
     bot_response_queue: "asyncio.Queue | None" = None,
     followup_queue: "asyncio.Queue | None" = None,
+    figurine_ack_queue: "asyncio.Queue | None" = None,
 ):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
@@ -747,7 +752,15 @@ async def run_listener(
     decides someone's actually reacting, the generated clap-back is put on
     `followup_queue` for bot_listener.py to send, same bot-account-only rule as
     everything else. All four queues are passed in (not created here) so main() can
-    share them between both tasks."""
+    share them between both tasks.
+
+    `figurine_ack_queue`, if given, is where (allowed_chats entry, message_id) goes for a
+    #япокрасил+photo message this session has just seen -- see on_message's figurine-
+    detection block. This session always does the counting itself (stats.
+    record_figurine_live), since it's the only one that sees every message, and reacts
+    itself too when there's no bot account to defer to -- but once a bot token is
+    configured, the reaction has to come from the bot account instead, same bot-account-
+    only rule as every reply, hence the hand-off (see bot_takeover below)."""
     assert cfg.summary_queue_delay_seconds >= 0, "internal bug: queue delay should have been validated by config"
 
     me = await client.get_me()
@@ -1120,6 +1133,29 @@ async def run_listener(
 
         text = msg.raw_text or ""
         text_lower = text.lower()
+
+        # #япокрасил + an attached photo -- a "figurine painted" post (see
+        # POINTS_PER_FIGURINE in stats.py). This session sees every message as it
+        # arrives, so it's the one place that ever calls record_figurine_live -- a plain
+        # local counter bump, not a re-fetch of anything -- so /stat and /top pick it up
+        # immediately instead of waiting on the transcript cache's own TTL. Reacting is
+        # the one part that has to defer to the bot account once bot_takeover is on, same
+        # as every other reply (see figurine_ack_queue).
+        if cfg.stats_enabled and msg.photo and stats.is_figurine_caption(text):
+            chat = await event.get_chat()
+            entry = matched_allowed_chat(chat)
+            if entry is not None:
+                sender = await event.get_sender()
+                count = stats.record_figurine_live(
+                    entry, datetime.now(tz).date(), msg.sender_id,
+                    getattr(sender, "username", None), sender_display_name(sender), log=log,
+                )
+                log(f"[listener] figurine painted by {sender_display_name(sender)} in '{entry}' (today: {count})")
+                if bot_takeover:
+                    if figurine_ack_queue is not None:
+                        await figurine_ack_queue.put((entry, msg.id))
+                else:
+                    await react_emoji(event.chat_id, msg.id, FIGURINE_ACK_EMOJI)
 
         if joke_enabled and text:
             await maybe_joke(event, msg, text)
@@ -1539,16 +1575,24 @@ async def main():
         # reply.
         bot_response_queue: asyncio.Queue = asyncio.Queue()
         followup_queue: asyncio.Queue = asyncio.Queue()
+        # figurine_ack_queue carries (allowed_chats entry, message_id) from this session
+        # -- the only one that sees every message, so it's the one that detects a
+        # #япокрасил+photo post and bumps the counter (stats.record_figurine_live) -- to
+        # bot_listener.py, so the *reaction* onto that message still comes from the bot
+        # account, same bot-account-only rule as every other reply.
+        figurine_ack_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
             run_listener(
                 client, cfg, tz,
                 joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 bot_response_queue=bot_response_queue, followup_queue=followup_queue,
+                figurine_ack_queue=figurine_ack_queue,
             ),
             bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
                 joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 bot_response_queue=bot_response_queue, followup_queue=followup_queue,
+                figurine_ack_queue=figurine_ack_queue,
             ),
         )
     else:
