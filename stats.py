@@ -641,6 +641,7 @@ async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, 
 
 
 PROCRASTINATOR_REMINDER = "Скидывайте свою последнюю или новую работу с хэштегом #япокрасил"
+PROCRASTINATOR_TAUNT = "Языком чесать - не кистями работать."
 
 
 async def format_procrastinators(
@@ -726,7 +727,8 @@ async def format_procrastinators(
         return None
     entries.sort(key=lambda pair: pair[0], reverse=True)
     lines = [line for _, line in entries]
-    return "🐌 Топ покрастинаторов:\n\n" + "\n".join(lines) + f"\n\n{PROCRASTINATOR_REMINDER}"
+    header = "🐌 Список Покрастинаторов\n2 недели не скидывали свои покрасы:\n\n"
+    return header + "\n".join(lines) + f"\n\n{PROCRASTINATOR_TAUNT}\n{PROCRASTINATOR_REMINDER}"
 
 
 def _favorite_hour_label(hours: dict) -> str:
