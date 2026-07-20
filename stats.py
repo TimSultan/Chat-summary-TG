@@ -32,7 +32,7 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
     +1 per message containing a photo or video
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
-    +100 per message tagged #япокрасил that has an actual photo attached (a "figurine
+    +150 per message tagged #япокрасил that has an actual photo attached (a "figurine
         painted" post -- see FIGURINE_HASHTAG; a video or a hashtag with no photo doesn't
         qualify). Also surfaced as its own raw count, "Покрашено фигурок", in /stat.
 Points are never stored -- always recomputed on demand from the raw per-day counters for
@@ -63,7 +63,7 @@ POINTS_PER_MESSAGE = 1
 POINTS_PER_MEDIA_MESSAGE = 1
 POINTS_PER_REPLY = 1
 POINTS_PER_ACTIVE_DAY = 5
-POINTS_PER_FIGURINE = 100
+POINTS_PER_FIGURINE = 150
 
 # Telegram_fetch.describe_media prepends one of these bracketed tags to a media message's
 # cached text (e.g. "[Photo] nice caption"). Narrowed to photo/video only, per spec --
