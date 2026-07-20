@@ -32,6 +32,9 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
     +1 per message containing a photo or video
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
+    +100 per message tagged #япокрасил that has an actual photo attached (a "figurine
+        painted" post -- see FIGURINE_HASHTAG; a video or a hashtag with no photo doesn't
+        qualify). Also surfaced as its own raw count, "Покрашено фигурок", in /stat.
 Points are never stored -- always recomputed on demand from the raw per-day counters for
 whatever window (day/week/month/year, or -- for a bare /stat lookup -- every recorded
 day) is asked about, so changing the point values later doesn't require re-processing
@@ -60,12 +63,19 @@ POINTS_PER_MESSAGE = 1
 POINTS_PER_MEDIA_MESSAGE = 1
 POINTS_PER_REPLY = 1
 POINTS_PER_ACTIVE_DAY = 5
+POINTS_PER_FIGURINE = 100
 
 # Telegram_fetch.describe_media prepends one of these bracketed tags to a media message's
 # cached text (e.g. "[Photo] nice caption"). Narrowed to photo/video only, per spec --
 # stickers/voice notes/documents/etc. aren't counted as "media" here even though
 # describe_media tags those too.
 MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
+
+# A "figurine painted" post: the #япокрасил hashtag, anywhere in the caption, on a
+# message that has an actual photo attached (a video or a hashtag-only text message
+# doesn't count -- per spec it "has to contain image"). Matched case-insensitively since
+# people don't reliably type Cyrillic hashtags in one consistent case.
+FIGURINE_HASHTAG = "#япокрасил"
 
 VALID_PERIODS = ("today", "week", "month", "year", "all")
 # "day" isn't a distinct window -- it's just the word people actually type for "today".
@@ -124,6 +134,7 @@ def compute_day_stats(messages: list) -> dict:
                 "chars": 0,
                 "media": 0,
                 "replies": 0,
+                "figurines": 0,
                 "hours": {},
                 "last_message_at": None,
             },
@@ -136,6 +147,8 @@ def compute_day_stats(messages: list) -> dict:
         u["chars"] += len(m.text)
         if m.text.startswith(MEDIA_TAG_PREFIXES):
             u["media"] += 1
+        if m.text.startswith("[Photo]") and FIGURINE_HASHTAG in m.text.lower():
+            u["figurines"] += 1
         if m.is_reply:
             u["replies"] += 1
         hour_key = str(m.dt_local.hour)
@@ -197,6 +210,7 @@ class UserStats:
     # to message's sender, a real schema change for a small accuracy gain on a gamified
     # scoring stat.
     replies: int = 0
+    figurines_painted: int = 0
     active_days: int = 0
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
@@ -208,6 +222,7 @@ class UserStats:
             + self.media * POINTS_PER_MEDIA_MESSAGE
             + self.replies * POINTS_PER_REPLY
             + self.active_days * POINTS_PER_ACTIVE_DAY
+            + self.figurines_painted * POINTS_PER_FIGURINE
         )
 
 
@@ -222,6 +237,7 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
         s.chars += u.get("chars", 0)
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
+        s.figurines_painted += u.get("figurines", 0)
         if u.get("messages", 0) > 0:
             s.active_days += 1
         for hour, count in u.get("hours", {}).items():
@@ -406,6 +422,7 @@ def format_stat(user: UserStats, rank: int, total: int) -> str:
         f"Сообщений: {user.messages}\n"
         f"Среднее сообщений в день: {avg:.1f}\n"
         f"Активность: {_ru_days(user.active_days)}\n"
+        f"Покрашено фигурок: {user.figurines_painted}\n"
         f"Любимое время: {_favorite_hour_label(user.hours)}\n"
         f"Последняя активность: {last_seen}"
     )
