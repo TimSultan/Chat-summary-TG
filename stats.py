@@ -77,6 +77,12 @@ MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
 # people don't reliably type Cyrillic hashtags in one consistent case.
 FIGURINE_HASHTAG = "#япокрасил"
 
+# How many of a person's most recent figurine posts /stat links to (see
+# figurine_message_links) -- UserStats.recent_figurine_posts is kept trimmed to this
+# many entries (newest first) everywhere it's built or merged, so no caller ever has to
+# re-truncate it itself.
+RECENT_FIGURINE_LINKS = 3
+
 # "Топ покрастинаторов": once a day (see run_stats_rollover), calls out whoever's in the
 # top PROCRASTINATOR_TOP_N all-time scorers but hasn't posted a #япокрасил+photo in the
 # last PROCRASTINATOR_INACTIVE_DAYS days -- see format_procrastinators.
@@ -150,10 +156,11 @@ def record_figurine_live(
     arrives) -- a plain local read-modify-write, no Telegram call involved, so /stat and
     /top reflect it immediately rather than waiting on the transcript cache's own TTL
     (see _live_today_users, which overlays this on top of that cache for "today").
-    `message_id` (if given) is remembered as this user's latest qualifying message, for
-    /stat's link to it (see figurine_message_link) -- Telegram has no deep link for a
-    filtered/scoped search, only a link to one specific message. Returns the user's new
-    total for `day`, for logging.
+    `message_id` (if given) is appended to this user's recent-posts list (kept trimmed to
+    RECENT_FIGURINE_LINKS, newest first), for /stat's links to them (see
+    figurine_message_links) -- Telegram has no deep link for a filtered/scoped search,
+    only a link to one specific message. Returns the user's new total for `day`, for
+    logging.
 
     Kept in a file separate from the per-day file `_path` writes (record_day's finalized,
     immutable snapshot of a CLOSED day) -- writing here must never be mistaken by
@@ -166,16 +173,15 @@ def record_figurine_live(
     except (json.JSONDecodeError, OSError):
         data = {}
     key = str(user_id)
-    u = data.setdefault(
-        key, {"username": None, "display_name": display_name, "count": 0, "last_message_id": None, "last_at": None}
-    )
+    u = data.setdefault(key, {"username": None, "display_name": display_name, "count": 0, "recent_posts": []})
     if username:
         u["username"] = username
     if display_name:
         u["display_name"] = display_name
     u["count"] += 1
-    u["last_message_id"] = message_id
-    u["last_at"] = app_now().isoformat()
+    u["recent_posts"] = _merge_recent_figurine_posts(
+        [tuple(p) for p in u.get("recent_posts", [])], [(app_now().isoformat(), message_id)]
+    )
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     log(f"[stats] figurine recorded live for '{entry}' user {key}: {u['count']} today")
     return u["count"]
@@ -229,8 +235,10 @@ def compute_day_stats(messages: list) -> dict:
                 "media": 0,
                 "replies": 0,
                 "figurines": 0,
-                "last_figurine_message_id": None,
-                "last_figurine_at": None,
+                # [ts, message_id] pairs, one per qualifying message this day -- NOT yet
+                # trimmed to RECENT_FIGURINE_LINKS (that happens once, at merge time in
+                # _merge_day, across the whole history rather than per day).
+                "figurine_posts": [],
                 "hours": {},
                 "last_message_at": None,
             },
@@ -246,9 +254,7 @@ def compute_day_stats(messages: list) -> dict:
         ts = m.dt_local.isoformat()
         if m.text.startswith("[Photo]") and is_figurine_caption(m.text):
             u["figurines"] += 1
-            if u["last_figurine_at"] is None or ts > u["last_figurine_at"]:
-                u["last_figurine_at"] = ts
-                u["last_figurine_message_id"] = m.message_id
+            u["figurine_posts"].append([ts, m.message_id])
         if m.is_reply:
             u["replies"] += 1
         hour_key = str(m.dt_local.hour)
@@ -314,11 +320,12 @@ class UserStats:
     # scoring stat.
     replies: int = 0
     figurines_painted: int = 0
-    # The single most recent qualifying message, so /stat can link straight to it (see
-    # figurine_message_link) -- Telegram has no deep link for a filtered/scoped search, so
-    # this is the closest thing to "show me theirs": one tap to the latest one instead.
-    last_figurine_message_id: int | None = None
-    last_figurine_at: str | None = None
+    # Up to RECENT_FIGURINE_LINKS [ts, message_id] pairs, newest first, so /stat can link
+    # straight to them (see figurine_message_links) -- Telegram has no deep link for a
+    # filtered/scoped search, so this is the closest thing to "show me theirs": direct
+    # taps to their last few instead. Kept trimmed to RECENT_FIGURINE_LINKS everywhere
+    # it's built or merged (_merge_day, _overlay_live_figurines), never grows unbounded.
+    recent_figurine_posts: list = field(default_factory=list)
     active_days: int = 0
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
@@ -334,6 +341,16 @@ class UserStats:
         )
 
 
+def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
+    """Combines `existing` [ts, message_id] pairs with `new_posts` (any iterable of the
+    same shape), sorts newest-first, and trims to RECENT_FIGURINE_LINKS -- the one place
+    this merge+trim happens, used by both _merge_day (across recorded days) and
+    _overlay_live_figurines (today's live counter on top of that)."""
+    combined = existing + list(new_posts)
+    combined.sort(key=lambda p: p[0], reverse=True)
+    return combined[:RECENT_FIGURINE_LINKS]
+
+
 def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
     for user_id, u in payload.get("users", {}).items():
         s = combined.setdefault(user_id, UserStats(user_id=user_id))
@@ -346,10 +363,8 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
         s.figurines_painted += u.get("figurines", 0)
-        last_figurine = u.get("last_figurine_at")
-        if last_figurine and (s.last_figurine_at is None or last_figurine > s.last_figurine_at):
-            s.last_figurine_at = last_figurine
-            s.last_figurine_message_id = u.get("last_figurine_message_id")
+        if u.get("figurine_posts"):
+            s.recent_figurine_posts = _merge_recent_figurine_posts(s.recent_figurine_posts, u["figurine_posts"])
         if u.get("messages", 0) > 0:
             s.active_days += 1
         for hour, count in u.get("hours", {}).items():
@@ -505,15 +520,13 @@ async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict
             {
                 "username": None, "display_name": live.get("display_name", "Unknown"),
                 "messages": 0, "chars": 0, "media": 0, "replies": 0, "figurines": 0,
-                "last_figurine_message_id": None, "last_figurine_at": None,
+                "figurine_posts": [],
                 "hours": {}, "last_message_at": None,
             },
         )
         u["figurines"] = max(u.get("figurines", 0), live.get("count", 0))
-        live_at = live.get("last_at")
-        if live_at and (u.get("last_figurine_at") is None or live_at > u["last_figurine_at"]):
-            u["last_figurine_at"] = live_at
-            u["last_figurine_message_id"] = live.get("last_message_id")
+        if live.get("recent_posts"):
+            u["figurine_posts"] = _merge_recent_figurine_posts(u["figurine_posts"], live["recent_posts"])
         if live.get("username"):
             u["username"] = live["username"]
         if live.get("display_name"):
@@ -566,22 +579,21 @@ PROCRASTINATOR_REMINDER = "Скидывайте свою последнюю ил
 
 def _overlay_live_figurines(combined: dict[str, UserStats], entry: str, today: date) -> None:
     """Merges today's live figurine counter (record_figurine_live -- a plain local file,
-    no Telegram involved) into an already-built {user_id: UserStats} dict, in place. Same
-    reasoning as _live_today_users' own overlay for the async /stat and /top query path:
-    aggregate_all_time alone only reflects days that have actually closed and been
-    recorded, so a same-day post would otherwise still look like "hasn't posted" until
-    the NEXT midnight rollover finalizes today -- a real gap for format_procrastinators
-    specifically, since its bootstrap send (see run_stats_rollover) can fire mid-day, the
-    same day someone just posted. Unlike _live_today_users this needs no Telegram fetch
-    at all -- the figurine counter is the only thing being overlaid, and it's already a
-    local file."""
+    no Telegram involved) into an already-built {user_id: UserStats} dict, in place.
+    `combined` here is expected to come from aggregate_all_time, which only reflects days
+    that have actually closed and been recorded (today is NEVER among them) -- so unlike
+    _live_today_users' own max()-based overlay (deduplicating two views of the SAME
+    "today"), the count here is ADDED: historical and live-today are disjoint periods, no
+    overlap to guard against. Without this, a same-day post would look like "hasn't
+    posted" until the NEXT midnight rollover finalizes today -- a real gap for
+    format_procrastinators specifically, since its bootstrap send (see
+    run_stats_rollover) can fire mid-day. Needs no Telegram fetch at all -- the figurine
+    counter is the only thing being overlaid, and it's already a local file."""
     for key, live in _load_live_figurines(entry, today).items():
         s = combined.setdefault(key, UserStats(user_id=key, display_name=live.get("display_name", "Unknown")))
-        s.figurines_painted = max(s.figurines_painted, live.get("count", 0))
-        live_at = live.get("last_at")
-        if live_at and (s.last_figurine_at is None or live_at > s.last_figurine_at):
-            s.last_figurine_at = live_at
-            s.last_figurine_message_id = live.get("last_message_id")
+        s.figurines_painted += live.get("count", 0)
+        if live.get("recent_posts"):
+            s.recent_figurine_posts = _merge_recent_figurine_posts(s.recent_figurine_posts, live["recent_posts"])
         if live.get("username"):
             s.username = live["username"]
         if live.get("display_name"):
@@ -620,10 +632,11 @@ def format_procrastinators(
         # mention of the person being called out. Falls back to the display name only
         # for the rare tracked user with no Telegram username set at all.
         who = f"@{s.username}" if s.username else s.display_name
-        if not s.last_figurine_at:
+        if not s.recent_figurine_posts:
             entries.append((10**9, f"{who} — ещё ни разу не скидывал(а) работы"))
             continue
-        days_since = (today - datetime.fromisoformat(s.last_figurine_at).date()).days
+        last_at = s.recent_figurine_posts[0][0]  # newest-first, see _merge_recent_figurine_posts
+        days_since = (today - datetime.fromisoformat(last_at).date()).days
         if days_since >= inactive_days:
             entries.append((days_since, f"{who} — не скидывал работы {_ru_days(days_since)}"))
     if not entries:
@@ -666,15 +679,26 @@ def figurine_message_link(chat_username: str | None, chat_id: int | None, messag
     return None
 
 
-def format_stat(user: UserStats, rank: int, total: int, figurine_link: str | None = None) -> str:
+def figurine_message_links(chat_username: str | None, chat_id: int | None, user: UserStats) -> list[str]:
+    """figurine_message_link, applied across `user.recent_figurine_posts` (up to
+    RECENT_FIGURINE_LINKS entries, newest first) -- what /stat's "Последние N работы"
+    section links to. Skips (rather than emitting a broken link for) any post that
+    can't be linked, e.g. a chat with neither a public username nor a resolvable marked
+    id -- see figurine_message_link's own docstring for when that happens."""
+    links = []
+    for _, message_id in user.recent_figurine_posts:
+        link = figurine_message_link(chat_username, chat_id, message_id)
+        if link:
+            links.append(link)
+    return links
+
+
+def format_stat(user: UserStats, rank: int, total: int, figurine_links: list[str] | None = None) -> str:
     avg = user.messages / user.active_days if user.active_days else 0.0
     last_seen = "нет данных"
     if user.last_message_at:
         last_seen = datetime.fromisoformat(user.last_message_at).strftime("%Y-%m-%d %H:%M")
-    figurines_line = f"Покрашено фигурок: {user.figurines_painted}"
-    if figurine_link:
-        figurines_line += f" (последняя: {figurine_link})"
-    return (
+    text = (
         "📊 Статистика пользователя:\n\n"
         f"Имя: {user.display_name}\n"
         f"🏆 Очки: {user.score}\n"
@@ -682,10 +706,14 @@ def format_stat(user: UserStats, rank: int, total: int, figurine_link: str | Non
         f"Сообщений: {user.messages}\n"
         f"Среднее сообщений в день: {avg:.1f}\n"
         f"Активность: {_ru_days(user.active_days)}\n"
-        f"{figurines_line}\n"
+        f"Покрашено фигурок: {user.figurines_painted}\n"
         f"Любимое время: {_favorite_hour_label(user.hours)}\n"
         f"Последняя активность: {last_seen}"
     )
+    if figurine_links:
+        works = "\n".join(f"{i}. {link}" for i, link in enumerate(figurine_links, start=1))
+        text += f"\n\nПоследние 3 работы:\n{works}"
+    return text
 
 
 def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats | None:

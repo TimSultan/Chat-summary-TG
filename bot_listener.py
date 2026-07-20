@@ -811,10 +811,8 @@ async def _dispatch_update(
                         from_user.get("username"), _display_name(from_user), tz, log=log,
                     )
                     if user:
-                        figurine_link = stats.figurine_message_link(
-                            chat.get("username"), chat_key, user.last_figurine_message_id
-                        )
-                        reply_text = stats.format_stat(user, rank, total, figurine_link)
+                        figurine_links = stats.figurine_message_links(chat.get("username"), chat_key, user)
+                        reply_text = stats.format_stat(user, rank, total, figurine_links)
                     else:
                         reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
             # parse_mode=None: reply_text can embed a raw display name (leaderboard

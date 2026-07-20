@@ -1301,10 +1301,10 @@ async def run_listener(
                             client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
                         )
                         if user:
-                            figurine_link = stats.figurine_message_link(
-                                getattr(chat, "username", None), event.chat_id, user.last_figurine_message_id
+                            figurine_links = stats.figurine_message_links(
+                                getattr(chat, "username", None), event.chat_id, user
                             )
-                            reply_text = stats.format_stat(user, rank, total, figurine_link)
+                            reply_text = stats.format_stat(user, rank, total, figurine_links)
                         else:
                             reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
                 sent = await event.reply(reply_text)
