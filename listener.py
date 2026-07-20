@@ -1200,16 +1200,20 @@ async def run_listener(
                     period = stats.parse_top_command(stats_text)
                     reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                 else:
-                    sender = await event.get_sender()
                     arg = stats_text[len("/stat") :].strip()
-                    user, rank, total = await stats.resolve_stat_target(
-                        client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
-                    )
-                    reply_text = (
-                        stats.format_stat(user, rank, total)
-                        if user
-                        else "Статистика не найдена -- пользователь ещё не отслеживается."
-                    )
+                    period = stats.parse_stat_period(arg)
+                    if period:
+                        reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
+                    else:
+                        sender = await event.get_sender()
+                        user, rank, total = await stats.resolve_stat_target(
+                            client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
+                        )
+                        reply_text = (
+                            stats.format_stat(user, rank, total)
+                            if user
+                            else "Статистика не найдена -- пользователь ещё не отслеживается."
+                        )
                 sent = await event.reply(reply_text)
                 if sent is not None:
                     sent_message_ids.add(sent.id)

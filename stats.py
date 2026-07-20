@@ -2,8 +2,11 @@
 media/reply counts, active days, and an hourly activity histogram, computed once per
 calendar day from the SAME per-day transcript cache telegram_fetch.py already maintains
 (see finalize_and_record, called by listener.py's midnight rollover job). Powers "/top
-today|week|month|all" (a simple points leaderboard) and "/stat [username]" (one person's
-tracked history).
+day|week|month|year|all" (a simple points leaderboard) and "/stat [username]" (one
+person's tracked history). "/stat" accepts those same period keywords too (e.g. "/stat
+all", "/stat year") -- given one, bare, with nothing else, it shows the same leaderboard
+as the equivalent "/top" instead of searching for a user literally named "all" or "year"
+(see parse_stat_period).
 
 The daily rollover only ever permanently records a day once it's actually over (closed
 days are immutable, see record_day) -- but a query for "today" run *during* today
@@ -30,8 +33,9 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
 Points are never stored -- always recomputed on demand from the raw per-day counters for
-whatever window (today/week/month, or -- for /stat -- every recorded day) is asked about,
-so changing the point values later doesn't require re-processing any history.
+whatever window (day/week/month/year, or -- for a bare /stat lookup -- every recorded
+day) is asked about, so changing the point values later doesn't require re-processing
+any history.
 """
 
 import hashlib
@@ -63,14 +67,17 @@ POINTS_PER_ACTIVE_DAY = 5
 # describe_media tags those too.
 MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
 
-VALID_PERIODS = ("today", "week", "month", "all")
+VALID_PERIODS = ("today", "week", "month", "year", "all")
+# "day" isn't a distinct window -- it's just the word people actually type for "today".
+# Normalized away by _normalize_period before anything looks at VALID_PERIODS.
+PERIOD_ALIASES = {"day": "today"}
 # Days back from today (inclusive of today) each bounded period covers -- rolling
 # windows, not calendar-aligned (a "week" is always the last 7 days, not necessarily
-# Mon-Sun) so /top week and /top month are never thin just because it happens to be
-# early in a calendar week/month. "all" isn't a bounded window at all -- format_top
-# special-cases it to aggregate_all_time_live instead of a start/end range, so it has no
-# entry here.
-PERIOD_LOOKBACK_DAYS = {"today": 0, "week": 6, "month": 29}
+# Mon-Sun, and a "year" the last 365 days, not Jan 1-Dec 31) so /top week/month/year are
+# never thin just because it happens to be early in a calendar week/month/year. "all"
+# isn't a bounded window at all -- format_top special-cases it to
+# aggregate_all_time_live instead of a start/end range, so it has no entry here.
+PERIOD_LOOKBACK_DAYS = {"today": 0, "week": 6, "month": 29, "year": 364}
 
 
 def _cache_key(entry: str) -> str:
@@ -290,13 +297,37 @@ def strip_command_bot_mention(text: str, bot_username: str | None) -> str:
     return pattern.sub(r"\1", text, count=1)
 
 
+def _normalize_period(word: str) -> str | None:
+    """Case-folds `word` and resolves the "day" -> "today" alias, then returns it only if
+    it names one of VALID_PERIODS -- None for anything else (a username, a typo, ...)."""
+    word = word.strip().lower()
+    word = PERIOD_ALIASES.get(word, word)
+    return word if word in VALID_PERIODS else None
+
+
 def parse_top_command(text: str) -> str:
     """Extracts the period keyword from a "/top ..." command. Defaults to "today" if
-    none is given, or it's not one of VALID_PERIODS, rather than rejecting the request."""
+    none is given, or it's not one of VALID_PERIODS (after alias normalization), rather
+    than rejecting the request."""
     parts = text.strip().split()
-    if len(parts) > 1 and parts[1].lower() in VALID_PERIODS:
-        return parts[1].lower()
+    if len(parts) > 1:
+        normalized = _normalize_period(parts[1])
+        if normalized:
+            return normalized
     return "today"
+
+
+def parse_stat_period(arg: str) -> str | None:
+    """Recognizes a "/stat <period>" call -- e.g. "/stat all" or "/stat year" -- so it
+    shows the same leaderboard as the equivalent "/top <period>" instead of
+    resolve_stat_target searching for a user literally named "all" or "year". Only
+    matches when `arg` is a single bare word naming a period (after alias
+    normalization): a leading "@" or any extra word makes it an unambiguous username/name
+    lookup instead, and is left alone (returns None)."""
+    arg = arg.strip()
+    if not arg or arg.startswith("@") or len(arg.split()) != 1:
+        return None
+    return _normalize_period(arg)
 
 
 async def _live_today_users(client, chat_ref, tz, log=print) -> dict:
