@@ -118,14 +118,18 @@ def _live_figurines_path(entry: str, day: date) -> Path:
 
 
 def record_figurine_live(
-    entry: str, day: date, user_id, username: str | None, display_name: str, log=print
+    entry: str, day: date, user_id, username: str | None, display_name: str,
+    message_id: int | None = None, log=print,
 ) -> int:
     """Bumps one user's figurine-painted count for `day` the instant a qualifying
     message is seen live (listener.py's on_message, which sees every message as it
     arrives) -- a plain local read-modify-write, no Telegram call involved, so /stat and
     /top reflect it immediately rather than waiting on the transcript cache's own TTL
     (see _live_today_users, which overlays this on top of that cache for "today").
-    Returns the user's new total for `day`, for logging.
+    `message_id` (if given) is remembered as this user's latest qualifying message, for
+    /stat's link to it (see figurine_message_link) -- Telegram has no deep link for a
+    filtered/scoped search, only a link to one specific message. Returns the user's new
+    total for `day`, for logging.
 
     Kept in a file separate from the per-day file `_path` writes (record_day's finalized,
     immutable snapshot of a CLOSED day) -- writing here must never be mistaken by
@@ -138,12 +142,16 @@ def record_figurine_live(
     except (json.JSONDecodeError, OSError):
         data = {}
     key = str(user_id)
-    u = data.setdefault(key, {"username": None, "display_name": display_name, "count": 0})
+    u = data.setdefault(
+        key, {"username": None, "display_name": display_name, "count": 0, "last_message_id": None, "last_at": None}
+    )
     if username:
         u["username"] = username
     if display_name:
         u["display_name"] = display_name
     u["count"] += 1
+    u["last_message_id"] = message_id
+    u["last_at"] = app_now().isoformat()
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     log(f"[stats] figurine recorded live for '{entry}' user {key}: {u['count']} today")
     return u["count"]
@@ -197,6 +205,8 @@ def compute_day_stats(messages: list) -> dict:
                 "media": 0,
                 "replies": 0,
                 "figurines": 0,
+                "last_figurine_message_id": None,
+                "last_figurine_at": None,
                 "hours": {},
                 "last_message_at": None,
             },
@@ -209,13 +219,16 @@ def compute_day_stats(messages: list) -> dict:
         u["chars"] += len(m.text)
         if m.text.startswith(MEDIA_TAG_PREFIXES):
             u["media"] += 1
+        ts = m.dt_local.isoformat()
         if m.text.startswith("[Photo]") and is_figurine_caption(m.text):
             u["figurines"] += 1
+            if u["last_figurine_at"] is None or ts > u["last_figurine_at"]:
+                u["last_figurine_at"] = ts
+                u["last_figurine_message_id"] = m.message_id
         if m.is_reply:
             u["replies"] += 1
         hour_key = str(m.dt_local.hour)
         u["hours"][hour_key] = u["hours"].get(hour_key, 0) + 1
-        ts = m.dt_local.isoformat()
         if u["last_message_at"] is None or ts > u["last_message_at"]:
             u["last_message_at"] = ts
     return users
@@ -277,6 +290,11 @@ class UserStats:
     # scoring stat.
     replies: int = 0
     figurines_painted: int = 0
+    # The single most recent qualifying message, so /stat can link straight to it (see
+    # figurine_message_link) -- Telegram has no deep link for a filtered/scoped search, so
+    # this is the closest thing to "show me theirs": one tap to the latest one instead.
+    last_figurine_message_id: int | None = None
+    last_figurine_at: str | None = None
     active_days: int = 0
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
@@ -304,6 +322,10 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
         s.figurines_painted += u.get("figurines", 0)
+        last_figurine = u.get("last_figurine_at")
+        if last_figurine and (s.last_figurine_at is None or last_figurine > s.last_figurine_at):
+            s.last_figurine_at = last_figurine
+            s.last_figurine_message_id = u.get("last_figurine_message_id")
         if u.get("messages", 0) > 0:
             s.active_days += 1
         for hour, count in u.get("hours", {}).items():
@@ -439,10 +461,15 @@ async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict
             {
                 "username": None, "display_name": live.get("display_name", "Unknown"),
                 "messages": 0, "chars": 0, "media": 0, "replies": 0, "figurines": 0,
+                "last_figurine_message_id": None, "last_figurine_at": None,
                 "hours": {}, "last_message_at": None,
             },
         )
         u["figurines"] = max(u.get("figurines", 0), live.get("count", 0))
+        live_at = live.get("last_at")
+        if live_at and (u.get("last_figurine_at") is None or live_at > u["last_figurine_at"]):
+            u["last_figurine_at"] = live_at
+            u["last_figurine_message_id"] = live.get("last_message_id")
         if live.get("username"):
             u["username"] = live["username"]
         if live.get("display_name"):
@@ -497,11 +524,40 @@ def _favorite_hour_label(hours: dict) -> str:
     return f"{best_hour:02d}:00–{(best_hour + 1) % 24:02d}:00"
 
 
-def format_stat(user: UserStats, rank: int, total: int) -> str:
+def figurine_message_link(chat_username: str | None, chat_id: int | None, message_id: int | None) -> str | None:
+    """Best-effort t.me link straight to someone's single most recent #япокрасил+photo
+    post -- the closest thing to "show me all of theirs" that Telegram actually exposes
+    as a URL: there is no documented deep link for a sender+hashtag-filtered in-chat
+    search (only the in-app search UI supports that combination, entered by hand), just a
+    link to one specific message (see message_id, tracked by compute_day_stats/
+    record_figurine_live). `chat_id` must be the "marked" id (event.chat_id in
+    listener.py, chat_id straight from the Bot API -- both use the same numbering, see
+    bot_listener._resolve_chat_id), NOT Telethon's raw entity.id.
+
+    Prefers the public-username form (works for anyone); falls back to the "-100"-prefixed
+    marked-id form (t.me/c/..., only resolvable by an existing chat member) for a private
+    supergroup/channel with no username. None if there's nothing to link yet, or the chat
+    is a small basic group (never upgraded to a supergroup), which has no stable t.me/c/
+    numbering at all."""
+    if message_id is None:
+        return None
+    if chat_username:
+        return f"https://t.me/{chat_username}/{message_id}"
+    if chat_id is not None:
+        marked = str(chat_id)
+        if marked.startswith("-100"):
+            return f"https://t.me/c/{marked[4:]}/{message_id}"
+    return None
+
+
+def format_stat(user: UserStats, rank: int, total: int, figurine_link: str | None = None) -> str:
     avg = user.messages / user.active_days if user.active_days else 0.0
     last_seen = "нет данных"
     if user.last_message_at:
         last_seen = datetime.fromisoformat(user.last_message_at).strftime("%Y-%m-%d %H:%M")
+    figurines_line = f"Покрашено фигурок: {user.figurines_painted}"
+    if figurine_link:
+        figurines_line += f" (последняя: {figurine_link})"
     return (
         "📊 Статистика пользователя:\n\n"
         f"Имя: {user.display_name}\n"
@@ -510,7 +566,7 @@ def format_stat(user: UserStats, rank: int, total: int) -> str:
         f"Сообщений: {user.messages}\n"
         f"Среднее сообщений в день: {avg:.1f}\n"
         f"Активность: {_ru_days(user.active_days)}\n"
-        f"Покрашено фигурок: {user.figurines_painted}\n"
+        f"{figurines_line}\n"
         f"Любимое время: {_favorite_hour_label(user.hours)}\n"
         f"Последняя активность: {last_seen}"
     )

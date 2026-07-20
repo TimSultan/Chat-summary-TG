@@ -808,11 +808,13 @@ async def _dispatch_update(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
                     )
-                    reply_text = (
-                        stats.format_stat(user, rank, total)
-                        if user
-                        else "Статистика не найдена -- пользователь ещё не отслеживается."
-                    )
+                    if user:
+                        figurine_link = stats.figurine_message_link(
+                            chat.get("username"), chat_key, user.last_figurine_message_id
+                        )
+                        reply_text = stats.format_stat(user, rank, total, figurine_link)
+                    else:
+                        reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
             # parse_mode=None: reply_text can embed a raw display name (leaderboard
             # entries, /stat's "Имя:" line) -- Telegram's Markdown mode would reject the
             # whole message if that name has an unbalanced _/*/`/[ (a real username with

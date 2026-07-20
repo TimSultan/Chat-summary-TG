@@ -1148,7 +1148,8 @@ async def run_listener(
                 sender = await event.get_sender()
                 count = stats.record_figurine_live(
                     entry, datetime.now(tz).date(), msg.sender_id,
-                    getattr(sender, "username", None), sender_display_name(sender), log=log,
+                    getattr(sender, "username", None), sender_display_name(sender),
+                    message_id=msg.id, log=log,
                 )
                 log(f"[listener] figurine painted by {sender_display_name(sender)} in '{entry}' (today: {count})")
                 if bot_takeover:
@@ -1245,11 +1246,13 @@ async def run_listener(
                         user, rank, total = await stats.resolve_stat_target(
                             client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
                         )
-                        reply_text = (
-                            stats.format_stat(user, rank, total)
-                            if user
-                            else "Статистика не найдена -- пользователь ещё не отслеживается."
-                        )
+                        if user:
+                            figurine_link = stats.figurine_message_link(
+                                getattr(chat, "username", None), event.chat_id, user.last_figurine_message_id
+                            )
+                            reply_text = stats.format_stat(user, rank, total, figurine_link)
+                        else:
+                            reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
                 sent = await event.reply(reply_text)
                 if sent is not None:
                     sent_message_ids.add(sent.id)
