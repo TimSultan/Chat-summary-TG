@@ -138,8 +138,9 @@ SUMMARY_ACK_EMOJI = "✍"
 FIGURINE_ACK_EMOJI = "🔥"
 
 # "/stat pokras" on-demand fallback when stats.format_procrastinators finds nobody to
-# call out (everyone in the top-30 posted within the window) -- it returns None rather
-# than an empty list in that case, so callers supply their own "all clear" message.
+# call out (no candidates at all, or everyone it walked through posted within the
+# window) -- it returns None rather than an empty list in that case, so callers supply
+# their own "all clear" message.
 PROCRASTINATOR_NONE_FOUND_MESSAGE = "Все скидывали покрасы вовремя -- прокрастинаторов не найдено."
 
 ERROR_DELETE_AFTER = 10  # short rejection notices (such as day limit) self-delete fast

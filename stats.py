@@ -99,11 +99,14 @@ RECENT_FIGURINE_LINKS = 3
 
 # "Топ покрастинаторов": sent automatically every PROCRASTINATOR_DIGEST_INTERVAL_DAYS
 # days at PROCRASTINATOR_DIGEST_HOUR local (app-timezone) time -- see run_stats_rollover's
-# digest loop and should_send_procrastinator_digest -- calling out whoever's in the top
-# PROCRASTINATOR_TOP_N scorers of the last 30 days (the same window /top month uses, NOT
-# all-time -- see format_procrastinators) but hasn't posted a #япокрасил+photo in the last
-# PROCRASTINATOR_INACTIVE_DAYS days.
-PROCRASTINATOR_TOP_N = 30
+# digest loop and should_send_procrastinator_digest -- calling out exactly
+# PROCRASTINATOR_LIST_SIZE people (fewer only if there simply aren't that many
+# candidates), walking down the last-30-days scorers (the same window /top month uses,
+# NOT all-time -- see format_procrastinators) from the top, SKIPPING (not counting
+# towards the list) anyone who's posted a #япокрасил+photo within the last
+# PROCRASTINATOR_INACTIVE_DAYS days -- so the list is always full-size instead of
+# shrinking on a day when most of the top scorers happen to be caught up.
+PROCRASTINATOR_LIST_SIZE = 21
 PROCRASTINATOR_INACTIVE_DAYS = 14
 PROCRASTINATOR_DIGEST_HOUR = 19
 PROCRASTINATOR_DIGEST_INTERVAL_DAYS = 2
@@ -642,39 +645,50 @@ PROCRASTINATOR_REMINDER = "Скидывайте свою последнюю ил
 
 async def format_procrastinators(
     client, chat_ref, entry: str, tz,
-    top_n: int = PROCRASTINATOR_TOP_N, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS, log=print,
+    list_size: int = PROCRASTINATOR_LIST_SIZE, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS, log=print,
 ) -> str | None:
     """The "Топ покрастинаторов" call-out, sent automatically every
     PROCRASTINATOR_DIGEST_INTERVAL_DAYS days (see run_stats_rollover's digest loop) and
-    available on demand via "/stat pokras": among the top `top_n` scorers of the last 30
-    days for `entry` (same rolling window /top month uses -- "currently active", NOT
-    all-time, so someone who was huge months ago but has since gone quiet isn't in the
-    pool just because of old history), whoever hasn't posted a #япокрасил+photo within the
-    last `inactive_days` days. Includes people who have NEVER posted one at all, not just
-    people who used to and stopped -- both count as "hasn't sent new work recently" --
-    shown with a distinct line since there's no "last time" to count days from for them.
+    available on demand via "/stat pokras": always exactly `list_size` people (fewer only
+    if there simply aren't that many candidates at all), walking DOWN the last-30-days
+    scorers for `entry` (same rolling window /top month uses -- "currently active", NOT
+    all-time, so someone who was huge months ago but has since gone quiet isn't
+    considered just because of old history) from the top, SKIPPING -- not counting
+    towards `list_size` -- anyone who's posted a #япокрасил+photo within the last
+    `inactive_days` days. Unlike a fixed top-N pool filtered afterwards (the old design),
+    this keeps walking as far down the ranking as it takes, so the list is always full
+    whenever enough overdue people exist at all, instead of shrinking on a day when most
+    of the top scorers happen to already be caught up. Includes people who have NEVER
+    posted one at all, not just people who used to and stopped -- both count as "hasn't
+    sent new work recently" -- shown with a distinct line since there's no "last time" to
+    count days from for them.
 
-    The pool (who's "active") and the recency check (when did they last post)
-    deliberately use two different windows: the pool is scored over the last 30 days,
-    but "last posted" is looked up against their WHOLE history (aggregate_all_time) --
-    otherwise someone overdue by more than a month would wrongly look like they've never
-    posted at all, just because that post fell outside the 30-day pool window.
+    The ranking (who's "active", and what order candidates get considered in) and the
+    recency check (when did they last post) deliberately use two different windows:
+    ranking is by score over the last 30 days, but "last posted" is looked up against
+    their WHOLE history (aggregate_all_time) -- otherwise someone overdue by more than a
+    month would wrongly look like they've never posted at all, just because that post
+    fell outside the 30-day ranking window. Because the recency check goes through
+    `all_time` (which holds an entry for every tracked user, independent of whether
+    they're ever reached/shown here), someone's "last posted" timer is always correctly
+    updated by a fresh post even on a day they're skipped for already being caught up, or
+    never reached at all because `list_size` filled up before the ranking got to them.
 
     `client`/`chat_ref` are required (unlike the old, purely file-based design) so today
     can be re-derived via _live_today_users -- the SAME fresh-transcript-plus-live-file
-    merge /stat and /top already rely on -- fetched ONCE and reused for both `pool` and
-    `all_time` below. This matters: a version of this function that trusted ONLY the
-    local live-figurine-counter file (record_figurine_live's write, which only ever
-    happens from listener.py's on_message seeing a message live, in real time) was found
-    in production to disagree with /stat -- someone whose post /stat correctly showed
-    (via its own fresh transcript re-derivation) still showed up here as "never posted",
-    because the live-counter file alone doesn't cover every way a today-post can become
-    known (e.g. a process restart between the post and the check-in means on_message
-    never ran for it, yet a fresh fetch still finds it in the actual message history).
-    Using the same _live_today_users merge as /stat closes that gap.
+    merge /stat and /top already rely on -- fetched ONCE and reused for both the ranking
+    and the recency lookup below. This matters: a version of this function that trusted
+    ONLY the local live-figurine-counter file (record_figurine_live's write, which only
+    ever happens from listener.py's on_message seeing a message live, in real time) was
+    found in production to disagree with /stat -- someone whose post /stat correctly
+    showed (via its own fresh transcript re-derivation) still showed up here as "never
+    posted", because the live-counter file alone doesn't cover every way a today-post can
+    become known (e.g. a process restart between the post and the check-in means
+    on_message never ran for it, yet a fresh fetch still finds it in the actual message
+    history). Using the same _live_today_users merge as /stat closes that gap.
 
-    Returns None if there's nobody to call out (empty top_n, or everyone in it already
-    posted within the window) -- callers should simply not send anything in that case."""
+    Returns None if there's nobody to call out at all (nobody ranked, or everyone ranked
+    has already posted within the window) -- callers should simply not send anything."""
     today = datetime.now(tz).date()
     live_today = await _live_today_users(client, chat_ref, entry, tz, log=log)
 
@@ -682,7 +696,7 @@ async def format_procrastinators(
     historical_end = min(month_end, today - timedelta(days=1))
     pool = aggregate(entry, month_start, historical_end) if month_start <= historical_end else {}
     _merge_day(pool, {"users": live_today})
-    ranked = sorted(pool.values(), key=lambda s: s.score, reverse=True)[:top_n]
+    ranked = sorted(pool.values(), key=lambda s: s.score, reverse=True)
 
     all_time = aggregate_all_time(entry)
     _merge_day(all_time, {"users": live_today})
@@ -692,6 +706,8 @@ async def format_procrastinators(
     # needing a fabricated day count.
     entries: list[tuple[int, str]] = []
     for s in ranked:
+        if len(entries) >= list_size:
+            break
         # Deliberately the display name, not an @username mention -- per explicit user
         # request, this call-out shouldn't ping people (it repeats every
         # PROCRASTINATOR_DIGEST_INTERVAL_DAYS days, unlike a one-off notification).
@@ -705,6 +721,7 @@ async def format_procrastinators(
         days_since = (today - datetime.fromisoformat(last_at).date()).days
         if days_since >= inactive_days:
             entries.append((days_since, f"{who} — не скидывал работы {_ru_days(days_since)}"))
+        # else: posted recently -- skip without counting towards list_size, keep walking
     if not entries:
         return None
     entries.sort(key=lambda pair: pair[0], reverse=True)
