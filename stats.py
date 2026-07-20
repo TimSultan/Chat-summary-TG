@@ -71,6 +71,17 @@ POINTS_PER_FIGURINE = 150
 # describe_media tags those too.
 MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
 
+
+def is_zero_content_message(text: str) -> bool:
+    """A message that's JUST a sticker or JUST a GIF, with nothing else -- these don't
+    count towards points at all (not even the base +1/message), so sticker/GIF spam
+    can't inflate someone's message count, score, or leaderboard rank. Stickers never
+    carry accompanying text in Telegram (no caption support there), so any
+    "[Sticker ...]"-tagged message already qualifies by prefix alone. A GIF DOES support
+    a caption, so only an exact bare "[GIF]" (no caption at all) qualifies -- "[GIF] nice
+    one" still counts in full, since that's real authored content alongside the media."""
+    return text.startswith("[Sticker") or text == "[GIF]"
+
 # A "figurine painted" post: the #япокрасил hashtag, anywhere in the caption, on a
 # message that has an actual photo attached (a video or a hashtag-only text message
 # doesn't count -- per spec it "has to contain image"). Matched case-insensitively since
@@ -217,13 +228,15 @@ def compute_day_stats(messages: list) -> dict:
     """Returns {user_id_str: {...counters...}} for one day's messages (a full day's
     telegram_fetch.ChatMessage list). Messages with no resolvable sender_id (rare --
     sender resolution failed) are skipped, since there's no stable key to attribute them
-    to. `chars` counts the full cached text including any media-tag prefix (e.g.
-    "[Photo] "), not just a caption -- a minor, deliberate over-count for media messages
-    given chars isn't scored and the cache doesn't separately store a caption-only
-    string."""
+    to -- same for a zero-content sticker/GIF-only message (see is_zero_content_message):
+    both are excluded entirely, not just from scoring, so they don't even nudge
+    active_days or last_message_at. `chars` counts the full cached text including any
+    media-tag prefix (e.g. "[Photo] "), not just a caption -- a minor, deliberate
+    over-count for media messages given chars isn't scored and the cache doesn't
+    separately store a caption-only string."""
     users: dict[str, dict] = {}
     for m in messages:
-        if m.sender_id is None:
+        if m.sender_id is None or is_zero_content_message(m.text):
             continue
         key = str(m.sender_id)
         u = users.setdefault(
