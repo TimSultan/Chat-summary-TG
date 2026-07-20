@@ -38,11 +38,23 @@ def is_image_message(msg) -> bool:
     return bool(mime and mime.startswith("image/"))
 
 
+def is_video_message(msg) -> bool:
+    """True for msg.video OR a video sent as an uncompressed document (mime type
+    video/*) -- same reasoning as is_image_message: a sender can pick "send without
+    compression" for a video too, e.g. to avoid Telegram re-encoding a painting timelapse.
+    describe_media tags both the same way ("[Video]"). Doesn't match msg.video_note
+    (round "video message" bubbles) or msg.gif (animated GIF) -- those are checked
+    earlier in describe_media's own if-chain and are semantically distinct, not "a video
+    of the artwork"."""
+    if msg.video:
+        return True
+    mime = getattr(msg.document, "mime_type", None) if msg.document else None
+    return bool(mime and mime.startswith("video/"))
+
+
 def describe_media(msg) -> str:
     if msg.video_note:
         return "[Video note]"
-    if msg.video:
-        return "[Video]"
     if msg.voice:
         return "[Voice message]"
     if msg.gif:
@@ -63,6 +75,8 @@ def describe_media(msg) -> str:
         return f"[Poll: {question}]" if question else "[Poll]"
     if is_image_message(msg):
         return "[Photo]"
+    if is_video_message(msg):
+        return "[Video]"
     if msg.document:
         fname = None
         if msg.file:

@@ -45,6 +45,7 @@ from telegram_fetch import (
     fetch_range_messages_cached,
     format_transcript_lines,
     is_image_message,
+    is_video_message,
     resolve_chat,
     sender_display_name,
     sender_matches,
@@ -129,7 +130,7 @@ NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих со�
 # (which can take a few seconds) run.
 SUMMARY_ACK_EMOJI = "✍"
 
-# Reacted onto a #япокрасил post (with a photo attached) the instant it's seen -- see
+# Reacted onto a #япокрасил post (with a photo or video attached) the instant it's seen -- see
 # on_message's figurine-detection block and stats.record_figurine_live. Must be one of
 # Telegram's own fixed "quick reaction" emoji set (core.telegram.org/api/reactions) --
 # anything outside that set is rejected by the API. "🎨" (artist palette) is NOT in that
@@ -835,7 +836,7 @@ async def run_listener(
     share them between both tasks.
 
     `figurine_ack_queue`, if given, is where (allowed_chats entry, message_id) goes for a
-    #япокрасил+photo message this session has just seen -- see on_message's figurine-
+    #япокрасил+photo/video message this session has just seen -- see on_message's figurine-
     detection block. This session always does the counting itself (stats.
     record_figurine_live), since it's the only one that sees every message, and reacts
     itself too when there's no bot account to defer to -- but once a bot token is
@@ -1227,20 +1228,21 @@ async def run_listener(
         # the literal command text as something worth reacting to or joking about).
         is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
 
-        # #япокрасил + an attached image -- a "figurine painted" post (see
-        # POINTS_PER_FIGURINE in stats.py). is_image_message (not just msg.photo) also
-        # catches an image sent as an uncompressed file/document -- Telegram's own
-        # compressed-photo-vs-document split is just a sender-side choice, and artists
-        # posting full-resolution art routinely pick "send without compression" (a real
-        # missed-post bug found in production: some users' #япокрасил images silently
-        # never counted because they'd sent them as files, not compressed photos -- see
-        # is_image_message's docstring). This session sees every message as it arrives,
-        # so it's the one place that ever calls record_figurine_live -- a plain local
-        # counter bump, not a re-fetch of anything -- so /stat and /top pick it up
-        # immediately instead of waiting on the transcript cache's own TTL. Reacting is
-        # the one part that has to defer to the bot account once bot_takeover is on, same
-        # as every other reply (see figurine_ack_queue).
-        if cfg.stats_enabled and is_image_message(msg) and stats.is_figurine_caption(text):
+        # #япокрасил + an attached photo OR video -- a "figurine painted" post (see
+        # POINTS_PER_FIGURINE in stats.py). is_image_message/is_video_message (not just
+        # msg.photo/msg.video) also catch media sent as an uncompressed file/document --
+        # Telegram's own compressed-vs-document split is just a sender-side choice, and
+        # artists posting full-resolution art or a painting timelapse routinely pick
+        # "send without compression" (a real missed-post bug found in production for the
+        # photo case: some users' #япокрасил images silently never counted because they'd
+        # sent them as files -- see is_image_message's docstring). This session sees
+        # every message as it arrives, so it's the one place that ever calls
+        # record_figurine_live -- a plain local counter bump, not a re-fetch of anything
+        # -- so /stat and /top pick it up immediately instead of waiting on the
+        # transcript cache's own TTL. Reacting is the one part that has to defer to the
+        # bot account once bot_takeover is on, same as every other reply (see
+        # figurine_ack_queue).
+        if cfg.stats_enabled and (is_image_message(msg) or is_video_message(msg)) and stats.is_figurine_caption(text):
             chat = await event.get_chat()
             entry = matched_allowed_chat(chat)
             if entry is not None:
@@ -1680,7 +1682,7 @@ async def main():
         followup_queue: asyncio.Queue = asyncio.Queue()
         # figurine_ack_queue carries (allowed_chats entry, message_id) from this session
         # -- the only one that sees every message, so it's the one that detects a
-        # #япокрасил+photo post and bumps the counter (stats.record_figurine_live) -- to
+        # #япокрасил+photo/video post and bumps the counter (stats.record_figurine_live) -- to
         # bot_listener.py, so the *reaction* onto that message still comes from the bot
         # account, same bot-account-only rule as every other reply.
         figurine_ack_queue: asyncio.Queue = asyncio.Queue()

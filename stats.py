@@ -32,8 +32,8 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
     +1 per message containing a photo or video
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
-    +150 per message tagged #япокрасил that has an actual photo attached (a "figurine
-        painted" post -- see FIGURINE_HASHTAG; a video or a hashtag with no photo doesn't
+    +150 per message tagged #япокрасил that has an actual photo OR video attached (a
+        "figurine painted" post -- see FIGURINE_HASHTAG; a hashtag with no media doesn't
         qualify). Also surfaced as its own raw count, "Покрашено фигурок", in /stat.
 Points are never stored -- always recomputed on demand from the raw per-day counters for
 whatever window (day/week/month/year, or -- for a bare /stat lookup -- every recorded
@@ -44,6 +44,7 @@ any history.
 import hashlib
 import json
 import os
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -83,8 +84,8 @@ def is_zero_content_message(text: str) -> bool:
     return text.startswith("[Sticker") or text == "[GIF]"
 
 # A "figurine painted" post: the #япокрасил hashtag, anywhere in the caption, on a
-# message that has an actual photo attached (a video or a hashtag-only text message
-# doesn't count -- per spec it "has to contain image"). Matched case-insensitively since
+# message that has an actual photo OR video attached (a hashtag-only text message
+# doesn't count -- per spec it "has to contain media"). Matched case-insensitively since
 # people don't reliably type Cyrillic hashtags in one consistent case.
 FIGURINE_HASHTAG = "#япокрасил"
 
@@ -103,7 +104,7 @@ RECENT_FIGURINE_LINKS = 3
 # PROCRASTINATOR_LIST_SIZE people (fewer only if there simply aren't that many
 # candidates), walking down the last-30-days scorers (the same window /top month uses,
 # NOT all-time -- see format_procrastinators) from the top, SKIPPING (not counting
-# towards the list) anyone who's posted a #япокрасил+photo within the last
+# towards the list) anyone who's posted a #япокрасил+photo/video within the last
 # PROCRASTINATOR_INACTIVE_DAYS days -- so the list is always full-size instead of
 # shrinking on a day when most of the top scorers happen to be caught up.
 PROCRASTINATOR_LIST_SIZE = 21
@@ -176,11 +177,11 @@ def should_send_procrastinator_digest(
 
 
 def is_figurine_caption(text: str) -> bool:
-    """Whether `text` (a raw caption/message text, NOT the "[Photo] ..." tagged form
-    compute_day_stats works with) carries the #япокрасил hashtag. Callers still have to
-    check for an attached photo themselves -- what that looks like differs by API
-    (Telethon's `msg.photo` vs. the Bot API's "photo" key), so there's no one shared
-    check for that half."""
+    """Whether `text` (a raw caption/message text, NOT the "[Photo] "/"[Video] " tagged
+    form compute_day_stats works with) carries the #япокрасил hashtag. Callers still have
+    to check for an attached photo OR video themselves -- what that looks like differs by
+    API (Telethon's `msg.photo`/`msg.video` vs. the Bot API's "photo"/"video" key), so
+    there's no one shared check for that half."""
     return FIGURINE_HASHTAG in (text or "").lower()
 
 
@@ -295,7 +296,7 @@ def compute_day_stats(messages: list) -> dict:
         if m.text.startswith(MEDIA_TAG_PREFIXES):
             u["media"] += 1
         ts = m.dt_local.isoformat()
-        if m.text.startswith("[Photo]") and is_figurine_caption(m.text):
+        if m.text.startswith(MEDIA_TAG_PREFIXES) and is_figurine_caption(m.text):
             u["figurines"] += 1
             u["figurine_posts"].append([ts, m.message_id])
         if m.is_reply:
@@ -642,6 +643,11 @@ async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, 
 
 PROCRASTINATOR_REMINDER = "Скидывайте свою последнюю или новую работу с хэштегом #япокрасил"
 PROCRASTINATOR_TAUNT = "Языком чесать - не кистями работать."
+# Purely decorative -- one random pick per line (see format_procrastinators), just to
+# make the call-out list less of a wall of plain text. Themed around slowness/napping to
+# match the existing 🐌 header, but there's no other meaning attached to WHICH one a
+# given person gets -- re-rolled fresh every send, not tied to the person.
+PROCRASTINATOR_NAME_EMOJI = ("🐢", "🦥", "🐌", "😴", "🛌", "⏰", "🙈", "💤", "🫠", "🥱")
 
 
 async def format_procrastinators(
@@ -655,7 +661,7 @@ async def format_procrastinators(
     scorers for `entry` (same rolling window /top month uses -- "currently active", NOT
     all-time, so someone who was huge months ago but has since gone quiet isn't
     considered just because of old history) from the top, SKIPPING -- not counting
-    towards `list_size` -- anyone who's posted a #япокрасил+photo within the last
+    towards `list_size` -- anyone who's posted a #япокрасил+photo/video within the last
     `inactive_days` days. Unlike a fixed top-N pool filtered afterwards (the old design),
     this keeps walking as far down the ranking as it takes, so the list is always full
     whenever enough overdue people exist at all, instead of shrinking on a day when most
@@ -711,8 +717,9 @@ async def format_procrastinators(
             break
         # Deliberately the display name, not an @username mention -- per explicit user
         # request, this call-out shouldn't ping people (it repeats every
-        # PROCRASTINATOR_DIGEST_INTERVAL_DAYS days, unlike a one-off notification).
-        who = s.display_name
+        # PROCRASTINATOR_DIGEST_INTERVAL_DAYS days, unlike a one-off notification). A
+        # random decorative emoji is prepended per line (see PROCRASTINATOR_NAME_EMOJI).
+        who = f"{random.choice(PROCRASTINATOR_NAME_EMOJI)} {s.display_name}"
         history = all_time.get(s.user_id)
         posts = history.recent_figurine_posts if history else []
         if not posts:
@@ -739,8 +746,8 @@ def _favorite_hour_label(hours: dict) -> str:
 
 
 def figurine_message_link(chat_username: str | None, chat_id: int | None, message_id: int | None) -> str | None:
-    """Best-effort t.me link straight to someone's single most recent #япокрасил+photo
-    post -- the closest thing to "show me all of theirs" that Telegram actually exposes
+    """Best-effort t.me link straight to someone's single most recent #япокрасил+photo/
+    video post -- the closest thing to "show me all of theirs" that Telegram actually exposes
     as a URL: there is no documented deep link for a sender+hashtag-filtered in-chat
     search (only the in-app search UI supports that combination, entered by hand), just a
     link to one specific message (see message_id, tracked by compute_day_stats/

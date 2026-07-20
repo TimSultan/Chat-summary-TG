@@ -941,7 +941,7 @@ async def run_bot_listener(
     back on `followup_queue` for this function to send, same as every other reply.
 
     `figurine_ack_queue`, if given, carries (allowed_chats entry, message_id) pairs put
-    there by listener.py's on_message the instant it sees a #япокрасил+photo post and
+    there by listener.py's on_message the instant it sees a #япокрасил+photo/video post and
     bumps the counter (stats.record_figurine_live) -- only the reaction itself is done
     here, via the bot account, same bot-account-only rule as every other reply.
 
