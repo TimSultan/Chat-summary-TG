@@ -84,10 +84,11 @@ FIGURINE_HASHTAG = "#япокрасил"
 RECENT_FIGURINE_LINKS = 3
 
 # "Топ покрастинаторов": once a day (see run_stats_rollover), calls out whoever's in the
-# top PROCRASTINATOR_TOP_N all-time scorers but hasn't posted a #япокрасил+photo in the
-# last PROCRASTINATOR_INACTIVE_DAYS days -- see format_procrastinators.
+# top PROCRASTINATOR_TOP_N scorers of the last 30 days (the same window /top month uses,
+# NOT all-time -- see format_procrastinators) but hasn't posted a #япокрасил+photo in the
+# last PROCRASTINATOR_INACTIVE_DAYS days.
 PROCRASTINATOR_TOP_N = 30
-PROCRASTINATOR_INACTIVE_DAYS = 7
+PROCRASTINATOR_INACTIVE_DAYS = 14
 
 VALID_PERIODS = ("today", "week", "month", "year", "all")
 # "day" isn't a distinct window -- it's just the word people actually type for "today".
@@ -603,26 +604,41 @@ def _overlay_live_figurines(combined: dict[str, UserStats], entry: str, today: d
 def format_procrastinators(
     entry: str, tz, top_n: int = PROCRASTINATOR_TOP_N, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS
 ) -> str | None:
-    """The daily "Топ покрастинаторов" call-out: among the top `top_n` all-time scorers
-    for `entry` (same ranking /top all uses -- "active users"), whoever hasn't posted a
-    #япокрасил+photo within the last `inactive_days` days. Includes people who have
-    NEVER posted one at all, not just people who used to and stopped -- both count as
-    "hasn't sent new work in a week" -- shown with a distinct line since there's no
-    "last time" to count days from for them.
+    """The daily "Топ покрастинаторов" call-out: among the top `top_n` scorers of the
+    last 30 days for `entry` (same rolling window /top month uses -- "currently active",
+    NOT all-time, so someone who was huge months ago but has since gone quiet isn't in
+    the pool just because of old history), whoever hasn't posted a #япокрасил+photo
+    within the last `inactive_days` days. Includes people who have NEVER posted one at
+    all, not just people who used to and stopped -- both count as "hasn't sent new work
+    recently" -- shown with a distinct line since there's no "last time" to count days
+    from for them.
 
-    Deliberately synchronous: builds on aggregate_all_time (persisted per-day files) plus
-    a same-day overlay of the live figurine counter (_overlay_live_figurines) -- the
-    latter matters because this can run mid-day (see run_stats_rollover's startup
-    bootstrap send), when today itself isn't finalized/recorded yet, so without it
-    someone who posted an hour ago would still show up as overdue. No Telegram fetch
-    either way -- both sources are local files.
+    The pool (who's "active") and the recency check (when did they last post)
+    deliberately use two different windows: the pool is scored over the last 30 days,
+    but "last posted" is looked up against their WHOLE history (aggregate_all_time) --
+    otherwise someone overdue by more than a month would wrongly look like they've never
+    posted at all, just because that post fell outside the 30-day pool window.
+
+    Deliberately synchronous: builds on aggregate/aggregate_all_time (persisted per-day
+    files) plus a same-day overlay of the live figurine counter
+    (_overlay_live_figurines) on each -- the latter matters because this can run mid-day
+    (see run_stats_rollover's startup bootstrap send), when today itself isn't
+    finalized/recorded yet, so without it someone who posted an hour ago would still
+    show up as overdue. No Telegram fetch either way -- both sources are local files.
 
     Returns None if there's nobody to call out (empty top_n, or everyone in it already
     posted within the window) -- callers should simply not send anything in that case."""
     today = datetime.now(tz).date()
-    combined = aggregate_all_time(entry)
-    _overlay_live_figurines(combined, entry, today)
-    ranked = sorted(combined.values(), key=lambda s: s.score, reverse=True)[:top_n]
+
+    month_start, month_end = resolve_period_window("month", tz)
+    historical_end = min(month_end, today - timedelta(days=1))
+    pool = aggregate(entry, month_start, historical_end) if month_start <= historical_end else {}
+    _overlay_live_figurines(pool, entry, today)
+    ranked = sorted(pool.values(), key=lambda s: s.score, reverse=True)[:top_n]
+
+    all_time = aggregate_all_time(entry)
+    _overlay_live_figurines(all_time, entry, today)
+
     # (sort_key, line) pairs -- sort_key is days-since-last-post, with a large sentinel
     # for "never posted" so those sort to the top (the most overdue, in spirit) without
     # needing a fabricated day count.
@@ -632,10 +648,12 @@ def format_procrastinators(
         # mention of the person being called out. Falls back to the display name only
         # for the rare tracked user with no Telegram username set at all.
         who = f"@{s.username}" if s.username else s.display_name
-        if not s.recent_figurine_posts:
+        history = all_time.get(s.user_id)
+        posts = history.recent_figurine_posts if history else []
+        if not posts:
             entries.append((10**9, f"{who} — ещё ни разу не скидывал(а) работы"))
             continue
-        last_at = s.recent_figurine_posts[0][0]  # newest-first, see _merge_recent_figurine_posts
+        last_at = posts[0][0]  # newest-first, see _merge_recent_figurine_posts
         days_since = (today - datetime.fromisoformat(last_at).date()).days
         if days_since >= inactive_days:
             entries.append((days_since, f"{who} — не скидывал работы {_ru_days(days_since)}"))
