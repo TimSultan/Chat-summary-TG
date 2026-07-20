@@ -462,6 +462,22 @@ def parse_stat_period(arg: str) -> str | None:
     return _normalize_period(arg)
 
 
+# "pokras" (Latin, as typed) and "покрас" (its natural Cyrillic spelling, added as a
+# free alias) both call up the "Топ покрастинаторов" list on demand -- see
+# is_procrastinator_command/format_procrastinators.
+PROCRASTINATOR_KEYWORDS = ("pokras", "покрас")
+
+
+def is_procrastinator_command(arg: str) -> bool:
+    """Recognizes a "/stat pokras" call -- shows the same "Топ покрастинаторов" call-out
+    format_procrastinators sends once daily, on demand instead of waiting for the next
+    midnight. Same single-bare-word matching rule as parse_stat_period, so a real
+    username that happens to resemble one of PROCRASTINATOR_KEYWORDS isn't shadowed
+    (checked first by callers regardless, since these two keyword sets don't overlap)."""
+    arg = arg.strip().lower()
+    return arg in PROCRASTINATOR_KEYWORDS
+
+
 async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict:
     """Computes (but does NOT persist -- see record_day) today's per-user stats fresh, by
     fetching today's current transcript same as /summary would (reusing the same
@@ -545,6 +561,33 @@ async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, 
     return "\n".join(lines)
 
 
+PROCRASTINATOR_REMINDER = "Скидывайте свою последнюю или новую работу с хэштегом #япокрасил"
+
+
+def _overlay_live_figurines(combined: dict[str, UserStats], entry: str, today: date) -> None:
+    """Merges today's live figurine counter (record_figurine_live -- a plain local file,
+    no Telegram involved) into an already-built {user_id: UserStats} dict, in place. Same
+    reasoning as _live_today_users' own overlay for the async /stat and /top query path:
+    aggregate_all_time alone only reflects days that have actually closed and been
+    recorded, so a same-day post would otherwise still look like "hasn't posted" until
+    the NEXT midnight rollover finalizes today -- a real gap for format_procrastinators
+    specifically, since its bootstrap send (see run_stats_rollover) can fire mid-day, the
+    same day someone just posted. Unlike _live_today_users this needs no Telegram fetch
+    at all -- the figurine counter is the only thing being overlaid, and it's already a
+    local file."""
+    for key, live in _load_live_figurines(entry, today).items():
+        s = combined.setdefault(key, UserStats(user_id=key, display_name=live.get("display_name", "Unknown")))
+        s.figurines_painted = max(s.figurines_painted, live.get("count", 0))
+        live_at = live.get("last_at")
+        if live_at and (s.last_figurine_at is None or live_at > s.last_figurine_at):
+            s.last_figurine_at = live_at
+            s.last_figurine_message_id = live.get("last_message_id")
+        if live.get("username"):
+            s.username = live["username"]
+        if live.get("display_name"):
+            s.display_name = live["display_name"]
+
+
 def format_procrastinators(
     entry: str, tz, top_n: int = PROCRASTINATOR_TOP_N, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS
 ) -> str | None:
@@ -555,31 +598,39 @@ def format_procrastinators(
     "hasn't sent new work in a week" -- shown with a distinct line since there's no
     "last time" to count days from for them.
 
-    Deliberately synchronous and reading ONLY persisted per-day files (aggregate_all_time,
-    no live-today overlay): meant to run once daily, right after the day that just ended
-    has been recorded (see run_stats_rollover), by which point it's already part of the
-    historical record -- no Telegram fetch needed.
+    Deliberately synchronous: builds on aggregate_all_time (persisted per-day files) plus
+    a same-day overlay of the live figurine counter (_overlay_live_figurines) -- the
+    latter matters because this can run mid-day (see run_stats_rollover's startup
+    bootstrap send), when today itself isn't finalized/recorded yet, so without it
+    someone who posted an hour ago would still show up as overdue. No Telegram fetch
+    either way -- both sources are local files.
 
     Returns None if there's nobody to call out (empty top_n, or everyone in it already
     posted within the window) -- callers should simply not send anything in that case."""
-    combined = aggregate_all_time(entry)
-    ranked = sorted(combined.values(), key=lambda s: s.score, reverse=True)[:top_n]
     today = datetime.now(tz).date()
+    combined = aggregate_all_time(entry)
+    _overlay_live_figurines(combined, entry, today)
+    ranked = sorted(combined.values(), key=lambda s: s.score, reverse=True)[:top_n]
     # (sort_key, line) pairs -- sort_key is days-since-last-post, with a large sentinel
     # for "never posted" so those sort to the top (the most overdue, in spirit) without
     # needing a fabricated day count.
     entries: list[tuple[int, str]] = []
     for s in ranked:
+        # @handle is more useful here than a display name -- it's a direct, tappable
+        # mention of the person being called out. Falls back to the display name only
+        # for the rare tracked user with no Telegram username set at all.
+        who = f"@{s.username}" if s.username else s.display_name
         if not s.last_figurine_at:
-            entries.append((10**9, f"{s.display_name} — ещё ни разу не скидывал(а) работы"))
+            entries.append((10**9, f"{who} — ещё ни разу не скидывал(а) работы"))
             continue
         days_since = (today - datetime.fromisoformat(s.last_figurine_at).date()).days
         if days_since >= inactive_days:
-            entries.append((days_since, f"{s.display_name} — не скидывал работы {_ru_days(days_since)}"))
+            entries.append((days_since, f"{who} — не скидывал работы {_ru_days(days_since)}"))
     if not entries:
         return None
     entries.sort(key=lambda pair: pair[0], reverse=True)
-    return "🐌 Топ покрастинаторов:\n\n" + "\n".join(line for _, line in entries)
+    lines = [line for _, line in entries]
+    return "🐌 Топ покрастинаторов:\n\n" + "\n".join(lines) + f"\n\n{PROCRASTINATOR_REMINDER}"
 
 
 def _favorite_hour_label(hours: dict) -> str:

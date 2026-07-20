@@ -132,6 +132,11 @@ SUMMARY_ACK_EMOJI = "✍"
 # on_message's figurine-detection block and stats.record_figurine_live.
 FIGURINE_ACK_EMOJI = "🎨"
 
+# "/stat pokras" on-demand fallback when stats.format_procrastinators finds nobody to
+# call out (everyone in the top-30 posted within the window) -- it returns None rather
+# than an empty list in that case, so callers supply their own "all clear" message.
+PROCRASTINATOR_NONE_FOUND_MESSAGE = "Все скидывали покрасы вовремя -- прокрастинаторов не найдено."
+
 ERROR_DELETE_AFTER = 10  # short rejection notices (such as day limit) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 STATS_DELETE_AFTER = 300  # /top and /stat replies (incl. their own errors) self-delete after 5 minutes
@@ -1286,8 +1291,9 @@ async def run_listener(
                     reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                 else:
                     arg = stats_text[len("/stat") :].strip()
-                    period = stats.parse_stat_period(arg)
-                    if period:
+                    if stats.is_procrastinator_command(arg):
+                        reply_text = stats.format_procrastinators(entry, tz) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                    elif (period := stats.parse_stat_period(arg)):
                         reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                     else:
                         sender = await event.get_sender()

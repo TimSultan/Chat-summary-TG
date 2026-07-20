@@ -64,6 +64,7 @@ from listener import (
     ERROR_DELETE_AFTER,
     FIGURINE_ACK_EMOJI,
     NO_ROAST_MATERIAL_MESSAGE,
+    PROCRASTINATOR_NONE_FOUND_MESSAGE,
     ROAST_BUSY_EMOJI,
     ROAST_DELETE_AFTER,
     STATS_DELETE_AFTER,
@@ -797,8 +798,9 @@ async def _dispatch_update(
                 )
             else:
                 arg = stats_text[len("/stat") :].strip()
-                period = stats.parse_stat_period(arg)
-                if period:
+                if stats.is_procrastinator_command(arg):
+                    reply_text = stats.format_procrastinators(matched_entry, tz) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                elif (period := stats.parse_stat_period(arg)):
                     reply_text = await stats.format_top(
                         telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
                     )
