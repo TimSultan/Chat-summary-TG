@@ -799,7 +799,9 @@ async def _dispatch_update(
             else:
                 arg = stats_text[len("/stat") :].strip()
                 if stats.is_procrastinator_command(arg):
-                    reply_text = stats.format_procrastinators(matched_entry, tz) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                    reply_text = await stats.format_procrastinators(
+                        telethon_client, matched_entry, matched_entry, tz, log=log
+                    ) or PROCRASTINATOR_NONE_FOUND_MESSAGE
                 elif (period := stats.parse_stat_period(arg)):
                     reply_text = await stats.format_top(
                         telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
@@ -944,9 +946,12 @@ async def run_bot_listener(
     here, via the bot account, same bot-account-only rule as every other reply.
 
     `stats_digest_queue`, if given, carries (allowed_chats entry, text) pairs put there
-    once daily by listener.py's run_stats_rollover -- the "Топ покрастинаторов" call-out
-    (see stats.format_procrastinators) -- sent here as a plain message, same account as
-    everything else.
+    every stats.PROCRASTINATOR_DIGEST_INTERVAL_DAYS days by listener.py's
+    run_stats_rollover -- the "Топ покрастинаторов" call-out (see
+    stats.format_procrastinators) -- sent here as a plain message, same account as
+    everything else, and deliberately never scheduled for deletion (unlike the on-demand
+    "/stat pokras" reply, which self-deletes like every other /stat or /top reply): this
+    is an ambient reminder meant to stay visible in the chat.
 
     All queues are left None when run standalone (this module's own main()), which
     just means jokes/follow-ups/figurine reactions/digests never fire, matching that

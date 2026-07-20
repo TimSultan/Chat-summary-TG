@@ -88,18 +88,25 @@ def is_zero_content_message(text: str) -> bool:
 # people don't reliably type Cyrillic hashtags in one consistent case.
 FIGURINE_HASHTAG = "#япокрасил"
 
-# How many of a person's most recent figurine posts /stat links to (see
-# figurine_message_links) -- UserStats.recent_figurine_posts is kept trimmed to this
-# many entries (newest first) everywhere it's built or merged, so no caller ever has to
-# re-truncate it itself.
+# How many of a person's most recent figurine posts /stat LINKS TO (see
+# figurine_message_links, the only place this cap is actually applied). Every qualifying
+# post is saved and kept forever -- UserStats.recent_figurine_posts is deduped and sorted
+# newest-first wherever it's built or merged (_merge_recent_figurine_posts) but never
+# truncated there, precisely so format_procrastinators can still find the true most
+# recent post even for someone who's painted far more than 3 total; only the /stat
+# DISPLAY trims to this many.
 RECENT_FIGURINE_LINKS = 3
 
-# "Топ покрастинаторов": once a day (see run_stats_rollover), calls out whoever's in the
-# top PROCRASTINATOR_TOP_N scorers of the last 30 days (the same window /top month uses,
-# NOT all-time -- see format_procrastinators) but hasn't posted a #япокрасил+photo in the
-# last PROCRASTINATOR_INACTIVE_DAYS days.
+# "Топ покрастинаторов": sent automatically every PROCRASTINATOR_DIGEST_INTERVAL_DAYS
+# days at PROCRASTINATOR_DIGEST_HOUR local (app-timezone) time -- see run_stats_rollover's
+# digest loop and should_send_procrastinator_digest -- calling out whoever's in the top
+# PROCRASTINATOR_TOP_N scorers of the last 30 days (the same window /top month uses, NOT
+# all-time -- see format_procrastinators) but hasn't posted a #япокрасил+photo in the last
+# PROCRASTINATOR_INACTIVE_DAYS days.
 PROCRASTINATOR_TOP_N = 30
 PROCRASTINATOR_INACTIVE_DAYS = 14
+PROCRASTINATOR_DIGEST_HOUR = 19
+PROCRASTINATOR_DIGEST_INTERVAL_DAYS = 2
 
 VALID_PERIODS = ("today", "week", "month", "year", "all")
 # "day" isn't a distinct window -- it's just the word people actually type for "today".
@@ -128,22 +135,41 @@ def is_recorded(entry: str, day: date) -> bool:
     return _path(entry, day).exists()
 
 
-def _procrastinator_bootstrap_marker(entry: str) -> Path:
-    return _stats_dir() / f"{_cache_key(entry)}_procrastinator_bootstrap_sent"
+def _procrastinator_last_sent_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_procrastinator_last_sent"
 
 
-def procrastinator_digest_bootstrapped(entry: str) -> bool:
-    """Whether the one-time "just shipped this feature" digest (see
-    run_stats_rollover's startup call in listener.py) has already gone out for `entry` --
-    a plain marker file, no content, checked once at process startup so a later restart
-    doesn't re-send it. Every day AFTER that goes out unconditionally from the midnight
-    loop instead, same as every other daily rollover job."""
-    return _procrastinator_bootstrap_marker(entry).exists()
+def procrastinator_last_sent(entry: str) -> date | None:
+    """The calendar day (app timezone) the automatic "Топ покрастинаторов" digest was
+    last sent for `entry`, or None if it's never gone out -- a plain date string in a
+    marker file (not a full day-file: nothing else about the send needs remembering).
+    Used by should_send_procrastinator_digest to enforce the every-other-day cadence
+    across restarts."""
+    path = _procrastinator_last_sent_path(entry)
+    if not path.exists():
+        return None
+    try:
+        return date.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return None
 
 
-def mark_procrastinator_digest_bootstrapped(entry: str) -> None:
+def mark_procrastinator_sent(entry: str, day: date) -> None:
     _stats_dir().mkdir(parents=True, exist_ok=True)
-    _procrastinator_bootstrap_marker(entry).touch()
+    _procrastinator_last_sent_path(entry).write_text(day.isoformat(), encoding="utf-8")
+
+
+def should_send_procrastinator_digest(
+    entry: str, today: date, interval_days: int = PROCRASTINATOR_DIGEST_INTERVAL_DAYS
+) -> bool:
+    """Whether today's PROCRASTINATOR_DIGEST_HOUR check-in (see run_stats_rollover's
+    digest loop) is a "send" day for `entry`'s every-other-day cadence: true the very
+    first time (never sent before) or once `interval_days` or more have passed since the
+    last send. Using elapsed days rather than e.g. an odd/even day-of-year means a missed
+    check-in (downtime spanning the send hour) still catches up on the next one instead of
+    permanently drifting the cadence."""
+    last = procrastinator_last_sent(entry)
+    return last is None or (today - last).days >= interval_days
 
 
 def is_figurine_caption(text: str) -> bool:
@@ -168,11 +194,11 @@ def record_figurine_live(
     arrives) -- a plain local read-modify-write, no Telegram call involved, so /stat and
     /top reflect it immediately rather than waiting on the transcript cache's own TTL
     (see _live_today_users, which overlays this on top of that cache for "today").
-    `message_id` (if given) is appended to this user's recent-posts list (kept trimmed to
-    RECENT_FIGURINE_LINKS, newest first), for /stat's links to them (see
-    figurine_message_links) -- Telegram has no deep link for a filtered/scoped search,
-    only a link to one specific message. Returns the user's new total for `day`, for
-    logging.
+    `message_id` (if given) is appended to this user's recent-posts list (deduped and
+    kept newest-first, but never truncated -- see RECENT_FIGURINE_LINKS), for /stat's
+    links to them (see figurine_message_links) -- Telegram has no deep link for a
+    filtered/scoped search, only a link to one specific message. Returns the user's new
+    total for `day`, for logging.
 
     Kept in a file separate from the per-day file `_path` writes (record_day's finalized,
     immutable snapshot of a CLOSED day) -- writing here must never be mistaken by
@@ -334,11 +360,11 @@ class UserStats:
     # scoring stat.
     replies: int = 0
     figurines_painted: int = 0
-    # Up to RECENT_FIGURINE_LINKS [ts, message_id] pairs, newest first, so /stat can link
-    # straight to them (see figurine_message_links) -- Telegram has no deep link for a
-    # filtered/scoped search, so this is the closest thing to "show me theirs": direct
-    # taps to their last few instead. Kept trimmed to RECENT_FIGURINE_LINKS everywhere
-    # it's built or merged (_merge_day, _overlay_live_figurines), never grows unbounded.
+    # ALL of this person's [ts, message_id] figurine posts ever, newest first, never
+    # truncated (see RECENT_FIGURINE_LINKS) -- so /stat can link straight to their most
+    # recent few (see figurine_message_links, which slices to RECENT_FIGURINE_LINKS at
+    # DISPLAY time) while format_procrastinators can still find the true most recent post
+    # for anyone regardless of their total count.
     recent_figurine_posts: list = field(default_factory=list)
     active_days: int = 0
     hours: dict = field(default_factory=dict)
@@ -357,10 +383,13 @@ class UserStats:
 
 def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
     """Combines `existing` [ts, message_id] pairs with `new_posts` (any iterable of the
-    same shape), sorts newest-first, and trims to RECENT_FIGURINE_LINKS -- the one place
-    this merge+trim happens, used by both _merge_day (across recorded days) and
-    _live_today_users/_overlay_live_figurines (today's live counter on top of a
-    transcript-derived or all-time view).
+    same shape) and sorts newest-first -- deliberately NEVER truncates (see
+    RECENT_FIGURINE_LINKS's own docstring): every qualifying post is kept forever, so
+    format_procrastinators can always find the TRUE most recent post regardless of how
+    many someone has painted in total. Callers that only want a bounded list for display
+    (figurine_message_links) slice it themselves. The one place this merge+dedup happens,
+    used by both _merge_day (across recorded days) and record_figurine_live/
+    _live_today_users (today's live counter).
 
     De-dupes by message_id first: the SAME message can legitimately reach this from two
     independent sources with two different timestamps -- record_figurine_live's live
@@ -378,7 +407,7 @@ def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
             by_message_id[message_id] = (ts, message_id)
     deduped = list(by_message_id.values())
     deduped.sort(key=lambda p: p[0], reverse=True)
-    return deduped[:RECENT_FIGURINE_LINKS]
+    return deduped
 
 
 def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
@@ -515,10 +544,14 @@ PROCRASTINATOR_KEYWORDS = ("pokras", "покрас")
 
 def is_procrastinator_command(arg: str) -> bool:
     """Recognizes a "/stat pokras" call -- shows the same "Топ покрастинаторов" call-out
-    format_procrastinators sends once daily, on demand instead of waiting for the next
-    midnight. Same single-bare-word matching rule as parse_stat_period, so a real
-    username that happens to resemble one of PROCRASTINATOR_KEYWORDS isn't shadowed
-    (checked first by callers regardless, since these two keyword sets don't overlap)."""
+    format_procrastinators sends automatically (see PROCRASTINATOR_DIGEST_HOUR/
+    PROCRASTINATOR_DIGEST_INTERVAL_DAYS), on demand instead of waiting for the next
+    scheduled send. This on-demand reply still self-deletes like every other /stat reply
+    (STATS_DELETE_AFTER, see listener.py/bot_listener.py) -- unlike the automatic digest,
+    which is deliberately left in the chat. Same single-bare-word matching rule as
+    parse_stat_period, so a real username that happens to resemble one of
+    PROCRASTINATOR_KEYWORDS isn't shadowed (checked first by callers regardless, since
+    these two keyword sets don't overlap)."""
     arg = arg.strip().lower()
     return arg in PROCRASTINATOR_KEYWORDS
 
@@ -607,40 +640,19 @@ async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, 
 PROCRASTINATOR_REMINDER = "Скидывайте свою последнюю или новую работу с хэштегом #япокрасил"
 
 
-def _overlay_live_figurines(combined: dict[str, UserStats], entry: str, today: date) -> None:
-    """Merges today's live figurine counter (record_figurine_live -- a plain local file,
-    no Telegram involved) into an already-built {user_id: UserStats} dict, in place.
-    `combined` here is expected to come from aggregate_all_time, which only reflects days
-    that have actually closed and been recorded (today is NEVER among them) -- so unlike
-    _live_today_users' own max()-based overlay (deduplicating two views of the SAME
-    "today"), the count here is ADDED: historical and live-today are disjoint periods, no
-    overlap to guard against. Without this, a same-day post would look like "hasn't
-    posted" until the NEXT midnight rollover finalizes today -- a real gap for
-    format_procrastinators specifically, since its bootstrap send (see
-    run_stats_rollover) can fire mid-day. Needs no Telegram fetch at all -- the figurine
-    counter is the only thing being overlaid, and it's already a local file."""
-    for key, live in _load_live_figurines(entry, today).items():
-        s = combined.setdefault(key, UserStats(user_id=key, display_name=live.get("display_name", "Unknown")))
-        s.figurines_painted += live.get("count", 0)
-        if live.get("recent_posts"):
-            s.recent_figurine_posts = _merge_recent_figurine_posts(s.recent_figurine_posts, live["recent_posts"])
-        if live.get("username"):
-            s.username = live["username"]
-        if live.get("display_name"):
-            s.display_name = live["display_name"]
-
-
-def format_procrastinators(
-    entry: str, tz, top_n: int = PROCRASTINATOR_TOP_N, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS
+async def format_procrastinators(
+    client, chat_ref, entry: str, tz,
+    top_n: int = PROCRASTINATOR_TOP_N, inactive_days: int = PROCRASTINATOR_INACTIVE_DAYS, log=print,
 ) -> str | None:
-    """The daily "Топ покрастинаторов" call-out: among the top `top_n` scorers of the
-    last 30 days for `entry` (same rolling window /top month uses -- "currently active",
-    NOT all-time, so someone who was huge months ago but has since gone quiet isn't in
-    the pool just because of old history), whoever hasn't posted a #япокрасил+photo
-    within the last `inactive_days` days. Includes people who have NEVER posted one at
-    all, not just people who used to and stopped -- both count as "hasn't sent new work
-    recently" -- shown with a distinct line since there's no "last time" to count days
-    from for them.
+    """The "Топ покрастинаторов" call-out, sent automatically every
+    PROCRASTINATOR_DIGEST_INTERVAL_DAYS days (see run_stats_rollover's digest loop) and
+    available on demand via "/stat pokras": among the top `top_n` scorers of the last 30
+    days for `entry` (same rolling window /top month uses -- "currently active", NOT
+    all-time, so someone who was huge months ago but has since gone quiet isn't in the
+    pool just because of old history), whoever hasn't posted a #япокрасил+photo within the
+    last `inactive_days` days. Includes people who have NEVER posted one at all, not just
+    people who used to and stopped -- both count as "hasn't sent new work recently" --
+    shown with a distinct line since there's no "last time" to count days from for them.
 
     The pool (who's "active") and the recency check (when did they last post)
     deliberately use two different windows: the pool is scored over the last 30 days,
@@ -648,35 +660,42 @@ def format_procrastinators(
     otherwise someone overdue by more than a month would wrongly look like they've never
     posted at all, just because that post fell outside the 30-day pool window.
 
-    Deliberately synchronous: builds on aggregate/aggregate_all_time (persisted per-day
-    files) plus a same-day overlay of the live figurine counter
-    (_overlay_live_figurines) on each -- the latter matters because this can run mid-day
-    (see run_stats_rollover's startup bootstrap send), when today itself isn't
-    finalized/recorded yet, so without it someone who posted an hour ago would still
-    show up as overdue. No Telegram fetch either way -- both sources are local files.
+    `client`/`chat_ref` are required (unlike the old, purely file-based design) so today
+    can be re-derived via _live_today_users -- the SAME fresh-transcript-plus-live-file
+    merge /stat and /top already rely on -- fetched ONCE and reused for both `pool` and
+    `all_time` below. This matters: a version of this function that trusted ONLY the
+    local live-figurine-counter file (record_figurine_live's write, which only ever
+    happens from listener.py's on_message seeing a message live, in real time) was found
+    in production to disagree with /stat -- someone whose post /stat correctly showed
+    (via its own fresh transcript re-derivation) still showed up here as "never posted",
+    because the live-counter file alone doesn't cover every way a today-post can become
+    known (e.g. a process restart between the post and the check-in means on_message
+    never ran for it, yet a fresh fetch still finds it in the actual message history).
+    Using the same _live_today_users merge as /stat closes that gap.
 
     Returns None if there's nobody to call out (empty top_n, or everyone in it already
     posted within the window) -- callers should simply not send anything in that case."""
     today = datetime.now(tz).date()
+    live_today = await _live_today_users(client, chat_ref, entry, tz, log=log)
 
     month_start, month_end = resolve_period_window("month", tz)
     historical_end = min(month_end, today - timedelta(days=1))
     pool = aggregate(entry, month_start, historical_end) if month_start <= historical_end else {}
-    _overlay_live_figurines(pool, entry, today)
+    _merge_day(pool, {"users": live_today})
     ranked = sorted(pool.values(), key=lambda s: s.score, reverse=True)[:top_n]
 
     all_time = aggregate_all_time(entry)
-    _overlay_live_figurines(all_time, entry, today)
+    _merge_day(all_time, {"users": live_today})
 
     # (sort_key, line) pairs -- sort_key is days-since-last-post, with a large sentinel
     # for "never posted" so those sort to the top (the most overdue, in spirit) without
     # needing a fabricated day count.
     entries: list[tuple[int, str]] = []
     for s in ranked:
-        # @handle is more useful here than a display name -- it's a direct, tappable
-        # mention of the person being called out. Falls back to the display name only
-        # for the rare tracked user with no Telegram username set at all.
-        who = f"@{s.username}" if s.username else s.display_name
+        # Deliberately the display name, not an @username mention -- per explicit user
+        # request, this call-out shouldn't ping people (it repeats every
+        # PROCRASTINATOR_DIGEST_INTERVAL_DAYS days, unlike a one-off notification).
+        who = s.display_name
         history = all_time.get(s.user_id)
         posts = history.recent_figurine_posts if history else []
         if not posts:
@@ -727,13 +746,16 @@ def figurine_message_link(chat_username: str | None, chat_id: int | None, messag
 
 
 def figurine_message_links(chat_username: str | None, chat_id: int | None, user: UserStats) -> list[str]:
-    """figurine_message_link, applied across `user.recent_figurine_posts` (up to
-    RECENT_FIGURINE_LINKS entries, newest first) -- what /stat's "Последние N работы"
-    section links to. Skips (rather than emitting a broken link for) any post that
-    can't be linked, e.g. a chat with neither a public username nor a resolvable marked
-    id -- see figurine_message_link's own docstring for when that happens."""
+    """figurine_message_link, applied across the `RECENT_FIGURINE_LINKS` most recent of
+    `user.recent_figurine_posts` (which itself holds the person's WHOLE history, newest
+    first, never truncated -- see RECENT_FIGURINE_LINKS's own docstring) -- what /stat's
+    "Последние N работы" section links to. This is the one place that cap is actually
+    applied. Skips (rather than emitting a broken link for) any post that can't be
+    linked, e.g. a chat with neither a public username nor a resolvable marked id -- see
+    figurine_message_link's own docstring for when that happens -- so the result can have
+    fewer than RECENT_FIGURINE_LINKS links, never more."""
     links = []
-    for _, message_id in user.recent_figurine_posts:
+    for _, message_id in user.recent_figurine_posts[:RECENT_FIGURINE_LINKS]:
         link = figurine_message_link(chat_username, chat_id, message_id)
         if link:
             links.append(link)

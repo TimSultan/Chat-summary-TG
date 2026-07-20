@@ -23,9 +23,22 @@ class ChatMessage:
     is_reply: bool
 
 
-def describe_media(msg) -> str:
+def is_image_message(msg) -> bool:
+    """True for msg.photo OR an image sent as an uncompressed document (mime type
+    image/*) -- Telegram lets a sender pick "send without compression", which delivers
+    the exact same picture as a msg.document instead of msg.photo, purely a technical
+    choice by the sender with no meaningful semantic difference. Artists posting full-
+    resolution artwork routinely choose this to avoid Telegram's JPEG recompression, so
+    describe_media tags both the same way ("[Photo]") -- this is the shared check kept in
+    sync with that (listener.py's on_message figurine-detection block calls this directly
+    instead of duplicating the mime-type logic)."""
     if msg.photo:
-        return "[Photo]"
+        return True
+    mime = getattr(msg.document, "mime_type", None) if msg.document else None
+    return bool(mime and mime.startswith("image/"))
+
+
+def describe_media(msg) -> str:
     if msg.video_note:
         return "[Video note]"
     if msg.video:
@@ -48,6 +61,8 @@ def describe_media(msg) -> str:
     if msg.poll:
         question = getattr(msg.poll.poll, "question", "") if msg.poll else ""
         return f"[Poll: {question}]" if question else "[Poll]"
+    if is_image_message(msg):
+        return "[Photo]"
     if msg.document:
         fname = None
         if msg.file:

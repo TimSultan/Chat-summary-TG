@@ -44,6 +44,7 @@ from summarizer import summarize_transcript
 from telegram_fetch import (
     fetch_range_messages_cached,
     format_transcript_lines,
+    is_image_message,
     resolve_chat,
     sender_display_name,
     sender_matches,
@@ -691,63 +692,91 @@ async def _stats_catch_up(client, cfg, tz, log=print) -> None:
                 log(f"[stats] failed to catch up '{entry}' for {day}:\n{traceback.format_exc()}")
 
 
-async def _send_procrastinator_digests(cfg, tz, stats_digest_queue, bootstrap_only: bool, log=print) -> None:
+async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=print) -> None:
     """Builds and queues the "Топ покрастинаторов" call-out (stats.format_procrastinators)
-    for every chat in LISTENER_ALLOWED_CHATS -- ambient, unprompted content posted to the
-    group with nobody having asked for it, so it follows the SAME bot-account-only rule
-    as jokes/follow-ups: `stats_digest_queue` is only ever non-None when a bot account is
-    configured (see main()), and this is simply a no-op otherwise -- no personal-account
-    fallback, matching joke_enabled's own gating.
+    for every chat in LISTENER_ALLOWED_CHATS due for one today (stats.
+    should_send_procrastinator_digest -- the every-other-day cadence, tracked per entry via
+    a persisted last-sent date so it survives restarts) -- ambient, unprompted content
+    posted to the group with nobody having asked for it, so it follows the SAME
+    bot-account-only rule as jokes/follow-ups: `stats_digest_queue` is only ever non-None
+    when a bot account is configured (see main()), and this is simply a no-op otherwise --
+    no personal-account fallback, matching joke_enabled's own gating.
 
-    `bootstrap_only=True` is the one-time "just shipped this feature" send: skips any
-    entry already marked (stats.procrastinator_digest_bootstrapped) so a later restart
-    doesn't repeat it, and marks each entry right after attempting it regardless of
-    whether there was anything to report (an empty result today doesn't mean try again
-    tomorrow morning -- the recurring midnight call below already covers that). Called
-    once at startup; every midnight after that calls this again with bootstrap_only=False,
-    unconditionally, same as every other daily rollover job."""
+    `client` is passed straight through to stats.format_procrastinators (as both `client`
+    and, via the plain entry string, `chat_ref` -- resolve_chat can take either) so it can
+    re-derive today's figurine posts the same reliable way /stat does, instead of trusting
+    only the local live-counter file (see format_procrastinators's own docstring for the
+    real production bug this fixed).
+
+    Marks each due entry as sent (stats.mark_procrastinator_sent) right after attempting
+    it, regardless of whether there was anything to report -- an empty result still counts
+    as today's check-in, so it doesn't get retried before the next scheduled one. Only
+    skipped (left for a future check-in) if building the digest itself raises."""
     if stats_digest_queue is None:
         return
+    today = datetime.now(tz).date()
     for entry in cfg.listener_allowed_chats:
-        if bootstrap_only and stats.procrastinator_digest_bootstrapped(entry):
+        if not stats.should_send_procrastinator_digest(entry, today):
             continue
         try:
-            text = stats.format_procrastinators(entry, tz)
+            text = await stats.format_procrastinators(client, entry, entry, tz, log=log)
             if text:
                 await stats_digest_queue.put((entry, text))
-                log(f"[stats] queued procrastinator digest for '{entry}'" + (" (one-time bootstrap)" if bootstrap_only else ""))
-            elif bootstrap_only:
-                log(f"[stats] procrastinator digest for '{entry}' has nothing to report yet")
-            if bootstrap_only:
-                stats.mark_procrastinator_digest_bootstrapped(entry)
+                log(f"[stats] queued procrastinator digest for '{entry}'")
+            else:
+                log(f"[stats] procrastinator digest for '{entry}' has nothing to report today")
+            stats.mark_procrastinator_sent(entry, today)
         except Exception:
             log(f"[stats] failed to build procrastinator digest for '{entry}':\n{traceback.format_exc()}")
 
 
-async def run_stats_rollover(client, cfg, tz, stats_digest_queue=None, log=print) -> None:
-    """Keeps stats.py's per-day-per-chat files up to date for every chat named in
-    LISTENER_ALLOWED_CHATS (stats tracking, like jokes, needs specific chats named --
-    there's no "everywhere" fallback): runs _stats_catch_up once immediately (covers a
-    restart that missed one or more midnights while down), then sleeps until the next
-    local midnight and runs it again, forever. A few seconds of buffer after :00 avoids
-    any edge-case race right at the rollover instant.
-
-    Also sends the daily "Топ покрастинаторов" digest (see _send_procrastinator_digests)
-    right after each _stats_catch_up call -- once, bootstrap-only, right after this
-    startup catch-up (so shipping the feature sends it immediately instead of waiting for
-    the next real midnight), then unconditionally every midnight after that."""
-    if not cfg.listener_allowed_chats:
-        log("[stats] STATS_ENABLED is set but LISTENER_ALLOWED_CHATS is empty -- stats tracking needs specific chats named, so it's off.")
-        return
-
+async def _stats_catchup_loop(client, cfg, tz, log=print) -> None:
+    """Runs _stats_catch_up once immediately (covers a restart that missed one or more
+    midnights while down), then sleeps until the next local midnight and runs it again,
+    forever. A few seconds of buffer after :00 avoids any edge-case race right at the
+    rollover instant."""
     await _stats_catch_up(client, cfg, tz, log=log)
-    await _send_procrastinator_digests(cfg, tz, stats_digest_queue, bootstrap_only=True, log=log)
     while True:
         now = datetime.now(tz)
         next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
         await _stats_catch_up(client, cfg, tz, log=log)
-        await _send_procrastinator_digests(cfg, tz, stats_digest_queue, bootstrap_only=False, log=log)
+
+
+async def _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> None:
+    """Wakes every day at stats.PROCRASTINATOR_DIGEST_HOUR local time and hands off to
+    _send_procrastinator_digests, which itself decides (per entry) whether today is
+    actually a "send" day under the every-other-day cadence -- so this loop's job is only
+    ever "check in at 19:00", not "send every time". No-ops immediately (never sleeps) if
+    there's no bot account, same gating as the catch-up loop's caller checks for
+    LISTENER_ALLOWED_CHATS."""
+    if stats_digest_queue is None:
+        return
+    while True:
+        now = datetime.now(tz)
+        next_run = now.replace(hour=stats.PROCRASTINATOR_DIGEST_HOUR, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        await _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=log)
+
+
+async def run_stats_rollover(client, cfg, tz, stats_digest_queue=None, log=print) -> None:
+    """Keeps stats.py's per-day-per-chat files up to date for every chat named in
+    LISTENER_ALLOWED_CHATS (stats tracking, like jokes, needs specific chats named --
+    there's no "everywhere" fallback), and separately drives the automatic "Топ
+    покрастинаторов" digest -- two independent cadences run concurrently
+    (_stats_catchup_loop at midnight, _procrastinator_digest_loop at
+    stats.PROCRASTINATOR_DIGEST_HOUR every stats.PROCRASTINATOR_DIGEST_INTERVAL_DAYS days)
+    since they serve different purposes and shouldn't block on each other."""
+    if not cfg.listener_allowed_chats:
+        log("[stats] STATS_ENABLED is set but LISTENER_ALLOWED_CHATS is empty -- stats tracking needs specific chats named, so it's off.")
+        return
+
+    await asyncio.gather(
+        _stats_catchup_loop(client, cfg, tz, log=log),
+        _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=log),
+    )
 
 
 def build_client(cfg) -> TelegramClient:
@@ -812,8 +841,9 @@ async def run_listener(
     configured, the reaction has to come from the bot account instead, same bot-account-
     only rule as every reply, hence the hand-off (see bot_takeover below).
 
-    `stats_digest_queue`, if given, is where (allowed_chats entry, text) goes once daily
-    for the "Топ покрастинаторов" call-out (see run_stats_rollover/
+    `stats_digest_queue`, if given, is where (allowed_chats entry, text) goes every
+    stats.PROCRASTINATOR_DIGEST_INTERVAL_DAYS days at stats.PROCRASTINATOR_DIGEST_HOUR
+    local time for the "Топ покрастинаторов" call-out (see run_stats_rollover/
     stats.format_procrastinators) -- unprompted, ambient content, so same
     bot-account-only rule as jokes/follow-ups: passed through to run_stats_rollover, and
     simply never sent (no personal-account fallback) if there's no bot account, matching
@@ -1196,14 +1226,20 @@ async def run_listener(
         # the literal command text as something worth reacting to or joking about).
         is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
 
-        # #япокрасил + an attached photo -- a "figurine painted" post (see
-        # POINTS_PER_FIGURINE in stats.py). This session sees every message as it
-        # arrives, so it's the one place that ever calls record_figurine_live -- a plain
-        # local counter bump, not a re-fetch of anything -- so /stat and /top pick it up
+        # #япокрасил + an attached image -- a "figurine painted" post (see
+        # POINTS_PER_FIGURINE in stats.py). is_image_message (not just msg.photo) also
+        # catches an image sent as an uncompressed file/document -- Telegram's own
+        # compressed-photo-vs-document split is just a sender-side choice, and artists
+        # posting full-resolution art routinely pick "send without compression" (a real
+        # missed-post bug found in production: some users' #япокрасил images silently
+        # never counted because they'd sent them as files, not compressed photos -- see
+        # is_image_message's docstring). This session sees every message as it arrives,
+        # so it's the one place that ever calls record_figurine_live -- a plain local
+        # counter bump, not a re-fetch of anything -- so /stat and /top pick it up
         # immediately instead of waiting on the transcript cache's own TTL. Reacting is
         # the one part that has to defer to the bot account once bot_takeover is on, same
         # as every other reply (see figurine_ack_queue).
-        if cfg.stats_enabled and msg.photo and stats.is_figurine_caption(text):
+        if cfg.stats_enabled and is_image_message(msg) and stats.is_figurine_caption(text):
             chat = await event.get_chat()
             entry = matched_allowed_chat(chat)
             if entry is not None:
@@ -1301,7 +1337,7 @@ async def run_listener(
                 else:
                     arg = stats_text[len("/stat") :].strip()
                     if stats.is_procrastinator_command(arg):
-                        reply_text = stats.format_procrastinators(entry, tz) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                        reply_text = await stats.format_procrastinators(client, chat, entry, tz, log=log) or PROCRASTINATOR_NONE_FOUND_MESSAGE
                     elif (period := stats.parse_stat_period(arg)):
                         reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                     else:
@@ -1647,9 +1683,10 @@ async def main():
         # bot_listener.py, so the *reaction* onto that message still comes from the bot
         # account, same bot-account-only rule as every other reply.
         figurine_ack_queue: asyncio.Queue = asyncio.Queue()
-        # stats_digest_queue carries (allowed_chats entry, text) once daily for the "Топ
-        # покрастинаторов" call-out (see run_stats_rollover/stats.format_procrastinators)
-        # -- ambient, unprompted content, same bot-account-only rule as jokes.
+        # stats_digest_queue carries (allowed_chats entry, text) every other day for the
+        # "Топ покрастинаторов" call-out (see run_stats_rollover/
+        # stats.format_procrastinators) -- ambient, unprompted content, same
+        # bot-account-only rule as jokes.
         stats_digest_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
             run_listener(
