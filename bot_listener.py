@@ -856,7 +856,7 @@ async def _dispatch_update(
         roast_key = (chat_key, sender_id)
         if roast_key in roast_pending or roast_key in roast_in_progress:
             log(f"[bot_listener] roast already pending/in-progress for {roast_key}, reacting instead")
-            await api.set_message_reaction(chat_key, message["message_id"], ROAST_BUSY_EMOJI)
+            await api.set_message_reaction(chat_key, message["message_id"], ROAST_BUSY_EMOJI, log=log)
             return
 
     is_private = chat.get("type") == "private"
@@ -894,7 +894,7 @@ async def _dispatch_update(
             log(f"[bot_listener] failed to send roast confirmation: {e}")
         return
 
-    await api.set_message_reaction(chat_key, message["message_id"], SUMMARY_ACK_EMOJI)
+    await api.set_message_reaction(chat_key, message["message_id"], SUMMARY_ACK_EMOJI, log=log)
     await summary_queue.put(message)
     log(
         f"[bot_listener] queued request #{summary_queue.qsize()} from "
@@ -1086,7 +1086,7 @@ async def run_bot_listener(
                 if chat_id is None:
                     log(f"[bot_listener] dropping figurine reaction for '{entry}': could not resolve a chat_id for it")
                     continue
-                await api.set_message_reaction(chat_id, message_id, FIGURINE_ACK_EMOJI)
+                await api.set_message_reaction(chat_id, message_id, FIGURINE_ACK_EMOJI, log=log)
 
         async def _consume_stats_digests():
             while True:

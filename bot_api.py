@@ -84,14 +84,18 @@ class TelegramBotAPI:
         except ChatSummaryError:
             pass  # best-effort: already deleted, too old (>48h), or lacking rights
 
-    async def set_message_reaction(self, chat_id, message_id: int, emoji: str) -> None:
+    async def set_message_reaction(self, chat_id, message_id: int, emoji: str, log=print) -> None:
         try:
             await self._call(
                 "setMessageReaction", chat_id=chat_id, message_id=message_id,
                 reaction=[{"type": "emoji", "emoji": emoji}],
             )
-        except ChatSummaryError:
-            pass  # best-effort ack -- never worth failing the request over
+        except ChatSummaryError as e:
+            # Best-effort ack -- never worth failing the request over -- but still
+            # logged: a wrong/non-standard emoji (Telegram only accepts a specific set
+            # of "quick reaction" emoji, see core.telegram.org/api/reactions) fails
+            # exactly like this, silently, with no other symptom at all.
+            log(f"[bot_api] setMessageReaction({emoji!r}) failed for chat {chat_id}, message {message_id}: {e}")
 
     async def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
         try:

@@ -129,8 +129,12 @@ NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих со�
 SUMMARY_ACK_EMOJI = "✍"
 
 # Reacted onto a #япокрасил post (with a photo attached) the instant it's seen -- see
-# on_message's figurine-detection block and stats.record_figurine_live.
-FIGURINE_ACK_EMOJI = "🎨"
+# on_message's figurine-detection block and stats.record_figurine_live. Must be one of
+# Telegram's own fixed "quick reaction" emoji set (core.telegram.org/api/reactions) --
+# anything outside that set is rejected by the API. "🎨" (artist palette) is NOT in that
+# set, which is why reactions were silently failing (see bot_api.set_message_reaction's
+# now-added failure logging); "🔥" is a real quick-reaction emoji.
+FIGURINE_ACK_EMOJI = "🔥"
 
 # "/stat pokras" on-demand fallback when stats.format_procrastinators finds nobody to
 # call out (everyone in the top-30 posted within the window) -- it returns None rather
@@ -1186,6 +1190,11 @@ async def run_listener(
 
         text = msg.raw_text or ""
         text_lower = text.lower()
+        # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
+        # chat content, so it must never count as "activity" for the joke buffer or as
+        # commentary a follow-up watch might be checking for (both would otherwise treat
+        # the literal command text as something worth reacting to or joking about).
+        is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
 
         # #япокрасил + an attached photo -- a "figurine painted" post (see
         # POINTS_PER_FIGURINE in stats.py). This session sees every message as it
@@ -1211,9 +1220,9 @@ async def run_listener(
                 else:
                     await react_emoji(event.chat_id, msg.id, FIGURINE_ACK_EMOJI)
 
-        if joke_enabled and text:
+        if joke_enabled and text and not is_stats_command:
             await maybe_joke(event, msg, text)
-        if followup_enabled and text:
+        if followup_enabled and text and not is_stats_command:
             await maybe_followup(event, msg, text)
 
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
@@ -1271,7 +1280,7 @@ async def run_listener(
         # these always work immediately rather than entering the summary queue. Skipped once a bot account has
         # taken over (bot_takeover), same as /summary -- bot_listener.py handles both
         # there instead, to avoid two replies to the same command.
-        if not bot_takeover and cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
+        if not bot_takeover and cfg.stats_enabled and is_stats_command:
             chat = await event.get_chat()
             entry = matched_allowed_chat(chat)
             if entry is None:
