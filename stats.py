@@ -346,10 +346,26 @@ def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
     """Combines `existing` [ts, message_id] pairs with `new_posts` (any iterable of the
     same shape), sorts newest-first, and trims to RECENT_FIGURINE_LINKS -- the one place
     this merge+trim happens, used by both _merge_day (across recorded days) and
-    _overlay_live_figurines (today's live counter on top of that)."""
+    _live_today_users/_overlay_live_figurines (today's live counter on top of a
+    transcript-derived or all-time view).
+
+    De-dupes by message_id first: the SAME message can legitimately reach this from two
+    independent sources with two different timestamps -- record_figurine_live's live
+    counter (stamped the instant the message was seen) and, once the transcript cache
+    catches up, compute_day_stats independently re-deriving that same day's posts from
+    the actual cached messages (stamped from the message's own dt_local). Without this,
+    that one post would show up twice in "Последние N работы" -- a real bug caught by
+    the user ("duplicated 1 and 2") once the transcript cache had caught up with a
+    same-day live post."""
     combined = existing + list(new_posts)
-    combined.sort(key=lambda p: p[0], reverse=True)
-    return combined[:RECENT_FIGURINE_LINKS]
+    by_message_id: dict = {}
+    for ts, message_id in combined:
+        current = by_message_id.get(message_id)
+        if current is None or ts > current[0]:
+            by_message_id[message_id] = (ts, message_id)
+    deduped = list(by_message_id.values())
+    deduped.sort(key=lambda p: p[0], reverse=True)
+    return deduped[:RECENT_FIGURINE_LINKS]
 
 
 def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
