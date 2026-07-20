@@ -139,7 +139,7 @@ PROCRASTINATOR_NONE_FOUND_MESSAGE = "Все скидывали покрасы в
 
 ERROR_DELETE_AFTER = 10  # short rejection notices (such as day limit) self-delete fast
 ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
-STATS_DELETE_AFTER = 300  # /top and /stat replies (incl. their own errors) self-delete after 5 minutes
+STATS_DELETE_AFTER = 60  # /top and /stat replies (incl. their own errors) self-delete after 1 minute
 
 # "сохрани" (config.py, SAVE_TRIGGER_KEYWORD env var), sent by you as a reply to any
 # message, asks (via a confirmation prompt + reaction, like the roast flow) whether to
