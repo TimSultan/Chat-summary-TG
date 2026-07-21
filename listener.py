@@ -162,6 +162,15 @@ SAVE_TICK_EMOJI = "✅"
 SAVE_CONFIRM_TIMEOUT = 10  # seconds to wait for a confirming reaction before cancelling
 SAVE_CONFIRM_DELETE_AFTER = 3  # seconds after a tick reaction before the prompt is deleted
 
+# Reacting with a thumbs-up on ANY message this account or the bot sent -- not just one
+# awaiting a specific confirmation, like the save/roast flows above -- is a one-tap "get
+# rid of this" shortcut, checked in on_reaction only once none of those more specific
+# flows claim the reaction first. Deliberately scoped to messages we sent (msg.out or a
+# bot sender): this account may well have delete rights over the whole chat, but a stray
+# 👍 on someone else's message must never delete it.
+DISMISS_EMOJI = "👍"
+DISMISS_DELETE_AFTER = 1  # seconds -- meant to feel closer to instant than a courtesy pause
+
 
 def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     names = {m.group(1) for m in MENTION_RE.finditer(text or "")}
@@ -1449,6 +1458,55 @@ async def run_listener(
             log(f"[listener] failed to fetch reactor list for msg {update.msg_id}: {e}")
             return set()
 
+    async def _my_reaction_emoticons(chat_id, update) -> set[str]:
+        """Like _reactor_ids, but returns the emoticon(s) *this account* reacted with on
+        update.msg_id, instead of every reactor's id -- lets the thumbs-up dismiss
+        shortcut below gate on the specific emoji, not just "you reacted with something"."""
+
+        def _mine_emoticons(reactions):
+            found = set()
+            for r in reactions:
+                try:
+                    if tl_utils.get_peer_id(r.peer_id) != me.id:
+                        continue
+                except Exception:
+                    continue
+                if isinstance(getattr(r, "reaction", None), ReactionEmoji):
+                    found.add(r.reaction.emoticon)
+            return found
+
+        found = _mine_emoticons(update.reactions.recent_reactions or [])
+        if found:
+            return found
+        # Same recent_reactions-not-always-populated fallback as _reactor_ids.
+        try:
+            result = await client(GetMessageReactionsListRequest(peer=chat_id, id=update.msg_id, limit=100))
+            return _mine_emoticons(result.reactions)
+        except Exception as e:
+            log(f"[listener] failed to fetch reactor list for msg {update.msg_id}: {e}")
+            return set()
+
+    async def _maybe_dismiss_on_thumbs_up(chat_id, update):
+        """Reacting DISMISS_EMOJI onto any message the bot (or this account) sent deletes
+        it almost immediately -- a one-tap way to clean up a reply without hunting for a
+        message-specific control. Only ever called once save_pending/joke_reaction_watch/
+        roast_pending have all already passed on the reaction (see on_reaction), so it
+        never fights an in-progress confirm flow for the same message."""
+        if DISMISS_EMOJI not in await _my_reaction_emoticons(chat_id, update):
+            return
+        try:
+            msg = await client.get_messages(chat_id, ids=update.msg_id)
+        except Exception as e:
+            log(f"[listener] failed to fetch message {update.msg_id} for thumbs-up dismiss: {e}")
+            return
+        if msg is None:
+            return
+        is_bot_sender = bool(msg.sender and getattr(msg.sender, "bot", False))
+        if not (msg.out or is_bot_sender):
+            return  # only ever our own/the bot's messages -- never someone else's
+        log(f"[listener] thumbs-up dismiss: deleting message {update.msg_id} in chat {chat_id}")
+        schedule_delete(client, chat_id, [update.msg_id], DISMISS_DELETE_AFTER)
+
     # Reactions from a *user* account (not a bot) arrive as this raw update, carrying the
     # message's full new reaction state (not a per-reaction delta) -- used to confirm
     # both the roast flow (did the person asked "точно хочешь прожарку?" react to that
@@ -1508,12 +1566,18 @@ async def run_listener(
                         f"[listener] joke in chat {chat_id} (msg {update.msg_id}) got "
                         f"{len(reactor_ids)} reactions -- cooldown reduced"
                     )
+            # Orthogonal to the threshold count above (that's about total reactors, this
+            # is specifically "did *I* thumbs-up it") -- falls through so a joke can still
+            # be dismissed on the spot instead of being stuck undismissable for as long as
+            # it stays in the reaction-count watch window (up to 4x the cooldown max).
+            await _maybe_dismiss_on_thumbs_up(chat_id, update)
             return
 
         key = next(
             (k for k, (mid, _) in roast_pending.items() if k[0] == chat_id and mid == update.msg_id), None
         )
         if key is None:
+            await _maybe_dismiss_on_thumbs_up(chat_id, update)
             return  # not a reaction on a pending roast-confirmation message
 
         _, target_user_id = key

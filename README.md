@@ -348,3 +348,7 @@ before leaving it deployed indefinitely.
 - Every question the listener answers (and its full answer) is recorded under `history/`
   (`history.py`) -- one small index file plus one file per answer. The GUI's History tab
   reads this; it's also there if you'd rather grep the files directly.
+- **👍 to delete.** Reacting with a thumbs-up (from your own account) on any message the
+  bot or your account sent -- a summary, joke, `/stat`/`/top` reply, whatever -- deletes
+  it almost immediately, as a one-tap cleanup shortcut. It never touches other people's
+  messages, even though your account may have delete rights over the whole chat.
