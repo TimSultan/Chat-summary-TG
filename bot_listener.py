@@ -61,6 +61,7 @@ from joke import CONTEXT_MESSAGE_COUNT, generate_joke
 from listener import (
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
+    DISMISS_DELETE_AFTER,
     ERROR_DELETE_AFTER,
     FIGURINE_ACK_EMOJI,
     NO_ROAST_MATERIAL_MESSAGE,
@@ -916,6 +917,7 @@ async def run_bot_listener(
     followup_queue: "asyncio.Queue | None" = None,
     figurine_ack_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
+    dismiss_queue: "asyncio.Queue | None" = None,
 ):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -953,9 +955,16 @@ async def run_bot_listener(
     "/stat pokras" reply, which self-deletes like every other /stat or /top reply): this
     is an ambient reminder meant to stay visible in the chat.
 
+    `dismiss_queue`, if given, carries (chat_id, message_id) pairs from listener.py's
+    thumbs-up dismiss shortcut (_maybe_dismiss_on_thumbs_up) whenever the reacted-to
+    message was sent by this bot account -- that session's Telethon client typically has
+    no delete rights over a message it didn't send itself, but this account can always
+    delete its OWN messages via the Bot API regardless of admin status, so the deletion
+    itself has to happen here.
+
     All queues are left None when run standalone (this module's own main()), which
-    just means jokes/follow-ups/figurine reactions/digests never fire, matching that
-    listener.py isn't running its activity tracking either in that mode."""
+    just means jokes/follow-ups/figurine reactions/digests/dismissals never fire,
+    matching that listener.py isn't running its activity tracking either in that mode."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     summary_queue: asyncio.Queue = asyncio.Queue()
@@ -1109,6 +1118,14 @@ async def run_bot_listener(
                 except Exception:
                     log(f"[bot_listener] failed to send stats digest:\n{traceback.format_exc()}")
 
+        async def _consume_dismissals():
+            while True:
+                chat_id, message_id = await dismiss_queue.get()
+                # schedule_bot_delete already does the DISMISS_DELETE_AFTER wait via a
+                # background task, so this loop isn't blocked from picking up the next
+                # dismissal while one is still pending.
+                schedule_bot_delete(api, chat_id, [message_id], DISMISS_DELETE_AFTER, log, background_tasks)
+
         tasks = [_poll_loop(), _consume_summaries()]
         if joke_queue is not None:
             tasks.append(_consume_jokes())
@@ -1118,6 +1135,8 @@ async def run_bot_listener(
             tasks.append(_consume_figurine_acks())
         if stats_digest_queue is not None:
             tasks.append(_consume_stats_digests())
+        if dismiss_queue is not None:
+            tasks.append(_consume_dismissals())
         await asyncio.gather(*tasks)
 
 

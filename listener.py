@@ -816,6 +816,7 @@ async def run_listener(
     followup_queue: "asyncio.Queue | None" = None,
     figurine_ack_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
+    dismiss_queue: "asyncio.Queue | None" = None,
 ):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
@@ -858,7 +859,16 @@ async def run_listener(
     stats.format_procrastinators) -- unprompted, ambient content, so same
     bot-account-only rule as jokes/follow-ups: passed through to run_stats_rollover, and
     simply never sent (no personal-account fallback) if there's no bot account, matching
-    joke_enabled's own gating."""
+    joke_enabled's own gating.
+
+    `dismiss_queue`, if given, is where (chat_id, message_id) goes from
+    _maybe_dismiss_on_thumbs_up (see on_reaction) when the thumbs-up dismiss shortcut
+    targets a message THIS session can't delete itself -- one sent by the bot account,
+    which this personal account typically has no delete rights over unless it happens to
+    be a chat admin (unlike a message this account sent itself, which it can always
+    delete and does directly, no hand-off needed). bot_listener.py deletes it via the Bot
+    API instead, which -- like every other reply -- can always delete its OWN messages
+    without needing admin rights."""
     assert cfg.summary_queue_delay_seconds >= 0, "internal bug: queue delay should have been validated by config"
 
     me = await client.get_me()
@@ -1501,11 +1511,29 @@ async def run_listener(
             return
         if msg is None:
             return
-        is_bot_sender = bool(msg.sender and getattr(msg.sender, "bot", False))
-        if not (msg.out or is_bot_sender):
+        if msg.out:
+            log(f"[listener] thumbs-up dismiss: deleting own message {update.msg_id} in chat {chat_id}")
+            schedule_delete(client, chat_id, [update.msg_id], DISMISS_DELETE_AFTER)
+            return
+        # .sender is a lazily-cached property -- not guaranteed populated just from
+        # get_messages -- so get_sender() (which fetches on a cache miss) is what
+        # reliably tells a bot-sent message apart from a fellow human's.
+        try:
+            sender = await msg.get_sender()
+        except Exception as e:
+            log(f"[listener] failed to resolve sender of message {update.msg_id} for thumbs-up dismiss: {e}")
+            return
+        if not (sender and getattr(sender, "bot", False)):
             return  # only ever our own/the bot's messages -- never someone else's
-        log(f"[listener] thumbs-up dismiss: deleting message {update.msg_id} in chat {chat_id}")
-        schedule_delete(client, chat_id, [update.msg_id], DISMISS_DELETE_AFTER)
+        if dismiss_queue is None:
+            log(
+                f"[listener] thumbs-up dismiss: message {update.msg_id} in chat {chat_id} was sent by a "
+                "bot account, but no dismiss_queue is wired up (no TELEGRAM_BOT_TOKEN?) -- can't delete it "
+                "without admin rights this account may not have"
+            )
+            return
+        log(f"[listener] thumbs-up dismiss: queuing bot-sent message {update.msg_id} in chat {chat_id} for deletion")
+        await dismiss_queue.put((chat_id, update.msg_id))
 
     # Reactions from a *user* account (not a bot) arrive as this raw update, carrying the
     # message's full new reaction state (not a per-reaction delta) -- used to confirm
@@ -1755,18 +1783,27 @@ async def main():
         # stats.format_procrastinators) -- ambient, unprompted content, same
         # bot-account-only rule as jokes.
         stats_digest_queue: asyncio.Queue = asyncio.Queue()
+        # dismiss_queue carries (chat_id, message_id) from this session's thumbs-up
+        # dismiss shortcut (see _maybe_dismiss_on_thumbs_up in run_listener) whenever the
+        # message to delete was sent by the bot account -- this account typically has no
+        # delete rights over another account's message unless it happens to be a chat
+        # admin, but the bot can always delete its own messages via the Bot API, same as
+        # every other reply is bot-account-only.
+        dismiss_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
             run_listener(
                 client, cfg, tz,
                 joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 bot_response_queue=bot_response_queue, followup_queue=followup_queue,
                 figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
+                dismiss_queue=dismiss_queue,
             ),
             bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
                 joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 bot_response_queue=bot_response_queue, followup_queue=followup_queue,
                 figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
+                dismiss_queue=dismiss_queue,
             ),
         )
     else:
