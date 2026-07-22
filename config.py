@@ -52,9 +52,6 @@ class Config:
     joke_profile_lookback_days: int
     joke_profile_ttl_seconds: int
     joke_profile_max_messages: int
-    followup_enabled: bool
-    followup_window_messages: int
-    followup_check_every_messages: int
     stats_enabled: bool
     stats_top_limit: int
     stats_catchup_days: int
@@ -235,24 +232,6 @@ def load_config() -> Config:
     if joke_profile_max_messages < 1:
         raise ChatSummaryError(f"JOKE_PROFILE_MAX_MESSAGES must be >= 1, got {joke_profile_max_messages}.")
 
-    followup_enabled = os.getenv("FOLLOWUP_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-
-    followup_window_raw = os.getenv("FOLLOWUP_WINDOW_MESSAGES", "15")
-    try:
-        followup_window_messages = int(followup_window_raw)
-    except ValueError:
-        raise ChatSummaryError(f"FOLLOWUP_WINDOW_MESSAGES must be a number, got '{followup_window_raw}'.")
-    if followup_window_messages < 1:
-        raise ChatSummaryError(f"FOLLOWUP_WINDOW_MESSAGES must be >= 1, got {followup_window_messages}.")
-
-    followup_check_every_raw = os.getenv("FOLLOWUP_CHECK_EVERY_MESSAGES", "5")
-    try:
-        followup_check_every_messages = int(followup_check_every_raw)
-    except ValueError:
-        raise ChatSummaryError(f"FOLLOWUP_CHECK_EVERY_MESSAGES must be a number, got '{followup_check_every_raw}'.")
-    if followup_check_every_messages < 1:
-        raise ChatSummaryError(f"FOLLOWUP_CHECK_EVERY_MESSAGES must be >= 1, got {followup_check_every_messages}.")
-
     stats_enabled = os.getenv("STATS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "10")
@@ -300,9 +279,6 @@ def load_config() -> Config:
         joke_profile_lookback_days=joke_profile_lookback_days,
         joke_profile_ttl_seconds=joke_profile_ttl_seconds,
         joke_profile_max_messages=joke_profile_max_messages,
-        followup_enabled=followup_enabled,
-        followup_window_messages=followup_window_messages,
-        followup_check_every_messages=followup_check_every_messages,
         stats_enabled=stats_enabled,
         stats_top_limit=stats_top_limit,
         stats_catchup_days=stats_catchup_days,

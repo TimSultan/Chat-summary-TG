@@ -237,6 +237,21 @@ landing in front of everyone. Both need `LISTENER_ALLOWED_CHATS` to name exactly
 (same requirement as DM `/summary`), and work independently of `JOKE_ENABLED` -- a manual
 ask doesn't carry the "unprompted" risk that setting is guarding against.
 
+### Conversational replies to the bot
+
+When a person uses Telegram's **Reply** action on any message authored by the bot, the
+bot always answers as a normal participant. This is built-in behavior, not part of
+`JOKE_ENABLED`, and has no probability, cooldown, short watch window, or separate feature
+flag. It works for bot messages sent before the current process started too, because the
+incoming Telegram update identifies the replied-to message and its author directly.
+
+The answer sees the exact bot message being replied to, the person's response, the newest
+20 messages in the chat, and the same cached multi-day style profile used by natural chat
+remarks. It may be funny when that fits, but it is prompted to answer questions and react
+normally rather than forcing a joke. Messages in the general chat flow do not trigger
+this behavior; the person must reply directly to the bot. Explicit commands such as
+`/summary`, `/stat`, and `/top` keep their specialized behavior even when sent as replies.
+
 ## Model choice
 
 `config.py` defines `RECOMMENDED_MODELS`, curated as of July 2026: `gpt-5.4-mini`

@@ -1,10 +1,11 @@
 """Builds and caches a compact "flavor profile" of a chat -- its everyday writing style,
 rhythm, slang, recurring context, and humor when relevant -- from a few days of its
 already-cached transcript. Fed into joke.py's prompts (both the buffer-triggered automatic
-path and the manual "пошути" trigger) so generated remarks fit the conversation instead
-of reading like generic bot jokes.
+path and the manual "пошути" trigger) and direct replies to the bot, so generated messages
+fit the conversation instead of reading like generic bot text.
 
-Refreshed on a TTL (JOKE_PROFILE_TTL_SECONDS in config.py), not on every joke -- this
+Refreshed on a TTL (legacy setting name JOKE_PROFILE_TTL_SECONDS in config.py), not on
+every generated message -- this
 reads multiple days of history, which is comparatively expensive, and a chat's overall
 vibe doesn't meaningfully shift message to message. `ensure_profile` is the entry point
 everything else calls: it returns the cached profile if still fresh, otherwise fetches
