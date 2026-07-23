@@ -28,7 +28,11 @@ job for a day it already processed (e.g. a restart landing near midnight) is the
 no-op, not a double-count.
 
 Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not points):
-    +1 per message
+    +(word count / words_per_point) per message -- NOT a flat +1/message. A flat rate
+        rewarded spamming lots of short messages just as much as writing one that says
+        something; word count divided by the chat's own recent average words/message
+        (see words_per_point) keeps a "typical" message worth about 1 point while a
+        one-word "ok" is worth a fraction and a long one worth more.
     +1 per message containing a photo or video
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
@@ -38,7 +42,17 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
 Points are never stored -- always recomputed on demand from the raw per-day counters for
 whatever window (day/week/month/year, or -- for a bare /stat lookup -- every recorded
 day) is asked about, so changing the point values later doesn't require re-processing
-any history.
+any history. words_per_point is the one number here that ISN'T a fixed constant in code
+-- it's calibrated per chat, from that chat's own trailing WORDS_PER_POINT_LOOKBACK_DAYS
+days of real activity -- but it's still fixed in effect: calibrated exactly ONCE (the
+first time any stats command needs it after this feature ships for a chat), then cached
+to disk and reused forever, never automatically recomputed (see words_per_point's own
+docstring). So a message's point value stays stable over time, same as the old flat
++1/message did -- the only thing that's ever freshly recomputed per call, same as before
+this feature, is "today" itself (not yet finalized -- see record_day), not the conversion
+rate. Per-day files recorded before this feature shipped have no "words" counter at all
+(it defaults to 0 via `.get`), so message-based points for those old days are effectively
+zero -- only the media/reply/active-day/figurine bonuses are unaffected for them.
 """
 
 import hashlib
@@ -60,11 +74,24 @@ STATS_DIR = DATA_DIR / "cache" / "stats"
 def _stats_dir() -> Path:
     return STATS_DIR / cache_namespace(resolve_timezone())
 
-POINTS_PER_MESSAGE = 1
 POINTS_PER_MEDIA_MESSAGE = 1
 POINTS_PER_REPLY = 1
 POINTS_PER_ACTIVE_DAY = 5
 POINTS_PER_FIGURINE = 150
+
+# Message points are no longer a flat +1/message (that let someone rack up points just by
+# spamming short messages) -- instead a message is worth its word count divided by the
+# chat's OWN recent average words/message, so a typical-length message is still worth
+# about 1 point, a long one worth more, and a one-word "ok" worth a fraction of one. The
+# average is recomputed fresh (see words_per_point) from the trailing
+# WORDS_PER_POINT_LOOKBACK_DAYS days every time it's needed rather than fixed to one
+# number, so it tracks this chat's actual current typing style instead of a guessed
+# constant -- see the module docstring's Scoring section for the full rationale.
+WORDS_PER_POINT_LOOKBACK_DAYS = 3
+# Fallback words-per-point when the lookback window has no messages at all (a brand new
+# chat, or one that's been silent for days) -- avoids a division by zero / a degenerate
+# "any message is worth infinite points" result.
+DEFAULT_WORDS_PER_POINT = 5.0
 
 # Telegram_fetch.describe_media prepends one of these bracketed tags to a media message's
 # cached text (e.g. "[Photo] nice caption"). Narrowed to photo/video only, per spec --
@@ -276,6 +303,7 @@ def compute_day_stats(messages: list) -> dict:
                 "display_name": m.sender_name,
                 "messages": 0,
                 "chars": 0,
+                "words": 0,
                 "media": 0,
                 "replies": 0,
                 "figurines": 0,
@@ -293,6 +321,7 @@ def compute_day_stats(messages: list) -> dict:
             u["display_name"] = m.sender_name
         u["messages"] += 1
         u["chars"] += len(m.text)
+        u["words"] += len(m.text.split())
         if m.text.startswith(MEDIA_TAG_PREFIXES):
             u["media"] += 1
         ts = m.dt_local.isoformat()
@@ -354,6 +383,7 @@ class UserStats:
     display_name: str = "Unknown"
     messages: int = 0
     chars: int = 0
+    words: int = 0
     media: int = 0
     # Counts any message Telegram itself flags as a reply (ChatMessage.is_reply) --
     # including a reply to one's own earlier message, which the cache doesn't currently
@@ -374,10 +404,15 @@ class UserStats:
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
 
-    @property
-    def score(self) -> int:
-        return (
-            self.messages * POINTS_PER_MESSAGE
+    def score(self, words_per_point: float) -> int:
+        """`words_per_point` -- see the function of that name -- is this chat's frozen
+        words/message baseline. It's a required argument rather than a module constant
+        because, unlike the other POINTS_PER_* values, it's calibrated per chat (from
+        that chat's own real activity) rather than picked as one universal number (see
+        the module docstring's Scoring section) -- but once calibrated, it's fixed, same
+        as the others."""
+        return round(
+            self.words / words_per_point
             + self.media * POINTS_PER_MEDIA_MESSAGE
             + self.replies * POINTS_PER_REPLY
             + self.active_days * POINTS_PER_ACTIVE_DAY
@@ -423,6 +458,7 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
             s.display_name = u["display_name"]
         s.messages += u.get("messages", 0)
         s.chars += u.get("chars", 0)
+        s.words += u.get("words", 0)
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
         s.figurines_painted += u.get("figurines", 0)
@@ -586,7 +622,7 @@ async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict
             key,
             {
                 "username": None, "display_name": live.get("display_name", "Unknown"),
-                "messages": 0, "chars": 0, "media": 0, "replies": 0, "figurines": 0,
+                "messages": 0, "chars": 0, "words": 0, "media": 0, "replies": 0, "figurines": 0,
                 "figurine_posts": [],
                 "hours": {}, "last_message_at": None,
             },
@@ -626,18 +662,70 @@ async def aggregate_all_time_live(client, chat_ref, entry: str, tz, log=print) -
     return combined
 
 
+def _words_per_point_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_words_per_point.json"
+
+
+def _load_words_per_point(entry: str) -> float | None:
+    path = _words_per_point_path(entry)
+    if not path.exists():
+        return None
+    try:
+        return float(json.loads(path.read_text(encoding="utf-8"))["words_per_point"])
+    except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
+        return None
+
+
+def _save_words_per_point(entry: str, value: float) -> None:
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _words_per_point_path(entry).write_text(
+        json.dumps({"words_per_point": value, "calibrated_at": app_now().isoformat()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+async def words_per_point(client, chat_ref, entry: str, tz, log=print) -> float:
+    """The chat-wide average words/message this chat's scoring treats as "1 point" (see
+    UserStats.score). Calibrated ONCE -- the first time any stats command needs it for
+    this chat -- from the trailing WORDS_PER_POINT_LOOKBACK_DAYS days of real activity
+    (today included, live) at that moment, then cached to disk forever (see
+    _words_per_point_path/_load_words_per_point) and simply read back on every later
+    call, never recomputed. This is deliberate, unlike almost everything else in this
+    module: a message posted a month ago must keep the same point value it always has --
+    if the divisor kept drifting with the chat's current average, every already-recorded
+    day's score would silently shift every time someone checked, even though nothing
+    about that day actually changed. Only "today" (not yet finalized -- see record_day)
+    is ever naturally re-derived on each call, same as every other stat; the conversion
+    rate itself is not. To force a one-time recalibration (e.g. the chat's typical
+    message length has genuinely shifted), delete this entry's cache file -- nothing
+    does that automatically."""
+    cached = _load_words_per_point(entry)
+    if cached is not None:
+        return cached
+    today = datetime.now(tz).date()
+    start = today - timedelta(days=WORDS_PER_POINT_LOOKBACK_DAYS - 1)
+    combined = await aggregate_live(client, chat_ref, entry, start, today, tz, log=log)
+    total_words = sum(s.words for s in combined.values())
+    total_messages = sum(s.messages for s in combined.values())
+    value = (total_words / total_messages) if total_messages else DEFAULT_WORDS_PER_POINT
+    _save_words_per_point(entry, value)
+    log(f"[stats] calibrated words_per_point for '{entry}': {value:.2f} words/message (frozen, won't auto-update)")
+    return value
+
+
 async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, log=print) -> str:
     if period == "all":
         combined = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
     else:
         start, end = resolve_period_window(period, tz)
         combined = await aggregate_live(client, chat_ref, entry, start, end, tz, log=log)
-    ranked = sorted(combined.values(), key=lambda s: s.score, reverse=True)[:top_n]
+    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
+    ranked = sorted(combined.values(), key=lambda s: s.score(wpp), reverse=True)[:top_n]
     if not ranked:
         return "Пока нет данных за этот период."
     lines = ["🏆 Топ активистов:", ""]
     for i, s in enumerate(ranked, start=1):
-        lines.append(f"{i}. {s.display_name} — {s.score} очков")
+        lines.append(f"{i}. {s.display_name} — {s.score(wpp)} очков")
     return "\n".join(lines)
 
 
@@ -703,7 +791,8 @@ async def format_procrastinators(
     historical_end = min(month_end, today - timedelta(days=1))
     pool = aggregate(entry, month_start, historical_end) if month_start <= historical_end else {}
     _merge_day(pool, {"users": live_today})
-    ranked = sorted(pool.values(), key=lambda s: s.score, reverse=True)
+    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
+    ranked = sorted(pool.values(), key=lambda s: s.score(wpp), reverse=True)
 
     all_time = aggregate_all_time(entry)
     _merge_day(all_time, {"users": live_today})
@@ -788,7 +877,10 @@ def figurine_message_links(chat_username: str | None, chat_id: int | None, user:
     return links
 
 
-def format_stat(user: UserStats, rank: int, total: int, figurine_links: list[str] | None = None) -> str:
+def format_stat(user: UserStats, rank: int, total: int, score: int, figurine_links: list[str] | None = None) -> str:
+    """`score` is computed by the caller (resolve_stat_target) rather than read off
+    `user` directly -- UserStats.score needs the chat's current words_per_point, which
+    this function has no way to compute itself (it's sync, with no client/chat_ref)."""
     avg = user.messages / user.active_days if user.active_days else 0.0
     last_seen = "нет данных"
     if user.last_message_at:
@@ -796,7 +888,7 @@ def format_stat(user: UserStats, rank: int, total: int, figurine_links: list[str
     text = (
         "📊 Статистика пользователя:\n\n"
         f"Имя: {user.display_name}\n"
-        f"🏆 Очки: {user.score}\n"
+        f"🏆 Очки: {score}\n"
         f"📈 Место в рейтинге: {rank} из {total}\n"
         f"Сообщений: {user.messages}\n"
         f"Среднее сообщений в день: {avg:.1f}\n"
@@ -829,19 +921,21 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
 
 async def resolve_stat_target(
     client, chat_ref, entry: str, arg: str, requester_username: str | None, requester_display_name: str, tz, log=print
-) -> tuple[UserStats | None, int | None, int]:
+) -> tuple[UserStats | None, int | None, int, int | None]:
     """Resolves who a /stat command is asking about: an explicit argument (@username or
     a name fragment) if given, otherwise the requester's own tracked stats -- tried first
     by @username (exact), falling back to their display name (substring). Fetches the
     all-time-plus-today-live aggregate exactly once regardless of how many of those three
     lookups it takes, rather than once per attempt.
 
-    Returns (user, rank, total): `rank` is the person's 1-based position by score among
-    everyone ever tracked for this chat (ties broken by dict iteration order, which is
-    stable but arbitrary -- fine for a gamified leaderboard, not meant to be exact), and
-    `total` is how many people that's out of. `rank` is None (with user) if no match was
-    found; `total` is still meaningful in that case (could be used for a "N people
-    tracked" message even without a match, though callers currently don't)."""
+    Returns (user, rank, total, score): `rank` is the person's 1-based position by score
+    among everyone ever tracked for this chat (ties broken by dict iteration order, which
+    is stable but arbitrary -- fine for a gamified leaderboard, not meant to be exact),
+    and `total` is how many people that's out of. `score` is returned alongside `user`
+    (rather than left for the caller to read off UserStats.score) since scoring now needs
+    words_per_point -- see UserStats.score. `rank`/`score` are None (with user) if no
+    match was found; `total` is still meaningful in that case (could be used for a "N
+    people tracked" message even without a match, though callers currently don't)."""
     all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
     total = len(all_time)
     if arg:
@@ -851,7 +945,8 @@ async def resolve_stat_target(
         if user is None:
             user = _find_user(all_time, requester_display_name)
     if user is None:
-        return None, None, total
-    ranked = sorted(all_time.values(), key=lambda s: s.score, reverse=True)
+        return None, None, total, None
+    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
+    ranked = sorted(all_time.values(), key=lambda s: s.score(wpp), reverse=True)
     rank = next(i for i, s in enumerate(ranked, start=1) if s.user_id == user.user_id)
-    return user, rank, total
+    return user, rank, total, user.score(wpp)
