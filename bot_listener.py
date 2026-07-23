@@ -923,13 +923,13 @@ async def _dispatch_update(
                     )
                 else:
                     from_user = message.get("from") or {}
-                    user, rank, total, score = await stats.resolve_stat_target(
+                    user, rank, total, score, streak = await stats.resolve_stat_target(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
                     )
                     if user:
                         figurine_links = stats.figurine_message_links(chat.get("username"), chat_key, user)
-                        reply_text = stats.format_stat(user, rank, total, score, figurine_links)
+                        reply_text = stats.format_stat(user, rank, total, score, streak, figurine_links)
                     else:
                         reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
             # parse_mode=None: reply_text can embed a raw display name (leaderboard

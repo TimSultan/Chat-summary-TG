@@ -28,11 +28,16 @@ job for a day it already processed (e.g. a restart landing near midnight) is the
 no-op, not a double-count.
 
 Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not points):
-    +(word count / words_per_point) per message -- NOT a flat +1/message. A flat rate
-        rewarded spamming lots of short messages just as much as writing one that says
-        something; word count divided by the chat's own recent average words/message
-        (see words_per_point) keeps a "typical" message worth about 1 point while a
-        one-word "ok" is worth a fraction and a long one worth more.
+    Message points, PER DAY, are one of two things depending on whether that day predates
+    word-tracking (see _has_word_data / UserStats.legacy_message_points vs. .words):
+        +1 per message (flat), for any day recorded before this feature shipped -- kept
+            forever exactly as it always scored, never reinterpreted.
+        +(word count / words_per_point), for any day from after -- NOT a flat rate. A
+            flat +1/message rewarded spamming lots of short messages just as much as
+            writing one that says something; word count divided by the chat's own
+            average words/message (see words_per_point) keeps a "typical" message worth
+            about 1 point while a one-word "ok" is worth a fraction and a long one worth
+            more.
     +1 per message containing a photo or video
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
@@ -41,18 +46,17 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
         qualify). Also surfaced as its own raw count, "Покрашено фигурок", in /stat.
 Points are never stored -- always recomputed on demand from the raw per-day counters for
 whatever window (day/week/month/year, or -- for a bare /stat lookup -- every recorded
-day) is asked about, so changing the point values later doesn't require re-processing
-any history. words_per_point is the one number here that ISN'T a fixed constant in code
--- it's calibrated per chat, from that chat's own trailing WORDS_PER_POINT_LOOKBACK_DAYS
-days of real activity -- but it's still fixed in effect: calibrated exactly ONCE (the
-first time any stats command needs it after this feature ships for a chat), then cached
-to disk and reused forever, never automatically recomputed (see words_per_point's own
-docstring). So a message's point value stays stable over time, same as the old flat
-+1/message did -- the only thing that's ever freshly recomputed per call, same as before
-this feature, is "today" itself (not yet finalized -- see record_day), not the conversion
-rate. Per-day files recorded before this feature shipped have no "words" counter at all
-(it defaults to 0 via `.get`), so message-based points for those old days are effectively
-zero -- only the media/reply/active-day/figurine bonuses are unaffected for them.
+day) is asked about, so changing the point values later doesn't require re-processing any
+history -- and per the split above, a day's message-scoring RULE never changes after the
+fact either, regardless of what happens to word-tracking later. words_per_point is the
+one number here that isn't a fixed constant in code -- it's calibrated per chat, from
+that chat's own real activity (see MIN_CALIBRATION_MESSAGES) -- but it's still fixed in
+effect: calibrated exactly once, then cached to disk and reused forever, never
+automatically recomputed (see words_per_point's own docstring). So a message's point
+value, once it has one, stays stable over time -- the only thing that's ever freshly
+recomputed per call, same as before this feature, is "today" itself (not yet finalized --
+see record_day), not the scoring rule or conversion rate applied to any already-recorded
+day.
 """
 
 import hashlib
@@ -77,21 +81,34 @@ def _stats_dir() -> Path:
 POINTS_PER_MEDIA_MESSAGE = 1
 POINTS_PER_REPLY = 1
 POINTS_PER_ACTIVE_DAY = 5
-POINTS_PER_FIGURINE = 150
+POINTS_PER_FIGURINE = 200
+# The flat rate every message scored under before word-based points existed. ONLY applied
+# (via UserStats.legacy_message_points) to days recorded before word-tracking existed --
+# those days keep exactly the score they always had, forever, rather than being
+# reinterpreted by a formula that didn't exist when they happened. See _has_word_data.
+LEGACY_POINTS_PER_MESSAGE = 1
 
-# Message points are no longer a flat +1/message (that let someone rack up points just by
-# spamming short messages) -- instead a message is worth its word count divided by the
-# chat's OWN recent average words/message, so a typical-length message is still worth
-# about 1 point, a long one worth more, and a one-word "ok" worth a fraction of one. The
-# average is recomputed fresh (see words_per_point) from the trailing
-# WORDS_PER_POINT_LOOKBACK_DAYS days every time it's needed rather than fixed to one
-# number, so it tracks this chat's actual current typing style instead of a guessed
-# constant -- see the module docstring's Scoring section for the full rationale.
+# From the day this feature shipped onward, a message is worth its word count divided by
+# the chat's OWN average words/message, rather than a flat +1/message -- so a typical-
+# length message is still worth about 1 point, a long one worth more, and a one-word "ok"
+# worth a fraction of one. That average is calibrated ONCE per chat, from the trailing
+# WORDS_PER_POINT_LOOKBACK_DAYS days, then frozen -- see words_per_point and the module
+# docstring's Scoring section.
 WORDS_PER_POINT_LOOKBACK_DAYS = 3
-# Fallback words-per-point when the lookback window has no messages at all (a brand new
-# chat, or one that's been silent for days) -- avoids a division by zero / a degenerate
-# "any message is worth infinite points" result.
+# Fallback words-per-point when there isn't yet enough real data to calibrate from (see
+# MIN_CALIBRATION_MESSAGES) -- avoids a division by zero / a degenerate "any message is
+# worth infinite points" result.
 DEFAULT_WORDS_PER_POINT = 5.0
+# words_per_point won't freeze a calibration based on fewer than this many real
+# (post-migration) messages -- a tiny sample right after this feature ships (or in a
+# quiet chat) could easily be skewed by one or two messages, and unlike everything else
+# here, a bad calibration doesn't get a chance to self-correct once cached.
+MIN_CALIBRATION_MESSAGES = 30
+# Bumped whenever the calibration algorithm changes in a way that could make an
+# already-cached value wrong -- a cache file written under an older version is ignored
+# and recalibrated fresh next call, rather than requiring anyone to manually find and
+# delete it on the deployed Railway volume (which this codebase has no way to reach).
+WORDS_PER_POINT_CACHE_VERSION = 2
 
 # Telegram_fetch.describe_media prepends one of these bracketed tags to a media message's
 # cached text (e.g. "[Photo] nice caption"). Narrowed to photo/video only, per spec --
@@ -281,6 +298,23 @@ def _ru_days(n: int) -> str:
     return f"{n} дней"
 
 
+def _current_streak(active_day_dates: set, today: date) -> int:
+    """How many CONSECUTIVE days, counting backward, this person has posted at least
+    once -- the number shown next to /stat's fire emoji. Starts counting from today if
+    they've already posted today, otherwise from yesterday: the streak isn't considered
+    broken just because today isn't over yet and they haven't posted YET (matching how
+    "streak" counters commonly work elsewhere, e.g. Duolingo) -- it only actually breaks
+    once a full day passes with no post at all. Walks backward through
+    UserStats.active_day_dates (the actual dates behind the active_days count) until it
+    hits a gap."""
+    day = today if today.isoformat() in active_day_dates else today - timedelta(days=1)
+    streak = 0
+    while day.isoformat() in active_day_dates:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
+
+
 def compute_day_stats(messages: list) -> dict:
     """Returns {user_id_str: {...counters...}} for one day's messages (a full day's
     telegram_fetch.ChatMessage list). Messages with no resolvable sender_id (rare --
@@ -383,7 +417,16 @@ class UserStats:
     display_name: str = "Unknown"
     messages: int = 0
     chars: int = 0
+    # Only from days with real word-tracking (see _has_word_data) -- the words/points
+    # formula (see score) applies exclusively to those. `legacy_message_points` below is
+    # the counterpart for days recorded before word-tracking existed.
     words: int = 0
+    # Message points already locked in from days recorded BEFORE word-tracking existed --
+    # each such day contributes its original flat messages*LEGACY_POINTS_PER_MESSAGE value
+    # (see _merge_day), computed once at merge time and simply summed here, so an old day's
+    # score can never change again no matter what happens to words_per_point later. `words`
+    # above is the separate, live counterpart for days that DO have real word data.
+    legacy_message_points: int = 0
     media: int = 0
     # Counts any message Telegram itself flags as a reply (ChatMessage.is_reply) --
     # including a reply to one's own earlier message, which the cache doesn't currently
@@ -401,6 +444,12 @@ class UserStats:
     # for anyone regardless of their total count.
     recent_figurine_posts: list = field(default_factory=list)
     active_days: int = 0
+    # ISO date strings ("YYYY-MM-DD") for every day this person posted at least once --
+    # the actual DATES behind the `active_days` count above, needed to walk backward day
+    # by day for a "current streak" (see _current_streak). Populated by _merge_day from
+    # each merged day's own "day" key (present on every recorded day-file and on every
+    # synthetic live-today payload built for this purpose -- see aggregate_live etc.).
+    active_day_dates: set = field(default_factory=set)
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
 
@@ -410,9 +459,13 @@ class UserStats:
         because, unlike the other POINTS_PER_* values, it's calibrated per chat (from
         that chat's own real activity) rather than picked as one universal number (see
         the module docstring's Scoring section) -- but once calibrated, it's fixed, same
-        as the others."""
+        as the others. `legacy_message_points` (days from before word-tracking existed)
+        and `words / words_per_point` (days from after) are two DIFFERENT ways of
+        scoring a message, added side by side rather than one replacing the other --
+        see UserStats.legacy_message_points."""
         return round(
-            self.words / words_per_point
+            self.legacy_message_points
+            + self.words / words_per_point
             + self.media * POINTS_PER_MEDIA_MESSAGE
             + self.replies * POINTS_PER_REPLY
             + self.active_days * POINTS_PER_ACTIVE_DAY
@@ -449,7 +502,34 @@ def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
     return deduped
 
 
+def _has_word_data(payload: dict) -> bool:
+    """False for a recorded day-file from before the words-per-message feature shipped:
+    old files never wrote a "words" key on any user record, while compute_day_stats has
+    written it (even as an explicit 0) for every user since. Two callers rely on this:
+
+    - _merge_day uses it to decide, per day, which of the two message-scoring paths that
+      day's messages go through -- UserStats.legacy_message_points (the original flat
+      +1/message, for days from before this existed) or UserStats.words (the word-count
+      formula, for days from after) -- so an old day keeps exactly the score it always
+      had, forever, rather than being silently reinterpreted by a formula that didn't
+      exist when it happened.
+    - words_per_point's calibration uses it to skip pre-migration days entirely when
+      averaging, rather than treating their real, un-tracked word counts as zero (which
+      would understate the chat's true words/message and freeze a permanently-too-
+      generous rate -- the actual cause of a real production bug: right after this
+      feature shipped, the lookback window was mostly old zero-word days, so the
+      one-time calibration froze on an artificially tiny baseline, letting one quiet
+      person's single long message outscore actually chatty regulars).
+
+    A day with no messages at all (empty `users`) contributes nothing either way and is
+    treated as unusable too, just to keep this check simple."""
+    users = payload.get("users") or {}
+    return bool(users) and all("words" in u for u in users.values())
+
+
 def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
+    word_scored_day = _has_word_data(payload)
+    day_str = payload.get("day")
     for user_id, u in payload.get("users", {}).items():
         s = combined.setdefault(user_id, UserStats(user_id=user_id))
         if u.get("username"):
@@ -458,7 +538,10 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
             s.display_name = u["display_name"]
         s.messages += u.get("messages", 0)
         s.chars += u.get("chars", 0)
-        s.words += u.get("words", 0)
+        if word_scored_day:
+            s.words += u.get("words", 0)
+        else:
+            s.legacy_message_points += u.get("messages", 0) * LEGACY_POINTS_PER_MESSAGE
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
         s.figurines_painted += u.get("figurines", 0)
@@ -466,6 +549,8 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
             s.recent_figurine_posts = _merge_recent_figurine_posts(s.recent_figurine_posts, u["figurine_posts"])
         if u.get("messages", 0) > 0:
             s.active_days += 1
+            if day_str:
+                s.active_day_dates.add(day_str)
         for hour, count in u.get("hours", {}).items():
             s.hours[hour] = s.hours.get(hour, 0) + count
         last = u.get("last_message_at")
@@ -649,7 +734,8 @@ async def aggregate_live(
     historical_end = min(end_day, today - timedelta(days=1))
     combined = aggregate(entry, start_day, historical_end) if start_day <= historical_end else {}
     if start_day <= today <= end_day:
-        _merge_day(combined, {"users": await _live_today_users(client, chat_ref, entry, tz, log=log)})
+        live_users = await _live_today_users(client, chat_ref, entry, tz, log=log)
+        _merge_day(combined, {"day": today.isoformat(), "users": live_users})
     return combined
 
 
@@ -658,7 +744,9 @@ async def aggregate_all_time_live(client, chat_ref, entry: str, tz, log=print) -
     aggregate_live's same reasoning. Used by /stat, and by resolve_stat_target so someone
     who has only ever posted today (no recorded day yet at all) is still found."""
     combined = aggregate_all_time(entry)
-    _merge_day(combined, {"users": await _live_today_users(client, chat_ref, entry, tz, log=log)})
+    today = datetime.now(tz).date()
+    live_users = await _live_today_users(client, chat_ref, entry, tz, log=log)
+    _merge_day(combined, {"day": today.isoformat(), "users": live_users})
     return combined
 
 
@@ -671,7 +759,10 @@ def _load_words_per_point(entry: str) -> float | None:
     if not path.exists():
         return None
     try:
-        return float(json.loads(path.read_text(encoding="utf-8"))["words_per_point"])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != WORDS_PER_POINT_CACHE_VERSION:
+            return None
+        return float(data["words_per_point"])
     except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
         return None
 
@@ -679,35 +770,56 @@ def _load_words_per_point(entry: str) -> float | None:
 def _save_words_per_point(entry: str, value: float) -> None:
     _stats_dir().mkdir(parents=True, exist_ok=True)
     _words_per_point_path(entry).write_text(
-        json.dumps({"words_per_point": value, "calibrated_at": app_now().isoformat()}, ensure_ascii=False),
+        json.dumps(
+            {
+                "words_per_point": value,
+                "calibrated_at": app_now().isoformat(),
+                "version": WORDS_PER_POINT_CACHE_VERSION,
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
 
 
 async def words_per_point(client, chat_ref, entry: str, tz, log=print) -> float:
     """The chat-wide average words/message this chat's scoring treats as "1 point" (see
-    UserStats.score). Calibrated ONCE -- the first time any stats command needs it for
-    this chat -- from the trailing WORDS_PER_POINT_LOOKBACK_DAYS days of real activity
-    (today included, live) at that moment, then cached to disk forever (see
-    _words_per_point_path/_load_words_per_point) and simply read back on every later
-    call, never recomputed. This is deliberate, unlike almost everything else in this
-    module: a message posted a month ago must keep the same point value it always has --
-    if the divisor kept drifting with the chat's current average, every already-recorded
-    day's score would silently shift every time someone checked, even though nothing
-    about that day actually changed. Only "today" (not yet finalized -- see record_day)
-    is ever naturally re-derived on each call, same as every other stat; the conversion
-    rate itself is not. To force a one-time recalibration (e.g. the chat's typical
-    message length has genuinely shifted), delete this entry's cache file -- nothing
-    does that automatically."""
+    UserStats.score). Calibrated ONCE -- the first time this chat has at least
+    MIN_CALIBRATION_MESSAGES real (post-migration) messages to calibrate from -- out of
+    the trailing WORDS_PER_POINT_LOOKBACK_DAYS recorded days (skipping any that predate
+    word-tracking, see _has_word_data) plus today's live snapshot (always real, since
+    it's computed fresh rather than read from a persisted file). Once calibrated, it's
+    cached to disk (see _words_per_point_path) and simply read back on every later call,
+    never recomputed: unlike almost everything else in this module, a message posted a
+    month ago must keep the same point value it always has, not silently reprice itself
+    every time someone happens to check /top. To force a one-time recalibration (e.g. the
+    chat's typical message length has genuinely shifted), delete this entry's cache file
+    -- nothing does that automatically."""
     cached = _load_words_per_point(entry)
     if cached is not None:
         return cached
     today = datetime.now(tz).date()
-    start = today - timedelta(days=WORDS_PER_POINT_LOOKBACK_DAYS - 1)
-    combined = await aggregate_live(client, chat_ref, entry, start, today, tz, log=log)
-    total_words = sum(s.words for s in combined.values())
-    total_messages = sum(s.messages for s in combined.values())
-    value = (total_words / total_messages) if total_messages else DEFAULT_WORDS_PER_POINT
+    total_words = 0
+    total_messages = 0
+    day = today - timedelta(days=WORDS_PER_POINT_LOOKBACK_DAYS - 1)
+    while day < today:
+        payload = _load_day(entry, day)
+        if payload and _has_word_data(payload):
+            for u in payload["users"].values():
+                total_words += u.get("words", 0)
+                total_messages += u.get("messages", 0)
+        day += timedelta(days=1)
+    for u in (await _live_today_users(client, chat_ref, entry, tz, log=log)).values():
+        total_words += u.get("words", 0)
+        total_messages += u.get("messages", 0)
+    if total_messages < MIN_CALIBRATION_MESSAGES:
+        log(
+            f"[stats] not enough post-migration messages yet to calibrate words_per_point "
+            f"for '{entry}' ({total_messages}/{MIN_CALIBRATION_MESSAGES}) -- using the "
+            f"default of {DEFAULT_WORDS_PER_POINT} for now, uncached, will retry next call"
+        )
+        return DEFAULT_WORDS_PER_POINT
+    value = total_words / total_messages
     _save_words_per_point(entry, value)
     log(f"[stats] calibrated words_per_point for '{entry}': {value:.2f} words/message (frozen, won't auto-update)")
     return value
@@ -790,12 +902,12 @@ async def format_procrastinators(
     month_start, month_end = resolve_period_window("month", tz)
     historical_end = min(month_end, today - timedelta(days=1))
     pool = aggregate(entry, month_start, historical_end) if month_start <= historical_end else {}
-    _merge_day(pool, {"users": live_today})
+    _merge_day(pool, {"day": today.isoformat(), "users": live_today})
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
     ranked = sorted(pool.values(), key=lambda s: s.score(wpp), reverse=True)
 
     all_time = aggregate_all_time(entry)
-    _merge_day(all_time, {"users": live_today})
+    _merge_day(all_time, {"day": today.isoformat(), "users": live_today})
 
     # (sort_key, line) pairs -- sort_key is days-since-last-post, with a large sentinel
     # for "never posted" so those sort to the top (the most overdue, in spirit) without
@@ -877,23 +989,30 @@ def figurine_message_links(chat_username: str | None, chat_id: int | None, user:
     return links
 
 
-def format_stat(user: UserStats, rank: int, total: int, score: int, figurine_links: list[str] | None = None) -> str:
-    """`score` is computed by the caller (resolve_stat_target) rather than read off
-    `user` directly -- UserStats.score needs the chat's current words_per_point, which
-    this function has no way to compute itself (it's sync, with no client/chat_ref)."""
+def format_stat(
+    user: UserStats, rank: int, total: int, score: int, streak: int, figurine_links: list[str] | None = None
+) -> str:
+    """`score` and `streak` are computed by the caller (resolve_stat_target) rather than
+    read/derived off `user` directly -- UserStats.score needs the chat's current
+    words_per_point, and the streak needs "today" (see _current_streak), neither of which
+    this function has any way to get itself (it's sync, with no client/chat_ref/tz)."""
     avg = user.messages / user.active_days if user.active_days else 0.0
     last_seen = "нет данных"
     if user.last_message_at:
         last_seen = datetime.fromisoformat(user.last_message_at).strftime("%Y-%m-%d %H:%M")
+    score_str = f"{score:,}".replace(",", ".")
+    activity_line = f"Активность: {_ru_days(user.active_days)}"
+    if streak > 0:
+        activity_line += f" 🔥{_ru_days(streak)}"
     text = (
         "📊 Статистика пользователя:\n\n"
         f"Имя: {user.display_name}\n"
-        f"🏆 Очки: {score}\n"
+        f"🏆 Очки: 🪙{score_str}\n"
         f"📈 Место в рейтинге: {rank} из {total}\n"
         f"Сообщений: {user.messages}\n"
         f"Среднее сообщений в день: {avg:.1f}\n"
-        f"Активность: {_ru_days(user.active_days)}\n"
-        f"Покрашено фигурок: {user.figurines_painted}\n"
+        f"{activity_line}\n"
+        f"Покрашено фигурок: {user.figurines_painted} (+{POINTS_PER_FIGURINE} за фигурку {FIGURINE_HASHTAG})\n"
         f"Любимое время: {_favorite_hour_label(user.hours)}\n"
         f"Последняя активность: {last_seen}"
     )
@@ -921,21 +1040,23 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
 
 async def resolve_stat_target(
     client, chat_ref, entry: str, arg: str, requester_username: str | None, requester_display_name: str, tz, log=print
-) -> tuple[UserStats | None, int | None, int, int | None]:
+) -> tuple[UserStats | None, int | None, int, int | None, int | None]:
     """Resolves who a /stat command is asking about: an explicit argument (@username or
     a name fragment) if given, otherwise the requester's own tracked stats -- tried first
     by @username (exact), falling back to their display name (substring). Fetches the
     all-time-plus-today-live aggregate exactly once regardless of how many of those three
     lookups it takes, rather than once per attempt.
 
-    Returns (user, rank, total, score): `rank` is the person's 1-based position by score
-    among everyone ever tracked for this chat (ties broken by dict iteration order, which
-    is stable but arbitrary -- fine for a gamified leaderboard, not meant to be exact),
-    and `total` is how many people that's out of. `score` is returned alongside `user`
-    (rather than left for the caller to read off UserStats.score) since scoring now needs
-    words_per_point -- see UserStats.score. `rank`/`score` are None (with user) if no
-    match was found; `total` is still meaningful in that case (could be used for a "N
-    people tracked" message even without a match, though callers currently don't)."""
+    Returns (user, rank, total, score, streak): `rank` is the person's 1-based position by
+    score among everyone ever tracked for this chat (ties broken by dict iteration order,
+    which is stable but arbitrary -- fine for a gamified leaderboard, not meant to be
+    exact), and `total` is how many people that's out of. `score` and `streak` are
+    returned alongside `user` (rather than left for the caller to derive from `user`
+    itself) since both need context this function already has and format_stat doesn't --
+    words_per_point for score (see UserStats.score) and today's date for streak (see
+    _current_streak). `rank`/`score`/`streak` are None (with user) if no match was found;
+    `total` is still meaningful in that case (could be used for a "N people tracked"
+    message even without a match, though callers currently don't)."""
     all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
     total = len(all_time)
     if arg:
@@ -945,8 +1066,10 @@ async def resolve_stat_target(
         if user is None:
             user = _find_user(all_time, requester_display_name)
     if user is None:
-        return None, None, total, None
+        return None, None, total, None, None
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
     ranked = sorted(all_time.values(), key=lambda s: s.score(wpp), reverse=True)
     rank = next(i for i, s in enumerate(ranked, start=1) if s.user_id == user.user_id)
-    return user, rank, total, user.score(wpp)
+    today = datetime.now(tz).date()
+    streak = _current_streak(user.active_day_dates, today)
+    return user, rank, total, user.score(wpp), streak

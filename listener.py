@@ -1241,14 +1241,14 @@ async def run_listener(
                         reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                     else:
                         sender = await event.get_sender()
-                        user, rank, total, score = await stats.resolve_stat_target(
+                        user, rank, total, score, streak = await stats.resolve_stat_target(
                             client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
                         )
                         if user:
                             figurine_links = stats.figurine_message_links(
                                 getattr(chat, "username", None), event.chat_id, user
                             )
-                            reply_text = stats.format_stat(user, rank, total, score, figurine_links)
+                            reply_text = stats.format_stat(user, rank, total, score, streak, figurine_links)
                         else:
                             reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
                 sent = await event.reply(reply_text)
