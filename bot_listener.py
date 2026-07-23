@@ -963,8 +963,13 @@ async def _dispatch_update(
     # A direct Telegram Reply to this bot is normal conversational input. It is handled
     # immediately and independently of JOKE_ENABLED: that flag only controls unprompted
     # ambient remarks. Explicit commands keep their existing specialized handlers.
+    #
+    # Turned off -- forced False rather than removing the handler below, so it stays a
+    # one-line revert if it's ever turned back on.
+    direct_reply_enabled = False
     if (
-        not has_summary
+        direct_reply_enabled
+        and not has_summary
         and not has_roast
         and _is_direct_reply_to_bot(message, bot_user_id)
         and _message_content(message)

@@ -1569,7 +1569,7 @@ async def run_listener(
         else "off"
     )
     stats_status = "on" if (cfg.stats_enabled and cfg.listener_allowed_chats) else "off"
-    direct_reply_status = "on" if bot_takeover else "off (no TELEGRAM_BOT_TOKEN)"
+    direct_reply_status = "off (disabled)" if bot_takeover else "off (no TELEGRAM_BOT_TOKEN)"
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
