@@ -121,16 +121,32 @@ PAINTING_BADGE_TIERS = (
     (1, "painted_bronze", "🥉", "Я покрасил III"),
 )
 
+# Upgrade families are ordered highest-first. A user receives exactly one badge from
+# each family, so reaching a stronger tier replaces the previous label in /stat rather
+# than accumulating near-duplicate badges.
+MESSAGE_BADGE_TIERS = (
+    (1_000, "chat_voice", "📣", "Голос чата"),
+    (100, "hundred_messages", "💯", "Сотня"),
+)
+
+STREAK_BADGE_TIERS = (
+    (30, "streak_30", "🔥", "Не остановить I"),
+    (14, "streak_14", "🔥", "Не остановить II"),
+    (7, "streak_7", "🔥", "Не остановить III"),
+)
+
+NIGHT_BADGE_TIERS = (
+    (1_000, "night_shift_1000", "🦉", "Ночная смена I"),
+    (250, "night_shift_250", "🦉", "Ночная смена II"),
+    (50, "night_shift", "🦉", "Ночная смена III"),
+)
+
 # Automatic badges use only counters already present in every production stats file.
 # Nothing here requires another Telegram fetch or a schema migration.
 AUTOMATIC_BADGES = (
-    ("hundred_messages", "💯", "Сотня", "написать 100 сообщений"),
-    ("chat_voice", "📣", "Голос чата", "написать 1 000 сообщений"),
     ("gallery", "🖼️", "Галерея", "отправить 25 фото или видео"),
     ("conversation", "💬", "В диалоге", "написать 100 ответов"),
     ("regular", "📅", "Завсегдатай", "быть активным 30 дней"),
-    ("streak_7", "🔥", "Не остановить", "держать серию 7 дней"),
-    ("night_shift", "🦉", "Ночная смена", "написать 50 сообщений с 00:00 до 05:59"),
 )
 
 # The flat rate every message scored under before word-based points existed. ONLY applied
@@ -233,37 +249,62 @@ def _longest_streak(active_day_dates: set) -> int:
     return longest
 
 
+def _highest_badge_tier(value: int, tiers, condition: str) -> Badge | None:
+    """Return only the strongest unlocked badge from one highest-first tier family."""
+    tier = next((candidate for candidate in tiers if value >= candidate[0]), None)
+    if tier is None:
+        return None
+    threshold, badge_id, emoji, name = tier
+    return Badge(badge_id, emoji, name, condition.format(threshold=threshold))
+
+
 def earned_badges(user: "UserStats") -> list[Badge]:
     """Automatic badges earned from the existing all-time UserStats counters."""
     longest_streak = _longest_streak(user.active_day_dates)
     night_messages = sum(user.hours.get(str(hour), 0) for hour in range(6))
     earned_ids = set()
-    if user.messages >= 100:
-        earned_ids.add("hundred_messages")
-    if user.messages >= 1_000:
-        earned_ids.add("chat_voice")
     if user.media >= 25:
         earned_ids.add("gallery")
     if user.replies >= 100:
         earned_ids.add("conversation")
     if user.active_days >= 30:
         earned_ids.add("regular")
-    if longest_streak >= 7:
-        earned_ids.add("streak_7")
-    if night_messages >= 50:
-        earned_ids.add("night_shift")
-    badges = []
-    painting_tier = next(
-        (tier for tier in PAINTING_BADGE_TIERS if user.figurines_painted >= tier[0]),
-        None,
-    )
-    if painting_tier:
-        threshold, badge_id, emoji, name = painting_tier
-        badges.append(Badge(badge_id, emoji, name, f"покрасить {threshold} фигурок"))
+    badges = [
+        badge
+        for badge in (
+            _highest_badge_tier(
+                user.figurines_painted,
+                PAINTING_BADGE_TIERS,
+                "покрасить {threshold} фигурок",
+            ),
+            _highest_badge_tier(
+                user.messages,
+                MESSAGE_BADGE_TIERS,
+                "написать {threshold} сообщений",
+            ),
+        )
+        if badge is not None
+    ]
     badges.extend(
         Badge(badge_id=badge_id, emoji=emoji, name=name, description=description)
         for badge_id, emoji, name, description in AUTOMATIC_BADGES
         if badge_id in earned_ids
+    )
+    badges.extend(
+        badge
+        for badge in (
+            _highest_badge_tier(
+                longest_streak,
+                STREAK_BADGE_TIERS,
+                "держать серию {threshold} дней",
+            ),
+            _highest_badge_tier(
+                night_messages,
+                NIGHT_BADGE_TIERS,
+                "написать {threshold} ночных сообщений",
+            ),
+        )
+        if badge is not None
     )
     if user.not_gay_hashtag_uses:
         badges.append(Badge("not_gay", "🦄", "Я не пидор", f"написать {NOT_GAY_HASHTAG}"))

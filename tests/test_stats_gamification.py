@@ -3,7 +3,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import bot_listener
 import stats
@@ -51,7 +51,6 @@ class GamificationTests(unittest.TestCase):
             {badge.badge_id for badge in stats.earned_badges(user)},
             {
                 "painted_bronze",
-                "hundred_messages",
                 "chat_voice",
                 "gallery",
                 "conversation",
@@ -69,6 +68,54 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual([(badge.emoji, badge.name) for badge in bronze], [("🥉", "Я покрасил III")])
         self.assertEqual([(badge.emoji, badge.name) for badge in silver], [("🥈", "Я покрасил II")])
         self.assertEqual([(badge.emoji, badge.name) for badge in gold], [("🥇", "Я покрасил I")])
+
+    def test_higher_message_badge_replaces_lower_tier(self):
+        none = stats.earned_badges(stats.UserStats(user_id="1", messages=99))
+        hundred = stats.earned_badges(stats.UserStats(user_id="1", messages=100))
+        still_hundred = stats.earned_badges(stats.UserStats(user_id="1", messages=999))
+        voice = stats.earned_badges(stats.UserStats(user_id="1", messages=1_000))
+
+        self.assertEqual(none, [])
+        self.assertEqual(
+            [(badge.badge_id, badge.name) for badge in hundred],
+            [("hundred_messages", "Сотня")],
+        )
+        self.assertEqual(
+            [(badge.badge_id, badge.name) for badge in still_hundred],
+            [("hundred_messages", "Сотня")],
+        )
+        self.assertEqual(
+            [(badge.badge_id, badge.name) for badge in voice],
+            [("chat_voice", "Голос чата")],
+        )
+
+    def test_streak_and_night_badges_upgrade_without_stacking(self):
+        def user_for(streak_days, night_messages):
+            first_day = date(2026, 1, 1)
+            return stats.UserStats(
+                user_id="1",
+                active_day_dates={
+                    (first_day + timedelta(days=offset)).isoformat()
+                    for offset in range(streak_days)
+                },
+                hours={"0": night_messages},
+            )
+
+        expected = (
+            (7, 50, "streak_7", "Не остановить III", "night_shift", "Ночная смена III"),
+            (14, 250, "streak_14", "Не остановить II", "night_shift_250", "Ночная смена II"),
+            (30, 1_000, "streak_30", "Не остановить I", "night_shift_1000", "Ночная смена I"),
+        )
+        for streak, night, streak_id, streak_name, night_id, night_name in expected:
+            with self.subTest(streak=streak, night=night):
+                badges = stats.earned_badges(user_for(streak, night))
+                self.assertEqual(
+                    [(badge.badge_id, badge.name) for badge in badges],
+                    [(streak_id, streak_name), (night_id, night_name)],
+                )
+
+        almost = stats.earned_badges(user_for(6, 49))
+        self.assertEqual(almost, [])
 
     def test_hashtag_badges_and_weekly_participation_are_derived_from_messages(self):
         def message(moment, text, message_id):
@@ -327,7 +374,10 @@ class FakeBotAPI:
     async def send_message(self, chat_id, text, **kwargs):
         message = {
             "message_id": self.next_message_id,
-            "chat": {"id": chat_id, "type": "supergroup"},
+            "chat": {
+                "id": chat_id,
+                "type": "private" if chat_id > 0 else "supergroup",
+            },
             "text": text,
         }
         self.next_message_id += 1
@@ -339,22 +389,21 @@ class FakeBotAPI:
 
 
 class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_admin_can_create_and_give_a_badge_to_replied_user(self):
+    async def test_admin_can_create_and_give_a_badge_in_bot_dm(self):
         api = FakeBotAPI()
         flows = {}
         admin = {"id": 10, "first_name": "Admin"}
         target = {"id": 20, "first_name": "User"}
         command = {
             "message_id": 1,
-            "chat": {"id": -1001, "type": "supergroup", "title": "Chat"},
+            "chat": {"id": 10, "type": "private"},
             "from": admin,
             "text": "/badge",
-            "reply_to_message": {"message_id": 50, "from": target},
         }
 
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
-                await bot_listener.handle_badge_command(api, command, "chat", 999, flows)
+                await bot_listener.handle_badge_command(api, command, "chat", -1001, flows)
                 create_flow_id = next(iter(flows))
                 menu_message = api.sent[-1][0]
                 await bot_listener.handle_badge_callback(
@@ -383,7 +432,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(consumed)
 
-                await bot_listener.handle_badge_command(api, command, "chat", 999, flows)
+                await bot_listener.handle_badge_command(api, command, "chat", -1001, flows)
                 give_flow_id = next(iter(flows))
                 give_menu = api.sent[-1][0]
                 await bot_listener.handle_badge_callback(
@@ -408,6 +457,30 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                     },
                     flows,
                 )
+                target_prompt = api.sent[-1][0]
+                tracked_target = stats.UserStats(
+                    user_id=str(target["id"]),
+                    username="user",
+                    display_name=target["first_name"],
+                )
+                with patch(
+                    "stats.resolve_stat_target",
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                ):
+                    consumed = await bot_listener.handle_badge_text_input(
+                        api,
+                        None,
+                        {
+                            "message_id": 3,
+                            "chat": command["chat"],
+                            "from": admin,
+                            "text": "@user",
+                            "reply_to_message": target_prompt,
+                        },
+                        timezone.utc,
+                        flows,
+                    )
+                self.assertTrue(consumed)
 
                 self.assertEqual(
                     [item.label for item in stats.custom_badges_for_user("chat", target["id"])],
@@ -415,36 +488,65 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("получает значок 🎯 Меткий глаз", api.sent[-1][0]["text"])
 
-    async def test_admin_can_record_numbered_weekly_winner_by_reply(self):
+    async def test_admin_can_record_numbered_weekly_winner_in_bot_dm(self):
         api = FakeBotAPI()
         command = {
             "message_id": 1,
-            "chat": {"id": -1001, "type": "supergroup", "title": "Chat"},
+            "chat": {"id": 10, "type": "private"},
             "from": {"id": 10, "first_name": "Admin"},
-            "text": "/weekwinner 1",
-            "reply_to_message": {
-                "message_id": 50,
-                "from": {"id": 20, "first_name": "User"},
-            },
+            "text": "/weekwinner 1 @user",
         }
 
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
-                await bot_listener.handle_week_winner_command(
-                    api,
-                    None,
-                    command,
-                    command["text"],
-                    "chat",
-                    999,
-                    timezone.utc,
+                tracked_target = stats.UserStats(
+                    user_id="20",
+                    username="user",
+                    display_name="User",
                 )
+                with patch(
+                    "stats.resolve_stat_target",
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                ):
+                    await bot_listener.handle_week_winner_command(
+                        api,
+                        None,
+                        command,
+                        command["text"],
+                        "chat",
+                        -1001,
+                        timezone.utc,
+                    )
 
                 self.assertIn("победитель Недельного Конкурса №1", api.sent[-1][0]["text"])
                 self.assertEqual(
                     stats.weekly_winner_badges_for_user("chat", 20)[0].label,
                     "🏆 Победитель Недельного Конкурса ×1",
                 )
+
+    async def test_management_commands_are_silent_in_group_chat(self):
+        api = FakeBotAPI()
+        group_message = {
+            "message_id": 1,
+            "chat": {"id": -1001, "type": "supergroup", "title": "Chat"},
+            "from": {"id": 10, "first_name": "Admin"},
+            "text": "/badge",
+        }
+
+        flows = {}
+        await bot_listener.handle_badge_command(api, group_message, "chat", -1001, flows)
+        await bot_listener.handle_week_winner_command(
+            api,
+            None,
+            {**group_message, "text": "/weekwinner 1 @user"},
+            "/weekwinner 1 @user",
+            "chat",
+            -1001,
+            timezone.utc,
+        )
+
+        self.assertEqual(api.sent, [])
+        self.assertEqual(flows, {})
 
 
 if __name__ == "__main__":

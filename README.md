@@ -310,41 +310,42 @@ highest earned painting medal is shown:
 - 🖼️ Галерея — 25 photo/video messages
 - 💬 В диалоге — 100 replies
 - 📅 Завсегдатай — 30 active days
-- 🔥 Не остановить — a historical seven-day streak
-- 🦉 Ночная смена — 50 messages between 00:00 and 05:59
+- 🔥 Не остановить III / II / I — a longest historical streak of 7 / 14 / 30 days
+- 🦉 Ночная смена III / II / I — 50 / 250 / 1,000 messages between 00:00 and 05:59
+
+Painting medals, message-count badges, streak badges, and night-shift badges are upgrade
+families: `/stat` displays only the highest unlocked badge in each family. For example,
+`📣 Голос чата` replaces `💯 Сотня` at 1,000 messages instead of appearing beside it.
 
 Badges appear near the end of `/stat`, immediately before the complete tracked work
 history. Every work is represented by a compact clickable number (newest first), with
 no three-work display cap. No new message schema or history fetch is needed for
 automatic badges.
 
-Chat administrators can also create and award custom badges with `/badge`. The bot
-shows two inline options:
+Chat administrators can also create and award custom badges by sending `/badge` in a
+private chat with the bot. The bot shows two inline options:
 
 - **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
-- **Выдать значок** shows the chat's saved custom badges. Invoke `/badge` as a reply to
-  the recipient's message to preselect them; otherwise the bot asks for their
-  `@username` after the badge is selected.
+- **Выдать значок** shows the chat's saved custom badges, then asks for the recipient's
+  exact `@username`.
 
 Custom definitions and assignments are persisted per chat under the existing stats
 cache. Awarding the same badge to the same member twice is idempotent. The menu and its
 force-reply steps expire after ten minutes and remain bound to the administrator who
-opened them.
+opened them. The bot verifies that the person using the DM menu is still an
+administrator of the configured home chat. `/badge` is silently ignored in groups.
 
-The weekly winner is assigned separately by a chat administrator, using the contest's
-sequence number rather than the calendar week:
+The weekly winner is assigned separately by a chat administrator in the bot's private
+chat, using the contest's sequence number rather than the calendar week:
 
 ```text
-# as a reply to the winner's message
-/weekwinner 1
-
-# or by tracked username
 /weekwinner 1 @username
 ```
 
 Only one winner can occupy each numbered week. Repeating the same assignment is
 idempotent; trying to give that week to somebody else is refused. `/stat` displays
 `🏆 Победитель Недельного Конкурса ×N`, where N is that person's number of winning weeks.
+`/weekwinner` is silently ignored in groups.
 On startup, the normal recent-day stats catch-up backfills the new hashtag fields from
 the raw transcript cache without recomputing or changing anybody's historical XP.
 

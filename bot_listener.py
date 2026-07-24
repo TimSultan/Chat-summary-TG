@@ -173,68 +173,50 @@ async def handle_badge_command(
     api: TelegramBotAPI,
     message: dict,
     entry: str | None,
-    bot_user_id: int,
+    admin_chat_id: int | None,
     badge_flows: dict[str, dict],
 ) -> None:
-    """Starts an admin-bound custom-badge flow. Replying with /badge to a member's
-    message preselects that member as the eventual recipient."""
+    """Start an admin-bound custom-badge flow in a private chat with the bot."""
     chat = message["chat"]
-    chat_id = chat["id"]
+    dm_chat_id = chat["id"]
     admin = message.get("from") or {}
     admin_id = admin.get("id")
-    if chat.get("type") == "private":
+    # Management commands are deliberately silent in a group. Apart from keeping the
+    # admin UI private, this prevents command/menu clutter in the public chat.
+    if chat.get("type") != "private":
+        return
+    if entry is None or admin_chat_id is None:
         await api.send_message(
-            chat_id,
-            "Значки создаются и выдаются в группе.",
+            dm_chat_id,
+            "Не настроен единственный основной чат для управления значками.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )
         return
-    if entry is None:
+    if not admin_id or not await _is_chat_admin(api, admin_chat_id, admin_id):
         await api.send_message(
-            chat_id,
-            "Значки недоступны в этом чате.",
-            reply_to_message_id=message["message_id"],
-            parse_mode=None,
-        )
-        return
-    if not admin_id or not await _is_chat_admin(api, chat_id, admin_id):
-        await api.send_message(
-            chat_id,
+            dm_chat_id,
             "Создавать и выдавать значки могут только администраторы чата.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )
         return
 
-    replied = message.get("reply_to_message") or {}
-    target = replied.get("from")
-    if target and (target.get("id") == bot_user_id or target.get("is_bot")):
-        target = None
-
     flow_id = uuid.uuid4().hex[:10]
     badge_flows[flow_id] = {
         "created_at": time.monotonic(),
-        "chat_id": chat_id,
+        "chat_id": dm_chat_id,
+        "admin_chat_id": admin_chat_id,
         "entry": entry,
         "admin_id": admin_id,
         "admin_name": _display_name(admin),
-        "target": (
-            {"user_id": str(target["id"]), "display_name": _display_name(target)}
-            if target and target.get("id") is not None
-            else None
-        ),
+        "target": None,
         "awaiting": None,
         "selected_badge_id": None,
     }
-    target_line = (
-        f"\nПолучатель: {badge_flows[flow_id]['target']['display_name']}"
-        if badge_flows[flow_id]["target"]
-        else "\nЧтобы сразу выбрать получателя, вызовите /badge ответом на его сообщение."
-    )
     await api.send_message(
-        chat_id,
-        "🏅 Управление значками" + target_line,
+        dm_chat_id,
+        "🏅 Управление значками\nРаботает только в этой личной переписке.",
         reply_to_message_id=message["message_id"],
         reply_markup={
             "inline_keyboard": [
@@ -290,7 +272,7 @@ async def handle_badge_callback(
     if flow is None:
         await api.answer_callback_query(callback_id, "Меню устарело или принадлежит другому администратору.")
         return
-    if not await _is_chat_admin(api, flow["chat_id"], flow["admin_id"]):
+    if not await _is_chat_admin(api, flow["admin_chat_id"], flow["admin_id"]):
         await api.answer_callback_query(callback_id, "Нужны права администратора.")
         return
 
@@ -340,7 +322,7 @@ async def handle_badge_callback(
             prompt = await api.send_message(
                 flow["chat_id"],
                 "Ответьте на это сообщение именем или @username получателя.\n"
-                "В следующий раз можно вызвать /badge ответом на сообщение участника.",
+                "Участник должен уже присутствовать в статистике основного чата.",
                 reply_to_message_id=message.get("message_id"),
                 reply_markup={"force_reply": True, "selective": True},
                 parse_mode=None,
@@ -383,7 +365,7 @@ async def handle_badge_text_input(
             chat_id, "Действие отменено.", reply_to_message_id=message["message_id"], parse_mode=None
         )
         return True
-    if not await _is_chat_admin(api, chat_id, actor_id):
+    if not await _is_chat_admin(api, flow["admin_chat_id"], actor_id):
         badge_flows.pop(flow_id, None)
         return True
 
@@ -451,30 +433,28 @@ async def handle_week_winner_command(
     message: dict,
     command_text: str,
     entry: str | None,
-    bot_user_id: int,
+    admin_chat_id: int | None,
     tz,
     log=print,
 ) -> None:
-    """Admin command: /weekwinner <contest week> [@username].
-
-    Sending it as a reply preselects the replied-to member, e.g. reply with
-    "/weekwinner 1" to record the already-completed first contest.
-    """
+    """DM-only admin command: /weekwinner <contest week> @username."""
     chat = message["chat"]
-    chat_id = chat["id"]
+    dm_chat_id = chat["id"]
     admin = message.get("from") or {}
     admin_id = admin.get("id")
-    if chat.get("type") == "private" or entry is None:
+    if chat.get("type") != "private":
+        return
+    if entry is None or admin_chat_id is None:
         await api.send_message(
-            chat_id,
-            "Победителя нужно назначать в настроенной группе.",
+            dm_chat_id,
+            "Не настроен единственный основной чат для назначения победителя.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )
         return
-    if not admin_id or not await _is_chat_admin(api, chat_id, admin_id):
+    if not admin_id or not await _is_chat_admin(api, admin_chat_id, admin_id):
         await api.send_message(
-            chat_id,
+            dm_chat_id,
             "Назначать победителя могут только администраторы чата.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
@@ -482,47 +462,36 @@ async def handle_week_winner_command(
         return
 
     parts = command_text.strip().split(maxsplit=2)
-    if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) < 1:
+    if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) < 1:
         await api.send_message(
-            chat_id,
-            "Использование: /weekwinner 1 ответом на сообщение победителя\n"
-            "или /weekwinner 1 @username",
+            dm_chat_id,
+            "Использование: /weekwinner 1 @username",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )
         return
     contest_week = int(parts[1])
 
-    replied = message.get("reply_to_message") or {}
-    replied_user = replied.get("from")
-    if replied_user and replied_user.get("id") != bot_user_id and not replied_user.get("is_bot"):
-        target = {
-            "user_id": str(replied_user["id"]),
-            "display_name": _display_name(replied_user),
-        }
-    elif len(parts) == 3:
-        tracked, _, _, _, _ = await stats.resolve_stat_target(
-            telethon_client,
-            entry,
-            entry,
-            parts[2],
-            None,
-            "",
-            tz,
-            log=log,
-        )
-        target = (
-            {"user_id": tracked.user_id, "display_name": tracked.display_name}
-            if tracked
-            else None
-        )
-    else:
-        target = None
+    tracked, _, _, _, _ = await stats.resolve_stat_target(
+        telethon_client,
+        entry,
+        entry,
+        parts[2],
+        None,
+        "",
+        tz,
+        log=log,
+    )
+    target = (
+        {"user_id": tracked.user_id, "display_name": tracked.display_name}
+        if tracked
+        else None
+    )
 
     if target is None:
         await api.send_message(
-            chat_id,
-            "Не нашёл победителя. Ответьте командой на его сообщение или добавьте точный @username.",
+            dm_chat_id,
+            "Не нашёл победителя. Укажите точный @username участника из статистики.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )
@@ -549,7 +518,7 @@ async def handle_week_winner_command(
     else:
         text = f"Неделя №{contest_week} уже записана за участником {existing_winner}."
     await api.send_message(
-        chat_id,
+        dm_chat_id,
         text,
         reply_to_message_id=message["message_id"],
         parse_mode=None,
@@ -1304,16 +1273,36 @@ async def _dispatch_update(
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
     if re.match(r"^/badge(?:\s|$)", command_text, re.IGNORECASE):
-        await handle_badge_command(api, message, matched_entry, bot_user_id, badge_flows)
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_badge_command(
+            api,
+            message,
+            home_chat_ref,
+            admin_chat_id,
+            badge_flows,
+        )
         return
     if re.match(rf"^{re.escape(WEEK_WINNER_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
         await handle_week_winner_command(
             api,
             telethon_client,
             message,
             command_text,
-            matched_entry,
-            bot_user_id,
+            home_chat_ref,
+            admin_chat_id,
             tz,
             log=log,
         )
