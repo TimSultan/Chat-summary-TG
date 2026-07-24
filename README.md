@@ -333,7 +333,9 @@ Custom definitions and assignments are persisted per chat under the existing sta
 cache. Awarding the same badge to the same member twice is idempotent. The menu and its
 force-reply steps expire after ten minutes and remain bound to the administrator who
 opened them. The bot verifies that the person using the DM menu is still an
-administrator of the configured home chat. `/badge` is silently ignored in groups.
+administrator of the configured home chat. The explicitly delegated
+`@sultan_kembayev` account has the same DM-management permission without requiring
+group administrator status. `/badge` is silently ignored in groups.
 
 The weekly winner is assigned separately by a chat administrator in the bot's private
 chat, using the contest's sequence number rather than the calendar week:
@@ -346,6 +348,19 @@ Only one winner can occupy each numbered week. Repeating the same assignment is
 idempotent; trying to give that week to somebody else is refused. `/stat` displays
 `🏆 Победитель Недельного Конкурса ×N`, where N is that person's number of winning weeks.
 `/weekwinner` is silently ignored in groups.
+
+If a counted `#япокрасил` Telegram post was deleted, an administrator can remove its
+stale work link and figurine credit from the bot's private chat:
+
+```text
+/deletepokras @username 1
+```
+
+The final argument is the clickable work number currently shown in `/stat`; number 1 is
+the newest work. Removing it also removes one figurine and its 200 XP, then the remaining
+work numbers are compacted. A persistent tombstone prevents a stale transcript cache
+from restoring the deleted submission. `/deletepokras` is silently ignored in groups.
+
 On startup, the normal recent-day stats catch-up backfills the new hashtag fields from
 the raw transcript cache without recomputing or changing anybody's historical XP.
 

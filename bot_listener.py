@@ -116,6 +116,12 @@ BADGE_FLOW_TTL_SECONDS = 10 * 60
 BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
 BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
 WEEK_WINNER_COMMAND = "/weekwinner"
+DELETE_POKRAS_COMMAND = "/deletepokras"
+
+# Explicit bot-management delegates. These users may use the DM-only management
+# commands even without Telegram administrator status in the configured home chat.
+# Usernames are compared case-insensitively and without a leading @.
+PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
 
 
 def _display_name(user: dict | None) -> str:
@@ -169,6 +175,16 @@ async def _is_chat_admin(api: TelegramBotAPI, chat_id: int, user_id: int) -> boo
     return any((member.get("user") or {}).get("id") == user_id for member in administrators)
 
 
+async def _can_manage_chat(api: TelegramBotAPI, chat_id: int, user: dict | None) -> bool:
+    """Group administrators plus explicitly delegated usernames can manage via DM."""
+    user = user or {}
+    username = (user.get("username") or "").strip().lstrip("@").lower()
+    if username in PRIVILEGED_MANAGEMENT_USERNAMES:
+        return True
+    user_id = user.get("id")
+    return bool(user_id and await _is_chat_admin(api, chat_id, user_id))
+
+
 async def handle_badge_command(
     api: TelegramBotAPI,
     message: dict,
@@ -193,7 +209,7 @@ async def handle_badge_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _is_chat_admin(api, admin_chat_id, admin_id):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
         await api.send_message(
             dm_chat_id,
             "Создавать и выдавать значки могут только администраторы чата.",
@@ -272,7 +288,7 @@ async def handle_badge_callback(
     if flow is None:
         await api.answer_callback_query(callback_id, "Меню устарело или принадлежит другому администратору.")
         return
-    if not await _is_chat_admin(api, flow["admin_chat_id"], flow["admin_id"]):
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor):
         await api.answer_callback_query(callback_id, "Нужны права администратора.")
         return
 
@@ -365,7 +381,7 @@ async def handle_badge_text_input(
             chat_id, "Действие отменено.", reply_to_message_id=message["message_id"], parse_mode=None
         )
         return True
-    if not await _is_chat_admin(api, flow["admin_chat_id"], actor_id):
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor):
         badge_flows.pop(flow_id, None)
         return True
 
@@ -452,7 +468,7 @@ async def handle_week_winner_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _is_chat_admin(api, admin_chat_id, admin_id):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
         await api.send_message(
             dm_chat_id,
             "Назначать победителя могут только администраторы чата.",
@@ -520,6 +536,112 @@ async def handle_week_winner_command(
     await api.send_message(
         dm_chat_id,
         text,
+        reply_to_message_id=message["message_id"],
+        parse_mode=None,
+    )
+
+
+async def handle_delete_pokras_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    tz,
+    log=print,
+) -> None:
+    """DM-only admin command: /deletepokras @username <visible work number>."""
+    chat = message["chat"]
+    dm_chat_id = chat["id"]
+    admin = message.get("from") or {}
+    admin_id = admin.get("id")
+    if chat.get("type") != "private":
+        return
+    if entry is None or admin_chat_id is None:
+        await api.send_message(
+            dm_chat_id,
+            "Не настроен единственный основной чат для удаления покраса.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+        await api.send_message(
+            dm_chat_id,
+            "Удалять покрасы из статистики могут только администраторы чата.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    parts = command_text.strip().split()
+    if len(parts) != 3 or not parts[2].isdigit() or int(parts[2]) < 1:
+        await api.send_message(
+            dm_chat_id,
+            "Использование: /deletepokras @username 1",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    work_number = int(parts[2])
+    tracked, _, _, _, _ = await stats.resolve_stat_target(
+        telethon_client,
+        entry,
+        entry,
+        parts[1],
+        None,
+        "",
+        tz,
+        log=log,
+    )
+    if tracked is None:
+        await api.send_message(
+            dm_chat_id,
+            "Не нашёл участника. Укажите точный @username из статистики.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    # /stat numbers only posts that can produce a Telegram deep link. Use the same
+    # newest-first filter here so N always selects the number the administrator sees.
+    linked_posts = [
+        post
+        for post in tracked.recent_figurine_posts
+        if len(post) >= 2
+        and stats.figurine_message_link(None, admin_chat_id, post[1]) is not None
+    ]
+    if not linked_posts:
+        await api.send_message(
+            dm_chat_id,
+            f"У {tracked.display_name} нет работ с доступными ссылками.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    if work_number > len(linked_posts):
+        await api.send_message(
+            dm_chat_id,
+            f"У {tracked.display_name} доступны номера работ от 1 до {len(linked_posts)}.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    _, selected_message_id = linked_posts[work_number - 1]
+    stats.delete_figurine_submission(
+        entry,
+        tracked.user_id,
+        int(selected_message_id),
+        admin_id,
+        _display_name(admin),
+    )
+    remaining = max(0, tracked.figurines_painted - 1)
+    await api.send_message(
+        dm_chat_id,
+        f"Удалил работу №{work_number} пользователя {tracked.display_name} из статистики.\n"
+        f"Фигурок осталось: {remaining}. Номера оставшихся работ обновились.",
         reply_to_message_id=message["message_id"],
         parse_mode=None,
     )
@@ -1297,6 +1419,25 @@ async def _dispatch_update(
             else None
         )
         await handle_week_winner_command(
+            api,
+            telethon_client,
+            message,
+            command_text,
+            home_chat_ref,
+            admin_chat_id,
+            tz,
+            log=log,
+        )
+        return
+    if re.match(rf"^{re.escape(DELETE_POKRAS_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_delete_pokras_command(
             api,
             telethon_client,
             message,

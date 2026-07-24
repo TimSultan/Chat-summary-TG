@@ -193,6 +193,48 @@ class GamificationTests(unittest.TestCase):
                 text,
             )
 
+    def test_deleted_figurine_tombstone_removes_link_count_and_xp(self):
+        payload = {
+            "entry": "chat",
+            "day": "2026-07-01",
+            "users": {
+                "20": {
+                    "username": "user",
+                    "display_name": "User",
+                    "messages": 3,
+                    "chars": 30,
+                    "words": 15,
+                    "media": 3,
+                    "replies": 0,
+                    "figurines": 3,
+                    "not_gay_hashtag_uses": 0,
+                    "weekly_contest_weeks": [],
+                    "figurine_posts": [
+                        ["2026-07-01T15:00:00", 303],
+                        ["2026-07-01T14:00:00", 302],
+                        ["2026-07-01T13:00:00", 301],
+                    ],
+                    "hours": {"13": 1, "14": 1, "15": 1},
+                    "last_message_at": "2026-07-01T15:00:00",
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats._write_json_atomic(stats._path("chat", date(2026, 7, 1)), payload)
+                before = stats.aggregate_all_time("chat")["20"]
+                created = stats.delete_figurine_submission("chat", "20", 302, "10", "Admin")
+                duplicate = stats.delete_figurine_submission("chat", "20", 302, "10", "Admin")
+                after = stats.aggregate_all_time("chat")["20"]
+
+        self.assertTrue(created)
+        self.assertFalse(duplicate)
+        self.assertEqual(before.figurines_painted, 3)
+        self.assertEqual(after.figurines_painted, 2)
+        self.assertEqual([post[1] for post in after.recent_figurine_posts], [303, 301])
+        self.assertEqual(before.xp(5.0) - after.xp(5.0), stats.XP_PER_FIGURINE)
+
     def test_stat_html_escapes_user_controlled_fields(self):
         user = stats.UserStats(user_id="1", display_name="<Painter & Friend>")
         custom = stats.Badge("custom", "🏹", "A < B & C", custom=True)
@@ -524,6 +566,98 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                     "🏆 Победитель Недельного Конкурса ×1",
                 )
 
+    async def test_sultan_can_manage_without_group_admin_status(self):
+        api = FakeBotAPI()
+        delegated_user = {
+            "id": 99,
+            "username": "Sultan_Kembayev",
+            "first_name": "Sultan",
+        }
+        self.assertTrue(
+            await bot_listener._can_manage_chat(api, -1001, delegated_user)
+        )
+        self.assertFalse(
+            await bot_listener._can_manage_chat(
+                api,
+                -1001,
+                {"id": 98, "username": "someone_else"},
+            )
+        )
+
+        command = {
+            "message_id": 1,
+            "chat": {"id": 99, "type": "private"},
+            "from": delegated_user,
+            "text": "/weekwinner 2 @user",
+        }
+        tracked_target = stats.UserStats(
+            user_id="20",
+            username="user",
+            display_name="User",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                with patch(
+                    "stats.resolve_stat_target",
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                ):
+                    await bot_listener.handle_week_winner_command(
+                        api,
+                        None,
+                        command,
+                        command["text"],
+                        "chat",
+                        -1001,
+                        timezone.utc,
+                    )
+
+                self.assertEqual(
+                    stats.weekly_winner_badges_for_user("chat", 20)[0].label,
+                    "🏆 Победитель Недельного Конкурса ×1",
+                )
+        self.assertIn("победитель Недельного Конкурса №2", api.sent[-1][0]["text"])
+
+    async def test_admin_can_delete_numbered_pokras_in_bot_dm(self):
+        api = FakeBotAPI()
+        command = {
+            "message_id": 1,
+            "chat": {"id": 10, "type": "private"},
+            "from": {"id": 10, "first_name": "Admin"},
+            "text": "/deletepokras @user 2",
+        }
+        tracked_target = stats.UserStats(
+            user_id="20",
+            username="user",
+            display_name="User",
+            figurines_painted=3,
+            recent_figurine_posts=[
+                ["2026-07-03T12:00:00", 103],
+                ["2026-07-02T12:00:00", 102],
+                ["2026-07-01T12:00:00", 101],
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                with patch(
+                    "stats.resolve_stat_target",
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                ):
+                    await bot_listener.handle_delete_pokras_command(
+                        api,
+                        None,
+                        command,
+                        command["text"],
+                        "chat",
+                        -1001,
+                        timezone.utc,
+                    )
+                deleted = stats._load_deleted_figurines("chat")["posts"]
+
+        self.assertEqual(deleted["102"]["user_id"], "20")
+        self.assertIn("Удалил работу №2", api.sent[-1][0]["text"])
+        self.assertIn("Фигурок осталось: 2", api.sent[-1][0]["text"])
+
     async def test_management_commands_are_silent_in_group_chat(self):
         api = FakeBotAPI()
         group_message = {
@@ -540,6 +674,15 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             None,
             {**group_message, "text": "/weekwinner 1 @user"},
             "/weekwinner 1 @user",
+            "chat",
+            -1001,
+            timezone.utc,
+        )
+        await bot_listener.handle_delete_pokras_command(
+            api,
+            None,
+            {**group_message, "text": "/deletepokras @user 1"},
+            "/deletepokras @user 1",
             "chat",
             -1001,
             timezone.utc,

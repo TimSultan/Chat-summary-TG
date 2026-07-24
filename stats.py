@@ -106,6 +106,7 @@ CUSTOM_BADGE_STORE_VERSION = 1
 BADGE_STATS_SCHEMA_VERSION = 1
 WEEKLY_CONTEST_STORE_VERSION = 1
 LEVEL_STATE_VERSION = 1
+DELETED_FIGURINE_STORE_VERSION = 1
 # Two calendar weeks ensure the immediately preceding weekly contest is covered no
 # matter which weekday the upgraded process first starts. Only already-recorded days
 # outside the normal STATS_CATCHUP_DAYS window are considered (see listener.py).
@@ -384,6 +385,10 @@ def _level_state_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_level_state.json"
 
 
+def _deleted_figurines_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_deleted_figurines.json"
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -395,6 +400,51 @@ def _write_json_atomic(path: Path, data: dict) -> None:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _load_deleted_figurines(entry: str) -> dict:
+    path = _deleted_figurines_path(entry)
+    if not path.exists():
+        return {"version": DELETED_FIGURINE_STORE_VERSION, "posts": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"version": DELETED_FIGURINE_STORE_VERSION, "posts": {}}
+    if not isinstance(data, dict):
+        return {"version": DELETED_FIGURINE_STORE_VERSION, "posts": {}}
+    data.setdefault("posts", {})
+    return data
+
+
+def delete_figurine_submission(
+    entry: str,
+    user_id: int | str,
+    message_id: int,
+    deleted_by_id: int | str,
+    deleted_by_name: str,
+) -> bool:
+    """Persistently exclude one deleted #япокрасил post from stats.
+
+    This is a tombstone instead of an edit to a single day file because today's
+    transcript cache may still contain a Telegram message for a while after it was
+    deleted. Applying the tombstone at aggregation time removes the work link, one
+    figurine, its XP, and any badge/level progress derived from that figurine even if a
+    stale transcript or immutable historical snapshot still contains the old post.
+    Returns False when the same post was already excluded.
+    """
+    data = _load_deleted_figurines(entry)
+    key = str(message_id)
+    if key in data["posts"]:
+        return False
+    data["posts"][key] = {
+        "user_id": str(user_id),
+        "deleted_at": app_now().isoformat(),
+        "deleted_by_id": str(deleted_by_id),
+        "deleted_by_name": deleted_by_name,
+    }
+    data["version"] = DELETED_FIGURINE_STORE_VERSION
+    _write_json_atomic(_deleted_figurines_path(entry), data)
+    return True
 
 
 def _empty_custom_badge_data() -> dict:
@@ -1035,6 +1085,32 @@ class UserStats:
         return self.xp(words_per_point)
 
 
+def _apply_deleted_figurines(entry: str, users: dict[str, UserStats]) -> None:
+    """Remove tombstoned posts and their one-per-post figurine credit in-place."""
+    records = _load_deleted_figurines(entry).get("posts", {})
+    if not records:
+        return
+    deleted_by_user: dict[str, set[str]] = {}
+    for message_id, record in records.items():
+        user_id = str((record or {}).get("user_id", ""))
+        if user_id:
+            deleted_by_user.setdefault(user_id, set()).add(str(message_id))
+    for user_id, user in users.items():
+        deleted_ids = deleted_by_user.get(str(user_id))
+        if not deleted_ids:
+            continue
+        kept_posts = []
+        removed = 0
+        for post in user.recent_figurine_posts:
+            if len(post) >= 2 and str(post[1]) in deleted_ids:
+                removed += 1
+            else:
+                kept_posts.append(post)
+        if removed:
+            user.recent_figurine_posts = kept_posts
+            user.figurines_painted = max(0, user.figurines_painted - removed)
+
+
 def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
     """Combines `existing` [ts, message_id] pairs with `new_posts` (any iterable of the
     same shape) and sorts newest-first -- deliberately NEVER truncates: every qualifying
@@ -1141,6 +1217,7 @@ def aggregate(entry: str, start_day: date, end_day: date) -> dict[str, UserStats
         if payload:
             _merge_day(combined, payload)
         day += timedelta(days=1)
+    _apply_deleted_figurines(entry, combined)
     return combined
 
 
@@ -1163,6 +1240,7 @@ def aggregate_all_time(entry: str) -> dict[str, UserStats]:
         except (json.JSONDecodeError, OSError):
             continue
         _merge_day(combined, payload)
+    _apply_deleted_figurines(entry, combined)
     return combined
 
 
@@ -1299,6 +1377,7 @@ async def aggregate_live(
     if start_day <= today <= end_day:
         live_users = await _live_today_users(client, chat_ref, entry, tz, log=log)
         _merge_day(combined, {"day": today.isoformat(), "users": live_users})
+        _apply_deleted_figurines(entry, combined)
     return combined
 
 
@@ -1310,6 +1389,7 @@ async def aggregate_all_time_live(client, chat_ref, entry: str, tz, log=print) -
     today = datetime.now(tz).date()
     live_users = await _live_today_users(client, chat_ref, entry, tz, log=log)
     _merge_day(combined, {"day": today.isoformat(), "users": live_users})
+    _apply_deleted_figurines(entry, combined)
     return combined
 
 

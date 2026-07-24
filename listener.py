@@ -1144,7 +1144,11 @@ async def run_listener(
         # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
         # chat content, so it must never count as activity for the joke buffer.
         is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
-        is_badge_command = text_lower.startswith("/badge") or text_lower.startswith("/weekwinner")
+        is_badge_command = (
+            text_lower.startswith("/badge")
+            or text_lower.startswith("/weekwinner")
+            or text_lower.startswith("/deletepokras")
+        )
 
         # #япокрасил + an attached photo OR video -- a "figurine painted" post (see
         # XP_PER_FIGURINE in stats.py). is_image_message/is_video_message (not just
