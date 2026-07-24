@@ -250,7 +250,103 @@ The answer sees the exact bot message being replied to, the person's response, t
 remarks. It may be funny when that fits, but it is prompted to answer questions and react
 normally rather than forcing a joke. Messages in the general chat flow do not trigger
 this behavior; the person must reply directly to the bot. Explicit commands such as
-`/summary`, `/stat`, and `/top` keep their specialized behavior even when sent as replies.
+`/summary`, `/stat`, `/top`, and `/badge` keep their specialized behavior even when sent
+as replies.
+
+### XP, levels, coins, and badges
+
+`/top today|week|month|year|all` ranks tracked members by XP. The existing activity
+formula is unchanged; only its user-facing name changed from points to XP. `/top week`
+also shows the member with the largest positive XP change compared with the preceding
+seven-day window.
+
+`/stat [username]` shows all-time XP and one earned coin for every complete 10 XP. Coins
+are currently an earned balance; spending is intentionally not implemented until there
+are actual shop rewards. Permanent levels are:
+
+- 🩶 Серый новичок — `0 XP`, 0 figurines
+- ⚪ Ученик грунта — `2,500 XP` **and** 3 figurines
+- 🖌️ Подмастерье кисти — `5,000 XP` **and** 5 figurines
+- 💨 Укротитель аэрографа — `10,000 XP` **and** 10 figurines
+- 💧 Повелитель проливок — `20,000 XP` **and** 20 figurines
+- 🏛️ Мастер витрины — `35,000 XP` **and** 35 figurines
+- 👑 Легенда покраса — `50,000 XP` **and** 50 figurines
+
+Both requirements unlock a level. `/stat` shows only the current level and deliberately
+does not reveal what is missing for the next one.
+
+The activity block stays compact and uses dot-separated thousands:
+
+```text
+Фигурок: 12 (#япокрасил)
+Активных дней: 96 (🔥 Серия: 11 дней)
+💬 Сообщений: 1.842 (19.2 в день)
+```
+
+The streak note is hidden when the current streak is zero.
+
+When a tracked user reaches a higher level, the bot posts one persistent announcement:
+
+```text
+@user получил новый уровень «🖌️ Подмастерье кисти»! 🎉🎊🥳
+```
+
+The last observed level is persisted per chat, so a promotion is announced only once
+across `/stat` calls and process restarts. Existing users are silently baselined when
+this feature is first deployed; only later promotions generate announcements. Level
+checks run during `/stat` and the daily stats rollover.
+
+Automatic badges are derived from production counters and hashtag activity. Only the
+highest earned painting medal is shown:
+
+- 🥉 Я покрасил III — 1 painted figurine
+- 🥈 Я покрасил II — 10 painted figurines
+- 🥇 Я покрасил I — 50 painted figurines
+- 🦄 Я не пидор — post `#янепидор`
+- 🎪 Участник Недельного конкурса ×N — post `#итогинедели`; several posts by the
+  same person in one Monday–Sunday ISO week count once
+- 💯 Сотня — 100 messages
+- 📣 Голос чата — 1,000 messages
+- 🖼️ Галерея — 25 photo/video messages
+- 💬 В диалоге — 100 replies
+- 📅 Завсегдатай — 30 active days
+- 🔥 Не остановить — a historical seven-day streak
+- 🦉 Ночная смена — 50 messages between 00:00 and 05:59
+
+Badges appear near the end of `/stat`, immediately before the complete tracked work
+history. Every work is represented by a compact clickable number (newest first), with
+no three-work display cap. No new message schema or history fetch is needed for
+automatic badges.
+
+Chat administrators can also create and award custom badges with `/badge`. The bot
+shows two inline options:
+
+- **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
+- **Выдать значок** shows the chat's saved custom badges. Invoke `/badge` as a reply to
+  the recipient's message to preselect them; otherwise the bot asks for their
+  `@username` after the badge is selected.
+
+Custom definitions and assignments are persisted per chat under the existing stats
+cache. Awarding the same badge to the same member twice is idempotent. The menu and its
+force-reply steps expire after ten minutes and remain bound to the administrator who
+opened them.
+
+The weekly winner is assigned separately by a chat administrator, using the contest's
+sequence number rather than the calendar week:
+
+```text
+# as a reply to the winner's message
+/weekwinner 1
+
+# or by tracked username
+/weekwinner 1 @username
+```
+
+Only one winner can occupy each numbered week. Repeating the same assignment is
+idempotent; trying to give that week to somebody else is refused. `/stat` displays
+`🏆 Победитель Недельного Конкурса ×N`, where N is that person's number of winning weeks.
+On startup, the normal recent-day stats catch-up backfills the new hashtag fields from
+the raw transcript cache without recomputing or changing anybody's historical XP.
 
 ## Model choice
 

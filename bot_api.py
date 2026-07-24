@@ -2,7 +2,7 @@
 -- used by bot_listener.py to run a bot account alongside the Telethon user session that
 listener.py drives. Deliberately minimal: just the handful of methods bot_listener.py
 needs (getMe, getUpdates via long polling, sendMessage, deleteMessage,
-setMessageReaction, answerCallbackQuery), not a full SDK.
+setMessageReaction, answerCallbackQuery, getChatAdministrators), not a full SDK.
 
 Roast confirmation uses an inline-keyboard button + callback_query rather than reactions
 (like the Telethon listener uses): receiving *other users'* reactions via getUpdates
@@ -40,6 +40,9 @@ class TelegramBotAPI:
 
     async def get_me(self) -> dict:
         return await self._call("getMe")
+
+    async def get_chat_administrators(self, chat_id) -> list[dict]:
+        return await self._call("getChatAdministrators", chat_id=chat_id)
 
     async def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict]:
         # HTTP read timeout must exceed Telegram's own long-poll `timeout` param below, or

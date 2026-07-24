@@ -48,6 +48,7 @@ import re
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -110,6 +111,12 @@ ROAST_CALLBACK_PREFIX = "roast"
 JOKE_PREVIEW_BUTTON_TEXT = "✅ Отправить в чат"
 JOKE_PREVIEW_CALLBACK_PREFIX = "jokeprev"
 
+BADGE_CALLBACK_PREFIX = "badge"
+BADGE_FLOW_TTL_SECONDS = 10 * 60
+BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
+BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
+WEEK_WINNER_COMMAND = "/weekwinner"
+
 
 def _display_name(user: dict | None) -> str:
     if not user:
@@ -121,6 +128,432 @@ def _display_name(user: dict | None) -> str:
     if user.get("username"):
         return f"@{user['username']}"
     return f"id{user.get('id')}"
+
+
+def _badge_callback_data(action: str, flow_id: str, badge_id: str | None = None) -> str:
+    parts = [BADGE_CALLBACK_PREFIX, action, flow_id]
+    if badge_id:
+        parts.append(badge_id)
+    return ":".join(parts)
+
+
+def _parse_badge_callback(data: str) -> tuple[str, str, str | None] | None:
+    parts = (data or "").split(":")
+    if len(parts) not in (3, 4) or parts[0] != BADGE_CALLBACK_PREFIX:
+        return None
+    return parts[1], parts[2], parts[3] if len(parts) == 4 else None
+
+
+def _badge_flow(
+    badge_flows: dict[str, dict],
+    flow_id: str,
+    chat_id: int,
+    admin_id: int,
+) -> dict | None:
+    flow = badge_flows.get(flow_id)
+    if not flow:
+        return None
+    if time.monotonic() - flow["created_at"] > BADGE_FLOW_TTL_SECONDS:
+        badge_flows.pop(flow_id, None)
+        return None
+    if flow["chat_id"] != chat_id or flow["admin_id"] != admin_id:
+        return None
+    return flow
+
+
+async def _is_chat_admin(api: TelegramBotAPI, chat_id: int, user_id: int) -> bool:
+    try:
+        administrators = await api.get_chat_administrators(chat_id)
+    except ChatSummaryError:
+        return False
+    return any((member.get("user") or {}).get("id") == user_id for member in administrators)
+
+
+async def handle_badge_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    bot_user_id: int,
+    badge_flows: dict[str, dict],
+) -> None:
+    """Starts an admin-bound custom-badge flow. Replying with /badge to a member's
+    message preselects that member as the eventual recipient."""
+    chat = message["chat"]
+    chat_id = chat["id"]
+    admin = message.get("from") or {}
+    admin_id = admin.get("id")
+    if chat.get("type") == "private":
+        await api.send_message(
+            chat_id,
+            "Значки создаются и выдаются в группе.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    if entry is None:
+        await api.send_message(
+            chat_id,
+            "Значки недоступны в этом чате.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    if not admin_id or not await _is_chat_admin(api, chat_id, admin_id):
+        await api.send_message(
+            chat_id,
+            "Создавать и выдавать значки могут только администраторы чата.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    replied = message.get("reply_to_message") or {}
+    target = replied.get("from")
+    if target and (target.get("id") == bot_user_id or target.get("is_bot")):
+        target = None
+
+    flow_id = uuid.uuid4().hex[:10]
+    badge_flows[flow_id] = {
+        "created_at": time.monotonic(),
+        "chat_id": chat_id,
+        "entry": entry,
+        "admin_id": admin_id,
+        "admin_name": _display_name(admin),
+        "target": (
+            {"user_id": str(target["id"]), "display_name": _display_name(target)}
+            if target and target.get("id") is not None
+            else None
+        ),
+        "awaiting": None,
+        "selected_badge_id": None,
+    }
+    target_line = (
+        f"\nПолучатель: {badge_flows[flow_id]['target']['display_name']}"
+        if badge_flows[flow_id]["target"]
+        else "\nЧтобы сразу выбрать получателя, вызовите /badge ответом на его сообщение."
+    )
+    await api.send_message(
+        chat_id,
+        "🏅 Управление значками" + target_line,
+        reply_to_message_id=message["message_id"],
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
+                [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
+            ]
+        },
+        parse_mode=None,
+    )
+
+
+async def _award_badge_from_flow(
+    api: TelegramBotAPI,
+    flow: dict,
+    badge_id: str,
+    target: dict,
+    reply_to_message_id: int | None,
+) -> None:
+    badge, newly_awarded = stats.give_custom_badge(
+        flow["entry"],
+        badge_id,
+        target["user_id"],
+        target["display_name"],
+        flow["admin_id"],
+        flow["admin_name"],
+    )
+    if newly_awarded:
+        text = f"🎉 {target['display_name']} получает значок {badge.label}!"
+    else:
+        text = f"{target['display_name']} уже имеет значок {badge.label}."
+    await api.send_message(
+        flow["chat_id"],
+        text,
+        reply_to_message_id=reply_to_message_id,
+        parse_mode=None,
+    )
+
+
+async def handle_badge_callback(
+    api: TelegramBotAPI,
+    callback: dict,
+    badge_flows: dict[str, dict],
+) -> None:
+    parsed = _parse_badge_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    action, flow_id, badge_id = parsed
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    actor = callback.get("from") or {}
+    flow = _badge_flow(badge_flows, flow_id, chat.get("id"), actor.get("id"))
+    if flow is None:
+        await api.answer_callback_query(callback_id, "Меню устарело или принадлежит другому администратору.")
+        return
+    if not await _is_chat_admin(api, flow["chat_id"], flow["admin_id"]):
+        await api.answer_callback_query(callback_id, "Нужны права администратора.")
+        return
+
+    await api.answer_callback_query(callback_id)
+    if action == "create":
+        flow["awaiting"] = "create_spec"
+        prompt = await api.send_message(
+            flow["chat_id"],
+            "Ответьте на это сообщение: сначала эмодзи, затем название.\nНапример: 🎯 Меткий глаз",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+        return
+
+    if action == "list":
+        badges = stats.list_custom_badges(flow["entry"])
+        if not badges:
+            await api.send_message(
+                flow["chat_id"],
+                "Пока нет пользовательских значков. Сначала создайте первый.",
+                reply_to_message_id=message.get("message_id"),
+                parse_mode=None,
+            )
+            return
+        keyboard = [
+            [{"text": badge.label, "callback_data": _badge_callback_data("give", flow_id, badge.badge_id)}]
+            for badge in badges
+        ]
+        await api.send_message(
+            flow["chat_id"],
+            "Выберите значок:",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"inline_keyboard": keyboard},
+            parse_mode=None,
+        )
+        return
+
+    if action == "give" and badge_id:
+        if flow["target"]:
+            await _award_badge_from_flow(api, flow, badge_id, flow["target"], message.get("message_id"))
+            badge_flows.pop(flow_id, None)
+        else:
+            flow["selected_badge_id"] = badge_id
+            flow["awaiting"] = "target"
+            prompt = await api.send_message(
+                flow["chat_id"],
+                "Ответьте на это сообщение именем или @username получателя.\n"
+                "В следующий раз можно вызвать /badge ответом на сообщение участника.",
+                reply_to_message_id=message.get("message_id"),
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+            flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+
+
+async def handle_badge_text_input(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    tz,
+    badge_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consumes the admin's force-reply after Create or after choosing a recipient."""
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    actor_id = actor.get("id")
+    replied_message_id = (message.get("reply_to_message") or {}).get("message_id")
+    flow_pair = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in badge_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("admin_id") == actor_id
+            and flow.get("awaiting") in ("create_spec", "target")
+            and flow.get("prompt_message_id") == replied_message_id
+            and time.monotonic() - flow["created_at"] <= BADGE_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if flow_pair is None:
+        return False
+    flow_id, flow = flow_pair
+    text = (message.get("text") or "").strip()
+    if text.lower() in ("/cancel", "отмена"):
+        badge_flows.pop(flow_id, None)
+        await api.send_message(
+            chat_id, "Действие отменено.", reply_to_message_id=message["message_id"], parse_mode=None
+        )
+        return True
+    if not await _is_chat_admin(api, chat_id, actor_id):
+        badge_flows.pop(flow_id, None)
+        return True
+
+    if flow["awaiting"] == "create_spec":
+        try:
+            emoji, name = stats.parse_custom_badge_spec(text)
+            badge = stats.create_custom_badge(
+                flow["entry"], emoji, name, flow["admin_id"], flow["admin_name"]
+            )
+        except ValueError as e:
+            prompt = await api.send_message(
+                chat_id,
+                str(e),
+                reply_to_message_id=message["message_id"],
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+            flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+            return True
+        badge_flows.pop(flow_id, None)
+        await api.send_message(
+            chat_id,
+            f"Создан значок {badge.label}. Теперь его можно выдать через /badge.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return True
+
+    try:
+        target, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client,
+            flow["entry"],
+            flow["entry"],
+            text,
+            None,
+            "",
+            tz,
+            log=log,
+        )
+        if target is None:
+            raise ValueError("Участник не найден в статистике. Попробуйте точный @username.")
+        await _award_badge_from_flow(
+            api,
+            flow,
+            flow["selected_badge_id"],
+            {"user_id": target.user_id, "display_name": target.display_name},
+            message["message_id"],
+        )
+        badge_flows.pop(flow_id, None)
+    except ValueError as e:
+        prompt = await api.send_message(
+            chat_id,
+            str(e),
+            reply_to_message_id=message["message_id"],
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+    return True
+
+
+async def handle_week_winner_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    bot_user_id: int,
+    tz,
+    log=print,
+) -> None:
+    """Admin command: /weekwinner <contest week> [@username].
+
+    Sending it as a reply preselects the replied-to member, e.g. reply with
+    "/weekwinner 1" to record the already-completed first contest.
+    """
+    chat = message["chat"]
+    chat_id = chat["id"]
+    admin = message.get("from") or {}
+    admin_id = admin.get("id")
+    if chat.get("type") == "private" or entry is None:
+        await api.send_message(
+            chat_id,
+            "Победителя нужно назначать в настроенной группе.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    if not admin_id or not await _is_chat_admin(api, chat_id, admin_id):
+        await api.send_message(
+            chat_id,
+            "Назначать победителя могут только администраторы чата.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    parts = command_text.strip().split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) < 1:
+        await api.send_message(
+            chat_id,
+            "Использование: /weekwinner 1 ответом на сообщение победителя\n"
+            "или /weekwinner 1 @username",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    contest_week = int(parts[1])
+
+    replied = message.get("reply_to_message") or {}
+    replied_user = replied.get("from")
+    if replied_user and replied_user.get("id") != bot_user_id and not replied_user.get("is_bot"):
+        target = {
+            "user_id": str(replied_user["id"]),
+            "display_name": _display_name(replied_user),
+        }
+    elif len(parts) == 3:
+        tracked, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client,
+            entry,
+            entry,
+            parts[2],
+            None,
+            "",
+            tz,
+            log=log,
+        )
+        target = (
+            {"user_id": tracked.user_id, "display_name": tracked.display_name}
+            if tracked
+            else None
+        )
+    else:
+        target = None
+
+    if target is None:
+        await api.send_message(
+            chat_id,
+            "Не нашёл победителя. Ответьте командой на его сообщение или добавьте точный @username.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    status, wins, existing_winner = stats.record_weekly_contest_winner(
+        entry,
+        contest_week,
+        target["user_id"],
+        target["display_name"],
+        admin_id,
+        _display_name(admin),
+    )
+    if status == "awarded":
+        text = (
+            f"🏆 {target['display_name']} — победитель Недельного Конкурса №{contest_week}!\n"
+            f"Всего побед: {wins}"
+        )
+    elif status == "already":
+        text = (
+            f"{target['display_name']} уже записан(а) победителем недели №{contest_week}. "
+            f"Всего побед: {wins}"
+        )
+    else:
+        text = f"Неделя №{contest_week} уже записана за участником {existing_winner}."
+    await api.send_message(
+        chat_id,
+        text,
+        reply_to_message_id=message["message_id"],
+        parse_mode=None,
+    )
 
 
 def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
@@ -825,6 +1258,7 @@ async def _dispatch_update(
     known_chat_ids: dict[str, int],
     joke_preview_pending: dict[int, dict],
     joke_posted_queue,
+    badge_flows: dict[str, dict],
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -838,7 +1272,10 @@ async def _dispatch_update(
     around this call is strictly a last-resort backstop, not the primary safety net."""
     callback = update.get("callback_query")
     if callback is not None:
-        if (callback.get("data") or "").startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
+        callback_data = callback.get("data") or ""
+        if callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
+            await handle_badge_callback(api, callback, badge_flows)
+        elif callback_data.startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(
                 api, telethon_client, callback, joke_preview_pending, known_chat_ids,
                 joke_posted_queue, log=log,
@@ -864,6 +1301,28 @@ async def _dispatch_update(
     matched_entry = _match_allowed_chat(chat, cfg.listener_allowed_chats)
     if matched_entry is not None:
         known_chat_ids[matched_entry] = chat["id"]
+
+    command_text = stats.strip_command_bot_mention(message_text, bot_username)
+    if re.match(r"^/badge(?:\s|$)", command_text, re.IGNORECASE):
+        await handle_badge_command(api, message, matched_entry, bot_user_id, badge_flows)
+        return
+    if re.match(rf"^{re.escape(WEEK_WINNER_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        await handle_week_winner_command(
+            api,
+            telethon_client,
+            message,
+            command_text,
+            matched_entry,
+            bot_user_id,
+            tz,
+            log=log,
+        )
+        return
+
+    if await handle_badge_text_input(
+        api, telethon_client, message, tz, badge_flows, log=log
+    ):
+        return
 
     # "пошути"/"пошути превью" (see JOKE_PREVIEW_* constants) only ever fires from a DM to
     # the bot, per JOKE_MANUAL_TRIGGER_KEYWORD's own docs -- checked before has_summary/
@@ -906,6 +1365,8 @@ async def _dispatch_update(
         # argument -- see strip_command_bot_mention in stats.py.
         stats_text = stats.strip_command_bot_mention(message_text, bot_username)
         try:
+            level_announcements = []
+            reply_parse_mode = None
             if text_lower.startswith("/top"):
                 period = stats.parse_top_command(stats_text)
                 reply_text = await stats.format_top(
@@ -923,24 +1384,41 @@ async def _dispatch_update(
                     )
                 else:
                     from_user = message.get("from") or {}
-                    user, rank, total, score, streak = await stats.resolve_stat_target(
+                    user, rank, total, xp, streak = await stats.resolve_stat_target(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
                     )
                     if user:
                         figurine_links = stats.figurine_message_links(chat.get("username"), chat_key, user)
-                        reply_text = stats.format_stat(user, rank, total, score, streak, figurine_links)
+                        custom_badges = (
+                            stats.custom_badges_for_user(matched_entry, user.user_id)
+                            + stats.weekly_winner_badges_for_user(matched_entry, user.user_id)
+                        )
+                        reply_text = stats.format_stat(
+                            user, rank, total, xp, streak, figurine_links, custom_badges
+                        )
+                        reply_parse_mode = "HTML"
+                        level_announcements = stats.record_level_observations(
+                            matched_entry, [(user, xp)]
+                        )
                     else:
                         reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
-            # parse_mode=None: reply_text can embed a raw display name (leaderboard
-            # entries, /stat's "Имя:" line) -- Telegram's Markdown mode would reject the
-            # whole message if that name has an unbalanced _/*/`/[ (a real username with
-            # a single underscore is enough), so these are always sent as plain text.
+            # Direct /stat output is safely HTML-escaped by stats.format_stat so its
+            # numbered work links can be clickable. Leaderboards/digests remain plain
+            # text because they can contain uncontrolled display names.
             sent = await api.send_message(
-                chat_key, reply_text, reply_to_message_id=message["message_id"], parse_mode=None
+                chat_key,
+                reply_text,
+                reply_to_message_id=message["message_id"],
+                parse_mode=reply_parse_mode,
             )
             if sent and "message_id" in sent:
                 schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
+            for announcement in level_announcements:
+                try:
+                    await api.send_message(chat_key, announcement, parse_mode=None)
+                except Exception as e:
+                    log(f"[bot_listener] failed to send level-up announcement: {e}")
         except Exception:
             log(f"[bot_listener] error handling stats command:\n{traceback.format_exc()}")
             try:
@@ -1105,6 +1583,9 @@ async def run_bot_listener(
     # "пошути превью" confirm-button state, keyed by the DM's own chat_id (see
     # handle_manual_joke) -- value: {"entry", "joke_text"}.
     joke_preview_pending: dict[int, dict] = {}
+    # Short-lived, admin-bound /badge conversations. Definitions and assignments are
+    # persisted by stats.py; only the in-progress menu/prompt state lives in memory.
+    badge_flows: dict[str, dict] = {}
 
     # Roast confirm/button flow state, keyed by (chat_id, target_user_id) -- mirrors
     # listener.py's roast_pending/roast_in_progress. Value: {"confirm_msg_id",
@@ -1151,7 +1632,7 @@ async def run_bot_listener(
                         await _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
-                            known_chat_ids, joke_preview_pending, joke_posted_queue, log=log,
+                            known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows, log=log,
                         )
                     except Exception:
                         log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
@@ -1224,16 +1705,16 @@ async def run_bot_listener(
                 entry, text = await stats_digest_queue.get()
                 chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
                 if chat_id is None:
-                    log(f"[bot_listener] dropping stats digest for '{entry}': could not resolve a chat_id for it")
+                    log(f"[bot_listener] dropping stats notification for '{entry}': could not resolve a chat_id for it")
                     continue
                 try:
                     # parse_mode=None: the digest embeds raw display names, same reasoning
                     # as every other stats reply -- see the send_message call in the
                     # /top and /stat handling above.
                     await api.send_message(chat_id, text, parse_mode=None)
-                    log(f"[bot_listener] sent procrastinator digest to '{entry}'")
+                    log(f"[bot_listener] sent stats notification to '{entry}'")
                 except Exception:
-                    log(f"[bot_listener] failed to send stats digest:\n{traceback.format_exc()}")
+                    log(f"[bot_listener] failed to send stats notification:\n{traceback.format_exc()}")
 
         async def _consume_dismissals():
             while True:

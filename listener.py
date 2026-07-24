@@ -679,14 +679,15 @@ async def run_roast(
     await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
 
 
-async def _stats_catch_up(client, cfg, tz, log=print) -> None:
+async def _stats_catch_up(client, cfg, tz, level_announcement_queue=None, log=print) -> None:
     """For each chat in cfg.listener_allowed_chats, closes out every day in the last
     cfg.stats_catchup_days that isn't recorded yet (see stats.finalize_and_record) --
-    oldest first. Cheap to call repeatedly: stats.finalize_and_record's own idempotency
-    check (stats.is_recorded) means any day already recorded costs nothing but a file
-    existence check, no Telegram calls -- so this covers both the very first run (backfill
-    up to stats_catchup_days of history) and every subsequent midnight (where only the
-    single just-closed day is actually new work) with the same code path."""
+    oldest first. Cheap to call repeatedly: a day on the current stats schema costs only
+    a local JSON read. A recorded day from before hashtag badges existed is read once
+    from the normal transcript cache so those badge counters can be backfilled without
+    changing XP. The badge-only scan covers the last 14 days (and skips days that do not
+    already have stats), ensuring the preceding weekly contest is included. This covers both the very first run (backfill up to
+    stats_catchup_days of history) and every subsequent midnight with the same path."""
     today = datetime.now(tz).date()
     for entry in cfg.listener_allowed_chats:
         try:
@@ -694,12 +695,30 @@ async def _stats_catch_up(client, cfg, tz, log=print) -> None:
         except Exception as e:
             log(f"[stats] could not resolve '{entry}' for catch-up: {e}")
             continue
-        for delta in range(cfg.stats_catchup_days, 0, -1):
+        lookback_days = max(cfg.stats_catchup_days, stats.HASHTAG_BADGE_BACKFILL_DAYS)
+        for delta in range(lookback_days, 0, -1):
             day = today - timedelta(days=delta)
+            # Outside the configured general catch-up window, augment only a day that
+            # already has stats. This reaches the previous contest week for hashtag
+            # badges without creating extra historical XP days as a side effect.
+            if delta > cfg.stats_catchup_days and not stats.is_recorded(entry, day):
+                continue
             try:
                 await stats.finalize_and_record(client, chat_entity, entry, day, tz, log=log)
             except Exception:
                 log(f"[stats] failed to catch up '{entry}' for {day}:\n{traceback.format_exc()}")
+        if level_announcement_queue is not None:
+            try:
+                announcements = await stats.collect_level_up_announcements(
+                    client, chat_entity, entry, tz, log=log
+                )
+                for announcement in announcements:
+                    await level_announcement_queue.put((entry, announcement))
+            except Exception:
+                log(
+                    f"[stats] failed to collect level-up announcements for "
+                    f"'{entry}':\n{traceback.format_exc()}"
+                )
 
 
 async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=print) -> None:
@@ -740,17 +759,17 @@ async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=
             log(f"[stats] failed to build procrastinator digest for '{entry}':\n{traceback.format_exc()}")
 
 
-async def _stats_catchup_loop(client, cfg, tz, log=print) -> None:
+async def _stats_catchup_loop(client, cfg, tz, level_announcement_queue=None, log=print) -> None:
     """Runs _stats_catch_up once immediately (covers a restart that missed one or more
     midnights while down), then sleeps until the next local midnight and runs it again,
     forever. A few seconds of buffer after :00 avoids any edge-case race right at the
     rollover instant."""
-    await _stats_catch_up(client, cfg, tz, log=log)
+    await _stats_catch_up(client, cfg, tz, level_announcement_queue, log=log)
     while True:
         now = datetime.now(tz)
         next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
-        await _stats_catch_up(client, cfg, tz, log=log)
+        await _stats_catch_up(client, cfg, tz, level_announcement_queue, log=log)
 
 
 async def _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> None:
@@ -784,7 +803,7 @@ async def run_stats_rollover(client, cfg, tz, stats_digest_queue=None, log=print
         return
 
     await asyncio.gather(
-        _stats_catchup_loop(client, cfg, tz, log=log),
+        _stats_catchup_loop(client, cfg, tz, stats_digest_queue, log=log),
         _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=log),
     )
 
@@ -1125,9 +1144,10 @@ async def run_listener(
         # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
         # chat content, so it must never count as activity for the joke buffer.
         is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
+        is_badge_command = text_lower.startswith("/badge") or text_lower.startswith("/weekwinner")
 
         # #япокрасил + an attached photo OR video -- a "figurine painted" post (see
-        # POINTS_PER_FIGURINE in stats.py). is_image_message/is_video_message (not just
+        # XP_PER_FIGURINE in stats.py). is_image_message/is_video_message (not just
         # msg.photo/msg.video) also catch media sent as an uncompressed file/document --
         # Telegram's own compressed-vs-document split is just a sender-side choice, and
         # artists posting full-resolution art or a painting timelapse routinely pick
@@ -1157,7 +1177,7 @@ async def run_listener(
                 else:
                     await react_emoji(event.chat_id, msg.id, FIGURINE_ACK_EMOJI)
 
-        if joke_enabled and text and not is_stats_command:
+        if joke_enabled and text and not is_stats_command and not is_badge_command:
             await maybe_joke(event, msg, text)
 
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
@@ -1230,6 +1250,8 @@ async def run_listener(
             # for a user literally named after the bot -- see strip_command_bot_mention.
             stats_text = stats.strip_command_bot_mention(text, my_username)
             try:
+                level_announcements = []
+                stat_uses_html = False
                 if text_lower.startswith("/top"):
                     period = stats.parse_top_command(stats_text)
                     reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
@@ -1241,20 +1263,38 @@ async def run_listener(
                         reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                     else:
                         sender = await event.get_sender()
-                        user, rank, total, score, streak = await stats.resolve_stat_target(
+                        user, rank, total, xp, streak = await stats.resolve_stat_target(
                             client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
                         )
                         if user:
                             figurine_links = stats.figurine_message_links(
                                 getattr(chat, "username", None), event.chat_id, user
                             )
-                            reply_text = stats.format_stat(user, rank, total, score, streak, figurine_links)
+                            custom_badges = (
+                                stats.custom_badges_for_user(entry, user.user_id)
+                                + stats.weekly_winner_badges_for_user(entry, user.user_id)
+                            )
+                            reply_text = stats.format_stat(
+                                user, rank, total, xp, streak, figurine_links, custom_badges
+                            )
+                            stat_uses_html = True
+                            level_announcements = stats.record_level_observations(
+                                entry, [(user, xp)]
+                            )
                         else:
                             reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
-                sent = await event.reply(reply_text)
+                reply_kwargs = {"parse_mode": "html"} if stat_uses_html else {}
+                sent = await event.reply(reply_text, **reply_kwargs)
                 if sent is not None:
                     sent_message_ids.add(sent.id)
                     schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
+                for announcement in level_announcements:
+                    try:
+                        level_message = await event.client.send_message(event.chat_id, announcement)
+                        if level_message is not None:
+                            sent_message_ids.add(level_message.id)
+                    except Exception as e:
+                        log(f"[listener] failed to send level-up announcement: {e}")
             except Exception:
                 log(f"[listener] error handling stats command:\n{traceback.format_exc()}")
                 try:

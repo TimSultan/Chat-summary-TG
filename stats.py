@@ -2,7 +2,7 @@
 media/reply counts, active days, and an hourly activity histogram, computed once per
 calendar day from the SAME per-day transcript cache telegram_fetch.py already maintains
 (see finalize_and_record, called by listener.py's midnight rollover job). Powers "/top
-day|week|month|year|all" (a simple points leaderboard) and "/stat [username]" (one
+day|week|month|year|all" (an XP leaderboard) and "/stat [username]" (one
 person's tracked history). "/stat" accepts those same period keywords too (e.g. "/stat
 all", "/stat year") -- given one, bare, with nothing else, it shows the same leaderboard
 as the equivalent "/top" instead of searching for a user literally named "all" or "year"
@@ -27,8 +27,8 @@ check record_day/finalize_and_record need to stay idempotent -- rerunning the ro
 job for a day it already processed (e.g. a restart landing near midnight) is then a cheap
 no-op, not a double-count.
 
-Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not points):
-    Message points, PER DAY, are one of two things depending on whether that day predates
+XP scoring:
+    Message XP, PER DAY, is one of two things depending on whether that day predates
     word-tracking (see _has_word_data / UserStats.legacy_message_points vs. .words):
         +1 per message (flat), for any day recorded before this feature shipped -- kept
             forever exactly as it always scored, never reinterpreted.
@@ -36,23 +36,23 @@ Scoring (used only by /top's leaderboard ranking -- /stat shows raw counts, not 
             flat +1/message rewarded spamming lots of short messages just as much as
             writing one that says something; word count divided by the chat's own
             average words/message (see words_per_point) keeps a "typical" message worth
-            about 1 point while a one-word "ok" is worth a fraction and a long one worth
+            about 1 XP while a one-word "ok" is worth a fraction and a long one worth
             more.
     +1 per message containing a photo or video
     +1 per message that's a reply (see the is_reply note on UserStats.replies below)
     +5 per distinct calendar day the person posted at least once
-    +150 per message tagged #япокрасил that has an actual photo OR video attached (a
+    +200 per message tagged #япокрасил that has an actual photo OR video attached (a
         "figurine painted" post -- see FIGURINE_HASHTAG; a hashtag with no media doesn't
         qualify). Also surfaced as its own raw count, "Покрашено фигурок", in /stat.
-Points are never stored -- always recomputed on demand from the raw per-day counters for
+XP is never stored -- always recomputed on demand from the raw per-day counters for
 whatever window (day/week/month/year, or -- for a bare /stat lookup -- every recorded
 day) is asked about, so changing the point values later doesn't require re-processing any
-history -- and per the split above, a day's message-scoring RULE never changes after the
+history -- and per the split above, a day's message-scoring rule never changes after the
 fact either, regardless of what happens to word-tracking later. words_per_point is the
 one number here that isn't a fixed constant in code -- it's calibrated per chat, from
 that chat's own real activity (see MIN_CALIBRATION_MESSAGES) -- but it's still fixed in
 effect: calibrated exactly once, then cached to disk and reused forever, never
-automatically recomputed (see words_per_point's own docstring). So a message's point
+automatically recomputed (see words_per_point's own docstring). So a message's XP
 value, once it has one, stays stable over time -- the only thing that's ever freshly
 recomputed per call, same as before this feature, is "today" itself (not yet finalized --
 see record_day), not the scoring rule or conversion rate applied to any already-recorded
@@ -64,8 +64,10 @@ import json
 import os
 import random
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from html import escape
 from pathlib import Path
 
 import telegram_fetch
@@ -78,15 +80,64 @@ STATS_DIR = DATA_DIR / "cache" / "stats"
 def _stats_dir() -> Path:
     return STATS_DIR / cache_namespace(resolve_timezone())
 
-POINTS_PER_MEDIA_MESSAGE = 1
-POINTS_PER_REPLY = 1
-POINTS_PER_ACTIVE_DAY = 5
-POINTS_PER_FIGURINE = 200
+XP_PER_MEDIA_MESSAGE = 1
+XP_PER_REPLY = 1
+XP_PER_ACTIVE_DAY = 5
+XP_PER_FIGURINE = 200
+XP_PER_COIN = 10
+
+# Permanent, all-time levels. Both thresholds must be met. Keep this ordered from the
+# lowest XP/figurine requirements upward.
+XP_LEVELS = (
+    (0, 0, "🩶", "Серый новичок"),
+    (2_500, 3, "⚪", "Ученик грунта"),
+    (5_000, 5, "🖌️", "Подмастерье кисти"),
+    (10_000, 10, "💨", "Укротитель аэрографа"),
+    (20_000, 20, "💧", "Повелитель проливок"),
+    (35_000, 35, "🏛️", "Мастер витрины"),
+    (50_000, 50, "👑", "Легенда покраса"),
+)
+
+# Custom badges are deliberately bounded because Telegram inline keyboards allow at
+# most 100 buttons. Fifty leaves comfortable room for navigation/menu buttons later.
+MAX_CUSTOM_BADGES = 50
+CUSTOM_BADGE_NAME_MAX_CHARS = 40
+CUSTOM_BADGE_STORE_VERSION = 1
+BADGE_STATS_SCHEMA_VERSION = 1
+WEEKLY_CONTEST_STORE_VERSION = 1
+LEVEL_STATE_VERSION = 1
+# Two calendar weeks ensure the immediately preceding weekly contest is covered no
+# matter which weekday the upgraded process first starts. Only already-recorded days
+# outside the normal STATS_CATCHUP_DAYS window are considered (see listener.py).
+HASHTAG_BADGE_BACKFILL_DAYS = 14
+
+NOT_GAY_HASHTAG = "#янепидор"
+WEEKLY_CONTEST_HASHTAG = "#итогинедели"
+
+# Only the highest earned painting tier is displayed.
+PAINTING_BADGE_TIERS = (
+    (50, "painted_gold", "🥇", "Я покрасил I"),
+    (10, "painted_silver", "🥈", "Я покрасил II"),
+    (1, "painted_bronze", "🥉", "Я покрасил III"),
+)
+
+# Automatic badges use only counters already present in every production stats file.
+# Nothing here requires another Telegram fetch or a schema migration.
+AUTOMATIC_BADGES = (
+    ("hundred_messages", "💯", "Сотня", "написать 100 сообщений"),
+    ("chat_voice", "📣", "Голос чата", "написать 1 000 сообщений"),
+    ("gallery", "🖼️", "Галерея", "отправить 25 фото или видео"),
+    ("conversation", "💬", "В диалоге", "написать 100 ответов"),
+    ("regular", "📅", "Завсегдатай", "быть активным 30 дней"),
+    ("streak_7", "🔥", "Не остановить", "держать серию 7 дней"),
+    ("night_shift", "🦉", "Ночная смена", "написать 50 сообщений с 00:00 до 05:59"),
+)
+
 # The flat rate every message scored under before word-based points existed. ONLY applied
 # (via UserStats.legacy_message_points) to days recorded before word-tracking existed --
 # those days keep exactly the score they always had, forever, rather than being
 # reinterpreted by a formula that didn't exist when they happened. See _has_word_data.
-LEGACY_POINTS_PER_MESSAGE = 1
+LEGACY_XP_PER_MESSAGE = 1
 
 # From the day this feature shipped onward, a message is worth its word count divided by
 # the chat's OWN average words/message, rather than a flat +1/message -- so a typical-
@@ -117,6 +168,118 @@ WORDS_PER_POINT_CACHE_VERSION = 2
 MEDIA_TAG_PREFIXES = ("[Photo]", "[Video]")
 
 
+@dataclass(frozen=True)
+class Badge:
+    badge_id: str
+    emoji: str
+    name: str
+    description: str = ""
+    custom: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.emoji} {self.name}"
+
+
+@dataclass(frozen=True)
+class Level:
+    minimum_xp: int
+    minimum_figurines: int
+    emoji: str
+    name: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.emoji} {self.name}"
+
+
+def coins_for_xp(xp: int) -> int:
+    """One earned coin for every complete 10 XP. Coins are currently an earned balance,
+    not a spend ledger, so they can be derived without migrating or mutating old stats."""
+    return max(0, xp) // XP_PER_COIN
+
+
+def level_for_progress(xp: int, figurines_painted: int) -> tuple[Level, Level | None]:
+    """Highest level for which both the XP and figurine requirements are met."""
+    levels = [Level(*definition) for definition in XP_LEVELS]
+    current_index = 0
+    for index, level in enumerate(levels):
+        if xp < level.minimum_xp or figurines_painted < level.minimum_figurines:
+            break
+        current_index = index
+    current = levels[current_index]
+    next_level = levels[current_index + 1] if current_index + 1 < len(levels) else None
+    return current, next_level
+
+
+def level_for_xp(xp: int, figurines_painted: int = 0) -> tuple[str, int, int | None]:
+    """Backward-compatible tuple helper; new code should use level_for_progress."""
+    current, next_level = level_for_progress(xp, figurines_painted)
+    return current.label, current.minimum_xp, next_level.minimum_xp if next_level else None
+
+
+def _longest_streak(active_day_dates: set) -> int:
+    """Longest historical run inferable from the stored active-day date set."""
+    parsed = sorted(date.fromisoformat(day) for day in active_day_dates)
+    longest = current = 0
+    previous = None
+    for day in parsed:
+        if previous is not None and day == previous + timedelta(days=1):
+            current += 1
+        else:
+            current = 1
+        longest = max(longest, current)
+        previous = day
+    return longest
+
+
+def earned_badges(user: "UserStats") -> list[Badge]:
+    """Automatic badges earned from the existing all-time UserStats counters."""
+    longest_streak = _longest_streak(user.active_day_dates)
+    night_messages = sum(user.hours.get(str(hour), 0) for hour in range(6))
+    earned_ids = set()
+    if user.messages >= 100:
+        earned_ids.add("hundred_messages")
+    if user.messages >= 1_000:
+        earned_ids.add("chat_voice")
+    if user.media >= 25:
+        earned_ids.add("gallery")
+    if user.replies >= 100:
+        earned_ids.add("conversation")
+    if user.active_days >= 30:
+        earned_ids.add("regular")
+    if longest_streak >= 7:
+        earned_ids.add("streak_7")
+    if night_messages >= 50:
+        earned_ids.add("night_shift")
+    badges = []
+    painting_tier = next(
+        (tier for tier in PAINTING_BADGE_TIERS if user.figurines_painted >= tier[0]),
+        None,
+    )
+    if painting_tier:
+        threshold, badge_id, emoji, name = painting_tier
+        badges.append(Badge(badge_id, emoji, name, f"покрасить {threshold} фигурок"))
+    badges.extend(
+        Badge(badge_id=badge_id, emoji=emoji, name=name, description=description)
+        for badge_id, emoji, name, description in AUTOMATIC_BADGES
+        if badge_id in earned_ids
+    )
+    if user.not_gay_hashtag_uses:
+        badges.append(Badge("not_gay", "🦄", "Я не пидор", f"написать {NOT_GAY_HASHTAG}"))
+    if user.weekly_contest_weeks:
+        count = len(user.weekly_contest_weeks)
+        badges.append(
+            Badge(
+                "weekly_contest_participant",
+                "🎪",
+                f"Участник Недельного конкурса ×{count}",
+                f"{WEEKLY_CONTEST_HASHTAG}, максимум один раз в неделю",
+            )
+        )
+    return badges
+
+
 def is_zero_content_message(text: str) -> bool:
     """A message that's JUST a sticker or JUST a GIF, with nothing else -- these don't
     count towards points at all (not even the base +1/message), so sticker/GIF spam
@@ -132,15 +295,6 @@ def is_zero_content_message(text: str) -> bool:
 # doesn't count -- per spec it "has to contain media"). Matched case-insensitively since
 # people don't reliably type Cyrillic hashtags in one consistent case.
 FIGURINE_HASHTAG = "#япокрасил"
-
-# How many of a person's most recent figurine posts /stat LINKS TO (see
-# figurine_message_links, the only place this cap is actually applied). Every qualifying
-# post is saved and kept forever -- UserStats.recent_figurine_posts is deduped and sorted
-# newest-first wherever it's built or merged (_merge_recent_figurine_posts) but never
-# truncated there, precisely so format_procrastinators can still find the true most
-# recent post even for someone who's painted far more than 3 total; only the /stat
-# DISPLAY trims to this many.
-RECENT_FIGURINE_LINKS = 3
 
 # "Топ покрастинаторов": sent automatically every PROCRASTINATOR_DIGEST_INTERVAL_DAYS
 # days at PROCRASTINATOR_DIGEST_HOUR local (app-timezone) time -- see run_stats_rollover's
@@ -175,6 +329,324 @@ def _cache_key(entry: str) -> str:
 
 def _path(entry: str, day: date) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_{day.isoformat()}.json"
+
+
+def _custom_badges_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_custom_badges.json"
+
+
+def _weekly_contest_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_weekly_contest.json"
+
+
+def _level_state_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_level_state.json"
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _empty_custom_badge_data() -> dict:
+    return {"version": CUSTOM_BADGE_STORE_VERSION, "badges": {}, "assignments": {}}
+
+
+def _load_custom_badge_data(entry: str) -> dict:
+    path = _custom_badges_path(entry)
+    if not path.exists():
+        return _empty_custom_badge_data()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("custom badge file must contain a JSON object")
+    data.setdefault("badges", {})
+    data.setdefault("assignments", {})
+    return data
+
+
+def _save_custom_badge_data(entry: str, data: dict) -> None:
+    """Atomic replace keeps /stat readers from observing a half-written JSON file."""
+    path = _custom_badges_path(entry)
+    data["version"] = CUSTOM_BADGE_STORE_VERSION
+    _write_json_atomic(path, data)
+
+
+def _contains_emoji(text: str) -> bool:
+    """Practical stdlib-only check covering the emoji blocks Telegram commonly renders."""
+    return any(
+        0x1F000 <= ord(char) <= 0x1FAFF
+        or 0x2600 <= ord(char) <= 0x27BF
+        or 0x1F1E6 <= ord(char) <= 0x1F1FF
+        or ord(char) in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299)
+        for char in text
+    )
+
+
+def parse_custom_badge_spec(text: str) -> tuple[str, str]:
+    """Parses "<emoji> <name>" from the create-badge conversation."""
+    parts = (text or "").strip().split(maxsplit=1)
+    if len(parts) != 2 or not _contains_emoji(parts[0]):
+        raise ValueError("Отправьте эмодзи и название через пробел, например: 🎯 Меткий глаз")
+    emoji, name = parts[0], " ".join(parts[1].split())
+    if len(emoji) > 16:
+        raise ValueError("Эмодзи слишком длинный.")
+    if not name:
+        raise ValueError("У значка должно быть название.")
+    if len(name) > CUSTOM_BADGE_NAME_MAX_CHARS:
+        raise ValueError(f"Название должно быть не длиннее {CUSTOM_BADGE_NAME_MAX_CHARS} символов.")
+    return emoji, name
+
+
+def list_custom_badges(entry: str) -> list[Badge]:
+    data = _load_custom_badge_data(entry)
+    records = sorted(data["badges"].values(), key=lambda item: item.get("created_at", ""))
+    return [
+        Badge(
+            badge_id=record["id"],
+            emoji=record["emoji"],
+            name=record["name"],
+            description="выдан администратором",
+            custom=True,
+        )
+        for record in records
+    ]
+
+
+def create_custom_badge(
+    entry: str,
+    emoji: str,
+    name: str,
+    creator_id: int | str,
+    creator_name: str,
+) -> Badge:
+    data = _load_custom_badge_data(entry)
+    if len(data["badges"]) >= MAX_CUSTOM_BADGES:
+        raise ValueError(f"В одном чате можно создать не больше {MAX_CUSTOM_BADGES} значков.")
+    duplicate = next(
+        (
+            record
+            for record in data["badges"].values()
+            if record.get("emoji") == emoji and record.get("name", "").casefold() == name.casefold()
+        ),
+        None,
+    )
+    if duplicate:
+        raise ValueError("Такой значок уже существует.")
+    badge_id = uuid.uuid4().hex[:10]
+    record = {
+        "id": badge_id,
+        "emoji": emoji,
+        "name": name,
+        "created_at": app_now().isoformat(),
+        "created_by_id": str(creator_id),
+        "created_by_name": creator_name,
+    }
+    data["badges"][badge_id] = record
+    _save_custom_badge_data(entry, data)
+    return Badge(badge_id=badge_id, emoji=emoji, name=name, description="выдан администратором", custom=True)
+
+
+def give_custom_badge(
+    entry: str,
+    badge_id: str,
+    user_id: int | str,
+    user_display_name: str,
+    giver_id: int | str,
+    giver_name: str,
+) -> tuple[Badge, bool]:
+    """Returns (badge, newly_awarded); awarding the same badge twice is idempotent."""
+    data = _load_custom_badge_data(entry)
+    record = data["badges"].get(badge_id)
+    if record is None:
+        raise ValueError("Этот значок больше не существует.")
+    user_assignments = data["assignments"].setdefault(str(user_id), {})
+    newly_awarded = badge_id not in user_assignments
+    if newly_awarded:
+        user_assignments[badge_id] = {
+            "given_at": app_now().isoformat(),
+            "given_by_id": str(giver_id),
+            "given_by_name": giver_name,
+            "user_display_name": user_display_name,
+        }
+        _save_custom_badge_data(entry, data)
+    badge = Badge(
+        badge_id=record["id"],
+        emoji=record["emoji"],
+        name=record["name"],
+        description="выдан администратором",
+        custom=True,
+    )
+    return badge, newly_awarded
+
+
+def custom_badges_for_user(entry: str, user_id: int | str) -> list[Badge]:
+    """Custom badge corruption must never prevent the core /stat response."""
+    try:
+        data = _load_custom_badge_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+    assigned_ids = data["assignments"].get(str(user_id), {})
+    badges = []
+    for badge_id in assigned_ids:
+        record = data["badges"].get(badge_id)
+        if record:
+            badges.append(
+                Badge(
+                    badge_id=record["id"],
+                    emoji=record["emoji"],
+                    name=record["name"],
+                    description="выдан администратором",
+                    custom=True,
+                )
+            )
+    return badges
+
+
+def _load_weekly_contest_data(entry: str) -> dict:
+    path = _weekly_contest_path(entry)
+    if not path.exists():
+        return {"version": WEEKLY_CONTEST_STORE_VERSION, "winners": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("weekly contest file must contain a JSON object")
+    data.setdefault("winners", {})
+    return data
+
+
+def record_weekly_contest_winner(
+    entry: str,
+    contest_week: int,
+    user_id: int | str,
+    user_display_name: str,
+    giver_id: int | str,
+    giver_name: str,
+) -> tuple[str, int, str | None]:
+    """Records exactly one winner for a numbered contest week.
+
+    Returns (status, this user's total wins, existing winner name). Status is one of
+    "awarded", "already", or "taken". Repeating the same award is idempotent; assigning
+    an already-claimed week to someone else is refused rather than silently overwritten.
+    """
+    if contest_week < 1:
+        raise ValueError("Номер недели должен быть положительным числом.")
+    data = _load_weekly_contest_data(entry)
+    week_key = str(contest_week)
+    existing = data["winners"].get(week_key)
+    if existing:
+        user_wins = sum(
+            1 for winner in data["winners"].values() if str(winner.get("user_id")) == str(user_id)
+        )
+        if str(existing.get("user_id")) == str(user_id):
+            return "already", user_wins, existing.get("user_display_name")
+        return "taken", user_wins, existing.get("user_display_name")
+
+    data["winners"][week_key] = {
+        "contest_week": contest_week,
+        "user_id": str(user_id),
+        "user_display_name": user_display_name,
+        "given_at": app_now().isoformat(),
+        "given_by_id": str(giver_id),
+        "given_by_name": giver_name,
+    }
+    data["version"] = WEEKLY_CONTEST_STORE_VERSION
+    _write_json_atomic(_weekly_contest_path(entry), data)
+    user_wins = sum(
+        1 for winner in data["winners"].values() if str(winner.get("user_id")) == str(user_id)
+    )
+    return "awarded", user_wins, None
+
+
+def weekly_winner_badges_for_user(entry: str, user_id: int | str) -> list[Badge]:
+    try:
+        data = _load_weekly_contest_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+    won_weeks = sorted(
+        int(week)
+        for week, winner in data["winners"].items()
+        if str(winner.get("user_id")) == str(user_id)
+    )
+    if not won_weeks:
+        return []
+    count = len(won_weeks)
+    return [
+        Badge(
+            "weekly_contest_winner",
+            "🏆",
+            f"Победитель Недельного Конкурса ×{count}",
+            "победы в неделях: " + ", ".join(f"№{week}" for week in won_weeks),
+        )
+    ]
+
+
+def _load_level_state(entry: str) -> dict:
+    path = _level_state_path(entry)
+    if not path.exists():
+        return {"version": LEVEL_STATE_VERSION, "users": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("level state file must contain a JSON object")
+    data.setdefault("users", {})
+    return data
+
+
+def _level_announcement_name(user: "UserStats") -> str:
+    return f"@{user.username}" if user.username else user.display_name
+
+
+def record_level_observations(
+    entry: str,
+    observations: list[tuple["UserStats", int]],
+) -> list[str]:
+    """Persists observed levels and returns one announcement per actual promotion.
+
+    A user's first observation silently establishes a baseline, preventing a deployment
+    from announcing every historical level in a busy chat. Stored progress never moves
+    backward if stats are temporarily incomplete or level rules are later adjusted.
+    """
+    try:
+        data = _load_level_state(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+    announcements = []
+    dirty = False
+    for user, xp in observations:
+        level, _ = level_for_progress(xp, user.figurines_painted)
+        user_key = str(user.user_id)
+        previous = data["users"].get(user_key)
+        if previous is None:
+            data["users"][user_key] = {
+                "minimum_xp": level.minimum_xp,
+                "level_name": level.name,
+                "observed_at": app_now().isoformat(),
+            }
+            dirty = True
+            continue
+        previous_minimum_xp = int(previous.get("minimum_xp", 0))
+        if level.minimum_xp <= previous_minimum_xp:
+            continue
+        data["users"][user_key] = {
+            "minimum_xp": level.minimum_xp,
+            "level_name": level.name,
+            "observed_at": app_now().isoformat(),
+        }
+        dirty = True
+        announcements.append(
+            f"{_level_announcement_name(user)} получил новый уровень "
+            f"«{level.label}»! 🎉🎊🥳"
+        )
+    if dirty:
+        data["version"] = LEVEL_STATE_VERSION
+        _write_json_atomic(_level_state_path(entry), data)
+    return announcements
 
 
 def is_recorded(entry: str, day: date) -> bool:
@@ -229,6 +701,16 @@ def is_figurine_caption(text: str) -> bool:
     return FIGURINE_HASHTAG in (text or "").lower()
 
 
+def _has_hashtag(text: str, hashtag: str) -> bool:
+    """Case-insensitive whole-hashtag match; longer lookalike tags do not qualify."""
+    return re.search(rf"(?<!\w){re.escape(hashtag)}(?!\w)", text or "", re.IGNORECASE) is not None
+
+
+def _iso_week_key(moment: datetime) -> str:
+    iso_year, iso_week, _ = moment.date().isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
 def _live_figurines_path(entry: str, day: date) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_{day.isoformat()}_live_figurines.json"
 
@@ -242,9 +724,9 @@ def record_figurine_live(
     arrives) -- a plain local read-modify-write, no Telegram call involved, so /stat and
     /top reflect it immediately rather than waiting on the transcript cache's own TTL
     (see _live_today_users, which overlays this on top of that cache for "today").
-    `message_id` (if given) is appended to this user's recent-posts list (deduped and
-    kept newest-first, but never truncated -- see RECENT_FIGURINE_LINKS), for /stat's
-    links to them (see figurine_message_links) -- Telegram has no deep link for a
+    `message_id` (if given) is appended to this user's figurine-posts list (deduped,
+    kept newest-first, and never truncated), for /stat's links to every tracked work
+    (see figurine_message_links) -- Telegram has no deep link for a
     filtered/scoped search, only a link to one specific message. Returns the user's new
     total for `day`, for logging.
 
@@ -341,9 +823,10 @@ def compute_day_stats(messages: list) -> dict:
                 "media": 0,
                 "replies": 0,
                 "figurines": 0,
-                # [ts, message_id] pairs, one per qualifying message this day -- NOT yet
-                # trimmed to RECENT_FIGURINE_LINKS (that happens once, at merge time in
-                # _merge_day, across the whole history rather than per day).
+                "not_gay_hashtag_uses": 0,
+                "weekly_contest_weeks": [],
+                # [ts, message_id] pairs, one per qualifying message this day. The full
+                # history stays available so /stat can link to every tracked work.
                 "figurine_posts": [],
                 "hours": {},
                 "last_message_at": None,
@@ -362,6 +845,12 @@ def compute_day_stats(messages: list) -> dict:
         if m.text.startswith(MEDIA_TAG_PREFIXES) and is_figurine_caption(m.text):
             u["figurines"] += 1
             u["figurine_posts"].append([ts, m.message_id])
+        if _has_hashtag(m.text, NOT_GAY_HASHTAG):
+            u["not_gay_hashtag_uses"] += 1
+        if _has_hashtag(m.text, WEEKLY_CONTEST_HASHTAG):
+            week_key = _iso_week_key(m.dt_local)
+            if week_key not in u["weekly_contest_weeks"]:
+                u["weekly_contest_weeks"].append(week_key)
         if m.is_reply:
             u["replies"] += 1
         hour_key = str(m.dt_local.hour)
@@ -381,6 +870,7 @@ def record_day(entry: str, day: date, messages: list, log=print) -> bool:
     _stats_dir().mkdir(parents=True, exist_ok=True)
     users = compute_day_stats(messages)
     payload = {
+        "badge_stats_schema_version": BADGE_STATS_SCHEMA_VERSION,
         "entry": entry,
         "day": day.isoformat(),
         "recorded_at": app_now().isoformat(),
@@ -395,18 +885,43 @@ def record_day(entry: str, day: date, messages: list, log=print) -> bool:
     return True
 
 
+def _backfill_day_badge_stats(entry: str, day: date, payload: dict, messages: list, log=print) -> bool:
+    """Adds only the new hashtag-derived fields to an existing immutable day.
+
+    XP counters are left byte-for-byte unchanged, so introducing badges cannot reprice
+    old activity. This is used once for recent already-recorded days whose raw transcript
+    is still available through the normal transcript cache.
+    """
+    if payload.get("badge_stats_schema_version", 0) >= BADGE_STATS_SCHEMA_VERSION:
+        return False
+    recomputed = compute_day_stats(messages)
+    for user_id, existing_user in payload.get("users", {}).items():
+        source = recomputed.get(user_id, {})
+        existing_user["not_gay_hashtag_uses"] = source.get("not_gay_hashtag_uses", 0)
+        existing_user["weekly_contest_weeks"] = source.get("weekly_contest_weeks", [])
+    payload["badge_stats_schema_version"] = BADGE_STATS_SCHEMA_VERSION
+    payload["badge_stats_backfilled_at"] = app_now().isoformat()
+    _write_json_atomic(_path(entry, day), payload)
+    log(f"[stats] backfilled hashtag badges for '{entry}' on {day}")
+    return True
+
+
 async def finalize_and_record(client, chat_ref, entry: str, day: date, tz, log=print) -> bool:
     """The whole "close out a day" step listener.py's midnight rollover (and its startup
     catch-up) calls once per (entry, day): makes sure `day`'s transcript cache is
     complete (see telegram_fetch.ensure_day_finalized) then records that day's per-user
-    stats from it (see record_day). Returns False, without any Telegram calls at all, if
-    `day` was already recorded for `entry`."""
-    if is_recorded(entry, day):
+    stats from it (see record_day). A recently recorded day from before hashtag badges
+    existed is read once from the transcript cache and augmented with only those badge
+    counters; its XP fields are never recomputed."""
+    existing = _load_day(entry, day)
+    if existing and existing.get("badge_stats_schema_version", 0) >= BADGE_STATS_SCHEMA_VERSION:
         return False
     await telegram_fetch.ensure_day_finalized(client, chat_ref, day, tz, log=log)
     _, messages = await telegram_fetch.fetch_range_messages_cached(
         client=client, chat_ref=chat_ref, start_day=day, end_day=day, tz=tz, log=log,
     )
+    if existing:
+        return _backfill_day_badge_stats(entry, day, existing, messages, log=log)
     return record_day(entry, day, messages, log=log)
 
 
@@ -422,7 +937,7 @@ class UserStats:
     # the counterpart for days recorded before word-tracking existed.
     words: int = 0
     # Message points already locked in from days recorded BEFORE word-tracking existed --
-    # each such day contributes its original flat messages*LEGACY_POINTS_PER_MESSAGE value
+    # each such day contributes its original flat messages*LEGACY_XP_PER_MESSAGE value
     # (see _merge_day), computed once at merge time and simply summed here, so an old day's
     # score can never change again no matter what happens to words_per_point later. `words`
     # above is the separate, live counterpart for days that DO have real word data.
@@ -437,11 +952,13 @@ class UserStats:
     # scoring stat.
     replies: int = 0
     figurines_painted: int = 0
+    not_gay_hashtag_uses: int = 0
+    # ISO week keys, e.g. "2026-W30". A set makes several #итогинедели posts in the
+    # same week count only once, including when that week spans two merged day files.
+    weekly_contest_weeks: set = field(default_factory=set)
     # ALL of this person's [ts, message_id] figurine posts ever, newest first, never
-    # truncated (see RECENT_FIGURINE_LINKS) -- so /stat can link straight to their most
-    # recent few (see figurine_message_links, which slices to RECENT_FIGURINE_LINKS at
-    # DISPLAY time) while format_procrastinators can still find the true most recent post
-    # for anyone regardless of their total count.
+    # truncated -- /stat links to the complete tracked set, while
+    # format_procrastinators uses the first item as the true most recent post.
     recent_figurine_posts: list = field(default_factory=list)
     active_days: int = 0
     # ISO date strings ("YYYY-MM-DD") for every day this person posted at least once --
@@ -453,10 +970,10 @@ class UserStats:
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
 
-    def score(self, words_per_point: float) -> int:
+    def xp(self, words_per_point: float) -> int:
         """`words_per_point` -- see the function of that name -- is this chat's frozen
         words/message baseline. It's a required argument rather than a module constant
-        because, unlike the other POINTS_PER_* values, it's calibrated per chat (from
+        because, unlike the other XP_PER_* values, it's calibrated per chat (from
         that chat's own real activity) rather than picked as one universal number (see
         the module docstring's Scoring section) -- but once calibrated, it's fixed, same
         as the others. `legacy_message_points` (days from before word-tracking existed)
@@ -466,22 +983,24 @@ class UserStats:
         return round(
             self.legacy_message_points
             + self.words / words_per_point
-            + self.media * POINTS_PER_MEDIA_MESSAGE
-            + self.replies * POINTS_PER_REPLY
-            + self.active_days * POINTS_PER_ACTIVE_DAY
-            + self.figurines_painted * POINTS_PER_FIGURINE
+            + self.media * XP_PER_MEDIA_MESSAGE
+            + self.replies * XP_PER_REPLY
+            + self.active_days * XP_PER_ACTIVE_DAY
+            + self.figurines_painted * XP_PER_FIGURINE
         )
+
+    def score(self, words_per_point: float) -> int:
+        """Backward-compatible alias for integrations that imported the old name."""
+        return self.xp(words_per_point)
 
 
 def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
     """Combines `existing` [ts, message_id] pairs with `new_posts` (any iterable of the
-    same shape) and sorts newest-first -- deliberately NEVER truncates (see
-    RECENT_FIGURINE_LINKS's own docstring): every qualifying post is kept forever, so
-    format_procrastinators can always find the TRUE most recent post regardless of how
-    many someone has painted in total. Callers that only want a bounded list for display
-    (figurine_message_links) slice it themselves. The one place this merge+dedup happens,
-    used by both _merge_day (across recorded days) and record_figurine_live/
-    _live_today_users (today's live counter).
+    same shape) and sorts newest-first -- deliberately NEVER truncates: every qualifying
+    post is kept forever, so /stat can link to every tracked work and
+    format_procrastinators can always find the TRUE most recent post. The one place this
+    merge+dedup happens, used by both _merge_day (across recorded days) and
+    record_figurine_live/_live_today_users (today's live counter).
 
     De-dupes by message_id first: the SAME message can legitimately reach this from two
     independent sources with two different timestamps -- record_figurine_live's live
@@ -541,10 +1060,12 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
         if word_scored_day:
             s.words += u.get("words", 0)
         else:
-            s.legacy_message_points += u.get("messages", 0) * LEGACY_POINTS_PER_MESSAGE
+            s.legacy_message_points += u.get("messages", 0) * LEGACY_XP_PER_MESSAGE
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
         s.figurines_painted += u.get("figurines", 0)
+        s.not_gay_hashtag_uses += u.get("not_gay_hashtag_uses", 0)
+        s.weekly_contest_weeks.update(u.get("weekly_contest_weeks", []))
         if u.get("figurine_posts"):
             s.recent_figurine_posts = _merge_recent_figurine_posts(s.recent_figurine_posts, u["figurine_posts"])
         if u.get("messages", 0) > 0:
@@ -708,6 +1229,7 @@ async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict
             {
                 "username": None, "display_name": live.get("display_name", "Unknown"),
                 "messages": 0, "chars": 0, "words": 0, "media": 0, "replies": 0, "figurines": 0,
+                "not_gay_hashtag_uses": 0, "weekly_contest_weeks": [],
                 "figurine_posts": [],
                 "hours": {}, "last_message_at": None,
             },
@@ -825,19 +1347,64 @@ async def words_per_point(client, chat_ref, entry: str, tz, log=print) -> float:
     return value
 
 
+async def collect_level_up_announcements(
+    client,
+    chat_ref,
+    entry: str,
+    tz,
+    log=print,
+) -> list[str]:
+    """Observes every tracked user's current level, normally once at daily rollover."""
+    users = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
+    if not users:
+        return []
+    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
+    observations = [(user, user.xp(wpp)) for user in users.values()]
+    return record_level_observations(entry, observations)
+
+
+def most_improved_user(
+    current: dict[str, UserStats],
+    previous: dict[str, UserStats],
+    words_per_point_value: float,
+) -> tuple[UserStats, int] | None:
+    """Largest positive XP change between two equal windows, including newcomers."""
+    candidates = []
+    for user_id, user in current.items():
+        current_xp = user.xp(words_per_point_value)
+        previous_user = previous.get(user_id)
+        previous_xp = previous_user.xp(words_per_point_value) if previous_user else 0
+        delta = current_xp - previous_xp
+        if delta > 0:
+            candidates.append((delta, current_xp, user))
+    if not candidates:
+        return None
+    delta, _, user = max(candidates, key=lambda item: (item[0], item[1]))
+    return user, delta
+
+
 async def format_top(client, chat_ref, entry: str, period: str, tz, top_n: int, log=print) -> str:
     if period == "all":
         combined = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
+        start = None
     else:
         start, end = resolve_period_window(period, tz)
         combined = await aggregate_live(client, chat_ref, entry, start, end, tz, log=log)
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
-    ranked = sorted(combined.values(), key=lambda s: s.score(wpp), reverse=True)[:top_n]
+    ranked = sorted(combined.values(), key=lambda s: s.xp(wpp), reverse=True)[:top_n]
     if not ranked:
         return "Пока нет данных за этот период."
-    lines = ["🏆 Топ активистов:", ""]
+    lines = ["🏆 Топ по XP:", ""]
     for i, s in enumerate(ranked, start=1):
-        lines.append(f"{i}. {s.display_name} — {s.score(wpp)} очков")
+        lines.append(f"{i}. {s.display_name} — {s.xp(wpp)} XP")
+    if period == "week" and start is not None:
+        previous_end = start - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=PERIOD_LOOKBACK_DAYS["week"])
+        previous = aggregate(entry, previous_start, previous_end)
+        improved = most_improved_user(combined, previous, wpp)
+        if improved:
+            user, delta = improved
+            lines.extend(["", f"🚀 Прорыв недели: {user.display_name} (+{delta} XP к прошлой неделе)"])
     return "\n".join(lines)
 
 
@@ -904,7 +1471,7 @@ async def format_procrastinators(
     pool = aggregate(entry, month_start, historical_end) if month_start <= historical_end else {}
     _merge_day(pool, {"day": today.isoformat(), "users": live_today})
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
-    ranked = sorted(pool.values(), key=lambda s: s.score(wpp), reverse=True)
+    ranked = sorted(pool.values(), key=lambda s: s.xp(wpp), reverse=True)
 
     all_time = aggregate_all_time(entry)
     _merge_day(all_time, {"day": today.isoformat(), "users": live_today})
@@ -973,16 +1540,13 @@ def figurine_message_link(chat_username: str | None, chat_id: int | None, messag
 
 
 def figurine_message_links(chat_username: str | None, chat_id: int | None, user: UserStats) -> list[str]:
-    """figurine_message_link, applied across the `RECENT_FIGURINE_LINKS` most recent of
-    `user.recent_figurine_posts` (which itself holds the person's WHOLE history, newest
-    first, never truncated -- see RECENT_FIGURINE_LINKS's own docstring) -- what /stat's
-    "Последние N работы" section links to. This is the one place that cap is actually
-    applied. Skips (rather than emitting a broken link for) any post that can't be
-    linked, e.g. a chat with neither a public username nor a resolvable marked id -- see
-    figurine_message_link's own docstring for when that happens -- so the result can have
-    fewer than RECENT_FIGURINE_LINKS links, never more."""
+    """Return direct links for every tracked figurine post, newest first.
+
+    Skips a post rather than emitting a broken link when the chat has neither a public
+    username nor a resolvable marked id; see figurine_message_link for those cases.
+    """
     links = []
-    for _, message_id in user.recent_figurine_posts[:RECENT_FIGURINE_LINKS]:
+    for _, message_id in user.recent_figurine_posts:
         link = figurine_message_link(chat_username, chat_id, message_id)
         if link:
             links.append(link)
@@ -990,35 +1554,59 @@ def figurine_message_links(chat_username: str | None, chat_id: int | None, user:
 
 
 def format_stat(
-    user: UserStats, rank: int, total: int, score: int, streak: int, figurine_links: list[str] | None = None
+    user: UserStats,
+    rank: int,
+    total: int,
+    xp: int,
+    streak: int,
+    figurine_links: list[str] | None = None,
+    custom_badges: list[Badge] | None = None,
 ) -> str:
-    """`score` and `streak` are computed by the caller (resolve_stat_target) rather than
-    read/derived off `user` directly -- UserStats.score needs the chat's current
+    """Build an HTML-formatted `/stat` message.
+
+    `xp` and `streak` are computed by the caller (resolve_stat_target) rather than
+    read/derived off `user` directly -- UserStats.xp needs the chat's current
     words_per_point, and the streak needs "today" (see _current_streak), neither of which
-    this function has any way to get itself (it's sync, with no client/chat_ref/tz)."""
+    this function has any way to get itself (it's sync, with no client/chat_ref/tz).
+    User-controlled fields are escaped so callers can safely send the result with
+    Telegram's HTML parse mode; that enables compact clickable work numbers.
+    """
     avg = user.messages / user.active_days if user.active_days else 0.0
     last_seen = "нет данных"
     if user.last_message_at:
         last_seen = datetime.fromisoformat(user.last_message_at).strftime("%Y-%m-%d %H:%M")
-    score_str = f"{score:,}".replace(",", ".")
-    activity_line = f"Активность: {_ru_days(user.active_days)}"
+    xp_str = f"{xp:,}".replace(",", ".")
+    coins_str = f"{coins_for_xp(xp):,}".replace(",", ".")
+    messages_str = f"{user.messages:,}".replace(",", ".")
+    level, _ = level_for_progress(xp, user.figurines_painted)
+    activity_line = f"Активных дней: {user.active_days}"
     if streak > 0:
-        activity_line += f" 🔥{_ru_days(streak)}"
+        activity_line += f" (🔥 Серия: {_ru_days(streak)})"
     text = (
         "📊 Статистика пользователя:\n\n"
-        f"Имя: {user.display_name}\n"
-        f"🏆 Очки: 🪙{score_str}\n"
+        f"Имя: {escape(user.display_name)}\n"
+        f"⭐ XP: {xp_str}\n"
+        f"🪙 Монеты: {coins_str}\n"
+        f"🧩 Уровень: {escape(level.label)}\n"
         f"📈 Место в рейтинге: {rank} из {total}\n"
-        f"Сообщений: {user.messages}\n"
-        f"Среднее сообщений в день: {avg:.1f}\n"
+        f"Фигурок: {user.figurines_painted} ({FIGURINE_HASHTAG})\n"
         f"{activity_line}\n"
-        f"Покрашено фигурок: {user.figurines_painted} (+{POINTS_PER_FIGURINE} за фигурку {FIGURINE_HASHTAG})\n"
+        f"💬 Сообщений: {messages_str} ({avg:.1f} в день)\n"
         f"Любимое время: {_favorite_hour_label(user.hours)}\n"
         f"Последняя активность: {last_seen}"
     )
+    badges = earned_badges(user) + list(custom_badges or [])
+    if badges:
+        text += "\n\n🏅 Значки:\n" + "\n".join(escape(badge.label) for badge in badges)
+    else:
+        text += "\n\n🏅 Значки: пока нет"
+
     if figurine_links:
-        works = "\n".join(f"{i}. {link}" for i, link in enumerate(figurine_links, start=1))
-        text += f"\n\nПоследние 3 работы:\n{works}"
+        works = " · ".join(
+            f'<a href="{escape(link, quote=True)}">{i}</a>'
+            for i, link in enumerate(figurine_links, start=1)
+        )
+        text += f"\n\n🎨 Все работы (сначала новые):\n{works}"
     return text
 
 
@@ -1047,14 +1635,14 @@ async def resolve_stat_target(
     all-time-plus-today-live aggregate exactly once regardless of how many of those three
     lookups it takes, rather than once per attempt.
 
-    Returns (user, rank, total, score, streak): `rank` is the person's 1-based position by
-    score among everyone ever tracked for this chat (ties broken by dict iteration order,
+    Returns (user, rank, total, xp, streak): `rank` is the person's 1-based position by
+    XP among everyone ever tracked for this chat (ties broken by dict iteration order,
     which is stable but arbitrary -- fine for a gamified leaderboard, not meant to be
-    exact), and `total` is how many people that's out of. `score` and `streak` are
+    exact), and `total` is how many people that's out of. `xp` and `streak` are
     returned alongside `user` (rather than left for the caller to derive from `user`
     itself) since both need context this function already has and format_stat doesn't --
-    words_per_point for score (see UserStats.score) and today's date for streak (see
-    _current_streak). `rank`/`score`/`streak` are None (with user) if no match was found;
+    words_per_point for XP (see UserStats.xp) and today's date for streak (see
+    _current_streak). `rank`/`xp`/`streak` are None (with user) if no match was found;
     `total` is still meaningful in that case (could be used for a "N people tracked"
     message even without a match, though callers currently don't)."""
     all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
@@ -1068,8 +1656,8 @@ async def resolve_stat_target(
     if user is None:
         return None, None, total, None, None
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
-    ranked = sorted(all_time.values(), key=lambda s: s.score(wpp), reverse=True)
+    ranked = sorted(all_time.values(), key=lambda s: s.xp(wpp), reverse=True)
     rank = next(i for i, s in enumerate(ranked, start=1) if s.user_id == user.user_id)
     today = datetime.now(tz).date()
     streak = _current_streak(user.active_day_dates, today)
-    return user, rank, total, user.score(wpp), streak
+    return user, rank, total, user.xp(wpp), streak
