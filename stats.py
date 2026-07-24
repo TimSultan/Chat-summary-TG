@@ -1693,9 +1693,6 @@ def format_stat(
     Telegram's HTML parse mode; that enables compact clickable work numbers.
     """
     avg = user.messages / user.active_days if user.active_days else 0.0
-    last_seen = "нет данных"
-    if user.last_message_at:
-        last_seen = datetime.fromisoformat(user.last_message_at).strftime("%Y-%m-%d %H:%M")
     xp_str = f"{xp:,}".replace(",", ".")
     coins_str = f"{coins_for_xp(xp):,}".replace(",", ".")
     messages_str = f"{user.messages:,}".replace(",", ".")
@@ -1705,20 +1702,25 @@ def format_stat(
         activity_line += f" (🔥 Серия: {_ru_days(streak)})"
     text = (
         "📊 Статистика пользователя:\n\n"
-        f"Имя: {escape(user.display_name)}\n"
+        f"Имя: {escape(user.display_name)}\n\n"
         f"⭐ XP: {xp_str}\n"
         f"🪙 Монеты: {coins_str}\n"
         f"🧩 Уровень: {escape(level.label)}\n"
-        f"📈 Место в рейтинге: {rank} из {total}\n"
+        f"📈 Место в рейтинге: {rank} из {total}\n\n"
         f"Фигурок: {user.figurines_painted} ({FIGURINE_HASHTAG})\n"
         f"{activity_line}\n"
         f"💬 Сообщений: {messages_str} ({avg:.1f} в день)\n"
-        f"Любимое время: {_favorite_hour_label(user.hours)}\n"
-        f"Последняя активность: {last_seen}"
+        f"Любимое время: {_favorite_hour_label(user.hours)}"
     )
     badges = earned_badges(user) + list(custom_badges or [])
     if badges:
-        text += "\n\n🏅 Значки:\n" + "\n".join(escape(badge.label) for badge in badges)
+        labels = [escape(badge.label) for badge in badges]
+        badge_rows = [
+            labels[index]
+            + (f"  │  {labels[index + 1]}" if index + 1 < len(labels) else "")
+            for index in range(0, len(labels), 2)
+        ]
+        text += "\n\n🏅 Значки:\n" + "\n".join(badge_rows)
     else:
         text += "\n\n🏅 Значки: пока нет"
 
@@ -1727,7 +1729,7 @@ def format_stat(
             f'<a href="{escape(link, quote=True)}">{i}</a>'
             for i, link in enumerate(figurine_links, start=1)
         )
-        text += f"\n\n🎨 Все работы (сначала новые):\n{works}"
+        text += f"\n\n🎨 Все работы:\n{works}"
     return text
 
 

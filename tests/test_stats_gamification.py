@@ -171,6 +171,40 @@ class GamificationTests(unittest.TestCase):
         self.assertIn("🏹 Лучник", text)
         self.assertIn('<a href="https://t.me/example/1">1</a>', text)
 
+    def test_stat_groups_sections_and_formats_badges_in_two_columns(self):
+        custom = [
+            stats.Badge(f"custom-{number}", emoji, name, custom=True)
+            for number, (emoji, name) in enumerate(
+                [
+                    ("🏹", "Лучник"),
+                    ("🎯", "Меткий глаз"),
+                    ("🛡️", "Защитник"),
+                    ("🧙", "Волшебник"),
+                    ("🐉", "Дракон"),
+                ],
+                start=1,
+            )
+        ]
+        text = stats.format_stat(
+            stats.UserStats(user_id="1", display_name="Tester"),
+            rank=1,
+            total=1,
+            xp=0,
+            streak=0,
+            custom_badges=custom,
+        )
+
+        self.assertIn("Имя: Tester\n\n⭐ XP:", text)
+        self.assertIn("Место в рейтинге: 1 из 1\n\nФигурок:", text)
+        self.assertNotIn("Последняя активность:", text)
+        self.assertIn(
+            "🏅 Значки:\n"
+            "🏹 Лучник  │  🎯 Меткий глаз\n"
+            "🛡️ Защитник  │  🧙 Волшебник\n"
+            "🐉 Дракон",
+            text,
+        )
+
     def test_every_tracked_figurine_post_gets_a_link(self):
         user = stats.UserStats(
             user_id="1",

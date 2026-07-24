@@ -284,6 +284,8 @@ The activity block stays compact and uses dot-separated thousands:
 ```
 
 The streak note is hidden when the current streak is zero.
+The name, progression, and activity sections are separated by blank lines. The last
+activity timestamp is intentionally omitted, and badges are rendered two per row.
 
 When a tracked user reaches a higher level, the bot posts one persistent announcement:
 
