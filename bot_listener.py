@@ -2467,6 +2467,7 @@ async def _dispatch_update(
                             user, rank, total, xp, streak, figurine_links, custom_badges,
                             best_work_link=best_work_link, workplace_link=workplace_link,
                             season_xp=season_xp, bot_username=bot_username,
+                            work_names=stats.work_name_list(matched_entry, user),
                             **economy.stat_extras(matched_entry, user.user_id, xp),
                         )
                         reply_parse_mode = "HTML"

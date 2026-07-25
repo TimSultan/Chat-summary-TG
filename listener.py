@@ -1287,6 +1287,7 @@ async def run_listener(
                                 user, rank, total, xp, streak, figurine_links, custom_badges,
                                 best_work_link=best_work_link, workplace_link=workplace_link,
                                 season_xp=season_xp,
+                                work_names=stats.work_name_list(entry, user),
                                 **economy.stat_extras(entry, user.user_id, xp),
                             )
                             stat_uses_html = True

@@ -791,6 +791,14 @@ def work_names_for_user(entry: str, user_id: int | str) -> dict:
     return (_load_work_names(entry).get("users") or {}).get(str(user_id)) or {}
 
 
+def work_name_list(entry: str, user: "UserStats") -> list:
+    """Names aligned position-for-position with figurine_message_links, None where a work
+    has not been named. One helper so /stat, the cabinet's stats screen and the group
+    reply all label works identically instead of each doing the message_id lookup."""
+    names = work_names_for_user(entry, user.user_id)
+    return [names.get(str(message_id)) for _, message_id in user.recent_figurine_posts]
+
+
 def set_work_name(entry: str, user_id: int | str, message_id: int | str, name: str) -> str:
     """Name (or, with an empty `name`, un-name) one work. Returns the stored name."""
     data = _load_work_names(entry)
@@ -2315,6 +2323,7 @@ def format_stat(
     custom_title: str | None = None,
     season_xp: int | None = None,
     bot_username: str | None = None,
+    work_names: list | None = None,
 ) -> str:
     """Build an HTML-formatted `/stat` message.
 
@@ -2403,11 +2412,16 @@ def format_stat(
         text += "\n\n🏅 Значки: пока нет"
 
     if figurine_links:
-        works = " · ".join(
-            f'<a href="{escape(link, quote=True)}">{i}</a>'
-            for i, link in enumerate(figurine_links, start=1)
-        )
-        text += f"\n\n🎨 Все работы:\n{works}"
+        # The NUMBER always stays visible, named or not: /deletepokras takes the number
+        # shown here as its argument, so replacing it with a name would leave an
+        # administrator with nothing to point at.
+        labels = list(work_names or [])
+        entries = []
+        for index, link in enumerate(figurine_links, start=1):
+            name = labels[index - 1] if index - 1 < len(labels) else None
+            caption = f"{index}. {escape(name)}" if name else str(index)
+            entries.append(f'<a href="{escape(link, quote=True)}">{caption}</a>')
+        text += "\n\n🎨 Все работы:\n" + " · ".join(entries)
 
     # Last line, so it reads as "and there's more over there" rather than competing with
     # the numbers above. The ?start= payload means one tap opens the cabinet instead of

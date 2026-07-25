@@ -357,6 +357,48 @@ class GamificationTests(unittest.TestCase):
             text,
         )
 
+    def test_stat_shows_work_names_but_keeps_the_numbers(self):
+        user = stats.UserStats(user_id="1", display_name="T", figurines_painted=3)
+        links = [f"https://t.me/example/{n}" for n in (105, 104, 103)]
+
+        text = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0,
+            figurine_links=links, work_names=[None, "Дредноут", None],
+        )
+
+        self.assertIn(">2. Дредноут</a>", text)
+        # The number must survive: /deletepokras takes it as its argument, so an
+        # administrator needs something to point at.
+        self.assertIn(">1</a>", text)
+        self.assertIn(">3</a>", text)
+
+    def test_work_names_are_escaped_and_a_short_list_is_tolerated(self):
+        user = stats.UserStats(user_id="1", display_name="T", figurines_painted=2)
+        links = ["https://t.me/example/105", "https://t.me/example/104"]
+
+        # Fewer names than links must not raise -- the two lists are built from the same
+        # source, but a stale cache could briefly disagree.
+        text = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0,
+            figurine_links=links, work_names=["<b>hax</b>"],
+        )
+
+        self.assertNotIn("<b>hax", text)
+        self.assertIn("&lt;b&gt;hax", text)
+        self.assertIn(">2</a>", text)
+
+    def test_work_name_list_lines_up_with_the_links(self):
+        user = stats.UserStats(
+            user_id="1",
+            recent_figurine_posts=[["t3", 105], ["t2", 104], ["t1", 103]],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.set_work_name("chat", "1", 104, "Дредноут")
+                labels = stats.work_name_list("chat", user)
+
+        self.assertEqual(labels, [None, "Дредноут", None])
+
     def test_unique_badges_lead_and_earned_ones_follow(self):
         user = stats.UserStats(user_id="1", display_name="Tester", messages=1_000)
         unique = stats.Badge("custom", "🏹", "Лучник", custom=True)

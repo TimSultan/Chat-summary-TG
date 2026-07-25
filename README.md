@@ -547,8 +547,11 @@ omitted entirely when no bot username is available, which is exactly the case wh
 `listener.py` answers `/stat` itself and there is no cabinet to link to.
 
 Badges appear near the end of `/stat`, immediately before the complete tracked work
-history. Every work is represented by a compact clickable number (newest first), with
-no three-work display cap. No new message schema or history fetch is needed for
+history. Every work is a compact clickable entry (newest first) with no display cap, showing
+`номер. Название` once it has been named in the cabinet and a bare number until then. The
+number always stays visible even for a named work: `/deletepokras` takes the number shown
+here as its argument, so replacing it with a name would leave an administrator nothing to
+point at. No new message schema or history fetch is needed for
 automatic badges.
 
 Custom badges are created and awarded with `/badge` in a private chat with the bot.
