@@ -534,6 +534,18 @@ Painting medals, message-count badges, streak badges, and night-shift badges are
 families: `/stat` displays only the highest unlocked badge in each family. For example,
 `📣 Голос чата` replaces `💯 Сотня` at 1,000 messages instead of appearing beside it.
 
+Custom badges are rendered **first**, in their own `✨ Уникальные значки` block, above the
+automatic ones — they are the only badges somebody chose to give this person, and mixed
+into a dozen automatic counters that is exactly what gets lost. The split is on
+`Badge.custom`, so a weekly-contest win (assigned by an administrator, but *won*) stays
+with the earned ones.
+
+The last line of `/stat` is a `t.me/<bot>?start=cabinet` deep link — one tap opens the
+member's cabinet instead of dropping them into an empty DM where they would still have to
+know a command. `/start` (with or without the payload) opens the cabinet too. The link is
+omitted entirely when no bot username is available, which is exactly the case where
+`listener.py` answers `/stat` itself and there is no cabinet to link to.
+
 Badges appear near the end of `/stat`, immediately before the complete tracked work
 history. Every work is represented by a compact clickable number (newest first), with
 no three-work display cap. No new message schema or history fetch is needed for

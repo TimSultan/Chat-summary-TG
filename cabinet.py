@@ -272,11 +272,12 @@ def badges_view(
     custom_badges: list,
     chat_custom_badge_total: int = 0,
 ) -> tuple[str, dict]:
-    """Admin-granted badges first, then earned ones, then a completion counter.
+    """Hand-made badges first, then earned ones, then a completion counter.
 
-    Admin badges lead because they are the only ones somebody chose to give this person;
-    buried among a dozen automatic counters they lose exactly what makes them worth
-    having. The split is on Badge.custom, which is what that flag exists for.
+    They lead because they are the only ones somebody chose to give this person; buried
+    among a dozen automatic counters that is exactly what gets lost. The split is on
+    Badge.custom, which is what that flag exists for -- a weekly-contest win is assigned
+    by an administrator but is still earned, so it stays below.
     """
     given = [badge for badge in (custom_badges or []) if getattr(badge, "custom", False)]
     other_awarded = [badge for badge in (custom_badges or []) if not getattr(badge, "custom", False)]
@@ -284,7 +285,7 @@ def badges_view(
 
     lines = ["🏅 <b>Значки</b>"]
     if given:
-        lines.append("\n<b>От администрации</b>")
+        lines.append("\n✨ <b>Уникальные значки</b>")
         for badge in given:
             lines.append(escape(badge.label))
     if earned:

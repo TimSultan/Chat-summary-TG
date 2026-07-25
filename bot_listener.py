@@ -2265,6 +2265,14 @@ async def _dispatch_update(
         known_chat_ids[matched_entry] = chat["id"]
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
+    if re.match(r"^/start(?:\s|$)", command_text, re.IGNORECASE):
+        # Where /stat's "Открыть личный кабинет" link lands (t.me/<bot>?start=cabinet),
+        # and the natural first thing a new member does anyway. Groups are ignored: a
+        # /start there is somebody's fat finger, not a request.
+        if chat.get("type") != "private":
+            return
+        await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
+        return
     if re.match(rf"^{re.escape(CABINET_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         # In a group this would print somebody's balance for everyone and offer buttons
         # that spend their coins, so it points them at the DM instead of refusing.
@@ -2458,7 +2466,7 @@ async def _dispatch_update(
                         reply_text = stats.format_stat(
                             user, rank, total, xp, streak, figurine_links, custom_badges,
                             best_work_link=best_work_link, workplace_link=workplace_link,
-                            season_xp=season_xp,
+                            season_xp=season_xp, bot_username=bot_username,
                             **economy.stat_extras(matched_entry, user.user_id, xp),
                         )
                         reply_parse_mode = "HTML"

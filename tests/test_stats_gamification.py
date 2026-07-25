@@ -318,7 +318,8 @@ class GamificationTests(unittest.TestCase):
         self.assertIn("🧩 Уровень: 🗣️ Голос чата 11", text)
         self.assertIn("🎨 Звание: 🩶 Серый новичок", text)
         self.assertNotIn("До уровня", text)
-        self.assertLess(text.index("🏅 Значки:"), text.index("🎨 Все работы"))
+        # A hand-made badge goes in its own block, above the works list.
+        self.assertLess(text.index("✨ Уникальные значки:"), text.index("🎨 Все работы"))
         self.assertIn("🏹 Лучник", text)
         self.assertIn('<a href="https://t.me/example/1">1</a>', text)
 
@@ -349,12 +350,59 @@ class GamificationTests(unittest.TestCase):
         self.assertIn("Место в рейтинге: 1 из 1\n\nФигурок:", text)
         self.assertNotIn("Последняя активность:", text)
         self.assertIn(
-            "🏅 Значки:\n"
+            "✨ Уникальные значки:\n"
             "🏹 Лучник  │  🎯 Меткий глаз\n"
             "🛡️ Защитник  │  🧙 Волшебник\n"
             "🐉 Дракон",
             text,
         )
+
+    def test_unique_badges_lead_and_earned_ones_follow(self):
+        user = stats.UserStats(user_id="1", display_name="Tester", messages=1_000)
+        unique = stats.Badge("custom", "🏹", "Лучник", custom=True)
+        # Assigned by an administrator, but won -- it belongs with the earned ones.
+        won = stats.Badge("weekly_contest_winner", "🏆", "Победитель ×1")
+
+        text = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0, custom_badges=[unique, won]
+        )
+
+        self.assertLess(text.index("✨ Уникальные значки:"), text.index("🏅 Значки:"))
+        self.assertLess(text.index("🏹 Лучник"), text.index("🏅 Значки:"))
+        self.assertGreater(text.index("🏆 Победитель ×1"), text.index("🏅 Значки:"))
+
+    def test_the_no_badges_notice_only_shows_when_there_are_truly_none(self):
+        blank = stats.format_stat(
+            stats.UserStats(user_id="1", display_name="T"), rank=1, total=1, xp=0, streak=0
+        )
+        self.assertIn("🏅 Значки: пока нет", blank)
+
+        # A unique badge alone must not read as "no badges yet".
+        unique = stats.Badge("custom", "🏹", "Лучник", custom=True)
+        only_unique = stats.format_stat(
+            stats.UserStats(user_id="1", display_name="T"),
+            rank=1, total=1, xp=0, streak=0, custom_badges=[unique],
+        )
+        self.assertNotIn("пока нет", only_unique)
+        self.assertIn("✨ Уникальные значки:", only_unique)
+
+    def test_the_cabinet_link_is_last_and_omitted_without_a_bot(self):
+        user = stats.UserStats(user_id="1", display_name="Tester", figurines_painted=1)
+
+        linked = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0,
+            figurine_links=["https://t.me/example/1"], bot_username="Trash_Modelist",
+        )
+        self.assertIn("t.me/Trash_Modelist?start=cabinet", linked)
+        # Truly last, below even the works list.
+        self.assertGreater(linked.index("Открыть личный кабинет"), linked.index("🎨 Все работы"))
+        self.assertTrue(linked.rstrip().endswith("</a>"))
+
+        # listener.py's own /stat only runs when no bot is configured, and then there is
+        # no cabinet to link to at all.
+        self.assertNotIn("Открыть личный кабинет", stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0
+        ))
 
     def test_every_tracked_figurine_post_gets_a_link(self):
         user = stats.UserStats(

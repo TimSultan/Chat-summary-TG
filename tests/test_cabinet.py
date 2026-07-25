@@ -211,21 +211,21 @@ class BadgeSectionTests(unittest.TestCase):
 
         text, _ = cabinet.badges_view("chat", user, [given])
 
-        self.assertIn("От администрации", text)
+        self.assertIn("Уникальные значки", text)
         self.assertIn("Заработанные", text)
-        self.assertLess(text.index("От администрации"), text.index("Заработанные"))
+        self.assertLess(text.index("Уникальные значки"), text.index("Заработанные"))
         self.assertLess(text.index("🏹 Лучник"), text.index("Заработанные"))
 
     def test_the_admin_section_is_omitted_when_there_are_none(self):
         text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
-        self.assertNotIn("От администрации", text)
+        self.assertNotIn("Уникальные значки", text)
 
     def test_a_weekly_win_is_earned_not_admin_granted(self):
         # It is assigned by an administrator, but it is won -- Badge.custom is the
         # discriminator, and the contest badge does not set it.
         won = stats.Badge("weekly_contest_winner", "🏆", "Победитель ×1")
         text, _ = cabinet.badges_view("chat", _user(), [won])
-        self.assertNotIn("От администрации", text)
+        self.assertNotIn("Уникальные значки", text)
         self.assertIn("🏆 Победитель ×1", text)
 
     def test_collection_counter_counts_tiers_levels_and_ranks(self):

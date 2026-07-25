@@ -207,6 +207,9 @@ CUSTOM_BADGE_STORE_VERSION = 1
 # would already look current and the two tags would only ever be seen going forward.
 BADGE_STATS_SCHEMA_VERSION = 2
 WEEKLY_CONTEST_STORE_VERSION = 1
+# Deep-link payload behind /stat's cabinet link: t.me/<bot>?start=cabinet makes
+# Telegram show a START button that sends "/start cabinet" to the bot.
+CABINET_START_PAYLOAD = "cabinet"
 WORK_NAME_STORE_VERSION = 1
 BADGE_MANAGER_STORE_VERSION = 1
 # Long enough for "Космодесантник Ультрамаринов", short enough that thirty of them still
@@ -2311,6 +2314,7 @@ def format_stat(
     reputation: int = 0,
     custom_title: str | None = None,
     season_xp: int | None = None,
+    bot_username: str | None = None,
 ) -> str:
     """Build an HTML-formatted `/stat` message.
 
@@ -2375,16 +2379,27 @@ def format_stat(
         f"💬 Сообщений: {messages_str} ({avg:.1f} в день)\n"
         f"Любимое время: {_favorite_hour_label(user.hours)}"
     )
-    badges = earned_badges(user) + list(custom_badges or [])
-    if badges:
-        labels = [escape(badge.label) for badge in badges]
-        badge_rows = [
-            labels[index]
-            + (f"  │  {labels[index + 1]}" if index + 1 < len(labels) else "")
+    def _two_column(items: list[Badge]) -> str:
+        labels = [escape(badge.label) for badge in items]
+        return "\n".join(
+            labels[index] + (f"  │  {labels[index + 1]}" if index + 1 < len(labels) else "")
             for index in range(0, len(labels), 2)
-        ]
-        text += "\n\n🏅 Значки:\n" + "\n".join(badge_rows)
-    else:
+        )
+
+    # Hand-made badges lead, in their own named block: they are the only ones somebody
+    # chose to give this person, and mixed into a dozen automatic counters that is
+    # exactly what gets lost. Split on Badge.custom, which is what that flag is for --
+    # a weekly-contest win is assigned by an administrator but is still earned, so it
+    # stays below with the rest.
+    unique = [badge for badge in (custom_badges or []) if badge.custom]
+    earned = earned_badges(user) + [
+        badge for badge in (custom_badges or []) if not badge.custom
+    ]
+    if unique:
+        text += "\n\n✨ Уникальные значки:\n" + _two_column(unique)
+    if earned:
+        text += "\n\n🏅 Значки:\n" + _two_column(earned)
+    elif not unique:
         text += "\n\n🏅 Значки: пока нет"
 
     if figurine_links:
@@ -2393,6 +2408,17 @@ def format_stat(
             for i, link in enumerate(figurine_links, start=1)
         )
         text += f"\n\n🎨 Все работы:\n{works}"
+
+    # Last line, so it reads as "and there's more over there" rather than competing with
+    # the numbers above. The ?start= payload means one tap opens the cabinet instead of
+    # dropping somebody into an empty DM where they still have to know a command.
+    # Omitted entirely when there is no bot to link to -- listener.py's own /stat path
+    # only runs when no bot token is configured, and then there is no cabinet at all.
+    if bot_username:
+        text += (
+            f'\n\n<a href="https://t.me/{escape(bot_username, quote=True)}'
+            f'?start={CABINET_START_PAYLOAD}">👤 Открыть личный кабинет</a>'
+        )
     return text
 
 
