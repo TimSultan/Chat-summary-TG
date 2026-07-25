@@ -312,6 +312,121 @@ class MenuFallbackTests(unittest.TestCase):
         self.assertEqual(len(self.api.sent), 2)
 
 
+class RenderCostTests(unittest.TestCase):
+    """Every screen used to cost two Telegram entity lookups and a full re-aggregation,
+    which is what made the menu feel slow. These pin the fix."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        bot_listener._CABINET_CHAT_REF_CACHE.clear()
+        bot_listener._CABINET_CONTEXT_CACHE.clear()
+        self.addCleanup(bot_listener._CABINET_CHAT_REF_CACHE.clear)
+        self.addCleanup(bot_listener._CABINET_CONTEXT_CACHE.clear)
+
+    def _render(self, action, resolutions, contexts):
+        async def fake_chat_id(client, entry, cache, log=print):
+            resolutions.append(entry)
+            return -1001234567890
+
+        async def fake_resolve(client, entry):
+            resolutions.append(entry)
+            return type("E", (), {"username": "testchat"})()
+
+        async def fake_context(telethon_client, entry, tz, from_user, log=print):
+            contexts.append(entry)
+            return _user(), 5_000, 3, 190, 4
+
+        with patch("bot_listener._resolve_chat_id", fake_chat_id), \
+             patch("bot_listener.resolve_chat", fake_resolve), \
+             patch("bot_listener._cabinet_context", fake_context):
+            return asyncio.run(
+                bot_listener._render_cabinet_section(
+                    None, FakeAPI(), None, "chat", None, action, "",
+                    {"id": 20, "username": "user"}, 999, log=lambda *_: None,
+                )
+            )
+
+    def test_screens_without_links_never_touch_telegram(self):
+        for action in ("main", "shop", "title", "send", "badges"):
+            with self.subTest(action=action):
+                resolutions = []
+                self._render(action, resolutions, [])
+                self.assertEqual(resolutions, [], f"{action} resolved a chat entity")
+
+    def test_link_screens_resolve_once_then_reuse_the_cache(self):
+        resolutions = []
+        self._render("works", resolutions, [])
+        first = len(resolutions)
+        self.assertGreater(first, 0)
+
+        self._render("works", resolutions, [])
+        self._render("stats", resolutions, [])
+        self.assertEqual(len(resolutions), first, "chat ref was resolved more than once")
+
+    def test_a_failed_resolution_is_not_cached_permanently(self):
+        async def failing_chat_id(client, entry, cache, log=print):
+            return None
+
+        async def failing_resolve(client, entry):
+            raise RuntimeError("telegram down")
+
+        with patch("bot_listener._resolve_chat_id", failing_chat_id), \
+             patch("bot_listener.resolve_chat", failing_resolve):
+            asyncio.run(bot_listener._cabinet_chat_ref(None, "chat", {}, log=lambda *_: None))
+
+        self.assertNotIn("chat", bot_listener._CABINET_CHAT_REF_CACHE)
+
+    def test_context_is_reused_across_rapid_navigation(self):
+        calls = []
+
+        async def counting_resolve(*args, **kwargs):
+            calls.append(1)
+            return _user(), 3, 190, 5_000, 4
+
+        with patch("stats.resolve_stat_target", counting_resolve):
+            for _ in range(5):
+                asyncio.run(
+                    bot_listener._cabinet_context(
+                        None, "chat", None, {"id": 20, "username": "user"}, log=lambda *_: None
+                    )
+                )
+
+        self.assertEqual(len(calls), 1, "the heavy aggregate ran more than once")
+
+    def test_different_members_do_not_share_a_cached_context(self):
+        calls = []
+
+        async def counting_resolve(*args, **kwargs):
+            calls.append(1)
+            return _user(), 3, 190, 5_000, 4
+
+        with patch("stats.resolve_stat_target", counting_resolve):
+            for user_id in (20, 21):
+                asyncio.run(
+                    bot_listener._cabinet_context(
+                        None, "chat", None, {"id": user_id, "username": "user"},
+                        log=lambda *_: None,
+                    )
+                )
+
+        self.assertEqual(len(calls), 2)
+
+    def test_a_purchase_is_visible_immediately_despite_the_cached_context(self):
+        # Balances are deliberately read from the ledger by each view, never cached with
+        # the context -- otherwise buying something would appear to do nothing for 45s.
+        user = _user()
+        before, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
+        economy.purchase("chat", user.user_id, 5_000, economy.find_item("freeze"))
+        after, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
+
+        self.assertIn("🪙 Монеты: 500", before)
+        self.assertIn("🪙 Монеты: 300", after)
+
+
 class MenuRegistrationTests(unittest.TestCase):
     def test_every_advertised_dm_command_resolves_to_a_chat_in_a_dm(self):
         """A published menu must not contain commands that do nothing where they are

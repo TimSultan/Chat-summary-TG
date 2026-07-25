@@ -923,12 +923,57 @@ async def _deliver_shop_item(
     raise ChatSummaryError(f"unknown shop item {item.code}")
 
 
+# A chat's id and @username never change while the process runs, but resolving them costs
+# a Telethon get_entity round trip each time. The cabinet re-renders on every button
+# press, so this is the difference between a menu that responds instantly and one that
+# waits on Telegram twice per tap.
+_CABINET_CHAT_REF_CACHE: dict[str, tuple] = {}
+
+# (entry, user_id) -> (deadline, context). resolve_stat_target re-reads every recorded
+# day file AND may refetch today's transcript; doing that again for each tap of a
+# six-button menu is what made the cabinet feel slow. Balances, titles and freezes are
+# deliberately NOT part of this -- every view reads those straight from the ledger -- so a
+# purchase still shows up immediately while navigation stays cheap.
+_CABINET_CONTEXT_CACHE: dict[tuple, tuple] = {}
+CABINET_CONTEXT_TTL_SECONDS = 45
+
+
+async def _cabinet_chat_ref(telethon_client, entry: str, known_chat_ids: dict, log=print):
+    """(chat_id, username) for building t.me links into the group from a DM."""
+    cached = _CABINET_CHAT_REF_CACHE.get(entry)
+    if cached is not None:
+        return cached
+    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+    username = None
+    try:
+        entity = await resolve_chat(telethon_client, entry)
+        username = getattr(entity, "username", None)
+    except Exception:
+        log(f"[bot_listener] could not resolve '{entry}' for cabinet links")
+    resolved = (chat_id, username)
+    # Only cache a usable answer, so a transient failure doesn't permanently break links.
+    if chat_id is not None or username:
+        _CABINET_CHAT_REF_CACHE[entry] = resolved
+    return resolved
+
+
 async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log=print):
     """(user, xp, rank, total, streak) for whoever is using the cabinet, or None.
 
     Every cabinet view needs the same resolved identity, and resolve_stat_target is also
     what applies any bought streak freeze, so this is the one place that call is made.
+
+    Cached for CABINET_CONTEXT_TTL_SECONDS per member: the underlying call re-reads every
+    recorded day file and can refetch today's transcript from Telegram, which is far too
+    much work to repeat for each tap of a menu. Skipping it also skips re-applying streak
+    freezes, which is harmless -- consume_streak_freeze is idempotent per day and runs
+    again on the next uncached read.
     """
+    cache_key = (entry, from_user.get("id"))
+    cached = _CABINET_CONTEXT_CACHE.get(cache_key)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+
     user, rank, total, xp, streak = await stats.resolve_stat_target(
         telethon_client, entry, entry, "",
         from_user.get("username"), _display_name(from_user), tz, log=log,
@@ -936,11 +981,14 @@ async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log
     )
     if user is None:
         return None
-    return user, xp, rank, total, streak
+    context = (user, xp, rank, total, streak)
+    _CABINET_CONTEXT_CACHE[cache_key] = (time.monotonic() + CABINET_CONTEXT_TTL_SECONDS, context)
+    return context
 
 
 async def _render_cabinet_section(
-    telethon_client, api, cfg, entry, tz, action, argument, from_user, chat_id, log=print,
+    telethon_client, api, cfg, entry, tz, action, argument, from_user, chat_id,
+    known_chat_ids: dict | None = None, log=print,
 ) -> tuple[str, dict] | None:
     """Build one cabinet screen. Returns None when the member isn't tracked yet."""
     context = await _cabinet_context(telethon_client, entry, tz, from_user, log=log)
@@ -948,16 +996,12 @@ async def _render_cabinet_section(
         return None
     user, xp, rank, total, streak = context
 
-    # The links need the group's own chat id/username, which the DM doesn't carry.
-    home_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
-    home_username = None
-    try:
-        home_entity = await resolve_chat(telethon_client, entry)
-        home_username = getattr(home_entity, "username", None)
-    except Exception:
-        log(f"[bot_listener] could not resolve '{entry}' for cabinet links")
-
-    def links():
+    async def links():
+        """Resolved lazily and only by the two screens that show links -- every other
+        screen used to pay for two Telegram entity lookups it never read."""
+        home_chat_id, home_username = await _cabinet_chat_ref(
+            telethon_client, entry, known_chat_ids if known_chat_ids is not None else {}, log=log
+        )
         figurines = stats.figurine_message_links(home_username, home_chat_id, user)
         best, workplace = stats.showcase_message_links(home_username, home_chat_id, user)
         return figurines, best, workplace
@@ -969,14 +1013,14 @@ async def _render_cabinet_section(
         )
 
     if action == "stats":
-        figurines, best, workplace = links()
+        figurines, best, workplace = await links()
         return cabinet.stats_view(
             entry, user, xp, rank, total, streak, figurines, badges(), best, workplace
         )
     if action == "shop":
         return cabinet.shop_view(entry, user, xp)
     if action == "works":
-        figurines, best, workplace = links()
+        figurines, best, workplace = await links()
         return cabinet.works_view(user, figurines, best, workplace)
     if action == "badges":
         return cabinet.badges_view(user, badges())
@@ -1172,6 +1216,7 @@ async def handle_cabinet_callback(
     callback: dict,
     entry: str | None,
     cabinet_flows: dict[str, dict],
+    known_chat_ids: dict | None = None,
     log=print,
 ) -> None:
     parsed = cabinet.parse_callback(callback.get("data") or "")
@@ -1221,7 +1266,8 @@ async def handle_cabinet_callback(
     await api.answer_callback_query(callback_id)
     try:
         rendered = await _render_cabinet_section(
-            telethon_client, api, cfg, entry, tz, action, argument, actor, chat_id, log=log,
+            telethon_client, api, cfg, entry, tz, action, argument, actor, chat_id,
+            known_chat_ids=known_chat_ids, log=log,
         )
     except Exception:
         log(f"[bot_listener] cabinet section '{action}' failed:\n{traceback.format_exc()}")
@@ -1994,7 +2040,8 @@ async def _dispatch_update(
         callback_data = callback.get("data") or ""
         if callback_data.startswith(f"{cabinet.CALLBACK_PREFIX}:"):
             await handle_cabinet_callback(
-                api, telethon_client, cfg, tz, callback, home_chat_ref, cabinet_flows, log=log,
+                api, telethon_client, cfg, tz, callback, home_chat_ref, cabinet_flows,
+                known_chat_ids=known_chat_ids, log=log,
             )
         elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
             await handle_badge_callback(api, callback, badge_flows)

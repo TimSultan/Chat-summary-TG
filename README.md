@@ -378,6 +378,21 @@ inert (`Это чужой кабинет.`) and navigation keeps working across 
 unlike the admin `/badge` flows, only the two text-entry prompts hold server-side state.
 Views are rendered as HTML with every user-controlled string escaped.
 
+**Render cost.** A button press must not wait on Telegram. Two caches keep it cheap:
+
+- `_CABINET_CHAT_REF_CACHE` — the group's chat id and `@username`, needed only to build
+  `t.me` links, resolved once per process instead of twice per press. A failed resolution
+  is not cached, so a transient outage doesn't permanently break links.
+- `_CABINET_CONTEXT_CACHE` — the resolved member, XP and rank, for
+  `CABINET_CONTEXT_TTL_SECONDS` (45s) per person. The underlying `resolve_stat_target`
+  re-reads every recorded day file (~70 ms at 60 days × 190 members) and can refetch
+  today's transcript from Telegram, which is far too much to repeat per tap.
+
+Balances, titles and streak freezes are deliberately **not** cached — every view reads
+them straight from the ledger, so a purchase shows up immediately rather than 45 seconds
+later. Screens with no links (main, shop, title, send, badges) resolve no chat entity at
+all; only Статистика and Мои работы do.
+
 Shop v1, priced against the chat's real earn rate (the most active members earn 60–233
 coins/week, the p90 member ~55/week):
 
