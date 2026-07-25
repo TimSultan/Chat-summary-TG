@@ -193,6 +193,50 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(best_link, "https://t.me/example/1")
         self.assertEqual(workplace_link, "https://t.me/example/5")
 
+    def test_reposting_a_showcase_tag_supersedes_the_previous_link(self):
+        def message(moment, text, message_id):
+            return SimpleNamespace(
+                sender_id=20,
+                sender_name="User",
+                sender_username="user",
+                text=text,
+                dt_local=moment,
+                message_id=message_id,
+                is_reply=False,
+            )
+
+        # Two workplace posts on the SAME day, plus a third on a later day using the
+        # other spelling: /stat must always show the most recent one.
+        same_day = stats.compute_day_stats(
+            [
+                message(datetime(2026, 7, 20, 9, tzinfo=timezone.utc), "[Photo] #рабочееместо", 10),
+                message(datetime(2026, 7, 20, 18, tzinfo=timezone.utc), "[Photo] #рабочееместо переставил стол", 11),
+            ]
+        )
+        combined = {}
+        stats._merge_day(combined, {"day": "2026-07-20", "users": same_day})
+        _, workplace_link = stats.showcase_message_links("example", None, combined["20"])
+        self.assertEqual(workplace_link, "https://t.me/example/11")
+
+        later_day = stats.compute_day_stats(
+            [message(datetime(2026, 7, 24, 8, tzinfo=timezone.utc), "[Photo] #рабочее_место", 12)]
+        )
+        stats._merge_day(combined, {"day": "2026-07-24", "users": later_day})
+        user = combined["20"]
+        _, workplace_link = stats.showcase_message_links("example", None, user)
+        self.assertEqual(workplace_link, "https://t.me/example/12")
+        # Superseded posts are still retained, newest-first, so the display choice stays
+        # reversible without re-scanning any transcripts.
+        self.assertEqual([post[1] for post in user.workplace_posts], [12, 11, 10])
+
+        # Re-merging an already-merged day (a backfill re-visit, or a live overlay of a
+        # day the transcript cache has since caught up on) must not resurrect an older
+        # post or duplicate the current one.
+        stats._merge_day(combined, {"day": "2026-07-20", "users": same_day})
+        _, workplace_link = stats.showcase_message_links("example", None, combined["20"])
+        self.assertEqual(workplace_link, "https://t.me/example/12")
+        self.assertEqual([post[1] for post in combined["20"].workplace_posts], [12, 11, 10])
+
     def test_showcase_links_render_before_the_figurine_line(self):
         user = stats.UserStats(user_id="1", display_name="Tester", figurines_painted=3)
         text = stats.format_stat(
