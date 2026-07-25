@@ -278,12 +278,29 @@ does not reveal what is missing for the next one.
 The activity block stays compact and uses dot-separated thousands:
 
 ```text
+🛠️ Рабочее место: ссылка
+💎 Моя лучшая: ссылка
 Фигурок: 12 (#япокрасил)
 Активных дней: 96 (🔥 Серия: 11 дней)
 💬 Сообщений: 1.842 (19.2 в день)
 ```
 
 The streak note is hidden when the current streak is zero.
+
+The two showcase lines link straight to the person's own post and sit immediately above
+`Фигурок:`:
+
+- `💎 Моя лучшая` — `#моялучшая`
+- `🛠️ Рабочее место` — `#рабочееместо` or `#рабочее_место`; Telegram treats `_` as part
+  of a hashtag, so both spellings are matched separately
+
+Both require an attached photo or video, exactly like `#япокрасил`, so a text-only
+message that merely mentions the tag never becomes somebody's link. Each line is omitted
+entirely when that person has no such post. Only the **newest** post of each tag is
+linked, since both describe a current state that a later post supersedes — the full
+history is still stored, so that display choice can be changed later without a re-scan.
+Neither tag awards XP or a badge, and neither is covered by `/deletepokras` (that command
+remains specific to `#япокрасил` figurine credit).
 The name, progression, and activity sections are separated by blank lines. The last
 activity timestamp is intentionally omitted, and badges are rendered two per row.
 
@@ -364,7 +381,10 @@ work numbers are compacted. A persistent tombstone prevents a stale transcript c
 from restoring the deleted submission. `/deletepokras` is silently ignored in groups.
 
 On startup, the normal recent-day stats catch-up backfills the new hashtag fields from
-the raw transcript cache without recomputing or changing anybody's historical XP.
+the raw transcript cache without recomputing or changing anybody's historical XP. That
+scan covers the last 30 days (`HASHTAG_BADGE_BACKFILL_DAYS`) and only revisits days that
+already have stats. Anything older than the window keeps whatever it was recorded with —
+a hashtag introduced before then is only tracked from the window's start onward.
 
 ## Model choice
 

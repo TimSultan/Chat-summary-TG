@@ -150,6 +150,101 @@ class GamificationTests(unittest.TestCase):
         self.assertIn("🦄 Я не пидор", labels)
         self.assertIn("🎪 Участник Недельного конкурса ×2", labels)
 
+    def test_showcase_hashtags_are_tracked_as_linkable_posts(self):
+        def message(moment, text, message_id):
+            return SimpleNamespace(
+                sender_id=20,
+                sender_name="User",
+                sender_username="user",
+                text=text,
+                dt_local=moment,
+                message_id=message_id,
+                is_reply=False,
+            )
+
+        day_one = stats.compute_day_stats(
+            [
+                message(datetime(2026, 7, 15, 12, tzinfo=timezone.utc), "[Photo] #МояЛучшая", 1),
+                message(datetime(2026, 7, 15, 13, tzinfo=timezone.utc), "[Photo] #рабочееместо", 2),
+                # The organizer's text-only announcement: carries the tag, has no photo,
+                # and must never become somebody's "best work" link.
+                message(datetime(2026, 7, 15, 14, tzinfo=timezone.utc), "Показываем #моялучшая", 3),
+                # A longer lookalike tag is a different tag.
+                message(datetime(2026, 7, 15, 15, tzinfo=timezone.utc), "[Photo] #моялучшаяработа", 4),
+            ]
+        )
+        # The underscored spelling is a genuinely different Telegram tag, and a newer
+        # post of either supersedes the older one in /stat.
+        day_two = stats.compute_day_stats(
+            [message(datetime(2026, 7, 22, 9, tzinfo=timezone.utc), "[Video] #рабочее_место", 5)]
+        )
+
+        combined = {}
+        stats._merge_day(combined, {"day": "2026-07-15", "users": day_one})
+        stats._merge_day(combined, {"day": "2026-07-22", "users": day_two})
+        user = combined["20"]
+
+        self.assertEqual([post[1] for post in user.best_work_posts], [1])
+        self.assertEqual([post[1] for post in user.workplace_posts], [5, 2])
+        # Showcase posts are not figurines and must not silently earn figurine XP.
+        self.assertEqual(user.figurines_painted, 0)
+
+        best_link, workplace_link = stats.showcase_message_links("example", None, user)
+        self.assertEqual(best_link, "https://t.me/example/1")
+        self.assertEqual(workplace_link, "https://t.me/example/5")
+
+    def test_showcase_links_render_before_the_figurine_line(self):
+        user = stats.UserStats(user_id="1", display_name="Tester", figurines_painted=3)
+        text = stats.format_stat(
+            user,
+            rank=1,
+            total=1,
+            xp=100,
+            streak=0,
+            best_work_link="https://t.me/example/7",
+            workplace_link="https://t.me/example/8",
+        )
+
+        self.assertIn('🛠️ Рабочее место: <a href="https://t.me/example/8">ссылка</a>', text)
+        self.assertIn('💎 Моя лучшая: <a href="https://t.me/example/7">ссылка</a>', text)
+        self.assertLess(text.index("🛠️ Рабочее место"), text.index("💎 Моя лучшая"))
+        self.assertLess(text.index("💎 Моя лучшая"), text.index("Фигурок:"))
+
+        without = stats.format_stat(user, rank=1, total=1, xp=100, streak=0)
+        self.assertNotIn("Рабочее место", without)
+        self.assertNotIn("Моя лучшая", without)
+
+    def test_showcase_backfill_reaches_days_recorded_under_the_previous_schema(self):
+        message = SimpleNamespace(
+            sender_id=20,
+            sender_name="User",
+            sender_username="user",
+            text="[Photo] #моялучшая",
+            dt_local=datetime(2026, 7, 15, 12, tzinfo=timezone.utc),
+            message_id=42,
+            is_reply=False,
+        )
+        payload = {
+            "badge_stats_schema_version": 1,
+            "entry": "chat",
+            "day": "2026-07-15",
+            "users": {"20": {"display_name": "User", "messages": 99, "media": 7}},
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                backfilled = stats._backfill_day_badge_stats(
+                    "chat", date(2026, 7, 15), payload, [message], log=lambda _: None
+                )
+                saved = stats._load_day("chat", date(2026, 7, 15))
+
+        self.assertTrue(backfilled)
+        self.assertEqual(saved["users"]["20"]["best_work_posts"], [["2026-07-15T12:00:00+00:00", 42]])
+        self.assertEqual(saved["users"]["20"]["workplace_posts"], [])
+        # The whole point of the backfill: existing XP inputs stay byte-for-byte intact.
+        self.assertEqual(saved["users"]["20"]["messages"], 99)
+        self.assertEqual(saved["users"]["20"]["media"], 7)
+
     def test_badges_are_immediately_before_clickable_works(self):
         user = stats.UserStats(user_id="1", display_name="Tester")
         custom = stats.Badge("custom", "🏹", "Лучник", custom=True)

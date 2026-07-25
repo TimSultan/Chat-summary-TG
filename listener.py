@@ -1274,12 +1274,16 @@ async def run_listener(
                             figurine_links = stats.figurine_message_links(
                                 getattr(chat, "username", None), event.chat_id, user
                             )
+                            best_work_link, workplace_link = stats.showcase_message_links(
+                                getattr(chat, "username", None), event.chat_id, user
+                            )
                             custom_badges = (
                                 stats.custom_badges_for_user(entry, user.user_id)
                                 + stats.weekly_winner_badges_for_user(entry, user.user_id)
                             )
                             reply_text = stats.format_stat(
-                                user, rank, total, xp, streak, figurine_links, custom_badges
+                                user, rank, total, xp, streak, figurine_links, custom_badges,
+                                best_work_link=best_work_link, workplace_link=workplace_link,
                             )
                             stat_uses_html = True
                             level_announcements = stats.record_level_observations(

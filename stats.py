@@ -103,17 +103,41 @@ XP_LEVELS = (
 MAX_CUSTOM_BADGES = 50
 CUSTOM_BADGE_NAME_MAX_CHARS = 40
 CUSTOM_BADGE_STORE_VERSION = 1
-BADGE_STATS_SCHEMA_VERSION = 1
+# 2 added the showcase-post refs (see BEST_WORK_HASHTAGS/WORKPLACE_HASHTAGS). Bumping
+# this is what makes _backfill_day_badge_stats revisit already-recorded days and fill the
+# new fields in from the transcript cache -- without a bump, every existing day file
+# would already look current and the two tags would only ever be seen going forward.
+BADGE_STATS_SCHEMA_VERSION = 2
 WEEKLY_CONTEST_STORE_VERSION = 1
 LEVEL_STATE_VERSION = 1
 DELETED_FIGURINE_STORE_VERSION = 1
 # Two calendar weeks ensure the immediately preceding weekly contest is covered no
 # matter which weekday the upgraded process first starts. Only already-recorded days
 # outside the normal STATS_CATCHUP_DAYS window are considered (see listener.py).
-HASHTAG_BADGE_BACKFILL_DAYS = 14
+#
+# Widened from 14 to 30 for the showcase tags: #моялучшая was a one-day themed event
+# rather than a rolling habit, so a window that merely "covers the last contest" can miss
+# the single day that carries almost every post -- 14 days would already have been cutting
+# it close, and any delay between writing this and deploying it would silently drop the
+# event entirely. 30 days covers both tags' full history with margin. The ongoing cost is
+# unchanged (a day already on the current schema is one local JSON read and returns
+# early); the one-off cost is a transcript re-fetch for any day 15-30 back that is
+# recorded but no longer cached, and final days are cached indefinitely.
+HASHTAG_BADGE_BACKFILL_DAYS = 30
 
 NOT_GAY_HASHTAG = "#янепидор"
 WEEKLY_CONTEST_HASHTAG = "#итогинедели"
+
+# Showcase hashtags. Unlike NOT_GAY_HASHTAG/WEEKLY_CONTEST_HASHTAG above -- which only
+# ever needed a COUNT, so that's all their day files store -- /stat links straight to
+# these posts, and a bare counter can't produce a link. They're therefore tracked the
+# same way FIGURINE_HASHTAG posts are: as [ts, message_id] refs (see _merge_post_refs).
+BEST_WORK_HASHTAGS = ("#моялучшая",)
+# Both spellings are in real use in the chat. Telegram treats "_" as part of a hashtag,
+# so "#рабочееместо" and "#рабочее_место" are two genuinely different tags to Telegram
+# (and to _has_hashtag's \w-boundary match) -- neither matches the other, so both have to
+# be listed rather than normalized into one.
+WORKPLACE_HASHTAGS = ("#рабочееместо", "#рабочее_место")
 
 # Only the highest earned painting tier is displayed.
 PAINTING_BADGE_TIERS = (
@@ -797,6 +821,12 @@ def _has_hashtag(text: str, hashtag: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(hashtag)}(?!\w)", text or "", re.IGNORECASE) is not None
 
 
+def _has_any_hashtag(text: str, hashtags) -> bool:
+    """True if `text` carries any one of `hashtags` -- for a tag people spell more than
+    one way (see WORKPLACE_HASHTAGS), where each spelling is its own distinct tag."""
+    return any(_has_hashtag(text, hashtag) for hashtag in hashtags)
+
+
 def _iso_week_key(moment: datetime) -> str:
     iso_year, iso_week, _ = moment.date().isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
@@ -838,7 +868,7 @@ def record_figurine_live(
     if display_name:
         u["display_name"] = display_name
     u["count"] += 1
-    u["recent_posts"] = _merge_recent_figurine_posts(
+    u["recent_posts"] = _merge_post_refs(
         [tuple(p) for p in u.get("recent_posts", [])], [(app_now().isoformat(), message_id)]
     )
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -919,6 +949,10 @@ def compute_day_stats(messages: list) -> dict:
                 # [ts, message_id] pairs, one per qualifying message this day. The full
                 # history stays available so /stat can link to every tracked work.
                 "figurine_posts": [],
+                # Same [ts, message_id] shape, for the two showcase tags /stat links to
+                # (see BEST_WORK_HASHTAGS/WORKPLACE_HASHTAGS).
+                "best_work_posts": [],
+                "workplace_posts": [],
                 "hours": {},
                 "last_message_at": None,
             },
@@ -936,6 +970,17 @@ def compute_day_stats(messages: list) -> dict:
         if m.text.startswith(MEDIA_TAG_PREFIXES) and is_figurine_caption(m.text):
             u["figurines"] += 1
             u["figurine_posts"].append([ts, m.message_id])
+        # Showcase tags, media-gated for the same reason FIGURINE_HASHTAG is: /stat
+        # advertises these as a link to the person's own photo, so a text-only message
+        # that merely mentions the tag must not become that link. This is not
+        # hypothetical -- the day #моялучшая launched, the one text-only use of it in the
+        # whole chat was the organizer's announcement ("Сегодня показываем самую лучшую
+        # вашу работу"), which would otherwise have been linked as their best work.
+        if m.text.startswith(MEDIA_TAG_PREFIXES):
+            if _has_any_hashtag(m.text, BEST_WORK_HASHTAGS):
+                u["best_work_posts"].append([ts, m.message_id])
+            if _has_any_hashtag(m.text, WORKPLACE_HASHTAGS):
+                u["workplace_posts"].append([ts, m.message_id])
         if _has_hashtag(m.text, NOT_GAY_HASHTAG):
             u["not_gay_hashtag_uses"] += 1
         if _has_hashtag(m.text, WEEKLY_CONTEST_HASHTAG):
@@ -990,6 +1035,8 @@ def _backfill_day_badge_stats(entry: str, day: date, payload: dict, messages: li
         source = recomputed.get(user_id, {})
         existing_user["not_gay_hashtag_uses"] = source.get("not_gay_hashtag_uses", 0)
         existing_user["weekly_contest_weeks"] = source.get("weekly_contest_weeks", [])
+        existing_user["best_work_posts"] = source.get("best_work_posts", [])
+        existing_user["workplace_posts"] = source.get("workplace_posts", [])
     payload["badge_stats_schema_version"] = BADGE_STATS_SCHEMA_VERSION
     payload["badge_stats_backfilled_at"] = app_now().isoformat()
     _write_json_atomic(_path(entry, day), payload)
@@ -1051,6 +1098,13 @@ class UserStats:
     # truncated -- /stat links to the complete tracked set, while
     # format_procrastinators uses the first item as the true most recent post.
     recent_figurine_posts: list = field(default_factory=list)
+    # Same [ts, message_id] newest-first shape as recent_figurine_posts, for the two
+    # showcase tags. /stat renders only the newest of each as one link (both tags
+    # describe a CURRENT state -- "my best work", "my workplace" -- so an older post is
+    # superseded rather than accumulated), but the full history is still kept here so
+    # that display choice stays reversible without a re-scan.
+    best_work_posts: list = field(default_factory=list)
+    workplace_posts: list = field(default_factory=list)
     active_days: int = 0
     # ISO date strings ("YYYY-MM-DD") for every day this person posted at least once --
     # the actual DATES behind the `active_days` count above, needed to walk backward day
@@ -1111,13 +1165,17 @@ def _apply_deleted_figurines(entry: str, users: dict[str, UserStats]) -> None:
             user.figurines_painted = max(0, user.figurines_painted - removed)
 
 
-def _merge_recent_figurine_posts(existing: list, new_posts) -> list:
+def _merge_post_refs(existing: list, new_posts) -> list:
     """Combines `existing` [ts, message_id] pairs with `new_posts` (any iterable of the
     same shape) and sorts newest-first -- deliberately NEVER truncates: every qualifying
     post is kept forever, so /stat can link to every tracked work and
     format_procrastinators can always find the TRUE most recent post. The one place this
     merge+dedup happens, used by both _merge_day (across recorded days) and
     record_figurine_live/_live_today_users (today's live counter).
+
+    Tag-agnostic despite the figurine-shaped history above: the same merge backs
+    UserStats.best_work_posts and .workplace_posts (see BEST_WORK_HASHTAGS/
+    WORKPLACE_HASHTAGS), which need identical newest-first dedup semantics.
 
     De-dupes by message_id first: the SAME message can legitimately reach this from two
     independent sources with two different timestamps -- record_figurine_live's live
@@ -1184,7 +1242,11 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
         s.not_gay_hashtag_uses += u.get("not_gay_hashtag_uses", 0)
         s.weekly_contest_weeks.update(u.get("weekly_contest_weeks", []))
         if u.get("figurine_posts"):
-            s.recent_figurine_posts = _merge_recent_figurine_posts(s.recent_figurine_posts, u["figurine_posts"])
+            s.recent_figurine_posts = _merge_post_refs(s.recent_figurine_posts, u["figurine_posts"])
+        if u.get("best_work_posts"):
+            s.best_work_posts = _merge_post_refs(s.best_work_posts, u["best_work_posts"])
+        if u.get("workplace_posts"):
+            s.workplace_posts = _merge_post_refs(s.workplace_posts, u["workplace_posts"])
         if u.get("messages", 0) > 0:
             s.active_days += 1
             if day_str:
@@ -1349,13 +1411,13 @@ async def _live_today_users(client, chat_ref, entry: str, tz, log=print) -> dict
                 "username": None, "display_name": live.get("display_name", "Unknown"),
                 "messages": 0, "chars": 0, "words": 0, "media": 0, "replies": 0, "figurines": 0,
                 "not_gay_hashtag_uses": 0, "weekly_contest_weeks": [],
-                "figurine_posts": [],
+                "figurine_posts": [], "best_work_posts": [], "workplace_posts": [],
                 "hours": {}, "last_message_at": None,
             },
         )
         u["figurines"] = max(u.get("figurines", 0), live.get("count", 0))
         if live.get("recent_posts"):
-            u["figurine_posts"] = _merge_recent_figurine_posts(u["figurine_posts"], live["recent_posts"])
+            u["figurine_posts"] = _merge_post_refs(u["figurine_posts"], live["recent_posts"])
         if live.get("username"):
             u["username"] = live["username"]
         if live.get("display_name"):
@@ -1614,7 +1676,7 @@ async def format_procrastinators(
         if not posts:
             entries.append((10**9, f"{who} — ещё ни разу не скидывал(а) работы"))
             continue
-        last_at = posts[0][0]  # newest-first, see _merge_recent_figurine_posts
+        last_at = posts[0][0]  # newest-first, see _merge_post_refs
         days_since = (today - datetime.fromisoformat(last_at).date()).days
         if days_since >= inactive_days:
             entries.append((days_since, f"{who} — не скидывал работы {_ru_days(days_since)}"))
@@ -1660,18 +1722,36 @@ def figurine_message_link(chat_username: str | None, chat_id: int | None, messag
     return None
 
 
-def figurine_message_links(chat_username: str | None, chat_id: int | None, user: UserStats) -> list[str]:
-    """Return direct links for every tracked figurine post, newest first.
+def post_message_links(chat_username: str | None, chat_id: int | None, posts: list) -> list[str]:
+    """Return direct links for a [ts, message_id] ref list, preserving its newest-first
+    order (see _merge_post_refs).
 
     Skips a post rather than emitting a broken link when the chat has neither a public
     username nor a resolvable marked id; see figurine_message_link for those cases.
     """
     links = []
-    for _, message_id in user.recent_figurine_posts:
+    for _, message_id in posts:
         link = figurine_message_link(chat_username, chat_id, message_id)
         if link:
             links.append(link)
     return links
+
+
+def figurine_message_links(chat_username: str | None, chat_id: int | None, user: UserStats) -> list[str]:
+    """Direct links for every tracked figurine post of `user`, newest first."""
+    return post_message_links(chat_username, chat_id, user.recent_figurine_posts)
+
+
+def showcase_message_links(
+    chat_username: str | None, chat_id: int | None, user: UserStats
+) -> tuple[str | None, str | None]:
+    """(best-work link, workplace link) for `user` -- the NEWEST post of each showcase
+    tag, or None where there is none to link. Only the newest is returned because both
+    tags describe a current state that a later post supersedes; see
+    UserStats.best_work_posts for why the older ones are still stored."""
+    best = post_message_links(chat_username, chat_id, user.best_work_posts)
+    workplace = post_message_links(chat_username, chat_id, user.workplace_posts)
+    return (best[0] if best else None, workplace[0] if workplace else None)
 
 
 def format_stat(
@@ -1682,6 +1762,8 @@ def format_stat(
     streak: int,
     figurine_links: list[str] | None = None,
     custom_badges: list[Badge] | None = None,
+    best_work_link: str | None = None,
+    workplace_link: str | None = None,
 ) -> str:
     """Build an HTML-formatted `/stat` message.
 
@@ -1700,6 +1782,14 @@ def format_stat(
     activity_line = f"Активных дней: {user.active_days}"
     if streak > 0:
         activity_line += f" (🔥 Серия: {_ru_days(streak)})"
+    # Both showcase lines sit directly above "Фигурок:" and are omitted entirely when the
+    # person has no such post, rather than shown empty -- same rule the streak note above
+    # follows. A one-word anchor keeps the line short; the URL itself is never displayed.
+    showcase_lines = ""
+    if workplace_link:
+        showcase_lines += f'🛠️ Рабочее место: <a href="{escape(workplace_link, quote=True)}">ссылка</a>\n'
+    if best_work_link:
+        showcase_lines += f'💎 Моя лучшая: <a href="{escape(best_work_link, quote=True)}">ссылка</a>\n'
     text = (
         "📊 Статистика пользователя:\n\n"
         f"Имя: {escape(user.display_name)}\n\n"
@@ -1707,6 +1797,7 @@ def format_stat(
         f"🪙 Монеты: {coins_str}\n"
         f"🧩 Уровень: {escape(level.label)}\n"
         f"📈 Место в рейтинге: {rank} из {total}\n\n"
+        f"{showcase_lines}"
         f"Фигурок: {user.figurines_painted} ({FIGURINE_HASHTAG})\n"
         f"{activity_line}\n"
         f"💬 Сообщений: {messages_str} ({avg:.1f} в день)\n"
