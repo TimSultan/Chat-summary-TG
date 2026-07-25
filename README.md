@@ -340,9 +340,14 @@ Commands (any tracked chat):
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
 client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
-command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins`, groups get the
-shorter `/stat /top /cabinet` (wallet actions belong in the DM, where a balance isn't
-public). Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
+command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins`, groups get
+`/stat /topall /toppokras`. Wallet actions belong in the DM where a balance isn't public,
+and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a
+group button for it would just answer "напиши мне в личку".
+
+The two aliases are spelled without a space because Telegram only accepts `[a-z0-9_]` in
+a registered command name: **`/top all` cannot be a menu entry at all**. Both spellings
+work when typed — `/top all` = `/topall`, `/top pokras` = `/toppokras` = `/stat pokras`. Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
 deliberately **not** advertised. Registration is best-effort: the bot starts fine without
 a menu.
 

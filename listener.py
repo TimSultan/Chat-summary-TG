@@ -1258,8 +1258,15 @@ async def run_listener(
                 level_announcements = []
                 stat_uses_html = False
                 if text_lower.startswith("/top"):
-                    period = stats.parse_top_command(stats_text)
-                    reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
+                    top_arg = stats_text[len("/top"):].strip()
+                    # "/top pokras" reaches the procrastinator list, same as "/stat pokras".
+                    if stats.is_procrastinator_command(top_arg):
+                        reply_text = await stats.format_procrastinators(
+                            client, chat, entry, tz, log=log
+                        ) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                    else:
+                        period = stats.parse_top_argument(top_arg)
+                        reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                 else:
                     arg = stats_text[len("/stat") :].strip()
                     if stats.is_procrastinator_command(arg):

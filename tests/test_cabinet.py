@@ -951,6 +951,36 @@ class MenuRegistrationTests(unittest.TestCase):
         # An untracked group resolves to nothing at all, as before.
         self.assertIsNone(bot_listener._stats_entry_for(group, None, "mychat"))
 
+    def test_every_published_command_name_is_one_telegram_accepts(self):
+        """Telegram rejects anything outside [a-z0-9_]{1,32} -- "/top all" simply cannot
+        be a menu entry, which is why the aliases are spelled without a space."""
+        import re
+
+        allowed = re.compile(r"^[a-z0-9_]{1,32}$")
+        for command in bot_listener.PRIVATE_CHAT_COMMANDS + bot_listener.GROUP_CHAT_COMMANDS:
+            with self.subTest(command=command["command"]):
+                self.assertRegex(command["command"], allowed)
+                self.assertTrue(command["description"].strip())
+
+    def test_the_group_menu_drops_cabinet_and_offers_the_top_aliases(self):
+        group = {c["command"]: c["description"] for c in bot_listener.GROUP_CHAT_COMMANDS}
+        # /cabinet only works in a DM, so a group button for it would just say "напиши в личку".
+        self.assertNotIn("cabinet", group)
+        self.assertEqual(group.get("topall"), "Рейтинг чата")
+        self.assertIn("toppokras", group)
+        # It is still offered in the DM, where it does work.
+        self.assertIn("cabinet", {c["command"] for c in bot_listener.PRIVATE_CHAT_COMMANDS})
+
+    def test_top_arguments_resolve_the_same_spaced_or_not(self):
+        self.assertEqual(stats.parse_top_argument("all"), "all")
+        self.assertEqual(stats.parse_top_argument("week"), "week")
+        # "/top" bare, and anything unrecognised, still means today.
+        self.assertEqual(stats.parse_top_argument(""), "today")
+        self.assertEqual(stats.parse_top_argument("@someone"), "today")
+        # "/toppokras" and "/top pokras" both reach the procrastinator list.
+        self.assertTrue(stats.is_procrastinator_command("pokras"))
+        self.assertTrue(stats.is_procrastinator_command("покрас"))
+
     def test_admin_only_commands_are_not_advertised(self):
         published = {
             command["command"]

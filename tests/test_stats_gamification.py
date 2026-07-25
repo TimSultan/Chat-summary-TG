@@ -312,8 +312,8 @@ class GamificationTests(unittest.TestCase):
             custom_badges=[custom],
         )
 
-        self.assertIn("⭐ XP: 1.234", text)
-        self.assertIn("🪙 Монеты: 123", text)
+        # XP and coins share one line now.
+        self.assertIn("⭐️ XP: 1.234 🪙 Монеты: 123", text)
         # Chat level moves on XP alone; the painting rank is its own separate track.
         self.assertIn("🧩 Уровень: 🗣️ Голос чата 11", text)
         self.assertIn("🎨 Звание: 🩶 Серый новичок", text)
@@ -346,8 +346,10 @@ class GamificationTests(unittest.TestCase):
             custom_badges=custom,
         )
 
-        self.assertIn("Имя: Tester\n\n⭐ XP:", text)
-        self.assertIn("Место в рейтинге: 1 из 1\n\nФигурок:", text)
+        # The name is the header; there is no separate "Имя:" line.
+        self.assertIn("📊 Статистика Tester:\n\n⭐️ XP:", text)
+        self.assertNotIn("Имя:", text)
+        self.assertIn("Пока тихо)\n\nФигурок:", text)
         self.assertNotIn("Последняя активность:", text)
         self.assertIn(
             "✨ Уникальные значки:\n"
@@ -523,7 +525,7 @@ class GamificationTests(unittest.TestCase):
             custom_badges=[custom],
         )
 
-        self.assertIn("Имя: &lt;Painter &amp; Friend&gt;", text)
+        self.assertIn("📊 Статистика &lt;Painter &amp; Friend&gt;:", text)
         self.assertIn("🏹 A &lt; B &amp; C", text)
 
     def test_stat_hides_next_level_requirements(self):

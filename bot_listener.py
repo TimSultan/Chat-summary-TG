@@ -145,11 +145,17 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "shop", "description": "Магазин"},
     {"command": "coins", "description": "Мой баланс"},
 )
-# Shorter in groups: the wallet actions belong in the DM, where a balance isn't public.
+# Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
+# and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
+# be a button that answers "напиши мне в личку".
+#
+# "/topall" and "/toppokras" are spelled without a space because Telegram only accepts
+# [a-z0-9_] in a registered command name: "/top all" cannot be a menu entry at all. Both
+# spellings work when typed (see parse_top_argument).
 GROUP_CHAT_COMMANDS = (
     {"command": "stat", "description": "Статистика участника"},
-    {"command": "top", "description": "Рейтинг чата"},
-    {"command": "cabinet", "description": "Личный кабинет (в личке)"},
+    {"command": "topall", "description": "Рейтинг чата"},
+    {"command": "toppokras", "description": "Топ прокрастинаторов"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -2578,10 +2584,19 @@ async def _dispatch_update(
             level_announcements = []
             reply_parse_mode = None
             if text_lower.startswith("/top"):
-                period = stats.parse_top_command(stats_text)
-                reply_text = await stats.format_top(
-                    telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
-                )
+                top_arg = stats_text[len("/top"):].strip()
+                # "/top pokras" reads the same way "/stat pokras" always has, so both
+                # spellings reach the procrastinator list instead of one of them
+                # silently falling through to a leaderboard for "today".
+                if stats.is_procrastinator_command(top_arg):
+                    reply_text = await stats.format_procrastinators(
+                        telethon_client, matched_entry, matched_entry, tz, log=log
+                    ) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                else:
+                    period = stats.parse_top_argument(top_arg)
+                    reply_text = await stats.format_top(
+                        telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
+                    )
             else:
                 arg = stats_text[len("/stat") :].strip()
                 if stats.is_procrastinator_command(arg):

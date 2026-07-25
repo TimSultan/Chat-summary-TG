@@ -1945,6 +1945,16 @@ def _normalize_period(word: str) -> str | None:
     return word if word in VALID_PERIODS else None
 
 
+def parse_top_argument(arg: str) -> str:
+    """Period from whatever followed "/top", defaulting to "today".
+
+    Takes the ARGUMENT rather than the whole command line, so that "/top all" and the
+    "/topall" menu alias resolve identically. The alias exists because Telegram only
+    accepts [a-z0-9_] in a registered command name -- "/top all" cannot be a menu entry,
+    so the space has to go somewhere."""
+    return _normalize_period(arg) or "today"
+
+
 def parse_top_command(text: str) -> str:
     """Extracts the period keyword from a "/top ..." command. Defaults to "today" if
     none is given, or it's not one of VALID_PERIODS (after alias normalization), rather
@@ -2417,26 +2427,24 @@ def format_stat(
         showcase_lines += f'🛠️ Рабочее место: <a href="{escape(workplace_link, quote=True)}">ссылка</a>\n'
     if best_work_link:
         showcase_lines += f'💎 Моя лучшая: <a href="{escape(best_work_link, quote=True)}">ссылка</a>\n'
-    # A bought title (see economy.set_title) sits under the name, clearly marked as a
-    # title rather than merged into it, so it can never be mistaken for the real name.
-    name_block = f"Имя: {escape(user.display_name)}\n"
+    # The name lives in the header rather than on its own "Имя:" line. A bought title
+    # (see economy.set_title) goes below it in quotes, kept clearly separate so it can
+    # never be mistaken for the person's actual name.
+    header = f"📊 Статистика {escape(user.display_name)}:\n\n"
     if custom_title:
-        name_block += f"«{escape(custom_title)}»\n"
+        header += f"«{escape(custom_title)}»\n\n"
     # Three independent tracks. The chat level always moves for anybody who talks, the
     # painter rank only for figurines, and reputation only when somebody else grants it
     # -- so nobody is ever looking at a screen where nothing can progress. The bar shows
     # position within the current chat level WITHOUT printing the target, preserving the
     # existing "don't reveal the next requirement" rule.
     text = (
-        "📊 Статистика пользователя:\n\n"
-        f"{name_block}\n"
-        f"⭐ XP: {xp_str}\n"
-        f"🪙 Монеты: {coins_str}\n"
+        f"{header}"
+        f"⭐️ XP: {xp_str} 🪙 Монеты: {coins_str}\n"
+        f"📈 Место в рейтинге: {rank} из {total}\n"
         f"🧩 Уровень: {escape(level.label)}  {bar}\n"
-        f"🗓️ {escape(season_label(date.today()))}\n"
         f"🎨 Звание: {escape(rank_level.label)}\n"
-        f"{reputation_emoji} Репутация: {reputation} ({escape(reputation_name)})\n"
-        f"📈 Место в рейтинге: {rank} из {total}\n\n"
+        f"{reputation_emoji} Репутация: {reputation} ({escape(reputation_name)})\n\n"
         f"{showcase_lines}"
         f"Фигурок: {user.figurines_painted} ({FIGURINE_HASHTAG})\n"
         f"{activity_line}\n"
