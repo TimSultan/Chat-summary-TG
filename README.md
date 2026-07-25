@@ -393,9 +393,13 @@ coins — open a force-reply prompt and only debit once the reply arrives.
 - 🏪 **Магазин** — one button per item, with the same ✅/🔒/⏳ marks
 - 🎨 **Мои работы** — showcase links plus up to 30 `#япокрасил` works, one per line.
   ✏️ Переименовать renames one by position (`3 Дредноут`, up to 32 chars; a bare number
-  clears it). Names are stored against the work's **message_id**, not its position —
-  deleting a work compacts the numbering, and a name must follow the work rather than the
-  slot it happened to occupy.
+  clears it). 🗑 Удалить removes one of your own, behind a confirmation — it writes a
+  permanent tombstone, costs 200 XP and a figurine, and can drop a level or a badge with
+  it, so it is never a single tap. Both the name and the confirm button carry the work's
+  **message_id**, not its position: deleting compacts the numbering, so a position could
+  point at a different work by the time the second tap arrives. The confirm handler also
+  checks the message_id belongs to that member, so a hand-crafted callback cannot delete
+  somebody else's work.
 - 🏅 **Значки** — admin-granted badges in their own section **first** (split on
   `Badge.custom`, since those are the only ones somebody chose to give you), then earned
   ones, then `📦 Открыто: N из M`. The denominator counts every tier individually (all

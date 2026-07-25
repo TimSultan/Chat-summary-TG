@@ -1399,7 +1399,40 @@ async def handle_cabinet_callback(
         )
         return
 
-    if action in ("title_set", "work_rename"):
+    if action == "work_delete_ok":
+        context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
+        if context is None:
+            await api.answer_callback_query(callback_id, "Статистика не найдена.")
+            return
+        user = context[0]
+        # Only ever their OWN work: the message_id is checked against this member's own
+        # tracked posts, so a hand-crafted callback cannot delete somebody else's.
+        if argument not in {str(post[1]) for post in user.recent_figurine_posts}:
+            await api.answer_callback_query(callback_id, "Эта работа уже удалена.")
+            return
+        await api.answer_callback_query(callback_id)
+        stats.delete_figurine_submission(
+            entry, user.user_id, int(argument), actor.get("id"), _display_name(actor)
+        )
+        # The name would otherwise outlive the work it belonged to.
+        stats.set_work_name(entry, user.user_id, argument, "")
+        _CABINET_CONTEXT_CACHE.pop((entry, actor.get("id")), None)
+        rendered = await _render_cabinet_section(
+            telethon_client, api, cfg, entry, tz, "works", "", actor, chat_id,
+            known_chat_ids=known_chat_ids, log=log,
+        )
+        if rendered:
+            text, keyboard = rendered
+            try:
+                await api.edit_message_text(
+                    chat_id, message.get("message_id"), text,
+                    reply_markup=keyboard, parse_mode="HTML",
+                )
+            except Exception:
+                log(f"[bot_listener] redraw after delete failed:\n{traceback.format_exc()}")
+        return
+
+    if action in ("title_set", "work_rename", "work_delete"):
         await api.answer_callback_query(callback_id)
         flow_id = uuid.uuid4().hex[:10]
         prompt_text = (
@@ -1422,7 +1455,9 @@ async def handle_cabinet_callback(
             "chat_id": chat_id,
             "user_id": actor.get("id"),
             "entry": entry,
-            "awaiting": "title" if action == "title_set" else "work_rename",
+            "awaiting": {"title_set": "title", "work_delete": "work_delete"}.get(
+                action, "work_rename"
+            ),
             "prompt_message_id": prompt.get("message_id") if prompt else None,
         }
         return
@@ -1526,6 +1561,24 @@ async def handle_cabinet_text_input(
             user.user_id,
             f"✅ Титул «{html.escape(saved)}» активен {economy.TITLE_DAYS} дней.\n"
             f"🪙 Осталось: {remaining}.",
+        ))
+        return True
+
+    if flow["awaiting"] == "work_delete":
+        try:
+            position = int(text.strip())
+        except ValueError:
+            await answer(await _works_screen(
+                telethon_client, entry, user, notice="❌ Нужен номер работы.", log=log))
+            return True
+        message_id = cabinet.message_id_for_position(user, position)
+        if message_id is None:
+            await answer(await _works_screen(
+                telethon_client, entry, user, notice=f"❌ Работы №{position} нет.", log=log))
+            return True
+        names = stats.work_names_for_user(entry, user.user_id)
+        await answer(cabinet.confirm_work_delete_view(
+            user.user_id, position, names.get(str(message_id)), message_id
         ))
         return True
 

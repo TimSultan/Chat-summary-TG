@@ -270,6 +270,119 @@ class BadgeSectionTests(unittest.TestCase):
         self.assertGreater(text.index("📦 Открыто:"), text.index("🏅 <b>Значки</b>"))
 
 
+class WorkDeleteTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        bot_listener._CABINET_CONTEXT_CACHE.clear()
+        self.addCleanup(bot_listener._CABINET_CONTEXT_CACHE.clear)
+        self.api = FakeAPI()
+
+    @staticmethod
+    def _painter():
+        return _user(
+            figurines_painted=3,
+            recent_figurine_posts=[
+                ["2026-07-05T12:00:00", 105],
+                ["2026-07-04T12:00:00", 104],
+                ["2026-07-03T12:00:00", 103],
+            ],
+        )
+
+    def test_works_view_offers_delete_only_when_there_is_something_to_delete(self):
+        _, empty = cabinet.works_view("chat", _user(), [], None, None)
+        actions = {cabinet.parse_callback(b["callback_data"])[1]
+                   for row in empty["inline_keyboard"] for b in row}
+        self.assertNotIn("work_delete", actions)
+
+        _, filled = cabinet.works_view(
+            "chat", self._painter(), ["https://t.me/c/1/105"], None, None
+        )
+        actions = {cabinet.parse_callback(b["callback_data"])[1]
+                   for row in filled["inline_keyboard"] for b in row}
+        self.assertIn("work_delete", actions)
+        self.assertIn("work_rename", actions)
+
+    def test_the_confirmation_carries_the_message_id_not_the_position(self):
+        # Positions renumber after any delete; by the second tap the number could point
+        # at a different work entirely.
+        text, keyboard = cabinet.confirm_work_delete_view(20, 2, "Дредноут", 104)
+
+        self.assertIn("№2", text)
+        self.assertIn("Дредноут", text)
+        self.assertIn(str(stats.XP_PER_FIGURINE), text)
+        confirm = keyboard["inline_keyboard"][0][0]
+        self.assertEqual(cabinet.parse_callback(confirm["callback_data"]), ("20", "work_delete_ok", "104"))
+        # And a way out that is not the delete.
+        cancel = keyboard["inline_keyboard"][1][0]
+        self.assertEqual(cabinet.parse_callback(cancel["callback_data"])[1], "works")
+
+    def _confirm(self, message_id, user):
+        async def fake_context(telethon_client, entry, tz, from_user, log=print):
+            return user, 5_000, 3, 190, 4, 5_000
+
+        async def fake_render(*args, **kwargs):
+            return ("works", {"inline_keyboard": []})
+
+        with patch("bot_listener._cabinet_context", fake_context), \
+             patch("bot_listener._render_cabinet_section", fake_render):
+            asyncio.run(
+                bot_listener.handle_cabinet_callback(
+                    self.api, None, None, None,
+                    {
+                        "id": "cb1",
+                        "data": cabinet.callback_data(20, "work_delete_ok", str(message_id)),
+                        "from": {"id": 20, "username": "user", "first_name": "U"},
+                        "message": {"message_id": 42, "chat": {"id": 999, "type": "private"}},
+                    },
+                    "chat", {}, badge_flows={}, log=lambda *_: None,
+                )
+            )
+
+    def test_confirming_tombstones_the_work_and_clears_its_name(self):
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 104, "Дредноут")
+
+        self._confirm(104, user)
+
+        tombstones = stats._load_deleted_figurines("chat")["posts"]
+        self.assertIn("104", tombstones)
+        self.assertEqual(tombstones["104"]["user_id"], "20")
+        # The name must not outlive the work it belonged to.
+        self.assertNotIn("104", stats.work_names_for_user("chat", user.user_id))
+
+    def test_the_tombstone_removes_the_figurine_and_its_xp(self):
+        user = self._painter()
+        before = user.xp(5.0)
+        self._confirm(105, user)
+
+        users = {"20": self._painter()}
+        stats._apply_deleted_figurines("chat", users)
+        after = users["20"]
+
+        self.assertEqual(after.figurines_painted, 2)
+        self.assertEqual([p[1] for p in after.recent_figurine_posts], [104, 103])
+        self.assertEqual(before - after.xp(5.0), stats.XP_PER_FIGURINE)
+
+    def test_you_cannot_delete_a_work_that_is_not_yours(self):
+        # A hand-crafted callback naming somebody else's message_id must do nothing.
+        self._confirm(999_999, self._painter())
+
+        self.assertEqual(self.api.answers, ["Эта работа уже удалена."])
+        self.assertEqual(stats._load_deleted_figurines("chat")["posts"], {})
+
+    def test_the_cached_context_is_dropped_so_the_list_refreshes(self):
+        user = self._painter()
+        bot_listener._CABINET_CONTEXT_CACHE[("chat", 20)] = (10**9, (user, 1, 1, 1, 1, 1))
+
+        self._confirm(105, user)
+
+        self.assertNotIn(("chat", 20), bot_listener._CABINET_CONTEXT_CACHE)
+
+
 class BadgeDelegationTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()

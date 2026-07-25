@@ -204,10 +204,12 @@ def works_view(
         if len(figurine_links) > WORKS_SHOWN:
             lines.append(f"\n…и ещё {len(figurine_links) - WORKS_SHOWN}.")
         lines.append(f"\nНазвание — до {stats.WORK_NAME_MAX_CHARS} символов.")
-        rows.append([{
-            "text": "✏️ Переименовать",
-            "callback_data": callback_data(user.user_id, "work_rename"),
-        }])
+        rows.append([
+            {"text": "✏️ Переименовать",
+             "callback_data": callback_data(user.user_id, "work_rename")},
+            {"text": "🗑 Удалить",
+             "callback_data": callback_data(user.user_id, "work_delete")},
+        ])
     else:
         lines.append(f"Пока пусто — выложи работу с {stats.FIGURINE_HASHTAG}.")
 
@@ -239,6 +241,29 @@ def parse_rename_request(text: str) -> tuple[int, str] | None:
     if position < 1:
         return None
     return position, (parts[1] if len(parts) > 1 else "")
+
+
+def confirm_work_delete_view(owner_id, position: int, name: str | None, message_id: int):
+    """Ask before deleting. Removing a work is irreversible -- it writes a permanent
+    tombstone so a stale transcript cannot restore it -- and costs the member 200 XP,
+    which can drop their level and a painting badge with it. That is far too much to
+    hang off a single mistaken tap, so the number they typed is read back to them first.
+
+    The message_id, not the position, rides in the confirm button: positions renumber
+    when a work is deleted, and by the time the second tap arrives this member may have
+    deleted another one from a different screen.
+    """
+    label = f"«{escape(name)}»" if name else "без названия"
+    text = (
+        f"🗑 <b>Удалить работу №{position}</b> — {label}?\n\n"
+        f"Это уберёт {stats.XP_PER_FIGURINE} XP и одну фигурку. Отменить будет нельзя."
+    )
+    keyboard = {"inline_keyboard": [
+        [{"text": "🗑 Да, удалить",
+          "callback_data": callback_data(owner_id, "work_delete_ok", str(message_id))}],
+        [{"text": "◀️ Отмена", "callback_data": callback_data(owner_id, "works")}],
+    ]}
+    return text, keyboard
 
 
 def badges_view(
