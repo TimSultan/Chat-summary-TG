@@ -205,41 +205,52 @@ class SeasonTests(unittest.TestCase):
         self.assertLess(stats.chat_level(68 * 90).number, stats.MAX_CHAT_LEVEL)
         self.assertGreater(stats.chat_level(68 * 90).number, 25)
 
-    def test_a_new_season_rebaselines_instead_of_announcing(self):
+    def test_a_new_season_rebaselines_the_watermark_without_a_word(self):
         user = stats.UserStats(user_id="20", username="user", display_name="User")
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch("stats.app_now", return_value=datetime(2026, 7, 15, tzinfo=timezone.utc)):
                     stats.record_level_observations("chat", [(user, 0)])
                     climbed = stats.record_level_observations("chat", [(user, 9_000)])
-                # New quarter: everybody's season XP restarts at zero.
+                    high = stats._load_level_state("chat")["users"]["20"]
+
+                # New quarter: everybody's season XP restarts at zero, so the watermark
+                # must come down with it rather than freezing them at last season's peak.
                 with patch("stats.app_now", return_value=datetime(2026, 10, 2, tzinfo=timezone.utc)):
                     reset = stats.record_level_observations("chat", [(user, 0)])
-                    reclimb = stats.record_level_observations("chat", [(user, 9_000)])
+                    after = stats._load_level_state("chat")["users"]["20"]
 
-        self.assertTrue(climbed)
-        # The reset itself is silent -- the ladder was rebuilt, nobody was demoted.
+        self.assertEqual(climbed, [])
         self.assertEqual(reset, [])
-        # Climbing again in the new season is worth announcing again.
-        self.assertTrue(reclimb)
+        self.assertEqual(high["season"], "2026-S3")
+        self.assertGreater(high["chat_level"], 1)
+        self.assertEqual(after["season"], "2026-S4")
+        self.assertEqual(after["chat_level"], 1)
 
-    def test_only_tier_changes_are_announced(self):
+    def test_chat_levels_are_tracked_but_never_announced(self):
+        """Deliberately silent: on the seasonal curve these come round every quarter for
+        the same handful of people, and the level is always visible in /stat."""
         user = stats.UserStats(user_id="20", username="user", display_name="User")
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 stats.record_level_observations("chat", [(user, 0)])
-                # Level 2 and 3 are inside the same tier as level 1: silence.
                 within_tier = stats.record_level_observations(
                     "chat", [(user, stats.chat_level_threshold(3))]
                 )
-                # Level 6 opens a new tier: announced.
                 new_tier = stats.record_level_observations(
                     "chat", [(user, stats.chat_level_threshold(6))]
                 )
+                stored = stats._load_level_state("chat")["users"]["20"]
+
+                # A painting rank still is announced -- it is all-time and rare.
+                user.figurines_painted = 3
+                rank_up = stats.record_level_observations("chat", [(user, 0)])
 
         self.assertEqual(within_tier, [])
-        self.assertEqual(len(new_tier), 1)
-        self.assertIn("Болтун", new_tier[0])
+        self.assertEqual(new_tier, [])
+        # ...but the watermark keeps moving, so re-enabling the line needs no migration.
+        self.assertEqual(stored["chat_level"], 6)
+        self.assertEqual(rank_up, ["@user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳"])
 
 
 class LevelTrackTests(unittest.TestCase):

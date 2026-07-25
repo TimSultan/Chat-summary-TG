@@ -571,9 +571,7 @@ class GamificationTests(unittest.TestCase):
                 # chat's entire back catalogue of levels.
                 self.assertEqual(stats.record_level_observations("chat", [(user, 0)]), [])
 
-                # The chat level now moves on XP alone, with no figurine requirement
-                # holding it back. Only the TIER change is announced, not each of the
-                # sixteen levels crossed to get there.
+                # The chat level moves on XP alone, but is deliberately NOT announced.
                 chat_promotion = stats.record_level_observations("chat", [(user, 2_500)])
                 repeated = stats.record_level_observations("chat", [(user, 2_500)])
 
@@ -581,7 +579,7 @@ class GamificationTests(unittest.TestCase):
                 user.figurines_painted = 3
                 painter_promotion = stats.record_level_observations("chat", [(user, 2_500)])
 
-        self.assertEqual(chat_promotion, ["@user вырос до уровня «📣 Заводила 17»! 🎉🎊🥳"])
+        self.assertEqual(chat_promotion, [])
         self.assertEqual(repeated, [])
         self.assertEqual(
             painter_promotion,

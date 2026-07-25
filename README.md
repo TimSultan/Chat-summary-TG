@@ -493,12 +493,17 @@ remains specific to `#япокрасил` figurine credit).
 The name, progression, and activity sections are separated by blank lines. The last
 activity timestamp is intentionally omitted, and badges are rendered two per row.
 
-When a tracked user reaches a higher level, the bot posts one persistent announcement:
+A new **painting rank** is announced once:
 
 ```text
-@user вырос до уровня «💬 Болтун 7»! 🎉🎊🥳
 @user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳
 ```
+
+Chat levels are tracked but deliberately **not** announced: on the seasonal curve they
+come round again every quarter for the same handful of people, which turns the chat into
+a promotion feed, and the level is always visible in `/stat` and the cabinet. The
+watermark is still maintained, so restoring the announcement is two lines and needs no
+migration.
 
 The last observed level is persisted per chat, so a promotion is announced only once
 across `/stat` calls and process restarts. Existing users are silently baselined when
@@ -576,6 +581,13 @@ acting, so a menu left open after a revoke cannot still hand out badges.
 - **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
 - **Выдать значок** shows the chat's saved custom badges, then asks for the recipient's
   exact `@username`.
+- **Забрать у участника** takes one badge from one member, leaving the definition alone.
+  Not announced in the group: an award is good news worth sharing, having one taken away
+  is not something to publish about somebody.
+- **Удалить значок совсем** deletes the definition *and* every assignment of it, behind a
+  confirmation that spells out how many members currently hold it. Assignments are
+  cleared rather than left dangling — a leftover would be invisible but would still count
+  towards somebody's collection total and would come back if the id were reused.
 
 Custom definitions and assignments are persisted per chat under the existing stats
 cache. Awarding the same badge to the same member twice is idempotent.

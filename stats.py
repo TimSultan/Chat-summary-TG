@@ -928,6 +928,60 @@ def parse_custom_badge_spec(text: str) -> tuple[str, str]:
     return emoji, name
 
 
+def custom_badge_holder_count(entry: str, badge_id: str) -> int:
+    """How many members currently hold `badge_id` -- what a delete confirmation needs to
+    say out loud, since deleting a definition takes it away from all of them."""
+    try:
+        data = _load_custom_badge_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return 0
+    return sum(1 for assigned in data["assignments"].values() if badge_id in assigned)
+
+
+def delete_custom_badge(entry: str, badge_id: str) -> Badge | None:
+    """Remove a custom badge definition AND every assignment of it.
+
+    The assignments are cleared rather than left dangling: custom_badges_for_user already
+    skips an assignment whose definition is gone, so a leftover would be invisible but
+    would still count towards somebody's collection total and would come back to life if
+    a new badge were ever created with the same id. Returns the deleted badge, or None if
+    it was already gone."""
+    try:
+        data = _load_custom_badge_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    record = data["badges"].pop(badge_id, None)
+    if record is None:
+        return None
+    for assigned in data["assignments"].values():
+        assigned.pop(badge_id, None)
+    _save_custom_badge_data(entry, data)
+    return Badge(
+        badge_id=record["id"], emoji=record["emoji"], name=record["name"],
+        description="выдан администратором", custom=True,
+    )
+
+
+def revoke_custom_badge(entry: str, badge_id: str, user_id: int | str) -> Badge | None:
+    """Take one badge away from one member, leaving the definition in place. Returns the
+    badge, or None when that member did not have it."""
+    try:
+        data = _load_custom_badge_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    assigned = data["assignments"].get(str(user_id)) or {}
+    if assigned.pop(badge_id, None) is None:
+        return None
+    record = data["badges"].get(badge_id)
+    _save_custom_badge_data(entry, data)
+    if record is None:
+        return None
+    return Badge(
+        badge_id=record["id"], emoji=record["emoji"], name=record["name"],
+        description="выдан администратором", custom=True,
+    )
+
+
 def list_custom_badges(entry: str) -> list[Badge]:
     data = _load_custom_badge_data(entry)
     records = sorted(data["badges"].values(), key=lambda item: item.get("created_at", ""))
@@ -1214,10 +1268,11 @@ def record_level_observations(
         data["users"][user_key] = observed
         dirty = True
         name = _level_announcement_name(user)
-        if promoted_chat:
-            announcements.append(
-                f"{name} вырос до уровня «{level.label}»! 🎉🎊🥳"
-            )
+        # Chat-level promotions are tracked but NOT announced. On the seasonal curve they
+        # come round again every quarter for the same handful of people, which turns the
+        # chat into a promotion feed; the level is always visible in /stat and the
+        # cabinet. The watermark above is still maintained, so announcing them again is
+        # restoring these two lines, not rebuilding the state.
         if promoted_painter:
             announcements.append(
                 f"{name} получил новое звание «{rank.label}»! 🎉🎊🥳"

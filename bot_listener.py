@@ -118,6 +118,8 @@ BADGE_CALLBACK_PREFIX = "badge"
 BADGE_FLOW_TTL_SECONDS = 10 * 60
 BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
 BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
+BADGE_REVOKE_BUTTON_TEXT = "➖ Забрать у участника"
+BADGE_DELETE_BUTTON_TEXT = "🗑 Удалить значок совсем"
 WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
 BADGE_ADMIN_COMMAND = "/badgeadmin"
@@ -300,6 +302,8 @@ async def handle_badge_command(
             "inline_keyboard": [
                 [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
                 [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
+                [{"text": BADGE_REVOKE_BUTTON_TEXT, "callback_data": _badge_callback_data("revlist", flow_id)}],
+                [{"text": BADGE_DELETE_BUTTON_TEXT, "callback_data": _badge_callback_data("dellist", flow_id)}],
             ]
         },
         parse_mode=None,
@@ -423,7 +427,9 @@ async def handle_badge_callback(
 
     if action == "give" and badge_id:
         if flow["target"]:
-            await _award_badge_from_flow(api, flow, badge_id, flow["target"], message.get("message_id"))
+            await _award_badge_from_flow(
+                api, flow, badge_id, flow["target"], message.get("message_id")
+            )
             badge_flows.pop(flow_id, None)
         else:
             flow["selected_badge_id"] = badge_id
@@ -437,6 +443,83 @@ async def handle_badge_callback(
                 parse_mode=None,
             )
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+        return
+
+    # Pick a badge, for either of the two destructive actions.
+    if action in ("dellist", "revlist"):
+        badges = stats.list_custom_badges(flow["entry"])
+        if not badges:
+            await api.send_message(
+                flow["chat_id"], "Пока нет пользовательских значков.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+            return
+        next_action = "del" if action == "dellist" else "rev"
+        prompt_text = (
+            "Какой значок удалить совсем?" if action == "dellist"
+            else "Какой значок забрать у участника?"
+        )
+        await api.send_message(
+            flow["chat_id"], prompt_text,
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"inline_keyboard": [
+                [{"text": badge.label,
+                  "callback_data": _badge_callback_data(next_action, flow_id, badge.badge_id)}]
+                for badge in badges
+            ]},
+            parse_mode=None,
+        )
+        return
+
+    if action == "del" and badge_id:
+        # Deleting a definition takes the badge away from everybody holding it, so the
+        # count is spelled out before the second tap rather than discovered afterwards.
+        badge = next(
+            (item for item in stats.list_custom_badges(flow["entry"]) if item.badge_id == badge_id),
+            None,
+        )
+        if badge is None:
+            await api.send_message(
+                flow["chat_id"], "Этот значок уже удалён.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+            return
+        holders = stats.custom_badge_holder_count(flow["entry"], badge_id)
+        note = f"\nСейчас он есть у {holders} чел. — у них он тоже пропадёт." if holders else ""
+        await api.send_message(
+            flow["chat_id"],
+            f"Удалить значок {badge.label} совсем?{note}\nОтменить будет нельзя.",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"inline_keyboard": [
+                [{"text": "🗑 Да, удалить",
+                  "callback_data": _badge_callback_data("delok", flow_id, badge_id)}],
+            ]},
+            parse_mode=None,
+        )
+        return
+
+    if action == "delok" and badge_id:
+        deleted = stats.delete_custom_badge(flow["entry"], badge_id)
+        await api.send_message(
+            flow["chat_id"],
+            f"Значок {deleted.label} удалён." if deleted else "Этот значок уже удалён.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        badge_flows.pop(flow_id, None)
+        return
+
+    if action == "rev" and badge_id:
+        flow["selected_badge_id"] = badge_id
+        flow["awaiting"] = "revoke_target"
+        prompt = await api.send_message(
+            flow["chat_id"],
+            "Ответьте на это сообщение именем или @username участника, у которого забрать значок.",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+        return
 
 
 async def handle_badge_text_input(
@@ -458,7 +541,7 @@ async def handle_badge_text_input(
             for flow_id, flow in badge_flows.items()
             if flow.get("chat_id") == chat_id
             and flow.get("admin_id") == actor_id
-            and flow.get("awaiting") in ("create_spec", "target")
+            and flow.get("awaiting") in ("create_spec", "target", "revoke_target")
             and flow.get("prompt_message_id") == replied_message_id
             and time.monotonic() - flow["created_at"] <= BADGE_FLOW_TTL_SECONDS
         ),
@@ -498,6 +581,35 @@ async def handle_badge_text_input(
         await api.send_message(
             chat_id,
             f"Создан значок {badge.label}. Теперь его можно выдать через /badge.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return True
+
+    if flow["awaiting"] == "revoke_target":
+        target, _, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client, flow["entry"], flow["entry"], text, None, "", tz, log=log
+        )
+        if target is None:
+            prompt = await api.send_message(
+                chat_id,
+                "Участник не найден в статистике. Попробуйте точный @username.",
+                reply_to_message_id=message["message_id"],
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+            flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+            return True
+        badge_flows.pop(flow_id, None)
+        revoked = stats.revoke_custom_badge(
+            flow["entry"], flow["selected_badge_id"], target.user_id
+        )
+        # Deliberately NOT announced in the group: an award is good news worth sharing,
+        # having one taken away is not something to publish about somebody.
+        await api.send_message(
+            chat_id,
+            f"Забрал значок {revoked.label} у {target.display_name}." if revoked
+            else f"У {target.display_name} нет этого значка.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )

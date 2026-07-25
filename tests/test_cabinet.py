@@ -446,6 +446,72 @@ class BadgeAnnouncementTests(unittest.TestCase):
         )
 
 
+class BadgeRemovalTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
+        self.other = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+        for user_id in ("20", "21"):
+            stats.give_custom_badge("chat", self.badge.badge_id, user_id, "U", 10, "Admin")
+
+    def test_revoking_takes_it_from_one_member_only(self):
+        revoked = stats.revoke_custom_badge("chat", self.badge.badge_id, "20")
+
+        self.assertEqual(revoked.label, "🏹 Лучник")
+        self.assertEqual(stats.custom_badges_for_user("chat", "20"), [])
+        # The other holder is untouched, and the definition still exists.
+        self.assertEqual([b.label for b in stats.custom_badges_for_user("chat", "21")], ["🏹 Лучник"])
+        self.assertIn("🏹 Лучник", [b.label for b in stats.list_custom_badges("chat")])
+
+    def test_revoking_what_somebody_does_not_have_reports_it(self):
+        self.assertIsNone(stats.revoke_custom_badge("chat", self.other.badge_id, "20"))
+        self.assertIsNone(stats.revoke_custom_badge("chat", self.badge.badge_id, "999"))
+
+    def test_deleting_a_definition_takes_it_from_everybody(self):
+        self.assertEqual(stats.custom_badge_holder_count("chat", self.badge.badge_id), 2)
+
+        deleted = stats.delete_custom_badge("chat", self.badge.badge_id)
+
+        self.assertEqual(deleted.label, "🏹 Лучник")
+        self.assertEqual([b.label for b in stats.list_custom_badges("chat")], ["🎯 Меткий глаз"])
+        self.assertEqual(stats.custom_badges_for_user("chat", "20"), [])
+        self.assertEqual(stats.custom_badges_for_user("chat", "21"), [])
+
+    def test_a_deleted_badge_leaves_no_dangling_assignment(self):
+        """A leftover assignment would be invisible but would still count towards the
+        collection total, and would come back if the id were ever reused."""
+        stats.delete_custom_badge("chat", self.badge.badge_id)
+
+        data = stats._load_custom_badge_data("chat")
+        for assigned in data["assignments"].values():
+            self.assertNotIn(self.badge.badge_id, assigned)
+
+        unlocked, _ = stats.badge_collection_progress(
+            _user(), custom_badges=stats.custom_badges_for_user("chat", "20")
+        )
+        blank, _ = stats.badge_collection_progress(_user())
+        self.assertEqual(unlocked, blank)
+
+    def test_deleting_twice_is_reported_not_crashed(self):
+        self.assertIsNotNone(stats.delete_custom_badge("chat", self.badge.badge_id))
+        self.assertIsNone(stats.delete_custom_badge("chat", self.badge.badge_id))
+
+    def test_the_menu_offers_both_removals(self):
+        texts = {
+            bot_listener.BADGE_CREATE_BUTTON_TEXT,
+            bot_listener.BADGE_GIVE_BUTTON_TEXT,
+            bot_listener.BADGE_REVOKE_BUTTON_TEXT,
+            bot_listener.BADGE_DELETE_BUTTON_TEXT,
+        }
+        self.assertEqual(len(texts), 4)
+        self.assertIn("Забрать", bot_listener.BADGE_REVOKE_BUTTON_TEXT)
+        self.assertIn("Удалить", bot_listener.BADGE_DELETE_BUTTON_TEXT)
+
+
 class BadgeDelegationTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
