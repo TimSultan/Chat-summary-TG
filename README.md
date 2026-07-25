@@ -314,6 +314,30 @@ Commands (any tracked chat):
 - `/buy <item> [args]` — purchase
 - `/send @username 50` — transfer coins to another member
 
+### Menu button and the fallback menu
+
+The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
+client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
+command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins`, groups get the
+shorter `/stat /top /cabinet` (wallet actions belong in the DM, where a balance isn't
+public). Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
+deliberately **not** advertised. Registration is best-effort: the bot starts fine without
+a menu.
+
+Because `_match_allowed_chat` never matches a private chat, `/stat`, `/top`, `/shop` and
+`/coins` used to be silent no-ops in a DM. They now fall back to the configured home chat
+(`_stats_entry_for`), the same way `/cabinet` and the summary pipeline already did — a
+published menu must not contain commands that do nothing where it is published.
+
+**Any unhandled DM gets the menu back.** After every specific handler has declined —
+commands, summary keywords, the joke trigger, both force-reply flows — a private message
+the bot has no answer for is replied to with the cabinet menu instead of silence. It never
+fires in a group, stays quiet while somebody is mid-way through a force-reply step
+(another member's pending flow doesn't mute you), and a burst of messages produces one
+menu rather than one each (`MENU_FALLBACK_COOLDOWN_SECONDS`, 60s; set 0 to answer every
+message). Somebody the stats don't know yet gets a short welcome instead of six buttons
+leading to six empty screens.
+
 ### Личный кабинет (`/cabinet`)
 
 `/cabinet` in the bot's DM opens a button-driven personal cabinet (`cabinet.py`). Sent in

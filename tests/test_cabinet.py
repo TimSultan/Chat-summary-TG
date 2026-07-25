@@ -208,5 +208,139 @@ class CallbackTests(unittest.TestCase):
         self.assertFalse(handled)
 
 
+class MenuFallbackTests(unittest.TestCase):
+    """The fallback menu's whole risk is firing where it shouldn't, so that is what
+    these pin down."""
+
+    def setUp(self):
+        self.api = FakeAPI()
+
+    @staticmethod
+    def _message(chat_type="private", chat_id=999, user_id=20, text="привет"):
+        return {
+            "message_id": 7,
+            "chat": {"id": chat_id, "type": chat_type},
+            "from": {"id": user_id, "username": "user", "first_name": "Tester"},
+            "text": text,
+        }
+
+    def _send(self, message, entry=None, cabinet_flows=None, badge_flows=None, last_sent=None):
+        return asyncio.run(
+            bot_listener.maybe_send_menu(
+                self.api, None, None, message, entry,
+                cabinet_flows if cabinet_flows is not None else {},
+                badge_flows if badge_flows is not None else {},
+                last_sent if last_sent is not None else {},
+                log=lambda *_: None,
+            )
+        )
+
+    def test_never_fires_in_a_group(self):
+        # A menu posted under ordinary group chatter is spam, and it would print one
+        # person's balance in front of everybody.
+        self._send(self._message(chat_type="supergroup"))
+        self.assertEqual(self.api.sent, [])
+
+    def test_an_unknown_dm_gets_the_menu(self):
+        self._send(self._message())
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("inline_keyboard", self.api.sent[0]["reply_markup"])
+
+    def test_no_home_chat_configured_still_answers_with_something_useful(self):
+        self._send(self._message(), entry=None)
+        self.assertIn("пока не вижу", self.api.sent[0]["text"])
+
+    def test_a_tracked_member_gets_their_own_cabinet(self):
+        async def fake_context(telethon_client, entry, tz, from_user, log=print):
+            return _user(), 5_000, 3, 190, 4
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                with patch("bot_listener._cabinet_context", fake_context):
+                    self._send(self._message(), entry="chat")
+
+        self.assertIn("Личный кабинет", self.api.sent[0]["text"])
+        self.assertIn("🪙 Монеты: 500", self.api.sent[0]["text"])
+
+    def test_it_stays_quiet_while_a_cabinet_answer_is_awaited(self):
+        flows = {
+            "f1": {
+                "created_at": 10**9,  # far in the future of monotonic(), so never expired
+                "chat_id": 999,
+                "user_id": 20,
+                "entry": "chat",
+                "awaiting": "title",
+                "prompt_message_id": 5,
+            }
+        }
+        self._send(self._message(), cabinet_flows=flows)
+        self.assertEqual(self.api.sent, [])
+
+    def test_it_stays_quiet_while_a_badge_answer_is_awaited(self):
+        flows = {
+            "f1": {
+                "created_at": 10**9,
+                "chat_id": 999,
+                "admin_id": 20,
+                "awaiting": "target",
+                "prompt_message_id": 5,
+            }
+        }
+        self._send(self._message(), badge_flows=flows)
+        self.assertEqual(self.api.sent, [])
+
+    def test_another_members_pending_flow_does_not_mute_you(self):
+        flows = {
+            "f1": {
+                "created_at": 10**9, "chat_id": 999, "user_id": 77,
+                "awaiting": "title", "prompt_message_id": 5,
+            }
+        }
+        self._send(self._message(user_id=20), cabinet_flows=flows)
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_a_burst_of_messages_produces_one_menu(self):
+        last_sent = {}
+        for _ in range(4):
+            self._send(self._message(), last_sent=last_sent)
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_separate_dms_do_not_share_the_cooldown(self):
+        last_sent = {}
+        self._send(self._message(chat_id=111), last_sent=last_sent)
+        self._send(self._message(chat_id=222), last_sent=last_sent)
+        self.assertEqual(len(self.api.sent), 2)
+
+
+class MenuRegistrationTests(unittest.TestCase):
+    def test_every_advertised_dm_command_resolves_to_a_chat_in_a_dm(self):
+        """A published menu must not contain commands that do nothing where they are
+        published. _match_allowed_chat never matches a DM, so without the home-chat
+        fallback these would all be silent no-ops."""
+        private = {"type": "private", "id": 999}
+        self.assertEqual(bot_listener._stats_entry_for(private, None, "mychat"), "mychat")
+        # A group still reads its own stats, never the home chat's.
+        group = {"type": "supergroup", "id": -100123}
+        self.assertEqual(bot_listener._stats_entry_for(group, "othergroup", "mychat"), "othergroup")
+        # An untracked group resolves to nothing at all, as before.
+        self.assertIsNone(bot_listener._stats_entry_for(group, None, "mychat"))
+
+    def test_admin_only_commands_are_not_advertised(self):
+        published = {
+            command["command"]
+            for command in bot_listener.PRIVATE_CHAT_COMMANDS + bot_listener.GROUP_CHAT_COMMANDS
+        }
+        self.assertFalse(published & {"badge", "weekwinner", "deletepokras"})
+        self.assertIn("cabinet", published)
+
+    def test_registration_survives_a_telegram_failure(self):
+        class FailingAPI:
+            async def set_my_commands(self, commands, scope=None):
+                raise bot_listener.ChatSummaryError("boom")
+
+        # The bot must still start without a menu rather than refusing to boot.
+        asyncio.run(bot_listener.register_bot_menu(FailingAPI(), log=lambda *_: None))
+
+
 if __name__ == "__main__":
     unittest.main()

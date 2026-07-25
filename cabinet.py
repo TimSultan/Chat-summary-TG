@@ -238,6 +238,23 @@ def send_view(entry: str, user: stats.UserStats, xp: int, notice: str = "") -> t
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def welcome_view(user_id) -> tuple[str, dict]:
+    """Shown to somebody the stats don't know yet.
+
+    They have no balance, level or works to render, so offering the full board would be
+    six buttons leading to six empty screens. One honest sentence and a retry is better.
+    """
+    text = (
+        "👋 <b>Привет!</b>\n\n"
+        "Я веду статистику чата: уровни, монеты, значки и работы.\n"
+        "Тебя я пока не вижу — напиши что-нибудь в чат, и всё появится."
+    )
+    keyboard = {"inline_keyboard": [[
+        {"text": "🔄 Проверить снова", "callback_data": callback_data(user_id, "main")}
+    ]]}
+    return text, keyboard
+
+
 def result_view(owner_id, text: str) -> tuple[str, dict]:
     """A one-off outcome screen (a purchase, a transfer) that always offers the way back
     -- a member must never end up on a leaf with no route to the rest of the cabinet."""

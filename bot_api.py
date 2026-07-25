@@ -81,6 +81,21 @@ class TelegramBotAPI:
             params["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
         return await self._call("sendMessage", **params)
 
+    async def set_my_commands(self, commands: list[dict], scope: dict | None = None) -> None:
+        """Populate the client's own ☰ Menu button next to the input field.
+
+        This is what makes the bot usable without anybody memorising a command: Telegram
+        renders the list as a tappable menu. Registered per scope, so the group list can
+        stay short while the DM list carries the full set.
+
+        Best-effort -- a failure here leaves the bot fully functional, just without the
+        menu, which is never worth refusing to start over.
+        """
+        try:
+            await self._call("setMyCommands", commands=commands, scope=scope)
+        except ChatSummaryError as e:
+            raise ChatSummaryError(f"setMyCommands failed: {e}") from e
+
     async def edit_message_text(
         self,
         chat_id,

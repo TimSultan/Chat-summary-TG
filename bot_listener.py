@@ -130,6 +130,29 @@ PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
 SHOP_COMMANDS = ("/shop", "/buy", "/coins", "/send")
 
 CABINET_COMMAND = "/cabinet"
+
+# Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
+# -- the point being that nobody has to know a command exists in order to use the bot.
+# Deliberately excludes the admin-only DM commands (/badge, /weekwinner, /deletepokras):
+# advertising them to all 190 members would invite a wave of "нужны права администратора".
+PRIVATE_CHAT_COMMANDS = (
+    {"command": "cabinet", "description": "Личный кабинет"},
+    {"command": "stat", "description": "Моя статистика"},
+    {"command": "top", "description": "Рейтинг чата"},
+    {"command": "shop", "description": "Магазин"},
+    {"command": "coins", "description": "Мой баланс"},
+)
+# Shorter in groups: the wallet actions belong in the DM, where a balance isn't public.
+GROUP_CHAT_COMMANDS = (
+    {"command": "stat", "description": "Статистика участника"},
+    {"command": "top", "description": "Рейтинг чата"},
+    {"command": "cabinet", "description": "Личный кабинет (в личке)"},
+)
+
+# An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
+# cooldown only stops a burst of messages producing a wall of identical menus; set it to
+# 0 to answer literally every message.
+MENU_FALLBACK_COOLDOWN_SECONDS = 60
 # Same ten-minute window the badge flows use: only the two force-reply steps (setting a
 # title, sending coins) need server-side state at all -- every button in the cabinet
 # carries its own owner id, so navigation itself survives a restart.
@@ -1004,6 +1027,109 @@ async def _cabinet_buy(
     )
 
 
+def _stats_entry_for(chat: dict, matched_entry: str | None, home_chat_ref: str | None) -> str | None:
+    """Which tracked chat a stats/wallet command should read.
+
+    In a group that is the group itself. In a DM there is no tracked chat to match --
+    _match_allowed_chat deliberately never matches a private chat -- so it falls back to
+    the single configured home chat, exactly as /cabinet and the summary pipeline already
+    do. Without this, every command in the DM menu below would either answer
+    "недоступна в этом чате" or do nothing at all, which is a poor advertisement for a
+    menu the bot itself publishes.
+    """
+    if matched_entry is not None:
+        return matched_entry
+    if chat.get("type") == "private":
+        return home_chat_ref
+    return None
+
+
+def _has_pending_flow(flows: dict[str, dict], chat_id, user_id, ttl_seconds: int) -> bool:
+    """Whether this person is mid-way through a force-reply step in `flows`.
+
+    The menu must not barge in on somebody who has been asked a question -- they may be
+    typing the answer, or may have replied without using Telegram's reply UI, in which
+    case the correlated handler already declined and silence is the right response.
+    """
+    return any(
+        flow.get("chat_id") == chat_id
+        and flow.get("user_id", flow.get("admin_id")) == user_id
+        and time.monotonic() - flow["created_at"] <= ttl_seconds
+        for flow in flows.values()
+    )
+
+
+async def maybe_send_menu(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str | None,
+    cabinet_flows: dict[str, dict],
+    badge_flows: dict[str, dict],
+    menu_last_sent: dict,
+    log=print,
+) -> None:
+    """Answer an otherwise-unhandled DM with the cabinet menu.
+
+    This is the last thing tried in a private chat, deliberately: every specific handler
+    -- commands, summary keywords, the joke trigger, both force-reply flows -- gets to
+    claim the message first, and only what none of them wanted lands here. Without it a
+    DM the bot doesn't recognise produces total silence, which reads as "the bot is
+    broken" rather than "that wasn't a request I understand".
+
+    Never fires in a group: a menu posted in reply to ordinary chatter would be spam, and
+    it renders one person's private balance in front of everybody.
+    """
+    chat = message.get("chat") or {}
+    if chat.get("type") != "private":
+        return
+    chat_id = chat.get("id")
+    actor = message.get("from") or {}
+    user_id = actor.get("id")
+
+    if _has_pending_flow(cabinet_flows, chat_id, user_id, CABINET_FLOW_TTL_SECONDS):
+        return
+    if _has_pending_flow(badge_flows, chat_id, user_id, BADGE_FLOW_TTL_SECONDS):
+        return
+
+    now = time.monotonic()
+    last = menu_last_sent.get(chat_id)
+    if last is not None and now - last < MENU_FALLBACK_COOLDOWN_SECONDS:
+        return
+    menu_last_sent[chat_id] = now
+
+    try:
+        if entry is None:
+            text, keyboard = cabinet.welcome_view(user_id)
+        else:
+            context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
+            if context is None:
+                text, keyboard = cabinet.welcome_view(user_id)
+            else:
+                user, xp, rank, total, streak = context
+                text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak)
+        await api.send_message(
+            chat_id, text, reply_to_message_id=message.get("message_id"),
+            reply_markup=keyboard, parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[bot_listener] failed to send the fallback menu:\n{traceback.format_exc()}")
+
+
+async def register_bot_menu(api: TelegramBotAPI, log=print) -> None:
+    """Publish the ☰ Menu command lists once at startup. Best-effort: the bot works
+    without a menu, so a transient failure here must not stop it from starting."""
+    for scope, commands in (
+        ({"type": "all_private_chats"}, list(PRIVATE_CHAT_COMMANDS)),
+        ({"type": "all_group_chats"}, list(GROUP_CHAT_COMMANDS)),
+    ):
+        try:
+            await api.set_my_commands(commands, scope=scope)
+        except ChatSummaryError as e:
+            log(f"[bot_listener] could not register the {scope['type']} menu: {e}")
+
+
 async def handle_cabinet_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -1851,6 +1977,7 @@ async def _dispatch_update(
     joke_posted_queue,
     badge_flows: dict[str, dict],
     cabinet_flows: dict[str, dict],
+    menu_last_sent: dict,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -2006,12 +2133,13 @@ async def _dispatch_update(
     # spend against a tracked chat's ledger, so there is nothing meaningful to answer for
     # a chat that isn't tracked.
     if cfg.stats_enabled and text_lower.startswith(SHOP_COMMANDS):
-        if matched_entry is None:
+        shop_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if shop_entry is None:
             return
         shop_text = stats.strip_command_bot_mention(message_text, bot_username)
         task = asyncio.create_task(
             handle_shop_command(
-                api, telethon_client, cfg, tz, message, shop_text, matched_entry,
+                api, telethon_client, cfg, tz, message, shop_text, shop_entry,
                 background_tasks, log=log,
             )
         )
@@ -2024,6 +2152,9 @@ async def _dispatch_update(
     # from the known_chat_ids learning above rather than re-matching the chat.
     if cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
         chat_key = chat["id"]
+        # In a DM this resolves to the configured home chat, so /stat and /top work from
+        # the published menu instead of reporting themselves unavailable.
+        matched_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
         if matched_entry is None:
             try:
                 sent = await api.send_message(
@@ -2145,6 +2276,13 @@ async def _dispatch_update(
         return
 
     if not has_summary and not has_roast:
+        # Nothing above wanted this message. In a DM that means the person typed
+        # something the bot has no specific answer for, so show them what it CAN do
+        # rather than saying nothing at all. Groups fall through silently as before.
+        await maybe_send_menu(
+            api, telethon_client, tz, message, home_chat_ref,
+            cabinet_flows, badge_flows, menu_last_sent, log=log,
+        )
         return
 
     if not _is_chat_allowed(allowed_chats, chat):
@@ -2272,6 +2410,9 @@ async def run_bot_listener(
     # owner id -- so only these two text-entry prompts need correlating, and losing them
     # on a restart costs the member one re-press, nothing more.
     cabinet_flows: dict[str, dict] = {}
+    # Last time the fallback menu was sent per DM chat_id, so a burst of messages
+    # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
+    menu_last_sent: dict[int, float] = {}
 
     # Roast confirm/button flow state, keyed by (chat_id, target_user_id) -- mirrors
     # listener.py's roast_pending/roast_in_progress. Value: {"confirm_msg_id",
@@ -2293,6 +2434,7 @@ async def run_bot_listener(
         api = TelegramBotAPI(bot_token, session)
         me = await api.get_me()
         bot_username = me.get("username")
+        await register_bot_menu(api, log=log)
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
             f"{cfg.listener_trigger_keywords} (summary; roast is off) and direct replies. FIFO queue delay: "
@@ -2319,7 +2461,7 @@ async def run_bot_listener(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
                             known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
-                            cabinet_flows, log=log,
+                            cabinet_flows, menu_last_sent, log=log,
                         )
                     except Exception:
                         log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
