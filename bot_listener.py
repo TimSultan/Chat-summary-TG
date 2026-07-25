@@ -312,6 +312,7 @@ async def _award_badge_from_flow(
     badge_id: str,
     target: dict,
     reply_to_message_id: int | None,
+    log=print,
 ) -> None:
     badge, newly_awarded = stats.give_custom_badge(
         flow["entry"],
@@ -331,6 +332,36 @@ async def _award_badge_from_flow(
         reply_to_message_id=reply_to_message_id,
         parse_mode=None,
     )
+    if newly_awarded:
+        await _announce_badge_in_chat(api, flow.get("admin_chat_id"), badge, target, log=log)
+
+
+async def _announce_badge_in_chat(
+    api: TelegramBotAPI, chat_id, badge, target: dict, log=print
+) -> None:
+    """Tell the group somebody was given a unique badge.
+
+    Only on a genuinely NEW award -- give_custom_badge is idempotent, and re-running it
+    must not post the same announcement again. Best-effort: the badge is already
+    recorded by the time this runs, so a failed send costs the announcement, never the
+    badge.
+
+    Sent as plain text with the @username inline rather than an HTML mention: a display
+    name is user-controlled and would have to be escaped, and a plain @username is what
+    actually notifies the person.
+    """
+    if chat_id is None:
+        return
+    username = (target.get("username") or "").lstrip("@")
+    who = f"@{username}" if username else target.get("display_name", "Участник")
+    try:
+        await api.send_message(
+            chat_id,
+            f"{who} получил уникальный значок: {badge.label}",
+            parse_mode=None,
+        )
+    except Exception:
+        log(f"[bot_listener] failed to announce a badge in the chat:\n{traceback.format_exc()}")
 
 
 async def handle_badge_callback(
@@ -489,7 +520,8 @@ async def handle_badge_text_input(
             api,
             flow,
             flow["selected_badge_id"],
-            {"user_id": target.user_id, "display_name": target.display_name},
+            {"user_id": target.user_id, "display_name": target.display_name,
+             "username": target.username},
             message["message_id"],
         )
         badge_flows.pop(flow_id, None)
@@ -561,7 +593,8 @@ async def handle_week_winner_command(
         log=log,
     )
     target = (
-        {"user_id": tracked.user_id, "display_name": tracked.display_name}
+        {"user_id": tracked.user_id, "display_name": tracked.display_name,
+         "username": tracked.username}
         if tracked
         else None
     )

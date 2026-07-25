@@ -820,7 +820,23 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                     [item.label for item in stats.custom_badges_for_user("chat", target["id"])],
                     ["🎯 Меткий глаз"],
                 )
-                self.assertIn("получает значок 🎯 Меткий глаз", api.sent[-1][0]["text"])
+                sent = [call[0] for call in api.sent]
+                # The admin gets a confirmation in the DM...
+                self.assertTrue(
+                    any(
+                        "получает значок 🎯 Меткий глаз" in message["text"]
+                        and message["chat"]["id"] == command["chat"]["id"]
+                        for message in sent
+                    ),
+                    sent,
+                )
+                # ...and the group is told, naming the recipient by @username.
+                announcement = next(
+                    message for message in sent
+                    if "получил уникальный значок" in message["text"]
+                )
+                self.assertEqual(announcement["text"], "@user получил уникальный значок: 🎯 Меткий глаз")
+                self.assertNotEqual(announcement["chat"]["id"], command["chat"]["id"])
 
     async def test_admin_can_record_numbered_weekly_winner_in_bot_dm(self):
         api = FakeBotAPI()

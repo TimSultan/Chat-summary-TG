@@ -383,6 +383,69 @@ class WorkDeleteTests(unittest.TestCase):
         self.assertNotIn(("chat", 20), bot_listener._CABINET_CONTEXT_CACHE)
 
 
+class BadgeAnnouncementTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.api = FakeAPI()
+
+    def _award(self, target):
+        badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
+        flow = {
+            "entry": "chat", "chat_id": 10, "admin_chat_id": -1001234,
+            "admin_id": 10, "admin_name": "Admin",
+        }
+        asyncio.run(
+            bot_listener._award_badge_from_flow(
+                self.api, flow, badge.badge_id, target, None, log=lambda *_: None
+            )
+        )
+        return [m for m in self.api.sent if m["chat_id"] == -1001234]
+
+    def test_the_group_is_told_in_the_requested_shape(self):
+        announced = self._award({"user_id": "20", "display_name": "Tester", "username": "user"})
+        self.assertEqual(len(announced), 1)
+        self.assertEqual(announced[0]["text"], "@user получил уникальный значок: 🏹 Лучник")
+
+    def test_a_member_without_a_username_is_named_instead(self):
+        announced = self._award({"user_id": "20", "display_name": "Без Ника", "username": None})
+        self.assertEqual(announced[0]["text"], "Без Ника получил уникальный значок: 🏹 Лучник")
+
+    def test_re_awarding_the_same_badge_does_not_announce_again(self):
+        target = {"user_id": "20", "display_name": "Tester", "username": "user"}
+        badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
+        flow = {
+            "entry": "chat", "chat_id": 10, "admin_chat_id": -1001234,
+            "admin_id": 10, "admin_name": "Admin",
+        }
+        for _ in range(3):
+            asyncio.run(
+                bot_listener._award_badge_from_flow(
+                    self.api, flow, badge.badge_id, target, None, log=lambda *_: None
+                )
+            )
+
+        announced = [m for m in self.api.sent if m["chat_id"] == -1001234]
+        self.assertEqual(len(announced), 1, "the group was told more than once")
+
+    def test_a_failed_announcement_does_not_lose_the_badge(self):
+        class FailingAPI(FakeAPI):
+            async def send_message(self, chat_id, text, **kwargs):
+                if chat_id == -1001234:
+                    raise RuntimeError("telegram down")
+                return await super().send_message(chat_id, text, **kwargs)
+
+        self.api = FailingAPI()
+        self._award({"user_id": "20", "display_name": "Tester", "username": "user"})
+
+        self.assertEqual(
+            [b.label for b in stats.custom_badges_for_user("chat", "20")], ["🏹 Лучник"]
+        )
+
+
 class BadgeDelegationTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()

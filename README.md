@@ -578,7 +578,18 @@ acting, so a menu left open after a revoke cannot still hand out badges.
   exact `@username`.
 
 Custom definitions and assignments are persisted per chat under the existing stats
-cache. Awarding the same badge to the same member twice is idempotent. The menu and its
+cache. Awarding the same badge to the same member twice is idempotent.
+
+A **new** award is announced in the group chat:
+
+```text
+@user получил уникальный значок: 🎯 Меткий глаз
+```
+
+Only on a genuinely new award — re-running the flow must not post it again. The recipient
+is named by `@username` so they are actually notified, falling back to their display name
+when they have none. Best-effort: the badge is already recorded by the time this sends, so
+a failed announcement costs the message, never the badge. The menu and its
 force-reply steps expire after ten minutes and remain bound to the administrator who
 opened them. The bot verifies that the person using the DM menu is still an
 administrator of the configured home chat. The explicitly delegated
