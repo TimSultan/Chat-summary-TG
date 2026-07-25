@@ -50,7 +50,7 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(
             {badge.badge_id for badge in stats.earned_badges(user)},
             {
-                "painted_bronze",
+                "painted_2",  # 5 figurines is now the second step, not the first
                 "chat_voice",
                 "gallery",
                 "conversation",
@@ -61,13 +61,24 @@ class GamificationTests(unittest.TestCase):
         )
 
     def test_only_highest_painting_medal_is_shown(self):
-        bronze = stats.earned_badges(stats.UserStats(user_id="1", figurines_painted=1))
-        silver = stats.earned_badges(stats.UserStats(user_id="1", figurines_painted=10))
-        gold = stats.earned_badges(stats.UserStats(user_id="1", figurines_painted=50))
-
-        self.assertEqual([(badge.emoji, badge.name) for badge in bronze], [("🥉", "Я покрасил III")])
-        self.assertEqual([(badge.emoji, badge.name) for badge in silver], [("🥈", "Я покрасил II")])
-        self.assertEqual([(badge.emoji, badge.name) for badge in gold], [("🥇", "Я покрасил I")])
+        # Five steps, numbered ascending: 1 work -> "1", fifty -> "5". Exactly one shows.
+        expected = {
+            0: [],
+            1: [("🎨", "Я покрасил 1")],
+            4: [("🎨", "Я покрасил 1")],
+            5: [("🥉", "Я покрасил 2")],
+            10: [("🥈", "Я покрасил 3")],
+            24: [("🥈", "Я покрасил 3")],
+            25: [("🥇", "Я покрасил 4")],
+            50: [("💎", "Я покрасил 5")],
+            999: [("💎", "Я покрасил 5")],
+        }
+        for figurines, labels in expected.items():
+            with self.subTest(figurines=figurines):
+                badges = stats.earned_badges(
+                    stats.UserStats(user_id="1", figurines_painted=figurines)
+                )
+                self.assertEqual([(b.emoji, b.name) for b in badges], labels)
 
     def test_higher_message_badge_replaces_lower_tier(self):
         none = stats.earned_badges(stats.UserStats(user_id="1", messages=99))

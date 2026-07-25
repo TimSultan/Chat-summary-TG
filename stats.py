@@ -248,10 +248,18 @@ BEST_WORK_HASHTAGS = ("#моялучшая",)
 WORKPLACE_HASHTAGS = ("#рабочееместо", "#рабочее_место")
 
 # Only the highest earned painting tier is displayed.
+# Five steps from the first painted figurine to fifty. Numbered ASCENDING -- 1 is the
+# first work, 5 is fifty of them -- which is the opposite of the I/II/III convention the
+# streak and night-shift families still use, where I is the best. Ascending numbers were
+# chosen deliberately here: with five steps, "Я покрасил IV" gives no hint whether it
+# beats "Я покрасил II", while "4" versus "2" needs no explaining.
+# Ordered highest-first, as _highest_badge_tier requires.
 PAINTING_BADGE_TIERS = (
-    (50, "painted_gold", "🥇", "Я покрасил I"),
-    (10, "painted_silver", "🥈", "Я покрасил II"),
-    (1, "painted_bronze", "🥉", "Я покрасил III"),
+    (50, "painted_5", "💎", "Я покрасил 5"),
+    (25, "painted_4", "🥇", "Я покрасил 4"),
+    (10, "painted_3", "🥈", "Я покрасил 3"),
+    (5, "painted_2", "🥉", "Я покрасил 2"),
+    (1, "painted_1", "🎨", "Я покрасил 1"),
 )
 
 # Upgrade families are ordered highest-first. A user receives exactly one badge from

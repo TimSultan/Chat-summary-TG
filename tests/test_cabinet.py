@@ -247,7 +247,7 @@ class BadgeSectionTests(unittest.TestCase):
         self.assertEqual(same_total, total)
         self.assertEqual(
             more_unlocked - unlocked,
-            len(stats.PAINTING_BADGE_TIERS)          # all three medals, not just the top
+            len(stats.PAINTING_BADGE_TIERS)          # every step, not just the top one
             + (len(stats.XP_LEVELS) - 1)             # every painting rank above the base
             + (len(stats.CHAT_LEVEL_TIERS) - 1),     # 50 figurines is also 10k XP
         )

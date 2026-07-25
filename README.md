@@ -504,9 +504,15 @@ checks run during `/stat` and the daily stats rollover.
 Automatic badges are derived from production counters and hashtag activity. Only the
 highest earned painting medal is shown:
 
-- 🥉 Я покрасил III — 1 painted figurine
-- 🥈 Я покрасил II — 10 painted figurines
-- 🥇 Я покрасил I — 50 painted figurines
+- 🎨 Я покрасил 1 — 1 painted figurine
+- 🥉 Я покрасил 2 — 5
+- 🥈 Я покрасил 3 — 10
+- 🥇 Я покрасил 4 — 25
+- 💎 Я покрасил 5 — 50
+
+  Numbered **ascending** (1 = first work, 5 = fifty), unlike the streak and night-shift
+  families where I is still the best — with five steps, "IV" gives no hint whether it
+  beats "II".
 - 🦄 Я не пидор — post `#янепидор`
 - 🎪 Участник Недельного конкурса ×N — post `#итогинедели`; several posts by the
   same person in one Monday–Sunday ISO week count once
