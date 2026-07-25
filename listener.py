@@ -29,6 +29,7 @@ from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendR
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 import chat_profile
+import economy
 import history
 import stats
 from config import build_session, load_config
@@ -1268,7 +1269,8 @@ async def run_listener(
                     else:
                         sender = await event.get_sender()
                         user, rank, total, xp, streak = await stats.resolve_stat_target(
-                            client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
+                            client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log,
+                            frozen_days_for=economy.streak_freeze_lookup(entry),
                         )
                         if user:
                             figurine_links = stats.figurine_message_links(
@@ -1284,6 +1286,7 @@ async def run_listener(
                             reply_text = stats.format_stat(
                                 user, rank, total, xp, streak, figurine_links, custom_badges,
                                 best_work_link=best_work_link, workplace_link=workplace_link,
+                                **economy.stat_extras(entry, user.user_id, xp),
                             )
                             stat_uses_html = True
                             level_announcements = stats.record_level_observations(

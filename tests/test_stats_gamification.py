@@ -304,7 +304,9 @@ class GamificationTests(unittest.TestCase):
 
         self.assertIn("⭐ XP: 1.234", text)
         self.assertIn("🪙 Монеты: 123", text)
-        self.assertIn("🧩 Уровень: 🩶 Серый новичок", text)
+        # Chat level moves on XP alone; the painting rank is its own separate track.
+        self.assertIn("🧩 Уровень: 🌱 Новенький 4", text)
+        self.assertIn("🎨 Звание: 🩶 Серый новичок", text)
         self.assertNotIn("До уровня", text)
         self.assertLess(text.index("🏅 Значки:"), text.index("🎨 Все работы"))
         self.assertIn("🏹 Лучник", text)
@@ -465,27 +467,43 @@ class GamificationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
+                # First sighting only baselines -- a deployment must never announce a
+                # chat's entire back catalogue of levels.
                 self.assertEqual(stats.record_level_observations("chat", [(user, 0)]), [])
 
-                user.figurines_painted = 2
-                self.assertEqual(stats.record_level_observations("chat", [(user, 2_500)]), [])
-
-                user.figurines_painted = 3
-                first = stats.record_level_observations("chat", [(user, 2_500)])
+                # The chat level now moves on XP alone, with no figurine requirement
+                # holding it back.
+                chat_promotion = stats.record_level_observations("chat", [(user, 2_500)])
                 repeated = stats.record_level_observations("chat", [(user, 2_500)])
 
-                user.figurines_painted = 5
-                second = stats.record_level_observations("chat", [(user, 5_000)])
+                # ...and the painting rank moves on figurines alone, independently.
+                user.figurines_painted = 3
+                painter_promotion = stats.record_level_observations("chat", [(user, 2_500)])
 
-        self.assertEqual(
-            first,
-            ["@user получил новый уровень «⚪ Ученик грунта»! 🎉🎊🥳"],
-        )
+        self.assertEqual(chat_promotion, ["@user вырос до уровня «💬 Болтун 7»! 🎉🎊🥳"])
         self.assertEqual(repeated, [])
         self.assertEqual(
-            second,
-            ["@user получил новый уровень «🖌️ Подмастерье кисти»! 🎉🎊🥳"],
+            painter_promotion,
+            ["@user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳"],
         )
+
+    def test_retired_level_state_is_rebaselined_instead_of_re_announced(self):
+        user = stats.UserStats(user_id="20", username="user", display_name="User")
+        # What a pre-split deployment left on disk: a watermark from a ladder that no
+        # longer exists. Comparing new track positions against it would fire a promotion
+        # for effectively every member at once.
+        stale = {
+            "version": 1,
+            "users": {"20": {"minimum_xp": 2_500, "level_name": "Ученик грунта"}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats._write_json_atomic(stats._level_state_path("chat"), stale)
+                first = stats.record_level_observations("chat", [(user, 30_000)])
+                second = stats.record_level_observations("chat", [(user, 30_000)])
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
 
     def test_custom_badges_persist_and_duplicate_awards_are_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:

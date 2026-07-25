@@ -86,8 +86,51 @@ XP_PER_ACTIVE_DAY = 5
 XP_PER_FIGURINE = 200
 XP_PER_COIN = 10
 
+# Anti-farming limits, applied when a day is COMPUTED (compute_day_stats) rather than
+# when it is scored, so they can never reach back and reprice a day that was already
+# recorded -- the same immutability rule legacy_message_points exists to protect. Word
+# scoring already makes a one-word "ок" nearly worthless, but nothing previously stopped
+# someone from farming XP with a burst of long messages, and coins are about to be worth
+# something real (see economy.py).
+#
+# Messages inside the cooldown still count as messages -- they happened, and /stat's
+# message count, active days and hour histogram must keep telling the truth. Only the
+# three SCORED counters skip them.
+#
+# SHIPPED DISABLED (0), deliberately. The mechanism below is complete and turning it on
+# is a one-line change, but measuring the standard 30-60s advice against this chat's own
+# 62k cached messages showed it does not fit here at all:
+#
+#     cooldown | messages suppressed | words | media | replies
+#         15s  |        24.3%        | 12.7% | 41.8% |   7.9%
+#         30s  |        36.0%        | 21.7% | 46.5% |  17.7%
+#         45s  |        43.6%        | 29.0% | 50.3% |  25.9%
+#
+# Half of every photo in the chat arrives within 45s of that person's previous message,
+# because painters post several angles of one miniature back to back -- precisely the
+# behavior the chat exists to encourage. A cooldown here is not an anti-farming measure,
+# it is an across-the-board XP cut aimed at the most engaged members. The daily caps
+# below do the actual job: they bite 2-4% of person-days, all of them genuine outliers
+# (the worst real day seen was 11,025 words from one person).
+XP_MESSAGE_COOLDOWN_SECONDS = 0
+# Daily ceilings on the scored counters -- the limits that actually bound farming. Sized
+# off the chat's own distribution: over 1,579 measured person-days these caught 30 days
+# over the word cap, 67 over the media cap and 48 over the reply cap, leaving ordinary
+# days completely untouched.
+XP_DAILY_WORD_CAP = 1_500
+XP_DAILY_MEDIA_CAP = 25
+XP_DAILY_REPLY_CAP = 100
+
 # Permanent, all-time levels. Both thresholds must be met. Keep this ordered from the
 # lowest XP/figurine requirements upward.
+#
+# RETAINED for the painter rank only (see painter_rank). This used to be the chat's one
+# and only ladder, gated on XP *and* figurines at once, which meant a member who chatted
+# constantly but painted nothing and a member who painted constantly but rarely posted
+# were both frozen at the bottom forever -- the two requirements stalled each other, and
+# the most common member had no progress bar moving at all. The XP half of each tuple is
+# now unused: chat progression lives on its own track (see chat_level), and these
+# thresholds are read as figurine requirements alone.
 XP_LEVELS = (
     (0, 0, "🩶", "Серый новичок"),
     (2_500, 3, "⚪", "Ученик грунта"),
@@ -96,6 +139,48 @@ XP_LEVELS = (
     (20_000, 20, "💧", "Повелитель проливок"),
     (35_000, 35, "🏛️", "Мастер витрины"),
     (50_000, 50, "👑", "Легенда покраса"),
+)
+
+# --- chat level -------------------------------------------------------------------
+#
+# The activity track: XP only, no figurine gate, so it always moves for anybody who
+# talks. Deliberately many small steps instead of the old seven enormous ones -- at the
+# chat's measured rate a newcomer clears level 2 in a day and level 10 in about a month,
+# while the most active member in the cached window (11.6k XP) sits around level 19 and
+# the ceiling stays years away.
+CHAT_LEVEL_CURVE_BASE = 100
+CHAT_LEVEL_CURVE_EXPONENT = 1.6
+MAX_CHAT_LEVEL = 40
+
+# One name per five levels, so the number moves often while the title still means
+# something. Index 0 covers levels 1-5, index 1 covers 6-10, and so on up to MAX_CHAT_LEVEL.
+CHAT_LEVEL_TIERS = (
+    ("🌱", "Новенький"),
+    ("💬", "Болтун"),
+    ("🗣️", "Голос чата"),
+    ("📣", "Заводила"),
+    ("🎙️", "Старожил"),
+    ("🔥", "Душа чата"),
+    ("⚡", "Легенда общения"),
+    ("🌟", "Хранитель чата"),
+)
+
+# --- reputation -------------------------------------------------------------------
+#
+# The anti-grind track: none of it can be earned by posting. Every point comes from
+# somebody else choosing to give it, which is the one thing a farming script cannot do.
+REPUTATION_PER_CONTEST_WIN = 10
+REPUTATION_PER_BADGE_RECEIVED = 5
+# Coins RECEIVED from other members (see economy.transfer), divided down so a single
+# wealthy friend cannot mint somebody a reputation.
+REPUTATION_PER_COINS_RECEIVED = 20
+
+REPUTATION_TIERS = (
+    (100, "🏅", "Легенда сообщества"),
+    (50, "🤝", "Опора чата"),
+    (25, "👏", "Уважаемый"),
+    (10, "🌿", "Замеченный"),
+    (0, "·", "Пока тихо"),
 )
 
 # Custom badges are deliberately bounded because Telegram inline keyboards allow at
@@ -109,7 +194,13 @@ CUSTOM_BADGE_STORE_VERSION = 1
 # would already look current and the two tags would only ever be seen going forward.
 BADGE_STATS_SCHEMA_VERSION = 2
 WEEKLY_CONTEST_STORE_VERSION = 1
-LEVEL_STATE_VERSION = 1
+# 2 replaced the single figurine-gated ladder with two independently announced tracks
+# (chat level and painter rank). A stored version below this is discarded rather than
+# read: its "minimum_xp" watermark describes a ladder that no longer exists, and
+# comparing new track positions against it would announce a promotion for essentially
+# every member at once. Discarding re-baselines everybody silently on the next
+# observation, which is exactly what happened when levels first shipped.
+LEVEL_STATE_VERSION = 2
 DELETED_FIGURINE_STORE_VERSION = 1
 # Two calendar weeks ensure the immediately preceding weekly contest is covered no
 # matter which weekday the upgraded process first starts. Only already-recorded days
@@ -238,6 +329,98 @@ def coins_for_xp(xp: int) -> int:
     """One earned coin for every complete 10 XP. Coins are currently an earned balance,
     not a spend ledger, so they can be derived without migrating or mutating old stats."""
     return max(0, xp) // XP_PER_COIN
+
+
+@dataclass(frozen=True)
+class ChatLevel:
+    number: int
+    emoji: str
+    tier_name: str
+    current_threshold: int
+    next_threshold: int | None
+
+    @property
+    def label(self) -> str:
+        return f"{self.emoji} {self.tier_name} {self.number}"
+
+
+def chat_level_threshold(level_number: int) -> int:
+    """XP needed to reach `level_number`. Level 1 starts at 0 -- everybody is level 1."""
+    if level_number <= 1:
+        return 0
+    return int(CHAT_LEVEL_CURVE_BASE * (level_number ** CHAT_LEVEL_CURVE_EXPONENT))
+
+
+def chat_level(xp: int) -> ChatLevel:
+    """The activity level for `xp` alone -- no figurine requirement, by design.
+
+    This is the track that replaces the old figurine-gated ladder for everyday
+    progression; painting is still tracked, on its own separate rank (see painter_rank).
+    """
+    number = 1
+    while number < MAX_CHAT_LEVEL and xp >= chat_level_threshold(number + 1):
+        number += 1
+    tier_index = min((number - 1) // 5, len(CHAT_LEVEL_TIERS) - 1)
+    emoji, tier_name = CHAT_LEVEL_TIERS[tier_index]
+    next_threshold = chat_level_threshold(number + 1) if number < MAX_CHAT_LEVEL else None
+    return ChatLevel(number, emoji, tier_name, chat_level_threshold(number), next_threshold)
+
+
+def chat_level_progress(xp: int) -> int:
+    """Percentage into the current chat level, 0-100.
+
+    /stat renders this as a bar WITHOUT printing the target number, keeping the existing
+    "don't reveal what's missing for the next level" rule while still giving people the
+    visible near-goal progress that makes a level worth chasing at all."""
+    level = chat_level(xp)
+    if level.next_threshold is None:
+        return 100
+    span = level.next_threshold - level.current_threshold
+    if span <= 0:
+        return 100
+    return max(0, min(100, int((xp - level.current_threshold) * 100 / span)))
+
+
+def progress_bar(percent: int, width: int = 10) -> str:
+    """Floors rather than rounds, so only a genuinely complete level shows a full bar --
+    rounding let 98% render as ten filled blocks, which reads as "why haven't I levelled
+    up yet?" precisely when somebody is closest to caring."""
+    filled = max(0, min(width, int(percent * width / 100)))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def painter_rank(figurines_painted: int) -> tuple[Level, Level | None]:
+    """The craft track: XP_LEVELS read as figurine requirements only.
+
+    Keeps the seven original names, which always described painting skill rather than
+    chattiness, and drops their XP half -- a painter is no longer held back from
+    "Подмастерье кисти" by not having typed enough."""
+    levels = [Level(*definition) for definition in XP_LEVELS]
+    current_index = 0
+    for index, level in enumerate(levels):
+        if figurines_painted < level.minimum_figurines:
+            break
+        current_index = index
+    current = levels[current_index]
+    next_level = levels[current_index + 1] if current_index + 1 < len(levels) else None
+    return current, next_level
+
+
+def reputation_score(contest_wins: int, badges_received: int, coins_received: int) -> int:
+    """Peer-granted standing. Cannot be moved by posting, only by other members."""
+    return (
+        max(0, contest_wins) * REPUTATION_PER_CONTEST_WIN
+        + max(0, badges_received) * REPUTATION_PER_BADGE_RECEIVED
+        + max(0, coins_received) // REPUTATION_PER_COINS_RECEIVED
+    )
+
+
+def reputation_tier(score: int) -> tuple[str, str]:
+    """(emoji, name) for a reputation score. REPUTATION_TIERS is ordered highest-first."""
+    for threshold, emoji, name in REPUTATION_TIERS:
+        if score >= threshold:
+            return emoji, name
+    return REPUTATION_TIERS[-1][1], REPUTATION_TIERS[-1][2]
 
 
 def level_for_progress(xp: int, figurines_painted: int) -> tuple[Level, Level | None]:
@@ -679,6 +862,19 @@ def record_weekly_contest_winner(
     return "awarded", user_wins, None
 
 
+def weekly_wins_for_user(entry: str, user_id: int | str) -> int:
+    """How many numbered weekly contests this person has won -- the peer-granted half of
+    reputation_score. Same corruption tolerance as the badge readers: a broken store
+    costs somebody reputation points, it must never break /stat."""
+    try:
+        data = _load_weekly_contest_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return 0
+    return sum(
+        1 for winner in data["winners"].values() if str(winner.get("user_id")) == str(user_id)
+    )
+
+
 def weekly_winner_badges_for_user(entry: str, user_id: int | str) -> list[Badge]:
     try:
         data = _load_weekly_contest_data(entry)
@@ -709,6 +905,11 @@ def _load_level_state(entry: str) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("level state file must contain a JSON object")
+    if int(data.get("version", 1)) < LEVEL_STATE_VERSION:
+        # Watermarks from the retired single-ladder scheme cannot be compared against the
+        # new tracks -- see LEVEL_STATE_VERSION. Start clean so the next observation
+        # baselines everyone silently instead of announcing a chat-wide promotion storm.
+        return {"version": LEVEL_STATE_VERSION, "users": {}}
     data.setdefault("users", {})
     return data
 
@@ -734,30 +935,43 @@ def record_level_observations(
     announcements = []
     dirty = False
     for user, xp in observations:
-        level, _ = level_for_progress(xp, user.figurines_painted)
+        level = chat_level(xp)
+        rank, _ = painter_rank(user.figurines_painted)
         user_key = str(user.user_id)
         previous = data["users"].get(user_key)
-        if previous is None:
-            data["users"][user_key] = {
-                "minimum_xp": level.minimum_xp,
-                "level_name": level.name,
-                "observed_at": app_now().isoformat(),
-            }
-            dirty = True
-            continue
-        previous_minimum_xp = int(previous.get("minimum_xp", 0))
-        if level.minimum_xp <= previous_minimum_xp:
-            continue
-        data["users"][user_key] = {
-            "minimum_xp": level.minimum_xp,
-            "level_name": level.name,
+        observed = {
+            "chat_level": level.number,
+            "chat_level_name": level.tier_name,
+            "painter_figurines": rank.minimum_figurines,
+            "painter_rank_name": rank.name,
             "observed_at": app_now().isoformat(),
         }
+        if previous is None:
+            data["users"][user_key] = observed
+            dirty = True
+            continue
+        # Each track is compared against its own watermark, so progress on one never
+        # suppresses an announcement on the other, and neither can move backward if
+        # stats are momentarily incomplete.
+        previous_level = int(previous.get("chat_level", 0))
+        previous_figurines = int(previous.get("painter_figurines", 0))
+        promoted_chat = level.number > previous_level
+        promoted_painter = rank.minimum_figurines > previous_figurines
+        if not promoted_chat and not promoted_painter:
+            continue
+        observed["chat_level"] = max(level.number, previous_level)
+        observed["painter_figurines"] = max(rank.minimum_figurines, previous_figurines)
+        data["users"][user_key] = observed
         dirty = True
-        announcements.append(
-            f"{_level_announcement_name(user)} получил новый уровень "
-            f"«{level.label}»! 🎉🎊🥳"
-        )
+        name = _level_announcement_name(user)
+        if promoted_chat:
+            announcements.append(
+                f"{name} вырос до уровня «{level.label}»! 🎉🎊🥳"
+            )
+        if promoted_painter:
+            announcements.append(
+                f"{name} получил новое звание «{rank.label}»! 🎉🎊🥳"
+            )
     if dirty:
         data["version"] = LEVEL_STATE_VERSION
         _write_json_atomic(_level_state_path(entry), data)
@@ -901,7 +1115,7 @@ def _ru_days(n: int) -> str:
     return f"{n} дней"
 
 
-def _current_streak(active_day_dates: set, today: date) -> int:
+def _current_streak(active_day_dates: set, today: date, frozen_days: set | None = None) -> int:
     """How many CONSECUTIVE days, counting backward, this person has posted at least
     once -- the number shown next to /stat's fire emoji. Starts counting from today if
     they've already posted today, otherwise from yesterday: the streak isn't considered
@@ -909,11 +1123,23 @@ def _current_streak(active_day_dates: set, today: date) -> int:
     "streak" counters commonly work elsewhere, e.g. Duolingo) -- it only actually breaks
     once a full day passes with no post at all. Walks backward through
     UserStats.active_day_dates (the actual dates behind the active_days count) until it
-    hits a gap."""
+    hits a gap.
+
+    `frozen_days` are days covered by a bought streak freeze (economy.consume_streak_
+    freeze). A frozen day bridges the gap -- the walk continues through it -- but does
+    NOT itself add to the count: the freeze protects a streak, it doesn't fabricate
+    activity that never happened."""
+    frozen = frozen_days or set()
     day = today if today.isoformat() in active_day_dates else today - timedelta(days=1)
     streak = 0
-    while day.isoformat() in active_day_dates:
-        streak += 1
+    while True:
+        key = day.isoformat()
+        if key in active_day_dates:
+            streak += 1
+        elif key in frozen:
+            pass  # bridged by a freeze, contributes nothing itself
+        else:
+            break
         day -= timedelta(days=1)
     return streak
 
@@ -927,9 +1153,21 @@ def compute_day_stats(messages: list) -> dict:
     active_days or last_message_at. `chars` counts the full cached text including any
     media-tag prefix (e.g. "[Photo] "), not just a caption -- a minor, deliberate
     over-count for media messages given chars isn't scored and the cache doesn't
-    separately store a caption-only string."""
+    separately store a caption-only string.
+
+    Two anti-farming limits apply to the SCORED counters only (`words`, `media`,
+    `replies`): a per-sender cooldown (XP_MESSAGE_COOLDOWN_SECONDS) and per-day ceilings
+    (XP_DAILY_*_CAP). `messages`, `chars`, `hours`, `last_message_at` and active-day
+    membership deliberately still count every message, because those describe what
+    actually happened in the chat and are what /stat and the message-count badges read.
+    Messages are walked in timestamp order for the cooldown's benefit; every other
+    counter here is order-independent."""
     users: dict[str, dict] = {}
-    for m in messages:
+    # Per-sender timestamp of the last message that was allowed to score, which is what
+    # the cooldown is measured from -- NOT the last message seen. Otherwise a long burst
+    # would keep pushing the window forward and suppress everything after it.
+    last_scored_at: dict[str, datetime] = {}
+    for m in sorted(messages, key=lambda message: message.dt_local):
         if m.sender_id is None or is_zero_content_message(m.text):
             continue
         key = str(m.sender_id)
@@ -963,9 +1201,19 @@ def compute_day_stats(messages: list) -> dict:
             u["display_name"] = m.sender_name
         u["messages"] += 1
         u["chars"] += len(m.text)
-        u["words"] += len(m.text.split())
-        if m.text.startswith(MEDIA_TAG_PREFIXES):
-            u["media"] += 1
+        previous_scored = last_scored_at.get(key)
+        scores = (
+            not XP_MESSAGE_COOLDOWN_SECONDS
+            or previous_scored is None
+            or (m.dt_local - previous_scored).total_seconds() >= XP_MESSAGE_COOLDOWN_SECONDS
+        )
+        if scores:
+            last_scored_at[key] = m.dt_local
+            u["words"] = min(XP_DAILY_WORD_CAP, u["words"] + len(m.text.split()))
+            if m.text.startswith(MEDIA_TAG_PREFIXES):
+                u["media"] = min(XP_DAILY_MEDIA_CAP, u["media"] + 1)
+            if m.is_reply:
+                u["replies"] = min(XP_DAILY_REPLY_CAP, u["replies"] + 1)
         ts = m.dt_local.isoformat()
         if m.text.startswith(MEDIA_TAG_PREFIXES) and is_figurine_caption(m.text):
             u["figurines"] += 1
@@ -987,8 +1235,6 @@ def compute_day_stats(messages: list) -> dict:
             week_key = _iso_week_key(m.dt_local)
             if week_key not in u["weekly_contest_weeks"]:
                 u["weekly_contest_weeks"].append(week_key)
-        if m.is_reply:
-            u["replies"] += 1
         hour_key = str(m.dt_local.hour)
         u["hours"][hour_key] = u["hours"].get(hour_key, 0) + 1
         if u["last_message_at"] is None or ts > u["last_message_at"]:
@@ -1764,6 +2010,9 @@ def format_stat(
     custom_badges: list[Badge] | None = None,
     best_work_link: str | None = None,
     workplace_link: str | None = None,
+    coins: int | None = None,
+    reputation: int = 0,
+    custom_title: str | None = None,
 ) -> str:
     """Build an HTML-formatted `/stat` message.
 
@@ -1773,12 +2022,21 @@ def format_stat(
     this function has any way to get itself (it's sync, with no client/chat_ref/tz).
     User-controlled fields are escaped so callers can safely send the result with
     Telegram's HTML parse mode; that enables compact clickable work numbers.
+
+    `coins`, `reputation` and `custom_title` come from economy.py the same way and for
+    the same reason -- this module must not import economy (economy imports stats), so
+    the caller reads them and passes them down. `coins` falling back to the derived
+    coins_for_xp keeps every existing caller and test rendering a correct balance for
+    somebody who has never spent anything.
     """
     avg = user.messages / user.active_days if user.active_days else 0.0
     xp_str = f"{xp:,}".replace(",", ".")
-    coins_str = f"{coins_for_xp(xp):,}".replace(",", ".")
+    coins_str = f"{coins if coins is not None else coins_for_xp(xp):,}".replace(",", ".")
     messages_str = f"{user.messages:,}".replace(",", ".")
-    level, _ = level_for_progress(xp, user.figurines_painted)
+    level = chat_level(xp)
+    rank_level, _ = painter_rank(user.figurines_painted)
+    reputation_emoji, reputation_name = reputation_tier(reputation)
+    bar = progress_bar(chat_level_progress(xp))
     activity_line = f"Активных дней: {user.active_days}"
     if streak > 0:
         activity_line += f" (🔥 Серия: {_ru_days(streak)})"
@@ -1790,12 +2048,24 @@ def format_stat(
         showcase_lines += f'🛠️ Рабочее место: <a href="{escape(workplace_link, quote=True)}">ссылка</a>\n'
     if best_work_link:
         showcase_lines += f'💎 Моя лучшая: <a href="{escape(best_work_link, quote=True)}">ссылка</a>\n'
+    # A bought title (see economy.set_title) sits under the name, clearly marked as a
+    # title rather than merged into it, so it can never be mistaken for the real name.
+    name_block = f"Имя: {escape(user.display_name)}\n"
+    if custom_title:
+        name_block += f"«{escape(custom_title)}»\n"
+    # Three independent tracks. The chat level always moves for anybody who talks, the
+    # painter rank only for figurines, and reputation only when somebody else grants it
+    # -- so nobody is ever looking at a screen where nothing can progress. The bar shows
+    # position within the current chat level WITHOUT printing the target, preserving the
+    # existing "don't reveal the next requirement" rule.
     text = (
         "📊 Статистика пользователя:\n\n"
-        f"Имя: {escape(user.display_name)}\n\n"
+        f"{name_block}\n"
         f"⭐ XP: {xp_str}\n"
         f"🪙 Монеты: {coins_str}\n"
-        f"🧩 Уровень: {escape(level.label)}\n"
+        f"🧩 Уровень: {escape(level.label)}  {bar}\n"
+        f"🎨 Звание: {escape(rank_level.label)}\n"
+        f"{reputation_emoji} Репутация: {reputation} ({escape(reputation_name)})\n"
         f"📈 Место в рейтинге: {rank} из {total}\n\n"
         f"{showcase_lines}"
         f"Фигурок: {user.figurines_painted} ({FIGURINE_HASHTAG})\n"
@@ -1841,7 +2111,8 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
 
 
 async def resolve_stat_target(
-    client, chat_ref, entry: str, arg: str, requester_username: str | None, requester_display_name: str, tz, log=print
+    client, chat_ref, entry: str, arg: str, requester_username: str | None, requester_display_name: str, tz,
+    log=print, frozen_days_for=None,
 ) -> tuple[UserStats | None, int | None, int, int | None, int | None]:
     """Resolves who a /stat command is asking about: an explicit argument (@username or
     a name fragment) if given, otherwise the requester's own tracked stats -- tried first
@@ -1858,7 +2129,12 @@ async def resolve_stat_target(
     words_per_point for XP (see UserStats.xp) and today's date for streak (see
     _current_streak). `rank`/`xp`/`streak` are None (with user) if no match was found;
     `total` is still meaningful in that case (could be used for a "N people tracked"
-    message even without a match, though callers currently don't)."""
+    message even without a match, though callers currently don't).
+
+    `frozen_days_for`, if given, is called with the resolved user_id and returns the days
+    covered by bought streak freezes (economy.apply_streak_freezes). It is injected as a
+    callback rather than imported because economy imports this module, and it can only be
+    called once the target is known -- which is here, not in the caller."""
     all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
     total = len(all_time)
     if arg:
@@ -1873,5 +2149,12 @@ async def resolve_stat_target(
     ranked = sorted(all_time.values(), key=lambda s: s.xp(wpp), reverse=True)
     rank = next(i for i, s in enumerate(ranked, start=1) if s.user_id == user.user_id)
     today = datetime.now(tz).date()
-    streak = _current_streak(user.active_day_dates, today)
+    frozen = None
+    if frozen_days_for is not None:
+        try:
+            frozen = frozen_days_for(user.user_id, user.active_day_dates, today)
+        except Exception:
+            log("[stats] streak freeze lookup failed; falling back to an unfrozen streak")
+            frozen = None
+    streak = _current_streak(user.active_day_dates, today, frozen)
     return user, rank, total, user.xp(wpp), streak

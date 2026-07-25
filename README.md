@@ -260,20 +260,133 @@ formula is unchanged; only its user-facing name changed from points to XP. `/top
 also shows the member with the largest positive XP change compared with the preceding
 seven-day window.
 
-`/stat [username]` shows all-time XP and one earned coin for every complete 10 XP. Coins
-are currently an earned balance; spending is intentionally not implemented until there
-are actual shop rewards. Permanent levels are:
+`/stat [username]` shows all-time XP plus three **independent** progression tracks. They
+were split apart deliberately: a single ladder gated on XP *and* figurines at once meant
+a member who chatted constantly but painted nothing, and a member who painted constantly
+but rarely posted, were both frozen at the bottom forever. Now everybody always has at
+least one bar moving.
 
-- 🩶 Серый новичок — `0 XP`, 0 figurines
-- ⚪ Ученик грунта — `2,500 XP` **and** 3 figurines
-- 🖌️ Подмастерье кисти — `5,000 XP` **and** 5 figurines
-- 💨 Укротитель аэрографа — `10,000 XP` **and** 10 figurines
-- 💧 Повелитель проливок — `20,000 XP` **and** 20 figurines
-- 🏛️ Мастер витрины — `35,000 XP` **and** 35 figurines
-- 👑 Легенда покраса — `50,000 XP` **and** 50 figurines
+**🧩 Уровень — chat level.** XP only, no figurine requirement. Forty levels on a
+`100 × n^1.6` curve, renamed every five levels (🌱 Новенький → 💬 Болтун → 🗣️ Голос чата →
+📣 Заводила → 🎙️ Старожил → 🔥 Душа чата → ⚡ Легенда общения → 🌟 Хранитель чата). A
+progress bar shows position inside the current level **without** printing the target, so
+the old "don't reveal the next requirement" rule still holds.
 
-Both requirements unlock a level. `/stat` shows only the current level and deliberately
-does not reveal what is missing for the next one.
+**🎨 Звание — painter rank.** The original seven names, now gated on figurines alone:
+
+- 🩶 Серый новичок — 0 figurines
+- ⚪ Ученик грунта — 3
+- 🖌️ Подмастерье кисти — 5
+- 💨 Укротитель аэрографа — 10
+- 💧 Повелитель проливок — 20
+- 🏛️ Мастер витрины — 35
+- 👑 Легенда покраса — 50
+
+**Репутация — peer-granted standing.** Cannot be earned by posting at all: 10 per weekly
+contest win, 5 per administrator-awarded custom badge, and 1 per 20 coins *received* from
+another member. Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
+🏅 Легенда сообщества.
+
+A promotion on either the chat level or the painter rank is announced once, tracked per
+track so progress on one never suppresses the other. The stored level state from before
+the split is discarded rather than compared against, which silently re-baselines every
+existing member — otherwise the rollout would announce a promotion for the whole chat at
+once.
+
+### Coins, the shop, and anti-farming
+
+Coins are a **real ledger** (`economy.py`), not the derived `xp // 10` display they used
+to be. The earned half is still derived, and only what cannot be derived is stored:
+
+```text
+balance = coins_for_xp(xp) + bonus + received - spent
+```
+
+That means existing members were grandfathered automatically — on the first run `spent`
+is 0 for everyone, so the opening balance is exactly the number `/stat` had been showing
+all along. No migration script had to be right once. Balance is clamped at zero, because
+`/deletepokras` can remove 200 XP (20 coins) that may already have been spent.
+
+Commands (any tracked chat):
+
+- `/coins` — balance and banked streak freezes
+- `/shop` — catalogue, marked ✅ affordable / 🔒 too expensive / ⏳ on cooldown
+- `/buy <item> [args]` — purchase
+- `/send @username 50` — transfer coins to another member
+
+### Личный кабинет (`/cabinet`)
+
+`/cabinet` in the bot's DM opens a button-driven personal cabinet (`cabinet.py`). Sent in
+a group it just points the member at the DM — it shows one person's balance and offers
+buttons that spend their coins, neither of which belongs in a group.
+
+```text
+👤 Личный кабинет
+
+Леонид Уросов
+
+🧩 🗣️ Голос чата 15  ▓▓▓▓▓▓▓▓▓░
+🪙 Монеты: 841
+📈 Место в рейтинге: 4 из 191
+🔥 Серия: 6 дней
+❄️ Заморозок в запасе: 1
+
+[📊 Статистика] [🏪 Магазин]
+[🎨 Мои работы] [🏅 Значки]
+[✏️ Титул]      [💸 Перевод]
+[🔄 Обновить]
+```
+
+Sections navigate **in place** by editing the same message (`editMessageText`), so the DM
+never fills up with dead menus, and every leaf screen carries a ◀️ Назад button. Buying
+from the shop is one tap; the two actions that need free text — setting a title, sending
+coins — open a force-reply prompt and only debit once the reply arrives.
+
+- 📊 **Статистика** — the exact `/stat` card the group sees, so the cabinet never becomes
+  a second, subtly different source of truth
+- 🏪 **Магазин** — one button per item, with the same ✅/🔒/⏳ marks
+- 🎨 **Мои работы** — showcase links plus up to 30 numbered `#япокрасил` links
+- 🏅 **Значки** — every badge with the condition that earned it
+- ✏️ **Титул** / 💸 **Перевод** — the two force-reply flows
+
+Each button carries its owner's user id inside its `callback_data`, so a forwarded menu is
+inert (`Это чужой кабинет.`) and navigation keeps working across a process restart —
+unlike the admin `/badge` flows, only the two text-entry prompts hold server-side state.
+Views are rendered as HTML with every user-controlled string escaped.
+
+Shop v1, priced against the chat's real earn rate (the most active members earn 60–233
+coins/week, the p90 member ~55/week):
+
+| Item | Price | Cooldown | Effect |
+|---|---|---|---|
+| `roast` Прожарка | 100 | 24 h | Roast built from your own last month of messages |
+| `critique` Разбор работы | 150 | 12 h | Vision critique of your newest `#япокрасил` photo (`critique.py`) |
+| `freeze` Заморозка серии | 200 | — | Covers one missed day so a streak survives |
+| `title` Свой титул | 400 | — | Custom title under your name in `/stat`, 30 days |
+
+If delivery fails (an LLM error, no work to critique) the purchase is **refunded** — the
+debit and the effect are never left half-applied. A freeze is consumed automatically when
+a gap actually threatens a streak, never when there is no gap, and covering the same gap
+twice costs one freeze. A frozen day bridges the streak but does not itself count as an
+active day. Transfers burn `TRANSFER_BURN_PERCENT` (10%) of the amount, which is the
+economy's only always-on sink; the sender is charged exactly what they typed.
+
+**Note on reach:** because coins track XP, the economy is only meaningful for roughly the
+top quarter of the chat. The median member earns ~3 coins/week and will not realistically
+buy anything. That is a property of the curve, not the prices.
+
+**Anti-farming.** Per-day ceilings on the scored counters — 1,500 words, 25 media, 100
+replies — applied when a day is *computed*, so they never reach back and reprice an
+already-recorded day. Measured against 1,579 real person-days these bite 30, 67 and 48
+days respectively, all genuine outliers (the worst real day was 11,025 words from one
+person). `messages`, `chars`, active days and the hour histogram are never capped, since
+they describe what actually happened.
+
+A per-message XP cooldown is implemented but **ships disabled** (`XP_MESSAGE_COOLDOWN_
+SECONDS = 0`). Measured against this chat's own 62k cached messages, the standard 30–60s
+advice suppressed 42–50% of all media, because painters post several angles of one model
+back to back — it is an XP cut aimed at the most engaged members, not an anti-farming
+measure. Setting the constant non-zero re-enables it.
 
 The activity block stays compact and uses dot-separated thousands:
 
@@ -307,7 +420,8 @@ activity timestamp is intentionally omitted, and badges are rendered two per row
 When a tracked user reaches a higher level, the bot posts one persistent announcement:
 
 ```text
-@user получил новый уровень «🖌️ Подмастерье кисти»! 🎉🎊🥳
+@user вырос до уровня «💬 Болтун 7»! 🎉🎊🥳
+@user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳
 ```
 
 The last observed level is persisted per chat, so a promotion is announced only once

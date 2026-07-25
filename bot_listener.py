@@ -54,11 +54,14 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 from telethon import utils as tl_utils
 
+import cabinet
 import chat_profile
+import economy
 import history
 import stats
 from bot_api import TelegramBotAPI
 from config import build_session, load_config
+from critique import critique_work
 from errors import ChatSummaryError
 from followup import generate_direct_reply
 from intent import resolve_name_hint
@@ -124,6 +127,16 @@ DELETE_POKRAS_COMMAND = "/deletepokras"
 PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
 
 
+SHOP_COMMANDS = ("/shop", "/buy", "/coins", "/send")
+
+CABINET_COMMAND = "/cabinet"
+# Same ten-minute window the badge flows use: only the two force-reply steps (setting a
+# title, sending coins) need server-side state at all -- every button in the cabinet
+# carries its own owner id, so navigation itself survives a restart.
+CABINET_FLOW_TTL_SECONDS = 10 * 60
+CABINET_DM_ONLY_NOTICE = "Личный кабинет работает в личке с ботом: напиши мне /cabinet."
+
+
 def _display_name(user: dict | None) -> str:
     if not user:
         return "Unknown"
@@ -134,6 +147,8 @@ def _display_name(user: dict | None) -> str:
     if user.get("username"):
         return f"@{user['username']}"
     return f"id{user.get('id')}"
+
+
 
 
 def _badge_callback_data(action: str, flow_id: str, badge_id: str | None = None) -> str:
@@ -832,6 +847,491 @@ async def run_bot_roast(
     await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
 
 
+async def _deliver_shop_item(
+    api, telethon_client, cfg, tz, entry, chat_ref, item, user, xp, requester, log,
+):
+    """Produce the thing a purchase actually bought.
+
+    Returns the reply text. Raising is the documented way to signal that delivery failed
+    -- handle_shop_command catches it and refunds, so a member is never charged for an
+    LLM call that errored or a work that turned out not to exist.
+    """
+    if item.code == "freeze":
+        held = economy.add_streak_freeze(entry, user.user_id)
+        return (
+            f"Заморозка куплена. В запасе: {held}.\n"
+            "Она сработает сама, когда ты пропустишь день -- серия не оборвётся."
+        )
+
+    if item.code == "roast":
+        end_date = datetime.now(tz).date()
+        start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
+        _, messages = await fetch_range_messages_cached(
+            client=telethon_client, chat_ref=chat_ref,
+            start_day=start_date, end_day=end_date, tz=tz, log=log,
+        )
+        own = [m for m in messages if str(m.sender_id) == str(user.user_id)]
+        if not own:
+            raise ChatSummaryError("no messages to roast")
+        own = own[-cfg.roast_max_messages :]
+        return await asyncio.to_thread(
+            roast_person,
+            api_key=cfg.openai_api_key, model=cfg.openai_model,
+            target_name=requester, lines=format_transcript_lines(own, include_date=True),
+        )
+
+    if item.code == "critique":
+        if not user.recent_figurine_posts:
+            raise ChatSummaryError("no tracked work to critique")
+        _, message_id = user.recent_figurine_posts[0]
+        source = await telethon_client.get_messages(chat_ref, ids=message_id)
+        if source is None:
+            raise ChatSummaryError("the tracked work is no longer available")
+        image_bytes = await telethon_client.download_media(source, file=bytes)
+        if not image_bytes:
+            raise ChatSummaryError("the tracked work has no downloadable image")
+        critique = await asyncio.to_thread(
+            critique_work,
+            api_key=cfg.openai_api_key, model=cfg.openai_model,
+            image_bytes=image_bytes, caption=getattr(source, "message", "") or "",
+        )
+        return f"🎨 Разбор твоей последней работы:\n\n{critique}"
+
+    raise ChatSummaryError(f"unknown shop item {item.code}")
+
+
+async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log=print):
+    """(user, xp, rank, total, streak) for whoever is using the cabinet, or None.
+
+    Every cabinet view needs the same resolved identity, and resolve_stat_target is also
+    what applies any bought streak freeze, so this is the one place that call is made.
+    """
+    user, rank, total, xp, streak = await stats.resolve_stat_target(
+        telethon_client, entry, entry, "",
+        from_user.get("username"), _display_name(from_user), tz, log=log,
+        frozen_days_for=economy.streak_freeze_lookup(entry),
+    )
+    if user is None:
+        return None
+    return user, xp, rank, total, streak
+
+
+async def _render_cabinet_section(
+    telethon_client, api, cfg, entry, tz, action, argument, from_user, chat_id, log=print,
+) -> tuple[str, dict] | None:
+    """Build one cabinet screen. Returns None when the member isn't tracked yet."""
+    context = await _cabinet_context(telethon_client, entry, tz, from_user, log=log)
+    if context is None:
+        return None
+    user, xp, rank, total, streak = context
+
+    # The links need the group's own chat id/username, which the DM doesn't carry.
+    home_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+    home_username = None
+    try:
+        home_entity = await resolve_chat(telethon_client, entry)
+        home_username = getattr(home_entity, "username", None)
+    except Exception:
+        log(f"[bot_listener] could not resolve '{entry}' for cabinet links")
+
+    def links():
+        figurines = stats.figurine_message_links(home_username, home_chat_id, user)
+        best, workplace = stats.showcase_message_links(home_username, home_chat_id, user)
+        return figurines, best, workplace
+
+    def badges():
+        return (
+            stats.custom_badges_for_user(entry, user.user_id)
+            + stats.weekly_winner_badges_for_user(entry, user.user_id)
+        )
+
+    if action == "stats":
+        figurines, best, workplace = links()
+        return cabinet.stats_view(
+            entry, user, xp, rank, total, streak, figurines, badges(), best, workplace
+        )
+    if action == "shop":
+        return cabinet.shop_view(entry, user, xp)
+    if action == "works":
+        figurines, best, workplace = links()
+        return cabinet.works_view(user, figurines, best, workplace)
+    if action == "badges":
+        return cabinet.badges_view(user, badges())
+    if action == "title":
+        return cabinet.title_view(entry, user, xp)
+    if action == "send":
+        return cabinet.send_view(entry, user, xp)
+    if action == "buy":
+        return await _cabinet_buy(
+            api, telethon_client, cfg, entry, tz, user, xp, argument, from_user, chat_id, log=log
+        )
+    return cabinet.main_view(entry, user, xp, rank, total, streak)
+
+
+async def _cabinet_buy(
+    api, telethon_client, cfg, entry, tz, user, xp, code, from_user, chat_id, log=print,
+) -> tuple[str, dict]:
+    """Purchase from a shop button, then re-render the shop with the outcome on top.
+
+    The title is not bought here: it needs text back from the member first, so its button
+    opens a force-reply step instead and only debits once that arrives.
+    """
+    item = economy.find_item(code)
+    if item is None:
+        return cabinet.shop_view(entry, user, xp, notice="Не знаю такой товар.")
+    if item.code == "title":
+        return cabinet.title_view(entry, user, xp)
+
+    ok, refusal, remaining = economy.purchase(entry, user.user_id, xp, item)
+    if not ok:
+        return cabinet.shop_view(entry, user, xp, notice=f"❌ {refusal}")
+
+    try:
+        delivered = await _deliver_shop_item(
+            api, telethon_client, cfg, tz, entry, entry, item, user, xp,
+            _display_name(from_user), log,
+        )
+    except Exception:
+        log(f"[bot_listener] cabinet delivery failed for {item.code}:\n{traceback.format_exc()}")
+        restored = economy.refund(entry, user.user_id, xp, item.price, item.code)
+        return cabinet.shop_view(
+            entry, user, xp,
+            notice=f"❌ Не получилось выдать «{item.name}» — монеты вернул. Баланс: {restored}.",
+        )
+
+    return cabinet.result_view(
+        user.user_id, f"{delivered}\n\n🪙 Осталось: {remaining}."
+    )
+
+
+async def handle_cabinet_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str | None,
+    log=print,
+) -> None:
+    """Open the cabinet. DM only: it shows one person's own balance and buttons that
+    spend their coins, neither of which belongs in a group."""
+    chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    if entry is None:
+        await api.send_message(
+            chat_id,
+            "Не настроен основной чат — кабинет недоступен.",
+            reply_to_message_id=reply_to, parse_mode=None,
+        )
+        return
+    context = await _cabinet_context(telethon_client, entry, tz, message.get("from") or {}, log=log)
+    if context is None:
+        await api.send_message(
+            chat_id,
+            "Ты ещё не отслеживаешься — напиши что-нибудь в чат и попробуй снова.",
+            reply_to_message_id=reply_to, parse_mode=None,
+        )
+        return
+    user, xp, rank, total, streak = context
+    text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak)
+    await api.send_message(
+        chat_id, text, reply_to_message_id=reply_to, reply_markup=keyboard, parse_mode="HTML"
+    )
+
+
+async def handle_cabinet_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    cabinet_flows: dict[str, dict],
+    log=print,
+) -> None:
+    parsed = cabinet.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    owner_id, action, argument = parsed
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    actor = callback.get("from") or {}
+
+    # The owner id rides inside the button, so somebody forwarded this menu -- or a
+    # second person in the same DM, which cannot happen but is cheap to rule out --
+    # cannot press buttons that spend another member's coins.
+    if str(actor.get("id")) != str(owner_id):
+        await api.answer_callback_query(callback_id, "Это чужой кабинет.")
+        return
+    if entry is None:
+        await api.answer_callback_query(callback_id, "Основной чат не настроен.")
+        return
+
+    # The two text-entry actions answer with a force-reply prompt instead of redrawing.
+    if action in ("title_set", "send_start"):
+        await api.answer_callback_query(callback_id)
+        flow_id = uuid.uuid4().hex[:10]
+        prompt_text = (
+            f"Ответь на это сообщение текстом титула (до {economy.TITLE_MAX_CHARS} символов)."
+            if action == "title_set"
+            else "Ответь на это сообщение в формате: @username 50"
+        )
+        prompt = await api.send_message(
+            chat_id, prompt_text,
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        cabinet_flows[flow_id] = {
+            "created_at": time.monotonic(),
+            "chat_id": chat_id,
+            "user_id": actor.get("id"),
+            "entry": entry,
+            "awaiting": "title" if action == "title_set" else "transfer",
+            "prompt_message_id": prompt.get("message_id") if prompt else None,
+        }
+        return
+
+    await api.answer_callback_query(callback_id)
+    try:
+        rendered = await _render_cabinet_section(
+            telethon_client, api, cfg, entry, tz, action, argument, actor, chat_id, log=log,
+        )
+    except Exception:
+        log(f"[bot_listener] cabinet section '{action}' failed:\n{traceback.format_exc()}")
+        return
+    if rendered is None:
+        return
+    text, keyboard = rendered
+    try:
+        await api.edit_message_text(
+            chat_id, message.get("message_id"), text, reply_markup=keyboard, parse_mode="HTML"
+        )
+    except Exception:
+        log(f"[bot_listener] cabinet redraw failed:\n{traceback.format_exc()}")
+
+
+async def handle_cabinet_text_input(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    cabinet_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consume the force-reply after "Сменить титул" or "Отправить монеты".
+
+    Returns True once this message belonged to a cabinet flow, so the caller stops
+    treating it as ordinary chat input."""
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    replied_to = (message.get("reply_to_message") or {}).get("message_id")
+    found = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in cabinet_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") == replied_to
+            and time.monotonic() - flow["created_at"] <= CABINET_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if found is None:
+        return False
+    flow_id, flow = found
+    cabinet_flows.pop(flow_id, None)
+    entry = flow["entry"]
+    text = (message.get("text") or "").strip()
+
+    async def answer(rendered: tuple[str, dict]) -> None:
+        body, keyboard = rendered
+        try:
+            await api.send_message(
+                chat_id, body, reply_to_message_id=message["message_id"],
+                reply_markup=keyboard, parse_mode="HTML",
+            )
+        except Exception:
+            log(f"[bot_listener] cabinet reply failed:\n{traceback.format_exc()}")
+
+    if text.lower() in ("отмена", "/cancel"):
+        return True
+
+    context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
+    if context is None:
+        return True
+    user, xp, _, _, _ = context
+
+    if flow["awaiting"] == "title":
+        item = economy.find_item("title")
+        ok, refusal, remaining = economy.purchase(entry, user.user_id, xp, item)
+        if not ok:
+            await answer(cabinet.title_view(entry, user, xp, notice=f"❌ {refusal}"))
+            return True
+        saved = economy.set_title(entry, user.user_id, text)
+        if not saved:
+            economy.refund(entry, user.user_id, xp, item.price, "title")
+            await answer(cabinet.title_view(entry, user, xp, notice="❌ Пустой титул — монеты вернул."))
+            return True
+        await answer(cabinet.result_view(
+            user.user_id,
+            f"✅ Титул «{html.escape(saved)}» активен {economy.TITLE_DAYS} дней.\n"
+            f"🪙 Осталось: {remaining}.",
+        ))
+        return True
+
+    parsed = cabinet.parse_transfer_request(text)
+    if parsed is None:
+        await answer(cabinet.send_view(entry, user, xp, notice="❌ Формат: @username 50"))
+        return True
+    target_name, amount = parsed
+    target, _, _, _, _ = await stats.resolve_stat_target(
+        telethon_client, entry, entry, target_name, None, "", tz, log=log
+    )
+    if target is None:
+        await answer(cabinet.send_view(entry, user, xp, notice="❌ Не нашёл такого участника."))
+        return True
+    ok, refusal, delivered = economy.transfer(entry, user.user_id, xp, target.user_id, amount)
+    if not ok:
+        await answer(cabinet.send_view(entry, user, xp, notice=f"❌ {refusal}"))
+        return True
+    await answer(cabinet.result_view(
+        user.user_id,
+        f"✅ Отправлено {delivered} монет — {html.escape(target.display_name)}.\n"
+        f"Сгорело: {amount - delivered}.",
+    ))
+    return True
+
+
+async def handle_shop_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    command_text: str,
+    entry: str,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/shop, /coins, /buy <item> [args] and /send @user <amount>.
+
+    Every path resolves the requester through stats.resolve_stat_target first, because a
+    balance is only meaningful next to the XP it is derived from (see economy.balance)
+    and because it is also how somebody who is not tracked yet gets a clear answer rather
+    than a zero balance.
+    """
+    chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    from_user = message.get("from") or {}
+    lowered = command_text.lower()
+
+    async def reply(text: str, parse_mode: str | None = None) -> None:
+        try:
+            sent = await api.send_message(
+                chat_id, text, reply_to_message_id=reply_to, parse_mode=parse_mode
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                )
+        except Exception:
+            log(f"[bot_listener] failed to answer a shop command:\n{traceback.format_exc()}")
+
+    user, _, _, xp, _ = await stats.resolve_stat_target(
+        telethon_client, entry, entry, "",
+        from_user.get("username"), _display_name(from_user), tz, log=log,
+    )
+    if user is None:
+        await reply("Ты ещё не отслеживаешься -- напиши что-нибудь в чат и попробуй снова.")
+        return
+
+    if lowered.startswith("/coins"):
+        current = economy.balance(entry, user.user_id, xp)
+        held = economy.streak_freezes(entry, user.user_id)
+        text = f"🪙 У тебя {current:,} монет.".replace(",", ".")
+        if held:
+            text += f"\n❄️ Заморозок серии: {held}."
+        await reply(text + "\n\nМагазин: /shop")
+        return
+
+    if lowered.startswith("/shop"):
+        await reply(economy.format_shop(entry, user.user_id, xp), parse_mode="HTML")
+        return
+
+    if lowered.startswith("/send"):
+        parts = command_text.split()
+        if len(parts) < 3:
+            await reply("Формат: /send @username 50")
+            return
+        target_name, raw_amount = parts[1], parts[2]
+        try:
+            amount = int(raw_amount)
+        except ValueError:
+            await reply("Сумма должна быть числом. Формат: /send @username 50")
+            return
+        target, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client, entry, entry, target_name, None, "", tz, log=log
+        )
+        if target is None:
+            await reply("Не нашёл такого участника.")
+            return
+        ok, refusal, delivered = economy.transfer(
+            entry, user.user_id, xp, target.user_id, amount
+        )
+        if not ok:
+            await reply(refusal)
+            return
+        burned = amount - delivered
+        await reply(
+            f"Отправлено {delivered} монет участнику {target.display_name}.\n"
+            f"Комиссия: {burned}."
+        )
+        return
+
+    # /buy
+    argument = command_text[len("/buy") :].strip()
+    code, _, extra = argument.partition(" ")
+    item = economy.find_item(code)
+    if item is None:
+        await reply("Не знаю такой товар. Посмотри /shop.")
+        return
+    if item.code == "title" and not extra.strip():
+        await reply(f"Формат: /buy title {item.argument_hint}")
+        return
+
+    ok, refusal, remaining = economy.purchase(entry, user.user_id, xp, item)
+    if not ok:
+        await reply(refusal)
+        return
+
+    # The title is stored directly rather than through _deliver_shop_item: it cannot
+    # fail, and set_title is what stamps its own purchase cooldown.
+    if item.code == "title":
+        saved = economy.set_title(entry, user.user_id, extra)
+        await reply(
+            f"Титул «{saved}» активен {economy.TITLE_DAYS} дней.\n"
+            f"🪙 Осталось: {remaining}."
+        )
+        return
+
+    try:
+        delivered_text = await _deliver_shop_item(
+            api, telethon_client, cfg, tz, entry, entry, item, user, xp,
+            _display_name(from_user), log,
+        )
+    except Exception:
+        log(f"[bot_listener] shop delivery failed for {item.code}:\n{traceback.format_exc()}")
+        restored = economy.refund(entry, user.user_id, xp, item.price, item.code)
+        await reply(
+            f"Не получилось выдать «{item.name}» -- монеты вернул.\n"
+            f"🪙 Баланс: {restored}."
+        )
+        return
+
+    await reply(f"{delivered_text}\n\n🪙 Осталось: {remaining}.")
+
+
 async def handle_bot_roast_callback(
     api: TelegramBotAPI,
     telethon_client,
@@ -1350,6 +1850,7 @@ async def _dispatch_update(
     joke_preview_pending: dict[int, dict],
     joke_posted_queue,
     badge_flows: dict[str, dict],
+    cabinet_flows: dict[str, dict],
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -1364,7 +1865,11 @@ async def _dispatch_update(
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
-        if callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
+        if callback_data.startswith(f"{cabinet.CALLBACK_PREFIX}:"):
+            await handle_cabinet_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, cabinet_flows, log=log,
+            )
+        elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
             await handle_badge_callback(api, callback, badge_flows)
         elif callback_data.startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(
@@ -1394,6 +1899,24 @@ async def _dispatch_update(
         known_chat_ids[matched_entry] = chat["id"]
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
+    if re.match(rf"^{re.escape(CABINET_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        # In a group this would print somebody's balance for everyone and offer buttons
+        # that spend their coins, so it points them at the DM instead of refusing.
+        if chat.get("type") != "private":
+            try:
+                sent = await api.send_message(
+                    chat["id"], CABINET_DM_ONLY_NOTICE,
+                    reply_to_message_id=message["message_id"], parse_mode=None,
+                )
+                if sent and "message_id" in sent:
+                    schedule_bot_delete(
+                        api, chat["id"], [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                    )
+            except Exception:
+                pass
+            return
+        await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
+        return
     if re.match(r"^/badge(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
             return
@@ -1449,6 +1972,11 @@ async def _dispatch_update(
         )
         return
 
+    if await handle_cabinet_text_input(
+        api, telethon_client, tz, message, cabinet_flows, log=log
+    ):
+        return
+
     if await handle_badge_text_input(
         api, telethon_client, message, tz, badge_flows, log=log
     ):
@@ -1473,6 +2001,23 @@ async def _dispatch_update(
             return
 
     text_lower = message_text.lower()
+
+    # Shop and wallet commands (see economy.py). Same chat gating as /stat: they read and
+    # spend against a tracked chat's ledger, so there is nothing meaningful to answer for
+    # a chat that isn't tracked.
+    if cfg.stats_enabled and text_lower.startswith(SHOP_COMMANDS):
+        if matched_entry is None:
+            return
+        shop_text = stats.strip_command_bot_mention(message_text, bot_username)
+        task = asyncio.create_task(
+            handle_shop_command(
+                api, telethon_client, cfg, tz, message, shop_text, matched_entry,
+                background_tasks, log=log,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
 
     # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
     # already-computed daily files, so they bypass the OpenAI summary queue. Reuses matched_entry
@@ -1517,6 +2062,7 @@ async def _dispatch_update(
                     user, rank, total, xp, streak = await stats.resolve_stat_target(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
+                        frozen_days_for=economy.streak_freeze_lookup(matched_entry),
                     )
                     if user:
                         figurine_links = stats.figurine_message_links(chat.get("username"), chat_key, user)
@@ -1530,6 +2076,7 @@ async def _dispatch_update(
                         reply_text = stats.format_stat(
                             user, rank, total, xp, streak, figurine_links, custom_badges,
                             best_work_link=best_work_link, workplace_link=workplace_link,
+                            **economy.stat_extras(matched_entry, user.user_id, xp),
                         )
                         reply_parse_mode = "HTML"
                         level_announcements = stats.record_level_observations(
@@ -1720,6 +2267,11 @@ async def run_bot_listener(
     # Short-lived, admin-bound /badge conversations. Definitions and assignments are
     # persisted by stats.py; only the in-progress menu/prompt state lives in memory.
     badge_flows: dict[str, dict] = {}
+    # Short-lived /cabinet force-reply steps (setting a title, sending coins). Cabinet
+    # *navigation* deliberately keeps no state at all -- every button carries its own
+    # owner id -- so only these two text-entry prompts need correlating, and losing them
+    # on a restart costs the member one re-press, nothing more.
+    cabinet_flows: dict[str, dict] = {}
 
     # Roast confirm/button flow state, keyed by (chat_id, target_user_id) -- mirrors
     # listener.py's roast_pending/roast_in_progress. Value: {"confirm_msg_id",
@@ -1766,7 +2318,8 @@ async def run_bot_listener(
                         await _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
-                            known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows, log=log,
+                            known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
+                            cabinet_flows, log=log,
                         )
                     except Exception:
                         log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
