@@ -144,13 +144,26 @@ XP_LEVELS = (
 # --- chat level -------------------------------------------------------------------
 #
 # The activity track: XP only, no figurine gate, so it always moves for anybody who
-# talks. Deliberately many small steps instead of the old seven enormous ones -- at the
-# chat's measured rate a newcomer clears level 2 in a day and level 10 in about a month,
-# while the most active member in the cached window (11.6k XP) sits around level 19 and
-# the ceiling stays years away.
-CHAT_LEVEL_CURVE_BASE = 100
+# talks. Deliberately many small steps instead of the old seven enormous ones.
+#
+# Scored against SEASON XP, not all-time (see season_bounds). Those two decisions are
+# inseparable: the target is that a season of active chatting reaches the ceiling, and
+# with all-time XP that is impossible to deliver -- members who have been tracked for a
+# year would start a cheap ladder already past its top, and it would never move again.
+#
+# Calibrated from the chat's own measured rates, with the daily caps applied: the p95
+# member earns ~103 XP/day, so a 90-day season is ~9,300 XP, which is what level 40 costs
+# at base 25. That puts the top of the ladder within reach of a genuinely active member
+# in one season, the busiest member well inside it, and the middle of the chat somewhere
+# up the middle -- median ~level 4, p75 ~11, p90 ~33 by season's end.
+CHAT_LEVEL_CURVE_BASE = 25
 CHAT_LEVEL_CURVE_EXPONENT = 1.6
 MAX_CHAT_LEVEL = 40
+
+# Seasons are calendar quarters: Jan-Mar, Apr-Jun, Jul-Sep, Oct-Dec. Fixed boundaries
+# rather than a rolling 90-day window so that everybody's season starts and ends on the
+# same day -- a rolling window would give each member a private, unannounceable reset.
+SEASON_MONTHS = 3
 
 # One name per five levels, so the number moves often while the title still means
 # something. Index 0 covers levels 1-5, index 1 covers 6-10, and so on up to MAX_CHAT_LEVEL.
@@ -342,6 +355,29 @@ class ChatLevel:
     @property
     def label(self) -> str:
         return f"{self.emoji} {self.tier_name} {self.number}"
+
+
+def season_bounds(day: date) -> tuple[date, date]:
+    """(first day, last day) of the calendar quarter containing `day`."""
+    start_month = ((day.month - 1) // SEASON_MONTHS) * SEASON_MONTHS + 1
+    start = date(day.year, start_month, 1)
+    if start_month + SEASON_MONTHS > 12:
+        end = date(day.year, 12, 31)
+    else:
+        end = date(day.year, start_month + SEASON_MONTHS, 1) - timedelta(days=1)
+    return start, end
+
+
+def season_key(day: date) -> str:
+    """Stable identifier for the season containing `day`, e.g. "2026-S3". Persisted with
+    the level watermark so a new season can be told apart from a data glitch."""
+    start, _ = season_bounds(day)
+    return f"{start.year}-S{(start.month - 1) // SEASON_MONTHS + 1}"
+
+
+def season_label(day: date) -> str:
+    start, end = season_bounds(day)
+    return f"Сезон {(start.month - 1) // SEASON_MONTHS + 1}/{start.year}"
 
 
 def chat_level_threshold(level_number: int) -> int:
@@ -898,6 +934,14 @@ def weekly_winner_badges_for_user(entry: str, user_id: int | str) -> list[Badge]
     ]
 
 
+def _chat_tier_index(level_number: int) -> int:
+    """Which CHAT_LEVEL_TIERS band a level falls in. Levels 1-5 are band 0, 6-10 band 1,
+    and so on; a level of 0 (never observed) sits below every band."""
+    if level_number < 1:
+        return -1
+    return min((level_number - 1) // 5, len(CHAT_LEVEL_TIERS) - 1)
+
+
 def _load_level_state(entry: str) -> dict:
     path = _level_state_path(entry)
     if not path.exists():
@@ -934,6 +978,7 @@ def record_level_observations(
         return []
     announcements = []
     dirty = False
+    current_season = season_key(app_now().date())
     for user, xp in observations:
         level = chat_level(xp)
         rank, _ = painter_rank(user.figurines_painted)
@@ -944,9 +989,20 @@ def record_level_observations(
             "chat_level_name": level.tier_name,
             "painter_figurines": rank.minimum_figurines,
             "painter_rank_name": rank.name,
+            "season": current_season,
             "observed_at": app_now().isoformat(),
         }
         if previous is None:
+            data["users"][user_key] = observed
+            dirty = True
+            continue
+        # A new season resets the chat level to 1 for everybody. Re-baseline silently
+        # instead of comparing across the boundary: the level has not "dropped", the
+        # ladder has been rebuilt, and there is nothing to announce about that.
+        if previous.get("season") != current_season:
+            observed["painter_figurines"] = max(
+                rank.minimum_figurines, int(previous.get("painter_figurines", 0))
+            )
             data["users"][user_key] = observed
             dirty = True
             continue
@@ -955,7 +1011,12 @@ def record_level_observations(
         # stats are momentarily incomplete.
         previous_level = int(previous.get("chat_level", 0))
         previous_figurines = int(previous.get("painter_figurines", 0))
-        promoted_chat = level.number > previous_level
+        # Only a TIER change is announced, not every single level. On the seasonal curve
+        # an active member climbs ~40 levels a season; announcing each one would put
+        # several promotion messages a day into the chat from the same few people. Tiers
+        # (every five levels) are the milestones worth interrupting the room for -- the
+        # exact level is always visible in /stat.
+        promoted_chat = _chat_tier_index(level.number) > _chat_tier_index(previous_level)
         promoted_painter = rank.minimum_figurines > previous_figurines
         if not promoted_chat and not promoted_painter:
             continue
@@ -1360,6 +1421,16 @@ class UserStats:
     active_day_dates: set = field(default_factory=set)
     hours: dict = field(default_factory=dict)
     last_message_at: str | None = None
+    # The same scoring inputs, restricted to the current season (see season_bounds).
+    # Accumulated in the SAME pass as the all-time counters rather than by a second
+    # aggregation, because /stat needs both at once: the level comes from the season, and
+    # rank, coins, badges and the painting rank all still come from all time.
+    season_words: int = 0
+    season_legacy_message_points: int = 0
+    season_media: int = 0
+    season_replies: int = 0
+    season_active_days: int = 0
+    season_figurines: int = 0
 
     def xp(self, words_per_point: float) -> int:
         """`words_per_point` -- see the function of that name -- is this chat's frozen
@@ -1378,6 +1449,34 @@ class UserStats:
             + self.replies * XP_PER_REPLY
             + self.active_days * XP_PER_ACTIVE_DAY
             + self.figurines_painted * XP_PER_FIGURINE
+        )
+
+    def season_xp(self, words_per_point: float) -> int:
+        """XP earned inside the current season -- what the chat level is scored against.
+
+        Identical arithmetic to xp(), over the season-restricted counters. Falls back to
+        the all-time total when no season window was applied during aggregation (an
+        aggregate built without a season_start, e.g. by an older caller or a test), so
+        the level never silently reads as zero for somebody who has clearly earned it."""
+        if not self._has_season_data():
+            return self.xp(words_per_point)
+        return round(
+            self.season_legacy_message_points
+            + self.season_words / words_per_point
+            + self.season_media * XP_PER_MEDIA_MESSAGE
+            + self.season_replies * XP_PER_REPLY
+            + self.season_active_days * XP_PER_ACTIVE_DAY
+            + self.season_figurines * XP_PER_FIGURINE
+        )
+
+    def _has_season_data(self) -> bool:
+        return bool(
+            self.season_words
+            or self.season_legacy_message_points
+            or self.season_media
+            or self.season_replies
+            or self.season_active_days
+            or self.season_figurines
         )
 
     def score(self, words_per_point: float) -> int:
@@ -1467,9 +1566,17 @@ def _has_word_data(payload: dict) -> bool:
     return bool(users) and all("words" in u for u in users.values())
 
 
-def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
+def _merge_day(combined: dict[str, UserStats], payload: dict, season_start: date | None = None) -> None:
+    """`season_start`, when given, also accumulates this day into the season counters if
+    it falls on or after that date -- one pass, both totals (see UserStats.season_xp)."""
     word_scored_day = _has_word_data(payload)
     day_str = payload.get("day")
+    in_season = False
+    if season_start is not None and day_str:
+        try:
+            in_season = date.fromisoformat(day_str) >= season_start
+        except ValueError:
+            in_season = False
     for user_id, u in payload.get("users", {}).items():
         s = combined.setdefault(user_id, UserStats(user_id=user_id))
         if u.get("username"):
@@ -1480,11 +1587,19 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
         s.chars += u.get("chars", 0)
         if word_scored_day:
             s.words += u.get("words", 0)
+            if in_season:
+                s.season_words += u.get("words", 0)
         else:
             s.legacy_message_points += u.get("messages", 0) * LEGACY_XP_PER_MESSAGE
+            if in_season:
+                s.season_legacy_message_points += u.get("messages", 0) * LEGACY_XP_PER_MESSAGE
         s.media += u.get("media", 0)
         s.replies += u.get("replies", 0)
         s.figurines_painted += u.get("figurines", 0)
+        if in_season:
+            s.season_media += u.get("media", 0)
+            s.season_replies += u.get("replies", 0)
+            s.season_figurines += u.get("figurines", 0)
         s.not_gay_hashtag_uses += u.get("not_gay_hashtag_uses", 0)
         s.weekly_contest_weeks.update(u.get("weekly_contest_weeks", []))
         if u.get("figurine_posts"):
@@ -1495,6 +1610,8 @@ def _merge_day(combined: dict[str, UserStats], payload: dict) -> None:
             s.workplace_posts = _merge_post_refs(s.workplace_posts, u["workplace_posts"])
         if u.get("messages", 0) > 0:
             s.active_days += 1
+            if in_season:
+                s.season_active_days += 1
             if day_str:
                 s.active_day_dates.add(day_str)
         for hour, count in u.get("hours", {}).items():
@@ -1529,7 +1646,7 @@ def aggregate(entry: str, start_day: date, end_day: date) -> dict[str, UserStats
     return combined
 
 
-def aggregate_all_time(entry: str) -> dict[str, UserStats]:
+def aggregate_all_time(entry: str, season_start: date | None = None) -> dict[str, UserStats]:
     """Like aggregate, but over every day ever recorded for this chat (globs STATS_DIR
     rather than walking a bounded date range) -- used by /stat, which reports a person's
     whole tracked history, not a fixed window. The glob is deliberately narrowed to the
@@ -1547,7 +1664,7 @@ def aggregate_all_time(entry: str) -> dict[str, UserStats]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        _merge_day(combined, payload)
+        _merge_day(combined, payload, season_start=season_start)
     _apply_deleted_figurines(entry, combined)
     return combined
 
@@ -1689,14 +1806,16 @@ async def aggregate_live(
     return combined
 
 
-async def aggregate_all_time_live(client, chat_ref, entry: str, tz, log=print) -> dict[str, UserStats]:
+async def aggregate_all_time_live(
+    client, chat_ref, entry: str, tz, log=print, season_start: date | None = None
+) -> dict[str, UserStats]:
     """Like aggregate_all_time(), plus today's live snapshot merged on top -- see
     aggregate_live's same reasoning. Used by /stat, and by resolve_stat_target so someone
     who has only ever posted today (no recorded day yet at all) is still found."""
-    combined = aggregate_all_time(entry)
+    combined = aggregate_all_time(entry, season_start=season_start)
     today = datetime.now(tz).date()
     live_users = await _live_today_users(client, chat_ref, entry, tz, log=log)
-    _merge_day(combined, {"day": today.isoformat(), "users": live_users})
+    _merge_day(combined, {"day": today.isoformat(), "users": live_users}, season_start=season_start)
     _apply_deleted_figurines(entry, combined)
     return combined
 
@@ -2013,6 +2132,7 @@ def format_stat(
     coins: int | None = None,
     reputation: int = 0,
     custom_title: str | None = None,
+    season_xp: int | None = None,
 ) -> str:
     """Build an HTML-formatted `/stat` message.
 
@@ -2033,10 +2153,13 @@ def format_stat(
     xp_str = f"{xp:,}".replace(",", ".")
     coins_str = f"{coins if coins is not None else coins_for_xp(xp):,}".replace(",", ".")
     messages_str = f"{user.messages:,}".replace(",", ".")
-    level = chat_level(xp)
+    # The level is scored on SEASON XP, everything else on all time. `season_xp` falls
+    # back to `xp` so every existing caller and test still renders a sensible level.
+    level_xp = xp if season_xp is None else season_xp
+    level = chat_level(level_xp)
     rank_level, _ = painter_rank(user.figurines_painted)
     reputation_emoji, reputation_name = reputation_tier(reputation)
-    bar = progress_bar(chat_level_progress(xp))
+    bar = progress_bar(chat_level_progress(level_xp))
     activity_line = f"Активных дней: {user.active_days}"
     if streak > 0:
         activity_line += f" (🔥 Серия: {_ru_days(streak)})"
@@ -2064,6 +2187,7 @@ def format_stat(
         f"⭐ XP: {xp_str}\n"
         f"🪙 Монеты: {coins_str}\n"
         f"🧩 Уровень: {escape(level.label)}  {bar}\n"
+        f"🗓️ {escape(season_label(date.today()))}\n"
         f"🎨 Звание: {escape(rank_level.label)}\n"
         f"{reputation_emoji} Репутация: {reputation} ({escape(reputation_name)})\n"
         f"📈 Место в рейтинге: {rank} из {total}\n\n"
@@ -2120,7 +2244,7 @@ async def resolve_stat_target(
     all-time-plus-today-live aggregate exactly once regardless of how many of those three
     lookups it takes, rather than once per attempt.
 
-    Returns (user, rank, total, xp, streak): `rank` is the person's 1-based position by
+    Returns (user, rank, total, xp, streak, season_xp): `rank` is the person's 1-based position by
     XP among everyone ever tracked for this chat (ties broken by dict iteration order,
     which is stable but arbitrary -- fine for a gamified leaderboard, not meant to be
     exact), and `total` is how many people that's out of. `xp` and `streak` are
@@ -2135,7 +2259,11 @@ async def resolve_stat_target(
     covered by bought streak freezes (economy.apply_streak_freezes). It is injected as a
     callback rather than imported because economy imports this module, and it can only be
     called once the target is known -- which is here, not in the caller."""
-    all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
+    today_for_season = datetime.now(tz).date()
+    season_start, _ = season_bounds(today_for_season)
+    all_time = await aggregate_all_time_live(
+        client, chat_ref, entry, tz, log=log, season_start=season_start
+    )
     total = len(all_time)
     if arg:
         user = _find_user(all_time, arg)
@@ -2144,7 +2272,7 @@ async def resolve_stat_target(
         if user is None:
             user = _find_user(all_time, requester_display_name)
     if user is None:
-        return None, None, total, None, None
+        return None, None, total, None, None, None
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
     ranked = sorted(all_time.values(), key=lambda s: s.xp(wpp), reverse=True)
     rank = next(i for i, s in enumerate(ranked, start=1) if s.user_id == user.user_id)
@@ -2157,4 +2285,4 @@ async def resolve_stat_target(
             log("[stats] streak freeze lookup failed; falling back to an unfrozen streak")
             frozen = None
     streak = _current_streak(user.active_day_dates, today, frozen)
-    return user, rank, total, user.xp(wpp), streak
+    return user, rank, total, user.xp(wpp), streak, user.season_xp(wpp)

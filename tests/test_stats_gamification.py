@@ -305,7 +305,7 @@ class GamificationTests(unittest.TestCase):
         self.assertIn("⭐ XP: 1.234", text)
         self.assertIn("🪙 Монеты: 123", text)
         # Chat level moves on XP alone; the painting rank is its own separate track.
-        self.assertIn("🧩 Уровень: 🌱 Новенький 4", text)
+        self.assertIn("🧩 Уровень: 🗣️ Голос чата 11", text)
         self.assertIn("🎨 Звание: 🩶 Серый новичок", text)
         self.assertNotIn("До уровня", text)
         self.assertLess(text.index("🏅 Значки:"), text.index("🎨 Все работы"))
@@ -472,7 +472,8 @@ class GamificationTests(unittest.TestCase):
                 self.assertEqual(stats.record_level_observations("chat", [(user, 0)]), [])
 
                 # The chat level now moves on XP alone, with no figurine requirement
-                # holding it back.
+                # holding it back. Only the TIER change is announced, not each of the
+                # sixteen levels crossed to get there.
                 chat_promotion = stats.record_level_observations("chat", [(user, 2_500)])
                 repeated = stats.record_level_observations("chat", [(user, 2_500)])
 
@@ -480,7 +481,7 @@ class GamificationTests(unittest.TestCase):
                 user.figurines_painted = 3
                 painter_promotion = stats.record_level_observations("chat", [(user, 2_500)])
 
-        self.assertEqual(chat_promotion, ["@user вырос до уровня «💬 Болтун 7»! 🎉🎊🥳"])
+        self.assertEqual(chat_promotion, ["@user вырос до уровня «📣 Заводила 17»! 🎉🎊🥳"])
         self.assertEqual(repeated, [])
         self.assertEqual(
             painter_promotion,
@@ -698,7 +699,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     consumed = await bot_listener.handle_badge_text_input(
                         api,
@@ -739,7 +740,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     await bot_listener.handle_week_winner_command(
                         api,
@@ -790,7 +791,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     await bot_listener.handle_week_winner_command(
                         api,
@@ -832,7 +833,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     await bot_listener.handle_delete_pokras_command(
                         api,

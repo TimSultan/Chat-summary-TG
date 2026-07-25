@@ -16,6 +16,7 @@ Every view is rendered with Telegram's HTML parse mode, so anything user-control
 display name, a bought title, another member's name) must go through html.escape.
 """
 
+from datetime import date
 from html import escape
 
 import economy
@@ -56,10 +57,19 @@ def _money(amount: int) -> str:
     return f"{amount:,}".replace(",", ".")
 
 
-def main_view(entry: str, user: stats.UserStats, xp: int, rank: int, total: int, streak: int) -> tuple[str, dict]:
-    """The landing screen: a compact identity card plus the section buttons."""
-    level = stats.chat_level(xp)
-    bar = stats.progress_bar(stats.chat_level_progress(xp))
+def main_view(
+    entry: str, user: stats.UserStats, xp: int, rank: int, total: int, streak: int,
+    season_xp: int | None = None,
+) -> tuple[str, dict]:
+    """The landing screen: a compact identity card plus the section buttons.
+
+    The level is scored on SEASON XP (see stats.season_bounds); `xp` remains the
+    all-time total that rank and coins come from. `season_xp` defaults to `xp` so
+    callers that have not been updated still render a coherent card.
+    """
+    level_xp = xp if season_xp is None else season_xp
+    level = stats.chat_level(level_xp)
+    bar = stats.progress_bar(stats.chat_level_progress(level_xp))
     coins = economy.balance(entry, user.user_id, xp)
     title = economy.active_title(entry, user.user_id)
     freezes = economy.streak_freezes(entry, user.user_id)
@@ -69,6 +79,7 @@ def main_view(entry: str, user: stats.UserStats, xp: int, rank: int, total: int,
         lines.append(f"«{escape(title)}»")
     lines.append("")
     lines.append(f"🧩 {escape(level.label)}  {bar}")
+    lines.append(f"🗓️ {escape(stats.season_label(date.today()))}")
     lines.append(f"🪙 Монеты: {_money(coins)}")
     lines.append(f"📈 Место в рейтинге: {rank} из {total}")
     if streak > 0:
@@ -107,6 +118,7 @@ def stats_view(
     custom_badges: list,
     best_work_link: str | None,
     workplace_link: str | None,
+    season_xp: int | None = None,
 ) -> tuple[str, dict]:
     """The same /stat card the group sees -- deliberately identical, so the cabinet never
     becomes a second, subtly different source of truth for somebody's numbers."""
@@ -116,6 +128,7 @@ def stats_view(
         custom_badges=custom_badges,
         best_work_link=best_work_link,
         workplace_link=workplace_link,
+        season_xp=season_xp,
         **economy.stat_extras(entry, user.user_id, xp),
     )
     return text, {"inline_keyboard": [_back_row(user.user_id)]}

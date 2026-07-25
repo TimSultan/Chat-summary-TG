@@ -160,12 +160,104 @@ class EffectTests(unittest.TestCase):
             self.assertEqual(economy.stat_extras("chat", "1", 500), {})
 
 
+class SeasonTests(unittest.TestCase):
+    def test_seasons_are_calendar_quarters(self):
+        self.assertEqual(
+            stats.season_bounds(date(2026, 7, 25)), (date(2026, 7, 1), date(2026, 9, 30))
+        )
+        self.assertEqual(
+            stats.season_bounds(date(2026, 1, 1)), (date(2026, 1, 1), date(2026, 3, 31))
+        )
+        # The Q4 boundary is the one that would break a naive month+3 calculation.
+        self.assertEqual(
+            stats.season_bounds(date(2026, 12, 31)), (date(2026, 10, 1), date(2026, 12, 31))
+        )
+        self.assertEqual(stats.season_key(date(2026, 7, 25)), "2026-S3")
+        self.assertNotEqual(
+            stats.season_key(date(2026, 9, 30)), stats.season_key(date(2026, 10, 1))
+        )
+
+    def test_season_xp_counts_only_days_inside_the_season(self):
+        combined = {}
+        payload = lambda day: {
+            "day": day,
+            "users": {"20": {"messages": 10, "words": 500, "media": 0, "replies": 0}},
+        }
+        season_start = date(2026, 7, 1)
+        stats._merge_day(combined, payload("2026-06-20"), season_start=season_start)
+        stats._merge_day(combined, payload("2026-07-10"), season_start=season_start)
+        user = combined["20"]
+
+        self.assertEqual(user.words, 1_000)
+        self.assertEqual(user.season_words, 500)
+        self.assertEqual(user.active_days, 2)
+        self.assertEqual(user.season_active_days, 1)
+        # All-time is strictly larger, and the level reads the smaller number.
+        self.assertGreater(user.xp(5.0), user.season_xp(5.0))
+
+    def test_season_xp_falls_back_to_all_time_when_no_window_was_applied(self):
+        # Aggregates built without a season_start (older callers, tests) must still
+        # render a sensible level rather than reporting everybody at level 1.
+        combined = {}
+        stats._merge_day(combined, {
+            "day": "2026-07-10",
+            "users": {"20": {"messages": 10, "words": 500, "media": 0, "replies": 0}},
+        })
+        user = combined["20"]
+        self.assertEqual(user.season_xp(5.0), user.xp(5.0))
+
+    def test_a_season_of_p95_activity_reaches_the_top_level(self):
+        """The calibration target: ~103 XP/day for 90 days maxes the ladder."""
+        season_xp = 103 * 90
+        self.assertEqual(stats.chat_level(season_xp).number, stats.MAX_CHAT_LEVEL)
+        # ...and a season at the p90 rate gets most of the way, not all of it.
+        self.assertLess(stats.chat_level(68 * 90).number, stats.MAX_CHAT_LEVEL)
+        self.assertGreater(stats.chat_level(68 * 90).number, 25)
+
+    def test_a_new_season_rebaselines_instead_of_announcing(self):
+        user = stats.UserStats(user_id="20", username="user", display_name="User")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                with patch("stats.app_now", return_value=datetime(2026, 7, 15, tzinfo=timezone.utc)):
+                    stats.record_level_observations("chat", [(user, 0)])
+                    climbed = stats.record_level_observations("chat", [(user, 9_000)])
+                # New quarter: everybody's season XP restarts at zero.
+                with patch("stats.app_now", return_value=datetime(2026, 10, 2, tzinfo=timezone.utc)):
+                    reset = stats.record_level_observations("chat", [(user, 0)])
+                    reclimb = stats.record_level_observations("chat", [(user, 9_000)])
+
+        self.assertTrue(climbed)
+        # The reset itself is silent -- the ladder was rebuilt, nobody was demoted.
+        self.assertEqual(reset, [])
+        # Climbing again in the new season is worth announcing again.
+        self.assertTrue(reclimb)
+
+    def test_only_tier_changes_are_announced(self):
+        user = stats.UserStats(user_id="20", username="user", display_name="User")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.record_level_observations("chat", [(user, 0)])
+                # Level 2 and 3 are inside the same tier as level 1: silence.
+                within_tier = stats.record_level_observations(
+                    "chat", [(user, stats.chat_level_threshold(3))]
+                )
+                # Level 6 opens a new tier: announced.
+                new_tier = stats.record_level_observations(
+                    "chat", [(user, stats.chat_level_threshold(6))]
+                )
+
+        self.assertEqual(within_tier, [])
+        self.assertEqual(len(new_tier), 1)
+        self.assertIn("Болтун", new_tier[0])
+
+
 class LevelTrackTests(unittest.TestCase):
     def test_chat_level_has_no_figurine_gate(self):
         # The exact case the split exists for: a prolific talker who has never painted.
+        # 11.6k XP is a full season at the very top of the chat, so it maxes the ladder.
         talker = stats.chat_level(11_648)
-        self.assertEqual(talker.number, 19)
-        self.assertIn("Заводила", talker.label)
+        self.assertEqual(talker.number, stats.MAX_CHAT_LEVEL)
+        self.assertIn("Хранитель чата", talker.label)
 
         # ...and a prolific painter who barely talks still ranks on the craft track.
         rank, _ = stats.painter_rank(50)

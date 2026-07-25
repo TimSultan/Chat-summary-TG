@@ -1268,7 +1268,7 @@ async def run_listener(
                         reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                     else:
                         sender = await event.get_sender()
-                        user, rank, total, xp, streak = await stats.resolve_stat_target(
+                        user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
                             client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log,
                             frozen_days_for=economy.streak_freeze_lookup(entry),
                         )
@@ -1286,6 +1286,7 @@ async def run_listener(
                             reply_text = stats.format_stat(
                                 user, rank, total, xp, streak, figurine_links, custom_badges,
                                 best_work_link=best_work_link, workplace_link=workplace_link,
+                                season_xp=season_xp,
                                 **economy.stat_extras(entry, user.user_id, xp),
                             )
                             stat_uses_html = True

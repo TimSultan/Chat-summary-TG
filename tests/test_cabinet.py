@@ -252,7 +252,7 @@ class MenuFallbackTests(unittest.TestCase):
 
     def test_a_tracked_member_gets_their_own_cabinet(self):
         async def fake_context(telethon_client, entry, tz, from_user, log=print):
-            return _user(), 5_000, 3, 190, 4
+            return _user(), 5_000, 3, 190, 4, 5_000
 
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
@@ -338,7 +338,7 @@ class RenderCostTests(unittest.TestCase):
 
         async def fake_context(telethon_client, entry, tz, from_user, log=print):
             contexts.append(entry)
-            return _user(), 5_000, 3, 190, 4
+            return _user(), 5_000, 3, 190, 4, 5_000
 
         with patch("bot_listener._resolve_chat_id", fake_chat_id), \
              patch("bot_listener.resolve_chat", fake_resolve), \
@@ -385,7 +385,7 @@ class RenderCostTests(unittest.TestCase):
 
         async def counting_resolve(*args, **kwargs):
             calls.append(1)
-            return _user(), 3, 190, 5_000, 4
+            return _user(), 3, 190, 5_000, 4, 5_000
 
         with patch("stats.resolve_stat_target", counting_resolve):
             for _ in range(5):
@@ -402,7 +402,7 @@ class RenderCostTests(unittest.TestCase):
 
         async def counting_resolve(*args, **kwargs):
             calls.append(1)
-            return _user(), 3, 190, 5_000, 4
+            return _user(), 3, 190, 5_000, 4, 5_000
 
         with patch("stats.resolve_stat_target", counting_resolve):
             for user_id in (20, 21):

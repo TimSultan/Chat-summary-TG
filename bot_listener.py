@@ -449,7 +449,7 @@ async def handle_badge_text_input(
         return True
 
     try:
-        target, _, _, _, _ = await stats.resolve_stat_target(
+        target, _, _, _, _, _ = await stats.resolve_stat_target(
             telethon_client,
             flow["entry"],
             flow["entry"],
@@ -526,7 +526,7 @@ async def handle_week_winner_command(
         return
     contest_week = int(parts[1])
 
-    tracked, _, _, _, _ = await stats.resolve_stat_target(
+    tracked, _, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client,
         entry,
         entry,
@@ -623,7 +623,7 @@ async def handle_delete_pokras_command(
         )
         return
     work_number = int(parts[2])
-    tracked, _, _, _, _ = await stats.resolve_stat_target(
+    tracked, _, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client,
         entry,
         entry,
@@ -958,7 +958,7 @@ async def _cabinet_chat_ref(telethon_client, entry: str, known_chat_ids: dict, l
 
 
 async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log=print):
-    """(user, xp, rank, total, streak) for whoever is using the cabinet, or None.
+    """(user, xp, rank, total, streak, season_xp) for whoever is using the cabinet, or None.
 
     Every cabinet view needs the same resolved identity, and resolve_stat_target is also
     what applies any bought streak freeze, so this is the one place that call is made.
@@ -974,14 +974,14 @@ async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log
     if cached is not None and cached[0] > time.monotonic():
         return cached[1]
 
-    user, rank, total, xp, streak = await stats.resolve_stat_target(
+    user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
         telethon_client, entry, entry, "",
         from_user.get("username"), _display_name(from_user), tz, log=log,
         frozen_days_for=economy.streak_freeze_lookup(entry),
     )
     if user is None:
         return None
-    context = (user, xp, rank, total, streak)
+    context = (user, xp, rank, total, streak, season_xp)
     _CABINET_CONTEXT_CACHE[cache_key] = (time.monotonic() + CABINET_CONTEXT_TTL_SECONDS, context)
     return context
 
@@ -994,7 +994,7 @@ async def _render_cabinet_section(
     context = await _cabinet_context(telethon_client, entry, tz, from_user, log=log)
     if context is None:
         return None
-    user, xp, rank, total, streak = context
+    user, xp, rank, total, streak, season_xp = context
 
     async def links():
         """Resolved lazily and only by the two screens that show links -- every other
@@ -1015,7 +1015,8 @@ async def _render_cabinet_section(
     if action == "stats":
         figurines, best, workplace = await links()
         return cabinet.stats_view(
-            entry, user, xp, rank, total, streak, figurines, badges(), best, workplace
+            entry, user, xp, rank, total, streak, figurines, badges(), best, workplace,
+            season_xp=season_xp,
         )
     if action == "shop":
         return cabinet.shop_view(entry, user, xp)
@@ -1032,7 +1033,7 @@ async def _render_cabinet_section(
         return await _cabinet_buy(
             api, telethon_client, cfg, entry, tz, user, xp, argument, from_user, chat_id, log=log
         )
-    return cabinet.main_view(entry, user, xp, rank, total, streak)
+    return cabinet.main_view(entry, user, xp, rank, total, streak, season_xp=season_xp)
 
 
 async def _cabinet_buy(
@@ -1151,8 +1152,8 @@ async def maybe_send_menu(
             if context is None:
                 text, keyboard = cabinet.welcome_view(user_id)
             else:
-                user, xp, rank, total, streak = context
-                text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak)
+                user, xp, rank, total, streak, season_xp = context
+                text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak, season_xp=season_xp)
         await api.send_message(
             chat_id, text, reply_to_message_id=message.get("message_id"),
             reply_markup=keyboard, parse_mode="HTML",
@@ -1201,8 +1202,8 @@ async def handle_cabinet_command(
             reply_to_message_id=reply_to, parse_mode=None,
         )
         return
-    user, xp, rank, total, streak = context
-    text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak)
+    user, xp, rank, total, streak, season_xp = context
+    text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak, season_xp=season_xp)
     await api.send_message(
         chat_id, text, reply_to_message_id=reply_to, reply_markup=keyboard, parse_mode="HTML"
     )
@@ -1332,7 +1333,7 @@ async def handle_cabinet_text_input(
     context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
     if context is None:
         return True
-    user, xp, _, _, _ = context
+    user, xp, _, _, _, _ = context
 
     if flow["awaiting"] == "title":
         item = economy.find_item("title")
@@ -1357,7 +1358,7 @@ async def handle_cabinet_text_input(
         await answer(cabinet.send_view(entry, user, xp, notice="❌ Формат: @username 50"))
         return True
     target_name, amount = parsed
-    target, _, _, _, _ = await stats.resolve_stat_target(
+    target, _, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client, entry, entry, target_name, None, "", tz, log=log
     )
     if target is None:
@@ -1410,7 +1411,7 @@ async def handle_shop_command(
         except Exception:
             log(f"[bot_listener] failed to answer a shop command:\n{traceback.format_exc()}")
 
-    user, _, _, xp, _ = await stats.resolve_stat_target(
+    user, _, _, xp, _, _ = await stats.resolve_stat_target(
         telethon_client, entry, entry, "",
         from_user.get("username"), _display_name(from_user), tz, log=log,
     )
@@ -1442,7 +1443,7 @@ async def handle_shop_command(
         except ValueError:
             await reply("Сумма должна быть числом. Формат: /send @username 50")
             return
-        target, _, _, _, _ = await stats.resolve_stat_target(
+        target, _, _, _, _, _ = await stats.resolve_stat_target(
             telethon_client, entry, entry, target_name, None, "", tz, log=log
         )
         if target is None:
@@ -2237,7 +2238,7 @@ async def _dispatch_update(
                     )
                 else:
                     from_user = message.get("from") or {}
-                    user, rank, total, xp, streak = await stats.resolve_stat_target(
+                    user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
                         frozen_days_for=economy.streak_freeze_lookup(matched_entry),
@@ -2254,6 +2255,7 @@ async def _dispatch_update(
                         reply_text = stats.format_stat(
                             user, rank, total, xp, streak, figurine_links, custom_badges,
                             best_work_link=best_work_link, workplace_link=workplace_link,
+                            season_xp=season_xp,
                             **economy.stat_extras(matched_entry, user.user_id, xp),
                         )
                         reply_parse_mode = "HTML"

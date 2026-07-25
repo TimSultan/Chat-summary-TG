@@ -266,11 +266,34 @@ a member who chatted constantly but painted nothing, and a member who painted co
 but rarely posted, were both frozen at the bottom forever. Now everybody always has at
 least one bar moving.
 
-**🧩 Уровень — chat level.** XP only, no figurine requirement. Forty levels on a
-`100 × n^1.6` curve, renamed every five levels (🌱 Новенький → 💬 Болтун → 🗣️ Голос чата →
-📣 Заводила → 🎙️ Старожил → 🔥 Душа чата → ⚡ Легенда общения → 🌟 Хранитель чата). A
-progress bar shows position inside the current level **without** printing the target, so
-the old "don't reveal the next requirement" rule still holds.
+**🧩 Уровень — chat level.** Scored on **season XP**, not all-time, with no figurine
+requirement. Forty levels on a `25 × n^1.6` curve, renamed every five levels (🌱 Новенький
+→ 💬 Болтун → 🗣️ Голос чата → 📣 Заводила → 🎙️ Старожил → 🔥 Душа чата → ⚡ Легенда общения
+→ 🌟 Хранитель чата). A progress bar shows position inside the current level **without**
+printing the target, so the old "don't reveal the next requirement" rule still holds.
+
+Seasons are calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec) — fixed boundaries so
+everyone's season starts on the same day. Season XP and all-time XP are accumulated in the
+**same aggregation pass** (`UserStats.season_*`), so `/stat` pays for one walk, not two.
+
+The curve is calibrated from the chat's own measured rates, caps applied:
+
+| | XP/day | after one season | max reached in |
+|---|---|---|---|
+| top-1 | 299 | level 40 | 31 days |
+| **p95** | **103** | **level 40** | **89 days** ← the target |
+| p90 | 68 | ⚡ Легенда общения 31 | 134 days |
+| p75 | 12 | 💬 Болтун 10 | 2 years |
+| median | 2.8 | 🌱 Новенький 4 | — |
+
+Levels are scored seasonally because the two goals are otherwise incompatible: with
+all-time XP, a ladder cheap enough to climb in a season is one that members tracked for a
+year would start already past the top of, and it would never move again.
+
+Only a **tier** change (every five levels) is announced, not each level. On this curve an
+active member crosses ~40 levels a season; announcing each would put several promotion
+messages a day into the chat from the same few people. A new season re-baselines everyone
+silently — the ladder was rebuilt, nobody was demoted.
 
 **🎨 Звание — painter rank.** The original seven names, now gated on figurines alone:
 
