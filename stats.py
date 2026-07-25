@@ -208,6 +208,7 @@ CUSTOM_BADGE_STORE_VERSION = 1
 BADGE_STATS_SCHEMA_VERSION = 2
 WEEKLY_CONTEST_STORE_VERSION = 1
 WORK_NAME_STORE_VERSION = 1
+BADGE_MANAGER_STORE_VERSION = 1
 # Long enough for "Космодесантник Ультрамаринов", short enough that thirty of them still
 # fit in one Telegram message alongside their links.
 WORK_NAME_MAX_CHARS = 32
@@ -270,23 +271,24 @@ MESSAGE_BADGE_TIERS = (
     (100, "hundred_messages", "💯", "Сотня"),
 )
 
+# Numbered ascending, same as PAINTING_BADGE_TIERS: 1 is the easiest step, 3 the
+# hardest. Ordered highest-first, as _highest_badge_tier requires.
 STREAK_BADGE_TIERS = (
-    (30, "streak_30", "🔥", "Не остановить I"),
-    (14, "streak_14", "🔥", "Не остановить II"),
-    (7, "streak_7", "🔥", "Не остановить III"),
+    (30, "streak_3", "🔥", "Не остановить 3"),
+    (14, "streak_2", "🔥", "Не остановить 2"),
+    (7, "streak_1", "🔥", "Не остановить 1"),
 )
 
 NIGHT_BADGE_TIERS = (
-    (1_000, "night_shift_1000", "🦉", "Ночная смена I"),
-    (250, "night_shift_250", "🦉", "Ночная смена II"),
-    (50, "night_shift", "🦉", "Ночная смена III"),
+    (1_000, "night_shift_3", "🦉", "Ночная смена 3"),
+    (250, "night_shift_2", "🦉", "Ночная смена 2"),
+    (50, "night_shift_1", "🦉", "Ночная смена 1"),
 )
 
 # Automatic badges use only counters already present in every production stats file.
 # Nothing here requires another Telegram fetch or a schema migration.
 AUTOMATIC_BADGES = (
     ("gallery", "🖼️", "Галерея", "отправить 25 фото или видео"),
-    ("conversation", "💬", "В диалоге", "написать 100 ответов"),
     ("regular", "📅", "Завсегдатай", "быть активным 30 дней"),
 )
 
@@ -546,7 +548,6 @@ def badge_collection_progress(
 
     simple = (
         (user.media >= 25),
-        (user.replies >= 100),
         (user.active_days >= 30),
         (user.not_gay_hashtag_uses > 0),
         (len(user.weekly_contest_weeks) > 0),
@@ -576,8 +577,6 @@ def earned_badges(user: "UserStats") -> list[Badge]:
     earned_ids = set()
     if user.media >= 25:
         earned_ids.add("gallery")
-    if user.replies >= 100:
-        earned_ids.add("conversation")
     if user.active_days >= 30:
         earned_ids.add("regular")
     badges = [
@@ -703,6 +702,10 @@ def _work_names_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_work_names.json"
 
 
+def _badge_managers_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_badge_managers.json"
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -797,6 +800,72 @@ def set_work_name(entry: str, user_id: int | str, message_id: int | str, name: s
     data["version"] = WORK_NAME_STORE_VERSION
     _write_json_atomic(_work_names_path(entry), data)
     return clean
+
+
+def _load_badge_managers(entry: str) -> dict:
+    path = _badge_managers_path(entry)
+    if not path.exists():
+        return {"version": BADGE_MANAGER_STORE_VERSION, "managers": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"version": BADGE_MANAGER_STORE_VERSION, "managers": {}}
+    if not isinstance(data, dict):
+        return {"version": BADGE_MANAGER_STORE_VERSION, "managers": {}}
+    data.setdefault("managers", {})
+    return data
+
+
+def is_badge_manager(entry: str, user_id: int | str) -> bool:
+    """Whether this member was delegated badge management for `entry`.
+
+    Read on every cabinet render, so it must never raise: a corrupt store costs a
+    delegate their extra button, it must not break the menu for everybody."""
+    try:
+        return str(user_id) in _load_badge_managers(entry).get("managers", {})
+    except (OSError, ValueError):
+        return False
+
+
+def list_badge_managers(entry: str) -> list[dict]:
+    managers = _load_badge_managers(entry).get("managers", {})
+    return [dict(record, user_id=user_id) for user_id, record in sorted(managers.items())]
+
+
+def grant_badge_manager(
+    entry: str,
+    user_id: int | str,
+    username: str | None,
+    display_name: str,
+    granted_by_id: int | str,
+    granted_by_name: str,
+) -> bool:
+    """Delegate badge management. False when they already had it (idempotent, like
+    give_custom_badge), so the caller can say "already" rather than "done" twice."""
+    data = _load_badge_managers(entry)
+    key = str(user_id)
+    if key in data["managers"]:
+        return False
+    data["managers"][key] = {
+        "username": (username or "").lstrip("@") or None,
+        "display_name": display_name,
+        "granted_at": app_now().isoformat(),
+        "granted_by_id": str(granted_by_id),
+        "granted_by_name": granted_by_name,
+    }
+    data["version"] = BADGE_MANAGER_STORE_VERSION
+    _write_json_atomic(_badge_managers_path(entry), data)
+    return True
+
+
+def revoke_badge_manager(entry: str, user_id: int | str) -> bool:
+    """Take the delegation back. False when they did not have it."""
+    data = _load_badge_managers(entry)
+    if data["managers"].pop(str(user_id), None) is None:
+        return False
+    data["version"] = BADGE_MANAGER_STORE_VERSION
+    _write_json_atomic(_badge_managers_path(entry), data)
+    return True
 
 
 def _empty_custom_badge_data() -> dict:

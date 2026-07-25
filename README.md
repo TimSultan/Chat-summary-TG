@@ -519,10 +519,12 @@ highest earned painting medal is shown:
 - 💯 Сотня — 100 messages
 - 📣 Голос чата — 1,000 messages
 - 🖼️ Галерея — 25 photo/video messages
-- 💬 В диалоге — 100 replies
 - 📅 Завсегдатай — 30 active days
-- 🔥 Не остановить III / II / I — a longest historical streak of 7 / 14 / 30 days
-- 🦉 Ночная смена III / II / I — 50 / 250 / 1,000 messages between 00:00 and 05:59
+- 🔥 Не остановить 1 / 2 / 3 — a longest historical streak of 7 / 14 / 30 days
+- 🦉 Ночная смена 1 / 2 / 3 — 50 / 250 / 1,000 messages between 00:00 and 05:59
+
+  All tier families now count **upward**: 1 is the easiest step, the highest number
+  the hardest.
 
 Painting medals, message-count badges, streak badges, and night-shift badges are upgrade
 families: `/stat` displays only the highest unlocked badge in each family. For example,
@@ -533,8 +535,24 @@ history. Every work is represented by a compact clickable number (newest first),
 no three-work display cap. No new message schema or history fetch is needed for
 automatic badges.
 
-Chat administrators can also create and award custom badges by sending `/badge` in a
-private chat with the bot. The bot shows two inline options:
+Custom badges are created and awarded with `/badge` in a private chat with the bot.
+
+Who may do that: Telegram administrators of the home chat, the hardcoded delegates in
+`PRIVILEGED_MANAGEMENT_USERNAMES`, and anybody an administrator delegates at runtime:
+
+```text
+/badgeadmin              list current delegates
+/badgeadmin @username    grant
+/badgeadmin - @username  revoke
+```
+
+`/badgeadmin` is administrators-only and DM-only — a delegate can award badges, but not
+appoint further delegates. A delegate sees a **🛠️ Выдать значок участнику** button in
+their `/cabinet`, which opens the same `/badge` menu rather than a second implementation.
+That button decides only what is *drawn*; the callback re-verifies permission before
+acting, so a menu left open after a revoke cannot still hand out badges.
+
+`/badge` itself: The bot shows two inline options:
 
 - **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
 - **Выдать значок** shows the chat's saved custom badges, then asks for the recipient's

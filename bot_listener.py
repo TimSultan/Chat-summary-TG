@@ -120,6 +120,7 @@ BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
 BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
 WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
+BADGE_ADMIN_COMMAND = "/badgeadmin"
 
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
@@ -213,8 +214,31 @@ async def _is_chat_admin(api: TelegramBotAPI, chat_id: int, user_id: int) -> boo
     return any((member.get("user") or {}).get("id") == user_id for member in administrators)
 
 
-async def _can_manage_chat(api: TelegramBotAPI, chat_id: int, user: dict | None) -> bool:
-    """Group administrators plus explicitly delegated usernames can manage via DM."""
+async def _can_manage_chat(
+    api: TelegramBotAPI, chat_id: int, user: dict | None, entry: str | None = None
+) -> bool:
+    """Who may create and award custom badges from a DM.
+
+    Three routes: a Telegram administrator of the home chat, a hardcoded delegate
+    (PRIVILEGED_MANAGEMENT_USERNAMES), or somebody an administrator delegated at runtime
+    with /badgeadmin (stats.is_badge_manager). The last one is checked first because it
+    is a local file read, while the admin check is a Telegram round trip.
+    """
+    user = user or {}
+    user_id = user.get("id")
+    if entry and user_id and stats.is_badge_manager(entry, user_id):
+        return True
+    username = (user.get("username") or "").strip().lstrip("@").lower()
+    if username in PRIVILEGED_MANAGEMENT_USERNAMES:
+        return True
+    return bool(user_id and await _is_chat_admin(api, chat_id, user_id))
+
+
+async def _is_chat_admin_or_privileged(
+    api: TelegramBotAPI, chat_id: int, user: dict | None
+) -> bool:
+    """Who may DELEGATE badge management. Deliberately excludes the delegates themselves:
+    a badge manager can hand out badges, not hand out the right to hand out badges."""
     user = user or {}
     username = (user.get("username") or "").strip().lstrip("@").lower()
     if username in PRIVILEGED_MANAGEMENT_USERNAMES:
@@ -247,7 +271,7 @@ async def handle_badge_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin, entry):
         await api.send_message(
             dm_chat_id,
             "Создавать и выдавать значки могут только администраторы чата.",
@@ -326,7 +350,7 @@ async def handle_badge_callback(
     if flow is None:
         await api.answer_callback_query(callback_id, "Меню устарело или принадлежит другому администратору.")
         return
-    if not await _can_manage_chat(api, flow["admin_chat_id"], actor):
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         await api.answer_callback_query(callback_id, "Нужны права администратора.")
         return
 
@@ -419,7 +443,7 @@ async def handle_badge_text_input(
             chat_id, "Действие отменено.", reply_to_message_id=message["message_id"], parse_mode=None
         )
         return True
-    if not await _can_manage_chat(api, flow["admin_chat_id"], actor):
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         badge_flows.pop(flow_id, None)
         return True
 
@@ -506,7 +530,7 @@ async def handle_week_winner_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin, entry):
         await api.send_message(
             dm_chat_id,
             "Назначать победителя могут только администраторы чата.",
@@ -604,7 +628,7 @@ async def handle_delete_pokras_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin, entry):
         await api.send_message(
             dm_chat_id,
             "Удалять покрасы из статистики могут только администраторы чата.",
@@ -682,6 +706,94 @@ async def handle_delete_pokras_command(
         f"Фигурок осталось: {remaining}. Номера оставшихся работ обновились.",
         reply_to_message_id=message["message_id"],
         parse_mode=None,
+    )
+
+
+async def handle_badge_admin_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    tz,
+    log=print,
+) -> None:
+    """/badgeadmin — delegate custom-badge management to another member.
+
+        /badgeadmin                  list current delegates
+        /badgeadmin @username        grant
+        /badgeadmin - @username      revoke
+
+    Only chat administrators (and the hardcoded delegates) may run this: a delegate can
+    award badges, not appoint further delegates -- see _is_chat_admin_or_privileged.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /badgeadmin:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Не настроен основной чат.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Выдавать это право могут только администраторы чата.")
+        return
+
+    argument = command_text[len(BADGE_ADMIN_COMMAND):].strip()
+    if not argument:
+        managers = stats.list_badge_managers(entry)
+        if not managers:
+            await reply(
+                "Пока никому не выдано.\n"
+                f"Выдать: {BADGE_ADMIN_COMMAND} @username\n"
+                f"Забрать: {BADGE_ADMIN_COMMAND} - @username"
+            )
+            return
+        listed = "\n".join(
+            f"• {record.get('display_name') or record['user_id']}"
+            + (f" (@{record['username']})" if record.get("username") else "")
+            for record in managers
+        )
+        await reply(f"Могут выдавать значки:\n{listed}")
+        return
+
+    revoking = argument.startswith("-")
+    target_name = argument.lstrip("-").strip()
+    if not target_name:
+        await reply(f"Формат: {BADGE_ADMIN_COMMAND} - @username")
+        return
+
+    target, _, _, _, _, _ = await stats.resolve_stat_target(
+        telethon_client, entry, entry, target_name, None, "", tz, log=log
+    )
+    if target is None:
+        await reply("Не нашёл такого участника в статистике чата.")
+        return
+
+    if revoking:
+        removed = stats.revoke_badge_manager(entry, target.user_id)
+        await reply(
+            f"{target.display_name} больше не может выдавать значки."
+            if removed
+            else f"У {target.display_name} и так не было этого права."
+        )
+        return
+
+    granted = stats.grant_badge_manager(
+        entry, target.user_id, target.username, target.display_name,
+        actor.get("id"), _display_name(actor),
+    )
+    await reply(
+        f"{target.display_name} теперь может создавать и выдавать значки.\n"
+        "Кнопка появится у него в /cabinet."
+        if granted
+        else f"{target.display_name} уже мог это делать."
     )
 
 
@@ -1034,7 +1146,10 @@ async def _render_cabinet_section(
         return await _cabinet_buy(
             api, telethon_client, cfg, entry, tz, user, xp, argument, from_user, chat_id, log=log
         )
-    return cabinet.main_view(entry, user, xp, rank, total, streak, season_xp=season_xp)
+    return cabinet.main_view(
+        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+    )
 
 
 async def _cabinet_buy(
@@ -1071,6 +1186,18 @@ async def _cabinet_buy(
     return cabinet.result_view(
         user.user_id, f"{delivered}\n\n🪙 Осталось: {remaining}."
     )
+
+
+def _shows_badge_admin_button(entry: str | None, user_id, username: str | None) -> bool:
+    """Whether to draw the delegate button. Deliberately does NOT call Telegram to check
+    chat-admin status: this runs on every cabinet render, and administrators already know
+    about /badge. The button only decides what is DRAWN -- handle_cabinet_callback
+    re-verifies with the full check before acting on it."""
+    if not entry:
+        return False
+    if (username or "").strip().lstrip("@").lower() in PRIVILEGED_MANAGEMENT_USERNAMES:
+        return True
+    return stats.is_badge_manager(entry, user_id)
 
 
 def _stats_entry_for(chat: dict, matched_entry: str | None, home_chat_ref: str | None) -> str | None:
@@ -1154,7 +1281,10 @@ async def maybe_send_menu(
                 text, keyboard = cabinet.welcome_view(user_id)
             else:
                 user, xp, rank, total, streak, season_xp = context
-                text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak, season_xp=season_xp)
+                text, keyboard = cabinet.main_view(
+        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+    )
         await api.send_message(
             chat_id, text, reply_to_message_id=message.get("message_id"),
             reply_markup=keyboard, parse_mode="HTML",
@@ -1204,7 +1334,10 @@ async def handle_cabinet_command(
         )
         return
     user, xp, rank, total, streak, season_xp = context
-    text, keyboard = cabinet.main_view(entry, user, xp, rank, total, streak, season_xp=season_xp)
+    text, keyboard = cabinet.main_view(
+        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+    )
     await api.send_message(
         chat_id, text, reply_to_message_id=reply_to, reply_markup=keyboard, parse_mode="HTML"
     )
@@ -1218,6 +1351,7 @@ async def handle_cabinet_callback(
     callback: dict,
     entry: str | None,
     cabinet_flows: dict[str, dict],
+    badge_flows: dict[str, dict] | None = None,
     known_chat_ids: dict | None = None,
     log=print,
 ) -> None:
@@ -1241,6 +1375,30 @@ async def handle_cabinet_callback(
         return
 
     # The two text-entry actions answer with a force-reply prompt instead of redrawing.
+    if action == "badge_admin":
+        admin_chat_id = await _resolve_chat_id(
+            telethon_client, entry, known_chat_ids if known_chat_ids is not None else {}, log=log
+        )
+        if not await _can_manage_chat(api, admin_chat_id, actor, entry):
+            await api.answer_callback_query(callback_id, "Нет прав на управление значками.")
+            return
+        await api.answer_callback_query(callback_id)
+        # Reuses the existing /badge menu wholesale -- same flow, same prompts, same
+        # idempotent awarding -- so this button adds an entry point, not a second
+        # implementation to keep in step.
+        if badge_flows is None:
+            # Only reachable from a caller that did not thread the flow state through;
+            # starting the menu without it would draw buttons that can never resolve.
+            log("[bot_listener] cabinet badge button pressed without badge_flows state")
+            return
+        await handle_badge_command(
+            api,
+            {"chat": {"id": chat_id, "type": "private"},
+             "message_id": message.get("message_id"), "from": actor},
+            entry, admin_chat_id, badge_flows,
+        )
+        return
+
     if action in ("title_set", "work_rename"):
         await api.answer_callback_query(callback_id)
         flow_id = uuid.uuid4().hex[:10]
@@ -2022,7 +2180,7 @@ async def _dispatch_update(
         if callback_data.startswith(f"{cabinet.CALLBACK_PREFIX}:"):
             await handle_cabinet_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, cabinet_flows,
-                known_chat_ids=known_chat_ids, log=log,
+                badge_flows=badge_flows, known_chat_ids=known_chat_ids, log=log,
             )
         elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
             await handle_badge_callback(api, callback, badge_flows)
@@ -2071,6 +2229,18 @@ async def _dispatch_update(
                 pass
             return
         await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
+        return
+    if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_badge_admin_command(
+            api, telethon_client, message, command_text, home_chat_ref, admin_chat_id, tz, log=log,
+        )
         return
     if re.match(r"^/badge(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":

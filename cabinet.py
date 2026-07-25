@@ -59,7 +59,7 @@ def _money(amount: int) -> str:
 
 def main_view(
     entry: str, user: stats.UserStats, xp: int, rank: int, total: int, streak: int,
-    season_xp: int | None = None,
+    season_xp: int | None = None, can_manage_badges: bool = False,
 ) -> tuple[str, dict]:
     """The landing screen: a compact identity card plus the section buttons.
 
@@ -87,21 +87,27 @@ def main_view(
     if freezes:
         lines.append(f"❄️ Заморозок в запасе: {freezes}")
 
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "📊 Статистика", "callback_data": callback_data(user.user_id, "stats")},
-                {"text": "🏪 Магазин", "callback_data": callback_data(user.user_id, "shop")},
-            ],
-            [
-                {"text": "🎨 Мои работы", "callback_data": callback_data(user.user_id, "works")},
-                {"text": "🏅 Значки", "callback_data": callback_data(user.user_id, "badges")},
-            ],
-            [{"text": "✏️ Титул", "callback_data": callback_data(user.user_id, "title")}],
-            [{"text": "🔄 Обновить", "callback_data": callback_data(user.user_id, "main")}],
-        ]
-    }
-    return "\n".join(lines), keyboard
+    rows = [
+        [
+            {"text": "📊 Статистика", "callback_data": callback_data(user.user_id, "stats")},
+            {"text": "🏪 Магазин", "callback_data": callback_data(user.user_id, "shop")},
+        ],
+        [
+            {"text": "🎨 Мои работы", "callback_data": callback_data(user.user_id, "works")},
+            {"text": "🏅 Значки", "callback_data": callback_data(user.user_id, "badges")},
+        ],
+        [{"text": "✏️ Титул", "callback_data": callback_data(user.user_id, "title")}],
+    ]
+    # Only drawn for somebody an administrator delegated with /badgeadmin (or a hardcoded
+    # delegate). The button is NOT the permission check -- handle_cabinet_callback
+    # re-verifies before acting, so a menu left open after a revoke cannot still act.
+    if can_manage_badges:
+        rows.append([{
+            "text": "🛠️ Выдать значок участнику",
+            "callback_data": callback_data(user.user_id, "badge_admin"),
+        }])
+    rows.append([{"text": "🔄 Обновить", "callback_data": callback_data(user.user_id, "main")}])
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def stats_view(

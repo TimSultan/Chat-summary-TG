@@ -238,7 +238,7 @@ class BadgeSectionTests(unittest.TestCase):
             total,
             len(stats.PAINTING_BADGE_TIERS) + len(stats.MESSAGE_BADGE_TIERS)
             + len(stats.STREAK_BADGE_TIERS) + len(stats.NIGHT_BADGE_TIERS)
-            + 5 + len(stats.CHAT_LEVEL_TIERS) + len(stats.XP_LEVELS),
+            + 4 + len(stats.CHAT_LEVEL_TIERS) + len(stats.XP_LEVELS),
         )
 
         # Every painting tier below the current one counts, not just the shown one.
@@ -268,6 +268,118 @@ class BadgeSectionTests(unittest.TestCase):
         text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
         self.assertIn("📦 Открыто:", text)
         self.assertGreater(text.index("📦 Открыто:"), text.index("🏅 <b>Значки</b>"))
+
+
+class BadgeDelegationTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_granting_is_idempotent_and_revocable(self):
+        self.assertFalse(stats.is_badge_manager("chat", 20))
+
+        self.assertTrue(stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin"))
+        self.assertTrue(stats.is_badge_manager("chat", 20))
+        # Granting twice reports "already", so the caller doesn't say "done" a second time.
+        self.assertFalse(stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin"))
+
+        self.assertTrue(stats.revoke_badge_manager("chat", 20))
+        self.assertFalse(stats.is_badge_manager("chat", 20))
+        self.assertFalse(stats.revoke_badge_manager("chat", 20))
+
+    def test_the_stored_username_drops_its_at_sign(self):
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        self.assertEqual(stats.list_badge_managers("chat")[0]["username"], "user")
+
+    def test_delegation_is_per_chat(self):
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        self.assertFalse(stats.is_badge_manager("other", 20))
+
+    def test_a_corrupt_store_costs_a_button_not_the_menu(self):
+        stats._badge_managers_path("chat").write_text("{not json", encoding="utf-8")
+        self.assertFalse(stats.is_badge_manager("chat", 20))
+        self.assertEqual(stats.list_badge_managers("chat"), [])
+
+    def test_the_button_only_appears_for_a_delegate(self):
+        user = _user()
+        _, plain = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
+        actions = {
+            cabinet.parse_callback(b["callback_data"])[1]
+            for row in plain["inline_keyboard"] for b in row
+        }
+        self.assertNotIn("badge_admin", actions)
+
+        _, delegated = cabinet.main_view(
+            "chat", user, 5_000, 1, 1, 0, can_manage_badges=True
+        )
+        actions = {
+            cabinet.parse_callback(b["callback_data"])[1]
+            for row in delegated["inline_keyboard"] for b in row
+        }
+        self.assertIn("badge_admin", actions)
+
+    def test_visibility_check_reads_the_store_and_the_hardcoded_delegates(self):
+        self.assertFalse(bot_listener._shows_badge_admin_button("chat", 20, "user"))
+
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        self.assertTrue(bot_listener._shows_badge_admin_button("chat", 20, "user"))
+
+        # The hardcoded delegate needs no store entry.
+        hardcoded = next(iter(bot_listener.PRIVILEGED_MANAGEMENT_USERNAMES))
+        self.assertTrue(bot_listener._shows_badge_admin_button("chat", 99, hardcoded))
+        self.assertTrue(bot_listener._shows_badge_admin_button("chat", 99, "@" + hardcoded.upper()))
+
+        # No home chat configured -> nothing to manage.
+        self.assertFalse(bot_listener._shows_badge_admin_button(None, 20, "user"))
+
+    def test_a_delegate_cannot_appoint_further_delegates(self):
+        """_can_manage_chat accepts a delegate; _is_chat_admin_or_privileged must not."""
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+
+        class NoAdminsAPI:
+            async def get_chat_administrators(self, chat_id):
+                return []
+
+        actor = {"id": 20, "username": "user"}
+        self.assertTrue(
+            asyncio.run(bot_listener._can_manage_chat(NoAdminsAPI(), -100, actor, "chat"))
+        )
+        self.assertFalse(
+            asyncio.run(bot_listener._is_chat_admin_or_privileged(NoAdminsAPI(), -100, actor))
+        )
+
+    def test_a_stale_menu_cannot_act_after_a_revoke(self):
+        # The button decides what is drawn; the callback re-verifies before acting.
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        api = FakeAPI()
+
+        stats.revoke_badge_manager("chat", 20)
+        with patch("bot_listener._resolve_chat_id", new=_async_return(-100)):
+            with patch("bot_listener._is_chat_admin", new=_async_return(False)):
+                asyncio.run(
+                    bot_listener.handle_cabinet_callback(
+                        api, None, None, None,
+                        {
+                            "id": "cb1",
+                            "data": cabinet.callback_data(20, "badge_admin"),
+                            "from": {"id": 20, "username": "user", "first_name": "U"},
+                            "message": {"message_id": 42, "chat": {"id": 999, "type": "private"}},
+                        },
+                        "chat", {}, badge_flows={}, log=lambda *_: None,
+                    )
+                )
+
+        self.assertEqual(api.answers, ["Нет прав на управление значками."])
+        self.assertEqual(api.sent, [])
+
+
+def _async_return(value):
+    async def _inner(*args, **kwargs):
+        return value
+    return _inner
 
 
 class FakeAPI:

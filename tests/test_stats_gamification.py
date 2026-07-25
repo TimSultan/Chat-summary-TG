@@ -53,10 +53,9 @@ class GamificationTests(unittest.TestCase):
                 "painted_2",  # 5 figurines is now the second step, not the first
                 "chat_voice",
                 "gallery",
-                "conversation",
                 "regular",
-                "streak_7",
-                "night_shift",
+                "streak_1",
+                "night_shift_1",
             },
         )
 
@@ -113,9 +112,9 @@ class GamificationTests(unittest.TestCase):
             )
 
         expected = (
-            (7, 50, "streak_7", "Не остановить III", "night_shift", "Ночная смена III"),
-            (14, 250, "streak_14", "Не остановить II", "night_shift_250", "Ночная смена II"),
-            (30, 1_000, "streak_30", "Не остановить I", "night_shift_1000", "Ночная смена I"),
+            (7, 50, "streak_1", "Не остановить 1", "night_shift_1", "Ночная смена 1"),
+            (14, 250, "streak_2", "Не остановить 2", "night_shift_2", "Ночная смена 2"),
+            (30, 1_000, "streak_3", "Не остановить 3", "night_shift_3", "Ночная смена 3"),
         )
         for streak, night, streak_id, streak_name, night_id, night_name in expected:
             with self.subTest(streak=streak, night=night):
