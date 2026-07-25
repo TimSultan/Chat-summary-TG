@@ -127,7 +127,7 @@ DELETE_POKRAS_COMMAND = "/deletepokras"
 PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
 
 
-SHOP_COMMANDS = ("/shop", "/buy", "/coins", "/send")
+SHOP_COMMANDS = ("/shop", "/buy", "/coins")
 
 CABINET_COMMAND = "/cabinet"
 
@@ -1022,13 +1022,14 @@ async def _render_cabinet_section(
         return cabinet.shop_view(entry, user, xp)
     if action == "works":
         figurines, best, workplace = await links()
-        return cabinet.works_view(user, figurines, best, workplace)
+        return cabinet.works_view(entry, user, figurines, best, workplace)
     if action == "badges":
-        return cabinet.badges_view(user, badges())
+        return cabinet.badges_view(
+            entry, user, badges(),
+            chat_custom_badge_total=len(stats.list_custom_badges(entry)),
+        )
     if action == "title":
         return cabinet.title_view(entry, user, xp)
-    if action == "send":
-        return cabinet.send_view(entry, user, xp)
     if action == "buy":
         return await _cabinet_buy(
             api, telethon_client, cfg, entry, tz, user, xp, argument, from_user, chat_id, log=log
@@ -1240,13 +1241,17 @@ async def handle_cabinet_callback(
         return
 
     # The two text-entry actions answer with a force-reply prompt instead of redrawing.
-    if action in ("title_set", "send_start"):
+    if action in ("title_set", "work_rename"):
         await api.answer_callback_query(callback_id)
         flow_id = uuid.uuid4().hex[:10]
         prompt_text = (
             f"Ответь на это сообщение текстом титула (до {economy.TITLE_MAX_CHARS} символов)."
             if action == "title_set"
-            else "Ответь на это сообщение в формате: @username 50"
+            else (
+                "Ответь на это сообщение в формате: номер и название.\n"
+                f"Например: 3 Дредноут (до {stats.WORK_NAME_MAX_CHARS} символов).\n"
+                "Один только номер — убрать название."
+            )
         )
         prompt = await api.send_message(
             chat_id, prompt_text,
@@ -1259,7 +1264,7 @@ async def handle_cabinet_callback(
             "chat_id": chat_id,
             "user_id": actor.get("id"),
             "entry": entry,
-            "awaiting": "title" if action == "title_set" else "transfer",
+            "awaiting": "title" if action == "title_set" else "work_rename",
             "prompt_message_id": prompt.get("message_id") if prompt else None,
         }
         return
@@ -1282,6 +1287,19 @@ async def handle_cabinet_callback(
         )
     except Exception:
         log(f"[bot_listener] cabinet redraw failed:\n{traceback.format_exc()}")
+
+
+async def _works_screen(telethon_client, entry: str, user, notice: str = "", log=print):
+    """Re-render "Мои работы" after a rename, links and all.
+
+    The chat ref is cached per process (_CABINET_CHAT_REF_CACHE), so by the time anybody
+    can rename a work -- they had to open this screen to see the numbers -- this costs no
+    Telegram round trip at all.
+    """
+    chat_id, username = await _cabinet_chat_ref(telethon_client, entry, {}, log=log)
+    figurines = stats.figurine_message_links(username, chat_id, user)
+    best, workplace = stats.showcase_message_links(username, chat_id, user)
+    return cabinet.works_view(entry, user, figurines, best, workplace, notice=notice)
 
 
 async def handle_cabinet_text_input(
@@ -1353,26 +1371,18 @@ async def handle_cabinet_text_input(
         ))
         return True
 
-    parsed = cabinet.parse_transfer_request(text)
+    parsed = cabinet.parse_rename_request(text)
     if parsed is None:
-        await answer(cabinet.send_view(entry, user, xp, notice="❌ Формат: @username 50"))
+        await answer(await _works_screen(telethon_client, entry, user, notice="❌ Формат: 3 Дредноут", log=log))
         return True
-    target_name, amount = parsed
-    target, _, _, _, _, _ = await stats.resolve_stat_target(
-        telethon_client, entry, entry, target_name, None, "", tz, log=log
-    )
-    if target is None:
-        await answer(cabinet.send_view(entry, user, xp, notice="❌ Не нашёл такого участника."))
+    position, name = parsed
+    message_id = cabinet.message_id_for_position(user, position)
+    if message_id is None:
+        await answer(await _works_screen(telethon_client, entry, user, notice=f"❌ Работы №{position} нет.", log=log))
         return True
-    ok, refusal, delivered = economy.transfer(entry, user.user_id, xp, target.user_id, amount)
-    if not ok:
-        await answer(cabinet.send_view(entry, user, xp, notice=f"❌ {refusal}"))
-        return True
-    await answer(cabinet.result_view(
-        user.user_id,
-        f"✅ Отправлено {delivered} монет — {html.escape(target.display_name)}.\n"
-        f"Сгорело: {amount - delivered}.",
-    ))
+    saved = stats.set_work_name(entry, user.user_id, message_id, name)
+    notice = f"✅ Работа №{position}: «{html.escape(saved)}»" if saved else f"✅ Название работы №{position} убрано."
+    await answer(await _works_screen(telethon_client, entry, user, notice=notice, log=log))
     return True
 
 
@@ -1387,7 +1397,7 @@ async def handle_shop_command(
     background_tasks: set,
     log=print,
 ) -> None:
-    """/shop, /coins, /buy <item> [args] and /send @user <amount>.
+    """/shop, /coins and /buy <item> [args].
 
     Every path resolves the requester through stats.resolve_stat_target first, because a
     balance is only meaningful next to the XP it is derived from (see economy.balance)
@@ -1430,36 +1440,6 @@ async def handle_shop_command(
 
     if lowered.startswith("/shop"):
         await reply(economy.format_shop(entry, user.user_id, xp), parse_mode="HTML")
-        return
-
-    if lowered.startswith("/send"):
-        parts = command_text.split()
-        if len(parts) < 3:
-            await reply("Формат: /send @username 50")
-            return
-        target_name, raw_amount = parts[1], parts[2]
-        try:
-            amount = int(raw_amount)
-        except ValueError:
-            await reply("Сумма должна быть числом. Формат: /send @username 50")
-            return
-        target, _, _, _, _, _ = await stats.resolve_stat_target(
-            telethon_client, entry, entry, target_name, None, "", tz, log=log
-        )
-        if target is None:
-            await reply("Не нашёл такого участника.")
-            return
-        ok, refusal, delivered = economy.transfer(
-            entry, user.user_id, xp, target.user_id, amount
-        )
-        if not ok:
-            await reply(refusal)
-            return
-        burned = amount - delivered
-        await reply(
-            f"Отправлено {delivered} монет участнику {target.display_name}.\n"
-            f"Комиссия: {burned}."
-        )
         return
 
     # /buy

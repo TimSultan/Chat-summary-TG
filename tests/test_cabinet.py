@@ -40,7 +40,7 @@ class ViewTests(unittest.TestCase):
             for button in row
         }
         self.assertEqual(
-            actions, {"stats", "shop", "works", "badges", "title", "send", "main"}
+            actions, {"stats", "shop", "works", "badges", "title", "main"}
         )
 
     def test_every_button_stays_inside_telegrams_callback_data_limit(self):
@@ -62,25 +62,30 @@ class ViewTests(unittest.TestCase):
         self.assertIsNone(cabinet.parse_callback("roast:20:x"))
         self.assertIsNone(cabinet.parse_callback(""))
 
-    def test_shop_view_marks_affordable_locked_and_cooling_down(self):
+    def test_shop_view_marks_affordable_and_locked(self):
         user = _user()
-        # 1_500 XP -> 150 coins: enough for the roast, not for the title.
-        text, keyboard = cabinet.shop_view("chat", user, 1_500)
-        self.assertIn("✅", text)
-        self.assertIn("🔒", text)
+        # 1_500 XP -> 150 coins: the 400-coin title is out of reach.
+        locked, _ = cabinet.shop_view("chat", user, 1_500)
+        self.assertIn("🔒", locked)
+        self.assertNotIn("✅", locked)
 
-        economy.purchase("chat", user.user_id, 1_500, economy.find_item("roast"))
-        text, _ = cabinet.shop_view("chat", user, 1_500)
-        self.assertIn("⏳", text)
+        # 5_000 XP -> 500 coins: affordable.
+        affordable, keyboard = cabinet.shop_view("chat", user, 5_000)
+        self.assertIn("✅", affordable)
+        self.assertEqual(
+            [cabinet.parse_callback(b["callback_data"])[2]
+             for row in keyboard["inline_keyboard"] for b in row
+             if cabinet.parse_callback(b["callback_data"])[1] == "buy"],
+            ["title"],
+        )
 
     def test_every_leaf_view_offers_a_way_back(self):
         user = _user()
         views = [
             cabinet.shop_view("chat", user, 5_000),
-            cabinet.works_view(user, [], None, None),
-            cabinet.badges_view(user, []),
+            cabinet.works_view("chat", user, [], None, None),
+            cabinet.badges_view("chat", user, []),
             cabinet.title_view("chat", user, 5_000),
-            cabinet.send_view("chat", user, 5_000),
             cabinet.result_view(user.user_id, "готово"),
         ]
         for text, keyboard in views:
@@ -98,19 +103,171 @@ class ViewTests(unittest.TestCase):
         self.assertIn("&lt;b&gt;hax", text)
 
     def test_works_view_handles_empty_and_capped_histories(self):
-        empty, _ = cabinet.works_view(_user(), [], None, None)
+        empty, keyboard = cabinet.works_view("chat", _user(), [], None, None)
         self.assertIn("Пока пусто", empty)
+        # Nothing to rename, so no rename button.
+        self.assertEqual(len(keyboard["inline_keyboard"]), 1)
 
         many = [f"https://t.me/c/1/{n}" for n in range(cabinet.WORKS_SHOWN + 5)]
-        capped, _ = cabinet.works_view(_user(figurines_painted=35), many, None, None)
+        capped, keyboard = cabinet.works_view(
+            "chat", _user(figurines_painted=35), many, None, None
+        )
         self.assertIn("и ещё 5", capped)
+        self.assertIn("✏️ Переименовать", capped + str(keyboard))
 
-    def test_transfer_request_parsing(self):
-        self.assertEqual(cabinet.parse_transfer_request("@someone 50"), ("@someone", 50))
-        self.assertEqual(cabinet.parse_transfer_request("someone   120"), ("someone", 120))
-        self.assertIsNone(cabinet.parse_transfer_request("@someone"))
-        self.assertIsNone(cabinet.parse_transfer_request("@someone много"))
-        self.assertIsNone(cabinet.parse_transfer_request(""))
+    def test_rename_request_parsing(self):
+        self.assertEqual(cabinet.parse_rename_request("3 Дредноут"), (3, "Дредноут"))
+        # Everything after the number is the name, spaces and all.
+        self.assertEqual(
+            cabinet.parse_rename_request("1  Космодесантник  Ультрамаринов"),
+            (1, "Космодесантник  Ультрамаринов"),
+        )
+        # A bare number clears the name.
+        self.assertEqual(cabinet.parse_rename_request("2"), (2, ""))
+        self.assertIsNone(cabinet.parse_rename_request("Дредноут"))
+        self.assertIsNone(cabinet.parse_rename_request("0 Ноль"))
+        self.assertIsNone(cabinet.parse_rename_request(""))
+
+
+class WorkNameTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    @staticmethod
+    def _painter():
+        return _user(
+            figurines_painted=3,
+            recent_figurine_posts=[
+                ["2026-07-05T12:00:00", 105],
+                ["2026-07-04T12:00:00", 104],
+                ["2026-07-03T12:00:00", 103],
+            ],
+        )
+
+    def test_named_works_render_by_name_and_unnamed_stay_numbered(self):
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 104, "Дредноут")
+        links = [f"https://t.me/c/1/{n}" for n in (105, 104, 103)]
+
+        text, _ = cabinet.works_view("chat", user, links, None, None)
+
+        self.assertIn("2. <a", text)
+        self.assertIn("Дредноут</a>", text)
+        self.assertIn("без названия", text)
+
+    def test_a_name_follows_its_work_when_positions_shift(self):
+        """Deleting a work compacts the numbering, so names keyed by position would
+        silently jump onto somebody else's model."""
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 103, "Дредноут")  # position 3
+
+        # The newest work is deleted; the dreadnought is now position 2.
+        user.recent_figurine_posts = user.recent_figurine_posts[1:]
+        links = [f"https://t.me/c/1/{n}" for n in (104, 103)]
+        text, _ = cabinet.works_view("chat", user, links, None, None)
+
+        self.assertIn("2. <a", text)
+        self.assertIn("Дредноут</a>", text)
+        self.assertEqual(cabinet.message_id_for_position(user, 2), 103)
+
+    def test_names_are_trimmed_bounded_and_clearable(self):
+        user = self._painter()
+        saved = stats.set_work_name("chat", user.user_id, 105, "  Очень   длинный  " + "я" * 80)
+        self.assertLessEqual(len(saved), stats.WORK_NAME_MAX_CHARS)
+        self.assertNotIn("  ", saved)
+
+        self.assertEqual(stats.set_work_name("chat", user.user_id, 105, ""), "")
+        self.assertNotIn("105", stats.work_names_for_user("chat", user.user_id))
+
+    def test_a_name_is_escaped_into_the_html_view(self):
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 105, "<b>hax</b>")
+        text, _ = cabinet.works_view("chat", user, ["https://t.me/c/1/105"], None, None)
+        self.assertNotIn("<b>hax", text)
+        self.assertIn("&lt;b&gt;hax", text)
+
+    def test_position_lookup_rejects_out_of_range(self):
+        user = self._painter()
+        self.assertEqual(cabinet.message_id_for_position(user, 1), 105)
+        self.assertIsNone(cabinet.message_id_for_position(user, 0))
+        self.assertIsNone(cabinet.message_id_for_position(user, 99))
+
+
+class BadgeSectionTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_admin_badges_get_their_own_section_above_earned_ones(self):
+        user = _user(messages=1_000, media=25)
+        given = stats.Badge("custom", "🏹", "Лучник", custom=True)
+
+        text, _ = cabinet.badges_view("chat", user, [given])
+
+        self.assertIn("От администрации", text)
+        self.assertIn("Заработанные", text)
+        self.assertLess(text.index("От администрации"), text.index("Заработанные"))
+        self.assertLess(text.index("🏹 Лучник"), text.index("Заработанные"))
+
+    def test_the_admin_section_is_omitted_when_there_are_none(self):
+        text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
+        self.assertNotIn("От администрации", text)
+
+    def test_a_weekly_win_is_earned_not_admin_granted(self):
+        # It is assigned by an administrator, but it is won -- Badge.custom is the
+        # discriminator, and the contest badge does not set it.
+        won = stats.Badge("weekly_contest_winner", "🏆", "Победитель ×1")
+        text, _ = cabinet.badges_view("chat", _user(), [won])
+        self.assertNotIn("От администрации", text)
+        self.assertIn("🏆 Победитель ×1", text)
+
+    def test_collection_counter_counts_tiers_levels_and_ranks(self):
+        # A genuinely blank member -- _user() has 500 messages, which already earns one.
+        empty = stats.UserStats(user_id="20")
+        unlocked, total = stats.badge_collection_progress(empty)
+        # A brand-new member already holds the base painting rank and the first chat tier.
+        self.assertEqual(unlocked, 2)
+        self.assertEqual(
+            total,
+            len(stats.PAINTING_BADGE_TIERS) + len(stats.MESSAGE_BADGE_TIERS)
+            + len(stats.STREAK_BADGE_TIERS) + len(stats.NIGHT_BADGE_TIERS)
+            + 5 + len(stats.CHAT_LEVEL_TIERS) + len(stats.XP_LEVELS),
+        )
+
+        # Every painting tier below the current one counts, not just the shown one.
+        painter = stats.UserStats(user_id="20", figurines_painted=50)
+        more_unlocked, same_total = stats.badge_collection_progress(painter)
+        self.assertEqual(same_total, total)
+        self.assertEqual(
+            more_unlocked - unlocked,
+            len(stats.PAINTING_BADGE_TIERS)          # all three medals, not just the top
+            + (len(stats.XP_LEVELS) - 1)             # every painting rank above the base
+            + (len(stats.CHAT_LEVEL_TIERS) - 1),     # 50 figurines is also 10k XP
+        )
+
+    def test_defined_custom_badges_widen_the_denominator(self):
+        user = stats.UserStats(user_id="20")
+        _, base_total = stats.badge_collection_progress(user)
+        given = stats.Badge("custom", "🏹", "Лучник", custom=True)
+
+        unlocked, total = stats.badge_collection_progress(
+            user, custom_badges=[given], chat_custom_badge_total=4
+        )
+
+        self.assertEqual(total, base_total + 4)
+        self.assertEqual(unlocked, 2 + 1)
+
+    def test_the_counter_is_rendered_at_the_bottom(self):
+        text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
+        self.assertIn("📦 Открыто:", text)
+        self.assertGreater(text.index("📦 Открыто:"), text.index("🏅 <b>Значки</b>"))
 
 
 class FakeAPI:
@@ -420,11 +577,11 @@ class RenderCostTests(unittest.TestCase):
         # the context -- otherwise buying something would appear to do nothing for 45s.
         user = _user()
         before, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
-        economy.purchase("chat", user.user_id, 5_000, economy.find_item("freeze"))
+        economy.purchase("chat", user.user_id, 5_000, economy.find_item("title"))
         after, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
 
         self.assertIn("🪙 Монеты: 500", before)
-        self.assertIn("🪙 Монеты: 300", after)
+        self.assertIn("🪙 Монеты: 100", after)
 
 
 class MenuRegistrationTests(unittest.TestCase):

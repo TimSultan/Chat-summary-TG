@@ -207,6 +207,10 @@ CUSTOM_BADGE_STORE_VERSION = 1
 # would already look current and the two tags would only ever be seen going forward.
 BADGE_STATS_SCHEMA_VERSION = 2
 WEEKLY_CONTEST_STORE_VERSION = 1
+WORK_NAME_STORE_VERSION = 1
+# Long enough for "Космодесантник Ультрамаринов", short enough that thirty of them still
+# fit in one Telegram message alongside their links.
+WORK_NAME_MAX_CHARS = 32
 # 2 replaced the single figurine-gated ladder with two independently announced tracks
 # (chat level and painter rank). A stored version below this is discarded rather than
 # read: its "minimum_xp" watermark describes a ladder that no longer exists, and
@@ -502,6 +506,61 @@ def _highest_badge_tier(value: int, tiers, condition: str) -> Badge | None:
     return Badge(badge_id, emoji, name, condition.format(threshold=threshold))
 
 
+def badge_collection_progress(
+    user: "UserStats",
+    custom_badges: list[Badge] | None = None,
+    chat_custom_badge_total: int = 0,
+) -> tuple[int, int]:
+    """(unlocked, total) across everything collectable -- badges, chat-level tiers and
+    painting ranks.
+
+    Every TIER counts as its own slot rather than one slot per family: /stat only ever
+    displays the highest 🥉/🥈/🥇 earned, but for a completion counter "1 of 3 painting
+    medals" is the honest reading, and collapsing families would make the total read as
+    far smaller than the number of things there actually are to chase.
+
+    Levels are included per the request, by tier rather than by level -- 40 individual
+    levels would swamp the badges and make the number meaningless. `chat_custom_badge_
+    total` is how many custom badges this chat has DEFINED, so admin-made badges count
+    towards the denominator instead of being an unbounded unknown.
+    """
+    tier_families = (
+        (PAINTING_BADGE_TIERS, user.figurines_painted),
+        (MESSAGE_BADGE_TIERS, user.messages),
+        (STREAK_BADGE_TIERS, _longest_streak(user.active_day_dates)),
+        (NIGHT_BADGE_TIERS, sum(user.hours.get(str(hour), 0) for hour in range(6))),
+    )
+    unlocked = 0
+    total = 0
+    for tiers, value in tier_families:
+        total += len(tiers)
+        unlocked += sum(1 for threshold, *_ in tiers if value >= threshold)
+
+    simple = (
+        (user.media >= 25),
+        (user.replies >= 100),
+        (user.active_days >= 30),
+        (user.not_gay_hashtag_uses > 0),
+        (len(user.weekly_contest_weeks) > 0),
+    )
+    total += len(simple)
+    unlocked += sum(1 for earned in simple if earned)
+
+    # Chat-level tiers: how many name bands this member has reached.
+    total += len(CHAT_LEVEL_TIERS)
+    unlocked += _chat_tier_index(chat_level(user.season_xp(DEFAULT_WORDS_PER_POINT)).number) + 1
+
+    # Painting ranks, including the starting one everybody holds.
+    total += len(XP_LEVELS)
+    unlocked += sum(
+        1 for _, minimum_figurines, *_ in XP_LEVELS if user.figurines_painted >= minimum_figurines
+    )
+
+    total += max(chat_custom_badge_total, len(custom_badges or []))
+    unlocked += len(custom_badges or [])
+    return unlocked, total
+
+
 def earned_badges(user: "UserStats") -> list[Badge]:
     """Automatic badges earned from the existing all-time UserStats counters."""
     longest_streak = _longest_streak(user.active_day_dates)
@@ -632,6 +691,10 @@ def _deleted_figurines_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_deleted_figurines.json"
 
 
+def _work_names_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_work_names.json"
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -688,6 +751,44 @@ def delete_figurine_submission(
     data["version"] = DELETED_FIGURINE_STORE_VERSION
     _write_json_atomic(_deleted_figurines_path(entry), data)
     return True
+
+
+def _load_work_names(entry: str) -> dict:
+    path = _work_names_path(entry)
+    if not path.exists():
+        return {"version": WORK_NAME_STORE_VERSION, "users": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"version": WORK_NAME_STORE_VERSION, "users": {}}
+    if not isinstance(data, dict):
+        return {"version": WORK_NAME_STORE_VERSION, "users": {}}
+    data.setdefault("users", {})
+    return data
+
+
+def work_names_for_user(entry: str, user_id: int | str) -> dict:
+    """{message_id (str): name} for one member's renamed works.
+
+    Keyed by message_id rather than by the position shown in /stat, because those
+    positions shift: deleting a work compacts the numbering (see delete_figurine_
+    submission), and a rename must follow the work rather than the slot it happened to
+    occupy. Corruption costs names, never the works themselves."""
+    return (_load_work_names(entry).get("users") or {}).get(str(user_id)) or {}
+
+
+def set_work_name(entry: str, user_id: int | str, message_id: int | str, name: str) -> str:
+    """Name (or, with an empty `name`, un-name) one work. Returns the stored name."""
+    data = _load_work_names(entry)
+    names = data["users"].setdefault(str(user_id), {})
+    clean = " ".join((name or "").split())[:WORK_NAME_MAX_CHARS]
+    if clean:
+        names[str(message_id)] = clean
+    else:
+        names.pop(str(message_id), None)
+    data["version"] = WORK_NAME_STORE_VERSION
+    _write_json_atomic(_work_names_path(entry), data)
+    return clean
 
 
 def _empty_custom_badge_data() -> dict:

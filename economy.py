@@ -37,12 +37,9 @@ ECONOMY_STORE_VERSION = 1
 # from, so trimming this can never change anybody's balance.
 LOG_LIMIT = 1_000
 
-# Share of every member-to-member transfer that is destroyed rather than delivered. This
-# is the economy's only always-on sink: without one, coins only ever move around and the
-# total in circulation rises forever (see GAMIFICATION_PLAN.md finding #2). 10% is small
-# enough that gifting still feels worth doing.
-TRANSFER_BURN_PERCENT = 10
-MIN_TRANSFER = 10
+# Member-to-member transfers were removed. `received` is still read by balance() and
+# reputation_for() so that any ledger written while they existed keeps computing exactly
+# the same numbers; nothing can add to it any more.
 
 # A 30-day rented title, priced so it stays a recurring decision rather than a one-off
 # purchase. See the price note on SHOP_ITEMS.
@@ -74,27 +71,23 @@ class ShopItem:
 # not of the prices.
 SHOP_ITEMS = (
     ShopItem(
-        "roast", "Прожарка", 100,
-        "Прожарка по твоим сообщениям за последний месяц",
-        cooldown_hours=24,
-    ),
-    ShopItem(
-        "critique", "Разбор работы", 150,
-        "Разбор твоей последней работы по #япокрасил",
-        cooldown_hours=12,
-    ),
-    ShopItem(
-        "freeze", "Заморозка серии", 200,
-        "Спасает серию активных дней за один пропущенный день",
-        cooldown_hours=0,
-    ),
-    ShopItem(
         "title", "Свой титул", 400,
         f"Свой титул в /stat на {TITLE_DAYS} дней",
         cooldown_hours=0,
         argument_hint="<текст титула>",
     ),
 )
+
+# The roast, the work critique and the streak freeze were removed from the catalogue.
+# Their delivery code (see bot_listener._deliver_shop_item) and the freeze machinery
+# below are deliberately LEFT IN PLACE rather than deleted -- re-listing any of them is
+# adding one ShopItem back, the same "disabled, not removed" convention the roast trigger
+# and the XP cooldown already follow in this codebase.
+#
+# Consequence worth knowing: transfers used to burn TRANSFER_BURN_PERCENT of every gift
+# and were the economy's only always-on sink. With transfers gone and one rentable item
+# left, the only thing draining coins is a 400-coin title every 30 days, while an active
+# member earns ~1,000 a month. Balances will grow. See the README note.
 
 
 def find_item(code: str) -> ShopItem | None:
@@ -214,32 +207,6 @@ def grant(entry: str, user_id, amount: int, reason: str) -> None:
     record["bonus"] = record.get("bonus", 0) + int(amount)
     _append_log(data, user_id, int(amount), reason)
     _save(entry, data)
-
-
-def transfer(entry: str, from_id, from_xp: int, to_id, amount: int) -> tuple[bool, str, int]:
-    """Move coins between members, destroying TRANSFER_BURN_PERCENT of the amount.
-
-    Returns (succeeded, human-readable reason when refused, delivered amount). The burn
-    is taken out of what arrives rather than added on top of what is paid, so the sender
-    is never charged more than the number they typed."""
-    if str(from_id) == str(to_id):
-        return False, "Нельзя переводить самому себе.", 0
-    if amount < MIN_TRANSFER:
-        return False, f"Минимальный перевод -- {MIN_TRANSFER} монет.", 0
-    data = _load(entry)
-    if _balance_from(data, from_id, from_xp) < amount:
-        return False, "Недостаточно монет.", 0
-    burned = amount * TRANSFER_BURN_PERCENT // 100
-    delivered = amount - burned
-    sender = _record(data, from_id)
-    sender["spent"] = sender.get("spent", 0) + amount
-    sender["burned"] = sender.get("burned", 0) + burned
-    recipient = _record(data, to_id)
-    recipient["received"] = recipient.get("received", 0) + delivered
-    _append_log(data, from_id, -amount, "transfer_out", str(to_id))
-    _append_log(data, to_id, delivered, "transfer_in", str(from_id))
-    _save(entry, data)
-    return True, "", delivered
 
 
 # --- purchase effects -------------------------------------------------------------

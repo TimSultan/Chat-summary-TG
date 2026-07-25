@@ -52,43 +52,29 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(economy.balance("chat", "1", 1_000), 0)
         self.assertEqual(economy.balance("chat", "1", 800), 0)
 
-    def test_transfer_burns_a_cut_and_moves_the_rest(self):
-        ok, refusal, delivered = economy.transfer("chat", "1", 10_000, "2", 100)
-        self.assertTrue(ok, refusal)
-        self.assertEqual(delivered, 90)
-        # The sender pays exactly what they typed; the burn comes out of what arrives.
-        self.assertEqual(economy.balance("chat", "1", 10_000), 900)
-        self.assertEqual(economy.balance("chat", "2", 0), 90)
-
-    def test_transfer_refusals(self):
-        ok, refusal, _ = economy.transfer("chat", "1", 10_000, "1", 100)
-        self.assertFalse(ok)
-        self.assertIn("самому себе", refusal)
-
-        ok, refusal, _ = economy.transfer("chat", "1", 10_000, "2", 1)
-        self.assertFalse(ok)
-        self.assertIn("Минимальный перевод", refusal)
-
-        ok, refusal, _ = economy.transfer("chat", "1", 0, "2", 50)
-        self.assertFalse(ok)
-        self.assertIn("Недостаточно", refusal)
+    def test_catalogue_is_the_title_alone(self):
+        self.assertEqual([item.code for item in economy.SHOP_ITEMS], ["title"])
+        self.assertIsNone(economy.find_item("roast"))
+        self.assertIsNone(economy.find_item("freeze"))
 
     def test_purchase_enforces_price_then_cooldown(self):
-        roast = economy.find_item("roast")
+        # No listed item carries a cooldown now, so the rule is exercised directly --
+        # re-listing anything with one must keep working.
+        item = economy.ShopItem("probe", "Проба", 100, "", cooldown_hours=24)
 
-        ok, refusal, _ = economy.purchase("chat", "1", 0, roast)
+        ok, refusal, _ = economy.purchase("chat", "1", 0, item)
         self.assertFalse(ok)
-        self.assertIn(str(roast.price), refusal)
+        self.assertIn("100", refusal)
 
-        ok, refusal, remaining = economy.purchase("chat", "1", 5_000, roast)
+        ok, refusal, remaining = economy.purchase("chat", "1", 5_000, item)
         self.assertTrue(ok, refusal)
-        self.assertEqual(remaining, 500 - roast.price)
+        self.assertEqual(remaining, 400)
 
         # Bought again immediately: refused by the cooldown, and no second debit.
-        ok, refusal, unchanged = economy.purchase("chat", "1", 5_000, roast)
+        ok, refusal, unchanged = economy.purchase("chat", "1", 5_000, item)
         self.assertFalse(ok)
         self.assertIn("Ещё рано", refusal)
-        self.assertEqual(unchanged, 500 - roast.price)
+        self.assertEqual(unchanged, 400)
 
 
 class EffectTests(unittest.TestCase):
@@ -150,10 +136,15 @@ class EffectTests(unittest.TestCase):
         # Nothing self-generated counts: posting all day leaves this at zero.
         self.assertEqual(economy.reputation_for("chat", "1"), 0)
 
-        economy.transfer("chat", "2", 100_000, "1", 400)
-        # 360 delivered // 20 = 18
-        self.assertEqual(economy.reputation_for("chat", "1"), 18)
-        self.assertEqual(stats.reputation_tier(18)[1], "Замеченный")
+        badge = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+        stats.give_custom_badge("chat", badge.badge_id, "1", "User", 10, "Admin")
+        self.assertEqual(economy.reputation_for("chat", "1"), stats.REPUTATION_PER_BADGE_RECEIVED)
+
+        stats.record_weekly_contest_winner("chat", 1, "1", "User", 10, "Admin")
+        self.assertEqual(
+            economy.reputation_for("chat", "1"),
+            stats.REPUTATION_PER_BADGE_RECEIVED + stats.REPUTATION_PER_CONTEST_WIN,
+        )
 
     def test_stat_extras_degrade_instead_of_breaking_stat(self):
         with patch("economy.balance", side_effect=OSError("disk gone")):

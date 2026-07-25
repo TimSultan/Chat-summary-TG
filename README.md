@@ -334,8 +334,7 @@ Commands (any tracked chat):
 
 - `/coins` — balance and banked streak freezes
 - `/shop` — catalogue, marked ✅ affordable / 🔒 too expensive / ⏳ on cooldown
-- `/buy <item> [args]` — purchase
-- `/send @username 50` — transfer coins to another member
+- `/buy title <текст>` — purchase
 
 ### Menu button and the fallback menu
 
@@ -392,9 +391,17 @@ coins — open a force-reply prompt and only debit once the reply arrives.
 - 📊 **Статистика** — the exact `/stat` card the group sees, so the cabinet never becomes
   a second, subtly different source of truth
 - 🏪 **Магазин** — one button per item, with the same ✅/🔒/⏳ marks
-- 🎨 **Мои работы** — showcase links plus up to 30 numbered `#япокрасил` links
-- 🏅 **Значки** — every badge with the condition that earned it
-- ✏️ **Титул** / 💸 **Перевод** — the two force-reply flows
+- 🎨 **Мои работы** — showcase links plus up to 30 `#япокрасил` works, one per line.
+  ✏️ Переименовать renames one by position (`3 Дредноут`, up to 32 chars; a bare number
+  clears it). Names are stored against the work's **message_id**, not its position —
+  deleting a work compacts the numbering, and a name must follow the work rather than the
+  slot it happened to occupy.
+- 🏅 **Значки** — admin-granted badges in their own section **first** (split on
+  `Badge.custom`, since those are the only ones somebody chose to give you), then earned
+  ones, then `📦 Открыто: N из M`. The denominator counts every tier individually (all
+  three painting medals, not just the highest shown), plus the 8 chat-level tiers, the 7
+  painting ranks, and however many custom badges the chat has defined.
+- ✏️ **Титул** — the one force-reply purchase flow
 
 Each button carries its owner's user id inside its `callback_data`, so a forwarded menu is
 inert (`Это чужой кабинет.`) and navigation keeps working across a process restart —
@@ -416,22 +423,25 @@ them straight from the ledger, so a purchase shows up immediately rather than 45
 later. Screens with no links (main, shop, title, send, badges) resolve no chat entity at
 all; only Статистика and Мои работы do.
 
-Shop v1, priced against the chat's real earn rate (the most active members earn 60–233
-coins/week, the p90 member ~55/week):
+The shop sells one thing:
 
-| Item | Price | Cooldown | Effect |
-|---|---|---|---|
-| `roast` Прожарка | 100 | 24 h | Roast built from your own last month of messages |
-| `critique` Разбор работы | 150 | 12 h | Vision critique of your newest `#япокрасил` photo (`critique.py`) |
-| `freeze` Заморозка серии | 200 | — | Covers one missed day so a streak survives |
-| `title` Свой титул | 400 | — | Custom title under your name in `/stat`, 30 days |
+| Item | Price | Effect |
+|---|---|---|
+| `title` Свой титул | 400 | Custom title under your name in `/stat` and the cabinet, 30 days |
 
-If delivery fails (an LLM error, no work to critique) the purchase is **refunded** — the
-debit and the effect are never left half-applied. A freeze is consumed automatically when
-a gap actually threatens a streak, never when there is no gap, and covering the same gap
-twice costs one freeze. A frozen day bridges the streak but does not itself count as an
-active day. Transfers burn `TRANSFER_BURN_PERCENT` (10%) of the amount, which is the
-economy's only always-on sink; the sender is charged exactly what they typed.
+The roast, the work critique and the streak freeze were removed from the catalogue;
+their delivery code and the freeze machinery are left in place, so re-listing any of them
+is adding one `ShopItem` back — the same "disabled, not removed" convention the roast
+trigger and the XP cooldown already follow.
+
+Member-to-member transfers were removed too. **That took the economy's only always-on
+sink with it**: transfers used to burn 10% of every gift, and now the sole drain is a
+400-coin title every 30 days against ~1,000 coins a month for an active member. Balances
+will grow. `received` is still read by `balance()` so any ledger written while transfers
+existed keeps computing the same number; nothing can add to it any more.
+
+If delivery of a purchase fails the coins are refunded, so a debit and its effect are
+never left half-applied.
 
 **Note on reach:** because coins track XP, the economy is only meaningful for roughly the
 top quarter of the chat. The median member earns ~3 coins/week and will not realistically

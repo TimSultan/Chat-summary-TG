@@ -97,10 +97,7 @@ def main_view(
                 {"text": "🎨 Мои работы", "callback_data": callback_data(user.user_id, "works")},
                 {"text": "🏅 Значки", "callback_data": callback_data(user.user_id, "badges")},
             ],
-            [
-                {"text": "✏️ Титул", "callback_data": callback_data(user.user_id, "title")},
-                {"text": "💸 Перевод", "callback_data": callback_data(user.user_id, "send")},
-            ],
+            [{"text": "✏️ Титул", "callback_data": callback_data(user.user_id, "title")}],
             [{"text": "🔄 Обновить", "callback_data": callback_data(user.user_id, "main")}],
         ]
     }
@@ -165,12 +162,23 @@ def shop_view(entry: str, user: stats.UserStats, xp: int, notice: str = "") -> t
 
 
 def works_view(
+    entry: str,
     user: stats.UserStats,
     figurine_links: list[str],
     best_work_link: str | None,
     workplace_link: str | None,
+    notice: str = "",
 ) -> tuple[str, dict]:
+    """One line per work, so the position stays visible next to its name.
+
+    A member renames by position ("3 Дредноут"), but the name is stored against that
+    work's message_id (see stats.set_work_name) -- positions shift when a work is
+    deleted, and a name must follow the work rather than the slot it happened to sit in.
+    """
+    names = stats.work_names_for_user(entry, user.user_id)
     lines = ["🎨 <b>Мои работы</b>\n"]
+    if notice:
+        lines.append(f"{notice}\n")
     if workplace_link:
         lines.append(f'🛠️ Рабочее место: <a href="{escape(workplace_link, quote=True)}">ссылка</a>')
     if best_work_link:
@@ -178,30 +186,89 @@ def works_view(
     if workplace_link or best_work_link:
         lines.append("")
 
-    lines.append(f"Фигурок засчитано: {user.figurines_painted} ({stats.FIGURINE_HASHTAG})")
+    lines.append(f"Фигурок засчитано: {user.figurines_painted} ({stats.FIGURINE_HASHTAG})\n")
+
+    rows = []
     if figurine_links:
-        shown = figurine_links[:WORKS_SHOWN]
-        numbered = " · ".join(
-            f'<a href="{escape(link, quote=True)}">{index}</a>'
-            for index, link in enumerate(shown, start=1)
-        )
-        lines.append(f"\n{numbered}")
+        for index, link in enumerate(figurine_links[:WORKS_SHOWN], start=1):
+            message_id = message_id_for_position(user, index)
+            name = names.get(str(message_id)) if message_id is not None else None
+            label = escape(name) if name else "<i>без названия</i>"
+            lines.append(f'{index}. <a href="{escape(link, quote=True)}">{label}</a>')
         if len(figurine_links) > WORKS_SHOWN:
             lines.append(f"\n…и ещё {len(figurine_links) - WORKS_SHOWN}.")
+        lines.append(f"\nНазвание — до {stats.WORK_NAME_MAX_CHARS} символов.")
+        rows.append([{
+            "text": "✏️ Переименовать",
+            "callback_data": callback_data(user.user_id, "work_rename"),
+        }])
     else:
-        lines.append(f"\nПока пусто — выложи работу с {stats.FIGURINE_HASHTAG}.")
-    return "\n".join(lines), {"inline_keyboard": [_back_row(user.user_id)]}
+        lines.append(f"Пока пусто — выложи работу с {stats.FIGURINE_HASHTAG}.")
+
+    rows.append(_back_row(user.user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
-def badges_view(user: stats.UserStats, custom_badges: list) -> tuple[str, dict]:
-    badges = stats.earned_badges(user) + list(custom_badges or [])
-    lines = ["🏅 <b>Значки</b>\n"]
-    if badges:
-        for badge in badges:
+def message_id_for_position(user: stats.UserStats, position: int) -> int | None:
+    """The message_id behind the 1-based position this view and /stat display.
+
+    recent_figurine_posts is newest-first and already has deleted works removed
+    (_apply_deleted_figurines), so position N here is the same work /stat calls N.
+    """
+    posts = user.recent_figurine_posts
+    if 1 <= position <= len(posts):
+        return posts[position - 1][1]
+    return None
+
+
+def parse_rename_request(text: str) -> tuple[int, str] | None:
+    """"3 Дредноут" -> (3, "Дредноут"). A bare number clears that work's name."""
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    try:
+        position = int(parts[0])
+    except ValueError:
+        return None
+    if position < 1:
+        return None
+    return position, (parts[1] if len(parts) > 1 else "")
+
+
+def badges_view(
+    entry: str,
+    user: stats.UserStats,
+    custom_badges: list,
+    chat_custom_badge_total: int = 0,
+) -> tuple[str, dict]:
+    """Admin-granted badges first, then earned ones, then a completion counter.
+
+    Admin badges lead because they are the only ones somebody chose to give this person;
+    buried among a dozen automatic counters they lose exactly what makes them worth
+    having. The split is on Badge.custom, which is what that flag exists for.
+    """
+    given = [badge for badge in (custom_badges or []) if getattr(badge, "custom", False)]
+    other_awarded = [badge for badge in (custom_badges or []) if not getattr(badge, "custom", False)]
+    earned = stats.earned_badges(user) + other_awarded
+
+    lines = ["🏅 <b>Значки</b>"]
+    if given:
+        lines.append("\n<b>От администрации</b>")
+        for badge in given:
+            lines.append(escape(badge.label))
+    if earned:
+        lines.append("\n<b>Заработанные</b>")
+        for badge in earned:
             description = f" — {escape(badge.description)}" if badge.description else ""
             lines.append(f"{escape(badge.label)}{description}")
-    else:
-        lines.append("Пока ни одного.")
+    if not given and not earned:
+        lines.append("\nПока ни одного.")
+
+    unlocked, total = stats.badge_collection_progress(
+        user, custom_badges=custom_badges, chat_custom_badge_total=chat_custom_badge_total
+    )
+    lines.append(f"\n📦 Открыто: {unlocked} из {total}")
+    lines.append("<i>считая уровни чата и звания художника</i>")
     return "\n".join(lines), {"inline_keyboard": [_back_row(user.user_id)]}
 
 
@@ -230,27 +297,6 @@ def title_view(entry: str, user: stats.UserStats, xp: int, notice: str = "") -> 
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
-def send_view(entry: str, user: stats.UserStats, xp: int, notice: str = "") -> tuple[str, dict]:
-    coins = economy.balance(entry, user.user_id, xp)
-    lines = ["💸 <b>Перевод монет</b>\n"]
-    if notice:
-        lines.append(f"{notice}\n")
-    lines.append(f"🪙 У тебя: {_money(coins)}\n")
-    lines.append(
-        f"Минимум {economy.MIN_TRANSFER} монет. "
-        f"Комиссия {economy.TRANSFER_BURN_PERCENT}% сгорает — "
-        "так монеты в чате не копятся бесконечно."
-    )
-    rows = []
-    if coins >= economy.MIN_TRANSFER:
-        rows.append([{
-            "text": "💸 Отправить монеты",
-            "callback_data": callback_data(user.user_id, "send_start"),
-        }])
-    rows.append(_back_row(user.user_id))
-    return "\n".join(lines), {"inline_keyboard": rows}
-
-
 def welcome_view(user_id) -> tuple[str, dict]:
     """Shown to somebody the stats don't know yet.
 
@@ -274,16 +320,3 @@ def result_view(owner_id, text: str) -> tuple[str, dict]:
     return text, {"inline_keyboard": [_back_row(owner_id)]}
 
 
-def parse_transfer_request(text: str) -> tuple[str, int] | None:
-    """"@user 50" / "user 50" -> (target, amount). None when it isn't that shape."""
-    parts = (text or "").split()
-    if len(parts) < 2:
-        return None
-    target, raw_amount = parts[0], parts[-1]
-    try:
-        amount = int(raw_amount)
-    except ValueError:
-        return None
-    if not target.strip():
-        return None
-    return target.strip(), amount
