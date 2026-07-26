@@ -247,8 +247,15 @@ def advice_for(day: date) -> str:
 
 def format_planting_message() -> str:
     """The one-off post that opens the whole thing, sent instead of the first morning
-    digest. Deliberately carries no numbers: on the day it goes out the tree is a seed,
-    and a height of "0 мм" would undercut the moment."""
+    digest.
+
+    Deliberately carries no numbers at all: on the day it goes out the tree is a seed,
+    and a height of "0 мм" would undercut the moment. It also never names how many
+    stages there are or how long the whole thing takes -- same rule /stat already
+    follows by not printing the next level's threshold. Knowing it is "thirteen stages
+    and three years" turns an open-ended thing the chat is growing into a progress bar
+    with a visible end, and the mystery is doing more work here than the number would.
+    """
     return "\n".join([
         "🌱 <b>Сегодня мы все вместе посадили семечко.</b>",
         "",
@@ -257,7 +264,7 @@ def format_planting_message() -> str:
         "каждая выложенная работа. Чем живее чат — тем выше оно тянется.",
         "",
         "Здесь не с кем соревноваться. Дерево одно, и чужой вклад — это и ваш рост тоже.",
-        "Впереди тринадцать стадий и три года пути до Легендарного Древа.",
+        "Никто не знает, каким оно вырастет и как высоко дотянется. Это зависит от нас.",
         "",
         "Каждое утро в 10:00 я буду рассказывать, на сколько оно подросло за сутки",
         "и кто вложил больше всех.",

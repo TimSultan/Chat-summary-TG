@@ -344,8 +344,12 @@ history. That is what makes "сегодня мы посадили семечко
 tracked activity before the tree existed, and counting it would plant a seed already a
 metre tall. It also means the three-year horizon starts when the tree does.
 
-The very first morning post plants it instead of reporting on it — no numbers, because on
-that day a height of "0 мм" would undercut the moment:
+The very first morning post plants it instead of reporting on it. No numbers, because on
+that day a height of "0 мм" would undercut the moment — and, deliberately, **no mention of
+how many stages there are or how long it takes**. Same rule `/stat` already follows by not
+printing the next level's threshold: "thirteen stages and three years" turns an open-ended
+thing the chat is growing into a progress bar with a visible end. The table above is
+engineering documentation; none of it is ever said in the chat.
 
 ```text
 🌱 Сегодня мы все вместе посадили семечко.

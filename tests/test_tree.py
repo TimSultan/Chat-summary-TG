@@ -167,6 +167,17 @@ class PlantingTests(unittest.TestCase):
         self.assertNotIn("мм", text)
         self.assertNotIn("Больше всех вложили", text)
 
+    def test_the_opening_post_never_reveals_where_it_ends(self):
+        """Same rule /stat already follows: naming "thirteen stages, three years" turns
+        an open-ended thing the chat is growing into a progress bar with a visible end."""
+        text = tree.format_planting_message()
+
+        for giveaway in ("тринадцать", "13", "три года", "трёх лет", "Легендарн"):
+            self.assertNotIn(giveaway, text)
+        # And no stage name from further up the ladder leaks in either.
+        for _, _, name in tree.TREE_STAGES[1:]:
+            self.assertNotIn(name, text)
+
     def test_the_planting_day_is_recorded_once_and_never_moved(self):
         first = date(2026, 7, 26)
         stats.mark_tree_planted("chat", first)
