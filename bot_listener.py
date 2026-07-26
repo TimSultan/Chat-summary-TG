@@ -58,6 +58,7 @@ import cabinet
 import chat_profile
 import economy
 import history
+import preview
 import stats
 from bot_api import TelegramBotAPI
 from config import build_session, load_config
@@ -125,6 +126,7 @@ WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
 BADGE_ADMIN_COMMAND = "/badgeadmin"
 REPLANT_COMMAND = "/replant"
+PREVIEW_COMMAND = "/preview"
 
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
@@ -919,6 +921,145 @@ async def handle_replant_command(
         f"Отправил в чат. Дерево посажено заново с {today.isoformat()}"
         + (f" (было {previous.isoformat()})." if previous else ".")
     )
+
+
+async def _send_preview(
+    api: TelegramBotAPI, dm_chat_id: int, preview_id: str, log=print
+) -> bool:
+    """Render one sample into the DM. True when it existed and went out."""
+    text = preview.render(preview_id)
+    if text is None:
+        return False
+    await api.send_message(
+        dm_chat_id, text, parse_mode="HTML", reply_markup=preview.keyboard_for(preview_id),
+    )
+    return True
+
+
+async def _post_group_test(
+    api: TelegramBotAPI, dm_chat_id: int, admin_chat_id: int, log=print
+) -> None:
+    """The one preview that goes to the real chat, so the button can be judged where it
+    will actually live. Its button is wired to the test payload, not the planting one, so
+    a member who taps it out of curiosity is told it's a test instead of being signed up
+    for a planting that isn't running."""
+    sent = await api.send_message(
+        admin_chat_id,
+        tree.format_seed_ceremony_message(),
+        parse_mode="HTML",
+        reply_markup=tree.seed_keyboard(preview.SAMPLE_CALLBACK),
+    )
+    text, keyboard = preview.group_test_sent_view(admin_chat_id, sent["message_id"])
+    await api.send_message(dm_chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_preview_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/preview — look at the scheduled and one-off posts without waiting for them.
+
+        /preview              the menu, one button per message
+        /preview rollcall     one sample straight away
+        /preview test_button  post the real thing to the chat, with an undo
+
+    Admin-only and DM-only. Not because the samples are secret -- because the menu's last
+    button posts to the chat, and because a preview of the planting invitation loose in
+    the group would be indistinguishable from the real invitation.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str, parse_mode: str | None = None, reply_markup=None) -> None:
+        try:
+            await api.send_message(
+                dm_chat_id, text, reply_to_message_id=reply_to,
+                parse_mode=parse_mode, reply_markup=reply_markup,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to answer /preview:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Не настроен основной чат.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Предпросмотр доступен только администраторам чата.")
+        return
+
+    argument = command_text[len(PREVIEW_COMMAND):].strip().lower()
+    if not argument:
+        text, keyboard = preview.menu_view()
+        await reply(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    try:
+        if argument == preview.GROUP_TEST_ID:
+            await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
+            return
+        if not await _send_preview(api, dm_chat_id, argument, log=log):
+            await reply(preview.unknown_preview_text(), parse_mode="HTML")
+    except Exception:
+        log(f"[bot_listener] /preview {argument} failed:\n{traceback.format_exc()}")
+        await reply("Не удалось отправить превью.")
+
+
+async def handle_preview_callback(
+    api: TelegramBotAPI,
+    callback: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """Buttons from the /preview menu, plus the button on the test post itself.
+
+    A sample planting button is answered for ANYBODY who presses it -- the test post sits
+    in a 190-member chat, and a member who taps it deserves an answer rather than a
+    spinner that never stops. Everything that acts (rendering into a DM, posting to the
+    chat, deleting) is still gated on the presser being an admin.
+    """
+    data = callback.get("data") or ""
+    callback_id = callback["id"]
+    presser = callback.get("from") or {}
+    dm_chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
+
+    deletion = preview.parse_delete_callback(data)
+    preview_id = preview.parse_callback(data) if deletion is None else None
+
+    # A sample planting button, in the chat or on a DM preview: no rights needed, nothing
+    # happens, everybody who taps it gets told what it is.
+    if preview_id == preview.SAMPLE_BUTTON_ID:
+        await api.answer_callback_query(callback_id, tree.SEED_BUTTON_TEST_ACK)
+        return
+
+    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+        await api.answer_callback_query(callback_id, "Нужны права администратора.")
+        return
+
+    if deletion is not None:
+        chat_id, message_id = deletion
+        await api.delete_message(chat_id, message_id)
+        await api.answer_callback_query(callback_id, "Удалил из чата.")
+        return
+
+    if not preview_id or dm_chat_id is None:
+        await api.answer_callback_query(callback_id)
+        return
+
+    try:
+        if preview_id == preview.GROUP_TEST_ID:
+            await api.answer_callback_query(callback_id, "Отправляю в чат...")
+            await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
+            return
+        await api.answer_callback_query(callback_id, preview.title_for(preview_id) or "")
+        await _send_preview(api, dm_chat_id, preview_id, log=log)
+    except Exception:
+        log(f"[bot_listener] preview button {preview_id} failed:\n{traceback.format_exc()}")
 
 
 async def handle_badge_admin_command(
@@ -2483,6 +2624,14 @@ async def _dispatch_update(
             )
         elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
             await handle_badge_callback(api, callback, badge_flows)
+        elif callback_data.startswith(f"{preview.CALLBACK_PREFIX}:"):
+            await handle_preview_callback(
+                api, callback, home_chat_ref,
+                await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+                if home_chat_ref
+                else None,
+                log=log,
+            )
         elif callback_data.startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(
                 api, telethon_client, callback, joke_preview_pending, known_chat_ids,
@@ -2547,6 +2696,18 @@ async def _dispatch_update(
         )
         await handle_replant_command(
             api, telethon_client, message, home_chat_ref, admin_chat_id, tz, log=log,
+        )
+        return
+    if re.match(rf"^{re.escape(PREVIEW_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_preview_command(
+            api, telethon_client, message, command_text, home_chat_ref, admin_chat_id, log=log,
         )
         return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):

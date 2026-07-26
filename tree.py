@@ -45,6 +45,21 @@ MORNING_GREETING = "Доброе утро, ЕПХ-чане!"
 # How many of yesterday's top contributors the morning post names.
 TOP_CONTRIBUTORS_SHOWN = 3
 
+# Members take part in the planting by tapping a button under the ceremony post, not by
+# reacting to it. A reaction was the original plan and had to go: Telegram only accepts
+# its own fixed quick-reaction set (core.telegram.org/api/reactions), which contains no
+# 🌳, 🌱 or 🌿 at all -- 🎄, a new year tree, is the only tree in it. A button carries any
+# emoji, reports exactly who pressed it, and needs no Telethon session to read.
+#
+# 🪏 (shovel) is Unicode 16, new enough that a very old client may draw it as a blank box;
+# ⛏ is the safe substitute if that ever shows up in the chat.
+SEED_BUTTON_TEXT = "🌰🪏🌳 Посадить семечко"
+# Answered as a toast on the presser's own screen -- nothing is posted to the chat, so
+# 190 members tapping a button cannot turn into 190 messages.
+SEED_BUTTON_ACK = "Записал. Ты в списке — в 10:00 назову всех."
+SEED_BUTTON_ALREADY = "Ты уже сажаешь это семечко."
+SEED_BUTTON_TEST_ACK = "Это тестовая кнопка — посадка ещё не идёт."
+
 
 def tree_height_mm(total_xp: int) -> int:
     """Height for the chat's pooled all-time XP, capped at the final stage. The cap
@@ -271,6 +286,119 @@ def format_planting_message() -> str:
         "",
         "🌳 <b>Давайте вырастим его вместе — покажите ему, на что мы способны.</b>",
         "Всё начинается сегодня.",
+    ])
+
+
+# --- Посадка семечка ------------------------------------------------------------------
+#
+# The opening ceremony, in three posts: an admin invites the chat, members react to that
+# invitation, and the next 10:00 post names everyone who did and puts the tree in the
+# ground. Nothing here pins or unpins anything -- the admin pins the invitation by hand,
+# which is why the bot never needs can_pin_messages in the chat at all.
+
+# The roll call carries this line instead of drawing from DAILY_ADVICE. On the one day the
+# chat plants a tree, a rotation line about cleaning your brushes would be a non sequitur;
+# this one is about the planting itself, so it only ever appears once.
+PLANTING_ADVICE = (
+    "Всё, что вы сегодня делаете и чему учитесь, уходит в корни. "
+    "Кривой слой, испорченная деталь, вопрос, который стыдно задать, — это тоже корни. "
+    "Плоды будут позже, и они будут ваши."
+)
+
+
+def _people_word(count: int) -> str:
+    """человек / человека: 1 человек, 24 человека, 25 человек, 11 человек."""
+    if 11 <= count % 100 <= 14:
+        return "человек"
+    if count % 10 in (2, 3, 4):
+        return "человека"
+    return "человек"
+
+
+def _planter_names(planters: list) -> list:
+    """[(display_name, username)] -> renderable names, @handle where there is one."""
+    return [
+        f"@{username.lstrip('@')}" if username else escape(display_name)
+        for display_name, username in planters
+    ]
+
+
+def format_seed_ceremony_message(same_day: bool = False) -> str:
+    """The invitation an admin posts to open the planting.
+
+    Carries no height, no stage and no end goal -- the same rule format_planting_message
+    follows, for the same reason: on this day there is nothing to report yet, and a
+    "0 мм" would undercut the moment.
+
+    `same_day` is True when the roll call lands later today (the ceremony was opened
+    before 10:00) rather than tomorrow morning.
+    """
+    when = "Сегодня" if same_day else "Завтра"
+    return "\n".join([
+        "🌰 <b>Сегодня мы сажаем семечко.</b>",
+        "",
+        "Из него вырастет дерево ЕПХ — одно на весь чат, общее.",
+        "Его питает всё, что вы здесь делаете: каждое сообщение, каждый ответ,",
+        "каждая выложенная работа. Чем живее чат — тем выше оно тянется.",
+        "",
+        "Здесь не с кем соревноваться. Дерево одно, и чужой вклад — это и ваш рост тоже.",
+        "Никто не знает, каким оно вырастет и как высоко дотянется. Это зависит от нас.",
+        "",
+        "🪏 <b>Нажмите кнопку под этим сообщением</b> — это и есть ваша рука на лопате.",
+        f"{when} в 10:00 мы насыпем последнюю горсть земли и назовём всех,",
+        "кто участвовал в посадке.",
+    ])
+
+
+def seed_keyboard(callback_data: str) -> dict:
+    """The one button under the ceremony post. The caller owns the callback payload, so
+    the same layout serves both the real planting and the /preview test post."""
+    return {"inline_keyboard": [[{"text": SEED_BUTTON_TEXT, "callback_data": callback_data}]]}
+
+
+def format_planting_roll_call(planters: list) -> str:
+    """The 10:00 post that closes the ceremony and plants the tree.
+
+    `planters` is [(display_name, username)] for everyone who reacted to the invitation,
+    in whatever order the caller collected them. Like the invitation it prints no numbers
+    about the tree itself: it goes into the ground as this is posted.
+    """
+    names = _planter_names(planters)
+    return "\n".join([
+        f"🌱 <b>{MORNING_GREETING}</b>",
+        "",
+        f"Семечко в земле. Его посадили {len(names)} {_people_word(len(names))}:",
+        "",
+        ", ".join(names),
+        "",
+        "С этой минуты дерево растёт от того, что вы здесь делаете.",
+        "Каждое утро в 10:00 буду рассказывать, на сколько оно подросло за сутки",
+        "и кто вложил больше всех.",
+        "",
+        "<b>Напутствие на день</b>",
+        escape(PLANTING_ADVICE),
+    ])
+
+
+def format_nobody_planted_message() -> str:
+    """10:00 with no reactions on the invitation. The tree is deliberately NOT planted:
+    opening the whole thing on an empty roll call would be worse than waiting a day."""
+    return "\n".join([
+        "🌰 <b>Семечко пока в руке.</b>",
+        "",
+        "Никто не взялся за лопату — подожду ещё сутки.",
+        "Закреплённый пост на месте, кнопка под ним работает.",
+    ])
+
+
+def format_awaiting_planting_status() -> str:
+    """/tree between the invitation and the roll call, when there is no tree yet and
+    format_tree_status would answer with a meaningless "0 мм"."""
+    return "\n".join([
+        "🌰 <b>Семечко ещё не в земле.</b>",
+        "",
+        "Нажмите кнопку под закреплённым сообщением — в 10:00 я назову всех,",
+        "кто сажал, и дерево пойдёт в рост.",
     ])
 
 
