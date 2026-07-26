@@ -79,6 +79,53 @@ class PreviewRegistryTests(unittest.TestCase):
         self.assertIsNone(preview.render(preview.SAMPLE_BUTTON_ID))
 
 
+class PollLoopTests(unittest.TestCase):
+    """Updates are handled one at a time, so a single stuck handler used to take the whole
+    bot with it. The reported symptom was never "this button is broken" -- it was "the shop
+    stopped opening", long after the button that actually wedged it."""
+
+    def test_a_handler_that_never_returns_does_not_kill_the_loop(self):
+        logged = []
+
+        async def _hangs_forever():
+            await asyncio.Event().wait()
+
+        async def _drive():
+            with patch.object(bot_listener, "UPDATE_HANDLING_TIMEOUT_SECONDS", 0.05):
+                await bot_listener._handle_one_update(_hangs_forever(), 7, log=logged.append)
+            # The loop must reach this line -- before the fix it never did.
+            return "still running"
+
+        self.assertEqual(asyncio.run(_drive()), "still running")
+        self.assertIn("abandoned", logged[0])
+        self.assertIn("7", logged[0])
+
+    def test_a_handler_that_raises_does_not_kill_the_loop(self):
+        logged = []
+
+        async def _explodes():
+            raise RuntimeError("boom")
+
+        asyncio.run(bot_listener._handle_one_update(_explodes(), 8, log=logged.append))
+        self.assertIn("unhandled error", logged[0])
+
+    def test_a_normal_handler_is_left_alone(self):
+        logged = []
+        done = []
+
+        async def _works():
+            done.append(True)
+
+        asyncio.run(bot_listener._handle_one_update(_works(), 9, log=logged.append))
+        self.assertEqual(done, [True])
+        self.assertEqual(logged, [])
+
+    def test_the_budget_is_far_longer_than_any_legitimate_inline_work(self):
+        # The slow inline paths are the vision critique and the conversational reply, both
+        # offloaded to a thread and bounded by the OpenAI client's own timeout.
+        self.assertGreaterEqual(bot_listener.UPDATE_HANDLING_TIMEOUT_SECONDS, 120)
+
+
 class TelegramHtmlTests(unittest.TestCase):
     """Telegram rejects a message outright if its HTML doesn't parse, and the bot's own
     error handling turns that into a button that looks broken: the send raises, the

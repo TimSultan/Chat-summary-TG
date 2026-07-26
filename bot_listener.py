@@ -101,6 +101,22 @@ from telegram_fetch import (
 MAX_REPLY_CHARS = 4000
 POLL_TIMEOUT_SECONDS = 30
 
+# How long ONE update may take before the poll loop abandons it and moves on.
+#
+# Updates are handled one at a time (see _poll_loop), so this is what stands between a
+# single stuck handler and a bot that stops answering anything at all -- which is not a
+# hypothetical: a Telethon call on a session that cannot connect waits indefinitely rather
+# than raising, and it took the whole bot down with it, the visible symptom being an
+# unrelated menu that "stopped opening" long after the button that actually wedged it.
+#
+# Generous on purpose. The genuinely slow inline paths are the vision critique and the
+# conversational reply, both offloaded to a thread and bounded by the OpenAI client's own
+# timeout; three minutes is far beyond either, so this can only ever fire on something
+# pathological. Note that cancelling an asyncio.to_thread does not stop the thread -- the
+# call finishes and its result is discarded, which costs one wasted request and no
+# correctness.
+UPDATE_HANDLING_TIMEOUT_SECONDS = 180
+
 BOT_ROAST_CONFIRM_TEXT = "Ты точно хочешь прожарку? Нажми кнопку, чтобы подтвердить."
 ROAST_BUTTON_TEXT = "🔥 Жги"
 ROAST_CALLBACK_PREFIX = "roast"
@@ -1537,6 +1553,10 @@ _CABINET_CHAT_REF_CACHE: dict[str, tuple] = {}
 # purchase still shows up immediately while navigation stays cheap.
 _CABINET_CONTEXT_CACHE: dict[tuple, tuple] = {}
 CABINET_CONTEXT_TTL_SECONDS = 45
+# Longer than CHAT_RESOLVE_TIMEOUT_SECONDS because this call legitimately re-reads every
+# recorded day file and may refetch today's transcript, but still bounded -- see
+# _cabinet_context.
+CABINET_CONTEXT_TIMEOUT_SECONDS = 30
 
 
 async def _cabinet_chat_ref(telethon_client, entry: str, known_chat_ids: dict, log=print):
@@ -1580,11 +1600,25 @@ async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log
     if cached is not None and cached[0] > time.monotonic():
         return cached[1]
 
-    user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
-        telethon_client, entry, entry, "",
-        from_user.get("username"), _display_name(from_user), tz, log=log,
-        frozen_days_for=economy.streak_freeze_lookup(entry),
-    )
+    try:
+        # Bounded: this call can refetch today's transcript through the Telethon session,
+        # and a session that cannot connect waits rather than failing. Unbounded, that is
+        # what made "магазин не открывается" a symptom -- the callback had already been
+        # answered, so the spinner stopped and the screen simply never arrived.
+        user, rank, total, xp, streak, season_xp = await asyncio.wait_for(
+            stats.resolve_stat_target(
+                telethon_client, entry, entry, "",
+                from_user.get("username"), _display_name(from_user), tz, log=log,
+                frozen_days_for=economy.streak_freeze_lookup(entry),
+            ),
+            timeout=CABINET_CONTEXT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        log(
+            f"[bot_listener] cabinet context for '{entry}' timed out after "
+            f"{CABINET_CONTEXT_TIMEOUT_SECONDS}s -- is the Telethon session alive?"
+        )
+        return None
     if user is None:
         return None
     context = (user, xp, rank, total, streak, season_xp)
@@ -2731,6 +2765,29 @@ async def handle_direct_bot_reply(
             pass
 
 
+async def _handle_one_update(dispatch, update_id, log=print) -> None:
+    """Await one update's handling, and never let it stop the poll loop.
+
+    Updates are processed one at a time, so this is the only thing standing between a
+    single stuck handler and a bot that answers nothing at all. That is not hypothetical:
+    a Telethon call on a session that cannot connect waits indefinitely instead of
+    raising, and it took the whole bot down with it -- the reported symptom being an
+    unrelated menu that "stopped opening", long after whatever actually wedged it.
+
+    Losing one update to a timeout is strictly better than losing every update after it.
+    """
+    try:
+        await asyncio.wait_for(dispatch, timeout=UPDATE_HANDLING_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        log(
+            f"[bot_listener] update {update_id} took longer than "
+            f"{UPDATE_HANDLING_TIMEOUT_SECONDS}s and was abandoned so the bot keeps answering "
+            f"-- something it awaited is not coming back"
+        )
+    except Exception:
+        log(f"[bot_listener] unhandled error processing update {update_id}:\n{traceback.format_exc()}")
+
+
 async def _dispatch_update(
     update: dict,
     api: TelegramBotAPI,
@@ -3322,15 +3379,16 @@ async def run_bot_listener(
                     # update throws, Telegram should still consider it delivered on the
                     # next getUpdates call rather than resending the same update forever.
                     offset = update["update_id"] + 1
-                    try:
-                        await _dispatch_update(
+                    await _handle_one_update(
+                        _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
                             known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
                             cabinet_flows, menu_last_sent, log=log,
-                        )
-                    except Exception:
-                        log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
+                        ),
+                        update.get("update_id"),
+                        log=log,
+                    )
 
         async def _consume_summaries():
             """Processes every accepted summary enquiry in FIFO order. The queue is
