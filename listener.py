@@ -786,19 +786,36 @@ async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> 
     """
     if stats_digest_queue is None:
         return
-    today = datetime.now(tz).date()
+    now = datetime.now(tz)
+    today = now.date()
+    # Nothing to catch up on before the hour itself. Without this the startup check
+    # would fire the moment the process comes up -- planting the tree at 05:00 on the
+    # day it ships instead of at the 10:00 it was promised for.
+    if now.hour < stats.TREE_DIGEST_HOUR:
+        return
     yesterday = today - timedelta(days=1)
     for entry in cfg.listener_allowed_chats:
         if not stats.should_send_tree_digest(entry, today):
             continue
         try:
-            total_xp, day_xp, contributors = await stats.chat_tree_totals(
-                client, entry, entry, yesterday, tz, log=log
-            )
-            text = tree.format_morning_digest(total_xp, day_xp, contributors, today)
+            # The very first post plants the tree rather than reporting on it: on that
+            # day there is nothing to report, and the height starts from zero here.
+            planting = stats.tree_planted_on(entry) is None
+            if planting:
+                stats.mark_tree_planted(entry, today)
+                text = tree.format_planting_message()
+                day_xp = 0
+            else:
+                total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                    client, entry, entry, yesterday, tz, log=log
+                )
+                text = tree.format_morning_digest(total_xp, day_xp, contributors, today)
             await stats_digest_queue.put((entry, text, "HTML"))
             stats.mark_tree_digest_sent(entry, today)
-            log(f"[stats] queued tree digest for '{entry}' (+{day_xp} XP yesterday)")
+            log(
+                f"[stats] queued tree {'planting' if planting else 'digest'} for "
+                f"'{entry}' (+{day_xp} XP yesterday)"
+            )
         except Exception:
             log(f"[stats] failed to build tree digest for '{entry}':\n{traceback.format_exc()}")
 
@@ -1317,8 +1334,11 @@ async def run_listener(
                 level_announcements = []
                 stat_uses_html = False
                 if text_lower.startswith("/tree"):
-                    total_xp = await stats.chat_total_xp(client, chat, entry, tz, log=log)
-                    reply_text = tree.format_tree_status(total_xp)
+                    yesterday = datetime.now(tz).date() - timedelta(days=1)
+                    total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                        client, chat, entry, yesterday, tz, log=log, live_total=True
+                    )
+                    reply_text = tree.format_tree_status(total_xp, day_xp, contributors)
                     stat_uses_html = True
                 elif text_lower.startswith("/top"):
                     top_arg = stats_text[len("/top"):].strip()

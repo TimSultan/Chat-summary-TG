@@ -245,9 +245,42 @@ def advice_for(day: date) -> str:
     return DAILY_ADVICE[day.toordinal() % len(DAILY_ADVICE)]
 
 
-def format_tree_status(total_xp: int) -> str:
-    """The /tree reply: how far the chat has got, and what is growing it."""
+def format_planting_message() -> str:
+    """The one-off post that opens the whole thing, sent instead of the first morning
+    digest. Deliberately carries no numbers: on the day it goes out the tree is a seed,
+    and a height of "0 мм" would undercut the moment."""
+    return "\n".join([
+        "🌱 <b>Сегодня мы все вместе посадили семечко.</b>",
+        "",
+        "Из него вырастет могучее дерево ЕПХ — одно на весь чат, общее.",
+        "Его питает всё, что вы здесь делаете: каждое сообщение, каждый ответ,",
+        "каждая выложенная работа. Чем живее чат — тем выше оно тянется.",
+        "",
+        "Здесь не с кем соревноваться. Дерево одно, и чужой вклад — это и ваш рост тоже.",
+        "Впереди тринадцать стадий и три года пути до Легендарного Древа.",
+        "",
+        "Каждое утро в 10:00 я буду рассказывать, на сколько оно подросло за сутки",
+        "и кто вложил больше всех.",
+        "",
+        "🌳 <b>Давайте вырастим его вместе — покажите ему, на что мы способны.</b>",
+        "Всё начинается сегодня.",
+    ])
+
+
+def _contributor_lines(contributors: list) -> list:
+    """The shared "who moved it" block, so /tree and the morning post cannot drift apart."""
+    shown = [item for item in contributors if item[2] > 0][:TOP_CONTRIBUTORS_SHOWN]
+    lines = []
+    for display_name, username, xp in shown:
+        who = f"@{username.lstrip('@')}" if username else escape(display_name)
+        lines.append(f"{who} — {xp} XP")
+    return lines
+
+
+def format_tree_status(total_xp: int, yesterday_xp: int = 0, contributors: list | None = None) -> str:
+    """The /tree reply: total height, yesterday's growth, and who drove it."""
     _, emoji, name = tree_stage(total_xp)
+    grown_mm = tree_height_mm(total_xp) - tree_height_mm(max(0, total_xp - yesterday_xp))
     lines = [
         f"🌳 Наше дерево ЕПХ выросло на {format_length(tree_height_mm(total_xp))}.",
         f"Сейчас это {emoji} <b>{escape(name)}</b>.",
@@ -256,6 +289,13 @@ def format_tree_status(total_xp: int) -> str:
     if upcoming:
         following, remaining = upcoming
         lines.append(f"До стадии «{escape(following)}» — {format_length(remaining)}.")
+
+    named = _contributor_lines(contributors or [])
+    if named:
+        lines.append("")
+        lines.append(f"За вчера подросло на {format_growth(grown_mm)}. Больше всех вложили:")
+        lines.extend(named)
+
     lines.append("")
     lines.append("Ваша активность и покрасы помогают ему расти.")
     return "\n".join(lines)

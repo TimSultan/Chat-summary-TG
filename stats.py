@@ -1347,6 +1347,30 @@ def should_send_procrastinator_digest(
     return last is None or (today - last).days >= interval_days
 
 
+def _tree_planted_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_tree_planted_on"
+
+
+def tree_planted_on(entry: str) -> date | None:
+    """The day this chat's tree was planted, or None before the first morning post."""
+    path = _tree_planted_path(entry)
+    if not path.exists():
+        return None
+    try:
+        return date.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return None
+
+
+def mark_tree_planted(entry: str, day: date) -> None:
+    """Records the planting day, once. Never overwritten: the tree's whole height is
+    measured from here, so moving this would silently resize the tree."""
+    if tree_planted_on(entry) is not None:
+        return
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _tree_planted_path(entry).write_text(day.isoformat(), encoding="utf-8")
+
+
 def _tree_digest_last_sent_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_tree_digest_last_sent"
 
@@ -2563,33 +2587,38 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
     return None
 
 
-async def chat_total_xp(client, chat_ref, entry: str, tz, log=print) -> int:
-    """Pooled all-time XP for the whole chat, including today so far.
+async def chat_tree_totals(
+    client, chat_ref, entry: str, day: date, tz, log=print, live_total: bool = False
+):
+    """(tree XP, that day's chat XP, that day's contributors) for the ЕПХ tree.
 
-    The live variant on purpose, unlike chat_tree_totals: /tree is an on-demand "how are
-    we doing right now" question, so a message sent an hour ago should already be in the
-    number. The morning post deliberately answers a different question (a closed day's
-    growth) and stays on the recorded-only total."""
-    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
-    users = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
-    return sum(user.xp(wpp) for user in users.values())
+    The tree's total is counted from the PLANTING DAY forward, not from the chat's whole
+    history. That is what makes "сегодня мы посадили семечко" true: this chat had months
+    of tracked activity before the tree existed, and counting it would plant a seed that
+    is already a metre tall. It also means the three-year horizon starts when the tree
+    does. Before planting (the very first run) the total is 0 by definition.
 
-
-async def chat_tree_totals(client, chat_ref, entry: str, day: date, tz, log=print):
-    """(all-time chat XP, that day's chat XP, that day's contributors) for the ЕПХ tree.
-
-    Contributors are [(display_name, username, xp)] sorted highest-first, for exactly
+    Contributors are [(display_name, username, xp)] sorted highest-first for exactly
     `day` -- the morning post names who moved the tree yesterday, so this reads one
     recorded day rather than a window.
 
-    The all-time total deliberately comes from the recorded files only (aggregate_all_
-    time, not the _live variant): the post runs at 10:00 about a day that is already
-    closed, and pulling today's half-finished transcript into the total would make the
-    tree jump by an amount the message then fails to explain.
+    `live_total` includes today so far. /tree wants it ("how are we doing right now"); the
+    morning post does not, because it reports a closed day and a total that had jumped by
+    an unexplained amount would contradict the growth figure right above it.
     """
     wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
-    all_time = aggregate_all_time(entry)
-    total_xp = sum(user.xp(wpp) for user in all_time.values())
+    planted = tree_planted_on(entry)
+    today = datetime.now(tz).date()
+
+    if planted is None:
+        total_xp = 0
+    elif live_total:
+        grown = await aggregate_live(client, chat_ref, entry, planted, today, tz, log=log)
+        total_xp = sum(user.xp(wpp) for user in grown.values())
+    else:
+        grown = aggregate(entry, planted, today - timedelta(days=1))
+        _apply_deleted_figurines(entry, grown)
+        total_xp = sum(user.xp(wpp) for user in grown.values())
 
     day_users = aggregate(entry, day, day)
     _apply_deleted_figurines(entry, day_users)

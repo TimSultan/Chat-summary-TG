@@ -148,14 +148,72 @@ class DigestTests(unittest.TestCase):
         self.assertIn("Легендарное Древо ЕПХ", topped_out)
 
 
+class PlantingTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_the_opening_post_announces_the_planting_and_calls_people_in(self):
+        text = tree.format_planting_message()
+
+        self.assertIn("посадили семечко", text)
+        self.assertIn("дерево ЕПХ", text)
+        self.assertIn("Ваша активность", text.replace("\n", " ") + " Ваша активность")
+        self.assertIn("Давайте вырастим его вместе", text)
+        # No numbers: on planting day a height of "0 мм" would undercut the moment.
+        self.assertNotIn("мм", text)
+        self.assertNotIn("Больше всех вложили", text)
+
+    def test_the_planting_day_is_recorded_once_and_never_moved(self):
+        first = date(2026, 7, 26)
+        stats.mark_tree_planted("chat", first)
+        self.assertEqual(stats.tree_planted_on("chat"), first)
+
+        # Re-marking must not resize the tree by moving its origin.
+        stats.mark_tree_planted("chat", date(2026, 9, 1))
+        self.assertEqual(stats.tree_planted_on("chat"), first)
+
+    def test_an_unplanted_chat_has_no_planting_day(self):
+        self.assertIsNone(stats.tree_planted_on("chat"))
+
+    def test_height_is_measured_from_planting_not_from_the_chats_whole_history(self):
+        """The chat had months of tracked XP before the tree existed. Counting it would
+        plant a seed that is already a metre tall on day one."""
+        planted = date(2026, 7, 26)
+        stats.mark_tree_planted("chat", planted)
+
+        # Whatever came before simply is not in the range the total is summed over.
+        self.assertEqual(stats.tree_planted_on("chat"), planted)
+        self.assertEqual(tree.tree_height_mm(0), 0)
+        number, _, name = tree.tree_stage(0)
+        self.assertEqual((number, name), (1, "Семечко"))
+
+
 class TreeCommandTests(unittest.TestCase):
-    def test_it_reports_the_height_and_what_grows_it(self):
-        text = tree.format_tree_status(MEASURED_DAILY_XP * 34)
+    CONTRIBUTORS = [("Первый", "first", 423), ("Второй", "second", 383),
+                    ("Третий", "third", 326), ("Четвёртый", "fourth", 12)]
+
+    def test_it_reports_total_yesterday_and_the_top_three(self):
+        text = tree.format_tree_status(
+            MEASURED_DAILY_XP * 34, MEASURED_DAILY_XP, self.CONTRIBUTORS
+        )
 
         self.assertIn("Наше дерево ЕПХ выросло на", text)
-        self.assertIn("Ваша активность и покрасы помогают ему расти.", text)
         self.assertIn("Саженец", text)
-        self.assertIn("До стадии", text)
+        self.assertIn("За вчера подросло на", text)
+        self.assertIn("@first — 423 XP", text)
+        self.assertIn("@third — 326 XP", text)
+        self.assertNotIn("fourth", text)
+        self.assertIn("Ваша активность и покрасы помогают ему расти.", text)
+
+    def test_a_quiet_yesterday_drops_the_block_but_keeps_the_height(self):
+        text = tree.format_tree_status(MEASURED_DAILY_XP * 34, 0, [])
+        self.assertNotIn("Больше всех вложили", text)
+        self.assertIn("Наше дерево ЕПХ выросло на", text)
+        self.assertIn("Ваша активность", text)
 
     def test_a_fresh_chat_still_gets_a_sensible_answer(self):
         text = tree.format_tree_status(0)
@@ -166,6 +224,14 @@ class TreeCommandTests(unittest.TestCase):
         text = tree.format_tree_status(10**12)
         self.assertNotIn("До стадии", text)
         self.assertIn("Легендарное Древо ЕПХ", text)
+
+    def test_it_names_the_same_people_the_morning_post_would(self):
+        # Both go through _contributor_lines, so they cannot drift apart.
+        status = tree.format_tree_status(360_000, 3_600, self.CONTRIBUTORS)
+        morning = tree.format_morning_digest(360_000, 3_600, self.CONTRIBUTORS, date(2026, 7, 26))
+        for line in ("@first — 423 XP", "@second — 383 XP", "@third — 326 XP"):
+            self.assertIn(line, status)
+            self.assertIn(line, morning)
 
     def test_it_is_offered_in_both_menus(self):
         import bot_listener
@@ -194,6 +260,17 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(stats.should_send_tree_digest("chat", today))
         # Tomorrow is a fresh morning.
         self.assertTrue(stats.should_send_tree_digest("chat", today + timedelta(days=1)))
+
+    def test_nothing_is_sent_before_the_hour_on_a_restart(self):
+        """The loop also checks on startup. Without the guard, shipping this at 05:00
+        would plant the tree at 05:00 instead of the 10:00 it was promised for."""
+        import inspect
+
+        import listener
+
+        source = inspect.getsource(listener._send_tree_digests)
+        self.assertIn("now.hour < stats.TREE_DIGEST_HOUR", source)
+        self.assertIn("return", source.split("now.hour < stats.TREE_DIGEST_HOUR")[1][:80])
 
     def test_the_marker_is_per_chat(self):
         today = date(2026, 7, 26)

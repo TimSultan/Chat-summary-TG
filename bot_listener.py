@@ -1764,8 +1764,11 @@ async def handle_tree_command(
     since the standing announcement of the tree is the 10:00 morning post."""
     chat_id = message["chat"]["id"]
     try:
-        total_xp = await stats.chat_total_xp(telethon_client, entry, entry, tz, log=log)
-        text = tree.format_tree_status(total_xp)
+        yesterday = datetime.now(tz).date() - timedelta(days=1)
+        total_xp, day_xp, contributors = await stats.chat_tree_totals(
+            telethon_client, entry, entry, yesterday, tz, log=log, live_total=True
+        )
+        text = tree.format_tree_status(total_xp, day_xp, contributors)
         parse_mode = "HTML"
     except Exception:
         log(f"[bot_listener] failed to build the tree status:\n{traceback.format_exc()}")

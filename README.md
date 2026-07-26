@@ -339,6 +339,22 @@ Thirteen stages, set in **height** rather than XP so the names line up with a tr
 somebody can picture. Height is capped at the top: XP accrues forever, and without the cap
 the tree would silently grow past its own last name.
 
+The tree's height is measured **from its planting day forward**, not from the chat's whole
+history. That is what makes "сегодня мы посадили семечко" true: this chat had months of
+tracked activity before the tree existed, and counting it would plant a seed already a
+metre tall. It also means the three-year horizon starts when the tree does.
+
+The very first morning post plants it instead of reporting on it — no numbers, because on
+that day a height of "0 мм" would undercut the moment:
+
+```text
+🌱 Сегодня мы все вместе посадили семечко.
+
+Из него вырастет могучее дерево ЕПХ — одно на весь чат, общее.
+...
+🌳 Давайте вырастим его вместе — покажите ему, на что мы способны.
+```
+
 Every morning at **10:00 Moscow** (`TREE_DIGEST_HOUR`, pinned to `Europe/Moscow` rather
 than the app timezone — the deployment's own zone is a hosting detail that could move):
 
@@ -368,16 +384,20 @@ than the app timezone — the deployment's own zone is a hosting detail that cou
 Ваша активность и покрасы помогают ему расти.
 ```
 
-`/tree` uses the **live** total, today included — it answers "how are we doing right
-now", so a message sent an hour ago should already be in the number. The morning post
-answers a different question (a closed day's growth) and stays on the recorded-only
-total, so the two can differ slightly by design. The reply self-deletes like every other
+`/tree` reports the same three things as the morning post — total height, yesterday's
+growth, and yesterday's top three — through the same `_contributor_lines`, so the two
+cannot drift apart. It uses the **live** total, today included, because it answers "how
+are we doing right now"; the morning post stays on the recorded-only total, since a total
+that had jumped by an unexplained amount would contradict the growth figure right above
+it. The two can therefore differ slightly, by design. The reply self-deletes like every other
 stats reply; the standing announcement of the tree is the 10:00 post.
 
 The morning post reports **yesterday**, a closed and recorded day: at 10:00 today's own numbers are
 three hours old and would make the growth figure meaningless. The loop also checks once
 on startup, so a process that was down at 10:00 still posts when it returns — a per-chat
-marker keeps that from double-posting.
+marker keeps that from double-posting. That startup check does nothing before the hour
+itself: without the guard, deploying at 05:00 would plant the tree at 05:00 rather than
+at the 10:00 it was promised for.
 
 `DAILY_ADVICE` holds **120** lines covering painting, 3D printing, creative work,
 curiosity, being inspired and inspiring others, not drowning in a backlog, being social
