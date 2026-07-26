@@ -358,7 +358,23 @@ than the app timezone — the deployment's own zone is a hosting detail that cou
 Если принтер работает — не трогай его настройки. Серьёзно.
 ```
 
-It reports **yesterday**, a closed and recorded day: at 10:00 today's own numbers are
+`/tree` answers the same question on demand, in a group or a DM:
+
+```text
+🌳 Наше дерево ЕПХ выросло на 61,2 см.
+Сейчас это 🪴 Саженец.
+До стадии «Молодая поросль» — 38,8 см.
+
+Ваша активность и покрасы помогают ему расти.
+```
+
+`/tree` uses the **live** total, today included — it answers "how are we doing right
+now", so a message sent an hour ago should already be in the number. The morning post
+answers a different question (a closed day's growth) and stays on the recorded-only
+total, so the two can differ slightly by design. The reply self-deletes like every other
+stats reply; the standing announcement of the tree is the 10:00 post.
+
+The morning post reports **yesterday**, a closed and recorded day: at 10:00 today's own numbers are
 three hours old and would make the growth figure meaningless. The loop also checks once
 on startup, so a process that was down at 10:00 still posts when it returns — a per-chat
 marker keeps that from double-posting.
@@ -398,8 +414,8 @@ Commands (any tracked chat):
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
 client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
-command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins`, groups get
-`/stat /topall /toppokras`. Wallet actions belong in the DM where a balance isn't public,
+command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins /tree`, groups get
+`/stat /topall /toppokras /tree`. Wallet actions belong in the DM where a balance isn't public,
 and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a
 group button for it would just answer "напиши мне в личку".
 

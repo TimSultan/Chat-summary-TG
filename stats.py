@@ -2563,6 +2563,18 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
     return None
 
 
+async def chat_total_xp(client, chat_ref, entry: str, tz, log=print) -> int:
+    """Pooled all-time XP for the whole chat, including today so far.
+
+    The live variant on purpose, unlike chat_tree_totals: /tree is an on-demand "how are
+    we doing right now" question, so a message sent an hour ago should already be in the
+    number. The morning post deliberately answers a different question (a closed day's
+    growth) and stays on the recorded-only total."""
+    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
+    users = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
+    return sum(user.xp(wpp) for user in users.values())
+
+
 async def chat_tree_totals(client, chat_ref, entry: str, day: date, tz, log=print):
     """(all-time chat XP, that day's chat XP, that day's contributors) for the ЕПХ tree.
 

@@ -88,6 +88,7 @@ from listener import (
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
 from roast import roast_person
+import tree
 from telegram_fetch import (
     fetch_range_messages_cached,
     fetch_recent_messages_fresh,
@@ -144,6 +145,7 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
     {"command": "coins", "description": "Мой баланс"},
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
 )
 # Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
 # and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
@@ -156,6 +158,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "stat", "description": "Статистика участника"},
     {"command": "topall", "description": "Рейтинг чата"},
     {"command": "toppokras", "description": "Топ прокрастинаторов"},
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -1748,6 +1751,37 @@ async def handle_cabinet_text_input(
     return True
 
 
+async def handle_tree_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/tree -- the chat's shared progression. Self-deletes like every other stats reply,
+    since the standing announcement of the tree is the 10:00 morning post."""
+    chat_id = message["chat"]["id"]
+    try:
+        total_xp = await stats.chat_total_xp(telethon_client, entry, entry, tz, log=log)
+        text = tree.format_tree_status(total_xp)
+        parse_mode = "HTML"
+    except Exception:
+        log(f"[bot_listener] failed to build the tree status:\n{traceback.format_exc()}")
+        text, parse_mode = "Не удалось посчитать дерево.", None
+    try:
+        sent = await api.send_message(
+            chat_id, text, reply_to_message_id=message["message_id"], parse_mode=parse_mode
+        )
+        if sent and "message_id" in sent:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+            )
+    except Exception:
+        log(f"[bot_listener] failed to send the tree status:\n{traceback.format_exc()}")
+
+
 async def handle_shop_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -2551,6 +2585,21 @@ async def _dispatch_update(
             handle_shop_command(
                 api, telethon_client, cfg, tz, message, shop_text, shop_entry,
                 background_tasks, log=log,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/tree" -- the chat's shared ЕПХ tree (see tree.py). Same chat resolution as the
+    # stats commands, so it answers in a DM about the home chat too.
+    if cfg.stats_enabled and text_lower.startswith("/tree"):
+        tree_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if tree_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_tree_command(
+                api, telethon_client, tz, message, tree_entry, background_tasks, log=log
             )
         )
         background_tasks.add(task)

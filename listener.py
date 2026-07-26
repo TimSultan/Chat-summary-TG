@@ -1199,7 +1199,11 @@ async def run_listener(
         text_lower = text.lower()
         # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
         # chat content, so it must never count as activity for the joke buffer.
-        is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
+        is_stats_command = (
+            text_lower.startswith("/top")
+            or text_lower.startswith("/stat")
+            or text_lower.startswith("/tree")
+        )
         is_badge_command = (
             text_lower.startswith("/badge")
             or text_lower.startswith("/weekwinner")
@@ -1312,7 +1316,11 @@ async def run_listener(
             try:
                 level_announcements = []
                 stat_uses_html = False
-                if text_lower.startswith("/top"):
+                if text_lower.startswith("/tree"):
+                    total_xp = await stats.chat_total_xp(client, chat, entry, tz, log=log)
+                    reply_text = tree.format_tree_status(total_xp)
+                    stat_uses_html = True
+                elif text_lower.startswith("/top"):
                     top_arg = stats_text[len("/top"):].strip()
                     # "/top pokras" reaches the procrastinator list, same as "/stat pokras".
                     if stats.is_procrastinator_command(top_arg):

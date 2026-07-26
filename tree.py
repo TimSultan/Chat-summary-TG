@@ -245,6 +245,22 @@ def advice_for(day: date) -> str:
     return DAILY_ADVICE[day.toordinal() % len(DAILY_ADVICE)]
 
 
+def format_tree_status(total_xp: int) -> str:
+    """The /tree reply: how far the chat has got, and what is growing it."""
+    _, emoji, name = tree_stage(total_xp)
+    lines = [
+        f"🌳 Наше дерево ЕПХ выросло на {format_length(tree_height_mm(total_xp))}.",
+        f"Сейчас это {emoji} <b>{escape(name)}</b>.",
+    ]
+    upcoming = next_stage(total_xp)
+    if upcoming:
+        following, remaining = upcoming
+        lines.append(f"До стадии «{escape(following)}» — {format_length(remaining)}.")
+    lines.append("")
+    lines.append("Ваша активность и покрасы помогают ему расти.")
+    return "\n".join(lines)
+
+
 def format_morning_digest(
     total_xp: int,
     yesterday_xp: int,

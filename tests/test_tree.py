@@ -148,6 +148,32 @@ class DigestTests(unittest.TestCase):
         self.assertIn("Легендарное Древо ЕПХ", topped_out)
 
 
+class TreeCommandTests(unittest.TestCase):
+    def test_it_reports_the_height_and_what_grows_it(self):
+        text = tree.format_tree_status(MEASURED_DAILY_XP * 34)
+
+        self.assertIn("Наше дерево ЕПХ выросло на", text)
+        self.assertIn("Ваша активность и покрасы помогают ему расти.", text)
+        self.assertIn("Саженец", text)
+        self.assertIn("До стадии", text)
+
+    def test_a_fresh_chat_still_gets_a_sensible_answer(self):
+        text = tree.format_tree_status(0)
+        self.assertIn("0 мм", text)
+        self.assertIn("Семечко", text)
+
+    def test_the_countdown_disappears_at_the_top(self):
+        text = tree.format_tree_status(10**12)
+        self.assertNotIn("До стадии", text)
+        self.assertIn("Легендарное Древо ЕПХ", text)
+
+    def test_it_is_offered_in_both_menus(self):
+        import bot_listener
+
+        for menu in (bot_listener.PRIVATE_CHAT_COMMANDS, bot_listener.GROUP_CHAT_COMMANDS):
+            self.assertIn("tree", {command["command"] for command in menu})
+
+
 class ScheduleTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
