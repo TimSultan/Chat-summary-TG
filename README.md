@@ -339,6 +339,17 @@ Thirteen stages, set in **height** rather than XP so the names line up with a tr
 somebody can picture. Height is capped at the top: XP accrues forever, and without the cap
 the tree would silently grow past its own last name.
 
+`/replant` (DM, administrators only) posts the planting announcement to the chat and
+starts the tree over from today. It exists because the planting date lives in the stats
+directory, which on a deployed host is a volume nothing else here can reach — without a
+command there is no way to re-run the opening post at all. Both halves happen together on
+purpose: re-posting "сегодня мы посадили семечко" while the tree is already a metre tall
+would be a lie, and re-planting without posting would silently zero the chat's progress.
+The reset only happens once the announcement has actually landed.
+
+Neither the planting post nor the morning digest is ever scheduled for deletion — they
+stay in the chat. Only `/tree` and the other on-demand stats replies self-delete.
+
 The tree's height is measured **from its planting day forward**, not from the chat's whole
 history. That is what makes "сегодня мы посадили семечко" true: this chat had months of
 tracked activity before the tree existed, and counting it would plant a seed already a

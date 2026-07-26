@@ -187,6 +187,36 @@ class PlantingTests(unittest.TestCase):
         stats.mark_tree_planted("chat", date(2026, 9, 1))
         self.assertEqual(stats.tree_planted_on("chat"), first)
 
+    def test_replanting_overwrites_and_unblocks_the_morning_loop(self):
+        """The automatic path must never move the planting date; the administrator's
+        deliberate one must, and must also clear the "already greeted today" marker --
+        otherwise a replant leaves the chat with an announcement and no follow-up."""
+        first, again = date(2026, 7, 26), date(2026, 8, 10)
+        stats.mark_tree_planted("chat", first)
+        stats.mark_tree_digest_sent("chat", first)
+        self.assertFalse(stats.should_send_tree_digest("chat", first))
+
+        stats.replant_tree("chat", again)
+
+        self.assertEqual(stats.tree_planted_on("chat"), again)
+        self.assertTrue(stats.should_send_tree_digest("chat", again))
+
+    def test_replanting_a_chat_that_was_never_planted_works(self):
+        stats.replant_tree("chat", date(2026, 7, 26))
+        self.assertEqual(stats.tree_planted_on("chat"), date(2026, 7, 26))
+
+    def test_the_announcement_is_never_scheduled_for_deletion(self):
+        """It is the post the whole thing opens with -- it has to stay in the chat."""
+        import inspect
+
+        import bot_listener
+
+        for source in (
+            inspect.getsource(bot_listener.handle_replant_command),
+            inspect.getsource(bot_listener.run_bot_listener).split("_consume_stats_digests")[1][:900],
+        ):
+            self.assertNotIn("schedule_bot_delete", source)
+
     def test_an_unplanted_chat_has_no_planting_day(self):
         self.assertIsNone(stats.tree_planted_on("chat"))
 

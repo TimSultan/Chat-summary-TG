@@ -124,6 +124,7 @@ BADGE_DELETE_BUTTON_TEXT = "🗑 Удалить значок совсем"
 WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
 BADGE_ADMIN_COMMAND = "/badgeadmin"
+REPLANT_COMMAND = "/replant"
 
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
@@ -860,6 +861,63 @@ async def handle_delete_pokras_command(
         f"Фигурок осталось: {remaining}. Номера оставшихся работ обновились.",
         reply_to_message_id=message["message_id"],
         parse_mode=None,
+    )
+
+
+async def handle_replant_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    tz,
+    log=print,
+) -> None:
+    """/replant — post the planting announcement to the chat and start the tree over.
+
+    Exists because the planting date lives in the stats directory, which on a deployed
+    host is a volume nothing else here can reach: without a command there is no way to
+    re-run the opening post at all.
+
+    Both halves happen together on purpose. Re-posting "сегодня мы посадили семечко"
+    while the tree is already a metre tall would be a lie, and re-planting without
+    posting would silently reset the chat's progress with no announcement.
+
+    The announcement is sent through the same path as the morning digest and, like it, is
+    never scheduled for deletion -- this is the post the whole thing opens with.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /replant:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Не настроен основной чат.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Пересадить дерево могут только администраторы чата.")
+        return
+
+    today = datetime.now(stats.tree_digest_tz()).date()
+    previous = stats.tree_planted_on(entry)
+    try:
+        await api.send_message(admin_chat_id, tree.format_planting_message(), parse_mode="HTML")
+    except Exception:
+        log(f"[bot_listener] failed to post the planting message:\n{traceback.format_exc()}")
+        await reply("Не удалось отправить сообщение в чат — дерево не тронул.")
+        return
+
+    # Only after the announcement actually landed: a reset with no post would leave the
+    # chat's progress silently zeroed.
+    stats.replant_tree(entry, today)
+    await reply(
+        f"Отправил в чат. Дерево посажено заново с {today.isoformat()}"
+        + (f" (было {previous.isoformat()})." if previous else ".")
     )
 
 
@@ -2478,6 +2536,18 @@ async def _dispatch_update(
                 pass
             return
         await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
+        return
+    if re.match(rf"^{re.escape(REPLANT_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_replant_command(
+            api, telethon_client, message, home_chat_ref, admin_chat_id, tz, log=log,
+        )
         return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":

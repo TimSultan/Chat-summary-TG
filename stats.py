@@ -1364,11 +1364,28 @@ def tree_planted_on(entry: str) -> date | None:
 
 def mark_tree_planted(entry: str, day: date) -> None:
     """Records the planting day, once. Never overwritten: the tree's whole height is
-    measured from here, so moving this would silently resize the tree."""
+    measured from here, so moving this would silently resize the tree. Use replant_tree
+    for the deliberate, administrator-initiated version."""
     if tree_planted_on(entry) is not None:
         return
     _stats_dir().mkdir(parents=True, exist_ok=True)
     _tree_planted_path(entry).write_text(day.isoformat(), encoding="utf-8")
+
+
+def replant_tree(entry: str, day: date) -> None:
+    """Start the tree over from `day`, overwriting an existing planting date.
+
+    The only way to reach these markers on a deployed host, where the stats directory is
+    a volume this codebase cannot otherwise touch. Also clears the "already greeted
+    today" marker, so the morning loop is not blocked from posting again -- re-planting
+    without that would leave the chat with an announcement and no follow-up until
+    tomorrow."""
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _tree_planted_path(entry).write_text(day.isoformat(), encoding="utf-8")
+    try:
+        _tree_digest_last_sent_path(entry).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _tree_digest_last_sent_path(entry: str) -> Path:
