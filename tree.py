@@ -303,12 +303,12 @@ def format_planting_message() -> str:
 
 # The roll call carries this line instead of drawing from DAILY_ADVICE. On the one day the
 # chat plants a tree, a rotation line about cleaning your brushes would be a non sequitur;
-# this one is about the planting itself, so it only ever appears once.
+# this one addresses each participant's own growth, so it only ever appears once.
 PLANTING_ADVICE = (
-    "Всё, что вы сегодня создаёте и чему учитесь, питает корни. "
-    "Каждый новый приём, смелая идея, заданный вопрос и завершённая работа делают дерево крепче. "
-    "День за днём оно будет расти вместе с вами — а со временем появятся и плоды, "
-    "которыми можно будет гордиться."
+    "Всё, что вы сегодня создаёте и чему учитесь, становится частью вашего мастерства. "
+    "Каждый новый приём, смелая идея, заданный вопрос и завершённая работа помогают вам расти. "
+    "День за днём будет прибавляться опыт, появится больше уверенности, "
+    "а со временем вы увидите результаты, которыми сможете гордиться."
 )
 
 

@@ -270,7 +270,9 @@ class CeremonyMessageTests(unittest.TestCase):
 
     def test_roll_call_carries_the_planting_advice_not_the_rotation(self):
         text = tree.format_planting_roll_call([("Аня", None)])
-        self.assertIn("питает корни", text)
+        self.assertIn("частью вашего мастерства", text)
+        self.assertNotIn("корни", tree.PLANTING_ADVICE.lower())
+        self.assertNotIn("дерев", tree.PLANTING_ADVICE.lower())
         for negative in ("неудач", "кривой", "испорчен", "стыдно"):
             self.assertNotIn(negative, text.lower())
         self.assertNotIn(tree.advice_for(date(2026, 7, 26)), text)
