@@ -505,11 +505,12 @@ text, lets the administrator choose **from one to five buttons**, asks for each 
 and then offers an optional photo. The final preview has **✅ Отправить в чат** and, once
 published, that control becomes **🗑 Удалить из чата**.
 
-Every tap increments that button's own persistent counter. The post is edited in place
-at most once every **three seconds**, so a busy burst produces one counter refresh rather
-than one Telegram edit per person. Photo posts use the same cycle by editing their caption.
-Published post state lives on the data volume, so buttons continue counting after a
-restart; only an unfinished constructor is discarded.
+Each member can make **one choice per post**. Repeated taps — on the same button or a
+different one — do not change any counter. The post is edited in place at most once every
+**three seconds**, so a busy burst produces one counter refresh rather than one Telegram
+edit per person. Photo posts use the same cycle by editing their caption. Published post
+state, including who already voted, lives on the data volume, so buttons continue
+counting correctly after a restart; only an unfinished constructor is discarded.
 
 #### Inline buttons must answer before they work
 

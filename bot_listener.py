@@ -1563,20 +1563,26 @@ async def handle_button_builder_callback(
                 and argument is not None
                 and chat.get("id") is not None
                 and callback_message.get("message_id") is not None
+                and actor_id is not None
             ):
-                result = stats.increment_button_post(
+                result = stats.record_button_post_vote(
                     entry,
                     item_id,
                     chat["id"],
                     callback_message["message_id"],
                     argument,
+                    actor_id,
                 )
         except Exception:
             log(f"[bot_listener] failed to count a generated-button press:\n{traceback.format_exc()}")
-        await api.answer_callback_query(
-            callback_id,
-            f"Засчитано: {result}" if result is not None else "Эта кнопка уже неактивна.",
+        answer = (
+            "Голос учтён."
+            if result is not None and result[0] == "added"
+            else "Ты уже голосовал в этом сообщении."
+            if result is not None
+            else "Эта кнопка уже неактивна."
         )
+        await api.answer_callback_query(callback_id, answer)
         return
 
     if action == "delete":

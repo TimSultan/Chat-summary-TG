@@ -12,6 +12,7 @@ import stats
 
 ADMIN = {"id": 7, "username": "sultan_kembayev", "first_name": "Sultan"}
 MEMBER = {"id": 8, "username": "member", "first_name": "Участник"}
+MEMBER_TWO = {"id": 9, "username": "member_two", "first_name": "Другой участник"}
 DM_CHAT = 999
 GROUP_CHAT = -1001234567890
 ENTRY = "chat"
@@ -133,21 +134,41 @@ class StoreTests(unittest.TestCase):
         self.addCleanup(self.patch.stop)
         self.addCleanup(self.temporary.cleanup)
 
-    def test_every_tap_counts_and_survives_a_fresh_read(self):
+    def test_each_member_gets_one_persistent_choice_for_the_whole_post(self):
         stats.create_button_post(
             ENTRY, "post", GROUP_CHAT, 501, "Текст", ["Да", "Нет"], ADMIN["id"], DM_CHAT
         )
-        self.assertEqual(stats.increment_button_post(ENTRY, "post", GROUP_CHAT, 501, 0), 1)
-        self.assertEqual(stats.increment_button_post(ENTRY, "post", GROUP_CHAT, 501, 0), 2)
-        self.assertEqual(stats.increment_button_post(ENTRY, "post", GROUP_CHAT, 501, 1), 1)
+        self.assertEqual(
+            stats.record_button_post_vote(ENTRY, "post", GROUP_CHAT, 501, 0, MEMBER["id"]),
+            ("added", 1),
+        )
+        self.assertEqual(
+            stats.record_button_post_vote(ENTRY, "post", GROUP_CHAT, 501, 0, MEMBER["id"]),
+            ("already", 0),
+        )
+        self.assertEqual(
+            stats.record_button_post_vote(ENTRY, "post", GROUP_CHAT, 501, 1, MEMBER["id"]),
+            ("already", 0),
+        )
+        self.assertEqual(
+            stats.record_button_post_vote(
+                ENTRY, "post", GROUP_CHAT, 501, 1, MEMBER_TWO["id"]
+            ),
+            ("added", 1),
+        )
         post = stats.button_post(ENTRY, "post")
-        self.assertEqual([button["count"] for button in post["buttons"]], [2, 1])
+        self.assertEqual([button["count"] for button in post["buttons"]], [1, 1])
+        self.assertEqual(post["voters"], {"8": 0, "9": 1})
 
     def test_an_old_message_cannot_increment_or_delete_a_new_post(self):
         stats.create_button_post(
             ENTRY, "post", GROUP_CHAT, 501, "Текст", ["Да"], ADMIN["id"], DM_CHAT
         )
-        self.assertIsNone(stats.increment_button_post(ENTRY, "post", GROUP_CHAT, 999, 0))
+        self.assertIsNone(
+            stats.record_button_post_vote(
+                ENTRY, "post", GROUP_CHAT, 999, 0, MEMBER["id"]
+            )
+        )
         self.assertIsNone(stats.delete_button_post(ENTRY, "post", GROUP_CHAT, 999))
         self.assertIsNotNone(stats.button_post(ENTRY, "post"))
 
@@ -274,6 +295,13 @@ class BuilderFlowTests(unittest.TestCase):
 
         self.press(post_data, actor=MEMBER, chat_id=GROUP_CHAT, message_id=published["message_id"])
         self.press(post_data, actor=MEMBER, chat_id=GROUP_CHAT, message_id=published["message_id"])
+        self.assertEqual(self.api.answers[-1], "Ты уже голосовал в этом сообщении.")
+        self.press(
+            post_data,
+            actor=MEMBER_TWO,
+            chat_id=GROUP_CHAT,
+            message_id=published["message_id"],
+        )
         rendered = {post_id: (0,)}
         self._run(
             bot_listener.refresh_button_counters_once(

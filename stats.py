@@ -1678,6 +1678,7 @@ def create_button_post(
         "message_id": int(message_id),
         "message_text": message_text,
         "buttons": [{"text": text, "count": 0} for text in button_texts],
+        "voters": {},
         "created_by_id": str(created_by_id),
         "dm_chat_id": int(dm_chat_id),
         "photo_file_id": photo_file_id or None,
@@ -1709,14 +1710,20 @@ def active_button_posts(entry: str) -> list[dict]:
     ]
 
 
-def increment_button_post(
+def record_button_post_vote(
     entry: str,
     post_id: str,
     chat_id: int,
     message_id: int,
     button_index: int,
-) -> int | None:
-    """Count one tap and return the new count, or None for an old/invalid button."""
+    user_id: int | str,
+) -> tuple[str, int] | None:
+    """Record one member's only choice on a post.
+
+    ("added", new button count) means a new vote. ("already", original button index)
+    means this member has already chosen either the same or another button. None means
+    the callback belongs to an old/invalid post.
+    """
     store = _button_posts_store(entry)
     post = store["posts"].get(post_id)
     if (
@@ -1728,10 +1735,15 @@ def increment_button_post(
         or button_index >= len(post["buttons"])
     ):
         return None
+    voters = post.setdefault("voters", {})
+    user_key = str(user_id)
+    if user_key in voters:
+        return "already", int(voters[user_key])
     button = post["buttons"][button_index]
     button["count"] = int(button.get("count", 0)) + 1
+    voters[user_key] = int(button_index)
     _write_json_atomic(_button_posts_path(entry), store)
-    return button["count"]
+    return "added", button["count"]
 
 
 def delete_button_post(entry: str, post_id: str, chat_id: int, message_id: int) -> dict | None:
