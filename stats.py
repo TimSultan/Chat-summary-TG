@@ -1633,6 +1633,122 @@ def close_preview_button_test(entry: str, chat_id: int, message_id: int) -> bool
     return True
 
 
+# --- Посты с настраиваемыми кнопками и счётчиками ------------------------------------
+#
+# /buttons publishes posts whose counters must survive a bot restart. Multiple posts may
+# remain active at once, so unlike the one-off preview test they share a keyed store.
+
+
+def _button_posts_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_button_posts.json"
+
+
+def _button_posts_store(entry: str) -> dict:
+    path = _button_posts_path(entry)
+    if not path.exists():
+        return {"version": 1, "posts": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {"version": 1, "posts": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("posts"), dict):
+        return {"version": 1, "posts": {}}
+    data["version"] = 1
+    return data
+
+
+def create_button_post(
+    entry: str,
+    post_id: str,
+    chat_id: int,
+    message_id: int,
+    message_text: str,
+    button_texts: list[str],
+    created_by_id: int | str,
+    dm_chat_id: int,
+    photo_file_id: str | None = None,
+) -> dict:
+    """Persist a newly published counter post and return its normalized state."""
+    if not post_id or not button_texts or len(button_texts) > 2:
+        raise ValueError("A button post needs an id and one or two buttons.")
+    store = _button_posts_store(entry)
+    post = {
+        "post_id": post_id,
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "message_text": message_text,
+        "buttons": [{"text": text, "count": 0} for text in button_texts],
+        "created_by_id": str(created_by_id),
+        "dm_chat_id": int(dm_chat_id),
+        "photo_file_id": photo_file_id or None,
+    }
+    store["posts"][post_id] = post
+    _write_json_atomic(_button_posts_path(entry), store)
+    return post
+
+
+def button_post(entry: str, post_id: str) -> dict | None:
+    post = _button_posts_store(entry)["posts"].get(post_id)
+    if not isinstance(post, dict):
+        return None
+    if not isinstance(post.get("buttons"), list) or not post.get("buttons"):
+        return None
+    return post
+
+
+def active_button_posts(entry: str) -> list[dict]:
+    """Every published counter post, in stable id order, for the refresh loop."""
+    store = _button_posts_store(entry)
+    return [
+        post
+        for post_id, post in sorted(store["posts"].items())
+        if isinstance(post, dict)
+        and post.get("post_id") == post_id
+        and isinstance(post.get("buttons"), list)
+        and post.get("buttons")
+    ]
+
+
+def increment_button_post(
+    entry: str,
+    post_id: str,
+    chat_id: int,
+    message_id: int,
+    button_index: int,
+) -> int | None:
+    """Count one tap and return the new count, or None for an old/invalid button."""
+    store = _button_posts_store(entry)
+    post = store["posts"].get(post_id)
+    if (
+        not isinstance(post, dict)
+        or int(post.get("chat_id", 0)) != int(chat_id)
+        or int(post.get("message_id", 0)) != int(message_id)
+        or not isinstance(post.get("buttons"), list)
+        or button_index < 0
+        or button_index >= len(post["buttons"])
+    ):
+        return None
+    button = post["buttons"][button_index]
+    button["count"] = int(button.get("count", 0)) + 1
+    _write_json_atomic(_button_posts_path(entry), store)
+    return button["count"]
+
+
+def delete_button_post(entry: str, post_id: str, chat_id: int, message_id: int) -> dict | None:
+    """Forget exactly this post without allowing an old control to remove a newer one."""
+    store = _button_posts_store(entry)
+    post = store["posts"].get(post_id)
+    if (
+        not isinstance(post, dict)
+        or int(post.get("chat_id", 0)) != int(chat_id)
+        or int(post.get("message_id", 0)) != int(message_id)
+    ):
+        return None
+    store["posts"].pop(post_id, None)
+    _write_json_atomic(_button_posts_path(entry), store)
+    return post
+
+
 def _tree_digest_last_sent_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_tree_digest_last_sent"
 

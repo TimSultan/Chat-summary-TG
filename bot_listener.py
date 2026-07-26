@@ -55,6 +55,7 @@ import aiohttp
 from telethon import utils as tl_utils
 
 import cabinet
+import button_builder
 import chat_profile
 import economy
 import history
@@ -143,6 +144,8 @@ DELETE_POKRAS_COMMAND = "/deletepokras"
 BADGE_ADMIN_COMMAND = "/badgeadmin"
 REPLANT_COMMAND = "/replant"
 PREVIEW_COMMAND = "/preview"
+BUTTON_BUILDER_COMMAND = button_builder.COMMAND
+BUTTON_BUILDER_FLOW_TTL_SECONDS = button_builder.FLOW_TTL_SECONDS
 
 # Opens the planting ceremony. Two spellings for one action: Telegram only treats
 # [a-zA-Z0-9_] after a slash as a command, so "/посадить_семечко" is never highlighted,
@@ -1276,6 +1279,521 @@ async def handle_preview_callback(
         await say("Не удалось показать превью. Попробуй ещё раз.")
 
 
+def _button_builder_flow(
+    flows: dict[str, dict],
+    flow_id: str,
+    chat_id,
+    user_id,
+) -> dict | None:
+    flow = flows.get(flow_id)
+    if flow is None:
+        return None
+    if time.monotonic() - flow["created_at"] > BUTTON_BUILDER_FLOW_TTL_SECONDS:
+        flows.pop(flow_id, None)
+        return None
+    if flow.get("chat_id") != chat_id or flow.get("user_id") != user_id:
+        return None
+    return flow
+
+
+def _button_builder_buttons(flow: dict) -> list[dict]:
+    return [{"text": text, "count": 0} for text in flow.get("button_texts", [])]
+
+
+async def _button_builder_force_reply(
+    api: TelegramBotAPI,
+    flow: dict,
+    text: str,
+    reply_to_message_id: int | None,
+) -> None:
+    prompt = await api.send_message(
+        flow["chat_id"],
+        text,
+        reply_to_message_id=reply_to_message_id,
+        reply_markup={"force_reply": True, "selective": True},
+        parse_mode=None,
+    )
+    flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+
+
+async def _send_button_builder_preview(
+    api: TelegramBotAPI,
+    flow_id: str,
+    flow: dict,
+    reply_to_message_id: int | None,
+) -> None:
+    buttons = _button_builder_buttons(flow)
+    with_photo = bool(flow.get("photo_file_id"))
+    button_builder.validate_rendered_length(flow["message_text"], buttons, with_photo)
+    rendered = button_builder.render_post(flow["message_text"], buttons)
+    keyboard = button_builder.preview_keyboard(flow_id, buttons)
+    if with_photo:
+        sent = await api.send_photo(
+            flow["chat_id"],
+            flow["photo_file_id"],
+            rendered,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+    else:
+        sent = await api.send_message(
+            flow["chat_id"],
+            rendered,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=keyboard,
+            parse_mode=None,
+        )
+    flow["awaiting"] = "ready"
+    flow["preview_message_id"] = sent.get("message_id") if sent else None
+
+
+async def handle_button_builder_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    flows: dict[str, dict],
+) -> None:
+    """/buttons — start an admin-only DM flow for a one/two-button counter post."""
+    chat = message["chat"]
+    if chat.get("type") != "private":
+        return
+    dm_chat_id = chat["id"]
+    actor = message.get("from") or {}
+    actor_id = actor.get("id")
+    if entry is None or admin_chat_id is None:
+        await api.send_message(
+            dm_chat_id,
+            "Основной чат не настроен.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+    if not actor_id or not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await api.send_message(
+            dm_chat_id,
+            "Публиковать сообщения с кнопками могут только администраторы чата.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return
+
+    for old_flow_id, old_flow in list(flows.items()):
+        if old_flow.get("chat_id") == dm_chat_id and old_flow.get("user_id") == actor_id:
+            flows.pop(old_flow_id, None)
+    flow_id = uuid.uuid4().hex[:10]
+    flow = {
+        "created_at": time.monotonic(),
+        "chat_id": dm_chat_id,
+        "admin_chat_id": admin_chat_id,
+        "entry": entry,
+        "user_id": actor_id,
+        "awaiting": "message",
+        "message_text": None,
+        "button_count": None,
+        "button_texts": [],
+        "photo_file_id": None,
+    }
+    flows[flow_id] = flow
+    await _button_builder_force_reply(
+        api,
+        flow,
+        "Отправь текст будущего сообщения.\n"
+        "Картинку можно будет добавить отдельным шагом. Для отмены: /cancel",
+        message["message_id"],
+    )
+
+
+async def handle_button_builder_text_input(
+    api: TelegramBotAPI,
+    message: dict,
+    flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consume the text, button labels or optional photo requested by /buttons."""
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    actor_id = actor.get("id")
+    replied_message_id = (message.get("reply_to_message") or {}).get("message_id")
+    flow_pair = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor_id
+            and flow.get("awaiting") in ("message", "button_1", "button_2", "photo")
+            and flow.get("prompt_message_id") == replied_message_id
+            and time.monotonic() - flow["created_at"] <= BUTTON_BUILDER_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if flow_pair is None:
+        return False
+    flow_id, flow = flow_pair
+    raw_text = (message.get("text") or message.get("caption") or "").strip()
+    if raw_text.lower() in ("/cancel", "отмена"):
+        flows.pop(flow_id, None)
+        await api.send_message(
+            chat_id,
+            "Конструктор закрыт.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return True
+
+    try:
+        if flow["awaiting"] == "message":
+            flow["message_text"] = button_builder.validate_message_text(raw_text)
+            flow["awaiting"] = "count"
+            await api.send_message(
+                chat_id,
+                "Сколько кнопок добавить?",
+                reply_to_message_id=message["message_id"],
+                reply_markup=button_builder.choose_count_keyboard(flow_id),
+                parse_mode=None,
+            )
+            return True
+
+        if flow["awaiting"] in ("button_1", "button_2"):
+            label = button_builder.validate_button_text(raw_text)
+            flow["button_texts"].append(label)
+            if len(flow["button_texts"]) < int(flow["button_count"]):
+                flow["awaiting"] = "button_2"
+                await _button_builder_force_reply(
+                    api, flow, "Отправь текст второй кнопки.", message["message_id"]
+                )
+            else:
+                flow["awaiting"] = "photo_choice"
+                await api.send_message(
+                    chat_id,
+                    "Добавить картинку к сообщению?",
+                    reply_to_message_id=message["message_id"],
+                    reply_markup=button_builder.choose_photo_keyboard(flow_id),
+                    parse_mode=None,
+                )
+            return True
+
+        photos = message.get("photo") or []
+        if not photos:
+            await _button_builder_force_reply(
+                api,
+                flow,
+                "Пришли картинку как фото. Для отмены: /cancel",
+                message["message_id"],
+            )
+            return True
+        button_builder.validate_rendered_length(
+            flow["message_text"], _button_builder_buttons(flow), with_photo=True
+        )
+        flow["photo_file_id"] = photos[-1]["file_id"]
+        await _send_button_builder_preview(api, flow_id, flow, message["message_id"])
+        return True
+    except ValueError as error:
+        prompt = (
+            "Пришли картинку как фото. Для отмены: /cancel"
+            if flow.get("awaiting") == "photo"
+            else str(error)
+        )
+        if flow.get("awaiting") == "photo":
+            await api.send_message(
+                chat_id, str(error), reply_to_message_id=message["message_id"], parse_mode=None
+            )
+        await _button_builder_force_reply(api, flow, prompt, message["message_id"])
+        return True
+    except Exception:
+        log(f"[bot_listener] button-builder text step failed:\n{traceback.format_exc()}")
+        await api.send_message(
+            chat_id,
+            "Не удалось продолжить конструктор. Запусти /buttons ещё раз.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        flows.pop(flow_id, None)
+        return True
+
+
+async def _edit_button_builder_control(
+    api: TelegramBotAPI,
+    callback_message: dict,
+    text: str,
+    reply_markup: dict | None,
+) -> None:
+    chat_id = (callback_message.get("chat") or {}).get("id")
+    message_id = callback_message.get("message_id")
+    if chat_id is None or message_id is None:
+        return
+    if callback_message.get("photo"):
+        await api.edit_message_caption(
+            chat_id, message_id, text, reply_markup=reply_markup, parse_mode=None
+        )
+    else:
+        await api.edit_message_text(
+            chat_id, message_id, text, reply_markup=reply_markup, parse_mode=None
+        )
+
+
+async def handle_button_builder_callback(
+    api: TelegramBotAPI,
+    callback: dict,
+    entry: str | None,
+    flows: dict[str, dict],
+    log=print,
+) -> None:
+    parsed = button_builder.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    action, item_id, argument = parsed
+    callback_id = callback.get("id")
+    callback_message = callback.get("message") or {}
+    chat = callback_message.get("chat") or {}
+    actor = callback.get("from") or {}
+    actor_id = actor.get("id")
+
+    # Public buttons remain valid across restarts, so their state lives on disk rather
+    # than in the short-lived builder flow.
+    if action == "press":
+        result = None
+        try:
+            if (
+                entry is not None
+                and argument is not None
+                and chat.get("id") is not None
+                and callback_message.get("message_id") is not None
+            ):
+                result = stats.increment_button_post(
+                    entry,
+                    item_id,
+                    chat["id"],
+                    callback_message["message_id"],
+                    argument,
+                )
+        except Exception:
+            log(f"[bot_listener] failed to count a generated-button press:\n{traceback.format_exc()}")
+        await api.answer_callback_query(
+            callback_id,
+            f"Засчитано: {result}" if result is not None else "Эта кнопка уже неактивна.",
+        )
+        return
+
+    if action == "delete":
+        post = stats.button_post(entry, item_id) if entry is not None else None
+        if post is None:
+            await api.answer_callback_query(callback_id, "Этот пост уже удалён.")
+            return
+        if str(post.get("created_by_id")) != str(actor_id):
+            await api.answer_callback_query(callback_id, "Удалить пост может только его автор.")
+            return
+        await api.answer_callback_query(callback_id)
+        await api.delete_message(post["chat_id"], post["message_id"])
+        stats.delete_button_post(entry, item_id, post["chat_id"], post["message_id"])
+        try:
+            await _edit_button_builder_control(
+                api, callback_message, "Пост удалён из общего чата.", reply_markup=None
+            )
+        except Exception:
+            log(f"[bot_listener] failed to update generated-post delete control:\n{traceback.format_exc()}")
+        return
+
+    flow = _button_builder_flow(flows, item_id, chat.get("id"), actor_id)
+    if flow is None:
+        await api.answer_callback_query(callback_id, "Конструктор устарел или принадлежит другому человеку.")
+        return
+    if action == "sample":
+        await api.answer_callback_query(callback_id, "Это предпросмотр — счётчик не изменился.")
+        return
+    await api.answer_callback_query(callback_id)
+
+    try:
+        if action == "cancel":
+            flows.pop(item_id, None)
+            await _edit_button_builder_control(
+                api, callback_message, "Конструктор закрыт.", reply_markup=None
+            )
+            return
+        if action == "count" and argument in (1, 2) and flow.get("awaiting") == "count":
+            flow["button_count"] = argument
+            flow["button_texts"] = []
+            flow["awaiting"] = "button_1"
+            await _button_builder_force_reply(
+                api, flow, "Отправь текст первой кнопки.", callback_message.get("message_id")
+            )
+            return
+        if action == "photo" and argument in (0, 1) and flow.get("awaiting") == "photo_choice":
+            if argument == 1:
+                button_builder.validate_rendered_length(
+                    flow["message_text"], _button_builder_buttons(flow), with_photo=True
+                )
+                flow["awaiting"] = "photo"
+                await _button_builder_force_reply(
+                    api,
+                    flow,
+                    "Пришли картинку как фото. Для отмены: /cancel",
+                    callback_message.get("message_id"),
+                )
+            else:
+                await _send_button_builder_preview(
+                    api, item_id, flow, callback_message.get("message_id")
+                )
+            return
+        if action == "send" and flow.get("awaiting") == "ready":
+            buttons = _button_builder_buttons(flow)
+            with_photo = bool(flow.get("photo_file_id"))
+            button_builder.validate_rendered_length(flow["message_text"], buttons, with_photo)
+            post_id = uuid.uuid4().hex[:10]
+            rendered = button_builder.render_post(flow["message_text"], buttons)
+            keyboard = button_builder.post_keyboard(post_id, buttons)
+            if with_photo:
+                sent = await api.send_photo(
+                    flow["admin_chat_id"],
+                    flow["photo_file_id"],
+                    rendered,
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+            else:
+                sent = await api.send_message(
+                    flow["admin_chat_id"],
+                    rendered,
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+            try:
+                stats.create_button_post(
+                    flow["entry"],
+                    post_id,
+                    flow["admin_chat_id"],
+                    sent["message_id"],
+                    flow["message_text"],
+                    [button["text"] for button in buttons],
+                    flow["user_id"],
+                    flow["chat_id"],
+                    photo_file_id=flow.get("photo_file_id"),
+                )
+            except Exception:
+                await api.delete_message(flow["admin_chat_id"], sent["message_id"])
+                raise
+            flows.pop(item_id, None)
+            try:
+                await _edit_button_builder_control(
+                    api,
+                    callback_message,
+                    "Пост отправлен в общий чат.",
+                    reply_markup=button_builder.delete_keyboard(post_id),
+                )
+            except Exception:
+                # The public post and its persistent counters already exist. Losing the
+                # in-place DM edit must not report the publish as failed or lose the only
+                # delete control; send a fresh receipt instead.
+                log(
+                    "[bot_listener] failed to edit generated-post receipt; "
+                    "sending a new control message"
+                )
+                await api.send_message(
+                    flow["chat_id"],
+                    "Пост отправлен в общий чат.",
+                    reply_markup=button_builder.delete_keyboard(post_id),
+                    parse_mode=None,
+                )
+            return
+    except ValueError as error:
+        await api.send_message(
+            flow["chat_id"],
+            str(error),
+            reply_to_message_id=callback_message.get("message_id"),
+            parse_mode=None,
+        )
+    except Exception:
+        log(f"[bot_listener] button-builder callback failed:\n{traceback.format_exc()}")
+        await api.send_message(
+            flow["chat_id"],
+            "Не удалось выполнить действие. Попробуй ещё раз.",
+            reply_to_message_id=callback_message.get("message_id"),
+            parse_mode=None,
+        )
+
+
+async def refresh_button_counters_once(
+    api: TelegramBotAPI,
+    entry: str | None,
+    rendered_counts: dict[str, tuple[int, ...]],
+    log=print,
+) -> None:
+    """Edit every changed generated post once; the caller supplies the in-memory cache."""
+    if entry is None:
+        return
+    posts = stats.active_button_posts(entry)
+    active_ids = set()
+    for post in posts:
+        post_id = post["post_id"]
+        active_ids.add(post_id)
+        counts = tuple(int(button.get("count", 0)) for button in post["buttons"])
+        if rendered_counts.get(post_id) == counts:
+            continue
+        try:
+            text = button_builder.render_post(post["message_text"], post["buttons"])
+            keyboard = button_builder.post_keyboard(post_id, post["buttons"])
+            if post.get("photo_file_id"):
+                await api.edit_message_caption(
+                    post["chat_id"],
+                    post["message_id"],
+                    text,
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+            else:
+                await api.edit_message_text(
+                    post["chat_id"],
+                    post["message_id"],
+                    text,
+                    reply_markup=keyboard,
+                    parse_mode=None,
+                )
+        except Exception as error:
+            lowered = str(error).lower()
+            permanently_gone = any(
+                marker in lowered
+                for marker in (
+                    "message to edit not found",
+                    "message can't be edited",
+                    "message_id_invalid",
+                )
+            )
+            if permanently_gone:
+                # Somebody removed the post by hand. Drop the orphaned state so the loop
+                # does not retry it forever.
+                stats.delete_button_post(
+                    entry, post_id, post["chat_id"], post["message_id"]
+                )
+            else:
+                # A network or Telegram-side failure is temporary: leave the cache
+                # unchanged so the same counts are retried three seconds later.
+                log(
+                    f"[bot_listener] failed to refresh button counters for {post_id}:\n"
+                    f"{traceback.format_exc()}"
+                )
+            continue
+        rendered_counts[post_id] = counts
+    for stale_id in set(rendered_counts) - active_ids:
+        rendered_counts.pop(stale_id, None)
+
+
+async def _button_counter_refresh_loop(
+    api: TelegramBotAPI,
+    entry: str | None,
+    log=print,
+) -> None:
+    rendered_counts: dict[str, tuple[int, ...]] = {}
+    while True:
+        await asyncio.sleep(button_builder.COUNTER_REFRESH_SECONDS)
+        try:
+            await refresh_button_counters_once(api, entry, rendered_counts, log=log)
+        except Exception:
+            # A corrupt store entry or one unexpected Telegram response must not kill the
+            # permanent refresh task. The next cycle gets a fresh read three seconds later.
+            log(f"[bot_listener] button-counter refresh cycle failed:\n{traceback.format_exc()}")
+
+
 async def handle_badge_admin_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -1846,6 +2364,7 @@ async def maybe_send_menu(
     cabinet_flows: dict[str, dict],
     badge_flows: dict[str, dict],
     menu_last_sent: dict,
+    button_builder_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Answer an otherwise-unhandled DM with the cabinet menu.
@@ -1869,6 +2388,10 @@ async def maybe_send_menu(
     if _has_pending_flow(cabinet_flows, chat_id, user_id, CABINET_FLOW_TTL_SECONDS):
         return
     if _has_pending_flow(badge_flows, chat_id, user_id, BADGE_FLOW_TTL_SECONDS):
+        return
+    if _has_pending_flow(
+        button_builder_flows or {}, chat_id, user_id, BUTTON_BUILDER_FLOW_TTL_SECONDS
+    ):
         return
 
     now = time.monotonic()
@@ -2885,6 +3408,7 @@ async def _dispatch_update(
     badge_flows: dict[str, dict],
     cabinet_flows: dict[str, dict],
     menu_last_sent: dict,
+    button_builder_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -2896,6 +3420,7 @@ async def _dispatch_update(
     listener.py's pattern), so one failed send (rate limit, transient network error)
     can't take the rest of the process down with it -- run_bot_listener's own try/except
     around this call is strictly a last-resort backstop, not the primary safety net."""
+    button_builder_flows = button_builder_flows if button_builder_flows is not None else {}
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
@@ -2908,6 +3433,10 @@ async def _dispatch_update(
             await handle_badge_callback(api, callback, badge_flows)
         elif callback_data.startswith(f"{PLANT_CALLBACK_PREFIX}:"):
             await handle_plant_callback(api, callback, home_chat_ref, log=log)
+        elif callback_data.startswith(f"{button_builder.CALLBACK_PREFIX}:"):
+            await handle_button_builder_callback(
+                api, callback, home_chat_ref, button_builder_flows, log=log
+            )
         elif callback_data.startswith(f"{preview.CALLBACK_PREFIX}:"):
             # The chat is resolved inside, AFTER the spinner is stopped -- see the
             # docstring. Doing it here, in the argument list, is what made these hang.
@@ -3004,6 +3533,18 @@ async def _dispatch_update(
             api, telethon_client, message, command_text, home_chat_ref, known_chat_ids, log=log,
         )
         return
+    if re.match(rf"^{re.escape(BUTTON_BUILDER_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_button_builder_command(
+            api, message, home_chat_ref, admin_chat_id, button_builder_flows
+        )
+        return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
             return
@@ -3069,6 +3610,11 @@ async def _dispatch_update(
             tz,
             log=log,
         )
+        return
+
+    if await handle_button_builder_text_input(
+        api, message, button_builder_flows, log=log
+    ):
         return
 
     if await handle_cabinet_text_input(
@@ -3279,7 +3825,8 @@ async def _dispatch_update(
         # rather than saying nothing at all. Groups fall through silently as before.
         await maybe_send_menu(
             api, telethon_client, tz, message, home_chat_ref,
-            cabinet_flows, badge_flows, menu_last_sent, log=log,
+            cabinet_flows, badge_flows, menu_last_sent,
+            button_builder_flows=button_builder_flows, log=log,
         )
         return
 
@@ -3408,6 +3955,9 @@ async def run_bot_listener(
     # owner id -- so only these two text-entry prompts need correlating, and losing them
     # on a restart costs the member one re-press, nothing more.
     cabinet_flows: dict[str, dict] = {}
+    # Short-lived /buttons conversations. Published posts and their counters are
+    # persisted separately by stats.py; only the unfinished constructor lives here.
+    button_builder_flows: dict[str, dict] = {}
     # Last time the fallback menu was sent per DM chat_id, so a burst of messages
     # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
     menu_last_sent: dict[int, float] = {}
@@ -3459,7 +4009,8 @@ async def run_bot_listener(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
                             known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
-                            cabinet_flows, menu_last_sent, log=log,
+                            cabinet_flows, menu_last_sent,
+                            button_builder_flows=button_builder_flows, log=log,
                         ),
                         update.get("update_id"),
                         log=log,
@@ -3553,7 +4104,11 @@ async def run_bot_listener(
                 # dismissal while one is still pending.
                 schedule_bot_delete(api, chat_id, [message_id], DISMISS_DELETE_AFTER, log, background_tasks)
 
-        tasks = [_poll_loop(), _consume_summaries()]
+        tasks = [
+            _poll_loop(),
+            _consume_summaries(),
+            _button_counter_refresh_loop(api, home_chat_ref, log=log),
+        ]
         if joke_queue is not None:
             tasks.append(_consume_jokes())
         if figurine_ack_queue is not None:

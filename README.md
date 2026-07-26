@@ -498,6 +498,19 @@ Sample planting buttons in the DM carry their own callback payload, separate fro
 the menu's post-to-the-chat action and the recording test button. Pressing a visual sample
 still just says "это тест": it neither posts anything nor adds the presser to a list.
 
+### `/buttons` — posts with one or two live counters
+
+`/buttons` is an administrator-only constructor in the bot's DM. It asks for the message
+text, lets the administrator choose **one or two buttons**, asks for each button's label,
+and then offers an optional photo. The final preview has **✅ Отправить в чат** and, once
+published, that control becomes **🗑 Удалить из чата**.
+
+Every tap increments that button's own persistent counter. The post is edited in place
+at most once every **three seconds**, so a busy burst produces one counter refresh rather
+than one Telegram edit per person. Photo posts use the same cycle by editing their caption.
+Published post state lives on the data volume, so buttons continue counting after a
+restart; only an unfinished constructor is discarded.
+
 #### Inline buttons must answer before they work
 
 Every callback handler answers `answerCallbackQuery` **first**, before anything that can
@@ -542,6 +555,7 @@ Administrator commands, none of them advertised in the menu:
 |---|---|---|
 | `/посадить_семечко`, `/plant` | chat or DM | open the planting ceremony |
 | `/preview [id]` | DM | look at a scheduled post before the chat does |
+| `/buttons` | DM | build a post with 1–2 buttons and live tap counters |
 | `/replant` | DM | re-post the planting announcement, start the tree over |
 | `/badgeadmin [-] @user` | DM | delegate custom-badge rights |
 | `/badge` | DM | create, award and remove custom badges |
@@ -562,7 +576,7 @@ work when typed — `/top all` = `/topall`, `/top pokras` = `/toppokras` = `/sta
 The procrastinator list is capped at `PROCRASTINATOR_LIST_SIZE` (10) names, on demand and
 in the automatic digest alike: it is a public call-out, and past about ten names it stops
 reading as a nudge and starts reading as a wall. Admin-only commands — `/badge`, `/weekwinner`, `/deletepokras`,
-`/badgeadmin`, `/replant`, `/preview`, and the two planting spellings — are deliberately
+`/badgeadmin`, `/replant`, `/preview`, `/buttons`, and the two planting spellings — are deliberately
 **not** advertised: putting them in front of all 190 members would invite a wave of "нужны
 права администратора". Registration is best-effort: the bot starts fine without a menu.
 

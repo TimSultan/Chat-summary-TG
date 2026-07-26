@@ -986,7 +986,7 @@ class MenuRegistrationTests(unittest.TestCase):
             command["command"]
             for command in bot_listener.PRIVATE_CHAT_COMMANDS + bot_listener.GROUP_CHAT_COMMANDS
         }
-        self.assertFalse(published & {"badge", "weekwinner", "deletepokras"})
+        self.assertFalse(published & {"badge", "weekwinner", "deletepokras", "buttons"})
         self.assertIn("cabinet", published)
 
     def test_registration_survives_a_telegram_failure(self):

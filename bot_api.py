@@ -1,7 +1,7 @@
 """Thin async wrapper around Telegram's Bot HTTP API (https://core.telegram.org/bots/api)
 -- used by bot_listener.py to run a bot account alongside the Telethon user session that
 listener.py drives. Deliberately minimal: just the handful of methods bot_listener.py
-needs (getMe, getUpdates via long polling, sendMessage, deleteMessage,
+needs (getMe, getUpdates via long polling, message/photo send and edit, deleteMessage,
 setMessageReaction, answerCallbackQuery, getChatAdministrators), not a full SDK.
 
 Roast confirmation uses an inline-keyboard button + callback_query rather than reactions
@@ -81,6 +81,30 @@ class TelegramBotAPI:
             params["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
         return await self._call("sendMessage", **params)
 
+    async def send_photo(
+        self,
+        chat_id,
+        photo: str,
+        caption: str,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
+    ) -> dict:
+        """Send a Telegram photo file_id with an optional caption and inline keyboard."""
+        params = {
+            "chat_id": chat_id,
+            "photo": photo,
+            "caption": caption,
+            "parse_mode": parse_mode,
+            "reply_markup": reply_markup,
+        }
+        if reply_to_message_id is not None:
+            params["reply_parameters"] = {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,
+            }
+        return await self._call("sendPhoto", **params)
+
     async def set_my_commands(self, commands: list[dict], scope: dict | None = None) -> None:
         """Populate the client's own ☰ Menu button next to the input field.
 
@@ -119,6 +143,28 @@ class TelegramBotAPI:
                 text=text,
                 parse_mode=parse_mode,
                 link_preview_options={"is_disabled": True},
+                reply_markup=reply_markup,
+            )
+        except ChatSummaryError as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    async def edit_message_caption(
+        self,
+        chat_id,
+        message_id: int,
+        caption: str,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        """Replace a photo caption while keeping its image and inline keyboard."""
+        try:
+            await self._call(
+                "editMessageCaption",
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=caption,
+                parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
         except ChatSummaryError as e:
