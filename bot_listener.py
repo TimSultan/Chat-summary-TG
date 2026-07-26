@@ -1108,17 +1108,23 @@ async def handle_preview_command(
 
 async def handle_preview_callback(
     api: TelegramBotAPI,
+    telethon_client,
     callback: dict,
     entry: str | None,
-    admin_chat_id: int | None,
+    known_chat_ids: dict[str, int],
     log=print,
 ) -> None:
     """Buttons from the /preview menu, plus the button on the test post itself.
 
+    The spinner is stopped FIRST, before anything that can be slow. Resolving the group
+    chat can go through the Telethon session, and a session that cannot connect does not
+    fail -- it waits. Doing that before answering is what left every one of these buttons
+    lit up forever with nothing in the log. Refusals and errors therefore arrive as a DM
+    rather than as a toast, which is a fair trade for a button that always responds.
+
     A sample planting button is answered for ANYBODY who presses it -- the test post sits
-    in a 190-member chat, and a member who taps it deserves an answer rather than a
-    spinner that never stops. Everything that acts (rendering into a DM, posting to the
-    chat, deleting) is still gated on the presser being an admin.
+    in a 190-member chat. Everything that acts (rendering into a DM, posting to the chat,
+    deleting) is still gated on the presser being an admin.
     """
     data = callback.get("data") or ""
     callback_id = callback["id"]
@@ -1134,29 +1140,47 @@ async def handle_preview_callback(
         await api.answer_callback_query(callback_id, tree.SEED_BUTTON_TEST_ACK)
         return
 
-    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
-        await api.answer_callback_query(callback_id, "Нужны права администратора.")
+    await api.answer_callback_query(callback_id)
+    if dm_chat_id is None:
         return
 
-    if deletion is not None:
-        chat_id, message_id = deletion
-        await api.delete_message(chat_id, message_id)
-        await api.answer_callback_query(callback_id, "Удалил из чата.")
-        return
-
-    if not preview_id or dm_chat_id is None:
-        await api.answer_callback_query(callback_id)
-        return
+    async def say(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer a preview button:\n{traceback.format_exc()}")
 
     try:
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+            if entry
+            else None
+        )
+        if admin_chat_id is None:
+            await say(
+                "Не удалось определить основной чат — Telethon-сессия не отвечает.\n"
+                "Проверь TELEGRAM_SESSION_STRING."
+            )
+            return
+        if not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+            await say("Предпросмотр доступен только администраторам чата.")
+            return
+
+        if deletion is not None:
+            chat_id, message_id = deletion
+            await api.delete_message(chat_id, message_id)
+            await say("Удалил тестовый пост из чата.")
+            return
+        if not preview_id:
+            return
         if preview_id == preview.GROUP_TEST_ID:
-            await api.answer_callback_query(callback_id, "Отправляю в чат...")
             await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
             return
-        await api.answer_callback_query(callback_id, preview.title_for(preview_id) or "")
-        await _send_preview(api, dm_chat_id, preview_id, log=log)
+        if not await _send_preview(api, dm_chat_id, preview_id, log=log):
+            await say("Нет такого превью.")
     except Exception:
         log(f"[bot_listener] preview button {preview_id} failed:\n{traceback.format_exc()}")
+        await say("Не удалось показать превью — подробности в логах.")
 
 
 async def handle_badge_admin_command(
@@ -1278,6 +1302,12 @@ def _match_allowed_chat(chat: dict, allowed_chats_original: list[str]) -> str | 
     return None
 
 
+# How long any interactive path will wait on the Telethon session before giving up. Ten
+# seconds is longer than a healthy resolve (milliseconds) and shorter than a member's
+# patience with a button that appears to do nothing.
+CHAT_RESOLVE_TIMEOUT_SECONDS = 10
+
+
 async def _resolve_chat_id(telethon_client, entry: str, known_chat_ids: dict[str, int], log=print) -> int | None:
     """Bot-API chat_id for `entry` (a LISTENER_ALLOWED_CHATS string). known_chat_ids
     (learned passively as _dispatch_update observes live updates from that chat -- see
@@ -1295,8 +1325,17 @@ async def _resolve_chat_id(telethon_client, entry: str, known_chat_ids: dict[str
     if chat_id is not None:
         return chat_id
     try:
-        entity = await resolve_chat(telethon_client, entry)
+        # Bounded, because a Telethon session that cannot connect does not raise -- it
+        # waits, indefinitely, retrying underneath. On an interactive path that is far
+        # worse than failing: an inline button whose handler is stuck here never reaches
+        # answerCallbackQuery, so the button spins forever with no error anywhere.
+        entity = await asyncio.wait_for(
+            resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS
+        )
         chat_id = tl_utils.get_peer_id(entity)
+    except asyncio.TimeoutError:
+        log(f"[bot_listener] timed out resolving chat_id for '{entry}' -- is the Telethon session alive?")
+        return None
     except Exception:
         log(f"[bot_listener] failed to resolve chat_id for '{entry}':\n{traceback.format_exc()}")
         return None
@@ -1508,7 +1547,12 @@ async def _cabinet_chat_ref(telethon_client, entry: str, known_chat_ids: dict, l
     chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
     username = None
     try:
-        entity = await resolve_chat(telethon_client, entry)
+        # Bounded for the same reason as _resolve_chat_id: this is only here to build a
+        # t.me link, and a Telethon session that cannot connect would otherwise stall the
+        # whole cabinet redraw waiting for one.
+        entity = await asyncio.wait_for(
+            resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS
+        )
         username = getattr(entity, "username", None)
     except Exception:
         log(f"[bot_listener] could not resolve '{entry}' for cabinet links")
@@ -2731,12 +2775,10 @@ async def _dispatch_update(
         elif callback_data.startswith(f"{PLANT_CALLBACK_PREFIX}:"):
             await handle_plant_callback(api, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{preview.CALLBACK_PREFIX}:"):
+            # The chat is resolved inside, AFTER the spinner is stopped -- see the
+            # docstring. Doing it here, in the argument list, is what made these hang.
             await handle_preview_callback(
-                api, callback, home_chat_ref,
-                await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
-                if home_chat_ref
-                else None,
-                log=log,
+                api, telethon_client, callback, home_chat_ref, known_chat_ids, log=log,
             )
         elif callback_data.startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(

@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -241,10 +242,11 @@ class PreviewCallbackTests(unittest.TestCase):
         self.api = FakeAPI()
 
     def _press(self, data, presser=ADMIN, chat_id=DM_CHAT, chat_type="private",
-               admin_chat_id=GROUP_CHAT):
+               known_chat_ids=None):
         asyncio.run(bot_listener.handle_preview_callback(
-            self.api, _callback(data, presser, chat_id, chat_type),
-            "chat", admin_chat_id, log=lambda *_: None,
+            self.api, None, _callback(data, presser, chat_id, chat_type),
+            "chat", {"chat": GROUP_CHAT} if known_chat_ids is None else known_chat_ids,
+            log=lambda *_: None,
         ))
 
     def test_a_menu_button_sends_that_sample_to_the_dm(self):
@@ -254,7 +256,6 @@ class PreviewCallbackTests(unittest.TestCase):
         self.assertEqual(sent["chat_id"], DM_CHAT)
         self.assertEqual(sent["parse_mode"], "HTML")
         self.assertIn("Семечко в земле", sent["text"])
-        self.assertEqual(self.api.answers, [preview.title_for("rollcall")])
 
     def test_every_menu_button_answers_and_sends_something(self):
         for preview_id in preview.preview_ids():
@@ -264,6 +265,30 @@ class PreviewCallbackTests(unittest.TestCase):
                 self.assertEqual(len(self.api.sent), 1, "button produced no message")
                 self.assertEqual(self.api.sent[0]["chat_id"], DM_CHAT)
                 self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
+
+    def test_the_spinner_stops_before_anything_that_can_block(self):
+        # The bug this pins: resolving the group chat goes through the Telethon session,
+        # and a session that cannot connect waits instead of failing. Every one of these
+        # buttons sat lit up forever because the resolve came first.
+        seen = []
+
+        async def _resolve(*args, **kwargs):
+            seen.append(len(self.api.answers))
+            return GROUP_CHAT
+
+        with patch.object(bot_listener, "_resolve_chat_id", _resolve):
+            self._press(preview.callback_data("seed"), known_chat_ids={})
+        self.assertEqual(seen, [1], "the chat was resolved before the spinner was stopped")
+
+    def test_a_dead_telethon_session_explains_itself_instead_of_hanging(self):
+        async def _resolve(*args, **kwargs):
+            return None  # what _resolve_chat_id returns once its timeout expires
+
+        with patch.object(bot_listener, "_resolve_chat_id", _resolve):
+            self._press(preview.callback_data("seed"), known_chat_ids={})
+
+        self.assertEqual(len(self.api.answers), 1)
+        self.assertIn("TELEGRAM_SESSION_STRING", self.api.sent[0]["text"])
 
     def test_the_test_button_posts_to_the_chat_and_offers_an_undo(self):
         self._press(preview.callback_data(preview.GROUP_TEST_ID))
@@ -279,7 +304,7 @@ class PreviewCallbackTests(unittest.TestCase):
     def test_the_undo_deletes_the_post_from_the_chat(self):
         self._press(f"{preview.CALLBACK_PREFIX}:del:{GROUP_CHAT}:501")
         self.assertEqual(self.api.deleted, [(GROUP_CHAT, 501)])
-        self.assertEqual(self.api.sent, [])
+        self.assertIn("Удалил", self.api.sent[0]["text"])
 
     def test_the_sample_button_posts_nothing_wherever_it_is_pressed(self):
         # The one button a member can reach: it sits on the test post in the group.
@@ -293,13 +318,9 @@ class PreviewCallbackTests(unittest.TestCase):
 
     def test_a_member_cannot_fire_the_group_test(self):
         self._press(preview.callback_data(preview.GROUP_TEST_ID), presser=MEMBER)
-        self.assertEqual(self.api.sent, [])
-        self.assertEqual(self.api.answers, ["Нужны права администратора."])
-
-    def test_an_unresolvable_home_chat_answers_instead_of_hanging(self):
-        self._press(preview.callback_data("seed"), admin_chat_id=None)
-        self.assertEqual(self.api.sent, [])
-        self.assertEqual(len(self.api.answers), 1)
+        self.assertEqual([item["chat_id"] for item in self.api.sent], [DM_CHAT])
+        self.assertIn("только администратор", self.api.sent[0]["text"])
+        self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
 
 
 if __name__ == "__main__":
