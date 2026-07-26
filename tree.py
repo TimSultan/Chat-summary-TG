@@ -18,6 +18,9 @@ from html import escape
 # ~18 mm a day and ~3.0 years to the final stage.
 TREE_XP_PER_MM = 200
 TREE_MAX_HEIGHT_MM = 20_000
+# Temporarily hide and ignore the on-demand /tree command without disabling planting,
+# previews or the automatic 10:00 posts. Both bot listeners read this same switch.
+TREE_COMMAND_ENABLED = False
 
 # (minimum height in mm, emoji, name). Ordered lowest-first; stage 1 is the seed everyone
 # starts from. Thresholds are set in HEIGHT rather than XP so the names line up with a
@@ -383,8 +386,7 @@ def format_nobody_planted_message() -> str:
 
 
 def format_awaiting_planting_status() -> str:
-    """/tree between the invitation and the roll call, when there is no tree yet and
-    format_tree_status would answer with a meaningless "0 мм"."""
+    """Preview status between the invitation and roll call, before the tree exists."""
     return "\n".join([
         "🌰 <b>Посадка открыта.</b>",
         "",
@@ -394,7 +396,7 @@ def format_awaiting_planting_status() -> str:
 
 
 def _contributor_lines(contributors: list) -> list:
-    """The shared "who moved it" block, so /tree and the morning post cannot drift apart."""
+    """Shared contributor block for the status preview and morning post."""
     shown = [item for item in contributors if item[2] > 0][:TOP_CONTRIBUTORS_SHOWN]
     lines = []
     for display_name, username, xp in shown:
@@ -404,7 +406,7 @@ def _contributor_lines(contributors: list) -> list:
 
 
 def format_tree_status(total_xp: int, yesterday_xp: int = 0, contributors: list | None = None) -> str:
-    """The /tree reply: total height, yesterday's growth, and who drove it."""
+    """Status preview: total height, yesterday's growth, and who drove it."""
     _, emoji, name = tree_stage(total_xp)
     grown_mm = tree_height_mm(total_xp) - tree_height_mm(max(0, total_xp - yesterday_xp))
     lines = [

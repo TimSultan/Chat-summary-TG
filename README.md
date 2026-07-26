@@ -367,8 +367,8 @@ never asks for `can_pin_messages` — and why nothing has to remember to unpin a
 
 If **nobody** pressed by 10:00 the tree is deliberately *not* planted and the ceremony
 stays open for another day: opening the whole thing on an empty roll call would be worse
-than waiting for a better one. While a ceremony is open `/tree` answers "Посадка открыта"
-rather than a meaningless "0 мм".
+than waiting for a better one. The on-demand `/tree` command is temporarily disabled;
+the open ceremony simply remains available through its planting button.
 
 The guest list goes through the stats directory because the two halves live in different
 processes — presses arrive at `bot_listener.py`, the 10:00 post is built by `listener.py`.
@@ -394,7 +394,7 @@ as already greeted — the announcement *is* that morning's post, so without thi
 loop would follow it with an ordinary zero-growth digest.
 
 Neither the planting post nor the morning digest is ever scheduled for deletion — they
-stay in the chat. Only `/tree` and the other on-demand stats replies self-delete.
+stay in the chat. Other on-demand stats replies self-delete.
 
 The tree's height is measured **from its planting day forward**, not from the chat's whole
 history. That is what makes "сегодня мы посадили семечко" true: this chat had months of
@@ -435,23 +435,10 @@ than the app timezone — the deployment's own zone is a hosting detail that cou
 Стабильный профиль принтера стоит сохранить прежде, чем экспериментировать дальше.
 ```
 
-`/tree` answers the same question on demand, in a group or a DM:
-
-```text
-🌳 Высота нашего дерева ЕПХ — 61,2 см.
-Сейчас оно на стадии 🪴 Саженец.
-До следующей стадии «Молодая поросль» — 38,8 см.
-
-Каждое сообщение, ответ и показанная работа помогают ему расти.
-```
-
-`/tree` reports the same three things as the morning post — total height, yesterday's
-growth, and yesterday's top three — through the same `_contributor_lines`, so the two
-cannot drift apart. It uses the **live** total, today included, because it answers "how
-are we doing right now"; the morning post stays on the recorded-only total, since a total
-that had jumped by an unexplained amount would contradict the growth figure right above
-it. The two can therefore differ slightly, by design. The reply self-deletes like every other
-stats reply; the standing announcement of the tree is the 10:00 post.
+The on-demand `/tree` command is temporarily disabled in both DMs and groups and is
+absent from both Telegram command menus. Its status formatter remains available through
+the private `/preview` menu as **Обычный**. This does not affect the planting ceremony or
+the automatic 10:00 morning post.
 
 The morning post reports **yesterday**, a closed and recorded day: at 10:00 today's own numbers are
 three hours old and would make the growth figure meaningless. The loop also checks once
@@ -566,8 +553,8 @@ Administrator commands, none of them advertised in the menu:
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
 client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
-command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins /tree`, groups get
-`/stat /topall /toppokras /tree`. Wallet actions belong in the DM where a balance isn't public,
+command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins`, groups get
+`/stat /topall /toppokras`. Wallet actions belong in the DM where a balance isn't public,
 and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a
 group button for it would just answer "напиши мне в личку".
 

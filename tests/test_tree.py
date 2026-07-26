@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import bot_listener
@@ -581,7 +582,7 @@ class TenOClockTests(unittest.TestCase):
         self.assertNotIn("Сегодня мы все вместе посадили семечко", posted[0][1])
 
 
-class TreeCommandTests(unittest.TestCase):
+class TreeStatusFormattingTests(unittest.TestCase):
     CONTRIBUTORS = [("Первый", "first", 423), ("Второй", "second", 383),
                     ("Третий", "third", 326), ("Четвёртый", "fourth", 12)]
 
@@ -622,11 +623,52 @@ class TreeCommandTests(unittest.TestCase):
             self.assertIn(line, status)
             self.assertIn(line, morning)
 
-    def test_it_is_offered_in_both_menus(self):
-        import bot_listener
-
+    def test_the_tree_command_is_temporarily_absent_from_both_menus(self):
+        self.assertFalse(tree.TREE_COMMAND_ENABLED)
         for menu in (bot_listener.PRIVATE_CHAT_COMMANDS, bot_listener.GROUP_CHAT_COMMANDS):
-            self.assertIn("tree", {command["command"] for command in menu})
+            self.assertNotIn("tree", {command["command"] for command in menu})
+
+    def test_a_manually_typed_tree_command_is_silent_in_the_bot(self):
+        class NoCallsExpected:
+            def __getattr__(self, name):
+                raise AssertionError(f"Bot API should not be called: {name}")
+
+        asyncio.run(bot_listener._dispatch_update(
+            {
+                "message": {
+                    "message_id": 1,
+                    "chat": {"id": 999, "type": "private"},
+                    "from": {"id": 7, "username": "sultan_kembayev"},
+                    "text": "/tree",
+                }
+            },
+            NoCallsExpected(),
+            None,
+            SimpleNamespace(listener_allowed_chats=[]),
+            timezone.utc,
+            "echhchat_bot",
+            99,
+            set(),
+            asyncio.Queue(),
+            {},
+            set(),
+            set(),
+            "chat",
+            {"chat": -100123},
+            {},
+            None,
+            {},
+            {},
+            {},
+            {},
+            log=lambda *_: None,
+        ))
+
+    def test_the_personal_listener_also_has_the_disabled_tree_guard(self):
+        import inspect
+
+        source = inspect.getsource(listener.run_listener)
+        self.assertIn("is_tree_command and not tree.TREE_COMMAND_ENABLED", source)
 
 
 class ScheduleTests(unittest.TestCase):
