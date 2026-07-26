@@ -29,8 +29,10 @@ from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendR
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 import chat_profile
+import economy
 import history
 import stats
+import tree
 from config import build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
@@ -750,7 +752,7 @@ async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=
         try:
             text = await stats.format_procrastinators(client, entry, entry, tz, log=log)
             if text:
-                await stats_digest_queue.put((entry, text))
+                await stats_digest_queue.put((entry, text, None))
                 log(f"[stats] queued procrastinator digest for '{entry}'")
             else:
                 log(f"[stats] procrastinator digest for '{entry}' has nothing to report today")
@@ -770,6 +772,76 @@ async def _stats_catchup_loop(client, cfg, tz, level_announcement_queue=None, lo
         next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
         await _stats_catch_up(client, cfg, tz, level_announcement_queue, log=log)
+
+
+async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> None:
+    """Builds and queues the morning ЕПХ-tree post for every tracked chat.
+
+    Reports YESTERDAY: at 10:00 today's own numbers are three hours old and would make
+    the growth figure meaningless. Yesterday is also a closed, recorded day, so the same
+    morning re-run after a restart produces the same post rather than a moving one.
+
+    A per-chat marker means a restart cannot post it twice, and a chat whose digest
+    raises is simply left for tomorrow instead of blocking the others.
+    """
+    if stats_digest_queue is None:
+        return
+    now = datetime.now(tz)
+    today = now.date()
+    # Nothing to catch up on before the hour itself. Without this the startup check
+    # would fire the moment the process comes up -- planting the tree at 05:00 on the
+    # day it ships instead of at the 10:00 it was promised for.
+    if now.hour < stats.TREE_DIGEST_HOUR:
+        return
+    yesterday = today - timedelta(days=1)
+    for entry in cfg.listener_allowed_chats:
+        if not stats.should_send_tree_digest(entry, today):
+            continue
+        try:
+            # The very first post plants the tree rather than reporting on it: on that
+            # day there is nothing to report, and the height starts from zero here.
+            planting = stats.tree_planted_on(entry) is None
+            if planting:
+                stats.mark_tree_planted(entry, today)
+                text = tree.format_planting_message()
+                day_xp = 0
+            else:
+                total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                    client, entry, entry, yesterday, tz, log=log
+                )
+                text = tree.format_morning_digest(total_xp, day_xp, contributors, today)
+            await stats_digest_queue.put((entry, text, "HTML"))
+            stats.mark_tree_digest_sent(entry, today)
+            log(
+                f"[stats] queued tree {'planting' if planting else 'digest'} for "
+                f"'{entry}' (+{day_xp} XP yesterday)"
+            )
+        except Exception:
+            log(f"[stats] failed to build tree digest for '{entry}':\n{traceback.format_exc()}")
+
+
+async def _tree_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> None:
+    """Wakes every day at 10:00 MOSCOW time -- pinned to Europe/Moscow rather than the
+    app timezone, because the chat asked for a Moscow morning and the deployment's own
+    timezone is a hosting detail that could move.
+
+    Runs a check once on startup too, so a process that was down at 10:00 still posts
+    when it comes back rather than skipping the day entirely; the per-chat marker keeps
+    that from double-posting.
+    """
+    if stats_digest_queue is None:
+        return
+    await _send_tree_digests(client, cfg, stats.tree_digest_tz(), stats_digest_queue, log=log)
+    while True:
+        moscow = stats.tree_digest_tz()
+        now = datetime.now(moscow)
+        next_run = now.replace(
+            hour=stats.TREE_DIGEST_HOUR, minute=0, second=10, microsecond=0
+        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        await _send_tree_digests(client, cfg, moscow, stats_digest_queue, log=log)
 
 
 async def _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> None:
@@ -805,6 +877,7 @@ async def run_stats_rollover(client, cfg, tz, stats_digest_queue=None, log=print
     await asyncio.gather(
         _stats_catchup_loop(client, cfg, tz, stats_digest_queue, log=log),
         _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=log),
+        _tree_digest_loop(client, cfg, tz, stats_digest_queue, log=log),
     )
 
 
@@ -1143,7 +1216,11 @@ async def run_listener(
         text_lower = text.lower()
         # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
         # chat content, so it must never count as activity for the joke buffer.
-        is_stats_command = text_lower.startswith("/top") or text_lower.startswith("/stat")
+        is_stats_command = (
+            text_lower.startswith("/top")
+            or text_lower.startswith("/stat")
+            or text_lower.startswith("/tree")
+        )
         is_badge_command = (
             text_lower.startswith("/badge")
             or text_lower.startswith("/weekwinner")
@@ -1256,9 +1333,23 @@ async def run_listener(
             try:
                 level_announcements = []
                 stat_uses_html = False
-                if text_lower.startswith("/top"):
-                    period = stats.parse_top_command(stats_text)
-                    reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
+                if text_lower.startswith("/tree"):
+                    yesterday = datetime.now(tz).date() - timedelta(days=1)
+                    total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                        client, chat, entry, yesterday, tz, log=log, live_total=True
+                    )
+                    reply_text = tree.format_tree_status(total_xp, day_xp, contributors)
+                    stat_uses_html = True
+                elif text_lower.startswith("/top"):
+                    top_arg = stats_text[len("/top"):].strip()
+                    # "/top pokras" reaches the procrastinator list, same as "/stat pokras".
+                    if stats.is_procrastinator_command(top_arg):
+                        reply_text = await stats.format_procrastinators(
+                            client, chat, entry, tz, log=log
+                        ) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                    else:
+                        period = stats.parse_top_argument(top_arg)
+                        reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                 else:
                     arg = stats_text[len("/stat") :].strip()
                     if stats.is_procrastinator_command(arg):
@@ -1267,8 +1358,9 @@ async def run_listener(
                         reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
                     else:
                         sender = await event.get_sender()
-                        user, rank, total, xp, streak = await stats.resolve_stat_target(
-                            client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log
+                        user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
+                            client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log,
+                            frozen_days_for=economy.streak_freeze_lookup(entry),
                         )
                         if user:
                             figurine_links = stats.figurine_message_links(
@@ -1284,6 +1376,9 @@ async def run_listener(
                             reply_text = stats.format_stat(
                                 user, rank, total, xp, streak, figurine_links, custom_badges,
                                 best_work_link=best_work_link, workplace_link=workplace_link,
+                                season_xp=season_xp,
+                                work_names=stats.work_name_list(entry, user),
+                                **economy.stat_extras(entry, user.user_id, xp),
                             )
                             stat_uses_html = True
                             level_announcements = stats.record_level_observations(

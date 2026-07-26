@@ -1,0 +1,1002 @@
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import bot_listener
+import cabinet
+import economy
+import stats
+
+
+def _user(**kwargs):
+    defaults = dict(user_id="20", username="user", display_name="Tester", messages=500)
+    defaults.update(kwargs)
+    return stats.UserStats(**defaults)
+
+
+class ViewTests(unittest.TestCase):
+    """The views are pure, so they can be checked without a bot token or a network."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_main_view_shows_the_card_and_every_section_button(self):
+        text, keyboard = cabinet.main_view("chat", _user(), 5_000, rank=3, total=190, streak=4)
+
+        self.assertIn("Личный кабинет", text)
+        self.assertIn("🪙 Монеты: 500", text)
+        self.assertIn("📈 Место в рейтинге: 3 из 190", text)
+        self.assertIn("🔥 Серия: 4 дня", text)
+
+        actions = {
+            cabinet.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        }
+        self.assertEqual(
+            actions, {"stats", "shop", "works", "badges", "title", "main"}
+        )
+
+    def test_every_button_stays_inside_telegrams_callback_data_limit(self):
+        _, keyboard = cabinet.main_view("chat", _user(user_id="1" * 19), 5_000, 1, 1, 0)
+        _, shop = cabinet.shop_view("chat", _user(user_id="1" * 19), 5_000)
+        for board in (keyboard, shop):
+            for row in board["inline_keyboard"]:
+                for button in row:
+                    self.assertLessEqual(
+                        len(button["callback_data"].encode("utf-8")),
+                        cabinet.MAX_CALLBACK_BYTES,
+                        button,
+                    )
+
+    def test_callback_round_trip(self):
+        data = cabinet.callback_data(20, "buy", "freeze")
+        self.assertEqual(cabinet.parse_callback(data), ("20", "buy", "freeze"))
+        self.assertEqual(cabinet.parse_callback(cabinet.callback_data(20, "main")), ("20", "main", ""))
+        self.assertIsNone(cabinet.parse_callback("roast:20:x"))
+        self.assertIsNone(cabinet.parse_callback(""))
+
+    def test_shop_view_marks_affordable_and_locked(self):
+        user = _user()
+        # 1_500 XP -> 150 coins: the 400-coin title is out of reach.
+        locked, _ = cabinet.shop_view("chat", user, 1_500)
+        self.assertIn("🔒", locked)
+        self.assertNotIn("✅", locked)
+
+        # 5_000 XP -> 500 coins: affordable.
+        affordable, keyboard = cabinet.shop_view("chat", user, 5_000)
+        self.assertIn("✅", affordable)
+        self.assertEqual(
+            [cabinet.parse_callback(b["callback_data"])[2]
+             for row in keyboard["inline_keyboard"] for b in row
+             if cabinet.parse_callback(b["callback_data"])[1] == "buy"],
+            ["title"],
+        )
+
+    def test_every_leaf_view_offers_a_way_back(self):
+        user = _user()
+        views = [
+            cabinet.shop_view("chat", user, 5_000),
+            cabinet.works_view("chat", user, [], None, None),
+            cabinet.badges_view("chat", user, []),
+            cabinet.title_view("chat", user, 5_000),
+            cabinet.result_view(user.user_id, "готово"),
+        ]
+        for text, keyboard in views:
+            last_row = keyboard["inline_keyboard"][-1]
+            self.assertEqual(last_row[0]["text"], cabinet.BACK_BUTTON)
+            self.assertEqual(cabinet.parse_callback(last_row[0]["callback_data"])[1], "main")
+
+    def test_user_controlled_text_is_escaped_into_html(self):
+        economy.set_title("chat", "20", "<b>hax</b>")
+        text, _ = cabinet.main_view(
+            "chat", _user(display_name="<script>alert(1)</script>"), 5_000, 1, 1, 0
+        )
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("&lt;b&gt;hax", text)
+
+    def test_works_view_handles_empty_and_capped_histories(self):
+        empty, keyboard = cabinet.works_view("chat", _user(), [], None, None)
+        self.assertIn("Пока пусто", empty)
+        # Nothing to rename, so no rename button.
+        self.assertEqual(len(keyboard["inline_keyboard"]), 1)
+
+        many = [f"https://t.me/c/1/{n}" for n in range(cabinet.WORKS_SHOWN + 5)]
+        capped, keyboard = cabinet.works_view(
+            "chat", _user(figurines_painted=35), many, None, None
+        )
+        self.assertIn("и ещё 5", capped)
+        self.assertIn("✏️ Переименовать", capped + str(keyboard))
+
+    def test_rename_request_parsing(self):
+        self.assertEqual(cabinet.parse_rename_request("3 Дредноут"), (3, "Дредноут"))
+        # Everything after the number is the name, spaces and all.
+        self.assertEqual(
+            cabinet.parse_rename_request("1  Космодесантник  Ультрамаринов"),
+            (1, "Космодесантник  Ультрамаринов"),
+        )
+        # A bare number clears the name.
+        self.assertEqual(cabinet.parse_rename_request("2"), (2, ""))
+        self.assertIsNone(cabinet.parse_rename_request("Дредноут"))
+        self.assertIsNone(cabinet.parse_rename_request("0 Ноль"))
+        self.assertIsNone(cabinet.parse_rename_request(""))
+
+
+class WorkNameTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    @staticmethod
+    def _painter():
+        return _user(
+            figurines_painted=3,
+            recent_figurine_posts=[
+                ["2026-07-05T12:00:00", 105],
+                ["2026-07-04T12:00:00", 104],
+                ["2026-07-03T12:00:00", 103],
+            ],
+        )
+
+    def test_named_works_render_by_name_and_unnamed_stay_numbered(self):
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 104, "Дредноут")
+        links = [f"https://t.me/c/1/{n}" for n in (105, 104, 103)]
+
+        text, _ = cabinet.works_view("chat", user, links, None, None)
+
+        self.assertIn("2. <a", text)
+        self.assertIn("Дредноут</a>", text)
+        self.assertIn("без названия", text)
+
+    def test_a_name_follows_its_work_when_positions_shift(self):
+        """Deleting a work compacts the numbering, so names keyed by position would
+        silently jump onto somebody else's model."""
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 103, "Дредноут")  # position 3
+
+        # The newest work is deleted; the dreadnought is now position 2.
+        user.recent_figurine_posts = user.recent_figurine_posts[1:]
+        links = [f"https://t.me/c/1/{n}" for n in (104, 103)]
+        text, _ = cabinet.works_view("chat", user, links, None, None)
+
+        self.assertIn("2. <a", text)
+        self.assertIn("Дредноут</a>", text)
+        self.assertEqual(cabinet.message_id_for_position(user, 2), 103)
+
+    def test_names_are_trimmed_bounded_and_clearable(self):
+        user = self._painter()
+        saved = stats.set_work_name("chat", user.user_id, 105, "  Очень   длинный  " + "я" * 80)
+        self.assertLessEqual(len(saved), stats.WORK_NAME_MAX_CHARS)
+        self.assertNotIn("  ", saved)
+
+        self.assertEqual(stats.set_work_name("chat", user.user_id, 105, ""), "")
+        self.assertNotIn("105", stats.work_names_for_user("chat", user.user_id))
+
+    def test_a_name_is_escaped_into_the_html_view(self):
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 105, "<b>hax</b>")
+        text, _ = cabinet.works_view("chat", user, ["https://t.me/c/1/105"], None, None)
+        self.assertNotIn("<b>hax", text)
+        self.assertIn("&lt;b&gt;hax", text)
+
+    def test_position_lookup_rejects_out_of_range(self):
+        user = self._painter()
+        self.assertEqual(cabinet.message_id_for_position(user, 1), 105)
+        self.assertIsNone(cabinet.message_id_for_position(user, 0))
+        self.assertIsNone(cabinet.message_id_for_position(user, 99))
+
+
+class BadgeSectionTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_admin_badges_get_their_own_section_above_earned_ones(self):
+        user = _user(messages=1_000, media=25)
+        given = stats.Badge("custom", "🏹", "Лучник", custom=True)
+
+        text, _ = cabinet.badges_view("chat", user, [given])
+
+        self.assertIn("Уникальные значки", text)
+        self.assertIn("Заработанные", text)
+        self.assertLess(text.index("Уникальные значки"), text.index("Заработанные"))
+        self.assertLess(text.index("🏹 Лучник"), text.index("Заработанные"))
+
+    def test_the_admin_section_is_omitted_when_there_are_none(self):
+        text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
+        self.assertNotIn("Уникальные значки", text)
+
+    def test_a_weekly_win_is_earned_not_admin_granted(self):
+        # It is assigned by an administrator, but it is won -- Badge.custom is the
+        # discriminator, and the contest badge does not set it.
+        won = stats.Badge("weekly_contest_winner", "🏆", "Победитель ×1")
+        text, _ = cabinet.badges_view("chat", _user(), [won])
+        self.assertNotIn("Уникальные значки", text)
+        self.assertIn("🏆 Победитель ×1", text)
+
+    def test_collection_counter_counts_tiers_levels_and_ranks(self):
+        # A genuinely blank member -- _user() has 500 messages, which already earns one.
+        empty = stats.UserStats(user_id="20")
+        unlocked, total = stats.badge_collection_progress(empty)
+        # A brand-new member already holds the base painting rank and the first chat tier.
+        self.assertEqual(unlocked, 2)
+        self.assertEqual(
+            total,
+            len(stats.PAINTING_BADGE_TIERS) + len(stats.MESSAGE_BADGE_TIERS)
+            + len(stats.STREAK_BADGE_TIERS) + len(stats.NIGHT_BADGE_TIERS)
+            + 4 + len(stats.CHAT_LEVEL_TIERS) + len(stats.XP_LEVELS),
+        )
+
+        # Every painting tier below the current one counts, not just the shown one.
+        painter = stats.UserStats(user_id="20", figurines_painted=50)
+        more_unlocked, same_total = stats.badge_collection_progress(painter)
+        self.assertEqual(same_total, total)
+        self.assertEqual(
+            more_unlocked - unlocked,
+            len(stats.PAINTING_BADGE_TIERS)          # every step, not just the top one
+            + (len(stats.XP_LEVELS) - 1)             # every painting rank above the base
+            + (len(stats.CHAT_LEVEL_TIERS) - 1),     # 50 figurines is also 10k XP
+        )
+
+    def test_defined_custom_badges_widen_the_denominator(self):
+        user = stats.UserStats(user_id="20")
+        _, base_total = stats.badge_collection_progress(user)
+        given = stats.Badge("custom", "🏹", "Лучник", custom=True)
+
+        unlocked, total = stats.badge_collection_progress(
+            user, custom_badges=[given], chat_custom_badge_total=4
+        )
+
+        self.assertEqual(total, base_total + 4)
+        self.assertEqual(unlocked, 2 + 1)
+
+    def test_the_counter_is_rendered_at_the_bottom(self):
+        text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
+        self.assertIn("📦 Открыто:", text)
+        self.assertGreater(text.index("📦 Открыто:"), text.index("🏅 <b>Значки</b>"))
+
+
+class WorkDeleteTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        bot_listener._CABINET_CONTEXT_CACHE.clear()
+        self.addCleanup(bot_listener._CABINET_CONTEXT_CACHE.clear)
+        self.api = FakeAPI()
+
+    @staticmethod
+    def _painter():
+        return _user(
+            figurines_painted=3,
+            recent_figurine_posts=[
+                ["2026-07-05T12:00:00", 105],
+                ["2026-07-04T12:00:00", 104],
+                ["2026-07-03T12:00:00", 103],
+            ],
+        )
+
+    def test_works_view_offers_delete_only_when_there_is_something_to_delete(self):
+        _, empty = cabinet.works_view("chat", _user(), [], None, None)
+        actions = {cabinet.parse_callback(b["callback_data"])[1]
+                   for row in empty["inline_keyboard"] for b in row}
+        self.assertNotIn("work_delete", actions)
+
+        _, filled = cabinet.works_view(
+            "chat", self._painter(), ["https://t.me/c/1/105"], None, None
+        )
+        actions = {cabinet.parse_callback(b["callback_data"])[1]
+                   for row in filled["inline_keyboard"] for b in row}
+        self.assertIn("work_delete", actions)
+        self.assertIn("work_rename", actions)
+
+    def test_the_confirmation_carries_the_message_id_not_the_position(self):
+        # Positions renumber after any delete; by the second tap the number could point
+        # at a different work entirely.
+        text, keyboard = cabinet.confirm_work_delete_view(20, 2, "Дредноут", 104)
+
+        self.assertIn("№2", text)
+        self.assertIn("Дредноут", text)
+        self.assertIn(str(stats.XP_PER_FIGURINE), text)
+        confirm = keyboard["inline_keyboard"][0][0]
+        self.assertEqual(cabinet.parse_callback(confirm["callback_data"]), ("20", "work_delete_ok", "104"))
+        # And a way out that is not the delete.
+        cancel = keyboard["inline_keyboard"][1][0]
+        self.assertEqual(cabinet.parse_callback(cancel["callback_data"])[1], "works")
+
+    def _confirm(self, message_id, user):
+        async def fake_context(telethon_client, entry, tz, from_user, log=print):
+            return user, 5_000, 3, 190, 4, 5_000
+
+        async def fake_render(*args, **kwargs):
+            return ("works", {"inline_keyboard": []})
+
+        with patch("bot_listener._cabinet_context", fake_context), \
+             patch("bot_listener._render_cabinet_section", fake_render):
+            asyncio.run(
+                bot_listener.handle_cabinet_callback(
+                    self.api, None, None, None,
+                    {
+                        "id": "cb1",
+                        "data": cabinet.callback_data(20, "work_delete_ok", str(message_id)),
+                        "from": {"id": 20, "username": "user", "first_name": "U"},
+                        "message": {"message_id": 42, "chat": {"id": 999, "type": "private"}},
+                    },
+                    "chat", {}, badge_flows={}, log=lambda *_: None,
+                )
+            )
+
+    def test_confirming_tombstones_the_work_and_clears_its_name(self):
+        user = self._painter()
+        stats.set_work_name("chat", user.user_id, 104, "Дредноут")
+
+        self._confirm(104, user)
+
+        tombstones = stats._load_deleted_figurines("chat")["posts"]
+        self.assertIn("104", tombstones)
+        self.assertEqual(tombstones["104"]["user_id"], "20")
+        # The name must not outlive the work it belonged to.
+        self.assertNotIn("104", stats.work_names_for_user("chat", user.user_id))
+
+    def test_the_tombstone_removes_the_figurine_and_its_xp(self):
+        user = self._painter()
+        before = user.xp(5.0)
+        self._confirm(105, user)
+
+        users = {"20": self._painter()}
+        stats._apply_deleted_figurines("chat", users)
+        after = users["20"]
+
+        self.assertEqual(after.figurines_painted, 2)
+        self.assertEqual([p[1] for p in after.recent_figurine_posts], [104, 103])
+        self.assertEqual(before - after.xp(5.0), stats.XP_PER_FIGURINE)
+
+    def test_you_cannot_delete_a_work_that_is_not_yours(self):
+        # A hand-crafted callback naming somebody else's message_id must do nothing.
+        self._confirm(999_999, self._painter())
+
+        self.assertEqual(self.api.answers, ["Эта работа уже удалена."])
+        self.assertEqual(stats._load_deleted_figurines("chat")["posts"], {})
+
+    def test_the_cached_context_is_dropped_so_the_list_refreshes(self):
+        user = self._painter()
+        bot_listener._CABINET_CONTEXT_CACHE[("chat", 20)] = (10**9, (user, 1, 1, 1, 1, 1))
+
+        self._confirm(105, user)
+
+        self.assertNotIn(("chat", 20), bot_listener._CABINET_CONTEXT_CACHE)
+
+
+class BadgeAnnouncementTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.api = FakeAPI()
+
+    def _award(self, target):
+        badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
+        flow = {
+            "entry": "chat", "chat_id": 10, "admin_chat_id": -1001234,
+            "admin_id": 10, "admin_name": "Admin",
+        }
+        asyncio.run(
+            bot_listener._award_badge_from_flow(
+                self.api, flow, badge.badge_id, target, None, log=lambda *_: None
+            )
+        )
+        return [m for m in self.api.sent if m["chat_id"] == -1001234]
+
+    def test_the_group_is_told_in_the_requested_shape(self):
+        announced = self._award({"user_id": "20", "display_name": "Tester", "username": "user"})
+        self.assertEqual(len(announced), 1)
+        self.assertEqual(announced[0]["text"], "@user получил уникальный значок: 🏹 Лучник")
+
+    def test_a_member_without_a_username_is_named_instead(self):
+        announced = self._award({"user_id": "20", "display_name": "Без Ника", "username": None})
+        self.assertEqual(announced[0]["text"], "Без Ника получил уникальный значок: 🏹 Лучник")
+
+    def test_re_awarding_the_same_badge_does_not_announce_again(self):
+        target = {"user_id": "20", "display_name": "Tester", "username": "user"}
+        badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
+        flow = {
+            "entry": "chat", "chat_id": 10, "admin_chat_id": -1001234,
+            "admin_id": 10, "admin_name": "Admin",
+        }
+        for _ in range(3):
+            asyncio.run(
+                bot_listener._award_badge_from_flow(
+                    self.api, flow, badge.badge_id, target, None, log=lambda *_: None
+                )
+            )
+
+        announced = [m for m in self.api.sent if m["chat_id"] == -1001234]
+        self.assertEqual(len(announced), 1, "the group was told more than once")
+
+    def test_a_failed_announcement_does_not_lose_the_badge(self):
+        class FailingAPI(FakeAPI):
+            async def send_message(self, chat_id, text, **kwargs):
+                if chat_id == -1001234:
+                    raise RuntimeError("telegram down")
+                return await super().send_message(chat_id, text, **kwargs)
+
+        self.api = FailingAPI()
+        self._award({"user_id": "20", "display_name": "Tester", "username": "user"})
+
+        self.assertEqual(
+            [b.label for b in stats.custom_badges_for_user("chat", "20")], ["🏹 Лучник"]
+        )
+
+
+class BadgeRemovalTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
+        self.other = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+        for user_id in ("20", "21"):
+            stats.give_custom_badge("chat", self.badge.badge_id, user_id, "U", 10, "Admin")
+
+    def test_revoking_takes_it_from_one_member_only(self):
+        revoked = stats.revoke_custom_badge("chat", self.badge.badge_id, "20")
+
+        self.assertEqual(revoked.label, "🏹 Лучник")
+        self.assertEqual(stats.custom_badges_for_user("chat", "20"), [])
+        # The other holder is untouched, and the definition still exists.
+        self.assertEqual([b.label for b in stats.custom_badges_for_user("chat", "21")], ["🏹 Лучник"])
+        self.assertIn("🏹 Лучник", [b.label for b in stats.list_custom_badges("chat")])
+
+    def test_revoking_what_somebody_does_not_have_reports_it(self):
+        self.assertIsNone(stats.revoke_custom_badge("chat", self.other.badge_id, "20"))
+        self.assertIsNone(stats.revoke_custom_badge("chat", self.badge.badge_id, "999"))
+
+    def test_deleting_a_definition_takes_it_from_everybody(self):
+        self.assertEqual(stats.custom_badge_holder_count("chat", self.badge.badge_id), 2)
+
+        deleted = stats.delete_custom_badge("chat", self.badge.badge_id)
+
+        self.assertEqual(deleted.label, "🏹 Лучник")
+        self.assertEqual([b.label for b in stats.list_custom_badges("chat")], ["🎯 Меткий глаз"])
+        self.assertEqual(stats.custom_badges_for_user("chat", "20"), [])
+        self.assertEqual(stats.custom_badges_for_user("chat", "21"), [])
+
+    def test_a_deleted_badge_leaves_no_dangling_assignment(self):
+        """A leftover assignment would be invisible but would still count towards the
+        collection total, and would come back if the id were ever reused."""
+        stats.delete_custom_badge("chat", self.badge.badge_id)
+
+        data = stats._load_custom_badge_data("chat")
+        for assigned in data["assignments"].values():
+            self.assertNotIn(self.badge.badge_id, assigned)
+
+        unlocked, _ = stats.badge_collection_progress(
+            _user(), custom_badges=stats.custom_badges_for_user("chat", "20")
+        )
+        blank, _ = stats.badge_collection_progress(_user())
+        self.assertEqual(unlocked, blank)
+
+    def test_deleting_twice_is_reported_not_crashed(self):
+        self.assertIsNotNone(stats.delete_custom_badge("chat", self.badge.badge_id))
+        self.assertIsNone(stats.delete_custom_badge("chat", self.badge.badge_id))
+
+    def test_the_menu_offers_both_removals(self):
+        texts = {
+            bot_listener.BADGE_CREATE_BUTTON_TEXT,
+            bot_listener.BADGE_GIVE_BUTTON_TEXT,
+            bot_listener.BADGE_REVOKE_BUTTON_TEXT,
+            bot_listener.BADGE_DELETE_BUTTON_TEXT,
+        }
+        self.assertEqual(len(texts), 4)
+        self.assertIn("Забрать", bot_listener.BADGE_REVOKE_BUTTON_TEXT)
+        self.assertIn("Удалить", bot_listener.BADGE_DELETE_BUTTON_TEXT)
+
+
+class BadgeDelegationTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_granting_is_idempotent_and_revocable(self):
+        self.assertFalse(stats.is_badge_manager("chat", 20))
+
+        self.assertTrue(stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin"))
+        self.assertTrue(stats.is_badge_manager("chat", 20))
+        # Granting twice reports "already", so the caller doesn't say "done" a second time.
+        self.assertFalse(stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin"))
+
+        self.assertTrue(stats.revoke_badge_manager("chat", 20))
+        self.assertFalse(stats.is_badge_manager("chat", 20))
+        self.assertFalse(stats.revoke_badge_manager("chat", 20))
+
+    def test_the_stored_username_drops_its_at_sign(self):
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        self.assertEqual(stats.list_badge_managers("chat")[0]["username"], "user")
+
+    def test_delegation_is_per_chat(self):
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        self.assertFalse(stats.is_badge_manager("other", 20))
+
+    def test_a_corrupt_store_costs_a_button_not_the_menu(self):
+        stats._badge_managers_path("chat").write_text("{not json", encoding="utf-8")
+        self.assertFalse(stats.is_badge_manager("chat", 20))
+        self.assertEqual(stats.list_badge_managers("chat"), [])
+
+    def test_the_button_only_appears_for_a_delegate(self):
+        user = _user()
+        _, plain = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
+        actions = {
+            cabinet.parse_callback(b["callback_data"])[1]
+            for row in plain["inline_keyboard"] for b in row
+        }
+        self.assertNotIn("badge_admin", actions)
+
+        _, delegated = cabinet.main_view(
+            "chat", user, 5_000, 1, 1, 0, can_manage_badges=True
+        )
+        actions = {
+            cabinet.parse_callback(b["callback_data"])[1]
+            for row in delegated["inline_keyboard"] for b in row
+        }
+        self.assertIn("badge_admin", actions)
+
+    def test_visibility_check_reads_the_store_and_the_hardcoded_delegates(self):
+        self.assertFalse(bot_listener._shows_badge_admin_button("chat", 20, "user"))
+
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        self.assertTrue(bot_listener._shows_badge_admin_button("chat", 20, "user"))
+
+        # The hardcoded delegate needs no store entry.
+        hardcoded = next(iter(bot_listener.PRIVILEGED_MANAGEMENT_USERNAMES))
+        self.assertTrue(bot_listener._shows_badge_admin_button("chat", 99, hardcoded))
+        self.assertTrue(bot_listener._shows_badge_admin_button("chat", 99, "@" + hardcoded.upper()))
+
+        # No home chat configured -> nothing to manage.
+        self.assertFalse(bot_listener._shows_badge_admin_button(None, 20, "user"))
+
+    def test_a_delegate_cannot_appoint_further_delegates(self):
+        """_can_manage_chat accepts a delegate; _is_chat_admin_or_privileged must not."""
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+
+        class NoAdminsAPI:
+            async def get_chat_administrators(self, chat_id):
+                return []
+
+        actor = {"id": 20, "username": "user"}
+        self.assertTrue(
+            asyncio.run(bot_listener._can_manage_chat(NoAdminsAPI(), -100, actor, "chat"))
+        )
+        self.assertFalse(
+            asyncio.run(bot_listener._is_chat_admin_or_privileged(NoAdminsAPI(), -100, actor))
+        )
+
+    def test_a_stale_menu_cannot_act_after_a_revoke(self):
+        # The button decides what is drawn; the callback re-verifies before acting.
+        stats.grant_badge_manager("chat", 20, "@user", "User", 10, "Admin")
+        api = FakeAPI()
+
+        stats.revoke_badge_manager("chat", 20)
+        with patch("bot_listener._resolve_chat_id", new=_async_return(-100)):
+            with patch("bot_listener._is_chat_admin", new=_async_return(False)):
+                asyncio.run(
+                    bot_listener.handle_cabinet_callback(
+                        api, None, None, None,
+                        {
+                            "id": "cb1",
+                            "data": cabinet.callback_data(20, "badge_admin"),
+                            "from": {"id": 20, "username": "user", "first_name": "U"},
+                            "message": {"message_id": 42, "chat": {"id": 999, "type": "private"}},
+                        },
+                        "chat", {}, badge_flows={}, log=lambda *_: None,
+                    )
+                )
+
+        self.assertEqual(api.answers, ["Нет прав на управление значками."])
+        self.assertEqual(api.sent, [])
+
+
+def _async_return(value):
+    async def _inner(*args, **kwargs):
+        return value
+    return _inner
+
+
+class FakeAPI:
+    """Records what the handler would have sent, so the callback flow can be driven
+    without Telegram."""
+
+    def __init__(self):
+        self.sent = []
+        self.edits = []
+        self.answers = []
+        self._next_id = 500
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None,
+                           reply_markup=None, parse_mode=None):
+        self._next_id += 1
+        self.sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+        return {"message_id": self._next_id}
+
+    async def edit_message_text(self, chat_id, message_id, text,
+                                reply_markup=None, parse_mode=None):
+        self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text,
+                           "reply_markup": reply_markup})
+
+    async def answer_callback_query(self, callback_query_id, text=None):
+        self.answers.append(text)
+
+
+class CallbackTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.api = FakeAPI()
+
+    @staticmethod
+    def _callback(owner_id, action, actor_id, argument=""):
+        return {
+            "id": "cb1",
+            "data": cabinet.callback_data(owner_id, action, argument),
+            "from": {"id": actor_id, "username": "user", "first_name": "Tester"},
+            "message": {"message_id": 42, "chat": {"id": 999, "type": "private"}},
+        }
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_another_member_cannot_press_your_buttons(self):
+        # The owner id travels inside the button, so a forwarded menu is inert.
+        self._run(
+            bot_listener.handle_cabinet_callback(
+                self.api, None, None, None,
+                self._callback(owner_id=20, action="shop", actor_id=99),
+                "chat", {}, log=lambda *_: None,
+            )
+        )
+        self.assertEqual(self.api.answers, ["Это чужой кабинет."])
+        self.assertEqual(self.api.edits, [])
+
+    def test_a_missing_home_chat_is_reported_not_crashed(self):
+        self._run(
+            bot_listener.handle_cabinet_callback(
+                self.api, None, None, None,
+                self._callback(owner_id=20, action="shop", actor_id=20),
+                None, {}, log=lambda *_: None,
+            )
+        )
+        self.assertEqual(self.api.answers, ["Основной чат не настроен."])
+
+    def test_text_entry_actions_open_a_force_reply_and_register_a_flow(self):
+        flows = {}
+        self._run(
+            bot_listener.handle_cabinet_callback(
+                self.api, None, None, None,
+                self._callback(owner_id=20, action="title_set", actor_id=20),
+                "chat", flows, log=lambda *_: None,
+            )
+        )
+        self.assertEqual(len(flows), 1)
+        flow = next(iter(flows.values()))
+        self.assertEqual(flow["awaiting"], "title")
+        self.assertEqual(flow["user_id"], 20)
+        self.assertTrue(self.api.sent[0]["reply_markup"]["force_reply"])
+
+    def test_a_reply_that_matches_no_flow_is_left_alone(self):
+        handled = self._run(
+            bot_listener.handle_cabinet_text_input(
+                self.api, None, None,
+                {"chat": {"id": 999}, "from": {"id": 20}, "message_id": 7,
+                 "text": "просто сообщение"},
+                {}, log=lambda *_: None,
+            )
+        )
+        self.assertFalse(handled)
+
+
+class MenuFallbackTests(unittest.TestCase):
+    """The fallback menu's whole risk is firing where it shouldn't, so that is what
+    these pin down."""
+
+    def setUp(self):
+        self.api = FakeAPI()
+
+    @staticmethod
+    def _message(chat_type="private", chat_id=999, user_id=20, text="привет"):
+        return {
+            "message_id": 7,
+            "chat": {"id": chat_id, "type": chat_type},
+            "from": {"id": user_id, "username": "user", "first_name": "Tester"},
+            "text": text,
+        }
+
+    def _send(self, message, entry=None, cabinet_flows=None, badge_flows=None, last_sent=None):
+        return asyncio.run(
+            bot_listener.maybe_send_menu(
+                self.api, None, None, message, entry,
+                cabinet_flows if cabinet_flows is not None else {},
+                badge_flows if badge_flows is not None else {},
+                last_sent if last_sent is not None else {},
+                log=lambda *_: None,
+            )
+        )
+
+    def test_never_fires_in_a_group(self):
+        # A menu posted under ordinary group chatter is spam, and it would print one
+        # person's balance in front of everybody.
+        self._send(self._message(chat_type="supergroup"))
+        self.assertEqual(self.api.sent, [])
+
+    def test_an_unknown_dm_gets_the_menu(self):
+        self._send(self._message())
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("inline_keyboard", self.api.sent[0]["reply_markup"])
+
+    def test_no_home_chat_configured_still_answers_with_something_useful(self):
+        self._send(self._message(), entry=None)
+        self.assertIn("пока не вижу", self.api.sent[0]["text"])
+
+    def test_a_tracked_member_gets_their_own_cabinet(self):
+        async def fake_context(telethon_client, entry, tz, from_user, log=print):
+            return _user(), 5_000, 3, 190, 4, 5_000
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                with patch("bot_listener._cabinet_context", fake_context):
+                    self._send(self._message(), entry="chat")
+
+        self.assertIn("Личный кабинет", self.api.sent[0]["text"])
+        self.assertIn("🪙 Монеты: 500", self.api.sent[0]["text"])
+
+    def test_it_stays_quiet_while_a_cabinet_answer_is_awaited(self):
+        flows = {
+            "f1": {
+                "created_at": 10**9,  # far in the future of monotonic(), so never expired
+                "chat_id": 999,
+                "user_id": 20,
+                "entry": "chat",
+                "awaiting": "title",
+                "prompt_message_id": 5,
+            }
+        }
+        self._send(self._message(), cabinet_flows=flows)
+        self.assertEqual(self.api.sent, [])
+
+    def test_it_stays_quiet_while_a_badge_answer_is_awaited(self):
+        flows = {
+            "f1": {
+                "created_at": 10**9,
+                "chat_id": 999,
+                "admin_id": 20,
+                "awaiting": "target",
+                "prompt_message_id": 5,
+            }
+        }
+        self._send(self._message(), badge_flows=flows)
+        self.assertEqual(self.api.sent, [])
+
+    def test_another_members_pending_flow_does_not_mute_you(self):
+        flows = {
+            "f1": {
+                "created_at": 10**9, "chat_id": 999, "user_id": 77,
+                "awaiting": "title", "prompt_message_id": 5,
+            }
+        }
+        self._send(self._message(user_id=20), cabinet_flows=flows)
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_a_burst_of_messages_produces_one_menu(self):
+        last_sent = {}
+        for _ in range(4):
+            self._send(self._message(), last_sent=last_sent)
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_separate_dms_do_not_share_the_cooldown(self):
+        last_sent = {}
+        self._send(self._message(chat_id=111), last_sent=last_sent)
+        self._send(self._message(chat_id=222), last_sent=last_sent)
+        self.assertEqual(len(self.api.sent), 2)
+
+
+class RenderCostTests(unittest.TestCase):
+    """Every screen used to cost two Telegram entity lookups and a full re-aggregation,
+    which is what made the menu feel slow. These pin the fix."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        bot_listener._CABINET_CHAT_REF_CACHE.clear()
+        bot_listener._CABINET_CONTEXT_CACHE.clear()
+        self.addCleanup(bot_listener._CABINET_CHAT_REF_CACHE.clear)
+        self.addCleanup(bot_listener._CABINET_CONTEXT_CACHE.clear)
+
+    def _render(self, action, resolutions, contexts):
+        async def fake_chat_id(client, entry, cache, log=print):
+            resolutions.append(entry)
+            return -1001234567890
+
+        async def fake_resolve(client, entry):
+            resolutions.append(entry)
+            return type("E", (), {"username": "testchat"})()
+
+        async def fake_context(telethon_client, entry, tz, from_user, log=print):
+            contexts.append(entry)
+            return _user(), 5_000, 3, 190, 4, 5_000
+
+        with patch("bot_listener._resolve_chat_id", fake_chat_id), \
+             patch("bot_listener.resolve_chat", fake_resolve), \
+             patch("bot_listener._cabinet_context", fake_context):
+            return asyncio.run(
+                bot_listener._render_cabinet_section(
+                    None, FakeAPI(), None, "chat", None, action, "",
+                    {"id": 20, "username": "user"}, 999, log=lambda *_: None,
+                )
+            )
+
+    def test_screens_without_links_never_touch_telegram(self):
+        for action in ("main", "shop", "title", "send", "badges"):
+            with self.subTest(action=action):
+                resolutions = []
+                self._render(action, resolutions, [])
+                self.assertEqual(resolutions, [], f"{action} resolved a chat entity")
+
+    def test_link_screens_resolve_once_then_reuse_the_cache(self):
+        resolutions = []
+        self._render("works", resolutions, [])
+        first = len(resolutions)
+        self.assertGreater(first, 0)
+
+        self._render("works", resolutions, [])
+        self._render("stats", resolutions, [])
+        self.assertEqual(len(resolutions), first, "chat ref was resolved more than once")
+
+    def test_a_failed_resolution_is_not_cached_permanently(self):
+        async def failing_chat_id(client, entry, cache, log=print):
+            return None
+
+        async def failing_resolve(client, entry):
+            raise RuntimeError("telegram down")
+
+        with patch("bot_listener._resolve_chat_id", failing_chat_id), \
+             patch("bot_listener.resolve_chat", failing_resolve):
+            asyncio.run(bot_listener._cabinet_chat_ref(None, "chat", {}, log=lambda *_: None))
+
+        self.assertNotIn("chat", bot_listener._CABINET_CHAT_REF_CACHE)
+
+    def test_context_is_reused_across_rapid_navigation(self):
+        calls = []
+
+        async def counting_resolve(*args, **kwargs):
+            calls.append(1)
+            return _user(), 3, 190, 5_000, 4, 5_000
+
+        with patch("stats.resolve_stat_target", counting_resolve):
+            for _ in range(5):
+                asyncio.run(
+                    bot_listener._cabinet_context(
+                        None, "chat", None, {"id": 20, "username": "user"}, log=lambda *_: None
+                    )
+                )
+
+        self.assertEqual(len(calls), 1, "the heavy aggregate ran more than once")
+
+    def test_different_members_do_not_share_a_cached_context(self):
+        calls = []
+
+        async def counting_resolve(*args, **kwargs):
+            calls.append(1)
+            return _user(), 3, 190, 5_000, 4, 5_000
+
+        with patch("stats.resolve_stat_target", counting_resolve):
+            for user_id in (20, 21):
+                asyncio.run(
+                    bot_listener._cabinet_context(
+                        None, "chat", None, {"id": user_id, "username": "user"},
+                        log=lambda *_: None,
+                    )
+                )
+
+        self.assertEqual(len(calls), 2)
+
+    def test_a_purchase_is_visible_immediately_despite_the_cached_context(self):
+        # Balances are deliberately read from the ledger by each view, never cached with
+        # the context -- otherwise buying something would appear to do nothing for 45s.
+        user = _user()
+        before, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
+        economy.purchase("chat", user.user_id, 5_000, economy.find_item("title"))
+        after, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
+
+        self.assertIn("🪙 Монеты: 500", before)
+        self.assertIn("🪙 Монеты: 100", after)
+
+
+class MenuRegistrationTests(unittest.TestCase):
+    def test_every_advertised_dm_command_resolves_to_a_chat_in_a_dm(self):
+        """A published menu must not contain commands that do nothing where they are
+        published. _match_allowed_chat never matches a DM, so without the home-chat
+        fallback these would all be silent no-ops."""
+        private = {"type": "private", "id": 999}
+        self.assertEqual(bot_listener._stats_entry_for(private, None, "mychat"), "mychat")
+        # A group still reads its own stats, never the home chat's.
+        group = {"type": "supergroup", "id": -100123}
+        self.assertEqual(bot_listener._stats_entry_for(group, "othergroup", "mychat"), "othergroup")
+        # An untracked group resolves to nothing at all, as before.
+        self.assertIsNone(bot_listener._stats_entry_for(group, None, "mychat"))
+
+    def test_every_published_command_name_is_one_telegram_accepts(self):
+        """Telegram rejects anything outside [a-z0-9_]{1,32} -- "/top all" simply cannot
+        be a menu entry, which is why the aliases are spelled without a space."""
+        import re
+
+        allowed = re.compile(r"^[a-z0-9_]{1,32}$")
+        for command in bot_listener.PRIVATE_CHAT_COMMANDS + bot_listener.GROUP_CHAT_COMMANDS:
+            with self.subTest(command=command["command"]):
+                self.assertRegex(command["command"], allowed)
+                self.assertTrue(command["description"].strip())
+
+    def test_the_group_menu_drops_cabinet_and_offers_the_top_aliases(self):
+        group = {c["command"]: c["description"] for c in bot_listener.GROUP_CHAT_COMMANDS}
+        # /cabinet only works in a DM, so a group button for it would just say "напиши в личку".
+        self.assertNotIn("cabinet", group)
+        self.assertEqual(group.get("topall"), "Рейтинг чата")
+        self.assertIn("toppokras", group)
+        # It is still offered in the DM, where it does work.
+        self.assertIn("cabinet", {c["command"] for c in bot_listener.PRIVATE_CHAT_COMMANDS})
+
+    def test_top_arguments_resolve_the_same_spaced_or_not(self):
+        self.assertEqual(stats.parse_top_argument("all"), "all")
+        self.assertEqual(stats.parse_top_argument("week"), "week")
+        # "/top" bare, and anything unrecognised, still means today.
+        self.assertEqual(stats.parse_top_argument(""), "today")
+        self.assertEqual(stats.parse_top_argument("@someone"), "today")
+        # "/toppokras" and "/top pokras" both reach the procrastinator list.
+        self.assertTrue(stats.is_procrastinator_command("pokras"))
+        self.assertTrue(stats.is_procrastinator_command("покрас"))
+
+    def test_admin_only_commands_are_not_advertised(self):
+        published = {
+            command["command"]
+            for command in bot_listener.PRIVATE_CHAT_COMMANDS + bot_listener.GROUP_CHAT_COMMANDS
+        }
+        self.assertFalse(published & {"badge", "weekwinner", "deletepokras"})
+        self.assertIn("cabinet", published)
+
+    def test_registration_survives_a_telegram_failure(self):
+        class FailingAPI:
+            async def set_my_commands(self, commands, scope=None):
+                raise bot_listener.ChatSummaryError("boom")
+
+        # The bot must still start without a menu rather than refusing to boot.
+        asyncio.run(bot_listener.register_bot_menu(FailingAPI(), log=lambda *_: None))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -50,24 +50,34 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(
             {badge.badge_id for badge in stats.earned_badges(user)},
             {
-                "painted_bronze",
+                "painted_2",  # 5 figurines is now the second step, not the first
                 "chat_voice",
                 "gallery",
-                "conversation",
                 "regular",
-                "streak_7",
-                "night_shift",
+                "streak_1",
+                "night_shift_1",
             },
         )
 
     def test_only_highest_painting_medal_is_shown(self):
-        bronze = stats.earned_badges(stats.UserStats(user_id="1", figurines_painted=1))
-        silver = stats.earned_badges(stats.UserStats(user_id="1", figurines_painted=10))
-        gold = stats.earned_badges(stats.UserStats(user_id="1", figurines_painted=50))
-
-        self.assertEqual([(badge.emoji, badge.name) for badge in bronze], [("🥉", "Я покрасил III")])
-        self.assertEqual([(badge.emoji, badge.name) for badge in silver], [("🥈", "Я покрасил II")])
-        self.assertEqual([(badge.emoji, badge.name) for badge in gold], [("🥇", "Я покрасил I")])
+        # Five steps, numbered ascending: 1 work -> "1", fifty -> "5". Exactly one shows.
+        expected = {
+            0: [],
+            1: [("🎨", "Я покрасил 1")],
+            4: [("🎨", "Я покрасил 1")],
+            5: [("🥉", "Я покрасил 2")],
+            10: [("🥈", "Я покрасил 3")],
+            24: [("🥈", "Я покрасил 3")],
+            25: [("🥇", "Я покрасил 4")],
+            50: [("💎", "Я покрасил 5")],
+            999: [("💎", "Я покрасил 5")],
+        }
+        for figurines, labels in expected.items():
+            with self.subTest(figurines=figurines):
+                badges = stats.earned_badges(
+                    stats.UserStats(user_id="1", figurines_painted=figurines)
+                )
+                self.assertEqual([(b.emoji, b.name) for b in badges], labels)
 
     def test_higher_message_badge_replaces_lower_tier(self):
         none = stats.earned_badges(stats.UserStats(user_id="1", messages=99))
@@ -102,9 +112,9 @@ class GamificationTests(unittest.TestCase):
             )
 
         expected = (
-            (7, 50, "streak_7", "Не остановить III", "night_shift", "Ночная смена III"),
-            (14, 250, "streak_14", "Не остановить II", "night_shift_250", "Ночная смена II"),
-            (30, 1_000, "streak_30", "Не остановить I", "night_shift_1000", "Ночная смена I"),
+            (7, 50, "streak_1", "Не остановить 1", "night_shift_1", "Ночная смена 1"),
+            (14, 250, "streak_2", "Не остановить 2", "night_shift_2", "Ночная смена 2"),
+            (30, 1_000, "streak_3", "Не остановить 3", "night_shift_3", "Ночная смена 3"),
         )
         for streak, night, streak_id, streak_name, night_id, night_name in expected:
             with self.subTest(streak=streak, night=night):
@@ -302,11 +312,14 @@ class GamificationTests(unittest.TestCase):
             custom_badges=[custom],
         )
 
-        self.assertIn("⭐ XP: 1.234", text)
-        self.assertIn("🪙 Монеты: 123", text)
-        self.assertIn("🧩 Уровень: 🩶 Серый новичок", text)
+        # XP and coins share one line now.
+        self.assertIn("⭐️ XP: 1.234 🪙 Монеты: 123", text)
+        # Chat level moves on XP alone; the painting rank is its own separate track.
+        self.assertIn("🧩 Уровень: 🗣️ Голос чата 11", text)
+        self.assertIn("🎨 Звание: 🩶 Серый новичок", text)
         self.assertNotIn("До уровня", text)
-        self.assertLess(text.index("🏅 Значки:"), text.index("🎨 Все работы"))
+        # A hand-made badge goes in its own block, above the works list.
+        self.assertLess(text.index("✨ Уникальные значки:"), text.index("🎨 Все работы"))
         self.assertIn("🏹 Лучник", text)
         self.assertIn('<a href="https://t.me/example/1">1</a>', text)
 
@@ -333,16 +346,107 @@ class GamificationTests(unittest.TestCase):
             custom_badges=custom,
         )
 
-        self.assertIn("Имя: Tester\n\n⭐ XP:", text)
-        self.assertIn("Место в рейтинге: 1 из 1\n\nФигурок:", text)
+        # The name is the header; there is no separate "Имя:" line.
+        self.assertIn("📊 Статистика Tester:\n\n⭐️ XP:", text)
+        self.assertNotIn("Имя:", text)
+        self.assertIn("Пока тихо)\n\nФигурок:", text)
         self.assertNotIn("Последняя активность:", text)
         self.assertIn(
-            "🏅 Значки:\n"
+            "✨ Уникальные значки:\n"
             "🏹 Лучник  │  🎯 Меткий глаз\n"
             "🛡️ Защитник  │  🧙 Волшебник\n"
             "🐉 Дракон",
             text,
         )
+
+    def test_stat_shows_work_names_but_keeps_the_numbers(self):
+        user = stats.UserStats(user_id="1", display_name="T", figurines_painted=3)
+        links = [f"https://t.me/example/{n}" for n in (105, 104, 103)]
+
+        text = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0,
+            figurine_links=links, work_names=[None, "Дредноут", None],
+        )
+
+        self.assertIn(">2. Дредноут</a>", text)
+        # The number must survive: /deletepokras takes it as its argument, so an
+        # administrator needs something to point at.
+        self.assertIn(">1</a>", text)
+        self.assertIn(">3</a>", text)
+
+    def test_work_names_are_escaped_and_a_short_list_is_tolerated(self):
+        user = stats.UserStats(user_id="1", display_name="T", figurines_painted=2)
+        links = ["https://t.me/example/105", "https://t.me/example/104"]
+
+        # Fewer names than links must not raise -- the two lists are built from the same
+        # source, but a stale cache could briefly disagree.
+        text = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0,
+            figurine_links=links, work_names=["<b>hax</b>"],
+        )
+
+        self.assertNotIn("<b>hax", text)
+        self.assertIn("&lt;b&gt;hax", text)
+        self.assertIn(">2</a>", text)
+
+    def test_work_name_list_lines_up_with_the_links(self):
+        user = stats.UserStats(
+            user_id="1",
+            recent_figurine_posts=[["t3", 105], ["t2", 104], ["t1", 103]],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.set_work_name("chat", "1", 104, "Дредноут")
+                labels = stats.work_name_list("chat", user)
+
+        self.assertEqual(labels, [None, "Дредноут", None])
+
+    def test_unique_badges_lead_and_earned_ones_follow(self):
+        user = stats.UserStats(user_id="1", display_name="Tester", messages=1_000)
+        unique = stats.Badge("custom", "🏹", "Лучник", custom=True)
+        # Assigned by an administrator, but won -- it belongs with the earned ones.
+        won = stats.Badge("weekly_contest_winner", "🏆", "Победитель ×1")
+
+        text = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0, custom_badges=[unique, won]
+        )
+
+        self.assertLess(text.index("✨ Уникальные значки:"), text.index("🏅 Значки:"))
+        self.assertLess(text.index("🏹 Лучник"), text.index("🏅 Значки:"))
+        self.assertGreater(text.index("🏆 Победитель ×1"), text.index("🏅 Значки:"))
+
+    def test_the_no_badges_notice_only_shows_when_there_are_truly_none(self):
+        blank = stats.format_stat(
+            stats.UserStats(user_id="1", display_name="T"), rank=1, total=1, xp=0, streak=0
+        )
+        self.assertIn("🏅 Значки: пока нет", blank)
+
+        # A unique badge alone must not read as "no badges yet".
+        unique = stats.Badge("custom", "🏹", "Лучник", custom=True)
+        only_unique = stats.format_stat(
+            stats.UserStats(user_id="1", display_name="T"),
+            rank=1, total=1, xp=0, streak=0, custom_badges=[unique],
+        )
+        self.assertNotIn("пока нет", only_unique)
+        self.assertIn("✨ Уникальные значки:", only_unique)
+
+    def test_the_cabinet_link_is_last_and_omitted_without_a_bot(self):
+        user = stats.UserStats(user_id="1", display_name="Tester", figurines_painted=1)
+
+        linked = stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0,
+            figurine_links=["https://t.me/example/1"], bot_username="Trash_Modelist",
+        )
+        self.assertIn("t.me/Trash_Modelist?start=cabinet", linked)
+        # Truly last, below even the works list.
+        self.assertGreater(linked.index("Открыть личный кабинет"), linked.index("🎨 Все работы"))
+        self.assertTrue(linked.rstrip().endswith("</a>"))
+
+        # listener.py's own /stat only runs when no bot is configured, and then there is
+        # no cabinet to link to at all.
+        self.assertNotIn("Открыть личный кабинет", stats.format_stat(
+            user, rank=1, total=1, xp=0, streak=0
+        ))
 
     def test_every_tracked_figurine_post_gets_a_link(self):
         user = stats.UserStats(
@@ -421,7 +525,7 @@ class GamificationTests(unittest.TestCase):
             custom_badges=[custom],
         )
 
-        self.assertIn("Имя: &lt;Painter &amp; Friend&gt;", text)
+        self.assertIn("📊 Статистика &lt;Painter &amp; Friend&gt;:", text)
         self.assertIn("🏹 A &lt; B &amp; C", text)
 
     def test_stat_hides_next_level_requirements(self):
@@ -465,27 +569,42 @@ class GamificationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
+                # First sighting only baselines -- a deployment must never announce a
+                # chat's entire back catalogue of levels.
                 self.assertEqual(stats.record_level_observations("chat", [(user, 0)]), [])
 
-                user.figurines_painted = 2
-                self.assertEqual(stats.record_level_observations("chat", [(user, 2_500)]), [])
-
-                user.figurines_painted = 3
-                first = stats.record_level_observations("chat", [(user, 2_500)])
+                # The chat level moves on XP alone, but is deliberately NOT announced.
+                chat_promotion = stats.record_level_observations("chat", [(user, 2_500)])
                 repeated = stats.record_level_observations("chat", [(user, 2_500)])
 
-                user.figurines_painted = 5
-                second = stats.record_level_observations("chat", [(user, 5_000)])
+                # ...and the painting rank moves on figurines alone, independently.
+                user.figurines_painted = 3
+                painter_promotion = stats.record_level_observations("chat", [(user, 2_500)])
 
-        self.assertEqual(
-            first,
-            ["@user получил новый уровень «⚪ Ученик грунта»! 🎉🎊🥳"],
-        )
+        self.assertEqual(chat_promotion, [])
         self.assertEqual(repeated, [])
         self.assertEqual(
-            second,
-            ["@user получил новый уровень «🖌️ Подмастерье кисти»! 🎉🎊🥳"],
+            painter_promotion,
+            ["@user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳"],
         )
+
+    def test_retired_level_state_is_rebaselined_instead_of_re_announced(self):
+        user = stats.UserStats(user_id="20", username="user", display_name="User")
+        # What a pre-split deployment left on disk: a watermark from a ladder that no
+        # longer exists. Comparing new track positions against it would fire a promotion
+        # for effectively every member at once.
+        stale = {
+            "version": 1,
+            "users": {"20": {"minimum_xp": 2_500, "level_name": "Ученик грунта"}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats._write_json_atomic(stats._level_state_path("chat"), stale)
+                first = stats.record_level_observations("chat", [(user, 30_000)])
+                second = stats.record_level_observations("chat", [(user, 30_000)])
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
 
     def test_custom_badges_persist_and_duplicate_awards_are_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -680,7 +799,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     consumed = await bot_listener.handle_badge_text_input(
                         api,
@@ -701,7 +820,23 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                     [item.label for item in stats.custom_badges_for_user("chat", target["id"])],
                     ["🎯 Меткий глаз"],
                 )
-                self.assertIn("получает значок 🎯 Меткий глаз", api.sent[-1][0]["text"])
+                sent = [call[0] for call in api.sent]
+                # The admin gets a confirmation in the DM...
+                self.assertTrue(
+                    any(
+                        "получает значок 🎯 Меткий глаз" in message["text"]
+                        and message["chat"]["id"] == command["chat"]["id"]
+                        for message in sent
+                    ),
+                    sent,
+                )
+                # ...and the group is told, naming the recipient by @username.
+                announcement = next(
+                    message for message in sent
+                    if "получил уникальный значок" in message["text"]
+                )
+                self.assertEqual(announcement["text"], "@user получил уникальный значок: 🎯 Меткий глаз")
+                self.assertNotEqual(announcement["chat"]["id"], command["chat"]["id"])
 
     async def test_admin_can_record_numbered_weekly_winner_in_bot_dm(self):
         api = FakeBotAPI()
@@ -721,7 +856,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     await bot_listener.handle_week_winner_command(
                         api,
@@ -772,7 +907,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     await bot_listener.handle_week_winner_command(
                         api,
@@ -814,7 +949,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
                 ):
                     await bot_listener.handle_delete_pokras_command(
                         api,

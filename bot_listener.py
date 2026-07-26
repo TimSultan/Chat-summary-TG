@@ -54,11 +54,14 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 from telethon import utils as tl_utils
 
+import cabinet
 import chat_profile
+import economy
 import history
 import stats
 from bot_api import TelegramBotAPI
 from config import build_session, load_config
+from critique import critique_work
 from errors import ChatSummaryError
 from followup import generate_direct_reply
 from intent import resolve_name_hint
@@ -85,6 +88,7 @@ from listener import (
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
 from roast import roast_person
+import tree
 from telegram_fetch import (
     fetch_range_messages_cached,
     fetch_recent_messages_fresh,
@@ -115,13 +119,58 @@ BADGE_CALLBACK_PREFIX = "badge"
 BADGE_FLOW_TTL_SECONDS = 10 * 60
 BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
 BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
+BADGE_REVOKE_BUTTON_TEXT = "➖ Забрать у участника"
+BADGE_DELETE_BUTTON_TEXT = "🗑 Удалить значок совсем"
 WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
+BADGE_ADMIN_COMMAND = "/badgeadmin"
+REPLANT_COMMAND = "/replant"
 
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
 # Usernames are compared case-insensitively and without a leading @.
 PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
+
+
+SHOP_COMMANDS = ("/shop", "/buy", "/coins")
+
+CABINET_COMMAND = "/cabinet"
+
+# Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
+# -- the point being that nobody has to know a command exists in order to use the bot.
+# Deliberately excludes the admin-only DM commands (/badge, /weekwinner, /deletepokras):
+# advertising them to all 190 members would invite a wave of "нужны права администратора".
+PRIVATE_CHAT_COMMANDS = (
+    {"command": "cabinet", "description": "Личный кабинет"},
+    {"command": "stat", "description": "Моя статистика"},
+    {"command": "top", "description": "Рейтинг чата"},
+    {"command": "shop", "description": "Магазин"},
+    {"command": "coins", "description": "Мой баланс"},
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
+)
+# Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
+# and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
+# be a button that answers "напиши мне в личку".
+#
+# "/topall" and "/toppokras" are spelled without a space because Telegram only accepts
+# [a-z0-9_] in a registered command name: "/top all" cannot be a menu entry at all. Both
+# spellings work when typed (see parse_top_argument).
+GROUP_CHAT_COMMANDS = (
+    {"command": "stat", "description": "Статистика участника"},
+    {"command": "topall", "description": "Рейтинг чата"},
+    {"command": "toppokras", "description": "Топ прокрастинаторов"},
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
+)
+
+# An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
+# cooldown only stops a burst of messages producing a wall of identical menus; set it to
+# 0 to answer literally every message.
+MENU_FALLBACK_COOLDOWN_SECONDS = 60
+# Same ten-minute window the badge flows use: only the two force-reply steps (setting a
+# title, sending coins) need server-side state at all -- every button in the cabinet
+# carries its own owner id, so navigation itself survives a restart.
+CABINET_FLOW_TTL_SECONDS = 10 * 60
+CABINET_DM_ONLY_NOTICE = "Личный кабинет работает в личке с ботом: напиши мне /cabinet."
 
 
 def _display_name(user: dict | None) -> str:
@@ -134,6 +183,8 @@ def _display_name(user: dict | None) -> str:
     if user.get("username"):
         return f"@{user['username']}"
     return f"id{user.get('id')}"
+
+
 
 
 def _badge_callback_data(action: str, flow_id: str, badge_id: str | None = None) -> str:
@@ -175,8 +226,31 @@ async def _is_chat_admin(api: TelegramBotAPI, chat_id: int, user_id: int) -> boo
     return any((member.get("user") or {}).get("id") == user_id for member in administrators)
 
 
-async def _can_manage_chat(api: TelegramBotAPI, chat_id: int, user: dict | None) -> bool:
-    """Group administrators plus explicitly delegated usernames can manage via DM."""
+async def _can_manage_chat(
+    api: TelegramBotAPI, chat_id: int, user: dict | None, entry: str | None = None
+) -> bool:
+    """Who may create and award custom badges from a DM.
+
+    Three routes: a Telegram administrator of the home chat, a hardcoded delegate
+    (PRIVILEGED_MANAGEMENT_USERNAMES), or somebody an administrator delegated at runtime
+    with /badgeadmin (stats.is_badge_manager). The last one is checked first because it
+    is a local file read, while the admin check is a Telegram round trip.
+    """
+    user = user or {}
+    user_id = user.get("id")
+    if entry and user_id and stats.is_badge_manager(entry, user_id):
+        return True
+    username = (user.get("username") or "").strip().lstrip("@").lower()
+    if username in PRIVILEGED_MANAGEMENT_USERNAMES:
+        return True
+    return bool(user_id and await _is_chat_admin(api, chat_id, user_id))
+
+
+async def _is_chat_admin_or_privileged(
+    api: TelegramBotAPI, chat_id: int, user: dict | None
+) -> bool:
+    """Who may DELEGATE badge management. Deliberately excludes the delegates themselves:
+    a badge manager can hand out badges, not hand out the right to hand out badges."""
     user = user or {}
     username = (user.get("username") or "").strip().lstrip("@").lower()
     if username in PRIVILEGED_MANAGEMENT_USERNAMES:
@@ -209,7 +283,7 @@ async def handle_badge_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin, entry):
         await api.send_message(
             dm_chat_id,
             "Создавать и выдавать значки могут только администраторы чата.",
@@ -238,6 +312,8 @@ async def handle_badge_command(
             "inline_keyboard": [
                 [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
                 [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
+                [{"text": BADGE_REVOKE_BUTTON_TEXT, "callback_data": _badge_callback_data("revlist", flow_id)}],
+                [{"text": BADGE_DELETE_BUTTON_TEXT, "callback_data": _badge_callback_data("dellist", flow_id)}],
             ]
         },
         parse_mode=None,
@@ -250,6 +326,7 @@ async def _award_badge_from_flow(
     badge_id: str,
     target: dict,
     reply_to_message_id: int | None,
+    log=print,
 ) -> None:
     badge, newly_awarded = stats.give_custom_badge(
         flow["entry"],
@@ -269,6 +346,36 @@ async def _award_badge_from_flow(
         reply_to_message_id=reply_to_message_id,
         parse_mode=None,
     )
+    if newly_awarded:
+        await _announce_badge_in_chat(api, flow.get("admin_chat_id"), badge, target, log=log)
+
+
+async def _announce_badge_in_chat(
+    api: TelegramBotAPI, chat_id, badge, target: dict, log=print
+) -> None:
+    """Tell the group somebody was given a unique badge.
+
+    Only on a genuinely NEW award -- give_custom_badge is idempotent, and re-running it
+    must not post the same announcement again. Best-effort: the badge is already
+    recorded by the time this runs, so a failed send costs the announcement, never the
+    badge.
+
+    Sent as plain text with the @username inline rather than an HTML mention: a display
+    name is user-controlled and would have to be escaped, and a plain @username is what
+    actually notifies the person.
+    """
+    if chat_id is None:
+        return
+    username = (target.get("username") or "").lstrip("@")
+    who = f"@{username}" if username else target.get("display_name", "Участник")
+    try:
+        await api.send_message(
+            chat_id,
+            f"{who} получил уникальный значок: {badge.label}",
+            parse_mode=None,
+        )
+    except Exception:
+        log(f"[bot_listener] failed to announce a badge in the chat:\n{traceback.format_exc()}")
 
 
 async def handle_badge_callback(
@@ -288,7 +395,7 @@ async def handle_badge_callback(
     if flow is None:
         await api.answer_callback_query(callback_id, "Меню устарело или принадлежит другому администратору.")
         return
-    if not await _can_manage_chat(api, flow["admin_chat_id"], actor):
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         await api.answer_callback_query(callback_id, "Нужны права администратора.")
         return
 
@@ -330,7 +437,9 @@ async def handle_badge_callback(
 
     if action == "give" and badge_id:
         if flow["target"]:
-            await _award_badge_from_flow(api, flow, badge_id, flow["target"], message.get("message_id"))
+            await _award_badge_from_flow(
+                api, flow, badge_id, flow["target"], message.get("message_id")
+            )
             badge_flows.pop(flow_id, None)
         else:
             flow["selected_badge_id"] = badge_id
@@ -344,6 +453,83 @@ async def handle_badge_callback(
                 parse_mode=None,
             )
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+        return
+
+    # Pick a badge, for either of the two destructive actions.
+    if action in ("dellist", "revlist"):
+        badges = stats.list_custom_badges(flow["entry"])
+        if not badges:
+            await api.send_message(
+                flow["chat_id"], "Пока нет пользовательских значков.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+            return
+        next_action = "del" if action == "dellist" else "rev"
+        prompt_text = (
+            "Какой значок удалить совсем?" if action == "dellist"
+            else "Какой значок забрать у участника?"
+        )
+        await api.send_message(
+            flow["chat_id"], prompt_text,
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"inline_keyboard": [
+                [{"text": badge.label,
+                  "callback_data": _badge_callback_data(next_action, flow_id, badge.badge_id)}]
+                for badge in badges
+            ]},
+            parse_mode=None,
+        )
+        return
+
+    if action == "del" and badge_id:
+        # Deleting a definition takes the badge away from everybody holding it, so the
+        # count is spelled out before the second tap rather than discovered afterwards.
+        badge = next(
+            (item for item in stats.list_custom_badges(flow["entry"]) if item.badge_id == badge_id),
+            None,
+        )
+        if badge is None:
+            await api.send_message(
+                flow["chat_id"], "Этот значок уже удалён.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+            return
+        holders = stats.custom_badge_holder_count(flow["entry"], badge_id)
+        note = f"\nСейчас он есть у {holders} чел. — у них он тоже пропадёт." if holders else ""
+        await api.send_message(
+            flow["chat_id"],
+            f"Удалить значок {badge.label} совсем?{note}\nОтменить будет нельзя.",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"inline_keyboard": [
+                [{"text": "🗑 Да, удалить",
+                  "callback_data": _badge_callback_data("delok", flow_id, badge_id)}],
+            ]},
+            parse_mode=None,
+        )
+        return
+
+    if action == "delok" and badge_id:
+        deleted = stats.delete_custom_badge(flow["entry"], badge_id)
+        await api.send_message(
+            flow["chat_id"],
+            f"Значок {deleted.label} удалён." if deleted else "Этот значок уже удалён.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        badge_flows.pop(flow_id, None)
+        return
+
+    if action == "rev" and badge_id:
+        flow["selected_badge_id"] = badge_id
+        flow["awaiting"] = "revoke_target"
+        prompt = await api.send_message(
+            flow["chat_id"],
+            "Ответьте на это сообщение именем или @username участника, у которого забрать значок.",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+        return
 
 
 async def handle_badge_text_input(
@@ -365,7 +551,7 @@ async def handle_badge_text_input(
             for flow_id, flow in badge_flows.items()
             if flow.get("chat_id") == chat_id
             and flow.get("admin_id") == actor_id
-            and flow.get("awaiting") in ("create_spec", "target")
+            and flow.get("awaiting") in ("create_spec", "target", "revoke_target")
             and flow.get("prompt_message_id") == replied_message_id
             and time.monotonic() - flow["created_at"] <= BADGE_FLOW_TTL_SECONDS
         ),
@@ -381,7 +567,7 @@ async def handle_badge_text_input(
             chat_id, "Действие отменено.", reply_to_message_id=message["message_id"], parse_mode=None
         )
         return True
-    if not await _can_manage_chat(api, flow["admin_chat_id"], actor):
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         badge_flows.pop(flow_id, None)
         return True
 
@@ -410,8 +596,37 @@ async def handle_badge_text_input(
         )
         return True
 
+    if flow["awaiting"] == "revoke_target":
+        target, _, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client, flow["entry"], flow["entry"], text, None, "", tz, log=log
+        )
+        if target is None:
+            prompt = await api.send_message(
+                chat_id,
+                "Участник не найден в статистике. Попробуйте точный @username.",
+                reply_to_message_id=message["message_id"],
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+            flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+            return True
+        badge_flows.pop(flow_id, None)
+        revoked = stats.revoke_custom_badge(
+            flow["entry"], flow["selected_badge_id"], target.user_id
+        )
+        # Deliberately NOT announced in the group: an award is good news worth sharing,
+        # having one taken away is not something to publish about somebody.
+        await api.send_message(
+            chat_id,
+            f"Забрал значок {revoked.label} у {target.display_name}." if revoked
+            else f"У {target.display_name} нет этого значка.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return True
+
     try:
-        target, _, _, _, _ = await stats.resolve_stat_target(
+        target, _, _, _, _, _ = await stats.resolve_stat_target(
             telethon_client,
             flow["entry"],
             flow["entry"],
@@ -427,7 +642,8 @@ async def handle_badge_text_input(
             api,
             flow,
             flow["selected_badge_id"],
-            {"user_id": target.user_id, "display_name": target.display_name},
+            {"user_id": target.user_id, "display_name": target.display_name,
+             "username": target.username},
             message["message_id"],
         )
         badge_flows.pop(flow_id, None)
@@ -468,7 +684,7 @@ async def handle_week_winner_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin, entry):
         await api.send_message(
             dm_chat_id,
             "Назначать победителя могут только администраторы чата.",
@@ -488,7 +704,7 @@ async def handle_week_winner_command(
         return
     contest_week = int(parts[1])
 
-    tracked, _, _, _, _ = await stats.resolve_stat_target(
+    tracked, _, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client,
         entry,
         entry,
@@ -499,7 +715,8 @@ async def handle_week_winner_command(
         log=log,
     )
     target = (
-        {"user_id": tracked.user_id, "display_name": tracked.display_name}
+        {"user_id": tracked.user_id, "display_name": tracked.display_name,
+         "username": tracked.username}
         if tracked
         else None
     )
@@ -566,7 +783,7 @@ async def handle_delete_pokras_command(
             parse_mode=None,
         )
         return
-    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin):
+    if not admin_id or not await _can_manage_chat(api, admin_chat_id, admin, entry):
         await api.send_message(
             dm_chat_id,
             "Удалять покрасы из статистики могут только администраторы чата.",
@@ -585,7 +802,7 @@ async def handle_delete_pokras_command(
         )
         return
     work_number = int(parts[2])
-    tracked, _, _, _, _ = await stats.resolve_stat_target(
+    tracked, _, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client,
         entry,
         entry,
@@ -644,6 +861,151 @@ async def handle_delete_pokras_command(
         f"Фигурок осталось: {remaining}. Номера оставшихся работ обновились.",
         reply_to_message_id=message["message_id"],
         parse_mode=None,
+    )
+
+
+async def handle_replant_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    tz,
+    log=print,
+) -> None:
+    """/replant — post the planting announcement to the chat and start the tree over.
+
+    Exists because the planting date lives in the stats directory, which on a deployed
+    host is a volume nothing else here can reach: without a command there is no way to
+    re-run the opening post at all.
+
+    Both halves happen together on purpose. Re-posting "сегодня мы посадили семечко"
+    while the tree is already a metre tall would be a lie, and re-planting without
+    posting would silently reset the chat's progress with no announcement.
+
+    The announcement is sent through the same path as the morning digest and, like it, is
+    never scheduled for deletion -- this is the post the whole thing opens with.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /replant:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Не настроен основной чат.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Пересадить дерево могут только администраторы чата.")
+        return
+
+    today = datetime.now(stats.tree_digest_tz()).date()
+    previous = stats.tree_planted_on(entry)
+    try:
+        await api.send_message(admin_chat_id, tree.format_planting_message(), parse_mode="HTML")
+    except Exception:
+        log(f"[bot_listener] failed to post the planting message:\n{traceback.format_exc()}")
+        await reply("Не удалось отправить сообщение в чат — дерево не тронул.")
+        return
+
+    # Only after the announcement actually landed: a reset with no post would leave the
+    # chat's progress silently zeroed.
+    stats.replant_tree(entry, today)
+    await reply(
+        f"Отправил в чат. Дерево посажено заново с {today.isoformat()}"
+        + (f" (было {previous.isoformat()})." if previous else ".")
+    )
+
+
+async def handle_badge_admin_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    tz,
+    log=print,
+) -> None:
+    """/badgeadmin — delegate custom-badge management to another member.
+
+        /badgeadmin                  list current delegates
+        /badgeadmin @username        grant
+        /badgeadmin - @username      revoke
+
+    Only chat administrators (and the hardcoded delegates) may run this: a delegate can
+    award badges, not appoint further delegates -- see _is_chat_admin_or_privileged.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /badgeadmin:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Не настроен основной чат.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Выдавать это право могут только администраторы чата.")
+        return
+
+    argument = command_text[len(BADGE_ADMIN_COMMAND):].strip()
+    if not argument:
+        managers = stats.list_badge_managers(entry)
+        if not managers:
+            await reply(
+                "Пока никому не выдано.\n"
+                f"Выдать: {BADGE_ADMIN_COMMAND} @username\n"
+                f"Забрать: {BADGE_ADMIN_COMMAND} - @username"
+            )
+            return
+        listed = "\n".join(
+            f"• {record.get('display_name') or record['user_id']}"
+            + (f" (@{record['username']})" if record.get("username") else "")
+            for record in managers
+        )
+        await reply(f"Могут выдавать значки:\n{listed}")
+        return
+
+    revoking = argument.startswith("-")
+    target_name = argument.lstrip("-").strip()
+    if not target_name:
+        await reply(f"Формат: {BADGE_ADMIN_COMMAND} - @username")
+        return
+
+    target, _, _, _, _, _ = await stats.resolve_stat_target(
+        telethon_client, entry, entry, target_name, None, "", tz, log=log
+    )
+    if target is None:
+        await reply("Не нашёл такого участника в статистике чата.")
+        return
+
+    if revoking:
+        removed = stats.revoke_badge_manager(entry, target.user_id)
+        await reply(
+            f"{target.display_name} больше не может выдавать значки."
+            if removed
+            else f"У {target.display_name} и так не было этого права."
+        )
+        return
+
+    granted = stats.grant_badge_manager(
+        entry, target.user_id, target.username, target.display_name,
+        actor.get("id"), _display_name(actor),
+    )
+    await reply(
+        f"{target.display_name} теперь может создавать и выдавать значки.\n"
+        "Кнопка появится у него в /cabinet."
+        if granted
+        else f"{target.display_name} уже мог это делать."
     )
 
 
@@ -830,6 +1192,754 @@ async def run_bot_roast(
     )
 
     await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
+
+
+async def _deliver_shop_item(
+    api, telethon_client, cfg, tz, entry, chat_ref, item, user, xp, requester, log,
+):
+    """Produce the thing a purchase actually bought.
+
+    Returns the reply text. Raising is the documented way to signal that delivery failed
+    -- handle_shop_command catches it and refunds, so a member is never charged for an
+    LLM call that errored or a work that turned out not to exist.
+    """
+    if item.code == "freeze":
+        held = economy.add_streak_freeze(entry, user.user_id)
+        return (
+            f"Заморозка куплена. В запасе: {held}.\n"
+            "Она сработает сама, когда ты пропустишь день -- серия не оборвётся."
+        )
+
+    if item.code == "roast":
+        end_date = datetime.now(tz).date()
+        start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
+        _, messages = await fetch_range_messages_cached(
+            client=telethon_client, chat_ref=chat_ref,
+            start_day=start_date, end_day=end_date, tz=tz, log=log,
+        )
+        own = [m for m in messages if str(m.sender_id) == str(user.user_id)]
+        if not own:
+            raise ChatSummaryError("no messages to roast")
+        own = own[-cfg.roast_max_messages :]
+        return await asyncio.to_thread(
+            roast_person,
+            api_key=cfg.openai_api_key, model=cfg.openai_model,
+            target_name=requester, lines=format_transcript_lines(own, include_date=True),
+        )
+
+    if item.code == "critique":
+        if not user.recent_figurine_posts:
+            raise ChatSummaryError("no tracked work to critique")
+        _, message_id = user.recent_figurine_posts[0]
+        source = await telethon_client.get_messages(chat_ref, ids=message_id)
+        if source is None:
+            raise ChatSummaryError("the tracked work is no longer available")
+        image_bytes = await telethon_client.download_media(source, file=bytes)
+        if not image_bytes:
+            raise ChatSummaryError("the tracked work has no downloadable image")
+        critique = await asyncio.to_thread(
+            critique_work,
+            api_key=cfg.openai_api_key, model=cfg.openai_model,
+            image_bytes=image_bytes, caption=getattr(source, "message", "") or "",
+        )
+        return f"🎨 Разбор твоей последней работы:\n\n{critique}"
+
+    raise ChatSummaryError(f"unknown shop item {item.code}")
+
+
+# A chat's id and @username never change while the process runs, but resolving them costs
+# a Telethon get_entity round trip each time. The cabinet re-renders on every button
+# press, so this is the difference between a menu that responds instantly and one that
+# waits on Telegram twice per tap.
+_CABINET_CHAT_REF_CACHE: dict[str, tuple] = {}
+
+# (entry, user_id) -> (deadline, context). resolve_stat_target re-reads every recorded
+# day file AND may refetch today's transcript; doing that again for each tap of a
+# six-button menu is what made the cabinet feel slow. Balances, titles and freezes are
+# deliberately NOT part of this -- every view reads those straight from the ledger -- so a
+# purchase still shows up immediately while navigation stays cheap.
+_CABINET_CONTEXT_CACHE: dict[tuple, tuple] = {}
+CABINET_CONTEXT_TTL_SECONDS = 45
+
+
+async def _cabinet_chat_ref(telethon_client, entry: str, known_chat_ids: dict, log=print):
+    """(chat_id, username) for building t.me links into the group from a DM."""
+    cached = _CABINET_CHAT_REF_CACHE.get(entry)
+    if cached is not None:
+        return cached
+    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+    username = None
+    try:
+        entity = await resolve_chat(telethon_client, entry)
+        username = getattr(entity, "username", None)
+    except Exception:
+        log(f"[bot_listener] could not resolve '{entry}' for cabinet links")
+    resolved = (chat_id, username)
+    # Only cache a usable answer, so a transient failure doesn't permanently break links.
+    if chat_id is not None or username:
+        _CABINET_CHAT_REF_CACHE[entry] = resolved
+    return resolved
+
+
+async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log=print):
+    """(user, xp, rank, total, streak, season_xp) for whoever is using the cabinet, or None.
+
+    Every cabinet view needs the same resolved identity, and resolve_stat_target is also
+    what applies any bought streak freeze, so this is the one place that call is made.
+
+    Cached for CABINET_CONTEXT_TTL_SECONDS per member: the underlying call re-reads every
+    recorded day file and can refetch today's transcript from Telegram, which is far too
+    much work to repeat for each tap of a menu. Skipping it also skips re-applying streak
+    freezes, which is harmless -- consume_streak_freeze is idempotent per day and runs
+    again on the next uncached read.
+    """
+    cache_key = (entry, from_user.get("id"))
+    cached = _CABINET_CONTEXT_CACHE.get(cache_key)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+
+    user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
+        telethon_client, entry, entry, "",
+        from_user.get("username"), _display_name(from_user), tz, log=log,
+        frozen_days_for=economy.streak_freeze_lookup(entry),
+    )
+    if user is None:
+        return None
+    context = (user, xp, rank, total, streak, season_xp)
+    _CABINET_CONTEXT_CACHE[cache_key] = (time.monotonic() + CABINET_CONTEXT_TTL_SECONDS, context)
+    return context
+
+
+async def _render_cabinet_section(
+    telethon_client, api, cfg, entry, tz, action, argument, from_user, chat_id,
+    known_chat_ids: dict | None = None, log=print,
+) -> tuple[str, dict] | None:
+    """Build one cabinet screen. Returns None when the member isn't tracked yet."""
+    context = await _cabinet_context(telethon_client, entry, tz, from_user, log=log)
+    if context is None:
+        return None
+    user, xp, rank, total, streak, season_xp = context
+
+    async def links():
+        """Resolved lazily and only by the two screens that show links -- every other
+        screen used to pay for two Telegram entity lookups it never read."""
+        home_chat_id, home_username = await _cabinet_chat_ref(
+            telethon_client, entry, known_chat_ids if known_chat_ids is not None else {}, log=log
+        )
+        figurines = stats.figurine_message_links(home_username, home_chat_id, user)
+        best, workplace = stats.showcase_message_links(home_username, home_chat_id, user)
+        return figurines, best, workplace
+
+    def badges():
+        return (
+            stats.custom_badges_for_user(entry, user.user_id)
+            + stats.weekly_winner_badges_for_user(entry, user.user_id)
+        )
+
+    if action == "stats":
+        figurines, best, workplace = await links()
+        return cabinet.stats_view(
+            entry, user, xp, rank, total, streak, figurines, badges(), best, workplace,
+            season_xp=season_xp,
+        )
+    if action == "shop":
+        return cabinet.shop_view(entry, user, xp)
+    if action == "works":
+        figurines, best, workplace = await links()
+        return cabinet.works_view(entry, user, figurines, best, workplace)
+    if action == "badges":
+        return cabinet.badges_view(
+            entry, user, badges(),
+            chat_custom_badge_total=len(stats.list_custom_badges(entry)),
+        )
+    if action == "title":
+        return cabinet.title_view(entry, user, xp)
+    if action == "buy":
+        return await _cabinet_buy(
+            api, telethon_client, cfg, entry, tz, user, xp, argument, from_user, chat_id, log=log
+        )
+    return cabinet.main_view(
+        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+    )
+
+
+async def _cabinet_buy(
+    api, telethon_client, cfg, entry, tz, user, xp, code, from_user, chat_id, log=print,
+) -> tuple[str, dict]:
+    """Purchase from a shop button, then re-render the shop with the outcome on top.
+
+    The title is not bought here: it needs text back from the member first, so its button
+    opens a force-reply step instead and only debits once that arrives.
+    """
+    item = economy.find_item(code)
+    if item is None:
+        return cabinet.shop_view(entry, user, xp, notice="Не знаю такой товар.")
+    if item.code == "title":
+        return cabinet.title_view(entry, user, xp)
+
+    ok, refusal, remaining = economy.purchase(entry, user.user_id, xp, item)
+    if not ok:
+        return cabinet.shop_view(entry, user, xp, notice=f"❌ {refusal}")
+
+    try:
+        delivered = await _deliver_shop_item(
+            api, telethon_client, cfg, tz, entry, entry, item, user, xp,
+            _display_name(from_user), log,
+        )
+    except Exception:
+        log(f"[bot_listener] cabinet delivery failed for {item.code}:\n{traceback.format_exc()}")
+        restored = economy.refund(entry, user.user_id, xp, item.price, item.code)
+        return cabinet.shop_view(
+            entry, user, xp,
+            notice=f"❌ Не получилось выдать «{item.name}» — монеты вернул. Баланс: {restored}.",
+        )
+
+    return cabinet.result_view(
+        user.user_id, f"{delivered}\n\n🪙 Осталось: {remaining}."
+    )
+
+
+def _shows_badge_admin_button(entry: str | None, user_id, username: str | None) -> bool:
+    """Whether to draw the delegate button. Deliberately does NOT call Telegram to check
+    chat-admin status: this runs on every cabinet render, and administrators already know
+    about /badge. The button only decides what is DRAWN -- handle_cabinet_callback
+    re-verifies with the full check before acting on it."""
+    if not entry:
+        return False
+    if (username or "").strip().lstrip("@").lower() in PRIVILEGED_MANAGEMENT_USERNAMES:
+        return True
+    return stats.is_badge_manager(entry, user_id)
+
+
+def _stats_entry_for(chat: dict, matched_entry: str | None, home_chat_ref: str | None) -> str | None:
+    """Which tracked chat a stats/wallet command should read.
+
+    In a group that is the group itself. In a DM there is no tracked chat to match --
+    _match_allowed_chat deliberately never matches a private chat -- so it falls back to
+    the single configured home chat, exactly as /cabinet and the summary pipeline already
+    do. Without this, every command in the DM menu below would either answer
+    "недоступна в этом чате" or do nothing at all, which is a poor advertisement for a
+    menu the bot itself publishes.
+    """
+    if matched_entry is not None:
+        return matched_entry
+    if chat.get("type") == "private":
+        return home_chat_ref
+    return None
+
+
+def _has_pending_flow(flows: dict[str, dict], chat_id, user_id, ttl_seconds: int) -> bool:
+    """Whether this person is mid-way through a force-reply step in `flows`.
+
+    The menu must not barge in on somebody who has been asked a question -- they may be
+    typing the answer, or may have replied without using Telegram's reply UI, in which
+    case the correlated handler already declined and silence is the right response.
+    """
+    return any(
+        flow.get("chat_id") == chat_id
+        and flow.get("user_id", flow.get("admin_id")) == user_id
+        and time.monotonic() - flow["created_at"] <= ttl_seconds
+        for flow in flows.values()
+    )
+
+
+async def maybe_send_menu(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str | None,
+    cabinet_flows: dict[str, dict],
+    badge_flows: dict[str, dict],
+    menu_last_sent: dict,
+    log=print,
+) -> None:
+    """Answer an otherwise-unhandled DM with the cabinet menu.
+
+    This is the last thing tried in a private chat, deliberately: every specific handler
+    -- commands, summary keywords, the joke trigger, both force-reply flows -- gets to
+    claim the message first, and only what none of them wanted lands here. Without it a
+    DM the bot doesn't recognise produces total silence, which reads as "the bot is
+    broken" rather than "that wasn't a request I understand".
+
+    Never fires in a group: a menu posted in reply to ordinary chatter would be spam, and
+    it renders one person's private balance in front of everybody.
+    """
+    chat = message.get("chat") or {}
+    if chat.get("type") != "private":
+        return
+    chat_id = chat.get("id")
+    actor = message.get("from") or {}
+    user_id = actor.get("id")
+
+    if _has_pending_flow(cabinet_flows, chat_id, user_id, CABINET_FLOW_TTL_SECONDS):
+        return
+    if _has_pending_flow(badge_flows, chat_id, user_id, BADGE_FLOW_TTL_SECONDS):
+        return
+
+    now = time.monotonic()
+    last = menu_last_sent.get(chat_id)
+    if last is not None and now - last < MENU_FALLBACK_COOLDOWN_SECONDS:
+        return
+    menu_last_sent[chat_id] = now
+
+    try:
+        if entry is None:
+            text, keyboard = cabinet.welcome_view(user_id)
+        else:
+            context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
+            if context is None:
+                text, keyboard = cabinet.welcome_view(user_id)
+            else:
+                user, xp, rank, total, streak, season_xp = context
+                text, keyboard = cabinet.main_view(
+        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+    )
+        await api.send_message(
+            chat_id, text, reply_to_message_id=message.get("message_id"),
+            reply_markup=keyboard, parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[bot_listener] failed to send the fallback menu:\n{traceback.format_exc()}")
+
+
+async def register_bot_menu(api: TelegramBotAPI, log=print) -> None:
+    """Publish the ☰ Menu command lists once at startup. Best-effort: the bot works
+    without a menu, so a transient failure here must not stop it from starting."""
+    for scope, commands in (
+        ({"type": "all_private_chats"}, list(PRIVATE_CHAT_COMMANDS)),
+        ({"type": "all_group_chats"}, list(GROUP_CHAT_COMMANDS)),
+    ):
+        try:
+            await api.set_my_commands(commands, scope=scope)
+        except ChatSummaryError as e:
+            log(f"[bot_listener] could not register the {scope['type']} menu: {e}")
+
+
+async def handle_cabinet_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str | None,
+    log=print,
+) -> None:
+    """Open the cabinet. DM only: it shows one person's own balance and buttons that
+    spend their coins, neither of which belongs in a group."""
+    chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    if entry is None:
+        await api.send_message(
+            chat_id,
+            "Не настроен основной чат — кабинет недоступен.",
+            reply_to_message_id=reply_to, parse_mode=None,
+        )
+        return
+    context = await _cabinet_context(telethon_client, entry, tz, message.get("from") or {}, log=log)
+    if context is None:
+        await api.send_message(
+            chat_id,
+            "Ты ещё не отслеживаешься — напиши что-нибудь в чат и попробуй снова.",
+            reply_to_message_id=reply_to, parse_mode=None,
+        )
+        return
+    user, xp, rank, total, streak, season_xp = context
+    text, keyboard = cabinet.main_view(
+        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+    )
+    await api.send_message(
+        chat_id, text, reply_to_message_id=reply_to, reply_markup=keyboard, parse_mode="HTML"
+    )
+
+
+async def handle_cabinet_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    cabinet_flows: dict[str, dict],
+    badge_flows: dict[str, dict] | None = None,
+    known_chat_ids: dict | None = None,
+    log=print,
+) -> None:
+    parsed = cabinet.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    owner_id, action, argument = parsed
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    actor = callback.get("from") or {}
+
+    # The owner id rides inside the button, so somebody forwarded this menu -- or a
+    # second person in the same DM, which cannot happen but is cheap to rule out --
+    # cannot press buttons that spend another member's coins.
+    if str(actor.get("id")) != str(owner_id):
+        await api.answer_callback_query(callback_id, "Это чужой кабинет.")
+        return
+    if entry is None:
+        await api.answer_callback_query(callback_id, "Основной чат не настроен.")
+        return
+
+    # The two text-entry actions answer with a force-reply prompt instead of redrawing.
+    if action == "badge_admin":
+        admin_chat_id = await _resolve_chat_id(
+            telethon_client, entry, known_chat_ids if known_chat_ids is not None else {}, log=log
+        )
+        if not await _can_manage_chat(api, admin_chat_id, actor, entry):
+            await api.answer_callback_query(callback_id, "Нет прав на управление значками.")
+            return
+        await api.answer_callback_query(callback_id)
+        # Reuses the existing /badge menu wholesale -- same flow, same prompts, same
+        # idempotent awarding -- so this button adds an entry point, not a second
+        # implementation to keep in step.
+        if badge_flows is None:
+            # Only reachable from a caller that did not thread the flow state through;
+            # starting the menu without it would draw buttons that can never resolve.
+            log("[bot_listener] cabinet badge button pressed without badge_flows state")
+            return
+        await handle_badge_command(
+            api,
+            {"chat": {"id": chat_id, "type": "private"},
+             "message_id": message.get("message_id"), "from": actor},
+            entry, admin_chat_id, badge_flows,
+        )
+        return
+
+    if action == "work_delete_ok":
+        context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
+        if context is None:
+            await api.answer_callback_query(callback_id, "Статистика не найдена.")
+            return
+        user = context[0]
+        # Only ever their OWN work: the message_id is checked against this member's own
+        # tracked posts, so a hand-crafted callback cannot delete somebody else's.
+        if argument not in {str(post[1]) for post in user.recent_figurine_posts}:
+            await api.answer_callback_query(callback_id, "Эта работа уже удалена.")
+            return
+        await api.answer_callback_query(callback_id)
+        stats.delete_figurine_submission(
+            entry, user.user_id, int(argument), actor.get("id"), _display_name(actor)
+        )
+        # The name would otherwise outlive the work it belonged to.
+        stats.set_work_name(entry, user.user_id, argument, "")
+        _CABINET_CONTEXT_CACHE.pop((entry, actor.get("id")), None)
+        rendered = await _render_cabinet_section(
+            telethon_client, api, cfg, entry, tz, "works", "", actor, chat_id,
+            known_chat_ids=known_chat_ids, log=log,
+        )
+        if rendered:
+            text, keyboard = rendered
+            try:
+                await api.edit_message_text(
+                    chat_id, message.get("message_id"), text,
+                    reply_markup=keyboard, parse_mode="HTML",
+                )
+            except Exception:
+                log(f"[bot_listener] redraw after delete failed:\n{traceback.format_exc()}")
+        return
+
+    if action in ("title_set", "work_rename", "work_delete"):
+        await api.answer_callback_query(callback_id)
+        flow_id = uuid.uuid4().hex[:10]
+        prompt_text = (
+            f"Ответь на это сообщение текстом титула (до {economy.TITLE_MAX_CHARS} символов)."
+            if action == "title_set"
+            else (
+                "Ответь на это сообщение в формате: номер и название.\n"
+                f"Например: 3 Дредноут (до {stats.WORK_NAME_MAX_CHARS} символов).\n"
+                "Один только номер — убрать название."
+            )
+        )
+        prompt = await api.send_message(
+            chat_id, prompt_text,
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        cabinet_flows[flow_id] = {
+            "created_at": time.monotonic(),
+            "chat_id": chat_id,
+            "user_id": actor.get("id"),
+            "entry": entry,
+            "awaiting": {"title_set": "title", "work_delete": "work_delete"}.get(
+                action, "work_rename"
+            ),
+            "prompt_message_id": prompt.get("message_id") if prompt else None,
+        }
+        return
+
+    await api.answer_callback_query(callback_id)
+    try:
+        rendered = await _render_cabinet_section(
+            telethon_client, api, cfg, entry, tz, action, argument, actor, chat_id,
+            known_chat_ids=known_chat_ids, log=log,
+        )
+    except Exception:
+        log(f"[bot_listener] cabinet section '{action}' failed:\n{traceback.format_exc()}")
+        return
+    if rendered is None:
+        return
+    text, keyboard = rendered
+    try:
+        await api.edit_message_text(
+            chat_id, message.get("message_id"), text, reply_markup=keyboard, parse_mode="HTML"
+        )
+    except Exception:
+        log(f"[bot_listener] cabinet redraw failed:\n{traceback.format_exc()}")
+
+
+async def _works_screen(telethon_client, entry: str, user, notice: str = "", log=print):
+    """Re-render "Мои работы" after a rename, links and all.
+
+    The chat ref is cached per process (_CABINET_CHAT_REF_CACHE), so by the time anybody
+    can rename a work -- they had to open this screen to see the numbers -- this costs no
+    Telegram round trip at all.
+    """
+    chat_id, username = await _cabinet_chat_ref(telethon_client, entry, {}, log=log)
+    figurines = stats.figurine_message_links(username, chat_id, user)
+    best, workplace = stats.showcase_message_links(username, chat_id, user)
+    return cabinet.works_view(entry, user, figurines, best, workplace, notice=notice)
+
+
+async def handle_cabinet_text_input(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    cabinet_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consume the force-reply after "Сменить титул" or "Отправить монеты".
+
+    Returns True once this message belonged to a cabinet flow, so the caller stops
+    treating it as ordinary chat input."""
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    replied_to = (message.get("reply_to_message") or {}).get("message_id")
+    found = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in cabinet_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") == replied_to
+            and time.monotonic() - flow["created_at"] <= CABINET_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if found is None:
+        return False
+    flow_id, flow = found
+    cabinet_flows.pop(flow_id, None)
+    entry = flow["entry"]
+    text = (message.get("text") or "").strip()
+
+    async def answer(rendered: tuple[str, dict]) -> None:
+        body, keyboard = rendered
+        try:
+            await api.send_message(
+                chat_id, body, reply_to_message_id=message["message_id"],
+                reply_markup=keyboard, parse_mode="HTML",
+            )
+        except Exception:
+            log(f"[bot_listener] cabinet reply failed:\n{traceback.format_exc()}")
+
+    if text.lower() in ("отмена", "/cancel"):
+        return True
+
+    context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
+    if context is None:
+        return True
+    user, xp, _, _, _, _ = context
+
+    if flow["awaiting"] == "title":
+        item = economy.find_item("title")
+        ok, refusal, remaining = economy.purchase(entry, user.user_id, xp, item)
+        if not ok:
+            await answer(cabinet.title_view(entry, user, xp, notice=f"❌ {refusal}"))
+            return True
+        saved = economy.set_title(entry, user.user_id, text)
+        if not saved:
+            economy.refund(entry, user.user_id, xp, item.price, "title")
+            await answer(cabinet.title_view(entry, user, xp, notice="❌ Пустой титул — монеты вернул."))
+            return True
+        await answer(cabinet.result_view(
+            user.user_id,
+            f"✅ Титул «{html.escape(saved)}» активен {economy.TITLE_DAYS} дней.\n"
+            f"🪙 Осталось: {remaining}.",
+        ))
+        return True
+
+    if flow["awaiting"] == "work_delete":
+        try:
+            position = int(text.strip())
+        except ValueError:
+            await answer(await _works_screen(
+                telethon_client, entry, user, notice="❌ Нужен номер работы.", log=log))
+            return True
+        message_id = cabinet.message_id_for_position(user, position)
+        if message_id is None:
+            await answer(await _works_screen(
+                telethon_client, entry, user, notice=f"❌ Работы №{position} нет.", log=log))
+            return True
+        names = stats.work_names_for_user(entry, user.user_id)
+        await answer(cabinet.confirm_work_delete_view(
+            user.user_id, position, names.get(str(message_id)), message_id
+        ))
+        return True
+
+    parsed = cabinet.parse_rename_request(text)
+    if parsed is None:
+        await answer(await _works_screen(telethon_client, entry, user, notice="❌ Формат: 3 Дредноут", log=log))
+        return True
+    position, name = parsed
+    message_id = cabinet.message_id_for_position(user, position)
+    if message_id is None:
+        await answer(await _works_screen(telethon_client, entry, user, notice=f"❌ Работы №{position} нет.", log=log))
+        return True
+    saved = stats.set_work_name(entry, user.user_id, message_id, name)
+    notice = f"✅ Работа №{position}: «{html.escape(saved)}»" if saved else f"✅ Название работы №{position} убрано."
+    await answer(await _works_screen(telethon_client, entry, user, notice=notice, log=log))
+    return True
+
+
+async def handle_tree_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/tree -- the chat's shared progression. Self-deletes like every other stats reply,
+    since the standing announcement of the tree is the 10:00 morning post."""
+    chat_id = message["chat"]["id"]
+    try:
+        yesterday = datetime.now(tz).date() - timedelta(days=1)
+        total_xp, day_xp, contributors = await stats.chat_tree_totals(
+            telethon_client, entry, entry, yesterday, tz, log=log, live_total=True
+        )
+        text = tree.format_tree_status(total_xp, day_xp, contributors)
+        parse_mode = "HTML"
+    except Exception:
+        log(f"[bot_listener] failed to build the tree status:\n{traceback.format_exc()}")
+        text, parse_mode = "Не удалось посчитать дерево.", None
+    try:
+        sent = await api.send_message(
+            chat_id, text, reply_to_message_id=message["message_id"], parse_mode=parse_mode
+        )
+        if sent and "message_id" in sent:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+            )
+    except Exception:
+        log(f"[bot_listener] failed to send the tree status:\n{traceback.format_exc()}")
+
+
+async def handle_shop_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    command_text: str,
+    entry: str,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/shop, /coins and /buy <item> [args].
+
+    Every path resolves the requester through stats.resolve_stat_target first, because a
+    balance is only meaningful next to the XP it is derived from (see economy.balance)
+    and because it is also how somebody who is not tracked yet gets a clear answer rather
+    than a zero balance.
+    """
+    chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    from_user = message.get("from") or {}
+    lowered = command_text.lower()
+
+    async def reply(text: str, parse_mode: str | None = None) -> None:
+        try:
+            sent = await api.send_message(
+                chat_id, text, reply_to_message_id=reply_to, parse_mode=parse_mode
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                )
+        except Exception:
+            log(f"[bot_listener] failed to answer a shop command:\n{traceback.format_exc()}")
+
+    user, _, _, xp, _, _ = await stats.resolve_stat_target(
+        telethon_client, entry, entry, "",
+        from_user.get("username"), _display_name(from_user), tz, log=log,
+    )
+    if user is None:
+        await reply("Ты ещё не отслеживаешься -- напиши что-нибудь в чат и попробуй снова.")
+        return
+
+    if lowered.startswith("/coins"):
+        current = economy.balance(entry, user.user_id, xp)
+        held = economy.streak_freezes(entry, user.user_id)
+        text = f"🪙 У тебя {current:,} монет.".replace(",", ".")
+        if held:
+            text += f"\n❄️ Заморозок серии: {held}."
+        await reply(text + "\n\nМагазин: /shop")
+        return
+
+    if lowered.startswith("/shop"):
+        await reply(economy.format_shop(entry, user.user_id, xp), parse_mode="HTML")
+        return
+
+    # /buy
+    argument = command_text[len("/buy") :].strip()
+    code, _, extra = argument.partition(" ")
+    item = economy.find_item(code)
+    if item is None:
+        await reply("Не знаю такой товар. Посмотри /shop.")
+        return
+    if item.code == "title" and not extra.strip():
+        await reply(f"Формат: /buy title {item.argument_hint}")
+        return
+
+    ok, refusal, remaining = economy.purchase(entry, user.user_id, xp, item)
+    if not ok:
+        await reply(refusal)
+        return
+
+    # The title is stored directly rather than through _deliver_shop_item: it cannot
+    # fail, and set_title is what stamps its own purchase cooldown.
+    if item.code == "title":
+        saved = economy.set_title(entry, user.user_id, extra)
+        await reply(
+            f"Титул «{saved}» активен {economy.TITLE_DAYS} дней.\n"
+            f"🪙 Осталось: {remaining}."
+        )
+        return
+
+    try:
+        delivered_text = await _deliver_shop_item(
+            api, telethon_client, cfg, tz, entry, entry, item, user, xp,
+            _display_name(from_user), log,
+        )
+    except Exception:
+        log(f"[bot_listener] shop delivery failed for {item.code}:\n{traceback.format_exc()}")
+        restored = economy.refund(entry, user.user_id, xp, item.price, item.code)
+        await reply(
+            f"Не получилось выдать «{item.name}» -- монеты вернул.\n"
+            f"🪙 Баланс: {restored}."
+        )
+        return
+
+    await reply(f"{delivered_text}\n\n🪙 Осталось: {remaining}.")
 
 
 async def handle_bot_roast_callback(
@@ -1350,6 +2460,8 @@ async def _dispatch_update(
     joke_preview_pending: dict[int, dict],
     joke_posted_queue,
     badge_flows: dict[str, dict],
+    cabinet_flows: dict[str, dict],
+    menu_last_sent: dict,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -1364,7 +2476,12 @@ async def _dispatch_update(
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
-        if callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
+        if callback_data.startswith(f"{cabinet.CALLBACK_PREFIX}:"):
+            await handle_cabinet_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, cabinet_flows,
+                badge_flows=badge_flows, known_chat_ids=known_chat_ids, log=log,
+            )
+        elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
             await handle_badge_callback(api, callback, badge_flows)
         elif callback_data.startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
             await handle_joke_preview_callback(
@@ -1394,6 +2511,56 @@ async def _dispatch_update(
         known_chat_ids[matched_entry] = chat["id"]
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
+    if re.match(r"^/start(?:\s|$)", command_text, re.IGNORECASE):
+        # Where /stat's "Открыть личный кабинет" link lands (t.me/<bot>?start=cabinet),
+        # and the natural first thing a new member does anyway. Groups are ignored: a
+        # /start there is somebody's fat finger, not a request.
+        if chat.get("type") != "private":
+            return
+        await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
+        return
+    if re.match(rf"^{re.escape(CABINET_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        # In a group this would print somebody's balance for everyone and offer buttons
+        # that spend their coins, so it points them at the DM instead of refusing.
+        if chat.get("type") != "private":
+            try:
+                sent = await api.send_message(
+                    chat["id"], CABINET_DM_ONLY_NOTICE,
+                    reply_to_message_id=message["message_id"], parse_mode=None,
+                )
+                if sent and "message_id" in sent:
+                    schedule_bot_delete(
+                        api, chat["id"], [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                    )
+            except Exception:
+                pass
+            return
+        await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
+        return
+    if re.match(rf"^{re.escape(REPLANT_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_replant_command(
+            api, telethon_client, message, home_chat_ref, admin_chat_id, tz, log=log,
+        )
+        return
+    if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_badge_admin_command(
+            api, telethon_client, message, command_text, home_chat_ref, admin_chat_id, tz, log=log,
+        )
+        return
     if re.match(r"^/badge(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
             return
@@ -1449,6 +2616,11 @@ async def _dispatch_update(
         )
         return
 
+    if await handle_cabinet_text_input(
+        api, telethon_client, tz, message, cabinet_flows, log=log
+    ):
+        return
+
     if await handle_badge_text_input(
         api, telethon_client, message, tz, badge_flows, log=log
     ):
@@ -1474,11 +2646,47 @@ async def _dispatch_update(
 
     text_lower = message_text.lower()
 
+    # Shop and wallet commands (see economy.py). Same chat gating as /stat: they read and
+    # spend against a tracked chat's ledger, so there is nothing meaningful to answer for
+    # a chat that isn't tracked.
+    if cfg.stats_enabled and text_lower.startswith(SHOP_COMMANDS):
+        shop_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if shop_entry is None:
+            return
+        shop_text = stats.strip_command_bot_mention(message_text, bot_username)
+        task = asyncio.create_task(
+            handle_shop_command(
+                api, telethon_client, cfg, tz, message, shop_text, shop_entry,
+                background_tasks, log=log,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/tree" -- the chat's shared ЕПХ tree (see tree.py). Same chat resolution as the
+    # stats commands, so it answers in a DM about the home chat too.
+    if cfg.stats_enabled and text_lower.startswith("/tree"):
+        tree_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if tree_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_tree_command(
+                api, telethon_client, tz, message, tree_entry, background_tasks, log=log
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
     # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
     # already-computed daily files, so they bypass the OpenAI summary queue. Reuses matched_entry
     # from the known_chat_ids learning above rather than re-matching the chat.
     if cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
         chat_key = chat["id"]
+        # In a DM this resolves to the configured home chat, so /stat and /top work from
+        # the published menu instead of reporting themselves unavailable.
+        matched_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
         if matched_entry is None:
             try:
                 sent = await api.send_message(
@@ -1498,10 +2706,19 @@ async def _dispatch_update(
             level_announcements = []
             reply_parse_mode = None
             if text_lower.startswith("/top"):
-                period = stats.parse_top_command(stats_text)
-                reply_text = await stats.format_top(
-                    telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
-                )
+                top_arg = stats_text[len("/top"):].strip()
+                # "/top pokras" reads the same way "/stat pokras" always has, so both
+                # spellings reach the procrastinator list instead of one of them
+                # silently falling through to a leaderboard for "today".
+                if stats.is_procrastinator_command(top_arg):
+                    reply_text = await stats.format_procrastinators(
+                        telethon_client, matched_entry, matched_entry, tz, log=log
+                    ) or PROCRASTINATOR_NONE_FOUND_MESSAGE
+                else:
+                    period = stats.parse_top_argument(top_arg)
+                    reply_text = await stats.format_top(
+                        telethon_client, matched_entry, matched_entry, period, tz, cfg.stats_top_limit, log=log
+                    )
             else:
                 arg = stats_text[len("/stat") :].strip()
                 if stats.is_procrastinator_command(arg):
@@ -1514,9 +2731,10 @@ async def _dispatch_update(
                     )
                 else:
                     from_user = message.get("from") or {}
-                    user, rank, total, xp, streak = await stats.resolve_stat_target(
+                    user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
+                        frozen_days_for=economy.streak_freeze_lookup(matched_entry),
                     )
                     if user:
                         figurine_links = stats.figurine_message_links(chat.get("username"), chat_key, user)
@@ -1530,6 +2748,9 @@ async def _dispatch_update(
                         reply_text = stats.format_stat(
                             user, rank, total, xp, streak, figurine_links, custom_badges,
                             best_work_link=best_work_link, workplace_link=workplace_link,
+                            season_xp=season_xp, bot_username=bot_username,
+                            work_names=stats.work_name_list(matched_entry, user),
+                            **economy.stat_extras(matched_entry, user.user_id, xp),
                         )
                         reply_parse_mode = "HTML"
                         level_announcements = stats.record_level_observations(
@@ -1598,6 +2819,13 @@ async def _dispatch_update(
         return
 
     if not has_summary and not has_roast:
+        # Nothing above wanted this message. In a DM that means the person typed
+        # something the bot has no specific answer for, so show them what it CAN do
+        # rather than saying nothing at all. Groups fall through silently as before.
+        await maybe_send_menu(
+            api, telethon_client, tz, message, home_chat_ref,
+            cabinet_flows, badge_flows, menu_last_sent, log=log,
+        )
         return
 
     if not _is_chat_allowed(allowed_chats, chat):
@@ -1720,6 +2948,14 @@ async def run_bot_listener(
     # Short-lived, admin-bound /badge conversations. Definitions and assignments are
     # persisted by stats.py; only the in-progress menu/prompt state lives in memory.
     badge_flows: dict[str, dict] = {}
+    # Short-lived /cabinet force-reply steps (setting a title, sending coins). Cabinet
+    # *navigation* deliberately keeps no state at all -- every button carries its own
+    # owner id -- so only these two text-entry prompts need correlating, and losing them
+    # on a restart costs the member one re-press, nothing more.
+    cabinet_flows: dict[str, dict] = {}
+    # Last time the fallback menu was sent per DM chat_id, so a burst of messages
+    # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
+    menu_last_sent: dict[int, float] = {}
 
     # Roast confirm/button flow state, keyed by (chat_id, target_user_id) -- mirrors
     # listener.py's roast_pending/roast_in_progress. Value: {"confirm_msg_id",
@@ -1741,6 +2977,7 @@ async def run_bot_listener(
         api = TelegramBotAPI(bot_token, session)
         me = await api.get_me()
         bot_username = me.get("username")
+        await register_bot_menu(api, log=log)
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
             f"{cfg.listener_trigger_keywords} (summary; roast is off) and direct replies. FIFO queue delay: "
@@ -1766,7 +3003,8 @@ async def run_bot_listener(
                         await _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, roast_pending, roast_in_progress, background_tasks, home_chat_ref,
-                            known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows, log=log,
+                            known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
+                            cabinet_flows, menu_last_sent, log=log,
                         )
                     except Exception:
                         log(f"[bot_listener] unhandled error processing update {update.get('update_id')}:\n{traceback.format_exc()}")
@@ -1836,16 +3074,17 @@ async def run_bot_listener(
 
         async def _consume_stats_digests():
             while True:
-                entry, text = await stats_digest_queue.get()
+                entry, text, parse_mode = await stats_digest_queue.get()
                 chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
                 if chat_id is None:
                     log(f"[bot_listener] dropping stats notification for '{entry}': could not resolve a chat_id for it")
                     continue
                 try:
-                    # parse_mode=None: the digest embeds raw display names, same reasoning
-                    # as every other stats reply -- see the send_message call in the
-                    # /top and /stat handling above.
-                    await api.send_message(chat_id, text, parse_mode=None)
+                    # The producer decides: the procrastinator call-out is plain text
+                    # because it embeds raw display names, while the tree digest is HTML
+                    # and escapes them itself. Sending one with the other's mode either
+                    # prints tags verbatim or has Telegram reject the whole message.
+                    await api.send_message(chat_id, text, parse_mode=parse_mode)
                     log(f"[bot_listener] sent stats notification to '{entry}'")
                 except Exception:
                     log(f"[bot_listener] failed to send stats notification:\n{traceback.format_exc()}")

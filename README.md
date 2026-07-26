@@ -260,20 +260,328 @@ formula is unchanged; only its user-facing name changed from points to XP. `/top
 also shows the member with the largest positive XP change compared with the preceding
 seven-day window.
 
-`/stat [username]` shows all-time XP and one earned coin for every complete 10 XP. Coins
-are currently an earned balance; spending is intentionally not implemented until there
-are actual shop rewards. Permanent levels are:
+`/stat [username]` shows all-time XP plus three **independent** progression tracks. They
+were split apart deliberately: a single ladder gated on XP *and* figurines at once meant
+a member who chatted constantly but painted nothing, and a member who painted constantly
+but rarely posted, were both frozen at the bottom forever. Now everybody always has at
+least one bar moving.
 
-- 🩶 Серый новичок — `0 XP`, 0 figurines
-- ⚪ Ученик грунта — `2,500 XP` **and** 3 figurines
-- 🖌️ Подмастерье кисти — `5,000 XP` **and** 5 figurines
-- 💨 Укротитель аэрографа — `10,000 XP` **and** 10 figurines
-- 💧 Повелитель проливок — `20,000 XP` **and** 20 figurines
-- 🏛️ Мастер витрины — `35,000 XP` **and** 35 figurines
-- 👑 Легенда покраса — `50,000 XP` **and** 50 figurines
+**🧩 Уровень — chat level.** Scored on **season XP**, not all-time, with no figurine
+requirement. Forty levels on a `25 × n^1.6` curve, renamed every five levels (🌱 Новенький
+→ 💬 Болтун → 🗣️ Голос чата → 📣 Заводила → 🎙️ Старожил → 🔥 Душа чата → ⚡ Легенда общения
+→ 🌟 Хранитель чата). A progress bar shows position inside the current level **without**
+printing the target, so the old "don't reveal the next requirement" rule still holds.
 
-Both requirements unlock a level. `/stat` shows only the current level and deliberately
-does not reveal what is missing for the next one.
+Seasons are calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec) — fixed boundaries so
+everyone's season starts on the same day. Season XP and all-time XP are accumulated in the
+**same aggregation pass** (`UserStats.season_*`), so `/stat` pays for one walk, not two.
+
+The curve is calibrated from the chat's own measured rates, caps applied:
+
+| | XP/day | after one season | max reached in |
+|---|---|---|---|
+| top-1 | 299 | level 40 | 31 days |
+| **p95** | **103** | **level 40** | **89 days** ← the target |
+| p90 | 68 | ⚡ Легенда общения 31 | 134 days |
+| p75 | 12 | 💬 Болтун 10 | 2 years |
+| median | 2.8 | 🌱 Новенький 4 | — |
+
+Levels are scored seasonally because the two goals are otherwise incompatible: with
+all-time XP, a ladder cheap enough to climb in a season is one that members tracked for a
+year would start already past the top of, and it would never move again.
+
+Only a **tier** change (every five levels) is announced, not each level. On this curve an
+active member crosses ~40 levels a season; announcing each would put several promotion
+messages a day into the chat from the same few people. A new season re-baselines everyone
+silently — the ladder was rebuilt, nobody was demoted.
+
+**🎨 Звание — painter rank.** The original seven names, now gated on figurines alone:
+
+- 🩶 Серый новичок — 0 figurines
+- ⚪ Ученик грунта — 3
+- 🖌️ Подмастерье кисти — 5
+- 💨 Укротитель аэрографа — 10
+- 💧 Повелитель проливок — 20
+- 🏛️ Мастер витрины — 35
+- 👑 Легенда покраса — 50
+
+**Репутация — peer-granted standing.** Cannot be earned by posting at all: 10 per weekly
+contest win, 5 per administrator-awarded custom badge, and 1 per 20 coins *received* from
+another member. Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
+🏅 Легенда сообщества.
+
+A promotion on either the chat level or the painter rank is announced once, tracked per
+track so progress on one never suppresses the other. The stored level state from before
+the split is discarded rather than compared against, which silently re-baselines every
+existing member — otherwise the rollout would announce a promotion for the whole chat at
+once.
+
+### ЕПХ Дерево — the chat's shared progression
+
+One tree the whole chat grows together (`tree.py`). Unlike every other ladder here it is
+not per-member: all XP earned in the chat pools into a single height, so a quiet member's
+few points move the same tree as the loudest member's. It is the one score nobody
+competes on.
+
+Calibrated against the chat's own measured output rather than guessed — over a 34-day
+window the whole chat produced **~3,600 XP/day**. At 200 XP per millimetre and a 20 m
+ceiling that is ~18 mm a day, and the final stage lands just under three years out:
+
+| | after | stage |
+|---|---|---|
+| 1 day | 1.8 cm | 🌰 Семечко |
+| 1 month | 54 cm | 🪴 Саженец |
+| 1 year | 6.6 m | 🍃 Крепкое дерево |
+| 2 years | 13.1 m | 🦉 Дерево с дуплом |
+| **3 years** | **19.7 m** | **👑 Легендарное Древо ЕПХ** |
+
+Thirteen stages, set in **height** rather than XP so the names line up with a tree
+somebody can picture. Height is capped at the top: XP accrues forever, and without the cap
+the tree would silently grow past its own last name.
+
+`/replant` (DM, administrators only) posts the planting announcement to the chat and
+starts the tree over from today. It exists because the planting date lives in the stats
+directory, which on a deployed host is a volume nothing else here can reach — without a
+command there is no way to re-run the opening post at all. Both halves happen together on
+purpose: re-posting "сегодня мы посадили семечко" while the tree is already a metre tall
+would be a lie, and re-planting without posting would silently zero the chat's progress.
+The reset only happens once the announcement has actually landed, and it marks that day
+as already greeted — the announcement *is* that morning's post, so without this the 10:00
+loop would follow it with an ordinary digest reading "выросло на 0 мм, Семечко — 0 мм".
+
+Neither the planting post nor the morning digest is ever scheduled for deletion — they
+stay in the chat. Only `/tree` and the other on-demand stats replies self-delete.
+
+The tree's height is measured **from its planting day forward**, not from the chat's whole
+history. That is what makes "сегодня мы посадили семечко" true: this chat had months of
+tracked activity before the tree existed, and counting it would plant a seed already a
+metre tall. It also means the three-year horizon starts when the tree does.
+
+The very first morning post plants it instead of reporting on it. No numbers, because on
+that day a height of "0 мм" would undercut the moment — and, deliberately, **no mention of
+how many stages there are or how long it takes**. Same rule `/stat` already follows by not
+printing the next level's threshold: "thirteen stages and three years" turns an open-ended
+thing the chat is growing into a progress bar with a visible end. The table above is
+engineering documentation; none of it is ever said in the chat.
+
+```text
+🌱 Сегодня мы все вместе посадили семечко.
+
+Из него вырастет могучее дерево ЕПХ — одно на весь чат, общее.
+...
+🌳 Давайте вырастим его вместе — покажите ему, на что мы способны.
+```
+
+Every morning at **10:00 Moscow** (`TREE_DIGEST_HOUR`, pinned to `Europe/Moscow` rather
+than the app timezone — the deployment's own zone is a hosting detail that could move):
+
+```text
+🌳 Доброе утро, ЕПХ-чане!
+
+Сегодня наше дерево выросло на 20 мм.
+Сейчас это 🪴 Саженец — 61,2 см.
+До стадии «Молодая поросль» — 38,8 см.
+
+Самый большой вклад вчера внесли:
+@nalumurrr — 423 XP
+@citrusssska — 383 XP
+@Cloververona — 326 XP
+
+Напутствие на день
+Если принтер работает — не трогай его настройки. Серьёзно.
+```
+
+`/tree` answers the same question on demand, in a group or a DM:
+
+```text
+🌳 Наше дерево ЕПХ выросло на 61,2 см.
+Сейчас это 🪴 Саженец.
+До стадии «Молодая поросль» — 38,8 см.
+
+Ваша активность и покрасы помогают ему расти.
+```
+
+`/tree` reports the same three things as the morning post — total height, yesterday's
+growth, and yesterday's top three — through the same `_contributor_lines`, so the two
+cannot drift apart. It uses the **live** total, today included, because it answers "how
+are we doing right now"; the morning post stays on the recorded-only total, since a total
+that had jumped by an unexplained amount would contradict the growth figure right above
+it. The two can therefore differ slightly, by design. The reply self-deletes like every other
+stats reply; the standing announcement of the tree is the 10:00 post.
+
+The morning post reports **yesterday**, a closed and recorded day: at 10:00 today's own numbers are
+three hours old and would make the growth figure meaningless. The loop also checks once
+on startup, so a process that was down at 10:00 still posts when it returns — a per-chat
+marker keeps that from double-posting. That startup check does nothing before the hour
+itself: without the guard, deploying at 05:00 would plant the tree at 05:00 rather than
+at the 10:00 it was promised for.
+
+`DAILY_ADVICE` holds **120** lines covering painting, 3D printing, creative work,
+curiosity, being inspired and inspiring others, not drowning in a backlog, being social
+online and in person, time outdoors, and the workbench itself. Picked **by date**, not at
+random, so everybody sees the same line on the same morning and a restart cannot change it
+halfway through — 120 entries means no repeat for four months.
+
+The digest queue carries a parse mode alongside the text: the tree post is HTML (and
+escapes names itself), the procrastinator call-out stays plain text (it embeds raw display
+names). Sending either with the other's mode would print tags verbatim or have Telegram
+reject the message.
+
+### Coins, the shop, and anti-farming
+
+Coins are a **real ledger** (`economy.py`), not the derived `xp // 10` display they used
+to be. The earned half is still derived, and only what cannot be derived is stored:
+
+```text
+balance = coins_for_xp(xp) + bonus + received - spent
+```
+
+That means existing members were grandfathered automatically — on the first run `spent`
+is 0 for everyone, so the opening balance is exactly the number `/stat` had been showing
+all along. No migration script had to be right once. Balance is clamped at zero, because
+`/deletepokras` can remove 200 XP (20 coins) that may already have been spent.
+
+Commands (any tracked chat):
+
+- `/coins` — balance and banked streak freezes
+- `/shop` — catalogue, marked ✅ affordable / 🔒 too expensive / ⏳ on cooldown
+- `/buy title <текст>` — purchase
+
+### Menu button and the fallback menu
+
+The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
+client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
+command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins /tree`, groups get
+`/stat /topall /toppokras /tree`. Wallet actions belong in the DM where a balance isn't public,
+and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a
+group button for it would just answer "напиши мне в личку".
+
+The two aliases are spelled without a space because Telegram only accepts `[a-z0-9_]` in
+a registered command name: **`/top all` cannot be a menu entry at all**. Both spellings
+work when typed — `/top all` = `/topall`, `/top pokras` = `/toppokras` = `/stat pokras`.
+The procrastinator list is capped at `PROCRASTINATOR_LIST_SIZE` (10) names, on demand and
+in the automatic digest alike: it is a public call-out, and past about ten names it stops
+reading as a nudge and starts reading as a wall. Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
+deliberately **not** advertised. Registration is best-effort: the bot starts fine without
+a menu.
+
+Because `_match_allowed_chat` never matches a private chat, `/stat`, `/top`, `/shop` and
+`/coins` used to be silent no-ops in a DM. They now fall back to the configured home chat
+(`_stats_entry_for`), the same way `/cabinet` and the summary pipeline already did — a
+published menu must not contain commands that do nothing where it is published.
+
+**Any unhandled DM gets the menu back.** After every specific handler has declined —
+commands, summary keywords, the joke trigger, both force-reply flows — a private message
+the bot has no answer for is replied to with the cabinet menu instead of silence. It never
+fires in a group, stays quiet while somebody is mid-way through a force-reply step
+(another member's pending flow doesn't mute you), and a burst of messages produces one
+menu rather than one each (`MENU_FALLBACK_COOLDOWN_SECONDS`, 60s; set 0 to answer every
+message). Somebody the stats don't know yet gets a short welcome instead of six buttons
+leading to six empty screens.
+
+### Личный кабинет (`/cabinet`)
+
+`/cabinet` in the bot's DM opens a button-driven personal cabinet (`cabinet.py`). Sent in
+a group it just points the member at the DM — it shows one person's balance and offers
+buttons that spend their coins, neither of which belongs in a group.
+
+```text
+👤 Личный кабинет
+
+Леонид Уросов
+
+🧩 🗣️ Голос чата 15  ▓▓▓▓▓▓▓▓▓░
+🪙 Монеты: 841
+📈 Место в рейтинге: 4 из 191
+🔥 Серия: 6 дней
+❄️ Заморозок в запасе: 1
+
+[📊 Статистика] [🏪 Магазин]
+[🎨 Мои работы] [🏅 Значки]
+[✏️ Титул]      [💸 Перевод]
+[🔄 Обновить]
+```
+
+Sections navigate **in place** by editing the same message (`editMessageText`), so the DM
+never fills up with dead menus, and every leaf screen carries a ◀️ Назад button. Buying
+from the shop is one tap; the two actions that need free text — setting a title, sending
+coins — open a force-reply prompt and only debit once the reply arrives.
+
+- 📊 **Статистика** — the exact `/stat` card the group sees, so the cabinet never becomes
+  a second, subtly different source of truth
+- 🏪 **Магазин** — one button per item, with the same ✅/🔒/⏳ marks
+- 🎨 **Мои работы** — showcase links plus up to 30 `#япокрасил` works, one per line.
+  ✏️ Переименовать renames one by position (`3 Дредноут`, up to 32 chars; a bare number
+  clears it). 🗑 Удалить removes one of your own, behind a confirmation — it writes a
+  permanent tombstone, costs 200 XP and a figurine, and can drop a level or a badge with
+  it, so it is never a single tap. Both the name and the confirm button carry the work's
+  **message_id**, not its position: deleting compacts the numbering, so a position could
+  point at a different work by the time the second tap arrives. The confirm handler also
+  checks the message_id belongs to that member, so a hand-crafted callback cannot delete
+  somebody else's work.
+- 🏅 **Значки** — admin-granted badges in their own section **first** (split on
+  `Badge.custom`, since those are the only ones somebody chose to give you), then earned
+  ones, then `📦 Открыто: N из M`. The denominator counts every tier individually (all
+  three painting medals, not just the highest shown), plus the 8 chat-level tiers, the 7
+  painting ranks, and however many custom badges the chat has defined.
+- ✏️ **Титул** — the one force-reply purchase flow
+
+Each button carries its owner's user id inside its `callback_data`, so a forwarded menu is
+inert (`Это чужой кабинет.`) and navigation keeps working across a process restart —
+unlike the admin `/badge` flows, only the two text-entry prompts hold server-side state.
+Views are rendered as HTML with every user-controlled string escaped.
+
+**Render cost.** A button press must not wait on Telegram. Two caches keep it cheap:
+
+- `_CABINET_CHAT_REF_CACHE` — the group's chat id and `@username`, needed only to build
+  `t.me` links, resolved once per process instead of twice per press. A failed resolution
+  is not cached, so a transient outage doesn't permanently break links.
+- `_CABINET_CONTEXT_CACHE` — the resolved member, XP and rank, for
+  `CABINET_CONTEXT_TTL_SECONDS` (45s) per person. The underlying `resolve_stat_target`
+  re-reads every recorded day file (~70 ms at 60 days × 190 members) and can refetch
+  today's transcript from Telegram, which is far too much to repeat per tap.
+
+Balances, titles and streak freezes are deliberately **not** cached — every view reads
+them straight from the ledger, so a purchase shows up immediately rather than 45 seconds
+later. Screens with no links (main, shop, title, send, badges) resolve no chat entity at
+all; only Статистика and Мои работы do.
+
+The shop sells one thing:
+
+| Item | Price | Effect |
+|---|---|---|
+| `title` Свой титул | 400 | Custom title under your name in `/stat` and the cabinet, 30 days |
+
+The roast, the work critique and the streak freeze were removed from the catalogue;
+their delivery code and the freeze machinery are left in place, so re-listing any of them
+is adding one `ShopItem` back — the same "disabled, not removed" convention the roast
+trigger and the XP cooldown already follow.
+
+Member-to-member transfers were removed too. **That took the economy's only always-on
+sink with it**: transfers used to burn 10% of every gift, and now the sole drain is a
+400-coin title every 30 days against ~1,000 coins a month for an active member. Balances
+will grow. `received` is still read by `balance()` so any ledger written while transfers
+existed keeps computing the same number; nothing can add to it any more.
+
+If delivery of a purchase fails the coins are refunded, so a debit and its effect are
+never left half-applied.
+
+**Note on reach:** because coins track XP, the economy is only meaningful for roughly the
+top quarter of the chat. The median member earns ~3 coins/week and will not realistically
+buy anything. That is a property of the curve, not the prices.
+
+**Anti-farming.** Per-day ceilings on the scored counters — 1,500 words, 25 media, 100
+replies — applied when a day is *computed*, so they never reach back and reprice an
+already-recorded day. Measured against 1,579 real person-days these bite 30, 67 and 48
+days respectively, all genuine outliers (the worst real day was 11,025 words from one
+person). `messages`, `chars`, active days and the hour histogram are never capped, since
+they describe what actually happened.
+
+A per-message XP cooldown is implemented but **ships disabled** (`XP_MESSAGE_COOLDOWN_
+SECONDS = 0`). Measured against this chat's own 62k cached messages, the standard 30–60s
+advice suppressed 42–50% of all media, because painters post several angles of one model
+back to back — it is an XP cut aimed at the most engaged members, not an anti-farming
+measure. Setting the constant non-zero re-enables it.
 
 The activity block stays compact and uses dot-separated thousands:
 
@@ -304,11 +612,17 @@ remains specific to `#япокрасил` figurine credit).
 The name, progression, and activity sections are separated by blank lines. The last
 activity timestamp is intentionally omitted, and badges are rendered two per row.
 
-When a tracked user reaches a higher level, the bot posts one persistent announcement:
+A new **painting rank** is announced once:
 
 ```text
-@user получил новый уровень «🖌️ Подмастерье кисти»! 🎉🎊🥳
+@user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳
 ```
+
+Chat levels are tracked but deliberately **not** announced: on the seasonal curve they
+come round again every quarter for the same handful of people, which turns the chat into
+a promotion feed, and the level is always visible in `/stat` and the cabinet. The
+watermark is still maintained, so restoring the announcement is two lines and needs no
+migration.
 
 The last observed level is persisted per chat, so a promotion is announced only once
 across `/stat` calls and process restarts. Existing users are silently baselined when
@@ -318,38 +632,95 @@ checks run during `/stat` and the daily stats rollover.
 Automatic badges are derived from production counters and hashtag activity. Only the
 highest earned painting medal is shown:
 
-- 🥉 Я покрасил III — 1 painted figurine
-- 🥈 Я покрасил II — 10 painted figurines
-- 🥇 Я покрасил I — 50 painted figurines
+- 🎨 Я покрасил 1 — 1 painted figurine
+- 🥉 Я покрасил 2 — 5
+- 🥈 Я покрасил 3 — 10
+- 🥇 Я покрасил 4 — 25
+- 💎 Я покрасил 5 — 50
+
+  Numbered **ascending** (1 = first work, 5 = fifty), unlike the streak and night-shift
+  families where I is still the best — with five steps, "IV" gives no hint whether it
+  beats "II".
 - 🦄 Я не пидор — post `#янепидор`
 - 🎪 Участник Недельного конкурса ×N — post `#итогинедели`; several posts by the
   same person in one Monday–Sunday ISO week count once
 - 💯 Сотня — 100 messages
 - 📣 Голос чата — 1,000 messages
 - 🖼️ Галерея — 25 photo/video messages
-- 💬 В диалоге — 100 replies
 - 📅 Завсегдатай — 30 active days
-- 🔥 Не остановить III / II / I — a longest historical streak of 7 / 14 / 30 days
-- 🦉 Ночная смена III / II / I — 50 / 250 / 1,000 messages between 00:00 and 05:59
+- 🔥 Не остановить 1 / 2 / 3 — a longest historical streak of 7 / 14 / 30 days
+- 🦉 Ночная смена 1 / 2 / 3 — 50 / 250 / 1,000 messages between 00:00 and 05:59
+
+  All tier families now count **upward**: 1 is the easiest step, the highest number
+  the hardest.
 
 Painting medals, message-count badges, streak badges, and night-shift badges are upgrade
 families: `/stat` displays only the highest unlocked badge in each family. For example,
 `📣 Голос чата` replaces `💯 Сотня` at 1,000 messages instead of appearing beside it.
 
+Custom badges are rendered **first**, in their own `✨ Уникальные значки` block, above the
+automatic ones — they are the only badges somebody chose to give this person, and mixed
+into a dozen automatic counters that is exactly what gets lost. The split is on
+`Badge.custom`, so a weekly-contest win (assigned by an administrator, but *won*) stays
+with the earned ones.
+
+The last line of `/stat` is a `t.me/<bot>?start=cabinet` deep link — one tap opens the
+member's cabinet instead of dropping them into an empty DM where they would still have to
+know a command. `/start` (with or without the payload) opens the cabinet too. The link is
+omitted entirely when no bot username is available, which is exactly the case where
+`listener.py` answers `/stat` itself and there is no cabinet to link to.
+
 Badges appear near the end of `/stat`, immediately before the complete tracked work
-history. Every work is represented by a compact clickable number (newest first), with
-no three-work display cap. No new message schema or history fetch is needed for
+history. Every work is a compact clickable entry (newest first) with no display cap, showing
+`номер. Название` once it has been named in the cabinet and a bare number until then. The
+number always stays visible even for a named work: `/deletepokras` takes the number shown
+here as its argument, so replacing it with a name would leave an administrator nothing to
+point at. No new message schema or history fetch is needed for
 automatic badges.
 
-Chat administrators can also create and award custom badges by sending `/badge` in a
-private chat with the bot. The bot shows two inline options:
+Custom badges are created and awarded with `/badge` in a private chat with the bot.
+
+Who may do that: Telegram administrators of the home chat, the hardcoded delegates in
+`PRIVILEGED_MANAGEMENT_USERNAMES`, and anybody an administrator delegates at runtime:
+
+```text
+/badgeadmin              list current delegates
+/badgeadmin @username    grant
+/badgeadmin - @username  revoke
+```
+
+`/badgeadmin` is administrators-only and DM-only — a delegate can award badges, but not
+appoint further delegates. A delegate sees a **🛠️ Выдать значок участнику** button in
+their `/cabinet`, which opens the same `/badge` menu rather than a second implementation.
+That button decides only what is *drawn*; the callback re-verifies permission before
+acting, so a menu left open after a revoke cannot still hand out badges.
+
+`/badge` itself: The bot shows two inline options:
 
 - **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
 - **Выдать значок** shows the chat's saved custom badges, then asks for the recipient's
   exact `@username`.
+- **Забрать у участника** takes one badge from one member, leaving the definition alone.
+  Not announced in the group: an award is good news worth sharing, having one taken away
+  is not something to publish about somebody.
+- **Удалить значок совсем** deletes the definition *and* every assignment of it, behind a
+  confirmation that spells out how many members currently hold it. Assignments are
+  cleared rather than left dangling — a leftover would be invisible but would still count
+  towards somebody's collection total and would come back if the id were reused.
 
 Custom definitions and assignments are persisted per chat under the existing stats
-cache. Awarding the same badge to the same member twice is idempotent. The menu and its
+cache. Awarding the same badge to the same member twice is idempotent.
+
+A **new** award is announced in the group chat:
+
+```text
+@user получил уникальный значок: 🎯 Меткий глаз
+```
+
+Only on a genuinely new award — re-running the flow must not post it again. The recipient
+is named by `@username` so they are actually notified, falling back to their display name
+when they have none. Best-effort: the badge is already recorded by the time this sends, so
+a failed announcement costs the message, never the badge. The menu and its
 force-reply steps expire after ten minutes and remain bound to the administrator who
 opened them. The bot verifies that the person using the DM menu is still an
 administrator of the configured home chat. The explicitly delegated

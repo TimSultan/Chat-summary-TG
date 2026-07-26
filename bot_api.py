@@ -81,6 +81,50 @@ class TelegramBotAPI:
             params["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
         return await self._call("sendMessage", **params)
 
+    async def set_my_commands(self, commands: list[dict], scope: dict | None = None) -> None:
+        """Populate the client's own ☰ Menu button next to the input field.
+
+        This is what makes the bot usable without anybody memorising a command: Telegram
+        renders the list as a tappable menu. Registered per scope, so the group list can
+        stay short while the DM list carries the full set.
+
+        Best-effort -- a failure here leaves the bot fully functional, just without the
+        menu, which is never worth refusing to start over.
+        """
+        try:
+            await self._call("setMyCommands", commands=commands, scope=scope)
+        except ChatSummaryError as e:
+            raise ChatSummaryError(f"setMyCommands failed: {e}") from e
+
+    async def edit_message_text(
+        self,
+        chat_id,
+        message_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        """Replace an already-sent message in place -- how the cabinet menu navigates
+        between sections without leaving a trail of dead menus in the DM.
+
+        Telegram rejects an edit whose text AND markup both match what is already there
+        ("message is not modified"). That is an expected outcome of double-tapping a
+        button, not a failure, so it is swallowed like the other best-effort calls here.
+        """
+        try:
+            await self._call(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=parse_mode,
+                link_preview_options={"is_disabled": True},
+                reply_markup=reply_markup,
+            )
+        except ChatSummaryError as e:
+            if "not modified" not in str(e).lower():
+                raise
+
     async def delete_message(self, chat_id, message_id: int) -> None:
         try:
             await self._call("deleteMessage", chat_id=chat_id, message_id=message_id)
