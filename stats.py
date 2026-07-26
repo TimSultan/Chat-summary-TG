@@ -668,6 +668,23 @@ PROCRASTINATOR_INACTIVE_DAYS = 14
 PROCRASTINATOR_DIGEST_HOUR = 19
 PROCRASTINATOR_DIGEST_INTERVAL_DAYS = 2
 
+# The ЕПХ-tree morning post. Pinned to Moscow rather than the app timezone: the chat
+# asked for a Moscow morning, and the deployment's own timezone is a hosting detail that
+# could move without anybody deciding to move the greeting.
+TREE_DIGEST_HOUR = 10
+TREE_DIGEST_TIMEZONE = "Europe/Moscow"
+
+
+def tree_digest_tz():
+    """Europe/Moscow, falling back to the app timezone if the zoneinfo database is
+    missing on the host -- a wrong hour is better than no morning post at all."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(TREE_DIGEST_TIMEZONE)
+    except Exception:
+        return resolve_timezone()
+
 VALID_PERIODS = ("today", "week", "month", "year", "all")
 # "day" isn't a distinct window -- it's just the word people actually type for "today".
 # Normalized away by _normalize_period before anything looks at VALID_PERIODS.
@@ -1328,6 +1345,33 @@ def should_send_procrastinator_digest(
     permanently drifting the cadence."""
     last = procrastinator_last_sent(entry)
     return last is None or (today - last).days >= interval_days
+
+
+def _tree_digest_last_sent_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_tree_digest_last_sent"
+
+
+def tree_digest_last_sent(entry: str) -> date | None:
+    path = _tree_digest_last_sent_path(entry)
+    if not path.exists():
+        return None
+    try:
+        return date.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return None
+
+
+def mark_tree_digest_sent(entry: str, day: date) -> None:
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _tree_digest_last_sent_path(entry).write_text(day.isoformat(), encoding="utf-8")
+
+
+def should_send_tree_digest(entry: str, today: date) -> bool:
+    """Once per calendar day, per chat. Marker-based rather than "did the loop fire",
+    because the loop also checks on startup: without this, every restart between 10:00
+    and midnight would post another good morning."""
+    last = tree_digest_last_sent(entry)
+    return last is None or last < today
 
 
 def is_figurine_caption(text: str) -> bool:
@@ -2517,6 +2561,32 @@ def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats 
         if needle in s.display_name.lower():
             return s
     return None
+
+
+async def chat_tree_totals(client, chat_ref, entry: str, day: date, tz, log=print):
+    """(all-time chat XP, that day's chat XP, that day's contributors) for the ЕПХ tree.
+
+    Contributors are [(display_name, username, xp)] sorted highest-first, for exactly
+    `day` -- the morning post names who moved the tree yesterday, so this reads one
+    recorded day rather than a window.
+
+    The all-time total deliberately comes from the recorded files only (aggregate_all_
+    time, not the _live variant): the post runs at 10:00 about a day that is already
+    closed, and pulling today's half-finished transcript into the total would make the
+    tree jump by an amount the message then fails to explain.
+    """
+    wpp = await words_per_point(client, chat_ref, entry, tz, log=log)
+    all_time = aggregate_all_time(entry)
+    total_xp = sum(user.xp(wpp) for user in all_time.values())
+
+    day_users = aggregate(entry, day, day)
+    _apply_deleted_figurines(entry, day_users)
+    contributors = sorted(
+        ((user.display_name, user.username, user.xp(wpp)) for user in day_users.values()),
+        key=lambda item: item[2],
+        reverse=True,
+    )
+    return total_xp, sum(item[2] for item in contributors), contributors
 
 
 async def resolve_stat_target(

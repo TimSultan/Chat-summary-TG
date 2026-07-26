@@ -32,6 +32,7 @@ import chat_profile
 import economy
 import history
 import stats
+import tree
 from config import build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
@@ -751,7 +752,7 @@ async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=
         try:
             text = await stats.format_procrastinators(client, entry, entry, tz, log=log)
             if text:
-                await stats_digest_queue.put((entry, text))
+                await stats_digest_queue.put((entry, text, None))
                 log(f"[stats] queued procrastinator digest for '{entry}'")
             else:
                 log(f"[stats] procrastinator digest for '{entry}' has nothing to report today")
@@ -771,6 +772,59 @@ async def _stats_catchup_loop(client, cfg, tz, level_announcement_queue=None, lo
         next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
         await _stats_catch_up(client, cfg, tz, level_announcement_queue, log=log)
+
+
+async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> None:
+    """Builds and queues the morning ЕПХ-tree post for every tracked chat.
+
+    Reports YESTERDAY: at 10:00 today's own numbers are three hours old and would make
+    the growth figure meaningless. Yesterday is also a closed, recorded day, so the same
+    morning re-run after a restart produces the same post rather than a moving one.
+
+    A per-chat marker means a restart cannot post it twice, and a chat whose digest
+    raises is simply left for tomorrow instead of blocking the others.
+    """
+    if stats_digest_queue is None:
+        return
+    today = datetime.now(tz).date()
+    yesterday = today - timedelta(days=1)
+    for entry in cfg.listener_allowed_chats:
+        if not stats.should_send_tree_digest(entry, today):
+            continue
+        try:
+            total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                client, entry, entry, yesterday, tz, log=log
+            )
+            text = tree.format_morning_digest(total_xp, day_xp, contributors, today)
+            await stats_digest_queue.put((entry, text, "HTML"))
+            stats.mark_tree_digest_sent(entry, today)
+            log(f"[stats] queued tree digest for '{entry}' (+{day_xp} XP yesterday)")
+        except Exception:
+            log(f"[stats] failed to build tree digest for '{entry}':\n{traceback.format_exc()}")
+
+
+async def _tree_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> None:
+    """Wakes every day at 10:00 MOSCOW time -- pinned to Europe/Moscow rather than the
+    app timezone, because the chat asked for a Moscow morning and the deployment's own
+    timezone is a hosting detail that could move.
+
+    Runs a check once on startup too, so a process that was down at 10:00 still posts
+    when it comes back rather than skipping the day entirely; the per-chat marker keeps
+    that from double-posting.
+    """
+    if stats_digest_queue is None:
+        return
+    await _send_tree_digests(client, cfg, stats.tree_digest_tz(), stats_digest_queue, log=log)
+    while True:
+        moscow = stats.tree_digest_tz()
+        now = datetime.now(moscow)
+        next_run = now.replace(
+            hour=stats.TREE_DIGEST_HOUR, minute=0, second=10, microsecond=0
+        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        await _send_tree_digests(client, cfg, moscow, stats_digest_queue, log=log)
 
 
 async def _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> None:
@@ -806,6 +860,7 @@ async def run_stats_rollover(client, cfg, tz, stats_digest_queue=None, log=print
     await asyncio.gather(
         _stats_catchup_loop(client, cfg, tz, stats_digest_queue, log=log),
         _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=log),
+        _tree_digest_loop(client, cfg, tz, stats_digest_queue, log=log),
     )
 
 

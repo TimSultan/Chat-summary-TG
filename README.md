@@ -316,6 +316,64 @@ the split is discarded rather than compared against, which silently re-baselines
 existing member — otherwise the rollout would announce a promotion for the whole chat at
 once.
 
+### ЕПХ Дерево — the chat's shared progression
+
+One tree the whole chat grows together (`tree.py`). Unlike every other ladder here it is
+not per-member: all XP earned in the chat pools into a single height, so a quiet member's
+few points move the same tree as the loudest member's. It is the one score nobody
+competes on.
+
+Calibrated against the chat's own measured output rather than guessed — over a 34-day
+window the whole chat produced **~3,600 XP/day**. At 200 XP per millimetre and a 20 m
+ceiling that is ~18 mm a day, and the final stage lands just under three years out:
+
+| | after | stage |
+|---|---|---|
+| 1 day | 1.8 cm | 🌰 Семечко |
+| 1 month | 54 cm | 🪴 Саженец |
+| 1 year | 6.6 m | 🍃 Крепкое дерево |
+| 2 years | 13.1 m | 🦉 Дерево с дуплом |
+| **3 years** | **19.7 m** | **👑 Легендарное Древо ЕПХ** |
+
+Thirteen stages, set in **height** rather than XP so the names line up with a tree
+somebody can picture. Height is capped at the top: XP accrues forever, and without the cap
+the tree would silently grow past its own last name.
+
+Every morning at **10:00 Moscow** (`TREE_DIGEST_HOUR`, pinned to `Europe/Moscow` rather
+than the app timezone — the deployment's own zone is a hosting detail that could move):
+
+```text
+🌳 Доброе утро, ЕПХ-чане!
+
+Сегодня наше дерево выросло на 20 мм.
+Сейчас это 🪴 Саженец — 61,2 см.
+До стадии «Молодая поросль» — 38,8 см.
+
+Самый большой вклад вчера внесли:
+@nalumurrr — 423 XP
+@citrusssska — 383 XP
+@Cloververona — 326 XP
+
+Напутствие на день
+Если принтер работает — не трогай его настройки. Серьёзно.
+```
+
+It reports **yesterday**, a closed and recorded day: at 10:00 today's own numbers are
+three hours old and would make the growth figure meaningless. The loop also checks once
+on startup, so a process that was down at 10:00 still posts when it returns — a per-chat
+marker keeps that from double-posting.
+
+`DAILY_ADVICE` holds **120** lines covering painting, 3D printing, creative work,
+curiosity, being inspired and inspiring others, not drowning in a backlog, being social
+online and in person, time outdoors, and the workbench itself. Picked **by date**, not at
+random, so everybody sees the same line on the same morning and a restart cannot change it
+halfway through — 120 entries means no repeat for four months.
+
+The digest queue carries a parse mode alongside the text: the tree post is HTML (and
+escapes names itself), the procrastinator call-out stays plain text (it embeds raw display
+names). Sending either with the other's mode would print tags verbatim or have Telegram
+reject the message.
+
 ### Coins, the shop, and anti-farming
 
 Coins are a **real ledger** (`economy.py`), not the derived `xp // 10` display they used

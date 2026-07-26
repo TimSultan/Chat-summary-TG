@@ -2952,16 +2952,17 @@ async def run_bot_listener(
 
         async def _consume_stats_digests():
             while True:
-                entry, text = await stats_digest_queue.get()
+                entry, text, parse_mode = await stats_digest_queue.get()
                 chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
                 if chat_id is None:
                     log(f"[bot_listener] dropping stats notification for '{entry}': could not resolve a chat_id for it")
                     continue
                 try:
-                    # parse_mode=None: the digest embeds raw display names, same reasoning
-                    # as every other stats reply -- see the send_message call in the
-                    # /top and /stat handling above.
-                    await api.send_message(chat_id, text, parse_mode=None)
+                    # The producer decides: the procrastinator call-out is plain text
+                    # because it embeds raw display names, while the tree digest is HTML
+                    # and escapes them itself. Sending one with the other's mode either
+                    # prints tags verbatim or has Telegram reject the whole message.
+                    await api.send_message(chat_id, text, parse_mode=parse_mode)
                     log(f"[bot_listener] sent stats notification to '{entry}'")
                 except Exception:
                     log(f"[bot_listener] failed to send stats notification:\n{traceback.format_exc()}")
