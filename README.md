@@ -339,6 +339,50 @@ Thirteen stages, set in **height** rather than XP so the names line up with a tr
 somebody can picture. Height is capped at the top: XP accrues forever, and without the cap
 the tree would silently grow past its own last name.
 
+#### Planting it: the ceremony
+
+`/посадить_семечко` — or `/plant`, see below — posts an invitation to the chat and starts
+collecting presses on the button under it. The next 10:00 post names everyone who pressed,
+plants the tree, and hands each of them the **🌱 Основатель** badge. Administrators only,
+and it works from the chat itself as well as from the bot's DM; only the acknowledgement
+follows the admin back to wherever they typed it.
+
+Two spellings for one action because Telegram only treats `[a-zA-Z0-9_]` after a slash as
+a command: `/посадить_семечко` is never highlighted, never autocompletes, cannot be
+registered in the menu, and — if the bot's privacy mode is ever turned back on — would not
+reach the bot in a group at all. `/plant` always works. The Cyrillic spelling is kept
+because it reads far better in the chat.
+
+Members take part by **pressing a button**, not by reacting. A reaction was the original
+design and had to go: Telegram only accepts its own fixed quick-reaction set
+([core.telegram.org/api/reactions](https://core.telegram.org/api/reactions)), which
+contains no 🌳, 🌱 or 🌿 at all — 🎄, a new year tree, is the only tree in it, and anything
+outside the set fails silently with no other symptom. A button carries any emoji, reports
+exactly who pressed it, and needs no Telethon session to read. Presses are answered as a
+toast on the presser's own screen, so 190 members tapping a button cannot become 190
+messages in the chat.
+
+Nothing is pinned or unpinned. The admin pins the invitation by hand, which is why the bot
+never asks for `can_pin_messages` — and why nothing has to remember to unpin at 10:00.
+
+If **nobody** pressed by 10:00 the tree is deliberately *not* planted and the ceremony
+stays open for another day: opening the whole thing on an empty roll call would be worse
+than waiting for a better one. While a ceremony is open `/tree` answers "Семечко ещё не в
+земле" rather than a meaningless "0 мм".
+
+The guest list goes through the stats directory because the two halves live in different
+processes — presses arrive at `bot_listener.py`, the 10:00 post is built by `listener.py`.
+Each planter's display name is stored **at press time** rather than looked up later: the
+roll call has to name members who have never written a word in the chat, and those are
+exactly the ones no stats file knows about.
+
+The founder badge lives in the custom-badge store rather than in `AUTOMATIC_BADGES`,
+because nothing about it can be recomputed from a member's stats — it records a single
+afternoon, and afterwards there is no way to earn it again. That also puts it in the
+`✨ Уникальные значки` block at the top of `/stat`, which is where a thing you cannot earn
+belongs. It is exempt from `MAX_CUSTOM_BADGES`, so a chat that had already filled its badge
+budget still plants its tree with something to show for it.
+
 `/replant` (DM, administrators only) posts the planting announcement to the chat and
 starts the tree over from today. It exists because the planting date lives in the stats
 directory, which on a deployed host is a volume nothing else here can reach — without a
@@ -427,6 +471,48 @@ escapes names itself), the procrastinator call-out stays plain text (it embeds r
 names). Sending either with the other's mode would print tags verbatim or have Telegram
 reject the message.
 
+### `/preview` — looking at a scheduled post before the chat does
+
+`preview.py`. The tree posts were the only ones nobody could see in advance: the morning
+digest fires from a scheduler, the planting happens once in the lifetime of the chat, and
+the nobody-turned-up variant needs a roll call nobody signed up for to reproduce. `/preview`
+in the bot's DM (administrators only) renders all of them from fixed sample data.
+
+Without an argument it draws a menu, one button per message. `/preview rollcall` sends one
+directly. Everything is **pure** — fixed sample cast, fixed numbers, no stats store, no
+clock beyond the day passed in — and every builder calls the same formatter the scheduler
+calls, so a preview cannot drift from the real thing. Only hard-to-trigger messages are in
+here; `/stat`, `/top`, `/shop` and the cabinet are already one command away.
+
+`/preview test_button` is the exception: it posts the invitation, button and all, to the
+real chat, because a button can only be judged where it will live. The DM gets a receipt
+with a one-tap **🗑 Удалить из чата**. That undo matters more than it looks — this is the
+only preview that lands in front of 190 people, and hunting for the post to delete it by
+hand is exactly the friction that would stop somebody testing at all.
+
+Sample planting buttons carry their own callback payload, separate from the menu's
+post-to-the-chat action. The two look identical on screen, and sharing one payload meant
+that tapping the button on a DM sample, to see what it did, sent the invitation to all 190
+members. Pressing a sample now just says "это тест", whoever presses it and wherever.
+
+#### Inline buttons must answer before they work
+
+Every callback handler answers `answerCallbackQuery` **first**, before anything that can
+block, and reports refusals and errors as a DM instead of a toast. That is a fair trade for
+a button that always responds.
+
+The rule exists because the preview buttons once didn't. They resolved the group chat
+before answering, and resolving goes through the Telethon session whenever `known_chat_ids`
+misses — which is every press in a DM until the bot has seen a live group message. A
+Telethon session that cannot connect **does not raise; it waits**, retrying underneath,
+with no timeout anywhere. The handler sat on that await, `answerCallbackQuery` was never
+reached, and the button stayed lit up forever with nothing in the log to explain it.
+
+Every interactive Telethon call is now bounded by `CHAT_RESOLVE_TIMEOUT_SECONDS` (10 s —
+longer than a healthy resolve, shorter than a member's patience), so a sick session degrades
+to a message rather than a hang. `_resolve_chat_id` already returned `None` on failure, so a
+timeout fits its existing contract exactly.
+
 ### Coins, the shop, and anti-farming
 
 Coins are a **real ledger** (`economy.py`), not the derived `xp // 10` display they used
@@ -447,6 +533,17 @@ Commands (any tracked chat):
 - `/shop` — catalogue, marked ✅ affordable / 🔒 too expensive / ⏳ on cooldown
 - `/buy title <текст>` — purchase
 
+Administrator commands, none of them advertised in the menu:
+
+| command | where | what |
+|---|---|---|
+| `/посадить_семечко`, `/plant` | chat or DM | open the planting ceremony |
+| `/preview [id]` | DM | look at a scheduled post before the chat does |
+| `/replant` | DM | re-post the planting announcement, start the tree over |
+| `/badgeadmin [-] @user` | DM | delegate custom-badge rights |
+| `/badge` | DM | create, award and remove custom badges |
+| `/weekwinner`, `/deletepokras` | DM | weekly winner badge; remove a figurine credit |
+
 ### Menu button and the fallback menu
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
@@ -461,9 +558,10 @@ a registered command name: **`/top all` cannot be a menu entry at all**. Both sp
 work when typed — `/top all` = `/topall`, `/top pokras` = `/toppokras` = `/stat pokras`.
 The procrastinator list is capped at `PROCRASTINATOR_LIST_SIZE` (10) names, on demand and
 in the automatic digest alike: it is a public call-out, and past about ten names it stops
-reading as a nudge and starts reading as a wall. Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
-deliberately **not** advertised. Registration is best-effort: the bot starts fine without
-a menu.
+reading as a nudge and starts reading as a wall. Admin-only commands — `/badge`, `/weekwinner`, `/deletepokras`,
+`/badgeadmin`, `/replant`, `/preview`, and the two planting spellings — are deliberately
+**not** advertised: putting them in front of all 190 members would invite a wave of "нужны
+права администратора". Registration is best-effort: the bot starts fine without a menu.
 
 Because `_match_allowed_chat` never matches a private chat, `/stat`, `/top`, `/shop` and
 `/coins` used to be silent no-ops in a DM. They now fall back to the configured home chat
