@@ -479,9 +479,9 @@ the nobody-turned-up variant needs a roll call nobody signed up for to reproduce
 in the bot's DM (a hidden, unadvertised command) renders a curated set from fixed sample
 data.
 
-Without an argument it draws exactly seven buttons: **Приглашение**, **Перекличка в
-10:00**, **Утренний пост**, **Обычный**, **Старый пост**, **Значок** and **Отправить
-тест**. `/preview rollcall` sends the roll call directly. The six DM previews are
+Without an argument it draws exactly six buttons: **Приглашение**, **Перекличка в
+10:00**, **Утренний пост**, **Обычный**, **Значок** and **Отправить тест**.
+`/preview rollcall` sends the roll call directly. The five DM previews are
 **pure** — fixed sample cast, fixed numbers, no stats store, no clock beyond the day
 passed in — and every builder calls the same formatter the scheduler calls, so a preview
 cannot drift from the real thing. `/stat`, `/top`, `/shop` and the cabinet are already

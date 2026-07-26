@@ -34,10 +34,10 @@ class PreviewRegistryTests(unittest.TestCase):
             self.assertTrue(preview_id.isascii())
             self.assertNotIn(":", preview_id)  # would break parse_callback
 
-    def test_only_the_requested_six_dm_previews_remain(self):
+    def test_only_the_requested_five_dm_previews_remain(self):
         self.assertEqual(
             preview.preview_ids(),
-            ("seed", "rollcall", "morning", "status", "planting", "founder"),
+            ("seed", "rollcall", "morning", "status", "founder"),
         )
         self.assertEqual(
             [preview.title_for(preview_id) for preview_id in preview.preview_ids()],
@@ -46,7 +46,6 @@ class PreviewRegistryTests(unittest.TestCase):
                 "🌱 Перекличка в 10:00",
                 "☀️ Утренний пост",
                 "🌳 Обычный",
-                "🌱 Старый пост",
                 "🌱 Значок",
             ],
         )
