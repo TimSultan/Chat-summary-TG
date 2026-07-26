@@ -33,9 +33,9 @@ GROUP_TEST_TEXT = "Тестовый текст"
 GROUP_TEST_JOIN_ID = "test_join"
 GROUP_TEST_JOIN_CALLBACK = f"{CALLBACK_PREFIX}:{GROUP_TEST_JOIN_ID}"
 GROUP_TEST_BUTTON_TEXT = "Нажмите сюда"
-GROUP_TEST_BUTTON_ACK = "Записал!"
-GROUP_TEST_BUTTON_ALREADY = "Ты уже в списке."
-GROUP_TEST_BUTTON_CLOSED = "Этот тест уже закрыт."
+GROUP_TEST_BUTTON_ACK = "Готово, ты в тестовом списке."
+GROUP_TEST_BUTTON_ALREADY = "Ты уже в тестовом списке."
+GROUP_TEST_BUTTON_CLOSED = "Этот тест уже завершён."
 
 # Carried by every sample planting button rendered in the DM. It is deliberately NOT the
 # same payload as either the menu's "send to the chat" action or the group test's
@@ -141,10 +141,10 @@ PREVIEWS = (
 # rather than through stats.format_stat, which would need a real member with real history
 # behind it; the point of this one is only to show where the badge lands.
 FOUNDER_BADGE_SAMPLE = "\n".join([
-    "Так значок будет выглядеть в <code>/stat</code> у того, кто сажал:",
+    "Так значок выглядит в <code>/stat</code> у участника посадки:",
     "",
     "✨ <b>Уникальные значки:</b>",
-    "🌱 Основатель — посадил дерево ЕПХ",
+    "🌱 Основатель — участвовал в посадке дерева ЕПХ",
     "",
     "🏅 <b>Значки:</b>",
     "🎨 Я покрасил 2 — покрасить 5 фигурок",
@@ -208,11 +208,11 @@ def menu_view() -> tuple:
     text = "\n".join([
         "🧪 <b>Предпросмотр сообщений</b>",
         "",
-        "Каждая кнопка присылает сюда, в личку, готовое сообщение — ровно в том виде,",
-        "в котором его получит чат. Данные в примерах вымышленные, в чат ничего не уходит.",
+        "Первые шесть кнопок присылают сюда готовые примеры сообщений.",
+        "Данные в них вымышленные, а оформление совпадает с сообщениями для чата.",
         "",
-        f"Последняя кнопка — исключение: она отправляет пост <b>в общий чат</b>,",
-        "чтобы посмотреть кнопку там, где она будет жить. Удалить его можно одной кнопкой.",
+        "Кнопка «Отправить тест» публикует в общем чате нейтральный тест",
+        "и сохраняет имена всех, кто его нажал. Тест можно удалить отсюда.",
         "",
         "Можно и командой: <code>/preview rollcall</code>",
     ])
@@ -241,15 +241,15 @@ def group_test_sent_view(chat_id, message_id: int) -> tuple:
     that would stop somebody testing the button at all.
     """
     text = "\n".join([
-        "Отправил тестовый пост в общий чат.",
+        "Тестовый пост отправлен в общий чат.",
         "",
-        "Каждый участник, который нажмёт «Нажмите сюда», сохранится в тестовом списке.",
+        "Я сохраню имя каждого, кто нажмёт «Нажмите сюда».",
         "Кнопка ниже опубликует текущий список в общем чате.",
     ])
     keyboard = {
         "inline_keyboard": [
             [{
-                "text": "📋 Написать в чат всех нажавших",
+                "text": "📋 Опубликовать список нажавших",
                 "callback_data": f"{CALLBACK_PREFIX}:list:{chat_id}:{message_id}",
             }],
             [{
@@ -291,12 +291,12 @@ def group_test_result_chunks(
 ) -> list[str]:
     """Telegram-safe HTML chunks containing every tester in first-press order."""
     if not testers:
-        return ["Тестовую кнопку пока никто не нажал."]
+        return ["Тестовый список пока пуст."]
     names = [
         f"@{escape(username.lstrip('@'))}" if username else escape(display_name)
         for display_name, username in testers
     ]
-    header = f"<b>Тестовую кнопку нажали — {len(names)}:</b>"
+    header = f"<b>Тестовую кнопку нажали: {len(names)}</b>"
     if max_chars is None:
         return ["\n".join([header, "", "\n".join(f"• {name}" for name in names)])]
 
@@ -317,4 +317,4 @@ def group_test_result_chunks(
 def unknown_preview_text() -> str:
     listed = "\n".join(f"• <code>{preview_id}</code> — {title}" for preview_id, title, _, _ in PREVIEWS)
     listed += f"\n• <code>{GROUP_TEST_ID}</code> — {GROUP_TEST_TITLE}"
-    return f"Нет такого превью. Доступные:\n{listed}"
+    return f"Такого превью нет. Доступные варианты:\n{listed}"

@@ -367,8 +367,8 @@ never asks for `can_pin_messages` — and why nothing has to remember to unpin a
 
 If **nobody** pressed by 10:00 the tree is deliberately *not* planted and the ceremony
 stays open for another day: opening the whole thing on an empty roll call would be worse
-than waiting for a better one. While a ceremony is open `/tree` answers "Семечко ещё не в
-земле" rather than a meaningless "0 мм".
+than waiting for a better one. While a ceremony is open `/tree` answers "Посадка открыта"
+rather than a meaningless "0 мм".
 
 The guest list goes through the stats directory because the two halves live in different
 processes — presses arrive at `bot_listener.py`, the 10:00 post is built by `listener.py`.
@@ -391,7 +391,7 @@ purpose: re-posting "сегодня мы посадили семечко" while 
 would be a lie, and re-planting without posting would silently zero the chat's progress.
 The reset only happens once the announcement has actually landed, and it marks that day
 as already greeted — the announcement *is* that morning's post, so without this the 10:00
-loop would follow it with an ordinary digest reading "выросло на 0 мм, Семечко — 0 мм".
+loop would follow it with an ordinary zero-growth digest.
 
 Neither the planting post nor the morning digest is ever scheduled for deletion — they
 stay in the chat. Only `/tree` and the other on-demand stats replies self-delete.
@@ -413,7 +413,7 @@ engineering documentation; none of it is ever said in the chat.
 
 Из него вырастет могучее дерево ЕПХ — одно на весь чат, общее.
 ...
-🌳 Давайте вырастим его вместе — покажите ему, на что мы способны.
+🌳 Давайте растить его вместе и радоваться каждому новому шагу.
 ```
 
 Every morning at **10:00 Moscow** (`TREE_DIGEST_HOUR`, pinned to `Europe/Moscow` rather
@@ -422,27 +422,27 @@ than the app timezone — the deployment's own zone is a hosting detail that cou
 ```text
 🌳 Доброе утро, ЕПХ-чане!
 
-Сегодня наше дерево выросло на 20 мм.
-Сейчас это 🪴 Саженец — 61,2 см.
-До стадии «Молодая поросль» — 38,8 см.
+Вчера наше дерево подросло на 20 мм.
+Сейчас оно на стадии 🪴 Саженец. Высота — 61,2 см.
+До следующей стадии «Молодая поросль» — 38,8 см.
 
-Самый большой вклад вчера внесли:
+Особенно помогли дереву вырасти:
 @nalumurrr — 423 XP
 @citrusssska — 383 XP
 @Cloververona — 326 XP
 
-Напутствие на день
-Если принтер работает — не трогай его настройки. Серьёзно.
+Идея на день
+Стабильный профиль принтера стоит сохранить прежде, чем экспериментировать дальше.
 ```
 
 `/tree` answers the same question on demand, in a group or a DM:
 
 ```text
-🌳 Наше дерево ЕПХ выросло на 61,2 см.
-Сейчас это 🪴 Саженец.
-До стадии «Молодая поросль» — 38,8 см.
+🌳 Высота нашего дерева ЕПХ — 61,2 см.
+Сейчас оно на стадии 🪴 Саженец.
+До следующей стадии «Молодая поросль» — 38,8 см.
 
-Ваша активность и покрасы помогают ему расти.
+Каждое сообщение, ответ и показанная работа помогают ему расти.
 ```
 
 `/tree` reports the same three things as the morning post — total height, yesterday's
@@ -490,7 +490,7 @@ one command away.
 `/preview test_button` is the exception: it posts a neutral **Тестовый текст** with a
 **Нажмите сюда** button to the real chat. Each member who presses is persisted once in a
 test-only list; it never opens a planting, changes the tree, or awards a badge. The DM
-receipt has **📋 Написать в чат всех нажавших**, which posts the current names to the
+receipt has **📋 Опубликовать список нажавших**, which posts the current names to the
 group, and **🗑 Удалить из чата**, which removes the test and closes its list. Sending a
 new test starts a fresh list.
 

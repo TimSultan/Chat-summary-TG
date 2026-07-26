@@ -89,6 +89,12 @@ class AdviceTests(unittest.TestCase):
                 self.assertTrue(line[0].isupper())
                 self.assertIn(line[-1], ".!?")
 
+    def test_the_rotation_avoids_harsh_failure_language(self):
+        text = " ".join(tree.DAILY_ADVICE).lower()
+        for negative in ("неудач", "провал", "стыдно", "кривой", "испорчен", "уродлив"):
+            with self.subTest(negative=negative):
+                self.assertNotIn(negative, text)
+
     def test_the_same_day_always_gives_the_same_line(self):
         # It is a shared greeting, not a personal fortune: everybody must see one line,
         # and a restart must not change it halfway through the morning.
@@ -126,12 +132,12 @@ class DigestTests(unittest.TestCase):
         text = self._digest()
 
         self.assertIn("Доброе утро, ЕПХ-чане!", text)
-        self.assertIn("выросло на", text)
+        self.assertIn("Вчера наше дерево подросло на", text)
         self.assertIn("@first — 423 XP", text)
         self.assertIn("@third — 326 XP", text)
         # Only three, so the fourth is not named.
         self.assertNotIn("fourth", text)
-        self.assertIn("Напутствие на день", text)
+        self.assertIn("Идея на день", text)
 
     def test_a_member_without_a_username_is_named_and_escaped(self):
         text = self._digest(contributors=[("<Худож & ник>", None, 100)])
@@ -140,11 +146,16 @@ class DigestTests(unittest.TestCase):
 
     def test_nobody_earning_anything_drops_the_whole_block(self):
         text = self._digest(yesterday_xp=0, contributors=[("Никто", "nobody", 0)])
-        self.assertNotIn("Самый большой вклад", text)
-        self.assertIn("выросло на 0 мм", text)
+        self.assertNotIn("Особенно помогли дереву вырасти", text)
+        self.assertIn("Вчера высота дерева не изменилась", text)
         # The greeting and the advice still go out -- it is a morning post, not a report.
         self.assertIn("Доброе утро", text)
-        self.assertIn("Напутствие на день", text)
+        self.assertIn("Идея на день", text)
+
+    def test_the_growth_period_is_explicitly_yesterday(self):
+        text = self._digest()
+        self.assertIn("Вчера наше дерево", text)
+        self.assertNotIn("Сегодня наше дерево", text)
 
     def test_the_countdown_disappears_at_the_final_stage(self):
         topped_out = self._digest(total_xp=10**12)
@@ -165,11 +176,14 @@ class PlantingTests(unittest.TestCase):
 
         self.assertIn("посадили семечко", text)
         self.assertIn("дерево ЕПХ", text)
-        self.assertIn("Ваша активность", text.replace("\n", " ") + " Ваша активность")
-        self.assertIn("Давайте вырастим его вместе", text)
+        self.assertIn("каждое сообщение", text)
+        self.assertIn("Давайте растить его вместе", text)
         # No numbers: on planting day a height of "0 мм" would undercut the moment.
         self.assertNotIn("мм", text)
-        self.assertNotIn("Больше всех вложили", text)
+        self.assertNotIn("Особенно помогли дереву вырасти", text)
+
+    def test_roll_call_reuses_the_same_planting_story(self):
+        self.assertIn(tree.format_planting_message(), tree.format_planting_roll_call([("Аня", None)]))
 
     def test_the_opening_post_never_reveals_where_it_ends(self):
         """Same rule /stat already follows: naming "thirteen stages, three years" turns
@@ -414,7 +428,7 @@ class PlantHandlerTests(unittest.TestCase):
         self._plant()
         invitation = self.api.sent[0]
         self.assertEqual(invitation["chat_id"], self.GROUP)
-        self.assertIn("сажаем семечко", invitation["text"])
+        self.assertIn("начинаем общую посадку", invitation["text"])
         self.assertEqual(
             invitation["reply_markup"]["inline_keyboard"][0][0]["text"], tree.SEED_BUTTON_TEXT
         )
@@ -436,13 +450,13 @@ class PlantHandlerTests(unittest.TestCase):
         self._plant()
         self.api = self.API()
         self._plant()
-        self.assertIn("уже идёт", self.api.sent[0]["text"])
+        self.assertIn("уже открыта", self.api.sent[0]["text"])
         self.assertEqual(len(self.api.sent), 1)
 
     def test_it_refuses_once_the_tree_exists(self):
         stats.mark_tree_planted(self.ENTRY, date(2026, 7, 20))
         self._plant()
-        self.assertIn("уже посажено", self.api.sent[0]["text"])
+        self.assertIn("уже растёт", self.api.sent[0]["text"])
         self.assertFalse(stats.planting_is_open(self.ENTRY))
 
     def test_a_failed_post_does_not_open_collection(self):
@@ -477,7 +491,7 @@ class PlantHandlerTests(unittest.TestCase):
         self._plant()
         stats.close_planting(self.ENTRY)
         self._press(self.MEMBER)
-        self.assertEqual(self.api.answers, ["Посадка уже закрыта."])
+        self.assertEqual(self.api.answers, ["Эта посадка уже завершена."])
 
 
 class TenOClockTests(unittest.TestCase):
@@ -538,7 +552,7 @@ class TenOClockTests(unittest.TestCase):
         self._open_with([])
         posted = self._run_ten_am()
 
-        self.assertIn("Семечко пока в руке", posted[0][1])
+        self.assertIn("Семечко ждёт своих участников", posted[0][1])
         self.assertTrue(stats.planting_is_open(self.ENTRY))
         self.assertIsNone(stats.tree_planted_on(self.ENTRY))
 
@@ -563,7 +577,7 @@ class TenOClockTests(unittest.TestCase):
             posted = self._run_ten_am(datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc))
 
         self.assertIn("Доброе утро", posted[0][1])
-        self.assertIn("выросло на", posted[0][1])
+        self.assertIn("Вчера наше дерево подросло на", posted[0][1])
         self.assertNotIn("Сегодня мы все вместе посадили семечко", posted[0][1])
 
 
@@ -576,19 +590,19 @@ class TreeCommandTests(unittest.TestCase):
             MEASURED_DAILY_XP * 34, MEASURED_DAILY_XP, self.CONTRIBUTORS
         )
 
-        self.assertIn("Наше дерево ЕПХ выросло на", text)
+        self.assertIn("Высота нашего дерева ЕПХ", text)
         self.assertIn("Саженец", text)
-        self.assertIn("За вчера подросло на", text)
+        self.assertIn("Вчера дерево подросло на", text)
         self.assertIn("@first — 423 XP", text)
         self.assertIn("@third — 326 XP", text)
         self.assertNotIn("fourth", text)
-        self.assertIn("Ваша активность и покрасы помогают ему расти.", text)
+        self.assertIn("Каждое сообщение, ответ и показанная работа помогают ему расти.", text)
 
     def test_a_quiet_yesterday_drops_the_block_but_keeps_the_height(self):
         text = tree.format_tree_status(MEASURED_DAILY_XP * 34, 0, [])
-        self.assertNotIn("Больше всех вложили", text)
-        self.assertIn("Наше дерево ЕПХ выросло на", text)
-        self.assertIn("Ваша активность", text)
+        self.assertNotIn("Особенно помогли дереву вырасти", text)
+        self.assertIn("Высота нашего дерева ЕПХ", text)
+        self.assertIn("Каждое сообщение", text)
 
     def test_a_fresh_chat_still_gets_a_sensible_answer(self):
         text = tree.format_tree_status(0)

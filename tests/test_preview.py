@@ -280,10 +280,10 @@ class CeremonyMessageTests(unittest.TestCase):
         expected_lines = (
             "🌱 <b>Сегодня мы все вместе посадили семечко.</b>",
             "Из него вырастет могучее дерево ЕПХ — одно на весь чат, общее.",
-            "Каждое утро в 10:00 я буду рассказывать, на сколько оно подросло за сутки",
+            "Каждое утро в 10:00 я буду рассказывать, насколько оно подросло за сутки",
             "<b>Семечко посадили:</b>",
             "Аня, Боря",
-            "🌳 <b>Давайте вырастим его вместе — покажите ему, на что мы способны.</b>",
+            "🌳 <b>Давайте растить его вместе и радоваться каждому новому шагу.</b>",
             "Всё начинается сегодня.",
             "<b>Напутствие</b>",
             tree.PLANTING_ADVICE,
@@ -434,7 +434,7 @@ class PreviewCallbackTests(unittest.TestCase):
         with patch.object(bot_listener, "_resolve_chat_id", _resolve):
             self._press(preview.callback_data("seed"), known_chat_ids={})
 
-        self.assertIn("сажаем семечко", self.api.sent[0]["text"])
+        self.assertIn("начинаем общую посадку", self.api.sent[0]["text"])
 
     def test_only_posting_to_the_group_needs_the_group_resolved(self):
         called = []
@@ -456,7 +456,7 @@ class PreviewCallbackTests(unittest.TestCase):
         with patch.object(bot_listener, "_resolve_chat_id", _resolve):
             self._press(preview.callback_data(preview.GROUP_TEST_ID), known_chat_ids={})
 
-        self.assertIn("TELEGRAM_SESSION_STRING", self.api.sent[0]["text"])
+        self.assertIn("подключение бота", self.api.sent[0]["text"])
 
     def test_the_test_post_is_neutral_and_offers_list_and_delete_controls(self):
         self._press(preview.callback_data(preview.GROUP_TEST_ID))
@@ -525,18 +525,18 @@ class PreviewCallbackTests(unittest.TestCase):
         self.assertIn("@someone", published["text"])
         self.assertIn("Без ника", published["text"])
         self.assertIn("2", published["text"])
-        self.assertIn("отправлен", confirmation["text"])
+        self.assertIn("опубликован", confirmation["text"])
 
     def test_the_list_control_can_report_that_nobody_pressed(self):
         stats.open_preview_button_test("chat", GROUP_CHAT, 501)
         self._press(f"{preview.CALLBACK_PREFIX}:list:{GROUP_CHAT}:501")
-        self.assertIn("никто", self.api.sent[0]["text"])
+        self.assertIn("список пока пуст", self.api.sent[0]["text"])
 
     def test_the_undo_deletes_the_post_from_the_chat(self):
         stats.open_preview_button_test("chat", GROUP_CHAT, 501)
         self._press(f"{preview.CALLBACK_PREFIX}:del:{GROUP_CHAT}:501")
         self.assertEqual(self.api.deleted, [(GROUP_CHAT, 501)])
-        self.assertIn("Удалил", self.api.sent[0]["text"])
+        self.assertIn("удалён", self.api.sent[0]["text"])
         self.assertIsNone(stats.preview_button_test_state("chat"))
 
     def test_a_sample_planting_button_in_the_dm_still_records_nothing(self):

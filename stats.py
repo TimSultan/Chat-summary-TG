@@ -1087,7 +1087,7 @@ def ensure_founder_badge(entry: str) -> Badge:
         badge_id=FOUNDER_BADGE_ID,
         emoji=record["emoji"],
         name=record["name"],
-        description="посадил дерево ЕПХ",
+        description="участвовал в посадке дерева ЕПХ",
         custom=True,
     )
 

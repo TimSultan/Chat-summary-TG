@@ -938,28 +938,24 @@ async def handle_replant_command(
             log(f"[bot_listener] failed to answer /replant:\n{traceback.format_exc()}")
 
     if entry is None or admin_chat_id is None:
-        await reply("Не настроен основной чат.")
+        await reply("Основной чат не настроен.")
         return
     if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
-        await reply("Пересадить дерево могут только администраторы чата.")
+        await reply("Запустить дерево заново могут только администраторы чата.")
         return
 
     today = datetime.now(stats.tree_digest_tz()).date()
-    previous = stats.tree_planted_on(entry)
     try:
         await api.send_message(admin_chat_id, tree.format_planting_message(), parse_mode="HTML")
     except Exception:
         log(f"[bot_listener] failed to post the planting message:\n{traceback.format_exc()}")
-        await reply("Не удалось отправить сообщение в чат — дерево не тронул.")
+        await reply("Не удалось отправить пост в чат. Данные дерева остались без изменений.")
         return
 
     # Only after the announcement actually landed: a reset with no post would leave the
     # chat's progress silently zeroed.
     stats.replant_tree(entry, today)
-    await reply(
-        f"Отправил в чат. Дерево посажено заново с {today.isoformat()}"
-        + (f" (было {previous.isoformat()})." if previous else ".")
-    )
+    await reply("Готово: пост отправлен, отсчёт дерева начат заново с сегодняшнего дня.")
 
 
 async def handle_plant_command(
@@ -988,17 +984,17 @@ async def handle_plant_command(
             log(f"[bot_listener] failed to answer the plant command:\n{traceback.format_exc()}")
 
     if entry is None or admin_chat_id is None:
-        await reply("Не настроен основной чат.")
+        await reply("Основной чат не настроен.")
         return
     if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
         await reply("Посадку может открыть только администратор чата.")
         return
     if stats.planting_is_open(entry):
         signed = len(stats.planters(entry))
-        await reply(f"Посадка уже идёт — записалось {signed}. Итоги в 10:00.")
+        await reply(f"Посадка уже открыта. Сейчас в списке: {signed}. Перекличка в 10:00.")
         return
     if stats.tree_planted_on(entry) is not None:
-        await reply("Дерево уже посажено. Начать заново: /replant в личке.")
+        await reply("Дерево уже растёт. Чтобы начать заново, используй /replant в личке.")
         return
 
     now = datetime.now(stats.tree_digest_tz())
@@ -1015,13 +1011,14 @@ async def handle_plant_command(
         )
     except Exception:
         log(f"[bot_listener] failed to post the planting invitation:\n{traceback.format_exc()}")
-        await reply("Не удалось отправить приглашение в чат.")
+        await reply("Приглашение не отправилось. Попробуй ещё раз.")
         return
 
     stats.open_planting(entry, admin_chat_id, sent["message_id"], now.date())
     await reply(
-        "Посадка открыта. Закрепи пост — итоги в 10:00 "
-        + ("сегодня." if same_day else "завтра.")
+        "Посадка открыта. Закрепи приглашение — перекличка "
+        + ("сегодня" if same_day else "завтра")
+        + " в 10:00."
     )
 
 
@@ -1033,7 +1030,7 @@ async def handle_plant_callback(
     callback_id = callback["id"]
     presser = callback.get("from") or {}
     if entry is None or not stats.planting_is_open(entry):
-        await api.answer_callback_query(callback_id, "Посадка уже закрыта.")
+        await api.answer_callback_query(callback_id, "Эта посадка уже завершена.")
         return
     try:
         added = stats.add_planter(
@@ -1041,7 +1038,7 @@ async def handle_plant_callback(
         )
     except Exception:
         log(f"[bot_listener] failed to record a planter:\n{traceback.format_exc()}")
-        await api.answer_callback_query(callback_id, "Что-то пошло не так, попробуй ещё раз.")
+        await api.answer_callback_query(callback_id, "Не удалось добавить тебя в список. Попробуй ещё раз.")
         return
     await api.answer_callback_query(
         callback_id, tree.SEED_BUTTON_ACK if added else tree.SEED_BUTTON_ALREADY
@@ -1133,7 +1130,7 @@ async def handle_preview_command(
                 else None
             )
             if admin_chat_id is None:
-                await reply("Не удалось определить основной чат — Telethon-сессия не отвечает.")
+                await reply("Не удалось найти основной чат. Проверь подключение бота.")
                 return
             await _post_group_test(api, dm_chat_id, admin_chat_id, entry, log=log)
             return
@@ -1199,7 +1196,9 @@ async def handle_preview_callback(
             )
         except Exception:
             log(f"[bot_listener] failed to record a test-button press:\n{traceback.format_exc()}")
-            await api.answer_callback_query(callback_id, "Не удалось записать — попробуй ещё раз.")
+            await api.answer_callback_query(
+                callback_id, "Не удалось добавить тебя в тестовый список. Попробуй ещё раз."
+            )
             return
         acknowledgement = (
             preview.GROUP_TEST_BUTTON_ACK
@@ -1240,11 +1239,11 @@ async def handle_preview_callback(
                 else None
             )
             if testers is None:
-                await say("Этот тест уже неактуален.")
+                await say("Этот тест уже завершён.")
                 return
             for chunk in preview.group_test_result_chunks(testers):
                 await api.send_message(chat_id, chunk, parse_mode="HTML")
-            await say("Список нажавших отправлен в общий чат.")
+            await say("Список нажавших опубликован в общем чате.")
             return
 
         if deletion is not None:
@@ -1252,7 +1251,7 @@ async def handle_preview_callback(
             await api.delete_message(chat_id, message_id)
             if entry is not None:
                 stats.close_preview_button_test(entry, chat_id, message_id)
-            await say("Удалил тестовый пост из чата.")
+            await say("Тестовый пост удалён из общего чата.")
             return
 
         if not preview_id:
@@ -1265,10 +1264,7 @@ async def handle_preview_callback(
                 else None
             )
             if admin_chat_id is None:
-                await say(
-                    "Не удалось определить основной чат — Telethon-сессия не отвечает.\n"
-                    "Проверь TELEGRAM_SESSION_STRING."
-                )
+                await say("Не удалось найти основной чат. Проверь подключение бота.")
                 return
             await _post_group_test(api, dm_chat_id, admin_chat_id, entry, log=log)
             return
@@ -1277,7 +1273,7 @@ async def handle_preview_callback(
             await say("Нет такого превью.")
     except Exception:
         log(f"[bot_listener] preview button {preview_id} failed:\n{traceback.format_exc()}")
-        await say("Не удалось показать превью — подробности в логах.")
+        await say("Не удалось показать превью. Попробуй ещё раз.")
 
 
 async def handle_badge_admin_command(
