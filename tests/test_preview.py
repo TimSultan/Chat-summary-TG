@@ -304,6 +304,26 @@ class PreviewCallbackTests(unittest.TestCase):
         self.assertEqual(sent["parse_mode"], "HTML")
         self.assertIn("Семечко в земле", sent["text"])
 
+    def test_a_preview_button_reaches_its_handler_through_update_dispatch(self):
+        """Pin module-name shadowing in _dispatch_update, not just the leaf handler."""
+        handled = []
+
+        async def handle(*args, **kwargs):
+            handled.append(args[2])
+
+        async def dispatch():
+            with patch.object(bot_listener, "handle_preview_callback", handle):
+                await bot_listener._dispatch_update(
+                    {"callback_query": _callback(preview.callback_data("rollcall"))},
+                    self.api, None, None, None, None, 1, set(), asyncio.Queue(),
+                    {}, set(), set(), "chat", {}, {}, None, {}, {}, {},
+                    log=lambda *_: None,
+                )
+
+        asyncio.run(dispatch())
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0]["data"], preview.callback_data("rollcall"))
+
     def test_every_menu_button_answers_and_sends_something(self):
         for preview_id in preview.preview_ids():
             with self.subTest(preview_id=preview_id):

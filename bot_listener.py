@@ -3031,11 +3031,11 @@ async def _dispatch_update(
     # "preview" phrase is checked first since it contains the plain trigger word too.
     if chat.get("type") == "private" and message_text:
         stripped = message_text.lower()
-        preview = cfg.joke_manual_preview_keyword in stripped
-        if preview or cfg.joke_manual_trigger_keyword in stripped:
+        wants_preview = cfg.joke_manual_preview_keyword in stripped
+        if wants_preview or cfg.joke_manual_trigger_keyword in stripped:
             task = asyncio.create_task(
                 handle_manual_joke(
-                    api, telethon_client, cfg, tz, message, preview, home_chat_ref,
+                    api, telethon_client, cfg, tz, message, wants_preview, home_chat_ref,
                     known_chat_ids, joke_preview_pending, joke_posted_queue, log=log,
                 )
             )
