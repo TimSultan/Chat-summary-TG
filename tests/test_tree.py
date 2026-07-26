@@ -1,9 +1,13 @@
+import asyncio
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import bot_listener
+import listener
+import preview
 import stats
 import tree
 
@@ -239,6 +243,327 @@ class PlantingTests(unittest.TestCase):
         self.assertEqual(tree.tree_height_mm(0), 0)
         number, _, name = tree.tree_stage(0)
         self.assertEqual((number, name), (1, "Семечко"))
+
+
+class CeremonyStoreTests(unittest.TestCase):
+    """The guest list is written by bot_listener (button presses) and read by listener
+    (the 10:00 post) -- two processes, one file, so it gets checked like an interface."""
+
+    ENTRY = "chat"
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def _open(self):
+        stats.open_planting(self.ENTRY, -100123, 55, date(2026, 7, 26))
+
+    def test_nothing_is_open_to_begin_with(self):
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+        self.assertEqual(stats.planters(self.ENTRY), [])
+
+    def test_a_press_signs_you_up_once(self):
+        self._open()
+        self.assertTrue(stats.add_planter(self.ENTRY, 1, "Аня", "anya"))
+        self.assertFalse(stats.add_planter(self.ENTRY, 1, "Аня", "anya"))
+        self.assertEqual(stats.planters(self.ENTRY), [("Аня", "anya")])
+
+    def test_presses_keep_the_order_they_arrived_in(self):
+        self._open()
+        for user_id, name in ((1, "Первый"), (2, "Второй"), (3, "Третий")):
+            stats.add_planter(self.ENTRY, user_id, name, None)
+        self.assertEqual(
+            [name for name, _ in stats.planters(self.ENTRY)], ["Первый", "Второй", "Третий"]
+        )
+
+    def test_a_press_with_no_ceremony_open_is_dropped(self):
+        self.assertFalse(stats.add_planter(self.ENTRY, 1, "Аня", "anya"))
+
+    def test_names_are_stored_at_press_time(self):
+        # The roll call has to name members who never wrote a word in the chat, and those
+        # are exactly the ones no stats file knows about.
+        self._open()
+        stats.add_planter(self.ENTRY, 1, "Молчун", None)
+        stats.close_planting(self.ENTRY)
+        self._open()
+        self.assertEqual(stats.planters(self.ENTRY), [])
+
+    def test_closing_stops_collection(self):
+        self._open()
+        stats.close_planting(self.ENTRY)
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+        self.assertFalse(stats.add_planter(self.ENTRY, 1, "Аня", None))
+
+    def test_a_corrupt_guest_list_reads_as_no_ceremony(self):
+        # Consulted from the 10:00 loop: a broken file must not stop the morning post.
+        self._open()
+        (Path(self._temporary.name) / f"{stats._cache_key(self.ENTRY)}_planting.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        self.assertIsNone(stats.planting_state(self.ENTRY))
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+
+
+class FounderBadgeTests(unittest.TestCase):
+    ENTRY = "chat"
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        stats.open_planting(self.ENTRY, -100123, 55, date(2026, 7, 26))
+
+    def test_everyone_who_pressed_gets_it(self):
+        for user_id, name in ((1, "Аня"), (2, "Боря"), (3, "Вера")):
+            stats.add_planter(self.ENTRY, user_id, name, None)
+
+        self.assertEqual(stats.award_founder_badges(self.ENTRY), 3)
+        for user_id in (1, 2, 3):
+            badges = stats.custom_badges_for_user(self.ENTRY, user_id)
+            self.assertEqual([badge.badge_id for badge in badges], [stats.FOUNDER_BADGE_ID])
+            self.assertEqual(badges[0].name, "Основатель")
+
+    def test_awarding_twice_changes_nothing(self):
+        stats.add_planter(self.ENTRY, 1, "Аня", None)
+        self.assertEqual(stats.award_founder_badges(self.ENTRY), 1)
+        self.assertEqual(stats.award_founder_badges(self.ENTRY), 0)
+        self.assertEqual(len(stats.custom_badges_for_user(self.ENTRY, 1)), 1)
+
+    def test_nobody_pressed_means_nobody_is_awarded(self):
+        self.assertEqual(stats.award_founder_badges(self.ENTRY), 0)
+        self.assertEqual(stats.list_custom_badges(self.ENTRY), [])
+
+    def test_it_survives_a_chat_that_filled_its_badge_budget(self):
+        # Otherwise the chat plants its tree and nobody gets anything for it.
+        for index in range(stats.MAX_CUSTOM_BADGES):
+            stats.create_custom_badge(self.ENTRY, "🎯", f"Значок {index}", 9, "Admin")
+        stats.add_planter(self.ENTRY, 1, "Аня", None)
+
+        self.assertEqual(stats.award_founder_badges(self.ENTRY), 1)
+        self.assertEqual(
+            [badge.badge_id for badge in stats.custom_badges_for_user(self.ENTRY, 1)],
+            [stats.FOUNDER_BADGE_ID],
+        )
+
+    def test_it_is_a_unique_badge_not_an_earnable_one(self):
+        badge = stats.ensure_founder_badge(self.ENTRY)
+        self.assertTrue(badge.custom)
+        self.assertNotIn(
+            stats.FOUNDER_BADGE_ID, [badge_id for badge_id, _, _, _ in stats.AUTOMATIC_BADGES]
+        )
+
+
+class PlantHandlerTests(unittest.TestCase):
+    """The command that opens the ceremony and the button 190 people will press."""
+
+    ENTRY = "chat"
+    GROUP = -100123
+    ADMIN = {"id": 7, "username": "sultan_kembayev", "first_name": "Sultan"}
+    MEMBER = {"id": 8, "username": "anya", "first_name": "Аня"}
+
+    class API:
+        def __init__(self):
+            self.sent = []
+            self.answers = []
+            self._next_id = 54
+
+        async def send_message(self, chat_id, text, reply_to_message_id=None,
+                               reply_markup=None, parse_mode=None):
+            self._next_id += 1
+            self.sent.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+            return {"message_id": self._next_id}
+
+        async def answer_callback_query(self, callback_query_id, text=None):
+            self.answers.append(text)
+
+        async def get_chat_administrators(self, chat_id):
+            return []
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.api = self.API()
+
+    def _plant(self, actor=None, chat_id=None):
+        message = {
+            "message_id": 1,
+            "chat": {"id": chat_id if chat_id is not None else self.GROUP, "type": "supergroup"},
+            "from": actor or self.ADMIN,
+        }
+        asyncio.run(bot_listener.handle_plant_command(
+            self.api, message, self.ENTRY, self.GROUP, log=lambda *_: None,
+        ))
+
+    def _press(self, presser):
+        asyncio.run(bot_listener.handle_plant_callback(
+            self.api,
+            {"id": "cb", "data": "plant:join", "from": presser,
+             "message": {"message_id": 55, "chat": {"id": self.GROUP, "type": "supergroup"}}},
+            self.ENTRY, log=lambda *_: None,
+        ))
+
+    def test_it_posts_the_invitation_and_opens_collection(self):
+        self._plant()
+        invitation = self.api.sent[0]
+        self.assertEqual(invitation["chat_id"], self.GROUP)
+        self.assertIn("сажаем семечко", invitation["text"])
+        self.assertEqual(
+            invitation["reply_markup"]["inline_keyboard"][0][0]["text"], tree.SEED_BUTTON_TEXT
+        )
+        self.assertTrue(stats.planting_is_open(self.ENTRY))
+
+    def test_the_invitation_button_is_the_real_one_not_the_sample(self):
+        self._plant()
+        data = self.api.sent[0]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        self.assertTrue(data.startswith(f"{bot_listener.PLANT_CALLBACK_PREFIX}:"))
+        self.assertEqual(preview.parse_callback(data), None)
+
+    def test_a_member_cannot_open_it(self):
+        self._plant(actor=self.MEMBER)
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+        self.assertEqual(len(self.api.sent), 1)  # the refusal, and nothing in the chat
+        self.assertIn("только администратор", self.api.sent[0]["text"])
+
+    def test_it_refuses_to_open_twice(self):
+        self._plant()
+        self.api = self.API()
+        self._plant()
+        self.assertIn("уже идёт", self.api.sent[0]["text"])
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_it_refuses_once_the_tree_exists(self):
+        stats.mark_tree_planted(self.ENTRY, date(2026, 7, 20))
+        self._plant()
+        self.assertIn("уже посажено", self.api.sent[0]["text"])
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+
+    def test_a_failed_post_does_not_open_collection(self):
+        async def boom(*args, **kwargs):
+            raise RuntimeError("telegram is down")
+
+        self.api.send_message = boom
+        try:
+            self._plant()
+        except RuntimeError:
+            self.fail("the failure escaped the handler")
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+
+    def test_pressing_signs_you_up_and_answers_on_your_own_screen(self):
+        self._plant()
+        before = len(self.api.sent)
+        self._press(self.MEMBER)
+
+        self.assertEqual(stats.planters(self.ENTRY), [("Аня", "anya")])
+        self.assertEqual(self.api.answers, [tree.SEED_BUTTON_ACK])
+        # 190 members pressing a button must not become 190 messages in the chat.
+        self.assertEqual(len(self.api.sent), before)
+
+    def test_pressing_twice_says_so_and_signs_you_up_once(self):
+        self._plant()
+        self._press(self.MEMBER)
+        self._press(self.MEMBER)
+        self.assertEqual(len(stats.planters(self.ENTRY)), 1)
+        self.assertEqual(self.api.answers[-1], tree.SEED_BUTTON_ALREADY)
+
+    def test_pressing_after_it_closed_says_so(self):
+        self._plant()
+        stats.close_planting(self.ENTRY)
+        self._press(self.MEMBER)
+        self.assertEqual(self.api.answers, ["Посадка уже закрыта."])
+
+
+class TenOClockTests(unittest.TestCase):
+    """What the chat actually wakes up to. Drives listener._send_tree_digests, the code
+    that turns a day of button presses into the roll call."""
+
+    ENTRY = "chat"
+
+    class Config:
+        def __init__(self, entry):
+            self.listener_allowed_chats = [entry]
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.queue = asyncio.Queue()
+
+    def _run_ten_am(self, when=datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc)):
+        with patch("listener.datetime") as fake:
+            fake.now.return_value = when
+            asyncio.run(listener._send_tree_digests(
+                None, self.Config(self.ENTRY), timezone.utc, self.queue, log=lambda *_: None,
+            ))
+        return [] if self.queue.empty() else [self.queue.get_nowait()]
+
+    def _open_with(self, names):
+        stats.open_planting(self.ENTRY, -100123, 55, date(2026, 7, 26))
+        for index, name in enumerate(names, start=1):
+            stats.add_planter(self.ENTRY, index, name, None)
+
+    def test_the_roll_call_names_everyone_and_plants_the_tree(self):
+        self._open_with(["Аня", "Боря", "Вера"])
+        posted = self._run_ten_am()
+
+        self.assertEqual(len(posted), 1)
+        entry, text, parse_mode = posted[0]
+        self.assertEqual((entry, parse_mode), (self.ENTRY, "HTML"))
+        self.assertIn("Семечко в земле", text)
+        for name in ("Аня", "Боря", "Вера"):
+            self.assertIn(name, text)
+        self.assertEqual(stats.tree_planted_on(self.ENTRY), date(2026, 7, 27))
+        self.assertFalse(stats.planting_is_open(self.ENTRY))
+
+    def test_the_roll_call_hands_out_the_founder_badge(self):
+        self._open_with(["Аня", "Боря"])
+        self._run_ten_am()
+        for user_id in (1, 2):
+            self.assertEqual(
+                [b.badge_id for b in stats.custom_badges_for_user(self.ENTRY, user_id)],
+                [stats.FOUNDER_BADGE_ID],
+            )
+
+    def test_nobody_pressed_leaves_the_ceremony_open_and_the_tree_unplanted(self):
+        self._open_with([])
+        posted = self._run_ten_am()
+
+        self.assertIn("Семечко пока в руке", posted[0][1])
+        self.assertTrue(stats.planting_is_open(self.ENTRY))
+        self.assertIsNone(stats.tree_planted_on(self.ENTRY))
+
+    def test_a_second_run_the_same_morning_posts_nothing(self):
+        # A restart at 10:05 must not re-announce the planting.
+        self._open_with(["Аня"])
+        self.assertEqual(len(self._run_ten_am()), 1)
+        self.assertEqual(self._run_ten_am(), [])
+
+    def test_it_waits_for_ten_before_planting_anything(self):
+        self._open_with(["Аня"])
+        posted = self._run_ten_am(datetime(2026, 7, 27, 5, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(posted, [])
+        self.assertTrue(stats.planting_is_open(self.ENTRY))
+        self.assertIsNone(stats.tree_planted_on(self.ENTRY))
+
+    def test_the_morning_after_is_an_ordinary_digest(self):
+        self._open_with(["Аня"])
+        self._run_ten_am()
+        with patch("stats.chat_tree_totals", return_value=(7_200, 3_600, [("Аня", None, 3_600)])):
+            posted = self._run_ten_am(datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc))
+
+        self.assertIn("Доброе утро", posted[0][1])
+        self.assertIn("выросло на", posted[0][1])
+        self.assertNotIn("Семечко в земле", posted[0][1])
 
 
 class TreeCommandTests(unittest.TestCase):

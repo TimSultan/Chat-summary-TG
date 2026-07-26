@@ -1,3 +1,5 @@
+import asyncio
+import re
 import sys
 import unittest
 from datetime import date
@@ -5,8 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import bot_listener
 import preview
 import tree
+
+ADMIN = {"id": 7, "username": "sultan_kembayev", "first_name": "Sultan"}
+MEMBER = {"id": 8, "username": "someone", "first_name": "Кто-то"}
+DM_CHAT = 999
+GROUP_CHAT = -1001234567890
 
 
 class PreviewRegistryTests(unittest.TestCase):
@@ -68,6 +76,46 @@ class PreviewRegistryTests(unittest.TestCase):
     def test_the_sample_button_id_is_not_a_menu_action(self):
         self.assertNotIn(preview.SAMPLE_BUTTON_ID, preview.preview_ids())
         self.assertIsNone(preview.render(preview.SAMPLE_BUTTON_ID))
+
+
+class TelegramHtmlTests(unittest.TestCase):
+    """Telegram rejects a message outright if its HTML doesn't parse, and the bot's own
+    error handling turns that into a button that looks broken: the send raises, the
+    handler logs it, and the presser sees nothing at all. So the markup is checked here
+    rather than discovered in the chat."""
+
+    # Everything Telegram's HTML parse mode accepts that this project could plausibly use.
+    ALLOWED = {"b", "strong", "i", "em", "u", "s", "code", "pre", "a", "blockquote"}
+
+    def _check(self, label, text):
+        stack = []
+        for match in re.finditer(r"<(/?)([a-zA-Z0-9]+)[^>]*>", text):
+            closing, tag = match.group(1), match.group(2).lower()
+            with self.subTest(label=label, tag=tag):
+                self.assertIn(tag, self.ALLOWED, f"{label}: Telegram will reject <{tag}>")
+            if closing:
+                self.assertTrue(stack, f"{label}: </{tag}> with nothing open")
+                self.assertEqual(stack.pop(), tag, f"{label}: tags cross over")
+            else:
+                stack.append(tag)
+        self.assertEqual(stack, [], f"{label}: unclosed {stack}")
+
+    def test_every_preview_is_valid_telegram_html(self):
+        for preview_id in preview.preview_ids():
+            self._check(preview_id, preview.render(preview_id, date(2026, 7, 26)))
+
+    def test_the_menu_is_valid_telegram_html(self):
+        self._check("menu", preview.menu_view()[0])
+
+    def test_the_group_test_receipt_is_valid_telegram_html(self):
+        self._check("receipt", preview.group_test_sent_view(-100123, 7)[0])
+
+    def test_every_advice_line_survives_being_put_in_html(self):
+        # One stray "<" or "&" in 120 hand-written lines would kill exactly one morning
+        # post, on one unpredictable day, months from now.
+        for offset in range(len(tree.DAILY_ADVICE)):
+            day = date.fromordinal(date(2026, 1, 1).toordinal() + offset)
+            self._check(f"advice {offset}", tree.format_morning_digest(42_000, 3_600, [], day))
 
 
 class DeleteCallbackTests(unittest.TestCase):
@@ -148,6 +196,110 @@ class CeremonyMessageTests(unittest.TestCase):
     def test_button_shows_a_seed_a_shovel_and_a_tree(self):
         for emoji in ("🌰", "🪏", "🌳"):
             self.assertIn(emoji, tree.SEED_BUTTON_TEXT)
+
+
+class FakeAPI:
+    def __init__(self):
+        self.sent = []
+        self.answers = []
+        self.deleted = []
+        self._next_id = 500
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None,
+                           reply_markup=None, parse_mode=None):
+        self._next_id += 1
+        self.sent.append({
+            "chat_id": chat_id, "text": text,
+            "reply_markup": reply_markup, "parse_mode": parse_mode,
+        })
+        return {"message_id": self._next_id}
+
+    async def answer_callback_query(self, callback_query_id, text=None):
+        self.answers.append(text)
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+
+    async def get_chat_administrators(self, chat_id):
+        return [{"user": ADMIN}]
+
+
+def _callback(data, presser=ADMIN, chat_id=DM_CHAT, chat_type="private"):
+    return {
+        "id": "cb1",
+        "data": data,
+        "from": presser,
+        "message": {"message_id": 42, "chat": {"id": chat_id, "type": chat_type}},
+    }
+
+
+class PreviewCallbackTests(unittest.TestCase):
+    """Drives the real callback handler, because every one of these paths is a button
+    that either does nothing visible or posts to 190 people."""
+
+    def setUp(self):
+        self.api = FakeAPI()
+
+    def _press(self, data, presser=ADMIN, chat_id=DM_CHAT, chat_type="private",
+               admin_chat_id=GROUP_CHAT):
+        asyncio.run(bot_listener.handle_preview_callback(
+            self.api, _callback(data, presser, chat_id, chat_type),
+            "chat", admin_chat_id, log=lambda *_: None,
+        ))
+
+    def test_a_menu_button_sends_that_sample_to_the_dm(self):
+        self._press(preview.callback_data("rollcall"))
+        self.assertEqual(len(self.api.sent), 1)
+        sent = self.api.sent[0]
+        self.assertEqual(sent["chat_id"], DM_CHAT)
+        self.assertEqual(sent["parse_mode"], "HTML")
+        self.assertIn("Семечко в земле", sent["text"])
+        self.assertEqual(self.api.answers, [preview.title_for("rollcall")])
+
+    def test_every_menu_button_answers_and_sends_something(self):
+        for preview_id in preview.preview_ids():
+            with self.subTest(preview_id=preview_id):
+                self.api = FakeAPI()
+                self._press(preview.callback_data(preview_id))
+                self.assertEqual(len(self.api.sent), 1, "button produced no message")
+                self.assertEqual(self.api.sent[0]["chat_id"], DM_CHAT)
+                self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
+
+    def test_the_test_button_posts_to_the_chat_and_offers_an_undo(self):
+        self._press(preview.callback_data(preview.GROUP_TEST_ID))
+        chats = [item["chat_id"] for item in self.api.sent]
+        self.assertEqual(chats, [GROUP_CHAT, DM_CHAT])
+        posted, receipt = self.api.sent
+        self.assertEqual(
+            posted["reply_markup"]["inline_keyboard"][0][0]["text"], tree.SEED_BUTTON_TEXT
+        )
+        undo = receipt["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        self.assertEqual(preview.parse_delete_callback(undo), (GROUP_CHAT, 501))
+
+    def test_the_undo_deletes_the_post_from_the_chat(self):
+        self._press(f"{preview.CALLBACK_PREFIX}:del:{GROUP_CHAT}:501")
+        self.assertEqual(self.api.deleted, [(GROUP_CHAT, 501)])
+        self.assertEqual(self.api.sent, [])
+
+    def test_the_sample_button_posts_nothing_wherever_it_is_pressed(self):
+        # The one button a member can reach: it sits on the test post in the group.
+        for chat_id, chat_type in ((GROUP_CHAT, "supergroup"), (DM_CHAT, "private")):
+            with self.subTest(chat_type=chat_type):
+                self.api = FakeAPI()
+                self._press(preview.SAMPLE_CALLBACK, presser=MEMBER,
+                            chat_id=chat_id, chat_type=chat_type)
+                self.assertEqual(self.api.sent, [])
+                self.assertEqual(self.api.answers, [tree.SEED_BUTTON_TEST_ACK])
+
+    def test_a_member_cannot_fire_the_group_test(self):
+        self._press(preview.callback_data(preview.GROUP_TEST_ID), presser=MEMBER)
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(self.api.answers, ["Нужны права администратора."])
+
+    def test_an_unresolvable_home_chat_answers_instead_of_hanging(self):
+        self._press(preview.callback_data("seed"), admin_chat_id=None)
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(len(self.api.answers), 1)
 
 
 if __name__ == "__main__":

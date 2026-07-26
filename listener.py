@@ -798,8 +798,31 @@ async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> 
         if not stats.should_send_tree_digest(entry, today):
             continue
         try:
-            # The very first post plants the tree rather than reporting on it: on that
-            # day there is nothing to report, and the height starts from zero here.
+            # A ceremony opened with /посадить_семечко closes here: this is the "последняя
+            # горсть земли" the invitation promised, and the roll call takes the place of
+            # the morning digest for one day.
+            ceremony = stats.planting_state(entry)
+            if ceremony is not None:
+                joined = stats.planters(entry)
+                if not joined:
+                    # Nobody pressed. The tree is deliberately NOT planted and the
+                    # ceremony stays open: opening the whole thing on an empty roll call
+                    # would be worse than waiting another day for a better one.
+                    await stats_digest_queue.put((entry, tree.format_nobody_planted_message(), "HTML"))
+                    stats.mark_tree_digest_sent(entry, today)
+                    log(f"[stats] planting for '{entry}' had no takers, still open")
+                    continue
+                awarded = stats.award_founder_badges(entry)
+                stats.close_planting(entry)
+                stats.mark_tree_planted(entry, today)
+                await stats_digest_queue.put((entry, tree.format_planting_roll_call(joined), "HTML"))
+                stats.mark_tree_digest_sent(entry, today)
+                log(f"[stats] planted '{entry}' with {len(joined)} planters ({awarded} new badges)")
+                continue
+
+            # With no ceremony, the very first post plants the tree rather than reporting
+            # on it: on that day there is nothing to report, and the height starts from
+            # zero here.
             planting = stats.tree_planted_on(entry) is None
             if planting:
                 stats.mark_tree_planted(entry, today)
@@ -1334,11 +1357,16 @@ async def run_listener(
                 level_announcements = []
                 stat_uses_html = False
                 if text_lower.startswith("/tree"):
-                    yesterday = datetime.now(tz).date() - timedelta(days=1)
-                    total_xp, day_xp, contributors = await stats.chat_tree_totals(
-                        client, chat, entry, yesterday, tz, log=log, live_total=True
-                    )
-                    reply_text = tree.format_tree_status(total_xp, day_xp, contributors)
+                    # An open ceremony means there is no tree to measure yet -- see the
+                    # same branch in bot_listener.handle_tree_command.
+                    if stats.planting_is_open(entry):
+                        reply_text = tree.format_awaiting_planting_status()
+                    else:
+                        yesterday = datetime.now(tz).date() - timedelta(days=1)
+                        total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                            client, chat, entry, yesterday, tz, log=log, live_total=True
+                        )
+                        reply_text = tree.format_tree_status(total_xp, day_xp, contributors)
                     stat_uses_html = True
                 elif text_lower.startswith("/top"):
                     top_arg = stats_text[len("/top"):].strip()

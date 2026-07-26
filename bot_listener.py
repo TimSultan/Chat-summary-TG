@@ -128,6 +128,17 @@ BADGE_ADMIN_COMMAND = "/badgeadmin"
 REPLANT_COMMAND = "/replant"
 PREVIEW_COMMAND = "/preview"
 
+# Opens the planting ceremony. Two spellings for one action: Telegram only treats
+# [a-zA-Z0-9_] after a slash as a command, so "/посадить_семечко" is never highlighted,
+# never autocompletes, and -- if the bot's privacy mode is ever turned back on -- never
+# reaches the bot in a group at all. "/plant" always works and can be registered in the
+# menu; the Cyrillic spelling is kept because it is the one that was asked for and reads
+# far better in the chat.
+PLANT_COMMANDS = ("/посадить_семечко", "/plant")
+# The real planting button, as opposed to preview.SAMPLE_CALLBACK, which looks identical
+# and does nothing.
+PLANT_CALLBACK_PREFIX = "plant"
+
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
 # Usernames are compared case-insensitively and without a leading @.
@@ -920,6 +931,92 @@ async def handle_replant_command(
     await reply(
         f"Отправил в чат. Дерево посажено заново с {today.isoformat()}"
         + (f" (было {previous.isoformat()})." if previous else ".")
+    )
+
+
+async def handle_plant_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/посадить_семечко (or /plant) — post the invitation and start collecting presses.
+
+    Works from the chat itself and from the bot's DM alike. The invitation always goes to
+    the chat; only the acknowledgement follows the admin back to wherever they typed it.
+
+    Nothing is pinned here. The admin pins the invitation by hand, which is why the bot
+    never asks for can_pin_messages -- and why nothing has to remember to unpin at 10:00.
+    """
+    where = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(where, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer the plant command:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Не настроен основной чат.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Посадку может открыть только администратор чата.")
+        return
+    if stats.planting_is_open(entry):
+        signed = len(stats.planters(entry))
+        await reply(f"Посадка уже идёт — записалось {signed}. Итоги в 10:00.")
+        return
+    if stats.tree_planted_on(entry) is not None:
+        await reply("Дерево уже посажено. Начать заново: /replant в личке.")
+        return
+
+    now = datetime.now(stats.tree_digest_tz())
+    # Opened before 10:00 and the roll call is today, otherwise tomorrow morning. No
+    # minimum window is enforced: the admin chooses when to open it, and the invitation
+    # says which morning it closes, so a short one is a decision rather than a surprise.
+    same_day = now.hour < stats.TREE_DIGEST_HOUR
+    try:
+        sent = await api.send_message(
+            admin_chat_id,
+            tree.format_seed_ceremony_message(same_day=same_day),
+            parse_mode="HTML",
+            reply_markup=tree.seed_keyboard(f"{PLANT_CALLBACK_PREFIX}:join"),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to post the planting invitation:\n{traceback.format_exc()}")
+        await reply("Не удалось отправить приглашение в чат.")
+        return
+
+    stats.open_planting(entry, admin_chat_id, sent["message_id"], now.date())
+    await reply(
+        "Посадка открыта. Закрепи пост — итоги в 10:00 "
+        + ("сегодня." if same_day else "завтра.")
+    )
+
+
+async def handle_plant_callback(
+    api: TelegramBotAPI, callback: dict, entry: str | None, log=print
+) -> None:
+    """The planting button. Answered as a toast on the presser's own screen and nowhere
+    else: 190 members tapping a button must not become 190 messages in the chat."""
+    callback_id = callback["id"]
+    presser = callback.get("from") or {}
+    if entry is None or not stats.planting_is_open(entry):
+        await api.answer_callback_query(callback_id, "Посадка уже закрыта.")
+        return
+    try:
+        added = stats.add_planter(
+            entry, presser.get("id"), _display_name(presser), presser.get("username"),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to record a planter:\n{traceback.format_exc()}")
+        await api.answer_callback_query(callback_id, "Что-то пошло не так, попробуй ещё раз.")
+        return
+    await api.answer_callback_query(
+        callback_id, tree.SEED_BUTTON_ACK if added else tree.SEED_BUTTON_ALREADY
     )
 
 
@@ -1963,12 +2060,19 @@ async def handle_tree_command(
     since the standing announcement of the tree is the 10:00 morning post."""
     chat_id = message["chat"]["id"]
     try:
-        yesterday = datetime.now(tz).date() - timedelta(days=1)
-        total_xp, day_xp, contributors = await stats.chat_tree_totals(
-            telethon_client, entry, entry, yesterday, tz, log=log, live_total=True
-        )
-        text = tree.format_tree_status(total_xp, day_xp, contributors)
-        parse_mode = "HTML"
+        # While a ceremony is open there is no tree yet, and the ordinary status would
+        # answer "0 мм" -- which reads as a broken feature rather than as one that hasn't
+        # started.
+        if entry and stats.planting_is_open(entry):
+            text = tree.format_awaiting_planting_status()
+            parse_mode = "HTML"
+        else:
+            yesterday = datetime.now(tz).date() - timedelta(days=1)
+            total_xp, day_xp, contributors = await stats.chat_tree_totals(
+                telethon_client, entry, entry, yesterday, tz, log=log, live_total=True
+            )
+            text = tree.format_tree_status(total_xp, day_xp, contributors)
+            parse_mode = "HTML"
     except Exception:
         log(f"[bot_listener] failed to build the tree status:\n{traceback.format_exc()}")
         text, parse_mode = "Не удалось посчитать дерево.", None
@@ -2624,6 +2728,8 @@ async def _dispatch_update(
             )
         elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
             await handle_badge_callback(api, callback, badge_flows)
+        elif callback_data.startswith(f"{PLANT_CALLBACK_PREFIX}:"):
+            await handle_plant_callback(api, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{preview.CALLBACK_PREFIX}:"):
             await handle_preview_callback(
                 api, callback, home_chat_ref,
@@ -2697,6 +2803,20 @@ async def _dispatch_update(
         await handle_replant_command(
             api, telethon_client, message, home_chat_ref, admin_chat_id, tz, log=log,
         )
+        return
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in PLANT_COMMANDS
+    ):
+        # Unlike the other management commands this one is NOT DM-only: it was asked for
+        # as something an admin types in the chat, in front of everybody, and the reply
+        # follows them to wherever they typed it.
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_plant_command(api, message, home_chat_ref, admin_chat_id, log=log)
         return
     if re.match(rf"^{re.escape(PREVIEW_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":

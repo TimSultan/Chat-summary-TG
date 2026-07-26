@@ -167,7 +167,27 @@ PREVIEWS = (
         lambda day: tree.format_planting_message(),
         False,
     ),
+    (
+        "founder",
+        "🌱 Значок Основателя в /stat",
+        lambda day: FOUNDER_BADGE_SAMPLE,
+        False,
+    ),
 )
+
+# What a planter's badge block looks like afterwards. Rendered here as a fixed sample
+# rather than through stats.format_stat, which would need a real member with real history
+# behind it; the point of this one is only to show where the badge lands.
+FOUNDER_BADGE_SAMPLE = "\n".join([
+    "Так значок будет выглядеть в <code>/stat</code> у того, кто сажал:",
+    "",
+    "✨ <b>Уникальные значки:</b>",
+    "🌱 Основатель — посадил дерево ЕПХ",
+    "",
+    "🏅 <b>Значки:</b>",
+    "🎨 Я покрасил 2 — покрасить 5 фигурок",
+    "🖼️ Галерея — отправить 25 фото или видео",
+])
 
 
 def preview_ids() -> tuple:

@@ -1052,6 +1052,67 @@ def create_custom_badge(
     return Badge(badge_id=badge_id, emoji=emoji, name=name, description="выдан администратором", custom=True)
 
 
+# The badge everyone who took part in the planting keeps. It lives in the custom-badge
+# store rather than in AUTOMATIC_BADGES because nothing about it can be recomputed from a
+# member's stats -- it records a single afternoon, and after that afternoon there is no
+# way to earn it again. Being a custom badge also puts it in the "✨ Уникальные значки"
+# block at the top of /stat, which is exactly where a thing you cannot earn belongs.
+FOUNDER_BADGE_ID = "founder"
+FOUNDER_BADGE_EMOJI = "🌱"
+FOUNDER_BADGE_NAME = "Основатель"
+
+
+def ensure_founder_badge(entry: str) -> Badge:
+    """Create the founder badge if it isn't there yet, with a FIXED id so the ceremony
+    can hand it out without an administrator having to create it first.
+
+    Deliberately exempt from MAX_CUSTOM_BADGES: this is the bot's own badge, and a chat
+    that had already filled its badge budget would otherwise plant its tree with nobody
+    getting anything to show for it.
+    """
+    data = _load_custom_badge_data(entry)
+    record = data["badges"].get(FOUNDER_BADGE_ID)
+    if record is None:
+        record = {
+            "id": FOUNDER_BADGE_ID,
+            "emoji": FOUNDER_BADGE_EMOJI,
+            "name": FOUNDER_BADGE_NAME,
+            "created_at": app_now().isoformat(),
+            "created_by_id": "bot",
+            "created_by_name": "ЕПХ-бот",
+        }
+        data["badges"][FOUNDER_BADGE_ID] = record
+        _save_custom_badge_data(entry, data)
+    return Badge(
+        badge_id=FOUNDER_BADGE_ID,
+        emoji=record["emoji"],
+        name=record["name"],
+        description="посадил дерево ЕПХ",
+        custom=True,
+    )
+
+
+def award_founder_badges(entry: str) -> int:
+    """Give the founder badge to everyone on the open ceremony's guest list. Returns how
+    many members newly received it. Idempotent, so a retried 10:00 post cannot double-
+    award or fail on somebody who already has it."""
+    state = planting_state(entry)
+    if state is None or not state["planters"]:
+        return 0
+    ensure_founder_badge(entry)
+    awarded = 0
+    for planter in state["planters"]:
+        try:
+            _, newly = give_custom_badge(
+                entry, FOUNDER_BADGE_ID, planter["user_id"],
+                planter.get("display_name") or "", "bot", "ЕПХ-бот",
+            )
+        except ValueError:
+            continue
+        awarded += int(newly)
+    return awarded
+
+
 def give_custom_badge(
     entry: str,
     badge_id: str,
@@ -1385,6 +1446,94 @@ def replant_tree(entry: str, day: date) -> None:
     _stats_dir().mkdir(parents=True, exist_ok=True)
     _tree_planted_path(entry).write_text(day.isoformat(), encoding="utf-8")
     mark_tree_digest_sent(entry, day)
+
+
+# --- Посадка семечка ------------------------------------------------------------------
+#
+# The opening ceremony. An admin posts the invitation, members press the button under it
+# for as long as it stays open, and the next 10:00 post names all of them and plants the
+# tree. The two halves live in different processes -- the button presses arrive at
+# bot_listener.py, the 10:00 post is built by listener.py -- so the guest list goes
+# through the stats directory, the one thing both of them can already reach.
+
+
+def _planting_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_planting.json"
+
+
+def planting_state(entry: str) -> dict | None:
+    """The open ceremony, or None when there isn't one.
+
+    {"message_id": int, "chat_id": int, "opened_on": "YYYY-MM-DD", "planters": [...]}
+    A corrupt file reads as "no ceremony" rather than raising: this is consulted from the
+    10:00 loop, and a broken guest list must not be able to stop the morning post.
+    """
+    path = _planting_path(entry)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "message_id" not in data:
+        return None
+    data.setdefault("planters", [])
+    return data
+
+
+def planting_is_open(entry: str) -> bool:
+    return planting_state(entry) is not None
+
+
+def open_planting(entry: str, chat_id: int, message_id: int, day: date) -> None:
+    """Start collecting presses on the invitation just posted."""
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(_planting_path(entry), {
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "opened_on": day.isoformat(),
+        "planters": [],
+    })
+
+
+def add_planter(entry: str, user_id: int | str, display_name: str, username: str | None) -> bool:
+    """Sign one member up. True when this is the first time they pressed.
+
+    The name is stored at press time rather than looked up at 10:00 on purpose: the roll
+    call has to name people who may have said nothing at all in the chat, and those are
+    exactly the members the stats files know nothing about.
+    """
+    state = planting_state(entry)
+    if state is None:
+        return False
+    key = str(user_id)
+    if any(str(planter.get("user_id")) == key for planter in state["planters"]):
+        return False
+    state["planters"].append({
+        "user_id": key,
+        "display_name": display_name,
+        "username": (username or "").lstrip("@") or None,
+    })
+    _write_json_atomic(_planting_path(entry), state)
+    return True
+
+
+def planters(entry: str) -> list[tuple[str, str | None]]:
+    """[(display_name, username)] in the order they pressed -- whoever was first stays
+    first in the roll call."""
+    state = planting_state(entry)
+    if state is None:
+        return []
+    return [
+        (planter.get("display_name") or f"id{planter.get('user_id')}", planter.get("username"))
+        for planter in state["planters"]
+    ]
+
+
+def close_planting(entry: str) -> None:
+    """Stop collecting. The invitation's button starts answering "посадка уже закрыта"
+    from here on, which is why the file is removed rather than flagged."""
+    _planting_path(entry).unlink(missing_ok=True)
 
 
 def _tree_digest_last_sent_path(entry: str) -> Path:
