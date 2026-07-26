@@ -1093,9 +1093,15 @@ async def handle_preview_command(
         /preview rollcall     one sample straight away
         /preview test_button  post the real thing to the chat, with an undo
 
-    Admin-only and DM-only. Not because the samples are secret -- because the menu's last
-    button posts to the chat, and because a preview of the planting invitation loose in
-    the group would be indistinguishable from the real invitation.
+    DM-only, and NOT gated on being an administrator. The gate was removed deliberately:
+    it had to resolve the home chat before it could ask Telegram for the administrator
+    list, and resolving goes through the Telethon session, which when unwell waits rather
+    than failing -- so the check was the only part of this that could hang, on a command
+    whose entire job is to write a message back into the DM it was typed in.
+
+    Still DM-only, because a preview of the planting invitation loose in the group would
+    be indistinguishable from the real invitation. The command is not registered in the
+    menu and not advertised anywhere.
     """
     dm_chat_id = message["chat"]["id"]
     reply_to = message["message_id"]
@@ -1109,13 +1115,6 @@ async def handle_preview_command(
             )
         except Exception:
             log(f"[bot_listener] failed to answer /preview:\n{traceback.format_exc()}")
-
-    # A hardcoded delegate needs no chat resolved to draw a menu or render a sample into
-    # this DM -- see _is_privileged_username. Everybody else pays for the full gate.
-    if not _is_privileged_username(actor):
-        if not await _admin_via_chat(api, telethon_client, entry, known_chat_ids, actor, log=log):
-            await reply("Предпросмотр доступен только администраторам чата.")
-            return
 
     argument = command_text[len(PREVIEW_COMMAND):].strip().lower()
     if not argument:
@@ -1142,24 +1141,6 @@ async def handle_preview_command(
         await reply("Не удалось отправить превью.")
 
 
-async def _admin_via_chat(
-    api: TelegramBotAPI, telethon_client, entry: str | None, known_chat_ids: dict, user: dict,
-    log=print,
-) -> bool:
-    """The slow half of the admin gate, for everybody who isn't a hardcoded delegate.
-
-    Kept separate and called LAST so the fast path never pays for it: this resolves the
-    home chat through the Telethon session before it can ask Telegram who the
-    administrators are.
-    """
-    admin_chat_id = (
-        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log) if entry else None
-    )
-    if admin_chat_id is None:
-        return False
-    return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
-
-
 async def handle_preview_callback(
     api: TelegramBotAPI,
     telethon_client,
@@ -1170,15 +1151,14 @@ async def handle_preview_callback(
 ) -> None:
     """Buttons from the /preview menu, plus the button on the test post itself.
 
-    The spinner is stopped FIRST, before anything that can be slow. Resolving the group
-    chat can go through the Telethon session, and a session that cannot connect does not
-    fail -- it waits. Doing that before answering is what left every one of these buttons
-    lit up forever with nothing in the log. Refusals and errors therefore arrive as a DM
-    rather than as a toast, which is a fair trade for a button that always responds.
+    The spinner is stopped FIRST, before anything that can be slow, and errors arrive as a
+    DM rather than as a toast -- a fair trade for a button that always responds.
 
-    A sample planting button is answered for ANYBODY who presses it -- the test post sits
-    in a 190-member chat. Everything that acts (rendering into a DM, posting to the chat,
-    deleting) is still gated on the presser being an admin.
+    There is no administrator check here, by decision. It was the only thing on this path
+    that could hang: it had to resolve the home chat through the Telethon session before
+    it could ask Telegram for the administrator list, and an unwell session waits rather
+    than failing. What the buttons actually do is write into the DM they are already in,
+    and the menu is only reachable from a DM command that is registered nowhere.
     """
     data = callback.get("data") or ""
     callback_id = callback["id"]
@@ -1208,15 +1188,8 @@ async def handle_preview_callback(
         # Deleting the test post and rendering a sample into this DM both already know
         # every id they need -- the DM's from the callback, the test post's from the
         # button. Only posting a NEW test to the group needs the group resolved, so that
-        # is the only branch allowed to reach for it.
-        privileged = _is_privileged_username(presser)
-
+        # is the only branch that reaches for it.
         if deletion is not None:
-            if not privileged and not await _admin_via_chat(
-                api, telethon_client, entry, known_chat_ids, presser, log=log
-            ):
-                await say("Предпросмотр доступен только администраторам чата.")
-                return
             chat_id, message_id = deletion
             await api.delete_message(chat_id, message_id)
             await say("Удалил тестовый пост из чата.")
@@ -1237,17 +1210,9 @@ async def handle_preview_callback(
                     "Проверь TELEGRAM_SESSION_STRING."
                 )
                 return
-            if not privileged and not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
-                await say("Отправить тест в чат может только администратор.")
-                return
             await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
             return
 
-        if not privileged and not await _admin_via_chat(
-            api, telethon_client, entry, known_chat_ids, presser, log=log
-        ):
-            await say("Предпросмотр доступен только администраторам чата.")
-            return
         if not await _send_preview(api, dm_chat_id, preview_id, log=log):
             await say("Нет такого превью.")
     except Exception:

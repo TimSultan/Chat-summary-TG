@@ -328,12 +328,16 @@ class PreviewCallbackTests(unittest.TestCase):
             called.append(True)
             return GROUP_CHAT
 
-        with patch.object(bot_listener, "_resolve_chat_id", _resolve):
-            self._press(preview.callback_data("seed"), known_chat_ids={})
+        for presser in (ADMIN, MEMBER):
+            with self.subTest(presser=presser["username"]):
+                self.api = FakeAPI()
+                called.clear()
+                with patch.object(bot_listener, "_resolve_chat_id", _resolve):
+                    self._press(preview.callback_data("seed"), presser=presser, known_chat_ids={})
 
-        self.assertEqual(called, [], "a DM preview resolved the group chat")
-        self.assertEqual(len(self.api.sent), 1)
-        self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
+                self.assertEqual(called, [], "a DM preview resolved the group chat")
+                self.assertEqual(len(self.api.sent), 1)
+                self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
 
     def test_a_dead_telethon_session_no_longer_stops_a_preview(self):
         async def _resolve(*args, **kwargs):
@@ -392,10 +396,13 @@ class PreviewCallbackTests(unittest.TestCase):
                 self.assertEqual(self.api.sent, [])
                 self.assertEqual(self.api.answers, [tree.SEED_BUTTON_TEST_ACK])
 
-    def test_a_member_cannot_fire_the_group_test(self):
-        self._press(preview.callback_data(preview.GROUP_TEST_ID), presser=MEMBER)
-        self.assertEqual([item["chat_id"] for item in self.api.sent], [DM_CHAT])
-        self.assertIn("только администратор", self.api.sent[0]["text"])
+    def test_there_is_no_administrator_check_left(self):
+        # Removed on purpose: it resolved the home chat through the Telethon session
+        # before it could fetch the administrator list, which made it the one thing on
+        # this path that could hang. Anyone who reaches the menu can press its buttons.
+        self._press(preview.callback_data("rollcall"), presser=MEMBER)
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("Семечко в земле", self.api.sent[0]["text"])
         self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
 
 
