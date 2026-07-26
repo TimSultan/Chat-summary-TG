@@ -659,7 +659,11 @@ FIGURINE_HASHTAG = "#япокрасил"
 # towards the list) anyone who's posted a #япокрасил+photo/video within the last
 # PROCRASTINATOR_INACTIVE_DAYS days -- so the list is always full-size instead of
 # shrinking on a day when most of the top scorers happen to be caught up.
-PROCRASTINATOR_LIST_SIZE = 21
+# Ten, down from 21. This is a public call-out list, and past about ten names it stops
+# reading as a nudge and starts reading as a wall. Shared by BOTH the on-demand
+# "/top pokras" and the automatic digest -- they are the same list, and letting them
+# differ would mean the same command answers differently depending on who asked for it.
+PROCRASTINATOR_LIST_SIZE = 10
 PROCRASTINATOR_INACTIVE_DAYS = 14
 PROCRASTINATOR_DIGEST_HOUR = 19
 PROCRASTINATOR_DIGEST_INTERVAL_DAYS = 2

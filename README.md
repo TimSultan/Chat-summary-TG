@@ -347,7 +347,10 @@ group button for it would just answer "напиши мне в личку".
 
 The two aliases are spelled without a space because Telegram only accepts `[a-z0-9_]` in
 a registered command name: **`/top all` cannot be a menu entry at all**. Both spellings
-work when typed — `/top all` = `/topall`, `/top pokras` = `/toppokras` = `/stat pokras`. Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
+work when typed — `/top all` = `/topall`, `/top pokras` = `/toppokras` = `/stat pokras`.
+The procrastinator list is capped at `PROCRASTINATOR_LIST_SIZE` (10) names, on demand and
+in the automatic digest alike: it is a public call-out, and past about ten names it stops
+reading as a nudge and starts reading as a wall. Admin-only DM commands — `/badge`, `/weekwinner`, `/deletepokras` — are
 deliberately **not** advertised. Registration is best-effort: the bot starts fine without
 a menu.
 
