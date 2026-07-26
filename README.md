@@ -476,14 +476,16 @@ reject the message.
 `preview.py`. The tree posts were the only ones nobody could see in advance: the morning
 digest fires from a scheduler, the planting happens once in the lifetime of the chat, and
 the nobody-turned-up variant needs a roll call nobody signed up for to reproduce. `/preview`
-in the bot's DM (a hidden, unadvertised command) renders all of them from fixed sample
+in the bot's DM (a hidden, unadvertised command) renders a curated set from fixed sample
 data.
 
-Without an argument it draws a menu, one button per message. `/preview rollcall` sends one
-directly. Everything is **pure** — fixed sample cast, fixed numbers, no stats store, no
-clock beyond the day passed in — and every builder calls the same formatter the scheduler
-calls, so a preview cannot drift from the real thing. Only hard-to-trigger messages are in
-here; `/stat`, `/top`, `/shop` and the cabinet are already one command away.
+Without an argument it draws exactly seven buttons: **Приглашение**, **Перекличка в
+10:00**, **Утренний пост**, **Обычный**, **Старый пост**, **Значок** and **Отправить
+тест**. `/preview rollcall` sends the roll call directly. The six DM previews are
+**pure** — fixed sample cast, fixed numbers, no stats store, no clock beyond the day
+passed in — and every builder calls the same formatter the scheduler calls, so a preview
+cannot drift from the real thing. `/stat`, `/top`, `/shop` and the cabinet are already
+one command away.
 
 `/preview test_button` is the exception: it posts a neutral **Тестовый текст** with a
 **Нажмите сюда** button to the real chat. Each member who presses is persisted once in a

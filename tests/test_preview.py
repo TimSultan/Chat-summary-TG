@@ -34,6 +34,23 @@ class PreviewRegistryTests(unittest.TestCase):
             self.assertTrue(preview_id.isascii())
             self.assertNotIn(":", preview_id)  # would break parse_callback
 
+    def test_only_the_requested_six_dm_previews_remain(self):
+        self.assertEqual(
+            preview.preview_ids(),
+            ("seed", "rollcall", "morning", "status", "planting", "founder"),
+        )
+        self.assertEqual(
+            [preview.title_for(preview_id) for preview_id in preview.preview_ids()],
+            [
+                "🌰 Приглашение",
+                "🌱 Перекличка в 10:00",
+                "☀️ Утренний пост",
+                "🌳 Обычный",
+                "🌱 Старый пост",
+                "🌱 Значок",
+            ],
+        )
+
     def test_group_test_id_is_not_also_a_dm_preview(self):
         # It posts to the chat rather than rendering into the DM, so a caller that looked
         # it up in PREVIEWS and sent the result would silently skip the group entirely.
@@ -65,7 +82,7 @@ class PreviewRegistryTests(unittest.TestCase):
 
     def test_only_the_invitation_carries_the_planting_button(self):
         with_button = {i for i in preview.preview_ids() if preview.keyboard_for(i)}
-        self.assertEqual(with_button, {"seed", "seedtoday"})
+        self.assertEqual(with_button, {"seed"})
 
     def test_sample_button_never_carries_the_send_to_chat_payload(self):
         # The two buttons look identical on screen. Sharing a payload meant tapping the
@@ -256,17 +273,23 @@ class CeremonyMessageTests(unittest.TestCase):
         self.assertIn("уходит в корни", text)
         self.assertNotIn(tree.advice_for(date(2026, 7, 26)), text)
 
-    def test_roll_call_counts_people_in_russian(self):
-        def count_line(n):
-            planters = [(f"Имя{i}", None) for i in range(n)]
-            return tree.format_planting_roll_call(planters).splitlines()[2]
-
-        self.assertIn("1 человек:", count_line(1))
-        self.assertIn("2 человека:", count_line(2))
-        self.assertIn("5 человек:", count_line(5))
-        self.assertIn("11 человек:", count_line(11))
-        self.assertIn("21 человек:", count_line(21))
-        self.assertIn("24 человека:", count_line(24))
+    def test_roll_call_uses_the_new_planting_announcement(self):
+        text = tree.format_planting_roll_call([("Аня", None), ("Боря", None)])
+        expected_lines = (
+            "🌱 <b>Сегодня мы все вместе посадили семечко.</b>",
+            "Из него вырастет могучее дерево ЕПХ — одно на весь чат, общее.",
+            "Каждое утро в 10:00 я буду рассказывать, на сколько оно подросло за сутки",
+            "<b>Семечко посадили:</b>",
+            "Аня, Боря",
+            "🌳 <b>Давайте вырастим его вместе — покажите ему, на что мы способны.</b>",
+            "Всё начинается сегодня.",
+            "<b>Напутствие</b>",
+            tree.PLANTING_ADVICE,
+        )
+        for line in expected_lines:
+            self.assertIn(line, text)
+        self.assertLess(text.index("Всё начинается сегодня."), text.index("<b>Семечко посадили:</b>"))
+        self.assertLess(text.index("<b>Семечко посадили:</b>"), text.index("<b>Напутствие</b>"))
 
     def test_awaiting_status_does_not_claim_a_height(self):
         text = tree.format_awaiting_planting_status()
@@ -345,7 +368,7 @@ class PreviewCallbackTests(unittest.TestCase):
         sent = self.api.sent[0]
         self.assertEqual(sent["chat_id"], DM_CHAT)
         self.assertEqual(sent["parse_mode"], "HTML")
-        self.assertIn("Семечко в земле", sent["text"])
+        self.assertIn("Сегодня мы все вместе посадили семечко", sent["text"])
 
     def test_a_preview_button_reaches_its_handler_through_update_dispatch(self):
         """Pin module-name shadowing in _dispatch_update, not just the leaf handler."""
@@ -526,7 +549,7 @@ class PreviewCallbackTests(unittest.TestCase):
         # this path that could hang. Anyone who reaches the menu can press its buttons.
         self._press(preview.callback_data("rollcall"), presser=MEMBER)
         self.assertEqual(len(self.api.sent), 1)
-        self.assertIn("Семечко в земле", self.api.sent[0]["text"])
+        self.assertIn("Сегодня мы все вместе посадили семечко", self.api.sent[0]["text"])
         self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
 
 

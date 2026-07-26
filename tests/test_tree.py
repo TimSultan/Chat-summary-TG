@@ -518,7 +518,8 @@ class TenOClockTests(unittest.TestCase):
         self.assertEqual(len(posted), 1)
         entry, text, parse_mode = posted[0]
         self.assertEqual((entry, parse_mode), (self.ENTRY, "HTML"))
-        self.assertIn("Семечко в земле", text)
+        self.assertIn("Сегодня мы все вместе посадили семечко", text)
+        self.assertIn("Семечко посадили:", text)
         for name in ("Аня", "Боря", "Вера"):
             self.assertIn(name, text)
         self.assertEqual(stats.tree_planted_on(self.ENTRY), date(2026, 7, 27))
@@ -563,7 +564,7 @@ class TenOClockTests(unittest.TestCase):
 
         self.assertIn("Доброе утро", posted[0][1])
         self.assertIn("выросло на", posted[0][1])
-        self.assertNotIn("Семечко в земле", posted[0][1])
+        self.assertNotIn("Сегодня мы все вместе посадили семечко", posted[0][1])
 
 
 class TreeCommandTests(unittest.TestCase):

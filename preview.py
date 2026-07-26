@@ -28,7 +28,7 @@ CALLBACK_PREFIX = "prev"
 # checking that Telegram delivers every button press to the bot. It keeps its own
 # participant list, wholly separate from the real planting ceremony.
 GROUP_TEST_ID = "test_button"
-GROUP_TEST_TITLE = "🧨 Отправить тест в общий чат"
+GROUP_TEST_TITLE = "🧨 Отправить тест"
 GROUP_TEST_TEXT = "Тестовый текст"
 GROUP_TEST_JOIN_ID = "test_join"
 GROUP_TEST_JOIN_CALLBACK = f"{CALLBACK_PREFIX}:{GROUP_TEST_JOIN_ID}"
@@ -83,9 +83,6 @@ SAMPLE_CONTRIBUTORS = (
 
 # ~21 см of tree: a few weeks in, still small enough that a day's growth is visible.
 SAMPLE_TOTAL_XP = 42_000
-# 7 м: far enough along to show how format_length switches to metres and how a stage name
-# reads once the tree is no longer a sprout.
-SAMPLE_GROWN_TOTAL_XP = 1_400_000
 # The chat's own measured output, ~3,600 XP/day -- so the growth number in a preview is
 # the one an ordinary day actually produces.
 SAMPLE_DAY_XP = 3_600
@@ -100,67 +97,27 @@ def _sample_day(day: date | None) -> date:
 PREVIEWS = (
     (
         "seed",
-        "🌰 Посадка — приглашение",
+        "🌰 Приглашение",
         lambda day: tree.format_seed_ceremony_message(),
         True,
     ),
     (
-        "seedtoday",
-        "🌰 Посадка — приглашение (сегодня в 10:00)",
-        lambda day: tree.format_seed_ceremony_message(same_day=True),
-        True,
-    ),
-    (
         "rollcall",
-        "🌱 Посадка — перекличка в 10:00",
+        "🌱 Перекличка в 10:00",
         lambda day: tree.format_planting_roll_call(list(SAMPLE_PLANTERS)),
         False,
     ),
     (
-        "rollcallone",
-        "🌱 Посадка — перекличка, сажал один",
-        lambda day: tree.format_planting_roll_call(list(SAMPLE_PLANTERS[:1])),
-        False,
-    ),
-    (
-        "empty",
-        "🌰 Посадка — никто не нажал",
-        lambda day: tree.format_nobody_planted_message(),
-        False,
-    ),
-    (
-        "waiting",
-        "🌳 /tree во время посадки",
-        lambda day: tree.format_awaiting_planting_status(),
-        False,
-    ),
-    (
         "morning",
-        "☀️ Утренний пост (молодое дерево)",
+        "☀️ Утренний пост",
         lambda day: tree.format_morning_digest(
             SAMPLE_TOTAL_XP, SAMPLE_DAY_XP, list(SAMPLE_CONTRIBUTORS), _sample_day(day)
         ),
         False,
     ),
     (
-        "morningbig",
-        "☀️ Утренний пост (выросшее дерево)",
-        lambda day: tree.format_morning_digest(
-            SAMPLE_GROWN_TOTAL_XP, SAMPLE_DAY_XP, list(SAMPLE_CONTRIBUTORS), _sample_day(day)
-        ),
-        False,
-    ),
-    (
-        "quiet",
-        "☀️ Утренний пост (тихий день, никто не писал)",
-        lambda day: tree.format_morning_digest(
-            SAMPLE_TOTAL_XP, 0, [], _sample_day(day)
-        ),
-        False,
-    ),
-    (
         "status",
-        "🌳 /tree обычный",
+        "🌳 Обычный",
         lambda day: tree.format_tree_status(
             SAMPLE_TOTAL_XP, SAMPLE_DAY_XP, list(SAMPLE_CONTRIBUTORS)
         ),
@@ -168,13 +125,13 @@ PREVIEWS = (
     ),
     (
         "planting",
-        "🌱 Старый пост посадки (/replant)",
+        "🌱 Старый пост",
         lambda day: tree.format_planting_message(),
         False,
     ),
     (
         "founder",
-        "🌱 Значок Основателя в /stat",
+        "🌱 Значок",
         lambda day: FOUNDER_BADGE_SAMPLE,
         False,
     ),
