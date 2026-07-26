@@ -345,7 +345,9 @@ directory, which on a deployed host is a volume nothing else here can reach — 
 command there is no way to re-run the opening post at all. Both halves happen together on
 purpose: re-posting "сегодня мы посадили семечко" while the tree is already a metre tall
 would be a lie, and re-planting without posting would silently zero the chat's progress.
-The reset only happens once the announcement has actually landed.
+The reset only happens once the announcement has actually landed, and it marks that day
+as already greeted — the announcement *is* that morning's post, so without this the 10:00
+loop would follow it with an ordinary digest reading "выросло на 0 мм, Семечко — 0 мм".
 
 Neither the planting post nor the morning digest is ever scheduled for deletion — they
 stay in the chat. Only `/tree` and the other on-demand stats replies self-delete.

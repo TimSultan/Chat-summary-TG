@@ -1376,16 +1376,15 @@ def replant_tree(entry: str, day: date) -> None:
     """Start the tree over from `day`, overwriting an existing planting date.
 
     The only way to reach these markers on a deployed host, where the stats directory is
-    a volume this codebase cannot otherwise touch. Also clears the "already greeted
-    today" marker, so the morning loop is not blocked from posting again -- re-planting
-    without that would leave the chat with an announcement and no follow-up until
-    tomorrow."""
+    a volume this codebase cannot otherwise touch.
+
+    Marks `day` as already greeted, because the planting announcement the caller has just
+    posted IS that day's post. Leaving the marker unset would have the 10:00 loop follow
+    the announcement with an ordinary digest reading "выросло на 0 мм, Семечко — 0 мм",
+    since the tree was planted moments earlier and has nothing to report yet."""
     _stats_dir().mkdir(parents=True, exist_ok=True)
     _tree_planted_path(entry).write_text(day.isoformat(), encoding="utf-8")
-    try:
-        _tree_digest_last_sent_path(entry).unlink(missing_ok=True)
-    except OSError:
-        pass
+    mark_tree_digest_sent(entry, day)
 
 
 def _tree_digest_last_sent_path(entry: str) -> Path:

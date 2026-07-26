@@ -187,19 +187,27 @@ class PlantingTests(unittest.TestCase):
         stats.mark_tree_planted("chat", date(2026, 9, 1))
         self.assertEqual(stats.tree_planted_on("chat"), first)
 
-    def test_replanting_overwrites_and_unblocks_the_morning_loop(self):
+    def test_replanting_overwrites_the_planting_date(self):
         """The automatic path must never move the planting date; the administrator's
-        deliberate one must, and must also clear the "already greeted today" marker --
-        otherwise a replant leaves the chat with an announcement and no follow-up."""
+        deliberate one must."""
         first, again = date(2026, 7, 26), date(2026, 8, 10)
         stats.mark_tree_planted("chat", first)
-        stats.mark_tree_digest_sent("chat", first)
-        self.assertFalse(stats.should_send_tree_digest("chat", first))
+        self.assertEqual(stats.tree_planted_on("chat"), first)
 
         stats.replant_tree("chat", again)
 
         self.assertEqual(stats.tree_planted_on("chat"), again)
-        self.assertTrue(stats.should_send_tree_digest("chat", again))
+
+    def test_replanting_counts_as_that_days_post(self):
+        """The announcement the caller just posted IS that morning's post. Without this
+        the 10:00 loop would follow it with "выросло на 0 мм, Семечко — 0 мм", because
+        the tree was planted moments earlier and has nothing to report."""
+        today = date(2026, 8, 10)
+        stats.replant_tree("chat", today)
+
+        self.assertFalse(stats.should_send_tree_digest("chat", today))
+        # Tomorrow's morning post happens as normal, reporting today's growth.
+        self.assertTrue(stats.should_send_tree_digest("chat", today + timedelta(days=1)))
 
     def test_replanting_a_chat_that_was_never_planted_works(self):
         stats.replant_tree("chat", date(2026, 7, 26))
