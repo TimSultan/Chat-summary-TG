@@ -11,6 +11,7 @@ FLOW_TTL_SECONDS = 15 * 60
 COUNTER_REFRESH_SECONDS = 3
 MAX_MESSAGE_CHARS = 3500
 MAX_BUTTON_TEXT_CHARS = 64
+MAX_BUTTONS = 5
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
 
@@ -38,8 +39,11 @@ def parse_callback(data: str) -> tuple[str, str, int | None] | None:
 def choose_count_keyboard(flow_id: str) -> dict:
     return {
         "inline_keyboard": [[
-            {"text": "1 кнопка", "callback_data": callback_data("count", flow_id, 1)},
-            {"text": "2 кнопки", "callback_data": callback_data("count", flow_id, 2)},
+            {
+                "text": str(count),
+                "callback_data": callback_data("count", flow_id, count),
+            }
+            for count in range(1, MAX_BUTTONS + 1)
         ]]
     }
 

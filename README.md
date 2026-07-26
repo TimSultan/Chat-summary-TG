@@ -498,10 +498,10 @@ Sample planting buttons in the DM carry their own callback payload, separate fro
 the menu's post-to-the-chat action and the recording test button. Pressing a visual sample
 still just says "это тест": it neither posts anything nor adds the presser to a list.
 
-### `/buttons` — posts with one or two live counters
+### `/buttons` — posts with up to five live counters
 
 `/buttons` is an administrator-only constructor in the bot's DM. It asks for the message
-text, lets the administrator choose **one or two buttons**, asks for each button's label,
+text, lets the administrator choose **from one to five buttons**, asks for each button's label,
 and then offers an optional photo. The final preview has **✅ Отправить в чат** and, once
 published, that control becomes **🗑 Удалить из чата**.
 
@@ -555,7 +555,7 @@ Administrator commands, none of them advertised in the menu:
 |---|---|---|
 | `/посадить_семечко`, `/plant` | chat or DM | open the planting ceremony |
 | `/preview [id]` | DM | look at a scheduled post before the chat does |
-| `/buttons` | DM | build a post with 1–2 buttons and live tap counters |
+| `/buttons` | DM | build a post with 1–5 buttons and live tap counters |
 | `/replant` | DM | re-post the planting announcement, start the tree over |
 | `/badgeadmin [-] @user` | DM | delegate custom-badge rights |
 | `/badge` | DM | create, award and remove custom badges |

@@ -1355,7 +1355,7 @@ async def handle_button_builder_command(
     admin_chat_id: int | None,
     flows: dict[str, dict],
 ) -> None:
-    """/buttons — start an admin-only DM flow for a one/two-button counter post."""
+    """/buttons — start an admin-only DM flow for a one-to-five-button counter post."""
     chat = message["chat"]
     if chat.get("type") != "private":
         return
@@ -1422,7 +1422,7 @@ async def handle_button_builder_text_input(
             for flow_id, flow in flows.items()
             if flow.get("chat_id") == chat_id
             and flow.get("user_id") == actor_id
-            and flow.get("awaiting") in ("message", "button_1", "button_2", "photo")
+            and flow.get("awaiting") in ("message", "button_text", "photo")
             and flow.get("prompt_message_id") == replied_message_id
             and time.monotonic() - flow["created_at"] <= BUTTON_BUILDER_FLOW_TTL_SECONDS
         ),
@@ -1455,13 +1455,16 @@ async def handle_button_builder_text_input(
             )
             return True
 
-        if flow["awaiting"] in ("button_1", "button_2"):
+        if flow["awaiting"] == "button_text":
             label = button_builder.validate_button_text(raw_text)
             flow["button_texts"].append(label)
             if len(flow["button_texts"]) < int(flow["button_count"]):
-                flow["awaiting"] = "button_2"
+                next_number = len(flow["button_texts"]) + 1
                 await _button_builder_force_reply(
-                    api, flow, "Отправь текст второй кнопки.", message["message_id"]
+                    api,
+                    flow,
+                    f"Отправь текст кнопки №{next_number}.",
+                    message["message_id"],
                 )
             else:
                 flow["awaiting"] = "photo_choice"
@@ -1611,12 +1614,17 @@ async def handle_button_builder_callback(
                 api, callback_message, "Конструктор закрыт.", reply_markup=None
             )
             return
-        if action == "count" and argument in (1, 2) and flow.get("awaiting") == "count":
+        if (
+            action == "count"
+            and argument is not None
+            and 1 <= argument <= button_builder.MAX_BUTTONS
+            and flow.get("awaiting") == "count"
+        ):
             flow["button_count"] = argument
             flow["button_texts"] = []
-            flow["awaiting"] = "button_1"
+            flow["awaiting"] = "button_text"
             await _button_builder_force_reply(
-                api, flow, "Отправь текст первой кнопки.", callback_message.get("message_id")
+                api, flow, "Отправь текст кнопки №1.", callback_message.get("message_id")
             )
             return
         if action == "photo" and argument in (0, 1) and flow.get("awaiting") == "photo_choice":

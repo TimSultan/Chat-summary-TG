@@ -1669,8 +1669,8 @@ def create_button_post(
     photo_file_id: str | None = None,
 ) -> dict:
     """Persist a newly published counter post and return its normalized state."""
-    if not post_id or not button_texts or len(button_texts) > 2:
-        raise ValueError("A button post needs an id and one or two buttons.")
+    if not post_id or not button_texts or len(button_texts) > 5:
+        raise ValueError("A button post needs an id and one to five buttons.")
     store = _button_posts_store(entry)
     post = {
         "post_id": post_id,

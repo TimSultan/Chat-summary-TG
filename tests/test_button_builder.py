@@ -93,13 +93,13 @@ def callback(data, actor=ADMIN, chat_id=DM_CHAT, message_id=42, with_photo=False
 
 
 class RenderingTests(unittest.TestCase):
-    def test_count_is_selected_between_one_and_two(self):
+    def test_count_is_selected_between_one_and_five(self):
         keyboard = button_builder.choose_count_keyboard("flow")
         buttons = keyboard["inline_keyboard"][0]
-        self.assertEqual([button["text"] for button in buttons], ["1 кнопка", "2 кнопки"])
+        self.assertEqual([button["text"] for button in buttons], ["1", "2", "3", "4", "5"])
         self.assertEqual(
             [button_builder.parse_callback(button["callback_data"])[2] for button in buttons],
-            [1, 2],
+            [1, 2, 3, 4, 5],
         )
 
     def test_post_renders_each_counter_and_matching_button(self):
@@ -150,6 +150,17 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(stats.increment_button_post(ENTRY, "post", GROUP_CHAT, 999, 0))
         self.assertIsNone(stats.delete_button_post(ENTRY, "post", GROUP_CHAT, 999))
         self.assertIsNotNone(stats.button_post(ENTRY, "post"))
+
+    def test_store_accepts_five_buttons_but_not_six(self):
+        labels = ["1", "2", "3", "4", "5"]
+        post = stats.create_button_post(
+            ENTRY, "five", GROUP_CHAT, 501, "Текст", labels, ADMIN["id"], DM_CHAT
+        )
+        self.assertEqual([button["text"] for button in post["buttons"]], labels)
+        with self.assertRaises(ValueError):
+            stats.create_button_post(
+                ENTRY, "six", GROUP_CHAT, 502, "Текст", labels + ["6"], ADMIN["id"], DM_CHAT
+            )
 
 
 class BuilderFlowTests(unittest.TestCase):
@@ -211,9 +222,9 @@ class BuilderFlowTests(unittest.TestCase):
         flow_id, flow = self.start()
         self.reply(flow, text="Какой вариант выбираем?")
         self.press(button_builder.callback_data("count", flow_id, count))
-        self.reply(flow, text="Первый")
-        if count == 2:
-            self.reply(flow, text="Второй")
+        labels = ["Первый", "Второй", "Третий", "Четвёртый", "Пятый"]
+        for label in labels[:count]:
+            self.reply(flow, text=label)
         return flow_id, flow
 
     def test_the_flow_asks_for_text_count_and_each_selected_label(self):
@@ -224,7 +235,21 @@ class BuilderFlowTests(unittest.TestCase):
         self.assertEqual(flow["awaiting"], "photo_choice")
         self.assertIn("Добавить картинку", self.api.sent[-1]["text"])
         count_keyboard = self.api.sent[1]["reply_markup"]["inline_keyboard"][0]
-        self.assertEqual([button["text"] for button in count_keyboard], ["1 кнопка", "2 кнопки"])
+        self.assertEqual([button["text"] for button in count_keyboard], ["1", "2", "3", "4", "5"])
+
+    def test_five_buttons_are_requested_and_rendered(self):
+        flow_id, flow = self.build_labels(count=5)
+        self.assertEqual(
+            flow["button_texts"],
+            ["Первый", "Второй", "Третий", "Четвёртый", "Пятый"],
+        )
+        self.press(button_builder.callback_data("photo", flow_id, 0))
+        preview = self.api.sent[-1]
+        self.assertEqual(
+            [row[0]["text"] for row in preview["reply_markup"]["inline_keyboard"][:5]],
+            flow["button_texts"],
+        )
+        self.assertIn("• Пятый — 0", preview["text"])
 
     def test_one_button_without_a_photo_publishes_counts_and_delete_control(self):
         flow_id, flow = self.build_labels(count=1)
