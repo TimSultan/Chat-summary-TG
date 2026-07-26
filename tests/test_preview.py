@@ -313,28 +313,57 @@ class PreviewCallbackTests(unittest.TestCase):
                 self.assertEqual(self.api.sent[0]["chat_id"], DM_CHAT)
                 self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
 
-    def test_the_spinner_stops_before_anything_that_can_block(self):
-        # The bug this pins: resolving the group chat goes through the Telethon session,
-        # and a session that cannot connect waits instead of failing. Every one of these
-        # buttons sat lit up forever because the resolve came first.
-        seen = []
+    def test_rendering_a_sample_never_touches_telethon(self):
+        """The bug this pins, and the reason it kept coming back.
+
+        Writing a sample into this DM needs the DM's chat id, which arrives inside the
+        callback, and nothing else. The handler nevertheless resolved the GROUP chat first
+        so it could ask Telegram for the administrator list -- and resolving goes through
+        the Telethon session, which when unwell waits instead of failing. The button hung
+        on a round trip it never needed.
+        """
+        called = []
 
         async def _resolve(*args, **kwargs):
-            seen.append(len(self.api.answers))
+            called.append(True)
             return GROUP_CHAT
 
         with patch.object(bot_listener, "_resolve_chat_id", _resolve):
             self._press(preview.callback_data("seed"), known_chat_ids={})
-        self.assertEqual(seen, [1], "the chat was resolved before the spinner was stopped")
 
-    def test_a_dead_telethon_session_explains_itself_instead_of_hanging(self):
+        self.assertEqual(called, [], "a DM preview resolved the group chat")
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
+
+    def test_a_dead_telethon_session_no_longer_stops_a_preview(self):
         async def _resolve(*args, **kwargs):
             return None  # what _resolve_chat_id returns once its timeout expires
 
         with patch.object(bot_listener, "_resolve_chat_id", _resolve):
             self._press(preview.callback_data("seed"), known_chat_ids={})
 
-        self.assertEqual(len(self.api.answers), 1)
+        self.assertIn("сажаем семечко", self.api.sent[0]["text"])
+
+    def test_only_posting_to_the_group_needs_the_group_resolved(self):
+        called = []
+
+        async def _resolve(*args, **kwargs):
+            called.append(True)
+            return GROUP_CHAT
+
+        with patch.object(bot_listener, "_resolve_chat_id", _resolve):
+            self._press(preview.callback_data(preview.GROUP_TEST_ID), known_chat_ids={})
+
+        self.assertEqual(len(called), 1)
+        self.assertEqual([item["chat_id"] for item in self.api.sent], [GROUP_CHAT, DM_CHAT])
+
+    def test_a_dead_session_is_named_when_the_group_test_needs_it(self):
+        async def _resolve(*args, **kwargs):
+            return None
+
+        with patch.object(bot_listener, "_resolve_chat_id", _resolve):
+            self._press(preview.callback_data(preview.GROUP_TEST_ID), known_chat_ids={})
+
         self.assertIn("TELEGRAM_SESSION_STRING", self.api.sent[0]["text"])
 
     def test_the_test_button_posts_to_the_chat_and_offers_an_undo(self):

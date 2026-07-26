@@ -275,16 +275,28 @@ async def _can_manage_chat(
     return bool(user_id and await _is_chat_admin(api, chat_id, user_id))
 
 
+def _is_privileged_username(user: dict | None) -> bool:
+    """Whether this person is a hardcoded delegate (PRIVILEGED_MANAGEMENT_USERNAMES).
+
+    Split out so it can be checked ON ITS OWN, and FIRST, wherever an admin gate sits in
+    front of work that needs no chat at all. The full gate below has to resolve the home
+    chat's id before it can ask Telegram for the administrator list, and resolving goes
+    through the Telethon session -- which, when unwell, waits instead of failing. For a
+    button whose entire job is to write a message back into the DM it is already in, that
+    round trip was the only thing that could go wrong, and it did.
+    """
+    username = ((user or {}).get("username") or "").strip().lstrip("@").lower()
+    return username in PRIVILEGED_MANAGEMENT_USERNAMES
+
+
 async def _is_chat_admin_or_privileged(
     api: TelegramBotAPI, chat_id: int, user: dict | None
 ) -> bool:
     """Who may DELEGATE badge management. Deliberately excludes the delegates themselves:
     a badge manager can hand out badges, not hand out the right to hand out badges."""
-    user = user or {}
-    username = (user.get("username") or "").strip().lstrip("@").lower()
-    if username in PRIVILEGED_MANAGEMENT_USERNAMES:
+    if _is_privileged_username(user):
         return True
-    user_id = user.get("id")
+    user_id = (user or {}).get("id")
     return bool(user_id and await _is_chat_admin(api, chat_id, user_id))
 
 
@@ -1072,7 +1084,7 @@ async def handle_preview_command(
     message: dict,
     command_text: str,
     entry: str | None,
-    admin_chat_id: int | None,
+    known_chat_ids: dict[str, int],
     log=print,
 ) -> None:
     """/preview — look at the scheduled and one-off posts without waiting for them.
@@ -1098,12 +1110,12 @@ async def handle_preview_command(
         except Exception:
             log(f"[bot_listener] failed to answer /preview:\n{traceback.format_exc()}")
 
-    if entry is None or admin_chat_id is None:
-        await reply("Не настроен основной чат.")
-        return
-    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
-        await reply("Предпросмотр доступен только администраторам чата.")
-        return
+    # A hardcoded delegate needs no chat resolved to draw a menu or render a sample into
+    # this DM -- see _is_privileged_username. Everybody else pays for the full gate.
+    if not _is_privileged_username(actor):
+        if not await _admin_via_chat(api, telethon_client, entry, known_chat_ids, actor, log=log):
+            await reply("Предпросмотр доступен только администраторам чата.")
+            return
 
     argument = command_text[len(PREVIEW_COMMAND):].strip().lower()
     if not argument:
@@ -1113,6 +1125,14 @@ async def handle_preview_command(
 
     try:
         if argument == preview.GROUP_TEST_ID:
+            admin_chat_id = (
+                await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                if entry
+                else None
+            )
+            if admin_chat_id is None:
+                await reply("Не удалось определить основной чат — Telethon-сессия не отвечает.")
+                return
             await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
             return
         if not await _send_preview(api, dm_chat_id, argument, log=log):
@@ -1120,6 +1140,24 @@ async def handle_preview_command(
     except Exception:
         log(f"[bot_listener] /preview {argument} failed:\n{traceback.format_exc()}")
         await reply("Не удалось отправить превью.")
+
+
+async def _admin_via_chat(
+    api: TelegramBotAPI, telethon_client, entry: str | None, known_chat_ids: dict, user: dict,
+    log=print,
+) -> bool:
+    """The slow half of the admin gate, for everybody who isn't a hardcoded delegate.
+
+    Kept separate and called LAST so the fast path never pays for it: this resolves the
+    home chat through the Telethon session before it can ask Telegram who the
+    administrators are.
+    """
+    admin_chat_id = (
+        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log) if entry else None
+    )
+    if admin_chat_id is None:
+        return False
+    return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
 
 
 async def handle_preview_callback(
@@ -1167,30 +1205,48 @@ async def handle_preview_callback(
             log(f"[bot_listener] failed to answer a preview button:\n{traceback.format_exc()}")
 
     try:
-        admin_chat_id = (
-            await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
-            if entry
-            else None
-        )
-        if admin_chat_id is None:
-            await say(
-                "Не удалось определить основной чат — Telethon-сессия не отвечает.\n"
-                "Проверь TELEGRAM_SESSION_STRING."
-            )
-            return
-        if not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
-            await say("Предпросмотр доступен только администраторам чата.")
-            return
+        # Deleting the test post and rendering a sample into this DM both already know
+        # every id they need -- the DM's from the callback, the test post's from the
+        # button. Only posting a NEW test to the group needs the group resolved, so that
+        # is the only branch allowed to reach for it.
+        privileged = _is_privileged_username(presser)
 
         if deletion is not None:
+            if not privileged and not await _admin_via_chat(
+                api, telethon_client, entry, known_chat_ids, presser, log=log
+            ):
+                await say("Предпросмотр доступен только администраторам чата.")
+                return
             chat_id, message_id = deletion
             await api.delete_message(chat_id, message_id)
             await say("Удалил тестовый пост из чата.")
             return
+
         if not preview_id:
             return
+
         if preview_id == preview.GROUP_TEST_ID:
+            admin_chat_id = (
+                await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                if entry
+                else None
+            )
+            if admin_chat_id is None:
+                await say(
+                    "Не удалось определить основной чат — Telethon-сессия не отвечает.\n"
+                    "Проверь TELEGRAM_SESSION_STRING."
+                )
+                return
+            if not privileged and not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+                await say("Отправить тест в чат может только администратор.")
+                return
             await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
+            return
+
+        if not privileged and not await _admin_via_chat(
+            api, telethon_client, entry, known_chat_ids, presser, log=log
+        ):
+            await say("Предпросмотр доступен только администраторам чата.")
             return
         if not await _send_preview(api, dm_chat_id, preview_id, log=log):
             await say("Нет такого превью.")
@@ -2920,13 +2976,11 @@ async def _dispatch_update(
     if re.match(rf"^{re.escape(PREVIEW_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
             return
-        admin_chat_id = (
-            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
-            if home_chat_ref
-            else None
-        )
+        # The chat is NOT resolved here. Resolving goes through the Telethon session, and
+        # doing it in the argument list means even the paths that never need it pay for
+        # it -- which is how a menu that only writes back to this DM ended up hanging.
         await handle_preview_command(
-            api, telethon_client, message, command_text, home_chat_ref, admin_chat_id, log=log,
+            api, telethon_client, message, command_text, home_chat_ref, known_chat_ids, log=log,
         )
         return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
