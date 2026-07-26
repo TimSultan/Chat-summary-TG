@@ -18,23 +18,28 @@ Rendered previews go to the admin's DM. Nothing here can post to the chat.
 """
 
 from datetime import date
+from html import escape
 
 import tree
 
 CALLBACK_PREFIX = "prev"
 
-# The one preview that does NOT render into the DM: it posts the ceremony message, button
-# and all, into the real chat, because a button can only really be judged where it will
-# live. Handled separately in bot_listener (it needs the chat, and an undo) rather than
-# through PREVIEWS, which is pure by construction.
+# The one preview that does NOT render into the DM: a deliberately neutral post for
+# checking that Telegram delivers every button press to the bot. It keeps its own
+# participant list, wholly separate from the real planting ceremony.
 GROUP_TEST_ID = "test_button"
 GROUP_TEST_TITLE = "🧨 Отправить тест в общий чат"
+GROUP_TEST_TEXT = "Тестовый текст"
+GROUP_TEST_JOIN_ID = "test_join"
+GROUP_TEST_JOIN_CALLBACK = f"{CALLBACK_PREFIX}:{GROUP_TEST_JOIN_ID}"
+GROUP_TEST_BUTTON_TEXT = "Нажмите сюда"
+GROUP_TEST_BUTTON_ACK = "Записал!"
+GROUP_TEST_BUTTON_ALREADY = "Ты уже в списке."
+GROUP_TEST_BUTTON_CLOSED = "Этот тест уже закрыт."
 
-# Carried by every sample planting button -- the one on a DM preview and the one on the
-# test post in the chat alike. It is deliberately NOT the same payload as the menu's
-# "send to the chat" button: those two look identical on screen, and reusing one payload
-# meant an admin tapping the button on a DM sample, to see what it does, would fire a real
-# post at 190 people. This one never does anything but say "это тест".
+# Carried by every sample planting button rendered in the DM. It is deliberately NOT the
+# same payload as either the menu's "send to the chat" action or the group test's
+# recording button: tapping a visual sample must never post publicly or record anybody.
 SAMPLE_BUTTON_ID = "sample"
 SAMPLE_CALLBACK = f"{CALLBACK_PREFIX}:{SAMPLE_BUTTON_ID}"
 
@@ -215,8 +220,8 @@ def render(preview_id: str, day: date | None = None) -> str | None:
 def keyboard_for(preview_id: str) -> dict | None:
     """The planting button, for the previews that carry one.
 
-    Wired to SAMPLE_CALLBACK, so a curious tap answers "это тест" instead of falling
-    through to an unhandled button -- or, worse, doing something.
+    Wired to SAMPLE_CALLBACK, so a curious tap answers "это тест" without affecting the
+    separate, recording button used by the neutral group test.
     """
     for candidate, _, _, with_button in PREVIEWS:
         if candidate == preview_id:
@@ -262,8 +267,17 @@ def menu_view() -> tuple:
     return text, {"inline_keyboard": rows}
 
 
+def group_test_keyboard() -> dict:
+    return {
+        "inline_keyboard": [[{
+            "text": GROUP_TEST_BUTTON_TEXT,
+            "callback_data": GROUP_TEST_JOIN_CALLBACK,
+        }]]
+    }
+
+
 def group_test_sent_view(chat_id, message_id: int) -> tuple:
-    """The DM receipt for a test post, with its own undo.
+    """The DM controls for publishing the collected names or removing the test post.
 
     The undo matters more than it looks: this is the only preview that lands in front of
     190 people, and hunting for the post to delete it by hand is exactly the friction
@@ -272,27 +286,75 @@ def group_test_sent_view(chat_id, message_id: int) -> tuple:
     text = "\n".join([
         "Отправил тестовый пост в общий чат.",
         "",
-        "Кнопка под ним рабочая, но никого не записывает — на нажатие отвечает,",
-        "что это тест.",
+        "Каждый участник, который нажмёт «Нажмите сюда», сохранится в тестовом списке.",
+        "Кнопка ниже опубликует текущий список в общем чате.",
     ])
     keyboard = {
-        "inline_keyboard": [[{
-            "text": "🗑 Удалить из чата",
-            "callback_data": f"{CALLBACK_PREFIX}:del:{chat_id}:{message_id}",
-        }]]
+        "inline_keyboard": [
+            [{
+                "text": "📋 Написать в чат всех нажавших",
+                "callback_data": f"{CALLBACK_PREFIX}:list:{chat_id}:{message_id}",
+            }],
+            [{
+                "text": "🗑 Удалить из чата",
+                "callback_data": f"{CALLBACK_PREFIX}:del:{chat_id}:{message_id}",
+            }],
+        ]
     }
     return text, keyboard
 
 
-def parse_delete_callback(data: str) -> tuple | None:
-    """(chat_id, message_id) behind the undo button, or None."""
+def _parse_group_test_control(data: str, action: str) -> tuple | None:
     parts = (data or "").split(":")
-    if len(parts) != 4 or parts[0] != CALLBACK_PREFIX or parts[1] != "del":
+    if len(parts) != 4 or parts[0] != CALLBACK_PREFIX or parts[1] != action:
         return None
     try:
         return int(parts[2]), int(parts[3])
     except ValueError:
         return None
+
+
+def parse_delete_callback(data: str) -> tuple | None:
+    """(chat_id, message_id) behind the undo button, or None."""
+    return _parse_group_test_control(data, "del")
+
+
+def parse_publish_callback(data: str) -> tuple | None:
+    """(chat_id, message_id) behind the publish-participants button, or None."""
+    return _parse_group_test_control(data, "list")
+
+
+def group_test_results_text(testers: list[tuple[str, str | None]]) -> str:
+    """An HTML list of everybody who pressed, in first-press order."""
+    return "\n".join(group_test_result_chunks(testers, max_chars=None))
+
+
+def group_test_result_chunks(
+    testers: list[tuple[str, str | None]], max_chars: int | None = 4000
+) -> list[str]:
+    """Telegram-safe HTML chunks containing every tester in first-press order."""
+    if not testers:
+        return ["Тестовую кнопку пока никто не нажал."]
+    names = [
+        f"@{escape(username.lstrip('@'))}" if username else escape(display_name)
+        for display_name, username in testers
+    ]
+    header = f"<b>Тестовую кнопку нажали — {len(names)}:</b>"
+    if max_chars is None:
+        return ["\n".join([header, "", "\n".join(f"• {name}" for name in names)])]
+
+    chunks: list[str] = []
+    current = header
+    for name in names:
+        line = f"• {name}"
+        separator = "\n\n" if current == header else "\n"
+        if len(current) + len(separator) + len(line) > max_chars and current != header:
+            chunks.append(current)
+            current = "<b>Продолжение списка:</b>\n\n" + line
+        else:
+            current += separator + line
+    chunks.append(current)
+    return chunks
 
 
 def unknown_preview_text() -> str:

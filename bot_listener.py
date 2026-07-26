@@ -1062,18 +1062,21 @@ async def _send_preview(
 
 
 async def _post_group_test(
-    api: TelegramBotAPI, dm_chat_id: int, admin_chat_id: int, log=print
+    api: TelegramBotAPI, dm_chat_id: int, admin_chat_id: int, entry: str, log=print
 ) -> None:
-    """The one preview that goes to the real chat, so the button can be judged where it
-    will actually live. Its button is wired to the test payload, not the planting one, so
-    a member who taps it out of curiosity is told it's a test instead of being signed up
-    for a planting that isn't running."""
+    """Post a neutral button test and start a fresh, persistent participant list."""
     sent = await api.send_message(
         admin_chat_id,
-        tree.format_seed_ceremony_message(),
-        parse_mode="HTML",
-        reply_markup=tree.seed_keyboard(preview.SAMPLE_CALLBACK),
+        preview.GROUP_TEST_TEXT,
+        parse_mode=None,
+        reply_markup=preview.group_test_keyboard(),
     )
+    try:
+        stats.open_preview_button_test(entry, admin_chat_id, sent["message_id"])
+    except Exception:
+        # Do not leave a visible test whose button can never record anyone.
+        await api.delete_message(admin_chat_id, sent["message_id"])
+        raise
     text, keyboard = preview.group_test_sent_view(admin_chat_id, sent["message_id"])
     await api.send_message(dm_chat_id, text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -1132,7 +1135,7 @@ async def handle_preview_command(
             if admin_chat_id is None:
                 await reply("Не удалось определить основной чат — Telethon-сессия не отвечает.")
                 return
-            await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
+            await _post_group_test(api, dm_chat_id, admin_chat_id, entry, log=log)
             return
         if not await _send_preview(api, dm_chat_id, argument, log=log):
             await reply(preview.unknown_preview_text(), parse_mode="HTML")
@@ -1163,13 +1166,53 @@ async def handle_preview_callback(
     data = callback.get("data") or ""
     callback_id = callback["id"]
     presser = callback.get("from") or {}
-    dm_chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
+    callback_message = callback.get("message") or {}
+    dm_chat_id = callback_message.get("chat", {}).get("id")
+    callback_message_id = callback_message.get("message_id")
 
     deletion = preview.parse_delete_callback(data)
-    preview_id = preview.parse_callback(data) if deletion is None else None
+    publication = preview.parse_publish_callback(data) if deletion is None else None
+    preview_id = (
+        preview.parse_callback(data)
+        if deletion is None and publication is None
+        else None
+    )
 
-    # A sample planting button, in the chat or on a DM preview: no rights needed, nothing
-    # happens, everybody who taps it gets told what it is.
+    # This is the button on the neutral post in the group. Unlike the sample planting
+    # buttons rendered inside the DM, it really records each member once.
+    if preview_id == preview.GROUP_TEST_JOIN_ID:
+        try:
+            result = (
+                stats.add_preview_button_tester(
+                    entry,
+                    dm_chat_id,
+                    callback_message_id,
+                    presser.get("id"),
+                    _display_name(presser),
+                    presser.get("username"),
+                )
+                if entry is not None
+                and dm_chat_id is not None
+                and callback_message_id is not None
+                and presser.get("id") is not None
+                else None
+            )
+        except Exception:
+            log(f"[bot_listener] failed to record a test-button press:\n{traceback.format_exc()}")
+            await api.answer_callback_query(callback_id, "Не удалось записать — попробуй ещё раз.")
+            return
+        acknowledgement = (
+            preview.GROUP_TEST_BUTTON_ACK
+            if result is True
+            else preview.GROUP_TEST_BUTTON_ALREADY
+            if result is False
+            else preview.GROUP_TEST_BUTTON_CLOSED
+        )
+        await api.answer_callback_query(callback_id, acknowledgement)
+        return
+
+    # A sample planting button from a DM preview: no rights needed, nothing is recorded,
+    # and everybody who taps it gets told what it is.
     if preview_id == preview.SAMPLE_BUTTON_ID:
         await api.answer_callback_query(callback_id, tree.SEED_BUTTON_TEST_ACK)
         return
@@ -1189,9 +1232,26 @@ async def handle_preview_callback(
         # every id they need -- the DM's from the callback, the test post's from the
         # button. Only posting a NEW test to the group needs the group resolved, so that
         # is the only branch that reaches for it.
+        if publication is not None:
+            chat_id, message_id = publication
+            testers = (
+                stats.preview_button_testers(entry, chat_id, message_id)
+                if entry is not None
+                else None
+            )
+            if testers is None:
+                await say("Этот тест уже неактуален.")
+                return
+            for chunk in preview.group_test_result_chunks(testers):
+                await api.send_message(chat_id, chunk, parse_mode="HTML")
+            await say("Список нажавших отправлен в общий чат.")
+            return
+
         if deletion is not None:
             chat_id, message_id = deletion
             await api.delete_message(chat_id, message_id)
+            if entry is not None:
+                stats.close_preview_button_test(entry, chat_id, message_id)
             await say("Удалил тестовый пост из чата.")
             return
 
@@ -1210,7 +1270,7 @@ async def handle_preview_callback(
                     "Проверь TELEGRAM_SESSION_STRING."
                 )
                 return
-            await _post_group_test(api, dm_chat_id, admin_chat_id, log=log)
+            await _post_group_test(api, dm_chat_id, admin_chat_id, entry, log=log)
             return
 
         if not await _send_preview(api, dm_chat_id, preview_id, log=log):

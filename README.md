@@ -476,7 +476,8 @@ reject the message.
 `preview.py`. The tree posts were the only ones nobody could see in advance: the morning
 digest fires from a scheduler, the planting happens once in the lifetime of the chat, and
 the nobody-turned-up variant needs a roll call nobody signed up for to reproduce. `/preview`
-in the bot's DM (administrators only) renders all of them from fixed sample data.
+in the bot's DM (a hidden, unadvertised command) renders all of them from fixed sample
+data.
 
 Without an argument it draws a menu, one button per message. `/preview rollcall` sends one
 directly. Everything is **pure** — fixed sample cast, fixed numbers, no stats store, no
@@ -484,16 +485,16 @@ clock beyond the day passed in — and every builder calls the same formatter th
 calls, so a preview cannot drift from the real thing. Only hard-to-trigger messages are in
 here; `/stat`, `/top`, `/shop` and the cabinet are already one command away.
 
-`/preview test_button` is the exception: it posts the invitation, button and all, to the
-real chat, because a button can only be judged where it will live. The DM gets a receipt
-with a one-tap **🗑 Удалить из чата**. That undo matters more than it looks — this is the
-only preview that lands in front of 190 people, and hunting for the post to delete it by
-hand is exactly the friction that would stop somebody testing at all.
+`/preview test_button` is the exception: it posts a neutral **Тестовый текст** with a
+**Нажмите сюда** button to the real chat. Each member who presses is persisted once in a
+test-only list; it never opens a planting, changes the tree, or awards a badge. The DM
+receipt has **📋 Написать в чат всех нажавших**, which posts the current names to the
+group, and **🗑 Удалить из чата**, which removes the test and closes its list. Sending a
+new test starts a fresh list.
 
-Sample planting buttons carry their own callback payload, separate from the menu's
-post-to-the-chat action. The two look identical on screen, and sharing one payload meant
-that tapping the button on a DM sample, to see what it did, sent the invitation to all 190
-members. Pressing a sample now just says "это тест", whoever presses it and wherever.
+Sample planting buttons in the DM carry their own callback payload, separate from both
+the menu's post-to-the-chat action and the recording test button. Pressing a visual sample
+still just says "это тест": it neither posts anything nor adds the presser to a list.
 
 #### Inline buttons must answer before they work
 

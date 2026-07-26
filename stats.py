@@ -1536,6 +1536,103 @@ def close_planting(entry: str) -> None:
     _planting_path(entry).unlink(missing_ok=True)
 
 
+# --- Тест inline-кнопки ---------------------------------------------------------------
+#
+# /preview test_button is intentionally separate from the planting ceremony: it proves
+# that callback queries arrive and records their senders without opening a ceremony,
+# awarding badges, or changing the tree. The state is persisted because the bot may
+# restart while the test post is still visible.
+
+
+def _preview_button_test_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_preview_button_test.json"
+
+
+def preview_button_test_state(entry: str) -> dict | None:
+    path = _preview_button_test_path(entry)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "chat_id" not in data or "message_id" not in data:
+        return None
+    data.setdefault("testers", [])
+    return data
+
+
+def open_preview_button_test(entry: str, chat_id: int, message_id: int) -> None:
+    """Start a fresh list for the newly posted test, replacing any older test."""
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(_preview_button_test_path(entry), {
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "testers": [],
+    })
+
+
+def add_preview_button_tester(
+    entry: str,
+    chat_id: int,
+    message_id: int,
+    user_id: int | str,
+    display_name: str,
+    username: str | None,
+) -> bool | None:
+    """Record one test press.
+
+    True means a new participant, False a repeated press, and None an old/closed test.
+    """
+    state = preview_button_test_state(entry)
+    if (
+        state is None
+        or int(state["chat_id"]) != int(chat_id)
+        or int(state["message_id"]) != int(message_id)
+    ):
+        return None
+    key = str(user_id)
+    if any(str(tester.get("user_id")) == key for tester in state["testers"]):
+        return False
+    state["testers"].append({
+        "user_id": key,
+        "display_name": display_name,
+        "username": (username or "").lstrip("@") or None,
+    })
+    _write_json_atomic(_preview_button_test_path(entry), state)
+    return True
+
+
+def preview_button_testers(
+    entry: str, chat_id: int, message_id: int
+) -> list[tuple[str, str | None]] | None:
+    """The active test's participants, or None when these ids name an old test."""
+    state = preview_button_test_state(entry)
+    if (
+        state is None
+        or int(state["chat_id"]) != int(chat_id)
+        or int(state["message_id"]) != int(message_id)
+    ):
+        return None
+    return [
+        (tester.get("display_name") or f"id{tester.get('user_id')}", tester.get("username"))
+        for tester in state["testers"]
+    ]
+
+
+def close_preview_button_test(entry: str, chat_id: int, message_id: int) -> bool:
+    """Close this test without accidentally clearing a newer one."""
+    state = preview_button_test_state(entry)
+    if (
+        state is None
+        or int(state["chat_id"]) != int(chat_id)
+        or int(state["message_id"]) != int(message_id)
+    ):
+        return False
+    _preview_button_test_path(entry).unlink(missing_ok=True)
+    return True
+
+
 def _tree_digest_last_sent_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_tree_digest_last_sent"
 

@@ -1,6 +1,7 @@
 import asyncio
 import re
 import sys
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bot_listener
 import preview
+import stats
 import tree
 
 ADMIN = {"id": 7, "username": "sultan_kembayev", "first_name": "Sultan"}
@@ -158,6 +160,22 @@ class TelegramHtmlTests(unittest.TestCase):
     def test_the_group_test_receipt_is_valid_telegram_html(self):
         self._check("receipt", preview.group_test_sent_view(-100123, 7)[0])
 
+    def test_group_test_results_escape_display_names(self):
+        text = preview.group_test_results_text([("<b>Аня</b>", None)])
+        self._check("test results", text)
+        self.assertIn("&lt;b&gt;Аня&lt;/b&gt;", text)
+        self.assertNotIn("<b>Аня</b>", text)
+
+    def test_a_large_test_list_is_split_without_losing_anyone(self):
+        testers = [(f"Участник {index} " + "я" * 50, None) for index in range(190)]
+        chunks = preview.group_test_result_chunks(testers)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 4000 for chunk in chunks))
+        for index in range(190):
+            self.assertIn(f"Участник {index} ", "\n".join(chunks))
+        for index, chunk in enumerate(chunks):
+            self._check(f"test results {index}", chunk)
+
     def test_every_advice_line_survives_being_put_in_html(self):
         # One stray "<" or "&" in 120 hand-written lines would kill exactly one morning
         # post, on one unpredictable day, months from now.
@@ -169,7 +187,7 @@ class TelegramHtmlTests(unittest.TestCase):
 class DeleteCallbackTests(unittest.TestCase):
     def test_round_trip(self):
         _, keyboard = preview.group_test_sent_view(-1001234567890, 4242)
-        data = keyboard["inline_keyboard"][0][0]["callback_data"]
+        data = keyboard["inline_keyboard"][1][0]["callback_data"]
         self.assertLessEqual(len(data.encode()), 64)
         self.assertEqual(preview.parse_delete_callback(data), (-1001234567890, 4242))
 
@@ -178,12 +196,32 @@ class DeleteCallbackTests(unittest.TestCase):
 
     def test_a_delete_button_is_not_a_plain_preview(self):
         _, keyboard = preview.group_test_sent_view(-100123, 7)
-        data = keyboard["inline_keyboard"][0][0]["callback_data"]
+        data = keyboard["inline_keyboard"][1][0]["callback_data"]
         self.assertIsNone(preview.parse_callback(data))
 
     def test_garbage_is_rejected(self):
         for data in ("", "prev:del:abc:1", "prev:del:1", "other:del:1:2"):
             self.assertIsNone(preview.parse_delete_callback(data))
+
+
+class PublishCallbackTests(unittest.TestCase):
+    def test_round_trip(self):
+        _, keyboard = preview.group_test_sent_view(-1001234567890, 4242)
+        data = keyboard["inline_keyboard"][0][0]["callback_data"]
+        self.assertLessEqual(len(data.encode()), 64)
+        self.assertEqual(preview.parse_publish_callback(data), (-1001234567890, 4242))
+
+    def test_publish_and_delete_payloads_do_not_overlap(self):
+        _, keyboard = preview.group_test_sent_view(-100123, 7)
+        publish = keyboard["inline_keyboard"][0][0]["callback_data"]
+        delete = keyboard["inline_keyboard"][1][0]["callback_data"]
+        self.assertIsNone(preview.parse_delete_callback(publish))
+        self.assertIsNone(preview.parse_publish_callback(delete))
+        self.assertIsNone(preview.parse_callback(publish))
+
+    def test_garbage_is_rejected(self):
+        for data in ("", "prev:list:abc:1", "prev:list:1", "other:list:1:2"):
+            self.assertIsNone(preview.parse_publish_callback(data))
 
 
 class CeremonyMessageTests(unittest.TestCase):
@@ -272,12 +310,12 @@ class FakeAPI:
         return [{"user": ADMIN}]
 
 
-def _callback(data, presser=ADMIN, chat_id=DM_CHAT, chat_type="private"):
+def _callback(data, presser=ADMIN, chat_id=DM_CHAT, chat_type="private", message_id=42):
     return {
         "id": "cb1",
         "data": data,
         "from": presser,
-        "message": {"message_id": 42, "chat": {"id": chat_id, "type": chat_type}},
+        "message": {"message_id": message_id, "chat": {"id": chat_id, "type": chat_type}},
     }
 
 
@@ -287,11 +325,16 @@ class PreviewCallbackTests(unittest.TestCase):
 
     def setUp(self):
         self.api = FakeAPI()
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
 
     def _press(self, data, presser=ADMIN, chat_id=DM_CHAT, chat_type="private",
-               known_chat_ids=None):
+               known_chat_ids=None, message_id=42):
         asyncio.run(bot_listener.handle_preview_callback(
-            self.api, None, _callback(data, presser, chat_id, chat_type),
+            self.api, None, _callback(data, presser, chat_id, chat_type, message_id),
             "chat", {"chat": GROUP_CHAT} if known_chat_ids is None else known_chat_ids,
             log=lambda *_: None,
         ))
@@ -390,31 +433,92 @@ class PreviewCallbackTests(unittest.TestCase):
 
         self.assertIn("TELEGRAM_SESSION_STRING", self.api.sent[0]["text"])
 
-    def test_the_test_button_posts_to_the_chat_and_offers_an_undo(self):
+    def test_the_test_post_is_neutral_and_offers_list_and_delete_controls(self):
         self._press(preview.callback_data(preview.GROUP_TEST_ID))
         chats = [item["chat_id"] for item in self.api.sent]
         self.assertEqual(chats, [GROUP_CHAT, DM_CHAT])
         posted, receipt = self.api.sent
-        self.assertEqual(
-            posted["reply_markup"]["inline_keyboard"][0][0]["text"], tree.SEED_BUTTON_TEXT
-        )
-        undo = receipt["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        self.assertEqual(posted["text"], "Тестовый текст")
+        self.assertNotIn("дерев", posted["text"].lower())
+        test_button = posted["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(test_button["text"], "Нажмите сюда")
+        self.assertEqual(test_button["callback_data"], preview.GROUP_TEST_JOIN_CALLBACK)
+
+        publish = receipt["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        undo = receipt["reply_markup"]["inline_keyboard"][1][0]["callback_data"]
+        self.assertEqual(preview.parse_publish_callback(publish), (GROUP_CHAT, 501))
         self.assertEqual(preview.parse_delete_callback(undo), (GROUP_CHAT, 501))
+        self.assertEqual(stats.preview_button_testers("chat", GROUP_CHAT, 501), [])
+
+    def test_the_group_test_button_records_each_member_once(self):
+        stats.open_preview_button_test("chat", GROUP_CHAT, 501)
+
+        self._press(
+            preview.GROUP_TEST_JOIN_CALLBACK,
+            presser=MEMBER,
+            chat_id=GROUP_CHAT,
+            chat_type="supergroup",
+            message_id=501,
+        )
+        self.assertEqual(self.api.answers, [preview.GROUP_TEST_BUTTON_ACK])
+        self.assertEqual(
+            stats.preview_button_testers("chat", GROUP_CHAT, 501),
+            [("Кто-то", "someone")],
+        )
+
+        self._press(
+            preview.GROUP_TEST_JOIN_CALLBACK,
+            presser=MEMBER,
+            chat_id=GROUP_CHAT,
+            chat_type="supergroup",
+            message_id=501,
+        )
+        self.assertEqual(self.api.answers[-1], preview.GROUP_TEST_BUTTON_ALREADY)
+        self.assertEqual(len(stats.preview_button_testers("chat", GROUP_CHAT, 501)), 1)
+
+    def test_an_old_test_button_says_it_is_closed(self):
+        stats.open_preview_button_test("chat", GROUP_CHAT, 502)
+        self._press(
+            preview.GROUP_TEST_JOIN_CALLBACK,
+            presser=MEMBER,
+            chat_id=GROUP_CHAT,
+            chat_type="supergroup",
+            message_id=501,
+        )
+        self.assertEqual(self.api.answers, [preview.GROUP_TEST_BUTTON_CLOSED])
+
+    def test_the_list_control_posts_every_tester_to_the_group(self):
+        stats.open_preview_button_test("chat", GROUP_CHAT, 501)
+        stats.add_preview_button_tester("chat", GROUP_CHAT, 501, 8, "Кто-то", "someone")
+        stats.add_preview_button_tester("chat", GROUP_CHAT, 501, 9, "Без ника", None)
+
+        self._press(f"{preview.CALLBACK_PREFIX}:list:{GROUP_CHAT}:501")
+
+        self.assertEqual([item["chat_id"] for item in self.api.sent], [GROUP_CHAT, DM_CHAT])
+        published, confirmation = self.api.sent
+        self.assertEqual(published["parse_mode"], "HTML")
+        self.assertIn("@someone", published["text"])
+        self.assertIn("Без ника", published["text"])
+        self.assertIn("2", published["text"])
+        self.assertIn("отправлен", confirmation["text"])
+
+    def test_the_list_control_can_report_that_nobody_pressed(self):
+        stats.open_preview_button_test("chat", GROUP_CHAT, 501)
+        self._press(f"{preview.CALLBACK_PREFIX}:list:{GROUP_CHAT}:501")
+        self.assertIn("никто", self.api.sent[0]["text"])
 
     def test_the_undo_deletes_the_post_from_the_chat(self):
+        stats.open_preview_button_test("chat", GROUP_CHAT, 501)
         self._press(f"{preview.CALLBACK_PREFIX}:del:{GROUP_CHAT}:501")
         self.assertEqual(self.api.deleted, [(GROUP_CHAT, 501)])
         self.assertIn("Удалил", self.api.sent[0]["text"])
+        self.assertIsNone(stats.preview_button_test_state("chat"))
 
-    def test_the_sample_button_posts_nothing_wherever_it_is_pressed(self):
-        # The one button a member can reach: it sits on the test post in the group.
-        for chat_id, chat_type in ((GROUP_CHAT, "supergroup"), (DM_CHAT, "private")):
-            with self.subTest(chat_type=chat_type):
-                self.api = FakeAPI()
-                self._press(preview.SAMPLE_CALLBACK, presser=MEMBER,
-                            chat_id=chat_id, chat_type=chat_type)
-                self.assertEqual(self.api.sent, [])
-                self.assertEqual(self.api.answers, [tree.SEED_BUTTON_TEST_ACK])
+    def test_a_sample_planting_button_in_the_dm_still_records_nothing(self):
+        self._press(preview.SAMPLE_CALLBACK, presser=MEMBER)
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(self.api.answers, [tree.SEED_BUTTON_TEST_ACK])
+        self.assertIsNone(stats.preview_button_test_state("chat"))
 
     def test_there_is_no_administrator_check_left(self):
         # Removed on purpose: it resolved the home chat through the Telethon session
