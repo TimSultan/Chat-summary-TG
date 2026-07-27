@@ -154,6 +154,7 @@ BUTTON_BUILDER_FLOW_TTL_SECONDS = button_builder.FLOW_TTL_SECONDS
 # menu; the Cyrillic spelling is kept because it is the one that was asked for and reads
 # far better in the chat.
 PLANT_COMMANDS = ("/посадить_семечко", "/plant")
+PLANT_REMINDER_COMMANDS = ("/напомнить_посадку", "/plantreminder")
 # The real planting button, as opposed to preview.SAMPLE_CALLBACK, which looks identical
 # and does nothing.
 PLANT_CALLBACK_PREFIX = "plant"
@@ -1052,6 +1053,49 @@ async def handle_plant_callback(
     await api.answer_callback_query(
         callback_id, tree.SEED_BUTTON_ACK if added else tree.SEED_BUTTON_ALREADY
     )
+
+
+async def handle_plant_reminder_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """Post a count-only reminder for the currently open planting ceremony."""
+    where = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(where, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer the plant reminder command:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Напоминание о посадке может отправить только администратор чата.")
+        return
+    if not stats.planting_is_open(entry):
+        await reply("Посадка сейчас не открыта. Сначала используй /plant.")
+        return
+
+    try:
+        await api.send_message(
+            admin_chat_id,
+            tree.format_seed_reminder_message(len(stats.planters(entry))),
+            parse_mode="HTML",
+            reply_markup=tree.seed_keyboard(f"{PLANT_CALLBACK_PREFIX}:join"),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to post the planting reminder:\n{traceback.format_exc()}")
+        await reply("Напоминание не отправилось. Попробуй ещё раз.")
+        return
+
+    await reply("Напоминание о посадке отправлено.")
 
 
 async def _send_preview(
@@ -3549,6 +3593,19 @@ async def _dispatch_update(
             else None
         )
         await handle_plant_command(api, message, home_chat_ref, admin_chat_id, log=log)
+        return
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in PLANT_REMINDER_COMMANDS
+    ):
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_plant_reminder_command(
+            api, message, home_chat_ref, admin_chat_id, log=log
+        )
         return
     if re.match(rf"^{re.escape(PREVIEW_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":

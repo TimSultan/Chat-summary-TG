@@ -425,6 +425,16 @@ class PlantHandlerTests(unittest.TestCase):
             self.ENTRY, log=lambda *_: None,
         ))
 
+    def _remind(self, actor=None, chat_id=None):
+        message = {
+            "message_id": 2,
+            "chat": {"id": chat_id if chat_id is not None else self.GROUP, "type": "supergroup"},
+            "from": actor or self.ADMIN,
+        }
+        asyncio.run(bot_listener.handle_plant_reminder_command(
+            self.api, message, self.ENTRY, self.GROUP, log=lambda *_: None,
+        ))
+
     def test_it_posts_the_invitation_and_opens_collection(self):
         self._plant()
         invitation = self.api.sent[0]
@@ -487,6 +497,34 @@ class PlantHandlerTests(unittest.TestCase):
         self._press(self.MEMBER)
         self.assertEqual(len(stats.planters(self.ENTRY)), 1)
         self.assertEqual(self.api.answers[-1], tree.SEED_BUTTON_ALREADY)
+
+    def test_reminder_shows_only_the_unique_planter_count(self):
+        self._plant()
+        self._press(self.MEMBER)
+        self._press(self.MEMBER)
+        self.api = self.API()
+
+        self._remind()
+
+        reminder = self.api.sent[0]
+        self.assertEqual(reminder["chat_id"], self.GROUP)
+        self.assertIn("Уже участвуют: <b>1</b>", reminder["text"])
+        self.assertNotIn("Аня", reminder["text"])
+        self.assertEqual(
+            reminder["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "plant:join"
+        )
+
+    def test_reminder_requires_an_open_planting(self):
+        self._remind()
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("не открыта", self.api.sent[0]["text"])
+
+    def test_member_cannot_send_a_reminder(self):
+        self._plant()
+        self.api = self.API()
+        self._remind(actor=self.MEMBER)
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("только администратор", self.api.sent[0]["text"])
 
     def test_pressing_after_it_closed_says_so(self):
         self._plant()

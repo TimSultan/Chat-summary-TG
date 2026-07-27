@@ -350,6 +350,19 @@ def format_seed_ceremony_message(same_day: bool = False) -> str:
     ])
 
 
+def format_seed_reminder_message(planter_count: int) -> str:
+    """A count-only follow-up for an open planting ceremony."""
+    return "\n".join([
+        "🌰 <b>Напоминание о посадке дерева ЕПХ</b>",
+        "",
+        "Помогите нам посадить дерево ЕПХ.",
+        f"Уже участвуют: <b>{max(0, int(planter_count))}</b>.",
+        "",
+        "Нажмите кнопку под этим сообщением, чтобы посадить семечко.",
+        "За участие вы получите уникальный значок.",
+    ])
+
+
 def seed_keyboard(callback_data: str) -> dict:
     """The one button under the ceremony post. The caller owns the callback payload, so
     the same layout serves both the real planting and the /preview test post."""
