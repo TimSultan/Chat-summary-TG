@@ -435,6 +435,16 @@ class PlantHandlerTests(unittest.TestCase):
             self.api, message, self.ENTRY, self.GROUP, log=lambda *_: None,
         ))
 
+    def _send(self, command_text, actor=None, chat_type="private"):
+        message = {
+            "message_id": 3,
+            "chat": {"id": 999, "type": chat_type},
+            "from": actor or self.ADMIN,
+        }
+        asyncio.run(bot_listener.handle_send_command(
+            self.api, message, command_text, self.ENTRY, self.GROUP, log=lambda *_: None,
+        ))
+
     def test_it_posts_the_invitation_and_opens_collection(self):
         self._plant()
         invitation = self.api.sent[0]
@@ -525,6 +535,24 @@ class PlantHandlerTests(unittest.TestCase):
         self._remind(actor=self.MEMBER)
         self.assertEqual(len(self.api.sent), 1)
         self.assertIn("только администратор", self.api.sent[0]["text"])
+
+    def test_send_posts_the_exact_message_to_the_group(self):
+        self._send("/send Первая строка\nВторая строка")
+
+        self.assertEqual(self.api.sent[0]["chat_id"], self.GROUP)
+        self.assertEqual(self.api.sent[0]["text"], "Первая строка\nВторая строка")
+        self.assertEqual(self.api.sent[1]["chat_id"], 999)
+        self.assertIn("отправлено", self.api.sent[1]["text"])
+
+    def test_send_requires_an_admin_and_message_text(self):
+        self._send("/send Сообщение", actor=self.MEMBER)
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("только администраторы", self.api.sent[0]["text"])
+
+        self.api = self.API()
+        self._send("/send")
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("Использование", self.api.sent[0]["text"])
 
     def test_pressing_after_it_closed_says_so(self):
         self._plant()

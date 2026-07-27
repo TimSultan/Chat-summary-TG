@@ -143,6 +143,7 @@ WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
 BADGE_ADMIN_COMMAND = "/badgeadmin"
 REPLANT_COMMAND = "/replant"
+SEND_COMMAND = "/send"
 PREVIEW_COMMAND = "/preview"
 BUTTON_BUILDER_COMMAND = button_builder.COMMAND
 BUTTON_BUILDER_FLOW_TTL_SECONDS = button_builder.FLOW_TTL_SECONDS
@@ -1096,6 +1097,48 @@ async def handle_plant_reminder_command(
         return
 
     await reply("Напоминание о посадке отправлено.")
+
+
+async def handle_send_command(
+    api: TelegramBotAPI,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """DM-only admin command: /send <text> posts plain text to the home chat."""
+    chat = message["chat"]
+    if chat.get("type") != "private":
+        return
+    dm_chat_id = chat["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+    text = command_text[len(SEND_COMMAND):].strip()
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /send:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Отправлять сообщения в чат могут только администраторы.")
+        return
+    if not text:
+        await reply("Использование: /send текст сообщения")
+        return
+
+    try:
+        await api.send_message(admin_chat_id, text, parse_mode=None)
+    except Exception:
+        log(f"[bot_listener] failed to send an admin message:\n{traceback.format_exc()}")
+        await reply("Не удалось отправить сообщение в чат. Попробуй ещё раз.")
+        return
+    await reply("Сообщение отправлено в чат.")
 
 
 async def _send_preview(
@@ -3605,6 +3648,18 @@ async def _dispatch_update(
         )
         await handle_plant_reminder_command(
             api, message, home_chat_ref, admin_chat_id, log=log
+        )
+        return
+    if re.match(rf"^{re.escape(SEND_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_send_command(
+            api, message, command_text, home_chat_ref, admin_chat_id, log=log
         )
         return
     if re.match(rf"^{re.escape(PREVIEW_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
