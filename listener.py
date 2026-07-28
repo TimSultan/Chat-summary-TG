@@ -1237,17 +1237,12 @@ async def run_listener(
 
         text = msg.raw_text or ""
         text_lower = text.lower()
-        is_tree_command = bool(re.match(r"^/tree(?:@\w+)?(?:\s|$)", text_lower))
-        if is_tree_command and not tree.TREE_COMMAND_ENABLED:
-            # /tree is temporarily removed from every surface. Keep the automatic
-            # morning tree posts and planting flow, but silently ignore this command.
-            return
         # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
         # chat content, so it must never count as activity for the joke buffer.
         is_stats_command = (
             text_lower.startswith("/top")
             or text_lower.startswith("/stat")
-            or is_tree_command
+            or text_lower.startswith("/tree")
         )
         is_badge_command = (
             text_lower.startswith("/badge")

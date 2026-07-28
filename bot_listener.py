@@ -180,10 +180,7 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
     {"command": "coins", "description": "Мой баланс"},
-) + (
-    ({"command": "tree", "description": "Наше дерево ЕПХ"},)
-    if tree.TREE_COMMAND_ENABLED
-    else ()
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
 )
 # Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
 # and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
@@ -196,10 +193,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "stat", "description": "Статистика участника"},
     {"command": "topall", "description": "Рейтинг чата"},
     {"command": "toppokras", "description": "Топ прокрастинаторов"},
-) + (
-    ({"command": "tree", "description": "Наше дерево ЕПХ"},)
-    if tree.TREE_COMMAND_ENABLED
-    else ()
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -3578,13 +3572,6 @@ async def _dispatch_update(
         known_chat_ids[matched_entry] = chat["id"]
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
-    if (
-        not tree.TREE_COMMAND_ENABLED
-        and re.match(r"^/tree(?:\s|$)", command_text, re.IGNORECASE)
-    ):
-        # Temporarily removed everywhere: no menu item, no DM fallback and no group
-        # reply. Automatic 10:00 posts and tree previews remain active.
-        return
     if re.match(r"^/start(?:\s|$)", command_text, re.IGNORECASE):
         # Where /stat's "Открыть личный кабинет" link lands (t.me/<bot>?start=cabinet),
         # and the natural first thing a new member does anyway. Groups are ignored: a
@@ -3806,7 +3793,7 @@ async def _dispatch_update(
 
     # "/tree" -- the chat's shared ЕПХ tree (see tree.py). Same chat resolution as the
     # stats commands, so it answers in a DM about the home chat too.
-    if tree.TREE_COMMAND_ENABLED and cfg.stats_enabled and text_lower.startswith("/tree"):
+    if cfg.stats_enabled and text_lower.startswith("/tree"):
         tree_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
         if tree_entry is None:
             return
