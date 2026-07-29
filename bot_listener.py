@@ -59,9 +59,10 @@ import button_builder
 import chat_profile
 import economy
 import history
+import poker
 import preview
 import stats
-from bot_api import TelegramBotAPI
+from bot_api import CAPTION_LIMIT, TelegramBotAPI
 from config import build_session, load_config
 from critique import critique_work
 from errors import ChatSummaryError
@@ -159,6 +160,12 @@ PLANT_REMINDER_COMMANDS = ("/напомнить_посадку", "/plantreminder
 # The real planting button, as opposed to preview.SAMPLE_CALLBACK, which looks identical
 # and does nothing.
 PLANT_CALLBACK_PREFIX = "plant"
+
+# Opens a poker table. Same two-spelling rule as the planting command; "/покер" is the one
+# people actually type, "/poker" is the one Telegram can highlight.
+POKER_COMMANDS = (poker.COMMAND, "/покер")
+# "/poker стоп" closes a table whose buttons have scrolled out of reach.
+POKER_STOP_WORDS = frozenset({"стоп", "закрыть", "заверши", "завершить", "stop", "close", "end"})
 
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
@@ -1093,6 +1100,362 @@ async def handle_plant_reminder_command(
     await reply("Напоминание о посадке отправлено.")
 
 
+# --- Покер ----------------------------------------------------------------------------
+#
+# The rules, the pot maths and every rendered string live in poker.py; everything here is
+# Telegram. One table per chat, its state on disk, so a redeploy mid-hand does not eat
+# anybody's chips.
+
+
+def _poker_live_message(table: dict) -> int | None:
+    """The id of the message that currently carries the table's buttons.
+
+    Newest first: a finished hand's showdown message owns them, otherwise the street being
+    played, otherwise the lobby. Getting this order wrong leaves a live keyboard on a
+    message the game has already moved past.
+    """
+    hand = table.get("hand") or {}
+    return (
+        hand.get("showdown_message_id")
+        or hand.get("message_id")
+        or table.get("lobby_message_id")
+    )
+
+
+async def _poker_deal_cards(api: TelegramBotAPI, table: dict, log=print) -> list[dict]:
+    """DM each player their two cards. Returns whoever could not be reached.
+
+    A private chat's id IS the user id, so no lookup is needed -- but a bot cannot open a
+    conversation the member has never started, which is why joining the table checks
+    reachability up front. Getting here with an unreachable player means they blocked the
+    bot mid-session; the group message names them rather than letting them play blind.
+    """
+    unreachable = []
+    for player in table["players"]:
+        try:
+            await api.send_message(
+                int(player["user_id"]),
+                poker.format_hole_cards(table, player["user_id"]),
+                parse_mode="HTML",
+            )
+        except Exception:
+            unreachable.append(player)
+            log(f"[bot_listener] could not deal cards to {player['user_id']}:\n{traceback.format_exc()}")
+    return unreachable
+
+
+async def _poker_post_street(api: TelegramBotAPI, entry: str, table: dict, log=print) -> None:
+    """Send the message a street is played on and remember it for in-place edits.
+
+    A new message per street rather than one edited all hand: an edit is silent, and a
+    table where the flop arrives without anything appearing in the chat is a table nobody
+    notices it is their turn at.
+    """
+    sent = await api.send_message(
+        table["chat_id"],
+        poker.format_hand(table),
+        parse_mode="HTML",
+        reply_markup=poker.action_keyboard(table),
+    )
+    table["hand"]["message_id"] = sent.get("message_id")
+    poker.save_table(entry, table)
+
+
+async def _poker_retire_message(api: TelegramBotAPI, chat_id, message_id, log=print) -> None:
+    """Leave a finished round's message exactly as it is but take its buttons away, so a
+    scroll back up cannot offer a live action on a hand that has moved on.
+
+    Buttons only, never the text: rewriting it would mean reproducing what that message
+    said at the time, and the state it was rendered from has already moved on.
+    """
+    if not message_id:
+        return
+    try:
+        await api.edit_message_reply_markup(chat_id, message_id, poker.no_keyboard())
+    except Exception:
+        log(f"[bot_listener] failed to retire a poker message:\n{traceback.format_exc()}")
+
+
+async def _poker_start_hand(api: TelegramBotAPI, entry: str, table: dict, log=print) -> None:
+    """Deal, DM the cards, and open the first betting round in the chat."""
+    poker.start_hand(table)
+    poker.save_table(entry, table)
+    unreachable = await _poker_deal_cards(api, table, log=log)
+    if unreachable:
+        names = ", ".join(poker.player_label(player) for player in unreachable)
+        try:
+            await api.send_message(
+                table["chat_id"],
+                f"Не удалось отправить карты в личку: {names}. Откройте чат с ботом и нажмите Start.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log(f"[bot_listener] failed to report undelivered poker cards:\n{traceback.format_exc()}")
+    await _poker_post_street(api, entry, table, log=log)
+
+
+async def _poker_close_table(api: TelegramBotAPI, entry: str, table: dict, note: str, log=print) -> None:
+    """Forget the table, take the live keyboard away, and post the session's standings."""
+    poker.clear_table(entry)
+    await _poker_retire_message(api, table["chat_id"], _poker_live_message(table), log=log)
+    try:
+        await api.send_message(
+            table["chat_id"], poker.format_session_over(table, note), parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[bot_listener] failed to post the poker session summary:\n{traceback.format_exc()}")
+
+
+async def handle_poker_command(
+    api: TelegramBotAPI,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/poker -- open a table. Only a holder of the «Диллер» badge may do it.
+
+    "/poker стоп" closes the current one. That exists because the button that normally
+    does it lives on a message in the chat, and a table opened yesterday is a table whose
+    message has scrolled away -- without a command form, a chat could end up unable to
+    open a new table and unable to close the old one.
+
+    Like the planting command this works from the chat and from the bot's DM alike: the
+    table always goes to the chat, and only the acknowledgement follows whoever typed it.
+    """
+    where = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(where, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer the poker command:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+
+    parts = (command_text or "").split(maxsplit=1)
+    argument = parts[1].strip().casefold() if len(parts) > 1 else ""
+    existing = poker.load_table(entry)
+
+    if argument in POKER_STOP_WORDS:
+        # Checked before the badge gate: an administrator clearing a stuck table may not
+        # be a dealer at all, and requiring the badge to close would recreate the dead end
+        # this branch exists to remove.
+        if existing is None:
+            await reply("Открытого стола нет.")
+            return
+        if not (
+            poker.is_table_dealer(existing, actor.get("id"))
+            or await _is_chat_admin_or_privileged(api, existing["chat_id"], actor)
+        ):
+            await reply("Закрыть стол может только его диллер или администратор чата.")
+            return
+        await _poker_close_table(api, entry, existing, "Стол закрыт командой.", log=log)
+        await reply("Стол закрыт.")
+        return
+
+    if not poker.is_dealer(entry, actor.get("id")):
+        await reply("Открыть стол может только участник со значком «Диллер».")
+        return
+
+    if existing is not None:
+        await reply(
+            "Стол уже открыт. Закрой его кнопкой «Завершить стол» "
+            "или командой /poker стоп, и открывай новый."
+        )
+        return
+
+    table = poker.open_table(admin_chat_id, actor.get("id"), _display_name(actor))
+    try:
+        sent = await api.send_message(
+            admin_chat_id,
+            poker.format_lobby(table),
+            parse_mode="HTML",
+            reply_markup=poker.lobby_keyboard(table),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to open a poker table:\n{traceback.format_exc()}")
+        await reply("Стол не открылся. Попробуй ещё раз.")
+        return
+
+    table["lobby_message_id"] = sent.get("message_id")
+    poker.save_table(entry, table)
+    if where != admin_chat_id:
+        await reply("Стол открыт в чате.")
+
+
+async def _poker_join(api: TelegramBotAPI, entry: str, table: dict, callback_id: str, presser: dict, log=print) -> None:
+    """One member takes a seat. Pressing twice is answered, not seated twice."""
+    result = poker.seat(
+        table, presser.get("id"), _display_name(presser), presser.get("username")
+    )
+    if result != "seated":
+        await api.answer_callback_query(callback_id, {
+            "already": "Ты уже за столом.",
+            "full": f"За столом уже {poker.MAX_PLAYERS} игроков.",
+            "closed": "Игра уже началась.",
+        }[result])
+        return
+
+    # Reachability is checked HERE, before the spinner stops, and deliberately so: cards
+    # are dealt privately, and a bot cannot write to somebody who has never started it.
+    # Finding that out at the deal would mean a player sitting through a hand blind.
+    try:
+        await api.send_message(
+            int(presser["id"]),
+            "Ты за покерным столом. Карты придут сюда, как только диллер начнёт игру.",
+            parse_mode=None,
+        )
+    except Exception:
+        table["players"] = [p for p in table["players"] if p["user_id"] != str(presser.get("id"))]
+        poker.save_table(entry, table)
+        await api.answer_callback_query(
+            callback_id, "Сначала открой чат со мной и нажми Start — туда придут карты.",
+        )
+        return
+
+    poker.save_table(entry, table)
+    await api.answer_callback_query(callback_id, "Ты в игре.")
+    try:
+        await api.edit_message_text(
+            table["chat_id"], table["lobby_message_id"], poker.format_lobby(table),
+            reply_markup=poker.lobby_keyboard(table), parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[bot_listener] failed to update the poker lobby:\n{traceback.format_exc()}")
+
+
+async def handle_poker_callback(
+    api: TelegramBotAPI,
+    callback: dict,
+    entry: str | None,
+    log=print,
+) -> None:
+    """Every poker button in the group.
+
+    Telegram has no per-viewer keyboards, so everybody sees everybody's buttons and the
+    wrong person pressing is not an error case but the normal case: it is answered with a
+    toast on that person's own screen and changes nothing at all.
+    """
+    parsed = poker.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    action, table_id, hand_no, street = parsed
+    callback_id = callback["id"]
+    presser = callback.get("from") or {}
+    if presser.get("id") is None:
+        await api.answer_callback_query(callback_id, "Не удалось определить, кто нажал.")
+        return
+
+    table = poker.load_table(entry) if entry else None
+    if table is None or table.get("table_id") != table_id:
+        await api.answer_callback_query(callback_id, "Этот стол уже закрыт.")
+        return
+
+    if action == "join":
+        if table.get("phase") != poker.PHASE_LOBBY:
+            await api.answer_callback_query(callback_id, "Игра уже началась.")
+            return
+        await _poker_join(api, entry, table, callback_id, presser, log=log)
+        return
+
+    if action == "end":
+        # The one action a chat administrator can also take: without it a dealer who has
+        # left, muted the chat or simply gone to bed would wedge the table forever, and
+        # no new one can be opened while it exists.
+        # The table carries its own chat id, so this works after a restart too -- unlike
+        # known_chat_ids, which is only populated by messages the process has itself seen.
+        allowed = poker.is_table_dealer(table, presser.get("id")) or (
+            await _is_chat_admin_or_privileged(api, table["chat_id"], presser)
+        )
+        if not allowed:
+            await api.answer_callback_query(callback_id, "Закрыть стол может только диллер.")
+            return
+        await api.answer_callback_query(callback_id, "Стол закрыт.")
+        await _poker_close_table(api, entry, table, "Диллер закрыл стол.", log=log)
+        return
+
+    if action in ("start", "next"):
+        if not poker.is_table_dealer(table, presser.get("id")):
+            await api.answer_callback_query(callback_id, "Начать игру может только диллер.")
+            return
+        expected = poker.PHASE_LOBBY if action == "start" else poker.PHASE_SHOWDOWN
+        if table.get("phase") != expected:
+            await api.answer_callback_query(callback_id, "Сейчас это не нужно.")
+            return
+        if poker.players_with_chips(table) < poker.MIN_PLAYERS:
+            await api.answer_callback_query(
+                callback_id, f"Нужно хотя бы {poker.MIN_PLAYERS} игрока с фишками.",
+            )
+            return
+        await api.answer_callback_query(callback_id)
+        # Read before the deal: starting a hand replaces `hand`, and with it the id of the
+        # message whose buttons have to be taken away.
+        previous_id = _poker_live_message(table)
+        try:
+            await _poker_start_hand(api, entry, table, log=log)
+        except ValueError as error:
+            log(f"[bot_listener] refused to start a poker hand: {error}")
+            return
+        except Exception:
+            log(f"[bot_listener] failed to start a poker hand:\n{traceback.format_exc()}")
+            return
+        await _poker_retire_message(api, table["chat_id"], previous_id, log=log)
+        return
+
+    # Everything left is a betting action, and every one of them is refused unless it is
+    # this person's turn on this exact street of this exact hand.
+    if table.get("phase") != poker.PHASE_HAND or not table.get("hand"):
+        await api.answer_callback_query(callback_id, "Сейчас нет активной раздачи.")
+        return
+    if hand_no != table["hand_no"] or street != table["hand"]["street"]:
+        await api.answer_callback_query(callback_id, "Эта раздача уже сыграна.")
+        return
+
+    street_before = table["hand"]["street"]
+    message_before = table["hand"].get("message_id")
+    ok, problem = poker.act(table, presser.get("id"), action)
+    if not ok:
+        await api.answer_callback_query(callback_id, problem)
+        return
+
+    poker.save_table(entry, table)
+    await api.answer_callback_query(callback_id)
+
+    if poker.hand_is_over(table):
+        await _poker_retire_message(api, table["chat_id"], message_before, log=log)
+        try:
+            sent = await api.send_message(
+                table["chat_id"], poker.format_showdown(table),
+                parse_mode="HTML", reply_markup=poker.showdown_keyboard(table),
+            )
+            # Remembered so the next hand can take these buttons away: without it the
+            # finished hand keeps a live "Следующая раздача" that would deal a second one.
+            table["hand"]["showdown_message_id"] = sent.get("message_id")
+            poker.save_table(entry, table)
+        except Exception:
+            log(f"[bot_listener] failed to post a poker showdown:\n{traceback.format_exc()}")
+        return
+
+    if table["hand"]["street"] != street_before:
+        await _poker_retire_message(api, table["chat_id"], message_before, log=log)
+        await _poker_post_street(api, entry, table, log=log)
+        return
+
+    try:
+        await api.edit_message_text(
+            table["chat_id"], message_before, poker.format_hand(table),
+            reply_markup=poker.action_keyboard(table), parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[bot_listener] failed to update a poker hand:\n{traceback.format_exc()}")
+
+
 async def handle_send_command(
     api: TelegramBotAPI,
     message: dict,
@@ -1142,9 +1505,19 @@ async def _send_preview(
     text = preview.render(preview_id)
     if text is None:
         return False
-    await api.send_message(
-        dm_chat_id, text, parse_mode="HTML", reply_markup=preview.keyboard_for(preview_id),
-    )
+    keyboard = preview.keyboard_for(preview_id)
+    # Same rule the real post follows (see _consume_stats_digests): the picture is
+    # optional, and a failure to send it must still leave the admin with the text.
+    image = preview.image_for(preview_id)
+    if image is not None and len(text) <= CAPTION_LIMIT:
+        try:
+            await api.send_photo_file(
+                dm_chat_id, image, caption=text, parse_mode="HTML", reply_markup=keyboard,
+            )
+            return True
+        except Exception:
+            log(f"[bot_listener] failed to preview {image.name}, falling back to text:\n{traceback.format_exc()}")
+    await api.send_message(dm_chat_id, text, parse_mode="HTML", reply_markup=keyboard)
     return True
 
 
@@ -2522,6 +2895,50 @@ async def maybe_send_menu(
         log(f"[bot_listener] failed to send the fallback menu:\n{traceback.format_exc()}")
 
 
+async def send_stats_digest(
+    api: TelegramBotAPI,
+    chat_id,
+    entry: str,
+    text: str,
+    parse_mode: str | None,
+    photo=None,
+    log=print,
+) -> None:
+    """Post one scheduled digest, with its stage picture when there is one.
+
+    The picture is the part that is allowed to fail, and every way it can fail ends in the
+    same place -- the post goes out as plain text:
+
+      * no file for the current stage (nobody has uploaded it yet, which is the normal
+        state of a half-filled assets/tree_stages),
+      * a caption over Telegram's 1024-character limit, which is rejected outright,
+      * an upload Telegram refuses (odd dimensions, a file somebody replaced with
+        something huge, a file that vanished between the check and the send).
+
+    Lives out here rather than inside run_bot_listener's queue consumer so all of that is
+    testable: it is the code path that decides whether the chat gets its morning post.
+    """
+    if photo is not None and len(text) > CAPTION_LIMIT:
+        log(f"[bot_listener] text too long for a caption ({len(text)}), sending '{entry}' without {photo.name}")
+        photo = None
+    if photo is not None:
+        try:
+            await api.send_photo_file(chat_id, photo, caption=text, parse_mode=parse_mode)
+            log(f"[bot_listener] sent stats notification to '{entry}' with {photo.name}")
+            return
+        except Exception:
+            log(f"[bot_listener] failed to send {photo.name}, falling back to text:\n{traceback.format_exc()}")
+    try:
+        # The producer decides the mode: the procrastinator call-out is plain text because
+        # it embeds raw display names, while the tree digest is HTML and escapes them
+        # itself. Sending one with the other's mode either prints tags verbatim or has
+        # Telegram reject the whole message.
+        await api.send_message(chat_id, text, parse_mode=parse_mode)
+        log(f"[bot_listener] sent stats notification to '{entry}'")
+    except Exception:
+        log(f"[bot_listener] failed to send stats notification:\n{traceback.format_exc()}")
+
+
 async def register_bot_menu(api: TelegramBotAPI, log=print) -> None:
     """Publish the ☰ Menu command lists once at startup. Best-effort: the bot works
     without a menu, so a transient failure here must not stop it from starting."""
@@ -3534,6 +3951,10 @@ async def _dispatch_update(
             await handle_badge_callback(api, callback, badge_flows)
         elif callback_data.startswith(f"{PLANT_CALLBACK_PREFIX}:"):
             await handle_plant_callback(api, callback, home_chat_ref, log=log)
+        elif callback_data.startswith(f"{poker.CALLBACK_PREFIX}:"):
+            # No chat resolution here: the table carries its own chat id, so not one of
+            # these buttons ever touches the Telethon session.
+            await handle_poker_callback(api, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{button_builder.CALLBACK_PREFIX}:"):
             await handle_button_builder_callback(
                 api, callback, home_chat_ref, button_builder_flows, log=log
@@ -3635,6 +4056,21 @@ async def _dispatch_update(
         )
         await handle_plant_reminder_command(
             api, message, home_chat_ref, admin_chat_id, log=log
+        )
+        return
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in POKER_COMMANDS
+    ):
+        # Not DM-only: the table is a group event, and the dealer opens it in front of
+        # everybody. Typed in the DM it still posts to the chat, like /plant.
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_poker_command(
+            api, message, command_text, home_chat_ref, admin_chat_id, log=log
         )
         return
     if re.match(rf"^{re.escape(SEND_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
@@ -4042,7 +4478,9 @@ async def run_bot_listener(
     bumps the counter (stats.record_figurine_live) -- only the reaction itself is done
     here, via the bot account, same bot-account-only rule as every other reply.
 
-    `stats_digest_queue`, if given, carries (allowed_chats entry, text) pairs put there
+    `stats_digest_queue`, if given, carries (allowed_chats entry, text, parse_mode, image
+    path or None) tuples -- the image being the tree's current stage picture, posted as a
+    photo with the text as its caption. Put there
     every stats.PROCRASTINATOR_DIGEST_INTERVAL_DAYS days by listener.py's
     run_stats_rollover -- the "Топ покрастинаторов" call-out (see
     stats.format_procrastinators) -- sent here as a plain message, same account as
@@ -4109,6 +4547,14 @@ async def run_bot_listener(
         me = await api.get_me()
         bot_username = me.get("username")
         await register_bot_menu(api, log=log)
+        if home_chat_ref:
+            # So the «Диллер» badge is already in the /badgeadmin list waiting to be
+            # given, rather than something an administrator has to know to create first.
+            try:
+                if poker.ensure_dealer_badge(home_chat_ref):
+                    log(f"[bot_listener] created the {poker.DEALER_BADGE_EMOJI} {poker.DEALER_BADGE_NAME} badge")
+            except Exception:
+                log(f"[bot_listener] could not ensure the dealer badge:\n{traceback.format_exc()}")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
             f"{cfg.listener_trigger_keywords} (summary; roast is off) and direct replies. FIFO queue delay: "
@@ -4207,20 +4653,12 @@ async def run_bot_listener(
 
         async def _consume_stats_digests():
             while True:
-                entry, text, parse_mode = await stats_digest_queue.get()
+                entry, text, parse_mode, photo = await stats_digest_queue.get()
                 chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
                 if chat_id is None:
                     log(f"[bot_listener] dropping stats notification for '{entry}': could not resolve a chat_id for it")
                     continue
-                try:
-                    # The producer decides: the procrastinator call-out is plain text
-                    # because it embeds raw display names, while the tree digest is HTML
-                    # and escapes them itself. Sending one with the other's mode either
-                    # prints tags verbatim or has Telegram reject the whole message.
-                    await api.send_message(chat_id, text, parse_mode=parse_mode)
-                    log(f"[bot_listener] sent stats notification to '{entry}'")
-                except Exception:
-                    log(f"[bot_listener] failed to send stats notification:\n{traceback.format_exc()}")
+                await send_stats_digest(api, chat_id, entry, text, parse_mode, photo, log=log)
 
         async def _consume_dismissals():
             while True:

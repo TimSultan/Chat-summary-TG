@@ -19,6 +19,7 @@ Rendered previews go to the admin's DM. Nothing here can post to the chat.
 
 from datetime import date
 from html import escape
+from pathlib import Path
 
 import tree
 
@@ -129,7 +130,55 @@ PREVIEWS = (
         lambda day: FOUNDER_BADGE_SAMPLE,
         False,
     ),
+    (
+        "stages",
+        "🖼 Картинки стадий",
+        lambda day: stage_images_overview(),
+        False,
+    ),
 )
+
+# The one preview that reads the disk. It is still pure in the way that matters -- no
+# stats, no Telegram, no clock -- and it is the only way to find out whether a picture
+# actually made it into the deployment, which is not something the folder on somebody's
+# laptop can answer.
+MORNING_PREVIEW_ID = "morning"
+
+
+def stage_images_overview() -> str:
+    """Every stage, in order, with a mark for whether its picture is uploaded."""
+    lines = [
+        "🖼 <b>Картинки стадий дерева</b>",
+        "",
+        "Папка: <code>assets/tree_stages/</code>",
+        "Имя файла — как в списке, расширение любое: .png, .jpg, .jpeg, .webp",
+        "",
+    ]
+    for position, (minimum, emoji, name, slug) in enumerate(tree.TREE_STAGES, start=1):
+        mark = "✅" if tree.find_stage_image(slug) else "⬜"
+        lines.append(
+            f"{mark} {position}. {emoji} <b>{escape(name)}</b> — <code>{slug}</code>"
+            f" (от {tree.format_length(minimum)})"
+        )
+    missing = tree.missing_stage_images()
+    lines.append("")
+    if missing:
+        lines.append(f"Не хватает картинок: <b>{len(missing)}</b> из {len(tree.TREE_STAGES)}.")
+        lines.append("Без картинки утренний пост уходит обычным текстом.")
+    else:
+        lines.append("Все картинки на месте.")
+    return "\n".join(lines)
+
+
+def image_for(preview_id: str, total_xp: int | None = None) -> Path | None:
+    """The picture the real post would carry, or None when this preview has none.
+
+    Only the morning post carries one; everything else here is either too long for a
+    caption or has nothing to illustrate.
+    """
+    if preview_id != MORNING_PREVIEW_ID:
+        return None
+    return tree.stage_image(SAMPLE_TOTAL_XP if total_xp is None else total_xp)
 
 # What a planter's badge block looks like afterwards. Rendered here as a fixed sample
 # rather than through stats.format_stat, which would need a real member with real history

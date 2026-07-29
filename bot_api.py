@@ -10,9 +10,18 @@ Roast confirmation uses an inline-keyboard button + callback_query rather than r
 the bot's own inline keyboard requires no special rights at all.
 """
 
+import json
+import mimetypes
+from pathlib import Path
+
 import aiohttp
 
 from errors import ChatSummaryError
+
+# Telegram's own cap on a photo caption (sendPhoto, "0-1024 characters after entities
+# parsing"). A caption one character over is rejected outright, so a caller with a longer
+# text sends it as a plain message instead of losing the post.
+CAPTION_LIMIT = 1024
 
 
 class TelegramBotAPI:
@@ -31,6 +40,24 @@ class TelegramBotAPI:
                 data = await resp.json()
         except aiohttp.ClientError as e:
             raise ChatSummaryError(f"Telegram Bot API request failed ({method}): {e}") from e
+
+        if not data.get("ok"):
+            raise ChatSummaryError(
+                f"Telegram Bot API {method} failed: {data.get('description', data)}"
+            )
+        return data["result"]
+
+    async def _upload(self, method: str, form: aiohttp.FormData, _http_timeout: float = 60.0) -> object:
+        """_call's twin for multipart requests -- same error handling, same result
+        unwrapping. Separate because Telegram takes a file only as form data, never as
+        JSON, and because an upload deserves a longer timeout than an API call."""
+        try:
+            async with self._session.post(
+                f"{self._base_url}/{method}", data=form, timeout=aiohttp.ClientTimeout(total=_http_timeout)
+            ) as resp:
+                data = await resp.json()
+        except aiohttp.ClientError as e:
+            raise ChatSummaryError(f"Telegram Bot API upload failed ({method}): {e}") from e
 
         if not data.get("ok"):
             raise ChatSummaryError(
@@ -105,6 +132,39 @@ class TelegramBotAPI:
             }
         return await self._call("sendPhoto", **params)
 
+    async def send_photo_file(
+        self,
+        chat_id,
+        path,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
+    ) -> dict:
+        """Upload a picture from disk and post it with an optional caption.
+
+        send_photo's counterpart for files Telegram has never seen: that one takes a
+        file_id or a URL, which the stage pictures (committed alongside the code, never
+        posted before) have neither of. Read into memory in one go -- these are a few
+        hundred kilobytes, sent once a day.
+        """
+        path = Path(path)
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
+        if parse_mode:
+            form.add_field("parse_mode", parse_mode)
+        if reply_markup:
+            form.add_field("reply_markup", json.dumps(reply_markup))
+        if reply_to_message_id is not None:
+            form.add_field("reply_parameters", json.dumps(
+                {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
+            ))
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        form.add_field("photo", path.read_bytes(), filename=path.name, content_type=content_type)
+        return await self._upload("sendPhoto", form)
+
     async def set_my_commands(self, commands: list[dict], scope: dict | None = None) -> None:
         """Populate the client's own ☰ Menu button next to the input field.
 
@@ -144,6 +204,27 @@ class TelegramBotAPI:
                 parse_mode=parse_mode,
                 link_preview_options={"is_disabled": True},
                 reply_markup=reply_markup,
+            )
+        except ChatSummaryError as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    async def edit_message_reply_markup(
+        self, chat_id, message_id: int, reply_markup: dict | None = None
+    ) -> None:
+        """Change only a message's buttons, leaving its text alone.
+
+        What takes a finished round's keyboard away without having to reproduce the text
+        it was attached to -- reproducing it is how an edit turns into a rewrite that
+        loses whatever the message actually said. Pass {"inline_keyboard": []} to remove
+        the keyboard: an omitted reply_markup means "leave it as it is".
+        """
+        try:
+            await self._call(
+                "editMessageReplyMarkup",
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup if reply_markup is not None else {"inline_keyboard": []},
             )
         except ChatSummaryError as e:
             if "not modified" not in str(e).lower():

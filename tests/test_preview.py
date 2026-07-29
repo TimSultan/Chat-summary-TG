@@ -34,10 +34,10 @@ class PreviewRegistryTests(unittest.TestCase):
             self.assertTrue(preview_id.isascii())
             self.assertNotIn(":", preview_id)  # would break parse_callback
 
-    def test_only_the_requested_five_dm_previews_remain(self):
+    def test_only_the_requested_dm_previews_remain(self):
         self.assertEqual(
             preview.preview_ids(),
-            ("seed", "rollcall", "morning", "status", "founder"),
+            ("seed", "rollcall", "morning", "status", "founder", "stages"),
         )
         self.assertEqual(
             [preview.title_for(preview_id) for preview_id in preview.preview_ids()],
@@ -47,6 +47,7 @@ class PreviewRegistryTests(unittest.TestCase):
                 "☀️ Утренний пост",
                 "🌳 Обычный",
                 "🌱 Значок",
+                "🖼 Картинки стадий",
             ],
         )
 
@@ -313,6 +314,7 @@ class CeremonyMessageTests(unittest.TestCase):
 class FakeAPI:
     def __init__(self):
         self.sent = []
+        self.photos = []
         self.answers = []
         self.deleted = []
         self._next_id = 500
@@ -325,6 +327,20 @@ class FakeAPI:
             "reply_markup": reply_markup, "parse_mode": parse_mode,
         })
         return {"message_id": self._next_id}
+
+    async def send_photo_file(self, chat_id, path, caption=None, reply_to_message_id=None,
+                              reply_markup=None, parse_mode=None):
+        self._next_id += 1
+        self.photos.append({
+            "chat_id": chat_id, "path": path, "text": caption,
+            "reply_markup": reply_markup, "parse_mode": parse_mode,
+        })
+        return {"message_id": self._next_id}
+
+    def posted(self) -> list:
+        """Everything that reached the DM, photo or not -- what a caller checks when it
+        does not care which of the two a preview happened to be."""
+        return self.sent + self.photos
 
     async def answer_callback_query(self, callback_query_id, text=None):
         self.answers.append(text)
@@ -394,13 +410,50 @@ class PreviewCallbackTests(unittest.TestCase):
         self.assertEqual(handled[0]["data"], preview.callback_data("rollcall"))
 
     def test_every_menu_button_answers_and_sends_something(self):
+        # posted() rather than sent: the morning sample arrives as a photo once somebody
+        # has uploaded that stage's picture, and this test is about the button, not the
+        # shape of what it produced.
         for preview_id in preview.preview_ids():
             with self.subTest(preview_id=preview_id):
                 self.api = FakeAPI()
                 self._press(preview.callback_data(preview_id))
-                self.assertEqual(len(self.api.sent), 1, "button produced no message")
-                self.assertEqual(self.api.sent[0]["chat_id"], DM_CHAT)
+                self.assertEqual(len(self.api.posted()), 1, "button produced no message")
+                self.assertEqual(self.api.posted()[0]["chat_id"], DM_CHAT)
                 self.assertEqual(len(self.api.answers), 1, "spinner never stopped")
+
+    def test_the_morning_sample_carries_the_stage_picture_when_there_is_one(self):
+        """The only way to check an uploaded picture before the chat sees it at 10:00."""
+        with tempfile.TemporaryDirectory() as folder:
+            uploaded = Path(folder) / "03_seedling.png"
+            uploaded.write_bytes(b"not really a picture")
+            with patch.object(tree, "TREE_IMAGE_DIR", Path(folder)):
+                self._press(preview.callback_data("morning"))
+
+        self.assertEqual(len(self.api.sent), 0)
+        self.assertEqual(len(self.api.photos), 1)
+        photo = self.api.photos[0]
+        self.assertEqual(photo["path"], uploaded)
+        self.assertEqual(photo["parse_mode"], "HTML")
+        self.assertIn("Доброе утро, ЕПХ-чане!", photo["text"])
+
+    def test_the_morning_sample_falls_back_to_text_without_one(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(tree, "TREE_IMAGE_DIR", Path(folder)):
+                self._press(preview.callback_data("morning"))
+
+        self.assertEqual(len(self.api.photos), 0)
+        self.assertIn("Доброе утро, ЕПХ-чане!", self.api.sent[0]["text"])
+
+    def test_the_stage_list_marks_what_is_uploaded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "01_seed.jpg").write_bytes(b"not really a picture")
+            with patch.object(tree, "TREE_IMAGE_DIR", Path(folder)):
+                self._press(preview.callback_data("stages"))
+
+        text = self.api.sent[0]["text"]
+        self.assertIn("✅ 1. 🌰 <b>Семечко</b>", text)
+        self.assertIn("⬜ 2. 🌱 <b>Росток</b>", text)
+        self.assertIn(f"Не хватает картинок: <b>{len(tree.TREE_STAGES) - 1}</b>", text)
 
     def test_rendering_a_sample_never_touches_telethon(self):
         """The bug this pins, and the reason it kept coming back.

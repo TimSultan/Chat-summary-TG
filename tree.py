@@ -13,33 +13,44 @@ that a quiet day reads differently from a busy one.
 
 from datetime import date
 from html import escape
+from pathlib import Path
 
 # 200 XP per millimetre, 20 m at the top. At the chat's measured ~3,600 XP/day that is
 # ~18 mm a day and ~3.0 years to the final stage.
 TREE_XP_PER_MM = 200
 TREE_MAX_HEIGHT_MM = 20_000
 
-# (minimum height in mm, emoji, name). Ordered lowest-first; stage 1 is the seed everyone
-# starts from. Thresholds are set in HEIGHT rather than XP so the names line up with a
-# tree somebody can picture -- a 2 m "деревце", a 20 m giant.
+# (minimum height in mm, emoji, name, image slug). Ordered lowest-first; stage 1 is the
+# seed everyone starts from. Thresholds are set in HEIGHT rather than XP so the names line
+# up with a tree somebody can picture -- a 2 m "деревце", a 20 m giant.
+#
+# The slug is the file name (without extension) of that stage's picture in
+# TREE_IMAGE_DIR; it is numbered so the folder sorts in stage order for whoever is filling
+# it, and ASCII so it survives being uploaded from any machine.
 TREE_STAGES = (
-    (0, "🌰", "Семечко"),
-    (50, "🌱", "Росток"),
-    (200, "🌿", "Проросток"),
-    (500, "🪴", "Саженец"),
-    (1_000, "🌾", "Молодая поросль"),
-    (2_000, "🌲", "Деревце"),
-    (3_500, "🌳", "Молодое дерево"),
-    (5_500, "🍃", "Крепкое дерево"),
-    (8_000, "🌳", "Раскидистое дерево"),
-    (11_000, "🦉", "Дерево с дуплом"),
-    (14_000, "🌸", "Цветущий великан"),
-    (17_000, "🏛️", "Древо-исполин"),
+    (0, "🌰", "Семечко", "01_seed"),
+    (50, "🌱", "Росток", "02_sprout"),
+    (200, "🌿", "Проросток", "03_seedling"),
+    (500, "🪴", "Саженец", "04_sapling"),
+    (1_000, "🌾", "Молодая поросль", "05_young_growth"),
+    (2_000, "🌲", "Деревце", "06_little_tree"),
+    (3_500, "🌳", "Молодое дерево", "07_young_tree"),
+    (5_500, "🍃", "Крепкое дерево", "08_strong_tree"),
+    (8_000, "🌳", "Раскидистое дерево", "09_spreading_tree"),
+    (11_000, "🦉", "Дерево с дуплом", "10_hollow_tree"),
+    (14_000, "🌸", "Цветущий великан", "11_blooming_giant"),
+    (17_000, "🏛️", "Древо-исполин", "12_ancient_giant"),
     # 19.5 m rather than the full 20: at the measured rate this lands the final stage a
     # touch under three years, so the tree reaches its name on time and then keeps
     # inching towards the cap instead of the name arriving three months late.
-    (19_500, "👑", "Легендарное Древо ЕПХ"),
+    (19_500, "👑", "Легендарное Древо ЕПХ", "13_legendary"),
 )
+
+# Pictures are dropped in by hand (see assets/tree_stages/README.md) and are optional:
+# every post falls back to text-only when the file for the current stage isn't there, so a
+# half-filled folder still leaves the chat with a working morning post.
+TREE_IMAGE_DIR = Path(__file__).resolve().parent / "assets" / "tree_stages"
+TREE_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 MORNING_GREETING = "Доброе утро, ЕПХ-чане!"
 # How many of yesterday's top contributors the morning post names.
@@ -68,24 +79,63 @@ def tree_height_mm(total_xp: int) -> int:
     return min(TREE_MAX_HEIGHT_MM, max(0, int(total_xp)) // TREE_XP_PER_MM)
 
 
-def tree_stage(total_xp: int) -> tuple[int, str, str]:
-    """(stage number starting at 1, emoji, name) for the pooled XP."""
+def stage_index(total_xp: int) -> int:
+    """Position of the current stage in TREE_STAGES, counting from 0."""
     height = tree_height_mm(total_xp)
     index = 0
-    for position, (minimum, _, _) in enumerate(TREE_STAGES):
-        if height >= minimum:
+    for position, stage in enumerate(TREE_STAGES):
+        if height >= stage[0]:
             index = position
-    _, emoji, name = TREE_STAGES[index]
+    return index
+
+
+def tree_stage(total_xp: int) -> tuple[int, str, str]:
+    """(stage number starting at 1, emoji, name) for the pooled XP."""
+    index = stage_index(total_xp)
+    _, emoji, name, _ = TREE_STAGES[index]
     return index + 1, emoji, name
 
 
 def next_stage(total_xp: int) -> tuple[str, int] | None:
     """(name, millimetres still to go) for the next stage, or None at the top."""
     height = tree_height_mm(total_xp)
-    for minimum, _, name in TREE_STAGES:
+    for minimum, _, name, _ in TREE_STAGES:
         if height < minimum:
             return name, minimum - height
     return None
+
+
+def find_stage_image(slug: str) -> Path | None:
+    """The picture file for one stage slug, or None when nobody has uploaded it yet.
+
+    Found by listing the folder rather than by probing slug + ".png", ".jpg", ... because
+    the folder is filled by hand: an image saved as SEED.JPG resolves fine on a Windows
+    machine and silently misses on the Linux host, which is exactly the sort of failure
+    nobody would notice until 10:00.
+    """
+    try:
+        entries = sorted(TREE_IMAGE_DIR.iterdir())
+    except OSError:
+        return None  # folder missing entirely -- same outcome as an empty one
+    for path in entries:
+        if (
+            path.is_file()
+            and path.stem.lower() == slug
+            and path.suffix.lower() in TREE_IMAGE_EXTENSIONS
+        ):
+            return path
+    return None
+
+
+def stage_image(total_xp: int) -> Path | None:
+    """The picture for the stage the tree is at right now, or None if it isn't there."""
+    return find_stage_image(TREE_STAGES[stage_index(total_xp)][3])
+
+
+def missing_stage_images() -> list[str]:
+    """Slugs with no file behind them -- what a startup log line reports so a missing
+    picture is noticed before the morning that needs it, not after."""
+    return [slug for _, _, _, slug in TREE_STAGES if find_stage_image(slug) is None]
 
 
 def format_length(mm: int) -> str:
@@ -457,8 +507,11 @@ def format_morning_digest(
     grown_mm = tree_height_mm(total_xp) - tree_height_mm(max(0, total_xp - yesterday_xp))
     _, emoji, name = tree_stage(total_xp)
 
+    # The greeting carries the CURRENT stage's emoji rather than a fixed 🌳: for the first
+    # months of a three-year climb a mature tree at the top of the post quietly contradicts
+    # the "🌰 Семечко" two lines below it, and the emoji is the part people actually see.
     lines = [
-        f"🌳 <b>{MORNING_GREETING}</b>",
+        f"{emoji} <b>{MORNING_GREETING}</b>",
         "",
     ]
     if grown_mm:

@@ -752,7 +752,7 @@ async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=
         try:
             text = await stats.format_procrastinators(client, entry, entry, tz, log=log)
             if text:
-                await stats_digest_queue.put((entry, text, None))
+                await stats_digest_queue.put((entry, text, None, None))
                 log(f"[stats] queued procrastinator digest for '{entry}'")
             else:
                 log(f"[stats] procrastinator digest for '{entry}' has nothing to report today")
@@ -808,14 +808,21 @@ async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> 
                     # Nobody pressed. The tree is deliberately NOT planted and the
                     # ceremony stays open: opening the whole thing on an empty roll call
                     # would be worse than waiting another day for a better one.
-                    await stats_digest_queue.put((entry, tree.format_nobody_planted_message(), "HTML"))
+                    await stats_digest_queue.put(
+                        (entry, tree.format_nobody_planted_message(), "HTML", None)
+                    )
                     stats.mark_tree_digest_sent(entry, today)
                     log(f"[stats] planting for '{entry}' had no takers, still open")
                     continue
                 awarded = stats.award_founder_badges(entry)
                 stats.close_planting(entry)
                 stats.mark_tree_planted(entry, today)
-                await stats_digest_queue.put((entry, tree.format_planting_roll_call(joined), "HTML"))
+                # No picture on this one, nor on the planting post below: both run far past
+                # Telegram's 1024-character caption limit, so a photo would only cost them
+                # the text.
+                await stats_digest_queue.put(
+                    (entry, tree.format_planting_roll_call(joined), "HTML", None)
+                )
                 stats.mark_tree_digest_sent(entry, today)
                 log(f"[stats] planted '{entry}' with {len(joined)} planters ({awarded} new badges)")
                 continue
@@ -824,6 +831,7 @@ async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> 
             # on it: on that day there is nothing to report, and the height starts from
             # zero here.
             planting = stats.tree_planted_on(entry) is None
+            image = None
             if planting:
                 stats.mark_tree_planted(entry, today)
                 text = tree.format_planting_message()
@@ -833,11 +841,14 @@ async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> 
                     client, entry, entry, yesterday, tz, log=log
                 )
                 text = tree.format_morning_digest(total_xp, day_xp, contributors, today)
-            await stats_digest_queue.put((entry, text, "HTML"))
+                # None until somebody drops a file in assets/tree_stages for this stage;
+                # the post then goes out as text, exactly as it did before.
+                image = tree.stage_image(total_xp)
+            await stats_digest_queue.put((entry, text, "HTML", image))
             stats.mark_tree_digest_sent(entry, today)
             log(
                 f"[stats] queued tree {'planting' if planting else 'digest'} for "
-                f"'{entry}' (+{day_xp} XP yesterday)"
+                f"'{entry}' (+{day_xp} XP yesterday, image: {image.name if image else 'none'})"
             )
         except Exception:
             log(f"[stats] failed to build tree digest for '{entry}':\n{traceback.format_exc()}")
@@ -854,6 +865,13 @@ async def _tree_digest_loop(client, cfg, tz, stats_digest_queue, log=print) -> N
     """
     if stats_digest_queue is None:
         return
+    # Said once, at startup, because a missing stage picture has no other symptom: the
+    # post simply goes out as text and nobody knows a file was expected.
+    missing = tree.missing_stage_images()
+    if missing:
+        log(f"[stats] tree stage images missing ({len(missing)}/{len(tree.TREE_STAGES)}): {', '.join(missing)}")
+    else:
+        log(f"[stats] all {len(tree.TREE_STAGES)} tree stage images present")
     await _send_tree_digests(client, cfg, stats.tree_digest_tz(), stats_digest_queue, log=log)
     while True:
         moscow = stats.tree_digest_tz()

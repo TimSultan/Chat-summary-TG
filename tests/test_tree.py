@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import bot_api
 import bot_listener
 import listener
 import preview
@@ -32,7 +33,7 @@ class GrowthTests(unittest.TestCase):
         self.assertEqual(tree.tree_height_mm(0), 0)
 
     def test_stages_are_ordered_and_never_go_backwards(self):
-        heights = [minimum for minimum, _, _ in tree.TREE_STAGES]
+        heights = [minimum for minimum, _, _, _ in tree.TREE_STAGES]
         self.assertEqual(heights, sorted(heights))
         self.assertEqual(len(set(heights)), len(heights))
 
@@ -163,6 +164,176 @@ class DigestTests(unittest.TestCase):
         self.assertIn("Легендарное Древо ЕПХ", topped_out)
 
 
+class StageImageTests(unittest.TestCase):
+    """One picture per stage, dropped into assets/tree_stages by hand."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.folder = Path(self._temporary.name)
+        patcher = patch.object(tree, "TREE_IMAGE_DIR", self.folder)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def _put(self, filename):
+        (self.folder / filename).write_bytes(b"not really a picture")
+
+    def test_every_stage_has_its_own_ascii_slug(self):
+        slugs = [slug for _, _, _, slug in tree.TREE_STAGES]
+        self.assertEqual(len(set(slugs)), len(slugs))
+        for slug in slugs:
+            self.assertTrue(slug.isascii())
+            self.assertEqual(slug, slug.lower())
+
+    def test_an_empty_folder_simply_means_no_picture(self):
+        # The whole feature is optional: the post still goes out, as text.
+        self.assertIsNone(tree.stage_image(0))
+        self.assertEqual(len(tree.missing_stage_images()), len(tree.TREE_STAGES))
+
+    def test_a_missing_folder_is_not_an_error(self):
+        with patch.object(tree, "TREE_IMAGE_DIR", self.folder / "nope"):
+            self.assertIsNone(tree.stage_image(0))
+
+    def test_the_picture_for_the_current_stage_is_the_one_picked(self):
+        self._put("01_seed.png")
+        self._put("04_sapling.jpg")
+
+        self.assertEqual(tree.stage_image(0).name, "01_seed.png")
+        # ~50 cm of tree: the Саженец stage.
+        self.assertEqual(tree.stage_image(500 * tree.TREE_XP_PER_MM).name, "04_sapling.jpg")
+        # Nothing uploaded for the stage in between.
+        self.assertIsNone(tree.stage_image(200 * tree.TREE_XP_PER_MM))
+        self.assertNotIn("01_seed", tree.missing_stage_images())
+
+    def test_extension_and_case_are_whatever_the_uploader_had(self):
+        """A file saved as SEED.JPG resolves on Windows either way; on the Linux host it
+        would not, and the only symptom would be a missing picture at 10:00."""
+        self._put("01_SEED.JPG")
+        self.assertEqual(tree.stage_image(0).name, "01_SEED.JPG")
+
+    def test_an_unrelated_file_in_the_folder_is_ignored(self):
+        self._put("README.md")
+        self._put("01_seed.txt")
+        self.assertIsNone(tree.stage_image(0))
+
+    def test_the_morning_post_always_fits_in_a_caption(self):
+        """It travels as a photo caption, and Telegram rejects one over 1024 characters
+        outright -- so the longest possible post has to clear the limit, not the average
+        one."""
+        longest = max(len(name) for _, _, name, _ in tree.TREE_STAGES)
+        contributors = [("Ф" * 64, None, 4_321)] * tree.TOP_CONTRIBUTORS_SHOWN
+        for offset in range(len(tree.DAILY_ADVICE)):
+            day = date.fromordinal(date(2026, 1, 1).toordinal() + offset)
+            text = tree.format_morning_digest(360_000, 3_600, contributors, day)
+            self.assertLessEqual(len(text), bot_api.CAPTION_LIMIT, f"advice {offset}")
+        self.assertGreater(longest, 0)
+
+    def test_the_greeting_carries_the_stage_it_is_reporting(self):
+        seed = tree.format_morning_digest(0, 0, [], date(2026, 7, 26))
+        grown = tree.format_morning_digest(360_000, 3_600, [], date(2026, 7, 26))
+
+        self.assertTrue(seed.startswith("🌰"))
+        self.assertTrue(grown.startswith(tree.tree_stage(360_000)[1]))
+
+
+class DigestDeliveryTests(unittest.TestCase):
+    """The morning post must survive every way its picture can be missing or broken.
+
+    This is the code path that decides whether the chat gets a post at all, so each of
+    these is "the picture is gone, is the text still there?" rather than a formatting
+    check.
+    """
+
+    class FakeAPI:
+        def __init__(self, photo_error=None):
+            self.messages = []
+            self.photos = []
+            self.photo_error = photo_error
+
+        async def send_message(self, chat_id, text, reply_to_message_id=None,
+                               reply_markup=None, parse_mode=None):
+            self.messages.append({"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+            return {"message_id": 1}
+
+        async def send_photo_file(self, chat_id, path, caption=None, reply_to_message_id=None,
+                                  reply_markup=None, parse_mode=None):
+            if self.photo_error:
+                raise self.photo_error
+            self.photos.append({"chat_id": chat_id, "path": path, "caption": caption})
+            return {"message_id": 2}
+
+    def _send(self, photo, text="Доброе утро", api=None):
+        api = api or self.FakeAPI()
+        asyncio.run(bot_listener.send_stats_digest(
+            api, -100, "chat", text, "HTML", photo, log=lambda *_: None,
+        ))
+        return api
+
+    def test_no_picture_at_all_still_posts_the_text(self):
+        api = self._send(None)
+
+        self.assertEqual(len(api.messages), 1)
+        self.assertEqual(api.photos, [])
+        self.assertEqual(api.messages[0]["parse_mode"], "HTML")
+
+    def test_a_picture_is_sent_as_a_photo_with_the_post_as_its_caption(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / "01_seed.png"
+            image.write_bytes(b"not really a picture")
+            api = self._send(image)
+
+        self.assertEqual(len(api.photos), 1)
+        self.assertEqual(api.messages, [])
+        self.assertEqual(api.photos[0]["caption"], "Доброе утро")
+
+    def test_a_rejected_upload_falls_back_to_text_rather_than_losing_the_post(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / "01_seed.png"
+            image.write_bytes(b"not really a picture")
+            api = self._send(image, api=self.FakeAPI(photo_error=RuntimeError("PHOTO_INVALID_DIMENSIONS")))
+
+        self.assertEqual(api.photos, [])
+        self.assertEqual(len(api.messages), 1)
+
+    def test_a_file_that_vanished_falls_back_to_text(self):
+        # The gap between "the file was there when the digest was built" and "the upload
+        # reads it" is a real one: a redeploy lands in between.
+        with tempfile.TemporaryDirectory() as folder:
+            api = self._send(Path(folder) / "01_seed.png", api=self.FakeAPI(photo_error=FileNotFoundError()))
+
+        self.assertEqual(len(api.messages), 1)
+
+    def test_a_caption_over_the_limit_drops_the_picture_not_the_post(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / "01_seed.png"
+            image.write_bytes(b"not really a picture")
+            api = self._send(image, text="я" * (bot_api.CAPTION_LIMIT + 1))
+
+        self.assertEqual(api.photos, [])
+        self.assertEqual(len(api.messages), 1)
+
+    def test_even_a_failing_send_never_raises_at_the_caller(self):
+        """It runs inside a queue consumer: an exception escaping here would take down
+        the loop that posts every scheduled message."""
+        class DeadAPI(self.FakeAPI):
+            async def send_message(self, *args, **kwargs):
+                raise RuntimeError("Telegram is down")
+
+        asyncio.run(bot_listener.send_stats_digest(
+            DeadAPI(), -100, "chat", "текст", "HTML", None, log=lambda *_: None,
+        ))
+
+    def test_the_morning_post_survives_an_empty_assets_folder_end_to_end(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(tree, "TREE_IMAGE_DIR", Path(folder)):
+                image = tree.stage_image(360_000)
+                text = tree.format_morning_digest(360_000, 3_600, [], date(2026, 7, 26))
+                api = self._send(image, text=text)
+
+        self.assertIsNone(image)
+        self.assertIn("Доброе утро", api.messages[0]["text"])
+
+
 class PlantingTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -193,7 +364,7 @@ class PlantingTests(unittest.TestCase):
         for giveaway in ("тринадцать", "13", "три года", "трёх лет", "Легендарн"):
             self.assertNotIn(giveaway, text)
         # And no stage name from further up the ladder leaks in either.
-        for _, _, name in tree.TREE_STAGES[1:]:
+        for _, _, name, _ in tree.TREE_STAGES[1:]:
             self.assertNotIn(name, text)
 
     def test_the_planting_day_is_recorded_once_and_never_moved(self):
@@ -237,9 +408,12 @@ class PlantingTests(unittest.TestCase):
 
         import bot_listener
 
+        consumer = inspect.getsource(bot_listener.run_bot_listener)
+        consumer = consumer.split("_consume_stats_digests")[1].split("async def")[0]
         for source in (
             inspect.getsource(bot_listener.handle_replant_command),
-            inspect.getsource(bot_listener.run_bot_listener).split("_consume_stats_digests")[1][:900],
+            inspect.getsource(bot_listener.send_stats_digest),
+            consumer,
         ):
             self.assertNotIn("schedule_bot_delete", source)
 
@@ -596,8 +770,10 @@ class TenOClockTests(unittest.TestCase):
         posted = self._run_ten_am()
 
         self.assertEqual(len(posted), 1)
-        entry, text, parse_mode = posted[0]
+        entry, text, parse_mode, image = posted[0]
         self.assertEqual((entry, parse_mode), (self.ENTRY, "HTML"))
+        # No picture: the roll call runs far past Telegram's caption limit.
+        self.assertIsNone(image)
         self.assertIn("Сегодня мы все вместе посадили семечко", text)
         self.assertIn("Семечко посадили:", text)
         for name in ("Аня", "Боря", "Вера"):
@@ -645,6 +821,29 @@ class TenOClockTests(unittest.TestCase):
         self.assertIn("Доброе утро", posted[0][1])
         self.assertIn("Вчера наше дерево подросло на", posted[0][1])
         self.assertNotIn("Сегодня мы все вместе посадили семечко", posted[0][1])
+
+    def test_the_morning_post_queues_the_current_stages_picture(self):
+        self._open_with(["Аня"])
+        self._run_ten_am()
+        with tempfile.TemporaryDirectory() as folder:
+            seed = Path(folder) / "01_seed.png"
+            seed.write_bytes(b"not really a picture")
+            with patch.object(tree, "TREE_IMAGE_DIR", Path(folder)), \
+                 patch("stats.chat_tree_totals", return_value=(7_200, 3_600, [])):
+                posted = self._run_ten_am(datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc))
+
+            self.assertEqual(posted[0][3], seed)
+
+    def test_a_morning_with_no_picture_uploaded_still_posts(self):
+        self._open_with(["Аня"])
+        self._run_ten_am()
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(tree, "TREE_IMAGE_DIR", Path(folder)), \
+                 patch("stats.chat_tree_totals", return_value=(7_200, 3_600, [])):
+                posted = self._run_ten_am(datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc))
+
+        self.assertIsNone(posted[0][3])
+        self.assertIn("Доброе утро", posted[0][1])
 
 
 class TreeCommandTests(unittest.TestCase):
@@ -746,8 +945,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("<b>", text)
 
         source = inspect.getsource(listener._send_tree_digests)
-        self.assertIn('put((entry, text, "HTML"))', source)
-        self.assertIn("put((entry, text, None))", inspect.getsource(listener._send_procrastinator_digests))
+        self.assertIn('put((entry, text, "HTML", image))', source)
+        self.assertIn("put((entry, text, None, None))", inspect.getsource(listener._send_procrastinator_digests))
 
 
 if __name__ == "__main__":

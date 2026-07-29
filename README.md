@@ -420,7 +420,7 @@ Every morning at **10:00 Moscow** (`TREE_DIGEST_HOUR`, pinned to `Europe/Moscow`
 than the app timezone — the deployment's own zone is a hosting detail that could move):
 
 ```text
-🌳 Доброе утро, ЕПХ-чане!
+🪴 Доброе утро, ЕПХ-чане!
 
 Вчера наше дерево подросло на 20 мм.
 Сейчас оно на стадии 🪴 Саженец. Высота — 61,2 см.
@@ -466,10 +466,35 @@ online and in person, time outdoors, and the workbench itself. Picked **by date*
 random, so everybody sees the same line on the same morning and a restart cannot change it
 halfway through — 120 entries means no repeat for four months.
 
-The digest queue carries a parse mode alongside the text: the tree post is HTML (and
-escapes names itself), the procrastinator call-out stays plain text (it embeds raw display
-names). Sending either with the other's mode would print tags verbatim or have Telegram
-reject the message.
+The greeting carries the **current stage's** emoji rather than a fixed 🌳: for the first
+months of a three-year climb a mature tree at the top of the post quietly contradicts the
+"🌰 Семечко" two lines below it.
+
+#### One picture per stage
+
+The morning post goes out as a **photo with the text as its caption** whenever the current
+stage has a picture in `assets/tree_stages/`. The file name is the stage's slug from
+`TREE_STAGES` (`01_seed`, `02_sprout`, … `13_legendary`), the extension any of `.png`,
+`.jpg`, `.jpeg`, `.webp`, and the match is case-insensitive — a file saved as `SEED.JPG`
+resolves on Windows and would silently miss on the Linux host. Uploading them is a manual
+job; `assets/tree_stages/README.md` is the list.
+
+Every part of this is optional and every failure degrades to the post that was there
+before: no file for the current stage, a caption over Telegram's 1024-character limit, or
+an upload Telegram rejects, and the day's post goes out as plain text. What is *not*
+allowed to be silent is a missing file — the startup log names every slug with nothing
+behind it, and `/preview stages` lists all thirteen with ✅/⬜ against what actually
+reached the deployment.
+
+The digest queue carries a parse mode and an optional image path alongside the text: the
+tree post is HTML (and escapes names itself), the procrastinator call-out stays plain text
+(it embeds raw display names). Sending either with the other's mode would print tags
+verbatim or have Telegram reject the message.
+
+The picture is uploaded fresh each morning (`sendPhoto` as multipart form data, not a
+`file_id`): these files ship with the code and Telegram has never seen them, and once a
+day a few hundred kilobytes is not worth a file_id cache that would have to survive a
+redeploy that changed the picture.
 
 ### `/preview` — looking at a scheduled post before the chat does
 
@@ -479,13 +504,20 @@ the nobody-turned-up variant needs a roll call nobody signed up for to reproduce
 in the bot's DM (a hidden, unadvertised command) renders a curated set from fixed sample
 data.
 
-Without an argument it draws exactly six buttons: **Приглашение**, **Перекличка в
-10:00**, **Утренний пост**, **Обычный**, **Значок** and **Отправить тест**.
-`/preview rollcall` sends the roll call directly. The five DM previews are
+Without an argument it draws exactly seven buttons: **Приглашение**, **Перекличка в
+10:00**, **Утренний пост**, **Обычный**, **Значок**, **Картинки стадий** and **Отправить
+тест**. `/preview rollcall` sends the roll call directly. The DM previews are
 **pure** — fixed sample cast, fixed numbers, no stats store, no clock beyond the day
 passed in — and every builder calls the same formatter the scheduler calls, so a preview
 cannot drift from the real thing. `/stat`, `/top`, `/shop` and the cabinet are already
 one command away.
+
+**Картинки стадий** is the one preview that reads the disk: it lists all thirteen stages
+with ✅/⬜ for whether that stage's picture is uploaded. Deliberately not pure, because a
+folder on somebody's laptop cannot answer the only question worth asking here — whether the
+file made it into the running deployment. **Утренний пост** likewise arrives as a photo
+once the sample stage's picture exists, so an upload can be looked at before 10:00 rather
+than after.
 
 `/preview test_button` is the exception: it posts a neutral **Тестовый текст** with a
 **Нажмите сюда** button to the real chat. Each member who presses is persisted once in a
@@ -529,6 +561,85 @@ Every interactive Telethon call is now bounded by `CHAT_RESOLVE_TIMEOUT_SECONDS`
 longer than a healthy resolve, shorter than a member's patience), so a sick session degrades
 to a message rather than a hang. `_resolve_chat_id` already returned `None` on failure, so a
 timeout fits its existing contract exactly.
+
+### `/poker` — a table for up to ten, run by the «Диллер»
+
+Техасский холдем in the group chat (`poker.py`). One table per chat at a time, opened with
+`/poker` (or `/покер`) by a member holding the **🃏 Диллер** badge. Nobody else can open
+one, and Telegram administrator status alone is not enough.
+
+The badge is created by the **bot itself** at startup with a fixed id (`dealer`), the same
+way `ensure_founder_badge` handles the planting badge and exempt from `MAX_CUSTOM_BADGES`
+for the same reason — a chat that had filled its badge budget would otherwise have a
+`/poker` nobody in it could ever use. An administrator therefore only has to *give* it
+(`/badgeadmin` → 🎁 Выдать значок), never invent it. Holding it is checked by that id **or**
+by name (`диллер`/`дилер`, case-insensitive), so a chat that hand-made its own badge before
+this existed keeps working.
+
+The table posts **🃏 Кто играет?** with a join button. Each press seats one member and
+edits the message to add them to the list; pressing again answers "ты уже за столом" and
+seats nobody twice. **▶️ Начать игру** works only for the member who opened *this* table.
+
+Chips are **session chips**: everybody starts on 1000, blinds are 10/20, and nothing here
+reads or writes `economy.py`. No hand can move a real coin balance, which is what makes it
+safe to abandon a table mid-hand. They vanish when the table closes.
+
+Betting is **fixed-limit** — one bet size per street — so every decision is a button and
+nobody types a number into a group chat. The keyboard is contextual and shows the amounts:
+
+```text
+Ход: @nalumurrr — до колла 20
+
+[ Колл 20 ]  [ Ставка 40 ]
+[ Ва-банк 980 ]  [ Пас ]
+[ 🛑 Завершить стол ]
+```
+
+Check replaces call when there is nothing to call, and a raise that would take the whole
+stack is offered as **Ва-банк** instead, so no two buttons ever mean the same thing.
+
+Hole cards go to each player's **DM**, which is why joining is what checks that the bot can
+write to them: a member who has never pressed Start is told to, and is not seated. Finding
+that out at the deal instead would mean somebody sitting through a hand blind.
+
+Everybody sees everybody's buttons — Telegram has no per-viewer keyboards in a group — so
+the wrong person pressing is the normal case, not an error case. It is answered with a
+toast on that person's own screen (*"Сейчас ход: @X"*, *"Эта раздача уже сыграна"*) and
+changes nothing at all. Every action button carries its hand number and street, so a press
+on a scrolled-back message is recognised and refused rather than applied to the current
+hand.
+
+Each street gets its **own message** rather than one edited all hand: an edit is silent,
+and a flop that arrives without anything appearing in the chat is a flop nobody notices is
+their turn at. The finished street's buttons are taken away (`editMessageReplyMarkup`,
+buttons only — never the text). After the showdown the dealer gets **🔄 Следующая раздача**
+and **🛑 Завершить стол**; players who ran out of chips leave before the next deal, and the
+next-hand button disappears once fewer than two remain.
+
+**Side pots are real.** An all-in wins only what it covered, a folded player's chips stay
+in the pot, an uncalled bet comes back to whoever made it, and a split pot's odd chip goes
+to the first winner left of the button. The property test that matters most plays 25 whole
+random hands at four unequal stacks and asserts that chips are conserved: a bug in the pot
+maths is a bug that invents or destroys somebody's chips.
+
+Table state lives on the data volume, so a redeploy mid-hand does not eat the session. The
+dealer can always close the table, and so can a chat administrator — without that escape
+hatch a dealer who went to bed would wedge the chat's only table forever. `/poker стоп`
+(also `закрыть`, `stop`, `close`) does the same from the command line, because the button
+that normally closes a table lives on a message that yesterday's table has long scrolled
+past.
+
+#### Where poker breaks the answer-first rule
+
+Two poker callbacks do a Telegram round trip *before* `answerCallbackQuery`, because each
+needs the result to decide what the toast should say. **Я в игре** writes the "ты за столом"
+DM to check reachability — the answer decides whether the presser is seated at all. **🛑
+Завершить стол** asks for the administrator list, but only when the presser is *not* the
+table's dealer, so the ordinary case still answers straight from local state.
+
+Both are bounded Bot API calls with an HTTP timeout, not the unbounded Telethon resolve that
+made the rule necessary: the spinner can be slow, but it cannot hang forever. Every other
+poker button decides from disk and answers immediately.
 
 ### Coins, the shop, and anti-farming
 
