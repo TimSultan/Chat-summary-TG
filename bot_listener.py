@@ -2463,11 +2463,32 @@ async def send_long_bot_message(api: TelegramBotAPI, chat_id, text: str, reply_t
     return sent_ids
 
 
-def schedule_bot_delete(api: TelegramBotAPI, chat_id, message_ids: list[int], delay_seconds: int, log, background_tasks: set):
+def schedule_bot_delete(
+    api: TelegramBotAPI,
+    chat_id,
+    message_ids: list[int],
+    delay_seconds: int,
+    log,
+    background_tasks: set,
+    trigger_message_id: int | None = None,
+):
+    """Fire-and-forget: deletes `message_ids` after `delay_seconds`.
+
+    `trigger_message_id` is the user's command that asked for the reply -- it goes with
+    the answer, so a self-deleting exchange leaves nothing behind on either side rather
+    than a chat full of orphaned "/stat" lines replying to messages that no longer exist.
+    Only pass it for replies a user actually prompted: a dismissal (a reaction on a
+    message we sent) or a scheduled post has no such command. Deletion is best-effort in
+    api.delete_message, so a bot without delete rights in the chat quietly removes only
+    its own message, exactly as it did before.
+    """
+
     async def _do():
         await asyncio.sleep(delay_seconds)
         for mid in message_ids:
             await api.delete_message(chat_id, mid)
+        if trigger_message_id is not None and trigger_message_id not in message_ids:
+            await api.delete_message(chat_id, trigger_message_id)
 
     task = asyncio.create_task(_do())
     background_tasks.add(task)
@@ -2500,6 +2521,7 @@ async def run_bot_roast(
     original_text: str,
     background_tasks: set,
     log=print,
+    trigger_msg_id: int | None = None,
 ):
     """Actually generates and sends the roast, once the target user has confirmed by
     tapping the inline button on BOT_ROAST_CONFIRM_TEXT. Mirrors listener.py's run_roast,
@@ -2519,7 +2541,10 @@ async def run_bot_roast(
             except Exception as e:
                 log(f"[bot_listener] failed to record history: {e}")
         if delete_after and sent_ids:
-            schedule_bot_delete(api, chat_id, sent_ids, delete_after, log, background_tasks)
+            schedule_bot_delete(
+                api, chat_id, sent_ids, delete_after, log, background_tasks,
+                trigger_message_id=trigger_msg_id,
+            )
 
     end_date = datetime.now(tz).date()
     start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
@@ -3278,7 +3303,8 @@ async def handle_tree_command(
         )
         if sent and "message_id" in sent:
             schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                trigger_message_id=message["message_id"],
             )
     except Exception:
         log(f"[bot_listener] failed to send the tree status:\n{traceback.format_exc()}")
@@ -3314,7 +3340,8 @@ async def handle_shop_command(
             )
             if sent and "message_id" in sent:
                 schedule_bot_delete(
-                    api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                    api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                    trigger_message_id=reply_to,
                 )
         except Exception:
             log(f"[bot_listener] failed to answer a shop command:\n{traceback.format_exc()}")
@@ -3420,6 +3447,7 @@ async def handle_bot_roast_callback(
             await run_bot_roast(
                 api, telethon_client, cfg, tz, chat_id, pending["chat_ref"], clicker,
                 pending["confirm_msg_id"], pending["original_text"], background_tasks, log=log,
+                trigger_msg_id=pending.get("trigger_msg_id"),
             )
         except Exception:
             log(f"[bot_listener] error generating confirmed roast:\n{traceback.format_exc()}")
@@ -3466,7 +3494,10 @@ async def handle_bot_summary_request(
             except Exception as e:
                 log(f"[bot_listener] failed to record history: {e}")
         if delete_after and sent_ids:
-            schedule_bot_delete(api, chat_id, sent_ids, delete_after, log, background_tasks)
+            schedule_bot_delete(
+                api, chat_id, sent_ids, delete_after, log, background_tasks,
+                trigger_message_id=message_id,
+            )
         return sent_ids
 
     # A DM has no group history of its own -- redirect data fetching to the configured
@@ -4012,7 +4043,8 @@ async def _dispatch_update(
                 )
                 if sent and "message_id" in sent:
                     schedule_bot_delete(
-                        api, chat["id"], [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks
+                        api, chat["id"], [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                        trigger_message_id=message["message_id"],
                     )
             except Exception:
                 pass
@@ -4257,7 +4289,10 @@ async def _dispatch_update(
                     reply_to_message_id=message["message_id"], parse_mode=None,
                 )
                 if sent and "message_id" in sent:
-                    schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
+                    schedule_bot_delete(
+                        api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                        trigger_message_id=message["message_id"],
+                    )
             except Exception:
                 pass
             return
@@ -4331,7 +4366,10 @@ async def _dispatch_update(
                 parse_mode=reply_parse_mode,
             )
             if sent and "message_id" in sent:
-                schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
+                schedule_bot_delete(
+                    api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                    trigger_message_id=message["message_id"],
+                )
             for announcement in level_announcements:
                 try:
                     await api.send_message(chat_key, announcement, parse_mode=None)
@@ -4345,7 +4383,10 @@ async def _dispatch_update(
                     reply_to_message_id=message["message_id"], parse_mode=None,
                 )
                 if sent and "message_id" in sent:
-                    schedule_bot_delete(api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks)
+                    schedule_bot_delete(
+                        api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                        trigger_message_id=message["message_id"],
+                    )
             except Exception:
                 pass
         return
@@ -4434,6 +4475,7 @@ async def _dispatch_update(
             if sent and "message_id" in sent:
                 roast_pending[(chat_key, sender_id)] = {
                     "confirm_msg_id": sent["message_id"],
+                    "trigger_msg_id": message["message_id"],
                     "original_text": message_text,
                     "chat_ref": home_chat_ref if is_private else (chat.get("username") or chat.get("title") or str(chat_key)),
                 }

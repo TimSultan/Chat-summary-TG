@@ -136,6 +136,35 @@ it, the listener will respond to *anyone* who mentions you in *any* chat you're 
 spending your OpenAI budget on their requests — fine for a private group with people you
 trust, risky in a large/public one.
 
+### Self-deleting replies take the command with them
+
+On-demand replies clean themselves up so a chat for posting work doesn't turn into a
+scrollback of lookups. **The command that asked for the reply is deleted along with it**,
+at the same moment — a reply disappearing on its own would otherwise leave the `/stat`
+line behind, quoting an answer that no longer exists.
+
+The timers (`listener.py`, top of file):
+
+| constant | delay | applies to |
+| --- | --- | --- |
+| `STATS_DELETE_AFTER` | 300 s (5 min) | `/top`, `/stat`, `/tree`, `/shop`, `/coins`, `/buy`, and their error notices |
+| `ROAST_DELETE_AFTER` | 600 s (10 min) | roast replies (the trigger is currently disabled) |
+| `ERROR_DELETE_AFTER` | 10 s | short rejection notices, such as the one-day limit |
+| `DISMISS_DELETE_AFTER` | 1 s | a 👍 on something the bot sent — a "get rid of this" tap |
+
+Two things are deliberately left out of the sweep:
+
+- **Scheduled posts never self-delete** — the 10:00 morning digest, the planting
+  announcement, and level-up announcements stay in the chat. They are the standing record;
+  a test in `tests/test_tree.py` guards this.
+- **Dismissals pass no command** — a 👍 reaction is not a message of the user's, so there
+  is nothing to take with it, and guessing would delete something unrelated.
+
+Deleting someone else's message needs delete rights, so **the bot has to be an admin** in
+the chat for the command half of the sweep to work. Without them, `deleteMessage` fails,
+`bot_api.delete_message` swallows the error, and the bot removes only its own reply —
+exactly the old behavior, never a crashed handler.
+
 ### Roasting (`прожарь меня`) -- currently disabled
 
 The trigger is switched off (forced to never match, in both `listener.py` and
