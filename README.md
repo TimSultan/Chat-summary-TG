@@ -334,10 +334,34 @@ silently — the ladder was rebuilt, nobody was demoted.
 - 🏛️ Мастер витрины — 35
 - 👑 Легенда покраса — 50
 
-**Репутация — peer-granted standing.** Cannot be earned by posting at all: 10 per weekly
-contest win, 5 per administrator-awarded custom badge, and 1 per 20 coins *received* from
-another member. Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
-🏅 Легенда сообщества.
+**Репутация — standing.** Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
+🏅 Легенда сообщества. Four inputs:
+
+| source | rate |
+| --- | --- |
+| weekly contest win | **10** each |
+| administrator-awarded custom badge | **5** each |
+| coins *received* from another member | **1** per 20 |
+| earned-badge **level** held | **1** each |
+
+The first three are peer-granted and cannot be moved by posting — that is the anti-grind
+core, and it still is. The fourth is the one self-earned input, added so a member nobody
+has handed anything yet still has a reputation that moves.
+
+A badge is worth **one point per level**, not one point per badge: a five-level family is
+five points at the top. `🏅 Я покрасил 5` means levels 1–5 are all unlocked, so it scores
+5 — "a point per medal" and "a point per level" are the same number here, not two rules to
+combine. The medal total is capped at **17**: painting 5, messages 2, streak 3, night
+shift 3, and one each for 🖼️ Галерея, 📅 Завсегдатай, 🦄 Я не пидор and 🎪 Участник
+Недельного конкурса. That ceiling is deliberately below two contest wins — grinding the
+whole collection can never outrank being valued by the chat.
+
+Custom badges and contest wins are **excluded** from the per-level count: they already
+score 5 and 10, and adding a point would pay twice for one medal.
+
+Reputation is **derived, never stored** (`economy.reputation_for`) — it is recomputed from
+the badge/contest/ledger stores on every `/stat`. Changing a rate therefore updates
+everybody at once on deploy, with no migration or backfill step.
 
 A promotion on either the chat level or the painter rank is announced once, tracked per
 track so progress on one never suppresses the other. The stored level state from before
@@ -951,11 +975,16 @@ their `/cabinet`, which opens the same `/badge` menu rather than a second implem
 That button decides only what is *drawn*; the callback re-verifies permission before
 acting, so a menu left open after a revoke cannot still hand out badges.
 
-`/badge` itself: The bot shows two inline options:
+`/badge` itself: The bot shows these inline options:
 
 - **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
-- **Выдать значок** shows the chat's saved custom badges, then asks for the recipient's
-  exact `@username`.
+- **Выдать значок** shows the chat's saved custom badges, then asks for the recipients.
+- **🤫 Выдать без уведомления** is the same award with **no group announcement**. A
+  separate button rather than a toggle on the menu: a toggle carries a state the
+  administrator has to read back before tapping, and misreading it publishes something
+  that was meant to stay quiet. The administrator's own DM confirmation is never
+  silenced — it is the only thing telling them the award landed — and it ends with
+  `Без объявления в чате.` so the choice is visible after the fact.
 - **Забрать у участника** takes one badge from one member, leaving the definition alone.
   Not announced in the group: an award is good news worth sharing, having one taken away
   is not something to publish about somebody.
@@ -967,16 +996,35 @@ acting, so a menu left open after a revoke cannot still hand out badges.
 Custom definitions and assignments are persisted per chat under the existing stats
 cache. Awarding the same badge to the same member twice is idempotent.
 
-A **new** award is announced in the group chat:
+**Several recipients at once.** The recipient prompt accepts a list separated by commas,
+semicolons or newlines — `@one, @two` or one name per line, up to 30 at a time:
+
+```text
+@one, @two
+Алексей Белявский
+```
+
+Spaces are deliberately **not** a separator: plenty of members are tracked under a
+two-word display name, and splitting on whitespace would go looking for people who do not
+exist. Repeats are dropped, both by spelling (`@user` / `user`) and after resolution, so
+naming the same person twice awards once and counts once.
+
+Names that resolve to nobody do not discard the rest — the ones that were found are
+awarded and the failures are listed back (`Не нашёл в статистике: @ghost`). Only when
+*nothing* matched does the flow re-prompt instead of awarding.
+
+A **new** award is announced in the group chat, once, however many people it went to:
 
 ```text
 @user получил уникальный значок: 🎯 Меткий глаз
+@one, @two, Алексей Белявский получили уникальный значок: 🎯 Меткий глаз
 ```
 
-Only on a genuinely new award — re-running the flow must not post it again. The recipient
-is named by `@username` so they are actually notified, falling back to their display name
-when they have none. Best-effort: the badge is already recorded by the time this sends, so
-a failed announcement costs the message, never the badge. The menu and its
+Only on a genuinely new award — re-running the flow must not post it again, and eight
+recipients must not mean eight posts. Recipients are named by `@username` so they are
+actually notified, falling back to their display name when they have none. Best-effort:
+the badge is already recorded by the time this sends, so a failed announcement costs the
+message, never the badge. The menu and its
 force-reply steps expire after ten minutes and remain bound to the administrator who
 opened them. The bot verifies that the person using the DM menu is still an
 administrator of the configured home chat. The explicitly delegated

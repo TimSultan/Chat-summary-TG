@@ -1424,7 +1424,7 @@ async def run_listener(
                                 best_work_link=best_work_link, workplace_link=workplace_link,
                                 season_xp=season_xp,
                                 work_names=stats.work_name_list(entry, user),
-                                **economy.stat_extras(entry, user.user_id, xp),
+                                **economy.stat_extras(entry, user.user_id, xp, user),
                             )
                             stat_uses_html = True
                             level_announcements = stats.record_level_observations(

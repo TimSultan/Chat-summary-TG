@@ -696,6 +696,75 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(saved["users"]["20"]["weekly_contest_weeks"], ["2026-W30"])
 
 
+class MedalReputationTests(unittest.TestCase):
+    """A point of reputation per earned-badge level (stats.medal_levels)."""
+
+    def test_a_member_with_no_badges_scores_nothing(self):
+        self.assertEqual(stats.medal_levels(stats.UserStats(user_id="1")), 0)
+
+    def test_a_tiered_badge_is_worth_its_level_not_one_point(self):
+        """The whole point of the rule: "Я покрасил 5" is five medals deep, so 5 rep."""
+        for figurines, expected in ((1, 1), (5, 2), (10, 3), (25, 4), (50, 5)):
+            with self.subTest(figurines=figurines):
+                user = stats.UserStats(user_id="1", figurines_painted=figurines)
+                self.assertEqual(stats.medal_levels(user), expected)
+
+    def test_a_tier_short_of_the_threshold_does_not_count(self):
+        self.assertEqual(stats.medal_levels(stats.UserStats(user_id="1", figurines_painted=49)), 4)
+
+    def test_every_family_and_flat_badge_adds_up_to_the_ceiling(self):
+        """17 = painting 5 + messages 2 + streak 3 + night 3 + four untiered ones."""
+        user = stats.UserStats(
+            user_id="1",
+            figurines_painted=50,
+            messages=1_000,
+            media=25,
+            active_days=30,
+            active_day_dates={
+                (date(2026, 6, 1) + timedelta(days=offset)).isoformat() for offset in range(30)
+            },
+            hours={str(hour): 200 for hour in range(6)},
+            not_gay_hashtag_uses=1,
+            weekly_contest_weeks={"2026-W30"},
+        )
+        self.assertEqual(stats.medal_levels(user), 17)
+
+    def test_the_count_matches_the_badges_stat_actually_shows(self):
+        """medal_levels must never award a point for a medal the member cannot see: the
+        earned list collapses each family to its top tier, so the level count is always
+        at least the badge count, and both move together."""
+        user = stats.UserStats(
+            user_id="1", figurines_painted=10, messages=100, media=25, active_days=30,
+        )
+        earned = {badge.badge_id for badge in stats.earned_badges(user)}
+        self.assertEqual(earned, {"painted_3", "hundred_messages", "gallery", "regular"})
+        # painting 3 + messages 1 + gallery + regular
+        self.assertEqual(stats.medal_levels(user), 6)
+
+    def test_peer_granted_medals_are_left_to_their_own_rates(self):
+        """A custom badge scores REPUTATION_PER_BADGE_RECEIVED and a weekly win
+        REPUTATION_PER_CONTEST_WIN. Counting them here too would pay twice for one medal."""
+        user = stats.UserStats(user_id="1", weekly_contest_weeks={"2026-W30"})
+        # Participation is an earned badge and counts; winning is scored elsewhere.
+        self.assertEqual(stats.medal_levels(user), 1)
+
+    def test_reputation_score_adds_medals_to_the_peer_granted_half(self):
+        self.assertEqual(
+            stats.reputation_score(1, 1, 40, 7),
+            stats.REPUTATION_PER_CONTEST_WIN
+            + stats.REPUTATION_PER_BADGE_RECEIVED
+            + 2
+            + 7 * stats.REPUTATION_PER_MEDAL_LEVEL,
+        )
+
+    def test_medals_default_to_zero_for_a_caller_without_userstats(self):
+        """economy.reputation_for is reachable from the ledger, which has no UserStats."""
+        self.assertEqual(stats.reputation_score(1, 0, 0), stats.REPUTATION_PER_CONTEST_WIN)
+
+    def test_a_negative_medal_count_cannot_subtract_reputation(self):
+        self.assertEqual(stats.reputation_score(0, 0, 0, -5), 0)
+
+
 class FakeBotAPI:
     def __init__(self):
         self.sent = []
@@ -720,6 +789,39 @@ class FakeBotAPI:
 
     async def answer_callback_query(self, callback_query_id, text=None):
         self.callbacks.append((callback_query_id, text))
+
+
+class BadgeRecipientParsingTests(unittest.TestCase):
+    def test_one_name_is_one_recipient(self):
+        self.assertEqual(bot_listener._parse_badge_recipients("@user"), ["@user"])
+
+    def test_commas_semicolons_and_newlines_all_separate(self):
+        self.assertEqual(
+            bot_listener._parse_badge_recipients("@a, @b; @c\n@d"),
+            ["@a", "@b", "@c", "@d"],
+        )
+
+    def test_a_two_word_display_name_stays_one_recipient(self):
+        """The reason spaces are not a separator: this is one member, not two."""
+        self.assertEqual(
+            bot_listener._parse_badge_recipients("Алексей Белявский"),
+            ["Алексей Белявский"],
+        )
+        self.assertEqual(
+            bot_listener._parse_badge_recipients("Алексей Белявский, @user"),
+            ["Алексей Белявский", "@user"],
+        )
+
+    def test_repeats_are_dropped_ignoring_case_and_the_at_sign(self):
+        self.assertEqual(bot_listener._parse_badge_recipients("@User, user, @user"), ["@User"])
+
+    def test_blank_chunks_and_stray_separators_vanish(self):
+        self.assertEqual(bot_listener._parse_badge_recipients(",,  @a ,\n\n, @b ,"), ["@a", "@b"])
+
+    def test_empty_input_is_no_recipients(self):
+        for text in ("", "   ", ",,,", None):
+            with self.subTest(text=text):
+                self.assertEqual(bot_listener._parse_badge_recipients(text), [])
 
 
 class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -837,6 +939,147 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(announcement["text"], "@user получил уникальный значок: 🎯 Меткий глаз")
                 self.assertNotEqual(announcement["chat"]["id"], command["chat"]["id"])
+
+    async def _give(self, api, flows, admin, entry_action, reply_text, targets):
+        """Drive /badge from the menu to the award, and return the DM/group messages.
+
+        `entry_action` is "list" (announced) or "listq" (quiet); `targets` is what
+        resolve_stat_target should return, in the order the names are resolved.
+        """
+        command = {
+            "message_id": 1,
+            "chat": {"id": 10, "type": "private"},
+            "from": admin,
+            "text": "/badge",
+        }
+        await bot_listener.handle_badge_command(api, command, "chat", -1001, flows)
+        flow_id = next(iter(flows))
+        await bot_listener.handle_badge_callback(
+            api,
+            {"id": "c1", "from": admin, "message": api.sent[-1][0],
+             "data": bot_listener._badge_callback_data(entry_action, flow_id)},
+            flows,
+        )
+        badge = stats.list_custom_badges("chat")[0]
+        await bot_listener.handle_badge_callback(
+            api,
+            {"id": "c2", "from": admin, "message": api.sent[-1][0],
+             "data": bot_listener._badge_callback_data("give", flow_id, badge.badge_id)},
+            flows,
+        )
+        prompt = api.sent[-1][0]
+        with patch("stats.resolve_stat_target", new=AsyncMock(side_effect=[
+            (target, 1, 1, 0, 0, 0) for target in targets
+        ])):
+            await bot_listener.handle_badge_text_input(
+                api, None,
+                {"message_id": 3, "chat": command["chat"], "from": admin,
+                 "text": reply_text, "reply_to_message": prompt},
+                timezone.utc, flows,
+            )
+        return [message for message, _ in api.sent]
+
+    def _make_badge(self):
+        return stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+
+    async def test_a_quiet_award_never_reaches_the_group(self):
+        api = FakeBotAPI()
+        admin = {"id": 10, "first_name": "Admin"}
+        target = stats.UserStats(user_id="20", username="user", display_name="User")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                self._make_badge()
+                sent = await self._give(api, {}, admin, "listq", "@user", [target])
+
+                # The badge is really awarded...
+                self.assertEqual(
+                    [item.label for item in stats.custom_badges_for_user("chat", 20)],
+                    ["🎯 Меткий глаз"],
+                )
+        # ...the admin is still told, in the DM...
+        self.assertIn("получает значок 🎯 Меткий глаз", sent[-1]["text"])
+        self.assertIn("Без объявления в чате.", sent[-1]["text"])
+        # ...and nothing at all went to the group.
+        self.assertEqual([m for m in sent if m["chat"]["id"] == -1001], [])
+
+    async def test_a_normal_award_still_announces(self):
+        api = FakeBotAPI()
+        admin = {"id": 10, "first_name": "Admin"}
+        target = stats.UserStats(user_id="20", username="user", display_name="User")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                self._make_badge()
+                sent = await self._give(api, {}, admin, "list", "@user", [target])
+        group = [m for m in sent if m["chat"]["id"] == -1001]
+        self.assertEqual(len(group), 1)
+        self.assertEqual(group[0]["text"], "@user получил уникальный значок: 🎯 Меткий глаз")
+        self.assertNotIn("Без объявления", sent[-2]["text"])
+
+    async def test_several_recipients_share_one_announcement(self):
+        api = FakeBotAPI()
+        admin = {"id": 10, "first_name": "Admin"}
+        people = [
+            stats.UserStats(user_id="20", username="one", display_name="Один"),
+            stats.UserStats(user_id="21", username="two", display_name="Два"),
+            stats.UserStats(user_id="22", username=None, display_name="Алексей Белявский"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                self._make_badge()
+                sent = await self._give(
+                    api, {}, admin, "list", "@one, @two\nАлексей Белявский", people
+                )
+                for user_id in (20, 21, 22):
+                    self.assertEqual(
+                        [b.label for b in stats.custom_badges_for_user("chat", user_id)],
+                        ["🎯 Меткий глаз"],
+                        user_id,
+                    )
+        group = [m for m in sent if m["chat"]["id"] == -1001]
+        self.assertEqual(len(group), 1, "three people must not mean three group posts")
+        self.assertEqual(
+            group[0]["text"],
+            "@one, @two, Алексей Белявский получили уникальный значок: 🎯 Меткий глаз",
+        )
+        self.assertIn("получают (3)", sent[-2]["text"])
+
+    async def test_unknown_names_are_reported_without_losing_the_rest(self):
+        api = FakeBotAPI()
+        admin = {"id": 10, "first_name": "Admin"}
+        found = stats.UserStats(user_id="20", username="one", display_name="Один")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                self._make_badge()
+                sent = await self._give(api, {}, admin, "list", "@one, @ghost", [found, None])
+                self.assertEqual(len(stats.custom_badges_for_user("chat", 20)), 1)
+        summary = sent[-2]["text"]
+        self.assertIn("получает значок", summary)
+        self.assertIn("Не нашёл в статистике: @ghost", summary)
+
+    async def test_nobody_found_re_prompts_instead_of_awarding(self):
+        api = FakeBotAPI()
+        admin = {"id": 10, "first_name": "Admin"}
+        flows = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                self._make_badge()
+                sent = await self._give(api, flows, admin, "list", "@ghost", [None])
+        self.assertIn("Не нашёл в статистике: @ghost", sent[-1]["text"])
+        # The flow stays open so the admin can simply reply again.
+        self.assertEqual(len(flows), 1)
+        self.assertEqual([m for m in sent if m["chat"]["id"] == -1001], [])
+
+    async def test_the_same_person_named_twice_is_awarded_once(self):
+        api = FakeBotAPI()
+        admin = {"id": 10, "first_name": "Admin"}
+        same = stats.UserStats(user_id="20", username="one", display_name="Один")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                self._make_badge()
+                # Two different spellings, one member behind them.
+                sent = await self._give(api, {}, admin, "list", "@one, Один", [same, same])
+        self.assertIn("получает значок", sent[-2]["text"])
+        self.assertNotIn("получают (2)", sent[-2]["text"])
 
     async def test_admin_can_record_numbered_weekly_winner_in_bot_dm(self):
         api = FakeBotAPI()

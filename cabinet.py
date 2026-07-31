@@ -133,7 +133,7 @@ def stats_view(
         workplace_link=workplace_link,
         season_xp=season_xp,
         work_names=stats.work_name_list(entry, user),
-        **economy.stat_extras(entry, user.user_id, xp),
+        **economy.stat_extras(entry, user.user_id, xp, user),
     )
     return text, {"inline_keyboard": [_back_row(user.user_id)]}
 

@@ -138,8 +138,16 @@ BADGE_CALLBACK_PREFIX = "badge"
 BADGE_FLOW_TTL_SECONDS = 10 * 60
 BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
 BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
+# Same award, minus the group announcement (see _award_badge_from_flow). A separate
+# button rather than a toggle on the menu: a toggle has a state the admin has to read
+# back before tapping, and getting it wrong publishes something meant to stay quiet.
+BADGE_GIVE_QUIET_BUTTON_TEXT = "🤫 Выдать без уведомления"
 BADGE_REVOKE_BUTTON_TEXT = "➖ Забрать у участника"
 BADGE_DELETE_BUTTON_TEXT = "🗑 Удалить значок совсем"
+# One reply can name several recipients. Bounded so a pasted wall of text turns into one
+# clear refusal instead of a few dozen resolve_stat_target lookups and a summary message
+# too long for Telegram to accept.
+BADGE_MAX_RECIPIENTS = 30
 WEEK_WINNER_COMMAND = "/weekwinner"
 DELETE_POKRAS_COMMAND = "/deletepokras"
 BADGE_ADMIN_COMMAND = "/badgeadmin"
@@ -233,6 +241,29 @@ def _badge_callback_data(action: str, flow_id: str, badge_id: str | None = None)
     if badge_id:
         parts.append(badge_id)
     return ":".join(parts)
+
+
+def _parse_badge_recipients(text: str) -> list[str]:
+    """Split one force-reply into the names it lists.
+
+    Separators are commas, semicolons and newlines -- deliberately NOT spaces: plenty of
+    members are tracked under a two-word display name ("Алексей Белявский"), and splitting
+    on whitespace would go looking for two people who do not exist. Repeats are dropped
+    case-insensitively (and ignoring a leading @) so pasting a list twice still awards
+    once, which matters because the confirmation reports a count.
+    """
+    seen = set()
+    names = []
+    for chunk in re.split(r"[,;\n]+", text or ""):
+        name = chunk.strip()
+        if not name:
+            continue
+        key = name.lower().lstrip("@")
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
 
 
 def _parse_badge_callback(data: str) -> tuple[str, str, str | None] | None:
@@ -356,6 +387,10 @@ async def handle_badge_command(
         "target": None,
         "awaiting": None,
         "selected_badge_id": None,
+        # Set when the admin enters the give step, by which button they used. Defaults to
+        # announcing: a flow that somehow reached the award without passing through either
+        # button behaves the way it always did.
+        "silent": False,
     }
     await api.send_message(
         dm_chat_id,
@@ -365,6 +400,7 @@ async def handle_badge_command(
             "inline_keyboard": [
                 [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
                 [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
+                [{"text": BADGE_GIVE_QUIET_BUTTON_TEXT, "callback_data": _badge_callback_data("listq", flow_id)}],
                 [{"text": BADGE_REVOKE_BUTTON_TEXT, "callback_data": _badge_callback_data("revlist", flow_id)}],
                 [{"text": BADGE_DELETE_BUTTON_TEXT, "callback_data": _badge_callback_data("dellist", flow_id)}],
             ]
@@ -377,54 +413,95 @@ async def _award_badge_from_flow(
     api: TelegramBotAPI,
     flow: dict,
     badge_id: str,
-    target: dict,
+    targets: dict | list[dict],
     reply_to_message_id: int | None,
     log=print,
+    missing: list[str] | None = None,
 ) -> None:
-    badge, newly_awarded = stats.give_custom_badge(
-        flow["entry"],
-        badge_id,
-        target["user_id"],
-        target["display_name"],
-        flow["admin_id"],
-        flow["admin_name"],
-    )
-    if newly_awarded:
-        text = f"🎉 {target['display_name']} получает значок {badge.label}!"
-    else:
-        text = f"{target['display_name']} уже имеет значок {badge.label}."
+    """Award one badge to one or more members.
+
+    However many recipients there are, the admin gets ONE summary and the group gets ONE
+    announcement -- handing a badge to eight people must not post eight messages. A single
+    dict is still accepted so the preset-target path reads unchanged.
+
+    `flow["silent"]` skips the group announcement entirely (the 🤫 button). The admin's own
+    confirmation is never silenced: it is the only thing telling them the award landed.
+    `missing` are names that resolved to nobody; they are reported alongside rather than
+    discarding the recipients that did resolve.
+    """
+    if isinstance(targets, dict):
+        targets = [targets]
+    badge = None
+    awarded, already = [], []
+    for target in targets:
+        badge, newly_awarded = stats.give_custom_badge(
+            flow["entry"],
+            badge_id,
+            target["user_id"],
+            target["display_name"],
+            flow["admin_id"],
+            flow["admin_name"],
+        )
+        (awarded if newly_awarded else already).append(target)
+
+    lines = []
+    if awarded:
+        who = ", ".join(target["display_name"] for target in awarded)
+        lines.append(
+            f"🎉 {who} получает значок {badge.label}!" if len(awarded) == 1
+            else f"🎉 Значок {badge.label} получают ({len(awarded)}): {who}"
+        )
+    if already:
+        who = ", ".join(target["display_name"] for target in already)
+        lines.append(
+            f"{who} уже имеет значок {badge.label}." if len(already) == 1
+            else f"Уже имели значок ({len(already)}): {who}"
+        )
+    if missing:
+        lines.append("Не нашёл в статистике: " + ", ".join(missing))
+    if awarded and flow.get("silent"):
+        lines.append("Без объявления в чате.")
     await api.send_message(
         flow["chat_id"],
-        text,
+        "\n".join(lines),
         reply_to_message_id=reply_to_message_id,
         parse_mode=None,
     )
-    if newly_awarded:
-        await _announce_badge_in_chat(api, flow.get("admin_chat_id"), badge, target, log=log)
+    if awarded and not flow.get("silent"):
+        await _announce_badge_in_chat(api, flow.get("admin_chat_id"), badge, awarded, log=log)
 
 
 async def _announce_badge_in_chat(
-    api: TelegramBotAPI, chat_id, badge, target: dict, log=print
+    api: TelegramBotAPI, chat_id, badge, targets: dict | list[dict], log=print
 ) -> None:
     """Tell the group somebody was given a unique badge.
 
-    Only on a genuinely NEW award -- give_custom_badge is idempotent, and re-running it
+    Only for genuinely NEW awards -- give_custom_badge is idempotent, and re-running it
     must not post the same announcement again. Best-effort: the badge is already
     recorded by the time this runs, so a failed send costs the announcement, never the
     badge.
 
     Sent as plain text with the @username inline rather than an HTML mention: a display
     name is user-controlled and would have to be escaped, and a plain @username is what
-    actually notifies the person.
+    actually notifies the person. Several recipients share one message, which still
+    notifies each of them, rather than one message apiece.
     """
     if chat_id is None:
         return
-    username = (target.get("username") or "").lstrip("@")
-    who = f"@{username}" if username else target.get("display_name", "Участник")
+    if isinstance(targets, dict):
+        targets = [targets]
+    if not targets:
+        return
+    names = []
+    for target in targets:
+        username = (target.get("username") or "").lstrip("@")
+        names.append(f"@{username}" if username else target.get("display_name", "Участник"))
+    who = ", ".join(names)
+    verb = "получил" if len(names) == 1 else "получили"
     try:
         await api.send_message(
             chat_id,
-            f"{who} получил уникальный значок: {badge.label}",
+            f"{who} {verb} уникальный значок: {badge.label}",
             parse_mode=None,
         )
     except Exception:
@@ -465,7 +542,10 @@ async def handle_badge_callback(
         flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
         return
 
-    if action == "list":
+    # Both give buttons land here; they differ only in whether the award is announced in
+    # the group, which the flow carries from this point on.
+    if action in ("list", "listq"):
+        flow["silent"] = action == "listq"
         badges = stats.list_custom_badges(flow["entry"])
         if not badges:
             await api.send_message(
@@ -481,7 +561,7 @@ async def handle_badge_callback(
         ]
         await api.send_message(
             flow["chat_id"],
-            "Выберите значок:",
+            "Выберите значок (без объявления в чате):" if flow["silent"] else "Выберите значок:",
             reply_to_message_id=message.get("message_id"),
             reply_markup={"inline_keyboard": keyboard},
             parse_mode=None,
@@ -500,7 +580,9 @@ async def handle_badge_callback(
             prompt = await api.send_message(
                 flow["chat_id"],
                 "Ответьте на это сообщение именем или @username получателя.\n"
-                "Участник должен уже присутствовать в статистике основного чата.",
+                "Можно сразу несколько — через запятую или с новой строки.\n"
+                "Участник должен уже присутствовать в статистике основного чата."
+                + ("\n\n🤫 Объявления в чате не будет." if flow.get("silent") else ""),
                 reply_to_message_id=message.get("message_id"),
                 reply_markup={"force_reply": True, "selective": True},
                 parse_mode=None,
@@ -679,25 +761,54 @@ async def handle_badge_text_input(
         return True
 
     try:
-        target, _, _, _, _, _ = await stats.resolve_stat_target(
-            telethon_client,
-            flow["entry"],
-            flow["entry"],
-            text,
-            None,
-            "",
-            tz,
-            log=log,
-        )
-        if target is None:
-            raise ValueError("Участник не найден в статистике. Попробуйте точный @username.")
+        names = _parse_badge_recipients(text)
+        if not names:
+            raise ValueError("Укажите имя или @username получателя.")
+        if len(names) > BADGE_MAX_RECIPIENTS:
+            raise ValueError(
+                f"Слишком много получателей ({len(names)}), максимум {BADGE_MAX_RECIPIENTS} за раз."
+            )
+        resolved, missing = [], []
+        seen_ids = set()
+        for name in names:
+            target, _, _, _, _, _ = await stats.resolve_stat_target(
+                telethon_client,
+                flow["entry"],
+                flow["entry"],
+                name,
+                None,
+                "",
+                tz,
+                log=log,
+            )
+            if target is None:
+                missing.append(name)
+                continue
+            # Two spellings of the same member (a name and their @username) resolve to one
+            # person; awarding twice is harmless but would be counted twice in the summary.
+            if str(target.user_id) in seen_ids:
+                continue
+            seen_ids.add(str(target.user_id))
+            resolved.append({
+                "user_id": target.user_id,
+                "display_name": target.display_name,
+                "username": target.username,
+            })
+        if not resolved:
+            # Nobody at all matched -- re-prompt, since there is nothing to report but the
+            # failure and the admin most likely mistyped.
+            raise ValueError(
+                "Не нашёл в статистике: " + ", ".join(missing)
+                + "\nПопробуйте точный @username."
+            )
         await _award_badge_from_flow(
             api,
             flow,
             flow["selected_badge_id"],
-            {"user_id": target.user_id, "display_name": target.display_name,
-             "username": target.username},
+            resolved,
             message["message_id"],
+            log=log,
+            missing=missing,
         )
         badge_flows.pop(flow_id, None)
     except ValueError as e:
@@ -4348,7 +4459,7 @@ async def _dispatch_update(
                             best_work_link=best_work_link, workplace_link=workplace_link,
                             season_xp=season_xp, bot_username=bot_username,
                             work_names=stats.work_name_list(matched_entry, user),
-                            **economy.stat_extras(matched_entry, user.user_id, xp),
+                            **economy.stat_extras(matched_entry, user.user_id, xp, user),
                         )
                         reply_parse_mode = "HTML"
                         level_announcements = stats.record_level_observations(

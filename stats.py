@@ -180,13 +180,20 @@ CHAT_LEVEL_TIERS = (
 
 # --- reputation -------------------------------------------------------------------
 #
-# The anti-grind track: none of it can be earned by posting. Every point comes from
-# somebody else choosing to give it, which is the one thing a farming script cannot do.
+# Mostly the anti-grind track: the three peer-granted components below cannot be moved by
+# posting at all. Every point of them comes from somebody else choosing to give it, which
+# is the one thing a farming script cannot do.
 REPUTATION_PER_CONTEST_WIN = 10
 REPUTATION_PER_BADGE_RECEIVED = 5
 # Coins RECEIVED from other members (see economy.transfer), divided down so a single
 # wealthy friend cannot mint somebody a reputation.
 REPUTATION_PER_COINS_RECEIVED = 20
+# The one self-earned component: a point per earned-badge LEVEL held (see medal_levels).
+# It IS grindable, unlike the three above -- deliberately, so that a member with no peers
+# handing them anything still has a reputation that moves. Kept at 1 against a 10-point
+# contest win so the whole collection, 17 levels at present, is worth less than two wins:
+# the ceiling is low enough that grinding it can never outrank being valued by the chat.
+REPUTATION_PER_MEDAL_LEVEL = 1
 
 REPUTATION_TIERS = (
     (100, "🏅", "Легенда сообщества"),
@@ -459,12 +466,59 @@ def painter_rank(figurines_painted: int) -> tuple[Level, Level | None]:
     return current, next_level
 
 
-def reputation_score(contest_wins: int, badges_received: int, coins_received: int) -> int:
-    """Peer-granted standing. Cannot be moved by posting, only by other members."""
+def medal_levels(user: "UserStats") -> int:
+    """How many earned-badge LEVELS this member holds -- the medal half of reputation.
+
+    One point per medal, and one per tier inside a tiered family: somebody wearing
+    "Я покрасил 5" holds all five painting steps and scores 5. That reading satisfies
+    "a point per medal" and "a point per level" at the same time, because reaching tier 5
+    means having unlocked 1 through 5 -- there is no separate cumulative rule to apply.
+
+    Counts exactly what `earned_badges` puts in /stat's "🏅 Значки" block, and nothing
+    else. The two peer-granted families are deliberately excluded: a custom badge already
+    scores REPUTATION_PER_BADGE_RECEIVED and a weekly win REPUTATION_PER_CONTEST_WIN, so
+    a point on top would be the same medal counted twice.
+
+    Ceiling today is 17: painting 5, messages 2, streak 3, night shift 3, plus one each
+    for gallery, regular, #янепидор and contest participation.
+    """
+    tier_families = (
+        (PAINTING_BADGE_TIERS, user.figurines_painted),
+        (MESSAGE_BADGE_TIERS, user.messages),
+        (STREAK_BADGE_TIERS, _longest_streak(user.active_day_dates)),
+        (NIGHT_BADGE_TIERS, sum(user.hours.get(str(hour), 0) for hour in range(6))),
+    )
+    levels = sum(
+        1
+        for tiers, value in tier_families
+        for threshold, *_ in tiers
+        if value >= threshold
+    )
+    # The untiered ones, in the same order and on the same conditions earned_badges uses.
+    levels += sum(
+        1
+        for earned in (
+            user.media >= 25,                 # 🖼️ Галерея
+            user.active_days >= 30,           # 📅 Завсегдатай
+            user.not_gay_hashtag_uses > 0,    # 🦄 Я не пидор
+            bool(user.weekly_contest_weeks),  # 🎪 Участник Недельного конкурса
+        )
+        if earned
+    )
+    return levels
+
+
+def reputation_score(
+    contest_wins: int, badges_received: int, coins_received: int, medals: int = 0
+) -> int:
+    """Standing: three peer-granted components nobody can move by posting, plus the
+    earned-badge levels from medal_levels. `medals` defaults to 0 so a caller with no
+    UserStats to hand (and every pre-existing test) still scores the peer-granted half."""
     return (
         max(0, contest_wins) * REPUTATION_PER_CONTEST_WIN
         + max(0, badges_received) * REPUTATION_PER_BADGE_RECEIVED
         + max(0, coins_received) // REPUTATION_PER_COINS_RECEIVED
+        + max(0, medals) * REPUTATION_PER_MEDAL_LEVEL
     )
 
 

@@ -387,20 +387,26 @@ def streak_freeze_lookup(entry: str):
     return lookup
 
 
-def reputation_for(entry: str, user_id) -> int:
-    """This member's peer-granted reputation (see stats.reputation_score).
+def reputation_for(entry: str, user_id, user=None) -> int:
+    """This member's reputation (see stats.reputation_score).
 
     Lives here rather than in stats because the coins-received half is ledger data, and
-    stats must not import this module (the dependency runs the other way)."""
+    stats must not import this module (the dependency runs the other way).
+
+    `user` is the UserStats the earned-badge levels are read off. It is optional because
+    the ledger knows a user_id but has no way to load stats for it; callers that already
+    hold a UserStats (every /stat path) pass it, and one that does not scores the
+    peer-granted half alone rather than failing."""
     record = _load(entry)["users"].get(str(user_id)) or {}
     return stats.reputation_score(
         stats.weekly_wins_for_user(entry, user_id),
         len(stats.custom_badges_for_user(entry, user_id)),
         record.get("received", 0),
+        stats.medal_levels(user) if user is not None else 0,
     )
 
 
-def stat_extras(entry: str, user_id, xp: int) -> dict:
+def stat_extras(entry: str, user_id, xp: int, user=None) -> dict:
     """Everything /stat needs from the economy, in the keyword shape format_stat takes.
 
     One helper so both call sites (listener.py and bot_listener.py) stay identical, and
@@ -409,7 +415,7 @@ def stat_extras(entry: str, user_id, xp: int) -> dict:
     try:
         return {
             "coins": balance(entry, user_id, xp),
-            "reputation": reputation_for(entry, user_id),
+            "reputation": reputation_for(entry, user_id, user),
             "custom_title": active_title(entry, user_id),
         }
     except (OSError, ValueError):

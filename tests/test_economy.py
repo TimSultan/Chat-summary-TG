@@ -132,8 +132,9 @@ class EffectTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(economy.streak_freezes("chat", "1"), 1)
 
-    def test_reputation_only_moves_on_peer_granted_input(self):
-        # Nothing self-generated counts: posting all day leaves this at zero.
+    def test_the_peer_granted_half_moves_only_on_peer_granted_input(self):
+        # Called without a UserStats -- the earned-badge half has nothing to read, so
+        # this is the peer-granted score on its own.
         self.assertEqual(economy.reputation_for("chat", "1"), 0)
 
         badge = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
@@ -145,6 +146,29 @@ class EffectTests(unittest.TestCase):
             economy.reputation_for("chat", "1"),
             stats.REPUTATION_PER_BADGE_RECEIVED + stats.REPUTATION_PER_CONTEST_WIN,
         )
+
+    def test_earned_badges_add_reputation_once_a_userstats_is_passed(self):
+        """The /stat paths all hold a UserStats, so this is what members actually see."""
+        user = stats.UserStats(user_id="1", figurines_painted=10, media=25)
+        # Painting tiers 1-3, plus the gallery badge.
+        self.assertEqual(stats.medal_levels(user), 4)
+        self.assertEqual(
+            economy.reputation_for("chat", "1", user),
+            4 * stats.REPUTATION_PER_MEDAL_LEVEL,
+        )
+
+        stats.record_weekly_contest_winner("chat", 1, "1", "User", 10, "Admin")
+        self.assertEqual(
+            economy.reputation_for("chat", "1", user),
+            4 * stats.REPUTATION_PER_MEDAL_LEVEL + stats.REPUTATION_PER_CONTEST_WIN,
+        )
+
+    def test_stat_extras_passes_the_userstats_through_to_reputation(self):
+        user = stats.UserStats(user_id="1", figurines_painted=50, media=25)
+        extras = economy.stat_extras("chat", "1", 500, user)
+        self.assertEqual(extras["reputation"], stats.medal_levels(user))
+        # Without it, the same member scores only the peer-granted half.
+        self.assertEqual(economy.stat_extras("chat", "1", 500)["reputation"], 0)
 
     def test_stat_extras_degrade_instead_of_breaking_stat(self):
         with patch("economy.balance", side_effect=OSError("disk gone")):
