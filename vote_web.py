@@ -123,6 +123,10 @@ async def handle_poll(request: web.Request) -> web.Response:
         "my_vote": poll.votes.get(str(user["id"]), []),
         "entries": [_entry_payload(e, poll, base) for e in visible],
         "winner": _entry_payload(winner, poll, base) if winner else None,
+        # Both are voter-facing (they decide what the ballot UI lets you do), not just
+        # admin-mode information -- unlike approved/counts below.
+        "max_choices": poll.max_choices,
+        "allow_revote": poll.allow_revote,
     }
     if admin_mode:
         payload["approved"] = list(poll.approved)
@@ -132,7 +136,12 @@ async def handle_poll(request: web.Request) -> web.Response:
 
 
 async def handle_ballot(request: web.Request) -> web.Response:
-    """Records this user's choices, replacing any earlier ballot of theirs."""
+    """Records this user's choices, replacing any earlier ballot of theirs -- unless the
+    poll's own settings (set from the moderation screen) say otherwise: `max_choices`
+    caps how many entries one ballot may name, and `allow_revote=False` locks a voter's
+    first ballot in permanently. Both are rejected here, at the request boundary, rather
+    than silently truncated in voting.record_vote -- a voter should know their ballot
+    didn't count as sent, not have it quietly reshaped."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -150,6 +159,12 @@ async def handle_ballot(request: web.Request) -> web.Response:
     if not isinstance(choices, list) or not all(isinstance(c, str) for c in choices):
         return _json_error("choices must be a list of entry ids")
 
+    if not poll.allow_revote and str(user["id"]) in poll.votes:
+        return _json_error("менять голос нельзя -- голосование уже зафиксировано", status=409)
+    distinct = len(set(choices))
+    if poll.max_choices and distinct > poll.max_choices:
+        return _json_error(f"можно выбрать не более {poll.max_choices}", status=400)
+
     voting.record_vote(poll, user["id"], choices)
     voting.save_poll(poll)
     request.app[_LOG_KEY](f"[vote_web] ballot from {voting.display_name(user)}: {len(choices)} choice(s)")
@@ -157,7 +172,9 @@ async def handle_ballot(request: web.Request) -> web.Response:
 
 
 async def handle_moderate(request: web.Request) -> web.Response:
-    """Sets which nominations are admitted to the vote. Administrators only."""
+    """Sets which nominations are admitted to the vote, and (optionally, whenever present
+    in the body) its `max_choices`/`allow_revote` settings -- the moderation screen's one
+    "Сохранить" button submits all of it together. Administrators only."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -176,6 +193,16 @@ async def handle_moderate(request: web.Request) -> web.Response:
     if not isinstance(approved, list) or not all(isinstance(a, str) for a in approved):
         return _json_error("approved must be a list of entry ids")
 
+    if "max_choices" in body:
+        max_choices = body["max_choices"]
+        if max_choices is not None and (
+            isinstance(max_choices, bool) or not isinstance(max_choices, int) or max_choices < 1
+        ):
+            return _json_error("max_choices must be a positive integer or null")
+        poll.max_choices = max_choices
+    if "allow_revote" in body:
+        poll.allow_revote = bool(body["allow_revote"])
+
     voting.set_approved(poll, approved)
     if "open" in body:
         poll.open = bool(body["open"])
@@ -183,7 +210,10 @@ async def handle_moderate(request: web.Request) -> web.Response:
     request.app[_LOG_KEY](
         f"[vote_web] {voting.display_name(user)} admitted {len(poll.approved)}/{len(poll.entries)} entries"
     )
-    return web.json_response({"ok": True, "approved": poll.approved, "open": poll.open})
+    return web.json_response({
+        "ok": True, "approved": poll.approved, "open": poll.open,
+        "max_choices": poll.max_choices, "allow_revote": poll.allow_revote,
+    })
 
 
 async def handle_announce(request: web.Request) -> web.Response:
@@ -236,6 +266,31 @@ async def handle_announce(request: web.Request) -> web.Response:
         "votes": votes,
         "top": [{"entry": _entry_payload(e, poll, base), "votes": v} for e, v in top],
     })
+
+
+async def handle_clear(request: web.Request) -> web.Response:
+    """Deletes the current poll outright -- entries, votes, admitted flags, downloaded
+    photos, all of it -- so the next "/vote собрать" starts a genuinely fresh poll.
+    Administrators only. Unlike announcing, there is nothing to keep on a failure here:
+    delete_poll is a local filesystem operation, not a Telegram send that can fail
+    independently of the state change."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+
+    user = await _authenticate(request, body)
+    if not await request.app[_IS_ADMIN_KEY](user):
+        return _json_error("только администраторы могут очищать голосование", status=403)
+
+    entry_name = request.app[_ENTRY_KEY]
+    poll = voting.latest_poll(entry_name)
+    if poll is None:
+        return _json_error("голосование ещё не создано -- нечего очищать", status=404)
+
+    voting.delete_poll(entry_name, poll.poll_id)
+    request.app[_LOG_KEY](f"[vote_web] {voting.display_name(user)} cleared poll {poll.poll_id}")
+    return web.json_response({"ok": True})
 
 
 async def handle_media(request: web.Request) -> web.Response:
@@ -299,6 +354,7 @@ def create_app(
         web.post(f"{prefix}/api/ballot", handle_ballot),
         web.post(f"{prefix}/api/moderate", handle_moderate),
         web.post(f"{prefix}/api/announce", handle_announce),
+        web.post(f"{prefix}/api/clear", handle_clear),
         web.get(prefix + "/media/{poll_id}/{name}", handle_media),
     ])
     return app
@@ -380,12 +436,25 @@ PAGE_HTML = """<!doctype html>
   .go[disabled] { opacity: .5; }
   .go.secondary { background: transparent; color: var(--accent);
                   border: 1px solid var(--accent); margin-bottom: 8px; }
+  .go.danger { background: transparent; color: #e5534b;
+               border: 1px solid #e5534b; margin-bottom: 8px;
+               font-size: 13px; padding: 10px; font-weight: 500; }
   .msg { padding: 24px 16px; color: var(--muted); text-align: center; }
   .winner { margin: 0 12px 4px; padding: 10px 12px; border-radius: 10px;
             background: var(--card); display: flex; gap: 10px; align-items: center; }
   .winner img { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; flex: none; }
   .winner .label { font-size: 12px; color: var(--muted); }
   .winner .name { font-weight: 600; }
+  .settings { margin: 0 12px 4px; padding: 10px 12px; border-radius: 10px;
+              background: var(--card); font-size: 13px; }
+  .settings .row { display: flex; align-items: center; justify-content: space-between;
+                    gap: 8px; padding: 4px 0; }
+  .settings input[type="number"] { width: 56px; text-align: center; border-radius: 6px;
+              border: 1px solid rgba(128,128,128,.4); background: var(--bg);
+              color: var(--fg); padding: 4px; font-size: 13px; }
+  .settings input[type="checkbox"] { width: 18px; height: 18px; }
+  .locked { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
+            background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
   dialog {
     border: 0; padding: 0; width: 100%; max-width: 100%; height: 100%; max-height: 100%;
     margin: 0; background: var(--bg); color: var(--fg);
@@ -406,9 +475,21 @@ PAGE_HTML = """<!doctype html>
   <div class="sub" id="sub">Загружаю…</div>
 </header>
 <div class="winner" id="winnerBanner" hidden></div>
+<div class="settings" id="settings" hidden>
+  <div class="row">
+    <span>Сколько работ можно выбрать</span>
+    <input type="number" id="maxChoices" min="1" placeholder="∞">
+  </div>
+  <div class="row">
+    <span>Разрешить менять голос</span>
+    <input type="checkbox" id="allowRevote">
+  </div>
+</div>
+<div class="locked" id="locked" hidden>Голос зафиксирован — менять нельзя.</div>
 <div class="grid" id="grid"></div>
 <div class="msg" id="msg" hidden></div>
 <div class="bar">
+  <button class="go danger" id="clear" hidden>🗑 Очистить голосование</button>
   <button class="go secondary" id="announce" hidden>Подвести итоги</button>
   <button class="go" id="go" disabled>Загружаю…</button>
 </div>
@@ -456,17 +537,29 @@ function renderWinnerBanner() {
     '<div class="name">' + esc(who(w)) + "</div></div>";
 }
 
-function updateAnnounceButton() {
-  const button = $("announce");
-  if (!poll.is_admin) { button.hidden = true; return; }
-  button.hidden = false;
-  button.disabled = false;
-  button.textContent = poll.open ? "Закрыть голосование и объявить победителя" : "Пересчитать победителя";
+function updateAdminButtons() {
+  const announce = $("announce");
+  const clear = $("clear");
+  if (!poll.is_admin) { announce.hidden = true; clear.hidden = true; return; }
+  announce.hidden = false;
+  announce.disabled = false;
+  announce.textContent = poll.open ? "Закрыть голосование и объявить победителя" : "Пересчитать победителя";
+  clear.hidden = false;
+  clear.disabled = false;
+}
+
+// True once a voter can no longer submit anything, either because voting closed or
+// because their one ballot is locked in (allow_revote=false and they already voted).
+// Never true for the admin's own moderation view.
+function ballotLocked() {
+  if (poll.is_admin) return false;
+  if (!poll.open) return true;
+  return !poll.allow_revote && poll.my_vote && poll.my_vote.length > 0;
 }
 
 function render() {
   renderWinnerBanner();
-  updateAnnounceButton();
+  updateAdminButtons();
   const grid = $("grid");
   grid.innerHTML = "";
   if (!poll.entries.length) {
@@ -517,17 +610,27 @@ function render() {
 
 function updateButton() {
   const go = $("go");
-  go.hidden = false;
+  const locked = $("locked");
   if (poll.is_admin) {
+    locked.hidden = true;
+    go.hidden = false;
     go.disabled = false;
     go.textContent = "Сохранить: допущено " + admitted.size + " из " + poll.entries.length;
-  } else if (!poll.open) {
-    go.disabled = true;
-    go.textContent = "Голосование закрыто";
-  } else {
-    go.disabled = picked.size === 0;
-    go.textContent = picked.size ? "Проголосовать (" + picked.size + ")" : "Выбери работы";
+    return;
   }
+  if (ballotLocked()) {
+    go.hidden = true;
+    locked.hidden = false;
+    locked.textContent = poll.open ? "Голос зафиксирован — менять нельзя." : "Голосование закрыто.";
+    return;
+  }
+  locked.hidden = true;
+  go.hidden = false;
+  const cap = poll.max_choices;
+  go.disabled = picked.size === 0;
+  go.textContent = picked.size
+    ? "Проголосовать (" + picked.size + (cap ? "/" + cap : "") + ")"
+    : (cap ? "Выбери до " + cap + " работ" : "Выбери работы");
 }
 
 function openEntry(id) {
@@ -547,8 +650,17 @@ function openEntry(id) {
 }
 
 function togglePick(id) {
+  if (ballotLocked()) {
+    alert(poll.open ? "Голос уже зафиксирован, менять нельзя." : "Голосование закрыто.");
+    return;
+  }
   const set = poll.is_admin ? admitted : picked;
-  if (set.has(id)) set.delete(id); else set.add(id);
+  const adding = !set.has(id);
+  if (adding && !poll.is_admin && poll.max_choices && set.size >= poll.max_choices) {
+    alert("Можно выбрать не более " + poll.max_choices + ".");
+    return;
+  }
+  if (adding) set.add(id); else set.delete(id);
   if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
   render();
 }
@@ -575,14 +687,28 @@ $("go").addEventListener("click", async () => {
   try {
     const path = poll.is_admin ? "/api/moderate" : "/api/ballot";
     const body = poll.is_admin
-      ? { init_data: initData, approved: [...admitted] }
+      ? {
+          init_data: initData,
+          approved: [...admitted],
+          max_choices: $("maxChoices").value ? parseInt($("maxChoices").value, 10) : null,
+          allow_revote: $("allowRevote").checked,
+        }
       : { init_data: initData, choices: [...picked] };
     const response = await api(path, { method: "POST", body: JSON.stringify(body) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
+    if (poll.is_admin) {
+      poll.max_choices = data.max_choices;
+      poll.allow_revote = data.allow_revote;
+    } else {
+      poll.my_vote = data.my_vote;
+    }
     go.textContent = poll.is_admin ? "Сохранено" : "Голос принят";
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
-    setTimeout(() => { go.textContent = original; go.disabled = false; }, 1500);
+    // Deferred, not immediate: render() would otherwise overwrite this confirmation text
+    // right away with whatever updateButton() computes next (e.g. the locked banner, if
+    // this vote was the one that used up an allow_revote=false ballot).
+    setTimeout(() => { render(); }, 1500);
   } catch (e) {
     go.textContent = String(e.message || e);
     setTimeout(() => { go.textContent = original; go.disabled = false; }, 2500);
@@ -603,15 +729,52 @@ $("announce").addEventListener("click", async () => {
     if (!response.ok) throw new Error(data.error || "не получилось");
     poll.open = false;
     poll.winner = data.winner;
+    renderWinnerBanner();  // shows the banner right away, without touching this button's text
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
     button.textContent = data.notified
       ? "Победитель объявлен, сообщение отправлено тебе в личку"
       : "Победитель выбран, но сообщение не отправилось -- смотри логи";
-    render();
-    setTimeout(() => { button.textContent = original; button.disabled = false; }, 4000);
+    // Deferred: a full render() right now would immediately overwrite this confirmation
+    // text via updateAdminButtons(), which recomputes the button label from poll.open.
+    setTimeout(() => { render(); }, 4000);
   } catch (e) {
     button.textContent = String(e.message || e);
     setTimeout(() => { button.textContent = original; button.disabled = false; }, 2500);
+  }
+});
+
+$("clear").addEventListener("click", async () => {
+  if (!confirm(
+    "Точно очистить голосование? Все заявки, голоса и настройки удалятся безвозвратно " +
+    "-- дальше нужно будет /vote собрать заново."
+  )) return;
+  const button = $("clear");
+  button.disabled = true;
+  button.textContent = "Очищаю…";
+  try {
+    const response = await api("/api/clear", {
+      method: "POST", body: JSON.stringify({ init_data: initData }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось");
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    poll = { poll_id: null, entries: [], is_admin: true, can_moderate: true, open: false };
+    picked = new Set();
+    admitted = new Set();
+    $("winnerBanner").hidden = true;
+    $("settings").hidden = true;
+    $("locked").hidden = true;
+    $("announce").hidden = true;
+    $("grid").innerHTML = "";
+    $("go").hidden = true;
+    $("sub").textContent = "";
+    $("msg").hidden = false;
+    $("msg").textContent = "Голосование очищено. Собери заново: /vote собрать";
+    button.textContent = "Очищено";
+  } catch (e) {
+    button.textContent = "🗑 Очистить голосование";
+    button.disabled = false;
+    alert(String(e.message || e));
   }
 });
 
@@ -633,13 +796,19 @@ $("announce").addEventListener("click", async () => {
     }
     picked = new Set(poll.my_vote || []);
     admitted = new Set(poll.approved || []);
+    $("settings").hidden = !poll.is_admin;
     if (poll.is_admin) {
       $("sub").textContent =
         "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
+      $("maxChoices").value = poll.max_choices || "";
+      $("allowRevote").checked = poll.allow_revote !== false;
     } else {
-      $("sub").textContent = poll.my_vote && poll.my_vote.length
-        ? "Твой голос учтён — можно переголосовать"
-        : "Выбери понравившиеся работы";
+      const voted = poll.my_vote && poll.my_vote.length;
+      if (voted && !poll.allow_revote) {
+        $("sub").textContent = "Твой голос зафиксирован — менять нельзя";
+      } else {
+        $("sub").textContent = voted ? "Твой голос учтён — можно переголосовать" : "Выбери понравившиеся работы";
+      }
       if (poll.can_moderate) {
         $("sub").textContent += " · модерация: /vote выбрать";
       }

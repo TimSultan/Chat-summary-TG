@@ -206,12 +206,21 @@ class PollTests(unittest.TestCase):
         voting.set_approved(poll, ["a"])
         voting.record_vote(poll, 7, ["a"])
         voting.close_and_announce(poll)
+        poll.max_choices = 2
+        poll.allow_revote = False
         restored = voting.Poll.from_dict(json.loads(json.dumps(poll.to_dict())))
         self.assertEqual(restored.approved, poll.approved)
         self.assertEqual(restored.votes, poll.votes)
         self.assertEqual(restored.open, poll.open)
         self.assertEqual(restored.winner_entry_id, poll.winner_entry_id)
+        self.assertEqual(restored.max_choices, 2)
+        self.assertEqual(restored.allow_revote, False)
         self.assertEqual([e.entry_id for e in restored.entries], [e.entry_id for e in poll.entries])
+
+    def test_settings_default_to_unlimited_and_revote_allowed(self):
+        poll = self._poll()
+        self.assertIsNone(poll.max_choices)
+        self.assertTrue(poll.allow_revote)
 
 
 class BuildPollMergeTests(unittest.TestCase):
@@ -231,6 +240,16 @@ class BuildPollMergeTests(unittest.TestCase):
         self.assertEqual(merged.votes, {"1": ["a"]})
         self.assertEqual(merged.created_at, "t0")  # the poll's identity doesn't reset
         self.assertEqual([e.entry_id for e in merged.entries], ["a", "c"])
+
+    def test_re_collecting_keeps_the_max_choices_and_allow_revote_settings(self):
+        existing = voting.Poll(poll_id="p", entry="Chat", created_at="t0", entries=[self._entry("a")])
+        existing.max_choices = 2
+        existing.allow_revote = False
+
+        merged = voting.build_poll("Chat", "p", [self._entry("a")], existing=existing)
+
+        self.assertEqual(merged.max_choices, 2)
+        self.assertFalse(merged.allow_revote)
 
     def test_a_first_collection_has_no_existing_poll_to_merge(self):
         fresh = [self._entry("a")]
@@ -287,6 +306,28 @@ class StorageTests(unittest.TestCase):
     def test_latest_poll_is_scoped_to_its_own_chat(self):
         voting.save_poll(voting.Poll(poll_id="p", entry="Chat A", created_at="t0", entries=[]))
         self.assertIsNone(voting.latest_poll("Chat B"))
+
+    def test_delete_poll_removes_the_file_and_its_media(self):
+        voting.save_poll(voting.Poll(poll_id="p", entry="Chat", created_at="t0", entries=[]))
+        media_dir = voting.media_path("Chat", "p")
+        media_dir.mkdir(parents=True)
+        (media_dir / "photo.jpg").write_bytes(b"x")
+
+        existed = voting.delete_poll("Chat", "p")
+
+        self.assertTrue(existed)
+        self.assertIsNone(voting.load_poll("Chat", "p"))
+        self.assertFalse(media_dir.exists())
+
+    def test_deleting_a_poll_that_never_existed_reports_so(self):
+        self.assertFalse(voting.delete_poll("Chat", "never-existed"))
+
+    def test_deleting_one_poll_does_not_touch_another(self):
+        voting.save_poll(voting.Poll(poll_id="p1", entry="Chat", created_at="t0", entries=[]))
+        voting.save_poll(voting.Poll(poll_id="p2", entry="Chat", created_at="t1", entries=[]))
+        voting.delete_poll("Chat", "p1")
+        self.assertIsNone(voting.load_poll("Chat", "p1"))
+        self.assertIsNotNone(voting.load_poll("Chat", "p2"))
 
     def test_no_poll_directory_yet_is_not_an_error(self):
         self.assertIsNone(voting.latest_poll("anything"))

@@ -34,7 +34,8 @@ for rollback/comparison -- see intent_v2.py's module docstring.
 page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
 and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for everyone,
 including an admin -- "/vote выбрать" (DM, admin-only) is the separate moderation screen,
-and "/vote собрать" (DM, admin-only) (re-)scans #итогинедели posts into the poll. See
+"/vote собрать" (DM, admin-only) (re-)scans #итогинедели posts into the poll, and
+"/vote очистить" (DM, admin-only, tap-to-confirm) deletes it outright. See
 handle_vote_command's docstring.
 
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
@@ -192,6 +193,12 @@ VOTE_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect",
 # as opposed to bare "/vote" -- which now always opens the plain ballot, even for an
 # administrator, so admitting entries never blocks an admin from casting their own vote.
 VOTE_MODERATE_WORDS = frozenset({"выбрать", "модерация", "moderate", "admin"})
+# Deletes the current poll outright -- entries, votes, admitted flags, downloaded photos
+# -- so the next "/vote собрать" starts genuinely fresh. Destructive and irreversible, so
+# it goes through the same tap-to-confirm inline button as everything else that deletes
+# real data (see VOTE_CLEAR_CALLBACK_PREFIX below), rather than firing on the word alone.
+VOTE_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
+VOTE_CLEAR_CALLBACK_PREFIX = "voteclear"
 VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
 
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
@@ -3333,6 +3340,65 @@ def _vote_page_url(cfg) -> str | None:
     return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
 
 
+def _current_vote_poll_id(tz) -> str:
+    """Keyed by ISO week, not by today's date: собрать/выбрать/очистить all need to agree
+    on which poll "this week" refers to regardless of which day of the week they're run,
+    and a date-keyed id would silently point at a different poll once the day rolls over
+    mid-week."""
+    iso_year, iso_week, _ = datetime.now(tz).isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def _vote_clear_callback_data(chat_id, user_id) -> str:
+    return f"{VOTE_CLEAR_CALLBACK_PREFIX}:{chat_id}:{user_id}"
+
+
+def _parse_vote_clear_callback(data: str) -> tuple[int, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != VOTE_CLEAR_CALLBACK_PREFIX:
+        return None
+    try:
+        return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+async def handle_vote_clear_callback(
+    api: TelegramBotAPI, cfg, tz, callback: dict, entry: str | None, log=print,
+) -> None:
+    """Confirms and executes "/vote очистить"'s tap-to-confirm button. Re-checks admin
+    status against the tapper (not just whoever the confirmation was originally sent to)
+    even though a DM only that person can see the button in the first place -- the same
+    belt-and-suspenders check every other confirm flow in this file does."""
+    parsed = _parse_vote_clear_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    chat_id, target_user_id = parsed
+
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    if not entry or not await _can_manage_chat(api, chat_id, clicker, entry):
+        await api.answer_callback_query(callback["id"], text="Только администраторы.")
+        return
+
+    poll_id = _current_vote_poll_id(tz)
+    existed = voting.delete_poll(entry, poll_id)
+    await api.answer_callback_query(callback["id"], text="Очищено" if existed else "Уже пусто")
+    log(f"[bot_listener] {clicker.get('username') or target_user_id} cleared vote poll {poll_id} (existed={existed})")
+    try:
+        await api.send_message(
+            chat_id,
+            "Голосование очищено. Собери заново: /vote собрать" if existed
+            else "Голосование за эту неделю уже было пустым.",
+            parse_mode=None,
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to confirm the vote clear: {e}")
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -3345,18 +3411,20 @@ async def handle_vote_command(
     log=print,
     forced_mode: str | None = None,
 ) -> None:
-    """Three distinct things live behind /vote, deliberately kept apart rather than one
+    """Four distinct things live behind /vote, deliberately kept apart rather than one
     page that changes shape depending who opens it:
 
     - "/vote собрать" (DM, admin-only) rebuilds the entry list from #итогинедели posts.
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
-      counts, and closing the vote.
+      counts, ballot settings, and closing the vote.
+    - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
     - bare "/vote" opens the actual ballot, for EVERYONE including an administrator --
       an admin is never forced into moderation mode just to cast their own vote.
 
-    `forced_mode` ("moderate") is set by the /start deep-link an admin-only group message
-    hands out for "выбрать", bypassing the usual text parsing since a /start payload never
-    carries the Russian word itself (see VOTE_MODERATE_WORDS below).
+    `forced_mode` ("moderate" or "clear") is set by the /start deep-link an admin-only
+    group message hands out for "выбрать"/"очистить", bypassing the usual text parsing
+    since a /start payload never carries the Russian word itself (see VOTE_MODERATE_WORDS/
+    VOTE_CLEAR_WORDS below).
 
     Every web_app button differs by chat type because Telegram only allows one in a
     private chat. In a group the same command therefore offers a plain link into the DM,
@@ -3389,7 +3457,9 @@ async def handle_vote_command(
         return
 
     if forced_mode == "moderate":
-        wants_collect, wants_moderate = False, True
+        wants_collect, wants_moderate, wants_clear = False, True, False
+    elif forced_mode == "clear":
+        wants_collect, wants_moderate, wants_clear = False, False, True
     else:
         argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
         for spelling in VOTE_COMMANDS:
@@ -3399,16 +3469,17 @@ async def handle_vote_command(
         normalized = argument.strip().lower()
         wants_collect = normalized in VOTE_COLLECT_WORDS
         wants_moderate = normalized in VOTE_MODERATE_WORDS
+        wants_clear = normalized in VOTE_CLEAR_WORDS
 
     async def require_admin_in_dm(denial: str) -> bool:
-        """Common gate for собрать/выбрать: DM only, admin only. Returns whether the
-        caller passed; the group-vs-DM split lives here once instead of being repeated
-        for both admin-only subcommands."""
+        """Common gate for собрать/выбрать/очистить: DM only, admin only. Returns whether
+        the caller passed; the group-vs-DM split lives here once instead of being repeated
+        for all three admin-only subcommands."""
         if not is_private:
             if not bot_username:
                 await reply("Открой в личке с ботом.")
                 return False
-            start_payload = "vote_admin" if wants_moderate else None
+            start_payload = "vote_admin" if wants_moderate else "vote_clear" if wants_clear else None
             url = f"https://t.me/{bot_username}" + (f"?start={start_payload}" if start_payload else "")
             await reply(
                 "Это только в личке с ботом:",
@@ -3426,12 +3497,7 @@ async def handle_vote_command(
             return
 
         await reply("Собираю заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
-        # Keyed by ISO week, not by today's date: the admin may run "собрать" more than
-        # once over the days a vote is open (to pick up late entries), and each run must
-        # land in the SAME poll so votes already cast survive it -- a date-keyed id would
-        # silently start a fresh, empty poll the moment "today" rolled over.
-        iso_year, iso_week, _ = datetime.now(tz).isocalendar()
-        poll_id = f"{iso_year}-W{iso_week:02d}"
+        poll_id = _current_vote_poll_id(tz)
         try:
             entries = await voting.collect_entries(
                 client=telethon_client,
@@ -3466,6 +3532,21 @@ async def handle_vote_command(
             "Модерация: отметь, какие работы допустить к голосованию, и закрой голосование, когда пора подводить итоги.",
             reply_markup={"inline_keyboard": [[
                 {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
+            ]]},
+        )
+        return
+
+    if wants_clear:
+        if not await require_admin_in_dm("Очищать голосование могут только администраторы."):
+            return
+        poll_id = _current_vote_poll_id(tz)
+        if voting.load_poll(entry, poll_id) is None:
+            await reply("Голосование за эту неделю ещё не создано -- нечего очищать.")
+            return
+        await reply(
+            "Точно очистить голосование за эту неделю? Все заявки, голоса и настройки удалятся безвозвратно.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "🗑 Да, очистить", "callback_data": _vote_clear_callback_data(chat_id, user.get("id"))}
             ]]},
         )
         return
@@ -4131,6 +4212,8 @@ async def _dispatch_update(
                 api, telethon_client, callback, joke_preview_pending, known_chat_ids,
                 joke_posted_queue, log=log,
             )
+        elif callback_data.startswith(f"{VOTE_CLEAR_CALLBACK_PREFIX}:"):
+            await handle_vote_clear_callback(api, cfg, tz, callback, home_chat_ref, log=log)
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner
             # doesn't hang forever on the client.
@@ -4157,20 +4240,21 @@ async def _dispatch_update(
     start_match = re.match(r"^/start(?:\s+(\S+))?\s*$", command_text, re.IGNORECASE)
     if start_match:
         # Where /stat's "Открыть личный кабинет" link (t.me/<bot>?start=cabinet) and the
-        # group /vote buttons' DM links (?start=vote, ?start=vote_admin) land, and the
-        # natural first thing a new member does anyway. Groups are ignored: a /start there
-        # is somebody's fat finger, not a request. Any payload other than the vote ones --
-        # including none at all -- opens the cabinet, matching the old unconditional
-        # behavior.
+        # group /vote buttons' DM links (?start=vote, ?start=vote_admin, ?start=vote_clear)
+        # land, and the natural first thing a new member does anyway. Groups are ignored: a
+        # /start there is somebody's fat finger, not a request. Any payload other than the
+        # vote ones -- including none at all -- opens the cabinet, matching the old
+        # unconditional behavior.
         if chat.get("type") != "private":
             return
         start_payload = (start_match.group(1) or "").lower()
-        if start_payload in ("vote", "vote_admin"):
+        if start_payload in ("vote", "vote_admin", "vote_clear"):
+            forced_mode = {"vote_admin": "moderate", "vote_clear": "clear"}.get(start_payload)
             await handle_vote_command(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
                 background_tasks, log=log,
-                forced_mode=("moderate" if start_payload == "vote_admin" else None),
+                forced_mode=forced_mode,
             )
             return
         await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)

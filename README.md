@@ -671,9 +671,16 @@ page that changes shape depending on who opens it:
   nominations and dropping ones that no longer exist.
 - **`/vote выбрать`** (DM, administrators only) opens the moderation screen: every
   nomination (not just admitted ones), an "допустить" toggle instead of a vote button, a
-  live count on each card, and the button that closes the vote (below). Nothing is shown
-  to ordinary voters -- or to an admin on the plain ballot -- until this has admitted it,
-  so an unmoderated poll shows an empty page rather than everything anyone posted.
+  live count **and a proportional bar, relative to the current leader** on each card, and
+  the buttons that close the vote or clear it entirely (below). Nothing is shown to
+  ordinary voters -- or to an admin on the plain ballot -- until this has admitted it, so
+  an unmoderated poll shows an empty page rather than everything anyone posted.
+- **`/vote очистить`** (DM, administrators only) deletes the current poll outright --
+  entries, votes, admitted flags, downloaded photos, settings, all of it -- behind a
+  tap-to-confirm inline button, same as every other irreversible action in this bot. The
+  next `/vote собрать` then starts a genuinely fresh poll rather than resetting the old
+  one in place. The moderation screen has the same action as a button
+  ("🗑 Очистить голосование"), also behind its own confirmation.
 
 Which of these opens is decided server-side by a `?mode=admin` marker on the page's own
 URL, checked against a real admin lookup on every request (`handle_poll`) -- not by trusting
@@ -692,13 +699,22 @@ the tracked chat, a `/badgeadmin`-delegated manager, or a hardcoded name in
 
 **Closing the vote** (admin-only, "Закрыть голосование и объявить победителя") picks the
 top-voted admitted entry (`voting.close_and_announce` — refuses if nothing has any votes
-yet) and sends the winner — name, their photo, their post's own text — as a message. For
-now that message goes to whoever closed the vote, in their own DM with the bot, not into
-the group; posting the announcement into the chat itself is a manual copy-paste away until
-that's wired up directly. The poll records who won (`Poll.winner_entry_id`) independently
-of whether the message actually sent, so a delivery hiccup never loses the result, and
-re-closing (say, after adjusting which entries are admitted) recomputes rather than
-refusing.
+yet) and sends the **top 3** — name, vote count, medal emoji each, plus the winner's photo
+and their post's own text — as a message. For now that message goes to whoever closed the
+vote, in their own DM with the bot, not into the group; posting the announcement into the
+chat itself is a manual copy-paste away until that's wired up directly. The poll records
+who won (`Poll.winner_entry_id`) independently of whether the message actually sent, so a
+delivery hiccup never loses the result, and re-closing (say, after adjusting which entries
+are admitted) recomputes rather than refusing.
+
+**Ballot settings**, set from the moderation screen alongside admitting entries: how many
+entries one ballot may name (`max_choices`, unlimited by default) and whether resubmitting
+replaces a previous ballot (`allow_revote`, on by default). Both are enforced server-side
+in `vote_web.handle_ballot` — a ballot over the cap is rejected outright (400) rather than
+silently truncated, and once `allow_revote` is off, a second ballot from the same person is
+refused (409) instead of overwriting their first. The page reflects both: it blocks picking
+past the cap client-side too (so the rejection is never the first the voter hears of it),
+and shows "голос зафиксирован" instead of a vote button once a locked ballot is in.
 
 Requires `WEBAPP_PUBLIC_URL` (a real `https://` domain — Telegram refuses to open a Mini
 App over plain http) and, on a host with no persistent disk by default, `DATA_DIR` on a

@@ -23,6 +23,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -235,6 +236,13 @@ class Poll:
     # second look days later) can still show who won without recomputing it from votes
     # that may since have shifted (an un-admit after closing, say).
     winner_entry_id: str | None = None
+    # Admin-configurable, set from the moderation screen. None means unlimited -- a voter
+    # may admit as many approved entries as they like, the original behavior.
+    max_choices: int | None = None
+    # Whether re-submitting a ballot replaces the previous one. False locks a voter's
+    # FIRST ballot in permanently -- enforced by vote_web.handle_ballot, not here (see its
+    # docstring): this field is just the setting, not the enforcement.
+    allow_revote: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -246,6 +254,8 @@ class Poll:
             "votes": {k: list(v) for k, v in self.votes.items()},
             "open": self.open,
             "winner_entry_id": self.winner_entry_id,
+            "max_choices": self.max_choices,
+            "allow_revote": self.allow_revote,
         }
 
     @classmethod
@@ -259,6 +269,8 @@ class Poll:
             votes={str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()},
             open=bool(raw.get("open", True)),
             winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
+            max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
+            allow_revote=bool(raw.get("allow_revote", True)),
         )
 
     def approved_entries(self) -> list[Entry]:
@@ -310,6 +322,21 @@ def save_poll(poll: Poll) -> None:
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(poll.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def delete_poll(entry: str, poll_id: str) -> bool:
+    """Deletes a poll's JSON file and its downloaded media outright, rather than just
+    resetting its fields in place -- "start over" means the next /vote собрать builds a
+    genuinely fresh poll (its own created_at), not a same-poll reset that would still
+    carry the old identity. Returns whether there was anything to delete."""
+    path = poll_path(entry, poll_id)
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    media_dir = media_path(entry, poll_id)
+    if media_dir.exists():
+        shutil.rmtree(media_dir)
+    return existed
 
 
 def load_poll(entry: str, poll_id: str) -> Poll | None:
@@ -367,6 +394,8 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
     poll.open = existing.open
     if existing.winner_entry_id in known:
         poll.winner_entry_id = existing.winner_entry_id
+    poll.max_choices = existing.max_choices
+    poll.allow_revote = existing.allow_revote
     return poll
 
 

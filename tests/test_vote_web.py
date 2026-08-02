@@ -175,6 +175,142 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 404)
 
+    # ---- max_choices / allow_revote settings ---------------------------------------------
+
+    async def test_a_ballot_over_the_max_choices_cap_is_rejected(self):
+        poll = self._seed_poll(approved=("a", "b"))
+        poll.max_choices = 1
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["a", "b"]},
+        )
+        self.assertEqual(response.status, 400)
+        self.assertIsNone(voting.load_poll(CHAT, "2026-08-02").votes.get(str(self.voter_id)))
+
+    async def test_a_ballot_at_exactly_the_cap_is_accepted(self):
+        poll = self._seed_poll(approved=("a", "b"))
+        poll.max_choices = 2
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["a", "b"]},
+        )
+        self.assertEqual(response.status, 200)
+
+    async def test_revoting_is_refused_once_allow_revote_is_off(self):
+        poll = self._seed_poll(approved=("a", "b"))
+        poll.allow_revote = False
+        voting.record_vote(poll, self.voter_id, ["a"])
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["b"]},
+        )
+        self.assertEqual(response.status, 409)
+        # The original ballot is untouched by the refused attempt.
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes[str(self.voter_id)], ["a"])
+
+    async def test_a_first_vote_is_still_accepted_when_allow_revote_is_off(self):
+        poll = self._seed_poll(approved=("a",))
+        poll.allow_revote = False
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+        )
+        self.assertEqual(response.status, 200)
+
+    async def test_the_poll_payload_carries_settings_for_voters_too(self):
+        poll = self._seed_poll(approved=("a",))
+        poll.max_choices = 1
+        poll.allow_revote = False
+        voting.save_poll(poll)
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertEqual(data["max_choices"], 1)
+        self.assertFalse(data["allow_revote"])
+
+    async def test_moderate_updates_the_settings_alongside_admitted_entries(self):
+        self._seed_poll(approved=())
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/moderate",
+            json={
+                "init_data": _init_data(self.admin_id), "approved": ["a"],
+                "max_choices": 2, "allow_revote": False,
+            },
+        )
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data["max_choices"], 2)
+        self.assertFalse(data["allow_revote"])
+        stored = voting.load_poll(CHAT, "2026-08-02")
+        self.assertEqual(stored.max_choices, 2)
+        self.assertFalse(stored.allow_revote)
+
+    async def test_moderate_can_clear_max_choices_back_to_unlimited(self):
+        poll = self._seed_poll(approved=("a",))
+        poll.max_choices = 2
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/moderate",
+            json={"init_data": _init_data(self.admin_id), "approved": ["a"], "max_choices": None},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(voting.load_poll(CHAT, "2026-08-02").max_choices)
+
+    async def test_moderate_rejects_a_non_positive_max_choices(self):
+        self._seed_poll(approved=("a",))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/moderate",
+            json={"init_data": _init_data(self.admin_id), "approved": ["a"], "max_choices": 0},
+        )
+        self.assertEqual(response.status, 400)
+
+    # ---- clearing the poll entirely ------------------------------------------------------
+
+    async def test_a_non_admin_cannot_clear(self):
+        self._seed_poll(approved=("a",))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/clear",
+            json={"init_data": _init_data(self.voter_id)},
+        )
+        self.assertEqual(response.status, 403)
+        self.assertIsNotNone(voting.load_poll(CHAT, "2026-08-02"))
+
+    async def test_an_admin_can_clear_the_poll(self):
+        self._seed_poll(approved=("a",))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/clear",
+            json={"init_data": _init_data(self.admin_id)},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(voting.load_poll(CHAT, "2026-08-02"))
+
+        # A fresh poll GET after clearing reports no poll at all, not a stale one.
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+        )
+        data = await response.json()
+        self.assertIsNone(data["poll_id"])
+
+    async def test_clearing_with_no_poll_created_yet_is_a_clean_404(self):
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/clear",
+            json={"init_data": _init_data(self.admin_id)},
+        )
+        self.assertEqual(response.status, 404)
+
     # ---- moderation is admin-only --------------------------------------------------------
 
     async def test_a_non_admin_cannot_moderate(self):
