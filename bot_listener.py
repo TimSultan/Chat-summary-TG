@@ -4841,25 +4841,31 @@ async def run_bot_listener(
                 return False
             return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
 
-        async def _announce_vote_winner(user: dict, poll, winner_entry, votes: int) -> None:
+        _VOTE_MEDALS = ("🥇", "🥈", "🥉")
+
+        def _vote_who(entry) -> str:
+            return f"{entry.author_name} (@{entry.author_username})" if entry.author_username else entry.author_name
+
+        async def _announce_vote_winner(user: dict, poll, top: list) -> None:
             """Sends the winner announcement -- for now into the admin's own DM with the
             bot (the same chat the Mini App was opened from), not the group. `user` is
             whoever closed the vote, taken from the page's own verified identity rather
-            than re-deriving "the admin" some other way.
+            than re-deriving "the admin" some other way. `top` is poll.tally()'s ranked
+            (Entry, votes) pairs, already sliced to at most 3, winner first.
 
             Reaches directly into voting's on-disk media rather than re-downloading:
             collect_entries already pulled every photo down when the poll was built."""
             chat_id = user.get("id")
-            if chat_id is None:
+            if not top or chat_id is None:
                 return
-            lines = [f"🏆 Победитель голосования за {poll.entry}: {winner_entry.author_name}"]
-            if winner_entry.author_username:
-                lines.append(f"@{winner_entry.author_username}")
-            if winner_entry.text:
+            winner_entry, winner_votes = top[0]
+
+            lines = [f"🏆 Итоги голосования за {poll.entry}"]
+            for medal, (entry, votes) in zip(_VOTE_MEDALS, top):
                 lines.append("")
-                lines.append(winner_entry.text)
-            lines.append("")
-            lines.append(f"Голосов: {votes}")
+                lines.append(f"{medal} {_vote_who(entry)} — {votes} голосов")
+                if entry is winner_entry and entry.text:
+                    lines.append(entry.text)
             text = "\n".join(lines)
 
             photo_path = None

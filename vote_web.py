@@ -37,9 +37,12 @@ _ENTRY_KEY = web.AppKey("entry", str)
 _IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[dict], Awaitable[bool]])
 # Sends the winner announcement wherever bot_listener.py decides "the chat" currently
 # means (its own DM with the admin who closed the vote, for now). Takes the admin's user
-# dict, the poll, the winning entry, and its vote count; failure is caught by the caller
-# and reported back, not raised through the API response.
-_ANNOUNCE_KEY = web.AppKey("announce", Callable[[dict, voting.Poll, voting.Entry, int], Awaitable[None]])
+# dict, the poll, and the top 3 (Entry, votes) pairs ranked highest-first (fewer if there
+# aren't 3 admitted entries) -- element 0 is always the recorded winner. Failure is caught
+# by the caller and reported back, not raised through the API response.
+_ANNOUNCE_KEY = web.AppKey(
+    "announce", Callable[[dict, voting.Poll, list[tuple[voting.Entry, int]]], Awaitable[None]]
+)
 _ROUTE_PREFIX_KEY = web.AppKey("route_prefix", str)
 _LOG_KEY = web.AppKey("log", Callable[..., None])
 
@@ -211,13 +214,16 @@ async def handle_announce(request: web.Request) -> web.Response:
         return _json_error("пока не за что подводить итоги -- нет голосов за допущенные работы", status=409)
     winner_entry, votes = result
     voting.save_poll(poll)
+    # Recomputed fresh from the poll (now closed) rather than reused from close_and_announce,
+    # which only ever tracks the single #1 winner -- the top 3 is purely a reporting concern.
+    top = poll.tally()[:3]
     request.app[_LOG_KEY](
         f"[vote_web] {voting.display_name(user)} closed the vote -- winner {winner_entry.entry_id} ({votes} votes)"
     )
 
     notified = True
     try:
-        await request.app[_ANNOUNCE_KEY](user, poll, winner_entry, votes)
+        await request.app[_ANNOUNCE_KEY](user, poll, top)
     except Exception as e:
         notified = False
         request.app[_LOG_KEY](f"[vote_web] announcing the winner failed: {e}")
@@ -228,6 +234,7 @@ async def handle_announce(request: web.Request) -> web.Response:
         "notified": notified,
         "winner": _entry_payload(winner_entry, poll, base),
         "votes": votes,
+        "top": [{"entry": _entry_payload(e, poll, base), "votes": v} for e, v in top],
     })
 
 
@@ -262,15 +269,16 @@ def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
-    returning a bool; `announce` is an async callable taking (user, poll, winner_entry,
-    votes) that delivers the winner message. Both are supplied by bot_listener.py, which
-    owns the Bot API client they need, so this module needs to know nothing about how
-    administrators are determined or where an announcement actually goes.
+    returning a bool; `announce` is an async callable taking (user, poll, top3) -- top3
+    being the ranked (Entry, votes) pairs, winner first -- that delivers the announcement.
+    Both are supplied by bot_listener.py, which owns the Bot API client they need, so this
+    module needs to know nothing about how administrators are determined or where an
+    announcement actually goes.
 
     `announce` defaults to a no-op so the app is still constructible (e.g. in tests that
     don't exercise closing a vote) without a bot_listener.py running alongside it.
     """
-    async def _default_announce(user, poll, winner_entry, votes):
+    async def _default_announce(user, poll, top):
         return None
 
     app = web.Application()
@@ -358,6 +366,9 @@ PAGE_HTML = """<!doctype html>
   .card.pending { opacity: .55; }
   .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
            color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+  .votebar { height: 4px; margin: 3px 6px 0; border-radius: 2px;
+             background: rgba(128,128,128,.25); overflow: hidden; }
+  .votebar-fill { height: 100%; background: var(--accent); border-radius: 2px; }
   .bar {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom));
@@ -466,6 +477,11 @@ function render() {
     $("go").hidden = true;
     return;
   }
+  // The bar is relative to the currently leading entry, not to the voter count, so it
+  // stays readable in a poll with only a handful of ballots in so far.
+  const maxCount = poll.is_admin && poll.counts
+    ? Math.max(1, ...Object.values(poll.counts)) : 1;
+
   for (const entry of poll.entries) {
     const card = document.createElement("div");
     card.className = "card";
@@ -473,16 +489,22 @@ function render() {
     if (chosen) card.classList.add("on");
     if (poll.is_admin && !admitted.has(entry.id)) card.classList.add("pending");
 
-    const votes = poll.is_admin && poll.counts && poll.counts[entry.id]
-      ? '<span class="votes">' + poll.counts[entry.id] + "</span>" : "";
+    const count = poll.is_admin && poll.counts ? (poll.counts[entry.id] || 0) : 0;
+    const votes = poll.is_admin && poll.counts && count
+      ? '<span class="votes">' + count + "</span>" : "";
     const more = entry.photos.length > 1
       ? '<span class="count">+' + (entry.photos.length - 1) + "</span>" : "";
+    const votebar = poll.is_admin
+      ? '<div class="votebar"><div class="votebar-fill" style="width:' +
+        Math.round(100 * count / maxCount) + '%"></div></div>'
+      : "";
 
     card.innerHTML =
       '<a class="thumb" href="#" data-open="' + esc(entry.id) + '">' +
         '<img loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' +
         more + votes +
       "</a>" +
+      votebar +
       '<div class="who">' + esc(who(entry)) + "</div>" +
       '<button class="pick" data-pick="' + esc(entry.id) + '">' +
         (poll.is_admin ? (chosen ? "допущена" : "допустить")
