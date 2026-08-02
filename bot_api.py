@@ -4,10 +4,11 @@ listener.py drives. Deliberately minimal: just the handful of methods bot_listen
 needs (getMe, getUpdates via long polling, message/photo send and edit, deleteMessage,
 setMessageReaction, answerCallbackQuery, getChatAdministrators), not a full SDK.
 
-Roast confirmation uses an inline-keyboard button + callback_query rather than reactions
-(like the Telethon listener uses): receiving *other users'* reactions via getUpdates
-(message_reaction updates) requires the bot to be a chat admin, while callback_query from
-the bot's own inline keyboard requires no special rights at all.
+Confirmation flows (cabinet, badges, shop, etc.) use inline-keyboard buttons +
+callback_query rather than reactions (like the Telethon listener uses for its own
+confirmations): receiving *other users'* reactions via getUpdates (message_reaction
+updates) requires the bot to be a chat admin, while callback_query from the bot's own
+inline keyboard requires no special rights at all.
 """
 
 import json

@@ -118,7 +118,6 @@ class CallSiteTests(unittest.TestCase):
             bot_listener.handle_tree_command,
             bot_listener.handle_shop_command,
             bot_listener.handle_bot_summary_request,
-            bot_listener.run_bot_roast,
         ):
             source = inspect.getsource(func)
             with self.subTest(func=func.__name__):

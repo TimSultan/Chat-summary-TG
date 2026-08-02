@@ -40,7 +40,6 @@ from intent_v2 import route_request
 from joke import CONTEXT_MESSAGE_COUNT, generate_joke
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
-from roast import roast_person
 from summarizer import summarize_transcript
 from telegram_fetch import (
     fetch_range_messages_cached,
@@ -117,15 +116,6 @@ def resolve_time_window(start_date, end_date, lookback_hours, request_dt, tz, lo
     return start_date, end_date, window_start_dt, window_end_dt, lookback_hours
 
 
-# "прожарь меня" roasts the requester using their own messages from the last
-# ROAST_LOOKBACK_DAYS days (config.py, ROAST_LOOKBACK_DAYS env var, default 30). It's a
-# two-step flow: the trigger message gets a confirmation prompt, and only an actual
-# *reaction* from that same person on that prompt (any emoji) starts generation -- see
-# roast_pending/roast_in_progress in run_listener.
-ROAST_CONFIRM_TEXT = "Ты точно хочешь прожарку? поставь реакцию для подтверждения"
-ROAST_BUSY_EMOJI = "⏳"
-NO_ROAST_MATERIAL_MESSAGE = "За последний месяц твоих сообщений тут не нашлось -- нечем прожаривать."
-
 # Reacted onto the triggering message itself as soon as a summary request is accepted,
 # so the requester gets instant feedback that it was picked up while the LLM calls
 # (which can take a few seconds) run.
@@ -146,17 +136,16 @@ FIGURINE_ACK_EMOJI = "🔥"
 PROCRASTINATOR_NONE_FOUND_MESSAGE = "Все скидывали покрасы вовремя -- прокрастинаторов не найдено."
 
 ERROR_DELETE_AFTER = 10  # short rejection notices (such as day limit) self-delete fast
-ROAST_DELETE_AFTER = 600  # roast replies self-delete after 10 minutes
 STATS_DELETE_AFTER = 300  # /top and /stat replies (incl. their own errors) self-delete after 5 minutes
 
 # "сохрани" (config.py, SAVE_TRIGGER_KEYWORD env var), sent by you as a reply to any
-# message, asks (via a confirmation prompt + reaction, like the roast flow) whether to
+# message, asks (via a confirmation prompt + reaction) whether to
 # repost that message -- photo, video, any media, or just text -- to your save channel
 # (SAVE_CHANNEL), with any text after the trigger word appended as a caption. Your own
 # trigger message is deleted immediately (it's always yours -- see msg.out check in
 # on_message); the confirmation prompt gets a tick reaction and self-deletes once
 # confirmed, or self-deletes unconfirmed after SAVE_CONFIRM_TIMEOUT. Unlike
-# summary/roast, this ignores LISTENER_ALLOWED_CHATS entirely, since it never touches
+# summary, this ignores LISTENER_ALLOWED_CHATS entirely, since it never touches
 # the OpenAI budget.
 SAVE_CONFIRM_TEXT = "Сохранить в t.me/papka_pokrasa?\nреакция для подтверждения."
 SAVE_TICK_EMOJI = "✅"
@@ -164,7 +153,7 @@ SAVE_CONFIRM_TIMEOUT = 10  # seconds to wait for a confirming reaction before ca
 SAVE_CONFIRM_DELETE_AFTER = 3  # seconds after a tick reaction before the prompt is deleted
 
 # Reacting with a thumbs-up on ANY message this account or the bot sent -- not just one
-# awaiting a specific confirmation, like the save/roast flows above -- is a one-tap "get
+# awaiting a specific confirmation, like the save flow above -- is a one-tap "get
 # rid of this" shortcut, checked in on_reaction only once none of those more specific
 # flows claim the reaction first. Deliberately scoped to messages we sent (msg.out or a
 # bot sender): this account may well have delete rights over the whole chat, but a stray
@@ -348,7 +337,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         intent = await asyncio.to_thread(
             parse_summary_request,
             api_key=cfg.openai_api_key,
-            model=cfg.openai_model,
+            model=cfg.openai_routing_model,
             text=text,
             reference_date=ref_date,
             mentioned_usernames=mentioned,
@@ -398,7 +387,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         log(f"[listener] resolving name hint '{name_hint}' against {len(candidates)} candidates: {shown}")
         try:
             focus_user = await asyncio.to_thread(
-                resolve_name_hint, cfg.openai_api_key, cfg.openai_model, name_hint, candidates
+                resolve_name_hint, cfg.openai_api_key, cfg.openai_routing_model, name_hint, candidates
             )
         except ChatSummaryError as e:
             log(f"[listener] name resolution failed: {e}")
@@ -480,7 +469,7 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
         routed = await asyncio.to_thread(
             route_request,
             api_key=cfg.openai_api_key,
-            model=cfg.openai_model,
+            model=cfg.openai_routing_model,
             text=text,
             reference_date=ref_date,
             mentioned_usernames=mentioned,
@@ -564,7 +553,7 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
             log(f"[listener] v2 resolving name hint '{username_hint}' against {len(candidates)} candidates: {shown}")
             try:
                 focus_user = await asyncio.to_thread(
-                    resolve_name_hint, cfg.openai_api_key, cfg.openai_model, username_hint, candidates
+                    resolve_name_hint, cfg.openai_api_key, cfg.openai_routing_model, username_hint, candidates
                 )
             except ChatSummaryError as e:
                 log(f"[listener] v2 name resolution failed: {e}")
@@ -601,84 +590,6 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
     )
 
     await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
-
-
-async def run_roast(
-    client,
-    chat,
-    target_user,
-    confirm_msg_id: int,
-    original_text: str,
-    cfg,
-    tz,
-    sent_ids: set[int],
-    schedule_delete,
-    log=print,
-):
-    """Actually generates and sends the roast, once the target user has confirmed by
-    reacting to the ROAST_CONFIRM_TEXT prompt. Uses their own messages from the last
-    cfg.roast_lookback_days days (reusing the same per-day transcript cache as the
-    summary path)."""
-    chat_title_for_history = getattr(chat, "title", None) or "Unknown chat"
-    requester = sender_display_name(target_user)
-
-    async def respond(answer: str, delete_after: int | None = None, record: bool = True):
-        message_ids = await send_long_message(client, chat, answer, reply_to=confirm_msg_id, sent_ids=sent_ids)
-        if record:
-            try:
-                history.record(chat_title_for_history, requester, original_text, answer)
-            except Exception as e:
-                log(f"[listener] failed to record history: {e}")
-        if delete_after and message_ids:
-            schedule_delete(client, chat.id, message_ids, delete_after)
-
-    end_date = datetime.now(tz).date()
-    start_date = end_date - timedelta(days=cfg.roast_lookback_days - 1)
-
-    _, messages = await fetch_range_messages_cached(
-        client=client,
-        chat_ref=chat,
-        start_day=start_date,
-        end_day=end_date,
-        tz=tz,
-        log=log,
-    )
-
-    target_id = getattr(target_user, "id", None)
-    own_messages = [m for m in messages if m.sender_id == target_id] if target_id is not None else []
-    if not own_messages:
-        username = getattr(target_user, "username", None)
-        if username:
-            own_messages = [m for m in messages if sender_matches(m, username)]
-
-    log(f"[listener] roast target={requester} matched={len(own_messages)}/{len(messages)}")
-    if not own_messages:
-        await respond(NO_ROAST_MATERIAL_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
-        return
-
-    if len(own_messages) > cfg.roast_max_messages:
-        # A very active poster can have thousands of messages in the lookback window --
-        # roast_person map-reduces the transcript into 6000-token chunks with one
-        # *sequential* OpenAI call per chunk, so an uncapped input can mean dozens of
-        # blocking calls (minutes of silence before anything is sent). Capping to the
-        # most recent N keeps generation fast; a roast doesn't need the whole month, just
-        # enough material.
-        log(
-            f"[listener] capping roast input for {requester}: {len(own_messages)} -> "
-            f"{cfg.roast_max_messages} most recent messages"
-        )
-        own_messages = own_messages[-cfg.roast_max_messages :]
-
-    lines = format_transcript_lines(own_messages, include_date=True)
-    roast = await asyncio.to_thread(
-        roast_person,
-        api_key=cfg.openai_api_key,
-        model=cfg.openai_model,
-        target_name=requester,
-        lines=lines,
-    )
-
-    await respond(f"{roast}\n\n{COMMANDS_FOOTER}", delete_after=ROAST_DELETE_AFTER)
 
 
 async def _stats_catch_up(client, cfg, tz, level_announcement_queue=None, log=print) -> None:
@@ -1010,8 +921,7 @@ async def run_listener(
     # When a bot account (bot_listener.py) is configured, it takes over /summary entirely
     # -- this Telethon listener would otherwise also see and answer the same trigger
     # message, producing two replies. Save is unaffected: it only ever makes sense as
-    # *your own* account reposting to your own channel. Roast is off everywhere (see
-    # has_roast_keyword below), so it's not part of this handoff.
+    # *your own* account reposting to your own channel.
     bot_takeover = bool(cfg.telegram_bot_token)
     if bot_takeover:
         log("[listener] TELEGRAM_BOT_TOKEN is set -- /summary is handled by bot_listener.py instead of this account.")
@@ -1046,7 +956,7 @@ async def run_listener(
     # "joke" (joke.py) is the one feature nobody asks for -- it's fired autonomously off
     # recent chat activity instead of a keyword. Kept off unless explicitly enabled AND a
     # bot account is available to actually post it (jokes always go out via the bot, never
-    # this personal account, matching how summary/roast were moved over), AND at least one
+    # this personal account, matching how summary was moved over), AND at least one
     # chat is named in LISTENER_ALLOWED_CHATS -- unlike summary's "empty = respond
     # anywhere" fallback, something nobody asked for should never default to "everywhere".
     joke_enabled = joke_queue is not None and cfg.joke_enabled and bool(cfg.listener_allowed_chats)
@@ -1071,18 +981,8 @@ async def run_listener(
     joke_entry_to_chat: dict[str, int] = {}
     joke_reaction_watch: dict[tuple[int, int], float] = {}
 
-    # Roast confirm/react flow state, keyed by (chat_id, target_user_id):
-    # - roast_pending: confirmation prompt sent, awaiting a reaction from that user.
-    #   Value is (confirmation_message_id, original_trigger_text).
-    # - roast_in_progress: they reacted, generation is under way (until the reply is sent
-    #   or it errors out).
-    # Re-triggering "прожарь меня" while either is true doesn't restart anything -- it
-    # just reacts to the new message with ROAST_BUSY_EMOJI.
-    roast_pending: dict[tuple[int, int], tuple[int, str]] = {}
-    roast_in_progress: set[tuple[int, int]] = set()
-
-    # Save confirm/react flow state, keyed by (chat_id, confirm_message_id) -- unlike
-    # roast_pending, keyed directly by the confirmation message itself since a save
+    # Save confirm/react flow state, keyed by (chat_id, confirm_message_id) --
+    # keyed directly by the confirmation message itself since a save
     # only ever needs one pending confirmation per prompt (no "already pending for this
     # user" concept to track). Value carries what to repost once/if confirmed.
     save_pending: dict[tuple[int, int], dict] = {}
@@ -1459,10 +1359,6 @@ async def run_listener(
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
         has_summary_keyword = not bot_takeover and any(k in text_lower for k in cfg.listener_trigger_keywords)
-        # Roast ("прожарь меня") is turned off -- forced False rather than removing the
-        # surrounding roast_pending/on_reaction machinery below, so it stays a one-line
-        # revert if it's ever turned back on.
-        has_roast_keyword = False
 
         # Two more ways to ask for a summary without the exact trigger keyword: naming
         # you by first name alongside the word "summary" in one message, or replying to
@@ -1470,7 +1366,7 @@ async def run_listener(
         # bare word "summary" being present at all, so plain chat never pays for the
         # extra (async, for the reply case) checks below. Skipped entirely once the bot
         # account has taken over (see bot_takeover above).
-        if not bot_takeover and not has_summary_keyword and not has_roast_keyword and "summary" in text_lower:
+        if not bot_takeover and not has_summary_keyword and "summary" in text_lower:
             if my_first_name and my_first_name in text_lower:
                 has_summary_keyword = True
             elif msg.is_reply:
@@ -1478,35 +1374,20 @@ async def run_listener(
                 if replied is not None and replied.sender_id == me.id:
                     has_summary_keyword = True
 
-        if not has_summary_keyword and not has_roast_keyword:
+        if not has_summary_keyword:
             return
 
         chat = await event.get_chat()
         if not is_chat_allowed(chat):
             return
 
-        sender = await event.get_sender()
-        if has_roast_keyword:
-            roast_key = (event.chat_id, sender.id)
-            if roast_key in roast_pending or roast_key in roast_in_progress:
-                log(f"[listener] roast already pending/in-progress for {roast_key}, reacting instead of re-asking")
-                await react_emoji(event.chat_id, msg.id, ROAST_BUSY_EMOJI)
-                return
-
         try:
-            if has_roast_keyword:
-                confirm = await event.reply(ROAST_CONFIRM_TEXT)
-                if confirm is not None:
-                    sent_message_ids.add(confirm.id)
-                    roast_pending[(event.chat_id, sender.id)] = (confirm.id, text)
-                    log(f"[listener] sent roast confirmation to {sender_display_name(sender)} (msg {confirm.id})")
-            else:
-                await react_emoji(event.chat_id, msg.id, SUMMARY_ACK_EMOJI)
-                await summary_queue.put((event, chat, text))
-                log(
-                    f"[listener] queued request #{summary_queue.qsize()} from "
-                    f"'{getattr(chat, 'title', event.chat_id)}': {text!r}"
-                )
+            await react_emoji(event.chat_id, msg.id, SUMMARY_ACK_EMOJI)
+            await summary_queue.put((event, chat, text))
+            log(
+                f"[listener] queued request #{summary_queue.qsize()} from "
+                f"'{getattr(chat, 'title', event.chat_id)}': {text!r}"
+            )
         except Exception:
             log(f"[listener] error handling request:\n{traceback.format_exc()}")
             try:
@@ -1565,8 +1446,8 @@ async def run_listener(
     async def _maybe_dismiss_on_thumbs_up(chat_id, update):
         """Reacting DISMISS_EMOJI onto any message the bot (or this account) sent deletes
         it almost immediately -- a one-tap way to clean up a reply without hunting for a
-        message-specific control. Only ever called once save_pending/joke_reaction_watch/
-        roast_pending have all already passed on the reaction (see on_reaction), so it
+        message-specific control. Only ever called once save_pending/joke_reaction_watch
+        have already passed on the reaction (see on_reaction), so it
         never fights an in-progress confirm flow for the same message."""
         if DISMISS_EMOJI not in await _my_reaction_emoticons(chat_id, update):
             return
@@ -1603,8 +1484,7 @@ async def run_listener(
 
     # Reactions from a *user* account (not a bot) arrive as this raw update, carrying the
     # message's full new reaction state (not a per-reaction delta) -- used to confirm
-    # both the roast flow (did the person asked "точно хочешь прожарку?" react to that
-    # exact prompt) and the save flow (did *you* react to your own save confirmation).
+    # the save flow (did *you* react to your own save confirmation).
     @client.on(events.Raw(types=UpdateMessageReactions))
     async def on_reaction(update):
         try:
@@ -1667,54 +1547,7 @@ async def run_listener(
             await _maybe_dismiss_on_thumbs_up(chat_id, update)
             return
 
-        key = next(
-            (k for k, (mid, _) in roast_pending.items() if k[0] == chat_id and mid == update.msg_id), None
-        )
-        if key is None:
-            await _maybe_dismiss_on_thumbs_up(chat_id, update)
-            return  # not a reaction on a pending roast-confirmation message
-
-        _, target_user_id = key
-        reactor_ids = await _reactor_ids(chat_id, update)
-        if target_user_id not in reactor_ids:
-            return  # someone else reacted -- not the person who was actually asked
-
-        confirm_msg_id, original_text = roast_pending.pop(key)
-        roast_in_progress.add(key)
-        log(f"[listener] roast confirmed via reaction: chat={chat_id} user={target_user_id}")
-
-        async def _run():
-            try:
-                chat_entity = await client.get_entity(chat_id)
-                target_user = await client.get_entity(target_user_id)
-                await run_roast(
-                    client,
-                    chat_entity,
-                    target_user,
-                    confirm_msg_id,
-                    original_text,
-                    cfg,
-                    tz,
-                    sent_message_ids,
-                    schedule_delete,
-                    log=log,
-                )
-            except Exception:
-                log(f"[listener] error generating confirmed roast:\n{traceback.format_exc()}")
-                try:
-                    sent = await client.send_message(
-                        chat_id, "Что-то пошло не так при генерации прожарки.", reply_to=confirm_msg_id
-                    )
-                    if sent is not None:
-                        sent_message_ids.add(sent.id)
-                except Exception:
-                    pass
-            finally:
-                roast_in_progress.discard(key)
-
-        task = asyncio.create_task(_run())
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
+        await _maybe_dismiss_on_thumbs_up(chat_id, update)
 
     if joke_enabled:
         # Drains joke_posted_queue for the life of the process: bot_listener.py puts
@@ -1761,7 +1594,7 @@ async def run_listener(
     direct_reply_status = "off (disabled)" if bot_takeover else "off (no TELEGRAM_BOT_TOKEN)"
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
-        f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}; roast is off) "
+        f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
         f"Summary queue: FIFO, {cfg.summary_queue_delay_seconds}s between completed jobs. "
         f"Joke: {joke_status}. Direct bot replies: {direct_reply_status}. "

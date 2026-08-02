@@ -231,7 +231,11 @@ def summarize_transcript(
     topic_hint: str | None = None,
     length_hint: str | None = None,
     original_question: str | None = None,
-    max_chunk_tokens: int = 6000,
+    # See responder_v2.answer_request's identical parameter for the full rationale:
+    # gpt-5.4-mini's 400k-token context window comfortably fits even this chat's busiest
+    # observed day as a single chunk, skipping map-reduce (and the repeated system-prompt
+    # cost of each extra chunk) entirely rather than just shrinking it.
+    max_chunk_tokens: int = 200_000,
 ) -> str:
     if style not in VALID_STYLES:
         raise ChatSummaryError(f"Unknown summary style '{style}', expected one of {VALID_STYLES}.")

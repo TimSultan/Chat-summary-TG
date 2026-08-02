@@ -1,7 +1,7 @@
 """Generates a Russian-language painting critique of one member's own miniature, from
 the actual photo they posted under #япокрасил. Sold in the shop (see economy.py).
 
-Unlike joke.py/roast.py, which reason over text, this one needs the image itself -- a
+Unlike joke.py, which reasons over text, this one needs the image itself -- a
 critique written from a caption alone would be generic filler, which is exactly what the
 gamification plan warns cosmetic-feeling rewards degrade into. The photo is sent inline
 as a base64 data URL rather than a public link, because the source chat is private and
@@ -59,7 +59,7 @@ def critique_work(
     caption: str = "",
     mime_type: str = "image/jpeg",
 ) -> str:
-    """Blocking OpenAI call -- callers run it via asyncio.to_thread, same as roast_person.
+    """Blocking OpenAI call -- callers run it via asyncio.to_thread.
 
     `caption` is the poster's own text under the photo, passed as context only: it may
     say what the model is or what they were attempting, which makes the critique less

@@ -30,12 +30,10 @@ class Config:
     session_string: str | None
     openai_api_key: str
     openai_model: str
+    openai_routing_model: str
     listener_allowed_chats: list[str]
     listener_trigger_keywords: list[str]
     summary_queue_delay_seconds: int
-    roast_trigger_keywords: list[str]
-    roast_lookback_days: int
-    roast_max_messages: int
     save_trigger_keyword: str
     save_channel: str | None
     summary_pipeline_version: str
@@ -107,27 +105,6 @@ def load_config() -> Config:
     trigger_keywords = [k.strip().lower() for k in trigger_keywords_raw.split(",") if k.strip()]
     if not trigger_keywords:
         raise ChatSummaryError("LISTENER_TRIGGER_KEYWORDS must contain at least one keyword.")
-
-    roast_trigger_keywords_raw = os.getenv("ROAST_TRIGGER_KEYWORDS", "прожарь меня")
-    roast_trigger_keywords = [k.strip().lower() for k in roast_trigger_keywords_raw.split(",") if k.strip()]
-    if not roast_trigger_keywords:
-        raise ChatSummaryError("ROAST_TRIGGER_KEYWORDS must contain at least one keyword.")
-
-    roast_lookback_raw = os.getenv("ROAST_LOOKBACK_DAYS", "30")
-    try:
-        roast_lookback_days = int(roast_lookback_raw)
-    except ValueError:
-        raise ChatSummaryError(f"ROAST_LOOKBACK_DAYS must be a number, got '{roast_lookback_raw}'.")
-    if roast_lookback_days < 1:
-        raise ChatSummaryError(f"ROAST_LOOKBACK_DAYS must be >= 1, got {roast_lookback_days}.")
-
-    roast_max_messages_raw = os.getenv("ROAST_MAX_MESSAGES", "400")
-    try:
-        roast_max_messages = int(roast_max_messages_raw)
-    except ValueError:
-        raise ChatSummaryError(f"ROAST_MAX_MESSAGES must be a number, got '{roast_max_messages_raw}'.")
-    if roast_max_messages < 1:
-        raise ChatSummaryError(f"ROAST_MAX_MESSAGES must be >= 1, got {roast_max_messages}.")
 
     save_trigger_keyword = os.getenv("SAVE_TRIGGER_KEYWORD", "сохрани").strip().lower()
     if not save_trigger_keyword:
@@ -257,12 +234,13 @@ def load_config() -> Config:
         session_string=os.getenv("TELEGRAM_SESSION_STRING") or None,
         openai_api_key=openai_api_key,
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
+        # Structured JSON routing/classification calls (intent parsing, name matching)
+        # need little reasoning and have a tiny input, so they default to the cheapest
+        # tier instead of paying for the same model used for full-transcript generation.
+        openai_routing_model=os.getenv("OPENAI_ROUTING_MODEL", "gpt-5.4-nano"),
         listener_allowed_chats=[c.strip() for c in allowed_chats_raw.split(",") if c.strip()],
         listener_trigger_keywords=trigger_keywords,
         summary_queue_delay_seconds=summary_queue_delay_seconds,
-        roast_trigger_keywords=roast_trigger_keywords,
-        roast_lookback_days=roast_lookback_days,
-        roast_max_messages=roast_max_messages,
         save_trigger_keyword=save_trigger_keyword,
         save_channel=save_channel,
         summary_pipeline_version=summary_pipeline_version,

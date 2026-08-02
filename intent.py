@@ -196,6 +196,15 @@ def resolve_name_hint(api_key: str, model: str, hint: str, candidates: list[str]
     if not hint or not candidates:
         return None
 
+    # Skip the OpenAI call entirely when the hint is already an exact (case-insensitive)
+    # match for exactly one candidate -- common when someone types a real username or
+    # display name without the leading "@". Zero or multiple matches (ambiguous either
+    # way) still fall through to the LLM below.
+    hint_normalized = hint.strip().lower()
+    exact_matches = [c for c in candidates if c.strip().lower() == hint_normalized]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
     client = OpenAI(api_key=api_key)
     prompt = RESOLVE_USER_TEMPLATE.format(hint=hint, candidates=", ".join(candidates))
     try:

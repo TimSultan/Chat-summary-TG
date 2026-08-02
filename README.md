@@ -148,7 +148,6 @@ The timers (`listener.py`, top of file):
 | constant | delay | applies to |
 | --- | --- | --- |
 | `STATS_DELETE_AFTER` | 300 s (5 min) | `/top`, `/stat`, `/tree`, `/shop`, `/coins`, `/buy`, and their error notices |
-| `ROAST_DELETE_AFTER` | 600 s (10 min) | roast replies (the trigger is currently disabled) |
 | `ERROR_DELETE_AFTER` | 10 s | short rejection notices, such as the one-day limit |
 | `DISMISS_DELETE_AFTER` | 1 s | a 👍 on something the bot sent — a "get rid of this" tap |
 
@@ -164,47 +163,6 @@ Deleting someone else's message needs delete rights, so **the bot has to be an a
 the chat for the command half of the sweep to work. Without them, `deleteMessage` fails,
 `bot_api.delete_message` swallows the error, and the bot removes only its own reply —
 exactly the old behavior, never a crashed handler.
-
-### Roasting (`прожарь меня`) -- currently disabled
-
-The trigger is switched off (forced to never match, in both `listener.py` and
-`bot_listener.py`) rather than removed, so turning it back on is a one-line revert. The
-rest of this section describes how it behaves when enabled.
-
-A second trigger keyword (default `прожарь меня`, `ROAST_TRIGGER_KEYWORDS` in `.env`)
-roasts whoever sends it, in Russian, using **their own** messages from the last
-`ROAST_LOOKBACK_DAYS` days (default 30). It's a two-step, confirm-then-react flow rather
-than an immediate reply:
-
-```
-прожарь меня
-  -> bot replies "Ты точно хочешь прожарку? поставь реакцию для подтверждения"
-
-(you react to that prompt with any emoji)
-  -> pulls your own messages from the last 30 days (across each day's cached
-     transcript), sends them to OpenAI, and replies with a no-holds-barred 5-point
-     roast (Russian, swearing allowed) plus a punchline
-```
-
-Only a reaction from the **same person who was asked** counts -- someone else reacting
-to your confirmation prompt does nothing. If you send `прожарь меня` again while your
-previous request is still awaiting a reaction or already generating, the bot doesn't
-send another prompt -- it just reacts to your new message with ⏳ to show one's already
-in flight.
-
-It reuses the same per-day transcript cache as `/summary` (see caching below), so
-roasting doesn't re-fetch days already pulled for other requests. The same allowlist
-applies to its initial confirmation prompt. Unlike
-`/summary`, **the roast itself does not self-delete** -- it stays in the chat. If you
-have no messages in that window, it replies with a short "nothing to roast" notice
-instead of calling OpenAI.
-
-**On an active chat, generation itself can take a while.** Roasting map-reduces the
-transcript into ~6000-token chunks with one *sequential* OpenAI call per chunk, so an
-uncapped month of messages from a chatty poster can mean dozens of blocking calls before
-anything is sent -- with no "generating..." message in between, that looks like the bot
-hung. `ROAST_MAX_MESSAGES` (default 400) caps input to the requester's most recent N
-messages to keep this bounded; lower it for faster/cheaper roasts.
 
 ### Natural chat remarks -- off by default
 
@@ -832,10 +790,10 @@ The shop sells one thing:
 |---|---|---|
 | `title` Свой титул | 400 | Custom title under your name in `/stat` and the cabinet, 30 days |
 
-The roast, the work critique and the streak freeze were removed from the catalogue;
-their delivery code and the freeze machinery are left in place, so re-listing any of them
-is adding one `ShopItem` back — the same "disabled, not removed" convention the roast
-trigger and the XP cooldown already follow.
+The work critique and the streak freeze were removed from the catalogue; their delivery
+code and the freeze machinery are left in place, so re-listing either is adding one
+`ShopItem` back — the same "disabled, not removed" convention the XP cooldown already
+follows.
 
 Member-to-member transfers were removed too. **That took the economy's only always-on
 sink with it**: transfers used to burn 10% of every gift, and now the sole drain is a
@@ -1138,10 +1096,9 @@ generate a portable session first:
    step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
    warning above), `LISTENER_TRIGGER_KEYWORDS`, `SUMMARY_QUEUE_DELAY_SECONDS`,
-   `ROAST_TRIGGER_KEYWORDS`, `ROAST_LOOKBACK_DAYS`, `TELEGRAM_BOT_TOKEN` (if replies
-   should come from a bot account instead of this one -- see above), `JOKE_ENABLED` and
-   the other `JOKE_*` vars if you also want the occasional unprompted remark (off by
-   default; see Jokes above).
+   `TELEGRAM_BOT_TOKEN` (if replies should come from a bot account instead of this one --
+   see above), `JOKE_ENABLED` and the other `JOKE_*` vars if you also want the occasional
+   unprompted remark (off by default; see Jokes above).
 4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
    running.
 

@@ -401,7 +401,7 @@ class PreviewCallbackTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": _callback(preview.callback_data("rollcall"))},
                     self.api, None, None, None, None, 1, set(), asyncio.Queue(),
-                    {}, set(), set(), "chat", {}, {}, None, {}, {}, {},
+                    set(), "chat", {}, {}, None, {}, {}, {},
                     log=lambda *_: None,
                 )
 

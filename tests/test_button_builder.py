@@ -430,8 +430,6 @@ class BuilderFlowTests(unittest.TestCase):
             99,
             set(),
             asyncio.Queue(),
-            {},
-            set(),
             set(),
             ENTRY,
             {ENTRY: GROUP_CHAT},

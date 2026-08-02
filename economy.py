@@ -78,11 +78,11 @@ SHOP_ITEMS = (
     ),
 )
 
-# The roast, the work critique and the streak freeze were removed from the catalogue.
-# Their delivery code (see bot_listener._deliver_shop_item) and the freeze machinery
-# below are deliberately LEFT IN PLACE rather than deleted -- re-listing any of them is
-# adding one ShopItem back, the same "disabled, not removed" convention the roast trigger
-# and the XP cooldown already follow in this codebase.
+# The work critique and the streak freeze were removed from the catalogue. Their
+# delivery code (see bot_listener._deliver_shop_item) and the freeze machinery below are
+# deliberately LEFT IN PLACE rather than deleted -- re-listing either is adding one
+# ShopItem back, the same "disabled, not removed" convention the XP cooldown already
+# follows in this codebase.
 #
 # Consequence worth knowing: transfers used to burn TRANSFER_BURN_PERCENT of every gift
 # and were the economy's only always-on sink. With transfers gone and one rentable item
