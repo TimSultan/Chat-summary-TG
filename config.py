@@ -34,6 +34,8 @@ class Config:
     listener_allowed_chats: list[str]
     listener_trigger_keywords: list[str]
     summary_queue_delay_seconds: int
+    webapp_public_url: str | None
+    webapp_port: int
     save_trigger_keyword: str
     save_channel: str | None
     summary_pipeline_version: str
@@ -105,6 +107,25 @@ def load_config() -> Config:
     trigger_keywords = [k.strip().lower() for k in trigger_keywords_raw.split(",") if k.strip()]
     if not trigger_keywords:
         raise ChatSummaryError("LISTENER_TRIGGER_KEYWORDS must contain at least one keyword.")
+
+    # Public https:// origin this app is reachable at, used to build the Mini App link
+    # for /vote. Telegram will not open a Mini App over plain http or from an IP, so
+    # without a real domain here the voting button is simply not offered. PORT is set by
+    # the host (Railway does it automatically); the web server is off when unset locally.
+    webapp_public_url = (os.getenv("WEBAPP_PUBLIC_URL", "") or "").strip().rstrip("/") or None
+    if webapp_public_url and not webapp_public_url.startswith("https://"):
+        raise ChatSummaryError(
+            f"WEBAPP_PUBLIC_URL must start with https:// (Telegram refuses anything else), "
+            f"got '{webapp_public_url}'."
+        )
+
+    webapp_port_raw = os.getenv("PORT", "0")
+    try:
+        webapp_port = int(webapp_port_raw)
+    except ValueError:
+        raise ChatSummaryError(f"PORT must be a number, got '{webapp_port_raw}'.")
+    if webapp_port < 0 or webapp_port > 65535:
+        raise ChatSummaryError(f"PORT must be between 0 and 65535, got {webapp_port}.")
 
     save_trigger_keyword = os.getenv("SAVE_TRIGGER_KEYWORD", "сохрани").strip().lower()
     if not save_trigger_keyword:
@@ -241,6 +262,8 @@ def load_config() -> Config:
         listener_allowed_chats=[c.strip() for c in allowed_chats_raw.split(",") if c.strip()],
         listener_trigger_keywords=trigger_keywords,
         summary_queue_delay_seconds=summary_queue_delay_seconds,
+        webapp_public_url=webapp_public_url,
+        webapp_port=webapp_port,
         save_trigger_keyword=save_trigger_keyword,
         save_channel=save_channel,
         summary_pipeline_version=summary_pipeline_version,

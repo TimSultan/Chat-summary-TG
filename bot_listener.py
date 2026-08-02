@@ -30,6 +30,12 @@ Always uses the v2 pipeline (intent_v2 + responder_v2) regardless of
 SUMMARY_PIPELINE_VERSION, which only governs the older Telethon-listener code path kept
 for rollback/comparison -- see intent_v2.py's module docstring.
 
+/vote opens the weekly-contest voting Mini App (voting.py / vote_web.py) -- a real web
+page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
+and PORT are set (see run_bot_listener). "/vote собрать", DM-only and admin-only,
+(re-)scans #итогинедели posts into that poll; the page itself is where an administrator
+admits which nominations are votable and everyone else votes, once.
+
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
 session) -- or, more commonly, let listener.py's main() start this automatically
 alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
@@ -55,6 +61,8 @@ import history
 import poker
 import preview
 import stats
+import vote_web
+import voting
 from bot_api import CAPTION_LIMIT, TelegramBotAPI
 from config import build_session, load_config
 from critique import critique_work
@@ -170,6 +178,17 @@ SHOP_COMMANDS = ("/shop", "/buy", "/coins")
 
 CABINET_COMMAND = "/cabinet"
 
+# Opens the weekly-contest voting Mini App (voting.py / vote_web.py). Two spellings for
+# the same reason /plant has two: "/голосование" is what people type, "/vote" is what
+# Telegram can highlight and register in the menu.
+VOTE_COMMANDS = ("/vote", "/голосование")
+# Rebuilds the entry list from the last two days of #итогинедели posts. Admin-only and
+# separate from opening the page: collecting downloads every photo in every nomination,
+# which is slow enough that it must be something somebody asks for, not something that
+# happens each time a voter taps a button.
+VOTE_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
+VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
+
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
 # -- the point being that nobody has to know a command exists in order to use the bot.
 # Deliberately excludes the admin-only DM commands (/badge, /weekwinner, /deletepokras):
@@ -181,6 +200,7 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "shop", "description": "Магазин"},
     {"command": "coins", "description": "Мой баланс"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
+    {"command": "vote", "description": "Голосование за итоги недели"},
 )
 # Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
 # and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
@@ -194,6 +214,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "topall", "description": "Рейтинг чата"},
     {"command": "toppokras", "description": "Топ прокрастинаторов"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
+    {"command": "vote", "description": "Голосование за итоги недели"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -3303,6 +3324,126 @@ async def handle_tree_command(
         log(f"[bot_listener] failed to send the tree status:\n{traceback.format_exc()}")
 
 
+def _vote_page_url(cfg) -> str | None:
+    return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
+
+
+async def handle_vote_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/vote -- opens the weekly-contest voting Mini App, and (for an administrator, from a
+    DM) rebuilds the entry list with "/vote собрать".
+
+    The button differs by chat type because Telegram only allows a `web_app` button in a
+    private chat. In a group the same command therefore offers a plain link into the DM,
+    where the real Mini App button is waiting: the round trip is what buys a signed
+    identity, which is the whole basis for one-vote-per-person.
+    """
+    chat = message["chat"]
+    chat_id = chat["id"]
+    is_private = chat.get("type") == "private"
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            return await api.send_message(
+                chat_id, text, reply_to_message_id=message["message_id"],
+                parse_mode=None, reply_markup=reply_markup,
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to send the vote reply: {e}")
+            return None
+
+    page_url = _vote_page_url(cfg)
+    if not page_url:
+        await reply(
+            "Голосование не настроено: не задан WEBAPP_PUBLIC_URL (нужен https-адрес приложения)."
+        )
+        return
+    if not entry:
+        await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS) -- нечего выносить на голосование.")
+        return
+
+    argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
+    for spelling in VOTE_COMMANDS:
+        if argument.lower().startswith(spelling):
+            argument = argument[len(spelling):]
+            break
+    wants_collect = argument.strip().lower() in VOTE_COLLECT_WORDS
+
+    if wants_collect:
+        if not is_private:
+            await reply("Собрать заявки можно только в личке с ботом.")
+            return
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
+            await reply("Собирать заявки могут только администраторы.")
+            return
+
+        await reply("Собираю заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
+        # Keyed by ISO week, not by today's date: the admin may run "собрать" more than
+        # once over the days a vote is open (to pick up late entries), and each run must
+        # land in the SAME poll so votes already cast survive it -- a date-keyed id would
+        # silently start a fresh, empty poll the moment "today" rolled over.
+        iso_year, iso_week, _ = datetime.now(tz).isocalendar()
+        poll_id = f"{iso_year}-W{iso_week:02d}"
+        try:
+            entries = await voting.collect_entries(
+                client=telethon_client,
+                chat_ref=entry,
+                tz=tz,
+                media_dir=voting.media_path(entry, poll_id),
+                log=log,
+            )
+        except Exception:
+            log(f"[bot_listener] collecting vote entries failed:\n{traceback.format_exc()}")
+            await reply("Не получилось собрать заявки.")
+            return
+
+        poll = voting.build_poll(entry, poll_id, entries, existing=voting.load_poll(entry, poll_id))
+        voting.save_poll(poll)
+        log(f"[bot_listener] vote poll {poll_id}: {len(entries)} entries, {len(poll.approved)} admitted")
+        if not entries:
+            await reply("За сегодня и вчера постов с #итогинедели не нашлось.")
+            return
+        await reply(
+            f"Нашёл заявок: {len(entries)}. Открой голосование и отметь, какие работы допустить.",
+            reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+        )
+        return
+
+    if is_private:
+        await reply(
+            "Голосование за итоги недели:",
+            reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+        )
+        return
+
+    # In a group: a link into the DM, since a web_app button is private-chat only.
+    if not bot_username:
+        await reply("Открой голосование в личке с ботом.")
+        return
+    sent = await reply(
+        "Голосование за итоги недели -- открывается в личке с ботом:",
+        reply_markup={"inline_keyboard": [[
+            {"text": VOTE_OPEN_BUTTON_TEXT, "url": f"https://t.me/{bot_username}?start=vote"}
+        ]]},
+    )
+    if sent and "message_id" in sent:
+        schedule_bot_delete(
+            api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+            trigger_message_id=message["message_id"],
+        )
+
+
 async def handle_shop_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -3961,11 +4102,21 @@ async def _dispatch_update(
         known_chat_ids[matched_entry] = chat["id"]
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
-    if re.match(r"^/start(?:\s|$)", command_text, re.IGNORECASE):
-        # Where /stat's "Открыть личный кабинет" link lands (t.me/<bot>?start=cabinet),
-        # and the natural first thing a new member does anyway. Groups are ignored: a
-        # /start there is somebody's fat finger, not a request.
+    start_match = re.match(r"^/start(?:\s+(\S+))?\s*$", command_text, re.IGNORECASE)
+    if start_match:
+        # Where /stat's "Открыть личный кабинет" link (t.me/<bot>?start=cabinet) and the
+        # group /vote button's DM link (?start=vote) land, and the natural first thing a
+        # new member does anyway. Groups are ignored: a /start there is somebody's fat
+        # finger, not a request. Any payload other than "vote" -- including none at all --
+        # opens the cabinet, matching the old unconditional behavior.
         if chat.get("type") != "private":
+            return
+        if (start_match.group(1) or "").lower() == "vote":
+            await handle_vote_command(
+                api, telethon_client, cfg, tz, message,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
+                background_tasks, log=log,
+            )
             return
         await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
         return
@@ -4189,6 +4340,22 @@ async def _dispatch_update(
         task = asyncio.create_task(
             handle_shop_command(
                 api, telethon_client, cfg, tz, message, shop_text, shop_entry,
+                background_tasks, log=log,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/vote" / "/голосование" -- the weekly-contest voting Mini App (voting.py /
+    # vote_web.py). Same chat resolution as the stats commands.
+    if any(command_text.lower().startswith(c) for c in VOTE_COMMANDS):
+        vote_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if vote_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_vote_command(
+                api, telethon_client, cfg, tz, message, vote_entry, bot_username,
                 background_tasks, log=log,
             )
         )
@@ -4606,6 +4773,18 @@ async def run_bot_listener(
                 # dismissal while one is still pending.
                 schedule_bot_delete(api, chat_id, [message_id], DISMISS_DELETE_AFTER, log, background_tasks)
 
+        async def _is_vote_admin(user_id: int) -> bool:
+            """Who may admit nominations and see live counts on the voting page --
+            reuses the same "chat admin or delegate" rule as every other moderation
+            surface (_can_manage_chat), just with a fabricated `user` dict since all the
+            Mini App gives us is the id Telegram already verified."""
+            if not home_chat_ref:
+                return False
+            admin_chat_id = await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if admin_chat_id is None:
+                return False
+            return await _can_manage_chat(api, admin_chat_id, {"id": user_id}, home_chat_ref)
+
         tasks = [
             _poll_loop(),
             _consume_summaries(),
@@ -4619,6 +4798,15 @@ async def run_bot_listener(
             tasks.append(_consume_stats_digests())
         if dismiss_queue is not None:
             tasks.append(_consume_dismissals())
+        if cfg.webapp_port:
+            # PORT is set by the host (Railway does this automatically for any service
+            # with public networking on); off when running locally without it, same as
+            # every other optional piece here.
+            tasks.append(
+                vote_web.run_web_server(cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port, log=log)
+            )
+        else:
+            log("[bot_listener] PORT is not set -- the voting page is not being served.")
         await asyncio.gather(*tasks)
 
 

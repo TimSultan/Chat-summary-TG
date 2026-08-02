@@ -652,6 +652,41 @@ Both are bounded Bot API calls with an HTTP timeout, not the unbounded Telethon 
 made the rule necessary: the spinner can be slow, but it cannot hang forever. Every other
 poker button decides from disk and answers immediately.
 
+### `/vote` — voting on the week's #итогинедели posts
+
+A mobile-first voting page (`voting.py`, `vote_web.py`) opened as a **Telegram Mini App**
+from `/vote` (or `/голосование`) — a real web page that loads inside Telegram itself,
+identifying the viewer without a login. In a group the button links to the bot's DM
+instead, since Telegram only allows a Mini App button in a private chat; the round trip
+through the DM is what gets a signed identity to vote with.
+
+**One post is one entry**, not one message. A `#итогинедели` post that's several photos
+sent together (an album) is several Telegram messages sharing one `grouped_id` — usually
+only the first carries the caption/hashtag — so entries are built by grouping on that id
+first, then checking any message in the group for the hashtag. All photos in the group
+show on the card; the first one is the large one.
+
+**Collecting is manual, not automatic**: `/vote собрать` (DM, administrators only)
+re-scans today and yesterday for `#итогинедели` posts and downloads every attached photo.
+Re-collecting is safe to run repeatedly — it keeps whatever has already been admitted and
+voted on, only adding new nominations and dropping ones that no longer exist.
+
+**Moderation is the same page.** An administrator sees every nomination and a "допустить"
+toggle instead of a vote button, plus a live count on each card and a save action instead
+of a submit — nothing is shown to ordinary voters until an administrator has admitted it,
+so an unmoderated poll shows an empty page rather than everything anyone posted.
+
+**One ballot per person**: the page authenticates via Telegram's signed `initData`
+(`voting.verify_init_data`) — an HMAC over the payload Telegram itself attached when it
+opened the Mini App, keyed off the bot token — so a vote is tied to a real Telegram user
+id the server verified itself, not a cookie or an unauthenticated form. Voting again
+replaces the previous ballot rather than adding to it.
+
+Requires `WEBAPP_PUBLIC_URL` (a real `https://` domain — Telegram refuses to open a Mini
+App over plain http) and, on a host with no persistent disk by default, `DATA_DIR` on a
+Volume — see both in `.env.example`. Without `WEBAPP_PUBLIC_URL` set, `/vote` explains
+that the voting page isn't configured instead of offering a button that wouldn't open.
+
 ### Coins, the shop, and anti-farming
 
 Coins are a **real ledger** (`economy.py`), not the derived `xp // 10` display they used
