@@ -208,6 +208,12 @@ VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
 # whatever the admin says next in the DM.
 VOTE_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
 VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
+# Buttons on an administrator's bare-/vote status message for собрать/chat/очистить --
+# unlike "Открыть голосование"/"Модерация", those three are bot ACTIONS, not Mini App
+# pages, so they can't be a web_app button; tapping one runs the exact same code path as
+# typing the command (see handle_vote_action_callback), just via a synthetic message.
+VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
+VOTE_ACTIONS = {"collect": "/vote собрать", "chat": "/vote chat", "clear": "/vote очистить"}
 
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
 # -- the point being that nobody has to know a command exists in order to use the bot.
@@ -3439,6 +3445,70 @@ async def handle_vote_clear_callback(
         log(f"[bot_listener] failed to confirm the vote clear: {e}")
 
 
+def _vote_action_callback_data(action: str, chat_id, user_id) -> str:
+    return f"{VOTE_ACTION_CALLBACK_PREFIX}:{action}:{chat_id}:{user_id}"
+
+
+def _parse_vote_action_callback(data: str) -> tuple[str, int, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 4 or parts[0] != VOTE_ACTION_CALLBACK_PREFIX or parts[1] not in VOTE_ACTIONS:
+        return None
+    try:
+        return parts[1], int(parts[2]), int(parts[3])
+    except ValueError:
+        return None
+
+
+async def handle_vote_action_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """One button per subcommand on an administrator's bare-/vote status message
+    (собрать/chat/очистить -- "Открыть голосование"/"Модерация" are plain web_app
+    buttons, not callbacks, since those just open a page). Rather than duplicating
+    собрать/chat/очистить's logic here, this builds the same message shape
+    handle_vote_command already parses and hands it straight over -- the admin/DM gate,
+    the actual work, all of it, from one place."""
+    parsed = _parse_vote_action_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, chat_id, target_user_id = parsed
+
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    # собрать can take close to a minute -- answered immediately regardless of action, so
+    # the tap never sits spinning while handle_vote_command does the real (re-verified)
+    # admin check and the actual work in the background.
+    await api.answer_callback_query(callback["id"])
+
+    trigger = callback.get("message") or {}
+    synthetic_message = {
+        "message_id": trigger.get("message_id"),
+        "chat": {"id": chat_id, "type": "private"},
+        "from": clicker,
+        "text": VOTE_ACTIONS[action],
+    }
+    task = asyncio.create_task(
+        handle_vote_command(
+            api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+        )
+    )
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -3655,8 +3725,9 @@ async def handle_vote_command(
 
     # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
     # unless they specifically asked for "выбрать". An administrator's bare /vote is also
-    # a status/control panel: current standings plus the full command list, rather than
-    # just the vote button, since they're the one who has four subcommands to remember.
+    # a status/control panel: current standings, the full command list, and a button per
+    # command, rather than just the vote button, since they're the one who has four
+    # subcommands to remember.
     if is_private:
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
@@ -3670,12 +3741,31 @@ async def handle_vote_command(
                 "/vote chat — подготовить объявление с кнопкой\n"
                 "/vote очистить — очистить голосование"
             )
+            admin_user_id = user.get("id")
             await reply(
                 text,
-                reply_markup={"inline_keyboard": [[
-                    {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
-                    {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
-                ]]},
+                reply_markup={"inline_keyboard": [
+                    [
+                        {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
+                        {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
+                    ],
+                    [
+                        {
+                            "text": "🔄 Собрать заявки",
+                            "callback_data": _vote_action_callback_data("collect", chat_id, admin_user_id),
+                        },
+                        {
+                            "text": "📣 Объявление",
+                            "callback_data": _vote_action_callback_data("chat", chat_id, admin_user_id),
+                        },
+                    ],
+                    [
+                        {
+                            "text": "🗑 Очистить",
+                            "callback_data": _vote_action_callback_data("clear", chat_id, admin_user_id),
+                        },
+                    ],
+                ]},
             )
         else:
             await reply(
@@ -4414,6 +4504,11 @@ async def _dispatch_update(
             )
         elif callback_data.startswith(f"{VOTE_CLEAR_CALLBACK_PREFIX}:"):
             await handle_vote_clear_callback(api, cfg, tz, callback, home_chat_ref, log=log)
+        elif callback_data.startswith(f"{VOTE_ACTION_CALLBACK_PREFIX}:"):
+            await handle_vote_action_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
+                background_tasks, vote_chat_flows, log=log,
+            )
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner
             # doesn't hang forever on the client.

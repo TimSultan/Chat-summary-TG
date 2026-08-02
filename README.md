@@ -666,8 +666,11 @@ page that changes shape depending on who opens it:
 - **Bare `/vote`** opens the actual ballot, for **everyone including an administrator** —
   an admin is never forced into moderation just to cast their own vote. For an
   administrator specifically, it's also a status/control panel: current standings (how
-  many voted, the top 3 so far) plus the full command list and quick-open buttons for the
-  ballot and moderation, since remembering four subcommands is more friction than a menu.
+  many voted, the top 3 so far), the full command list, and a button for every one of
+  them — "Открыть голосование"/"Модерация" open the Mini App directly, while
+  "Собрать заявки"/"Объявление"/"Очистить" run the exact same code path as typing the
+  command (`handle_vote_action_callback` builds a synthetic message and hands it straight
+  to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
 - **`/vote собрать`** (DM, administrators only) scans today and yesterday for
   `#итогинедели` posts and adds any that aren't already in the poll. Already-known
   entries are left alone entirely — no re-fetch, no re-resolving who posted them, no
