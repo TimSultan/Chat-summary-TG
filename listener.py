@@ -65,7 +65,13 @@ EXPLICIT_TIME_RE = re.compile(
 # Appended to every successful summary reply so people re-discover the available commands
 # without having to ask -- not shown on short rejection/error notices, which already
 # explain themselves and self-delete fast.
-COMMANDS_FOOTER = "Список команд - summary + время или юзер"
+COMMANDS_FOOTER = (
+    "Список команд:\n"
+    "/summary + время, юзер, вопрос\n"
+    "/tree наше ЕЧХ дерево\n"
+    "/stat @user - статистика пользователя\n"
+    "/stat pokras - список лентяев"
+)
 
 # Only ever answer about one specific day at a time -- multi-day ranges (a whole week,
 # etc.) are refused outright rather than processed, to keep replies cheap and the chat
