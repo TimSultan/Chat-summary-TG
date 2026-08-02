@@ -33,9 +33,10 @@ for rollback/comparison -- see intent_v2.py's module docstring.
 /vote opens the weekly-contest voting Mini App (voting.py / vote_web.py) -- a real web
 page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
 and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for everyone,
-including an admin -- "/vote выбрать" (DM, admin-only) is the separate moderation screen,
-"/vote собрать" (DM, admin-only) (re-)scans #итогинедели posts into the poll, and
-"/vote очистить" (DM, admin-only, tap-to-confirm) deletes it outright. See
+including an admin (also a status/control panel for one); "/vote выбрать" (DM, admin-only)
+is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans
+#итогинедели posts into the poll; "/vote очистить" (DM, admin-only, tap-to-confirm)
+deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement. See
 handle_vote_command's docstring.
 
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
@@ -200,6 +201,13 @@ VOTE_MODERATE_WORDS = frozenset({"выбрать", "модерация", "modera
 VOTE_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
 VOTE_CLEAR_CALLBACK_PREFIX = "voteclear"
 VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
+# "/vote chat" -- drafts an announcement (custom text + the vote button) for posting
+# somewhere. Asks for the text via the same force-reply convention as every other
+# short text-entry flow in this file (badge_flows, cabinet_flows), rather than trying to
+# read a message-after-the-command, since that has no natural end and would swallow
+# whatever the admin says next in the DM.
+VOTE_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
+VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
 
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
 # -- the point being that nobody has to know a command exists in order to use the bot.
@@ -3340,6 +3348,38 @@ def _vote_page_url(cfg) -> str | None:
     return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
 
 
+_VOTE_MEDALS = ("🥇", "🥈", "🥉")
+
+
+def _vote_who(entry) -> str:
+    return f"{entry.author_name} (@{entry.author_username})" if entry.author_username else entry.author_name
+
+
+def _vote_status_text(entry: str) -> str:
+    """The "current standings" block shared by an administrator's bare /vote status
+    message and (implicitly, via the same shape) the winner announcement -- top 3 with
+    medals, or an explanation of why there's nothing to show yet."""
+    poll = voting.latest_poll(entry)
+    if poll is None:
+        return "Голосование ещё не создано."
+    lines = [f"Проголосовало: {len(poll.votes)} чел. · {'открыто' if poll.open else 'закрыто'}"]
+    top = poll.tally()[:3]
+    # poll.tally() lists every APPROVED entry, zero-vote ones included -- so "top" alone
+    # doesn't mean anyone actually voted, only that something was admitted.
+    if top and top[0][1] > 0:
+        lines.append("")
+        lines.append("Топ сейчас:" if poll.open else "Топ:")
+        for medal, (e, v) in zip(_VOTE_MEDALS, top):
+            if v <= 0:
+                break  # don't pad the top with zero-vote entries just to reach 3
+            lines.append(f"{medal} {_vote_who(e)} — {v} голосов")
+    elif poll.approved:
+        lines.append("Пока никто не проголосовал.")
+    else:
+        lines.append("Работы ещё не допущены к голосованию -- /vote выбрать.")
+    return "\n".join(lines)
+
+
 def _current_vote_poll_id(tz) -> str:
     """Keyed by ISO week, not by today's date: собрать/выбрать/очистить all need to agree
     on which poll "this week" refers to regardless of which day of the week they're run,
@@ -3410,21 +3450,30 @@ async def handle_vote_command(
     background_tasks: set,
     log=print,
     forced_mode: str | None = None,
+    vote_chat_flows: dict[str, dict] | None = None,
 ) -> None:
-    """Four distinct things live behind /vote, deliberately kept apart rather than one
+    """Five distinct things live behind /vote, deliberately kept apart rather than one
     page that changes shape depending who opens it:
 
     - "/vote собрать" (DM, admin-only) rebuilds the entry list from #итогинедели posts.
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
+    - "/vote chat" (DM, admin-only) drafts an announcement -- asks for the text via a
+      force-reply, then sends that text plus the vote button, for now into the same DM
+      (see handle_vote_chat_text_input).
     - bare "/vote" opens the actual ballot, for EVERYONE including an administrator --
-      an admin is never forced into moderation mode just to cast their own vote.
+      an admin is never forced into moderation mode just to cast their own vote. For an
+      administrator specifically, it's also a status/control panel: current standings
+      plus the full command list, since remembering four subcommands is more friction
+      than a menu.
 
-    `forced_mode` ("moderate" or "clear") is set by the /start deep-link an admin-only
-    group message hands out for "выбрать"/"очистить", bypassing the usual text parsing
-    since a /start payload never carries the Russian word itself (see VOTE_MODERATE_WORDS/
-    VOTE_CLEAR_WORDS below).
+    `forced_mode` ("moderate", "clear", or "chat") is set by the /start deep-link an
+    admin-only group message hands out for "выбрать"/"очистить"/"chat", bypassing the
+    usual text parsing since a /start payload never carries the Russian word itself (see
+    VOTE_MODERATE_WORDS/VOTE_CLEAR_WORDS/VOTE_CHAT_WORDS below). `vote_chat_flows` is
+    required for "/vote chat" to have anywhere to remember it's waiting for text; every
+    other subcommand ignores it.
 
     Every web_app button differs by chat type because Telegram only allows one in a
     private chat. In a group the same command therefore offers a plain link into the DM,
@@ -3457,9 +3506,11 @@ async def handle_vote_command(
         return
 
     if forced_mode == "moderate":
-        wants_collect, wants_moderate, wants_clear = False, True, False
+        wants_collect, wants_moderate, wants_clear, wants_chat = False, True, False, False
     elif forced_mode == "clear":
-        wants_collect, wants_moderate, wants_clear = False, False, True
+        wants_collect, wants_moderate, wants_clear, wants_chat = False, False, True, False
+    elif forced_mode == "chat":
+        wants_collect, wants_moderate, wants_clear, wants_chat = False, False, False, True
     else:
         argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
         for spelling in VOTE_COMMANDS:
@@ -3470,16 +3521,21 @@ async def handle_vote_command(
         wants_collect = normalized in VOTE_COLLECT_WORDS
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
+        wants_chat = normalized in VOTE_CHAT_WORDS
 
     async def require_admin_in_dm(denial: str) -> bool:
-        """Common gate for собрать/выбрать/очистить: DM only, admin only. Returns whether
-        the caller passed; the group-vs-DM split lives here once instead of being repeated
-        for all three admin-only subcommands."""
+        """Common gate for собрать/выбрать/очистить/chat: DM only, admin only. Returns
+        whether the caller passed; the group-vs-DM split lives here once instead of being
+        repeated for all four admin-only subcommands."""
         if not is_private:
             if not bot_username:
                 await reply("Открой в личке с ботом.")
                 return False
-            start_payload = "vote_admin" if wants_moderate else "vote_clear" if wants_clear else None
+            start_payload = (
+                "vote_admin" if wants_moderate else
+                "vote_clear" if wants_clear else
+                "vote_chat" if wants_chat else None
+            )
             url = f"https://t.me/{bot_username}" + (f"?start={start_payload}" if start_payload else "")
             await reply(
                 "Это только в личке с ботом:",
@@ -3551,13 +3607,68 @@ async def handle_vote_command(
         )
         return
 
-    # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
-    # unless they specifically asked for "выбрать".
-    if is_private:
-        await reply(
-            "Голосование за итоги недели:",
-            reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+    if wants_chat:
+        if not await require_admin_in_dm("Готовить объявление могут только администраторы."):
+            return
+        if vote_chat_flows is None:
+            await reply("Не получилось открыть черновик объявления -- попробуй ещё раз.")
+            return
+        # One pending draft per (chat, admin) at a time -- starting a new one abandons
+        # whatever text prompt was already waiting, rather than accumulating stale flows
+        # nobody will ever reply to.
+        for old_flow_id, old_flow in list(vote_chat_flows.items()):
+            if old_flow.get("chat_id") == chat_id and old_flow.get("user_id") == user.get("id"):
+                vote_chat_flows.pop(old_flow_id, None)
+        flow_id = uuid.uuid4().hex[:10]
+        prompt = await reply(
+            "Какой текст написать в объявлении о голосовании? Ответь на это сообщение.",
+            reply_markup={"force_reply": True, "selective": True},
         )
+        if prompt is None:
+            return
+        vote_chat_flows[flow_id] = {
+            "chat_id": chat_id,
+            "user_id": user.get("id"),
+            "entry": entry,
+            # Resolved again (require_admin_in_dm's own lookup isn't exposed) so the
+            # consuming side (handle_vote_chat_text_input) can re-check admin status
+            # without needing the Telethon client at all -- same "store what you'll need
+            # to re-verify" convention badge_flows/cabinet_flows already follow.
+            "admin_chat_id": await _resolve_chat_id(telethon_client, entry, {}, log=log),
+            "prompt_message_id": prompt.get("message_id") if prompt else None,
+            "created_at": time.monotonic(),
+        }
+        return
+
+    # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
+    # unless they specifically asked for "выбрать". An administrator's bare /vote is also
+    # a status/control panel: current standings plus the full command list, rather than
+    # just the vote button, since they're the one who has four subcommands to remember.
+    if is_private:
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
+        if is_manager:
+            text = (
+                f"{_vote_status_text(entry)}\n\n"
+                "Команды:\n"
+                "/vote — открыть бюллетень (проголосовать)\n"
+                "/vote выбрать — модерация заявок\n"
+                "/vote собрать — собрать новые заявки\n"
+                "/vote chat — подготовить объявление с кнопкой\n"
+                "/vote очистить — очистить голосование"
+            )
+            await reply(
+                text,
+                reply_markup={"inline_keyboard": [[
+                    {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
+                    {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
+                ]]},
+            )
+        else:
+            await reply(
+                "Голосование за итоги недели:",
+                reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+            )
         return
 
     # In a group: a link into the DM, since a web_app button is private-chat only.
@@ -3575,6 +3686,80 @@ async def handle_vote_command(
             api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
             trigger_message_id=message["message_id"],
         )
+
+
+async def handle_vote_chat_text_input(
+    api: TelegramBotAPI,
+    cfg,
+    message: dict,
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consumes "/vote chat"'s force-reply and sends the finished announcement -- the
+    admin's own text, plus the vote button -- into the same DM the draft was started in
+    (see handle_vote_command's docstring: posting it into the actual group chat is a
+    manual copy-paste away until that's wired up directly).
+
+    Returns True once this message belonged to a pending draft, so the caller stops
+    treating it as ordinary chat input -- same contract as handle_badge_text_input/
+    handle_cabinet_text_input/handle_button_builder_text_input.
+    """
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    replied_to = (message.get("reply_to_message") or {}).get("message_id")
+    found = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in vote_chat_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") == replied_to
+            and time.monotonic() - flow["created_at"] <= VOTE_CHAT_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if found is None:
+        return False
+    flow_id, flow = found
+    vote_chat_flows.pop(flow_id, None)
+
+    text = (message.get("text") or "").strip()
+    if text.lower() in ("/cancel", "отмена"):
+        await api.send_message(
+            chat_id, "Черновик отменён.", reply_to_message_id=message["message_id"], parse_mode=None
+        )
+        return True
+    if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
+        return True  # silently dropped, same as badge_flows -- admin status changed mid-flow
+    if not text:
+        await api.send_message(
+            chat_id, "Пустой текст -- объявление не отправлено.",
+            reply_to_message_id=message["message_id"], parse_mode=None,
+        )
+        return True
+
+    page_url = _vote_page_url(cfg)
+    if not page_url:
+        await api.send_message(
+            chat_id, "Голосование не настроено -- некуда вести кнопку.",
+            reply_to_message_id=message["message_id"], parse_mode=None,
+        )
+        return True
+
+    try:
+        await api.send_message(
+            chat_id, text, parse_mode=None,
+            reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to send the vote chat announcement: {e}")
+        await api.send_message(
+            chat_id, "Не получилось отправить объявление.",
+            reply_to_message_id=message["message_id"], parse_mode=None,
+        )
+        return True
+    log(f"[bot_listener] {actor.get('username') or actor.get('id')} sent a vote announcement ({len(text)} chars)")
+    return True
 
 
 async def handle_shop_command(
@@ -4169,6 +4354,7 @@ async def _dispatch_update(
     cabinet_flows: dict[str, dict],
     menu_last_sent: dict,
     button_builder_flows: dict[str, dict] | None = None,
+    vote_chat_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -4181,6 +4367,7 @@ async def _dispatch_update(
     can't take the rest of the process down with it -- run_bot_listener's own try/except
     around this call is strictly a last-resort backstop, not the primary safety net."""
     button_builder_flows = button_builder_flows if button_builder_flows is not None else {}
+    vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
@@ -4240,21 +4427,22 @@ async def _dispatch_update(
     start_match = re.match(r"^/start(?:\s+(\S+))?\s*$", command_text, re.IGNORECASE)
     if start_match:
         # Where /stat's "Открыть личный кабинет" link (t.me/<bot>?start=cabinet) and the
-        # group /vote buttons' DM links (?start=vote, ?start=vote_admin, ?start=vote_clear)
-        # land, and the natural first thing a new member does anyway. Groups are ignored: a
+        # group /vote buttons' DM links (?start=vote, ?start=vote_admin, ?start=vote_clear,
+        # ?start=vote_chat) land, and the natural first thing a new member does anyway.
+        # Groups are ignored: a
         # /start there is somebody's fat finger, not a request. Any payload other than the
         # vote ones -- including none at all -- opens the cabinet, matching the old
         # unconditional behavior.
         if chat.get("type") != "private":
             return
         start_payload = (start_match.group(1) or "").lower()
-        if start_payload in ("vote", "vote_admin", "vote_clear"):
-            forced_mode = {"vote_admin": "moderate", "vote_clear": "clear"}.get(start_payload)
+        if start_payload in ("vote", "vote_admin", "vote_clear", "vote_chat"):
+            forced_mode = {"vote_admin": "moderate", "vote_clear": "clear", "vote_chat": "chat"}.get(start_payload)
             await handle_vote_command(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
                 background_tasks, log=log,
-                forced_mode=forced_mode,
+                forced_mode=forced_mode, vote_chat_flows=vote_chat_flows,
             )
             return
         await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)
@@ -4448,6 +4636,11 @@ async def _dispatch_update(
     ):
         return
 
+    if await handle_vote_chat_text_input(
+        api, cfg, message, vote_chat_flows, log=log
+    ):
+        return
+
     # "пошути"/"пошути превью" (see JOKE_PREVIEW_* constants) only ever fires from a DM to
     # the bot, per JOKE_MANUAL_TRIGGER_KEYWORD's own docs -- checked before has_summary
     # since it's a wholly separate trigger with its own keyword(s). The longer
@@ -4495,7 +4688,7 @@ async def _dispatch_update(
         task = asyncio.create_task(
             handle_vote_command(
                 api, telethon_client, cfg, tz, message, vote_entry, bot_username,
-                background_tasks, log=log,
+                background_tasks, log=log, vote_chat_flows=vote_chat_flows,
             )
         )
         background_tasks.add(task)
@@ -4773,6 +4966,10 @@ async def run_bot_listener(
     # Short-lived /buttons conversations. Published posts and their counters are
     # persisted separately by stats.py; only the unfinished constructor lives here.
     button_builder_flows: dict[str, dict] = {}
+    # Short-lived "/vote chat" draft-text prompts. The finished announcement itself is
+    # just sent, not persisted anywhere -- losing this on a restart costs the admin one
+    # re-press, same as every other force-reply flow here.
+    vote_chat_flows: dict[str, dict] = {}
     # Last time the fallback menu was sent per DM chat_id, so a burst of messages
     # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
     menu_last_sent: dict[int, float] = {}
@@ -4826,7 +5023,7 @@ async def run_bot_listener(
                             summary_queue, background_tasks, home_chat_ref,
                             known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
                             cabinet_flows, menu_last_sent,
-                            button_builder_flows=button_builder_flows, log=log,
+                            button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows, log=log,
                         ),
                         update.get("update_id"),
                         log=log,
@@ -4925,11 +5122,6 @@ async def run_bot_listener(
                 return False
             return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
 
-        _VOTE_MEDALS = ("🥇", "🥈", "🥉")
-
-        def _vote_who(entry) -> str:
-            return f"{entry.author_name} (@{entry.author_username})" if entry.author_username else entry.author_name
-
         async def _announce_vote_winner(user: dict, poll, top: list) -> None:
             """Sends the winner announcement -- for now into the admin's own DM with the
             bot (the same chat the Mini App was opened from), not the group. `user` is
@@ -4946,6 +5138,8 @@ async def run_bot_listener(
 
             lines = [f"🏆 Итоги голосования за {poll.entry}"]
             for medal, (entry, votes) in zip(_VOTE_MEDALS, top):
+                if votes <= 0:
+                    break  # don't pad the runners-up with entries nobody voted for
                 lines.append("")
                 lines.append(f"{medal} {_vote_who(entry)} — {votes} голосов")
                 if entry is winner_entry and entry.text:

@@ -660,11 +660,14 @@ login. In a group every subcommand's button links to the bot's DM instead, since
 only allows a Mini App button in a private chat; the round trip through the DM is what
 gets a signed identity to vote with.
 
-Three distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
+Five distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
 page that changes shape depending on who opens it:
 
 - **Bare `/vote`** opens the actual ballot, for **everyone including an administrator** —
-  an admin is never forced into moderation just to cast their own vote.
+  an admin is never forced into moderation just to cast their own vote. For an
+  administrator specifically, it's also a status/control panel: current standings (how
+  many voted, the top 3 so far) plus the full command list and quick-open buttons for the
+  ballot and moderation, since remembering four subcommands is more friction than a menu.
 - **`/vote собрать`** (DM, administrators only) re-scans today and yesterday for
   `#итогинедели` posts and downloads every attached photo. Re-collecting is safe to run
   repeatedly — it keeps whatever has already been admitted and voted on, only adding new
@@ -681,6 +684,11 @@ page that changes shape depending on who opens it:
   next `/vote собрать` then starts a genuinely fresh poll rather than resetting the old
   one in place. The moderation screen has the same action as a button
   ("🗑 Очистить голосование"), also behind its own confirmation.
+- **`/vote chat`** (DM, administrators only) drafts an announcement: asks for the text via
+  a force-reply (same convention as every other short text prompt in this bot -- badge
+  creation, cabinet's title/coin entry), then sends that text plus the vote button. For
+  now that goes into the same DM the draft was written in, not the group -- posting it
+  into the chat itself is a manual copy-paste away until that's wired up directly.
 
 Which of these opens is decided server-side by a `?mode=admin` marker on the page's own
 URL, checked against a real admin lookup on every request (`handle_poll`) -- not by trusting
