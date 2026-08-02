@@ -668,10 +668,14 @@ page that changes shape depending on who opens it:
   administrator specifically, it's also a status/control panel: current standings (how
   many voted, the top 3 so far) plus the full command list and quick-open buttons for the
   ballot and moderation, since remembering four subcommands is more friction than a menu.
-- **`/vote собрать`** (DM, administrators only) re-scans today and yesterday for
-  `#итогинедели` posts and downloads every attached photo. Re-collecting is safe to run
-  repeatedly — it keeps whatever has already been admitted and voted on, only adding new
-  nominations and dropping ones that no longer exist.
+- **`/vote собрать`** (DM, administrators only) scans today and yesterday for
+  `#итогинедели` posts and adds any that aren't already in the poll. Already-known
+  entries are left alone entirely — no re-fetch, no re-resolving who posted them, no
+  re-downloading their photos — so re-collecting a poll that already has a dozen entries
+  costs only whatever's actually new, and never re-touches what's already been admitted
+  or voted on. The tradeoff: a post that gets deleted from the chat after being collected
+  stays in the poll (nothing re-checks it) — un-admitting it by hand in
+  `/vote выбрать` is the way to drop it.
 - **`/vote выбрать`** (DM, administrators only) opens the moderation screen: every
   nomination (not just admitted ones), an "допустить" toggle instead of a vote button, a
   live count **and a proportional bar, relative to the current leader** on each card, and

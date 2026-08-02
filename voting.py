@@ -129,10 +129,19 @@ async def collect_entries(
     media_dir: Path,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     hashtag: str = CONTEST_HASHTAG,
+    skip_entry_ids=frozenset(),
     log=print,
 ) -> list[Entry]:
     """Reads the last `lookback_days` calendar days of `chat_ref` and returns one Entry per
-    nominated post, downloading every attached photo into `media_dir`.
+    NEWLY found nominated post, downloading every attached photo into `media_dir`.
+
+    `skip_entry_ids` -- entry ids (message ids, as strings) already known from a previous
+    collection -- are recognized from the message listing alone (needed either way, to
+    find anything new) but never resolved further: no get_sender() round trip, no photo
+    download, no Entry built. Re-collecting a poll that already has a dozen entries would
+    otherwise redo all of that work for every one of them just to end up with the same
+    Entry again. The caller is responsible for keeping those already-known entries around
+    (see bot_listener.handle_vote_command) -- this function only ever reports what's new.
 
     Uses the Telethon session directly rather than telegram_fetch's cache: that cache
     stores plain text dicts, and this needs the media and the grouped_id, neither of which
@@ -161,8 +170,12 @@ async def collect_entries(
 
     media_dir.mkdir(parents=True, exist_ok=True)
     entries: list[Entry] = []
+    skipped = 0
     for group in groups:
         head = group[0]
+        if str(head.id) in skip_entry_ids:
+            skipped += 1
+            continue
         sender = await head.get_sender()
         files: list[str] = []
         for index, message in enumerate(group):
@@ -193,6 +206,7 @@ async def collect_entries(
                 posted_at=head.date.astimezone(tz).isoformat(),
             )
         )
+    log(f"[voting] {len(entries)} new entr{'y' if len(entries) == 1 else 'ies'}, {skipped} already known -- skipped")
     return entries
 
 

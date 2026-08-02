@@ -7,6 +7,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,45 @@ BOT_TOKEN = "123456:FAKE-TOKEN-FOR-TESTS"
 
 def _msg(id, text="", grouped_id=None):
     return SimpleNamespace(id=id, text=text, grouped_id=grouped_id)
+
+
+class _FakeMessage:
+    """Just enough of a Telethon Message for collect_entries: an id/text/grouped_id/date
+    to group and filter by, a `photo` truthy flag, and an async get_sender() that records
+    into `resolved` -- how the tests confirm a SKIPPED (already-known) entry never gets
+    this far."""
+
+    def __init__(self, id, text="", grouped_id=None, date=None, photo=True, sender_id=1, resolved=None):
+        self.id = id
+        self.text = text
+        self.grouped_id = grouped_id
+        self.date = date or datetime.now(timezone.utc)
+        self.photo = photo
+        self.action = None
+        self._sender = SimpleNamespace(id=sender_id, username=f"user{sender_id}")
+        self._resolved = resolved if resolved is not None else []
+
+    async def get_sender(self):
+        self._resolved.append(self.id)
+        return self._sender
+
+
+class _FakeClient:
+    """Just enough of a Telethon client for collect_entries -- newest-first message
+    listing (matching real iter_messages(reverse=False)) and a download that only ever
+    writes a marker file, tracking which message ids it was actually asked to touch."""
+
+    def __init__(self, messages):
+        self._messages = messages
+        self.downloads: list[int] = []
+
+    async def iter_messages(self, entity, reverse=False):
+        for message in self._messages:
+            yield message
+
+    async def download_media(self, message, file=None):
+        self.downloads.append(message.id)
+        Path(file).write_bytes(b"fake-photo")
 
 
 def _sign_init_data(fields: dict, bot_token: str = BOT_TOKEN) -> str:
@@ -73,6 +113,56 @@ class GroupIntoEntriesTests(unittest.TestCase):
     def test_clean_caption_strips_the_hashtag_but_keeps_the_rest(self):
         group = [_msg(1, "моя работа #итогинедели  на этой неделе")]
         self.assertEqual(voting._clean_caption(group), "моя работа на этой неделе")
+
+
+class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
+    """collect_entries against a fake Telethon client -- in particular, that
+    skip_entry_ids actually skips resolving/downloading already-known entries rather
+    than just filtering the result afterwards."""
+
+    async def asyncSetUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.media_dir = Path(self._temporary.name) / "media"
+        self.resolved: list[int] = []
+
+    async def asyncTearDown(self):
+        self._temporary.cleanup()
+
+    def _messages(self, *ids):
+        return [
+            _FakeMessage(i, text="работа #итогинедели", resolved=self.resolved)
+            for i in ids
+        ]
+
+    async def test_a_first_collection_resolves_and_downloads_everything_found(self):
+        client = _FakeClient(self._messages(1, 2))
+        entries = await voting.collect_entries(client, object(), timezone.utc, self.media_dir, log=lambda *_: None)
+        self.assertEqual({e.entry_id for e in entries}, {"1", "2"})
+        self.assertEqual(sorted(self.resolved), [1, 2])
+        self.assertEqual(sorted(client.downloads), [1, 2])
+
+    async def test_already_known_entries_are_never_resolved_or_downloaded(self):
+        client = _FakeClient(self._messages(1, 2, 3))
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir,
+            skip_entry_ids={"1", "2"}, log=lambda *_: None,
+        )
+        # Only the genuinely new one comes back...
+        self.assertEqual([e.entry_id for e in entries], ["3"])
+        # ...and the known ones never even had get_sender()/download_media called on them
+        # -- that's the whole point, not just that they're filtered from the result.
+        self.assertEqual(self.resolved, [3])
+        self.assertEqual(client.downloads, [3])
+
+    async def test_nothing_new_means_an_empty_list_not_an_error(self):
+        client = _FakeClient(self._messages(1, 2))
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir,
+            skip_entry_ids={"1", "2"}, log=lambda *_: None,
+        )
+        self.assertEqual(entries, [])
+        self.assertEqual(self.resolved, [])
+        self.assertEqual(client.downloads, [])
 
 
 class InitDataTests(unittest.TestCase):

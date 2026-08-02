@@ -3455,7 +3455,8 @@ async def handle_vote_command(
     """Five distinct things live behind /vote, deliberately kept apart rather than one
     page that changes shape depending who opens it:
 
-    - "/vote собрать" (DM, admin-only) rebuilds the entry list from #итогинедели posts.
+    - "/vote собрать" (DM, admin-only) adds newly posted #итогинедели entries to the
+      list -- already-known ones are left alone, not re-fetched or re-processed.
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
@@ -3552,14 +3553,17 @@ async def handle_vote_command(
         if not await require_admin_in_dm("Собирать заявки могут только администраторы."):
             return
 
-        await reply("Собираю заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
+        await reply("Собираю новые заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
         poll_id = _current_vote_poll_id(tz)
+        existing_poll = voting.load_poll(entry, poll_id)
+        known_ids = {e.entry_id for e in existing_poll.entries} if existing_poll else set()
         try:
-            entries = await voting.collect_entries(
+            new_entries = await voting.collect_entries(
                 client=telethon_client,
                 chat_ref=entry,
                 tz=tz,
                 media_dir=voting.media_path(entry, poll_id),
+                skip_entry_ids=known_ids,
                 log=log,
             )
         except Exception:
@@ -3567,14 +3571,23 @@ async def handle_vote_command(
             await reply("Не получилось собрать заявки.")
             return
 
-        poll = voting.build_poll(entry, poll_id, entries, existing=voting.load_poll(entry, poll_id))
+        # Already-known entries are carried over as-is, not re-fetched -- collect_entries
+        # only ever resolves and returns what's new (see its docstring). Concatenating
+        # rather than replacing is what makes build_poll's "known" set include them, so
+        # their admitted/vote state survives untouched.
+        all_entries = (existing_poll.entries if existing_poll else []) + new_entries
+        poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll)
         voting.save_poll(poll)
-        log(f"[bot_listener] vote poll {poll_id}: {len(entries)} entries, {len(poll.approved)} admitted")
-        if not entries:
+        log(f"[bot_listener] vote poll {poll_id}: {len(all_entries)} entries ({len(new_entries)} new), {len(poll.approved)} admitted")
+        if not all_entries:
             await reply("За сегодня и вчера постов с #итогинедели не нашлось.")
             return
+        summary = (
+            f"Новых заявок: {len(new_entries)} (всего {len(all_entries)})." if new_entries
+            else f"Новых заявок нет (всего {len(all_entries)})."
+        )
         await reply(
-            f"Нашёл заявок: {len(entries)}. Открой модерацию и отметь, какие работы допустить.",
+            f"{summary} Открой модерацию и отметь, какие работы допустить.",
             reply_markup={"inline_keyboard": [[
                 {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
             ]]},
