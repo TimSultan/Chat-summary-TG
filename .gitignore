@@ -6,6 +6,7 @@ __pycache__/
 output/
 cache/
 history/
+export/
 .venv/
 *.log
 *.session_string*

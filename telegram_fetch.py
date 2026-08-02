@@ -8,6 +8,8 @@ from telethon import TelegramClient
 from telethon.errors import RPCError
 from telethon.tl.types import Channel, Chat, User
 
+import re
+
 import transcript_cache
 from errors import ChatSummaryError
 
@@ -442,9 +444,23 @@ def sender_matches(message: ChatMessage, user_filter: str) -> bool:
     return False
 
 
+_BARE_MEDIA_TAG = re.compile(r"^\[[^\[\]]*\]$")
+
+
+def is_low_signal(message: ChatMessage) -> bool:
+    """True for a message that's nothing but a bare media placeholder -- "[Photo]",
+    "[Sticker]", "[Voice message]", etc. -- with no caption or reaction text next to it.
+    format_transcript_lines already tells the LLM a photo/sticker/video was posted; the
+    placeholder alone buys it no further information, only tokens. A tag WITH something
+    next to it ("[Photo] 🤑🤑🤑") is kept -- that's content, not noise."""
+    return bool(_BARE_MEDIA_TAG.fullmatch(message.text.strip()))
+
+
 def format_transcript_lines(messages: list[ChatMessage], include_date: bool = False) -> list[str]:
     lines = []
     for m in messages:
+        if is_low_signal(m):
+            continue
         reply_tag = " (reply)" if m.is_reply else ""
         ts = m.dt_local.strftime("%Y-%m-%d %H:%M") if include_date else m.dt_local.strftime("%H:%M")
         lines.append(f"[{ts}] {m.sender_name}{reply_tag}: {m.text}")
