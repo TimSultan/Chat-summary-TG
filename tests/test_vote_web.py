@@ -119,6 +119,33 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         data = await response.json()
         self.assertEqual(data["entries"], [])
 
+    # ---- moderation mode is opt-in, even for an admin -----------------------------------
+
+    async def test_an_admin_without_mode_admin_gets_the_plain_ballot(self):
+        """Bare /vote must never force an administrator into moderation -- they need to
+        be able to cast their own vote like everyone else."""
+        self._seed_poll(approved=("a",))
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+        )
+        data = await response.json()
+        self.assertFalse(data["is_admin"])
+        self.assertTrue(data["can_moderate"])  # still told they COULD moderate
+        self.assertEqual([e["id"] for e in data["entries"]], ["a"])
+        self.assertNotIn("counts", data)
+
+    async def test_mode_admin_is_ignored_for_a_non_admin(self):
+        self._seed_poll(approved=("a",))
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll?mode=admin",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertFalse(data["is_admin"])
+        self.assertFalse(data["can_moderate"])
+        self.assertEqual([e["id"] for e in data["entries"]], ["a"])  # not entry "b" too
+
     # ---- voting -------------------------------------------------------------------------
 
     async def test_a_vote_is_recorded_and_reflected_back(self):
@@ -178,7 +205,7 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         voting.save_poll(poll)
 
         response = await self.client.get(
-            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            f"{vote_web.ROUTE_PREFIX}/api/poll?mode=admin",
             headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
         )
         data = await response.json()

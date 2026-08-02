@@ -32,9 +32,10 @@ for rollback/comparison -- see intent_v2.py's module docstring.
 
 /vote opens the weekly-contest voting Mini App (voting.py / vote_web.py) -- a real web
 page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
-and PORT are set (see run_bot_listener). "/vote собрать", DM-only and admin-only,
-(re-)scans #итогинедели posts into that poll; the page itself is where an administrator
-admits which nominations are votable and everyone else votes, once.
+and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for everyone,
+including an admin -- "/vote выбрать" (DM, admin-only) is the separate moderation screen,
+and "/vote собрать" (DM, admin-only) (re-)scans #итогинедели posts into the poll. See
+handle_vote_command's docstring.
 
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
 session) -- or, more commonly, let listener.py's main() start this automatically
@@ -187,6 +188,10 @@ VOTE_COMMANDS = ("/vote", "/голосование")
 # which is slow enough that it must be something somebody asks for, not something that
 # happens each time a voter taps a button.
 VOTE_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
+# Opens the moderation screen (admit toggles, live counts, closing the vote) explicitly,
+# as opposed to bare "/vote" -- which now always opens the plain ballot, even for an
+# administrator, so admitting entries never blocks an admin from casting their own vote.
+VOTE_MODERATE_WORDS = frozenset({"выбрать", "модерация", "moderate", "admin"})
 VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
 
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
@@ -3338,11 +3343,22 @@ async def handle_vote_command(
     bot_username: str | None,
     background_tasks: set,
     log=print,
+    forced_mode: str | None = None,
 ) -> None:
-    """/vote -- opens the weekly-contest voting Mini App, and (for an administrator, from a
-    DM) rebuilds the entry list with "/vote собрать".
+    """Three distinct things live behind /vote, deliberately kept apart rather than one
+    page that changes shape depending who opens it:
 
-    The button differs by chat type because Telegram only allows a `web_app` button in a
+    - "/vote собрать" (DM, admin-only) rebuilds the entry list from #итогинедели posts.
+    - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
+      counts, and closing the vote.
+    - bare "/vote" opens the actual ballot, for EVERYONE including an administrator --
+      an admin is never forced into moderation mode just to cast their own vote.
+
+    `forced_mode` ("moderate") is set by the /start deep-link an admin-only group message
+    hands out for "выбрать", bypassing the usual text parsing since a /start payload never
+    carries the Russian word itself (see VOTE_MODERATE_WORDS below).
+
+    Every web_app button differs by chat type because Telegram only allows one in a
     private chat. In a group the same command therefore offers a plain link into the DM,
     where the real Mini App button is waiting: the round trip is what buys a signed
     identity, which is the whole basis for one-vote-per-person.
@@ -3372,20 +3388,41 @@ async def handle_vote_command(
         await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS) -- нечего выносить на голосование.")
         return
 
-    argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
-    for spelling in VOTE_COMMANDS:
-        if argument.lower().startswith(spelling):
-            argument = argument[len(spelling):]
-            break
-    wants_collect = argument.strip().lower() in VOTE_COLLECT_WORDS
+    if forced_mode == "moderate":
+        wants_collect, wants_moderate = False, True
+    else:
+        argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
+        for spelling in VOTE_COMMANDS:
+            if argument.lower().startswith(spelling):
+                argument = argument[len(spelling):]
+                break
+        normalized = argument.strip().lower()
+        wants_collect = normalized in VOTE_COLLECT_WORDS
+        wants_moderate = normalized in VOTE_MODERATE_WORDS
 
-    if wants_collect:
+    async def require_admin_in_dm(denial: str) -> bool:
+        """Common gate for собрать/выбрать: DM only, admin only. Returns whether the
+        caller passed; the group-vs-DM split lives here once instead of being repeated
+        for both admin-only subcommands."""
         if not is_private:
-            await reply("Собрать заявки можно только в личке с ботом.")
-            return
+            if not bot_username:
+                await reply("Открой в личке с ботом.")
+                return False
+            start_payload = "vote_admin" if wants_moderate else None
+            url = f"https://t.me/{bot_username}" + (f"?start={start_payload}" if start_payload else "")
+            await reply(
+                "Это только в личке с ботом:",
+                reply_markup={"inline_keyboard": [[{"text": "Открыть в личке", "url": url}]]},
+            )
+            return False
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
         if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
-            await reply("Собирать заявки могут только администраторы.")
+            await reply(denial)
+            return False
+        return True
+
+    if wants_collect:
+        if not await require_admin_in_dm("Собирать заявки могут только администраторы."):
             return
 
         await reply("Собираю заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
@@ -3415,11 +3452,26 @@ async def handle_vote_command(
             await reply("За сегодня и вчера постов с #итогинедели не нашлось.")
             return
         await reply(
-            f"Нашёл заявок: {len(entries)}. Открой голосование и отметь, какие работы допустить.",
-            reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+            f"Нашёл заявок: {len(entries)}. Открой модерацию и отметь, какие работы допустить.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
+            ]]},
         )
         return
 
+    if wants_moderate:
+        if not await require_admin_in_dm("Модерировать заявки могут только администраторы."):
+            return
+        await reply(
+            "Модерация: отметь, какие работы допустить к голосованию, и закрой голосование, когда пора подводить итоги.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
+            ]]},
+        )
+        return
+
+    # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
+    # unless they specifically asked for "выбрать".
     if is_private:
         await reply(
             "Голосование за итоги недели:",
@@ -4105,17 +4157,20 @@ async def _dispatch_update(
     start_match = re.match(r"^/start(?:\s+(\S+))?\s*$", command_text, re.IGNORECASE)
     if start_match:
         # Where /stat's "Открыть личный кабинет" link (t.me/<bot>?start=cabinet) and the
-        # group /vote button's DM link (?start=vote) land, and the natural first thing a
-        # new member does anyway. Groups are ignored: a /start there is somebody's fat
-        # finger, not a request. Any payload other than "vote" -- including none at all --
-        # opens the cabinet, matching the old unconditional behavior.
+        # group /vote buttons' DM links (?start=vote, ?start=vote_admin) land, and the
+        # natural first thing a new member does anyway. Groups are ignored: a /start there
+        # is somebody's fat finger, not a request. Any payload other than the vote ones --
+        # including none at all -- opens the cabinet, matching the old unconditional
+        # behavior.
         if chat.get("type") != "private":
             return
-        if (start_match.group(1) or "").lower() == "vote":
+        start_payload = (start_match.group(1) or "").lower()
+        if start_payload in ("vote", "vote_admin"):
             await handle_vote_command(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
                 background_tasks, log=log,
+                forced_mode=("moderate" if start_payload == "vote_admin" else None),
             )
             return
         await handle_cabinet_command(api, telethon_client, tz, message, home_chat_ref, log=log)

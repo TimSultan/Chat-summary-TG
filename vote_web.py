@@ -84,33 +84,44 @@ def _entry_payload(entry: voting.Entry, poll: voting.Poll, base: str) -> dict:
 async def handle_poll(request: web.Request) -> web.Response:
     """What the page renders: the entries this caller may see, and their own current vote.
 
-    An administrator gets every nomination plus the admitted flags and live counts, which
-    is what turns the same page into the moderation screen. Everyone else gets only what
-    has been admitted -- an unmoderated poll shows them nothing rather than showing them
-    posts nobody has approved yet.
+    Moderation mode is requested explicitly, via `?mode=admin` on the page URL (see
+    bot_listener.handle_vote_command's "/vote выбрать") -- being an administrator is NOT
+    by itself enough to switch the view. Otherwise an administrator could never open the
+    plain ballot to cast their own vote; bare "/vote" would always land them back in
+    moderation. `can_moderate` still reports true admin status regardless of which view
+    is showing, so the page can point them at "/vote выбрать" instead of hiding it.
+
+    Moderation mode gets every nomination plus the admitted flags and live counts.
+    Everyone else (including an admin viewing the plain ballot) gets only what has been
+    admitted -- an unmoderated poll shows them nothing rather than showing them posts
+    nobody has approved yet.
     """
     user = await _authenticate(request)
     entry_name = request.app[_ENTRY_KEY]
     poll = voting.latest_poll(entry_name)
     if poll is None:
-        return web.json_response({"poll_id": None, "entries": [], "is_admin": False, "open": False})
+        return web.json_response({
+            "poll_id": None, "entries": [], "is_admin": False, "can_moderate": False, "open": False,
+        })
 
-    is_admin = await request.app[_IS_ADMIN_KEY](user)
+    can_moderate = await request.app[_IS_ADMIN_KEY](user)
+    admin_mode = can_moderate and request.query.get("mode") == "admin"
     base = request.app[_ROUTE_PREFIX_KEY]
-    visible = poll.entries if is_admin else poll.approved_entries()
+    visible = poll.entries if admin_mode else poll.approved_entries()
     winner = poll.winner()
 
     payload = {
         "poll_id": poll.poll_id,
         "chat": poll.entry,
         "open": poll.open,
-        "is_admin": is_admin,
+        "is_admin": admin_mode,
+        "can_moderate": can_moderate,
         "me": voting.display_name(user),
         "my_vote": poll.votes.get(str(user["id"]), []),
         "entries": [_entry_payload(e, poll, base) for e in visible],
         "winner": _entry_payload(winner, poll, base) if winner else None,
     }
-    if is_admin:
+    if admin_mode:
         payload["approved"] = list(poll.approved)
         payload["voter_count"] = len(poll.votes)
         payload["counts"] = {e.entry_id: count for e, count in poll.tally()}
@@ -584,7 +595,10 @@ $("announce").addEventListener("click", async () => {
 
 (async function load() {
   try {
-    const response = await api("/api/poll");
+    // Forwards ?mode=admin straight through -- the server decides moderation vs. plain
+    // ballot from this, being an admin alone is not enough (see handle_poll).
+    const mode = new URLSearchParams(location.search).get("mode");
+    const response = await api("/api/poll" + (mode ? "?mode=" + encodeURIComponent(mode) : ""));
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось загрузить");
     poll = data;
@@ -597,9 +611,17 @@ $("announce").addEventListener("click", async () => {
     }
     picked = new Set(poll.my_vote || []);
     admitted = new Set(poll.approved || []);
-    $("sub").textContent = poll.is_admin
-      ? "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0)
-      : (poll.my_vote && poll.my_vote.length ? "Твой голос учтён — можно переголосовать" : "Выбери понравившиеся работы");
+    if (poll.is_admin) {
+      $("sub").textContent =
+        "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
+    } else {
+      $("sub").textContent = poll.my_vote && poll.my_vote.length
+        ? "Твой голос учтён — можно переголосовать"
+        : "Выбери понравившиеся работы";
+      if (poll.can_moderate) {
+        $("sub").textContent += " · модерация: /vote выбрать";
+      }
+    }
     render();
   } catch (e) {
     $("sub").textContent = "";

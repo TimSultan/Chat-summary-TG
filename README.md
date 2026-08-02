@@ -655,26 +655,31 @@ poker button decides from disk and answers immediately.
 ### `/vote` — voting on the week's #итогинедели posts
 
 A mobile-first voting page (`voting.py`, `vote_web.py`) opened as a **Telegram Mini App**
-from `/vote` (or `/голосование`) — a real web page that loads inside Telegram itself,
-identifying the viewer without a login. In a group the button links to the bot's DM
-instead, since Telegram only allows a Mini App button in a private chat; the round trip
-through the DM is what gets a signed identity to vote with.
+— a real web page that loads inside Telegram itself, identifying the viewer without a
+login. In a group every subcommand's button links to the bot's DM instead, since Telegram
+only allows a Mini App button in a private chat; the round trip through the DM is what
+gets a signed identity to vote with.
 
-**One post is one entry**, not one message. A `#итогинедели` post that's several photos
-sent together (an album) is several Telegram messages sharing one `grouped_id` — usually
-only the first carries the caption/hashtag — so entries are built by grouping on that id
-first, then checking any message in the group for the hashtag. All photos in the group
-show on the card; the first one is the large one.
+Three distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
+page that changes shape depending on who opens it:
 
-**Collecting is manual, not automatic**: `/vote собрать` (DM, administrators only)
-re-scans today and yesterday for `#итогинедели` posts and downloads every attached photo.
-Re-collecting is safe to run repeatedly — it keeps whatever has already been admitted and
-voted on, only adding new nominations and dropping ones that no longer exist.
+- **Bare `/vote`** opens the actual ballot, for **everyone including an administrator** —
+  an admin is never forced into moderation just to cast their own vote.
+- **`/vote собрать`** (DM, administrators only) re-scans today and yesterday for
+  `#итогинедели` posts and downloads every attached photo. Re-collecting is safe to run
+  repeatedly — it keeps whatever has already been admitted and voted on, only adding new
+  nominations and dropping ones that no longer exist.
+- **`/vote выбрать`** (DM, administrators only) opens the moderation screen: every
+  nomination (not just admitted ones), an "допустить" toggle instead of a vote button, a
+  live count on each card, and the button that closes the vote (below). Nothing is shown
+  to ordinary voters -- or to an admin on the plain ballot -- until this has admitted it,
+  so an unmoderated poll shows an empty page rather than everything anyone posted.
 
-**Moderation is the same page.** An administrator sees every nomination and a "допустить"
-toggle instead of a vote button, plus a live count on each card and a save action instead
-of a submit — nothing is shown to ordinary voters until an administrator has admitted it,
-so an unmoderated poll shows an empty page rather than everything anyone posted.
+Which of these opens is decided server-side by a `?mode=admin` marker on the page's own
+URL, checked against a real admin lookup on every request (`handle_poll`) -- not by trusting
+whichever button the client happened to tap, so the moderation payload (full entry list,
+per-entry counts) is never sent to anyone who isn't actually an administrator, however
+they ask for it.
 
 **One ballot per person**: the page authenticates via Telegram's signed `initData`
 (`voting.verify_init_data`) — an HMAC over the payload Telegram itself attached when it
