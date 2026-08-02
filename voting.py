@@ -231,6 +231,10 @@ class Poll:
     # user_id (as a string, since JSON keys are strings) -> list of entry_ids.
     votes: dict[str, list[str]] = field(default_factory=dict)
     open: bool = True
+    # Set once by close_and_announce, kept alongside the poll so a reloaded page (or a
+    # second look days later) can still show who won without recomputing it from votes
+    # that may since have shifted (an un-admit after closing, say).
+    winner_entry_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -241,6 +245,7 @@ class Poll:
             "approved": list(self.approved),
             "votes": {k: list(v) for k, v in self.votes.items()},
             "open": self.open,
+            "winner_entry_id": self.winner_entry_id,
         }
 
     @classmethod
@@ -253,6 +258,7 @@ class Poll:
             approved=[str(e) for e in raw.get("approved") or []],
             votes={str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()},
             open=bool(raw.get("open", True)),
+            winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
         )
 
     def approved_entries(self) -> list[Entry]:
@@ -271,6 +277,29 @@ class Poll:
         ranked = [(e, counts.get(e.entry_id, 0)) for e in self.approved_entries()]
         ranked.sort(key=lambda pair: (-pair[1], pair[0].entry_id))
         return ranked
+
+    def winner(self) -> Entry | None:
+        """The entry recorded by close_and_announce, or None if nothing has been
+        announced yet -- looked up fresh each time rather than cached as an Entry, since
+        the poll's own entries list is the single source of truth for entry data."""
+        if not self.winner_entry_id:
+            return None
+        return next((e for e in self.entries if e.entry_id == self.winner_entry_id), None)
+
+
+def close_and_announce(poll: Poll) -> tuple[Entry, int] | None:
+    """Closes voting and records the winner: the top of `tally()`, provided it actually
+    has at least one vote. Returns (entry, vote_count), or None -- and leaves the poll
+    untouched -- if there is nothing to announce (no admitted entries yet, or admitted
+    entries that nobody has voted for). Idempotent: announcing an already-closed poll
+    just recomputes and re-records the same winner rather than refusing."""
+    ranked = poll.tally()
+    if not ranked or ranked[0][1] <= 0:
+        return None
+    winner_entry, votes = ranked[0]
+    poll.open = False
+    poll.winner_entry_id = winner_entry.entry_id
+    return winner_entry, votes
 
 
 def save_poll(poll: Poll) -> None:
@@ -336,6 +365,8 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
         for user_id, choices in existing.votes.items()
     }
     poll.open = existing.open
+    if existing.winner_entry_id in known:
+        poll.winner_entry_id = existing.winner_entry_id
     return poll
 
 

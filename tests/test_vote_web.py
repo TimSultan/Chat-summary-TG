@@ -51,12 +51,16 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.admin_id = 1
         self.voter_id = 2
+        self.announced = []  # (user, poll, winner_entry, votes) tuples, in call order
         cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
 
-        async def is_admin(user_id: int) -> bool:
-            return user_id == self.admin_id
+        async def is_admin(user: dict) -> bool:
+            return user.get("id") == self.admin_id
 
-        app = vote_web.create_app(cfg, CHAT, is_admin, log=lambda *_: None)
+        async def announce(user, poll, winner_entry, votes):
+            self.announced.append((user, poll, winner_entry, votes))
+
+        app = vote_web.create_app(cfg, CHAT, is_admin, announce=announce, log=lambda *_: None)
         self.server = TestServer(app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -181,6 +185,103 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data["is_admin"])
         self.assertEqual({e["id"] for e in data["entries"]}, {"a", "b"})  # sees the unadmitted one too
         self.assertEqual(data["counts"]["a"], 1)
+
+    # ---- closing the vote and announcing a winner ----------------------------------------
+
+    async def test_a_non_admin_cannot_announce(self):
+        self._seed_poll(approved=("a", "b"))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/announce",
+            json={"init_data": _init_data(self.voter_id)},
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.announced, [])
+        self.assertTrue(voting.load_poll(CHAT, "2026-08-02").open)
+
+    async def test_announcing_with_no_votes_is_refused(self):
+        self._seed_poll(approved=("a",))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/announce",
+            json={"init_data": _init_data(self.admin_id)},
+        )
+        self.assertEqual(response.status, 409)
+        self.assertEqual(self.announced, [])
+
+    async def test_an_admin_can_close_the_vote_and_the_winner_is_announced(self):
+        self._seed_poll(approved=("a", "b"))
+        poll = voting.load_poll(CHAT, "2026-08-02")
+        voting.record_vote(poll, 10, ["a"])
+        voting.record_vote(poll, 11, ["a"])
+        voting.record_vote(poll, 12, ["b"])
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/announce",
+            json={"init_data": _init_data(self.admin_id)},
+        )
+        data = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(data["notified"])
+        self.assertEqual(data["winner"]["id"], "a")
+        self.assertEqual(data["votes"], 2)
+
+        stored = voting.load_poll(CHAT, "2026-08-02")
+        self.assertFalse(stored.open)
+        self.assertEqual(stored.winner_entry_id, "a")
+
+        self.assertEqual(len(self.announced), 1)
+        user, announced_poll, winner_entry, votes = self.announced[0]
+        self.assertEqual(user["id"], self.admin_id)
+        self.assertEqual(winner_entry.entry_id, "a")
+        self.assertEqual(votes, 2)
+
+    async def test_a_closed_poll_still_reports_its_winner_to_a_voter(self):
+        self._seed_poll(approved=("a", "b"))
+        poll = voting.load_poll(CHAT, "2026-08-02")
+        voting.record_vote(poll, 10, ["a"])
+        voting.save_poll(poll)
+        await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/announce",
+            json={"init_data": _init_data(self.admin_id)},
+        )
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertFalse(data["open"])
+        self.assertEqual(data["winner"]["id"], "a")
+
+    async def test_a_delivery_failure_still_leaves_the_poll_closed(self):
+        """The poll's own state is authoritative -- a failed send must not un-close it or
+        forget who won, only report that the message itself didn't go out. Built with its
+        own client, rather than mutating the shared one from setUp, since aiohttp warns
+        against changing an Application's state after it's started."""
+        async def broken_announce(user, poll, winner_entry, votes):
+            raise RuntimeError("Bot API is down")
+
+        async def is_admin(user: dict) -> bool:
+            return user.get("id") == self.admin_id
+
+        cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
+        app = vote_web.create_app(cfg, CHAT, is_admin, announce=broken_announce, log=lambda *_: None)
+        async with TestClient(TestServer(app)) as client:
+            self._seed_poll(approved=("a",))
+            poll = voting.load_poll(CHAT, "2026-08-02")
+            voting.record_vote(poll, 10, ["a"])
+            voting.save_poll(poll)
+
+            response = await client.post(
+                f"{vote_web.ROUTE_PREFIX}/api/announce",
+                json={"init_data": _init_data(self.admin_id)},
+            )
+            data = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(data["notified"])
+        self.assertFalse(voting.load_poll(CHAT, "2026-08-02").open)
 
     # ---- media ----------------------------------------------------------------------------
 

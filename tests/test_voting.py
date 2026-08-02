@@ -161,13 +161,56 @@ class PollTests(unittest.TestCase):
         ranked = poll.tally()
         self.assertEqual([e.entry_id for e, _ in ranked], ["b"])
 
+    def test_close_and_announce_picks_the_top_voted_entry_and_closes_the_poll(self):
+        poll = self._poll()
+        voting.set_approved(poll, ["a", "b"])
+        voting.record_vote(poll, 1, ["a"])
+        voting.record_vote(poll, 2, ["a"])
+        voting.record_vote(poll, 3, ["b"])
+
+        result = voting.close_and_announce(poll)
+
+        self.assertIsNotNone(result)
+        winner, votes = result
+        self.assertEqual(winner.entry_id, "a")
+        self.assertEqual(votes, 2)
+        self.assertFalse(poll.open)
+        self.assertEqual(poll.winner_entry_id, "a")
+        self.assertEqual(poll.winner().entry_id, "a")
+
+    def test_close_and_announce_refuses_when_nobody_voted(self):
+        poll = self._poll()
+        voting.set_approved(poll, ["a"])
+        result = voting.close_and_announce(poll)
+        self.assertIsNone(result)
+        self.assertTrue(poll.open)  # untouched -- nothing to announce
+        self.assertIsNone(poll.winner_entry_id)
+
+    def test_close_and_announce_refuses_when_nothing_is_admitted_yet(self):
+        poll = self._poll()  # no set_approved call at all
+        self.assertIsNone(voting.close_and_announce(poll))
+
+    def test_closing_again_recomputes_rather_than_refusing(self):
+        poll = self._poll()
+        voting.set_approved(poll, ["a", "b"])
+        voting.record_vote(poll, 1, ["a"])
+        voting.close_and_announce(poll)
+        voting.record_vote(poll, 2, ["b"])
+        voting.record_vote(poll, 3, ["b"])
+        winner, votes = voting.close_and_announce(poll)
+        self.assertEqual(winner.entry_id, "b")
+        self.assertEqual(votes, 2)
+
     def test_dict_round_trip_preserves_everything(self):
         poll = self._poll()
         voting.set_approved(poll, ["a"])
         voting.record_vote(poll, 7, ["a"])
+        voting.close_and_announce(poll)
         restored = voting.Poll.from_dict(json.loads(json.dumps(poll.to_dict())))
         self.assertEqual(restored.approved, poll.approved)
         self.assertEqual(restored.votes, poll.votes)
+        self.assertEqual(restored.open, poll.open)
+        self.assertEqual(restored.winner_entry_id, poll.winner_entry_id)
         self.assertEqual([e.entry_id for e in restored.entries], [e.entry_id for e in poll.entries])
 
 
@@ -194,6 +237,24 @@ class BuildPollMergeTests(unittest.TestCase):
         merged = voting.build_poll("Chat", "p", fresh, existing=None)
         self.assertEqual(merged.approved, [])
         self.assertEqual(merged.votes, {})
+
+    def test_a_recorded_winner_carries_over_if_still_present(self):
+        existing = voting.Poll(poll_id="p", entry="Chat", created_at="t0", entries=[self._entry("a")])
+        voting.set_approved(existing, ["a"])
+        voting.record_vote(existing, 1, ["a"])
+        voting.close_and_announce(existing)
+
+        merged = voting.build_poll("Chat", "p", [self._entry("a")], existing=existing)
+        self.assertEqual(merged.winner_entry_id, "a")
+
+    def test_a_recorded_winner_is_dropped_if_its_post_is_gone(self):
+        existing = voting.Poll(poll_id="p", entry="Chat", created_at="t0", entries=[self._entry("a")])
+        voting.set_approved(existing, ["a"])
+        voting.record_vote(existing, 1, ["a"])
+        voting.close_and_announce(existing)
+
+        merged = voting.build_poll("Chat", "p", [self._entry("b")], existing=existing)
+        self.assertIsNone(merged.winner_entry_id)
 
 
 class StorageTests(unittest.TestCase):

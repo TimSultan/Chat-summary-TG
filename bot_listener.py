@@ -4773,17 +4773,52 @@ async def run_bot_listener(
                 # dismissal while one is still pending.
                 schedule_bot_delete(api, chat_id, [message_id], DISMISS_DELETE_AFTER, log, background_tasks)
 
-        async def _is_vote_admin(user_id: int) -> bool:
-            """Who may admit nominations and see live counts on the voting page --
-            reuses the same "chat admin or delegate" rule as every other moderation
-            surface (_can_manage_chat), just with a fabricated `user` dict since all the
-            Mini App gives us is the id Telegram already verified."""
+        async def _is_vote_admin(user: dict) -> bool:
+            """Who may admit nominations, see live counts, and close the vote on the
+            voting page -- reuses the same "chat admin or delegate" rule as every other
+            moderation surface (_can_manage_chat). Takes the FULL Telegram user dict
+            Telegram's signed initData verified, not just the id: _can_manage_chat's
+            PRIVILEGED_MANAGEMENT_USERNAMES check needs the username too."""
             if not home_chat_ref:
                 return False
             admin_chat_id = await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
             if admin_chat_id is None:
                 return False
-            return await _can_manage_chat(api, admin_chat_id, {"id": user_id}, home_chat_ref)
+            return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
+
+        async def _announce_vote_winner(user: dict, poll, winner_entry, votes: int) -> None:
+            """Sends the winner announcement -- for now into the admin's own DM with the
+            bot (the same chat the Mini App was opened from), not the group. `user` is
+            whoever closed the vote, taken from the page's own verified identity rather
+            than re-deriving "the admin" some other way.
+
+            Reaches directly into voting's on-disk media rather than re-downloading:
+            collect_entries already pulled every photo down when the poll was built."""
+            chat_id = user.get("id")
+            if chat_id is None:
+                return
+            lines = [f"🏆 Победитель голосования за {poll.entry}: {winner_entry.author_name}"]
+            if winner_entry.author_username:
+                lines.append(f"@{winner_entry.author_username}")
+            if winner_entry.text:
+                lines.append("")
+                lines.append(winner_entry.text)
+            lines.append("")
+            lines.append(f"Голосов: {votes}")
+            text = "\n".join(lines)
+
+            photo_path = None
+            # Same rule as send_stats_digest: a caption over Telegram's limit is rejected
+            # outright, so a long post text falls back to plain text rather than losing
+            # the announcement entirely.
+            if winner_entry.media and len(text) <= CAPTION_LIMIT:
+                candidate = voting.media_path(poll.entry, poll.poll_id) / winner_entry.media[0]
+                if candidate.is_file():
+                    photo_path = candidate
+            if photo_path is not None:
+                await api.send_photo_file(chat_id, photo_path, caption=text, parse_mode=None)
+            else:
+                await api.send_message(chat_id, text, parse_mode=None)
 
         tasks = [
             _poll_loop(),
@@ -4803,7 +4838,10 @@ async def run_bot_listener(
             # with public networking on); off when running locally without it, same as
             # every other optional piece here.
             tasks.append(
-                vote_web.run_web_server(cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port, log=log)
+                vote_web.run_web_server(
+                    cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
+                    announce=_announce_vote_winner, log=log,
+                )
             )
         else:
             log("[bot_listener] PORT is not set -- the voting page is not being served.")

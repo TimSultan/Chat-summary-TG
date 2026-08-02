@@ -31,7 +31,15 @@ _SAFE_MEDIA_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 # but warn on every access as of aiohttp 3.9+.
 _CFG_KEY = web.AppKey("cfg")
 _ENTRY_KEY = web.AppKey("entry", str)
-_IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[int], Awaitable[bool]])
+# Takes the FULL verified Telegram user dict, not just an id -- bot_listener.py's
+# _can_manage_chat also honors a hardcoded username allowlist (PRIVILEGED_MANAGEMENT_
+# USERNAMES), which needs the username, not only the id, to check.
+_IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[dict], Awaitable[bool]])
+# Sends the winner announcement wherever bot_listener.py decides "the chat" currently
+# means (its own DM with the admin who closed the vote, for now). Takes the admin's user
+# dict, the poll, the winning entry, and its vote count; failure is caught by the caller
+# and reported back, not raised through the API response.
+_ANNOUNCE_KEY = web.AppKey("announce", Callable[[dict, voting.Poll, voting.Entry, int], Awaitable[None]])
 _ROUTE_PREFIX_KEY = web.AppKey("route_prefix", str)
 _LOG_KEY = web.AppKey("log", Callable[..., None])
 
@@ -87,9 +95,10 @@ async def handle_poll(request: web.Request) -> web.Response:
     if poll is None:
         return web.json_response({"poll_id": None, "entries": [], "is_admin": False, "open": False})
 
-    is_admin = await request.app[_IS_ADMIN_KEY](user["id"])
+    is_admin = await request.app[_IS_ADMIN_KEY](user)
     base = request.app[_ROUTE_PREFIX_KEY]
     visible = poll.entries if is_admin else poll.approved_entries()
+    winner = poll.winner()
 
     payload = {
         "poll_id": poll.poll_id,
@@ -99,6 +108,7 @@ async def handle_poll(request: web.Request) -> web.Response:
         "me": voting.display_name(user),
         "my_vote": poll.votes.get(str(user["id"]), []),
         "entries": [_entry_payload(e, poll, base) for e in visible],
+        "winner": _entry_payload(winner, poll, base) if winner else None,
     }
     if is_admin:
         payload["approved"] = list(poll.approved)
@@ -140,7 +150,7 @@ async def handle_moderate(request: web.Request) -> web.Response:
         return _json_error("malformed request body")
 
     user = await _authenticate(request, body)
-    if not await request.app[_IS_ADMIN_KEY](user["id"]):
+    if not await request.app[_IS_ADMIN_KEY](user):
         return _json_error("только администраторы могут допускать работы", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
@@ -160,6 +170,54 @@ async def handle_moderate(request: web.Request) -> web.Response:
         f"[vote_web] {voting.display_name(user)} admitted {len(poll.approved)}/{len(poll.entries)} entries"
     )
     return web.json_response({"ok": True, "approved": poll.approved, "open": poll.open})
+
+
+async def handle_announce(request: web.Request) -> web.Response:
+    """Closes the vote, records the top-voted admitted entry as the winner, and asks
+    bot_listener.py to send the announcement. Administrators only.
+
+    Closing and picking the winner happen even if the send itself fails (a transient
+    Bot API error, say) -- the poll's own state is the source of truth for who won, not
+    whether a particular message went out, so a delivery failure is reported back rather
+    than losing the result.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+
+    user = await _authenticate(request, body)
+    if not await request.app[_IS_ADMIN_KEY](user):
+        return _json_error("только администраторы могут подводить итоги", status=403)
+
+    entry_name = request.app[_ENTRY_KEY]
+    poll = voting.latest_poll(entry_name)
+    if poll is None:
+        return _json_error("голосование ещё не создано", status=404)
+
+    result = voting.close_and_announce(poll)
+    if result is None:
+        return _json_error("пока не за что подводить итоги -- нет голосов за допущенные работы", status=409)
+    winner_entry, votes = result
+    voting.save_poll(poll)
+    request.app[_LOG_KEY](
+        f"[vote_web] {voting.display_name(user)} closed the vote -- winner {winner_entry.entry_id} ({votes} votes)"
+    )
+
+    notified = True
+    try:
+        await request.app[_ANNOUNCE_KEY](user, poll, winner_entry, votes)
+    except Exception as e:
+        notified = False
+        request.app[_LOG_KEY](f"[vote_web] announcing the winner failed: {e}")
+
+    base = request.app[_ROUTE_PREFIX_KEY]
+    return web.json_response({
+        "ok": True,
+        "notified": notified,
+        "winner": _entry_payload(winner_entry, poll, base),
+        "votes": votes,
+    })
 
 
 async def handle_media(request: web.Request) -> web.Response:
@@ -189,14 +247,26 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def create_app(cfg, entry: str, is_admin, route_prefix: str = ROUTE_PREFIX, log=print) -> web.Application:
-    """`is_admin` is an async callable taking a Telegram user id and returning a bool --
-    supplied by bot_listener.py, which owns the Bot API client that can answer it, so this
-    module needs to know nothing about how administrators are determined."""
+def create_app(
+    cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print
+) -> web.Application:
+    """`is_admin` is an async callable taking the verified Telegram user dict and
+    returning a bool; `announce` is an async callable taking (user, poll, winner_entry,
+    votes) that delivers the winner message. Both are supplied by bot_listener.py, which
+    owns the Bot API client they need, so this module needs to know nothing about how
+    administrators are determined or where an announcement actually goes.
+
+    `announce` defaults to a no-op so the app is still constructible (e.g. in tests that
+    don't exercise closing a vote) without a bot_listener.py running alongside it.
+    """
+    async def _default_announce(user, poll, winner_entry, votes):
+        return None
+
     app = web.Application()
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_ADMIN_KEY] = is_admin
+    app[_ANNOUNCE_KEY] = announce or _default_announce
     app[_ROUTE_PREFIX_KEY] = route_prefix.rstrip("/")
     app[_LOG_KEY] = log
 
@@ -209,14 +279,15 @@ def create_app(cfg, entry: str, is_admin, route_prefix: str = ROUTE_PREFIX, log=
         web.get(f"{prefix}/api/poll", handle_poll),
         web.post(f"{prefix}/api/ballot", handle_ballot),
         web.post(f"{prefix}/api/moderate", handle_moderate),
+        web.post(f"{prefix}/api/announce", handle_announce),
         web.get(prefix + "/media/{poll_id}/{name}", handle_media),
     ])
     return app
 
 
-async def run_web_server(cfg, entry: str, is_admin, port: int, log=print) -> None:
+async def run_web_server(cfg, entry: str, is_admin, port: int, announce=None, log=print) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
-    app = create_app(cfg, entry, is_admin, log=log)
+    app = create_app(cfg, entry, is_admin, announce=announce, log=log)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
@@ -285,7 +356,14 @@ PAGE_HTML = """<!doctype html>
         font-size: 16px; font-weight: 600; background: var(--accent);
         color: var(--accent-fg); cursor: pointer; }
   .go[disabled] { opacity: .5; }
+  .go.secondary { background: transparent; color: var(--accent);
+                  border: 1px solid var(--accent); margin-bottom: 8px; }
   .msg { padding: 24px 16px; color: var(--muted); text-align: center; }
+  .winner { margin: 0 12px 4px; padding: 10px 12px; border-radius: 10px;
+            background: var(--card); display: flex; gap: 10px; align-items: center; }
+  .winner img { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; flex: none; }
+  .winner .label { font-size: 12px; color: var(--muted); }
+  .winner .name { font-weight: 600; }
   dialog {
     border: 0; padding: 0; width: 100%; max-width: 100%; height: 100%; max-height: 100%;
     margin: 0; background: var(--bg); color: var(--fg);
@@ -305,9 +383,13 @@ PAGE_HTML = """<!doctype html>
   <h1 id="title">Итоги недели</h1>
   <div class="sub" id="sub">Загружаю…</div>
 </header>
+<div class="winner" id="winnerBanner" hidden></div>
 <div class="grid" id="grid"></div>
 <div class="msg" id="msg" hidden></div>
-<div class="bar"><button class="go" id="go" disabled>Загружаю…</button></div>
+<div class="bar">
+  <button class="go secondary" id="announce" hidden>Подвести итоги</button>
+  <button class="go" id="go" disabled>Загружаю…</button>
+</div>
 
 <dialog id="lightbox"><div class="full" id="full"></div></dialog>
 
@@ -341,7 +423,28 @@ function who(entry) {
   return entry.username ? "@" + entry.username : entry.author;
 }
 
+function renderWinnerBanner() {
+  const banner = $("winnerBanner");
+  if (!poll.winner) { banner.hidden = true; return; }
+  const w = poll.winner;
+  banner.hidden = false;
+  banner.innerHTML =
+    (w.photos[0] ? '<img src="' + esc(w.photos[0]) + '" alt="">' : "") +
+    '<div><div class="label">🏆 Победитель голосования</div>' +
+    '<div class="name">' + esc(who(w)) + "</div></div>";
+}
+
+function updateAnnounceButton() {
+  const button = $("announce");
+  if (!poll.is_admin) { button.hidden = true; return; }
+  button.hidden = false;
+  button.disabled = false;
+  button.textContent = poll.open ? "Закрыть голосование и объявить победителя" : "Пересчитать победителя";
+}
+
 function render() {
+  renderWinnerBanner();
+  updateAnnounceButton();
   const grid = $("grid");
   grid.innerHTML = "";
   if (!poll.entries.length) {
@@ -450,6 +553,32 @@ $("go").addEventListener("click", async () => {
   } catch (e) {
     go.textContent = String(e.message || e);
     setTimeout(() => { go.textContent = original; go.disabled = false; }, 2500);
+  }
+});
+
+$("announce").addEventListener("click", async () => {
+  const button = $("announce");
+  if (!confirm("Закрыть голосование и объявить победителя? Дальше голосовать будет нельзя.")) return;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "Подвожу итоги…";
+  try {
+    const response = await api("/api/announce", {
+      method: "POST", body: JSON.stringify({ init_data: initData }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось");
+    poll.open = false;
+    poll.winner = data.winner;
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    button.textContent = data.notified
+      ? "Победитель объявлен, сообщение отправлено тебе в личку"
+      : "Победитель выбран, но сообщение не отправилось -- смотри логи";
+    render();
+    setTimeout(() => { button.textContent = original; button.disabled = false; }, 4000);
+  } catch (e) {
+    button.textContent = String(e.message || e);
+    setTimeout(() => { button.textContent = original; button.disabled = false; }, 2500);
   }
 });
 

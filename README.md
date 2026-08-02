@@ -680,7 +680,20 @@ so an unmoderated poll shows an empty page rather than everything anyone posted.
 (`voting.verify_init_data`) — an HMAC over the payload Telegram itself attached when it
 opened the Mini App, keyed off the bot token — so a vote is tied to a real Telegram user
 id the server verified itself, not a cookie or an unauthenticated form. Voting again
-replaces the previous ballot rather than adding to it.
+replaces the previous ballot rather than adding to it. Who counts as an administrator here
+is the same `_can_manage_chat` rule everything else in the bot uses: a Telegram admin of
+the tracked chat, a `/badgeadmin`-delegated manager, or a hardcoded name in
+`PRIVILEGED_MANAGEMENT_USERNAMES`.
+
+**Closing the vote** (admin-only, "Закрыть голосование и объявить победителя") picks the
+top-voted admitted entry (`voting.close_and_announce` — refuses if nothing has any votes
+yet) and sends the winner — name, their photo, their post's own text — as a message. For
+now that message goes to whoever closed the vote, in their own DM with the bot, not into
+the group; posting the announcement into the chat itself is a manual copy-paste away until
+that's wired up directly. The poll records who won (`Poll.winner_entry_id`) independently
+of whether the message actually sent, so a delivery hiccup never loses the result, and
+re-closing (say, after adjusting which entries are admitted) recomputes rather than
+refusing.
 
 Requires `WEBAPP_PUBLIC_URL` (a real `https://` domain — Telegram refuses to open a Mini
 App over plain http) and, on a host with no persistent disk by default, `DATA_DIR` on a
