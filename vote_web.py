@@ -459,31 +459,65 @@ PAGE_HTML = """<!doctype html>
   header { padding: 14px 12px 6px; }
   h1 { font-size: 17px; margin: 0 0 2px; }
   .sub { color: var(--muted); font-size: 13px; }
-  /* One continuous vertical feed, full-width cards -- no grid, nothing to open. A thin
-     rule between cards (border-bottom) stands in for the grid's gaps as the separator. */
-  .feed { padding: 4px 12px 0; }
-  .card { padding: 14px 0; border-bottom: 1px solid rgba(128,128,128,.2); }
-  .card:last-child { border-bottom: 0; }
-  .card .who { font-size: 13px; font-weight: 600; margin-bottom: 6px;
-               display: flex; align-items: center; }
-  .card .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
-  .card .photos { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
-  .card .photos img { width: 100%; border-radius: 10px; display: block; }
-  .votesBadge { margin-left: 6px; background: var(--accent); color: var(--accent-fg);
-                font-size: 11px; padding: 1px 6px; border-radius: 8px; }
-  .votebar { height: 4px; margin: 0 0 10px; border-radius: 2px;
+  /* The browsing view: three columns, the whole poll at a glance. Every cell carries its
+     own pick button, so voting never requires opening anything -- opening is for looking
+     closely, which is what the reel below is. */
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
+  .gcard { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
+  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .count { position: absolute; right: 4px; top: 4px; background: rgba(0,0,0,.6);
+           color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 8px; }
+  .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
+           color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+  .gcard .who { padding: 5px 6px 2px; font-size: 11px; overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; }
+  .pick { display: block; width: 100%; border: 0; padding: 7px 4px; font-size: 12px;
+          background: transparent; color: var(--muted); cursor: pointer;
+          border-top: 1px solid rgba(128,128,128,.25); }
+  .gcard.on { outline: 2px solid var(--accent); }
+  .gcard.on .pick { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
+  .gcard.pending { opacity: .55; }
+  .pick[disabled], .pickBtn[disabled] { opacity: .5; cursor: default; }
+  .votebar { height: 4px; margin: 3px 6px 0; border-radius: 2px;
              background: rgba(128,128,128,.25); overflow: hidden; }
   .votebar-fill { height: 100%; background: var(--accent); border-radius: 2px; }
+
+  /* Tapping a picture opens the reel: EVERY work in one continuous scroll, full width,
+     starting at the one that was tapped. So looking properly at the whole poll is one
+     gesture instead of open-look-close, once per entry -- but it stays a deliberate step,
+     rather than the grid itself being replaced by a page you must scroll past.
+     A fixed overlay rather than a <dialog> so the close button can float over its own
+     scrolling content on every browser Telegram embeds. */
+  .reel { position: fixed; inset: 0; z-index: 10; background: var(--bg);
+          overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  body.reelOpen { overflow: hidden; }
+  .reelClose { position: fixed; top: 10px; right: 10px; z-index: 12;
+               border: 0; border-radius: 50%; width: 36px; height: 36px;
+               background: rgba(0,0,0,.55); color: #fff; font-size: 17px;
+               line-height: 1; cursor: pointer; }
+  .feed { padding: 12px 12px calc(var(--barH, 96px) + 16px); }
+  .rcard { padding: 14px 0; border-bottom: 1px solid rgba(128,128,128,.2); }
+  .rcard:last-child { border-bottom: 0; }
+  .rcard .who { font-size: 13px; font-weight: 600; margin-bottom: 6px;
+                display: flex; align-items: center; }
+  .rcard .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
+  .rcard .photos { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+  .rcard .photos img { width: 100%; border-radius: 10px; display: block; }
+  .rcard .votebar { margin: 0 0 10px; }
+  .votesBadge { margin-left: 6px; background: var(--accent); color: var(--accent-fg);
+                font-size: 11px; padding: 1px 6px; border-radius: 8px; }
   .pickBtn { display: block; width: 100%; border: 1px solid rgba(128,128,128,.35);
              border-radius: 8px; padding: 10px; font-size: 14px; font-weight: 600;
              background: transparent; color: var(--fg); cursor: pointer; }
-  .pickBtn[disabled] { opacity: .5; cursor: default; }
-  .card.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-  .card.pending { opacity: .6; }
+  .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .rcard.pending { opacity: .6; }
   .bar {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom));
     background: var(--bg); border-top: 1px solid rgba(128,128,128,.25);
+    /* Above the reel: the ballot's submit button stays reachable while browsing it. */
+    z-index: 20;
   }
   .go { width: 100%; border: 0; border-radius: 10px; padding: 14px;
         font-size: 16px; font-weight: 600; background: var(--accent);
@@ -550,13 +584,18 @@ PAGE_HTML = """<!doctype html>
   </div>
 </div>
 <div class="notice" id="notice" hidden></div>
-<div class="feed" id="feed"></div>
+<div class="grid" id="grid"></div>
 <div class="msg" id="msg" hidden></div>
 <div class="results" id="results" hidden></div>
 <div class="bar" id="bar">
   <button class="go danger" id="clear" hidden>🗑 Очистить голосование</button>
   <button class="go secondary" id="announce" hidden>Подвести итоги</button>
   <button class="go" id="go" disabled>Загружаю…</button>
+</div>
+
+<div class="reel" id="reel" hidden>
+  <button class="reelClose" id="reelClose" aria-label="Закрыть">✕</button>
+  <div class="feed" id="feed"></div>
 </div>
 
 <script>
@@ -575,12 +614,16 @@ const $ = (id) => document.getElementById(id);
 // The bottom bar's height varies with how many buttons are actually showing (1 for a
 // voter, up to 3 stacked for the admin's moderation view, or none once an allow_revote
 // voter has nothing left to press) -- a fixed body padding sized for one button left the
-// feed's last card hidden behind the bar whenever more (or fewer) buttons appeared.
+// grid's last row hidden behind the bar whenever more (or fewer) buttons appeared.
 // Tracked with a ResizeObserver instead of recomputed by hand after every place the bar's
 // contents change, so it can't be missed. (id="bar" matters: observe(null) throws.)
+// Published as --barH too, because the reel scrolls independently of the body and needs
+// the same allowance at its own bottom.
 if (window.ResizeObserver) {
   new ResizeObserver((entries) => {
-    document.body.style.paddingBottom = (entries[0].contentRect.height + 16) + "px";
+    const height = entries[0].contentRect.height;
+    document.documentElement.style.setProperty("--barH", height + "px");
+    document.body.style.paddingBottom = (height + 16) + "px";
   }).observe($("bar"));
 }
 
@@ -677,20 +720,127 @@ function isChosen(id) {
   return picked.has(id);
 }
 
-function pickLabel(id) {
-  if (poll.is_admin) return admitted.has(id) ? "Допущена" : "Допустить";
-  if (poll.allow_revote) return picked.has(id) ? "Голос учтён ✓" : "Выбрать";
-  if (ballotLocked()) return (poll.my_vote || []).includes(id) ? "Голос учтён ✓" : "Выбрать";
-  return picked.has(id) ? "Выбрано" : "Выбрать";
+// `short` is the grid's version: a cell one third of the screen wide cannot hold
+// "Голос учтён ✓", and shouting it in three columns would be noise anyway.
+function pickLabel(id, short) {
+  if (poll.is_admin) {
+    if (admitted.has(id)) return short ? "допущена" : "Допущена";
+    return short ? "допустить" : "Допустить";
+  }
+  const accepted = poll.allow_revote
+    ? picked.has(id)
+    : ballotLocked() && (poll.my_vote || []).includes(id);
+  if (accepted) return short ? "✓ учтён" : "Голос учтён ✓";
+  if (!poll.allow_revote && !ballotLocked() && picked.has(id)) return short ? "выбрано" : "Выбрано";
+  return short ? "выбрать" : "Выбрать";
+}
+
+// A voter who isn't a chat member gets a disabled button on every card, plus the notice
+// updateButton() shows in place of the bar's own button. Admins are unaffected.
+function picksDisabled() {
+  return !poll.is_admin && poll.is_member === false;
+}
+
+// The admin's vote bar is relative to the currently leading entry, not to the voter
+// count, so it stays readable in a poll with only a handful of ballots in so far.
+function voteBarHtml(entry, maxCount) {
+  if (!poll.is_admin) return "";
+  const count = poll.counts ? (poll.counts[entry.id] || 0) : 0;
+  return '<div class="votebar"><div class="votebar-fill" style="width:' +
+    Math.round(100 * count / maxCount) + '%"></div></div>';
+}
+
+function maxAdminCount() {
+  return poll.is_admin && poll.counts ? Math.max(1, ...Object.values(poll.counts)) : 1;
+}
+
+function renderGrid() {
+  const grid = $("grid");
+  grid.innerHTML = "";
+  const maxCount = maxAdminCount();
+  const disabled = picksDisabled() ? " disabled" : "";
+
+  for (const entry of poll.entries) {
+    const card = document.createElement("div");
+    card.className = "card gcard";
+    if (isChosen(entry.id)) card.classList.add("on");
+    if (poll.is_admin && !admitted.has(entry.id)) card.classList.add("pending");
+
+    const count = poll.is_admin && poll.counts ? (poll.counts[entry.id] || 0) : 0;
+    const votes = count ? '<span class="votes">' + count + "</span>" : "";
+    const more = entry.photos.length > 1
+      ? '<span class="count">+' + (entry.photos.length - 1) + "</span>" : "";
+
+    card.innerHTML =
+      '<a class="thumb" href="#" data-open="' + esc(entry.id) + '">' +
+        '<img loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' +
+        more + votes +
+      "</a>" +
+      voteBarHtml(entry, maxCount) +
+      '<div class="who">' + esc(who(entry)) + "</div>" +
+      '<button class="pick" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
+        pickLabel(entry.id, true) +
+      "</button>";
+    grid.appendChild(card);
+  }
+}
+
+function renderReel() {
+  const feed = $("feed");
+  feed.innerHTML = "";
+  const maxCount = maxAdminCount();
+  const disabled = picksDisabled() ? " disabled" : "";
+
+  for (const entry of poll.entries) {
+    const card = document.createElement("div");
+    card.className = "card rcard";
+    card.dataset.entry = entry.id;
+    if (isChosen(entry.id)) card.classList.add("on");
+    if (poll.is_admin && !admitted.has(entry.id)) card.classList.add("pending");
+
+    const count = poll.is_admin && poll.counts ? (poll.counts[entry.id] || 0) : 0;
+    const votes = count ? '<span class="votesBadge">' + count + "</span>" : "";
+
+    card.innerHTML =
+      '<div class="who">' + esc(who(entry)) + votes + "</div>" +
+      (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
+      '<div class="photos">' +
+        entry.photos.map((p) => '<img loading="lazy" src="' + esc(p) + '" alt="">').join("") +
+      "</div>" +
+      voteBarHtml(entry, maxCount) +
+      '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
+        pickLabel(entry.id) +
+      "</button>";
+    feed.appendChild(card);
+  }
+}
+
+// Repaints only what a pick changes -- the button labels and the chosen/pending classes,
+// in the grid and the reel alike. Deliberately NOT a re-render: rebuilding the reel's
+// innerHTML would send it back to the top, so voting on the fifth work would throw the
+// reader out of their place every time.
+function syncPicks() {
+  const disabled = picksDisabled();
+  for (const button of document.querySelectorAll("[data-pick]")) {
+    const id = button.dataset.pick;
+    button.textContent = pickLabel(id, button.classList.contains("pick"));
+    button.disabled = disabled;
+    const card = button.closest(".card");
+    if (!card) continue;
+    card.classList.toggle("on", isChosen(id));
+    if (poll.is_admin) card.classList.toggle("pending", !admitted.has(id));
+  }
+  updateButton();
 }
 
 function render() {
   renderWinnerBanner();
   renderResults();
   updateAdminButtons();
-  const feed = $("feed");
-  feed.innerHTML = "";
   if (!poll.entries.length) {
+    $("grid").innerHTML = "";
+    $("feed").innerHTML = "";
+    closeReel();
     $("msg").hidden = false;
     $("msg").textContent = poll.is_admin
       ? "За сегодня и вчера заявок с #итогинедели не нашлось."
@@ -700,41 +850,13 @@ function render() {
     return;
   }
   $("msg").hidden = true;
-  // The bar is relative to the currently leading entry, not to the voter count, so it
-  // stays readable in a poll with only a handful of ballots in so far.
-  const maxCount = poll.is_admin && poll.counts
-    ? Math.max(1, ...Object.values(poll.counts)) : 1;
-  // A voter who isn't a chat member gets a disabled button on every card, plus the
-  // notice updateButton() shows in place of the bar's own button. Admins are unaffected.
-  const disablePicks = !poll.is_admin && poll.is_member === false;
-
-  for (const entry of poll.entries) {
-    const card = document.createElement("div");
-    card.className = "card";
-    const chosen = isChosen(entry.id);
-    if (chosen) card.classList.add("on");
-    if (poll.is_admin && !admitted.has(entry.id)) card.classList.add("pending");
-
-    const count = poll.is_admin && poll.counts ? (poll.counts[entry.id] || 0) : 0;
-    const votes = poll.is_admin && poll.counts && count
-      ? '<span class="votesBadge">' + count + "</span>" : "";
-    const votebar = poll.is_admin
-      ? '<div class="votebar"><div class="votebar-fill" style="width:' +
-        Math.round(100 * count / maxCount) + '%"></div></div>'
-      : "";
-
-    card.innerHTML =
-      '<div class="who">' + esc(who(entry)) + votes + "</div>" +
-      (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
-      '<div class="photos">' +
-        entry.photos.map((p) => '<img loading="lazy" src="' + esc(p) + '" alt="">').join("") +
-      "</div>" +
-      votebar +
-      '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' +
-        (disablePicks ? " disabled" : "") + ">" + pickLabel(entry.id) +
-      "</button>";
-    feed.appendChild(card);
-  }
+  // Kept across the rebuild: a full render can happen while the reel is open (saving
+  // moderation settings does one), and losing the reader's place is exactly what
+  // syncPicks exists to avoid on the far more common path.
+  const reelScroll = $("reel").scrollTop;
+  renderGrid();
+  renderReel();
+  $("reel").scrollTop = reelScroll;
   updateButton();
 }
 
@@ -806,11 +928,39 @@ async function submitBallot(choices) {
   showConfirmBanner();
 }
 
+// Opens the reel at the tapped work. Every entry is in it, so from here the rest of the
+// poll is just more scrolling -- which is the point: one gesture in, then nothing to
+// close and reopen per work.
+function openReel(id) {
+  const reel = $("reel");
+  reel.hidden = false;
+  document.body.classList.add("reelOpen");
+  // Scanned rather than matched with an attribute selector: esc() escapes for HTML, not
+  // for CSS, so an id needing either kind of quoting would silently find nothing.
+  const target = [...$("feed").children].find((card) => card.dataset.entry === id);
+  // scrollTop first: scrollIntoView on the first card is a no-op if the reel is already
+  // scrolled from a previous open, and the reader would land wherever they left off.
+  reel.scrollTop = 0;
+  if (target) target.scrollIntoView({ block: "start" });
+  if (tg && tg.BackButton) tg.BackButton.show();
+}
+
+function closeReel() {
+  $("reel").hidden = true;
+  document.body.classList.remove("reelOpen");
+  if (tg && tg.BackButton) tg.BackButton.hide();
+}
+
+// Telegram's own back arrow closes the reel too -- on a phone that is the gesture people
+// reach for first, and without this it would close the whole Mini App instead.
+if (tg && tg.BackButton) tg.BackButton.onClick(closeReel);
+$("reelClose").addEventListener("click", closeReel);
+
 function toggleAdmitted(id) {
   const adding = !admitted.has(id);
   if (adding) admitted.add(id); else admitted.delete(id);
   if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
-  render();
+  syncPicks();
 }
 
 // allow_revote=false: tapping only stages the choice locally -- the ballot is final once
@@ -823,7 +973,7 @@ function toggleDraftPick(id) {
   }
   picked = nextSelection(id, adding);
   if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
-  render();
+  syncPicks();
 }
 
 // allow_revote=true (the default): the tap itself IS the vote -- no separate submit step.
@@ -852,7 +1002,8 @@ async function toggleAndSubmit(id) {
   } finally {
     ballotInFlight = false;
   }
-  render();
+  syncPicks();
+  renderResults();
 }
 
 async function onPickTap(id) {
@@ -873,6 +1024,8 @@ async function onPickTap(id) {
 }
 
 document.addEventListener("click", (event) => {
+  const open = event.target.closest("[data-open]");
+  if (open) { event.preventDefault(); openReel(open.dataset.open); return; }
   const pick = event.target.closest("[data-pick]");
   if (!pick || pick.disabled) return;
   event.preventDefault();
@@ -983,7 +1136,9 @@ $("clear").addEventListener("click", async () => {
     $("results").hidden = true;
     $("confirmBanner").hidden = true;
     $("announce").hidden = true;
+    $("grid").innerHTML = "";
     $("feed").innerHTML = "";
+    closeReel();
     $("go").hidden = true;
     $("sub").textContent = "";
     $("msg").hidden = false;
