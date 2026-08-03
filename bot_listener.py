@@ -5309,13 +5309,26 @@ async def run_bot_listener(
                         )
                     except Exception:
                         log(f"[bot_listener] error handling queued request:\n{traceback.format_exc()}")
+                        sent = None
                         try:
-                            await api.send_message(
+                            sent = await api.send_message(
                                 chat["id"], "Что-то пошло не так при генерации сводки.",
                                 reply_to_message_id=message["message_id"],
                             )
                         except Exception:
                             pass
+                        # Swept on the same clock as the receipt handle_bot_summary_request
+                        # would have left (SUMMARY_RECEIPT_DELETE_AFTER): a crash was the
+                        # one outcome that still stranded both a notice AND the request in
+                        # the group for good. Groups only -- in a DM the exchange is the
+                        # person's own and there is no clutter to clear.
+                        if chat.get("type") != "private":
+                            schedule_bot_delete(
+                                api, chat["id"],
+                                [sent["message_id"]] if sent and "message_id" in sent else [],
+                                SUMMARY_RECEIPT_DELETE_AFTER, log, background_tasks,
+                                trigger_message_id=message["message_id"],
+                            )
                 finally:
                     last_finished_at = time.monotonic()
                     summary_queue.task_done()
