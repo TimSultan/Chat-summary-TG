@@ -656,9 +656,11 @@ poker button decides from disk and answers immediately.
 
 A mobile-first voting page (`voting.py`, `vote_web.py`) opened as a **Telegram Mini App**
 — a real web page that loads inside Telegram itself, identifying the viewer without a
-login. In a group every subcommand's button links to the bot's DM instead, since Telegram
-only allows a Mini App button in a private chat; the round trip through the DM is what
-gets a signed identity to vote with.
+login. In a group every subcommand's button is a plain link rather than a Mini App button,
+since Telegram only allows the latter in a private chat — either straight into the Mini
+App via a Direct Link (`VOTE_MINIAPP_SHORT_NAME`, see `/vote chat` below) or into the
+bot's DM, where the real Mini App button is waiting. Either way it is opening the page
+inside Telegram that gets a signed identity to vote with.
 
 Five distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
 page that changes shape depending on who opens it:
@@ -693,9 +695,28 @@ page that changes shape depending on who opens it:
   ("🗑 Очистить голосование"), also behind its own confirmation.
 - **`/vote chat`** (DM, administrators only) drafts an announcement: asks for the text via
   a force-reply (same convention as every other short text prompt in this bot -- badge
-  creation, cabinet's title/coin entry), then sends that text plus the vote button. For
-  now that goes into the same DM the draft was written in, not the group -- posting it
-  into the chat itself is a manual copy-paste away until that's wired up directly.
+  creation, cabinet's title/coin entry), and then, instead of sending it anywhere
+  immediately, asks **where it goes** — "В чат" (the tracked chat itself), "В Папку
+  художников" (`VOTE_ANNOUNCE_EXTRA_CHAT`, `@papkahudojnicov` by default), "В оба", or
+  "Отмена". That question is the reason this is the one force-reply flow in the bot that
+  keeps its entry alive past the reply: the drafted text has to survive in memory
+  (`vote_chat_flows`, same 10-minute TTL, restarted when the destination question is
+  asked) until a button is pressed, and is dropped only once the announcement is posted or
+  cancelled. Each destination is posted to independently, so a bot that has been kicked
+  out of one group still gets the announcement into the other, and the reply back to the
+  admin names what went where and what failed with the Telegram error attached. The posted
+  announcement is **never scheduled for auto-delete** — unlike the stats replies this
+  codebase otherwise sweeps away as noise, the whole point of it is to still be there
+  tomorrow. Leaving `VOTE_ANNOUNCE_EXTRA_CHAT` blank simply removes the second and third
+  buttons rather than offering a destination that could not work.
+
+  The button on that posted announcement is a plain `url`, not a `web_app` one: Telegram
+  accepts a Mini App button only in a private chat and rejects one posted to a group. With
+  `VOTE_MINIAPP_SHORT_NAME` set (BotFather's `/newapp` Direct Link Mini App short name)
+  that url is `https://t.me/<bot>/<short name>?startapp=vote`, which opens the Mini App
+  from the group in place; without it the url falls back to the `?start=vote` deep link
+  into the DM, where the real `web_app` button is waiting one tap away. The same rule
+  governs the button a bare `/vote` leaves in a group.
 
 Which of these opens is decided server-side by a `?mode=admin` marker on the page's own
 URL, checked against a real admin lookup on every request (`handle_poll`) -- not by trusting
@@ -735,6 +756,11 @@ Requires `WEBAPP_PUBLIC_URL` (a real `https://` domain — Telegram refuses to o
 App over plain http) and, on a host with no persistent disk by default, `DATA_DIR` on a
 Volume — see both in `.env.example`. Without `WEBAPP_PUBLIC_URL` set, `/vote` explains
 that the voting page isn't configured instead of offering a button that wouldn't open.
+Two optional settings shape where announcements go and how their button opens:
+`VOTE_ANNOUNCE_EXTRA_CHAT` (the second group `/vote chat` may post to, `@papkahudojnicov`
+by default — an `@username` is all Telegram's `sendMessage` needs, so no numeric id lookup
+is involved) and `VOTE_MINIAPP_SHORT_NAME` (BotFather's `/newapp` short name, which has to
+be created by hand once, pointing at `WEBAPP_PUBLIC_URL` + `/vote`).
 
 ### Coins, the shop, and anti-farming
 

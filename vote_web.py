@@ -503,7 +503,9 @@ PAGE_HTML = """<!doctype html>
                 display: flex; align-items: center; }
   .rcard .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
   .rcard .photos { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
-  .rcard .photos img { width: 100%; border-radius: 10px; display: block; }
+  /* cursor, because tapping the picture is what closes the reel (see the #feed tap
+     handler) -- without it nothing says the biggest thing on the screen is a control. */
+  .rcard .photos img { width: 100%; border-radius: 10px; display: block; cursor: pointer; }
   .rcard .votebar { margin: 0 0 10px; }
   .votesBadge { margin-left: 6px; background: var(--accent); color: var(--accent-fg);
                 font-size: 11px; padding: 1px 6px; border-radius: 8px; }
@@ -556,14 +558,27 @@ PAGE_HTML = """<!doctype html>
              background: var(--card); font-size: 13px; }
   .results h2 { margin: 0 0 4px; font-size: 14px; }
   .results .voterCount { color: var(--muted); margin-bottom: 8px; }
-  .results .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
-  .results .rank { width: 16px; flex: none; color: var(--muted); font-size: 12px; }
-  .results .name { flex: none; max-width: 38%; overflow: hidden;
+  /* One grid for the entire standings table, rather than a flex row per line: sized per
+     row, a short name and a long one started their bars at different places, so the
+     table read as ragged lines instead of columns. The rank and tally columns are `auto`,
+     which sizes them to the widest entry in the whole table -- a three-digit count widens
+     the column for everyone instead of clipping, and the digits stay right-aligned under
+     each other. The name is capped at a share of the width so a long @username can never
+     squeeze the bar away on a phone. The tally is class="num" and not the obvious
+     class="count" because that name is already taken by the grid's photo-count badge,
+     which is position:absolute -- inherited here, it lifted every number out of its row
+     and stacked them all in the corner of the page. */
+  .results .table { display: grid; align-items: center; column-gap: 8px; row-gap: 6px;
+                    grid-template-columns: auto minmax(0, 38%) minmax(0, 1fr) auto; }
+  .results .rank { color: var(--muted); font-size: 12px; text-align: right;
+                    font-variant-numeric: tabular-nums; }
+  .results .name { min-width: 0; overflow: hidden;
                     text-overflow: ellipsis; white-space: nowrap; }
-  .results .track { flex: 1; height: 8px; border-radius: 4px;
+  .results .track { height: 8px; border-radius: 4px;
                      background: rgba(128,128,128,.2); overflow: hidden; }
   .results .fill { height: 100%; background: var(--accent); border-radius: 4px; }
-  .results .count { flex: none; width: 26px; text-align: right; font-size: 12px; color: var(--muted); }
+  .results .num { text-align: right; font-size: 12px; color: var(--muted);
+                   font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -676,15 +691,18 @@ function renderResults() {
   box.innerHTML =
     "<h2>Голоса</h2>" +
     '<div class="voterCount">Проголосовало: ' + (poll.voter_count || 0) + "</div>" +
+    // Four cells per entry, straight into one grid with no per-row wrapper -- a wrapper
+    // would make every line its own formatting context again, which is what stopped the
+    // columns lining up.
+    '<div class="table">' +
     poll.results.map((r, i) =>
-      '<div class="row">' +
-        '<span class="rank">' + (i + 1) + "</span>" +
-        '<span class="name">' + esc(who(r)) + "</span>" +
-        '<span class="track"><span class="fill" style="width:' +
-          Math.round(100 * r.votes / max) + '%"></span></span>' +
-        '<span class="count">' + r.votes + "</span>" +
-      "</div>"
-    ).join("");
+      '<span class="rank">' + (i + 1) + "</span>" +
+      '<span class="name">' + esc(who(r)) + "</span>" +
+      '<span class="track"><span class="fill" style="width:' +
+        Math.round(100 * r.votes / max) + '%"></span></span>' +
+      '<span class="num">' + r.votes + "</span>"
+    ).join("") +
+    "</div>";
 }
 
 function updateAdminButtons() {
@@ -763,6 +781,9 @@ function renderGrid() {
   for (const entry of poll.entries) {
     const card = document.createElement("div");
     card.className = "card gcard";
+    // Also on the grid cell, not just the reel card: closing the reel scrolls back to the
+    // cell for whatever entry was being read (see closeReelAt).
+    card.dataset.entry = entry.id;
     if (isChosen(entry.id)) card.classList.add("on");
     if (poll.is_admin && !admitted.has(entry.id)) card.classList.add("pending");
 
@@ -951,10 +972,58 @@ function closeReel() {
   if (tg && tg.BackButton) tg.BackButton.hide();
 }
 
+// Closing from inside the feed puts the grid back under the entry that was being read,
+// so a look through the reel doesn't cost the reader their place in the poll. Wraps
+// closeReel rather than replacing it, both because the ✕ and Telegram's back arrow have
+// no entry to return to and because the BackButton bookkeeping must stay in one place.
+function closeReelAt(entryId) {
+  closeReel();
+  const card = [...$("grid").children].find((c) => c.dataset.entry === entryId);
+  if (card) card.scrollIntoView({ block: "center" });
+}
+
 // Telegram's own back arrow closes the reel too -- on a phone that is the gesture people
 // reach for first, and without this it would close the whole Mini App instead.
 if (tg && tg.BackButton) tg.BackButton.onClick(closeReel);
 $("reelClose").addEventListener("click", closeReel);
+
+// A tap on a picture closes the reel as well: while reading down the feed the picture is
+// the whole screen, and the ✕ in the corner is the awkward way back to the grid. Only
+// pictures -- the vote button and everything else in a card keep their own handling.
+//
+// A scroll that comes to rest on a picture must not dismiss the feed under the reader,
+// and a `click` alone cannot tell the two apart on the desktop clients, where dragging a
+// scrollbar or the mouse still ends in one. So the gesture is measured from pointerdown:
+// the finger has to come back up near where it went down, soon enough to be a tap. When
+// there is no pointerdown to measure (a keyboard activation, a client without pointer
+// events) the click is taken at face value.
+const TAP_SLOP = 10;    // px of drift still read as a tap rather than a drag
+const TAP_MS = 600;     // longer is a press or a stalled scroll, not a tap
+let reelTap = null;
+
+$("feed").addEventListener("pointerdown", (event) => {
+  reelTap = event.target.tagName === "IMG"
+    ? { x: event.clientX, y: event.clientY, at: Date.now(), target: event.target }
+    : null;
+});
+// A gesture the browser took over (the touch became a scroll) is remembered as cancelled
+// rather than simply forgotten: forgotten, it would be indistinguishable from "no
+// pointerdown to measure", and any click that still followed would read as a tap.
+$("feed").addEventListener("pointercancel", () => { reelTap = { cancelled: true }; });
+
+$("feed").addEventListener("click", (event) => {
+  if (event.target.tagName !== "IMG") return;
+  const start = reelTap;
+  reelTap = null;
+  if (start) {
+    if (start.cancelled || start.target !== event.target) return;
+    if (Date.now() - start.at > TAP_MS) return;
+    if (Math.abs(event.clientX - start.x) > TAP_SLOP) return;
+    if (Math.abs(event.clientY - start.y) > TAP_SLOP) return;
+  }
+  const card = event.target.closest("[data-entry]");
+  closeReelAt(card && card.dataset.entry);
+});
 
 function toggleAdmitted(id) {
   const adding = !admitted.has(id);

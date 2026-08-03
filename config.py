@@ -36,6 +36,8 @@ class Config:
     summary_queue_delay_seconds: int
     webapp_public_url: str | None
     webapp_port: int
+    vote_announce_extra_chat: str | None
+    vote_miniapp_short_name: str | None
     save_trigger_keyword: str
     save_channel: str | None
     summary_pipeline_version: str
@@ -126,6 +128,25 @@ def load_config() -> Config:
         raise ChatSummaryError(f"PORT must be a number, got '{webapp_port_raw}'.")
     if webapp_port < 0 or webapp_port > 65535:
         raise ChatSummaryError(f"PORT must be between 0 and 65535, got {webapp_port}.")
+
+    # The second group "/vote chat" may post its announcement into, next to the tracked
+    # chat itself. Telegram's sendMessage takes an "@username" straight as the chat id, so
+    # this needs neither a numeric id nor a Telethon resolve -- the bot only has to be a
+    # member there. An @ is added when it's missing because the bare username is the one
+    # spelling sendMessage rejects, and it's the spelling people naturally type. Blank
+    # removes the choice altogether: the announcement then only offers the main chat,
+    # rather than offering a destination that could never work.
+    vote_announce_extra_chat = os.getenv("VOTE_ANNOUNCE_EXTRA_CHAT", "@papkahudojnicov").strip() or None
+    if vote_announce_extra_chat and not vote_announce_extra_chat.startswith("@") \
+            and not vote_announce_extra_chat.lstrip("-").isdigit():
+        vote_announce_extra_chat = f"@{vote_announce_extra_chat}"
+
+    # BotFather's Direct Link Mini App short name (/newapp), which lets the vote button in
+    # a GROUP be "https://t.me/<bot>/<short name>?startapp=vote" and open the Mini App
+    # right there. A web_app button is private-chat only -- Telegram rejects one posted to
+    # a group -- so without this short name the group button can only be the ?start=vote
+    # deep link into the DM, which works but costs the voter an extra tap.
+    vote_miniapp_short_name = os.getenv("VOTE_MINIAPP_SHORT_NAME", "").strip().strip("/") or None
 
     save_trigger_keyword = os.getenv("SAVE_TRIGGER_KEYWORD", "сохрани").strip().lower()
     if not save_trigger_keyword:
@@ -264,6 +285,8 @@ def load_config() -> Config:
         summary_queue_delay_seconds=summary_queue_delay_seconds,
         webapp_public_url=webapp_public_url,
         webapp_port=webapp_port,
+        vote_announce_extra_chat=vote_announce_extra_chat,
+        vote_miniapp_short_name=vote_miniapp_short_name,
         save_trigger_keyword=save_trigger_keyword,
         save_channel=save_channel,
         summary_pipeline_version=summary_pipeline_version,
