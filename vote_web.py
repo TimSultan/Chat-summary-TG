@@ -576,7 +576,10 @@ PAGE_HTML = """<!doctype html>
                     text-overflow: ellipsis; white-space: nowrap; }
   .results .track { height: 8px; border-radius: 4px;
                      background: rgba(128,128,128,.2); overflow: hidden; }
-  .results .fill { height: 100%; background: var(--accent); border-radius: 4px; }
+  /* display:block, because the fill is a span: width and height do nothing on an inline
+     box, so without this the bar was a grey track with an invisible zero-sized fill in it.
+     The track escapes the same fate only by being a grid item, which blockifies it. */
+  .results .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
   .results .num { text-align: right; font-size: 12px; color: var(--muted);
                    font-variant-numeric: tabular-nums; }
 </style>
