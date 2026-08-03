@@ -274,6 +274,25 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
             [(r["id"], r["votes"]) for r in data["results"]], [("a", 2), ("b", 0)]
         )
 
+    async def test_a_results_row_carries_every_field_the_standings_render(self):
+        """The page's who() reads `username` first and falls back to `author`, so a row
+        missing either renders a blank name -- results rows must carry both, exactly like
+        the entry payload they are rendered next to."""
+        poll = self._seed_poll(approved=("a",))
+        voting.record_vote(poll, self.voter_id, ["a"])
+        voting.save_poll(poll)
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        row = data["results"][0]
+        self.assertEqual(set(row), {"id", "author", "username", "votes"})
+        self.assertEqual(row["author"], "Author")
+        self.assertEqual(row["username"], "author")
+        self.assertIsInstance(row["votes"], int)
+
     async def test_results_are_present_on_a_closed_poll_even_for_a_non_voter(self):
         self._seed_poll(approved=("a", "b"))
         poll = voting.load_poll(CHAT, "2026-08-02")
@@ -618,6 +637,25 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get(vote_web.ROUTE_PREFIX)
         self.assertEqual(response.status, 200)
         self.assertIn("telegram-web-app.js", await response.text())
+
+    async def test_the_standings_number_does_not_reuse_the_photo_badge_class(self):
+        """`.count` is the grid thumbnail's absolutely positioned "+2 photos" badge. The
+        standings tally borrowed the name and inherited position:absolute with it, which
+        lifted every number out of its row -- hence class="num" and no `.results .count`
+        rule left to grow one back."""
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn('<span class="num">', page)
+        self.assertNotIn(".results .count", page)
+        self.assertIn(".results .table { display: grid;", page)
+
+    async def test_the_page_wires_a_tap_on_a_reel_photo_to_closing_it(self):
+        """Tapping a picture in the reel goes back to the grid, and does it through the
+        same closeReel() as the ✕ so Telegram's BackButton is always put away with it."""
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn('$("feed").addEventListener("pointerdown"', page)
+        self.assertIn('$("feed").addEventListener("click"', page)
+        self.assertIn("function closeReelAt(", page)
+        self.assertIn("closeReelAt(card && card.dataset.entry)", page)
 
 
 if __name__ == "__main__":

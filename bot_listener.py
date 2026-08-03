@@ -42,8 +42,8 @@ and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for ev
 including an admin (also a status/control panel for one); "/vote выбрать" (DM, admin-only)
 is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans
 #итогинедели posts into the poll; "/vote очистить" (DM, admin-only, tap-to-confirm)
-deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement. See
-handle_vote_command's docstring.
+deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement and posts it to
+the chats the admin picks. See handle_vote_command's docstring.
 
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
 session) -- or, more commonly, let listener.py's main() start this automatically
@@ -226,6 +226,14 @@ VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
 # whatever the admin says next in the DM.
 VOTE_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
 VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
+# The draft is written in the admin's DM but is almost never meant to stay there, so the
+# finished text is not sent anywhere until they say where it goes: the main chat, the
+# second group (VOTE_ANNOUNCE_EXTRA_CHAT), or both. That choice is what keeps a /vote chat
+# flow alive past its own text step -- the text has to survive in memory until the button
+# is pressed, so unlike every other force-reply flow here the entry is popped on the
+# button, not on the reply.
+VOTE_CHAT_DEST_CALLBACK_PREFIX = "votechatdest"
+VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "cancel")
 # Buttons on an administrator's bare-/vote status message for собрать/chat/очистить --
 # unlike "Открыть голосование"/"Модерация", those three are bot ACTIONS, not Mini App
 # pages, so they can't be a web_app button; tapping one runs the exact same code path as
@@ -3450,6 +3458,23 @@ def _vote_page_url(cfg) -> str | None:
     return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
 
 
+def _vote_group_button_url(cfg, bot_username: str | None) -> str | None:
+    """What the vote button links to in a message that lands in a GROUP. A web_app button
+    is private-chat only -- Telegram rejects one posted to a group outright -- so a group
+    can only carry a plain url, and which url depends on how the bot is registered.
+
+    With a Direct Link Mini App (BotFather's /newapp short name) the url opens the Mini App
+    in place, which is what the button promises. Without one the best available is the
+    ?start=vote deep link into the DM, where the real web_app button is waiting: it still
+    gets there, at the cost of one extra tap.
+    """
+    if not bot_username:
+        return None
+    if cfg.vote_miniapp_short_name:
+        return f"https://t.me/{bot_username}/{cfg.vote_miniapp_short_name}?startapp=vote"
+    return f"https://t.me/{bot_username}?start=vote"
+
+
 _VOTE_MEDALS = ("🥇", "🥈", "🥉")
 
 
@@ -3627,8 +3652,9 @@ async def handle_vote_command(
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
     - "/vote chat" (DM, admin-only) drafts an announcement -- asks for the text via a
-      force-reply, then sends that text plus the vote button, for now into the same DM
-      (see handle_vote_chat_text_input).
+      force-reply, then asks where it goes (main chat, the second group, or both) and
+      posts that text plus the vote button there (see handle_vote_chat_text_input and
+      handle_vote_chat_destination_callback).
     - bare "/vote" opens the actual ballot, for EVERYONE including an administrator --
       an admin is never forced into moderation mode just to cast their own vote. For an
       administrator specifically, it's also a status/control panel: current standings
@@ -3870,18 +3896,21 @@ async def handle_vote_command(
             )
         return
 
-    # In a group: a link into the DM, since a web_app button is private-chat only.
-    if not bot_username:
+    # In a group: a plain url button, since a web_app button is private-chat only. Where
+    # that url goes -- the Mini App itself or the DM -- is _vote_group_button_url's call,
+    # so the wording follows it rather than promising a trip through the DM that a
+    # configured Direct Link Mini App no longer needs.
+    group_url = _vote_group_button_url(cfg, bot_username)
+    if not group_url:
         await reply("Открой голосование в личке с ботом.")
         return
     # Deliberately kept in the chat, unlike the stats replies this codebase otherwise
     # sweeps away as noise -- people need to be able to find the vote announcement later,
     # so it is never scheduled for auto-delete.
     await reply(
-        "Голосование за итоги недели -- открывается в личке с ботом:",
-        reply_markup={"inline_keyboard": [[
-            {"text": VOTE_OPEN_BUTTON_TEXT, "url": f"https://t.me/{bot_username}?start=vote"}
-        ]]},
+        "Голосование за итоги недели:" if cfg.vote_miniapp_short_name
+        else "Голосование за итоги недели -- открывается в личке с ботом:",
+        reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "url": group_url}]]},
     )
     # background_tasks is now unused in this function, but stays a required parameter --
     # callers (handle_vote_action_callback, _dispatch_update) pass it positionally.
@@ -3894,10 +3923,12 @@ async def handle_vote_chat_text_input(
     vote_chat_flows: dict[str, dict],
     log=print,
 ) -> bool:
-    """Consumes "/vote chat"'s force-reply and sends the finished announcement -- the
-    admin's own text, plus the vote button -- into the same DM the draft was started in
-    (see handle_vote_command's docstring: posting it into the actual group chat is a
-    manual copy-paste away until that's wired up directly).
+    """Consumes "/vote chat"'s force-reply and asks where the finished announcement should
+    go -- the main chat, the second group (VOTE_ANNOUNCE_EXTRA_CHAT), or both. Nothing is
+    posted here: the text is parked in its own flow and
+    handle_vote_chat_destination_callback sends it once a destination button is pressed,
+    which is why this is the one force-reply flow in this file that does NOT pop its entry
+    on the reply.
 
     Returns True once this message belonged to a pending draft, so the caller stops
     treating it as ordinary chat input -- same contract as handle_badge_text_input/
@@ -3920,45 +3951,187 @@ async def handle_vote_chat_text_input(
     if found is None:
         return False
     flow_id, flow = found
-    vote_chat_flows.pop(flow_id, None)
 
     text = (message.get("text") or "").strip()
     if text.lower() in ("/cancel", "отмена"):
+        vote_chat_flows.pop(flow_id, None)
         await api.send_message(
             chat_id, "Черновик отменён.", reply_to_message_id=message["message_id"], parse_mode=None
         )
         return True
     if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
+        vote_chat_flows.pop(flow_id, None)
         return True  # silently dropped, same as badge_flows -- admin status changed mid-flow
     if not text:
+        vote_chat_flows.pop(flow_id, None)
         await api.send_message(
             chat_id, "Пустой текст -- объявление не отправлено.",
             reply_to_message_id=message["message_id"], parse_mode=None,
         )
         return True
 
-    page_url = _vote_page_url(cfg)
-    if not page_url:
+    if not _vote_page_url(cfg):
+        vote_chat_flows.pop(flow_id, None)
         await api.send_message(
             chat_id, "Голосование не настроено -- некуда вести кнопку.",
             reply_to_message_id=message["message_id"], parse_mode=None,
         )
         return True
 
+    destinations = [[{
+        "text": "📣 В чат", "callback_data": _vote_chat_dest_callback_data("main", flow_id),
+    }]]
+    # The second group only appears when it's configured -- offering "В оба" with nothing
+    # on the other side would be a button whose only possible outcome is an error.
+    if cfg.vote_announce_extra_chat:
+        destinations[0].append({
+            "text": "🎨 В Папку художников",
+            "callback_data": _vote_chat_dest_callback_data("extra", flow_id),
+        })
+        destinations.append([{
+            "text": "📣 В оба", "callback_data": _vote_chat_dest_callback_data("both", flow_id),
+        }])
+    destinations.append([{
+        "text": "Отмена", "callback_data": _vote_chat_dest_callback_data("cancel", flow_id),
+    }])
+
+    flow["text"] = text
+    # The destination step gets the full TTL of its own: the clock so far measured how long
+    # the admin took to write the text, which says nothing about how long they need to
+    # decide where it goes.
+    flow["created_at"] = time.monotonic()
     try:
         await api.send_message(
-            chat_id, text, parse_mode=None,
-            reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+            chat_id, "Куда отправить объявление?",
+            reply_to_message_id=message["message_id"], parse_mode=None,
+            reply_markup={"inline_keyboard": destinations},
         )
     except Exception as e:
-        log(f"[bot_listener] failed to send the vote chat announcement: {e}")
-        await api.send_message(
-            chat_id, "Не получилось отправить объявление.",
-            reply_to_message_id=message["message_id"], parse_mode=None,
-        )
+        log(f"[bot_listener] failed to offer the vote announcement destinations: {e}")
+        vote_chat_flows.pop(flow_id, None)
         return True
-    log(f"[bot_listener] {actor.get('username') or actor.get('id')} sent a vote announcement ({len(text)} chars)")
+    log(f"[bot_listener] {actor.get('username') or actor.get('id')} drafted a vote announcement ({len(text)} chars)")
     return True
+
+
+def _vote_chat_dest_callback_data(destination: str, flow_id: str) -> str:
+    return f"{VOTE_CHAT_DEST_CALLBACK_PREFIX}:{destination}:{flow_id}"
+
+
+def _parse_vote_chat_dest_callback(data: str) -> tuple[str, str] | None:
+    parts = (data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[0] != VOTE_CHAT_DEST_CALLBACK_PREFIX
+        or parts[1] not in VOTE_CHAT_DESTINATIONS
+        or not parts[2]
+    ):
+        return None
+    return parts[1], parts[2]
+
+
+async def handle_vote_chat_destination_callback(
+    api: TelegramBotAPI,
+    cfg,
+    callback: dict,
+    vote_chat_flows: dict[str, dict],
+    bot_username: str | None,
+    log=print,
+) -> None:
+    """Posts a drafted "/vote chat" announcement once the admin picks where it goes, or
+    drops it on "Отмена". Either way the flow is finished with here -- this is where the
+    entry handle_vote_chat_text_input deliberately left alive gets popped.
+
+    Each destination is its own send, with its own try/except: two groups are two Bot API
+    calls, and a bot that has been kicked from one of them must still get the announcement
+    into the other rather than failing the whole thing. The report back to the admin names
+    both sides so a silent half-delivery is impossible.
+    """
+    parsed = _parse_vote_chat_dest_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    destination, flow_id = parsed
+
+    flow = vote_chat_flows.get(flow_id)
+    if flow is None or time.monotonic() - flow["created_at"] > VOTE_CHAT_FLOW_TTL_SECONDS:
+        vote_chat_flows.pop(flow_id, None)
+        await api.answer_callback_query(
+            callback["id"], text="Черновик устарел -- начни заново: /vote chat"
+        )
+        return
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != flow.get("user_id"):
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    # Answered before anything else that talks to Telegram: posting into two groups is two
+    # round trips plus the re-verification below, and a button that waits for all of them
+    # sits spinning on the presser's screen for the whole time.
+    await api.answer_callback_query(callback["id"])
+    vote_chat_flows.pop(flow_id, None)
+
+    dm_chat_id = flow["chat_id"]
+
+    async def report(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] failed to report the vote announcement result: {e}")
+
+    if destination == "cancel":
+        await report("Объявление отменено.")
+        return
+    # Re-checked against the tapper even though only they could see the button, the same
+    # belt-and-suspenders check every other confirm flow in this file does -- admin status
+    # can have been taken away between writing the text and choosing a destination.
+    if not await _can_manage_chat(api, flow["admin_chat_id"], clicker, flow.get("entry")):
+        await report("Публиковать объявление могут только администраторы.")
+        return
+
+    button_url = _vote_group_button_url(cfg, bot_username)
+    if not button_url:
+        await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
+        return
+    # A url button, never web_app: every destination here is a group, and Telegram accepts
+    # a web_app button only in a private chat (see _vote_group_button_url).
+    keyboard = {"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "url": button_url}]]}
+
+    targets: list[tuple[str, object]] = []
+    if destination in ("main", "both"):
+        targets.append(("основной чат", flow.get("admin_chat_id")))
+    if destination in ("extra", "both") and cfg.vote_announce_extra_chat:
+        targets.append(("Папка художников", cfg.vote_announce_extra_chat))
+
+    posted: list[str] = []
+    failed: list[str] = []
+    for label, target in targets:
+        if target is None:
+            failed.append(f"{label} (чат не определён)")
+            continue
+        try:
+            # Never scheduled for auto-delete, unlike the stats replies this codebase
+            # sweeps away as noise: an announcement whose whole purpose is to be come back
+            # to and voted from is the one message that has to still be there tomorrow.
+            await api.send_message(target, flow["text"], parse_mode=None, reply_markup=keyboard)
+        except Exception as e:
+            log(f"[bot_listener] failed to post the vote announcement to {label}: {e}")
+            failed.append(f"{label} ({e})")
+        else:
+            posted.append(label)
+
+    if not targets:
+        await report("Некуда отправлять: второй чат не настроен (VOTE_ANNOUNCE_EXTRA_CHAT).")
+        return
+    lines = []
+    if posted:
+        lines.append("Объявление опубликовано: " + ", ".join(posted) + ".")
+    if failed:
+        lines.append("Не получилось отправить: " + "; ".join(failed))
+    await report("\n".join(lines))
+    log(
+        f"[bot_listener] {clicker.get('username') or clicker.get('id')} posted a vote "
+        f"announcement to {destination}: {len(posted)} ok, {len(failed)} failed"
+    )
 
 
 async def handle_shop_command(
@@ -4652,6 +4825,12 @@ async def _dispatch_update(
             await handle_vote_action_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
                 background_tasks, vote_chat_flows, log=log,
+            )
+        elif callback_data.startswith(f"{VOTE_CHAT_DEST_CALLBACK_PREFIX}:"):
+            # No chat resolution here either: the draft carries the ids it needs, so
+            # choosing a destination never waits on the Telethon session.
+            await handle_vote_chat_destination_callback(
+                api, cfg, callback, vote_chat_flows, bot_username, log=log,
             )
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner

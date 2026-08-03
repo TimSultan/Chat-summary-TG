@@ -93,7 +93,11 @@ class VoteGroupPostIsNotAutoDeletedTests(unittest.TestCase):
 
     def test_a_bare_vote_in_a_group_sends_but_never_schedules_a_delete(self):
         api = self.FakeApi()
-        cfg = SimpleNamespace(webapp_public_url="https://example.com")
+        cfg = SimpleNamespace(
+            webapp_public_url="https://example.com",
+            vote_miniapp_short_name=None,
+            vote_announce_extra_chat=None,
+        )
         message = {
             "message_id": 1,
             "chat": {"id": CHAT_ID, "type": "group"},
