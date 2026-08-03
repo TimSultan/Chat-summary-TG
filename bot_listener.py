@@ -27,8 +27,8 @@ With zero or multiple entries there's no unambiguous default, and a DM request g
 to ask in the group instead of guessing which one you meant.
 
 The DM is also where every summary ANSWER goes, including for a request typed in a group
--- the group only gets a short receipt, which takes the request down with it half a
-minute later (see handle_bot_summary_request and SUMMARY_RECEIPT_DELETE_AFTER). Since
+-- the group only gets a short receipt, which takes the request down with it ten seconds
+later (see handle_bot_summary_request and SUMMARY_RECEIPT_DELETE_AFTER). Since
 Telegram forbids a bot from writing first, somebody who has never opened the DM has
 nowhere to receive an answer, and is told to open it instead of being answered.
 
@@ -112,13 +112,13 @@ POLL_TIMEOUT_SECONDS = 30
 # A summary asked for in a group is now ANSWERED IN THE REQUESTER'S DM with the bot; the
 # group itself keeps only a short receipt pointing there. Both that receipt and the
 # request that prompted it are swept after this long -- everything left in the group is
-# bookkeeping, and bookkeeping shouldn't outlive being read. Longer than
-# ERROR_DELETE_AFTER's 10s because this one carries a link people are meant to tap.
-SUMMARY_RECEIPT_DELETE_AFTER = 30
+# bookkeeping, and bookkeeping shouldn't outlive being read. The same 10s
+# ERROR_DELETE_AFTER gives its notices: long enough to read one line and tap a link.
+SUMMARY_RECEIPT_DELETE_AFTER = 10
 SUMMARY_RECEIPT_TEXT = "Сообщение отправлено 👍"
 # Telegram forbids a bot from writing first, so somebody who has never opened the DM is
 # simply unreachable -- there is no way to deliver their answer and nothing to do but say
-# so. Same 30s sweep: the request is gone either way.
+# so. Same 10s sweep: the request is gone either way.
 SUMMARY_DM_CLOSED_TEXT = "Активируй личку бота, чтобы получать ответы там."
 
 # How long ONE update may take before the poll loop abandons it and moves on.
@@ -4079,7 +4079,7 @@ async def handle_bot_summary_request(
     A summary is long, it is for the person who asked, and a group that produces a dozen a
     day drowns in them. So a request made in a group is answered in that person's DM and
     the group gets only a receipt (see _post_summary_receipt), which takes the request
-    down with it half a minute later. A request already made in a DM is simply answered
+    down with it ten seconds later. A request already made in a DM is simply answered
     where it was asked -- same destination, no receipt, nothing to clean up.
 
     That makes an unopened DM a hard blocker rather than a degraded case: Telegram won't
