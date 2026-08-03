@@ -26,6 +26,12 @@ _home_chat_ref): whichever chat LISTENER_ALLOWED_CHATS names, IF it names exactl
 With zero or multiple entries there's no unambiguous default, and a DM request gets told
 to ask in the group instead of guessing which one you meant.
 
+The DM is also where every summary ANSWER goes, including for a request typed in a group
+-- the group only gets a short receipt, which takes the request down with it half a
+minute later (see handle_bot_summary_request and SUMMARY_RECEIPT_DELETE_AFTER). Since
+Telegram forbids a bot from writing first, somebody who has never opened the DM has
+nowhere to receive an answer, and is told to open it instead of being answered.
+
 Always uses the v2 pipeline (intent_v2 + responder_v2) regardless of
 SUMMARY_PIPELINE_VERSION, which only governs the older Telethon-listener code path kept
 for rollback/comparison -- see intent_v2.py's module docstring.
@@ -102,6 +108,18 @@ from telegram_fetch import (
 
 MAX_REPLY_CHARS = 4000
 POLL_TIMEOUT_SECONDS = 30
+
+# A summary asked for in a group is now ANSWERED IN THE REQUESTER'S DM with the bot; the
+# group itself keeps only a short receipt pointing there. Both that receipt and the
+# request that prompted it are swept after this long -- everything left in the group is
+# bookkeeping, and bookkeeping shouldn't outlive being read. Longer than
+# ERROR_DELETE_AFTER's 10s because this one carries a link people are meant to tap.
+SUMMARY_RECEIPT_DELETE_AFTER = 30
+SUMMARY_RECEIPT_TEXT = "Сообщение отправлено 👍"
+# Telegram forbids a bot from writing first, so somebody who has never opened the DM is
+# simply unreachable -- there is no way to deliver their answer and nothing to do but say
+# so. Same 30s sweep: the request is gone either way.
+SUMMARY_DM_CLOSED_TEXT = "Активируй личку бота, чтобы получать ответы там."
 
 # How long ONE update may take before the poll loop abandons it and moves on.
 #
@@ -328,6 +346,28 @@ async def _is_chat_admin(api: TelegramBotAPI, chat_id: int, user_id: int) -> boo
     except ChatSummaryError:
         return False
     return any((member.get("user") or {}).get("id") == user_id for member in administrators)
+
+
+_CHAT_MEMBER_STATUSES = frozenset({"creator", "administrator", "member"})
+
+
+async def _is_chat_member(api: TelegramBotAPI, chat_id: int, user_id: int) -> bool:
+    """Whether this user is currently a member of the chat -- the "подписчики" gate for
+    /vote. "restricted" is special-cased because Telegram uses that single status for two
+    different situations: a member under restrictions (still in the chat) and someone who
+    was restricted and then left. Only the payload's `is_member` field tells them apart;
+    trusting the status alone would let a departed user keep voting."""
+    try:
+        member = await api.get_chat_member(chat_id, user_id)
+    except ChatSummaryError:
+        # A user who never joined makes Telegram return an error here, same as a
+        # transient API failure -- either way, failing closed beats letting a
+        # non-member's vote through.
+        return False
+    status = member.get("status")
+    if status == "restricted":
+        return bool(member.get("is_member"))
+    return status in _CHAT_MEMBER_STATUSES
 
 
 async def _can_manage_chat(
@@ -2638,6 +2678,62 @@ def schedule_bot_delete(
     task.add_done_callback(background_tasks.discard)
 
 
+async def _can_dm(api: TelegramBotAPI, user_id: int | None, log=print) -> bool:
+    """Whether the bot may write to this person's DM at all.
+
+    Probed with sendChatAction rather than by just trying the real send and handling the
+    failure: a summary answer is only ready after a minute of OpenAI work, and finding out
+    THEN that there was nowhere to put it means having paid for an answer nobody can read.
+    The probe costs nothing, delivers no message to someone who has opened the DM, and
+    fails with exactly the 403 the real send would have.
+    """
+    if not user_id:
+        return False
+    try:
+        await api.send_chat_action(user_id, "typing")
+        return True
+    except ChatSummaryError as e:
+        log(f"[bot_listener] cannot DM {user_id}: {e}")
+        return False
+
+
+async def _post_summary_receipt(
+    api: TelegramBotAPI,
+    chat_id,
+    trigger_message_id: int,
+    text: str,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """Leaves the group a short receipt for a summary that was answered in the DM (or
+    couldn't be), with a link into that DM, and schedules both it and the request that
+    prompted it for deletion -- see SUMMARY_RECEIPT_DELETE_AFTER.
+
+    The link is an inline button rather than a URL in the text so the receipt reads as one
+    line whichever of the two things it is saying.
+    """
+    markup = (
+        {"inline_keyboard": [[{"text": "Открыть чат с ботом", "url": f"https://t.me/{bot_username}"}]]}
+        if bot_username else None
+    )
+    sent = None
+    try:
+        sent = await api.send_message(
+            chat_id, text, reply_to_message_id=trigger_message_id,
+            parse_mode=None, reply_markup=markup,
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to post the summary receipt: {e}")
+    # Scheduled even when the receipt itself failed to send: the request still has to go,
+    # and schedule_bot_delete takes the trigger separately from the message list.
+    schedule_bot_delete(
+        api, chat_id, [sent["message_id"]] if sent and "message_id" in sent else [],
+        SUMMARY_RECEIPT_DELETE_AFTER, log, background_tasks,
+        trigger_message_id=trigger_message_id,
+    )
+
+
 async def _deliver_shop_item(
     api, telethon_client, cfg, tz, entry, chat_ref, item, user, xp, requester, log,
 ):
@@ -3778,17 +3874,17 @@ async def handle_vote_command(
     if not bot_username:
         await reply("Открой голосование в личке с ботом.")
         return
-    sent = await reply(
+    # Deliberately kept in the chat, unlike the stats replies this codebase otherwise
+    # sweeps away as noise -- people need to be able to find the vote announcement later,
+    # so it is never scheduled for auto-delete.
+    await reply(
         "Голосование за итоги недели -- открывается в личке с ботом:",
         reply_markup={"inline_keyboard": [[
             {"text": VOTE_OPEN_BUTTON_TEXT, "url": f"https://t.me/{bot_username}?start=vote"}
         ]]},
     )
-    if sent and "message_id" in sent:
-        schedule_bot_delete(
-            api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
-            trigger_message_id=message["message_id"],
-        )
+    # background_tasks is now unused in this function, but stays a required parameter --
+    # callers (handle_vote_action_callback, _dispatch_update) pass it positionally.
 
 
 async def handle_vote_chat_text_input(
@@ -3978,6 +4074,18 @@ async def handle_bot_summary_request(
     home_chat_ref: str | None,
     log=print,
 ):
+    """Answers one summary enquiry -- ALWAYS in the requester's DM with the bot.
+
+    A summary is long, it is for the person who asked, and a group that produces a dozen a
+    day drowns in them. So a request made in a group is answered in that person's DM and
+    the group gets only a receipt (see _post_summary_receipt), which takes the request
+    down with it half a minute later. A request already made in a DM is simply answered
+    where it was asked -- same destination, no receipt, nothing to clean up.
+
+    That makes an unopened DM a hard blocker rather than a degraded case: Telegram won't
+    let a bot write first, so there is nowhere to deliver to. It's checked BEFORE any
+    OpenAI work for that reason -- see _can_dm.
+    """
     chat = message["chat"]
     chat_id = chat["id"]
     message_id = message["message_id"]
@@ -3987,14 +4095,44 @@ async def handle_bot_summary_request(
     chat_title_for_history = chat.get("title") or chat.get("first_name") or "Unknown chat"
     request_dt = datetime.fromtimestamp(message["date"], tz=timezone.utc)
 
+    is_private = chat.get("type") == "private"
+    # Where the answer goes. In a DM that is this very chat; from a group it is the
+    # requester's own DM, whose chat_id for a private chat IS their user id.
+    answer_chat_id = chat_id if is_private else sender.get("id")
+
     async def respond(answer: str, delete_after: int | None = None, record: bool = True) -> list[int]:
-        sent_ids = await send_long_bot_message(api, chat_id, answer, reply_to_message_id=message_id)
+        try:
+            sent_ids = await send_long_bot_message(
+                api, answer_chat_id, answer,
+                # A group request's message_id means nothing in the DM the answer lands
+                # in, so there is nothing to reply to there.
+                reply_to_message_id=message_id if is_private else None,
+            )
+        except Exception as e:
+            # _can_dm said this DM was reachable, so getting here means something else
+            # went wrong -- but from the group's side the outcome is the same: no answer
+            # arrived, and saying "отправлено" would be a lie.
+            log(f"[bot_listener] failed to deliver the answer to {answer_chat_id}: {e}")
+            if not is_private:
+                await _post_summary_receipt(
+                    api, chat_id, message_id, SUMMARY_DM_CLOSED_TEXT, bot_username,
+                    background_tasks, log=log,
+                )
+            return []
         if record:
             try:
                 history.record(chat_title_for_history, requester, text, answer)
             except Exception as e:
                 log(f"[bot_listener] failed to record history: {e}")
-        if delete_after and sent_ids:
+        if not is_private:
+            await _post_summary_receipt(
+                api, chat_id, message_id, SUMMARY_RECEIPT_TEXT, bot_username,
+                background_tasks, log=log,
+            )
+        elif delete_after and sent_ids:
+            # Only ever the DM's own short notices (the day limit, say). `delete_after` is
+            # meaningless for an answer sent to a group's requester: the group's receipt
+            # has its own sweep, and the DM copy is the one thing meant to be kept.
             schedule_bot_delete(
                 api, chat_id, sent_ids, delete_after, log, background_tasks,
                 trigger_message_id=message_id,
@@ -4004,12 +4142,18 @@ async def handle_bot_summary_request(
     # A DM has no group history of its own -- redirect data fetching to the configured
     # home group, but keep replying/recording history against the DM itself (chat_id,
     # requester above are untouched). See _home_chat_ref.
-    if chat.get("type") == "private":
+    if is_private:
         if not home_chat_ref:
             await respond("Не настроен основной чат для личных сообщений -- обратитесь в группе.")
             return
         data_chat_ref = home_chat_ref
     else:
+        if not await _can_dm(api, answer_chat_id, log=log):
+            await _post_summary_receipt(
+                api, chat_id, message_id, SUMMARY_DM_CLOSED_TEXT, bot_username,
+                background_tasks, log=log,
+            )
+            return
         data_chat_ref = chat.get("username") or chat_title_for_history
 
     mentioned = extract_mentioned_usernames(text, exclude=bot_username)
@@ -5230,6 +5374,22 @@ async def run_bot_listener(
                 return False
             return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
 
+        async def _is_vote_member(user: dict) -> bool:
+            """The "голосовать могут только подписчики" gate: only members of the home
+            chat may cast a ballot. Fails closed -- an unresolvable home chat blocks
+            voting entirely rather than letting a stranger through, the same tradeoff
+            _is_vote_admin makes above."""
+            if not home_chat_ref:
+                return False
+            admin_chat_id = await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if admin_chat_id is None:
+                log("[bot_listener] /vote membership check: could not resolve the home chat -- denying the vote.")
+                return False
+            user_id = user.get("id")
+            if user_id is None:
+                return False
+            return await _is_chat_member(api, admin_chat_id, user_id)
+
         async def _announce_vote_winner(user: dict, poll, top: list) -> None:
             """Sends the winner announcement -- for now into the admin's own DM with the
             bot (the same chat the Mini App was opened from), not the group. `user` is
@@ -5287,7 +5447,7 @@ async def run_bot_listener(
             tasks.append(
                 vote_web.run_web_server(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
-                    announce=_announce_vote_winner, log=log,
+                    announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
                 )
             )
         else:

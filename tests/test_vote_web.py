@@ -175,6 +175,133 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 404)
 
+    async def test_ballot_response_carries_results_and_voter_count(self):
+        """The success response gives the page enough to render the standings right
+        after a vote, without a second /api/poll round trip."""
+        self._seed_poll(approved=("a", "b"))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+        )
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data["voter_count"], 1)
+        self.assertEqual(
+            [(r["id"], r["votes"]) for r in data["results"]], [("a", 1), ("b", 0)]
+        )
+
+    # ---- the membership gate -------------------------------------------------------------
+
+    async def test_create_app_is_still_constructible_without_is_member(self):
+        """The default (create_app called with no is_member, as in asyncSetUp) must be
+        permissive -- this module has to keep working standalone, without bot_listener.py's
+        real Telegram chat-membership check wired up."""
+        self._seed_poll(approved=("a",))
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertTrue(data["is_member"])
+
+    async def test_a_non_member_is_refused_by_ballot_and_nothing_is_recorded(self):
+        async def is_admin(user: dict) -> bool:
+            return user.get("id") == self.admin_id
+
+        async def is_member(user: dict) -> bool:
+            return user.get("id") != self.voter_id
+
+        cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
+        app = vote_web.create_app(cfg, CHAT, is_admin, is_member=is_member, log=lambda *_: None)
+        async with TestClient(TestServer(app)) as client:
+            self._seed_poll(approved=("a",))
+            response = await client.post(
+                f"{vote_web.ROUTE_PREFIX}/api/ballot",
+                json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+            )
+            data = await response.json()
+
+        self.assertEqual(response.status, 403)
+        self.assertNotIn("ok", data)
+        self.assertIsNone(voting.load_poll(CHAT, "2026-08-02").votes.get(str(self.voter_id)))
+
+    async def test_the_poll_payload_reports_is_member(self):
+        self._seed_poll(approved=("a",))
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertIn("is_member", data)
+
+    # ---- results are gated on having earned the right to see them -------------------------
+
+    async def test_poll_payload_always_carries_voter_count(self):
+        poll = self._seed_poll(approved=("a",))
+        voting.record_vote(poll, 42, ["a"])
+        voting.save_poll(poll)
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertEqual(data["voter_count"], 1)
+
+    async def test_results_are_absent_for_a_voter_who_has_not_voted_on_an_open_poll(self):
+        """Showing a running vote count to somebody who hasn't cast their own ballot yet
+        would bias what they pick -- so results are withheld, not sent empty."""
+        self._seed_poll(approved=("a", "b"))
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertNotIn("results", data)
+
+    async def test_results_appear_once_the_voter_has_voted_ranked_with_zero_vote_entries(self):
+        poll = self._seed_poll(approved=("a", "b"))
+        voting.record_vote(poll, self.voter_id, ["a"])
+        voting.record_vote(poll, 99, ["a"])
+        voting.save_poll(poll)
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertEqual(
+            [(r["id"], r["votes"]) for r in data["results"]], [("a", 2), ("b", 0)]
+        )
+
+    async def test_results_are_present_on_a_closed_poll_even_for_a_non_voter(self):
+        self._seed_poll(approved=("a", "b"))
+        poll = voting.load_poll(CHAT, "2026-08-02")
+        voting.record_vote(poll, 10, ["a"])
+        voting.save_poll(poll)
+        await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/announce",
+            json={"init_data": _init_data(self.admin_id)},
+        )
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertIn("results", data)
+
+    async def test_results_are_present_in_admin_mode_regardless_of_voting(self):
+        self._seed_poll(approved=("a", "b"))
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll?mode=admin",
+            headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+        )
+        data = await response.json()
+        self.assertEqual(
+            [(r["id"], r["votes"]) for r in data["results"]], [("a", 0), ("b", 0)]
+        )
+
     # ---- max_choices / allow_revote settings ---------------------------------------------
 
     async def test_a_ballot_over_the_max_choices_cap_is_rejected(self):

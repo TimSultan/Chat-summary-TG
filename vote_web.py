@@ -35,6 +35,10 @@ _ENTRY_KEY = web.AppKey("entry", str)
 # _can_manage_chat also honors a hardcoded username allowlist (PRIVILEGED_MANAGEMENT_
 # USERNAMES), which needs the username, not only the id, to check.
 _IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[dict], Awaitable[bool]])
+# Same shape as _IS_ADMIN_KEY, for a different question: is this Telegram user a member of
+# the chat the poll belongs to at all. bot_listener.py's real implementation checks
+# Telegram chat membership; see create_app's docstring for why the default is permissive.
+_IS_MEMBER_KEY = web.AppKey("is_member", Callable[[dict], Awaitable[bool]])
 # Sends the winner announcement wherever bot_listener.py decides "the chat" currently
 # means (its own DM with the admin who closed the vote, for now). Takes the admin's user
 # dict, the poll, and the top 3 (Entry, votes) pairs ranked highest-first (fewer if there
@@ -84,6 +88,17 @@ def _entry_payload(entry: voting.Entry, poll: voting.Poll, base: str) -> dict:
     }
 
 
+def _results_payload(poll: voting.Poll) -> list[dict]:
+    """One dict per APPROVED entry, ranked most-votes-first (poll.tally()'s own order) --
+    what the page's standings table renders. A separate function from _entry_payload
+    because results have nothing to do with the media/text a voter picks from; they are
+    shown after the fact, next to a vote count."""
+    return [
+        {"id": entry.entry_id, "author": entry.author_name, "username": entry.author_username, "votes": count}
+        for entry, count in poll.tally()
+    ]
+
+
 async def handle_poll(request: web.Request) -> web.Response:
     """What the page renders: the entries this caller may see, and their own current vote.
 
@@ -98,6 +113,13 @@ async def handle_poll(request: web.Request) -> web.Response:
     Everyone else (including an admin viewing the plain ballot) gets only what has been
     admitted -- an unmoderated poll shows them nothing rather than showing them posts
     nobody has approved yet.
+
+    `results` (the standings, from _results_payload) is withheld from a voter who has not
+    voted yet on a poll that's still open -- showing somebody a running vote count before
+    they've cast their own ballot biases what they pick, so they only earn it by voting,
+    or once there's nothing left to bias (poll closed), or in admin mode where it's simply
+    moderation information. `voter_count` alone (just how many people have voted, not for
+    whom) carries none of that bias, so it goes out unconditionally.
     """
     user = await _authenticate(request)
     entry_name = request.app[_ENTRY_KEY]
@@ -109,9 +131,11 @@ async def handle_poll(request: web.Request) -> web.Response:
 
     can_moderate = await request.app[_IS_ADMIN_KEY](user)
     admin_mode = can_moderate and request.query.get("mode") == "admin"
+    is_member = await request.app[_IS_MEMBER_KEY](user)
     base = request.app[_ROUTE_PREFIX_KEY]
     visible = poll.entries if admin_mode else poll.approved_entries()
     winner = poll.winner()
+    voted_already = str(user["id"]) in poll.votes
 
     payload = {
         "poll_id": poll.poll_id,
@@ -119,8 +143,10 @@ async def handle_poll(request: web.Request) -> web.Response:
         "open": poll.open,
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
+        "is_member": is_member,
         "me": voting.display_name(user),
         "my_vote": poll.votes.get(str(user["id"]), []),
+        "voter_count": len(poll.votes),
         "entries": [_entry_payload(e, poll, base) for e in visible],
         "winner": _entry_payload(winner, poll, base) if winner else None,
         # Both are voter-facing (they decide what the ballot UI lets you do), not just
@@ -128,9 +154,10 @@ async def handle_poll(request: web.Request) -> web.Response:
         "max_choices": poll.max_choices,
         "allow_revote": poll.allow_revote,
     }
+    if voted_already or not poll.open or admin_mode:
+        payload["results"] = _results_payload(poll)
     if admin_mode:
         payload["approved"] = list(poll.approved)
-        payload["voter_count"] = len(poll.votes)
         payload["counts"] = {e.entry_id: count for e, count in poll.tally()}
     return web.json_response(payload)
 
@@ -141,7 +168,12 @@ async def handle_ballot(request: web.Request) -> web.Response:
     caps how many entries one ballot may name, and `allow_revote=False` locks a voter's
     first ballot in permanently. Both are rejected here, at the request boundary, rather
     than silently truncated in voting.record_vote -- a voter should know their ballot
-    didn't count as sent, not have it quietly reshaped."""
+    didn't count as sent, not have it quietly reshaped.
+
+    Also refuses anyone the membership gate (_IS_MEMBER_KEY) doesn't recognize as still
+    in the chat -- checked here rather than in voting.record_vote so the rule lives with
+    the rest of the request-boundary validation, and so a rejected ballot never touches
+    the poll at all."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -154,6 +186,8 @@ async def handle_ballot(request: web.Request) -> web.Response:
         return _json_error("голосование ещё не создано", status=404)
     if not poll.open:
         return _json_error("голосование закрыто", status=409)
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("голосовать могут только участники чата", status=403)
 
     choices = body.get("choices")
     if not isinstance(choices, list) or not all(isinstance(c, str) for c in choices):
@@ -168,7 +202,15 @@ async def handle_ballot(request: web.Request) -> web.Response:
     voting.record_vote(poll, user["id"], choices)
     voting.save_poll(poll)
     request.app[_LOG_KEY](f"[vote_web] ballot from {voting.display_name(user)}: {len(choices)} choice(s)")
-    return web.json_response({"ok": True, "my_vote": poll.votes[str(user["id"])]})
+    return web.json_response({
+        "ok": True,
+        "my_vote": poll.votes[str(user["id"])],
+        # Lets the page render the standings right after a vote without a second round
+        # trip to /api/poll -- the voter has just earned the right to see them (see
+        # handle_poll's docstring for the gating rule these mirror).
+        "results": _results_payload(poll),
+        "voter_count": len(poll.votes),
+    })
 
 
 async def handle_moderate(request: web.Request) -> web.Response:
@@ -321,7 +363,8 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 def create_app(
-    cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print
+    cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
+    is_member=None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
     returning a bool; `announce` is an async callable taking (user, poll, top3) -- top3
@@ -332,14 +375,25 @@ def create_app(
 
     `announce` defaults to a no-op so the app is still constructible (e.g. in tests that
     don't exercise closing a vote) without a bot_listener.py running alongside it.
+
+    `is_member` is an async callable, same shape as `is_admin`, answering "is this
+    Telegram user still in the chat". bot_listener.py supplies the real one, backed by a
+    Telegram chat-membership check. It defaults to a permissive stand-in that always
+    returns True -- not a security stance, just what keeps this module constructible
+    standalone (tests, or running the page without the bot alongside it) instead of
+    refusing every voter for want of a Bot API client to ask.
     """
     async def _default_announce(user, poll, top):
         return None
+
+    async def _default_is_member(user):
+        return True
 
     app = web.Application()
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_ADMIN_KEY] = is_admin
+    app[_IS_MEMBER_KEY] = is_member or _default_is_member
     app[_ANNOUNCE_KEY] = announce or _default_announce
     app[_ROUTE_PREFIX_KEY] = route_prefix.rstrip("/")
     app[_LOG_KEY] = log
@@ -360,9 +414,11 @@ def create_app(
     return app
 
 
-async def run_web_server(cfg, entry: str, is_admin, port: int, announce=None, log=print) -> None:
+async def run_web_server(
+    cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None
+) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
-    app = create_app(cfg, entry, is_admin, announce=announce, log=log)
+    app = create_app(cfg, entry, is_admin, announce=announce, log=log, is_member=is_member)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
@@ -403,28 +459,27 @@ PAGE_HTML = """<!doctype html>
   header { padding: 14px 12px 6px; }
   h1 { font-size: 17px; margin: 0 0 2px; }
   .sub { color: var(--muted); font-size: 13px; }
-  .grid {
-    display: grid; grid-template-columns: repeat(3, 1fr);
-    gap: 8px; padding: 12px;
-  }
-  .card { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
-  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; }
-  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .count { position: absolute; right: 4px; top: 4px; background: rgba(0,0,0,.6);
-           color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 8px; }
-  .who { padding: 5px 6px 2px; font-size: 11px; overflow: hidden;
-         text-overflow: ellipsis; white-space: nowrap; }
-  .pick { display: block; width: 100%; border: 0; padding: 7px 4px; font-size: 12px;
-          background: transparent; color: var(--muted); cursor: pointer;
-          border-top: 1px solid rgba(128,128,128,.25); }
-  .card.on { outline: 2px solid var(--accent); }
-  .card.on .pick { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
-  .card.pending { opacity: .55; }
-  .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
-           color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
-  .votebar { height: 4px; margin: 3px 6px 0; border-radius: 2px;
+  /* One continuous vertical feed, full-width cards -- no grid, nothing to open. A thin
+     rule between cards (border-bottom) stands in for the grid's gaps as the separator. */
+  .feed { padding: 4px 12px 0; }
+  .card { padding: 14px 0; border-bottom: 1px solid rgba(128,128,128,.2); }
+  .card:last-child { border-bottom: 0; }
+  .card .who { font-size: 13px; font-weight: 600; margin-bottom: 6px;
+               display: flex; align-items: center; }
+  .card .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
+  .card .photos { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+  .card .photos img { width: 100%; border-radius: 10px; display: block; }
+  .votesBadge { margin-left: 6px; background: var(--accent); color: var(--accent-fg);
+                font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+  .votebar { height: 4px; margin: 0 0 10px; border-radius: 2px;
              background: rgba(128,128,128,.25); overflow: hidden; }
   .votebar-fill { height: 100%; background: var(--accent); border-radius: 2px; }
+  .pickBtn { display: block; width: 100%; border: 1px solid rgba(128,128,128,.35);
+             border-radius: 8px; padding: 10px; font-size: 14px; font-weight: 600;
+             background: transparent; color: var(--fg); cursor: pointer; }
+  .pickBtn[disabled] { opacity: .5; cursor: default; }
+  .card.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .card.pending { opacity: .6; }
   .bar {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom));
@@ -453,20 +508,28 @@ PAGE_HTML = """<!doctype html>
               border: 1px solid rgba(128,128,128,.4); background: var(--bg);
               color: var(--fg); padding: 4px; font-size: 13px; }
   .settings input[type="checkbox"] { width: 18px; height: 18px; }
-  .locked { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
+  /* Stands in for whatever reason the vote controls are replaced with a sentence instead
+     of a button: locked-in ballot, closed poll, or (see is_member) not a chat member. */
+  .notice { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
             background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
-  dialog {
-    border: 0; padding: 0; width: 100%; max-width: 100%; height: 100%; max-height: 100%;
-    margin: 0; background: var(--bg); color: var(--fg);
-  }
-  dialog::backdrop { background: rgba(0,0,0,.85); }
-  .full { padding: 12px 12px 100px; overflow-y: auto; height: 100%; }
-  .full img { width: 100%; border-radius: 10px; margin-bottom: 8px; }
-  .full .cap { white-space: pre-wrap; margin: 8px 0 4px; }
-  .close { position: sticky; top: 0; float: right; border: 0; border-radius: 8px;
-           background: var(--card); color: var(--fg); font-size: 15px;
-           padding: 8px 14px; cursor: pointer; z-index: 2; }
-  .toggle { margin-left: 6px; font-size: 12px; color: var(--muted); }
+  /* The acceptance confirmation for an immediate (allow_revote) vote -- fades on its own
+     rather than waiting to be dismissed, since nothing about it needs a decision. */
+  .confirmBanner { margin: 8px 12px 0; padding: 8px 12px; border-radius: 8px;
+                   background: var(--accent); color: var(--accent-fg); font-size: 13px;
+                   text-align: center; opacity: 1; transition: opacity .6s ease; }
+  .confirmBanner.fade { opacity: 0; }
+  .results { margin: 4px 12px 12px; padding: 10px 12px; border-radius: 10px;
+             background: var(--card); font-size: 13px; }
+  .results h2 { margin: 0 0 4px; font-size: 14px; }
+  .results .voterCount { color: var(--muted); margin-bottom: 8px; }
+  .results .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .results .rank { width: 16px; flex: none; color: var(--muted); font-size: 12px; }
+  .results .name { flex: none; max-width: 38%; overflow: hidden;
+                    text-overflow: ellipsis; white-space: nowrap; }
+  .results .track { flex: 1; height: 8px; border-radius: 4px;
+                     background: rgba(128,128,128,.2); overflow: hidden; }
+  .results .fill { height: 100%; background: var(--accent); border-radius: 4px; }
+  .results .count { flex: none; width: 26px; text-align: right; font-size: 12px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -474,6 +537,7 @@ PAGE_HTML = """<!doctype html>
   <h1 id="title">Итоги недели</h1>
   <div class="sub" id="sub">Загружаю…</div>
 </header>
+<div class="confirmBanner" id="confirmBanner" hidden>Голос принят</div>
 <div class="winner" id="winnerBanner" hidden></div>
 <div class="settings" id="settings" hidden>
   <div class="row">
@@ -485,16 +549,15 @@ PAGE_HTML = """<!doctype html>
     <input type="checkbox" id="allowRevote">
   </div>
 </div>
-<div class="locked" id="locked" hidden>Голос зафиксирован — менять нельзя.</div>
-<div class="grid" id="grid"></div>
+<div class="notice" id="notice" hidden></div>
+<div class="feed" id="feed"></div>
 <div class="msg" id="msg" hidden></div>
-<div class="bar">
+<div class="results" id="results" hidden></div>
+<div class="bar" id="bar">
   <button class="go danger" id="clear" hidden>🗑 Очистить голосование</button>
   <button class="go secondary" id="announce" hidden>Подвести итоги</button>
   <button class="go" id="go" disabled>Загружаю…</button>
 </div>
-
-<dialog id="lightbox"><div class="full" id="full"></div></dialog>
 
 <script>
 const PREFIX = "__PREFIX__";
@@ -503,10 +566,23 @@ if (tg) { tg.ready(); tg.expand(); }
 const initData = (tg && tg.initData) || "";
 
 let poll = null;
-let picked = new Set();     // entry ids the voter chose
+let picked = new Set();     // entry ids the voter chose (server-confirmed when allow_revote)
 let admitted = new Set();   // entry ids the admin admits (admin mode only)
+let confirmTimers = [];     // pending timeouts for the fading "Голос принят" banner
 
 const $ = (id) => document.getElementById(id);
+
+// The bottom bar's height varies with how many buttons are actually showing (1 for a
+// voter, up to 3 stacked for the admin's moderation view, or none once an allow_revote
+// voter has nothing left to press) -- a fixed body padding sized for one button left the
+// feed's last card hidden behind the bar whenever more (or fewer) buttons appeared.
+// Tracked with a ResizeObserver instead of recomputed by hand after every place the bar's
+// contents change, so it can't be missed. (id="bar" matters: observe(null) throws.)
+if (window.ResizeObserver) {
+  new ResizeObserver((entries) => {
+    document.body.style.paddingBottom = (entries[0].contentRect.height + 16) + "px";
+  }).observe($("bar"));
+}
 
 function api(path, options = {}) {
   const headers = Object.assign(
@@ -537,6 +613,37 @@ function renderWinnerBanner() {
     '<div class="name">' + esc(who(w)) + "</div></div>";
 }
 
+// Shows "Голос принят" for a couple of seconds, then fades it out -- the acceptance
+// confirmation both voting modes give on a successful ballot (see submitBallot).
+function showConfirmBanner() {
+  const banner = $("confirmBanner");
+  confirmTimers.forEach(clearTimeout);
+  confirmTimers = [];
+  banner.hidden = false;
+  banner.classList.remove("fade");
+  confirmTimers.push(setTimeout(() => banner.classList.add("fade"), 1600));
+  confirmTimers.push(setTimeout(() => { banner.hidden = true; }, 2300));
+}
+
+function renderResults() {
+  const box = $("results");
+  if (!poll.results) { box.hidden = true; return; }  // not yet earned, see handle_poll
+  box.hidden = false;
+  const max = Math.max(1, ...poll.results.map((r) => r.votes));
+  box.innerHTML =
+    "<h2>Голоса</h2>" +
+    '<div class="voterCount">Проголосовало: ' + (poll.voter_count || 0) + "</div>" +
+    poll.results.map((r, i) =>
+      '<div class="row">' +
+        '<span class="rank">' + (i + 1) + "</span>" +
+        '<span class="name">' + esc(who(r)) + "</span>" +
+        '<span class="track"><span class="fill" style="width:' +
+          Math.round(100 * r.votes / max) + '%"></span></span>' +
+        '<span class="count">' + r.votes + "</span>" +
+      "</div>"
+    ).join("");
+}
+
 function updateAdminButtons() {
   const announce = $("announce");
   const clear = $("clear");
@@ -557,74 +664,109 @@ function ballotLocked() {
   return !poll.allow_revote && poll.my_vote && poll.my_vote.length > 0;
 }
 
+// Whether `id`'s card currently reads as chosen, and what its button should say. In
+// allow_revote mode `picked` IS the server-confirmed vote (submitBallot keeps it in sync
+// on every tap), so "chosen" there already means "accepted" -- hence "Голос учтён ✓"
+// unconditionally. Without allow_revote, `picked` is a draft the voter is still lining up
+// until they press the bottom bar's button, so it only means "accepted" once the ballot
+// is actually locked in.
+function isChosen(id) {
+  if (poll.is_admin) return admitted.has(id);
+  if (poll.allow_revote) return picked.has(id);
+  if (ballotLocked()) return (poll.my_vote || []).includes(id);
+  return picked.has(id);
+}
+
+function pickLabel(id) {
+  if (poll.is_admin) return admitted.has(id) ? "Допущена" : "Допустить";
+  if (poll.allow_revote) return picked.has(id) ? "Голос учтён ✓" : "Выбрать";
+  if (ballotLocked()) return (poll.my_vote || []).includes(id) ? "Голос учтён ✓" : "Выбрать";
+  return picked.has(id) ? "Выбрано" : "Выбрать";
+}
+
 function render() {
   renderWinnerBanner();
+  renderResults();
   updateAdminButtons();
-  const grid = $("grid");
-  grid.innerHTML = "";
+  const feed = $("feed");
+  feed.innerHTML = "";
   if (!poll.entries.length) {
     $("msg").hidden = false;
     $("msg").textContent = poll.is_admin
       ? "За сегодня и вчера заявок с #итогинедели не нашлось."
       : "Работы ещё не допущены к голосованию. Загляни позже.";
     $("go").hidden = true;
+    $("notice").hidden = true;
     return;
   }
+  $("msg").hidden = true;
   // The bar is relative to the currently leading entry, not to the voter count, so it
   // stays readable in a poll with only a handful of ballots in so far.
   const maxCount = poll.is_admin && poll.counts
     ? Math.max(1, ...Object.values(poll.counts)) : 1;
+  // A voter who isn't a chat member gets a disabled button on every card, plus the
+  // notice updateButton() shows in place of the bar's own button. Admins are unaffected.
+  const disablePicks = !poll.is_admin && poll.is_member === false;
 
   for (const entry of poll.entries) {
     const card = document.createElement("div");
     card.className = "card";
-    const chosen = poll.is_admin ? admitted.has(entry.id) : picked.has(entry.id);
+    const chosen = isChosen(entry.id);
     if (chosen) card.classList.add("on");
     if (poll.is_admin && !admitted.has(entry.id)) card.classList.add("pending");
 
     const count = poll.is_admin && poll.counts ? (poll.counts[entry.id] || 0) : 0;
     const votes = poll.is_admin && poll.counts && count
-      ? '<span class="votes">' + count + "</span>" : "";
-    const more = entry.photos.length > 1
-      ? '<span class="count">+' + (entry.photos.length - 1) + "</span>" : "";
+      ? '<span class="votesBadge">' + count + "</span>" : "";
     const votebar = poll.is_admin
       ? '<div class="votebar"><div class="votebar-fill" style="width:' +
         Math.round(100 * count / maxCount) + '%"></div></div>'
       : "";
 
     card.innerHTML =
-      '<a class="thumb" href="#" data-open="' + esc(entry.id) + '">' +
-        '<img loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' +
-        more + votes +
-      "</a>" +
+      '<div class="who">' + esc(who(entry)) + votes + "</div>" +
+      (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
+      '<div class="photos">' +
+        entry.photos.map((p) => '<img loading="lazy" src="' + esc(p) + '" alt="">').join("") +
+      "</div>" +
       votebar +
-      '<div class="who">' + esc(who(entry)) + "</div>" +
-      '<button class="pick" data-pick="' + esc(entry.id) + '">' +
-        (poll.is_admin ? (chosen ? "допущена" : "допустить")
-                       : (chosen ? "выбрано" : "выбрать")) +
+      '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' +
+        (disablePicks ? " disabled" : "") + ">" + pickLabel(entry.id) +
       "</button>";
-    grid.appendChild(card);
+    feed.appendChild(card);
   }
   updateButton();
 }
 
 function updateButton() {
   const go = $("go");
-  const locked = $("locked");
+  const notice = $("notice");
   if (poll.is_admin) {
-    locked.hidden = true;
+    notice.hidden = true;
     go.hidden = false;
     go.disabled = false;
     go.textContent = "Сохранить: допущено " + admitted.size + " из " + poll.entries.length;
     return;
   }
-  if (ballotLocked()) {
+  if (poll.is_member === false) {
     go.hidden = true;
-    locked.hidden = false;
-    locked.textContent = poll.open ? "Голос зафиксирован — менять нельзя." : "Голосование закрыто.";
+    notice.hidden = false;
+    notice.textContent = "Голосовать могут только участники чата";
     return;
   }
-  locked.hidden = true;
+  if (ballotLocked()) {
+    go.hidden = true;
+    notice.hidden = false;
+    notice.textContent = poll.open ? "Голос зафиксирован — менять нельзя." : "Голосование закрыто.";
+    return;
+  }
+  notice.hidden = true;
+  if (poll.allow_revote) {
+    // Voting IS the tap on a card in this mode -- there is nothing left for a bottom-bar
+    // button to do (see onPickTap/toggleAndSubmit below).
+    go.hidden = true;
+    return;
+  }
   go.hidden = false;
   const cap = poll.max_choices;
   go.disabled = picked.size === 0;
@@ -633,86 +775,160 @@ function updateButton() {
     : (cap ? "Выбери до " + cap + " работ" : "Выбери работы");
 }
 
-function openEntry(id) {
-  const entry = poll.entries.find((e) => e.id === id);
-  if (!entry) return;
-  const chosen = poll.is_admin ? admitted.has(id) : picked.has(id);
-  $("full").innerHTML =
-    '<button class="close" id="closeBtn">Закрыть</button>' +
-    "<h2>" + esc(who(entry)) + "</h2>" +
-    (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
-    entry.photos.map((p) => '<img src="' + esc(p) + '" alt="">').join("") +
-    '<button class="go" data-pick="' + esc(entry.id) + '">' +
-      (poll.is_admin ? (chosen ? "Не допускать" : "Допустить")
-                     : (chosen ? "Убрать выбор" : "Выбрать")) +
-    "</button>";
-  $("lightbox").showModal();
+// max_choices === 1 is special-cased to REPLACE the current pick rather than being
+// refused for exceeding the cap -- a single-choice poll behaves like a radio button, not
+// a checkbox that happens to top out at one.
+function nextSelection(id, adding) {
+  if (poll.max_choices === 1) return adding ? new Set([id]) : new Set();
+  const next = new Set(picked);
+  if (adding) next.add(id); else next.delete(id);
+  return next;
 }
 
-function togglePick(id) {
-  if (ballotLocked()) {
-    alert(poll.open ? "Голос уже зафиксирован, менять нельзя." : "Голосование закрыто.");
-    return;
-  }
-  const set = poll.is_admin ? admitted : picked;
-  const adding = !set.has(id);
-  if (adding && !poll.is_admin && poll.max_choices && set.size >= poll.max_choices) {
-    alert("Можно выбрать не более " + poll.max_choices + ".");
-    return;
-  }
-  if (adding) set.add(id); else set.delete(id);
+function overCap(adding) {
+  return adding && poll.max_choices && poll.max_choices !== 1 && picked.size >= poll.max_choices;
+}
+
+// Sends the current selection as a ballot and folds the server's answer back in --
+// my_vote is the authoritative record, results/voter_count let the standings appear
+// immediately without a second /api/poll round trip.
+async function submitBallot(choices) {
+  const response = await api("/api/ballot", {
+    method: "POST", body: JSON.stringify({ init_data: initData, choices }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "не получилось");
+  picked = new Set(data.my_vote);
+  poll.my_vote = data.my_vote;
+  poll.results = data.results;
+  poll.voter_count = data.voter_count;
+  if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+  showConfirmBanner();
+}
+
+function toggleAdmitted(id) {
+  const adding = !admitted.has(id);
+  if (adding) admitted.add(id); else admitted.delete(id);
   if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
   render();
 }
 
-document.addEventListener("click", (event) => {
-  const open = event.target.closest("[data-open]");
-  if (open) { event.preventDefault(); openEntry(open.dataset.open); return; }
-  const pick = event.target.closest("[data-pick]");
-  if (pick) {
-    event.preventDefault();
-    const inDialog = !!pick.closest("dialog");
-    togglePick(pick.dataset.pick);
-    if (inDialog) $("lightbox").close();
+// allow_revote=false: tapping only stages the choice locally -- the ballot is final once
+// sent, so the voter needs to be able to line up several picks before committing.
+function toggleDraftPick(id) {
+  const adding = !picked.has(id);
+  if (overCap(adding)) {
+    alert("Можно выбрать не более " + poll.max_choices + ".");
     return;
   }
-  if (event.target.id === "closeBtn") $("lightbox").close();
+  picked = nextSelection(id, adding);
+  if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+  render();
+}
+
+// allow_revote=true (the default): the tap itself IS the vote -- no separate submit step.
+// Tapping an already-chosen card removes that choice and re-submits.
+//
+// One ballot at a time: without the guard, a second tap while the first is still in
+// flight would compute its selection from a `picked` the first request hasn't updated
+// yet, and whichever response landed last would win -- so a fast double-tap could quietly
+// drop a choice. Dropping the extra tap is better than recording the wrong ballot.
+let ballotInFlight = false;
+
+async function toggleAndSubmit(id) {
+  if (ballotInFlight) return;
+  const adding = !picked.has(id);
+  if (overCap(adding)) {
+    alert("Можно выбрать не более " + poll.max_choices + ".");
+    return;
+  }
+  const choices = [...nextSelection(id, adding)];
+  if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+  ballotInFlight = true;
+  try {
+    await submitBallot(choices);
+  } catch (e) {
+    alert(String(e.message || e));
+  } finally {
+    ballotInFlight = false;
+  }
+  render();
+}
+
+async function onPickTap(id) {
+  if (poll.is_admin) { toggleAdmitted(id); return; }
+  if (poll.is_member === false) {
+    alert("Голосовать могут только участники чата");
+    return;
+  }
+  if (ballotLocked()) {
+    alert(poll.open ? "Голос уже зафиксирован, менять нельзя." : "Голосование закрыто.");
+    return;
+  }
+  if (poll.allow_revote) {
+    await toggleAndSubmit(id);
+  } else {
+    toggleDraftPick(id);
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const pick = event.target.closest("[data-pick]");
+  if (!pick || pick.disabled) return;
+  event.preventDefault();
+  onPickTap(pick.dataset.pick);
 });
 
-$("go").addEventListener("click", async () => {
+async function saveModeration() {
   const go = $("go");
   go.disabled = true;
   const original = go.textContent;
   go.textContent = "Отправляю…";
   try {
-    const path = poll.is_admin ? "/api/moderate" : "/api/ballot";
-    const body = poll.is_admin
-      ? {
-          init_data: initData,
-          approved: [...admitted],
-          max_choices: $("maxChoices").value ? parseInt($("maxChoices").value, 10) : null,
-          allow_revote: $("allowRevote").checked,
-        }
-      : { init_data: initData, choices: [...picked] };
-    const response = await api(path, { method: "POST", body: JSON.stringify(body) });
+    const body = {
+      init_data: initData,
+      approved: [...admitted],
+      max_choices: $("maxChoices").value ? parseInt($("maxChoices").value, 10) : null,
+      allow_revote: $("allowRevote").checked,
+    };
+    const response = await api("/api/moderate", { method: "POST", body: JSON.stringify(body) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
-    if (poll.is_admin) {
-      poll.max_choices = data.max_choices;
-      poll.allow_revote = data.allow_revote;
-    } else {
-      poll.my_vote = data.my_vote;
-    }
-    go.textContent = poll.is_admin ? "Сохранено" : "Голос принят";
+    poll.max_choices = data.max_choices;
+    poll.allow_revote = data.allow_revote;
+    go.textContent = "Сохранено";
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
     // Deferred, not immediate: render() would otherwise overwrite this confirmation text
-    // right away with whatever updateButton() computes next (e.g. the locked banner, if
-    // this vote was the one that used up an allow_revote=false ballot).
+    // right away with whatever updateButton() computes next.
     setTimeout(() => { render(); }, 1500);
   } catch (e) {
     go.textContent = String(e.message || e);
     setTimeout(() => { go.textContent = original; go.disabled = false; }, 2500);
   }
+}
+
+// allow_revote=false only: the bottom bar's own button, guarded by a confirm() since
+// this submit is the one that locks the ballot in for good.
+async function finalizeBallot() {
+  if (!confirm(
+    "Голос будет отправлен, изменить его потом будет нельзя. Проголосовать?"
+  )) return;
+  const go = $("go");
+  go.disabled = true;
+  const original = go.textContent;
+  go.textContent = "Отправляю…";
+  try {
+    await submitBallot([...picked]);
+    render();
+  } catch (e) {
+    go.textContent = String(e.message || e);
+    setTimeout(() => { go.textContent = original; go.disabled = false; }, 2500);
+  }
+}
+
+$("go").addEventListener("click", async () => {
+  if (poll.is_admin) { await saveModeration(); return; }
+  await finalizeBallot();
 });
 
 $("announce").addEventListener("click", async () => {
@@ -758,14 +974,16 @@ $("clear").addEventListener("click", async () => {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
-    poll = { poll_id: null, entries: [], is_admin: true, can_moderate: true, open: false };
+    poll = { poll_id: null, entries: [], is_admin: true, can_moderate: true, open: false, is_member: true };
     picked = new Set();
     admitted = new Set();
     $("winnerBanner").hidden = true;
     $("settings").hidden = true;
-    $("locked").hidden = true;
+    $("notice").hidden = true;
+    $("results").hidden = true;
+    $("confirmBanner").hidden = true;
     $("announce").hidden = true;
-    $("grid").innerHTML = "";
+    $("feed").innerHTML = "";
     $("go").hidden = true;
     $("sub").textContent = "";
     $("msg").hidden = false;
@@ -802,6 +1020,8 @@ $("clear").addEventListener("click", async () => {
         "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
       $("maxChoices").value = poll.max_choices || "";
       $("allowRevote").checked = poll.allow_revote !== false;
+    } else if (poll.is_member === false) {
+      $("sub").textContent = "Голосовать могут только участники чата";
     } else {
       const voted = poll.my_vote && poll.my_vote.length;
       if (voted && !poll.allow_revote) {

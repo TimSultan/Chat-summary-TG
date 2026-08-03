@@ -2,7 +2,8 @@
 -- used by bot_listener.py to run a bot account alongside the Telethon user session that
 listener.py drives. Deliberately minimal: just the handful of methods bot_listener.py
 needs (getMe, getUpdates via long polling, message/photo send and edit, deleteMessage,
-setMessageReaction, answerCallbackQuery, getChatAdministrators), not a full SDK.
+setMessageReaction, sendChatAction, answerCallbackQuery, getChatAdministrators,
+getChatMember), not a full SDK.
 
 Confirmation flows (cabinet, badges, shop, etc.) use inline-keyboard buttons +
 callback_query rather than reactions (like the Telethon listener uses for its own
@@ -71,6 +72,9 @@ class TelegramBotAPI:
 
     async def get_chat_administrators(self, chat_id) -> list[dict]:
         return await self._call("getChatAdministrators", chat_id=chat_id)
+
+    async def get_chat_member(self, chat_id, user_id: int) -> dict:
+        return await self._call("getChatMember", chat_id=chat_id, user_id=user_id)
 
     async def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict]:
         # HTTP read timeout must exceed Telegram's own long-poll `timeout` param below, or
@@ -258,6 +262,13 @@ class TelegramBotAPI:
             await self._call("deleteMessage", chat_id=chat_id, message_id=message_id)
         except ChatSummaryError:
             pass  # best-effort: already deleted, too old (>48h), or lacking rights
+
+    async def send_chat_action(self, chat_id, action: str = "typing") -> None:
+        """Shows the "typing…" indicator -- and, deliberately, is the one call here that
+        does NOT swallow its error. It doubles as a free reachability probe: Telegram
+        forbids a bot from opening a conversation, so this fails with a 403 for anyone who
+        has never pressed Start, without sending them anything if they have."""
+        await self._call("sendChatAction", chat_id=chat_id, action=action)
 
     async def set_message_reaction(self, chat_id, message_id: int, emoji: str, log=print) -> None:
         try:
