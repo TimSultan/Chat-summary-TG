@@ -288,10 +288,48 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         data = await response.json()
         row = data["results"][0]
-        self.assertEqual(set(row), {"id", "author", "username", "votes"})
+        self.assertEqual(set(row), {"id", "author", "username", "votes", "photo"})
         self.assertEqual(row["author"], "Author")
         self.assertEqual(row["username"], "author")
         self.assertIsInstance(row["votes"], int)
+        # The same url _entry_payload builds, so the standings thumbnail is served from
+        # cache instead of fetching the picture a second time.
+        self.assertEqual(row["photo"], f"{vote_web.ROUTE_PREFIX}/media/2026-08-02/a.jpg")
+
+    async def test_a_results_row_for_an_entry_without_media_has_no_photo(self):
+        """The standings row still has to render: the page emits an empty cell for a null
+        photo, because a row one cell short would slide every row below it sideways."""
+        poll = voting.Poll(
+            poll_id="2026-08-02", entry=CHAT, created_at="2026-08-02T00:00:00+00:00",
+            entries=[voting.Entry(
+                entry_id="a", message_id=1, author_id=1, author_name="Author",
+                author_username="author", text="", media=[],
+            )],
+        )
+        voting.set_approved(poll, ["a"])
+        voting.record_vote(poll, self.voter_id, ["a"])
+        voting.save_poll(poll)
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertIsNone(data["results"][0]["photo"])
+
+    async def test_the_ballot_response_carries_photos_in_its_standings_too(self):
+        """handle_ballot builds its own results payload so the page can render the
+        standings without a second round trip -- it must pass the same route prefix, or
+        the thumbnails would be the one thing missing right after voting."""
+        self._seed_poll(approved=("a",))
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+        )
+        data = await response.json()
+        self.assertEqual(
+            data["results"][0]["photo"], f"{vote_web.ROUTE_PREFIX}/media/2026-08-02/a.jpg"
+        )
 
     async def test_results_are_present_on_a_closed_poll_even_for_a_non_voter(self):
         self._seed_poll(approved=("a", "b"))

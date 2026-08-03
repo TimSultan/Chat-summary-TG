@@ -88,13 +88,25 @@ def _entry_payload(entry: voting.Entry, poll: voting.Poll, base: str) -> dict:
     }
 
 
-def _results_payload(poll: voting.Poll) -> list[dict]:
+def _results_payload(poll: voting.Poll, base: str) -> list[dict]:
     """One dict per APPROVED entry, ranked most-votes-first (poll.tally()'s own order) --
     what the page's standings table renders. A separate function from _entry_payload
     because results have nothing to do with the media/text a voter picks from; they are
-    shown after the fact, next to a vote count."""
+    shown after the fact, next to a vote count.
+
+    `photo` is the first picture only, and None for an entry that somehow has none: the
+    standings row shows a thumbnail barely bigger than the text beside it, so the rest of
+    an entry's media would be weight sent for nothing. It is the same url _entry_payload
+    builds, so the browser serves it from cache rather than fetching the picture twice.
+    """
     return [
-        {"id": entry.entry_id, "author": entry.author_name, "username": entry.author_username, "votes": count}
+        {
+            "id": entry.entry_id,
+            "author": entry.author_name,
+            "username": entry.author_username,
+            "votes": count,
+            "photo": f"{base}/media/{poll.poll_id}/{entry.media[0]}" if entry.media else None,
+        }
         for entry, count in poll.tally()
     ]
 
@@ -155,7 +167,7 @@ async def handle_poll(request: web.Request) -> web.Response:
         "allow_revote": poll.allow_revote,
     }
     if voted_already or not poll.open or admin_mode:
-        payload["results"] = _results_payload(poll)
+        payload["results"] = _results_payload(poll, base)
     if admin_mode:
         payload["approved"] = list(poll.approved)
         payload["counts"] = {e.entry_id: count for e, count in poll.tally()}
@@ -208,7 +220,7 @@ async def handle_ballot(request: web.Request) -> web.Response:
         # Lets the page render the standings right after a vote without a second round
         # trip to /api/poll -- the voter has just earned the right to see them (see
         # handle_poll's docstring for the gating rule these mirror).
-        "results": _results_payload(poll),
+        "results": _results_payload(poll, request.app[_ROUTE_PREFIX_KEY]),
         "voter_count": len(poll.votes),
     })
 
@@ -569,11 +581,20 @@ PAGE_HTML = """<!doctype html>
      which is position:absolute -- inherited here, it lifted every number out of its row
      and stacked them all in the corner of the page. */
   .results .table { display: grid; align-items: center; column-gap: 8px; row-gap: 6px;
-                    grid-template-columns: auto minmax(0, 38%) minmax(0, 1fr) auto; }
+                    grid-template-columns: auto minmax(0, 38%) auto minmax(0, 1fr) auto; }
   .results .rank { color: var(--muted); font-size: 12px; text-align: right;
                     font-variant-numeric: tabular-nums; }
   .results .name { min-width: 0; overflow: hidden;
                     text-overflow: ellipsis; white-space: nowrap; }
+  /* Just enough of the work to recognise it while reading the standings -- who won is the
+     question here, not what they drew, and the reel is one tap away for that. Fixed square
+     rather than the picture's own ratio, so the bars all still start at the same x.
+     class="mini" and not the obvious class="thumb": that one belongs to the grid cell and
+     is position:absolute-adjacent, the same trap the tally fell into (see above).
+     An entry with no media still emits this cell, empty, because every row must contribute
+     the same number of cells or the whole grid shifts by one from there down. */
+  .results .mini { width: 22px; height: 22px; border-radius: 4px; display: block;
+                    object-fit: cover; background: rgba(128,128,128,.2); }
   .results .track { height: 8px; border-radius: 4px;
                      background: rgba(128,128,128,.2); overflow: hidden; }
   /* display:block, because the fill is a span: width and height do nothing on an inline
@@ -694,13 +715,17 @@ function renderResults() {
   box.innerHTML =
     "<h2>Голоса</h2>" +
     '<div class="voterCount">Проголосовало: ' + (poll.voter_count || 0) + "</div>" +
-    // Four cells per entry, straight into one grid with no per-row wrapper -- a wrapper
+    // Five cells per entry, straight into one grid with no per-row wrapper -- a wrapper
     // would make every line its own formatting context again, which is what stopped the
-    // columns lining up.
+    // columns lining up. An entry without a picture contributes an empty cell rather than
+    // skipping it, since a row one cell short would slide every row after it sideways.
     '<div class="table">' +
     poll.results.map((r, i) =>
       '<span class="rank">' + (i + 1) + "</span>" +
       '<span class="name">' + esc(who(r)) + "</span>" +
+      (r.photo
+        ? '<img class="mini" loading="lazy" src="' + esc(r.photo) + '" alt="">'
+        : '<span class="mini"></span>') +
       '<span class="track"><span class="fill" style="width:' +
         Math.round(100 * r.votes / max) + '%"></span></span>' +
       '<span class="num">' + r.votes + "</span>"
