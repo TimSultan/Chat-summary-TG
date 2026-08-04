@@ -6,12 +6,15 @@ starts with it, and the bare word without its slash. Those all used to fire a re
 request, and in a busy chat that is a bill nobody chose to run up.
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import config
 from listener import has_trigger_keyword, matched_trigger_keyword, strip_trigger_keywords
 
 KEYWORDS = ["/summary"]
@@ -70,6 +73,41 @@ class TriggerMatchingTests(unittest.TestCase):
         keywords = ["сводка"]
         self.assertTrue(has_trigger_keyword("сводка за вчера", keywords))
         self.assertFalse(has_trigger_keyword("нужна сводка за вчера", keywords))
+
+
+class CommandIsNotConfigurableTests(unittest.TestCase):
+    """LISTENER_TRIGGER_KEYWORDS may only ADD spellings.
+
+    It used to be the sole source of the trigger, with "/summary" merely its default --
+    so a deployment that set it to anything else (production had "sum") had no working
+    /summary at all, and nothing in the code could tell.
+    """
+
+    def _keywords(self, raw):
+        env = {"LISTENER_TRIGGER_KEYWORDS": raw} if raw is not None else {}
+        with patch.dict(os.environ, env, clear=False):
+            if raw is None:
+                os.environ.pop("LISTENER_TRIGGER_KEYWORDS", None)
+            return config.load_config().listener_trigger_keywords
+
+    def test_the_command_survives_an_unset_variable(self):
+        self.assertIn(config.SUMMARY_COMMAND, self._keywords(None))
+
+    def test_the_command_survives_an_empty_variable(self):
+        self.assertIn(config.SUMMARY_COMMAND, self._keywords(""))
+
+    def test_the_command_survives_a_variable_that_replaces_it(self):
+        keywords = self._keywords("sum")
+        self.assertIn(config.SUMMARY_COMMAND, keywords)
+        self.assertIn("sum", keywords)
+        self.assertTrue(has_trigger_keyword("/summary за вчера", keywords))
+        self.assertTrue(has_trigger_keyword("sum за вчера", keywords))
+
+    def test_extra_spellings_are_added_not_substituted(self):
+        self.assertEqual(self._keywords("sum, СВОДКА"), [config.SUMMARY_COMMAND, "sum", "сводка"])
+
+    def test_naming_the_command_itself_does_not_duplicate_it(self):
+        self.assertEqual(self._keywords("/summary"), [config.SUMMARY_COMMAND])
 
 
 class StripTriggerKeywordsTests(unittest.TestCase):

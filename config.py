@@ -7,6 +7,11 @@ from errors import ChatSummaryError
 
 load_dotenv()
 
+# The command that asks for a summary. Hardcoded rather than configured: it is the bot's
+# own slash-command, registered with BotFather and named in the menu, so no deployment
+# should be able to end up without it. LISTENER_TRIGGER_KEYWORDS can only ADD to it.
+SUMMARY_COMMAND = "/summary"
+
 # Curated for this tool as of July 2026 -- fastest/cheapest first within each tier.
 # gpt-4o / gpt-4o-mini are kept for anyone pinned to them, but are the older, slower tier.
 RECOMMENDED_MODELS = [
@@ -105,10 +110,17 @@ def load_config() -> Config:
         )
 
     allowed_chats_raw = os.getenv("LISTENER_ALLOWED_CHATS", "")
-    trigger_keywords_raw = os.getenv("LISTENER_TRIGGER_KEYWORDS", "/summary")
-    trigger_keywords = [k.strip().lower() for k in trigger_keywords_raw.split(",") if k.strip()]
-    if not trigger_keywords:
-        raise ChatSummaryError("LISTENER_TRIGGER_KEYWORDS must contain at least one keyword.")
+    # "/summary" is the bot's command, not a setting: it is what BotFather advertises and
+    # what the menu tells people to type, so it always works regardless of the
+    # environment. It used to be only the DEFAULT of LISTENER_TRIGGER_KEYWORDS, which
+    # meant a deployment that had ever set that variable to anything else silently had no
+    # working /summary at all -- exactly how this broke in production.
+    #
+    # The variable survives as a way to add EXTRA spellings (a shorter one to type, say),
+    # never as a way to lose the command itself.
+    trigger_keywords_raw = os.getenv("LISTENER_TRIGGER_KEYWORDS", "")
+    extra_keywords = [k.strip().lower() for k in trigger_keywords_raw.split(",") if k.strip()]
+    trigger_keywords = list(dict.fromkeys([SUMMARY_COMMAND] + extra_keywords))
 
     # Public https:// origin this app is reachable at, used to build the Mini App link
     # for /vote. Telegram will not open a Mini App over plain http or from an IP, so
