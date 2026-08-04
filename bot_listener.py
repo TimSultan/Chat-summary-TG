@@ -5699,6 +5699,7 @@ async def run_bot_listener(
     figurine_ack_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
+    file_block_queue: "asyncio.Queue | None" = None,
 ):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -5733,6 +5734,17 @@ async def run_bot_listener(
     no delete rights over a message it didn't send itself, but this account can always
     delete its OWN messages via the Bot API regardless of admin status, so the deletion
     itself has to happen here.
+
+    `file_block_queue`, if given, carries (allowed_chats entry, message_id, notice text)
+    pairs from listener.py's blocked-file check (see BLOCKED_FILE_EXTENSIONS there): an
+    archive or 3D model somebody attached in the group. Both halves happen here -- the
+    delete, because removing SOMEBODY ELSE's message needs the "delete messages" admin
+    right that this bot account normally holds and that session's personal account normally
+    doesn't, and the notice, because it's a chat post like every other one. The notice is
+    HTML (it may carry a tg://user mention for a sender with no @username) and is
+    deliberately never scheduled for deletion: it is the only remaining trace of, and the
+    explanation for, the removed message. It is None for the second and later files of a
+    single album -- those are still deleted, just not each answered separately.
 
     All queues are left None when run standalone (this module's own main()), which
     just means jokes/figurine reactions/digests/dismissals never fire, matching that
@@ -5907,6 +5919,35 @@ async def run_bot_listener(
                     continue
                 await api.set_message_reaction(chat_id, message_id, FIGURINE_ACK_EMOJI, log=log)
 
+        async def _consume_file_blocks():
+            while True:
+                item = await file_block_queue.get()
+                # Guarded like _consume_stats_digests: every consumer here shares one
+                # asyncio.gather with the poll loop, so an exception escaping this loop
+                # takes the whole bot down rather than costing one item.
+                try:
+                    entry, message_id, notice = item
+                except (TypeError, ValueError):
+                    log(f"[bot_listener] dropping malformed file-block item: {item!r}")
+                    continue
+                try:
+                    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                    if chat_id is None:
+                        log(f"[bot_listener] dropping file deletion for '{entry}': could not resolve a chat_id for it")
+                        continue
+                    # api.delete_message is best-effort and swallows its own failure, so
+                    # the notice can still go out over a message that survived (no delete
+                    # rights, older than 48h) -- better a stated rule than silence.
+                    await api.delete_message(chat_id, message_id)
+                    # notice is None for the second and later files of one album: every
+                    # file goes, the sender is told once (see blocked_album_groups in
+                    # listener.py).
+                    if notice is not None:
+                        await api.send_message(chat_id, notice, parse_mode="HTML")
+                    log(f"[bot_listener] deleted blocked file {message_id} in '{entry}'")
+                except Exception:
+                    log(f"[bot_listener] failed to handle a blocked file in '{entry}':\n{traceback.format_exc()}")
+
         async def _consume_stats_digests():
             while True:
                 item = await stats_digest_queue.get()
@@ -6004,6 +6045,8 @@ async def run_bot_listener(
             tasks.append(_consume_stats_digests())
         if dismiss_queue is not None:
             tasks.append(_consume_dismissals())
+        if file_block_queue is not None:
+            tasks.append(_consume_file_blocks())
         if cfg.webapp_port:
             # PORT is set by the host (Railway does this automatically for any service
             # with public networking on); off when running locally without it, same as

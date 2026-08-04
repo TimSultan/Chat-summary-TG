@@ -16,6 +16,7 @@ client and a log callback that writes into the GUI's log pane instead of stdout.
 """
 
 import asyncio
+import html
 import random
 import re
 import sys
@@ -166,6 +167,57 @@ SAVE_CONFIRM_DELETE_AFTER = 3  # seconds after a tick reaction before the prompt
 # 👍 on someone else's message must never delete it.
 DISMISS_EMOJI = "👍"
 DISMISS_DELETE_AFTER = 1  # seconds -- meant to feel closer to instant than a courtesy pause
+
+# Archives and 3D-model files are the one kind of attachment the chat doesn't host: they
+# are deleted on sight and their sender is told to pass them around in a DM instead.
+# Matched on the attachment's own filename extension rather than its mime type -- Telegram
+# hands most of these over as a generic application/octet-stream, so the filename (carried
+# in the document's DocumentAttributeFilename) is the only thing that tells a .stl apart
+# from any other blob. Photos, videos and stickers have no filename attribute at all, so
+# an ordinary #япокрасил post can never match here.
+BLOCKED_FILE_EXTENSIONS = (".zip", ".7z", ".rar", ".stl", ".obj", ".glb")
+
+# Sent into the chat after such a file is deleted, with {mention} replaced by the sender
+# (see format_blocked_file_notice). Deliberately NOT scheduled for deletion, unlike the
+# short rejection notices above: it's the only trace left of the removed message and the
+# explanation for it, so it stays in the chat.
+BLOCKED_FILE_NOTICE = "{mention}, пересылка файлов разрешена только в личке. Спасибо за понимание."
+
+
+def blocked_file_name(msg) -> str | None:
+    """The attachment's filename if this message carries a file whose extension is in
+    BLOCKED_FILE_EXTENSIONS, else None -- returned rather than a bool purely so the log
+    line can name what was removed.
+
+    Only documents are inspected: a filename only ever reaches Telegram as a document
+    attribute, so compressed photos/videos, stickers, voice notes and plain text all fall
+    straight through."""
+    document = getattr(msg, "document", None)
+    if document is None:
+        return None
+    for attr in getattr(document, "attributes", None) or []:
+        name = getattr(attr, "file_name", None)
+        if name and name.lower().endswith(BLOCKED_FILE_EXTENSIONS):
+            return name
+    return None
+
+
+def format_blocked_file_notice(sender) -> str:
+    """BLOCKED_FILE_NOTICE addressed to `sender`, as HTML.
+
+    An @username is used when there is one -- it's what people recognise, and it notifies.
+    Without one (usernames are optional, and plenty of members have none) a
+    tg://user?id= link over the display name is the only way to still address the right
+    person, hence HTML rather than plain text; the name is escaped since it's somebody
+    else's uncontrolled text."""
+    username = getattr(sender, "username", None)
+    if username:
+        mention = f"@{username}"
+    else:
+        name = html.escape(sender_display_name(sender))
+        user_id = getattr(sender, "id", None)
+        mention = f'<a href="tg://user?id={user_id}">{name}</a>' if user_id else name
+    return BLOCKED_FILE_NOTICE.format(mention=mention)
 
 
 def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
@@ -903,6 +955,7 @@ async def run_listener(
     figurine_ack_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
+    file_block_queue: "asyncio.Queue | None" = None,
 ):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
@@ -940,7 +993,14 @@ async def run_listener(
     be a chat admin (unlike a message this account sent itself, which it can always
     delete and does directly, no hand-off needed). bot_listener.py deletes it via the Bot
     API instead, which -- like every other reply -- can always delete its OWN messages
-    without needing admin rights."""
+    without needing admin rights.
+
+    `file_block_queue`, if given, is where (allowed_chats entry, message_id, notice text)
+    goes when this session sees an archive/3D-model attachment (see BLOCKED_FILE_EXTENSIONS
+    and on_message's blocked-file block). Same split as everything else here: this session
+    is the only one that reliably sees every message and every filename, while the deletion
+    and the notice are done by the bot account over in bot_listener.py -- which, unlike this
+    personal account, is normally the chat admin holding the "delete messages" right."""
     assert cfg.summary_queue_delay_seconds >= 0, "internal bug: queue delay should have been validated by config"
 
     me = await client.get_me()
@@ -1024,6 +1084,13 @@ async def run_listener(
     # only ever needs one pending confirmation per prompt (no "already pending for this
     # user" concept to track). Value carries what to repost once/if confirmed.
     save_pending: dict[tuple[int, int], dict] = {}
+
+    # (chat_id, grouped_id) of albums already answered by a blocked-file notice. Telegram
+    # delivers an album as one message per file, so ten .stl files dragged in at once would
+    # otherwise be ten deletions AND ten identical notices -- every file still goes, but
+    # the sender is told once. Bounded by maxlen; nothing here needs to outlive the burst
+    # it belongs to.
+    blocked_album_groups: deque = deque(maxlen=50)
 
     def is_chat_allowed(chat) -> bool:
         if not allowed_chats:
@@ -1205,6 +1272,55 @@ async def run_listener(
             or text_lower.startswith("/weekwinner")
             or text_lower.startswith("/deletepokras")
         )
+
+        # An archive or a 3D model (BLOCKED_FILE_EXTENSIONS): removed from the chat and
+        # answered with a one-line explanation addressed to whoever sent it. Checked before
+        # everything below and returning immediately, so a blocked file never counts as a
+        # figurine, never feeds the joke buffer, and never gets read as a command. Groups
+        # only -- the notice tells people to send these in a DM, so deleting them in one
+        # would be absurd. Only in chats named in LISTENER_ALLOWED_CHATS: this account sits
+        # in other chats that aren't ours to moderate.
+        blocked_name = blocked_file_name(msg)
+        if blocked_name and not msg.is_private:
+            chat = await event.get_chat()
+            entry = matched_allowed_chat(chat)
+            if entry is not None:
+                sender = await event.get_sender()
+                # One notice per album, not per file -- see blocked_album_groups. A
+                # standalone file (no grouped_id) is always its own case.
+                group_key = (event.chat_id, msg.grouped_id) if msg.grouped_id else None
+                if group_key is not None and group_key in blocked_album_groups:
+                    notice = None
+                else:
+                    notice = format_blocked_file_notice(sender)
+                    if group_key is not None:
+                        blocked_album_groups.append(group_key)
+                log(
+                    f"[listener] blocked file {blocked_name!r} from "
+                    f"{sender_display_name(sender)} in '{entry}' -- deleting"
+                )
+                if bot_takeover:
+                    if file_block_queue is not None:
+                        await file_block_queue.put((entry, msg.id, notice))
+                else:
+                    # No bot account configured at all, so there is nobody to hand this to
+                    # -- same fallback the figurine reaction takes. Needs this account to
+                    # hold delete rights in the chat; if it doesn't, the delete fails and
+                    # the notice is skipped rather than left standing over a message that
+                    # is still there.
+                    try:
+                        await event.client.delete_messages(event.chat_id, [msg.id])
+                    except Exception as e:
+                        log(f"[listener] failed to delete blocked file: {e}")
+                    else:
+                        try:
+                            if notice is not None:
+                                sent = await client.send_message(event.chat_id, notice, parse_mode="html")
+                                if sent is not None:
+                                    sent_message_ids.add(sent.id)
+                        except Exception as e:
+                            log(f"[listener] failed to send blocked-file notice: {e}")
+                return
 
         # #япокрасил + an attached photo OR video -- a "figurine painted" post (see
         # XP_PER_FIGURINE in stats.py). is_image_message/is_video_message (not just
@@ -1681,18 +1797,24 @@ async def main():
         # admin, but the bot can always delete its own messages via the Bot API, same as
         # every other reply is bot-account-only.
         dismiss_queue: asyncio.Queue = asyncio.Queue()
+        # file_block_queue carries (allowed_chats entry, message_id, notice text) for an
+        # archive/3D-model attachment this session has just seen (BLOCKED_FILE_EXTENSIONS)
+        # -- again, this is the only session that sees every message, but deleting somebody
+        # ELSE's message needs the "delete messages" admin right, which the bot account is
+        # the one that normally holds, and the notice is a chat post like any other.
+        file_block_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
             run_listener(
                 client, cfg, tz,
                 joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
-                dismiss_queue=dismiss_queue,
+                dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
             ),
             bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
                 joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
-                dismiss_queue=dismiss_queue,
+                dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
             ),
         )
     else:

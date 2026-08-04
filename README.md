@@ -164,6 +164,36 @@ the chat for the command half of the sweep to work. Without them, `deleteMessage
 `bot_api.delete_message` swallows the error, and the bot removes only its own reply —
 exactly the old behavior, never a crashed handler.
 
+### Archives and 3D models are deleted on sight
+
+The chat is for finished work, not for passing files around, so an attachment whose
+filename ends in `.zip`, `.7z`, `.rar`, `.stl`, `.obj` or `.glb`
+(`BLOCKED_FILE_EXTENSIONS`, top of `listener.py`) is deleted the moment it arrives, and
+the bot posts one line naming the sender:
+
+> @user, пересылка файлов разрешена только в личке. Спасибо за понимание.
+
+Details worth knowing:
+
+- **The notice stays.** Unlike every other on-demand reply above, it is never scheduled
+  for deletion — it is the only remaining trace of the removed message, and its
+  explanation.
+- **Groups named in `LISTENER_ALLOWED_CHATS` only.** Never in a DM (the notice tells
+  people to use one), and never in some other chat your account happens to be in.
+- **One notice per album.** Ten `.stl` files dragged in at once arrive as ten messages;
+  all ten go, the sender is told once.
+- **Filename, not mime type.** Telegram hands most of these over as a generic
+  `application/octet-stream`, so the name carried on the document is the only thing that
+  tells a `.stl` from any other blob. Compressed photos and videos have no filename at all
+  and can never match, so a `#япокрасил` post is untouched.
+- **The bot must be an admin with delete rights.** Your personal session is the one that
+  sees every message and spots the file, but the delete and the notice are handed to the
+  bot account (`file_block_queue`), same split as jokes and figurine reactions. Without
+  those rights `deleteMessage` fails silently and only the notice appears.
+
+`tests/test_blocked_files.py` pins which attachments match and how the sender is
+addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
+
 ### Natural chat remarks -- off by default
 
 Unlike everything else in this project, `JOKE_ENABLED=true` (`.env`) adds one thing
