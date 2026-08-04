@@ -409,6 +409,26 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 200)
 
+    async def test_an_empty_recorded_ballot_does_not_lock_the_voter_out(self):
+        """Regression, matching the carousel's own fix: the lock is "has a vote", not "has
+        a row". record_vote drops choices that are no longer admitted, so un-admitting a
+        voter's only pick leaves them with a recorded-but-empty ballot -- which used to
+        mean they could never vote again."""
+        poll = self._seed_poll(approved=("a", "b"))
+        poll.allow_revote = False
+        voting.record_vote(poll, self.voter_id, ["a"])
+        voting.set_approved(poll, ["b"])          # "a" is un-admitted after the vote
+        voting.record_vote(poll, self.voter_id, poll.votes[str(self.voter_id)])
+        voting.save_poll(poll)
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes[str(self.voter_id)], [])
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["b"]},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes[str(self.voter_id)], ["b"])
+
     async def test_the_poll_payload_carries_settings_for_voters_too(self):
         poll = self._seed_poll(approved=("a",))
         poll.max_choices = 1

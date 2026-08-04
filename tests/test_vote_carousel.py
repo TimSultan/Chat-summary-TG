@@ -463,6 +463,40 @@ class CarouselVotingTests(CarouselTestCase):
         self.assertEqual(len(api.answered), 1)
         self.assertIn("Менять голос нельзя", api.answered[0])
 
+    def test_the_lock_still_holds_after_a_real_first_vote(self):
+        """The lock itself, reached the way a voter reaches it: one pick, then another."""
+        self.save(_poll(allow_revote=False))
+        self.press("pick", caption=_caption(0))
+        api = self.press("pick", caption=_caption(1))
+        self.assertEqual(self.stored().votes[str(VOTER)], ["e1"])
+        self.assertIn("Менять голос нельзя", api.answered[0])
+
+    def test_a_ballot_emptied_by_hiding_does_not_lock_the_voter_out(self):
+        """Regression: the lock used to be `str(user_id) in poll.votes` -- key presence,
+        not "has a vote". A voter who picked a work and then hid it (which drops it from
+        their ballot) was left with a recorded-but-empty ballot and could never vote at
+        all: every later tap answered "Менять голос нельзя" while their ballot said []."""
+        self.save(_poll(allow_revote=False))
+        self.press("pick", caption=_caption(0))
+        self.assertEqual(self.stored().votes[str(VOTER)], ["e1"])
+
+        self.press("hide", caption=_caption(0))
+        self.assertEqual(self.stored().votes[str(VOTER)], [])  # recorded, but empty
+
+        # Position 0 is now e2 -- e1 slid out of this voter's visible list.
+        api = self.press("pick", caption=_caption(0, 2))
+        self.assertEqual(self.stored().votes[str(VOTER)], ["e2"])
+        self.assertEqual(api.answered, ["Голос учтён"])
+
+    def test_a_ballot_emptied_by_an_un_admit_does_not_lock_the_voter_out(self):
+        """The same empty-ballot state, reached without hiding: record_vote drops choices
+        that are no longer admitted, so an administrator un-admitting a voter's only pick
+        empties their ballot too."""
+        self.save(_poll(allow_revote=False, approved=["e2", "e3"], votes={str(VOTER): []}))
+        api = self.press("pick", caption=_caption(0, 2))
+        self.assertEqual(self.stored().votes[str(VOTER)], ["e2"])
+        self.assertEqual(api.answered, ["Голос учтён"])
+
     def test_another_voter_s_locked_ballot_does_not_lock_this_one(self):
         self.save(_poll(allow_revote=False, votes={str(OTHER_VOTER): ["e1"]}))
         self.press("pick", caption=_caption(0))
@@ -527,6 +561,38 @@ class CarouselHidingTests(CarouselTestCase):
         self.save(_poll(votes={str(VOTER): ["e1", "e2"]}))
         self.press("hide", caption=_caption(1))
         self.assertEqual(self.stored().votes[str(VOTER)], ["e1"])
+
+    def test_hiding_on_an_open_poll_still_takes_the_vote_out_of_the_tally(self):
+        """The other half of the closed-poll rule below: while the vote is running,
+        dropping the vote is the whole point -- a vote for something the voter can no
+        longer see is the confusing outcome."""
+        self.save(_poll(votes={str(VOTER): ["e2"], str(OTHER_VOTER): ["e2"]}))
+        self.press("hide", caption=_caption(1))
+        self.assertEqual(
+            [(e.entry_id, n) for e, n in self.stored().tally()],
+            [("e2", 1), ("e1", 0), ("e3", 0)],
+        )
+
+    def test_hiding_on_a_closed_poll_never_touches_the_ballot_or_the_tally(self):
+        """Regression: 🙈 is not gated on poll.open (deliberately -- tidying up a finished
+        ballot is harmless), so before the fix a tap on a work the voter had chosen quietly
+        retracted that vote AFTER the contest was over and rewrote the standings. The
+        button still hides; it just no longer counts."""
+        self.save(_poll(open=False, votes={str(VOTER): ["e1", "e2"], str(OTHER_VOTER): ["e2"]}))
+        before = [(e.entry_id, n) for e, n in self.stored().tally()]
+
+        self.press("hide", caption=_caption(1))  # 🙈 on e2, which this voter chose
+
+        poll = self.stored()
+        self.assertEqual(poll.votes[str(VOTER)], ["e1", "e2"])
+        self.assertEqual(poll.votes[str(OTHER_VOTER)], ["e2"])
+        self.assertEqual([(e.entry_id, n) for e, n in poll.tally()], before)
+        self.assertEqual([(e.entry_id, n) for e, n in poll.tally()],
+                         [("e2", 2), ("e1", 1), ("e3", 0)])
+        # ...and it really did hide it, for this voter only.
+        self.assertEqual(voting.hidden_for(poll, VOTER), ["e2"])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, VOTER)], ["e1", "e3"])
+        self.assertEqual(len(voting.visible_entries(poll, OTHER_VOTER)), 3)
 
     def test_hiding_does_not_touch_anybody_else_s_ballot(self):
         self.save(_poll(votes={str(VOTER): ["e2"], str(OTHER_VOTER): ["e2"]}))
