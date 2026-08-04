@@ -643,7 +643,7 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
     await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
 
 
-async def _stats_catch_up(client, cfg, tz, level_announcement_queue=None, log=print) -> None:
+async def _stats_catch_up(client, cfg, tz, stats_digest_queue=None, log=print) -> None:
     """For each chat in cfg.listener_allowed_chats, closes out every day in the last
     cfg.stats_catchup_days that isn't recorded yet (see stats.finalize_and_record) --
     oldest first. Cheap to call repeatedly: a day on the current stats schema costs only
@@ -671,13 +671,19 @@ async def _stats_catch_up(client, cfg, tz, level_announcement_queue=None, log=pr
                 await stats.finalize_and_record(client, chat_entity, entry, day, tz, log=log)
             except Exception:
                 log(f"[stats] failed to catch up '{entry}' for {day}:\n{traceback.format_exc()}")
-        if level_announcement_queue is not None:
+        if stats_digest_queue is not None:
             try:
                 announcements = await stats.collect_level_up_announcements(
                     client, chat_entity, entry, tz, log=log
                 )
                 for announcement in announcements:
-                    await level_announcement_queue.put((entry, announcement))
+                    # The queue's item is (entry, text, parse_mode, image) -- the same
+                    # four-part shape the tree and procrastinator digests put on it. A
+                    # level-up is plain text with no picture, but it still has to be
+                    # spelled in full: the consumer unpacks four, and a short item took
+                    # bot_listener's digest loop down with a ValueError, silently ending
+                    # every digest until the process was restarted.
+                    await stats_digest_queue.put((entry, announcement, None, None))
             except Exception:
                 log(
                     f"[stats] failed to collect level-up announcements for "
@@ -723,17 +729,22 @@ async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=
             log(f"[stats] failed to build procrastinator digest for '{entry}':\n{traceback.format_exc()}")
 
 
-async def _stats_catchup_loop(client, cfg, tz, level_announcement_queue=None, log=print) -> None:
+async def _stats_catchup_loop(client, cfg, tz, stats_digest_queue=None, log=print) -> None:
     """Runs _stats_catch_up once immediately (covers a restart that missed one or more
     midnights while down), then sleeps until the next local midnight and runs it again,
     forever. A few seconds of buffer after :00 avoids any edge-case race right at the
-    rollover instant."""
-    await _stats_catch_up(client, cfg, tz, level_announcement_queue, log=log)
+    rollover instant.
+
+    The parameter is named for the queue it is actually given (run_stats_rollover passes
+    stats_digest_queue positionally): it used to be called level_announcement_queue, and
+    that name is what hid a mismatched item shape all the way into production.
+    """
+    await _stats_catch_up(client, cfg, tz, stats_digest_queue, log=log)
     while True:
         now = datetime.now(tz)
         next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
-        await _stats_catch_up(client, cfg, tz, level_announcement_queue, log=log)
+        await _stats_catch_up(client, cfg, tz, stats_digest_queue, log=log)
 
 
 async def _send_tree_digests(client, cfg, tz, stats_digest_queue, log=print) -> None:
@@ -1630,7 +1641,7 @@ async def run_listener(
     stats_status = "on" if (cfg.stats_enabled and cfg.listener_allowed_chats) else "off"
     direct_reply_status = "off (disabled)" if bot_takeover else "off (no TELEGRAM_BOT_TOKEN)"
     log(
-        f"[listener] logged in as @{my_username or me.id}. Watching for messages containing "
+        f"[listener] logged in as @{my_username or me.id}. Watching for messages STARTING WITH "
         f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
         f"Summary queue: FIFO, {cfg.summary_queue_delay_seconds}s between completed jobs. "

@@ -5798,8 +5798,8 @@ async def run_bot_listener(
             except Exception:
                 log(f"[bot_listener] could not ensure the dealer badge:\n{traceback.format_exc()}")
         log(
-            f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for "
-            f"{cfg.listener_trigger_keywords} (summary) and direct replies. FIFO queue delay: "
+            f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
+            f"STARTING WITH {cfg.listener_trigger_keywords} (summary) and direct replies. FIFO queue delay: "
             f"{cfg.summary_queue_delay_seconds}s. Timezone: {tz}."
         )
 
@@ -5909,12 +5909,26 @@ async def run_bot_listener(
 
         async def _consume_stats_digests():
             while True:
-                entry, text, parse_mode, photo = await stats_digest_queue.get()
-                chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
-                if chat_id is None:
-                    log(f"[bot_listener] dropping stats notification for '{entry}': could not resolve a chat_id for it")
+                item = await stats_digest_queue.get()
+                # Every consumer here runs under the same asyncio.gather as the polling
+                # loop, so an exception raised out of one does not merely lose its own
+                # item -- it takes the whole listener down. That is exactly what a
+                # short item on this queue did in production (ValueError: not enough
+                # values to unpack), killing the process for a level-up announcement.
+                # The producers are fixed; this makes the loop survive the next one.
+                try:
+                    entry, text, parse_mode, photo = item
+                except (TypeError, ValueError):
+                    log(f"[bot_listener] dropping malformed stats digest item: {item!r}")
                     continue
-                await send_stats_digest(api, chat_id, entry, text, parse_mode, photo, log=log)
+                try:
+                    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                    if chat_id is None:
+                        log(f"[bot_listener] dropping stats notification for '{entry}': could not resolve a chat_id for it")
+                        continue
+                    await send_stats_digest(api, chat_id, entry, text, parse_mode, photo, log=log)
+                except Exception:
+                    log(f"[bot_listener] failed to send a stats digest for '{entry}':\n{traceback.format_exc()}")
 
         async def _consume_dismissals():
             while True:
