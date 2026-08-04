@@ -42,7 +42,7 @@ class VoteActionDispatchTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": callback_query},
                     api or _FakeApi(), None, None, None, None, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 

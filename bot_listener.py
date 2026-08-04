@@ -244,6 +244,29 @@ VOTE_RESULT_ACTIONS = ("edit", "send", "cancel")
 # this draft appears, so an expired flow costs the admin their wording, never the result.
 VOTE_RESULT_FLOW_TTL_SECONDS = 60 * 60
 
+# The second ballot: an inline-keyboard photo carousel in the voter's own DM, next to the
+# Mini App button rather than instead of it. It exists because a Mini App is a web page the
+# PHONE fetches from our own host -- a proxy configured inside Telegram carries the chat but
+# not that request, so for anyone behind one the Mini App simply never loads. Everything
+# here travels over Telegram's own protocol: the pictures come from Telegram's CDN by
+# file_id, the taps are callback queries. If the chat can be read at all, this ballot works.
+#
+# One message per voter for the whole ballot -- every tap EDITS it (editMessageMedia)
+# instead of sending another photo. The current position is read back out of the message's
+# own caption ("Работа 3 из 12", see _carousel_position) rather than kept in a server-side
+# session, which is what lets the keyboard stay byte-identical across navigation: the
+# buttons carry no index, so a plain step can skip reply_markup entirely and the client has
+# nothing to re-render. It also means a redeploy never loses anybody's place.
+VOTE_CAROUSEL_CALLBACK_PREFIX = "votecar"
+VOTE_CAROUSEL_ACTIONS = frozenset({
+    "open", "prev", "next", "back5", "fwd5", "pick", "hide",
+    "list", "hidden", "unhide", "showall", "go", "done",
+})
+VOTE_CAROUSEL_BUTTON_TEXT = "🖼 Голосовать здесь"
+# How far ⏪/⏩ jump. Linear-only paging is what makes twenty nominees tedious no matter how
+# fast each step is; 📋 Список (jump straight to any number) is the other half of that.
+VOTE_CAROUSEL_JUMP = 5
+
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
 # -- the point being that nobody has to know a command exists in order to use the bot.
 # Deliberately excludes the admin-only DM commands (/badge, /weekwinner, /deletepokras):
@@ -3772,6 +3795,16 @@ async def handle_vote_command(
         # their admitted/vote state survives untouched.
         all_entries = (existing_poll.entries if existing_poll else []) + new_entries
         poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll)
+        # Uploaded here, once, in the admin's own DM (and deleted straight away) so that no
+        # voter ever waits on an upload while browsing -- see prewarm_entry_file_ids.
+        # Best-effort: an entry that fails to warm still collects, it just cannot appear in
+        # the in-chat ballot until the next "/vote собрать".
+        try:
+            warmed = await prewarm_entry_file_ids(api, chat_id, poll, log=log)
+            if warmed:
+                log(f"[bot_listener] vote poll {poll_id}: prewarmed photos for {warmed} entries")
+        except Exception:
+            log(f"[bot_listener] prewarming vote photos failed:\n{traceback.format_exc()}")
         voting.save_poll(poll)
         log(f"[bot_listener] vote poll {poll_id}: {len(all_entries)} entries ({len(new_entries)} new), {len(poll.approved)} admitted")
         if not all_entries:
@@ -3874,6 +3907,7 @@ async def handle_vote_command(
                         {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
                         {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
                     ],
+                    [{"text": VOTE_CAROUSEL_BUTTON_TEXT, "callback_data": _carousel_callback_data("open")}],
                     [
                         {
                             "text": "🔄 Собрать заявки",
@@ -3893,9 +3927,16 @@ async def handle_vote_command(
                 ]},
             )
         else:
+            # Two ballots, deliberately side by side. The Mini App is the nicer way to
+            # compare works; the carousel is the one that still works for anyone whose
+            # network cannot reach our host (see VOTE_CAROUSEL_CALLBACK_PREFIX). Both write
+            # the same poll, so it never matters which one somebody picks.
             await reply(
                 "Голосование за итоги недели:",
-                reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+                reply_markup={"inline_keyboard": [
+                    [{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}],
+                    [{"text": VOTE_CAROUSEL_BUTTON_TEXT, "callback_data": _carousel_callback_data("open")}],
+                ]},
             )
         return
 
@@ -3917,6 +3958,466 @@ async def handle_vote_command(
     )
     # background_tasks is now unused in this function, but stays a required parameter --
     # callers (handle_vote_action_callback, _dispatch_update) pass it positionally.
+
+
+def _carousel_callback_data(action: str, arg: str = "") -> str:
+    return f"{VOTE_CAROUSEL_CALLBACK_PREFIX}:{action}:{arg}"
+
+
+def _parse_carousel_callback(data: str) -> tuple[str, str] | None:
+    # split(":", 2) so an entry_id keeps whatever is in it -- entry ids are message ids
+    # today, but nothing here should break if that ever stops being true.
+    parts = (data or "").split(":", 2)
+    if len(parts) < 2 or parts[0] != VOTE_CAROUSEL_CALLBACK_PREFIX or parts[1] not in VOTE_CAROUSEL_ACTIONS:
+        return None
+    return parts[1], (parts[2] if len(parts) == 3 else "")
+
+
+_CAROUSEL_POSITION_RE = re.compile(r"Работа (\d+) из (\d+)")
+
+
+def _carousel_position(message: dict) -> int:
+    """Which nominee the carousel is currently showing, read back out of its own caption.
+
+    This is deliberately not kept in a server-side session. Holding it here would mean the
+    buttons had to carry the index (so the keyboard would change on every step, forcing a
+    reply_markup on every edit) AND that a redeploy would drop every voter back to the
+    first work mid-ballot. The message already displays the number; reading it back is
+    free, survives restarts, and keeps the keyboard byte-identical across navigation.
+    """
+    found = _CAROUSEL_POSITION_RE.search((message or {}).get("caption") or "")
+    return max(0, int(found.group(1)) - 1) if found else 0
+
+
+def _carousel_keyboard() -> dict:
+    """The photo view's keyboard -- CONSTANT, and that is the point.
+
+    No button carries an index or a selection state (both live in the caption instead), so
+    stepping between nominees can omit reply_markup entirely: less to send, and nothing for
+    the client to re-render. Only the list/hidden views, which are different keyboards
+    anyway, ever pass one.
+    """
+    return {"inline_keyboard": [
+        [
+            {"text": "⏪", "callback_data": _carousel_callback_data("back5")},
+            {"text": "◀", "callback_data": _carousel_callback_data("prev")},
+            {"text": "▶", "callback_data": _carousel_callback_data("next")},
+            {"text": "⏩", "callback_data": _carousel_callback_data("fwd5")},
+        ],
+        [
+            {"text": "🙈 Скрыть", "callback_data": _carousel_callback_data("hide")},
+            {"text": "✅ Голосовать", "callback_data": _carousel_callback_data("pick")},
+        ],
+        [
+            {"text": "📋 Список", "callback_data": _carousel_callback_data("list")},
+            {"text": "👁 Скрытые", "callback_data": _carousel_callback_data("hidden")},
+            {"text": "✔ Готово", "callback_data": _carousel_callback_data("done")},
+        ],
+    ]}
+
+
+def _carousel_caption(poll, entry, index: int, total: int, hidden_count: int, chosen: list[str]) -> str:
+    """Everything that changes as you browse: position, how many you have hidden, how many
+    you have chosen, and whether THIS work is one of them.
+
+    All of it lives here rather than on the buttons so the keyboard can stay constant (see
+    _carousel_keyboard). Plain text, never Markdown: a nominee's display name is somebody
+    else's uncontrolled text, and Telegram's legacy Markdown rejects the whole message over
+    a single stray underscore -- a real production break this codebase has already had once.
+    """
+    head = f"Работа {index + 1} из {total}"
+    if hidden_count:
+        head += f" · скрыто {hidden_count}"
+    head += f" · выбрано {len(chosen)}"
+    if poll.max_choices:
+        head += f"/{poll.max_choices}"
+    lines = [head, _vote_who(entry)]
+    if entry.entry_id in chosen:
+        lines.append("✔ Твой голос за эту работу")
+    text = " ".join((entry.text or "").split())
+    if text:
+        lines.append("")
+        lines.append(text)
+    caption = "\n".join(lines)
+    if len(caption) > CAPTION_LIMIT:
+        caption = caption[: CAPTION_LIMIT - 1].rstrip() + "…"
+    return caption
+
+
+def _carousel_file_id(entry) -> str | None:
+    return entry.file_ids[0] if entry.file_ids else None
+
+
+def _largest_photo_file_id(sent: dict | None) -> str | None:
+    """sendPhoto answers with every size Telegram generated, smallest first. The last one is
+    the full-size version, and its file_id is the one worth keeping: asking for it later
+    lets Telegram serve whichever size the client actually wants."""
+    photos = (sent or {}).get("photo") or []
+    return photos[-1].get("file_id") if photos else None
+
+
+async def prewarm_entry_file_ids(api: TelegramBotAPI, chat_id, poll, log=print) -> int:
+    """Uploads every nominee's pictures ONCE and remembers the file_id Telegram hands back.
+
+    This is what stops the carousel from re-uploading a photo on every tap. It runs at
+    collect time, paid once by the administrator who ran "/vote собрать" (already a
+    minute-long job they were warned about), so no voter ever waits on an upload.
+
+    Two things fall out of uploading as a PHOTO rather than a document: Telegram compresses
+    and downscales it server-side, which is exactly the preview the carousel wants -- these
+    are full-resolution art posts, and browsing the originals would crawl -- and the
+    file_id stays valid after the carrier message is deleted, so the upload leaves nothing
+    behind in the admin's DM. Best-effort throughout: an entry whose upload fails simply
+    keeps an empty file_ids and is skipped by the carousel, rather than failing the collect.
+
+    Returns how many entries were warmed, for the log line.
+    """
+    media_dir = voting.media_path(poll.entry, poll.poll_id)
+    warmed = 0
+    for entry in poll.entries:
+        if entry.file_ids or not entry.media:
+            continue
+        file_ids: list[str] = []
+        for name in entry.media:
+            path = media_dir / name
+            if not path.exists():
+                continue
+            try:
+                sent = await api.send_photo_file(chat_id, path)
+            except Exception as e:
+                log(f"[bot_listener] could not prewarm {name} for entry {entry.entry_id}: {e}")
+                continue
+            file_id = _largest_photo_file_id(sent)
+            if file_id:
+                file_ids.append(file_id)
+            message_id = (sent or {}).get("message_id")
+            if message_id:
+                await api.delete_message(chat_id, message_id)
+        if file_ids:
+            voting.set_entry_file_ids(poll, entry.entry_id, file_ids)
+            warmed += 1
+    return warmed
+
+
+async def _carousel_member_ok(
+    api: TelegramBotAPI, telethon_client, entry: str, user_id: int, known_chat_ids: dict, log=print
+) -> bool:
+    """The same "голосовать могут только подписчики" gate the Mini App applies, and it fails
+    closed for the same reason. Checked when the ballot is opened and again on every vote --
+    but NOT on navigation, which is the overwhelming majority of taps and must stay fast."""
+    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+    if chat_id is None:
+        return False
+    return await _is_chat_member(api, chat_id, user_id)
+
+
+async def _carousel_show(
+    api: TelegramBotAPI, chat_id, message_id: int | None, poll, user_id: int, index: int,
+    keyboard: dict | None = None, log=print,
+) -> None:
+    """Renders position `index` of that voter's visible list into the carousel message.
+
+    `message_id` None sends the first one; anything else edits in place. `keyboard` is only
+    passed when it actually differs from what is already on the message -- see
+    _carousel_keyboard for why navigation deliberately leaves it alone.
+    """
+    visible = voting.visible_entries(poll, user_id)
+    hidden_count = len(voting.hidden_for(poll, user_id))
+    chosen = poll.votes.get(str(user_id), [])
+    if not visible:
+        text = (
+            "Все работы скрыты." if hidden_count
+            else "Пока нечего показать -- работы ещё не допущены к голосованию."
+        )
+        markup = {"inline_keyboard": [[
+            {"text": "👁 Показать все", "callback_data": _carousel_callback_data("showall")}
+        ]]} if hidden_count else {"inline_keyboard": []}
+        if message_id is None:
+            # Opening onto an empty ballot still has to say something -- silence reads as a
+            # broken button.
+            await api.send_message(chat_id, text, reply_markup=markup, parse_mode=None)
+        else:
+            await api.edit_message_caption(chat_id, message_id, text, reply_markup=markup)
+        return
+
+    index = max(0, min(index, len(visible) - 1))
+    entry = visible[index]
+    caption = _carousel_caption(poll, entry, index, len(visible), hidden_count, chosen)
+    file_id = _carousel_file_id(entry)
+    if message_id is None:
+        if file_id is None:
+            # Nothing to open the ballot with. Rather than a broken first impression, say
+            # what is actually wrong -- an admin has to re-run "/vote собрать".
+            await api.send_message(
+                chat_id, "Фотографии работ ещё не готовы -- попроси администратора обновить заявки.",
+                parse_mode=None,
+            )
+            return
+        await api.send_photo(chat_id, file_id, caption, reply_markup=_carousel_keyboard())
+        return
+    if file_id is None:
+        # An entry whose upload failed: keep whatever picture is on the message and say so,
+        # instead of dropping the nominee out of the ballot entirely.
+        await api.edit_message_caption(
+            chat_id, message_id, caption + "\n\n(фото не загрузилось)", reply_markup=keyboard
+        )
+        return
+    await api.edit_message_media_photo(
+        chat_id, message_id, file_id, caption=caption, reply_markup=keyboard
+    )
+
+
+async def handle_vote_carousel_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    callback: dict,
+    home_chat_ref: str | None,
+    known_chat_ids: dict,
+    carousel_taps: dict,
+    log=print,
+) -> None:
+    """Every button of the in-chat ballot.
+
+    Answered FIRST, always: the spinner stops the moment Telegram gets that call, so a tap
+    feels acknowledged while its edit is still in flight.
+
+    Rapid taps are coalesced rather than queued. Five quick presses of ▶ must not mean five
+    sequential edits -- Telegram sustains roughly one edit per second per chat, so that is a
+    visibly stuttering carousel and eventually a 429. Each tap claims a token in
+    `carousel_taps`; if a newer tap has claimed it by the time this one is ready to draw,
+    this one silently drops and lets the newer one render. Hammering ▶ produces ONE edit,
+    straight to where the voter actually is.
+    """
+    parsed = _parse_carousel_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, argument = parsed
+    user = callback.get("from") or {}
+    user_id = user.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    if user_id is None or chat_id is None:
+        await api.answer_callback_query(callback["id"])
+        return
+
+    entry_ref = home_chat_ref
+    try:
+        poll = voting.latest_poll(entry_ref) if entry_ref else None
+    except Exception:
+        # These run as tasks, so an exception here would die with nothing but an asyncio
+        # warning and leave the tapped button spinning. Answering is the part that matters.
+        log(f"[bot_listener] could not load the poll for the in-chat ballot:\n{traceback.format_exc()}")
+        poll = None
+    if poll is None:
+        await api.answer_callback_query(callback["id"], text="Голосование ещё не создано.")
+        return
+
+    async def answer(text: str | None = None) -> None:
+        await api.answer_callback_query(callback["id"], text=text)
+
+    # The opening tap is on the /vote message, not on a carousel: it SENDS the ballot.
+    if action == "open":
+        await answer()
+        if not await _carousel_member_ok(api, telethon_client, entry_ref, user_id, known_chat_ids, log=log):
+            await api.send_message(chat_id, "Голосовать могут только участники чата.", parse_mode=None)
+            return
+        await _carousel_show(api, chat_id, None, poll, user_id, 0, log=log)
+        log(f"[bot_listener] opened the in-chat ballot for {user.get('username') or user_id}")
+        return
+
+    if message_id is None:
+        await answer()
+        return
+
+    token = carousel_taps.get(user_id, 0) + 1
+    carousel_taps[user_id] = token
+    current = _carousel_position(message)
+    # Deliberately NOT read here: every branch that needs the visible list reads it under
+    # the lock, from a poll loaded there, so nothing acts on a copy that another voter's
+    # tap has already superseded.
+    keyboard: dict | None = None
+    note: str | None = None
+
+    if action in ("prev", "next", "back5", "fwd5", "go"):
+        step = {"prev": -1, "next": 1, "back5": -VOTE_CAROUSEL_JUMP, "fwd5": VOTE_CAROUSEL_JUMP}
+        if action == "go":
+            try:
+                current = int(argument)
+            except ValueError:
+                current = 0
+            keyboard = _carousel_keyboard()  # coming back from the list view
+        else:
+            current += step[action]
+        await answer()
+
+    # Everything below that WRITES re-reads the poll under voting.poll_lock rather than
+    # trusting the copy loaded above. Two voters tapping at the same moment would otherwise
+    # each save a poll built from their own stale read, and the second write would erase the
+    # first one's ballot -- these handlers run as concurrent tasks, so that is a real race,
+    # not a theoretical one.
+    elif action == "pick":
+        # Membership is checked BEFORE taking the lock, deliberately: it is a Telegram round
+        # trip, and holding the poll lock across it would put everybody else's vote in a
+        # queue behind one person's network latency. It does not depend on poll state, so
+        # checking it outside is exactly as correct and much cheaper under load.
+        if not await _carousel_member_ok(api, telethon_client, entry_ref, user_id, known_chat_ids, log=log):
+            await answer("Голосовать могут только участники чата.")
+            return
+        async with voting.poll_lock:
+            poll = voting.latest_poll(entry_ref) or poll
+            visible = voting.visible_entries(poll, user_id)
+            if not poll.open:
+                await answer("Голосование уже закрыто.")
+                return
+            if not poll.allow_revote and str(user_id) in poll.votes:
+                await answer("Менять голос нельзя -- твой бюллетень уже зафиксирован.")
+                return
+            if not visible:
+                await answer()
+                return
+            entry = visible[max(0, min(current, len(visible) - 1))]
+            chosen = list(poll.votes.get(str(user_id), []))
+            if entry.entry_id in chosen:
+                chosen.remove(entry.entry_id)
+                note = "Голос снят"
+            elif poll.max_choices and len(chosen) >= poll.max_choices:
+                await answer(f"Можно выбрать не более {poll.max_choices}.")
+                return
+            else:
+                chosen.append(entry.entry_id)
+                note = "Голос учтён"
+            voting.record_vote(poll, user_id, chosen)
+            voting.save_poll(poll)
+        await answer(note)
+
+    elif action == "hide":
+        async with voting.poll_lock:
+            poll = voting.latest_poll(entry_ref) or poll
+            visible = voting.visible_entries(poll, user_id)
+            if not visible:
+                await answer()
+                return
+            entry = visible[max(0, min(current, len(visible) - 1))]
+            now_hidden = voting.toggle_hidden(poll, user_id, entry.entry_id)
+            voting.save_poll(poll)
+        # Hiding advances by standing still: the next work slides into this position, so a
+        # first pass of "не моё" is one tap per rejection rather than hide-then-next.
+        await answer("Скрыто (только у тебя)" if now_hidden else None)
+
+    elif action == "showall":
+        async with voting.poll_lock:
+            poll = voting.latest_poll(entry_ref) or poll
+            voting.clear_hidden(poll, user_id)
+            voting.save_poll(poll)
+        current = 0
+        keyboard = _carousel_keyboard()
+        await answer("Показаны все работы")
+
+    elif action == "unhide":
+        async with voting.poll_lock:
+            poll = voting.latest_poll(entry_ref) or poll
+            voting.toggle_hidden(poll, user_id, argument)
+            voting.save_poll(poll)
+        keyboard = _carousel_keyboard()
+        await answer("Работа возвращена")
+
+    elif action == "list":
+        await answer()
+        # `current` is carried into the Назад button so leaving the list puts the voter back
+        # where they were, not at the first work.
+        await _carousel_list_view(api, chat_id, message_id, poll, user_id, current, log=log)
+        return
+
+    elif action == "hidden":
+        await answer()
+        await _carousel_hidden_view(api, chat_id, message_id, poll, user_id, log=log)
+        return
+
+    elif action == "done":
+        await answer()
+        chosen = poll.votes.get(str(user_id), [])
+        text = (
+            f"Готово. Выбрано работ: {len(chosen)}. Можно вернуться и изменить: /vote"
+            if chosen else "Ты пока ни за кого не проголосовал. Открыть снова: /vote"
+        )
+        await api.edit_message_caption(chat_id, message_id, text, reply_markup={"inline_keyboard": []})
+        return
+
+    else:
+        await answer()
+        return
+
+    if carousel_taps.get(user_id) != token:
+        return  # a newer tap is already on its way -- let it draw instead of queueing behind us
+    try:
+        await _carousel_show(api, chat_id, message_id, poll, user_id, current, keyboard=keyboard, log=log)
+    except Exception:
+        log(f"[bot_listener] carousel render failed:\n{traceback.format_exc()}")
+
+
+async def _carousel_list_view(
+    api: TelegramBotAPI, chat_id, message_id: int, poll, user_id: int, back_to: int = 0, log=print
+) -> None:
+    """Every visible nominee as a numbered list with a grid of jump buttons.
+
+    Edits the SAME message (caption only -- the photo stays put), so browsing never costs a
+    send. This is what stops twenty nominees from meaning twenty taps.
+    """
+    visible = voting.visible_entries(poll, user_id)
+    chosen = poll.votes.get(str(user_id), [])
+    lines = ["Работы на голосовании:", ""]
+    rows: list[list[dict]] = []
+    row: list[dict] = []
+    for index, entry in enumerate(visible):
+        mark = "✔ " if entry.entry_id in chosen else ""
+        lines.append(f"{index + 1}. {mark}{_vote_who(entry)}")
+        row.append({"text": f"{mark}{index + 1}", "callback_data": _carousel_callback_data("go", str(index))})
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "↩ Назад", "callback_data": _carousel_callback_data("go", str(max(0, back_to)))}])
+    text = "\n".join(lines)
+    if len(text) > CAPTION_LIMIT:
+        text = text[: CAPTION_LIMIT - 1].rstrip() + "…"
+    await api.edit_message_caption(chat_id, message_id, text, reply_markup={"inline_keyboard": rows})
+
+
+async def _carousel_hidden_view(api: TelegramBotAPI, chat_id, message_id: int, poll, user_id: int, log=print) -> None:
+    """What that voter has hidden, with a button each to bring it back.
+
+    Hiding has to be reversible and visibly so: a mis-tap must never quietly cost a nominee
+    somebody's vote, and nothing here is hidden from anyone but this one voter.
+    """
+    hidden_ids = set(voting.hidden_for(poll, user_id))
+    entries = [e for e in poll.approved_entries() if e.entry_id in hidden_ids]
+    if not entries:
+        await api.edit_message_caption(
+            chat_id, message_id, "Ты ничего не скрывал.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "↩ Назад", "callback_data": _carousel_callback_data("go", "0")}
+            ]]},
+        )
+        return
+    lines = ["Скрытые работы (только у тебя):", ""]
+    rows = []
+    for entry in entries:
+        lines.append(f"• {_vote_who(entry)}")
+        rows.append([{
+            "text": f"↩ {_vote_who(entry)}"[:60],
+            "callback_data": _carousel_callback_data("unhide", entry.entry_id),
+        }])
+    rows.append([
+        {"text": "👁 Показать все", "callback_data": _carousel_callback_data("showall")},
+        {"text": "↩ Назад", "callback_data": _carousel_callback_data("go", "0")},
+    ])
+    text = "\n".join(lines)
+    if len(text) > CAPTION_LIMIT:
+        text = text[: CAPTION_LIMIT - 1].rstrip() + "…"
+    await api.edit_message_caption(chat_id, message_id, text, reply_markup={"inline_keyboard": rows})
 
 
 async def handle_vote_chat_text_input(
@@ -4855,6 +5356,7 @@ async def _dispatch_update(
     background_tasks: set,
     home_chat_ref: str | None,
     known_chat_ids: dict[str, int],
+    carousel_taps: dict[int, int],
     badge_flows: dict[str, dict],
     cabinet_flows: dict[str, dict],
     menu_last_sent: dict,
@@ -4914,6 +5416,18 @@ async def _dispatch_update(
             await handle_vote_chat_destination_callback(
                 api, cfg, callback, vote_chat_flows, bot_username, log=log,
             )
+        elif callback_data.startswith(f"{VOTE_CAROUSEL_CALLBACK_PREFIX}:"):
+            # Runs as a task rather than inline: a carousel tap is the one button somebody
+            # presses over and over, and awaiting it here would make every other person's
+            # update queue behind each step of one voter's browsing.
+            task = asyncio.create_task(
+                handle_vote_carousel_callback(
+                    api, telethon_client, callback, home_chat_ref, known_chat_ids,
+                    carousel_taps, log=log,
+                )
+            )
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
         elif callback_data.startswith(f"{VOTE_RESULT_CALLBACK_PREFIX}:"):
             # No chat resolution here either: the draft already carries the main chat's id
             # (resolved when the vote was closed), so pressing Отправить never waits on the
@@ -5438,6 +5952,11 @@ async def run_bot_listener(
     # (see the comment there) and, on a miss, actively by _resolve_chat_id via the
     # Telethon session -- see that function's docstring for why that's safe to do.
     known_chat_ids: dict[str, int] = {}
+    # user_id -> a counter bumped by every in-chat-ballot tap, so a burst of them collapses
+    # into one render instead of a queue of edits (see handle_vote_carousel_callback).
+    # Purely a rate-limit shock absorber: losing it on a restart costs nothing, since the
+    # carousel's actual position lives in the message itself.
+    carousel_taps: dict[int, int] = {}
     # Short-lived, admin-bound /badge conversations. Definitions and assignments are
     # persisted by stats.py; only the in-progress menu/prompt state lives in memory.
     badge_flows: dict[str, dict] = {}
@@ -5510,7 +6029,7 @@ async def run_bot_listener(
                         _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, background_tasks, home_chat_ref,
-                            known_chat_ids, badge_flows,
+                            known_chat_ids, carousel_taps, badge_flows,
                             cabinet_flows, menu_last_sent,
                             button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows,
                             vote_result_flows=vote_result_flows, log=log,

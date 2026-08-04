@@ -196,26 +196,30 @@ async def handle_ballot(request: web.Request) -> web.Response:
 
     user = await _authenticate(request, body)
     entry_name = request.app[_ENTRY_KEY]
-    poll = voting.latest_poll(entry_name)
-    if poll is None:
-        return _json_error("голосование ещё не создано", status=404)
-    if not poll.open:
-        return _json_error("голосование закрыто", status=409)
-    if not await request.app[_IS_MEMBER_KEY](user):
-        return _json_error("голосовать могут только участники чата", status=403)
+    # Everything from here to save_poll is under voting.poll_lock: the membership check is
+    # an await, so two ballots arriving together would otherwise interleave between the
+    # load and the save and one of them would be erased. See the lock's own comment.
+    async with voting.poll_lock:
+        poll = voting.latest_poll(entry_name)
+        if poll is None:
+            return _json_error("голосование ещё не создано", status=404)
+        if not poll.open:
+            return _json_error("голосование закрыто", status=409)
+        if not await request.app[_IS_MEMBER_KEY](user):
+            return _json_error("голосовать могут только участники чата", status=403)
 
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not all(isinstance(c, str) for c in choices):
-        return _json_error("choices must be a list of entry ids")
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not all(isinstance(c, str) for c in choices):
+            return _json_error("choices must be a list of entry ids")
 
-    if not poll.allow_revote and str(user["id"]) in poll.votes:
-        return _json_error("менять голос нельзя -- голосование уже зафиксировано", status=409)
-    distinct = len(set(choices))
-    if poll.max_choices and distinct > poll.max_choices:
-        return _json_error(f"можно выбрать не более {poll.max_choices}", status=400)
+        if not poll.allow_revote and str(user["id"]) in poll.votes:
+            return _json_error("менять голос нельзя -- голосование уже зафиксировано", status=409)
+        distinct = len(set(choices))
+        if poll.max_choices and distinct > poll.max_choices:
+            return _json_error(f"можно выбрать не более {poll.max_choices}", status=400)
 
-    voting.record_vote(poll, user["id"], choices)
-    voting.save_poll(poll)
+        voting.record_vote(poll, user["id"], choices)
+        voting.save_poll(poll)
     request.app[_LOG_KEY](f"[vote_web] ballot from {voting.display_name(user)}: {len(choices)} choice(s)")
     return web.json_response({
         "ok": True,

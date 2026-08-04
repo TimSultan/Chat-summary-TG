@@ -1,5 +1,11 @@
 """voting.py: album grouping into entries, the initData signature check, and the poll
-(moderation + one-ballot-per-user + tally)."""
+(moderation + one-ballot-per-user + tally).
+
+Also the state the second, in-chat ballot adds to that same poll file: cached photo
+file_ids and each voter's private hidden list. Two properties are guarded here above all
+-- that a poll written before those fields existed still loads, and that hiding is
+strictly personal: it never changes another voter's view, the admitted set, or the tally.
+"""
 
 import hashlib
 import hmac
@@ -311,6 +317,194 @@ class PollTests(unittest.TestCase):
         poll = self._poll()
         self.assertIsNone(poll.max_choices)
         self.assertTrue(poll.allow_revote)
+
+
+class CarouselStateTests(unittest.TestCase):
+    """The two fields the in-chat carousel adds to the poll -- cached photo file_ids and
+    the per-voter hidden list. The properties protected here: both survive a save/load
+    round trip, both are absent-tolerant so a poll written before they existed still
+    loads, and hiding is private to the voter who did it."""
+
+    def _poll(self, entry_ids=("a", "b", "c")):
+        entries = [
+            voting.Entry(
+                entry_id=eid, message_id=int(eid, 36), author_id=1, author_name="A",
+                author_username=None, text="", media=[f"{eid}_0.jpg"],
+            )
+            for eid in entry_ids
+        ]
+        poll = voting.Poll(
+            poll_id="2026-08-02", entry="Chat", created_at="2026-08-02T00:00:00+00:00", entries=entries
+        )
+        voting.set_approved(poll, list(entry_ids))
+        return poll
+
+    # ----------------------------------------------------------------- file_ids
+
+    def test_file_ids_start_empty_and_are_set_on_the_matching_entry_only(self):
+        poll = self._poll()
+        self.assertEqual(poll.entries[0].file_ids, [])
+
+        voting.set_entry_file_ids(poll, "b", ["AgACfake1", "AgACfake2"])
+
+        self.assertEqual(poll.entries[1].file_ids, ["AgACfake1", "AgACfake2"])
+        self.assertEqual(poll.entries[0].file_ids, [])
+        self.assertEqual(poll.entries[2].file_ids, [])
+
+    def test_setting_file_ids_on_an_unknown_entry_is_a_no_op_rather_than_an_error(self):
+        poll = self._poll()
+        voting.set_entry_file_ids(poll, "post-was-deleted", ["AgACfake"])
+        self.assertEqual([e.file_ids for e in poll.entries], [[], [], []])
+
+    # ------------------------------------------------------------------ hidden
+
+    def test_a_voter_with_nothing_hidden_sees_every_admitted_entry(self):
+        poll = self._poll()
+        self.assertEqual(voting.hidden_for(poll, 1), [])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 1)], ["a", "b", "c"])
+
+    def test_toggle_hidden_flips_the_state_and_returns_the_new_one(self):
+        poll = self._poll()
+        self.assertTrue(voting.toggle_hidden(poll, 1, "b"))
+        self.assertEqual(voting.hidden_for(poll, 1), ["b"])
+        self.assertFalse(voting.toggle_hidden(poll, 1, "b"))
+        self.assertEqual(voting.hidden_for(poll, 1), [])
+
+    def test_hiding_removes_only_that_entry_and_keeps_the_rest_in_order(self):
+        poll = self._poll()
+        voting.toggle_hidden(poll, 1, "b")
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 1)], ["a", "c"])
+
+    def test_one_voters_hidden_list_never_touches_another_voters_view(self):
+        poll = self._poll()
+        voting.toggle_hidden(poll, 1, "a")
+        voting.toggle_hidden(poll, 1, "b")
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 1)], ["c"])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 2)], ["a", "b", "c"])
+        self.assertEqual(voting.hidden_for(poll, 2), [])
+
+    def test_hiding_changes_nothing_about_what_is_admitted_or_counted(self):
+        poll = self._poll()
+        voting.record_vote(poll, 2, ["a"])
+        voting.toggle_hidden(poll, 1, "a")
+        self.assertEqual(poll.approved, ["a", "b", "c"])
+        self.assertEqual([(e.entry_id, c) for e, c in poll.tally()], [("a", 1), ("b", 0), ("c", 0)])
+
+    def test_hiding_an_entry_the_voter_chose_drops_it_from_their_ballot(self):
+        poll = self._poll()
+        voting.record_vote(poll, 1, ["a", "b"])
+        voting.toggle_hidden(poll, 1, "a")
+        # Keeping a vote for something they can no longer see is the confusing outcome.
+        self.assertEqual(poll.votes["1"], ["b"])
+
+    def test_unhiding_does_not_put_the_dropped_vote_back(self):
+        poll = self._poll()
+        voting.record_vote(poll, 1, ["a"])
+        voting.toggle_hidden(poll, 1, "a")
+        voting.toggle_hidden(poll, 1, "a")
+        self.assertEqual(poll.votes["1"], [])
+
+    def test_hiding_does_not_touch_anybody_elses_ballot(self):
+        poll = self._poll()
+        voting.record_vote(poll, 1, ["a"])
+        voting.record_vote(poll, 2, ["a"])
+        voting.toggle_hidden(poll, 1, "a")
+        self.assertEqual(poll.votes["1"], [])
+        self.assertEqual(poll.votes["2"], ["a"])
+
+    def test_hiding_an_unknown_entry_is_ignored_rather_than_recorded(self):
+        poll = self._poll()
+        self.assertFalse(voting.toggle_hidden(poll, 1, "post-was-deleted"))
+        self.assertEqual(voting.hidden_for(poll, 1), [])
+
+    def test_a_hidden_entry_that_is_no_longer_admitted_simply_does_not_matter(self):
+        poll = self._poll()
+        voting.toggle_hidden(poll, 1, "b")
+        voting.set_approved(poll, ["a", "c"])  # "b" un-admitted after being hidden
+        # Neither resurrected nor crashing -- it is just not among the admitted entries.
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 1)], ["a", "c"])
+        self.assertEqual(voting.hidden_for(poll, 1), ["b"])
+
+    def test_clear_hidden_restores_the_full_carousel_for_that_voter_only(self):
+        poll = self._poll()
+        voting.toggle_hidden(poll, 1, "a")
+        voting.toggle_hidden(poll, 2, "c")
+
+        voting.clear_hidden(poll, 1)
+
+        self.assertEqual(voting.hidden_for(poll, 1), [])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 1)], ["a", "b", "c"])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 2)], ["a", "b"])
+
+    def test_clearing_a_voter_who_hid_nothing_is_not_an_error(self):
+        poll = self._poll()
+        voting.clear_hidden(poll, 999)
+        self.assertEqual(voting.hidden_for(poll, 999), [])
+
+    def test_a_voter_id_is_the_same_whether_given_as_int_or_string(self):
+        poll = self._poll()
+        voting.toggle_hidden(poll, 1, "a")
+        self.assertEqual(voting.hidden_for(poll, "1"), ["a"])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, "1")], ["b", "c"])
+
+    # -------------------------------------------------------------- persistence
+
+    def test_dict_round_trip_preserves_file_ids_and_hidden(self):
+        poll = self._poll()
+        voting.set_entry_file_ids(poll, "a", ["AgACfake1", "AgACfake2"])
+        voting.toggle_hidden(poll, 1, "b")
+        voting.toggle_hidden(poll, 2, "c")
+
+        restored = voting.Poll.from_dict(json.loads(json.dumps(poll.to_dict())))
+
+        self.assertEqual(restored.entries[0].file_ids, ["AgACfake1", "AgACfake2"])
+        self.assertEqual(restored.entries[1].file_ids, [])
+        self.assertEqual(restored.hidden, {"1": ["b"], "2": ["c"]})
+        self.assertEqual([e.entry_id for e in voting.visible_entries(restored, 1)], ["a", "c"])
+
+    def test_a_poll_saved_before_these_fields_existed_still_loads_and_defaults_to_empty(self):
+        # Exactly the shape old poll JSON on disk has: no "file_ids" on the entry, no
+        # "hidden" on the poll. Backward compatibility is mandatory -- both ballots read
+        # and write the same file, and the Mini App has been writing this shape for weeks.
+        legacy = {
+            "poll_id": "2026-07-01",
+            "entry": "Chat",
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "entries": [
+                {
+                    "entry_id": "a",
+                    "message_id": 10,
+                    "author_id": 1,
+                    "author_name": "A",
+                    "author_username": None,
+                    "text": "",
+                    "media": ["a_0.jpg"],
+                    "posted_at": "",
+                }
+            ],
+            "approved": ["a"],
+            "votes": {"1": ["a"]},
+            "open": True,
+        }
+
+        poll = voting.Poll.from_dict(legacy)
+
+        self.assertEqual(poll.entries[0].file_ids, [])
+        self.assertEqual(poll.hidden, {})
+        self.assertEqual(voting.hidden_for(poll, 1), [])
+        self.assertEqual([e.entry_id for e in voting.visible_entries(poll, 1)], ["a"])
+        self.assertEqual(poll.votes, {"1": ["a"]})
+
+    def test_a_re_collection_keeps_hidden_lists_but_drops_vanished_entries(self):
+        poll = self._poll()
+        voting.toggle_hidden(poll, 1, "b")
+        voting.toggle_hidden(poll, 1, "c")
+
+        # Re-collected: "c"'s post was deleted.
+        fresh = [e for e in poll.entries if e.entry_id in {"a", "b"}]
+        merged = voting.build_poll("Chat", "2026-08-02", fresh, existing=poll)
+
+        self.assertEqual(voting.hidden_for(merged, 1), ["b"])
 
 
 class BuildPollMergeTests(unittest.TestCase):
