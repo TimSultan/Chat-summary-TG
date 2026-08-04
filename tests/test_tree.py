@@ -409,7 +409,10 @@ class PlantingTests(unittest.TestCase):
         import bot_listener
 
         consumer = inspect.getsource(bot_listener.run_bot_listener)
-        consumer = consumer.split("_consume_stats_digests")[1].split("async def")[0]
+        # Anchored on the `async def`, not the bare name: sibling consumers mention
+        # _consume_stats_digests in their comments, and splitting on the name alone
+        # picked up whichever one happened to be written first.
+        consumer = consumer.split("async def _consume_stats_digests")[1].split("async def")[0]
         for source in (
             inspect.getsource(bot_listener.handle_replant_command),
             inspect.getsource(bot_listener.send_stats_digest),

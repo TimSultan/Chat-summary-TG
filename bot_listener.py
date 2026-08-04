@@ -74,6 +74,7 @@ from errors import ChatSummaryError
 from intent import resolve_name_hint
 from intent_v2 import route_request
 from listener import (
+    BLOCKED_FILE_NOTICE_DELETE_AFTER,
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
     DISMISS_DELETE_AFTER,
@@ -5420,10 +5421,10 @@ async def run_bot_listener(
     delete, because removing SOMEBODY ELSE's message needs the "delete messages" admin
     right that this bot account normally holds and that session's personal account normally
     doesn't, and the notice, because it's a chat post like every other one. The notice is
-    HTML (it may carry a tg://user mention for a sender with no @username) and is
-    deliberately never scheduled for deletion: it is the only remaining trace of, and the
-    explanation for, the removed message. It is None for the second and later files of a
-    single album -- those are still deleted, just not each answered separately.
+    HTML (it may carry a tg://user mention for a sender with no @username) and sweeps
+    itself after BLOCKED_FILE_NOTICE_DELETE_AFTER, with no trigger message to take along:
+    the file that prompted it is already gone. It is None for the second and later files
+    of a single album -- those are still deleted, just not each answered separately.
 
     All queues are left None when run standalone (this module's own main()), which
     just means figurine reactions/digests/dismissals/file blocks never fire, matching
@@ -5603,7 +5604,14 @@ async def run_bot_listener(
                     # file goes, the sender is told once (see blocked_album_groups in
                     # listener.py).
                     if notice is not None:
-                        await api.send_message(chat_id, notice, parse_mode="HTML")
+                        sent = await api.send_message(chat_id, notice, parse_mode="HTML")
+                        # No trigger_message_id: the message that prompted this notice is
+                        # the file, and it has already been deleted above.
+                        if sent and "message_id" in sent:
+                            schedule_bot_delete(
+                                api, chat_id, [sent["message_id"]],
+                                BLOCKED_FILE_NOTICE_DELETE_AFTER, log, background_tasks,
+                            )
                     log(f"[bot_listener] deleted blocked file {message_id} in '{entry}'")
                 except Exception:
                     log(f"[bot_listener] failed to handle a blocked file in '{entry}':\n{traceback.format_exc()}")

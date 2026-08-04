@@ -174,10 +174,12 @@ DISMISS_DELETE_AFTER = 1  # seconds -- meant to feel closer to instant than a co
 BLOCKED_FILE_EXTENSIONS = (".zip", ".7z", ".rar", ".stl", ".obj", ".glb")
 
 # Sent into the chat after such a file is deleted, with {mention} replaced by the sender
-# (see format_blocked_file_notice). Deliberately NOT scheduled for deletion, unlike the
-# short rejection notices above: it's the only trace left of the removed message and the
-# explanation for it, so it stays in the chat.
+# (see format_blocked_file_notice). It self-deletes on its own clock: long enough for the
+# sender to actually read why their file went, short enough that the rule doesn't
+# accumulate in the chat one copy at a time. There is no command to take with it -- the
+# message that prompted it is already gone, which is the whole point.
 BLOCKED_FILE_NOTICE = "{mention}, пересылка файлов разрешена только в личке. Спасибо за понимание."
+BLOCKED_FILE_NOTICE_DELETE_AFTER = 30  # seconds
 
 
 def blocked_file_name(msg) -> str | None:
@@ -1192,6 +1194,10 @@ async def run_listener(
                                 sent = await client.send_message(event.chat_id, notice, parse_mode="html")
                                 if sent is not None:
                                     sent_message_ids.add(sent.id)
+                                    schedule_delete(
+                                        event.client, event.chat_id, [sent.id],
+                                        BLOCKED_FILE_NOTICE_DELETE_AFTER,
+                                    )
                         except Exception as e:
                             log(f"[listener] failed to send blocked-file notice: {e}")
                 return

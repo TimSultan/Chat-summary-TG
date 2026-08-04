@@ -149,6 +149,7 @@ The timers (`listener.py`, top of file):
 | --- | --- | --- |
 | `STATS_DELETE_AFTER` | 300 s (5 min) | `/top`, `/stat`, `/tree`, `/shop`, `/coins`, `/buy`, and their error notices |
 | `ERROR_DELETE_AFTER` | 10 s | short rejection notices, such as the one-day limit |
+| `BLOCKED_FILE_NOTICE_DELETE_AFTER` | 30 s | the "files only in DMs" notice left after a deleted attachment |
 | `DISMISS_DELETE_AFTER` | 1 s | a 👍 on something the bot sent — a "get rid of this" tap |
 
 Two things are deliberately left out of the sweep:
@@ -175,9 +176,10 @@ the bot posts one line naming the sender:
 
 Details worth knowing:
 
-- **The notice stays.** Unlike every other on-demand reply above, it is never scheduled
-  for deletion — it is the only remaining trace of the removed message, and its
-  explanation.
+- **The notice self-deletes after 30 seconds** (`BLOCKED_FILE_NOTICE_DELETE_AFTER`) —
+  long enough for the sender to read why their file went, short enough that the rule
+  doesn't pile up in the chat one copy at a time. It takes no command with it the way
+  `/stat` replies do: the message that prompted it is the file, already deleted.
 - **Groups named in `LISTENER_ALLOWED_CHATS` only.** Never in a DM (the notice tells
   people to use one), and never in some other chat your account happens to be in.
 - **One notice per album.** Ten `.stl` files dragged in at once arrive as ten messages;

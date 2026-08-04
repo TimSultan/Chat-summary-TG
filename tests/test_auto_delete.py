@@ -134,6 +134,19 @@ class CallSiteTests(unittest.TestCase):
         for site in self._call_sites(consumer):
             self.assertNotIn("trigger_message_id", site)
 
+    def test_the_blocked_file_notice_sweeps_itself_but_takes_nothing_with_it(self):
+        """The "files only in DMs" notice goes on its own 30s clock. It must NOT pass a
+        trigger: what prompted it is the attachment, which this same consumer deleted a
+        few lines earlier -- passing its id would be a second delete of a message that is
+        already gone."""
+        consumer = inspect.getsource(bot_listener.run_bot_listener)
+        consumer = consumer.split("async def _consume_file_blocks")[1].split("async def _consume_stats_digests")[0]
+        sites = self._call_sites(consumer)
+        self.assertTrue(sites, "the blocked-file notice no longer self-deletes")
+        for site in sites:
+            self.assertNotIn("trigger_message_id", site)
+            self.assertIn("BLOCKED_FILE_NOTICE_DELETE_AFTER", site)
+
 
 if __name__ == "__main__":
     unittest.main()
