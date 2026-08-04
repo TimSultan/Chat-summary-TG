@@ -618,10 +618,6 @@ App via a Direct Link (`VOTE_MINIAPP_SHORT_NAME`, see `/vote chat` below) or int
 bot's DM, where the real Mini App button is waiting. Either way it is opening the page
 inside Telegram that gets a signed identity to vote with.
 
-There are **two ballots**, side by side rather than one replacing the other — see
-"The in-chat ballot" below for why. Both write the same poll file, so it never matters
-which one a voter uses.
-
 Five distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
 page that changes shape depending on who opens it:
 
@@ -721,56 +717,6 @@ Two optional settings shape where announcements go and how their button opens:
 by default — an `@username` is all Telegram's `sendMessage` needs, so no numeric id lookup
 is involved) and `VOTE_MINIAPP_SHORT_NAME` (BotFather's `/newapp` short name, which has to
 be created by hand once, pointing at `WEBAPP_PUBLIC_URL` + `/vote`).
-
-#### The in-chat ballot — for people the Mini App can't reach
-
-A Mini App is a web page **the phone fetches from our own host**. That request never touches
-Telegram's infrastructure, which matters where Telegram is blocked: a proxy configured
-*inside* Telegram (the MTProto proxies people share in those countries) carries the chat but
-not the page, so for those members the Mini App simply never loads while it works fine for
-everyone on a full-tunnel VPN. Same chat, same button, different outcome.
-
-So `/vote` in the DM offers a second button, **«🖼 Голосовать здесь»**, which is a ballot made
-entirely of things that travel over Telegram's own protocol: photos served from Telegram's
-CDN by `file_id`, taps as callback queries. If a member can read the chat at all, they can
-vote.
-
-It is **one message for the whole ballot** — every tap edits it in place
-(`editMessageMedia`) instead of sending another photo:
-
-```text
-Работа 3 из 12 · скрыто 5 · выбрано 1/3
-Аня К. (@anna)
-✔ Твой голос за эту работу
-
-[ ⏪ ] [ ◀ ] [ ▶ ] [ ⏩ ]
-[ 🙈 Скрыть ]  [ ✅ Голосовать ]
-[ 📋 Список ] [ 👁 Скрытые ] [ ✔ Готово ]
-```
-
-Four decisions worth knowing, because each one is load-bearing:
-
-- **No server-side position.** The carousel reads which work it is showing back out of its
-  own caption (`_carousel_position`). That is what lets the keyboard carry no index, which
-  in turn lets a plain step skip `reply_markup` entirely — nothing for the client to
-  re-render — and it means a redeploy never drops anybody back to the first work.
-- **Photos are uploaded once, at collect time** (`prewarm_entry_file_ids`), in the admin's
-  own DM and deleted immediately; the `file_id` outlives the message. So no voter ever waits
-  on an upload, and because they go up as *photos*, Telegram downscales them server-side —
-  these are full-resolution art posts, and browsing the originals would crawl.
-- **Taps are coalesced, not queued.** Telegram sustains roughly one edit per second per
-  chat, so five fast presses of ▶ as five sequential edits is a stuttering carousel and
-  eventually a 429. Each tap claims a counter; a tap that finds a newer one has claimed it
-  drops instead of drawing. Hammering ▶ produces one edit, straight to where the voter is.
-- **🙈 Скрыть is per-voter and reversible.** It hides that work from *that person's* list
-  only — it can never touch the shared poll, which would be one member quietly removing
-  someone else's work from the contest. The count stays on screen, «👁 Скрытые» brings any of
-  them back, and hiding something already voted for drops that vote too rather than leaving
-  a vote for a work they can no longer see.
-
-`max_choices`, `allow_revote` and the members-only rule are the same checks the Mini App
-applies, enforced again here — the membership lookup runs when the ballot is opened and on
-every vote, but deliberately not on navigation, which is most taps and has to stay fast.
 
 ### Coins, the shop, and anti-farming
 

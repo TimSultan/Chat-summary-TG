@@ -398,26 +398,16 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         # The original ballot is untouched by the refused attempt.
         self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes[str(self.voter_id)], ["a"])
 
-    async def test_a_first_vote_is_still_accepted_when_allow_revote_is_off(self):
-        poll = self._seed_poll(approved=("a",))
-        poll.allow_revote = False
-        voting.save_poll(poll)
-
-        response = await self.client.post(
-            f"{vote_web.ROUTE_PREFIX}/api/ballot",
-            json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
-        )
-        self.assertEqual(response.status, 200)
-
     async def test_an_empty_recorded_ballot_does_not_lock_the_voter_out(self):
-        """Regression, matching the carousel's own fix: the lock is "has a vote", not "has
-        a row". record_vote drops choices that are no longer admitted, so un-admitting a
-        voter's only pick leaves them with a recorded-but-empty ballot -- which used to
-        mean they could never vote again."""
+        """A voter can hold a recorded-but-empty ballot: record_vote filters choices against
+        the admitted set, so an admin un-admitting everything they picked leaves the key
+        present with nothing behind it. Treating that as "already voted" would lock them out
+        of the contest holding no vote at all, which is why the check tests the choices
+        rather than the key."""
         poll = self._seed_poll(approved=("a", "b"))
         poll.allow_revote = False
         voting.record_vote(poll, self.voter_id, ["a"])
-        voting.set_approved(poll, ["b"])          # "a" is un-admitted after the vote
+        voting.set_approved(poll, ["b"])          # "a" is withdrawn by an administrator
         voting.record_vote(poll, self.voter_id, poll.votes[str(self.voter_id)])
         voting.save_poll(poll)
         self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes[str(self.voter_id)], [])
@@ -428,6 +418,17 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 200)
         self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes[str(self.voter_id)], ["b"])
+
+    async def test_a_first_vote_is_still_accepted_when_allow_revote_is_off(self):
+        poll = self._seed_poll(approved=("a",))
+        poll.allow_revote = False
+        voting.save_poll(poll)
+
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/ballot",
+            json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+        )
+        self.assertEqual(response.status, 200)
 
     async def test_the_poll_payload_carries_settings_for_voters_too(self):
         poll = self._seed_poll(approved=("a",))

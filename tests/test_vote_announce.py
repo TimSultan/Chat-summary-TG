@@ -290,7 +290,7 @@ class DestinationDispatchTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": _press("both", "f1")},
                     FakeApi(), None, None, None, BOT, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 
@@ -705,7 +705,7 @@ class ResultsDispatchTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": _press_result("send", "r1")},
                     FakeApi(), None, None, None, BOT, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 
@@ -727,7 +727,7 @@ class ResultsDispatchTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"message": _result_reply("Новый текст", 5)},
                     FakeApi(), None, cfg, None, BOT, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 

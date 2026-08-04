@@ -6,11 +6,6 @@ without a network: collecting entries from a chat, the on-disk poll, and verifyi
 signed identity Telegram hands a Mini App. The HTTP surface is vote_web.py; the bot
 command that creates a poll is in bot_listener.py.
 
-Two ballots read and write the same poll file: the Mini App, and an inline-keyboard photo
-carousel in the voter's own DM. Anything either of them adds to the stored poll has to
-default to empty when it is absent, since a poll saved by one is loaded by the other and
-by every build that predates the field (see Entry.file_ids and Poll.hidden).
-
 An entry is ONE POST, not one message. Several photos sent together are an album --
 Telegram delivers those as separate messages sharing a grouped_id, and only one of them
 carries the caption (so only one carries the hashtag). Collecting per-message would turn a
@@ -79,12 +74,6 @@ class Entry:
     text: str
     media: list[str] = field(default_factory=list)  # file names under the poll's media dir
     posted_at: str = ""    # ISO 8601, local time
-    # The Bot API file_id of each photo, in the same order as `media`. Empty until the
-    # collect step uploads them once. It exists so the in-chat carousel can render a photo
-    # by sending a file_id string, instead of re-uploading the picture on every navigation
-    # tap. Stays empty for polls collected before this existed -- from_dict tolerates the
-    # key being absent, and the Mini App, which serves the files off disk, never needs it.
-    file_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -100,7 +89,6 @@ class Entry:
             text=raw.get("text") or "",
             media=list(raw.get("media") or []),
             posted_at=raw.get("posted_at") or "",
-            file_ids=[str(f) for f in raw.get("file_ids") or []],
         )
 
 
@@ -262,13 +250,6 @@ class Poll:
     approved: list[str] = field(default_factory=list)
     # user_id (as a string, since JSON keys are strings) -> list of entry_ids.
     votes: dict[str, list[str]] = field(default_factory=dict)
-    # user_id (as a string, same as `votes`) -> the entry_ids that voter has hidden from
-    # THEIR OWN view of the in-chat carousel. This is purely per-voter and that is the
-    # whole safety property: hiding never changes what any other voter sees, never changes
-    # what is admitted, and never removes anything from the poll or the tally. It is a
-    # personal "I have looked at this one already" filter, not a moderation tool -- only
-    # set_approved decides what is in the contest. Empty for polls saved before it existed.
-    hidden: dict[str, list[str]] = field(default_factory=dict)
     open: bool = True
     # Set once by close_and_announce, kept alongside the poll so a reloaded page (or a
     # second look days later) can still show who won without recomputing it from votes
@@ -290,7 +271,6 @@ class Poll:
             "entries": [e.to_dict() for e in self.entries],
             "approved": list(self.approved),
             "votes": {k: list(v) for k, v in self.votes.items()},
-            "hidden": {k: list(v) for k, v in self.hidden.items()},
             "open": self.open,
             "winner_entry_id": self.winner_entry_id,
             "max_choices": self.max_choices,
@@ -306,7 +286,6 @@ class Poll:
             entries=[Entry.from_dict(e) for e in raw.get("entries") or []],
             approved=[str(e) for e in raw.get("approved") or []],
             votes={str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()},
-            hidden={str(k): [str(e) for e in v] for k, v in (raw.get("hidden") or {}).items()},
             open=bool(raw.get("open", True)),
             winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
             max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
@@ -354,14 +333,14 @@ def close_and_announce(poll: Poll) -> tuple[Entry, int] | None:
     return winner_entry, votes
 
 
-# Serialises every read-modify-write of a poll across BOTH ballots -- the Mini App's HTTP
-# handlers and the in-chat carousel's callback tasks run in the same process, on the same
-# event loop, against the same file. Without it two people voting at the same moment can
-# each load the poll, add their own choice and save, and whoever writes second silently
-# erases the other's ballot. Held around the whole load/mutate/save, not just the save:
-# locking only the write would still let the second writer save state built from a stale
-# read. Voting traffic is a handful of taps a second at most, so the contention this costs
-# is irrelevant next to losing a vote.
+# Serialises every read-modify-write of a poll. The voting page's handlers run
+# concurrently on one event loop against one file, and each ballot does load -> mutate ->
+# save with an await (the membership check) in the middle. Without this, two people voting
+# at the same moment can each load the poll, add their own choice and save, and whoever
+# writes second silently erases the other's ballot. Held around the whole load/mutate/save,
+# not just the save: locking only the write would still let the second writer save state
+# built from a stale read. Voting traffic is a handful of requests a second at most, so the
+# contention this costs is irrelevant next to losing a vote.
 poll_lock = asyncio.Lock()
 
 
@@ -442,13 +421,6 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
         user_id: [e for e in choices if e in known]
         for user_id, choices in existing.votes.items()
     }
-    # Personal hidden lists survive a re-collection for the same reason votes do -- a voter
-    # who has worked through half the carousel should not be shown it all again because an
-    # administrator picked up new nominations. Entries that are gone drop out here too.
-    poll.hidden = {
-        user_id: [e for e in concealed if e in known]
-        for user_id, concealed in existing.hidden.items()
-    }
     poll.open = existing.open
     if existing.winner_entry_id in known:
         poll.winner_entry_id = existing.winner_entry_id
@@ -473,76 +445,6 @@ def record_vote(poll: Poll, user_id: int | str, entry_ids: list[str]) -> Poll:
     allowed = set(poll.approved)
     poll.votes[str(user_id)] = [e for e in dict.fromkeys(entry_ids) if e in allowed]
     return poll
-
-
-def set_entry_file_ids(poll: Poll, entry_id: str, file_ids: list[str]) -> Poll:
-    """Records the Bot API file_ids of one entry's photos, uploaded once so the carousel
-    can re-send them without re-uploading. A no-op if `entry_id` is unknown -- an upload
-    that finishes after the entry has been dropped by a re-collection has nothing to
-    attach itself to, and that is not an error worth raising at the caller."""
-    for entry in poll.entries:
-        if entry.entry_id == str(entry_id):
-            entry.file_ids = [str(f) for f in file_ids]
-            break
-    return poll
-
-
-def hidden_for(poll: Poll, user_id: int | str) -> list[str]:
-    """The entry_ids this one voter has hidden from their own view -- empty if they have
-    hidden nothing, which is every voter until they press the button."""
-    return list(poll.hidden.get(str(user_id)) or [])
-
-
-def toggle_hidden(poll: Poll, user_id: int | str, entry_id: str) -> bool:
-    """Flips one entry's hidden state for one voter and returns the NEW state (True = the
-    voter has just hidden it). Unknown entry_ids are ignored -- returns False, changes
-    nothing -- so a stale button on a card whose post has since been deleted cannot write
-    a phantom id into the poll.
-
-    Hiding an entry the voter has already chosen also drops it from their ballot: a vote
-    for something they can no longer see is the confusing outcome, since nothing in the
-    carousel would ever show them they are still voting for it. Unhiding deliberately does
-    NOT put the vote back -- the voter's ballot is theirs to rebuild, and silently
-    re-casting a vote they dropped would be the same surprise in the other direction.
-
-    That vote-drop happens ONLY while the poll is open. A closed poll's tally is the
-    result: a voter whose carousel is still sitting in their DM with live buttons could
-    otherwise tap 🙈 after the contest ended and silently retract a counted vote, told only
-    that the work was hidden. Once voting is over, hiding is nothing but a view preference.
-
-    Only this voter is affected: the entry stays admitted and stays in everybody else's
-    carousel and in the tally.
-    """
-    key = str(user_id)
-    entry_id = str(entry_id)
-    if not any(e.entry_id == entry_id for e in poll.entries):
-        return False
-
-    current = list(poll.hidden.get(key) or [])
-    if entry_id in current:
-        poll.hidden[key] = [e for e in current if e != entry_id]
-        return False
-
-    poll.hidden[key] = current + [entry_id]
-    if poll.open and key in poll.votes:
-        poll.votes[key] = [e for e in poll.votes[key] if e != entry_id]
-    return True
-
-
-def clear_hidden(poll: Poll, user_id: int | str) -> Poll:
-    """Unhides everything for one voter -- what the "Показать все" button does. Their
-    ballot is left alone: votes dropped by hiding stay dropped (see toggle_hidden)."""
-    poll.hidden.pop(str(user_id), None)
-    return poll
-
-
-def visible_entries(poll: Poll, user_id: int | str) -> list[Entry]:
-    """The admitted entries this voter has not hidden, in the poll's own order -- what the
-    in-chat carousel paginates over. Hidden ids that are not (or are no longer) admitted
-    simply do not matter here: they cannot resurrect an entry, because this filters
-    approved_entries() rather than building from the hidden list."""
-    concealed = set(hidden_for(poll, user_id))
-    return [e for e in poll.approved_entries() if e.entry_id not in concealed]
 
 
 # -------------------------------------------------------------------- announced results

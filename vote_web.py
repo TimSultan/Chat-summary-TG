@@ -212,9 +212,10 @@ async def handle_ballot(request: web.Request) -> web.Response:
         if not isinstance(choices, list) or not all(isinstance(c, str) for c in choices):
             return _json_error("choices must be a list of entry ids")
 
-        # Truthiness, not `in`: an empty recorded ballot is not a cast one, and treating it
-        # as one locks that voter out entirely -- see the same check in bot_listener's
-        # carousel for how a voter ends up with an empty entry in the first place.
+        # Truthiness, not `in`: an EMPTY recorded ballot is not a cast one. A voter ends up
+        # with the key present and no choices behind it when an admin un-admits everything
+        # they picked (record_vote filters to the admitted set) -- and treating that as
+        # "already voted" locks them out of the contest holding no vote at all.
         if not poll.allow_revote and poll.votes.get(str(user["id"])):
             return _json_error("менять голос нельзя -- голосование уже зафиксировано", status=409)
         distinct = len(set(choices))

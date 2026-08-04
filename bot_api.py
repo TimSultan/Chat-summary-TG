@@ -257,55 +257,6 @@ class TelegramBotAPI:
             if "not modified" not in str(e).lower():
                 raise
 
-    async def edit_message_media_photo(
-        self,
-        chat_id,
-        message_id: int,
-        file_id: str,
-        caption: str | None = None,
-        parse_mode: str | None = None,
-        reply_markup: dict | None = None,
-    ) -> None:
-        """Swap the *picture* of an already-sent photo message, caption and all.
-
-        This is what powers the vote carousel: stepping to the next nominee edits the one
-        message in place instead of posting one photo message per nominee, so the chat
-        keeps a single card the voter scrolls through rather than a wall of near-identical
-        posts that would have to be cleaned up afterwards.
-
-        `file_id` is always a file_id Telegram already knows -- never a fresh upload --
-        which is what makes stepping through nominees cheap: no bytes leave this machine,
-        the edit is a small JSON call whatever the picture weighs. (An upload would need
-        multipart form data, i.e. _upload, not this method at all.)
-
-        reply_markup is only sent when the caller passes one, and that omission is
-        deliberate rather than a shortcut: Telegram leaves an omitted keyboard untouched,
-        so plain navigation steps -- where the buttons are identical anyway -- skip it and
-        the client has no reason to re-render them. caption/parse_mode are likewise left
-        out of `media` when None: _call only strips None from its top-level params, so
-        anything nested here has to be pruned by hand or Telegram receives explicit nulls.
-
-        Editing to the picture that is already displayed raises "message is not modified",
-        which is the expected result of double-tapping a navigation button, so it is
-        swallowed exactly like the sibling edit_* methods do.
-        """
-        media = {"type": "photo", "media": file_id}
-        if caption is not None:
-            media["caption"] = caption
-        if parse_mode is not None:
-            media["parse_mode"] = parse_mode
-        try:
-            await self._call(
-                "editMessageMedia",
-                chat_id=chat_id,
-                message_id=message_id,
-                media=media,
-                reply_markup=reply_markup,
-            )
-        except ChatSummaryError as e:
-            if "not modified" not in str(e).lower():
-                raise
-
     async def delete_message(self, chat_id, message_id: int) -> None:
         try:
             await self._call("deleteMessage", chat_id=chat_id, message_id=message_id)

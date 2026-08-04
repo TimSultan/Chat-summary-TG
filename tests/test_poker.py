@@ -976,7 +976,7 @@ class HandlerTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": _press(poker.callback_data("join", "abcd1234"), DEALER)},
                     self.api, None, None, None, None, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 
