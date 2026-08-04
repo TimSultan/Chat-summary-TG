@@ -505,6 +505,11 @@ def toggle_hidden(poll: Poll, user_id: int | str, entry_id: str) -> bool:
     NOT put the vote back -- the voter's ballot is theirs to rebuild, and silently
     re-casting a vote they dropped would be the same surprise in the other direction.
 
+    That vote-drop happens ONLY while the poll is open. A closed poll's tally is the
+    result: a voter whose carousel is still sitting in their DM with live buttons could
+    otherwise tap 🙈 after the contest ended and silently retract a counted vote, told only
+    that the work was hidden. Once voting is over, hiding is nothing but a view preference.
+
     Only this voter is affected: the entry stays admitted and stays in everybody else's
     carousel and in the tally.
     """
@@ -519,7 +524,7 @@ def toggle_hidden(poll: Poll, user_id: int | str, entry_id: str) -> bool:
         return False
 
     poll.hidden[key] = current + [entry_id]
-    if key in poll.votes:
+    if poll.open and key in poll.votes:
         poll.votes[key] = [e for e in poll.votes[key] if e != entry_id]
     return True
 

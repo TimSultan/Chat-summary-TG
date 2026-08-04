@@ -4271,7 +4271,12 @@ async def handle_vote_carousel_callback(
             if not poll.open:
                 await answer("Голосование уже закрыто.")
                 return
-            if not poll.allow_revote and str(user_id) in poll.votes:
+            # Truthiness, not `in`: an EMPTY ballot is not a cast one. A voter can end up
+            # with the key present and no choices behind it -- they hid the only work they
+            # picked, or an admin un-admitted it (record_vote filters to the admitted set)
+            # -- and treating that as "already voted" locks them out of the contest with no
+            # vote at all and no way to cast one.
+            if not poll.allow_revote and poll.votes.get(str(user_id)):
                 await answer("Менять голос нельзя -- твой бюллетень уже зафиксирован.")
                 return
             if not visible:
