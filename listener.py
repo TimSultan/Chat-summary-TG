@@ -175,13 +175,58 @@ def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     return sorted(names)
 
 
+def matched_trigger_keyword(text: str, keywords: list[str]) -> str | None:
+    """The trigger keyword this message OPENS with, or None if it does not invoke one.
+
+    A summary costs an OpenAI call, so the invocation has to be deliberate: the keyword
+    must be the first thing in the message, exactly as a slash-command is. Merely
+    containing it somewhere is not enough -- quoting what someone else asked ("я написал
+    /summary а он молчит"), or a word that happens to swallow it, used to fire a real
+    request, and in a busy chat that is a bill nobody chose to run up.
+
+    Right after the keyword there must be a boundary: end of message, whitespace, or "@"
+    -- Telegram appends "@botname" to commands in groups, and "/summary@my_bot за вчера"
+    is the same invocation as "/summary за вчера". Anything else ("/summarize") is a
+    different word and does not match.
+
+    Returns the keyword that matched (the longest one, so overlapping keywords resolve to
+    the most specific) rather than a bool, since strip_trigger_keywords needs to know
+    which one to take off the front.
+    """
+    stripped = (text or "").lstrip()
+    lowered = stripped.lower()
+    matches = []
+    for keyword in keywords:
+        if not keyword or not lowered.startswith(keyword):
+            continue
+        rest = stripped[len(keyword):]
+        if rest and not rest[0].isspace() and rest[0] != "@":
+            continue  # "/summarize" is not "/summary"
+        matches.append(keyword)
+    return max(matches, key=len) if matches else None
+
+
+def has_trigger_keyword(text: str, keywords: list[str]) -> bool:
+    return matched_trigger_keyword(text, keywords) is not None
+
+
 def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
-    """Removes the trigger keyword(s) (e.g. "/summary") from the request text, so the
-    LLM sees the actual question ("кто такой Степан") rather than the invocation itself."""
-    result = text
-    for kw in keywords:
-        result = re.sub(re.escape(kw), "", result, flags=re.IGNORECASE)
-    return result.strip()
+    """Removes the leading trigger keyword (e.g. "/summary", or "/summary@my_bot") from
+    the request text, so the LLM sees the actual question ("кто такой Степан") rather
+    than the invocation itself.
+
+    Only the opening invocation is removed, and only when the text actually starts with
+    one -- the same word later in the sentence is part of the question the person asked
+    and must survive into the prompt.
+    """
+    stripped = (text or "").lstrip()
+    keyword = matched_trigger_keyword(stripped, keywords)
+    if keyword is None:
+        return stripped.strip()
+    rest = stripped[len(keyword):]
+    # The "@botname" Telegram tacks onto a group command belongs to the invocation too.
+    rest = re.sub(r"^@\S+", "", rest)
+    return rest.strip()
 
 
 def _is_default_impression_request(text: str, routed: dict, ref_date: date) -> bool:
@@ -906,13 +951,6 @@ async def run_listener(
 
     me = await client.get_me()
     my_username = me.username
-    # Lets people trigger a summary without the exact keyword, either by naming you
-    # directly (e.g. "sultan summary" in one message) or by replying to one of your
-    # messages and saying "summary" -- see the two extra checks in on_message below.
-    # Require a few characters so a short/generic first name doesn't match constantly.
-    my_first_name = (me.first_name or "").strip().lower()
-    if len(my_first_name) < 3:
-        my_first_name = ""
 
     if not my_username:
         # Not fatal -- triggering no longer needs an @mention of this account, just the
@@ -1364,21 +1402,14 @@ async def run_listener(
         # The trigger keyword (default "/summary") is the invocation itself, like a
         # slash-command -- no need to also @mention or reply to you. Works the same
         # whether you type it yourself or someone else does, in any allowed chat.
-        has_summary_keyword = not bot_takeover and any(k in text_lower for k in cfg.listener_trigger_keywords)
-
-        # Two more ways to ask for a summary without the exact trigger keyword: naming
-        # you by first name alongside the word "summary" in one message, or replying to
-        # one of your own messages and saying "summary". Both checks are gated on the
-        # bare word "summary" being present at all, so plain chat never pays for the
-        # extra (async, for the reply case) checks below. Skipped entirely once the bot
-        # account has taken over (see bot_takeover above).
-        if not bot_takeover and not has_summary_keyword and "summary" in text_lower:
-            if my_first_name and my_first_name in text_lower:
-                has_summary_keyword = True
-            elif msg.is_reply:
-                replied = await msg.get_reply_message()
-                if replied is not None and replied.sender_id == me.id:
-                    has_summary_keyword = True
+        #
+        # It has to OPEN the message, and it has to be the keyword itself: there is
+        # deliberately no longer a way to ask by writing the bare word "summary" (naming
+        # this account alongside it, or replying to one of its messages with it), because
+        # those fired on people merely talking ABOUT the bot. See matched_trigger_keyword.
+        has_summary_keyword = not bot_takeover and has_trigger_keyword(
+            text, cfg.listener_trigger_keywords
+        )
 
         if not has_summary_keyword:
             return

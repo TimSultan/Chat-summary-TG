@@ -93,6 +93,7 @@ from listener import (
     _expand_sparse_impression_history,
     _format_hours,
     extract_mentioned_usernames,
+    has_trigger_keyword,
     resolve_time_window,
 )
 from main import period_label, resolve_tz
@@ -5617,7 +5618,11 @@ async def _dispatch_update(
                 pass
         return
 
-    has_summary = any(k in text_lower for k in cfg.listener_trigger_keywords)
+    # Only when the message OPENS with the keyword ("/summary ...", or "/summary@thisbot
+    # ..." as Telegram spells a command in a group). Quoting the command mid-sentence is
+    # talking about it, not asking for one, and a summary is an OpenAI call -- see
+    # listener.matched_trigger_keyword for the whole rule.
+    has_summary = has_trigger_keyword(message_text, cfg.listener_trigger_keywords)
 
     # A direct Telegram Reply to this bot is normal conversational input. It is handled
     # immediately and independently of JOKE_ENABLED: that flag only controls unprompted
