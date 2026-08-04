@@ -4056,6 +4056,64 @@ def _largest_photo_file_id(sent: dict | None) -> str | None:
     return photos[-1].get("file_id") if photos else None
 
 
+async def _upload_entry_media(api: TelegramBotAPI, chat_id, poll, entry, log=print) -> list[str]:
+    """Uploads one nominee's pictures and returns their file_ids. Persists nothing.
+
+    The carrier messages are deleted the moment Telegram answers -- a file_id outlives the
+    message it arrived on, which is what makes "upload once, reference forever" possible.
+    Best-effort per picture: one that fails is skipped rather than losing the whole entry.
+    """
+    media_dir = voting.media_path(poll.entry, poll.poll_id)
+    file_ids: list[str] = []
+    for name in entry.media:
+        path = media_dir / name
+        if not path.exists():
+            continue
+        try:
+            sent = await api.send_photo_file(chat_id, path)
+        except Exception as e:
+            log(f"[bot_listener] could not upload {name} for entry {entry.entry_id}: {e}")
+            continue
+        file_id = _largest_photo_file_id(sent)
+        if file_id:
+            file_ids.append(file_id)
+        message_id = (sent or {}).get("message_id")
+        if message_id:
+            await api.delete_message(chat_id, message_id)
+    return file_ids
+
+
+async def _ensure_file_id(api: TelegramBotAPI, chat_id, poll, entry, log=print) -> str | None:
+    """The file_id to render this nominee with, uploading it now if there isn't one yet.
+
+    Polls collected BEFORE the in-chat ballot existed have no file_ids at all, and there is
+    a live one of those with real votes in it -- so "warm at collect time" alone would mean
+    telling the whole chat to wait for the next poll. This warms lazily instead: the first
+    voter to reach a given work pays one upload for it, everybody after that gets the
+    file_id. It costs that voter a picture flashing up and vanishing in their own DM, which
+    is the price of Telegram having no way to obtain a file_id without sending something.
+
+    The write is deliberately narrow. It re-reads the poll under the lock and sets ONLY
+    this entry's file_ids on that fresh copy, so a ballot cast between the render and this
+    save cannot be overwritten -- nothing else in the poll is touched, ever.
+    """
+    if entry.file_ids:
+        return entry.file_ids[0]
+    if not entry.media:
+        return None
+    file_ids = await _upload_entry_media(api, chat_id, poll, entry, log=log)
+    if not file_ids:
+        return None
+    entry.file_ids = list(file_ids)  # keep the in-memory copy renderable for this tap
+    async with voting.poll_lock:
+        stored = voting.latest_poll(poll.entry)
+        if stored is not None and stored.poll_id == poll.poll_id:
+            voting.set_entry_file_ids(stored, entry.entry_id, file_ids)
+            voting.save_poll(stored)
+    log(f"[bot_listener] warmed {len(file_ids)} photo(s) for entry {entry.entry_id}")
+    return file_ids[0]
+
+
 async def prewarm_entry_file_ids(api: TelegramBotAPI, chat_id, poll, log=print) -> int:
     """Uploads every nominee's pictures ONCE and remembers the file_id Telegram hands back.
 
@@ -4072,27 +4130,11 @@ async def prewarm_entry_file_ids(api: TelegramBotAPI, chat_id, poll, log=print) 
 
     Returns how many entries were warmed, for the log line.
     """
-    media_dir = voting.media_path(poll.entry, poll.poll_id)
     warmed = 0
     for entry in poll.entries:
         if entry.file_ids or not entry.media:
             continue
-        file_ids: list[str] = []
-        for name in entry.media:
-            path = media_dir / name
-            if not path.exists():
-                continue
-            try:
-                sent = await api.send_photo_file(chat_id, path)
-            except Exception as e:
-                log(f"[bot_listener] could not prewarm {name} for entry {entry.entry_id}: {e}")
-                continue
-            file_id = _largest_photo_file_id(sent)
-            if file_id:
-                file_ids.append(file_id)
-            message_id = (sent or {}).get("message_id")
-            if message_id:
-                await api.delete_message(chat_id, message_id)
+        file_ids = await _upload_entry_media(api, chat_id, poll, entry, log=log)
         if file_ids:
             voting.set_entry_file_ids(poll, entry.entry_id, file_ids)
             warmed += 1
@@ -4142,19 +4184,30 @@ async def _carousel_show(
 
     index = max(0, min(index, len(visible) - 1))
     entry = visible[index]
-    caption = _carousel_caption(poll, entry, index, len(visible), hidden_count, chosen)
-    file_id = _carousel_file_id(entry)
+    # Uploads on the spot if this poll predates the prewarm step -- see _ensure_file_id.
+    file_id = await _ensure_file_id(api, chat_id, poll, entry, log=log)
     if message_id is None:
         if file_id is None:
-            # Nothing to open the ballot with. Rather than a broken first impression, say
-            # what is actually wrong -- an admin has to re-run "/vote собрать".
+            # The work this ballot happens to open on cannot be rendered -- its pictures
+            # never downloaded, or the upload just failed. Walk on to the first one that
+            # CAN be shown rather than refusing to open the ballot at all: one unrenderable
+            # nominee must not cost the voter the whole vote.
+            for offset in range(1, len(visible)):
+                candidate_index = (index + offset) % len(visible)
+                file_id = await _ensure_file_id(api, chat_id, poll, visible[candidate_index], log=log)
+                if file_id:
+                    index, entry = candidate_index, visible[candidate_index]
+                    break
+        if file_id is None:
             await api.send_message(
                 chat_id, "Фотографии работ ещё не готовы -- попроси администратора обновить заявки.",
                 parse_mode=None,
             )
             return
+        caption = _carousel_caption(poll, entry, index, len(visible), hidden_count, chosen)
         await api.send_photo(chat_id, file_id, caption, reply_markup=_carousel_keyboard())
         return
+    caption = _carousel_caption(poll, entry, index, len(visible), hidden_count, chosen)
     if file_id is None:
         # An entry whose upload failed: keep whatever picture is on the message and say so,
         # instead of dropping the nominee out of the ballot entirely.

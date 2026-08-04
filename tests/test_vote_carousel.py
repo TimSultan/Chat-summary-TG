@@ -734,11 +734,91 @@ class CarouselMembershipTests(CarouselTestCase):
         self.assertEqual(api.photos, [])
         self.assertIn("ещё не допущены", api.messages[0]["text"])
 
-    def test_opening_before_the_photos_are_warmed_asks_for_a_re_collect(self):
+    def test_opening_with_no_photos_anywhere_asks_for_a_re_collect(self):
+        # No file_ids AND no files on disk to warm from -- the only case left where the
+        # ballot genuinely cannot open. See CarouselLazyWarmTests for the case that matters
+        # in production, where the pictures are there and simply have not been uploaded yet.
         self.save(_poll(file_ids=False))
         api = self.press("open")
         self.assertEqual(api.photos, [])
         self.assertIn("Фотографии работ ещё не готовы", api.messages[0]["text"])
+
+
+class CarouselLazyWarmTests(CarouselTestCase):
+    """A poll collected BEFORE the in-chat ballot existed has no file_ids at all, and there
+    was a live one of those with real votes in it. The ballot has to warm those photos on
+    demand rather than dead-ending, and that write must touch nothing but file_ids.
+    """
+
+    PHOTO_RESPONSE = {"message_id": 9, "photo": [{"file_id": "small"}, {"file_id": "big"}]}
+
+    def _cold_poll(self, on_disk=(1, 2, 3), **fields):
+        """A saved poll whose entries carry media names but no file_ids -- exactly the shape
+        of a poll collected before this feature. `on_disk` is which entries' pictures were
+        actually downloaded at collect time."""
+        poll = _poll(file_ids=False, **fields)
+        self.save(poll)
+        media_dir = voting.media_path(ENTRY, POLL_ID)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        for number in on_disk:
+            (media_dir / f"photo{number}.jpg").write_bytes(b"not-really-a-jpeg")
+        return poll
+
+    def test_opening_a_cold_poll_uploads_the_work_and_shows_it(self):
+        self._cold_poll()
+        api = FakeApi(photo_response=self.PHOTO_RESPONSE)
+        self.press("open", api=api)
+        self.assertEqual(api.uploads, ["photo1.jpg"])
+        self.assertEqual(len(api.photos), 1)
+        self.assertEqual(api.photos[0]["file_id"], "big")
+        self.assertTrue(api.photos[0]["caption"].startswith("Работа 1 из 3"))
+        # The carrier message goes immediately -- a file_id outlives the message it came on.
+        self.assertEqual(api.deleted, [(VOTER, 9)])
+
+    def test_the_warmed_file_id_is_saved_so_nobody_uploads_it_twice(self):
+        self._cold_poll()
+        self.press("open", api=FakeApi(photo_response=self.PHOTO_RESPONSE))
+        self.assertEqual(self.stored().entries[0].file_ids, ["big"])
+
+        second = FakeApi(photo_response=self.PHOTO_RESPONSE)
+        self.press("open", api=second, user_id=OTHER_VOTER)
+        self.assertEqual(second.uploads, [], "the second voter paid for an upload again")
+        self.assertEqual(second.photos[0]["file_id"], "big")
+
+    def test_warming_leaves_every_vote_and_hidden_list_alone(self):
+        # The whole risk of writing to a live poll: this one already has ballots in it.
+        poll = self._cold_poll()
+        voting.record_vote(poll, VOTER, ["e1", "e2"])
+        voting.record_vote(poll, OTHER_VOTER, ["e3"])
+        voting.toggle_hidden(poll, OTHER_VOTER, "e1")
+        self.save(poll)
+        before = (self.stored().votes, self.stored().hidden, self.stored().approved)
+
+        self.press("open", api=FakeApi(photo_response=self.PHOTO_RESPONSE))
+
+        after = self.stored()
+        self.assertEqual(after.votes, before[0])
+        self.assertEqual(after.hidden, before[1])
+        self.assertEqual(after.approved, before[2])
+        self.assertEqual(after.entries[0].file_ids, ["big"])
+
+    def test_a_work_whose_picture_never_downloaded_is_stepped_over(self):
+        # One unrenderable nominee must not cost the voter the entire ballot.
+        self._cold_poll(on_disk=(2, 3))
+        api = FakeApi(photo_response=self.PHOTO_RESPONSE)
+        self.press("open", api=api)
+        self.assertEqual(api.uploads, ["photo2.jpg"])
+        self.assertEqual(len(api.photos), 1)
+        self.assertTrue(api.photos[0]["caption"].startswith("Работа 2 из 3"))
+
+    def test_navigating_onto_a_cold_work_warms_it_in_place(self):
+        self._cold_poll()
+        api = FakeApi(photo_response=self.PHOTO_RESPONSE)
+        self.press("next", caption=_caption(0), api=api)
+        self.assertEqual(api.uploads, ["photo2.jpg"])
+        self.assertEqual(len(api.media_edits), 1)
+        self.assertEqual(api.media_edits[0]["file_id"], "big")
+        self.assertTrue(api.media_edits[0]["caption"].startswith("Работа 2 из 3"))
 
 
 class LargestPhotoFileIdTests(unittest.TestCase):
