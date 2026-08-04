@@ -32,6 +32,10 @@ from urllib.parse import parse_qsl
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 VOTING_DIR = DATA_DIR / "voting"
+# Announced results live in their own subtree rather than beside the polls: latest_poll
+# globs "<key>_*.json" straight out of the voting dir, and a results file named on the
+# same key would be picked up by that glob and fail to parse as a Poll.
+RESULTS_DIR = VOTING_DIR / "results"
 
 # The hashtag that nominates a post. Kept in sync with stats.WEEKLY_CONTEST_HASHTAG,
 # imported lazily in collect_entries so this module stays importable on its own.
@@ -429,6 +433,141 @@ def record_vote(poll: Poll, user_id: int | str, entry_ids: list[str]) -> Poll:
     allowed = set(poll.approved)
     poll.votes[str(user_id)] = [e for e in dict.fromkeys(entry_ids) if e in allowed]
     return poll
+
+
+# -------------------------------------------------------------------- announced results
+
+
+def results_path(entry: str, poll_id: str) -> Path:
+    """Where this poll's results record lives -- same `<poll key>_<poll id>` naming as
+    poll_path, one directory down. Built from _voting_dir() rather than the RESULTS_DIR
+    constant so a test that patches _voting_dir redirects results too."""
+    return _voting_dir() / "results" / f"{_poll_key(entry)}_{poll_id}.json"
+
+
+def who(entry: Entry) -> str:
+    """How an entry's author is named in prose: the display name, plus the @handle when
+    there is one so the winner is actually pingable. Lives here rather than in
+    bot_listener because the announcement text is built here and the listener only
+    delivers it."""
+    return f"{entry.author_name} (@{entry.author_username})" if entry.author_username else entry.author_name
+
+
+def votes_label(count: int) -> str:
+    """"1 голос" / "2 голоса" / "5 голосов", with the 11-14 exception Russian grammar
+    makes for the teens -- 11 is "голосов" even though it ends in 1."""
+    tail_two = abs(count) % 100
+    tail_one = abs(count) % 10
+    if 11 <= tail_two <= 14 or tail_one == 0 or tail_one >= 5:
+        word = "голосов"
+    elif tail_one == 1:
+        word = "голос"
+    else:
+        word = "голоса"
+    return f"{count} {word}"
+
+
+# The announcement's closing lines, fixed wording dictated by the user. Deliberately
+# emoji-free: medals read as decoration the chat did not ask for, and bot prose in this
+# project stays plain (the stat/leaderboard displays are the only exception).
+_RESULTS_HEADER = "Результаты недельного голосования:"
+_RESULTS_FOOTER = "Всем спасибо за участие.\nКрасим дальше."
+# What replaces the list of places when the poll closed with no votes at all. Announcing
+# an empty top 3 would be worse than saying so: a header followed by nothing reads like
+# the message got truncated, so it says plainly that nobody scored.
+_RESULTS_NOBODY = "В этот раз голосов не набрал никто."
+
+
+def format_results_text(standings: list[tuple[Entry, int]], places: int | None = None) -> str:
+    """The announcement message for a finished poll.
+
+        Результаты недельного голосования:
+        1. Имя (@username) — 17 голосов
+        2. Имя — 14 голосов
+        3. Имя (@username) — 12 голосов
+
+        Всем спасибо за участие.
+        Красим дальше.
+
+    Every entrant is listed, not just a podium: the announcement is the only place the
+    chat ever sees the score -- the poll is closed by then and the Mini App shows nothing
+    to anyone who did not vote -- so cutting it at three would hide most of the week's
+    work. Entries nobody voted for are listed too, with their nought, since being in the
+    contest is the thing being acknowledged. `places` caps the list when a caller wants
+    one; None (the default) means all of them.
+
+    `standings` is a tally() result: already ordered, every admitted entry included.
+    Positions are positional -- a tie shares no number, the tally's own ordering decides,
+    because the chat needs one unambiguous winner to hand the prize to.
+    """
+    lines = []
+    for index, (entry, votes) in enumerate(standings if places is None else standings[:places], start=1):
+        lines.append(f"{index}. {who(entry)} — {votes_label(votes)}")
+    # A board of nothing but noughts is a worse read than saying it outright, so the whole
+    # list collapses to one line when the poll closed without a single vote cast.
+    if not any(votes > 0 for _, votes in standings):
+        lines = []
+    body = "\n".join(lines) if lines else _RESULTS_NOBODY
+    return f"{_RESULTS_HEADER}\n{body}\n\n{_RESULTS_FOOTER}"
+
+
+def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> Path:
+    """Writes the announced result of `poll` as a self-contained JSON record and returns
+    its path.
+
+    Self-contained on purpose: the poll file it came from keeps being rewritten (entries
+    re-collected, admitting changed, votes still arriving on a page someone left open),
+    so a record that only stored entry ids would quietly describe something other than
+    what was announced. Every ranked entry is copied in with the votes it had at the
+    moment of announcing -- all of them, since the announcement itself names every entrant
+    and any later "what happened that week" lookup wants the full board.
+
+    Overwrites an existing record for the same poll: announcing is idempotent here (see
+    close_and_announce), and a re-announcement is the newer truth, not a second event.
+    """
+    path = results_path(poll.entry, poll.poll_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "poll_id": poll.poll_id,
+        "entry": poll.entry,
+        "created_at": poll.created_at,
+        "announced_at": datetime.now(timezone.utc).isoformat(),
+        "voters": len(poll.votes),
+        "text": text,
+        "standings": [
+            {
+                "place": place,
+                "entry_id": e.entry_id,
+                "author_id": e.author_id,
+                "author_name": e.author_name,
+                "author_username": e.author_username,
+                "votes": votes,
+                "text": e.text,
+                "media": list(e.media),
+            }
+            for place, (e, votes) in enumerate(standings, start=1)
+        ],
+    }
+    # Same tmp-then-replace as save_poll: a crash mid-write must not leave a half-written
+    # record, which here would be a week's result lost for good rather than re-fetchable.
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def load_results(entry: str, poll_id: str) -> dict | None:
+    """The record save_results wrote, or None if there is none or it is unreadable --
+    same tolerance as load_poll: a corrupt file means "nothing announced yet" to every
+    caller, which is recoverable, rather than an exception on a page render."""
+    path = results_path(entry, poll_id)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 # ------------------------------------------------------ Telegram Mini App identity check

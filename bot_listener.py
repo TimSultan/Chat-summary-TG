@@ -241,6 +241,26 @@ VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "cancel")
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {"collect": "/vote собрать", "chat": "/vote chat", "clear": "/vote очистить"}
 
+# "Закрыть голосование и объявить победителя" in the Mini App no longer announces anything
+# by itself. It closes the poll and records the winner exactly as before, but what the
+# admin then gets is a DRAFT in their DM with the bot -- the results text on its own --
+# and three buttons:
+#
+#   Редактировать -- a force-reply prompt whose answer replaces the text; repeatable
+#   Отправить     -- posts the text straight into the main chat, no destination picker
+#                    (unlike "/vote chat": the results always belong in the chat)
+#   Отмена        -- posts nothing at all; the poll stays CLOSED and the results stay saved
+#
+# The results text is the one message a week whose wording the admin actually cares about,
+# which is the whole reason nothing reaches the chat until they say so.
+VOTE_RESULT_CALLBACK_PREFIX = "voteresult"
+VOTE_RESULT_ACTIONS = ("edit", "send", "cancel")
+# Deliberately far longer than VOTE_CHAT_FLOW_TTL_SECONDS: rewriting the week's results is
+# a "let me think about the wording" job, not a one-line announcement, and nothing is
+# racing it -- the poll is already closed and the results are already on disk by the time
+# this draft appears, so an expired flow costs the admin their wording, never the result.
+VOTE_RESULT_FLOW_TTL_SECONDS = 60 * 60
+
 # Registered with Telegram so the client shows a tappable ☰ Menu next to the input field
 # -- the point being that nobody has to know a command exists in order to use the bot.
 # Deliberately excludes the admin-only DM commands (/badge, /weekwinner, /deletepokras):
@@ -4134,6 +4154,333 @@ async def handle_vote_chat_destination_callback(
     )
 
 
+def _vote_result_callback_data(action: str, flow_id: str) -> str:
+    return f"{VOTE_RESULT_CALLBACK_PREFIX}:{action}:{flow_id}"
+
+
+def _parse_vote_result_callback(data: str) -> tuple[str, str] | None:
+    parts = (data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[0] != VOTE_RESULT_CALLBACK_PREFIX
+        or parts[1] not in VOTE_RESULT_ACTIONS
+        or not parts[2]
+    ):
+        return None
+    return parts[1], parts[2]
+
+
+def _vote_result_keyboard(flow_id: str) -> dict:
+    """The three buttons every copy of the draft carries. Emoji-free like the results text
+    itself: this whole flow speaks in the bot's plain voice."""
+    return {"inline_keyboard": [[
+        {"text": "Редактировать", "callback_data": _vote_result_callback_data("edit", flow_id)},
+        {"text": "Отправить", "callback_data": _vote_result_callback_data("send", flow_id)},
+        {"text": "Отмена", "callback_data": _vote_result_callback_data("cancel", flow_id)},
+    ]]}
+
+
+def _vote_results_text(standings: list, places: int | None = None) -> str:
+    """voting.format_results_text owns the wording -- this only guarantees there IS one.
+
+    `places` is passed straight through, and None (the default) means every entrant gets a
+    line: the announcement is the whole board, not a podium, so nothing here may cap it.
+
+    The poll is already closed by the time this is reached, so a formatting error would
+    otherwise leave the admin with a finished vote and no way to announce it. Falling back
+    to a bare list keeps the flow alive at the cost of the dictated wording.
+    """
+    try:
+        return voting.format_results_text(standings, places)
+    except Exception:
+        # Not traceback-logged at error level on purpose: this also covers running against
+        # an older voting.py that has no format_results_text at all.
+        lines = ["Результаты недельного голосования:"]
+        for index, (entry, votes) in enumerate(
+            standings if places is None else standings[:places], start=1
+        ):
+            lines.append(f"{index}. {_vote_who(entry)} — {votes} голосов")
+        return "\n".join(lines)
+
+
+def _save_vote_results(poll, standings: list, text: str, log=print) -> None:
+    """Writes the results record to disk.
+
+    Called three times over the life of one draft -- when the results are first produced,
+    after every edit, and after a successful post -- so that (a) the record exists even if
+    the admin presses Отмена and never announces anything, which is precisely what the
+    cancellation message promises them, and (b) what is on disk always matches the wording
+    they last saw rather than the first machine-generated draft.
+
+    Best-effort: this record is a convenience for later lookups, not the poll's own state
+    (voting.save_poll already stored that), so losing it must not cost the admin the draft
+    sitting in front of them.
+    """
+    try:
+        voting.save_results(poll, standings, text)
+    except Exception:
+        log(f"[bot_listener] failed to save the vote results record:\n{traceback.format_exc()}")
+
+
+async def _send_vote_result_draft(api: TelegramBotAPI, flow_id: str, flow: dict, log=print) -> bool:
+    """Puts one copy of the draft in front of the admin: the results text with the three
+    buttons under it.
+
+    Sent as a NEW message on every edit rather than edited in place, so the earlier wording
+    stays visible while the admin works on the next one -- an edit-in-place would make
+    "what did I just replace?" unanswerable in the middle of a rewrite.
+
+    Deliberately never handed to schedule_bot_delete, exactly like the /vote announcement
+    in the group: the draft is something the admin comes back to when they have thought of
+    better wording, so nothing in this bot's auto-delete sweep may touch it.
+
+    Returns False when nothing could be delivered at all, which is the caller's cue to drop
+    the flow rather than leave buttons nobody will ever see.
+    """
+    try:
+        await api.send_message(
+            flow["chat_id"], flow["text"], parse_mode=None,
+            reply_markup=_vote_result_keyboard(flow_id),
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to show the vote results draft: {e}")
+        return False
+    return True
+
+
+async def send_vote_results_draft(
+    api: TelegramBotAPI,
+    user: dict,
+    poll,
+    standings: list,
+    admin_chat_id,
+    vote_result_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """What vote_web.handle_announce reaches when the vote is closed from the Mini App.
+
+    `user` is whoever closed it, taken from the page's own verified identity rather than
+    re-derived some other way, and their user id doubles as the DM chat id -- the draft
+    goes to the person who pressed the button, in the chat they pressed it from.
+    `standings` is poll.tally() IN FULL, best first: the text lists every admitted work, so
+    a caller that had already sliced it to a podium could not be un-sliced from here.
+
+    The results record is written here, before a single button has been pressed, so that
+    closing the vote is what produces the results -- not announcing them. Отмена then
+    genuinely means "don't post", not "throw the week away".
+    """
+    chat_id = user.get("id")
+    if chat_id is None or not standings:
+        return
+
+    text = _vote_results_text(standings)
+    _save_vote_results(poll, standings, text, log=log)
+
+    # One live draft per admin, plus the usual TTL sweep -- a second "подведи итоги" in the
+    # same DM abandons the first draft rather than leaving two sets of buttons that would
+    # post the same results twice.
+    for old_flow_id, old_flow in list(vote_result_flows.items()):
+        if (
+            old_flow.get("chat_id") == chat_id
+            or time.monotonic() - old_flow["created_at"] > VOTE_RESULT_FLOW_TTL_SECONDS
+        ):
+            vote_result_flows.pop(old_flow_id, None)
+
+    flow_id = uuid.uuid4().hex[:10]
+    flow = {
+        "chat_id": chat_id,
+        "user_id": chat_id,
+        "entry": poll.entry,
+        # Resolved by the caller while the Telethon session was at hand and carried here so
+        # neither the buttons nor the re-verification below ever waits on a chat lookup --
+        # the same "store what you'll need" convention vote_chat_flows follows.
+        "admin_chat_id": admin_chat_id,
+        "poll": poll,
+        "standings": standings,
+        "text": text,
+        "prompt_message_id": None,
+        "created_at": time.monotonic(),
+    }
+    if not await _send_vote_result_draft(api, flow_id, flow, log=log):
+        return
+    vote_result_flows[flow_id] = flow
+    log(
+        f"[bot_listener] drafted the results of poll {poll.poll_id} for "
+        f"{user.get('username') or chat_id}"
+    )
+
+
+async def handle_vote_result_callback(
+    api: TelegramBotAPI,
+    callback: dict,
+    vote_result_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """Редактировать / Отправить / Отмена under a results draft.
+
+    Отправить posts into the main chat and nowhere else -- there is no destination picker
+    here on purpose, unlike "/vote chat": the results of the chat's own contest belong in
+    the chat, and asking would only be a button whose answer is always the same.
+
+    The flow is popped on Отмена and on a successful post, but deliberately NOT on a failed
+    post: a Bot API hiccup should leave the draft (and its buttons) intact so the admin can
+    simply press Отправить again, rather than having to close the vote a second time.
+    """
+    parsed = _parse_vote_result_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, flow_id = parsed
+
+    flow = vote_result_flows.get(flow_id)
+    if flow is None or time.monotonic() - flow["created_at"] > VOTE_RESULT_FLOW_TTL_SECONDS:
+        vote_result_flows.pop(flow_id, None)
+        await api.answer_callback_query(
+            callback["id"], text="Черновик устарел -- подведи итоги заново."
+        )
+        return
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != flow.get("user_id"):
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    # Answered before anything else that talks to Telegram: the admin re-check, the post
+    # into the chat and the confirmation back are three round trips, and a button that
+    # waits for them sits spinning on the presser's screen for the whole time.
+    await api.answer_callback_query(callback["id"])
+
+    async def report(text: str) -> None:
+        try:
+            await api.send_message(flow["chat_id"], text, parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] failed to report the vote results outcome: {e}")
+
+    if action == "cancel":
+        vote_result_flows.pop(flow_id, None)
+        await report(
+            "Итоги не опубликованы -- в чат ничего не отправлено. "
+            "Голосование остаётся закрытым, результаты сохранены."
+        )
+        return
+
+    # Re-checked against the tapper even though only they can see these buttons, the same
+    # belt-and-suspenders check every other confirm flow in this file does -- admin rights
+    # can have been taken away between closing the vote and pressing the button.
+    if not await _can_manage_chat(api, flow.get("admin_chat_id"), clicker, flow.get("entry")):
+        vote_result_flows.pop(flow_id, None)
+        await report("Публиковать итоги могут только администраторы.")
+        return
+
+    if action == "edit":
+        try:
+            prompt = await api.send_message(
+                flow["chat_id"],
+                "Пришли новый текст итогов ответом на это сообщение.",
+                parse_mode=None,
+                reply_markup={"force_reply": True, "selective": True},
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to open the vote results editor: {e}")
+            await report("Не получилось открыть редактирование -- попробуй ещё раз.")
+            return
+        flow["prompt_message_id"] = (prompt or {}).get("message_id")
+        # The clock restarts: what it measured so far was how long the admin looked at the
+        # draft, which says nothing about how long they need to rewrite it.
+        flow["created_at"] = time.monotonic()
+        return
+
+    target = flow.get("admin_chat_id")
+    if target is None:
+        await report("Не удалось определить основной чат -- итоги не отправлены.")
+        return
+    text = flow["text"]
+    try:
+        # Never scheduled for auto-delete, unlike the stats replies this codebase sweeps
+        # away as noise (see schedule_bot_delete) and exactly like the /vote announcement:
+        # the week's results are the message people scroll back to, so no sweep path may
+        # ever touch them.
+        await api.send_message(target, text, parse_mode=None)
+    except Exception as e:
+        log(f"[bot_listener] failed to post the vote results: {e}")
+        await report(f"Не получилось отправить итоги в чат: {e}")
+        return
+
+    vote_result_flows.pop(flow_id, None)
+    _save_vote_results(flow["poll"], flow["standings"], text, log=log)
+    await report("Итоги опубликованы в основном чате.")
+    log(
+        f"[bot_listener] {clicker.get('username') or clicker.get('id')} posted the results "
+        f"of poll {flow['poll'].poll_id} to the main chat"
+    )
+
+
+async def handle_vote_result_text_input(
+    api: TelegramBotAPI,
+    message: dict,
+    vote_result_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consumes the force-reply Редактировать opened: the reply becomes the draft text and
+    the draft is shown again, with the same three buttons, so editing can be repeated as
+    many times as the admin likes.
+
+    Like handle_vote_chat_text_input this does NOT pop its flow on the reply -- the draft
+    has to survive until Отправить or Отмена -- and unlike it, an empty reply is not fatal
+    either: the results already exist, so a reply with no text at all re-shows what is
+    there rather than throwing the week's announcement away.
+
+    Returns True once this message belonged to a pending draft, so the caller stops
+    treating it as ordinary chat input -- same contract as handle_badge_text_input/
+    handle_cabinet_text_input/handle_vote_chat_text_input.
+    """
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    replied_to = (message.get("reply_to_message") or {}).get("message_id")
+    found = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in vote_result_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") is not None
+            and flow.get("prompt_message_id") == replied_to
+            and time.monotonic() - flow["created_at"] <= VOTE_RESULT_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if found is None:
+        return False
+    flow_id, flow = found
+
+    text = (message.get("text") or "").strip()
+    if text.lower() in ("/cancel", "отмена"):
+        vote_result_flows.pop(flow_id, None)
+        await api.send_message(
+            chat_id,
+            "Итоги не опубликованы -- в чат ничего не отправлено. "
+            "Голосование остаётся закрытым, результаты сохранены.",
+            reply_to_message_id=message["message_id"], parse_mode=None,
+        )
+        return True
+    if not await _can_manage_chat(api, flow.get("admin_chat_id"), actor, flow.get("entry")):
+        vote_result_flows.pop(flow_id, None)
+        return True  # silently dropped, same as badge_flows -- admin status changed mid-flow
+
+    if text:
+        flow["text"] = text
+        _save_vote_results(flow["poll"], flow["standings"], text, log=log)
+        log(
+            f"[bot_listener] {actor.get('username') or actor.get('id')} rewrote the vote "
+            f"results text ({len(text)} chars)"
+        )
+    # Used up: the next Редактировать installs a prompt of its own, so a stale one can
+    # never swallow an unrelated reply later in the same DM.
+    flow["prompt_message_id"] = None
+    flow["created_at"] = time.monotonic()
+    if not await _send_vote_result_draft(api, flow_id, flow, log=log):
+        vote_result_flows.pop(flow_id, None)
+    return True
+
+
 async def handle_shop_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -4775,6 +5122,7 @@ async def _dispatch_update(
     menu_last_sent: dict,
     button_builder_flows: dict[str, dict] | None = None,
     vote_chat_flows: dict[str, dict] | None = None,
+    vote_result_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -4788,6 +5136,7 @@ async def _dispatch_update(
     around this call is strictly a last-resort backstop, not the primary safety net."""
     button_builder_flows = button_builder_flows if button_builder_flows is not None else {}
     vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
+    vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
@@ -4832,6 +5181,11 @@ async def _dispatch_update(
             await handle_vote_chat_destination_callback(
                 api, cfg, callback, vote_chat_flows, bot_username, log=log,
             )
+        elif callback_data.startswith(f"{VOTE_RESULT_CALLBACK_PREFIX}:"):
+            # No chat resolution here either: the draft already carries the main chat's id
+            # (resolved when the vote was closed), so pressing Отправить never waits on the
+            # Telethon session.
+            await handle_vote_result_callback(api, callback, vote_result_flows, log=log)
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner
             # doesn't hang forever on the client.
@@ -5069,6 +5423,11 @@ async def _dispatch_update(
 
     if await handle_vote_chat_text_input(
         api, cfg, message, vote_chat_flows, log=log
+    ):
+        return
+
+    if await handle_vote_result_text_input(
+        api, message, vote_result_flows, log=log
     ):
         return
 
@@ -5401,6 +5760,12 @@ async def run_bot_listener(
     # just sent, not persisted anywhere -- losing this on a restart costs the admin one
     # re-press, same as every other force-reply flow here.
     vote_chat_flows: dict[str, dict] = {}
+    # Short-lived results drafts, one per admin who has just closed a vote from the Mini
+    # App (see send_vote_results_draft). The results THEMSELVES are already on disk by the
+    # time an entry appears here -- voting.save_results is called when the draft is
+    # produced, not when it is posted -- so losing this on a restart costs the admin their
+    # wording and one "подведи итоги" again, never the week's result.
+    vote_result_flows: dict[str, dict] = {}
     # Last time the fallback menu was sent per DM chat_id, so a burst of messages
     # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
     menu_last_sent: dict[int, float] = {}
@@ -5454,7 +5819,8 @@ async def run_bot_listener(
                             summary_queue, background_tasks, home_chat_ref,
                             known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
                             cabinet_flows, menu_last_sent,
-                            button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows, log=log,
+                            button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows,
+                            vote_result_flows=vote_result_flows, log=log,
                         ),
                         update.get("update_id"),
                         log=log,
@@ -5582,42 +5948,29 @@ async def run_bot_listener(
                 return False
             return await _is_chat_member(api, admin_chat_id, user_id)
 
-        async def _announce_vote_winner(user: dict, poll, top: list) -> None:
-            """Sends the winner announcement -- for now into the admin's own DM with the
-            bot (the same chat the Mini App was opened from), not the group. `user` is
-            whoever closed the vote, taken from the page's own verified identity rather
-            than re-deriving "the admin" some other way. `top` is poll.tally()'s ranked
-            (Entry, votes) pairs, already sliced to at most 3, winner first.
+        async def _announce_vote_winner(user: dict, poll, standings: list) -> None:
+            """Hands the admin who just closed the vote a DRAFT of the results in their own
+            DM -- the results text with Редактировать/Отправить/Отмена under it -- instead
+            of announcing anything. Nothing reaches the chat until they press Отправить
+            (see send_vote_results_draft and handle_vote_result_callback).
 
-            Reaches directly into voting's on-disk media rather than re-downloading:
-            collect_entries already pulled every photo down when the poll was built."""
-            chat_id = user.get("id")
-            if not top or chat_id is None:
-                return
-            winner_entry, winner_votes = top[0]
+            `user` is whoever closed the vote, taken from the page's own verified identity
+            rather than re-deriving "the admin" some other way. `standings` is poll.tally()
+            IN FULL, best first: the text lists every admitted work, so slicing it to a
+            podium anywhere upstream would silently drop most of the week from the message.
 
-            lines = [f"🏆 Итоги голосования за {poll.entry}"]
-            for medal, (entry, votes) in zip(_VOTE_MEDALS, top):
-                if votes <= 0:
-                    break  # don't pad the runners-up with entries nobody voted for
-                lines.append("")
-                lines.append(f"{medal} {_vote_who(entry)} — {votes} голосов")
-                if entry is winner_entry and entry.text:
-                    lines.append(entry.text)
-            text = "\n".join(lines)
-
-            photo_path = None
-            # Same rule as send_stats_digest: a caption over Telegram's limit is rejected
-            # outright, so a long post text falls back to plain text rather than losing
-            # the announcement entirely.
-            if winner_entry.media and len(text) <= CAPTION_LIMIT:
-                candidate = voting.media_path(poll.entry, poll.poll_id) / winner_entry.media[0]
-                if candidate.is_file():
-                    photo_path = candidate
-            if photo_path is not None:
-                await api.send_photo_file(chat_id, photo_path, caption=text, parse_mode=None)
-            else:
-                await api.send_message(chat_id, text, parse_mode=None)
+            The main chat is resolved HERE, where the Telethon session is at hand, and
+            carried in the flow -- so that pressing Отправить later is a single Bot API
+            send with nothing to look up first.
+            """
+            admin_chat_id = (
+                await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+                if home_chat_ref
+                else None
+            )
+            await send_vote_results_draft(
+                api, user, poll, standings, admin_chat_id, vote_result_flows, log=log,
+            )
 
         tasks = [
             _poll_loop(),

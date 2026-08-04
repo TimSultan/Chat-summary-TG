@@ -39,11 +39,14 @@ _IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[dict], Awaitable[bool]])
 # the chat the poll belongs to at all. bot_listener.py's real implementation checks
 # Telegram chat membership; see create_app's docstring for why the default is permissive.
 _IS_MEMBER_KEY = web.AppKey("is_member", Callable[[dict], Awaitable[bool]])
-# Sends the winner announcement wherever bot_listener.py decides "the chat" currently
-# means (its own DM with the admin who closed the vote, for now). Takes the admin's user
-# dict, the poll, and the top 3 (Entry, votes) pairs ranked highest-first (fewer if there
-# aren't 3 admitted entries) -- element 0 is always the recorded winner. Failure is caught
-# by the caller and reported back, not raised through the API response.
+# Delivers the results of a closed vote. Takes the admin's user dict, the poll, and the
+# FULL standings -- every admitted entry as an (Entry, votes) pair, ranked highest-first,
+# element 0 being the recorded winner. Full, not the top 3: the results message
+# bot_listener.py writes lists every entrant, and a caller that had already sliced the
+# list to a podium could not be un-sliced from over there.
+# What bot_listener.py then does with it is entirely its own business (today: a draft in
+# the closing admin's DM, posted to the chat only once they confirm). Failure is caught by
+# the caller and reported back, not raised through the API response.
 _ANNOUNCE_KEY = web.AppKey(
     "announce", Callable[[dict, voting.Poll, list[tuple[voting.Entry, int]]], Awaitable[None]]
 )
@@ -271,13 +274,15 @@ async def handle_moderate(request: web.Request) -> web.Response:
 
 
 async def handle_announce(request: web.Request) -> web.Response:
-    """Closes the vote, records the top-voted admitted entry as the winner, and asks
-    bot_listener.py to send the announcement. Administrators only.
+    """Closes the vote, records the top-voted admitted entry as the winner, and hands the
+    results to bot_listener.py. Administrators only.
 
-    Closing and picking the winner happen even if the send itself fails (a transient
-    Bot API error, say) -- the poll's own state is the source of truth for who won, not
-    whether a particular message went out, so a delivery failure is reported back rather
-    than losing the result.
+    Closing and picking the winner happen even if that hand-off fails (a transient Bot API
+    error, say) -- the poll's own state is the source of truth for who won, not whether a
+    particular message went out, so a delivery failure is reported back rather than losing
+    the result. Note that "notified" only promises the results REACHED bot_listener.py:
+    what it does with them (today, a draft for the admin to approve) is not this module's
+    concern, which is why the page's own wording no longer claims anything was posted.
     """
     try:
         body = await request.json()
@@ -299,15 +304,19 @@ async def handle_announce(request: web.Request) -> web.Response:
     winner_entry, votes = result
     voting.save_poll(poll)
     # Recomputed fresh from the poll (now closed) rather than reused from close_and_announce,
-    # which only ever tracks the single #1 winner -- the top 3 is purely a reporting concern.
-    top = poll.tally()[:3]
+    # which only ever tracks the single #1 winner -- the standings are purely a reporting
+    # concern. The announcer gets all of them and the page gets the top 3: the results
+    # message bot_listener.py writes names every admitted work, while this response only
+    # ever feeds a three-line banner.
+    standings = poll.tally()
+    top = standings[:3]
     request.app[_LOG_KEY](
         f"[vote_web] {voting.display_name(user)} closed the vote -- winner {winner_entry.entry_id} ({votes} votes)"
     )
 
     notified = True
     try:
-        await request.app[_ANNOUNCE_KEY](user, poll, top)
+        await request.app[_ANNOUNCE_KEY](user, poll, standings)
     except Exception as e:
         notified = False
         request.app[_LOG_KEY](f"[vote_web] announcing the winner failed: {e}")
@@ -379,11 +388,11 @@ def create_app(
     is_member=None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
-    returning a bool; `announce` is an async callable taking (user, poll, top3) -- top3
-    being the ranked (Entry, votes) pairs, winner first -- that delivers the announcement.
-    Both are supplied by bot_listener.py, which owns the Bot API client they need, so this
-    module needs to know nothing about how administrators are determined or where an
-    announcement actually goes.
+    returning a bool; `announce` is an async callable taking (user, poll, standings) --
+    standings being the FULL list of ranked (Entry, votes) pairs, winner first -- that
+    delivers the results of a closed vote. Both are supplied by bot_listener.py, which owns
+    the Bot API client they need, so this module needs to know nothing about how
+    administrators are determined or what finally happens to a set of results.
 
     `announce` defaults to a no-op so the app is still constructible (e.g. in tests that
     don't exercise closing a vote) without a bot_listener.py running alongside it.
@@ -395,7 +404,7 @@ def create_app(
     standalone (tests, or running the page without the bot alongside it) instead of
     refusing every voter for want of a Bot API client to ask.
     """
-    async def _default_announce(user, poll, top):
+    async def _default_announce(user, poll, standings):
         return None
 
     async def _default_is_member(user):
@@ -1183,7 +1192,10 @@ $("go").addEventListener("click", async () => {
 
 $("announce").addEventListener("click", async () => {
   const button = $("announce");
-  if (!confirm("Закрыть голосование и объявить победителя? Дальше голосовать будет нельзя.")) return;
+  if (!confirm(
+    "Закрыть голосование и подвести итоги? Дальше голосовать будет нельзя. " +
+    "Итоги придут черновиком в личку -- в чат ничего не уйдёт без твоего подтверждения."
+  )) return;
   button.disabled = true;
   const original = button.textContent;
   button.textContent = "Подвожу итоги…";
@@ -1197,9 +1209,12 @@ $("announce").addEventListener("click", async () => {
     poll.winner = data.winner;
     renderWinnerBanner();  // shows the banner right away, without touching this button's text
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    // Nothing has been posted anywhere at this point: the bot only puts a DRAFT of the
+    // results in the admin's DM, and the chat sees them once "Отправить" is pressed there.
+    // The wording has to say so, or the admin walks away thinking the job is done.
     button.textContent = data.notified
-      ? "Победитель объявлен, сообщение отправлено тебе в личку"
-      : "Победитель выбран, но сообщение не отправилось -- смотри логи";
+      ? "Голосование закрыто. Черновик итогов ждёт в личке -- проверь и отправь"
+      : "Победитель выбран, но черновик не отправился -- смотри логи";
     // Deferred: a full render() right now would immediately overwrite this confirmation
     // text via updateAdminButtons(), which recomputes the button label from poll.open.
     setTimeout(() => { render(); }, 4000);

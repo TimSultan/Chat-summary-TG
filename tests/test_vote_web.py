@@ -51,14 +51,14 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.admin_id = 1
         self.voter_id = 2
-        self.announced = []  # (user, poll, winner_entry, votes) tuples, in call order
+        self.announced = []  # (user, poll, standings) tuples, in call order
         cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
 
         async def is_admin(user: dict) -> bool:
             return user.get("id") == self.admin_id
 
-        async def announce(user, poll, top):
-            self.announced.append((user, poll, top))
+        async def announce(user, poll, standings):
+            self.announced.append((user, poll, standings))
 
         app = vote_web.create_app(cfg, CHAT, is_admin, announce=announce, log=lambda *_: None)
         self.server = TestServer(app)
@@ -578,11 +578,11 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored.winner_entry_id, "a")
 
         self.assertEqual(len(self.announced), 1)
-        user, announced_poll, top = self.announced[0]
+        user, announced_poll, standings = self.announced[0]
         self.assertEqual(user["id"], self.admin_id)
-        self.assertEqual([(e.entry_id, v) for e, v in top], [("a", 2), ("b", 1)])
+        self.assertEqual([(e.entry_id, v) for e, v in standings], [("a", 2), ("b", 1)])
 
-    async def test_the_announced_top_is_capped_at_three_even_with_more_admitted_entries(self):
+    async def test_the_page_top_is_capped_at_three_but_the_announcer_gets_them_all(self):
         poll = voting.Poll(
             poll_id="2026-08-02", entry=CHAT, created_at="2026-08-02T00:00:00+00:00",
             entries=[_entry("a"), _entry("b"), _entry("c"), _entry("d")],
@@ -603,9 +603,13 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t["entry"]["id"] for t in data["top"]], ["d", "c", "b"])
         self.assertEqual([t["votes"] for t in data["top"]], [3, 2, 1])
 
+        # The announcer draws a picture of the whole table, so it is handed every admitted
+        # entry -- zero-vote ones included -- rather than the three the banner shows.
         self.assertEqual(len(self.announced), 1)
-        _, _, top = self.announced[0]
-        self.assertEqual([(e.entry_id, v) for e, v in top], [("d", 3), ("c", 2), ("b", 1)])
+        _, _, standings = self.announced[0]
+        self.assertEqual(
+            [(e.entry_id, v) for e, v in standings], [("d", 3), ("c", 2), ("b", 1), ("a", 0)]
+        )
 
     async def test_a_closed_poll_still_reports_its_winner_to_a_voter(self):
         self._seed_poll(approved=("a", "b"))
@@ -630,7 +634,7 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         forget who won, only report that the message itself didn't go out. Built with its
         own client, rather than mutating the shared one from setUp, since aiohttp warns
         against changing an Application's state after it's started."""
-        async def broken_announce(user, poll, winner_entry, votes):
+        async def broken_announce(user, poll, standings):
             raise RuntimeError("Bot API is down")
 
         async def is_admin(user: dict) -> bool:
