@@ -103,17 +103,42 @@ def sender_display_name(sender) -> str:
     return "Unknown"
 
 
+# Entities already resolved in this process, keyed by the exact string that was asked for.
+#
+# This is a latency fix, not a micro-optimisation. get_entity() only understands a
+# username, a numeric id or a link; a plain TITLE -- which is what LISTENER_ALLOWED_CHATS
+# is normally set to, e.g. "Единый Чат Художников" -- can never resolve that way and always
+# falls through to the iter_dialogs() walk below: a full pass over every dialog on the
+# account, over the network, before the caller gets to do any actual work. Every /stat,
+# /top, /tree, procrastinator list and transcript fetch was paying that walk, because they
+# all pass the configured chat as a string (see the `isinstance(chat_ref, str)` line in
+# fetch_range_messages_cached and friends), and it returns the same entity every time.
+#
+# One account per process, so the string alone is the key. Only successful lookups are
+# remembered: a miss or an ambiguous title must stay an error every time, and a restart is
+# what re-resolves a chat that has genuinely changed (a group migrating to a supergroup).
+_entity_cache: dict[str, object] = {}
+
+
 async def resolve_chat(client: TelegramClient, chat_ref: str):
     """Resolve a chat by username/id/phone, falling back to a case-insensitive
-    substring match against dialog titles for plain group names."""
+    substring match against dialog titles for plain group names. Successful lookups are
+    remembered for the life of the process -- see _entity_cache."""
     if not chat_ref or not chat_ref.strip():
         raise ChatSummaryError("Chat cannot be empty -- give a username, numeric ID, title, or invite link.")
+
+    cache_key = chat_ref.strip()
+    cached = _entity_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         candidate: Optional[str] = chat_ref
         if candidate.lstrip("-").isdigit():
             candidate = int(candidate)
-        return await client.get_entity(candidate)
+        entity = await client.get_entity(candidate)
+        _entity_cache[cache_key] = entity
+        return entity
     except ChatSummaryError:
         raise
     except ValueError as e:
@@ -142,6 +167,7 @@ async def resolve_chat(client: TelegramClient, chat_ref: str):
         raise ChatSummaryError(
             f"'{chat_ref}' matches multiple chats, be more specific:\n{names}"
         )
+    _entity_cache[cache_key] = matches[0].entity
     return matches[0].entity
 
 
