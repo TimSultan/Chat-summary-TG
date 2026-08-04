@@ -434,8 +434,6 @@ class BuilderFlowTests(unittest.TestCase):
             ENTRY,
             {ENTRY: GROUP_CHAT},
             {},
-            None,
-            {},
             {},
             {},
             self.flows,

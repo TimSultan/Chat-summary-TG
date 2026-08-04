@@ -1,7 +1,7 @@
 """Generates a Russian-language painting critique of one member's own miniature, from
 the actual photo they posted under #япокрасил. Sold in the shop (see economy.py).
 
-Unlike joke.py, which reasons over text, this one needs the image itself -- a
+This one needs the image itself, not just the text around it -- a
 critique written from a caption alone would be generic filler, which is exactly what the
 gamification plan warns cosmetic-feeling rewards degrade into. The photo is sent inline
 as a base64 data URL rather than a public link, because the source chat is private and

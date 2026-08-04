@@ -50,18 +50,6 @@ class Config:
     save_channel: str | None
     summary_pipeline_version: str
     telegram_bot_token: str | None
-    joke_enabled: bool
-    joke_activity_min_messages: int
-    joke_fire_probability: float
-    joke_cooldown_min_seconds: int
-    joke_cooldown_max_seconds: int
-    joke_reaction_threshold: int
-    joke_reaction_cooldown_seconds: int
-    joke_manual_trigger_keyword: str
-    joke_manual_preview_keyword: str
-    joke_profile_lookback_days: int
-    joke_profile_ttl_seconds: int
-    joke_profile_max_messages: int
     stats_enabled: bool
     stats_top_limit: int
     stats_catchup_days: int
@@ -166,95 +154,6 @@ def load_config() -> Config:
 
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
 
-    joke_enabled = os.getenv("JOKE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
-
-    joke_min_messages_raw = os.getenv("JOKE_ACTIVITY_MIN_MESSAGES", "20")
-    try:
-        joke_activity_min_messages = int(joke_min_messages_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_ACTIVITY_MIN_MESSAGES must be a number, got '{joke_min_messages_raw}'.")
-    if joke_activity_min_messages < 1:
-        raise ChatSummaryError(f"JOKE_ACTIVITY_MIN_MESSAGES must be >= 1, got {joke_activity_min_messages}.")
-
-    joke_probability_raw = os.getenv("JOKE_FIRE_PROBABILITY", "0.35")
-    try:
-        joke_fire_probability = float(joke_probability_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_FIRE_PROBABILITY must be a number, got '{joke_probability_raw}'.")
-    if not (0.0 <= joke_fire_probability <= 1.0):
-        raise ChatSummaryError(f"JOKE_FIRE_PROBABILITY must be between 0 and 1, got {joke_fire_probability}.")
-
-    joke_cooldown_min_raw = os.getenv("JOKE_COOLDOWN_MIN_SECONDS", "1800")
-    try:
-        joke_cooldown_min_seconds = int(joke_cooldown_min_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_COOLDOWN_MIN_SECONDS must be a number, got '{joke_cooldown_min_raw}'.")
-    if joke_cooldown_min_seconds < 0:
-        raise ChatSummaryError(f"JOKE_COOLDOWN_MIN_SECONDS must be >= 0, got {joke_cooldown_min_seconds}.")
-
-    joke_cooldown_max_raw = os.getenv("JOKE_COOLDOWN_MAX_SECONDS", "3600")
-    try:
-        joke_cooldown_max_seconds = int(joke_cooldown_max_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_COOLDOWN_MAX_SECONDS must be a number, got '{joke_cooldown_max_raw}'.")
-    if joke_cooldown_max_seconds < joke_cooldown_min_seconds:
-        raise ChatSummaryError(
-            f"JOKE_COOLDOWN_MAX_SECONDS ({joke_cooldown_max_seconds}) must be >= "
-            f"JOKE_COOLDOWN_MIN_SECONDS ({joke_cooldown_min_seconds})."
-        )
-
-    joke_reaction_threshold_raw = os.getenv("JOKE_REACTION_THRESHOLD", "3")
-    try:
-        joke_reaction_threshold = int(joke_reaction_threshold_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_REACTION_THRESHOLD must be a number, got '{joke_reaction_threshold_raw}'.")
-    if joke_reaction_threshold < 1:
-        raise ChatSummaryError(f"JOKE_REACTION_THRESHOLD must be >= 1, got {joke_reaction_threshold}.")
-
-    joke_reaction_cooldown_raw = os.getenv("JOKE_REACTION_COOLDOWN_SECONDS", "1800")
-    try:
-        joke_reaction_cooldown_seconds = int(joke_reaction_cooldown_raw)
-    except ValueError:
-        raise ChatSummaryError(
-            f"JOKE_REACTION_COOLDOWN_SECONDS must be a number, got '{joke_reaction_cooldown_raw}'."
-        )
-    if joke_reaction_cooldown_seconds < 0:
-        raise ChatSummaryError(
-            f"JOKE_REACTION_COOLDOWN_SECONDS must be >= 0, got {joke_reaction_cooldown_seconds}."
-        )
-
-    joke_manual_trigger_keyword = os.getenv("JOKE_MANUAL_TRIGGER_KEYWORD", "пошути").strip().lower()
-    if not joke_manual_trigger_keyword:
-        raise ChatSummaryError("JOKE_MANUAL_TRIGGER_KEYWORD cannot be empty.")
-
-    joke_manual_preview_keyword = os.getenv("JOKE_MANUAL_PREVIEW_KEYWORD", "пошути превью").strip().lower()
-    if not joke_manual_preview_keyword:
-        raise ChatSummaryError("JOKE_MANUAL_PREVIEW_KEYWORD cannot be empty.")
-
-    joke_profile_lookback_raw = os.getenv("JOKE_PROFILE_LOOKBACK_DAYS", "3")
-    try:
-        joke_profile_lookback_days = int(joke_profile_lookback_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_PROFILE_LOOKBACK_DAYS must be a number, got '{joke_profile_lookback_raw}'.")
-    if joke_profile_lookback_days < 1:
-        raise ChatSummaryError(f"JOKE_PROFILE_LOOKBACK_DAYS must be >= 1, got {joke_profile_lookback_days}.")
-
-    joke_profile_ttl_raw = os.getenv("JOKE_PROFILE_TTL_SECONDS", "86400")
-    try:
-        joke_profile_ttl_seconds = int(joke_profile_ttl_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_PROFILE_TTL_SECONDS must be a number, got '{joke_profile_ttl_raw}'.")
-    if joke_profile_ttl_seconds < 1:
-        raise ChatSummaryError(f"JOKE_PROFILE_TTL_SECONDS must be >= 1, got {joke_profile_ttl_seconds}.")
-
-    joke_profile_max_raw = os.getenv("JOKE_PROFILE_MAX_MESSAGES", "1000")
-    try:
-        joke_profile_max_messages = int(joke_profile_max_raw)
-    except ValueError:
-        raise ChatSummaryError(f"JOKE_PROFILE_MAX_MESSAGES must be a number, got '{joke_profile_max_raw}'.")
-    if joke_profile_max_messages < 1:
-        raise ChatSummaryError(f"JOKE_PROFILE_MAX_MESSAGES must be >= 1, got {joke_profile_max_messages}.")
-
     stats_enabled = os.getenv("STATS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "10")
@@ -294,18 +193,6 @@ def load_config() -> Config:
         save_channel=save_channel,
         summary_pipeline_version=summary_pipeline_version,
         telegram_bot_token=telegram_bot_token,
-        joke_enabled=joke_enabled,
-        joke_activity_min_messages=joke_activity_min_messages,
-        joke_fire_probability=joke_fire_probability,
-        joke_cooldown_min_seconds=joke_cooldown_min_seconds,
-        joke_cooldown_max_seconds=joke_cooldown_max_seconds,
-        joke_reaction_threshold=joke_reaction_threshold,
-        joke_reaction_cooldown_seconds=joke_reaction_cooldown_seconds,
-        joke_manual_trigger_keyword=joke_manual_trigger_keyword,
-        joke_manual_preview_keyword=joke_manual_preview_keyword,
-        joke_profile_lookback_days=joke_profile_lookback_days,
-        joke_profile_ttl_seconds=joke_profile_ttl_seconds,
-        joke_profile_max_messages=joke_profile_max_messages,
         stats_enabled=stats_enabled,
         stats_top_limit=stats_top_limit,
         stats_catchup_days=stats_catchup_days,

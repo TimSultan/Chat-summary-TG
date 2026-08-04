@@ -290,7 +290,7 @@ class DestinationDispatchTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": _press("both", "f1")},
                     FakeApi(), None, None, None, BOT, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, None, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 
@@ -705,7 +705,7 @@ class ResultsDispatchTests(unittest.TestCase):
                 await bot_listener._dispatch_update(
                     {"callback_query": _press_result("send", "r1")},
                     FakeApi(), None, None, None, BOT, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, None, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 
@@ -720,17 +720,14 @@ class ResultsDispatchTests(unittest.TestCase):
             handled.append(message)
             return True
 
-        cfg = SimpleNamespace(
-            listener_allowed_chats=[], stats_enabled=False,
-            joke_manual_trigger_keyword="пошути", joke_manual_preview_keyword="пошути превью",
-        )
+        cfg = SimpleNamespace(listener_allowed_chats=[], stats_enabled=False)
 
         async def go():
             with patch.object(bot_listener, "handle_vote_result_text_input", handle):
                 await bot_listener._dispatch_update(
                     {"message": _result_reply("Новый текст", 5)},
                     FakeApi(), None, cfg, None, BOT, 1, set(), asyncio.Queue(),
-                    set(), "chat", {}, {}, None, {}, {}, {},
+                    set(), "chat", {}, {}, {}, {},
                     log=lambda *_: None,
                 )
 

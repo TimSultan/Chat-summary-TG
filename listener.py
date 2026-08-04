@@ -17,7 +17,6 @@ client and a log callback that writes into the GUI's log pane instead of stdout.
 
 import asyncio
 import html
-import random
 import re
 import sys
 import time
@@ -29,8 +28,6 @@ from telethon import TelegramClient, events, utils as tl_utils
 from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
-import chat_profile
-import economy
 import history
 import stats
 import tree
@@ -38,7 +35,6 @@ from config import SUMMARY_COMMAND, build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
 from intent_v2 import route_request
-from joke import CONTEXT_MESSAGE_COUNT, generate_joke
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
 from summarizer import summarize_transcript
@@ -732,9 +728,9 @@ async def _send_procrastinator_digests(client, cfg, tz, stats_digest_queue, log=
     should_send_procrastinator_digest -- the every-other-day cadence, tracked per entry via
     a persisted last-sent date so it survives restarts) -- ambient, unprompted content
     posted to the group with nobody having asked for it, so it follows the SAME
-    bot-account-only rule as jokes/follow-ups: `stats_digest_queue` is only ever non-None
+    bot-account-only rule as every other post: `stats_digest_queue` is only ever non-None
     when a bot account is configured (see main()), and this is simply a no-op otherwise --
-    no personal-account fallback, matching joke_enabled's own gating.
+    no personal-account fallback.
 
     `client` is passed straight through to stats.format_procrastinators (as both `client`
     and, via the plain entry string, `chat_ref` -- resolve_chat can take either) so it can
@@ -913,8 +909,8 @@ async def _procrastinator_digest_loop(client, cfg, tz, stats_digest_queue, log=p
 
 async def run_stats_rollover(client, cfg, tz, stats_digest_queue=None, log=print) -> None:
     """Keeps stats.py's per-day-per-chat files up to date for every chat named in
-    LISTENER_ALLOWED_CHATS (stats tracking, like jokes, needs specific chats named --
-    there's no "everywhere" fallback), and separately drives the automatic "Топ
+    LISTENER_ALLOWED_CHATS (stats tracking needs specific chats named -- there's no
+    "everywhere" fallback), and separately drives the automatic "Топ
     покрастинаторов" digest -- two independent cadences run concurrently
     (_stats_catchup_loop at midnight, _procrastinator_digest_loop at
     stats.PROCRASTINATOR_DIGEST_HOUR every stats.PROCRASTINATOR_DIGEST_INTERVAL_DAYS days)
@@ -950,8 +946,6 @@ async def run_listener(
     cfg,
     tz,
     log=print,
-    joke_queue: "asyncio.Queue | None" = None,
-    joke_posted_queue: "asyncio.Queue | None" = None,
     figurine_ack_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
@@ -959,16 +953,6 @@ async def run_listener(
 ):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
-
-    `joke_queue`, if given, is where a generated joke (see joke.py) is put once the
-    activity trigger fires -- bot_listener.py's run_bot_listener consumes it and sends the
-    joke via the bot account, same as every other reply once a bot token is configured.
-    `joke_posted_queue` carries the reply the other way: bot_listener.py puts
-    (allowed_chats entry, sent message_id) on it once a queued joke is actually sent, so
-    this process can start the post-send cooldown and watch that specific message for
-    reactions (see the reaction-count cooldown reduction in on_reaction below) -- reactions
-    can only be reliably observed from this Telethon session, not the bot account (which
-    would need admin rights to see other users' reactions via the Bot API).
 
     `figurine_ack_queue`, if given, is where (allowed_chats entry, message_id) goes for a
     #япокрасил+photo/video message this session has just seen -- see on_message's figurine-
@@ -982,9 +966,8 @@ async def run_listener(
     stats.PROCRASTINATOR_DIGEST_INTERVAL_DAYS days at stats.PROCRASTINATOR_DIGEST_HOUR
     local time for the "Топ покрастинаторов" call-out (see run_stats_rollover/
     stats.format_procrastinators) -- unprompted, ambient content, so same
-    bot-account-only rule as jokes/follow-ups: passed through to run_stats_rollover, and
-    simply never sent (no personal-account fallback) if there's no bot account, matching
-    joke_enabled's own gating.
+    bot-account-only rule as every other post: passed through to run_stats_rollover, and
+    simply never sent (no personal-account fallback) if there's no bot account.
 
     `dismiss_queue`, if given, is where (chat_id, message_id) goes from
     _maybe_dismiss_on_thumbs_up (see on_reaction) when the thumbs-up dismiss shortcut
@@ -1051,34 +1034,6 @@ async def run_listener(
     sent_message_ids: set[int] = set()
     background_tasks: set[asyncio.Task] = set()
 
-    # "joke" (joke.py) is the one feature nobody asks for -- it's fired autonomously off
-    # recent chat activity instead of a keyword. Kept off unless explicitly enabled AND a
-    # bot account is available to actually post it (jokes always go out via the bot, never
-    # this personal account, matching how summary was moved over), AND at least one
-    # chat is named in LISTENER_ALLOWED_CHATS -- unlike summary's "empty = respond
-    # anywhere" fallback, something nobody asked for should never default to "everywhere".
-    joke_enabled = joke_queue is not None and cfg.joke_enabled and bool(cfg.listener_allowed_chats)
-    if cfg.joke_enabled and not joke_enabled:
-        log(
-            "[listener] JOKE_ENABLED is set but jokes need both TELEGRAM_BOT_TOKEN and a "
-            "non-empty LISTENER_ALLOWED_CHATS -- jokes are off."
-        )
-    # Per chat: a fixed-size activity ring buffer. It always holds at least the 20 live
-    # messages generate_joke needs for context. If the configured activity threshold is
-    # higher, only the newest 20 are sent to the model. Using maxlen keeps this bounded.
-    joke_buffer_size = max(cfg.joke_activity_min_messages, CONTEXT_MESSAGE_COUNT)
-    joke_activity: dict[int, deque] = {}
-    # Monotonic deadline before which a chat won't be considered again -- only set after
-    # an actual joke is sent (never after a SKIP, see maybe_joke), so a decline just costs
-    # another full buffer of messages, not a timer. May be pulled earlier by a reaction
-    # burst on that joke (see on_reaction).
-    joke_cooldown_until: dict[int, float] = {}
-    # Lets the joke_posted_queue consumer (below) and on_reaction map a
-    # LISTENER_ALLOWED_CHATS entry / a (chat, message) pair back to state kept here,
-    # since the actual send happens over in bot_listener.py.
-    joke_entry_to_chat: dict[str, int] = {}
-    joke_reaction_watch: dict[tuple[int, int], float] = {}
-
     # Save confirm/react flow state, keyed by (chat_id, confirm_message_id) --
     # keyed directly by the confirmation message itself since a save
     # only ever needs one pending confirmation per prompt (no "already pending for this
@@ -1102,10 +1057,10 @@ async def run_listener(
 
     def matched_allowed_chat(chat) -> str | None:
         """Like is_chat_allowed, but returns the actual LISTENER_ALLOWED_CHATS entry
-        (original casing) that matched, instead of a bool -- this is the key jokes are
-        queued under, so bot_listener.py's consumer can look up the matching Bot-API
-        chat_id. Jokes only ever consider chats explicitly named here, never
-        is_chat_allowed's "empty list = allow everywhere" fallback."""
+        (original casing) that matched, instead of a bool -- this is the key everything
+        handed to bot_listener.py is queued under, so its consumers can look up the
+        matching Bot-API chat_id. Those only ever consider chats explicitly named here,
+        never is_chat_allowed's "empty list = allow everywhere" fallback."""
         username = (getattr(chat, "username", "") or "").lower()
         title = (getattr(chat, "title", "") or "").lower()
         chat_id = str(getattr(chat, "id", ""))
@@ -1179,75 +1134,6 @@ async def run_listener(
     background_tasks.add(summary_worker)
     summary_worker.add_done_callback(background_tasks.discard)
 
-    async def maybe_joke(event, msg, text):
-        """Tracks this message in its chat's joke_activity ring buffer and, once that
-        buffer is full, considers firing. Called for every plain-text message in an
-        allowed chat, not just ones containing a keyword -- this is the only way jokes get
-        their "is the chat active right now" signal, and it's pure message count, not a
-        time window: a silent/sleeping chat simply never fills the buffer, so this can
-        never fire there, no matter how long it waits.
-
-        Once full (joke_buffer_size messages), a fire is considered if the
-        per-chat cooldown (joke_cooldown_until, unset until the first joke is ever sent)
-        has passed and a random roll under JOKE_FIRE_PROBABILITY hits. The buffer is only
-        cleared on an actual attempt (roll passed, OpenAI gets called) -- a roll *miss*
-        leaves it full so the very next qualifying message re-rolls immediately, instead of
-        waiting for another whole buffer's worth. Everything from the buffer-full check
-        through clearing it happens in one synchronous stretch with no `await` in between
-        (the two awaits below, for chat/sender, already happened by this point), so two
-        messages arriving close together can't both pass the check and double-fire.
-
-        If the model then declines (SKIP, see joke.py), that's it for this attempt -- no
-        cooldown is set, so it costs exactly "wait for another full buffer", not a timer.
-        Only an actual sent joke sets joke_cooldown_until (via the joke_posted_queue
-        consumer below), which a reaction burst on that joke can later pull earlier."""
-        chat = await event.get_chat()
-        entry = matched_allowed_chat(chat)
-        if entry is None:
-            return
-        sender = await event.get_sender()
-        if getattr(sender, "bot", False):
-            return  # never let either account's own messages (incl. past jokes) count as activity
-
-        now = time.monotonic()
-        chat_key = event.chat_id
-        joke_entry_to_chat[entry] = chat_key
-        bucket = joke_activity.setdefault(chat_key, deque(maxlen=joke_buffer_size))
-        bucket.append((msg.date.astimezone(tz).strftime("%H:%M"), sender_display_name(sender), text))
-
-        if len(bucket) < joke_buffer_size:
-            return
-        if now < joke_cooldown_until.get(chat_key, float("-inf")):
-            return
-        if random.random() >= cfg.joke_fire_probability:
-            return
-
-        lines = [f"[{hhmm}] {name}: {t}" for hhmm, name, t in list(bucket)[-CONTEXT_MESSAGE_COUNT:]]
-        bucket.clear()
-        log(f"[listener] joke conditions met in '{getattr(chat, 'title', chat_key)}' ({len(lines)} msgs) -- generating")
-
-        async def _run():
-            try:
-                profile = await chat_profile.ensure_profile(
-                    client, chat, entry, cfg.openai_api_key, cfg.openai_model, tz,
-                    cfg.joke_profile_ttl_seconds, cfg.joke_profile_lookback_days, cfg.joke_profile_max_messages,
-                    log=log,
-                )
-                joke_text = await asyncio.to_thread(
-                    generate_joke, cfg.openai_api_key, cfg.openai_model, lines, profile
-                )
-                if joke_text:
-                    await joke_queue.put((entry, joke_text))
-                    log(f"[listener] queued joke for '{entry}': {joke_text!r}")
-                else:
-                    log(f"[listener] chat remark generation skipped itself for '{entry}' -- next attempt after another {joke_buffer_size} messages")
-            except Exception:
-                log(f"[listener] error generating joke:\n{traceback.format_exc()}")
-
-        task = asyncio.create_task(_run())
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-
     # No incoming=True filter: watching outgoing messages too is what lets *you*
     # trigger a summary by typing "summary ..." yourself, not just other people
     # @mentioning you. The sent_message_ids/addressed_to_me logic below keeps this
@@ -1260,23 +1146,11 @@ async def run_listener(
 
         text = msg.raw_text or ""
         text_lower = text.lower()
-        # "/top ...", "/stat" or "/stat <period|pokras|username>" -- a bot command, not
-        # chat content, so it must never count as activity for the joke buffer.
-        is_stats_command = (
-            text_lower.startswith("/top")
-            or text_lower.startswith("/stat")
-            or text_lower.startswith("/tree")
-        )
-        is_badge_command = (
-            text_lower.startswith("/badge")
-            or text_lower.startswith("/weekwinner")
-            or text_lower.startswith("/deletepokras")
-        )
 
         # An archive or a 3D model (BLOCKED_FILE_EXTENSIONS): removed from the chat and
         # answered with a one-line explanation addressed to whoever sent it. Checked before
         # everything below and returning immediately, so a blocked file never counts as a
-        # figurine, never feeds the joke buffer, and never gets read as a command. Groups
+        # figurine and never gets read as a command. Groups
         # only -- the notice tells people to send these in a DM, so deleting them in one
         # would be absurd. Only in chats named in LISTENER_ALLOWED_CHATS: this account sits
         # in other chats that aren't ours to moderate.
@@ -1353,9 +1227,6 @@ async def run_listener(
                 else:
                     await react_emoji(event.chat_id, msg.id, FIGURINE_ACK_EMOJI)
 
-        if joke_enabled and text and not is_stats_command and not is_badge_command:
-            await maybe_joke(event, msg, text)
-
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
         # confirmation before reposting whatever you replied to into your save channel
         # -- see save_pending handling in on_reaction below. Only ever fires for your
@@ -1404,109 +1275,6 @@ async def run_listener(
                     await event.client.delete_messages(event.chat_id, [msg.id])
                 except Exception as e:
                     log(f"[listener] failed to delete save trigger message: {e}")
-            return
-
-        # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
-        # already-computed daily files, with no OpenAI summary generation involved, so
-        # these always work immediately rather than entering the summary queue. Skipped once a bot account has
-        # taken over (bot_takeover), same as /summary -- bot_listener.py handles both
-        # there instead, to avoid two replies to the same command.
-        if not bot_takeover and cfg.stats_enabled and is_stats_command:
-            chat = await event.get_chat()
-            entry = matched_allowed_chat(chat)
-            if entry is None:
-                sent = await event.reply("Статистика недоступна в этом чате.")
-                if sent is not None:
-                    sent_message_ids.add(sent.id)
-                    schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
-                return
-            # Strips a same-account "@my_username" mention Telegram tacks onto the
-            # command with no space (e.g. "/stat@Trash_Modelist") before parsing the
-            # period/username argument, so that alone means bare "/stat", not a lookup
-            # for a user literally named after the bot -- see strip_command_bot_mention.
-            stats_text = stats.strip_command_bot_mention(text, my_username)
-            try:
-                level_announcements = []
-                stat_uses_html = False
-                if text_lower.startswith("/tree"):
-                    # An open ceremony means there is no tree to measure yet -- see the
-                    # same branch in bot_listener.handle_tree_command.
-                    if stats.planting_is_open(entry):
-                        reply_text = tree.format_awaiting_planting_status()
-                    else:
-                        yesterday = datetime.now(tz).date() - timedelta(days=1)
-                        total_xp, day_xp, contributors = await stats.chat_tree_totals(
-                            client, chat, entry, yesterday, tz, log=log, live_total=True
-                        )
-                        reply_text = tree.format_tree_status(total_xp, day_xp, contributors)
-                    stat_uses_html = True
-                elif text_lower.startswith("/top"):
-                    top_arg = stats_text[len("/top"):].strip()
-                    # "/top pokras" reaches the procrastinator list, same as "/stat pokras".
-                    if stats.is_procrastinator_command(top_arg):
-                        reply_text = await stats.format_procrastinators(
-                            client, chat, entry, tz, log=log
-                        ) or PROCRASTINATOR_NONE_FOUND_MESSAGE
-                    else:
-                        period = stats.parse_top_argument(top_arg)
-                        reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
-                else:
-                    arg = stats_text[len("/stat") :].strip()
-                    if stats.is_procrastinator_command(arg):
-                        reply_text = await stats.format_procrastinators(client, chat, entry, tz, log=log) or PROCRASTINATOR_NONE_FOUND_MESSAGE
-                    elif (period := stats.parse_stat_period(arg)):
-                        reply_text = await stats.format_top(client, chat, entry, period, tz, cfg.stats_top_limit, log=log)
-                    else:
-                        sender = await event.get_sender()
-                        user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
-                            client, chat, entry, arg, getattr(sender, "username", None), sender_display_name(sender), tz, log=log,
-                            frozen_days_for=economy.streak_freeze_lookup(entry),
-                        )
-                        if user:
-                            figurine_links = stats.figurine_message_links(
-                                getattr(chat, "username", None), event.chat_id, user
-                            )
-                            best_work_link, workplace_link = stats.showcase_message_links(
-                                getattr(chat, "username", None), event.chat_id, user
-                            )
-                            custom_badges = (
-                                stats.custom_badges_for_user(entry, user.user_id)
-                                + stats.weekly_winner_badges_for_user(entry, user.user_id)
-                            )
-                            reply_text = stats.format_stat(
-                                user, rank, total, xp, streak, figurine_links, custom_badges,
-                                best_work_link=best_work_link, workplace_link=workplace_link,
-                                season_xp=season_xp,
-                                work_names=stats.work_name_list(entry, user),
-                                **economy.stat_extras(entry, user.user_id, xp, user),
-                            )
-                            stat_uses_html = True
-                            level_announcements = stats.record_level_observations(
-                                entry, [(user, xp)]
-                            )
-                        else:
-                            reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
-                reply_kwargs = {"parse_mode": "html"} if stat_uses_html else {}
-                sent = await event.reply(reply_text, **reply_kwargs)
-                if sent is not None:
-                    sent_message_ids.add(sent.id)
-                    schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
-                for announcement in level_announcements:
-                    try:
-                        level_message = await event.client.send_message(event.chat_id, announcement)
-                        if level_message is not None:
-                            sent_message_ids.add(level_message.id)
-                    except Exception as e:
-                        log(f"[listener] failed to send level-up announcement: {e}")
-            except Exception:
-                log(f"[listener] error handling stats command:\n{traceback.format_exc()}")
-                try:
-                    sent = await event.reply("Не удалось получить статистику.")
-                    if sent is not None:
-                        sent_message_ids.add(sent.id)
-                        schedule_delete(event.client, event.chat_id, [sent.id], STATS_DELETE_AFTER)
-                except Exception:
-                    pass
             return
 
         # "/summary" is the invocation itself, like any slash-command -- no need to also
@@ -1589,9 +1357,9 @@ async def run_listener(
     async def _maybe_dismiss_on_thumbs_up(chat_id, update):
         """Reacting DISMISS_EMOJI onto any message the bot (or this account) sent deletes
         it almost immediately -- a one-tap way to clean up a reply without hunting for a
-        message-specific control. Only ever called once save_pending/joke_reaction_watch
-        have already passed on the reaction (see on_reaction), so it
-        never fights an in-progress confirm flow for the same message."""
+        message-specific control. Only ever called once save_pending has already passed
+        on the reaction (see on_reaction), so it never fights an in-progress confirm flow
+        for the same message."""
         if DISMISS_EMOJI not in await _my_reaction_emoticons(chat_id, update):
             return
         try:
@@ -1664,83 +1432,20 @@ async def run_listener(
             task.add_done_callback(background_tasks.discard)
             return
 
-        joke_watch_key = (chat_id, update.msg_id)
-        if joke_watch_key in joke_reaction_watch:
-            # Keyed by the exact (chat, message) pair, so this can never fire off
-            # reactions to some other/older message -- and it's popped the instant it
-            # crosses the threshold, so a message that keeps collecting reactions after
-            # that (or this handler firing again for the same message, which it will, since
-            # every additional reaction re-sends the full state) can't re-trigger the
-            # reduction a second time.
-            posted_at = joke_reaction_watch[joke_watch_key]
-            reactor_ids = await _reactor_ids(chat_id, update)
-            if len(reactor_ids) >= cfg.joke_reaction_threshold:
-                del joke_reaction_watch[joke_watch_key]
-                reduced_until = posted_at + cfg.joke_reaction_cooldown_seconds
-                if reduced_until < joke_cooldown_until.get(chat_id, float("inf")):
-                    joke_cooldown_until[chat_id] = reduced_until
-                    log(
-                        f"[listener] joke in chat {chat_id} (msg {update.msg_id}) got "
-                        f"{len(reactor_ids)} reactions -- cooldown reduced"
-                    )
-            # Orthogonal to the threshold count above (that's about total reactors, this
-            # is specifically "did *I* thumbs-up it") -- falls through so a joke can still
-            # be dismissed on the spot instead of being stuck undismissable for as long as
-            # it stays in the reaction-count watch window (up to 4x the cooldown max).
-            await _maybe_dismiss_on_thumbs_up(chat_id, update)
-            return
-
         await _maybe_dismiss_on_thumbs_up(chat_id, update)
-
-    if joke_enabled:
-        # Drains joke_posted_queue for the life of the process: bot_listener.py puts
-        # (allowed_chats entry, sent message_id) here once a queued joke is actually sent,
-        # which is this process's only way to learn that -- it's what starts the post-send
-        # cooldown and what makes that specific message eligible for the reaction-count
-        # cooldown reduction in on_reaction above.
-        async def _consume_joke_posted():
-            while True:
-                entry, message_id = await joke_posted_queue.get()
-                chat_key = joke_entry_to_chat.get(entry)
-                if chat_key is None:
-                    log(f"[listener] joke was posted for '{entry}' but its chat_id isn't known here -- skipping cooldown/reaction tracking")
-                    continue
-                now = time.monotonic()
-                joke_cooldown_until[chat_key] = now + random.uniform(
-                    cfg.joke_cooldown_min_seconds, cfg.joke_cooldown_max_seconds
-                )
-                # Lazy GC: an entry only leaves this dict early if it actually crosses the
-                # reaction threshold (see on_reaction) -- anything that never does would
-                # otherwise sit here forever, so drop anything old enough that it's no
-                # longer worth watching (well past any realistic cooldown).
-                stale_cutoff = now - 4 * cfg.joke_cooldown_max_seconds
-                for k in [k for k, posted_at in joke_reaction_watch.items() if posted_at < stale_cutoff]:
-                    del joke_reaction_watch[k]
-                joke_reaction_watch[(chat_key, message_id)] = now
-
-        asyncio.create_task(_consume_joke_posted())
 
     if cfg.stats_enabled:
         # run_stats_rollover itself no-ops (with its own log line) if
-        # LISTENER_ALLOWED_CHATS is empty -- stats tracking, like jokes, needs specific
-        # chats named rather than defaulting to "everywhere".
+        # LISTENER_ALLOWED_CHATS is empty -- stats tracking needs specific chats named
+        # rather than defaulting to "everywhere".
         asyncio.create_task(run_stats_rollover(client, cfg, tz, stats_digest_queue=stats_digest_queue, log=log))
 
-    joke_status = (
-        f"on ({joke_buffer_size} msgs to fill the buffer, "
-        f"{cfg.joke_fire_probability:.0%} chance, {cfg.joke_cooldown_min_seconds}-{cfg.joke_cooldown_max_seconds}s "
-        f"cooldown, reduced to {cfg.joke_reaction_cooldown_seconds}s on {cfg.joke_reaction_threshold}+ reactions)"
-        if joke_enabled
-        else "off"
-    )
     stats_status = "on" if (cfg.stats_enabled and cfg.listener_allowed_chats) else "off"
-    direct_reply_status = "off (disabled)" if bot_takeover else "off (no TELEGRAM_BOT_TOKEN)"
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages STARTING WITH "
         f"'{SUMMARY_COMMAND}' (summary, pipeline {cfg.summary_pipeline_version}) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
         f"Summary queue: FIFO, {cfg.summary_queue_delay_seconds}s between completed jobs. "
-        f"Joke: {joke_status}. Direct bot replies: {direct_reply_status}. "
         f"Stats (/top, /stat): {stats_status}. "
         f"Timezone: {tz}. Ctrl+C to stop."
     )
@@ -1770,15 +1475,6 @@ async def main():
         import bot_listener
 
         print("[listener] TELEGRAM_BOT_TOKEN is set -- also starting bot_listener.py for /summary.")
-        # joke_queue hands a generated joke (see maybe_joke in run_listener) from this
-        # Telethon session, which is the only one that sees every plain-text message, to
-        # the bot account, which is the only one that should ever post one.
-        # joke_posted_queue carries the reply the other way: the sent message_id, once
-        # bot_listener.py actually posts it, so this session can start its cooldown and
-        # watch that message for reactions (only this session can reliably see other
-        # users' reactions without the bot needing admin rights).
-        joke_queue: asyncio.Queue = asyncio.Queue()
-        joke_posted_queue: asyncio.Queue = asyncio.Queue()
         # figurine_ack_queue carries (allowed_chats entry, message_id) from this session
         # -- the only one that sees every message, so it's the one that detects a
         # #япокрасил+photo/video post and bumps the counter (stats.record_figurine_live) -- to
@@ -1788,7 +1484,7 @@ async def main():
         # stats_digest_queue carries (allowed_chats entry, text) every other day for the
         # "Топ покрастинаторов" call-out (see run_stats_rollover/
         # stats.format_procrastinators) -- ambient, unprompted content, same
-        # bot-account-only rule as jokes.
+        # bot-account-only rule as every other post.
         stats_digest_queue: asyncio.Queue = asyncio.Queue()
         # dismiss_queue carries (chat_id, message_id) from this session's thumbs-up
         # dismiss shortcut (see _maybe_dismiss_on_thumbs_up in run_listener) whenever the
@@ -1806,13 +1502,11 @@ async def main():
         await asyncio.gather(
             run_listener(
                 client, cfg, tz,
-                joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
             ),
             bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
-                joke_queue=joke_queue, joke_posted_queue=joke_posted_queue,
                 figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
             ),

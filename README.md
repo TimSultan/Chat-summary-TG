@@ -188,87 +188,11 @@ Details worth knowing:
   and can never match, so a `#япокрасил` post is untouched.
 - **The bot must be an admin with delete rights.** Your personal session is the one that
   sees every message and spots the file, but the delete and the notice are handed to the
-  bot account (`file_block_queue`), same split as jokes and figurine reactions. Without
+  bot account (`file_block_queue`), same split as the figurine reactions. Without
   those rights `deleteMessage` fails silently and only the notice appears.
 
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
-
-### Natural chat remarks -- off by default
-
-Unlike everything else in this project, `JOKE_ENABLED=true` (`.env`) adds one thing
-nobody has to ask for: an occasional short, in-context remark, dropped into the chat
-while it's actually active. Despite the legacy `JOKE_*` setting names, the prompt does
-not ask the bot to make a joke; it asks for an ordinary continuation in the room's own
-style, with a short sarcastic reaction only when that naturally fits. Requires a bot account (`TELEGRAM_BOT_TOKEN`) and a
-non-empty `LISTENER_ALLOWED_CHATS` -- it never defaults to "everywhere" the way
-`/summary` does, and always posts as the bot, never your personal account.
-
-It only fires off real message volume, not a timer: `JOKE_ACTIVITY_MIN_MESSAGES` (default
-20) qualifying messages have to land in a rolling per-chat buffer before it's even
-considered -- a quiet or sleeping chat simply never fills that buffer, so it's
-structurally impossible for this to go off in a dead chat, no matter how long it waits.
-Once the buffer's full, it fires if the chat's cooldown has passed and a random roll under
-`JOKE_FIRE_PROBABILITY` (default 0.35) hits; a miss doesn't reset the buffer, so the very
-next message tries again rather than needing a whole new batch of 20.
-
-Cooldown only ever kicks in after an actual remark gets sent -- `JOKE_COOLDOWN_MIN_SECONDS`/
-`JOKE_COOLDOWN_MAX_SECONDS` (default 30-60 min, picked randomly each time so it's not a
-flat interval). If the model declines instead (see below), there's no cooldown at all --
-it just costs another full buffer of messages, not a timer, so one tense stretch of chat
-can't suppress remarks for an hour once things lighten back up. A remark that lands well gets
-rewarded: if it picks up `JOKE_REACTION_THRESHOLD` (default 3) reactions, that chat's
-cooldown is pulled in to `JOKE_REACTION_COOLDOWN_SECONDS` (default 30 min) from when it
-was posted, whichever is sooner.
-
-On top of all of that, nothing reviews a remark before it posts, so the model itself
-(`joke.py`) is instructed to back off (respond with a `SKIP` sentinel, which is silently
-dropped -- nothing gets sent) for anything that isn't actually a good moment: an active
-argument, a heavy or personal topic (appearance, health, money, relationships, grief),
-protected-characteristic territory, anything it would otherwise have to invent, or a
-moment where adding a message would feel forced.
-
-**Feeling the room (`chat_profile.py`).** Every remark -- automatic or manual -- gets a
-compact "flavor profile" of the chat alongside whatever prompted it: language mixing,
-typical message length and structure, casing, punctuation, slang, conversational rhythm,
-recurring context, and tone, built from a few days
-of the already-cached transcript (`JOKE_PROFILE_LOOKBACK_DAYS`, default 3). This is one
-OpenAI call, cached and reused for `JOKE_PROFILE_TTL_SECONDS` (default 24h) rather than
-regenerated per remark, so it stays cheap. The profile format is versioned, so changing
-these instructions invalidates an older cached profile immediately instead of waiting
-for its normal TTL.
-
-For each actual remark, the model gets exactly the newest 20 live chat messages. The
-first 15 are labelled as background context; the final 5 are labelled as the active
-conversation it must answer. Manual preview uses the same 20-message window. The model
-may add something useful, funny, serious, sarcastic, or simply conversational, but is
-never asked to produce a joke and is told not to use emoji.
-
-**Manual trigger.** DM the bot `пошути` (`JOKE_MANUAL_TRIGGER_KEYWORD`) to generate a remark in
-the home chat right now, bypassing the buffer/cooldown/random-roll gates above -- it's an
-explicit ask. The model can still decline, and a remark that does go out still starts the
-normal cooldown, so this can't be used to dodge it. DM `пошути превью`
-(`JOKE_MANUAL_PREVIEW_KEYWORD`) instead to see the remark in the DM first, with a button to
-actually send it to the chat -- useful for trying the feature out without risking a dud
-landing in front of everyone. Both need `LISTENER_ALLOWED_CHATS` to name exactly one chat
-(same requirement as DM `/summary`), and work independently of `JOKE_ENABLED` -- a manual
-ask doesn't carry the "unprompted" risk that setting is guarding against.
-
-### Conversational replies to the bot
-
-When a person uses Telegram's **Reply** action on any message authored by the bot, the
-bot always answers as a normal participant. This is built-in behavior, not part of
-`JOKE_ENABLED`, and has no probability, cooldown, short watch window, or separate feature
-flag. It works for bot messages sent before the current process started too, because the
-incoming Telegram update identifies the replied-to message and its author directly.
-
-The answer sees the exact bot message being replied to, the person's response, the newest
-20 messages in the chat, and the same cached multi-day style profile used by natural chat
-remarks. It may be funny when that fits, but it is prompted to answer questions and react
-normally rather than forcing a joke. Messages in the general chat flow do not trigger
-this behavior; the person must reply directly to the bot. Explicit commands such as
-`/summary`, `/stat`, `/top`, and `/badge` keep their specialized behavior even when sent
-as replies.
 
 ### XP, levels, coins, and badges
 
@@ -849,7 +773,7 @@ Because `_match_allowed_chat` never matches a private chat, `/stat`, `/top`, `/s
 published menu must not contain commands that do nothing where it is published.
 
 **Any unhandled DM gets the menu back.** After every specific handler has declined —
-commands, summary keywords, the joke trigger, both force-reply flows — a private message
+commands, summary keywords, both force-reply flows — a private message
 the bot has no answer for is replied to with the cabinet menu instead of silence. It never
 fires in a group, stays quiet while somebody is mid-way through a force-reply step
 (another member's pending flow doesn't mute you), and a burst of messages produces one
@@ -1237,8 +1161,7 @@ generate a portable session first:
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
    warning above), `SUMMARY_QUEUE_DELAY_SECONDS`,
    `TELEGRAM_BOT_TOKEN` (if replies should come from a bot account instead of this one --
-   see above), `JOKE_ENABLED` and the other `JOKE_*` vars if you also want the occasional
-   unprompted remark (off by default; see Jokes above).
+   see above).
 4. Deploy. Check the Railway logs for `[listener] logged in as @...` to confirm it's
    running.
 
@@ -1270,6 +1193,6 @@ before leaving it deployed indefinitely.
   (`history.py`) -- one small index file plus one file per answer. The GUI's History tab
   reads this; it's also there if you'd rather grep the files directly.
 - **👍 to delete.** Reacting with a thumbs-up (from your own account) on any message the
-  bot or your account sent -- a summary, joke, `/stat`/`/top` reply, whatever -- deletes
+  bot or your account sent -- a summary, a `/stat`/`/top` reply, whatever -- deletes
   it almost immediately, as a one-tap cleanup shortcut. It never touches other people's
   messages, even though your account may have delete rights over the whole chat.

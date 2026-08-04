@@ -74,9 +74,8 @@ class NothingIsConfigurableTests(unittest.TestCase):
         self.assertEqual(config.SUMMARY_COMMAND, "/summary")
 
     def test_the_config_carries_no_summary_trigger_field(self):
-        # Other features keep their own keywords (save_trigger_keyword,
-        # joke_manual_trigger_keyword) -- it is specifically the summary trigger that
-        # stopped being configurable.
+        # Other features keep their own keywords (save_trigger_keyword) -- it is
+        # specifically the summary trigger that stopped being configurable.
         self.assertNotIn("listener_trigger_keywords", config.Config.__annotations__)
 
     def test_setting_the_old_variable_changes_nothing(self):

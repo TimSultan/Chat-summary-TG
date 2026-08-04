@@ -1,5 +1,5 @@
-"""Long-polls the Telegram Bot HTTP API for /summary requests and direct replies in the
-same chats listener.py's Telethon-based listener watches, and answers them as the bot
+"""Long-polls the Telegram Bot HTTP API for /summary requests and every other command in
+the same chats listener.py's Telethon-based listener watches, and answers them as the bot
 account instead of your personal account.
 
 Why this exists alongside listener.py: a bot account lets people trigger this without it
@@ -9,10 +9,6 @@ sent after it's added to a chat. So message fetching here still goes through the
 connected Telethon `client` passed into run_bot_listener() (same
 fetch_range_messages_cached() listener.py itself uses); only trigger detection and
 replying happen over the bot's HTTP API.
-
-Any human message sent with Telegram's Reply action against a message authored by this
-bot gets a normal conversational response. This is unconditional once a bot token is
-configured and is separate from JOKE_ENABLED, which controls only unprompted remarks.
 
 Save ("сохрани") is NOT handled here -- it only makes sense as *your own* account
 reposting to your own channel. See listener.py's on_message: it stops handling /summary
@@ -64,7 +60,6 @@ from telethon import utils as tl_utils
 
 import cabinet
 import button_builder
-import chat_profile
 import economy
 import history
 import poker
@@ -76,10 +71,8 @@ from bot_api import CAPTION_LIMIT, TelegramBotAPI
 from config import SUMMARY_COMMAND, build_session, load_config
 from critique import critique_work
 from errors import ChatSummaryError
-from followup import generate_direct_reply
 from intent import resolve_name_hint
 from intent_v2 import route_request
-from joke import CONTEXT_MESSAGE_COUNT, generate_joke
 from listener import (
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
@@ -101,7 +94,6 @@ from responder_v2 import answer_request
 import tree
 from telegram_fetch import (
     fetch_range_messages_cached,
-    fetch_recent_messages_fresh,
     format_transcript_lines,
     resolve_chat,
     sender_matches,
@@ -137,17 +129,6 @@ SUMMARY_DM_CLOSED_TEXT = "Активируй личку бота, чтобы п�
 # call finishes and its result is discarded, which costs one wasted request and no
 # correctness.
 UPDATE_HANDLING_TIMEOUT_SECONDS = 180
-
-# "пошути"/"пошути превью" (config.py JOKE_MANUAL_TRIGGER_KEYWORD/JOKE_MANUAL_PREVIEW_KEYWORD),
-# sent as a DM to the bot, manually fires a joke (see joke.py) into the configured home
-# chat -- unlike the automatic buffer-triggered one in listener.py, this bypasses the
-# activity/cooldown/probability gates entirely (it's an explicit ask), but still goes
-# through the same model-level decline check and, once actually posted, feeds the same
-# cooldown/reaction-tracking machinery via joke_posted_queue so it doesn't stack
-# independently of the automatic path. "пошути" posts straight to the chat; "пошути
-# превью" sends it back to the DM first with a confirm button instead.
-JOKE_PREVIEW_BUTTON_TEXT = "✅ Отправить в чат"
-JOKE_PREVIEW_CALLBACK_PREFIX = "jokeprev"
 
 BADGE_CALLBACK_PREFIX = "badge"
 BADGE_FLOW_TTL_SECONDS = 10 * 60
@@ -2585,10 +2566,10 @@ def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
 def _match_allowed_chat(chat: dict, allowed_chats_original: list[str]) -> str | None:
     """Like _is_chat_allowed, but returns the actual LISTENER_ALLOWED_CHATS entry
     (original casing) that matched a group chat, instead of a bool -- used to key
-    known_chat_ids (see run_bot_listener) so a joke queued by listener.py under that same
-    entry string can be resolved back to this Bot-API chat_id. Deliberately does NOT
-    special-case private chats the way _is_chat_allowed does: a DM isn't a postable
-    target for a joke."""
+    known_chat_ids (see run_bot_listener) so anything queued by listener.py under that
+    same entry string (a figurine reaction, a stats digest) can be resolved back to this
+    Bot-API chat_id. Deliberately does NOT special-case private chats the way
+    _is_chat_allowed does: a DM isn't a postable target for chat-wide content."""
     username = (chat.get("username") or "").lower()
     title = (chat.get("title") or "").lower()
     chat_id = str(chat.get("id", ""))
@@ -3034,7 +3015,7 @@ async def maybe_send_menu(
     """Answer an otherwise-unhandled DM with the cabinet menu.
 
     This is the last thing tried in a private chat, deliberately: every specific handler
-    -- commands, summary keywords, the joke trigger, both force-reply flows -- gets to
+    -- commands, summary keywords, both force-reply flows -- gets to
     claim the message first, and only what none of them wanted lands here. Without it a
     DM the bot doesn't recognise produces total silence, which reads as "the bot is
     broken" rather than "that wasn't a request I understand".
@@ -4807,154 +4788,6 @@ async def handle_bot_summary_request(
     await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
 
 
-def _joke_preview_callback_data(dm_chat_id) -> str:
-    return f"{JOKE_PREVIEW_CALLBACK_PREFIX}:{dm_chat_id}"
-
-
-def _parse_joke_preview_callback(data: str) -> int | None:
-    parts = (data or "").split(":")
-    if len(parts) != 2 or parts[0] != JOKE_PREVIEW_CALLBACK_PREFIX:
-        return None
-    try:
-        return int(parts[1])
-    except ValueError:
-        return None
-
-
-async def handle_manual_joke(
-    api: TelegramBotAPI,
-    telethon_client,
-    cfg,
-    tz,
-    message: dict,
-    preview: bool,
-    home_chat_ref: str | None,
-    known_chat_ids: dict[str, int],
-    joke_preview_pending: dict[int, dict],
-    joke_posted_queue,
-    log=print,
-):
-    """Handles a manual "пошути"/"пошути превью" DM (see the JOKE_PREVIEW_* constants
-    above). Unlike the automatic buffer-triggered joke in listener.py, this bypasses the
-    activity/cooldown/probability gates entirely -- it's an explicit ask -- but still goes
-    through the same model-level decline check in joke.py, and once actually posted feeds
-    the same cooldown/reaction-tracking machinery as an automatic joke (via
-    joke_posted_queue), so a manual joke doesn't let someone dodge the cooldown that
-    follows any joke, automatic or not.
-
-    `preview=True` sends the generated joke back to the DM with a confirm button instead
-    of posting it straight to the group -- see handle_joke_preview_callback for what
-    tapping it does."""
-    dm_chat_id = message["chat"]["id"]
-    message_id = message["message_id"]
-
-    if not home_chat_ref:
-        await api.send_message(
-            dm_chat_id, "Не настроен основной чат (LISTENER_ALLOWED_CHATS) -- некуда отправить сообщение.",
-            reply_to_message_id=message_id,
-        )
-        return
-    entry = home_chat_ref
-
-    try:
-        # fetch_recent_messages_fresh, not fetch_range_messages_cached: a manual "пошути"
-        # is a deliberate, in-the-moment ask, so it needs to see whatever was *just*
-        # typed -- fetch_range_messages_cached would happily reuse today's cache as-is
-        # for up to TODAY_TTL_SECONDS (30 min), which is exactly why repeated tests
-        # within that window kept getting the same joke off the same stale tail.
-        chat_title, recent_messages = await fetch_recent_messages_fresh(
-            client=telethon_client, chat_ref=home_chat_ref, tz=tz, limit=CONTEXT_MESSAGE_COUNT, log=log,
-        )
-        lines = format_transcript_lines(recent_messages, include_date=False)
-        if not lines:
-            await api.send_message(
-                dm_chat_id, "Пока нет контекста -- в чате сегодня было пусто.", reply_to_message_id=message_id
-            )
-            return
-
-        profile = await chat_profile.ensure_profile(
-            telethon_client, home_chat_ref, entry, cfg.openai_api_key, cfg.openai_model, tz,
-            cfg.joke_profile_ttl_seconds, cfg.joke_profile_lookback_days, cfg.joke_profile_max_messages, log=log,
-        )
-        joke_text = await asyncio.to_thread(generate_joke, cfg.openai_api_key, cfg.openai_model, lines, profile)
-    except Exception:
-        log(f"[bot_listener] error generating manual joke:\n{traceback.format_exc()}")
-        await api.send_message(dm_chat_id, "Что-то пошло не так при генерации сообщения.", reply_to_message_id=message_id)
-        return
-
-    if not joke_text:
-        await api.send_message(
-            dm_chat_id, "Сейчас нечего естественно добавить к разговору.",
-            reply_to_message_id=message_id,
-        )
-        return
-
-    if preview:
-        # Keyed by the DM's own chat_id, not a per-message id -- a DM only ever has one
-        # bot conversation thread, so there's no need to track which specific message
-        # this confirmation belongs to; a second "пошути превью" before confirming just
-        # overwrites the pending one.
-        joke_preview_pending[dm_chat_id] = {"entry": entry, "joke_text": joke_text}
-        await api.send_message(
-            dm_chat_id, joke_text, reply_to_message_id=message_id,
-            reply_markup={"inline_keyboard": [[
-                {"text": JOKE_PREVIEW_BUTTON_TEXT, "callback_data": _joke_preview_callback_data(dm_chat_id)}
-            ]]},
-        )
-        return
-
-    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
-    if chat_id is None:
-        await api.send_message(
-            dm_chat_id, f"Не удалось найти чат '{entry}' -- проверь LISTENER_ALLOWED_CHATS.",
-            reply_to_message_id=message_id,
-        )
-        return
-    sent = await api.send_message(chat_id, joke_text)
-    await api.send_message(dm_chat_id, "Отправлено в чат.", reply_to_message_id=message_id)
-    log(f"[bot_listener] manual joke sent to '{entry}': {joke_text!r}")
-    if joke_posted_queue is not None and sent and "message_id" in sent:
-        await joke_posted_queue.put((entry, sent["message_id"]))
-
-
-async def handle_joke_preview_callback(
-    api: TelegramBotAPI,
-    telethon_client,
-    callback: dict,
-    joke_preview_pending: dict[int, dict],
-    known_chat_ids: dict[str, int],
-    joke_posted_queue,
-    log=print,
-):
-    parsed = _parse_joke_preview_callback(callback.get("data"))
-    if parsed is None:
-        await api.answer_callback_query(callback["id"])
-        return
-    dm_chat_id = parsed
-
-    pending = joke_preview_pending.pop(dm_chat_id, None)
-    if pending is None:
-        await api.answer_callback_query(callback["id"], text="Это предложение уже неактуально.")
-        return
-
-    entry = pending["entry"]
-    joke_text = pending["joke_text"]
-    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
-    if chat_id is None:
-        await api.answer_callback_query(callback["id"], text="Не удалось найти чат -- проверь LISTENER_ALLOWED_CHATS.")
-        return
-
-    try:
-        sent = await api.send_message(chat_id, joke_text)
-        await api.answer_callback_query(callback["id"], text="Отправлено!")
-        log(f"[bot_listener] manual joke (previewed) sent to '{entry}': {joke_text!r}")
-        if joke_posted_queue is not None and sent and "message_id" in sent:
-            await joke_posted_queue.put((entry, sent["message_id"]))
-    except Exception:
-        log(f"[bot_listener] failed to send previewed joke:\n{traceback.format_exc()}")
-        await api.answer_callback_query(callback["id"], text="Не удалось отправить.")
-
-
 def _message_content(message: dict | None) -> str:
     """Best-effort readable content for a Bot API message.
 
@@ -4983,101 +4816,6 @@ def _message_content(message: dict | None) -> str:
         if message.get(field):
             return label
     return ""
-
-
-def _is_direct_reply_to_bot(message: dict, bot_user_id: int) -> bool:
-    """True only for a human's explicit Telegram Reply to this bot account."""
-    sender = message.get("from") or {}
-    replied_to = message.get("reply_to_message") or {}
-    replied_sender = replied_to.get("from") or {}
-    return not sender.get("is_bot", False) and replied_sender.get("id") == bot_user_id
-
-
-async def handle_direct_bot_reply(
-    api: TelegramBotAPI,
-    telethon_client,
-    cfg,
-    tz,
-    message: dict,
-    matched_entry: str | None,
-    log=print,
-) -> None:
-    """Answer one explicit reply to any message authored by this bot.
-
-    Unlike the old follow-up watcher, this has no time/message window and does not need
-    to remember which bot messages were sent during the current process lifetime. The
-    Bot API embeds the replied-to message in the update, which is the authoritative
-    signal and also gives the model the exact bot text being answered.
-    """
-    chat = message["chat"]
-    chat_id = chat["id"]
-    user_message = _message_content(message)
-    bot_message = _message_content(message.get("reply_to_message"))
-    sender_name = _display_name(message.get("from"))
-
-    try:
-        lines: list[str] = []
-        profile = None
-        if chat.get("type") != "private":
-            # A fresh tail matters here: the response should know what people said just
-            # now, not the possibly 30-minute-old reusable daily-summary cache.
-            chat_ref = matched_entry or str(chat_id)
-            _, recent_messages = await fetch_recent_messages_fresh(
-                client=telethon_client,
-                chat_ref=chat_ref,
-                tz=tz,
-                limit=CONTEXT_MESSAGE_COUNT,
-                log=log,
-            )
-            lines = format_transcript_lines(recent_messages, include_date=False)
-
-            # Reuse the same multi-day room-style profile as natural remarks. It is
-            # regenerated only when its configured TTL expires, so normal replies don't
-            # add a profile-generation call every time.
-            profile = await chat_profile.ensure_profile(
-                telethon_client,
-                chat_ref,
-                matched_entry or str(chat_id),
-                cfg.openai_api_key,
-                cfg.openai_model,
-                tz,
-                cfg.joke_profile_ttl_seconds,
-                cfg.joke_profile_lookback_days,
-                cfg.joke_profile_max_messages,
-                log=log,
-            )
-
-        reply_text = await asyncio.to_thread(
-            generate_direct_reply,
-            cfg.openai_api_key,
-            cfg.openai_model,
-            bot_message,
-            user_message,
-            sender_name,
-            lines,
-            profile,
-        )
-        await api.send_message(
-            chat_id,
-            reply_text,
-            reply_to_message_id=message["message_id"],
-            parse_mode=None,
-        )
-        log(
-            f"[bot_listener] answered direct reply from {sender_name} in "
-            f"'{chat.get('title', chat_id)}': {reply_text!r}"
-        )
-    except Exception:
-        log(f"[bot_listener] error generating direct conversational reply:\n{traceback.format_exc()}")
-        try:
-            await api.send_message(
-                chat_id,
-                "Не получилось ответить — попробуй ещё раз.",
-                reply_to_message_id=message["message_id"],
-                parse_mode=None,
-            )
-        except Exception:
-            pass
 
 
 async def _handle_one_update(dispatch, update_id, log=print) -> None:
@@ -5116,8 +4854,6 @@ async def _dispatch_update(
     background_tasks: set,
     home_chat_ref: str | None,
     known_chat_ids: dict[str, int],
-    joke_preview_pending: dict[int, dict],
-    joke_posted_queue,
     badge_flows: dict[str, dict],
     cabinet_flows: dict[str, dict],
     menu_last_sent: dict,
@@ -5164,11 +4900,6 @@ async def _dispatch_update(
             await handle_preview_callback(
                 api, telethon_client, callback, home_chat_ref, known_chat_ids, log=log,
             )
-        elif callback_data.startswith(f"{JOKE_PREVIEW_CALLBACK_PREFIX}:"):
-            await handle_joke_preview_callback(
-                api, telethon_client, callback, joke_preview_pending, known_chat_ids,
-                joke_posted_queue, log=log,
-            )
         elif callback_data.startswith(f"{VOTE_CLEAR_CALLBACK_PREFIX}:"):
             await handle_vote_clear_callback(api, cfg, tz, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{VOTE_ACTION_CALLBACK_PREFIX}:"):
@@ -5199,7 +4930,7 @@ async def _dispatch_update(
     message_text = message.get("text") or message.get("caption") or ""
 
     # Learned regardless of whether this message is a trigger -- this is how
-    # known_chat_ids (see run_bot_listener's joke queue consumer) finds out the Bot-API
+    # known_chat_ids (see run_bot_listener's queue consumers) finds out the Bot-API
     # chat_id for a chat named in LISTENER_ALLOWED_CHATS, since there's no way to look
     # that up on demand (getChat needs an id/username we don't have yet either). Placed
     # before the has_summary early-return so it also learns from ordinary chat
@@ -5432,24 +5163,6 @@ async def _dispatch_update(
     ):
         return
 
-    # "пошути"/"пошути превью" (see JOKE_PREVIEW_* constants) only ever fires from a DM to
-    # the bot, per JOKE_MANUAL_TRIGGER_KEYWORD's own docs -- checked before has_summary
-    # since it's a wholly separate trigger with its own keyword(s). The longer
-    # "preview" phrase is checked first since it contains the plain trigger word too.
-    if chat.get("type") == "private" and message_text:
-        stripped = message_text.lower()
-        wants_preview = cfg.joke_manual_preview_keyword in stripped
-        if wants_preview or cfg.joke_manual_trigger_keyword in stripped:
-            task = asyncio.create_task(
-                handle_manual_joke(
-                    api, telethon_client, cfg, tz, message, wants_preview, home_chat_ref,
-                    known_chat_ids, joke_preview_pending, joke_posted_queue, log=log,
-                )
-            )
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
-            return
-
     text_lower = message_text.lower()
 
     # Shop and wallet commands (see economy.py). Same chat gating as /stat: they read and
@@ -5624,30 +5337,6 @@ async def _dispatch_update(
     # listener.is_summary_command for the whole rule.
     has_summary = is_summary_command(message_text)
 
-    # A direct Telegram Reply to this bot is normal conversational input. It is handled
-    # immediately and independently of JOKE_ENABLED: that flag only controls unprompted
-    # ambient remarks. Explicit commands keep their existing specialized handlers.
-    #
-    # Turned off -- forced False rather than removing the handler below, so it stays a
-    # one-line revert if it's ever turned back on.
-    direct_reply_enabled = False
-    if (
-        direct_reply_enabled
-        and not has_summary
-        and _is_direct_reply_to_bot(message, bot_user_id)
-        and _message_content(message)
-    ):
-        if not _is_chat_allowed(allowed_chats, chat):
-            return
-        task = asyncio.create_task(
-            handle_direct_bot_reply(
-                api, telethon_client, cfg, tz, message, matched_entry, log=log
-            )
-        )
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-        return
-
     if not has_summary:
         # Nothing above wanted this message. In a DM that means the person typed
         # something the bot has no specific answer for, so show them what it CAN do
@@ -5694,8 +5383,6 @@ async def run_bot_listener(
     tz,
     telethon_client,
     log=print,
-    joke_queue: "asyncio.Queue | None" = None,
-    joke_posted_queue: "asyncio.Queue | None" = None,
     figurine_ack_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
@@ -5704,14 +5391,6 @@ async def run_bot_listener(
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
     message fetching.
-
-    `joke_queue`, if given, carries (allowed_chats entry, joke text) pairs put there by
-    listener.py's activity trigger (see maybe_joke) -- this function drains it in a task
-    running alongside the usual getUpdates poll loop and sends each one via `api`, the
-    same account everything else replies from. `joke_posted_queue`, if given, is where
-    (entry, sent message_id) goes right after a successful send, so listener.py -- the
-    only side that can reliably watch reactions -- knows to start that chat's cooldown and
-    watch that specific message.
 
     `figurine_ack_queue`, if given, carries (allowed_chats entry, message_id) pairs put
     there by listener.py's on_message the instant it sees a #япокрасил+photo/video post and
@@ -5747,10 +5426,9 @@ async def run_bot_listener(
     single album -- those are still deleted, just not each answered separately.
 
     All queues are left None when run standalone (this module's own main()), which
-    just means jokes/figurine reactions/digests/dismissals never fire, matching that
-    listener.py isn't running their activity tracking either in that mode. Direct
-    replies still work standalone because the Bot API update carries the replied-to
-    message itself."""
+    just means figurine reactions/digests/dismissals/file blocks never fire, matching
+    that listener.py isn't running their detection either in that mode. Commands and
+    /summary still work standalone: those come from the bot's own updates."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
     background_tasks: set[asyncio.Task] = set()
     summary_queue: asyncio.Queue = asyncio.Queue()
@@ -5759,9 +5437,6 @@ async def run_bot_listener(
     # (see the comment there) and, on a miss, actively by _resolve_chat_id via the
     # Telethon session -- see that function's docstring for why that's safe to do.
     known_chat_ids: dict[str, int] = {}
-    # "пошути превью" confirm-button state, keyed by the DM's own chat_id (see
-    # handle_manual_joke) -- value: {"entry", "joke_text"}.
-    joke_preview_pending: dict[int, dict] = {}
     # Short-lived, admin-bound /badge conversations. Definitions and assignments are
     # persisted by stats.py; only the in-progress menu/prompt state lives in memory.
     badge_flows: dict[str, dict] = {}
@@ -5811,7 +5486,7 @@ async def run_bot_listener(
                 log(f"[bot_listener] could not ensure the dealer badge:\n{traceback.format_exc()}")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
-            f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and direct replies. FIFO queue delay: "
+            f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "
             f"{cfg.summary_queue_delay_seconds}s. Timezone: {tz}."
         )
 
@@ -5834,7 +5509,7 @@ async def run_bot_listener(
                         _dispatch_update(
                             update, api, telethon_client, cfg, tz, bot_username, me["id"], allowed_chats,
                             summary_queue, background_tasks, home_chat_ref,
-                            known_chat_ids, joke_preview_pending, joke_posted_queue, badge_flows,
+                            known_chat_ids, badge_flows,
                             cabinet_flows, menu_last_sent,
                             button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows,
                             vote_result_flows=vote_result_flows, log=log,
@@ -5894,21 +5569,6 @@ async def run_bot_listener(
                 finally:
                     last_finished_at = time.monotonic()
                     summary_queue.task_done()
-
-        async def _consume_jokes():
-            while True:
-                entry, joke_text = await joke_queue.get()
-                chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
-                if chat_id is None:
-                    log(f"[bot_listener] dropping joke for '{entry}': could not resolve a chat_id for it")
-                    continue
-                try:
-                    sent = await api.send_message(chat_id, joke_text)
-                    log(f"[bot_listener] sent joke to '{entry}': {joke_text!r}")
-                    if joke_posted_queue is not None and sent and "message_id" in sent:
-                        await joke_posted_queue.put((entry, sent["message_id"]))
-                except Exception:
-                    log(f"[bot_listener] failed to send joke:\n{traceback.format_exc()}")
 
         async def _consume_figurine_acks():
             while True:
@@ -6037,8 +5697,6 @@ async def run_bot_listener(
             _consume_summaries(),
             _button_counter_refresh_loop(api, home_chat_ref, log=log),
         ]
-        if joke_queue is not None:
-            tasks.append(_consume_jokes())
         if figurine_ack_queue is not None:
             tasks.append(_consume_figurine_acks())
         if stats_digest_queue is not None:

@@ -17,8 +17,7 @@ already recorded for earlier days, so "/top today" and "/stat" both reflect acti
 it happens rather than only ever showing yesterday-and-earlier.
 
 Storage: one JSON file per (chat, day) under DATA_DIR/cache/stats/<timezone>/, keyed by a hash of
-the LISTENER_ALLOWED_CHATS entry string -- same keying scheme chat_profile.py already
-uses for its own per-chat cache, chosen for the same reason: it sidesteps Telegram's two
+the LISTENER_ALLOWED_CHATS entry string. Chosen because it sidesteps Telegram's two
 different chat-id numbering schemes (Telethon's own vs. the Bot API's) entirely, since
 both listener.py and bot_listener.py can always recover the *entry* for an incoming
 message via their own matched_allowed_chat/_match_allowed_chat helpers, regardless of
