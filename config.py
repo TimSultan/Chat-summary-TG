@@ -7,9 +7,13 @@ from errors import ChatSummaryError
 
 load_dotenv()
 
-# The command that asks for a summary. Hardcoded rather than configured: it is the bot's
-# own slash-command, registered with BotFather and named in the menu, so no deployment
-# should be able to end up without it. LISTENER_TRIGGER_KEYWORDS can only ADD to it.
+# The one and only way to ask for a summary. Hardcoded rather than configured: it is the
+# bot's own slash-command, registered with BotFather and named in the menu.
+#
+# It used to come from LISTENER_TRIGGER_KEYWORDS, which was a knob nobody wanted and one
+# that could take the command away -- production had it set to "sum", which meant every
+# message merely OPENING with those three letters bought an OpenAI call, while "/summary"
+# itself did nothing. The variable is gone; there is nothing to misconfigure.
 SUMMARY_COMMAND = "/summary"
 
 # Curated for this tool as of July 2026 -- fastest/cheapest first within each tier.
@@ -37,7 +41,6 @@ class Config:
     openai_model: str
     openai_routing_model: str
     listener_allowed_chats: list[str]
-    listener_trigger_keywords: list[str]
     summary_queue_delay_seconds: int
     webapp_public_url: str | None
     webapp_port: int
@@ -110,17 +113,6 @@ def load_config() -> Config:
         )
 
     allowed_chats_raw = os.getenv("LISTENER_ALLOWED_CHATS", "")
-    # "/summary" is the bot's command, not a setting: it is what BotFather advertises and
-    # what the menu tells people to type, so it always works regardless of the
-    # environment. It used to be only the DEFAULT of LISTENER_TRIGGER_KEYWORDS, which
-    # meant a deployment that had ever set that variable to anything else silently had no
-    # working /summary at all -- exactly how this broke in production.
-    #
-    # The variable survives as a way to add EXTRA spellings (a shorter one to type, say),
-    # never as a way to lose the command itself.
-    trigger_keywords_raw = os.getenv("LISTENER_TRIGGER_KEYWORDS", "")
-    extra_keywords = [k.strip().lower() for k in trigger_keywords_raw.split(",") if k.strip()]
-    trigger_keywords = list(dict.fromkeys([SUMMARY_COMMAND] + extra_keywords))
 
     # Public https:// origin this app is reachable at, used to build the Mini App link
     # for /vote. Telegram will not open a Mini App over plain http or from an IP, so
@@ -293,7 +285,6 @@ def load_config() -> Config:
         # tier instead of paying for the same model used for full-transcript generation.
         openai_routing_model=os.getenv("OPENAI_ROUTING_MODEL", "gpt-5.4-nano"),
         listener_allowed_chats=[c.strip() for c in allowed_chats_raw.split(",") if c.strip()],
-        listener_trigger_keywords=trigger_keywords,
         summary_queue_delay_seconds=summary_queue_delay_seconds,
         webapp_public_url=webapp_public_url,
         webapp_port=webapp_port,

@@ -1205,7 +1205,7 @@ generate a portable session first:
    `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_STRING` (the string from
    step 1 -- leave `TELEGRAM_SESSION` unset, it's not used when this is set),
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `LISTENER_ALLOWED_CHATS` (**set this** -- see the
-   warning above), `LISTENER_TRIGGER_KEYWORDS`, `SUMMARY_QUEUE_DELAY_SECONDS`,
+   warning above), `SUMMARY_QUEUE_DELAY_SECONDS`,
    `TELEGRAM_BOT_TOKEN` (if replies should come from a bot account instead of this one --
    see above), `JOKE_ENABLED` and the other `JOKE_*` vars if you also want the occasional
    unprompted remark (off by default; see Jokes above).

@@ -33,7 +33,7 @@ import economy
 import history
 import stats
 import tree
-from config import build_session, load_config
+from config import SUMMARY_COMMAND, build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
 from intent_v2 import route_request
@@ -175,55 +175,38 @@ def extract_mentioned_usernames(text: str, exclude: str | None) -> list[str]:
     return sorted(names)
 
 
-def matched_trigger_keyword(text: str, keywords: list[str]) -> str | None:
-    """The trigger keyword this message OPENS with, or None if it does not invoke one.
+def is_summary_command(text: str) -> bool:
+    """Whether this message asks for a summary -- i.e. OPENS with "/summary".
 
-    A summary costs an OpenAI call, so the invocation has to be deliberate: the keyword
-    must be the first thing in the message, exactly as a slash-command is. Merely
-    containing it somewhere is not enough -- quoting what someone else asked ("я написал
-    /summary а он молчит"), or a word that happens to swallow it, used to fire a real
-    request, and in a busy chat that is a bill nobody chose to run up.
+    A summary costs an OpenAI call, so the invocation has to be deliberate. Merely
+    containing the word somewhere is not enough: quoting what someone else asked ("я
+    написал /summary а он молчит") used to fire a real request, and in a busy chat that
+    is a bill nobody chose to run up.
 
-    Right after the keyword there must be a boundary: end of message, whitespace, or "@"
+    Right after the command there must be a boundary: end of message, whitespace, or "@"
     -- Telegram appends "@botname" to commands in groups, and "/summary@my_bot за вчера"
     is the same invocation as "/summary за вчера". Anything else ("/summarize") is a
-    different word and does not match.
-
-    Returns the keyword that matched (the longest one, so overlapping keywords resolve to
-    the most specific) rather than a bool, since strip_trigger_keywords needs to know
-    which one to take off the front.
+    different command and does not match.
     """
     stripped = (text or "").lstrip()
-    lowered = stripped.lower()
-    matches = []
-    for keyword in keywords:
-        if not keyword or not lowered.startswith(keyword):
-            continue
-        rest = stripped[len(keyword):]
-        if rest and not rest[0].isspace() and rest[0] != "@":
-            continue  # "/summarize" is not "/summary"
-        matches.append(keyword)
-    return max(matches, key=len) if matches else None
+    if not stripped.lower().startswith(SUMMARY_COMMAND):
+        return False
+    rest = stripped[len(SUMMARY_COMMAND):]
+    return not rest or rest[0].isspace() or rest[0] == "@"
 
 
-def has_trigger_keyword(text: str, keywords: list[str]) -> bool:
-    return matched_trigger_keyword(text, keywords) is not None
-
-
-def strip_trigger_keywords(text: str, keywords: list[str]) -> str:
-    """Removes the leading trigger keyword (e.g. "/summary", or "/summary@my_bot") from
-    the request text, so the LLM sees the actual question ("кто такой Степан") rather
-    than the invocation itself.
+def strip_summary_command(text: str) -> str:
+    """Removes the leading "/summary" (or "/summary@my_bot") from the request, so the LLM
+    sees the actual question ("кто такой Степан") rather than the invocation itself.
 
     Only the opening invocation is removed, and only when the text actually starts with
     one -- the same word later in the sentence is part of the question the person asked
     and must survive into the prompt.
     """
     stripped = (text or "").lstrip()
-    keyword = matched_trigger_keyword(stripped, keywords)
-    if keyword is None:
+    if not is_summary_command(stripped):
         return stripped.strip()
-    rest = stripped[len(keyword):]
+    rest = stripped[len(SUMMARY_COMMAND):]
     # The "@botname" Telegram tacks onto a group command belongs to the invocation too.
     rest = re.sub(r"^@\S+", "", rest)
     return rest.strip()
@@ -469,7 +452,7 @@ async def handle_request(event, cfg, tz, my_username: str, sent_ids: set[int], s
         )
     else:
         label = period_label(start_date, end_date)
-    original_question = strip_trigger_keywords(text, cfg.listener_trigger_keywords)
+    original_question = strip_summary_command(text)
 
     summary = await asyncio.to_thread(
         summarize_transcript,
@@ -1410,19 +1393,15 @@ async def run_listener(
                     pass
             return
 
-        # The trigger keyword (default "/summary") is the invocation itself, like a
-        # slash-command -- no need to also @mention or reply to you. Works the same
-        # whether you type it yourself or someone else does, in any allowed chat.
+        # "/summary" is the invocation itself, like any slash-command -- no need to also
+        # @mention or reply to you. Works the same whether you type it yourself or someone
+        # else does, in any allowed chat.
         #
-        # It has to OPEN the message, and it has to be the keyword itself: there is
-        # deliberately no longer a way to ask by writing the bare word "summary" (naming
-        # this account alongside it, or replying to one of its messages with it), because
-        # those fired on people merely talking ABOUT the bot. See matched_trigger_keyword.
-        has_summary_keyword = not bot_takeover and has_trigger_keyword(
-            text, cfg.listener_trigger_keywords
-        )
-
-        if not has_summary_keyword:
+        # It has to OPEN the message. There is deliberately no way to ask by writing the
+        # bare word "summary" (naming this account alongside it, or replying to one of its
+        # messages with it), because those fired on people merely talking ABOUT the bot.
+        # See is_summary_command.
+        if bot_takeover or not is_summary_command(text):
             return
 
         chat = await event.get_chat()
@@ -1642,7 +1621,7 @@ async def run_listener(
     direct_reply_status = "off (disabled)" if bot_takeover else "off (no TELEGRAM_BOT_TOKEN)"
     log(
         f"[listener] logged in as @{my_username or me.id}. Watching for messages STARTING WITH "
-        f"{cfg.listener_trigger_keywords} (summary, pipeline {cfg.summary_pipeline_version}) "
+        f"'{SUMMARY_COMMAND}' (summary, pipeline {cfg.summary_pipeline_version}) "
         f"and your own '{cfg.save_trigger_keyword}' replies (save to {cfg.save_channel or 'disabled'}). "
         f"Summary queue: FIFO, {cfg.summary_queue_delay_seconds}s between completed jobs. "
         f"Joke: {joke_status}. Direct bot replies: {direct_reply_status}. "

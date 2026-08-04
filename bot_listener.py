@@ -73,7 +73,7 @@ import stats
 import vote_web
 import voting
 from bot_api import CAPTION_LIMIT, TelegramBotAPI
-from config import build_session, load_config
+from config import SUMMARY_COMMAND, build_session, load_config
 from critique import critique_work
 from errors import ChatSummaryError
 from followup import generate_direct_reply
@@ -93,7 +93,7 @@ from listener import (
     _expand_sparse_impression_history,
     _format_hours,
     extract_mentioned_usernames,
-    has_trigger_keyword,
+    is_summary_command,
     resolve_time_window,
 )
 from main import period_label, resolve_tz
@@ -5618,11 +5618,11 @@ async def _dispatch_update(
                 pass
         return
 
-    # Only when the message OPENS with the keyword ("/summary ...", or "/summary@thisbot
-    # ..." as Telegram spells a command in a group). Quoting the command mid-sentence is
-    # talking about it, not asking for one, and a summary is an OpenAI call -- see
-    # listener.matched_trigger_keyword for the whole rule.
-    has_summary = has_trigger_keyword(message_text, cfg.listener_trigger_keywords)
+    # Only when the message OPENS with the command ("/summary ...", or "/summary@thisbot
+    # ..." as Telegram spells a command in a group). Quoting it mid-sentence is talking
+    # about it, not asking for one, and a summary is an OpenAI call -- see
+    # listener.is_summary_command for the whole rule.
+    has_summary = is_summary_command(message_text)
 
     # A direct Telegram Reply to this bot is normal conversational input. It is handled
     # immediately and independently of JOKE_ENABLED: that flag only controls unprompted
@@ -5799,7 +5799,7 @@ async def run_bot_listener(
                 log(f"[bot_listener] could not ensure the dealer badge:\n{traceback.format_exc()}")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
-            f"STARTING WITH {cfg.listener_trigger_keywords} (summary) and direct replies. FIFO queue delay: "
+            f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and direct replies. FIFO queue delay: "
             f"{cfg.summary_queue_delay_seconds}s. Timezone: {tz}."
         )
 
