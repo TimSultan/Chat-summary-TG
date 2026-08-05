@@ -266,5 +266,70 @@ class CollectCarriesOverTests(unittest.TestCase):
         self.assertEqual(again.votes, {"42": ["1"]})
 
 
+class CarryOverPreviewTests(unittest.TestCase):
+    """"/vote перенос" -- the read-only "what would happen" button. The thing it must
+    never do is make the thing it describes happen."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("voting._voting_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def _last_week(self, count=5):
+        entries = [_entry(str(i)) for i in range(count)]
+        poll = voting.Poll(poll_id=LAST_WEEK, entry=CHAT, created_at="2026-07-20", entries=entries)
+        voting.set_approved(poll, [e.entry_id for e in entries])
+        for index in range(count):
+            for voter in range(index):
+                voting.record_vote(poll, f"{index}-{voter}", [str(index)])
+        voting.save_poll(poll)
+        return poll
+
+    def test_it_names_the_podium_that_retires_and_counts_what_returns(self):
+        self._last_week()
+        text = bot_listener._vote_carryover_preview_text(CHAT, THIS_WEEK)
+        self.assertIn(LAST_WEEK, text)
+        self.assertIn("Автор 4", text)          # top scorer, retiring
+        self.assertIn("Перенесётся работ: 2", text)
+        self.assertIn("Автор 1", text)          # a runner-up, returning
+
+    def test_it_says_whether_the_carry_over_would_actually_fire(self):
+        self._last_week()
+        self.assertIn("ещё не создано", bot_listener._vote_carryover_preview_text(CHAT, THIS_WEEK))
+
+        voting.save_poll(voting.Poll(poll_id=THIS_WEEK, entry=CHAT, created_at="2026-07-27"))
+        self.assertIn("уже создано", bot_listener._vote_carryover_preview_text(CHAT, THIS_WEEK))
+
+    def test_it_changes_nothing_on_disk(self):
+        previous = self._last_week()
+        before = sorted(p.name for p in Path(self._temporary.name).rglob("*"))
+        bot_listener._vote_carryover_preview_text(CHAT, THIS_WEEK)
+        after = sorted(p.name for p in Path(self._temporary.name).rglob("*"))
+
+        self.assertEqual(before, after, "the preview created or copied something")
+        self.assertIsNone(voting.load_poll(CHAT, THIS_WEEK), "the preview created this week's poll")
+        reloaded = voting.load_poll(CHAT, LAST_WEEK)
+        self.assertEqual(reloaded.to_dict(), previous.to_dict(), "the preview mutated last week")
+
+    def test_with_no_previous_poll_it_says_so_rather_than_erroring(self):
+        text = bot_listener._vote_carryover_preview_text(CHAT, THIS_WEEK)
+        self.assertIn("Прошлого голосования нет", text)
+
+    def test_a_long_field_is_summarised_rather_than_dumped(self):
+        self._last_week(count=30)
+        text = bot_listener._vote_carryover_preview_text(CHAT, THIS_WEEK)
+        self.assertIn("Перенесётся работ: 27", text)
+        self.assertIn("и ещё 12", text)
+        self.assertLess(len(text), 4096, "a Telegram message cannot be longer than this")
+
+    def test_the_menu_button_runs_the_preview_and_nothing_else(self):
+        """The button hands handle_vote_command a synthetic "/vote перенос"; if that text
+        stopped parsing, the button would silently open the plain ballot instead."""
+        argument = bot_listener.VOTE_ACTIONS["carryover"][len("/vote"):].strip().lower()
+        self.assertIn(argument, bot_listener.VOTE_CARRYOVER_WORDS)
+
+
 if __name__ == "__main__":
     unittest.main()

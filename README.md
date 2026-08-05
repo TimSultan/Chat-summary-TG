@@ -647,7 +647,14 @@ page that changes shape depending on who opens it:
   would render as a 404 on every carried card, and copying means clearing either week
   leaves the other intact. This happens only when the week's poll does not exist yet:
   re-collecting a week already under way must not resurrect what the moderator has since
-  un-admitted. `voting.CARRY_OVER_SKIP_TOP` is the 3. Already-known
+  un-admitted. `voting.CARRY_OVER_SKIP_TOP` is the 3.
+- **`/vote перенос`** (DM, administrators only, also the "🔁 Что перенесётся с прошлой
+  недели" button) shows what that carry-over *would* bring across — last week's poll, the
+  podium that retires with its vote counts, the works that return, and whether the
+  carry-over would fire at all (it won't if this week's poll already exists). It is
+  strictly a read: no poll is created, nothing is saved, no photo is copied. Checking what
+  will happen must not be a way of making it happen, which is also what makes it safe to
+  press on a live week. Already-known
   entries are left alone entirely — no re-fetch, no re-resolving who posted them, no
   re-downloading their photos — so re-collecting a poll that already has a dozen entries
   costs only whatever's actually new, and never re-touches what's already been admitted
