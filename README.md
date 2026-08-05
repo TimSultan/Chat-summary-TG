@@ -652,7 +652,12 @@ page that changes shape depending on who opens it:
   is **fitted** into its square rather than cropped to fill it (on the page a crop is a
   link to the full picture; here there is no tap, so an automatic crop would be all anyone
   ever sees) — framing a work by hand is what the cropping page below is for — and there is
-  exactly one image however many works there are, it just gets longer, a row per three. Sent as a document, not a photo, because Telegram re-encodes photos and
+  exactly one image however many works there are, it just gets longer, a row at a time.
+  `/vote картинка 4` (and the "4 в ряд" button next to it) renders the same board four
+  across: the cards keep their size and the picture gets wider, rather than the works
+  getting smaller, which is the only reason to want the wider board. 2–6 columns are
+  accepted and each non-default count is written to its own file, so rendering three-across
+  and then four-across leaves you holding both. Sent as a document, not a photo, because Telegram re-encodes photos and
   refuses anything past 10000px of width+height or a 20:1 side ratio, which a long board
   hits; the file is also kept on disk under `voting/exports/` either way. Only **admitted**
   entries are drawn (it renders `poll.tally()`, the same ranking the page and the
@@ -669,9 +674,9 @@ page that changes shape depending on who opens it:
   (or wheel/slider) to zoom** inside its square, with thirds drawn over it. The grid behind
   is the live preview: what is on screen is what renders. Per card there is "Вписать"
   (fit whole, letterboxed) and "Заполнить" (fill the square, i.e. the ballot's own
-  `object-fit: cover`), plus "Все: вписать"/"Все: заполнить" for the whole board. Then
-  "Выгрузить картинку" renders it, sends the file to the admin's DM and offers a link to
-  it.
+  `object-fit: cover`), plus "Все: вписать"/"Все: заполнить" for the whole board and a
+  3/4 column switch that re-lays the preview exactly as the export will. Then "Выгрузить
+  картинку" renders it, sends the file to the admin's DM and offers a link to it.
 
   A crop is stored (`voting.Poll.crops`) as **a square in the photo's own pixel
   coordinates**, taken after the EXIF rotation both the browser and Pillow apply — that is

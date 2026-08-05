@@ -814,6 +814,50 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('stage.addEventListener("pointerdown"', page)
         self.assertIn("touch-action: none", page)
 
+    async def test_exporting_four_across_writes_its_own_wider_file(self):
+        """Four-across is a different picture, not a replacement: both files survive, so
+        an admin who rendered one and then the other still has both to choose from."""
+        import vote_image
+
+        self._seed_poll(approved=("a", "b"))
+        self._seed_photo("a.jpg")
+        three = await (await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/export", json={"init_data": _init_data(self.admin_id)}
+        )).json()
+        four = await (await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/export", json={
+            "init_data": _init_data(self.admin_id), "columns": 4,
+        })).json()
+
+        self.assertEqual(three["columns"], 3)
+        self.assertEqual(four["columns"], 4)
+        self.assertNotEqual(three["url"], four["url"])
+        self.assertTrue(voting.export_image_path(CHAT, "2026-08-02", 3).is_file())
+        self.assertTrue(voting.export_image_path(CHAT, "2026-08-02", 4).is_file())
+        served = await self.client.get(four["url"])
+        self.assertEqual(served.status, 200)
+
+    async def test_a_nonsense_column_count_falls_back_instead_of_failing(self):
+        self._seed_poll()
+        self._seed_photo()
+        response = await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/export", json={
+            "init_data": _init_data(self.admin_id), "columns": "сколько-нибудь",
+        })
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data["columns"], 3)
+
+    async def test_the_board_page_hides_its_editor_until_a_card_is_tapped(self):
+        """The crop editor sets `display: flex` to lay itself out, which outranks the UA
+        rule behind the `hidden` attribute -- so without an explicit [hidden] rule it sat
+        permanently over the grid, showing one empty frame and no photos at all."""
+        page = await (await self.client.get(f"{vote_web.ROUTE_PREFIX}/board")).text()
+        self.assertIn("[hidden] { display: none !important; }", page)
+        self.assertIn('<div class="editor" id="editor" hidden>', page)
+
+    async def test_the_ballot_page_hides_its_winner_banner_the_same_way(self):
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn("[hidden] { display: none !important; }", page)
+
     async def test_an_export_of_a_poll_that_was_never_rendered_is_a_404(self):
         response = await self.client.get(f"{vote_web.ROUTE_PREFIX}/export/2026-08-02.jpg")
         self.assertEqual(response.status, 404)

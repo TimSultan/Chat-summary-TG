@@ -233,6 +233,10 @@ VOTE_ACTIONS = {
     "collect": "/vote собрать",
     "chat": "/vote chat",
     "image": "/vote картинка",
+    # Same command with the column count on the end -- see _vote_image_columns. A separate
+    # button rather than a setting, because "how wide" is the only choice the picture has
+    # and a button that renders it is shorter than a menu that asks first.
+    "image4": "/vote картинка 4",
     "clear": "/vote очистить",
 }
 
@@ -3581,6 +3585,23 @@ async def handle_vote_clear_callback(
         log(f"[bot_listener] failed to confirm the vote clear: {e}")
 
 
+def _vote_image_columns(argument: str) -> int | None:
+    """How many works per row "/vote картинка" was asked for, or None if this isn't the
+    картинка command at all.
+
+    Accepts the bare word (the default board), the word with a number after it
+    ("картинка 4", "image 4") and the two run together ("картинка4"), because all three
+    get typed and none of them should land on the plain ballot by falling through the
+    parser. The number itself is bounded by vote_image.clamp_columns, not here."""
+    normalized = (argument or "").strip().lower()
+    if normalized in VOTE_IMAGE_WORDS:
+        return vote_image.COLUMNS
+    match = re.match(r"^(?P<word>[^\s\d]+)\s*(?P<columns>\d{1,2})$", normalized)
+    if match and match.group("word") in VOTE_IMAGE_WORDS:
+        return vote_image.clamp_columns(match.group("columns"))
+    return None
+
+
 def _vote_action_callback_data(action: str, chat_id, user_id) -> str:
     return f"{VOTE_ACTION_CALLBACK_PREFIX}:{action}:{chat_id}:{user_id}"
 
@@ -3718,6 +3739,7 @@ async def handle_vote_command(
         return
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
+    image_columns = vote_image.COLUMNS
     if forced_mode == "moderate":
         wants_moderate = True
     elif forced_mode == "clear":
@@ -3737,7 +3759,10 @@ async def handle_vote_command(
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
-        wants_image = normalized in VOTE_IMAGE_WORDS
+        requested_columns = _vote_image_columns(normalized)
+        wants_image = requested_columns is not None
+        if requested_columns is not None:
+            image_columns = requested_columns
 
     async def require_admin_in_dm(denial: str) -> bool:
         """Common gate for собрать/выбрать/очистить/chat/картинка: DM only, admin only.
@@ -3881,7 +3906,10 @@ async def handle_vote_command(
             await reply("К голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
             return
 
-        await reply(f"Рисую картинку: {len(standings)} работ. Это займёт несколько секунд.")
+        await reply(
+            f"Рисую картинку: {len(standings)} работ, {image_columns} в ряд. "
+            "Это займёт несколько секунд."
+        )
         subtitle = (
             f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
             f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
@@ -3893,14 +3921,18 @@ async def handle_vote_command(
             path = await asyncio.to_thread(
                 vote_image.render_poll_image,
                 poll,
-                voting.export_image_path(entry, poll.poll_id),
+                voting.export_image_path(entry, poll.poll_id, image_columns),
                 subtitle=subtitle,
+                columns=image_columns,
             )
         except Exception:
             log(f"[bot_listener] rendering the vote image failed:\n{traceback.format_exc()}")
             await reply("Не получилось нарисовать картинку -- смотри логи.")
             return
-        log(f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} ({path.stat().st_size} bytes)")
+        log(
+            f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} "
+            f"({image_columns} columns, {path.stat().st_size} bytes)"
+        )
 
         # As a document, not a photo: Telegram re-encodes photos and refuses one past
         # 10000px of width+height or a 20:1 side ratio, and a board of a whole contest is
@@ -3933,7 +3965,8 @@ async def handle_vote_command(
                 "/vote выбрать — модерация заявок\n"
                 "/vote собрать — собрать новые заявки\n"
                 "/vote chat — подготовить объявление с кнопкой\n"
-                "/vote картинка — итоги одной картинкой (файлом)\n"
+                "/vote картинка — итоги одной картинкой (файлом), 3 в ряд\n"
+                "/vote картинка 4 — то же самое, но 4 работы в ряд\n"
                 "Кнопка «Кадрировать» — та же картинка, но с ручной обрезкой каждой работы\n"
                 "/vote очистить — очистить голосование"
             )
@@ -3957,14 +3990,20 @@ async def handle_vote_command(
                     ],
                     [
                         {
-                            "text": "🖼 Картинка итогов",
+                            "text": "🖼 Картинка 3 в ряд",
                             "callback_data": _vote_action_callback_data("image", chat_id, admin_user_id),
                         },
+                        {
+                            "text": "🖼 4 в ряд",
+                            "callback_data": _vote_action_callback_data("image4", chat_id, admin_user_id),
+                        },
+                    ],
+                    [
                         # A web_app button, not a callback: cropping is a page, and this is
                         # a DM, which is the only place Telegram allows one (see the
                         # docstring). It renders and delivers the picture itself, so it is
-                        # "Картинка итогов" with the framing step in front of it.
-                        {"text": "✂️ Кадрировать", "web_app": {"url": f"{page_url}/board"}},
+                        # the картинка buttons with a framing step in front of them.
+                        {"text": "✂️ Кадрировать и выгрузить", "web_app": {"url": f"{page_url}/board"}},
                     ],
                     [
                         {

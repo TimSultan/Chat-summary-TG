@@ -437,12 +437,16 @@ async def handle_export(request: web.Request) -> web.Response:
     if not standings:
         return _json_error("к голосованию не допущено ни одной работы -- нечего рисовать", status=409)
 
+    # Clamped rather than validated: the page only ever sends 3 or 4, and a nonsense value
+    # from anywhere else deserves the default board, not a failed export.
+    columns = vote_image.clamp_columns(body.get("columns", vote_image.COLUMNS))
     try:
         path = await asyncio.to_thread(
             vote_image.render_poll_image,
             poll,
-            voting.export_image_path(entry_name, poll.poll_id),
+            voting.export_image_path(entry_name, poll.poll_id, columns),
             subtitle=_export_subtitle(poll, standings),
+            columns=columns,
         )
     except Exception as e:
         request.app[_LOG_KEY](f"[vote_web] rendering the board failed: {e}")
@@ -456,34 +460,39 @@ async def handle_export(request: web.Request) -> web.Response:
         request.app[_LOG_KEY](f"[vote_web] delivering the board picture failed: {e}")
 
     request.app[_LOG_KEY](
-        f"[vote_web] {voting.display_name(user)} exported the board: "
-        f"{len(standings)} entr(ies), {path.stat().st_size} bytes, delivered={delivered}"
+        f"[vote_web] {voting.display_name(user)} exported the board: {len(standings)} entr(ies), "
+        f"{columns} columns, {path.stat().st_size} bytes, delivered={delivered}"
     )
     return web.json_response({
         "ok": True,
         "delivered": delivered,
         "entries": len(standings),
+        "columns": columns,
         "bytes": path.stat().st_size,
         # Cache-busted by mtime: the same poll re-exported must not come back as whatever
         # the browser (or Telegram's own proxy) kept from the previous render.
         "url": (
-            f"{request.app[_ROUTE_PREFIX_KEY]}/export/{poll.poll_id}{path.suffix}"
+            f"{request.app[_ROUTE_PREFIX_KEY]}/export/{path.name}"
             f"?v={int(path.stat().st_mtime)}"
         ),
     })
 
 
 async def handle_export_image(request: web.Request) -> web.Response:
-    """Serves the last rendered board picture. Unauthenticated for the same reason the
-    photos are (see the module docstring): it is a collage of pictures already posted
-    publicly in the chat, and an <img>/download link cannot carry a signed header."""
-    poll_id = request.match_info["poll_id"]
-    suffix = request.match_info["suffix"]
-    if not _SAFE_MEDIA_NAME.match(poll_id or "") or suffix not in ("jpg", "png"):
+    """Serves a rendered board picture by file name. Unauthenticated for the same reason
+    the photos are (see the module docstring): it is a collage of pictures already posted
+    publicly in the chat, and an <img>/download link cannot carry a signed header.
+
+    Same two-step guard as handle_media -- a strict name pattern AND a containment check
+    on the resolved path -- so nothing outside the exports directory is reachable however
+    the name is spelled."""
+    name = request.match_info["name"]
+    if not _SAFE_MEDIA_NAME.match(name or ""):
         raise web.HTTPNotFound()
 
-    path = voting.export_image_path(request.app[_ENTRY_KEY], poll_id).with_suffix(f".{suffix}")
-    if not path.is_file():
+    directory = voting.export_dir()
+    path = (directory / name).resolve()
+    if not str(path).startswith(str(directory.resolve())) or not path.is_file():
         raise web.HTTPNotFound()
     # no-store, unlike the photos' long cache: this file is rewritten every time anybody
     # presses "Выгрузить картинку", and a stale one looks exactly like a crop that didn't
@@ -618,7 +627,7 @@ def create_app(
         web.post(f"{prefix}/api/announce", handle_announce),
         web.post(f"{prefix}/api/clear", handle_clear),
         web.get(prefix + "/media/{poll_id}/{name}", handle_media),
-        web.get(prefix + "/export/{poll_id}.{suffix}", handle_export_image),
+        web.get(prefix + "/export/{name}", handle_export_image),
     ])
     return app
 
@@ -663,6 +672,10 @@ PAGE_HTML = """<!doctype html>
     --accent-fg: var(--tg-theme-button-text-color, #fff);
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  /* Same trap the cropping page fell into: [hidden] is a UA rule, and .winner's own
+     display: flex outranks it -- which is why an empty winner card sat above the grid
+     before anything had been announced. */
+  [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
     font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -1538,6 +1551,12 @@ BOARD_HTML = """<!doctype html>
     --thumb-bg: #1a2532;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  /* [hidden] is only a UA rule (display: none), so ANY author rule that sets display --
+     .editor and .tools both do, to lay themselves out -- silently wins over it and the
+     element is never hidden at all. That is what pinned the crop editor permanently over
+     the grid, showing one empty frame and no photos. !important, because the whole point
+     is to beat every other display in this sheet. */
+  [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
     font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -1546,13 +1565,18 @@ BOARD_HTML = """<!doctype html>
   header { padding: 14px 12px 6px; }
   h1 { font-size: 17px; margin: 0 0 2px; }
   .sub { color: var(--muted); font-size: 13px; }
-  .tools { display: flex; gap: 8px; padding: 8px 12px 0; flex-wrap: wrap; }
+  .tools { display: flex; gap: 8px; padding: 8px 12px 0; flex-wrap: wrap; align-items: center; }
+  .tools .spacer { flex: 1; }
+  .tools .label { color: var(--muted); font-size: 12px; }
   .chip { border: 1px solid rgba(128,128,128,.4); background: transparent; color: var(--fg);
           border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
-  /* The export's own geometry, in CSS: three columns, and a caption block tall enough for
-     both the name and the @tag so a card without a tag is still the same height as one
-     with -- exactly what vote_image.CAPTION_HEIGHT is a fixed constant for. */
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
+  .chip.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  /* The export's own geometry, in CSS: the same number of columns it will render with
+     (--cols, set from the chips), and a caption block tall enough for both the name and
+     the @tag so a card without a tag is still the same height as one with -- exactly what
+     vote_image.CAPTION_HEIGHT is a fixed constant for. */
+  .grid { display: grid; grid-template-columns: repeat(var(--cols, 3), 1fr);
+          gap: 8px; padding: 12px; }
   .gcard { background: var(--card); border-radius: 10px; overflow: hidden; cursor: pointer; }
   .frame { position: relative; width: 100%; aspect-ratio: 1; overflow: hidden;
            background: var(--thumb-bg); }
@@ -1565,6 +1589,11 @@ BOARD_HTML = """<!doctype html>
            color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
   .edit { position: absolute; right: 5px; bottom: 5px; background: rgba(0,0,0,.6);
           color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 8px; }
+  /* A photo that never arrives must SAY so: an empty frame is indistinguishable from a
+     page that hasn't finished loading, and there is nothing to crop either way. */
+  .failed { position: absolute; inset: 0; display: flex; align-items: center;
+            justify-content: center; text-align: center; padding: 6px;
+            color: var(--muted); font-size: 11px; }
   .who { padding: 6px 7px 8px; font-size: 11px; line-height: 1.25; }
   .who .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .who .tag { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
@@ -1633,6 +1662,10 @@ BOARD_HTML = """<!doctype html>
 <div class="tools" id="tools" hidden>
   <button class="chip" id="allFit">Все: вписать</button>
   <button class="chip" id="allFill">Все: заполнить</button>
+  <span class="spacer"></span>
+  <span class="label">В ряд:</span>
+  <button class="chip on" id="cols3" data-cols="3">3</button>
+  <button class="chip" id="cols4" data-cols="4">4</button>
 </div>
 <div class="grid" id="grid"></div>
 <div class="msg" id="msg" hidden></div>
@@ -1680,6 +1713,7 @@ let crops = {};       // id -> {x, y, size}: the square being framed, in photo p
 let natural = {};     // id -> {w, h}: learned from each photo as it loads
 let dirty = false;    // something changed since the last successful save
 let editing = null;   // id of the work the editor is open on
+let columns = 3;      // how many works per row, here AND in the exported picture
 
 const $ = (id) => document.getElementById(id);
 
@@ -1778,7 +1812,15 @@ function renderGrid() {
     grid.appendChild(cell);
 
     const img = cell.querySelector("img");
-    if (!img) return;
+    if (!img) {
+      cell.querySelector(".frame").insertAdjacentHTML("beforeend", '<span class="failed">без фото</span>');
+      return;
+    }
+    img.addEventListener("error", () => {
+      cell.querySelector(".frame").insertAdjacentHTML(
+        "beforeend", '<span class="failed">фото не загрузилось</span>'
+      );
+    });
     const onReady = () => {
       natural[work.id] = { w: img.naturalWidth, h: img.naturalHeight };
       // A saved crop wins; anything not framed yet starts fitted, which is what the
@@ -1803,7 +1845,12 @@ function whoText(work) {
 }
 
 function openEditor(id) {
-  if (!natural[id]) return;  // photo still loading: nothing sensible to frame yet
+  if (!natural[id]) {
+    // No natural size means the photo hasn't arrived, so there is no square to frame yet
+    // -- said out loud, because a tap that does nothing reads as a broken page.
+    status("Фото ещё не загрузилось - попробуй через секунду.");
+    return;
+  }
   editing = id;
   const work = works.find((w) => w.id === id);
   $("editorWho").textContent = whoText(work);
@@ -1950,6 +1997,21 @@ $("editorClose").addEventListener("click", closeEditor);
 // reach for first, and without this it would close the whole Mini App instead.
 if (tg && tg.BackButton) tg.BackButton.onClick(() => { if (editing) closeEditor(); });
 
+// Changing the column count changes the width of every frame, and a crop is only pixels
+// once it meets a frame width -- so every card has to be repainted, not just re-flowed.
+function setColumns(next) {
+  columns = next;
+  document.documentElement.style.setProperty("--cols", String(columns));
+  document.querySelectorAll("[data-cols]").forEach((chip) => {
+    chip.classList.toggle("on", Number(chip.dataset.cols) === columns);
+  });
+  works.forEach((w) => paint(w.id));
+}
+
+document.querySelectorAll("[data-cols]").forEach((chip) => {
+  chip.addEventListener("click", () => setColumns(Number(chip.dataset.cols)));
+});
+
 $("allFit").addEventListener("click", () => {
   works.forEach((w) => { if (natural[w.id]) { crops[w.id] = fitCrop(natural[w.id]); paint(w.id); } });
   markDirty();
@@ -2013,7 +2075,7 @@ $("export").addEventListener("click", async () => {
     // "Сохранить" was never pressed -- the server stores them as part of the same request.
     const response = await api("/api/export", {
       method: "POST",
-      body: JSON.stringify({ init_data: initData, crops: payloadCrops() }),
+      body: JSON.stringify({ init_data: initData, crops: payloadCrops(), columns: columns }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
@@ -2027,7 +2089,7 @@ $("export").addEventListener("click", async () => {
         ? "Готово: картинка отправлена файлом в личку с ботом. "
         : "Картинка готова, но отправить её в личку не вышло. ") +
       '<a href="#" id="openImage">Открыть картинку</a> - ' +
-      data.entries + " работ, " + kilobytes + " КБ"
+      data.entries + " работ, " + data.columns + " в ряд, " + kilobytes + " КБ"
     );
     const link = $("openImage");
     if (link) {
@@ -2081,6 +2143,7 @@ window.addEventListener("beforeunload", (event) => {
       " · порядок как в картинке, по голосам";
     $("tools").hidden = false;
     renderGrid();
+    setColumns(columns);  // publishes --cols and lights the matching chip
   } catch (e) {
     $("sub").textContent = "";
     $("msg").hidden = false;

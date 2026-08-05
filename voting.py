@@ -267,12 +267,26 @@ def set_crops(poll: "Poll", crops: dict) -> "Poll":
     return poll
 
 
-def export_image_path(entry: str, poll_id: str) -> Path:
-    """Where the rendered board picture (vote_image.py) is saved -- same
-    `<poll key>_<poll id>` naming as poll_path, in its own directory for the same reason
+def export_dir() -> Path:
+    """Where rendered board pictures live. Its own directory for the same reason
     results_path has one: latest_poll globs "<key>_*.json" out of the voting dir itself,
     and anything sharing that name shape belongs somewhere else."""
-    return _voting_dir() / "exports" / f"{_poll_key(entry)}_{poll_id}.jpg"
+    return _voting_dir() / "exports"
+
+
+def export_image_path(entry: str, poll_id: str, columns: int = 3) -> Path:
+    """Where the rendered board picture (vote_image.py) is saved -- same
+    `<poll key>_<poll id>` naming as poll_path.
+
+    A non-default column count gets its own file rather than overwriting: exporting the
+    week four-across and then three-across are two different pictures somebody may well
+    want both of, and one of them silently replacing the other is the kind of thing you
+    only notice after sending the wrong one. (3 is vote_image.COLUMNS, hardcoded here
+    because importing vote_image from this module would be a cycle -- vote_image imports
+    voting.)
+    """
+    variant = "" if columns == 3 else f"_c{columns}"
+    return export_dir() / f"{_poll_key(entry)}_{poll_id}{variant}.jpg"
 
 
 @dataclass

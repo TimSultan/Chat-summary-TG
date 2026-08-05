@@ -74,6 +74,28 @@ class RenderStandingsImageTests(unittest.TestCase):
             heights[4] - heights[3], vote_image.CARD_HEIGHT + vote_image.GAP
         )
 
+    def test_four_columns_widens_the_picture_without_shrinking_the_works(self):
+        """A wider board is a wider file, not smaller cards -- which is the only reason to
+        ask for one. Four across also fits 8 works in 2 rows where 3 across needs 3."""
+        out3, out4 = self.root / "b3.jpg", self.root / "b4.jpg"
+        vote_image.render_standings_image(self._standings(8), self.media, out3, title="", subtitle="")
+        vote_image.render_standings_image(
+            self._standings(8), self.media, out4, title="", subtitle="", columns=4
+        )
+        with Image.open(out3) as three, Image.open(out4) as four:
+            self.assertEqual(three.width, vote_image.WIDTH)
+            self.assertEqual(four.width, vote_image.width_for(4))
+            self.assertEqual(four.width - three.width, vote_image.CARD_WIDTH + vote_image.GAP)
+            self.assertEqual(three.height - four.height, vote_image.CARD_HEIGHT + vote_image.GAP)
+
+    def test_an_out_of_range_column_count_is_clamped_not_obeyed(self):
+        out = self.root / "b.jpg"
+        vote_image.render_standings_image(
+            self._standings(4), self.media, out, title="", subtitle="", columns=99
+        )
+        with Image.open(out) as image:
+            self.assertEqual(image.width, vote_image.width_for(vote_image.MAX_COLUMNS))
+
     def test_a_missing_photo_leaves_an_empty_card_rather_than_failing(self):
         standings = [
             (_entry("1", "Есть фото", "a", [self._photo("1.jpg")]), 2),
@@ -349,20 +371,52 @@ class VoteImageCommandTests(unittest.TestCase):
 
 
 class VoteImageButtonTests(unittest.TestCase):
-    def test_the_menu_button_synthesizes_a_command_the_parser_recognizes(self):
+    # The картинка actions are parsed by _vote_image_columns rather than by a word set,
+    # since the column count rides on the same command.
+    WORD_SET_ACTIONS = {
+        "collect": "VOTE_COLLECT_WORDS",
+        "chat": "VOTE_CHAT_WORDS",
+        "clear": "VOTE_CLEAR_WORDS",
+    }
+
+    def test_every_menu_button_synthesizes_a_command_the_parser_recognizes(self):
         """The moderator menu's buttons work by handing handle_vote_command a synthetic
-        message carrying VOTE_ACTIONS' text. If that text and the word set ever drifted
+        message carrying VOTE_ACTIONS' text. If that text and the parsing ever drifted
         apart the button would silently open the plain ballot instead."""
-        words = {
-            "collect": bot_listener.VOTE_COLLECT_WORDS,
-            "chat": bot_listener.VOTE_CHAT_WORDS,
-            "image": bot_listener.VOTE_IMAGE_WORDS,
-            "clear": bot_listener.VOTE_CLEAR_WORDS,
-        }
-        self.assertEqual(set(words), set(bot_listener.VOTE_ACTIONS))
         for action, command in bot_listener.VOTE_ACTIONS.items():
             argument = command[len("/vote"):].strip().lower()
-            self.assertIn(argument, words[action], f"{action}: {command} is unparseable")
+            if action in self.WORD_SET_ACTIONS:
+                words = getattr(bot_listener, self.WORD_SET_ACTIONS[action])
+                self.assertIn(argument, words, f"{action}: {command} is unparseable")
+            else:
+                self.assertIsNotNone(
+                    bot_listener._vote_image_columns(argument),
+                    f"{action}: {command} is unparseable",
+                )
+
+    def test_the_two_picture_buttons_ask_for_three_and_four_columns(self):
+        three = bot_listener.VOTE_ACTIONS["image"][len("/vote"):].strip()
+        four = bot_listener.VOTE_ACTIONS["image4"][len("/vote"):].strip()
+        self.assertEqual(bot_listener._vote_image_columns(three), 3)
+        self.assertEqual(bot_listener._vote_image_columns(four), 4)
+
+
+class VoteImageColumnsParsingTests(unittest.TestCase):
+    def test_the_bare_word_means_the_default_board(self):
+        for word in ("картинка", "image", "КАРТИНКУ"):
+            self.assertEqual(bot_listener._vote_image_columns(word), vote_image.COLUMNS)
+
+    def test_a_number_after_the_word_is_the_column_count(self):
+        for spelling in ("картинка 4", "картинка4", "image 4", "картинка  4"):
+            self.assertEqual(bot_listener._vote_image_columns(spelling), 4)
+
+    def test_an_absurd_column_count_is_clamped_rather_than_refused(self):
+        self.assertEqual(bot_listener._vote_image_columns("картинка 99"), vote_image.MAX_COLUMNS)
+        self.assertEqual(bot_listener._vote_image_columns("картинка 1"), vote_image.MIN_COLUMNS)
+
+    def test_anything_else_is_not_the_picture_command(self):
+        for other in ("", "собрать", "chat", "4", "картинки 4"):
+            self.assertIsNone(bot_listener._vote_image_columns(other))
 
 
 if __name__ == "__main__":

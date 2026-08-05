@@ -47,7 +47,15 @@ ACCENT_FG = "#ffffff"
 # reads as a picture on a card rather than as a card of an odd shape.
 THUMB_BG = "#1a2532"
 
+# How many works to a row by default. Every layout figure below is per-CARD rather than
+# per-image, so asking for another column widens the picture instead of shrinking the
+# works in it: at 4 across each one is still drawn at exactly the same size, which is the
+# whole reason to want the wider board (more of the week on one screenful, none of it
+# smaller). MIN/MAX only bound what a request may ask for -- two columns is barely a grid
+# and past six the picture is wider than anything renders it.
 COLUMNS = 3
+MIN_COLUMNS = 2
+MAX_COLUMNS = 6
 CARD_WIDTH = 360
 # Square, exactly like the page's `.thumb { aspect-ratio: 1 }`: it is what keeps rows
 # aligned when the works themselves are a mix of portrait and landscape.
@@ -61,7 +69,24 @@ MARGIN = 36
 CARD_RADIUS = 16
 TEXT_PADDING = 14
 
-WIDTH = COLUMNS * CARD_WIDTH + (COLUMNS - 1) * GAP + 2 * MARGIN
+def clamp_columns(columns) -> int:
+    """Whatever a caller asked for, reduced to a column count this can actually draw.
+    Takes the request from an HTTP body and a chat command alike, so the bounds live in
+    one place rather than at each door."""
+    try:
+        return max(MIN_COLUMNS, min(MAX_COLUMNS, int(columns)))
+    except (TypeError, ValueError):
+        return COLUMNS
+
+
+def width_for(columns: int = COLUMNS) -> int:
+    columns = clamp_columns(columns)
+    return columns * CARD_WIDTH + (columns - 1) * GAP + 2 * MARGIN
+
+
+# The default board's width, kept as a constant because most of the code (and every test
+# that isn't about column counts) only ever means this one.
+WIDTH = width_for(COLUMNS)
 
 TITLE_SIZE = 42
 SUBTITLE_SIZE = 26
@@ -328,13 +353,14 @@ def _rounded_mask() -> Image.Image:
     return mask
 
 
-def image_size(count: int, header_height: int = 0) -> tuple[int, int]:
-    """The canvas a board of `count` works needs. Fixed width, height grows a row at a
-    time -- one picture however many entries there are, which is the whole request: no
-    paging, no second file, just a longer one."""
-    rows = max(1, math.ceil(count / COLUMNS))
+def image_size(count: int, header_height: int = 0, columns: int = COLUMNS) -> tuple[int, int]:
+    """The canvas a board of `count` works needs. Width follows the column count; height
+    grows a row at a time -- one picture however many entries there are, which is the whole
+    request: no paging, no second file, just a longer one."""
+    columns = clamp_columns(columns)
+    rows = max(1, math.ceil(count / columns))
     height = MARGIN + header_height + rows * CARD_HEIGHT + (rows - 1) * GAP + MARGIN
-    return WIDTH, height
+    return width_for(columns), height
 
 
 def render_standings_image(
@@ -345,6 +371,7 @@ def render_standings_image(
     subtitle: str = "",
     show_votes: bool = True,
     crops: dict | None = None,
+    columns: int = COLUMNS,
 ) -> Path:
     """Draws `standings` -- a voting.Poll.tally() result, i.e. (Entry, votes) pairs already
     ranked most-votes-first -- into one picture at `out_path`, and returns that path.
@@ -361,12 +388,16 @@ def render_standings_image(
     it (or a None `crops` altogether) is fitted whole, letterboxed: untouched photos look
     exactly as they did before anybody could crop anything.
 
+    `columns` is how many works go in a row. The cards themselves do not change size with
+    it -- a wider board is a wider picture, not smaller works (see COLUMNS).
+
     Raises ValueError on empty standings -- a board of nothing is not a picture worth
     writing, and the caller has something better to say about it than a blank file.
     """
     standings = list(standings)
     if not standings:
         raise ValueError("nothing to render -- no admitted entries")
+    columns = clamp_columns(columns)
 
     media_dir = Path(media_dir)
     out_path = Path(out_path)
@@ -385,7 +416,7 @@ def render_standings_image(
     if header_height:
         header_height += 14  # breathing room between the header and the first row
 
-    width, height = image_size(len(standings), header_height)
+    width, height = image_size(len(standings), header_height, columns)
     canvas = Image.new("RGB", (width, height), BG)
     draw = ImageDraw.Draw(canvas)
 
@@ -402,7 +433,7 @@ def render_standings_image(
     crops = crops or {}
     mask = _rounded_mask()
     for index, (entry, votes) in enumerate(standings):
-        column, row = index % COLUMNS, index // COLUMNS
+        column, row = index % columns, index // columns
         x = MARGIN + column * (CARD_WIDTH + GAP)
         top = y + row * (CARD_HEIGHT + GAP)
         card = _draw_card(entry, votes, media_dir, show_votes, crops.get(entry.entry_id))
@@ -418,7 +449,9 @@ def render_standings_image(
     return out_path
 
 
-def render_poll_image(poll, out_path, title: str = "Итоги недели", subtitle: str = "") -> Path:
+def render_poll_image(
+    poll, out_path, title: str = "Итоги недели", subtitle: str = "", columns: int = COLUMNS,
+) -> Path:
     """render_standings_image for a whole voting.Poll: its own tally, its own photos.
 
     Only ADMITTED entries appear, because tally() only ranks those -- the export is a
@@ -431,4 +464,5 @@ def render_poll_image(poll, out_path, title: str = "Итоги недели", su
         title=title,
         subtitle=subtitle,
         crops=poll.crops,
+        columns=columns,
     )
