@@ -238,6 +238,14 @@ def media_path(entry: str, poll_id: str) -> Path:
     return _voting_dir() / "media" / f"{_poll_key(entry)}_{poll_id}"
 
 
+def export_image_path(entry: str, poll_id: str) -> Path:
+    """Where the rendered board picture (vote_image.py) is saved -- same
+    `<poll key>_<poll id>` naming as poll_path, in its own directory for the same reason
+    results_path has one: latest_poll globs "<key>_*.json" out of the voting dir itself,
+    and anything sharing that name shape belongs somewhere else."""
+    return _voting_dir() / "exports" / f"{_poll_key(entry)}_{poll_id}.jpg"
+
+
 @dataclass
 class Poll:
     poll_id: str

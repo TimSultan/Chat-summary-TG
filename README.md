@@ -618,7 +618,7 @@ App via a Direct Link (`VOTE_MINIAPP_SHORT_NAME`, see `/vote chat` below) or int
 bot's DM, where the real Mini App button is waiting. Either way it is opening the page
 inside Telegram that gets a signed identity to vote with.
 
-Five distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
+Six distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
 page that changes shape depending on who opens it:
 
 - **Bare `/vote`** opens the actual ballot, for **everyone including an administrator** —
@@ -626,7 +626,7 @@ page that changes shape depending on who opens it:
   administrator specifically, it's also a status/control panel: current standings (how
   many voted, the top 3 so far), the full command list, and a button for every one of
   them — "Открыть голосование"/"Модерация" open the Mini App directly, while
-  "Собрать заявки"/"Объявление"/"Очистить" run the exact same code path as typing the
+  "Собрать заявки"/"Объявление"/"Картинка итогов"/"Очистить" run the exact same code path as typing the
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
 - **`/vote собрать`** (DM, administrators only) scans today and yesterday for
@@ -643,6 +643,25 @@ page that changes shape depending on who opens it:
   the buttons that close the vote or clear it entirely (below). Nothing is shown to
   ordinary voters -- or to an admin on the plain ballot -- until this has admitted it, so
   an unmoderated poll shows an empty page rather than everything anyone posted.
+- **`/vote картинка`** (DM, administrators only, also the "🖼 Картинка итогов" button in
+  the admin menu) renders the standings as **one tall picture** (`vote_image.py`, Pillow)
+  and sends it back as a **file**. Deliberately the same board the Mini App shows — same
+  colours, same three columns, same square thumbnail with the author's name and @tag under
+  it, ranked by votes with the count in the corner — minus the vote button, which would be
+  a lie about what a picture can do. Two rules it does not share with the page: the photo
+  is **fitted** into its square rather than cropped to fill it (on the page a crop is a
+  link to the full picture; here there is no tap, so the crop would be all anyone ever
+  sees), and there is exactly one image however many works there are — it just gets longer,
+  a row per three. Sent as a document, not a photo, because Telegram re-encodes photos and
+  refuses anything past 10000px of width+height or a 20:1 side ratio, which a long board
+  hits; the file is also kept on disk under `voting/exports/` either way. Only **admitted**
+  entries are drawn (it renders `poll.tally()`, the same ranking the page and the
+  announcement text use, never re-sorted here). Rendering runs in a worker thread —
+  decoding and scaling every photo in the poll is seconds of CPU that would otherwise stall
+  every other chat the bot is serving. Fonts: the Docker image installs `fonts-dejavu-core`
+  since `python:*-slim` ships none and Pillow has no Cyrillic face of its own;
+  `VOTE_IMAGE_FONT`/`VOTE_IMAGE_FONT_BOLD` override the lookup on a host that keeps its
+  fonts elsewhere.
 - **`/vote очистить`** (DM, administrators only) deletes the current poll outright --
   entries, votes, admitted flags, downloaded photos, settings, all of it -- behind a
   tap-to-confirm inline button, same as every other irreversible action in this bot. The

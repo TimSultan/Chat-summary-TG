@@ -1,7 +1,7 @@
 """Thin async wrapper around Telegram's Bot HTTP API (https://core.telegram.org/bots/api)
 -- used by bot_listener.py to run a bot account alongside the Telethon user session that
 listener.py drives. Deliberately minimal: just the handful of methods bot_listener.py
-needs (getMe, getUpdates via long polling, message/photo send and edit, deleteMessage,
+needs (getMe, getUpdates via long polling, message/photo/document send and edit, deleteMessage,
 setMessageReaction, sendChatAction, answerCallbackQuery, getChatAdministrators,
 getChatMember), not a full SDK.
 
@@ -169,6 +169,43 @@ class TelegramBotAPI:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         form.add_field("photo", path.read_bytes(), filename=path.name, content_type=content_type)
         return await self._upload("sendPhoto", form)
+
+    async def send_document_file(
+        self,
+        chat_id,
+        path,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
+    ) -> dict:
+        """Upload a file from disk as a DOCUMENT, not a photo.
+
+        sendPhoto is the wrong door for the vote board (vote_image.py): Telegram
+        re-encodes a photo, caps it at 10000px of width plus height, and refuses a side
+        ratio past 20:1 -- all three of which a one-column-per-three-works board of a
+        whole contest walks straight into as it gets longer. A document arrives byte for
+        byte and has none of those limits, which is also what makes it worth saving.
+
+        The longer upload timeout is the point of not reusing _call: these are megabytes,
+        not a JSON message.
+        """
+        path = Path(path)
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
+        if parse_mode:
+            form.add_field("parse_mode", parse_mode)
+        if reply_markup:
+            form.add_field("reply_markup", json.dumps(reply_markup))
+        if reply_to_message_id is not None:
+            form.add_field("reply_parameters", json.dumps(
+                {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
+            ))
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        form.add_field("document", path.read_bytes(), filename=path.name, content_type=content_type)
+        return await self._upload("sendDocument", form, _http_timeout=180.0)
 
     async def set_my_commands(self, commands: list[dict], scope: dict | None = None) -> None:
         """Populate the client's own ☰ Menu button next to the input field.

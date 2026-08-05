@@ -39,7 +39,8 @@ including an admin (also a status/control panel for one); "/vote выбрать"
 is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans
 #итогинедели posts into the poll; "/vote очистить" (DM, admin-only, tap-to-confirm)
 deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement and posts it to
-the chats the admin picks. See handle_vote_command's docstring.
+the chats the admin picks; "/vote картинка" (DM, admin-only) renders the standings as one
+picture (vote_image.py) and sends it back as a file. See handle_vote_command's docstring.
 
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
 session) -- or, more commonly, let listener.py's main() start this automatically
@@ -65,6 +66,7 @@ import history
 import poker
 import preview
 import stats
+import vote_image
 import vote_web
 import voting
 from bot_api import CAPTION_LIMIT, TelegramBotAPI
@@ -208,6 +210,11 @@ VOTE_OPEN_BUTTON_TEXT = "🗳 Открыть голосование"
 # read a message-after-the-command, since that has no natural end and would swallow
 # whatever the admin says next in the DM.
 VOTE_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
+# "/vote картинка" -- renders the standings as one tall picture (vote_image.py) and sends
+# it back as a FILE. Admin-only like everything else that reads the whole poll, and
+# deliberately not offered to voters: it shows every vote count at once, which is exactly
+# what the page withholds from somebody who hasn't voted yet.
+VOTE_IMAGE_WORDS = frozenset({"картинка", "картинку", "изображение", "image", "png"})
 VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
 # The draft is written in the admin's DM but is almost never meant to stay there, so the
 # finished text is not sent anywhere until they say where it goes: the main chat, the
@@ -217,12 +224,17 @@ VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
 # button, not on the reply.
 VOTE_CHAT_DEST_CALLBACK_PREFIX = "votechatdest"
 VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "cancel")
-# Buttons on an administrator's bare-/vote status message for собрать/chat/очистить --
-# unlike "Открыть голосование"/"Модерация", those three are bot ACTIONS, not Mini App
-# pages, so they can't be a web_app button; tapping one runs the exact same code path as
-# typing the command (see handle_vote_action_callback), just via a synthetic message.
+# Buttons on an administrator's bare-/vote status message for собрать/chat/картинка/
+# очистить -- unlike "Открыть голосование"/"Модерация", those are bot ACTIONS, not Mini
+# App pages, so they can't be a web_app button; tapping one runs the exact same code path
+# as typing the command (see handle_vote_action_callback), just via a synthetic message.
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
-VOTE_ACTIONS = {"collect": "/vote собрать", "chat": "/vote chat", "clear": "/vote очистить"}
+VOTE_ACTIONS = {
+    "collect": "/vote собрать",
+    "chat": "/vote chat",
+    "image": "/vote картинка",
+    "clear": "/vote очистить",
+}
 
 # "Закрыть голосование и объявить победителя" in the Mini App no longer announces anything
 # by itself. It closes the poll and records the winner exactly as before, but what the
@@ -3596,9 +3608,9 @@ async def handle_vote_action_callback(
     log=print,
 ) -> None:
     """One button per subcommand on an administrator's bare-/vote status message
-    (собрать/chat/очистить -- "Открыть голосование"/"Модерация" are plain web_app
+    (собрать/chat/картинка/очистить -- "Открыть голосование"/"Модерация" are plain web_app
     buttons, not callbacks, since those just open a page). Rather than duplicating
-    собрать/chat/очистить's logic here, this builds the same message shape
+    those subcommands' logic here, this builds the same message shape
     handle_vote_command already parses and hands it straight over -- the admin/DM gate,
     the actual work, all of it, from one place."""
     parsed = _parse_vote_action_callback(callback.get("data"))
@@ -3646,7 +3658,7 @@ async def handle_vote_command(
     forced_mode: str | None = None,
     vote_chat_flows: dict[str, dict] | None = None,
 ) -> None:
-    """Five distinct things live behind /vote, deliberately kept apart rather than one
+    """Six distinct things live behind /vote, deliberately kept apart rather than one
     page that changes shape depending who opens it:
 
     - "/vote собрать" (DM, admin-only) adds newly posted #итогинедели entries to the
@@ -3658,16 +3670,20 @@ async def handle_vote_command(
       force-reply, then asks where it goes (main chat, the second group, or both) and
       posts that text plus the vote button there (see handle_vote_chat_text_input and
       handle_vote_chat_destination_callback).
+    - "/vote картинка" (DM, admin-only) renders the standings as one tall picture
+      (vote_image.py), saves it under the poll's own exports directory and sends it back
+      as a file.
     - bare "/vote" opens the actual ballot, for EVERYONE including an administrator --
       an admin is never forced into moderation mode just to cast their own vote. For an
       administrator specifically, it's also a status/control panel: current standings
       plus the full command list, since remembering four subcommands is more friction
       than a menu.
 
-    `forced_mode` ("moderate", "clear", or "chat") is set by the /start deep-link an
-    admin-only group message hands out for "выбрать"/"очистить"/"chat", bypassing the
-    usual text parsing since a /start payload never carries the Russian word itself (see
-    VOTE_MODERATE_WORDS/VOTE_CLEAR_WORDS/VOTE_CHAT_WORDS below). `vote_chat_flows` is
+    `forced_mode` ("moderate", "clear", "chat", or "image") is set by the /start deep-link
+    an admin-only group message hands out for "выбрать"/"очистить"/"chat"/"картинка",
+    bypassing the usual text parsing since a /start payload never carries the Russian word
+    itself (see VOTE_MODERATE_WORDS/VOTE_CLEAR_WORDS/VOTE_CHAT_WORDS/VOTE_IMAGE_WORDS
+    below). `vote_chat_flows` is
     required for "/vote chat" to have anywhere to remember it's waiting for text; every
     other subcommand ignores it.
 
@@ -3701,12 +3717,15 @@ async def handle_vote_command(
         await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS) -- нечего выносить на голосование.")
         return
 
+    wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
     if forced_mode == "moderate":
-        wants_collect, wants_moderate, wants_clear, wants_chat = False, True, False, False
+        wants_moderate = True
     elif forced_mode == "clear":
-        wants_collect, wants_moderate, wants_clear, wants_chat = False, False, True, False
+        wants_clear = True
     elif forced_mode == "chat":
-        wants_collect, wants_moderate, wants_clear, wants_chat = False, False, False, True
+        wants_chat = True
+    elif forced_mode == "image":
+        wants_image = True
     else:
         argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
         for spelling in VOTE_COMMANDS:
@@ -3718,11 +3737,12 @@ async def handle_vote_command(
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
+        wants_image = normalized in VOTE_IMAGE_WORDS
 
     async def require_admin_in_dm(denial: str) -> bool:
-        """Common gate for собрать/выбрать/очистить/chat: DM only, admin only. Returns
-        whether the caller passed; the group-vs-DM split lives here once instead of being
-        repeated for all four admin-only subcommands."""
+        """Common gate for собрать/выбрать/очистить/chat/картинка: DM only, admin only.
+        Returns whether the caller passed; the group-vs-DM split lives here once instead
+        of being repeated for all five admin-only subcommands."""
         if not is_private:
             if not bot_username:
                 await reply("Открой в личке с ботом.")
@@ -3730,7 +3750,8 @@ async def handle_vote_command(
             start_payload = (
                 "vote_admin" if wants_moderate else
                 "vote_clear" if wants_clear else
-                "vote_chat" if wants_chat else None
+                "vote_chat" if wants_chat else
+                "vote_image" if wants_image else None
             )
             url = f"https://t.me/{bot_username}" + (f"?start={start_payload}" if start_payload else "")
             await reply(
@@ -3848,6 +3869,54 @@ async def handle_vote_command(
         }
         return
 
+    if wants_image:
+        if not await require_admin_in_dm("Рендерить картинку итогов могут только администраторы."):
+            return
+        poll = voting.latest_poll(entry)
+        if poll is None:
+            await reply("Голосование ещё не создано -- нечего рисовать. Сначала /vote собрать.")
+            return
+        standings = poll.tally()
+        if not standings:
+            await reply("К голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
+            return
+
+        await reply(f"Рисую картинку: {len(standings)} работ. Это займёт несколько секунд.")
+        subtitle = (
+            f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
+            f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
+        )
+        try:
+            # In a thread: Pillow decodes, scales and re-encodes every photo in the poll,
+            # which is seconds of straight CPU work -- on the event loop it would stall
+            # every other chat the bot is serving for the whole render.
+            path = await asyncio.to_thread(
+                vote_image.render_poll_image,
+                poll,
+                voting.export_image_path(entry, poll.poll_id),
+                subtitle=subtitle,
+            )
+        except Exception:
+            log(f"[bot_listener] rendering the vote image failed:\n{traceback.format_exc()}")
+            await reply("Не получилось нарисовать картинку -- смотри логи.")
+            return
+        log(f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} ({path.stat().st_size} bytes)")
+
+        # As a document, not a photo: Telegram re-encodes photos and refuses one past
+        # 10000px of width+height or a 20:1 side ratio, and a board of a whole contest is
+        # exactly that shape (see bot_api.send_document_file). The file stays on disk
+        # either way -- the send is a copy, not the save.
+        try:
+            await api.send_document_file(
+                chat_id, path,
+                caption="Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
+                reply_to_message_id=message["message_id"],
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to send the vote image: {e}")
+            await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
+        return
+
     # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
     # unless they specifically asked for "выбрать". An administrator's bare /vote is also
     # a status/control panel: current standings, the full command list, and a button per
@@ -3864,6 +3933,7 @@ async def handle_vote_command(
                 "/vote выбрать — модерация заявок\n"
                 "/vote собрать — собрать новые заявки\n"
                 "/vote chat — подготовить объявление с кнопкой\n"
+                "/vote картинка — итоги одной картинкой (файлом)\n"
                 "/vote очистить — очистить голосование"
             )
             admin_user_id = user.get("id")
@@ -3885,6 +3955,10 @@ async def handle_vote_command(
                         },
                     ],
                     [
+                        {
+                            "text": "🖼 Картинка итогов",
+                            "callback_data": _vote_action_callback_data("image", chat_id, admin_user_id),
+                        },
                         {
                             "text": "🗑 Очистить",
                             "callback_data": _vote_action_callback_data("clear", chat_id, admin_user_id),
@@ -4946,7 +5020,8 @@ async def _dispatch_update(
     if start_match:
         # Where /stat's "Открыть личный кабинет" link (t.me/<bot>?start=cabinet) and the
         # group /vote buttons' DM links (?start=vote, ?start=vote_admin, ?start=vote_clear,
-        # ?start=vote_chat) land, and the natural first thing a new member does anyway.
+        # ?start=vote_chat, ?start=vote_image) land, and the natural first thing a new
+        # member does anyway.
         # Groups are ignored: a
         # /start there is somebody's fat finger, not a request. Any payload other than the
         # vote ones -- including none at all -- opens the cabinet, matching the old
@@ -4954,8 +5029,11 @@ async def _dispatch_update(
         if chat.get("type") != "private":
             return
         start_payload = (start_match.group(1) or "").lower()
-        if start_payload in ("vote", "vote_admin", "vote_clear", "vote_chat"):
-            forced_mode = {"vote_admin": "moderate", "vote_clear": "clear", "vote_chat": "chat"}.get(start_payload)
+        if start_payload in ("vote", "vote_admin", "vote_clear", "vote_chat", "vote_image"):
+            forced_mode = {
+                "vote_admin": "moderate", "vote_clear": "clear",
+                "vote_chat": "chat", "vote_image": "image",
+            }.get(start_payload)
             await handle_vote_command(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,

@@ -6,6 +6,13 @@ ENV TZ=Europe/Moscow \
 
 WORKDIR /app
 
+# Pillow ships no Cyrillic-capable font and python:*-slim ships no fonts at all, so the
+# vote board (vote_image.py) would render every Russian name as boxes without this. -core
+# is the ~1MB subset: the four DejaVu Sans faces, not the whole family.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
