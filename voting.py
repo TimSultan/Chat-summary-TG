@@ -442,11 +442,13 @@ def load_poll(entry: str, poll_id: str) -> Poll | None:
         return None
 
 
-def latest_poll(entry: str) -> Poll | None:
-    """The most recently created poll for this chat -- what /vote and the page open."""
+def _all_polls(entry: str) -> list[Poll]:
+    """Every readable poll for this chat, newest first. An unreadable file is skipped
+    rather than raising -- same tolerance load_poll has, for the same reason: one corrupt
+    week must not make the current one unopenable."""
     directory = _voting_dir()
     if not directory.exists():
-        return None
+        return []
     prefix = f"{_poll_key(entry)}_"
     polls = []
     for path in directory.glob(f"{prefix}*.json"):
@@ -454,10 +456,21 @@ def latest_poll(entry: str) -> Poll | None:
             polls.append(Poll.from_dict(json.loads(path.read_text(encoding="utf-8"))))
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             continue
-    if not polls:
-        return None
     polls.sort(key=lambda p: p.created_at, reverse=True)
-    return polls[0]
+    return polls
+
+
+def latest_poll(entry: str) -> Poll | None:
+    """The most recently created poll for this chat -- what /vote and the page open."""
+    polls = _all_polls(entry)
+    return polls[0] if polls else None
+
+
+def previous_poll(entry: str, poll_id: str) -> Poll | None:
+    """The most recent poll that ISN'T `poll_id` -- i.e. last week's, from the point of
+    view of the week being started now. Matched by poll id rather than by date order alone
+    so it stays right whether or not this week's poll has been created yet."""
+    return next((p for p in _all_polls(entry) if p.poll_id != poll_id), None)
 
 
 def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | None = None) -> Poll:
@@ -493,6 +506,92 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
     # administrator did by hand, and a poll refreshed to pick up two new nominations must
     # not silently un-crop the dozen that were already framed.
     poll.crops = {k: dict(v) for k, v in existing.crops.items() if k in known}
+    return poll
+
+
+# How many places at the top of last week's board retire rather than running again. The
+# podium has had its week; everything below it gets another.
+CARRY_OVER_SKIP_TOP = 3
+
+
+def carry_over_entries(previous: Poll, skip_top: int = CARRY_OVER_SKIP_TOP) -> list[Entry]:
+    """Last week's works that should run again: everything that was ADMITTED to that vote,
+    minus its top `skip_top`, ranked best-first.
+
+    Admitted only, deliberately. A poll's `entries` also holds nominations a moderator
+    looked at and did not admit -- carrying those over would quietly undo that decision
+    every week, and un-admitting is the only way there is to drop a post from a poll.
+
+    A "winner" here means a top-three work that actually got a vote. A poll nobody voted
+    in has no podium to retire, so its whole field runs again rather than three arbitrary
+    works being dropped for having sorted first among the noughts -- the same rule the
+    /vote status message follows when it refuses to pad a top 3 with zero-vote entries.
+    """
+    ranked = previous.tally()
+    retired = {entry.entry_id for entry, votes in ranked[:skip_top] if votes > 0}
+    return [entry for entry, _ in ranked if entry.entry_id not in retired]
+
+
+def copy_entry_media(entry: str, from_poll_id: str, to_poll_id: str, entries: list[Entry]) -> int:
+    """Copies the photos of `entries` from one poll's media directory into another's, and
+    returns how many files were copied.
+
+    Carried-over entries keep their file NAMES but their poll changes, and both the page
+    and the export address a photo as <poll id>/<file name> (see vote_web.handle_media).
+    Without this every carried-over card would point at a 404. Copied rather than shared
+    or symlinked so that clearing either week deletes only its own media -- delete_poll
+    removes the whole directory.
+    """
+    source = media_path(entry, from_poll_id)
+    target = media_path(entry, to_poll_id)
+    target.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for item in entries:
+        for name in item.media:
+            origin, destination = source / name, target / name
+            if destination.exists() or not origin.is_file():
+                continue
+            try:
+                shutil.copy2(origin, destination)
+                copied += 1
+            except OSError:
+                continue  # one unreadable photo costs that card its picture, not the week
+    return copied
+
+
+def seed_poll_from_previous(
+    entry: str, poll_id: str, previous: Poll, skip_top: int = CARRY_OVER_SKIP_TOP
+) -> Poll:
+    """A new poll pre-filled with last week's runners-up (see carry_over_entries).
+
+    They arrive ALREADY ADMITTED: a human admitted each of them last week, and making them
+    re-tick fifteen boxes to say so again is how a convenience becomes a chore. New
+    nominations collected afterwards still start pending, so the moderation screen still
+    shows exactly the works nobody has ruled on yet.
+
+    Their framing (Poll.crops) comes along too -- it is per-photo, and the photo is the
+    same one. So is the ballot's configuration: max_choices and allow_revote are how this
+    contest is run, not something about last week in particular.
+
+    Votes, the winner, and the closed flag are all deliberately left behind. This is a new
+    vote, not a copy of one.
+    """
+    entries = carry_over_entries(previous, skip_top)
+    copy_entry_media(entry, previous.poll_id, poll_id, entries)
+    poll = Poll(
+        poll_id=poll_id,
+        entry=entry,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        entries=entries,
+        approved=[e.entry_id for e in entries],
+        max_choices=previous.max_choices,
+        allow_revote=previous.allow_revote,
+        crops={
+            entry_id: dict(crop)
+            for entry_id, crop in previous.crops.items()
+            if entry_id in {e.entry_id for e in entries}
+        },
+    )
     return poll
 
 

@@ -630,7 +630,24 @@ page that changes shape depending on who opens it:
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
 - **`/vote собрать`** (DM, administrators only) scans today and yesterday for
-  `#итогинедели` posts and adds any that aren't already in the poll. Already-known
+  `#итогинедели` posts and adds any that aren't already in the poll.
+
+  **Starting a new week carries last week's field over**, minus its top 3: the podium has
+  had its week, everything below it runs again, and the reply says how many came across.
+  Only works that were **admitted** last week are carried (un-admitting is the only way to
+  drop a post from a poll, and a carry-over that ignored it would undo that decision every
+  week), and only a top-three place that actually scored retires — a week nobody voted in
+  has no podium, so its whole field returns rather than three works being dropped for
+  sorting first among the noughts. Carried works arrive **already admitted**, since a human
+  admitted them once already; new nominations still start pending, so the moderation screen
+  still shows exactly what nobody has ruled on. Their framing (`crops`) and the ballot's
+  settings (`max_choices`, `allow_revote`) come too; last week's votes, winner and closed
+  flag do not. Their photos are **copied** into the new poll's media directory — the page
+  and the export both address a photo as `<poll id>/<file name>`, so a file left behind
+  would render as a 404 on every carried card, and copying means clearing either week
+  leaves the other intact. This happens only when the week's poll does not exist yet:
+  re-collecting a week already under way must not resurrect what the moderator has since
+  un-admitted. `voting.CARRY_OVER_SKIP_TOP` is the 3. Already-known
   entries are left alone entirely — no re-fetch, no re-resolving who posted them, no
   re-downloading their photos — so re-collecting a poll that already has a dozen entries
   costs only whatever's actually new, and never re-touches what's already been admitted

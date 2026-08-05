@@ -3797,6 +3797,23 @@ async def handle_vote_command(
         await reply("Собираю новые заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
         poll_id = _current_vote_poll_id(tz)
         existing_poll = voting.load_poll(entry, poll_id)
+
+        # Starting a NEW week: last week's admitted works, minus its top 3, run again --
+        # the podium has had its week and everything below it deserves another (see
+        # voting.seed_poll_from_previous). Only when this week's poll doesn't exist yet:
+        # re-collecting an already-started week must not resurrect works the moderator
+        # has since un-admitted, which a carry-over on every /vote собрать would do.
+        carried = 0
+        if existing_poll is None:
+            last_week = voting.previous_poll(entry, poll_id)
+            if last_week is not None:
+                existing_poll = voting.seed_poll_from_previous(entry, poll_id, last_week)
+                carried = len(existing_poll.entries)
+                log(
+                    f"[bot_listener] vote poll {poll_id}: carried {carried} work(s) over from "
+                    f"{last_week.poll_id} (top {voting.CARRY_OVER_SKIP_TOP} retired)"
+                )
+
         known_ids = {e.entry_id for e in existing_poll.entries} if existing_poll else set()
         try:
             new_entries = await voting.collect_entries(
@@ -3827,6 +3844,15 @@ async def handle_vote_command(
             f"Новых заявок: {len(new_entries)} (всего {len(all_entries)})." if new_entries
             else f"Новых заявок нет (всего {len(all_entries)})."
         )
+        if carried:
+            # Said out loud, and said first: the moderator is about to open a screen with
+            # works in it they did not collect today, already admitted. Unexplained, that
+            # reads as the bot having picked up something it shouldn't.
+            summary = (
+                f"Перенёс с прошлого голосования: {carried} работ "
+                f"(топ-{voting.CARRY_OVER_SKIP_TOP} не переносится, они уже допущены). "
+                + summary
+            )
         await reply(
             f"{summary} Открой модерацию и отметь, какие работы допустить.",
             reply_markup={"inline_keyboard": [[
