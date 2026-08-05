@@ -4063,15 +4063,10 @@ async def handle_arena_command(
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
         if is_manager:
             admin_user_id = user.get("id")
+            # Status and buttons, and no list of the commands the buttons already are:
+            # every line of it was a slower way to press the button underneath it.
             await reply(
                 f"{_arena_status_text(entry)}\n\n"
-                "Команды:\n"
-                "/arena — голосовать (дуэли)\n"
-                "/arena выбрать — модерация арены\n"
-                "/arena собрать — собрать работы с #итогинедели\n"
-                "/arena импорт — взять допущенные работы из v1\n"
-                "/arena итоги — рейтинг\n"
-                "/arena очистить — удалить арену\n\n"
                 "Это отдельная система: v1 (/vote) работает как работал.",
                 reply_markup={"inline_keyboard": [
                     [
@@ -4424,26 +4419,15 @@ async def handle_vote_command(
 
     # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
     # unless they specifically asked for "выбрать". An administrator's bare /vote is also
-    # a status/control panel: current standings, the full command list, and a button per
-    # command, rather than just the vote button, since they're the one who has four
-    # subcommands to remember.
+    # a status/control panel: current standings and a button per command, rather than just
+    # the vote button, since they're the one who has four subcommands to remember. The
+    # written-out command list that used to sit here is gone: the buttons below say the
+    # same thing and do it in one tap.
     if is_private:
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
         if is_manager:
-            text = (
-                f"{_vote_status_text(entry)}\n\n"
-                "Команды:\n"
-                "/vote — открыть бюллетень (проголосовать)\n"
-                "/vote выбрать — модерация заявок\n"
-                "/vote собрать — собрать новые заявки\n"
-                "/vote перенос — что перенесётся с прошлой недели (только показать)\n"
-                "/vote chat — подготовить объявление с кнопкой\n"
-                "/vote картинка — итоги одной картинкой (файлом), 3 в ряд\n"
-                "/vote картинка 4 — то же самое, но 4 работы в ряд\n"
-                "Кнопка «Кадрировать» — та же картинка, но с ручной обрезкой каждой работы\n"
-                "/vote очистить — очистить голосование"
-            )
+            text = _vote_status_text(entry)
             admin_user_id = user.get("id")
             await reply(
                 text,

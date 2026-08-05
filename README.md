@@ -624,8 +624,9 @@ page that changes shape depending on who opens it:
 - **Bare `/vote`** opens the actual ballot, for **everyone including an administrator** —
   an admin is never forced into moderation just to cast their own vote. For an
   administrator specifically, it's also a status/control panel: current standings (how
-  many voted, the top 3 so far), the full command list, and a button for every one of
-  them — "Открыть голосование"/"Модерация" open the Mini App directly, while
+  many voted, the top 3 so far) and a button per command — the written-out list of the same
+  commands used to sit above them and is gone, since every line of it was a slower way to
+  press the button underneath. "Открыть голосование"/"Модерация" open the Mini App directly, while
   "Собрать заявки"/"Объявление"/"Картинка итогов"/"Очистить" run the exact same code path as typing the
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
@@ -824,6 +825,27 @@ ballot **never** reopens; re-entering **resumes** with the same pairs and picks 
 re-dealing (or a voter could re-roll until they liked their matchups); a submit for any
 position other than the one the server has is **returned unchanged**, so a double tap, a
 retry or a stale tab cannot count twice.
+
+A mistap is **taken back with «← Назад»**, as many times as needed, all the way to the first
+pair — `undo_pick` drops the last entry of the picks list and `position` is derived from its
+length, so there is no incremental state to unwind (the fit is order-independent anyway).
+The one pair that cannot be taken back is the one that *finished* the ballot: an undo that
+reopened a closed ballot would be a reopen under another name.
+
+In the duel itself a work is shown as **all of its photos**, not just the first: a snap
+scroller with a count, dots and arrows, and a **⛶ zoom** that opens the picture full screen
+with pinch, double-tap and drag-to-pan. The gestures are handled by hand rather than left to
+the browser — native pinch and native scroll-snap want opposite `touch-action` values, and an
+unhandled pinch inside a Mini App drags the whole app down instead of magnifying anything.
+Choosing is still **one tap on the work**; a tap is measured from `pointerdown` (the same
+rule `vote_web.py`'s reel uses) so a swipe through the photos never casts a vote.
+
+Somebody who opens the arena again after finishing is told **«Вы уже проголосовали»** rather
+than being sent to a refused session, and gets the **top of the table** — picture, name,
+rating — from `GET /arena/api/top`. That route is deliberately separate from the
+administrators-only `/api/standings` and opens only once *your own* ballot is closed: a
+running ranking in front of an unfinished voter is exactly the bias the pairing exists to
+avoid, but behind a closed ballot it can no longer reach any of their picks.
 
 Commands mirror `/vote` so knowing one is knowing the other — `/arena` (duels, plus a
 status panel for an administrator), `/arena выбрать` (moderation: admit works, pairs per

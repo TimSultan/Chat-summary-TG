@@ -111,6 +111,7 @@ class ArenaApiTests(unittest.IsolatedAsyncioTestCase):
         self._seed()
         for method, path in (
             ("get", "/api/state"), ("post", "/api/session"), ("post", "/api/pick"),
+            ("post", "/api/undo"), ("get", "/api/top"),
             ("get", "/api/standings"), ("get", "/api/progress"),
             ("post", "/api/moderate"), ("post", "/api/clear"),
         ):
@@ -178,6 +179,63 @@ class ArenaApiTests(unittest.IsolatedAsyncioTestCase):
             })
         self.assertEqual(len(arena.load_tournament(CHAT, TID).ballots[str(self.voter_id)].picks), 1)
 
+    async def test_going_back_puts_the_voter_on_the_pair_before(self):
+        self._seed(pairs=3)
+        started = await (await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(self.voter_id)}
+        )).json()
+        first = started["ballot"]["pair"]
+        await self.client.post(arena_web.ROUTE_PREFIX + "/api/pick", json={
+            "init_data": _init_data(self.voter_id), "position": 0, "pick": first["left"]["id"],
+        })
+        back = await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/undo", json={"init_data": _init_data(self.voter_id)}
+        )
+        self.assertEqual(back.status, 200)
+        ballot = (await back.json())["ballot"]
+        self.assertEqual(ballot["position"], 0)
+        self.assertEqual(ballot["pair"]["left"]["id"], first["left"]["id"])
+        self.assertEqual(arena.load_tournament(CHAT, TID).ballots[str(self.voter_id)].picks, [])
+
+        # nothing left to take back, and saying so is not an error the page has to dress up
+        again = await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/undo", json={"init_data": _init_data(self.voter_id)}
+        )
+        self.assertEqual(again.status, 400)
+        self.assertEqual((await again.json())["error"], "NOTHING_TO_UNDO")
+
+    async def test_going_back_cannot_reopen_a_closed_ballot(self):
+        self._seed(pairs=1)
+        await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(self.voter_id)}
+        )
+        await self.client.post(arena_web.ROUTE_PREFIX + "/api/pick", json={
+            "init_data": _init_data(self.voter_id), "position": 0, "pick": "tie",
+        })
+        response = await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/undo", json={"init_data": _init_data(self.voter_id)}
+        )
+        self.assertEqual(response.status, 409)
+        self.assertEqual((await response.json())["error"], "BALLOT_COMPLETE")
+        self.assertEqual(
+            arena.load_tournament(CHAT, TID).ballots[str(self.voter_id)].status, "done"
+        )
+
+    async def test_a_returning_voter_is_told_their_ballot_is_closed(self):
+        """What the page draws "Вы уже проголосовали" from: state says the ballot is done,
+        so it never asks for a session it would only be refused."""
+        self._seed(pairs=1)
+        await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(self.voter_id)}
+        )
+        await self.client.post(arena_web.ROUTE_PREFIX + "/api/pick", json={
+            "init_data": _init_data(self.voter_id), "position": 0, "pick": "tie",
+        })
+        data = await (await self.client.get(
+            arena_web.ROUTE_PREFIX + "/api/state", headers=self._auth(self.voter_id)
+        )).json()
+        self.assertEqual(data["ballot"]["status"], "done")
+
     async def test_a_non_member_cannot_start(self):
         self._seed()
         response = await self.client.post(
@@ -206,9 +264,49 @@ class ArenaApiTests(unittest.IsolatedAsyncioTestCase):
         for key in ("standings", "entries", "approved", "progress"):
             self.assertNotIn(key, data)
 
-        for path in ("/api/standings", "/api/progress"):
+        for path in ("/api/standings", "/api/progress", "/api/top"):
             response = await self.client.get(arena_web.ROUTE_PREFIX + path, headers=self._auth(self.voter_id))
             self.assertEqual(response.status, 403)
+
+    async def test_the_top_opens_up_only_once_this_voter_has_finished(self):
+        """The leaders shown on the thank-you screen. Behind a closed ballot the running
+        table can no longer reach any of that voter's picks, which is the whole reason
+        handle_standings stays shut and this does not."""
+        self._seed(works=4, pairs=1)
+        started = await (await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(self.voter_id)}
+        )).json()
+        winner = started["ballot"]["pair"]["left"]
+
+        early = await self.client.get(arena_web.ROUTE_PREFIX + "/api/top", headers=self._auth(self.voter_id))
+        self.assertEqual(early.status, 403)
+        self.assertEqual((await early.json())["error"], "NOT_FINISHED")
+
+        await self.client.post(arena_web.ROUTE_PREFIX + "/api/pick", json={
+            "init_data": _init_data(self.voter_id), "position": 0, "pick": winner["id"],
+        })
+        response = await self.client.get(arena_web.ROUTE_PREFIX + "/api/top", headers=self._auth(self.voter_id))
+        self.assertEqual(response.status, 200)
+        rows = (await response.json())["top"]
+        self.assertLessEqual(len(rows), arena_web.TOP_LIMIT)
+        self.assertEqual(rows[0]["id"], winner["id"])
+        # a name, a picture and a number -- everything the page puts in a row
+        self.assertTrue(rows[0]["photo"].startswith(arena_web.ROUTE_PREFIX + "/media/"))
+        self.assertTrue(rows[0]["author"])
+        self.assertIsInstance(rows[0]["rating"], int)
+
+    async def test_the_top_never_runs_past_its_limit(self):
+        self._seed(works=arena_web.TOP_LIMIT + 5, pairs=1)
+        await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(self.voter_id)}
+        )
+        await self.client.post(arena_web.ROUTE_PREFIX + "/api/pick", json={
+            "init_data": _init_data(self.voter_id), "position": 0, "pick": "tie",
+        })
+        rows = (await (await self.client.get(
+            arena_web.ROUTE_PREFIX + "/api/top", headers=self._auth(self.voter_id)
+        )).json())["top"]
+        self.assertEqual(len(rows), arena_web.TOP_LIMIT)
 
     async def test_an_admin_asking_for_admin_mode_gets_the_moderation_payload(self):
         self._seed()

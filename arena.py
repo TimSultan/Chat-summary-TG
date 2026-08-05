@@ -424,3 +424,34 @@ def record_pick(tournament: Tournament, user_id, position: int, pick: str) -> Ba
         ballot.done_at = datetime.now(timezone.utc).isoformat()
     _note_vote(tournament.tournament_id)
     return ballot
+
+
+def undo_pick(tournament: Tournament, user_id) -> Ballot:
+    """Take back the last judgement, so a mistap can be corrected.
+
+    Repeatable all the way back to the first pair: the picks are a plain list, `position`
+    is derived from its length, and nothing downstream remembers the order votes arrived in
+    (compute_standings refits from the whole table every time), so dropping the tail IS the
+    undo -- there is no incremental state to unwind.
+
+    A DONE ballot is refused, exactly as start_session refuses to resume one. "One voter,
+    one ballot, for ever" is the rule the arena is built on, and an undo that reopened a
+    closed ballot would be a reopen under another name. In practice that means every pair
+    can be taken back except the one that finished the ballot.
+
+    The cached table is dropped rather than left stale: it still counts a vote that no
+    longer exists, and adaptive pairing would go on seeding pairs from it.
+    """
+    ballot = tournament.ballots.get(str(user_id))
+    if ballot is None:
+        raise ArenaError("NO_SESSION", "Сессия не найдена -- открой арену заново.")
+    if ballot.status == "done":
+        raise ArenaError("BALLOT_COMPLETE", "Бюллетень уже закрыт -- вернуться нельзя.")
+    if not tournament.open:
+        raise ArenaError("VOTING_CLOSED", "Арена закрыта.")
+    if not ballot.picks:
+        raise ArenaError("NOTHING_TO_UNDO", "Это первая пара -- назад некуда.")
+
+    ballot.picks = ballot.picks[:-1]
+    invalidate_standings(tournament.tournament_id)
+    return ballot

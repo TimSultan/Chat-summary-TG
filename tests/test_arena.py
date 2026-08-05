@@ -215,6 +215,48 @@ class SessionRuleTests(unittest.TestCase):
         arena.record_pick(tournament, 7, 0, ballot.pairs[0][1])  # the same tap again
         self.assertEqual(len(ballot.picks), 1)
 
+    def test_going_back_returns_to_the_pair_before(self):
+        tournament = self._tournament()
+        ballot = arena.start_session(tournament, 7)
+        arena.record_pick(tournament, 7, 0, ballot.pairs[0][0])
+        arena.record_pick(tournament, 7, 1, TIE)
+        arena.undo_pick(tournament, 7)
+        self.assertEqual(ballot.position, 1)
+        self.assertEqual(ballot.picks, [ballot.pairs[0][0]])
+        # and the pair itself is the one that was dealt, not a fresh one
+        self.assertEqual(len(ballot.pairs), 3)
+
+    def test_going_back_repeats_all_the_way_to_the_first_pair(self):
+        tournament = self._tournament()
+        ballot = arena.start_session(tournament, 7)
+        for at in range(2):
+            arena.record_pick(tournament, 7, at, ballot.pairs[at][0])
+        arena.undo_pick(tournament, 7)
+        arena.undo_pick(tournament, 7)
+        self.assertEqual(ballot.picks, [])
+        with self.assertRaises(arena.ArenaError) as caught:
+            arena.undo_pick(tournament, 7)
+        self.assertEqual(caught.exception.code, "NOTHING_TO_UNDO")
+
+    def test_a_re_answered_pair_replaces_the_pick_it_took_back(self):
+        tournament = self._tournament()
+        ballot = arena.start_session(tournament, 7)
+        arena.record_pick(tournament, 7, 0, ballot.pairs[0][0])
+        arena.undo_pick(tournament, 7)
+        arena.record_pick(tournament, 7, 0, ballot.pairs[0][1])
+        self.assertEqual(ballot.picks, [ballot.pairs[0][1]])
+
+    def test_going_back_cannot_reopen_a_finished_ballot(self):
+        tournament = self._tournament(pairs=2)
+        ballot = arena.start_session(tournament, 7)
+        arena.record_pick(tournament, 7, 0, ballot.pairs[0][0])
+        arena.record_pick(tournament, 7, 1, TIE)
+        with self.assertRaises(arena.ArenaError) as caught:
+            arena.undo_pick(tournament, 7)
+        self.assertEqual(caught.exception.code, "BALLOT_COMPLETE")
+        self.assertEqual(ballot.status, "done")
+        self.assertEqual(len(ballot.picks), 2)
+
     def test_a_pick_outside_the_pair_is_refused(self):
         tournament = self._tournament()
         arena.start_session(tournament, 7)

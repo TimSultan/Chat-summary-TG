@@ -26,6 +26,10 @@ from arena_core import TIE
 
 ROUTE_PREFIX = "/arena"
 
+# How much of the table a voter who has finished is shown. The head of it is the interesting
+# part and the tail is mostly noise at any realistic coverage -- see arena_core.is_separated.
+TOP_LIMIT = 10
+
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 _CFG_KEY = web.AppKey("arena_cfg")
@@ -234,6 +238,55 @@ async def handle_pick(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "ballot": _ballot_payload(ballot, tournament, base)})
 
 
+async def handle_undo(request: web.Request) -> web.Response:
+    """Take back the last pick. No body beyond the credentials: there is only ever one
+    judgement that can be undone, the most recent one, so a position would be a second
+    opinion about where we are and a chance for the two to disagree.
+
+    Returns the whole ballot like /api/pick does, and for the same reason -- the page
+    redraws from it rather than trying to reconstruct the pair it just left.
+    """
+    body = await _body(request)
+    user = await _authenticate(request, body)
+    entry_name = request.app[_ENTRY_KEY]
+    base = request.app[_PREFIX_KEY]
+
+    async with arena.arena_lock:
+        tournament = arena.latest_tournament(entry_name)
+        if tournament is None:
+            return _json_error("арена ещё не создана", status=404, code="NO_TOURNAMENT")
+        try:
+            ballot = arena.undo_pick(tournament, user["id"])
+        except arena.ArenaError as e:
+            status = 409 if e.code in ("BALLOT_COMPLETE", "VOTING_CLOSED") else 400
+            return _json_error(e.message, status=status, code=e.code)
+        arena.save_tournament(tournament)
+
+    return web.json_response({"ok": True, "ballot": _ballot_payload(ballot, tournament, base)})
+
+
+async def handle_top(request: web.Request) -> web.Response:
+    """The head of the table, for somebody who has finished voting.
+
+    Deliberately a separate route from handle_standings with a softer guard rather than a
+    relaxed version of it: a voter gets the first few places only, and only once their OWN
+    ballot is closed. A running ranking in front of an unfinished voter is precisely the
+    bias the pairing is built to avoid; behind a closed ballot it can no longer reach any
+    of their picks.
+    """
+    user = await _authenticate(request)
+    tournament = arena.latest_tournament(request.app[_ENTRY_KEY])
+    if tournament is None:
+        return _json_error("арена ещё не создана", status=404, code="NO_TOURNAMENT")
+
+    ballot = tournament.ballots.get(str(user["id"]))
+    if not (ballot and ballot.status == "done") and not await request.app[_IS_ADMIN_KEY](user):
+        return _json_error("сначала пройди все пары", status=403, code="NOT_FINISHED")
+    return web.json_response({
+        "top": _standings_payload(tournament, request.app[_PREFIX_KEY], limit=TOP_LIMIT)
+    })
+
+
 async def handle_standings(request: web.Request) -> web.Response:
     """The fitted table. Administrators only -- a running ranking shown to a voter who has
     not finished is exactly the bias the pairing is built to avoid."""
@@ -379,6 +432,8 @@ def attach(app: web.Application, cfg, entry: str, is_admin, is_member=None, log=
         web.get(f"{prefix}/api/state", handle_state),
         web.post(f"{prefix}/api/session", handle_session),
         web.post(f"{prefix}/api/pick", handle_pick),
+        web.post(f"{prefix}/api/undo", handle_undo),
+        web.get(f"{prefix}/api/top", handle_top),
         web.get(f"{prefix}/api/standings", handle_standings),
         web.get(f"{prefix}/api/progress", handle_progress),
         web.post(f"{prefix}/api/moderate", handle_moderate),
@@ -428,11 +483,41 @@ PAGE_HTML = """<!doctype html>
           cursor: pointer; border: 2px solid transparent; }
   .card.chosen { border-color: var(--accent); }
   .card .shot { position: relative; width: 100%; aspect-ratio: 4 / 3; background: var(--thumb-bg); }
-  /* contain, not cover: this is a judgement of the work, so cropping it to fit would be
-     judging something the artist did not make. */
-  .card .shot img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .card .who { padding: 7px 10px 9px; font-size: 12px; color: var(--muted);
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* A work is often several photos, and judging it by the first one alone is judging half
+     of it. The strip is a real scroller with snap points rather than a JS carousel: the
+     browser's own inertia is the one that feels right, and it keeps working if the script
+     that draws the dots ever throws. */
+  .strip { position: absolute; inset: 0; display: flex; overflow-x: auto; overflow-y: hidden;
+           scroll-snap-type: x mandatory; scrollbar-width: none; }
+  .strip::-webkit-scrollbar { display: none; }
+  .frame { flex: 0 0 100%; scroll-snap-align: center; height: 100%; }
+  /* contain, not cover: this is a judgement of the work, so cropping it to fit would be
+     judging something the artist did not make. */
+  .frame img { width: 100%; height: 100%; object-fit: contain; display: block;
+               pointer-events: none; }
+
+  /* Three ways of saying the same thing, because "there is more to see" is the one thing a
+     reader must not miss: a count, dots, and arrows that are also the desktop way through.
+     All of them sit above the strip and swallow their own clicks, so none votes. */
+  .shot .count, .shot .dots, .shot .arrow, .shot .zoom {
+    position: absolute; z-index: 2; color: #fff; background: rgba(0,0,0,.45);
+    border: 0; border-radius: 999px; backdrop-filter: blur(2px); cursor: pointer;
+  }
+  .shot .count { top: 8px; left: 8px; padding: 3px 8px; font-size: 11px;
+                 font-variant-numeric: tabular-nums; cursor: default; }
+  .shot .zoom { top: 6px; right: 6px; width: 30px; height: 30px; font-size: 15px; line-height: 1; }
+  .shot .arrow { top: 50%; transform: translateY(-50%); width: 30px; height: 44px;
+                 border-radius: 8px; font-size: 20px; line-height: 1; }
+  .shot .arrow.prev { left: 6px; }
+  .shot .arrow.next { right: 6px; }
+  .shot .dots { left: 50%; transform: translateX(-50%); bottom: 8px; padding: 4px 7px;
+                display: flex; gap: 5px; background: rgba(0,0,0,.4); cursor: default; }
+  .shot .dots i { width: 6px; height: 6px; border-radius: 50%; background: rgba(255,255,255,.4); }
+  .shot .dots i.on { background: #fff; }
+
   .versus { text-align: center; color: var(--muted); font-size: 12px; margin: 2px 0 8px;
             letter-spacing: .08em; }
   .progress { height: 4px; background: rgba(128,128,128,.25); border-radius: 2px;
@@ -450,8 +535,14 @@ PAGE_HTML = """<!doctype html>
                   margin-bottom: 8px; }
   .go.danger { background: transparent; color: #e5534b; border: 1px solid #e5534b;
                margin-bottom: 8px; font-size: 13px; padding: 10px; font-weight: 500; }
+  /* "Назад" and "Ничья" share a line: neither is the thing to do, and stacking them full
+     width would make the bar read as three equal choices. */
+  .duo { display: flex; gap: 8px; }
+  .duo .go { flex: 1; }
   .status { font-size: 12px; color: var(--muted); text-align: center; min-height: 16px;
             margin-bottom: 8px; }
+  .notice { margin: 8px 12px 0; padding: 8px 10px; border-radius: 8px; font-size: 12px;
+            color: var(--muted); background: var(--card); text-align: center; }
 
   /* Moderation: the same three-column board v1 uses, so the two systems feel like one
      tool with two modes rather than two tools. */
@@ -490,6 +581,28 @@ PAGE_HTML = """<!doctype html>
   .table .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .table .num { text-align: right; font-variant-numeric: tabular-nums; }
   .table .num small { color: var(--muted); font-weight: 400; }
+
+  /* The zoom. Its own layer over everything, with the gesture handled by hand rather than
+     by the browser: native pinch and native scroll-snap want opposite touch-action values,
+     and the one thing that must never happen here is a pinch that ends up dismissing the
+     Mini App. */
+  .lb { position: fixed; inset: 0; z-index: 60; background: #000; display: flex; }
+  .lb .lbstrip { display: flex; width: 100%; height: 100%; touch-action: none;
+                 will-change: transform; }
+  .lb .lbframe { flex: 0 0 100%; height: 100%; display: flex; align-items: center;
+                 justify-content: center; overflow: hidden; }
+  .lb .lbframe img { max-width: 100%; max-height: 100%; object-fit: contain;
+                     transform-origin: center center; pointer-events: none;
+                     -webkit-user-select: none; user-select: none; }
+  .lb .close { position: absolute; z-index: 2; top: calc(10px + env(safe-area-inset-top));
+               right: 12px; width: 36px; height: 36px; border: 0; border-radius: 50%;
+               background: rgba(255,255,255,.15); color: #fff; font-size: 18px; cursor: pointer; }
+  .lb .lbcount { position: absolute; z-index: 2; top: calc(16px + env(safe-area-inset-top));
+                 left: 14px; color: rgba(255,255,255,.85); font-size: 12px;
+                 font-variant-numeric: tabular-nums; }
+  .lb .hint { position: absolute; z-index: 2; left: 0; right: 0;
+              bottom: calc(14px + env(safe-area-inset-bottom)); text-align: center;
+              color: rgba(255,255,255,.6); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -498,20 +611,36 @@ PAGE_HTML = """<!doctype html>
   <div class="sub" id="sub">Загружаю…</div>
 </header>
 <div class="progress" id="progress" hidden><span id="progressFill" style="width:0%"></span></div>
+<div class="notice" id="notice" hidden>Вы уже проголосовали.</div>
 
 <div class="duel" id="duel" hidden>
   <div class="card" id="left" data-side="left">
-    <div class="shot"><img id="leftImg" alt=""></div>
+    <div class="shot">
+      <div class="strip" id="leftStrip"></div>
+      <div class="count" id="leftCount" hidden></div>
+      <button class="zoom" data-zoom="left" aria-label="Увеличить">⛶</button>
+      <button class="arrow prev" data-nav="left:-1" aria-label="Предыдущее фото" hidden>‹</button>
+      <button class="arrow next" data-nav="left:1" aria-label="Следующее фото" hidden>›</button>
+      <div class="dots" id="leftDots" hidden></div>
+    </div>
     <div class="who" id="leftWho"></div>
   </div>
   <div class="versus">ПРОТИВ</div>
   <div class="card" id="right" data-side="right">
-    <div class="shot"><img id="rightImg" alt=""></div>
+    <div class="shot">
+      <div class="strip" id="rightStrip"></div>
+      <div class="count" id="rightCount" hidden></div>
+      <button class="zoom" data-zoom="right" aria-label="Увеличить">⛶</button>
+      <button class="arrow prev" data-nav="right:-1" aria-label="Предыдущее фото" hidden>‹</button>
+      <button class="arrow next" data-nav="right:1" aria-label="Следующее фото" hidden>›</button>
+      <div class="dots" id="rightDots" hidden></div>
+    </div>
     <div class="who" id="rightWho"></div>
   </div>
 </div>
 
 <div class="msg" id="msg" hidden></div>
+<div class="panel" id="top" hidden></div>
 
 <div class="panel" id="settings" hidden>
   <h2>Настройки арены</h2>
@@ -531,8 +660,18 @@ PAGE_HTML = """<!doctype html>
 <div class="bar" id="bar">
   <div class="status" id="status"></div>
   <button class="go danger" id="clear" hidden>🗑 Очистить арену</button>
-  <button class="go secondary" id="tie" hidden>Ничья</button>
+  <div class="duo" id="duo" hidden>
+    <button class="go secondary" id="back" disabled>← Назад</button>
+    <button class="go secondary" id="tie">Ничья</button>
+  </div>
   <button class="go" id="go" disabled>Загружаю…</button>
+</div>
+
+<div class="lb" id="lb" hidden>
+  <div class="lbstrip" id="lbStrip"></div>
+  <div class="lbcount" id="lbCount"></div>
+  <button class="close" id="lbClose" aria-label="Закрыть">✕</button>
+  <div class="hint">Двумя пальцами — приблизить · двойное касание — сброс</div>
 </div>
 
 <script>
@@ -563,38 +702,125 @@ function esc(s) {
 function who(work) { return work.username ? "@" + work.username : work.author; }
 function status(text) { $("status").textContent = text || ""; }
 
+/* ------------------------------- photos ------------------------------- */
+// A work is usually several pictures. The strip below is a plain scroller with snap points;
+// everything here only reads where it came to rest and says so out loud.
+
+const shown = { left: 0, right: 0 };   // which photo of that side is on screen
+const shots = { left: [], right: [] }; // the photo urls, kept for the zoom view
+
+function renderShot(side, work) {
+  const photos = work.photos || [];
+  shots[side] = photos;
+  shown[side] = 0;
+
+  const strip = $(side + "Strip");
+  strip.scrollLeft = 0;
+  strip.innerHTML = photos.length
+    ? photos.map((url) => '<div class="frame"><img loading="lazy" src="' + esc(url) + '" alt=""></div>').join("")
+    : '<div class="frame"></div>';
+
+  const many = photos.length > 1;
+  $(side + "Count").hidden = !many;
+  $(side + "Dots").hidden = !many;
+  for (const arrow of document.querySelectorAll('[data-nav^="' + side + ':"]')) arrow.hidden = !many;
+  if (many) {
+    $(side + "Dots").innerHTML = photos.map(() => "<i></i>").join("");
+  }
+  markShot(side);
+}
+
+function markShot(side) {
+  const total = shots[side].length;
+  if (total < 2) return;
+  $(side + "Count").textContent = (shown[side] + 1) + " / " + total;
+  const dots = $(side + "Dots").children;
+  for (let i = 0; i < dots.length; i++) dots[i].classList.toggle("on", i === shown[side]);
+}
+
+for (const side of ["left", "right"]) {
+  // Read from the scroller rather than tracked alongside it: the finger, the arrows and a
+  // trackpad all move the same scrollLeft, and only one of them goes through our code.
+  $(side + "Strip").addEventListener("scroll", () => {
+    const strip = $(side + "Strip");
+    const width = strip.clientWidth || 1;
+    const at = Math.max(0, Math.min(shots[side].length - 1, Math.round(strip.scrollLeft / width)));
+    if (at !== shown[side]) { shown[side] = at; markShot(side); }
+  }, { passive: true });
+}
+
+function scrollShot(side, delta) {
+  const strip = $(side + "Strip");
+  const total = shots[side].length;
+  const at = Math.max(0, Math.min(total - 1, shown[side] + delta));
+  strip.scrollTo({ left: at * strip.clientWidth, behavior: "smooth" });
+}
+
 /* ------------------------------- voting ------------------------------- */
 
 function showPair() {
   const pair = ballot && ballot.pair;
-  if (!pair) return showFinished();
+  if (!pair) return showFinished(false);
   $("duel").hidden = false;
   $("msg").hidden = true;
-  $("tie").hidden = false;
+  $("top").hidden = true;
+  $("notice").hidden = true;
+  $("duo").hidden = false;
   $("go").hidden = true;
   $("progress").hidden = false;
   $("progressFill").style.width = Math.round(100 * ballot.position / Math.max(1, ballot.total)) + "%";
   $("sub").textContent = "Пара " + (ballot.position + 1) + " из " + ballot.total + " · выбери, что нравится больше";
+  // Nothing to go back to on the first pair, and the button says so by being there and
+  // dead rather than by appearing and disappearing under the thumb.
+  $("back").disabled = ballot.position <= 0;
 
   for (const side of ["left", "right"]) {
     const work = pair[side];
-    $(side + "Img").src = work.photos[0] || "";
+    renderShot(side, work);
     $(side + "Who").textContent = who(work);
     $(side).classList.remove("chosen");
     $(side).dataset.entry = work.id;
   }
 }
 
-function showFinished() {
+// `already` separates the two ways of arriving here: having just finished, and opening the
+// arena again afterwards. The second is the one that needs telling.
+function showFinished(already) {
   $("duel").hidden = true;
-  $("tie").hidden = true;
+  $("duo").hidden = true;
   $("go").hidden = true;
   $("progress").hidden = false;
   $("progressFill").style.width = "100%";
   $("sub").textContent = "Готово";
+  $("notice").hidden = !already;
   $("msg").hidden = false;
-  $("msg").textContent =
-    "Спасибо, все пары пройдены. Результат считается по всем голосам сразу -- итоги объявит организатор.";
+  $("msg").textContent = already
+    ? "Твой бюллетень закрыт. Итоги объявит организатор."
+    : "Спасибо, все пары пройдены. Результат считается по всем голосам сразу -- итоги объявит организатор.";
+  loadTop();
+}
+
+// The table is only ever asked for once a ballot is closed -- see arena_web.handle_top. A
+// failure here is silent: the top is a courtesy, and an error under "спасибо" would read
+// as the vote having gone wrong.
+async function loadTop() {
+  try {
+    const response = await api("/api/top");
+    if (!response.ok) return;
+    const rows = (await response.json()).top || [];
+    if (!rows.length) return;
+    $("top").hidden = false;
+    $("top").innerHTML =
+      "<h2>Сейчас в лидерах</h2>" +
+      '<div class="table">' + rows.map((row, index) =>
+        '<span class="rank">' + (index + 1) + "</span>" +
+        (row.photo ? '<img class="mini" loading="lazy" src="' + esc(row.photo) + '" alt="">'
+                   : '<span class="mini"></span>') +
+        '<span class="name">' + esc(who(row)) + "</span>" +
+        '<span class="num">' + row.rating + " <small>очк.</small></span>"
+      ).join("") + "</div>" +
+      '<div class="sub">Счёт ещё уточняется, пока голосуют остальные.</div>';
+  } catch (e) { /* the vote is in; the table can wait */ }
 }
 
 // Optimistic: the next pair is drawn the moment you tap, and the server's answer only
@@ -622,14 +848,238 @@ async function sendPick(pick) {
   }
 }
 
+// Taking a pick back. The server refuses once the ballot is closed, so the button simply
+// stops mattering at the end -- there is nothing here that has to know that rule twice.
+async function sendUndo() {
+  if (sending || !ballot || !ballot.pair) return;
+  sending = true;
+  if (tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred("light");
+  try {
+    const response = await api("/api/undo", {
+      method: "POST", body: JSON.stringify({ init_data: initData }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.message || "не получилось");
+    ballot = data.ballot;
+    showPair();
+    status("");
+  } catch (e) {
+    status(String(e.message || e));
+  } finally {
+    sending = false;
+  }
+}
+
+// Choosing stays one tap on the work -- but a card is now also something you swipe through
+// and pinch, and neither of those may cast a vote. So the tap is measured from pointerdown
+// (the same rule vote_web.py's reel uses): the finger has to come back up near where it
+// went down, soon enough to be a tap. A gesture the browser took over is remembered as
+// cancelled rather than forgotten, or the click that still follows would read as a tap.
+const TAP_SLOP = 10;    // px of drift still read as a tap rather than a drag
+const TAP_MS = 600;     // longer is a press or a stalled scroll
+let cardTap = null;
+
 for (const side of ["left", "right"]) {
-  $(side).addEventListener("click", () => {
+  const card = $(side);
+  card.addEventListener("pointerdown", (event) => {
+    cardTap = { x: event.clientX, y: event.clientY, at: Date.now() };
+  });
+  card.addEventListener("pointercancel", () => { cardTap = { cancelled: true }; });
+  card.addEventListener("click", (event) => {
+    const start = cardTap;
+    cardTap = null;
+    // The arrows, the zoom and the dots live inside the card and are not votes.
+    if (event.target.closest("[data-nav], [data-zoom], .dots, .count")) return;
+    if (start) {
+      if (start.cancelled || Date.now() - start.at > TAP_MS) return;
+      if (Math.abs(event.clientX - start.x) > TAP_SLOP) return;
+      if (Math.abs(event.clientY - start.y) > TAP_SLOP) return;
+    }
     if (!ballot || !ballot.pair) return;
-    $(side).classList.add("chosen");
-    sendPick($(side).dataset.entry);
+    card.classList.add("chosen");
+    sendPick(card.dataset.entry);
   });
 }
+
 $("tie").addEventListener("click", () => sendPick("tie"));
+$("back").addEventListener("click", sendUndo);
+
+document.addEventListener("click", (event) => {
+  const arrow = event.target.closest("[data-nav]");
+  if (arrow) {
+    const [side, delta] = arrow.dataset.nav.split(":");
+    scrollShot(side, Number(delta));
+    return;
+  }
+  const zoom = event.target.closest("[data-zoom]");
+  if (zoom) openLightbox(zoom.dataset.zoom);
+});
+
+/* -------------------------------- zoom -------------------------------- */
+// Handled by hand, not by the browser: native pinch-zoom and native scroll-snap want
+// opposite touch-action values, and an unhandled pinch inside a Mini App can end up
+// dragging the whole app down instead of magnifying anything.
+
+const lb = { photos: [], index: 0, scale: 1, x: 0, y: 0, dragging: 0 };
+const touching = new Map();   // live pointers, by id
+let pinch = null;             // {gap, scale} at the moment the second finger landed
+let drag = null;              // {x, y, ox, oy} since the finger went down
+let lastTap = 0;
+
+function lbImage() { return $("lbStrip").children[lb.index].firstElementChild; }
+
+function openLightbox(side) {
+  if (!shots[side].length) return;
+  lb.photos = shots[side];
+  lb.index = shown[side];
+  lb.scale = 1; lb.x = 0; lb.y = 0; lb.dragging = 0;
+  $("lbStrip").innerHTML = lb.photos
+    .map((url) => '<div class="lbframe"><img src="' + esc(url) + '" alt=""></div>').join("");
+  $("lb").hidden = false;
+  // Telegram's own swipe-down would otherwise close the app halfway through a pan.
+  if (tg && tg.disableVerticalSwipes) tg.disableVerticalSwipes();
+  drawLightbox(false);
+}
+
+function closeLightbox() {
+  $("lb").hidden = true;
+  $("lbStrip").innerHTML = "";
+  touching.clear(); pinch = null; drag = null;
+  if (tg && tg.enableVerticalSwipes) tg.enableVerticalSwipes();
+}
+
+function drawLightbox(animate) {
+  const strip = $("lbStrip");
+  strip.style.transition = animate ? "transform .2s ease" : "none";
+  strip.style.transform =
+    "translateX(" + (-lb.index * strip.clientWidth + lb.dragging) + "px)";
+  const image = lbImage();
+  if (image) {
+    image.style.transform =
+      "translate(" + lb.x + "px," + lb.y + "px) scale(" + lb.scale + ")";
+  }
+  $("lbCount").textContent =
+    lb.photos.length > 1 ? (lb.index + 1) + " / " + lb.photos.length : "";
+}
+
+// How far the picture may be pushed before its edge comes inside the screen. Measured off
+// the drawn box (object-fit: contain leaves letterboxing that is not part of the picture),
+// so a portrait photo cannot be dragged sideways into empty black.
+function panLimits() {
+  const image = lbImage();
+  const frame = $("lbStrip");
+  if (!image) return { x: 0, y: 0 };
+  const width = image.clientWidth * lb.scale, height = image.clientHeight * lb.scale;
+  return {
+    x: Math.max(0, (width - frame.clientWidth) / 2),
+    y: Math.max(0, (height - frame.clientHeight) / 2),
+  };
+}
+
+function clampPan() {
+  const limit = panLimits();
+  lb.x = Math.max(-limit.x, Math.min(limit.x, lb.x));
+  lb.y = Math.max(-limit.y, Math.min(limit.y, lb.y));
+}
+
+function setScale(next, animate) {
+  lb.scale = Math.max(1, Math.min(6, next));
+  if (lb.scale === 1) { lb.x = 0; lb.y = 0; } else clampPan();
+  drawLightbox(animate);
+}
+
+function gap() {
+  const [a, b] = [...touching.values()];
+  return Math.hypot(a.x - b.x, a.y - b.y) || 1;
+}
+
+$("lbStrip").addEventListener("pointerdown", (event) => {
+  $("lbStrip").setPointerCapture(event.pointerId);
+  touching.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  if (touching.size === 2) {
+    pinch = { gap: gap(), scale: lb.scale };
+    drag = null;
+  } else if (touching.size === 1) {
+    drag = { x: event.clientX, y: event.clientY, ox: lb.x, oy: lb.y };
+  }
+});
+
+$("lbStrip").addEventListener("pointermove", (event) => {
+  if (!touching.has(event.pointerId)) return;
+  touching.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+  if (pinch && touching.size === 2) {
+    setScale(pinch.scale * (gap() / pinch.gap), false);
+    return;
+  }
+  if (!drag || touching.size !== 1) return;
+  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+  if (lb.scale > 1) {
+    // Zoomed in, one finger moves the picture.
+    lb.x = drag.ox + dx; lb.y = drag.oy + dy;
+    clampPan();
+  } else {
+    // At rest, the same finger turns the page instead.
+    lb.dragging = dx;
+  }
+  drawLightbox(false);
+});
+
+function endPointer(event) {
+  touching.delete(event.pointerId);
+  if (touching.size < 2) pinch = null;
+  if (touching.size === 1) {
+    // One finger left of a pinch keeps going as a pan, measured from where it is now --
+    // otherwise letting go of one finger freezes the picture until both come off.
+    const [remaining] = [...touching.values()];
+    drag = { x: remaining.x, y: remaining.y, ox: lb.x, oy: lb.y };
+  }
+  if (touching.size > 0) return;
+
+  if (drag && lb.scale === 1) {
+    const moved = lb.dragging;
+    lb.dragging = 0;
+    // A quarter of the screen commits to the next picture; anything less springs back.
+    if (Math.abs(moved) > $("lbStrip").clientWidth / 4) {
+      const next = lb.index + (moved < 0 ? 1 : -1);
+      if (next >= 0 && next < lb.photos.length) { lb.index = next; lb.x = 0; lb.y = 0; }
+    }
+    drawLightbox(true);
+  }
+  drag = null;
+}
+
+$("lbStrip").addEventListener("pointerup", (event) => {
+  const start = drag;
+  const still = start && Math.abs(event.clientX - start.x) < TAP_SLOP
+                      && Math.abs(event.clientY - start.y) < TAP_SLOP;
+  endPointer(event);
+  if (!still) { lastTap = 0; return; }
+  const now = Date.now();
+  // Double tap: in to a fixed 2.5x on the first, all the way back out on the next.
+  if (now - lastTap < 300) { setScale(lb.scale > 1 ? 1 : 2.5, true); lastTap = 0; }
+  else lastTap = now;
+});
+$("lbStrip").addEventListener("pointercancel", endPointer);
+
+// A trackpad and a mouse wheel are the desktop's pinch.
+$("lbStrip").addEventListener("wheel", (event) => {
+  event.preventDefault();
+  setScale(lb.scale * (event.deltaY < 0 ? 1.12 : 1 / 1.12), false);
+}, { passive: false });
+
+$("lbClose").addEventListener("click", closeLightbox);
+document.addEventListener("keydown", (event) => {
+  if ($("lb").hidden) return;
+  if (event.key === "Escape") closeLightbox();
+  if (event.key === "ArrowRight" && lb.index < lb.photos.length - 1) {
+    lb.index += 1; lb.x = 0; lb.y = 0; setScale(1, true);
+  }
+  if (event.key === "ArrowLeft" && lb.index > 0) {
+    lb.index -= 1; lb.x = 0; lb.y = 0; setScale(1, true);
+  }
+});
+window.addEventListener("resize", () => { if (!$("lb").hidden) drawLightbox(false); });
 
 async function startSession() {
   const response = await api("/api/session", {
@@ -637,8 +1087,11 @@ async function startSession() {
   });
   const data = await response.json();
   if (!response.ok) {
+    // A ballot that closed since this page loaded (a second tab, a slow tap) is not an
+    // error to report -- it is the finished screen, arrived at the long way round.
+    if (data.error === "ALREADY_VOTED") return showFinished(true);
     $("duel").hidden = true;
-    $("tie").hidden = true;
+    $("duo").hidden = true;
     $("go").hidden = true;
     $("msg").hidden = false;
     $("msg").textContent = data.message || "не получилось начать";
@@ -778,8 +1231,10 @@ async function load() {
       // after every save, and a moderator who had a duel on screen would otherwise keep it
       // underneath the moderation board.
       $("duel").hidden = true;
-      $("tie").hidden = true;
+      $("duo").hidden = true;
       $("progress").hidden = true;
+      $("notice").hidden = true;
+      $("top").hidden = true;
       $("settings").hidden = false;
       $("pairsPerVoter").value = state.pairs_per_voter;
       $("pairing").value = state.pairing;
@@ -804,6 +1259,13 @@ async function load() {
     }
     $("go").hidden = true;
     if (state.can_moderate) $("sub").textContent = "модерация: /arena выбрать";
+    // Somebody coming back to a ballot they already closed is told so, and shown the top of
+    // the table -- asked for a session they would get a 409 and read it as a fault.
+    if (state.ballot && state.ballot.status === "done") {
+      ballot = state.ballot;
+      showFinished(true);
+      return;
+    }
     await startSession();
   } catch (e) {
     $("sub").textContent = "";
