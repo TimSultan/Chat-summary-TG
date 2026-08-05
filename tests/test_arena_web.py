@@ -123,6 +123,28 @@ class ArenaApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("telegram-web-app.js", await response.text())
 
+    async def test_a_duel_offers_a_way_back_and_no_way_to_call_it_level(self):
+        """A duel asks which is better; "Ничья" made not choosing the easiest answer on
+        the screen, and a ballot of ties says nothing. Going back replaces it."""
+        page = await (await self.client.get(arena_web.ROUTE_PREFIX)).text()
+        self.assertNotIn("Ничья", page)
+        self.assertIn("Назад", page)
+
+    async def test_a_tie_already_cast_is_still_accepted_and_still_counts(self):
+        """The button is gone, not the pick: ballots cast before it went away name TIE, and
+        refusing it now would make an old ballot unreadable rather than merely old."""
+        self._seed(pairs=2)
+        await self.client.post(
+            arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(self.voter_id)}
+        )
+        response = await self.client.post(arena_web.ROUTE_PREFIX + "/api/pick", json={
+            "init_data": _init_data(self.voter_id), "position": 0, "pick": "tie",
+        })
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            arena.load_tournament(CHAT, TID).ballots[str(self.voter_id)].picks, ["tie"]
+        )
+
     # ---- voting --------------------------------------------------------------------
 
     async def test_opening_the_arena_does_not_create_a_ballot(self):

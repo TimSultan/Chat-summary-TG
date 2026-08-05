@@ -260,6 +260,68 @@ class DestinationCallbackTests(unittest.TestCase):
         self.assertEqual(api.posts_to(MAIN_CHAT_ID), [])
 
 
+class ArenaAnnouncementTests(unittest.TestCase):
+    """The arena drafts its announcement through this same flow, tagged "arena". Only the
+    button changes -- and it has to, or a duel announcement would send everybody to v1."""
+
+    def _arena_flow(self):
+        flow = _flow(text="Открылась арена")
+        flow["system"] = "arena"
+        return flow
+
+    def _tap(self, destination, flows, cfg=None):
+        api = FakeApi()
+        with patch.object(bot_listener, "_can_manage_chat", _AlwaysAdmin(True)):
+            _run(bot_listener.handle_vote_chat_destination_callback(
+                api, cfg or _cfg(), _press(destination, "f1"), flows, BOT, log=lambda *_: None,
+            ))
+        return api
+
+    def test_the_posted_button_opens_the_arena_not_v1(self):
+        api = self._tap("main", {"f1": self._arena_flow()})
+        posted = api.posts_to(MAIN_CHAT_ID)[0]
+        self.assertEqual(posted["text"], "Открылась арена")
+        button = posted["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["text"], bot_listener.ARENA_OPEN_BUTTON_TEXT)
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=arena")
+
+    def test_a_v1_short_name_does_not_hijack_the_arenas_button(self):
+        api = self._tap("main", {"f1": self._arena_flow()}, cfg=_cfg(short_name="vote"))
+        button = api.posts_to(MAIN_CHAT_ID)[0]["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=arena")
+
+    def test_it_reaches_both_groups_like_v1s_does(self):
+        api = self._tap("both", {"f1": self._arena_flow()})
+        self.assertEqual(len(api.posts_to(MAIN_CHAT_ID)), 1)
+        self.assertEqual(len(api.posts_to(EXTRA_CHAT)), 1)
+
+    def test_the_button_stays_a_plain_url_in_a_group(self):
+        api = self._tap("main", {"f1": self._arena_flow()})
+        self.assertNotIn(
+            "web_app", api.posts_to(MAIN_CHAT_ID)[0]["reply_markup"]["inline_keyboard"][0][0]
+        )
+
+    def test_a_flow_written_before_the_arena_existed_still_means_v1(self):
+        """Untagged drafts predate the field; they are v1's, and must keep behaving so."""
+        flow = _flow()
+        flow.pop("system", None)
+        api = self._tap("main", {"f1": flow})
+        button = api.posts_to(MAIN_CHAT_ID)[0]["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=vote")
+
+    def test_the_text_step_asks_where_it_goes_the_same_way(self):
+        api = FakeApi()
+        flows = {"f1": self._arena_flow()}
+        with patch.object(bot_listener, "_can_manage_chat", _AlwaysAdmin(True)):
+            handled = _run(bot_listener.handle_vote_chat_text_input(
+                api, _cfg(), _reply_message("Текст про арену"), flows, log=lambda *_: None,
+            ))
+        self.assertTrue(handled)
+        self.assertIn("Куда отправить объявление", api.sent[0]["text"])
+        self.assertEqual(flows["f1"]["text"], "Текст про арену")
+        self.assertEqual(flows["f1"]["system"], "arena")
+
+
 class DestinationCallbackDataTests(unittest.TestCase):
     def test_data_round_trips(self):
         data = bot_listener._vote_chat_dest_callback_data("both", "abc123")

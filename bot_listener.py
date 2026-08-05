@@ -247,12 +247,18 @@ ARENA_MODERATE_WORDS = frozenset({"выбрать", "модерация", "moder
 ARENA_IMPORT_WORDS = frozenset({"импорт", "import", "изv1", "изv1"})
 ARENA_RESULTS_WORDS = frozenset({"итоги", "результаты", "standings", "results"})
 ARENA_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
+# "/arena chat" -- the arena's own announcement, drafted and posted through the SAME flow
+# v1's uses (vote_chat_flows, tagged with which system asked for it). The two systems keep
+# their data apart; a composer that asks for a line of text and offers two groups to post
+# it into is not either system's data, and two copies of it would drift.
+ARENA_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
 ARENA_OPEN_BUTTON_TEXT = "⚔️ Открыть арену"
 # Buttons on the /arena status message, same synthetic-message trick as VOTE_ACTIONS.
 ARENA_ACTION_CALLBACK_PREFIX = "arenaaction"
 ARENA_ACTIONS = {
     "collect": "/arena собрать",
     "import": "/arena импорт",
+    "chat": "/arena chat",
     "results": "/arena итоги",
     "clear": "/arena очистить",
 }
@@ -3761,6 +3767,73 @@ def _arena_page_url(cfg) -> str | None:
     return f"{cfg.webapp_public_url}{arena_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
 
 
+def _arena_group_button_url(cfg, bot_username: str | None) -> str | None:
+    """What the arena button links to in a message that lands in a GROUP -- the same
+    constraint as v1's (a web_app button is private-chat only), and the same deep link the
+    group /arena reply already leaves behind.
+
+    No Direct Link Mini App branch, unlike _vote_group_button_url: a short name is
+    registered against ONE url in BotFather, VOTE_MINIAPP_SHORT_NAME points at v1's page,
+    and sending arena voters there with ?startapp=arena would open the wrong ballot.
+    """
+    return f"https://t.me/{bot_username}?start=arena" if bot_username else None
+
+
+def _announce_button(cfg, bot_username: str | None, system: str) -> dict | None:
+    """The one button an announcement carries into a group, for whichever system drafted
+    it. None when the link cannot be built (an unknown bot username), which every caller
+    reports rather than posting a message whose only promise is a button that isn't there.
+    """
+    if system == "arena":
+        url = _arena_group_button_url(cfg, bot_username)
+        return {"text": ARENA_OPEN_BUTTON_TEXT, "url": url} if url else None
+    url = _vote_group_button_url(cfg, bot_username)
+    return {"text": VOTE_OPEN_BUTTON_TEXT, "url": url} if url else None
+
+
+async def _start_announcement_draft(
+    vote_chat_flows: dict[str, dict] | None,
+    reply,
+    telethon_client,
+    chat_id,
+    user: dict,
+    entry: str,
+    system: str,
+    prompt_text: str,
+    log=print,
+) -> None:
+    """Open the force-reply draft an announcement starts as -- for "/vote chat" and for
+    "/arena chat" alike, tagged with which of them asked.
+
+    One pending draft per (chat, admin), across BOTH systems on purpose: they share the
+    prompt convention, so two live drafts would both be waiting on a reply to a message and
+    the wrong one could swallow it. Starting a second abandons the first rather than
+    accumulating flows nobody will ever answer.
+    """
+    if vote_chat_flows is None:
+        await reply("Не получилось открыть черновик объявления -- попробуй ещё раз.")
+        return
+    for old_flow_id, old_flow in list(vote_chat_flows.items()):
+        if old_flow.get("chat_id") == chat_id and old_flow.get("user_id") == user.get("id"):
+            vote_chat_flows.pop(old_flow_id, None)
+    prompt = await reply(prompt_text, reply_markup={"force_reply": True, "selective": True})
+    if prompt is None:
+        return
+    vote_chat_flows[uuid.uuid4().hex[:10]] = {
+        "chat_id": chat_id,
+        "user_id": user.get("id"),
+        "entry": entry,
+        "system": system,
+        # Resolved again (require_admin_in_dm's own lookup isn't exposed) so the consuming
+        # side (handle_vote_chat_text_input) can re-check admin status without needing the
+        # Telethon client at all -- the same "store what you'll need to re-verify"
+        # convention badge_flows/cabinet_flows already follow.
+        "admin_chat_id": await _resolve_chat_id(telethon_client, entry, {}, log=log),
+        "prompt_message_id": prompt.get("message_id"),
+        "created_at": time.monotonic(),
+    }
+
+
 def _arena_status_text(entry: str) -> str:
     """The arena's own status block for its /arena menu -- deliberately NOT v1's numbers.
     Two systems reporting one another's progress is how somebody ends up announcing the
@@ -3825,6 +3898,7 @@ async def handle_arena_action_callback(
     entry: str | None,
     bot_username: str | None,
     background_tasks: set,
+    vote_chat_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """The /arena menu's buttons, built the same way v1's are: the tap is answered first,
@@ -3853,7 +3927,7 @@ async def handle_arena_action_callback(
     task = asyncio.create_task(
         handle_arena_command(
             api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
-            background_tasks, log=log,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
         )
     )
     background_tasks.add(task)
@@ -3870,6 +3944,7 @@ async def handle_arena_command(
     bot_username: str | None,
     background_tasks: set,
     log=print,
+    vote_chat_flows: dict[str, dict] | None = None,
 ) -> None:
     """/arena -- the second voting system, with the same shape as /vote so an admin who
     knows one knows the other:
@@ -3882,10 +3957,14 @@ async def handle_arena_command(
       system's moderation is its own.
     - "/arena выбрать" (DM, admin) opens the arena's moderation screen: admit works, set
       pairs per voter and the pairing mode, open or close it.
+    - "/arena chat" (DM, admin) drafts an announcement for the group with the arena's own
+      button on it, through the same composer "/vote chat" uses (see
+      _start_announcement_draft) -- tagged "arena", so the button leads here and not to v1.
     - "/arena итоги" (DM, admin) prints the fitted table.
     - "/arena очистить" (DM, admin) deletes the arena and nothing else.
     - bare "/arena" opens the duels for everyone, and is the status/control panel for an
-      administrator.
+      administrator. A voter who is not one gets a single button and no panel: every other
+      button here is an administrator's, and one they cannot use is one that only lies.
     """
     chat = message["chat"]
     chat_id = chat["id"]
@@ -3921,6 +4000,7 @@ async def handle_arena_command(
     wants_import = normalized in ARENA_IMPORT_WORDS
     wants_results = normalized in ARENA_RESULTS_WORDS
     wants_clear = normalized in ARENA_CLEAR_WORDS
+    wants_chat = normalized in ARENA_CHAT_WORDS
 
     async def require_admin_in_dm(denial: str) -> bool:
         if not is_private:
@@ -4043,6 +4123,16 @@ async def handle_arena_command(
         await reply("\n".join(lines))
         return
 
+    if wants_chat:
+        if not await require_admin_in_dm("Готовить объявление могут только администраторы."):
+            return
+        await _start_announcement_draft(
+            vote_chat_flows, reply, telethon_client, chat_id, user, entry, "arena",
+            "Какой текст написать в объявлении об арене? Ответь на это сообщение.",
+            log=log,
+        )
+        return
+
     if wants_clear:
         if not await require_admin_in_dm("Очищать арену могут только администраторы."):
             return
@@ -4078,12 +4168,19 @@ async def handle_arena_command(
                         {"text": "⬇️ Взять из v1", "callback_data": _arena_action_callback_data("import", chat_id, admin_user_id)},
                     ],
                     [
+                        {"text": "📣 Объявление", "callback_data": _arena_action_callback_data("chat", chat_id, admin_user_id)},
                         {"text": "📊 Рейтинг", "callback_data": _arena_action_callback_data("results", chat_id, admin_user_id)},
+                    ],
+                    [
                         {"text": "🗑 Очистить", "callback_data": _arena_action_callback_data("clear", chat_id, admin_user_id)},
                     ],
                 ]},
             )
         else:
+            # Everything else on the panel above is an administrator's, and each one is
+            # refused twice over (the callback is bound to one user id, and the command it
+            # replays re-checks admin status). So a voter is shown none of them rather than
+            # buttons that exist only to say no.
             await reply(
                 "Арена: сравни работы попарно.",
                 reply_markup={"inline_keyboard": [[{"text": ARENA_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
@@ -4091,7 +4188,7 @@ async def handle_arena_command(
         return
 
     # In a group a web_app button is not allowed, so the same deep link v1 uses.
-    url = f"https://t.me/{bot_username}?start=arena" if bot_username else None
+    url = _arena_group_button_url(cfg, bot_username)
     await reply(
         "Арена открывается в личке с ботом:",
         reply_markup=({"inline_keyboard": [[{"text": ARENA_OPEN_BUTTON_TEXT, "url": url}]]} if url else None),
@@ -4324,34 +4421,11 @@ async def handle_vote_command(
     if wants_chat:
         if not await require_admin_in_dm("Готовить объявление могут только администраторы."):
             return
-        if vote_chat_flows is None:
-            await reply("Не получилось открыть черновик объявления -- попробуй ещё раз.")
-            return
-        # One pending draft per (chat, admin) at a time -- starting a new one abandons
-        # whatever text prompt was already waiting, rather than accumulating stale flows
-        # nobody will ever reply to.
-        for old_flow_id, old_flow in list(vote_chat_flows.items()):
-            if old_flow.get("chat_id") == chat_id and old_flow.get("user_id") == user.get("id"):
-                vote_chat_flows.pop(old_flow_id, None)
-        flow_id = uuid.uuid4().hex[:10]
-        prompt = await reply(
+        await _start_announcement_draft(
+            vote_chat_flows, reply, telethon_client, chat_id, user, entry, "vote",
             "Какой текст написать в объявлении о голосовании? Ответь на это сообщение.",
-            reply_markup={"force_reply": True, "selective": True},
+            log=log,
         )
-        if prompt is None:
-            return
-        vote_chat_flows[flow_id] = {
-            "chat_id": chat_id,
-            "user_id": user.get("id"),
-            "entry": entry,
-            # Resolved again (require_admin_in_dm's own lookup isn't exposed) so the
-            # consuming side (handle_vote_chat_text_input) can re-check admin status
-            # without needing the Telethon client at all -- same "store what you'll need
-            # to re-verify" convention badge_flows/cabinet_flows already follow.
-            "admin_chat_id": await _resolve_chat_id(telethon_client, entry, {}, log=log),
-            "prompt_message_id": prompt.get("message_id") if prompt else None,
-            "created_at": time.monotonic(),
-        }
         return
 
     if wants_carryover:
@@ -4560,10 +4634,15 @@ async def handle_vote_chat_text_input(
         )
         return True
 
-    if not _vote_page_url(cfg):
+    # Which system asked for the draft decides where its button goes; "vote" is the default
+    # so a flow written before the arena existed still means what it did.
+    system = flow.get("system") or "vote"
+    if not (_arena_page_url(cfg) if system == "arena" else _vote_page_url(cfg)):
         vote_chat_flows.pop(flow_id, None)
         await api.send_message(
-            chat_id, "Голосование не настроено -- некуда вести кнопку.",
+            chat_id,
+            "Арена не настроена -- некуда вести кнопку." if system == "arena"
+            else "Голосование не настроено -- некуда вести кнопку.",
             reply_to_message_id=message["message_id"], parse_mode=None,
         )
         return True
@@ -4678,13 +4757,13 @@ async def handle_vote_chat_destination_callback(
         await report("Публиковать объявление могут только администраторы.")
         return
 
-    button_url = _vote_group_button_url(cfg, bot_username)
-    if not button_url:
-        await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
-        return
     # A url button, never web_app: every destination here is a group, and Telegram accepts
     # a web_app button only in a private chat (see _vote_group_button_url).
-    keyboard = {"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "url": button_url}]]}
+    button = _announce_button(cfg, bot_username, flow.get("system") or "vote")
+    if button is None:
+        await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
+        return
+    keyboard = {"inline_keyboard": [[button]]}
 
     targets: list[tuple[str, object]] = []
     if destination in ("main", "both"):
@@ -5493,7 +5572,7 @@ async def _dispatch_update(
         elif callback_data.startswith(f"{ARENA_ACTION_CALLBACK_PREFIX}:"):
             await handle_arena_action_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
-                background_tasks, log=log,
+                background_tasks, vote_chat_flows, log=log,
             )
         elif callback_data.startswith(f"{VOTE_ACTION_CALLBACK_PREFIX}:"):
             await handle_vote_action_callback(
@@ -5553,7 +5632,7 @@ async def _dispatch_update(
             await handle_arena_command(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
-                background_tasks, log=log,
+                background_tasks, log=log, vote_chat_flows=vote_chat_flows,
             )
             return
         if start_payload in ("vote", "vote_admin", "vote_clear", "vote_chat", "vote_image"):
@@ -5799,7 +5878,7 @@ async def _dispatch_update(
         task = asyncio.create_task(
             handle_arena_command(
                 api, telethon_client, cfg, tz, message, arena_entry, bot_username,
-                background_tasks, log=log,
+                background_tasks, log=log, vote_chat_flows=vote_chat_flows,
             )
         )
         background_tasks.add(task)

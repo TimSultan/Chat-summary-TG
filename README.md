@@ -796,10 +796,16 @@ be created by hand once, pointing at `WEBAPP_PUBLIC_URL` + `/vote`).
 
 A **separate** system, not a replacement: `/vote` keeps working exactly as it did, and both
 can run in the same week. Instead of a grid where you tick favourites, the arena shows
-**two works at a time** and asks which is better — ten duels per voter by default, a "Ничья"
-button for when they are level. `arena_core.py` (pure logic), `arena.py` (storage and
-session rules), `arena_web.py` (its own Mini App at `/arena`, mounted onto the same server
-v1 uses via `create_app(..., attach=...)`).
+**two works at a time** and asks which is better — ten duels per voter by default.
+`arena_core.py` (pure logic), `arena.py` (storage and session rules), `arena_web.py` (its
+own Mini App at `/arena`, mounted onto the same server v1 uses via
+`create_app(..., attach=...)`).
+
+There is **no "Ничья" button**: it made not choosing the easiest answer on the screen, and a
+ballot of ties says nothing. A tie is still a legal *pick* — `record_pick` accepts `TIE` and
+`compute_standings` scores it half a point each — because ballots cast while the button
+existed name it, and refusing it now would make an old ballot unreadable rather than merely
+old.
 
 The logic is a Python port of the reference implementation in [`import/`](import/) — same
 pairing, same ranking, same rules — with one substitution: that module identifies a voter
@@ -850,10 +856,33 @@ avoid, but behind a closed ballot it can no longer reach any of their picks.
 Commands mirror `/vote` so knowing one is knowing the other — `/arena` (duels, plus a
 status panel for an administrator), `/arena выбрать` (moderation: admit works, pairs per
 voter, pairing mode, open/closed), `/arena собрать` (scan `#итогинедели` into the arena's
-**own** store and media), `/arena итоги` (the table), `/arena очистить` (delete the arena
-and nothing else). `/vote2` and `/арена` are accepted spellings.
+**own** store and media), `/arena chat` (draft an announcement for the group), `/arena итоги`
+(the table), `/arena очистить` (delete the arena and nothing else). `/vote2` and `/арена` are
+accepted spellings.
 
-**What the two systems share is a process, a port and the admin/membership checks.**
+**What a plain voter sees is one button.** Bare `/arena` in a DM gives an administrator the
+status panel — standings, «Открыть арену», «Модерация», «Собрать», «Взять из v1»,
+«Объявление», «Рейтинг», «Очистить» — and gives everybody else «Открыть арену» and nothing
+else: no callback buttons, no `?mode=admin` link, not even the top three from the status
+block (which is exactly what the Mini App withholds until you have finished voting). The
+admin actions are refused twice over anyway — each callback is bound to the one user id it
+was built for, and the command it replays re-checks admin status — but a button that only
+ever answers "не для тебя" reads as a permission the reader has, so it is not shown at all.
+Administrator here means a Telegram admin of the home chat, a runtime delegate, or a
+`PRIVILEGED_MANAGEMENT_USERNAMES` name, the same gate the rest of this file uses. In a
+group, everybody (administrators included) gets the same `?start=arena` deep link, since a
+`web_app` button is private-chat only.
+
+`/arena chat` reuses **v1's announcement composer** rather than growing a second one: the
+draft is parked in the same `vote_chat_flows` dict, tagged `system: "arena"`, and only the
+button on the finished post differs (`_announce_button`). One pending draft per admin across
+both systems — they share the force-reply convention, so two live drafts would both be
+waiting on a reply and the wrong one could swallow it. An untagged flow still means v1. The
+arena's button is always the `?start=arena` deep link and never `VOTE_MINIAPP_SHORT_NAME`: a
+Direct Link short name is registered against one url in BotFather, and that one is v1's page.
+
+**What the two systems share is a process, a port, the admin/membership checks and the
+announcement composer.**
 Separate directory (`DATA_DIR/arena`), separate files, separate photos, separate
 moderation, separate commands. `/arena импорт` is the only bridge and it runs one way, on
 demand, **by copying**: it takes the works v1 has *admitted* into the arena (with their

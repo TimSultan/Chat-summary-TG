@@ -535,10 +535,6 @@ PAGE_HTML = """<!doctype html>
                   margin-bottom: 8px; }
   .go.danger { background: transparent; color: #e5534b; border: 1px solid #e5534b;
                margin-bottom: 8px; font-size: 13px; padding: 10px; font-weight: 500; }
-  /* "Назад" and "Ничья" share a line: neither is the thing to do, and stacking them full
-     width would make the bar read as three equal choices. */
-  .duo { display: flex; gap: 8px; }
-  .duo .go { flex: 1; }
   .status { font-size: 12px; color: var(--muted); text-align: center; min-height: 16px;
             margin-bottom: 8px; }
   .notice { margin: 8px 12px 0; padding: 8px 10px; border-radius: 8px; font-size: 12px;
@@ -660,10 +656,7 @@ PAGE_HTML = """<!doctype html>
 <div class="bar" id="bar">
   <div class="status" id="status"></div>
   <button class="go danger" id="clear" hidden>🗑 Очистить арену</button>
-  <div class="duo" id="duo" hidden>
-    <button class="go secondary" id="back" disabled>← Назад</button>
-    <button class="go secondary" id="tie">Ничья</button>
-  </div>
+  <button class="go secondary" id="back" hidden disabled>← Назад</button>
   <button class="go" id="go" disabled>Загружаю…</button>
 </div>
 
@@ -765,7 +758,7 @@ function showPair() {
   $("msg").hidden = true;
   $("top").hidden = true;
   $("notice").hidden = true;
-  $("duo").hidden = false;
+  $("back").hidden = false;
   $("go").hidden = true;
   $("progress").hidden = false;
   $("progressFill").style.width = Math.round(100 * ballot.position / Math.max(1, ballot.total)) + "%";
@@ -787,7 +780,7 @@ function showPair() {
 // arena again afterwards. The second is the one that needs telling.
 function showFinished(already) {
   $("duel").hidden = true;
-  $("duo").hidden = true;
+  $("back").hidden = true;
   $("go").hidden = true;
   $("progress").hidden = false;
   $("progressFill").style.width = "100%";
@@ -901,7 +894,6 @@ for (const side of ["left", "right"]) {
   });
 }
 
-$("tie").addEventListener("click", () => sendPick("tie"));
 $("back").addEventListener("click", sendUndo);
 
 document.addEventListener("click", (event) => {
@@ -1091,7 +1083,7 @@ async function startSession() {
     // error to report -- it is the finished screen, arrived at the long way round.
     if (data.error === "ALREADY_VOTED") return showFinished(true);
     $("duel").hidden = true;
-    $("duo").hidden = true;
+    $("back").hidden = true;
     $("go").hidden = true;
     $("msg").hidden = false;
     $("msg").textContent = data.message || "не получилось начать";
@@ -1231,7 +1223,7 @@ async function load() {
       // after every save, and a moderator who had a duel on screen would otherwise keep it
       // underneath the moderation board.
       $("duel").hidden = true;
-      $("duo").hidden = true;
+      $("back").hidden = true;
       $("progress").hidden = true;
       $("notice").hidden = true;
       $("top").hidden = true;
