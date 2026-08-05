@@ -59,6 +59,9 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 from telethon import utils as tl_utils
 
+import arena
+import arena_core
+import arena_web
 import cabinet
 import button_builder
 import economy
@@ -232,6 +235,28 @@ VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "cancel")
 # очистить -- unlike "Открыть голосование"/"Модерация", those are bot ACTIONS, not Mini
 # App pages, so they can't be a web_app button; tapping one runs the exact same code path
 # as typing the command (see handle_vote_action_callback), just via a synthetic message.
+# ---------------------------------------------------------------- the arena (v2)
+#
+# The second voting system: head-to-head duels instead of a grid ballot (arena.py,
+# arena_core.py, arena_web.py). It shares this file's admin/membership checks and the web
+# server's port, and NOTHING else -- separate storage, separate media, separate moderation,
+# separate commands. Both can run in the same week; neither can break the other.
+ARENA_COMMANDS = ("/arena", "/арена", "/vote2")
+ARENA_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
+ARENA_MODERATE_WORDS = frozenset({"выбрать", "модерация", "moderate", "admin"})
+ARENA_IMPORT_WORDS = frozenset({"импорт", "import", "изv1", "изv1"})
+ARENA_RESULTS_WORDS = frozenset({"итоги", "результаты", "standings", "results"})
+ARENA_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
+ARENA_OPEN_BUTTON_TEXT = "⚔️ Открыть арену"
+# Buttons on the /arena status message, same synthetic-message trick as VOTE_ACTIONS.
+ARENA_ACTION_CALLBACK_PREFIX = "arenaaction"
+ARENA_ACTIONS = {
+    "collect": "/arena собрать",
+    "import": "/arena импорт",
+    "results": "/arena итоги",
+    "clear": "/arena очистить",
+}
+
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
     "collect": "/vote собрать",
@@ -3732,6 +3757,352 @@ async def handle_vote_action_callback(
     task.add_done_callback(background_tasks.discard)
 
 
+def _arena_page_url(cfg) -> str | None:
+    return f"{cfg.webapp_public_url}{arena_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
+
+
+def _arena_status_text(entry: str) -> str:
+    """The arena's own status block for its /arena menu -- deliberately NOT v1's numbers.
+    Two systems reporting one another's progress is how somebody ends up announcing the
+    wrong result."""
+    tournament = arena.latest_tournament(entry)
+    if tournament is None:
+        return "Арена ещё не создана. Собери работы: /arena собрать (или возьми их из v1: /arena импорт)."
+
+    progress = tournament.progress()
+    lines = [
+        f"Работ: {len(tournament.approved)} допущено из {len(tournament.entries)} · "
+        f"{'открыта' if tournament.open else 'закрыта'}",
+        f"Проголосовало: {progress['completed']} чел. (в процессе {progress['in_progress']}) · "
+        f"сравнений: {progress['judgements']}",
+    ]
+    rows = tournament.standings()["rows"]
+    if progress["judgements"] and rows:
+        lines.append("")
+        lines.append("Топ по рейтингу:")
+        for medal, row in zip(_VOTE_MEDALS, rows[:3]):
+            margin = f" ±{round(row['margin'])}" if row["margin"] is not None else ""
+            lines.append(
+                f"{medal} {_vote_who(row['entry'])} — {round(row['rating'])}{margin} "
+                f"({row['played']} дуэлей)"
+            )
+        # The sizing rule from import/CLAUDE.md: below ~4 judgements per possible pair the
+        # top of the table is not separated, and reporting a winner from it would be
+        # reporting noise.
+        if progress["coverage"] < 4:
+            lines.append("")
+            lines.append(
+                f"Голосов пока мало ({progress['coverage']:.1f} на пару из 4 нужных) -- "
+                "верх таблицы ещё может перевернуться."
+            )
+    elif tournament.approved:
+        lines.append("Пока никто не голосовал.")
+    else:
+        lines.append("Работы ещё не допущены -- /arena выбрать.")
+    return "\n".join(lines)
+
+
+def _arena_action_callback_data(action: str, chat_id, user_id) -> str:
+    return f"{ARENA_ACTION_CALLBACK_PREFIX}:{action}:{chat_id}:{user_id}"
+
+
+def _parse_arena_action_callback(data: str) -> tuple[str, int, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 4 or parts[0] != ARENA_ACTION_CALLBACK_PREFIX or parts[1] not in ARENA_ACTIONS:
+        return None
+    try:
+        return parts[1], int(parts[2]), int(parts[3])
+    except ValueError:
+        return None
+
+
+async def handle_arena_action_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """The /arena menu's buttons, built the same way v1's are: the tap is answered first,
+    then a synthetic message goes through handle_arena_command so the admin/DM gate and
+    the work itself live in exactly one place."""
+    parsed = _parse_arena_action_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, chat_id, target_user_id = parsed
+
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    # Answered before any of the slow work, or the button spins until Telegram times it out.
+    await api.answer_callback_query(callback["id"])
+
+    trigger = callback.get("message") or {}
+    synthetic_message = {
+        "message_id": trigger.get("message_id"),
+        "chat": {"id": chat_id, "type": "private"},
+        "from": clicker,
+        "text": ARENA_ACTIONS[action],
+    }
+    task = asyncio.create_task(
+        handle_arena_command(
+            api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
+            background_tasks, log=log,
+        )
+    )
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def handle_arena_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/arena -- the second voting system, with the same shape as /vote so an admin who
+    knows one knows the other:
+
+    - "/arena собрать" (DM, admin) scans #итогинедели into the ARENA's own store, with its
+      own copy of the photos. It never reads or writes a poll.
+    - "/arena импорт" (DM, admin) copies the works v1 has ADMITTED into the arena, so a
+      week already moderated in v1 doesn't have to be moderated from scratch here. One
+      way, on demand, by copy: v1 is not touched. They still arrive unadmitted -- this
+      system's moderation is its own.
+    - "/arena выбрать" (DM, admin) opens the arena's moderation screen: admit works, set
+      pairs per voter and the pairing mode, open or close it.
+    - "/arena итоги" (DM, admin) prints the fitted table.
+    - "/arena очистить" (DM, admin) deletes the arena and nothing else.
+    - bare "/arena" opens the duels for everyone, and is the status/control panel for an
+      administrator.
+    """
+    chat = message["chat"]
+    chat_id = chat["id"]
+    is_private = chat.get("type") == "private"
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            return await api.send_message(
+                chat_id, text, reply_to_message_id=message["message_id"],
+                parse_mode=None, reply_markup=reply_markup,
+            )
+        except Exception as e:
+            log(f"[arena] failed to send the reply: {e}")
+            return None
+
+    page_url = _arena_page_url(cfg)
+    if not page_url:
+        await reply("Арена не настроена: не задан WEBAPP_PUBLIC_URL.")
+        return
+    if not entry:
+        await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS).")
+        return
+
+    argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
+    for spelling in ARENA_COMMANDS:
+        if argument.lower().startswith(spelling):
+            argument = argument[len(spelling):]
+            break
+    normalized = argument.strip().lower()
+    wants_collect = normalized in ARENA_COLLECT_WORDS
+    wants_moderate = normalized in ARENA_MODERATE_WORDS
+    wants_import = normalized in ARENA_IMPORT_WORDS
+    wants_results = normalized in ARENA_RESULTS_WORDS
+    wants_clear = normalized in ARENA_CLEAR_WORDS
+
+    async def require_admin_in_dm(denial: str) -> bool:
+        if not is_private:
+            url = f"https://t.me/{bot_username}" if bot_username else None
+            await reply(
+                "Это только в личке с ботом.",
+                reply_markup=({"inline_keyboard": [[{"text": "Открыть в личке", "url": url}]]} if url else None),
+            )
+            return False
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
+            await reply(denial)
+            return False
+        return True
+
+    tournament_id = _current_vote_poll_id(tz)  # same ISO-week key, its own file
+
+    if wants_collect:
+        if not await require_admin_in_dm("Собирать работы могут только администраторы."):
+            return
+        await reply("Собираю работы с #итогинедели в арену -- это займёт минуту.")
+        existing = arena.load_tournament(entry, tournament_id)
+        known = {e.entry_id for e in existing.entries} if existing else set()
+        try:
+            new_entries = await voting.collect_entries(
+                client=telethon_client,
+                chat_ref=entry,
+                tz=tz,
+                # The arena's OWN media directory: v1's photos stay v1's, and clearing
+                # either system cannot delete the other's pictures.
+                media_dir=arena.media_path(entry, tournament_id),
+                skip_entry_ids=known,
+                log=log,
+            )
+        except Exception:
+            log(f"[arena] collecting failed:\n{traceback.format_exc()}")
+            await reply("Не получилось собрать работы.")
+            return
+
+        all_entries = (existing.entries if existing else []) + new_entries
+        tournament = arena.build_tournament(entry, tournament_id, all_entries, existing=existing)
+        arena.save_tournament(tournament)
+        arena.invalidate_standings(tournament_id)
+        if not all_entries:
+            await reply("Постов с #итогинедели не нашлось. Можно взять работы из v1: /arena импорт")
+            return
+        await reply(
+            f"Новых работ: {len(new_entries)} (всего {len(all_entries)}). "
+            "Открой модерацию и отметь, что допустить.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "🛠 Модерация арены", "web_app": {"url": f"{page_url}?mode=admin"}}
+            ]]},
+        )
+        return
+
+    if wants_import:
+        if not await require_admin_in_dm("Импортировать работы могут только администраторы."):
+            return
+        poll = voting.latest_poll(entry)
+        if poll is None or not poll.approved:
+            await reply("В v1 нет допущенных работ -- импортировать нечего.")
+            return
+        tournament = arena.load_tournament(entry, tournament_id) or arena.Tournament(
+            tournament_id=tournament_id, entry=entry,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        added = arena.import_entries_from_poll(tournament, poll)
+        arena.save_tournament(tournament)
+        arena.invalidate_standings(tournament_id)
+        log(f"[arena] imported {added} work(s) from poll {poll.poll_id}")
+        await reply(
+            (f"Взял из v1: {added} работ (всего в арене {len(tournament.entries)}). "
+             "Голосование v1 не изменилось. Работы пока НЕ допущены -- отметь их в модерации."
+             if added else
+             "Все работы из v1 уже в арене -- ничего не добавилось."),
+            reply_markup={"inline_keyboard": [[
+                {"text": "🛠 Модерация арены", "web_app": {"url": f"{page_url}?mode=admin"}}
+            ]]},
+        )
+        return
+
+    if wants_moderate:
+        if not await require_admin_in_dm("Модерировать арену могут только администраторы."):
+            return
+        await reply(
+            "Модерация арены: отметь работы, задай число пар на голосующего и режим подбора.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "🛠 Модерация арены", "web_app": {"url": f"{page_url}?mode=admin"}}
+            ]]},
+        )
+        return
+
+    if wants_results:
+        if not await require_admin_in_dm("Смотреть итоги арены могут только администраторы."):
+            return
+        tournament = arena.latest_tournament(entry)
+        if tournament is None:
+            await reply("Арена ещё не создана.")
+            return
+        rows = tournament.standings()["rows"]
+        if not rows:
+            await reply("В арене пока нет допущенных работ.")
+            return
+        lines = ["Рейтинг арены (Bradley-Terry, 1500 — середина поля):"]
+        for place, row in enumerate(rows, start=1):
+            margin = f" ±{round(row['margin'])}" if row["margin"] is not None else ""
+            lines.append(
+                f"{place}. {_vote_who(row['entry'])} — {round(row['rating'])}{margin} "
+                f"({row['played']} дуэлей, {row['score']:g} очк.)"
+            )
+        progress = tournament.progress()
+        lines.append("")
+        lines.append(
+            f"Сравнений: {progress['judgements']} · покрытие {progress['coverage']:.1f} на пару"
+        )
+        if len(rows) > 1 and not arena_core.is_separated(rows[0], rows[1]):
+            # Saying so is the whole point of carrying a margin around: two overlapping
+            # error bars are not a first and a second place, whatever the order shows.
+            lines.append("Первое и второе место статистически не разделены -- нужно больше голосов.")
+        await reply("\n".join(lines))
+        return
+
+    if wants_clear:
+        if not await require_admin_in_dm("Очищать арену могут только администраторы."):
+            return
+        tournament = arena.latest_tournament(entry)
+        if tournament is None:
+            await reply("Арена ещё не создана -- нечего очищать.")
+            return
+        existed = arena.delete_tournament(entry, tournament.tournament_id)
+        arena.invalidate_standings(tournament.tournament_id)
+        await reply(
+            "Арена очищена. Голосование v1 не тронуто." if existed else "Арена уже пуста."
+        )
+        return
+
+    # Bare "/arena": the duels for everyone, plus a control panel for an administrator.
+    if is_private:
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
+        if is_manager:
+            admin_user_id = user.get("id")
+            await reply(
+                f"{_arena_status_text(entry)}\n\n"
+                "Команды:\n"
+                "/arena — голосовать (дуэли)\n"
+                "/arena выбрать — модерация арены\n"
+                "/arena собрать — собрать работы с #итогинедели\n"
+                "/arena импорт — взять допущенные работы из v1\n"
+                "/arena итоги — рейтинг\n"
+                "/arena очистить — удалить арену\n\n"
+                "Это отдельная система: v1 (/vote) работает как работал.",
+                reply_markup={"inline_keyboard": [
+                    [
+                        {"text": ARENA_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
+                        {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
+                    ],
+                    [
+                        {"text": "🔄 Собрать", "callback_data": _arena_action_callback_data("collect", chat_id, admin_user_id)},
+                        {"text": "⬇️ Взять из v1", "callback_data": _arena_action_callback_data("import", chat_id, admin_user_id)},
+                    ],
+                    [
+                        {"text": "📊 Рейтинг", "callback_data": _arena_action_callback_data("results", chat_id, admin_user_id)},
+                        {"text": "🗑 Очистить", "callback_data": _arena_action_callback_data("clear", chat_id, admin_user_id)},
+                    ],
+                ]},
+            )
+        else:
+            await reply(
+                "Арена: сравни работы попарно.",
+                reply_markup={"inline_keyboard": [[{"text": ARENA_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+            )
+        return
+
+    # In a group a web_app button is not allowed, so the same deep link v1 uses.
+    url = f"https://t.me/{bot_username}?start=arena" if bot_username else None
+    await reply(
+        "Арена открывается в личке с ботом:",
+        reply_markup=({"inline_keyboard": [[{"text": ARENA_OPEN_BUTTON_TEXT, "url": url}]]} if url else None),
+    )
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -5135,6 +5506,11 @@ async def _dispatch_update(
             )
         elif callback_data.startswith(f"{VOTE_CLEAR_CALLBACK_PREFIX}:"):
             await handle_vote_clear_callback(api, cfg, tz, callback, home_chat_ref, log=log)
+        elif callback_data.startswith(f"{ARENA_ACTION_CALLBACK_PREFIX}:"):
+            await handle_arena_action_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
+                background_tasks, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_ACTION_CALLBACK_PREFIX}:"):
             await handle_vote_action_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
@@ -5187,6 +5563,15 @@ async def _dispatch_update(
         if chat.get("type") != "private":
             return
         start_payload = (start_match.group(1) or "").lower()
+        # The arena's own deep link, from the url button a group /arena leaves behind
+        # (a web_app button is private-chat only, exactly as for v1).
+        if start_payload == "arena":
+            await handle_arena_command(
+                api, telethon_client, cfg, tz, message,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
+                background_tasks, log=log,
+            )
+            return
         if start_payload in ("vote", "vote_admin", "vote_clear", "vote_chat", "vote_image"):
             forced_mode = {
                 "vote_admin": "moderate", "vote_clear": "clear",
@@ -5413,6 +5798,23 @@ async def _dispatch_update(
         task = asyncio.create_task(
             handle_shop_command(
                 api, telethon_client, cfg, tz, message, shop_text, shop_entry,
+                background_tasks, log=log,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/arena" / "/арена" / "/vote2" -- the second voting system. Checked BEFORE /vote so
+    # "/vote2" reaches the arena rather than being swallowed by "/vote"'s prefix match and
+    # opening v1's ballot with a stray "2" as its argument.
+    if any(command_text.lower().startswith(c) for c in ARENA_COMMANDS):
+        arena_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if arena_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_arena_command(
+                api, telethon_client, cfg, tz, message, arena_entry, bot_username,
                 background_tasks, log=log,
             )
         )
@@ -5973,6 +6375,13 @@ async def run_bot_listener(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
                     export=_deliver_vote_board,
+                    # The arena rides on the same server, under its own prefix. It reuses
+                    # the two questions that need a Bot API client and shares nothing else
+                    # -- v1 keeps its own routes, its own storage and its own rules.
+                    attach=lambda app: arena_web.attach(
+                        app, cfg, home_chat_ref or "", _is_vote_admin,
+                        is_member=_is_vote_member, log=log,
+                    ),
                 )
             )
         else:

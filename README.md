@@ -791,6 +791,55 @@ by default — an `@username` is all Telegram's `sendMessage` needs, so no numer
 is involved) and `VOTE_MINIAPP_SHORT_NAME` (BotFather's `/newapp` short name, which has to
 be created by hand once, pointing at `WEBAPP_PUBLIC_URL` + `/vote`).
 
+### `/arena` — the second voting system (v2), running beside the first
+
+A **separate** system, not a replacement: `/vote` keeps working exactly as it did, and both
+can run in the same week. Instead of a grid where you tick favourites, the arena shows
+**two works at a time** and asks which is better — ten duels per voter by default, a "Ничья"
+button for when they are level. `arena_core.py` (pure logic), `arena.py` (storage and
+session rules), `arena_web.py` (its own Mini App at `/arena`, mounted onto the same server
+v1 uses via `create_app(..., attach=...)`).
+
+The logic is a Python port of the reference implementation in [`import/`](import/) — same
+pairing, same ranking, same rules — with one substitution: that module identifies a voter
+by an invite code, and Telegram already knows who everybody is, so **the Telegram user id
+is the code**. There are no codes to hand out or lose.
+
+**Ranking is Bradley-Terry**, fitted by MM iteration and reported on the chess scale (1500
+is the field average, +400 ≈ ten times more likely to win). A win counts for more when the
+opponent is strong, so the table can rank two works that were never shown against each
+other, and every row carries a **margin** — roughly one standard error. `/arena итоги` says
+outright when first and second are not separated by more than noise, because a rating
+without its error bar invites reading a 12-point gap as a result. The fit is
+**order-independent by construction**: it refits from the whole vote table every time, so
+the same votes in any order give identical output (there is a test; incremental Elo would
+break it). Pairing deals in **rounds**, so exposure stays even — an under-exposed work gets
+a misleadingly wide margin. `adaptive` mode instead seeds each pair on the work with the
+widest error bar and matches it against a similar rating, keeping 30% random as a
+corrective and falling back to pure random for the first 15 ballots, when the ratings are
+still mostly prior.
+
+Session rules, all enforced in `arena.py`: **one voter, one ballot, for ever**; a finished
+ballot **never** reopens; re-entering **resumes** with the same pairs and picks rather than
+re-dealing (or a voter could re-roll until they liked their matchups); a submit for any
+position other than the one the server has is **returned unchanged**, so a double tap, a
+retry or a stale tab cannot count twice.
+
+Commands mirror `/vote` so knowing one is knowing the other — `/arena` (duels, plus a
+status panel for an administrator), `/arena выбрать` (moderation: admit works, pairs per
+voter, pairing mode, open/closed), `/arena собрать` (scan `#итогинедели` into the arena's
+**own** store and media), `/arena итоги` (the table), `/arena очистить` (delete the arena
+and nothing else). `/vote2` and `/арена` are accepted spellings.
+
+**What the two systems share is a process, a port and the admin/membership checks.**
+Separate directory (`DATA_DIR/arena`), separate files, separate photos, separate
+moderation, separate commands. `/arena импорт` is the only bridge and it runs one way, on
+demand, **by copying**: it takes the works v1 has *admitted* into the arena (with their
+photos), leaves v1's poll untouched, and they arrive **unadmitted** — this system moderates
+for itself, and inheriting an admit decision made for a different vote is exactly the quiet
+coupling that turns two systems into one. Clearing either one leaves the other whole;
+there are tests for both directions.
+
 ### Coins, the shop, and anti-farming
 
 Coins are a **real ledger** (`economy.py`), not the derived `xp // 10` display they used

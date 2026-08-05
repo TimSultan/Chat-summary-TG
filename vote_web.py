@@ -565,7 +565,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
-    is_member=None, export=None,
+    is_member=None, export=None, attach=None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
     returning a bool; `announce` is an async callable taking (user, poll, standings) --
@@ -589,6 +589,11 @@ def create_app(
     module draws the picture, bot_listener.py owns the Bot API client that can send it.
     Defaults to a no-op, which leaves the export working (the file is written, and the
     page links to it) minus the copy in the DM.
+
+    `attach` is called with the finished application, for mounting something else on the
+    same server -- today the arena (arena_web.attach), the second voting system. It runs
+    last, so it can only add to what this module has already registered, and this module
+    knows nothing about what it adds.
     """
     async def _default_announce(user, poll, standings):
         return None
@@ -629,16 +634,19 @@ def create_app(
         web.get(prefix + "/media/{poll_id}/{name}", handle_media),
         web.get(prefix + "/export/{name}", handle_export_image),
     ])
+    if attach:
+        attach(app)
     return app
 
 
 async def run_web_server(
     cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None,
-    export=None,
+    export=None, attach=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
     app = create_app(
         cfg, entry, is_admin, announce=announce, log=log, is_member=is_member, export=export,
+        attach=attach,
     )
     runner = web.AppRunner(app)
     await runner.setup()
