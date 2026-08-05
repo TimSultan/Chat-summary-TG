@@ -650,9 +650,9 @@ page that changes shape depending on who opens it:
   it, ranked by votes with the count in the corner — minus the vote button, which would be
   a lie about what a picture can do. Two rules it does not share with the page: the photo
   is **fitted** into its square rather than cropped to fill it (on the page a crop is a
-  link to the full picture; here there is no tap, so the crop would be all anyone ever
-  sees), and there is exactly one image however many works there are — it just gets longer,
-  a row per three. Sent as a document, not a photo, because Telegram re-encodes photos and
+  link to the full picture; here there is no tap, so an automatic crop would be all anyone
+  ever sees) — framing a work by hand is what the cropping page below is for — and there is
+  exactly one image however many works there are, it just gets longer, a row per three. Sent as a document, not a photo, because Telegram re-encodes photos and
   refuses anything past 10000px of width+height or a 20:1 side ratio, which a long board
   hits; the file is also kept on disk under `voting/exports/` either way. Only **admitted**
   entries are drawn (it renders `poll.tally()`, the same ranking the page and the
@@ -662,6 +662,31 @@ page that changes shape depending on who opens it:
   since `python:*-slim` ships none and Pillow has no Cyrillic face of its own;
   `VOTE_IMAGE_FONT`/`VOTE_IMAGE_FONT_BOLD` override the lookup on a host that keeps its
   fonts elsewhere.
+- **The "✂️ Кадрировать" button** (DM, administrators only) opens a second Mini App page,
+  `/vote/board` (`vote_web.BOARD_HTML`), for framing each work before the export. It shows
+  the export's own board — same three columns, same square thumbnails, ranked by votes —
+  and tapping any card opens a big editor where the photo is **dragged to pan and pinched
+  (or wheel/slider) to zoom** inside its square, with thirds drawn over it. The grid behind
+  is the live preview: what is on screen is what renders. Per card there is "Вписать"
+  (fit whole, letterboxed) and "Заполнить" (fill the square, i.e. the ballot's own
+  `object-fit: cover`), plus "Все: вписать"/"Все: заполнить" for the whole board. Then
+  "Выгрузить картинку" renders it, sends the file to the admin's DM and offers a link to
+  it.
+
+  A crop is stored (`voting.Poll.crops`) as **a square in the photo's own pixel
+  coordinates**, taken after the EXIF rotation both the browser and Pillow apply — that is
+  the only reason the page and the renderer agree on what was framed. The square is allowed
+  to hang off the edge of the photo, which is how "fit the whole thing" is expressed as a
+  crop rather than as a second mode: one representation, one renderer, and a work nobody
+  framed renders exactly as it did before cropping existed. Framing survives a
+  `/vote собрать` re-collect for the same reason admitting does — it is work somebody did by
+  hand. Names get one more pass before they are drawn: the board is rendered with a single
+  font and no fallback chain, so emoji and the "fancy" Unicode alphabets people set as
+  Telegram names would come out as hollow `.notdef` boxes. `vote_image.legible` NFKC-
+  normalises first (𝓐𝓷𝓷𝓪 → Anna, a rescue rather than a deletion) and then drops whatever
+  the loaded font genuinely has no glyph for, detected by comparing each character's
+  bitmap against the one an unassigned codepoint draws. A name left with nothing promotes
+  the `@tag` to its line rather than printing a blank card.
 - **`/vote очистить`** (DM, administrators only) deletes the current poll outright --
   entries, votes, admitted flags, downloaded photos, settings, all of it -- behind a
   tap-to-confirm inline button, same as every other irreversible action in this bot. The

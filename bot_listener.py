@@ -3934,6 +3934,7 @@ async def handle_vote_command(
                 "/vote собрать — собрать новые заявки\n"
                 "/vote chat — подготовить объявление с кнопкой\n"
                 "/vote картинка — итоги одной картинкой (файлом)\n"
+                "Кнопка «Кадрировать» — та же картинка, но с ручной обрезкой каждой работы\n"
                 "/vote очистить — очистить голосование"
             )
             admin_user_id = user.get("id")
@@ -3959,6 +3960,13 @@ async def handle_vote_command(
                             "text": "🖼 Картинка итогов",
                             "callback_data": _vote_action_callback_data("image", chat_id, admin_user_id),
                         },
+                        # A web_app button, not a callback: cropping is a page, and this is
+                        # a DM, which is the only place Telegram allows one (see the
+                        # docstring). It renders and delivers the picture itself, so it is
+                        # "Картинка итогов" with the framing step in front of it.
+                        {"text": "✂️ Кадрировать", "web_app": {"url": f"{page_url}/board"}},
+                    ],
+                    [
                         {
                             "text": "🗑 Очистить",
                             "callback_data": _vote_action_callback_data("clear", chat_id, admin_user_id),
@@ -5778,6 +5786,21 @@ async def run_bot_listener(
                 api, user, poll, standings, admin_chat_id, vote_result_flows, log=log,
             )
 
+        async def _deliver_vote_board(user: dict, poll, path) -> None:
+            """Sends the picture the cropping page just rendered to the administrator who
+            pressed "Выгрузить картинку", in their own DM.
+
+            Their Telegram id comes from the page's verified initData, and a DM to a user
+            id needs no lookup -- but it does need them to have started the bot, which any
+            administrator who has ever used /vote has. A failure here is reported back to
+            the page rather than swallowed: the file is on disk either way and the page
+            offers a link to it, so "не отправилось" is information, not a dead end.
+            """
+            await api.send_document_file(
+                user["id"], path,
+                caption="Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
+            )
+
         tasks = [
             _poll_loop(),
             _consume_summaries(),
@@ -5799,6 +5822,7 @@ async def run_bot_listener(
                 vote_web.run_web_server(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
+                    export=_deliver_vote_board,
                 )
             )
         else:

@@ -9,9 +9,12 @@ Two differences, both from the medium:
 
 - No "выбрать" button on a card. Nothing in a picture is tappable, and a button drawn into
   one is just a lie about what it does.
-- The photo is FITTED into its square (letterboxed), not cropped to fill it. On the page a
-  cropped thumbnail is a link to the full picture one tap away; here there is no tap, so a
-  crop would be the only thing anybody ever sees of that work.
+- The photo is FITTED into its square (letterboxed) by default, not cropped to fill it. On
+  the page a cropped thumbnail is a link to the full picture one tap away; here there is no
+  tap, so an automatic crop would be the only thing anybody ever sees of that work. An
+  administrator can still frame any card by hand on the cropping page
+  (vote_web.BOARD_HTML) -- what they draw arrives here as voting.Poll.crops, and a card
+  nobody framed stays fitted.
 
 Everything here is pure: it takes standings and a directory of photos and writes a file.
 Who is admitted, how the votes were counted and where the file then goes are voting.py's
@@ -20,6 +23,7 @@ and bot_listener.py's business respectively.
 
 import math
 import os
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
@@ -124,6 +128,65 @@ def _font(size: int, bold: bool = False):
         return ImageFont.load_default()
 
 
+# Permanently unassigned in Unicode, so no font anywhere maps it: whatever the current
+# face draws for THIS is what it draws for every character it doesn't have -- the .notdef
+# box. Comparing against it is how a missing glyph is recognised without parsing the font.
+_UNRENDERABLE_PROBE = "͸"
+
+
+@lru_cache(maxsize=None)
+def _notdef_bitmap(size: int, bold: bool) -> bytes | None:
+    """What a character this font does NOT have looks like, or None if the question can't
+    be asked of this font (the bitmap fallback, mainly)."""
+    try:
+        return bytes(_font(size, bold).getmask(_UNRENDERABLE_PROBE))
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=4096)
+def _renders(character: str, size: int, bold: bool) -> bool:
+    notdef = _notdef_bitmap(size, bold)
+    if notdef is None:
+        return True  # can't tell -- draw it and hope, rather than silently deleting text
+    try:
+        return bytes(_font(size, bold).getmask(character)) != notdef
+    except Exception:
+        return False  # a character the font can't even be asked about would kill the draw
+
+
+def legible(text: str, size: int = NAME_SIZE, bold: bool = False) -> str:
+    """`text` with everything the current font would draw as an empty box removed.
+
+    Telegram display names are full of things no ordinary font has: emoji, and the
+    "fancy" alphabets (𝓐𝓷𝓷𝓪, 𝔸𝕟𝕟𝕒) people set as their name. FreeType does not fail on
+    those -- it quietly draws .notdef, a hollow rectangle, so a whole name can come out as
+    a row of squares while every other card looks fine.
+
+    Two steps, in this order. NFKC normalisation first, because it turns most of those
+    fancy alphabets back into the ordinary letters they imitate (𝓐 -> A) -- a rescue, not
+    a deletion. Then whatever STILL has no glyph is dropped, along with the invisible
+    formatting characters (zero-width joiners, variation selectors) that emoji leave
+    behind. What's left is what the font can actually draw.
+    """
+    normalized = unicodedata.normalize("NFKC", text or "")
+    kept = []
+    for character in normalized:
+        if character.isspace():
+            kept.append(character)
+            continue
+        if unicodedata.category(character) in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            continue
+        # Variation selectors are category Mn, not Cf, so the check above misses them --
+        # and a font that happens to have a glyph for one draws a visible artefact where
+        # the emoji it was modifying used to be.
+        if 0xFE00 <= ord(character) <= 0xFE0F or 0xE0100 <= ord(character) <= 0xE01EF:
+            continue
+        if _renders(character, size, bold):
+            kept.append(character)
+    return " ".join("".join(kept).split())
+
+
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
     """Measured with textbbox rather than the font's own metrics, so it works for the
     bitmap fallback too (which supports neither anchors nor getlength)."""
@@ -144,44 +207,92 @@ def _ellipsize(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> st
     return (cut + ellipsis) if cut else ellipsis
 
 
-def _load_photo(path: Path) -> Image.Image | None:
-    """The work, fitted (never cropped) inside the thumbnail square. None if the file is
-    missing or unreadable -- one lost photo leaves an empty card, it does not lose the
-    board."""
+def default_crop(width: int, height: int) -> dict:
+    """The framing an entry gets when nobody has touched it: the smallest square that
+    contains the WHOLE photo, centred -- i.e. fitted and letterboxed, which is what this
+    export did before cropping existed. Shared with the cropping page (it computes the
+    same square in JavaScript for a card it is showing for the first time), so "не тронуто"
+    means the same thing in both places."""
+    size = float(max(width, height))
+    return {"x": (width - size) / 2, "y": (height - size) / 2, "size": size}
+
+
+def _crop_to_square(image: Image.Image, crop: dict | None) -> Image.Image:
+    """Draws `image` into the thumbnail square through `crop` -- a square in the image's
+    OWN pixel coordinates, which may hang off its edges. Whatever the square covers of the
+    photo is scaled to fill the thumbnail; whatever it covers of nothing becomes letterbox.
+
+    Only the part of the photo actually inside the square is ever resized, so a deep zoom
+    costs no more memory than a wide one: the region shrinks exactly as fast as the scale
+    factor grows, and the result is a THUMB-sized tile either way.
+    """
+    if crop is None:
+        crop = default_crop(image.width, image.height)
+    x, y, size = float(crop["x"]), float(crop["y"]), float(crop["size"])
+    scale = THUMB_HEIGHT / size
+
+    square = Image.new("RGB", (CARD_WIDTH, THUMB_HEIGHT), THUMB_BG)
+    left, top = max(0, math.floor(x)), max(0, math.floor(y))
+    right = min(image.width, math.ceil(x + size))
+    bottom = min(image.height, math.ceil(y + size))
+    if right <= left or bottom <= top:
+        return square  # framed entirely off the photo: all letterbox, nothing to draw
+
+    region = image.crop((left, top, right, bottom))
+    target = (max(1, round(region.width * scale)), max(1, round(region.height * scale)))
+    square.paste(
+        region.resize(target, Image.LANCZOS),
+        (round((left - x) * scale), round((top - y) * scale)),
+    )
+    return square
+
+
+def _load_photo(path: Path, crop: dict | None = None) -> Image.Image | None:
+    """The work as it should appear in its cell, already the size of the thumbnail square.
+    None if the file is missing or unreadable -- one lost photo leaves an empty card, it
+    does not lose the board."""
     try:
         with Image.open(path) as opened:
             # Phone photos carry their rotation in EXIF rather than in the pixels; without
-            # this a portrait shot lands on its side.
+            # this a portrait shot lands on its side. Applied before the crop is read,
+            # because the browser applies it too -- the square the editor drew is in
+            # rotated coordinates, so this is what makes the two agree.
             rotated = ImageOps.exif_transpose(opened) or opened
-            return ImageOps.contain(
-                rotated.convert("RGB"), (CARD_WIDTH, THUMB_HEIGHT), Image.LANCZOS
-            )
-    except (OSError, ValueError, Image.DecompressionBombError):
+            return _crop_to_square(rotated.convert("RGB"), crop)
+    except (OSError, ValueError, KeyError, TypeError, Image.DecompressionBombError):
         return None
 
 
 def _who_lines(entry) -> tuple[str, str]:
     """The two caption lines: the author's name, and their @tag under it. An author with
     no username gets an empty second line rather than having their name moved down into
-    it -- the name must sit at the same height on every card."""
-    tag = f"@{entry.author_username}" if entry.author_username else ""
-    return entry.author_name or "Unknown", tag
+    it -- the name must sit at the same height on every card.
+
+    A name that is ENTIRELY unrenderable (all emoji, say -- see legible) leaves nothing to
+    print, so the @tag is promoted to the name line rather than drawing a blank card, and
+    the tag line is cleared so it isn't printed twice. A user with neither is named as
+    plainly as possible instead of as a row of boxes.
+    """
+    name = legible(entry.author_name, NAME_SIZE)
+    tag = legible(f"@{entry.author_username}", TAG_SIZE) if entry.author_username else ""
+    if not name:
+        return (tag or "Без имени"), ""
+    return name, tag
 
 
-def _draw_card(entry, votes: int, media_dir: Path, show_votes: bool) -> Image.Image:
-    """One cell: the fitted photo, its vote count, the author. Drawn on its own canvas and
+def _draw_card(
+    entry, votes: int, media_dir: Path, show_votes: bool, crop: dict | None = None
+) -> Image.Image:
+    """One cell: the framed photo, its vote count, the author. Drawn on its own canvas and
     masked to rounded corners by the caller, which is the only way the corners stay round
     over a photo that happens to fill the square exactly."""
     card = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), CARD)
     draw = ImageDraw.Draw(card)
     draw.rectangle([0, 0, CARD_WIDTH, THUMB_HEIGHT], fill=THUMB_BG)
 
-    photo = _load_photo(media_dir / entry.media[0]) if entry.media else None
+    photo = _load_photo(media_dir / entry.media[0], crop) if entry.media else None
     if photo is not None:
-        card.paste(
-            photo,
-            ((CARD_WIDTH - photo.width) // 2, (THUMB_HEIGHT - photo.height) // 2),
-        )
+        card.paste(photo, (0, 0))  # already exactly the thumbnail square, letterbox and all
 
     if show_votes:
         # Top-left pill, where the page puts its own `.votes` badge. Drawn last of the
@@ -233,6 +344,7 @@ def render_standings_image(
     title: str = "Итоги недели",
     subtitle: str = "",
     show_votes: bool = True,
+    crops: dict | None = None,
 ) -> Path:
     """Draws `standings` -- a voting.Poll.tally() result, i.e. (Entry, votes) pairs already
     ranked most-votes-first -- into one picture at `out_path`, and returns that path.
@@ -243,6 +355,11 @@ def render_standings_image(
 
     `media_dir` is the poll's own photo directory (voting.media_path); only each entry's
     FIRST photo is drawn, exactly as the page's grid does with an album.
+
+    `crops` is voting.Poll.crops -- entry_id -> the square that entry's photo is framed
+    through, as drawn on the cropping page (vote_web.BOARD_HTML). An entry that isn't in
+    it (or a None `crops` altogether) is fitted whole, letterboxed: untouched photos look
+    exactly as they did before anybody could crop anything.
 
     Raises ValueError on empty standings -- a board of nothing is not a picture worth
     writing, and the caller has something better to say about it than a blank file.
@@ -282,12 +399,14 @@ def render_standings_image(
     if header_height:
         y = MARGIN + header_height
 
+    crops = crops or {}
     mask = _rounded_mask()
     for index, (entry, votes) in enumerate(standings):
         column, row = index % COLUMNS, index // COLUMNS
         x = MARGIN + column * (CARD_WIDTH + GAP)
         top = y + row * (CARD_HEIGHT + GAP)
-        canvas.paste(_draw_card(entry, votes, media_dir, show_votes), (x, top), mask)
+        card = _draw_card(entry, votes, media_dir, show_votes, crops.get(entry.entry_id))
+        canvas.paste(card, (x, top), mask)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.suffix.lower() in (".jpg", ".jpeg") and height > _JPEG_MAX_SIDE:
@@ -311,4 +430,5 @@ def render_poll_image(poll, out_path, title: str = "Итоги недели", su
         out_path,
         title=title,
         subtitle=subtitle,
+        crops=poll.crops,
     )

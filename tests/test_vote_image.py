@@ -102,6 +102,51 @@ class RenderStandingsImageTests(unittest.TestCase):
         self.assertLess(centre[1], 60)
         self.assertLess(edge[0], 100)
 
+    def test_a_crop_draws_exactly_the_square_it_names(self):
+        """The cropping page and this renderer only agree because a crop means the same
+        square of the same photo in both. A wide picture with a red patch at its left and
+        a blue one at its right, framed on each in turn, must come out solid -- anything
+        off by even a scale factor mixes the two."""
+        from PIL import ImageDraw
+
+        wide = Image.new("RGB", (1500, 500), (30, 30, 30))
+        ImageDraw.Draw(wide).rectangle([0, 0, 499, 499], fill=(220, 20, 20))
+        ImageDraw.Draw(wide).rectangle([1000, 0, 1499, 499], fill=(20, 120, 220))
+        wide.save(self.media / "w.jpg", "JPEG")
+
+        standings = [(_entry(str(i), f"Работа {i}", None, ["w.jpg"]), 3 - i) for i in (1, 2, 3)]
+        crops = {
+            "1": {"x": 0, "y": 0, "size": 500},        # the left square
+            "2": {"x": 1000, "y": 0, "size": 500},     # the right square
+            # "3" is left out entirely: fitted whole, letterboxed above and below.
+        }
+        out = self.root / "board.jpg"
+        vote_image.render_standings_image(
+            standings, self.media, out, title="", subtitle="", crops=crops
+        )
+
+        column = lambda i: vote_image.MARGIN + i * (vote_image.CARD_WIDTH + vote_image.GAP) + 180
+        with Image.open(out) as image:
+            pixels = image.convert("RGB").load()
+            middle = vote_image.MARGIN + vote_image.THUMB_HEIGHT // 2
+            red, blue = pixels[column(0), middle], pixels[column(1), middle]
+            fitted_middle = pixels[column(2), middle]
+            fitted_top = pixels[column(2), vote_image.MARGIN + 8]
+
+        self.assertGreater(red[0], 200); self.assertLess(red[2], 60)
+        self.assertGreater(blue[2], 200); self.assertLess(blue[0], 60)
+        # Untouched: the photo's own grey band across the middle, letterbox above it.
+        self.assertLess(max(fitted_middle) - min(fitted_middle), 12)
+        self.assertLess(fitted_top[0], fitted_top[2])
+
+    def test_a_crop_framed_completely_off_the_photo_is_survivable(self):
+        standings = [(_entry("1", "Мимо", None, [self._photo("1.jpg")]), 1)]
+        out = self.root / "board.jpg"
+        vote_image.render_standings_image(
+            standings, self.media, out, crops={"1": {"x": 99999, "y": 99999, "size": 100}}
+        )
+        self.assertTrue(out.exists())
+
     def test_empty_standings_is_refused_rather_than_written_blank(self):
         with self.assertRaises(ValueError):
             vote_image.render_standings_image([], self.media, self.root / "board.jpg")
@@ -112,9 +157,9 @@ class RenderStandingsImageTests(unittest.TestCase):
         drawn = []
         original = vote_image._draw_card
 
-        def spy(entry, votes, media_dir, show_votes):
+        def spy(entry, votes, media_dir, show_votes, crop=None):
             drawn.append(entry.entry_id)
-            return original(entry, votes, media_dir, show_votes)
+            return original(entry, votes, media_dir, show_votes, crop)
 
         vote_image._draw_card = spy
         self.addCleanup(setattr, vote_image, "_draw_card", original)
@@ -153,9 +198,9 @@ class RenderPollImageTests(unittest.TestCase):
         drawn = []
         original = vote_image._draw_card
 
-        def spy(entry, votes, media_dir, show_votes):
+        def spy(entry, votes, media_dir, show_votes, crop=None):
             drawn.append(entry.entry_id)
-            return original(entry, votes, media_dir, show_votes)
+            return original(entry, votes, media_dir, show_votes, crop)
 
         vote_image._draw_card = spy
         self.addCleanup(setattr, vote_image, "_draw_card", original)
@@ -163,6 +208,40 @@ class RenderPollImageTests(unittest.TestCase):
         path = vote_image.render_poll_image(poll, out)
         self.assertEqual(drawn, ["1"])
         self.assertTrue(path.exists())
+
+
+class LegibleNameTests(unittest.TestCase):
+    """The board is drawn with one font and no fallback chain, so anything that font
+    lacks comes out as a hollow .notdef box -- which is what happened to the first two
+    places of a real export, both of whom had decorated Telegram names."""
+
+    def test_a_fancy_alphabet_is_normalised_back_to_letters(self):
+        # MATHEMATICAL SCRIPT/DOUBLE-STRUCK "Anna" -- what people set as a Telegram name.
+        self.assertEqual(vote_image.legible("\U0001D4D0\U0001D4F7\U0001D4F7\U0001D4EA"), "Anna")
+        self.assertEqual(vote_image.legible("\U0001D538\U0001D55F\U0001D55F\U0001D552"), "Anna")
+
+    def test_emoji_are_dropped_and_the_rest_of_the_name_survives(self):
+        self.assertEqual(vote_image.legible("Аня \U0001F338 K"), "Аня K")
+
+    def test_zero_width_joiners_and_variation_selectors_go_too(self):
+        self.assertEqual(vote_image.legible("Аня‍️"), "Аня")
+
+    def test_ordinary_names_are_left_alone(self):
+        for name in ("Сергей Иванов", "Anna-Maria", "кто-то (тут)"):
+            self.assertEqual(vote_image.legible(name), name)
+
+    def test_a_name_with_nothing_drawable_falls_back_to_the_tag(self):
+        entry = _entry("1", "\U0001F338\U0001F31F", "onlyemoji")
+        self.assertEqual(vote_image._who_lines(entry), ("@onlyemoji", ""))
+
+    def test_a_name_with_nothing_drawable_and_no_tag_is_named_plainly(self):
+        entry = _entry("1", "\U0001F338\U0001F31F", None)
+        self.assertEqual(vote_image._who_lines(entry), ("Без имени", ""))
+
+    def test_a_normal_author_keeps_both_lines(self):
+        self.assertEqual(
+            vote_image._who_lines(_entry("1", "Сергей", "serg")), ("Сергей", "@serg")
+        )
 
 
 class VoteImageCommandTests(unittest.TestCase):

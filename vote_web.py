@@ -10,9 +10,19 @@ cannot vote.
 Photos are the one thing served without that check: an <img> cannot send a header, and
 signing every image URL to protect pictures that were already posted publicly in the chat
 would be ceremony without a threat. Their URLs are unguessable-ish (poll id plus message
-id) but not secret.
+id) but not secret. The rendered board picture (see below) is served the same way, being
+a collage of exactly those photos.
+
+Two pages live here, not one:
+
+- PAGE_HTML at ROUTE_PREFIX is the ballot (and, with ?mode=admin, the moderation screen).
+- BOARD_HTML at ROUTE_PREFIX + "/board" is the cropping page: the export's own three-column
+  board, WYSIWYG, where an administrator frames each work by hand and then renders the
+  picture (vote_image.py). Administrators only, enforced on every request it makes rather
+  than by which URL was opened.
 """
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -20,6 +30,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
+import vote_image
 import voting
 
 # Where the page and its API live, so the domain root stays free for a health check.
@@ -50,6 +61,12 @@ _IS_MEMBER_KEY = web.AppKey("is_member", Callable[[dict], Awaitable[bool]])
 _ANNOUNCE_KEY = web.AppKey(
     "announce", Callable[[dict, voting.Poll, list[tuple[voting.Entry, int]]], Awaitable[None]]
 )
+# Delivers a freshly rendered board picture (the cropping page's "Выгрузить картинку") to
+# the administrator who asked for it. Takes their verified user dict, the poll, and the
+# path of the file on disk -- the rendering happens here, the sending is bot_listener.py's,
+# for the same split of concerns _ANNOUNCE_KEY draws. Failure is reported back to the page,
+# not raised: the file is written either way, and the page offers a link to it.
+_EXPORT_KEY = web.AppKey("export", Callable[[dict, voting.Poll, Path], Awaitable[None]])
 _ROUTE_PREFIX_KEY = web.AppKey("route_prefix", str)
 _LOG_KEY = web.AppKey("log", Callable[..., None])
 
@@ -174,6 +191,9 @@ async def handle_poll(request: web.Request) -> web.Response:
     if admin_mode:
         payload["approved"] = list(poll.approved)
         payload["counts"] = {e.entry_id: count for e, count in poll.tally()}
+        # Only in admin mode, and only because the cropping page (BOARD_HTML) is the one
+        # thing that reads it -- a voter's ballot has no use for how the export is framed.
+        payload["crops"] = poll.crops
     return web.json_response(payload)
 
 
@@ -339,6 +359,138 @@ async def handle_announce(request: web.Request) -> web.Response:
     })
 
 
+def _export_subtitle(poll: voting.Poll, standings: list) -> str:
+    return (
+        f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
+        f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
+    )
+
+
+async def handle_crops(request: web.Request) -> web.Response:
+    """Stores how each work is framed in the exported picture -- the cropping page's
+    "Сохранить". Administrators only, and the whole set at once (see voting.set_crops):
+    the page always submits every card it is showing, so a save can never leave the poll
+    holding half of one editing session and half of another.
+
+    Under poll_lock like every other read-modify-write of a poll: two administrators
+    cropping at the same moment would otherwise each load, edit and save, and the second
+    would erase the first's admitting or votes along with their crops.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+
+    user = await _authenticate(request, body)
+    if not await request.app[_IS_ADMIN_KEY](user):
+        return _json_error("только администраторы могут кадрировать работы", status=403)
+
+    crops = body.get("crops")
+    if not isinstance(crops, dict):
+        return _json_error("crops must be an object of entry_id -> {x, y, size}")
+
+    entry_name = request.app[_ENTRY_KEY]
+    async with voting.poll_lock:
+        poll = voting.latest_poll(entry_name)
+        if poll is None:
+            return _json_error("голосование ещё не создано", status=404)
+        voting.set_crops(poll, crops)
+        voting.save_poll(poll)
+    request.app[_LOG_KEY](
+        f"[vote_web] {voting.display_name(user)} saved framing for {len(poll.crops)} entr(ies)"
+    )
+    return web.json_response({"ok": True, "crops": poll.crops})
+
+
+async def handle_export(request: web.Request) -> web.Response:
+    """Renders the board as one picture and hands it to bot_listener.py to deliver.
+    Administrators only.
+
+    Takes the crops in the same request rather than trusting that "Сохранить" was pressed
+    first: exporting a framing different from the one on screen is the one failure mode
+    that would be invisible until the picture arrives.
+
+    The render runs in a worker thread -- decoding and scaling every photo in the poll is
+    seconds of CPU, and this is the same event loop that serves every ballot. Delivery
+    failing (the admin never started a DM with the bot, say) does not fail the export: the
+    file is on disk and the response carries a link to it either way.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+
+    user = await _authenticate(request, body)
+    if not await request.app[_IS_ADMIN_KEY](user):
+        return _json_error("только администраторы могут выгружать картинку", status=403)
+
+    entry_name = request.app[_ENTRY_KEY]
+    async with voting.poll_lock:
+        poll = voting.latest_poll(entry_name)
+        if poll is None:
+            return _json_error("голосование ещё не создано", status=404)
+        if isinstance(body.get("crops"), dict):
+            voting.set_crops(poll, body["crops"])
+            voting.save_poll(poll)
+
+    standings = poll.tally()
+    if not standings:
+        return _json_error("к голосованию не допущено ни одной работы -- нечего рисовать", status=409)
+
+    try:
+        path = await asyncio.to_thread(
+            vote_image.render_poll_image,
+            poll,
+            voting.export_image_path(entry_name, poll.poll_id),
+            subtitle=_export_subtitle(poll, standings),
+        )
+    except Exception as e:
+        request.app[_LOG_KEY](f"[vote_web] rendering the board failed: {e}")
+        return _json_error("не получилось нарисовать картинку -- смотри логи сервера", status=500)
+
+    delivered = True
+    try:
+        await request.app[_EXPORT_KEY](user, poll, path)
+    except Exception as e:
+        delivered = False
+        request.app[_LOG_KEY](f"[vote_web] delivering the board picture failed: {e}")
+
+    request.app[_LOG_KEY](
+        f"[vote_web] {voting.display_name(user)} exported the board: "
+        f"{len(standings)} entr(ies), {path.stat().st_size} bytes, delivered={delivered}"
+    )
+    return web.json_response({
+        "ok": True,
+        "delivered": delivered,
+        "entries": len(standings),
+        "bytes": path.stat().st_size,
+        # Cache-busted by mtime: the same poll re-exported must not come back as whatever
+        # the browser (or Telegram's own proxy) kept from the previous render.
+        "url": (
+            f"{request.app[_ROUTE_PREFIX_KEY]}/export/{poll.poll_id}{path.suffix}"
+            f"?v={int(path.stat().st_mtime)}"
+        ),
+    })
+
+
+async def handle_export_image(request: web.Request) -> web.Response:
+    """Serves the last rendered board picture. Unauthenticated for the same reason the
+    photos are (see the module docstring): it is a collage of pictures already posted
+    publicly in the chat, and an <img>/download link cannot carry a signed header."""
+    poll_id = request.match_info["poll_id"]
+    suffix = request.match_info["suffix"]
+    if not _SAFE_MEDIA_NAME.match(poll_id or "") or suffix not in ("jpg", "png"):
+        raise web.HTTPNotFound()
+
+    path = voting.export_image_path(request.app[_ENTRY_KEY], poll_id).with_suffix(f".{suffix}")
+    if not path.is_file():
+        raise web.HTTPNotFound()
+    # no-store, unlike the photos' long cache: this file is rewritten every time anybody
+    # presses "Выгрузить картинку", and a stale one looks exactly like a crop that didn't
+    # save.
+    return web.FileResponse(path, headers={"Cache-Control": "no-store"})
+
+
 async def handle_clear(request: web.Request) -> web.Response:
     """Deletes the current poll outright -- entries, votes, admitted flags, downloaded
     photos, all of it -- so the next "/vote собрать" starts a genuinely fresh poll.
@@ -387,13 +539,24 @@ async def handle_page(request: web.Request) -> web.Response:
     )
 
 
+async def handle_board_page(request: web.Request) -> web.Response:
+    """The cropping page. Served to anyone who asks, like the ballot itself -- the page is
+    only markup; every request it then makes is authenticated and admin-gated (handle_poll
+    with mode=admin, handle_crops, handle_export), and a non-admin who opens the URL gets
+    an error where the works would be."""
+    return web.Response(
+        text=BOARD_HTML.replace("__PREFIX__", request.app[_ROUTE_PREFIX_KEY]),
+        content_type="text/html",
+    )
+
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
 def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
-    is_member=None,
+    is_member=None, export=None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
     returning a bool; `announce` is an async callable taking (user, poll, standings) --
@@ -411,6 +574,12 @@ def create_app(
     returns True -- not a security stance, just what keeps this module constructible
     standalone (tests, or running the page without the bot alongside it) instead of
     refusing every voter for want of a Bot API client to ask.
+
+    `export` is an async callable taking (user, poll, path) that delivers a rendered board
+    picture to the administrator who asked for it -- same arrangement as `announce`: this
+    module draws the picture, bot_listener.py owns the Bot API client that can send it.
+    Defaults to a no-op, which leaves the export working (the file is written, and the
+    page links to it) minus the copy in the DM.
     """
     async def _default_announce(user, poll, standings):
         return None
@@ -418,12 +587,16 @@ def create_app(
     async def _default_is_member(user):
         return True
 
+    async def _default_export(user, poll, path):
+        return None
+
     app = web.Application()
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_ADMIN_KEY] = is_admin
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
     app[_ANNOUNCE_KEY] = announce or _default_announce
+    app[_EXPORT_KEY] = export or _default_export
     app[_ROUTE_PREFIX_KEY] = route_prefix.rstrip("/")
     app[_LOG_KEY] = log
 
@@ -433,21 +606,31 @@ def create_app(
         web.get("/health", handle_health),
         web.get(prefix, handle_page),
         web.get(f"{prefix}/", handle_page),
+        # Before the api routes only for readability; aiohttp matches on the full path, so
+        # /vote/board can never be mistaken for /vote/api/anything.
+        web.get(f"{prefix}/board", handle_board_page),
+        web.get(f"{prefix}/board/", handle_board_page),
         web.get(f"{prefix}/api/poll", handle_poll),
         web.post(f"{prefix}/api/ballot", handle_ballot),
         web.post(f"{prefix}/api/moderate", handle_moderate),
+        web.post(f"{prefix}/api/crops", handle_crops),
+        web.post(f"{prefix}/api/export", handle_export),
         web.post(f"{prefix}/api/announce", handle_announce),
         web.post(f"{prefix}/api/clear", handle_clear),
         web.get(prefix + "/media/{poll_id}/{name}", handle_media),
+        web.get(prefix + "/export/{poll_id}.{suffix}", handle_export_image),
     ])
     return app
 
 
 async def run_web_server(
-    cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None
+    cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None,
+    export=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
-    app = create_app(cfg, entry, is_admin, announce=announce, log=log, is_member=is_member)
+    app = create_app(
+        cfg, entry, is_admin, announce=announce, log=log, is_member=is_member, export=export,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
@@ -1314,6 +1497,594 @@ $("clear").addEventListener("click", async () => {
     $("msg").hidden = false;
     $("msg").textContent = String(e.message || e);
     $("go").hidden = true;
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# The cropping page. Same board the export draws -- three columns, square thumbnail, the
+# author underneath -- except every thumbnail here is live: tapping one opens a big editor
+# where the photo can be dragged, pinched and zoomed inside its square, and the grid behind
+# it is the preview. What is on screen IS what renders, which is the only honest way to
+# offer cropping: a slider that promises a result you cannot see until the file arrives is
+# worse than no cropping at all.
+#
+# The crop is stored as a square in the PHOTO's own pixel coordinates (see
+# voting.Poll.crops), not as CSS: the browser and Pillow agree on those, whatever size
+# either happens to be displaying the picture at. A square that hangs off the edge of the
+# photo is how "fit the whole thing" is expressed, so fitted and cropped are one
+# representation with one renderer, not two modes.
+BOARD_HTML = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Кадрирование итогов</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --fg: var(--tg-theme-text-color, #f5f5f5);
+    --muted: var(--tg-theme-hint-color, #8a9aa9);
+    --card: var(--tg-theme-secondary-bg-color, #232e3c);
+    --accent: var(--tg-theme-button-color, #3390ec);
+    --accent-fg: var(--tg-theme-button-text-color, #fff);
+    /* The letterbox colour vote_image.py paints behind a fitted photo. Hardcoded rather
+       than themed on purpose: the picture that comes out has this colour baked into it,
+       so the preview must show it even to somebody running a light Telegram theme. */
+    --thumb-bg: #1a2532;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding-bottom: 130px;
+  }
+  header { padding: 14px 12px 6px; }
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .tools { display: flex; gap: 8px; padding: 8px 12px 0; flex-wrap: wrap; }
+  .chip { border: 1px solid rgba(128,128,128,.4); background: transparent; color: var(--fg);
+          border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+  /* The export's own geometry, in CSS: three columns, and a caption block tall enough for
+     both the name and the @tag so a card without a tag is still the same height as one
+     with -- exactly what vote_image.CAPTION_HEIGHT is a fixed constant for. */
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
+  .gcard { background: var(--card); border-radius: 10px; overflow: hidden; cursor: pointer; }
+  .frame { position: relative; width: 100%; aspect-ratio: 1; overflow: hidden;
+           background: var(--thumb-bg); }
+  .frame img { position: absolute; left: 0; top: 0; max-width: none; display: block;
+               /* Nothing here is meaningful until its crop has been applied, and that
+                  needs the natural size, which only arrives with the load event. */
+               visibility: hidden; }
+  .frame img.ready { visibility: visible; }
+  .badge { position: absolute; left: 5px; top: 5px; background: var(--accent);
+           color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+  .edit { position: absolute; right: 5px; bottom: 5px; background: rgba(0,0,0,.6);
+          color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 8px; }
+  .who { padding: 6px 7px 8px; font-size: 11px; line-height: 1.25; }
+  .who .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .who .tag { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+              white-space: nowrap; display: block; min-height: 14px; }
+  .msg { padding: 24px 16px; color: var(--muted); text-align: center; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
+         padding-bottom: calc(10px + env(safe-area-inset-bottom));
+         background: var(--bg); border-top: 1px solid rgba(128,128,128,.25); z-index: 20; }
+  .status { font-size: 12px; color: var(--muted); text-align: center; margin-bottom: 8px;
+            min-height: 16px; }
+  .status a { color: var(--accent); }
+  .go { width: 100%; border: 0; border-radius: 10px; padding: 14px; font-size: 16px;
+        font-weight: 600; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+  .go[disabled] { opacity: .5; cursor: default; }
+  .go.secondary { background: transparent; color: var(--accent);
+                  border: 1px solid var(--accent); margin-bottom: 8px; }
+
+  /* The editor: one work, as big as the screen allows. A fixed overlay rather than a
+     <dialog>, same as the ballot's reel -- it has to work in every browser Telegram
+     embeds, including the ones without dialog support. */
+  .editor { position: fixed; inset: 0; z-index: 30; background: var(--bg);
+            display: flex; flex-direction: column; padding: 12px; overflow-y: auto;
+            padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
+  body.editing { overflow: hidden; }
+  .etop { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .etop .ewho { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                white-space: nowrap; font-weight: 600; }
+  .eclose { border: 0; border-radius: 50%; width: 34px; height: 34px; flex: none;
+            background: rgba(128,128,128,.25); color: var(--fg); font-size: 16px;
+            cursor: pointer; }
+  .stagewrap { width: 100%; max-width: 460px; margin: 0 auto; }
+  /* touch-action: none, or the first drag becomes a page scroll and the photo never moves
+     -- on a phone that reads as the editor being broken. */
+  .stage { position: relative; width: 100%; aspect-ratio: 1; overflow: hidden;
+           background: var(--thumb-bg); border-radius: 12px; touch-action: none;
+           cursor: grab; user-select: none; }
+  .stage.dragging { cursor: grabbing; }
+  .stage img { position: absolute; left: 0; top: 0; max-width: none; display: block;
+               pointer-events: none; -webkit-user-drag: none; }
+  /* The thirds, over the photo: without them "centred" is guesswork, since the square
+     being framed has no edges of its own once it fills the screen. */
+  .thirds { position: absolute; inset: 0; pointer-events: none; }
+  .thirds i { position: absolute; background: rgba(255,255,255,.22); }
+  .thirds i.v { top: 0; bottom: 0; width: 1px; }
+  .thirds i.h { left: 0; right: 0; height: 1px; }
+  .zoomrow { display: flex; align-items: center; gap: 10px; margin: 12px auto 0;
+             max-width: 460px; width: 100%; }
+  .zoomrow input[type="range"] { flex: 1; accent-color: var(--accent); }
+  .zoomrow button { border: 1px solid rgba(128,128,128,.4); background: transparent;
+                    color: var(--fg); border-radius: 8px; width: 36px; height: 32px;
+                    font-size: 17px; cursor: pointer; }
+  .erow { display: flex; gap: 8px; margin: 12px auto 0; max-width: 460px; width: 100%; }
+  .erow button { flex: 1; border: 1px solid rgba(128,128,128,.4); background: transparent;
+                 color: var(--fg); border-radius: 8px; padding: 10px; font-size: 13px;
+                 cursor: pointer; }
+  .erow button.primary { background: var(--accent); color: var(--accent-fg);
+                         border-color: var(--accent); font-weight: 600; }
+  .ehint { color: var(--muted); font-size: 12px; text-align: center; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Кадрирование итогов</h1>
+  <div class="sub" id="sub">Загружаю…</div>
+</header>
+<div class="tools" id="tools" hidden>
+  <button class="chip" id="allFit">Все: вписать</button>
+  <button class="chip" id="allFill">Все: заполнить</button>
+</div>
+<div class="grid" id="grid"></div>
+<div class="msg" id="msg" hidden></div>
+<div class="bar">
+  <div class="status" id="status"></div>
+  <button class="go secondary" id="save" disabled>Кадрирование сохранено</button>
+  <button class="go" id="export">Выгрузить картинку</button>
+</div>
+
+<div class="editor" id="editor" hidden>
+  <div class="etop">
+    <button class="eclose" id="editorClose" aria-label="Закрыть">✕</button>
+    <div class="ewho" id="editorWho"></div>
+  </div>
+  <div class="stagewrap">
+    <div class="stage" id="stage">
+      <img id="stageImg" alt="">
+      <div class="thirds">
+        <i class="v" style="left:33.33%"></i><i class="v" style="left:66.66%"></i>
+        <i class="h" style="top:33.33%"></i><i class="h" style="top:66.66%"></i>
+      </div>
+    </div>
+  </div>
+  <div class="zoomrow">
+    <button id="zoomOut" aria-label="Отдалить">-</button>
+    <input type="range" id="zoom" min="0" max="1000" value="0">
+    <button id="zoomIn" aria-label="Приблизить">+</button>
+  </div>
+  <div class="erow">
+    <button id="doFit">Вписать</button>
+    <button id="doFill">Заполнить</button>
+    <button class="primary" id="doDone">Готово</button>
+  </div>
+  <div class="ehint">Тяни фото, чтобы сдвинуть. Двумя пальцами или ползунком - масштаб.</div>
+</div>
+
+<script>
+const PREFIX = "__PREFIX__";
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const initData = (tg && tg.initData) || "";
+
+let works = [];       // the ranked board: {id, author, username, votes, photo}
+let crops = {};       // id -> {x, y, size}: the square being framed, in photo pixels
+let natural = {};     // id -> {w, h}: learned from each photo as it loads
+let dirty = false;    // something changed since the last successful save
+let editing = null;   // id of the work the editor is open on
+
+const $ = (id) => document.getElementById(id);
+
+function api(path, options = {}) {
+  const headers = Object.assign({ "X-Telegram-Init-Data": initData }, options.headers || {});
+  if (options.body) headers["Content-Type"] = "application/json";
+  return fetch(PREFIX + path, Object.assign({}, options, { headers }));
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+// ------------------------------------------------------------------- the crop itself
+
+// The whole photo, centred: the smallest square that contains it, which leaves letterbox
+// on the short side. Mirrors vote_image.default_crop -- an untouched card must render the
+// same whether or not anybody ever opened this page.
+function fitCrop(size) {
+  const side = Math.max(size.w, size.h);
+  return { x: (size.w - side) / 2, y: (size.h - side) / 2, size: side };
+}
+
+// The biggest square entirely inside the photo, centred: object-fit: cover, i.e. exactly
+// what the ballot's own grid shows. The starting point for anyone who wants it filled.
+function fillCrop(size) {
+  const side = Math.min(size.w, size.h);
+  return { x: (size.w - side) / 2, y: (size.h - side) / 2, size: side };
+}
+
+function minSize(size) { return Math.max(16, Math.min(size.w, size.h) / 8); }
+function maxSize(size) { return Math.max(size.w, size.h) * 1.8; }
+
+// Keeps a fifth of the frame on the picture, whichever way it is dragged. Without it the
+// photo can be shoved off its own square entirely, and the card renders as a blank
+// letterbox that looks like a bug rather than like a choice.
+function clamp(id) {
+  const size = natural[id], crop = crops[id];
+  if (!size || !crop) return;
+  crop.size = Math.min(maxSize(size), Math.max(minSize(size), crop.size));
+  const keepX = Math.min(crop.size, size.w) * 0.2;
+  const keepY = Math.min(crop.size, size.h) * 0.2;
+  crop.x = Math.min(Math.max(crop.x, -crop.size + keepX), size.w - keepX);
+  crop.y = Math.min(Math.max(crop.y, -crop.size + keepY), size.h - keepY);
+}
+
+// The one place a crop becomes CSS: the frame shows crop.size photo-pixels across, so
+// everything scales by frame/crop.size and the photo is offset by where the square starts.
+function applyTo(img, crop, size, framePx) {
+  if (!img || !crop || !size || !framePx) return;
+  const scale = framePx / crop.size;
+  img.style.width = (size.w * scale) + "px";
+  img.style.height = (size.h * scale) + "px";
+  img.style.left = (-crop.x * scale) + "px";
+  img.style.top = (-crop.y * scale) + "px";
+  img.classList.add("ready");
+}
+
+function paint(id) {
+  clamp(id);
+  const cell = document.querySelector('[data-cell="' + CSS.escape(id) + '"]');
+  if (cell) applyTo(cell.querySelector("img"), crops[id], natural[id], cell.clientWidth);
+  if (editing === id) {
+    applyTo($("stageImg"), crops[id], natural[id], $("stage").clientWidth);
+    syncZoom();
+  }
+}
+
+function markDirty() {
+  dirty = true;
+  const save = $("save");
+  save.disabled = false;
+  save.textContent = "Сохранить кадрирование";
+}
+
+// -------------------------------------------------------------------------- the grid
+
+function renderGrid() {
+  const grid = $("grid");
+  grid.innerHTML = "";
+  works.forEach((work, index) => {
+    const cell = document.createElement("div");
+    cell.className = "gcard";
+    cell.dataset.cell = work.id;
+    cell.innerHTML =
+      '<div class="frame">' +
+        (work.photo ? '<img alt="" src="' + esc(work.photo) + '">' : "") +
+        '<span class="badge">' + (index + 1) + " - " + work.votes + "</span>" +
+        '<span class="edit">кадр</span>' +
+      "</div>" +
+      '<div class="who"><div class="name">' + esc(work.author || "") + "</div>" +
+        '<span class="tag">' + (work.username ? "@" + esc(work.username) : "") + "</span></div>";
+    cell.addEventListener("click", () => openEditor(work.id));
+    grid.appendChild(cell);
+
+    const img = cell.querySelector("img");
+    if (!img) return;
+    const onReady = () => {
+      natural[work.id] = { w: img.naturalWidth, h: img.naturalHeight };
+      // A saved crop wins; anything not framed yet starts fitted, which is what the
+      // renderer would have done with it anyway.
+      if (!crops[work.id]) crops[work.id] = fitCrop(natural[work.id]);
+      paint(work.id);
+    };
+    if (img.complete && img.naturalWidth) onReady(); else img.addEventListener("load", onReady);
+  });
+}
+
+// A phone rotating (or Telegram resizing the app) changes every frame's width, and a crop
+// only becomes pixels against that width -- without this the photos keep the old scale and
+// the whole grid goes visibly wrong.
+window.addEventListener("resize", () => { works.forEach((w) => paint(w.id)); });
+
+// ------------------------------------------------------------------------ the editor
+
+function whoText(work) {
+  if (!work) return "";
+  return work.username ? work.author + " (@" + work.username + ")" : work.author;
+}
+
+function openEditor(id) {
+  if (!natural[id]) return;  // photo still loading: nothing sensible to frame yet
+  editing = id;
+  const work = works.find((w) => w.id === id);
+  $("editorWho").textContent = whoText(work);
+  const img = $("stageImg");
+  img.classList.remove("ready");
+  img.src = work.photo;
+  $("editor").hidden = false;
+  document.body.classList.add("editing");
+  if (tg && tg.BackButton) tg.BackButton.show();
+  const show = () => { applyTo(img, crops[id], natural[id], $("stage").clientWidth); syncZoom(); };
+  if (img.complete && img.naturalWidth) show(); else img.addEventListener("load", show, { once: true });
+}
+
+function closeEditor() {
+  const id = editing;
+  editing = null;
+  $("editor").hidden = true;
+  document.body.classList.remove("editing");
+  if (tg && tg.BackButton) tg.BackButton.hide();
+  if (id) paint(id);
+}
+
+function syncZoom() {
+  const size = natural[editing], crop = crops[editing];
+  if (!size || !crop) return;
+  const low = minSize(size), high = maxSize(size);
+  // Logarithmic, so one step of the slider is the same proportional zoom everywhere --
+  // linear, the whole useful range of a big photo lives in the last tenth of the track.
+  const value = 1000 * Math.log(high / crop.size) / Math.log(high / low);
+  $("zoom").value = String(Math.max(0, Math.min(1000, Math.round(value))));
+}
+
+// Zooms to `size` photo-pixels across while keeping whatever is under (ax, ay) -- stage
+// coordinates -- exactly where it is. That is what makes pinching feel like the photo is
+// being pulled, rather than jumping to centre on every touch.
+function zoomTo(size, ax, ay) {
+  const crop = crops[editing], dims = natural[editing];
+  if (!crop || !dims) return;
+  const stagePx = $("stage").clientWidth || 1;
+  const bounded = Math.min(maxSize(dims), Math.max(minSize(dims), size));
+  const sx = crop.x + (ax / stagePx) * crop.size;
+  const sy = crop.y + (ay / stagePx) * crop.size;
+  crop.x = sx - (ax / stagePx) * bounded;
+  crop.y = sy - (ay / stagePx) * bounded;
+  crop.size = bounded;
+  markDirty();
+  paint(editing);
+}
+
+const stage = $("stage");
+const pointers = new Map();     // touches (or mouse buttons) currently down on the stage
+let pinchStart = null;          // {distance, size} from when the second finger went down
+
+function stagePoint(event) {
+  const box = stage.getBoundingClientRect();
+  return { x: event.clientX - box.left, y: event.clientY - box.top };
+}
+
+stage.addEventListener("pointerdown", (event) => {
+  if (!editing) return;
+  stage.setPointerCapture(event.pointerId);
+  pointers.set(event.pointerId, stagePoint(event));
+  stage.classList.add("dragging");
+  if (pointers.size === 2) {
+    const two = [...pointers.values()];
+    pinchStart = {
+      distance: Math.hypot(two[0].x - two[1].x, two[0].y - two[1].y),
+      size: crops[editing].size,
+    };
+  }
+});
+
+stage.addEventListener("pointermove", (event) => {
+  if (!editing || !pointers.has(event.pointerId)) return;
+  const previous = pointers.get(event.pointerId);
+  const current = stagePoint(event);
+  pointers.set(event.pointerId, current);
+
+  if (pointers.size >= 2 && pinchStart) {
+    const two = [...pointers.values()];
+    const distance = Math.hypot(two[0].x - two[1].x, two[0].y - two[1].y);
+    if (distance > 0 && pinchStart.distance > 0) {
+      // Fingers apart => a smaller square of the photo fills the frame => zoomed in.
+      zoomTo(
+        pinchStart.size * (pinchStart.distance / distance),
+        (two[0].x + two[1].x) / 2, (two[0].y + two[1].y) / 2
+      );
+    }
+    return;
+  }
+
+  const crop = crops[editing];
+  const perPixel = crop.size / (stage.clientWidth || 1);
+  crop.x -= (current.x - previous.x) * perPixel;
+  crop.y -= (current.y - previous.y) * perPixel;
+  markDirty();
+  paint(editing);
+});
+
+function endPointer(event) {
+  pointers.delete(event.pointerId);
+  // The pinch is over the moment either finger leaves: measuring the next one-finger drag
+  // against a stale two-finger distance is how a crop jumps for no reason.
+  if (pointers.size < 2) pinchStart = null;
+  if (!pointers.size) stage.classList.remove("dragging");
+}
+stage.addEventListener("pointerup", endPointer);
+stage.addEventListener("pointercancel", endPointer);
+
+stage.addEventListener("wheel", (event) => {
+  if (!editing) return;
+  event.preventDefault();
+  const point = stagePoint(event);
+  zoomTo(crops[editing].size * (event.deltaY < 0 ? 1 / 1.12 : 1.12), point.x, point.y);
+}, { passive: false });
+
+$("zoom").addEventListener("input", () => {
+  if (!editing) return;
+  const size = natural[editing];
+  const low = minSize(size), high = maxSize(size);
+  const centre = ($("stage").clientWidth || 1) / 2;
+  zoomTo(high * Math.pow(low / high, Number($("zoom").value) / 1000), centre, centre);
+});
+
+function nudgeZoom(factor) {
+  if (!editing) return;
+  const centre = ($("stage").clientWidth || 1) / 2;
+  zoomTo(crops[editing].size * factor, centre, centre);
+}
+$("zoomIn").addEventListener("click", () => nudgeZoom(1 / 1.2));
+$("zoomOut").addEventListener("click", () => nudgeZoom(1.2));
+
+$("doFit").addEventListener("click", () => {
+  if (!editing) return;
+  crops[editing] = fitCrop(natural[editing]); markDirty(); paint(editing);
+});
+$("doFill").addEventListener("click", () => {
+  if (!editing) return;
+  crops[editing] = fillCrop(natural[editing]); markDirty(); paint(editing);
+});
+$("doDone").addEventListener("click", closeEditor);
+$("editorClose").addEventListener("click", closeEditor);
+// Telegram's own back arrow closes the editor -- on a phone that is the gesture people
+// reach for first, and without this it would close the whole Mini App instead.
+if (tg && tg.BackButton) tg.BackButton.onClick(() => { if (editing) closeEditor(); });
+
+$("allFit").addEventListener("click", () => {
+  works.forEach((w) => { if (natural[w.id]) { crops[w.id] = fitCrop(natural[w.id]); paint(w.id); } });
+  markDirty();
+});
+$("allFill").addEventListener("click", () => {
+  works.forEach((w) => { if (natural[w.id]) { crops[w.id] = fillCrop(natural[w.id]); paint(w.id); } });
+  markDirty();
+});
+
+// ------------------------------------------------------------------- saving, exporting
+
+// Only the works actually on the board, and only the ones whose photo has loaded: sending
+// a crop for a card whose natural size was never learned would save a square computed from
+// nothing.
+function payloadCrops() {
+  const out = {};
+  works.forEach((w) => { if (natural[w.id] && crops[w.id]) out[w.id] = crops[w.id]; });
+  return out;
+}
+
+function status(html) { $("status").innerHTML = html; }
+
+async function save() {
+  const button = $("save");
+  button.disabled = true;
+  button.textContent = "Сохраняю…";
+  try {
+    const response = await api("/api/crops", {
+      method: "POST",
+      body: JSON.stringify({ init_data: initData, crops: payloadCrops() }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось");
+    dirty = false;
+    button.textContent = "Кадрирование сохранено";
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    return true;
+  } catch (e) {
+    button.disabled = false;
+    button.textContent = "Сохранить кадрирование";
+    status(esc(String(e.message || e)));
+    return false;
+  }
+}
+
+$("save").addEventListener("click", save);
+
+function openImage(url) {
+  const absolute = new URL(url, location.href).href;
+  if (tg && tg.openLink) tg.openLink(absolute); else window.open(absolute, "_blank");
+}
+
+$("export").addEventListener("click", async () => {
+  const button = $("export");
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "Рисую картинку…";
+  status("Это займёт несколько секунд.");
+  try {
+    // The crops ride along with the export, so what renders is what is on screen even if
+    // "Сохранить" was never pressed -- the server stores them as part of the same request.
+    const response = await api("/api/export", {
+      method: "POST",
+      body: JSON.stringify({ init_data: initData, crops: payloadCrops() }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось");
+    dirty = false;
+    $("save").disabled = true;
+    $("save").textContent = "Кадрирование сохранено";
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    const kilobytes = Math.round((data.bytes || 0) / 1024);
+    status(
+      (data.delivered
+        ? "Готово: картинка отправлена файлом в личку с ботом. "
+        : "Картинка готова, но отправить её в личку не вышло. ") +
+      '<a href="#" id="openImage">Открыть картинку</a> - ' +
+      data.entries + " работ, " + kilobytes + " КБ"
+    );
+    const link = $("openImage");
+    if (link) {
+      link.addEventListener("click", (event) => { event.preventDefault(); openImage(data.url); });
+    }
+  } catch (e) {
+    status(esc(String(e.message || e)));
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+});
+
+// A reload costs nothing but unsaved framing -- which is exactly the thing worth a
+// warning, since it can be twenty photos' worth of work.
+window.addEventListener("beforeunload", (event) => {
+  if (!dirty) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
+
+(async function load() {
+  try {
+    // mode=admin is what makes the server send `results` (the ranked board) and `crops` at
+    // all -- and it only obeys it for a real administrator, whoever asks (see handle_poll).
+    const response = await api("/api/poll?mode=admin");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось загрузить");
+    if (!data.poll_id) {
+      $("sub").textContent = "";
+      $("msg").hidden = false;
+      $("msg").textContent = "Голосование ещё не создано.";
+      return;
+    }
+    if (!data.is_admin) {
+      $("sub").textContent = "";
+      $("msg").hidden = false;
+      $("msg").textContent = "Кадрирование доступно только администраторам.";
+      return;
+    }
+    crops = data.crops || {};
+    works = data.results || [];
+    if (!works.length) {
+      $("sub").textContent = "";
+      $("msg").hidden = false;
+      $("msg").textContent = "К голосованию ещё не допущена ни одна работа -- /vote выбрать.";
+      return;
+    }
+    $("sub").textContent =
+      "Работ: " + works.length + " · проголосовало " + (data.voter_count || 0) +
+      " · порядок как в картинке, по голосам";
+    $("tools").hidden = false;
+    renderGrid();
+  } catch (e) {
+    $("sub").textContent = "";
+    $("msg").hidden = false;
+    $("msg").textContent = String(e.message || e);
   }
 })();
 </script>

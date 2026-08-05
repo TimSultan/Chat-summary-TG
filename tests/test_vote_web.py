@@ -52,6 +52,8 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.admin_id = 1
         self.voter_id = 2
         self.announced = []  # (user, poll, standings) tuples, in call order
+        self.exported = []   # paths of rendered board pictures handed over for delivery
+        self.export_fails = False
         cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
 
         async def is_admin(user: dict) -> bool:
@@ -60,7 +62,14 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         async def announce(user, poll, standings):
             self.announced.append((user, poll, standings))
 
-        app = vote_web.create_app(cfg, CHAT, is_admin, announce=announce, log=lambda *_: None)
+        async def export(user, poll, path):
+            if self.export_fails:
+                raise RuntimeError("bot could not DM this admin")
+            self.exported.append(path)
+
+        app = vote_web.create_app(
+            cfg, CHAT, is_admin, announce=announce, export=export, log=lambda *_: None,
+        )
         self.server = TestServer(app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -678,6 +687,140 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertFalse(data["notified"])
         self.assertFalse(voting.load_poll(CHAT, "2026-08-02").open)
+
+    # ---- cropping + export ------------------------------------------------------------------
+
+    def _seed_photo(self, name="a.jpg", size=(600, 400)):
+        """A real JPEG where the poll's media lives, so the export path renders for real
+        rather than against a mocked Pillow."""
+        from PIL import Image
+
+        directory = voting.media_path(CHAT, "2026-08-02")
+        directory.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", size, (40, 90, 160)).save(directory / name, "JPEG")
+
+    async def test_a_non_admin_cannot_save_crops(self):
+        self._seed_poll()
+        response = await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/crops", json={
+            "init_data": _init_data(self.voter_id), "crops": {"a": {"x": 0, "y": 0, "size": 10}},
+        })
+        self.assertEqual(response.status, 403)
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").crops, {})
+
+    async def test_an_admin_saves_crops_and_they_survive_a_reload(self):
+        self._seed_poll()
+        response = await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/crops", json={
+            "init_data": _init_data(self.admin_id),
+            "crops": {"a": {"x": -50.5, "y": 10, "size": 400}},
+        })
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            voting.load_poll(CHAT, "2026-08-02").crops, {"a": {"x": -50.5, "y": 10.0, "size": 400.0}}
+        )
+
+    async def test_a_crop_for_an_unknown_entry_is_dropped_not_stored(self):
+        self._seed_poll()
+        await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/crops", json={
+            "init_data": _init_data(self.admin_id),
+            "crops": {"a": {"x": 0, "y": 0, "size": 5}, "ghost": {"x": 0, "y": 0, "size": 5}},
+        })
+        self.assertEqual(list(voting.load_poll(CHAT, "2026-08-02").crops), ["a"])
+
+    async def test_a_malformed_crop_is_dropped_without_losing_the_good_ones(self):
+        self._seed_poll(approved=("a", "b"))
+        await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/crops", json={
+            "init_data": _init_data(self.admin_id),
+            "crops": {"a": {"x": 0, "y": 0, "size": 5}, "b": {"x": 0, "y": 0, "size": -1}},
+        })
+        self.assertEqual(list(voting.load_poll(CHAT, "2026-08-02").crops), ["a"])
+
+    async def test_a_non_admin_cannot_export(self):
+        self._seed_poll()
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/export", json={"init_data": _init_data(self.voter_id)}
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.exported, [])
+
+    async def test_exporting_renders_the_file_saves_the_crops_and_delivers_it(self):
+        self._seed_poll()
+        self._seed_photo()
+        response = await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/export", json={
+            "init_data": _init_data(self.admin_id),
+            "crops": {"a": {"x": 100, "y": 0, "size": 400}},
+        })
+        data = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(data["delivered"])
+        self.assertEqual(data["entries"], 1)
+        # The crops came with the export rather than through a separate save, and stuck.
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").crops["a"]["x"], 100.0)
+        path = voting.export_image_path(CHAT, "2026-08-02")
+        self.assertTrue(path.is_file())
+        self.assertEqual(self.exported, [path])
+        # And the url it hands back actually serves that file.
+        served = await self.client.get(data["url"])
+        self.assertEqual(served.status, 200)
+        self.assertEqual(len(await served.read()), path.stat().st_size)
+
+    async def test_a_delivery_failure_still_leaves_the_picture_on_disk(self):
+        self._seed_poll()
+        self._seed_photo()
+        self.export_fails = True
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/export", json={"init_data": _init_data(self.admin_id)}
+        )
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertFalse(data["delivered"])
+        self.assertTrue(voting.export_image_path(CHAT, "2026-08-02").is_file())
+
+    async def test_exporting_with_nothing_admitted_is_refused(self):
+        self._seed_poll(approved=())
+        response = await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/export", json={"init_data": _init_data(self.admin_id)}
+        )
+        self.assertEqual(response.status, 409)
+
+    async def test_the_admin_payload_carries_the_crops_and_a_voter_payload_does_not(self):
+        poll = self._seed_poll()
+        voting.set_crops(poll, {"a": {"x": 1, "y": 2, "size": 3}})
+        voting.save_poll(poll)
+
+        admin = await (await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll?mode=admin",
+            headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+        )).json()
+        voter = await (await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )).json()
+
+        self.assertEqual(admin["crops"], {"a": {"x": 1.0, "y": 2.0, "size": 3.0}})
+        self.assertNotIn("crops", voter)
+
+    async def test_the_board_page_loads_without_auth_and_talks_to_the_admin_api(self):
+        """The HTML shell is public like the ballot's; what makes it admin-only is that
+        every request it makes is (mode=admin, /api/crops, /api/export)."""
+        response = await self.client.get(f"{vote_web.ROUTE_PREFIX}/board")
+        page = await response.text()
+        self.assertEqual(response.status, 200)
+        self.assertIn("/api/poll?mode=admin", page)
+        self.assertIn("/api/crops", page)
+        self.assertIn("/api/export", page)
+        # The gesture surface: dragging pans, two fingers zoom, and the frame must not
+        # scroll the page out from under the finger.
+        self.assertIn('stage.addEventListener("pointerdown"', page)
+        self.assertIn("touch-action: none", page)
+
+    async def test_an_export_of_a_poll_that_was_never_rendered_is_a_404(self):
+        response = await self.client.get(f"{vote_web.ROUTE_PREFIX}/export/2026-08-02.jpg")
+        self.assertEqual(response.status, 404)
+
+    async def test_the_export_route_refuses_a_traversal(self):
+        response = await self.client.get(f"{vote_web.ROUTE_PREFIX}/export/..%2F..%2Fsecrets.jpg")
+        self.assertIn(response.status, (400, 403, 404))
 
     # ---- media ----------------------------------------------------------------------------
 

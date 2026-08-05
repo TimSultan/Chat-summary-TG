@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -238,6 +239,34 @@ def media_path(entry: str, poll_id: str) -> Path:
     return _voting_dir() / "media" / f"{_poll_key(entry)}_{poll_id}"
 
 
+def _clean_crops(raw) -> dict[str, dict]:
+    """Whatever was in the JSON, reduced to the crops that are actually usable: three
+    finite numbers with a positive size, keyed by entry id. Anything else is dropped
+    rather than raising -- a nonsense crop must cost that one work its framing, not make
+    the whole poll unloadable (same tolerance load_poll has for the file as a whole)."""
+    crops: dict[str, dict] = {}
+    for entry_id, crop in (raw or {}).items():
+        if not isinstance(crop, dict):
+            continue
+        try:
+            x, y, size = float(crop["x"]), float(crop["y"]), float(crop["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(map(math.isfinite, (x, y, size))) or size <= 0:
+            continue
+        crops[str(entry_id)] = {"x": x, "y": y, "size": size}
+    return crops
+
+
+def set_crops(poll: "Poll", crops: dict) -> "Poll":
+    """Replaces the framing wholesale -- the cropping page always submits every card it is
+    showing, so this cannot drift from what the editor saw. Crops for entries that are no
+    longer in the poll are dropped, same rule set_approved follows."""
+    known = {e.entry_id for e in poll.entries}
+    poll.crops = {k: v for k, v in _clean_crops(crops).items() if k in known}
+    return poll
+
+
 def export_image_path(entry: str, poll_id: str) -> Path:
     """Where the rendered board picture (vote_image.py) is saved -- same
     `<poll key>_<poll id>` naming as poll_path, in its own directory for the same reason
@@ -270,6 +299,16 @@ class Poll:
     # FIRST ballot in permanently -- enforced by vote_web.handle_ballot, not here (see its
     # docstring): this field is just the setting, not the enforcement.
     allow_revote: bool = True
+    # entry_id -> {"x": float, "y": float, "size": float}: how that entry's FIRST photo is
+    # framed in the exported board picture (vote_image.py), set on the cropping page. A
+    # square in the photo's own pixel coordinates, taken AFTER the EXIF rotation both the
+    # browser and Pillow apply, so the page and the render mean the same square.
+    #
+    # It may hang off the edge of the photo (negative x/y, or a size past the photo's own):
+    # that is how "fit the whole thing, letterboxed" is expressed as a crop rather than as
+    # a separate mode -- one representation for both, so the renderer has one path.
+    # An entry with no entry here is drawn fitted, exactly as before any cropping existed.
+    crops: dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -283,6 +322,7 @@ class Poll:
             "winner_entry_id": self.winner_entry_id,
             "max_choices": self.max_choices,
             "allow_revote": self.allow_revote,
+            "crops": {k: dict(v) for k, v in self.crops.items()},
         }
 
     @classmethod
@@ -298,6 +338,7 @@ class Poll:
             winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
             max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
             allow_revote=bool(raw.get("allow_revote", True)),
+            crops=_clean_crops(raw.get("crops")),
         )
 
     def approved_entries(self) -> list[Entry]:
@@ -434,6 +475,10 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
         poll.winner_entry_id = existing.winner_entry_id
     poll.max_choices = existing.max_choices
     poll.allow_revote = existing.allow_revote
+    # Framing survives a re-collect for the same reason admitting does: it is work the
+    # administrator did by hand, and a poll refreshed to pick up two new nominations must
+    # not silently un-crop the dozen that were already framed.
+    poll.crops = {k: dict(v) for k, v in existing.crops.items() if k in known}
     return poll
 
 
