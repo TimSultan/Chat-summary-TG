@@ -16,25 +16,32 @@ from a REPL:
 
 WHY THESE NUMBERS
 -----------------
-The wallet is the chat's existing coin ledger (economy.py), not a second currency, so
-the earn rate is already measured rather than guessed: over a 34-day window the most
-active members earned 60-233 coins/week, the p90 member ~55/week, the median ~3/week.
-On top of that the arena pays WIN_GOLD per win, capped at DAILY_FIGHTS fights a day.
+The wallet is the chat's existing coin ledger (economy.py), not a second currency, so the
+earn rate is already measured rather than guessed: over a 34-day window the most active
+members earned 60-233 coins/week, the p90 member ~55/week, the median ~3/week.
 
-    active chatter          ~150/week
-    5 fights/day at ~50%    ~790/week
-    -------------------------------------
-    combined                ~940/week, ~4,000/month
+Arena income is NOT flat. How many fights somebody gets is earned from what they did in
+the chat yesterday (see daily_fight_allowance), and losing costs half of what winning
+pays (LOSS_GOLD_SHARE), so the losing half of every fight is paid by a player rather than
+minted. Both together are what make chat activity actually decide income:
+
+    profile      msgs/day  fights  arena/wk  +chat  total/wk  3 stats -> 80
+    lurker              1       2       315      3       318      15 months
+    median             14       3       472     25       498      9.6 months
+    p75                41       5       788     80       868      5.5 months
+    p90                89       9     1,418    150     1,568      3.0 months
+    p95               166      12     1,890    233     2,123      2.2 months
 
 Against that, STAT_COST_EXPONENT = 1.2 puts one stat at 1 -> 80 at 6,896 gold and three
-stats at 20,688 -- roughly five months for somebody who both chats and fights daily, and
-level 40 in a stat (1,481 gold) inside the first two weeks. That is the shape asked for:
-an active member reaches a high level in three stats, and nobody maxes all four quickly.
+at 20,688 -- about five months for a solidly active member, and level 40 in a stat
+(1,481 gold) inside the first two weeks. That is the shape asked for: an active member
+reaches a high level in three stats, and nobody maxes all four quickly.
 
-The one thing worth knowing before re-tuning: the arena is ~85% of the faucet, so
-chatting matters much less than fighting. If that should change, the honest lever is
-DAILY_FIGHTS and WIN_GOLD, not the stat costs -- lowering the costs makes the arena even
-more dominant rather than less. See PETS_BALANCE.md.
+Worth knowing before re-tuning: this replaced a flat 5 fights a day with a free loss,
+which paid everybody ~1,575/week regardless of whether they ever wrote a word -- a 1.3x
+spread between a lurker and the chat's busiest member. It is now 6.2x. If it should move
+further, the levers are BASE_DAILY_FIGHTS and WIN_GOLD_*, not the stat costs: making
+levels cheaper raises everybody equally and widens nothing. See PETS_BALANCE.md.
 """
 
 # --------------------------------------------------------------------------- currency
@@ -109,16 +116,24 @@ def total_stat_cost(target_level: int, from_level: int = STAT_MIN_LEVEL) -> int:
 
 
 # --------------------------------------------------------------------------- combat
-# Tuned so a fight is 6-12 rounds at EVERY level, which is what keeps the battle log
-# readable: a level-1 pair trade ~11 blows, a maxed pair ~8. Both HP and damage scale,
-# damage slightly faster, so high-level fights are not slower slugfests.
+# Tuned so a fight is ~20 blows -- about ten from each side -- at EVERY level. That is
+# the target, and it is a tight one: the numbers below are what make it hold at level 1
+# and at level 80 alike, rather than starting long and getting shorter as stats climb.
 #
-#   HP     = BASE_HP + health * HP_PER_POINT          (500 + 13/pt -> 1,540 at 80)
-#   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT (45 + 2.2/pt ->   221 at 80)
+#   HP     = BASE_HP + health * HP_PER_POINT           (500 + 19/pt -> 2,020 at 80)
+#   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT  (48 + 2.2/pt ->   224 at 80)
+#
+# The ratio is what matters, not either number alone. Blows to drop somebody is
+# HP / (damage * (1 - their dodge) * (1 + their crit rate)), and since dodge and crit both
+# grow with level, HP has to grow FASTER than damage just to stay level -- which is why
+# HP_PER_POINT (19) is so far above DAMAGE_PER_POINT (2.2) relative to their bases.
+# Measured medians, 200 seeded fights per level: 10/10/10 blows per side at levels 1/40/80.
+# Armour from gear lengthens this by up to ~25%, which is the one thing that can push a
+# geared fight past 12 exchanges.
 
 BASE_HP = 500               # "все начинают с 500"
-HP_PER_POINT = 13
-BASE_DAMAGE = 45
+HP_PER_POINT = 19
+BASE_DAMAGE = 48
 DAMAGE_PER_POINT = 2.2
 # Every blow is nudged by +-15% so two identical pets do not play out identically.
 DAMAGE_VARIANCE = 0.15
@@ -155,7 +170,41 @@ DOMINANCE_RATIO = 1.30      # how far ahead counts as dominant
 DOMINANCE_BONUS = 0.30      # how much more that stat then gives
 
 # ------------------------------------------------------------------------ the arena
-DAILY_FIGHTS = 5            # before cage bonuses; CAGE_BONUS_FIGHTS adds to this
+#
+# How many fights a day somebody gets is EARNED, not granted flat:
+#
+#     allowance = BASE_DAILY_FIGHTS
+#               + messages_yesterday  * FIGHTS_PER_MESSAGE
+#               + figurines_yesterday * FIGHTS_PER_FIGURINE
+#               + CAGE_BONUS_FIGHTS[cage_level - 1]
+#
+# floored to a whole number and capped at MAX_DAILY_FIGHTS. Yesterday rather than today
+# because a closed day is a finished, recorded fact -- pricing off a day still in progress
+# would mean the allowance moved every time somebody typed, and a fight taken at noon
+# could be un-taken by evening.
+#
+# Calibrated against the real chat, not guessed. Measured over 162 user-days in
+# cache/stats: the median poster writes 14 messages a day, p75 writes 41, p90 writes 89,
+# p95 writes 166, and the busiest single day by one person was 412. So at 8% a message:
+#
+#     lurker (0-1 msgs)   2 fights      p90  (89 msgs)    9 fights
+#     median (14 msgs)    3 fights      p95  (166 msgs)  12 fights (the cap)
+#     p75    (41 msgs)    5 fights      busiest (412)    12 fights (the cap)
+#
+# The rate is 8% rather than something rounder because of the median specifically: at 6%
+# the median poster earned 0.84 of a fight, floored to zero, and got exactly what somebody
+# who never wrote anything got. A rate that cannot tell the typical member apart from a
+# lurker is not doing the job this formula exists for.
+#
+# The cap exists because the top of this distribution is very long -- uncapped, the busiest
+# poster would open with 35 fights a day and out-earn everybody else on volume alone.
+BASE_DAILY_FIGHTS = 2
+FIGHTS_PER_MESSAGE = 0.08
+# A painted figurine is the rarest and most valued thing anybody posts here, so it is
+# worth roughly eight messages.
+FIGHTS_PER_FIGURINE = 0.5
+MAX_DAILY_FIGHTS = 12
+
 OPPONENT_LEVEL_WINDOW = 3   # "поиск по +- 3 уровня"
 # Widened one step at a time if nobody is in range, so a chat with four pets can still
 # fight. Set to () to make the window hard.
@@ -163,11 +212,45 @@ OPPONENT_WINDOW_FALLBACKS = (6, 12, None)   # None = anybody at all
 
 WIN_GOLD_MIN = 30           # "случайно 30-60 голды"
 WIN_GOLD_MAX = 60
-LOSS_GOLD = 0               # "проигравший ничего не теряет пока"
+# The loser pays half of what the winner just took. This replaces the original "проигравший
+# ничего не теряет": with a free loss, the best strategy was to press "напасть" without
+# reading anything, and a fight nobody can lose is not a fight.
+#
+# It applies to whoever loses, INCLUDING a defender who never chose the fight. That is
+# safe here specifically because opponents are drawn at random within a level window --
+# nobody can pick a target, so there is no way to farm one person down. If matchmaking
+# ever lets somebody choose, this rule has to be revisited at the same time.
+#
+# It also roughly halves the faucet: gold minted per fight is now (win - loss), ~23 instead
+# of ~45, because the losing half is paid by a player rather than by the economy.
+LOSS_GOLD_SHARE = 0.5
+# A debt is never created: somebody with less than this in their wallet simply pays what
+# they have. economy.balance clamps at zero anyway, and a member who cannot see why they
+# owe money is worse than one who got off lightly.
 
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
 HISTORY_LIMIT = 10          # "список последних 10 боев"
+
+
+def daily_fight_allowance(messages: int = 0, figurines: int = 0, cage_level: int = 1) -> int:
+    """How many fights one member gets today, from what they did in the chat YESTERDAY.
+
+    Floored rather than rounded: half a fight is not a fight, and rounding up would hand a
+    lurker who wrote three messages the same allowance as somebody who wrote ten.
+    """
+    earned = (
+        BASE_DAILY_FIGHTS
+        + max(0, messages) * FIGHTS_PER_MESSAGE
+        + max(0, figurines) * FIGHTS_PER_FIGURINE
+    )
+    level = min(max(cage_level, 1), CAGE_MAX_LEVEL)
+    return min(MAX_DAILY_FIGHTS + CAGE_BONUS_FIGHTS[level - 1], int(earned) + CAGE_BONUS_FIGHTS[level - 1])
+
+
+def loss_gold_for(won_gold: int) -> int:
+    """What the loser of a fight pays, given what the winner took."""
+    return max(0, round(won_gold * LOSS_GOLD_SHARE))
 
 # --------------------------------------------------------------------- pet levelling
 # Pet levels are separate from stat levels: "у существ отдельный свой опыт и уровни. За

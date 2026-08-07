@@ -30,7 +30,7 @@ appended once and `history()` filters by either role.
 
 import json
 import random
-from datetime import date
+from datetime import date, timedelta
 
 import economy
 import pets_config as C
@@ -420,15 +420,66 @@ def unequip(entry, user_id, slot) -> tuple[bool, str]:
 # --- the arena ---------------------------------------------------------------------
 
 
+def _chat_xp_for(entry, user_id) -> int:
+    """One member's chat XP, derived synchronously from what is already on disk.
+
+    Needed because the loser of a fight may be the DEFENDER, who is not the person
+    playing -- the caller has the attacker's xp in hand and cannot possibly have theirs.
+    economy.balance derives the earned half of a wallet from live XP, so charging a
+    defender anything at all means working their XP out here.
+
+    Two deliberate approximations, both erring the same safe way:
+    `stats.aggregate_all_time` covers recorded days only, so today's earnings are not
+    counted, and `words_per_point` is read from its frozen on-disk calibration rather than
+    recomputed. Both make the number a slight UNDER-estimate, so the worst case is a loser
+    who is charged less than they could afford -- never one billed for money they do not
+    have.
+    """
+    wpp = stats._load_words_per_point(entry) or stats.DEFAULT_WORDS_PER_POINT
+    user = stats.aggregate_all_time(entry).get(str(user_id))
+    return user.xp(wpp) if user is not None else 0
+
+
+def yesterday_activity(entry, user_id, today) -> tuple[int, int]:
+    """(messages, figurines) this member posted YESTERDAY, from the recorded day file.
+
+    A closed day, deliberately -- see C.daily_fight_allowance. It is also the only reason
+    this is cheap enough to call on every menu draw: yesterday is already finalised on
+    disk, so this is one local JSON read and never a Telegram fetch, unlike anything that
+    has to know about today.
+
+    Returns (0, 0) when there is no file for yesterday at all -- a chat whose stats
+    tracking started this morning, or a midnight rollover that did not run. Everybody then
+    falls back to the base allowance, which is the right failure: fewer fights than earned,
+    never more.
+    """
+    day = today - timedelta(days=1)
+    users = stats.aggregate(entry, day, day)
+    user = users.get(str(user_id))
+    if user is None:
+        return 0, 0
+    return user.messages, user.figurines_painted
+
+
+def daily_allowance(entry, user_id, today) -> int:
+    """Today's fight budget for one member, before anything they have already spent."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return 0
+    messages, figurines = yesterday_activity(entry, user_id, today)
+    return C.daily_fight_allowance(messages, figurines, record.get("cage_level", 1))
+
+
 def fights_left(entry, user_id, today) -> int:
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
         return 0
     _reset_if_new_day(record, today)  # in-memory only; nothing to persist on a pure read
-    level = record.get("cage_level", 1)
-    bonus = C.CAGE_BONUS_FIGHTS[level - 1]
-    return max(0, C.DAILY_FIGHTS + bonus - record.get("fights_today", 0))
+    messages, figurines = yesterday_activity(entry, user_id, today)
+    allowance = C.daily_fight_allowance(messages, figurines, record.get("cage_level", 1))
+    return max(0, allowance - record.get("fights_today", 0))
 
 
 def find_opponent(entry, user_id, rng=None) -> str | None:
@@ -461,14 +512,15 @@ def find_opponent(entry, user_id, rng=None) -> str | None:
     return rng.choice(candidates)
 
 
-def record_fight(entry, attacker_id, defender_id, result, today) -> dict:
+def record_fight(entry, attacker_id, defender_id, result, today, attacker_xp=None) -> dict:
     data = _load(entry)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
     defender = data["pets"][defender_uid]
 
-    # Only the attacker spends a daily fight -- the defender did not choose this fight
-    # and "проигравший ничего не теряет пока" extends to their fight budget too.
+    # Only the attacker spends a daily fight. The defender did not choose this fight, so
+    # it must not come out of the budget they earned by chatting -- the loss penalty below
+    # is the only thing a defender can be made to pay.
     _reset_if_new_day(attacker, today)
     attacker["fights_today"] = attacker.get("fights_today", 0) + 1
     attacker["fights"] = attacker.get("fights", 0) + 1
@@ -484,6 +536,29 @@ def record_fight(entry, attacker_id, defender_id, result, today) -> dict:
     bonus_pct = C.CAGE_GOLD_BONUS_PCT[winner_cage_level - 1]
     gold = round(random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX) * (1 + bonus_pct / 100))
     economy.grant(entry, winner_uid, gold, "pet_fight_win")
+
+    # The loser pays half of that. Charged as a spend rather than a negative grant so it
+    # lands in the same ledger column as every other purchase -- and clamped to what they
+    # actually hold, because economy.balance floors at zero and a debt nobody can see the
+    # cause of is worse than a bill that got rounded down. `loser_xp` is the loser's live
+    # chat XP, which the caller cannot supply for a defender who is not the one playing,
+    # so it is read from the same aggregate economy.balance itself uses.
+    penalty = C.loss_gold_for(gold)
+    paid = 0
+    if penalty > 0:
+        # Prefer the caller's own figure for the attacker: it is the live, today-inclusive
+        # XP economy.balance wants, whereas _chat_xp_for can only see closed days. The
+        # fallback is for the defender, whose XP the caller has no way to know.
+        if loser_uid == attacker_uid and attacker_xp is not None:
+            loser_xp = attacker_xp
+        else:
+            loser_xp = _chat_xp_for(entry, loser_uid)
+        affordable = min(penalty, economy.balance(entry, loser_uid, loser_xp))
+        if affordable > 0:
+            ok, _ = economy.spend(
+                entry, loser_uid, loser_xp, affordable, "pet_fight_loss", ref=winner_uid
+            )
+            paid = affordable if ok else 0
 
     dropped_code = None
     if random.random() < C.DROP_CHANCE:
@@ -510,6 +585,10 @@ def record_fight(entry, attacker_id, defender_id, result, today) -> dict:
         "attacker_owner": attacker.get("owner_name"),
         "defender_owner": defender.get("owner_name"),
         "gold": gold,
+        # What the LOSER actually paid, which is not always C.loss_gold_for(gold): an
+        # empty wallet pays what it has. Stored so a history line can show the real
+        # number rather than recomputing an amount that was never charged.
+        "loss_gold": paid,
         "dropped_item": dropped_code,
     })
     _save(entry, data)
@@ -517,6 +596,7 @@ def record_fight(entry, attacker_id, defender_id, result, today) -> dict:
     attacker_won = winner_uid == attacker_uid
     return {
         "gold": gold if attacker_won else 0,
+        "loss_gold": 0 if attacker_won else paid,
         "xp": C.WIN_XP if attacker_won else C.LOSS_XP,
         "levels_gained": winner_levels_gained if attacker_won else loser_levels_gained,
         "level": attacker.get("level", 1),
@@ -532,9 +612,12 @@ def history(entry, user_id) -> list[dict]:
         if fight.get("attacker_id") != uid and fight.get("defender_id") != uid:
             continue
         row = dict(fight)
-        # "gold" in a history row is what the WINNER got -- zero it on the loser's own
-        # line, since that side never received it (see LOSS_GOLD).
-        row["gold"] = fight.get("gold", 0) if fight.get("winner_id") == uid else 0
+        # Both money columns are rewritten from the READER's side: "gold" is what the
+        # winner received and "loss_gold" what the loser paid, so exactly one of them can
+        # be non-zero on any one person's line.
+        won = fight.get("winner_id") == uid
+        row["gold"] = fight.get("gold", 0) if won else 0
+        row["loss_gold"] = 0 if won else fight.get("loss_gold", 0)
         mine.append(row)
     mine.reverse()  # stored oldest -> newest, so reverse for "newest first"
     return mine[:C.HISTORY_LIMIT]

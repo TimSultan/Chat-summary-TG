@@ -5964,7 +5964,9 @@ async def _pets_run_fight(
         _pets_fighter(entry, user_id, mine),
         _pets_fighter(entry, opponent_id, theirs),
     )
-    reward = pets.record_fight(entry, user_id, opponent_id, result, pets.today())
+    reward = pets.record_fight(
+        entry, user_id, opponent_id, result, pets.today(), attacker_xp=xp,
+    )
     report = pets_ui.fight_report(
         result, str(user_id),
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},

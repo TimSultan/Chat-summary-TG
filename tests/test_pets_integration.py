@@ -13,8 +13,10 @@ The one thing it does NOT do is re-test balance or storage semantics. Those belo
 unit tests, and duplicating them here would mean two files to update for one decision.
 """
 
+import json
 import random
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -133,14 +135,17 @@ class PetsIntegrationTests(unittest.TestCase):
             rng=random.Random(7),
         )
         purse_before = self._balance(ALICE)
-        reward = pets.record_fight(ENTRY, ALICE, BOB, result, pets.today())
+        reward = pets.record_fight(
+            ENTRY, ALICE, BOB, result, pets.today(), attacker_xp=RICH_XP,
+        )
 
         # The daily allowance is spent by the ATTACKER only.
         self.assertEqual(pets.fights_left(ENTRY, ALICE, pets.today()), left_before - 1)
         self.assertEqual(
             pets.fights_left(ENTRY, BOB, pets.today()),
-            C.DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0],
-            "the defender did not choose this fight and must not be charged for it",
+            pets.daily_allowance(ENTRY, BOB, pets.today()),
+            "the defender did not choose this fight, so it must not come out of the "
+            "budget they earned by chatting",
         )
 
         won = result.winner == str(ALICE)
@@ -149,8 +154,11 @@ class PetsIntegrationTests(unittest.TestCase):
             self.assertLessEqual(reward["gold"], round(C.WIN_GOLD_MAX * 1.25))
             self.assertEqual(self._balance(ALICE), purse_before + reward["gold"])
         else:
-            self.assertEqual(reward["gold"], C.LOSS_GOLD)
-            self.assertEqual(self._balance(ALICE), purse_before)
+            # Losing now costs half of what the winner took -- and the attacker here is
+            # rich enough that the "pays what they have" clamp cannot be what is measured.
+            self.assertEqual(reward["gold"], 0)
+            self.assertEqual(reward["loss_gold"], C.loss_gold_for(_won_gold(ENTRY)))
+            self.assertEqual(self._balance(ALICE), purse_before - reward["loss_gold"])
 
         # The report renders, and reads from the winner's side either way.
         report = pets_ui.fight_report(
@@ -171,6 +179,116 @@ class PetsIntegrationTests(unittest.TestCase):
             self.assertNotIn("None", text)
             self.assertNotIn("?", text.replace("Боёв пока не было.", ""))
 
+    def test_losing_costs_half_of_what_the_winner_took(self):
+        """The seeded walkthrough above only exercises whichever side happens to win, so
+        the losing branch is pinned here on a fight whose outcome is not left to chance."""
+        self._found(ALICE, "Кабанчик", "Alice")
+        self._found(BOB, "Тумблер", "Bob")
+        # Bob is overwhelming, so Alice loses; the result is asserted, not assumed.
+        pets.upgrade_stat(ENTRY, BOB, RICH_XP, "strength", times=60)
+        pets.upgrade_stat(ENTRY, BOB, RICH_XP, "health", times=60)
+        result = pets_combat.simulate(
+            _fighter(ALICE, "Кабанчик"), _fighter(BOB, "Тумблер"), rng=random.Random(1),
+        )
+        self.assertEqual(result.winner, str(BOB), "the fixture must produce a loss")
+
+        alice_before, bob_before = self._balance(ALICE), self._balance(BOB)
+        reward = pets.record_fight(
+            ENTRY, ALICE, BOB, result, pets.today(), attacker_xp=RICH_XP,
+        )
+        won = _won_gold(ENTRY)
+
+        self.assertGreater(won, 0)
+        self.assertEqual(reward["loss_gold"], C.loss_gold_for(won))
+        self.assertEqual(reward["loss_gold"], round(won * C.LOSS_GOLD_SHARE))
+        self.assertEqual(self._balance(ALICE), alice_before - reward["loss_gold"])
+        self.assertEqual(self._balance(BOB), bob_before + won)
+        # And the loser's own history line shows the debit, not the winner's credit.
+        row = pets.history(ENTRY, ALICE)[0]
+        self.assertEqual(row["gold"], 0)
+        self.assertEqual(row["loss_gold"], reward["loss_gold"])
+
+    def test_an_empty_wallet_pays_what_it_has_and_never_goes_into_debt(self):
+        self._found(ALICE, "Кабанчик", "Alice")
+        self._found(BOB, "Тумблер", "Bob")
+        # Alice is broke: no chat XP at all, so nothing was ever earned to spend.
+        result = pets_combat.simulate(
+            _fighter(ALICE, "Кабанчик"), _fighter(BOB, "Тумблер"), rng=random.Random(2),
+        )
+        loser = ALICE if result.winner == str(BOB) else BOB
+        self.assertEqual(economy.balance(ENTRY, loser, 0), 0)
+        reward = pets.record_fight(ENTRY, ALICE, BOB, result, pets.today())
+        self.assertEqual(economy.balance(ENTRY, loser, 0), 0)
+        self.assertGreaterEqual(reward["loss_gold"], 0)
+
+    def _record_yesterday(self, user_id, messages=0, figurines=0):
+        """Write a finalised day file for yesterday, the same shape stats.record_day
+        writes, so the allowance has real activity to price off."""
+        day = pets.today() - timedelta(days=1)
+        payload = {
+            "entry": ENTRY,
+            "day": day.isoformat(),
+            "recorded_at": day.isoformat(),
+            "users": {
+                str(user_id): {
+                    "display_name": "Alice", "username": "alice",
+                    "messages": messages, "chars": messages * 20, "media": 0,
+                    "replies": 0, "hours": {}, "figurines": figurines,
+                }
+            },
+        }
+        stats._path(ENTRY, day).write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_chatting_yesterday_buys_fights_today(self):
+        """The whole point of the earned allowance: a lurker and a regular must not get
+        the same number of fights."""
+        self._found(ALICE, "Кабанчик", "Alice")
+        lurker = pets.daily_allowance(ENTRY, ALICE, pets.today())
+        self.assertEqual(lurker, C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0])
+
+        # p75 of the real chat is 41 messages a day (measured over 162 user-days).
+        self._record_yesterday(ALICE, messages=41)
+        regular = pets.daily_allowance(ENTRY, ALICE, pets.today())
+        self.assertGreater(regular, lurker)
+        self.assertEqual(
+            regular,
+            C.BASE_DAILY_FIGHTS + int(41 * C.FIGHTS_PER_MESSAGE) + C.CAGE_BONUS_FIGHTS[0],
+        )
+
+        # A painted figurine is worth about eight messages.
+        self._record_yesterday(ALICE, messages=41, figurines=4)
+        painter = pets.daily_allowance(ENTRY, ALICE, pets.today())
+        self.assertGreater(painter, regular)
+
+    def test_the_allowance_is_capped_so_the_busiest_poster_cannot_run_away_with_it(self):
+        self._found(ALICE, "Кабанчик", "Alice")
+        # The busiest single user-day measured in the real chat was 412 messages.
+        self._record_yesterday(ALICE, messages=412, figurines=20)
+        self.assertEqual(
+            pets.daily_allowance(ENTRY, ALICE, pets.today()),
+            C.MAX_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0],
+        )
+
+    def test_yesterday_is_what_counts_not_today(self):
+        """Pricing off a day still in progress would move the allowance every time
+        somebody typed, and a fight taken at noon could be un-taken by evening."""
+        self._found(ALICE, "Кабанчик", "Alice")
+        day = pets.today()
+        payload = {
+            "entry": ENTRY, "day": day.isoformat(), "recorded_at": day.isoformat(),
+            "users": {str(ALICE): {
+                "display_name": "Alice", "username": "alice", "messages": 400,
+                "chars": 8000, "media": 0, "replies": 0, "hours": {},
+                "figurines": 0,
+            }},
+        }
+        stats._path(ENTRY, day).write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(
+            pets.daily_allowance(ENTRY, ALICE, day),
+            C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0],
+            "today's messages must not count towards today's allowance",
+        )
+
     def test_history_survives_a_rename(self):
         """The card shows the creature's name NOW; a fight that already happened keeps the
         name it was fought under. Snapshotting is the whole reason this is asserted."""
@@ -190,7 +308,9 @@ class PetsIntegrationTests(unittest.TestCase):
         self._found(ALICE, "Кабанчик", "Alice")
         self._found(BOB, "Тумблер", "Bob")
         allowance = pets.fights_left(ENTRY, ALICE, pets.today())
-        self.assertEqual(allowance, C.DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0])
+        # No recorded day file in this fixture, so yesterday's activity is nothing at all
+        # and everybody falls back to the base allowance.
+        self.assertEqual(allowance, C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0])
 
         for index in range(allowance):
             result = pets_combat.simulate(
@@ -237,6 +357,18 @@ class FlavorGrammarTests(unittest.TestCase):
     # Nouns that would have to agree with the number in front of them.
     COUNTABLE = ("очк", "единиц", "хитпоинт", "балл", "пункт")
 
+    def test_a_menu_number_agrees_with_the_noun_after_it(self):
+        """The menus know their numbers at render time, so unlike the flavour bank they
+        decline properly. The 11-vs-21 exception is the one worth pinning: both end in 1,
+        and only one of them takes the singular."""
+        cases = {
+            0: "0 монет", 1: "1 монета", 2: "2 монеты", 5: "5 монет",
+            11: "11 монет", 21: "21 монета", 22: "22 монеты", 25: "25 монет",
+            41: "41 монета", 100: "100 монет", 1234: "1.234 монеты",
+        }
+        for amount, expected in cases.items():
+            self.assertEqual(pets_ui._coins(amount), expected)
+
     def test_no_damage_figure_is_followed_by_a_noun_that_must_agree(self):
         import re
 
@@ -249,6 +381,19 @@ class FlavorGrammarTests(unittest.TestCase):
                         tail.lower().startswith(self.COUNTABLE),
                         f"{event}: «{template}» -- «{tail}» must agree with the numeral",
                     )
+
+
+def _won_gold(entry):
+    """What the winner of the most recent fight actually took, cage bonus included.
+
+    Read from BOTH sides and maxed, because history() zeroes the gold column on the
+    loser's own line -- reading only the loser's view would return 0 and make a "the
+    penalty is half the winnings" assertion pass against any penalty at all.
+    """
+    return max(
+        pets.history(entry, ALICE)[0]["gold"],
+        pets.history(entry, BOB)[0]["gold"],
+    )
 
 
 def _fighter(user_id, name):

@@ -55,6 +55,27 @@ def _money(amount: int) -> str:
     return f"{amount:,}".replace(",", ".")
 
 
+def _plural(amount: int, one: str, few: str, many: str) -> str:
+    """A number with the noun in the case Russian actually wants: 1 монета, 22 монеты,
+    25 монет. Same trap the battle log has to sidestep by using indeclinable words -- but
+    here the number IS known at render time, so it can just be done properly.
+
+    Note the 11-14 exception: 21 takes `one` and 11 takes `many`, which is why this checks
+    `% 100` as well as `% 10`.
+    """
+    if amount % 10 == 1 and amount % 100 != 11:
+        word = one
+    elif 2 <= amount % 10 <= 4 and not (12 <= amount % 100 <= 14):
+        word = few
+    else:
+        word = many
+    return f"{_money(amount)} {word}"
+
+
+def _coins(amount: int) -> str:
+    return _plural(amount, "монета", "монеты", "монет")
+
+
 def _name(pet: dict) -> str:
     return escape(pet.get("name") or "Существо")
 
@@ -73,10 +94,10 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines = ["🏟 <b>Арена</b>\n"]
     if not cage:
         lines.append("У тебя пока нет клетки, а значит и существа.")
-        lines.append(f"Клетка стоит {_money(C.CAGE_PRICE)} монет, приручение — {_money(C.TAME_PRICE)}.")
+        lines.append(f"Клетка стоит {_coins(C.CAGE_PRICE)}, приручение — {_coins(C.TAME_PRICE)}.")
     elif not pet:
         lines.append(f"🏠 Клетка: уровень {cage} — пустая.")
-        lines.append(f"Осталось приручить существо за {_money(C.TAME_PRICE)} монет.")
+        lines.append(f"Осталось приручить существо за {_coins(C.TAME_PRICE)}.")
     else:
         left = pets.fights_left(entry, user_id, pets.today())
         lines.append(f"🐾 {_name(pet)} — уровень {pet.get('level', 1)}")
@@ -121,16 +142,19 @@ def cage_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines = ["🏠 <b>Клетка</b>\n"]
     if not level:
         lines.append("Клетки нет. Без неё существо негде держать.")
-        lines.append(f"\nПокупка: {_money(C.CAGE_PRICE)} монет.")
+        lines.append(f"\nПокупка: {_coins(C.CAGE_PRICE)}.")
     else:
         lines.append(f"Уровень {level} из {C.CAGE_MAX_LEVEL}.")
-        lines.append(f"⚔️ Боёв в день: {C.DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[level - 1]}")
+        # The cage adds fights on top of what activity earned, so it is shown as a bonus
+        # rather than as a total -- a total here would contradict the number on the arena
+        # screen, which knows yesterday's activity and this screen does not.
+        lines.append(f"⚔️ Боёв в день: +{C.CAGE_BONUS_FIGHTS[level - 1]}")
         lines.append(f"🪙 Прибавка к добыче: +{C.CAGE_GOLD_BONUS_PCT[level - 1]}%")
         if level < C.CAGE_MAX_LEVEL:
             nxt = C.CAGE_UPGRADE_COSTS[level]
             lines.append(
-                f"\nСледующий уровень — {_money(nxt)} монет:"
-                f" боёв в день {C.DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[level]},"
+                f"\nСледующий уровень — {_coins(nxt)}:"
+                f" боёв в день +{C.CAGE_BONUS_FIGHTS[level]},"
                 f" добыча +{C.CAGE_GOLD_BONUS_PCT[level]}%."
             )
         else:
@@ -236,7 +260,9 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "slot", slot),
         }])
     if owned:
-        lines.append(f"\n<i>В сумке: {len(owned)} предмет(ов).</i>")
+        lines.append(
+            f"\n<i>В сумке: {_plural(len(owned), 'предмет', 'предмета', 'предметов')}.</i>"
+        )
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -263,7 +289,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
         elif item.source == "drop":
             state = "только из боёв"
         else:
-            state = f"{_money(item.price)} монет"
+            state = _coins(item.price)
         lines.append(f"<b>{escape(item.name)}</b>{mark} — {_bonus_text(item)} · {state}")
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
@@ -318,15 +344,30 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         return no_pet_view(user_id)
     left = pets.fights_left(entry, user_id, pets.today())
 
+    messages, figurines = pets.yesterday_activity(entry, user_id, pets.today())
+    allowance = pets.daily_allowance(entry, user_id, pets.today())
+
     lines = ["⚔️ <b>Арена</b>\n"]
     lines.append(f"{_name(pet)} — уровень {pet.get('level', 1)}")
-    lines.append(f"Боёв сегодня осталось: {left}")
+    lines.append(f"Боёв сегодня осталось: {left} из {allowance}")
+    # Spelled out rather than left as a number, because the allowance is the one thing in
+    # the game that rewards chatting, and a limit nobody understands reads as arbitrary.
+    lines.append(
+        f"\n<i>Бои начисляются за вчерашний день: {C.BASE_DAILY_FIGHTS} базовых"
+        f" + за сообщения + {C.FIGHTS_PER_FIGURINE} за каждый #япокрасил."
+        f" Вчера у тебя: {_plural(messages, 'сообщение', 'сообщения', 'сообщений')},"
+        f" работ — {figurines}.</i>"
+    )
     lines.append(
         f"\nСоперник подбирается случайно среди существ"
         f" ±{C.OPPONENT_LEVEL_WINDOW} уровня."
     )
+    lines.append(
+        f"Победа: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет."
+        f" Поражение: минус половина от этого."
+    )
     if left <= 0:
-        lines.append("\nНа сегодня всё. Заходи завтра — или улучши клетку, она даёт больше боёв.")
+        lines.append("\nНа сегодня всё. Пиши в чат — завтра боёв будет больше.")
 
     rows = []
     if left > 0:
@@ -387,7 +428,9 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
     lines.append("🏆 <b>Победа</b>" if won else "💀 <b>Поражение</b>")
     if reward:
         if reward.get("gold"):
-            lines.append(f"🪙 +{_money(reward['gold'])} монет")
+            lines.append(f"🪙 +{_coins(reward['gold'])}")
+        if reward.get("loss_gold"):
+            lines.append(f"🪙 −{_coins(reward['loss_gold'])}")
         if reward.get("xp"):
             lines.append(f"✨ +{reward['xp']} опыта")
         if reward.get("levels_gained"):
@@ -429,8 +472,13 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
         who = f"{escape(owner or '?')} — {escape(other or '?')}"
         outcome = "Победа" if won else "Поражение"
         gold = record.get("gold") or 0
+        lost = record.get("loss_gold") or 0
+        # Bare numbers here, with no noun to agree with -- the line is already dense and
+        # "(Победа, +45)" reads fine next to a column of them.
         if won and gold:
             outcome += f", +{_money(gold)}"
+        elif lost:
+            outcome += f", −{_money(lost)}"
         if attacked:
             lines.append(f"⚔️ Вы напали: {who} ({outcome})")
         else:
@@ -502,8 +550,8 @@ def pet_view(entry: str, user_id) -> tuple[str, dict]:
 def no_pet_view(user_id) -> tuple[str, dict]:
     text = (
         "У тебя ещё нет существа.\n\n"
-        f"Сначала клетка ({_money(C.CAGE_PRICE)} монет), потом приручение"
-        f" ({_money(C.TAME_PRICE)} монет)."
+        f"Сначала клетка ({_coins(C.CAGE_PRICE)}), потом приручение"
+        f" ({_coins(C.TAME_PRICE)})."
     )
     return text, {"inline_keyboard": [_back_row(user_id)]}
 

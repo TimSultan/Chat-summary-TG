@@ -908,9 +908,18 @@ whole reason chat activity funds the game rather than sitting beside it.
 
 The loop is: buy a **клетка** (100), **приручить** a creature by sending a photo and a name
 (100), spend coins on **Сила / Здоровье / Ловкость / Удача** (1–80 each), buy **оружие,
-амулет, перчатки, сапоги**, then fight — five duels a day, opponent drawn at random from
-creatures within ±3 levels. A win pays 30–60 coins and XP; the loser **loses nothing**. Each
-creature level gives **+1 to every stat**, on top of whatever was bought.
+амулет, перчатки, сапоги**, then fight — opponent drawn at random from creatures within
+±3 levels. A win pays 30–60 coins and XP; **losing costs half of what the winner took**, so
+"напасть" is a decision rather than a reflex. Each creature level gives **+1 to every
+stat**, on top of whatever was bought.
+
+**Fights a day are earned, not granted.** `BASE_DAILY_FIGHTS` (2) plus 8% of yesterday's
+messages plus half a fight per `#япокрасил`, capped at 12, plus whatever the cage adds.
+Yesterday rather than today, because a closed day is a finished fact — pricing off a day
+still running would move the allowance every time somebody typed. Calibrated on 162 real
+user-days: a lurker gets 2 fights, the median poster 3, p75 five, p90 nine, p95 the cap.
+That is a **6.2x** income spread between lurking and carrying the chat, where the flat
+five-a-day with a free loss it replaced gave 1.3x.
 
 `/pet` prints the card — photo, level, stats, gear, fights and wins — and works **in the
 group as well as the DM**, since it is the one screen meant to be shown off. `/arena` itself
@@ -940,16 +949,18 @@ stat 30% above the opponent's gives 30% more — compared per stat, once, at the
 applied **only to the stat-derived part**, since `BASE_HP` and `BASE_DAMAGE` are a floor
 everybody gets rather than a reward for out-scaling somebody.
 
-Tuned against the chat's **measured** earn rate (60–233 coins/week for the most active,
-~55 at p90), so three stats to level 80 is ~20,700 coins ≈ five months of playing daily,
-and a stat to 40 is inside a fortnight. Fights stay **6–12 rounds at every level** — measured
-medians 11/8/7 at levels 1/40/80 — because a longer log stops being read.
+Tuned against the chat's **measured** earn rate, so three stats to level 80 (~20,700 coins)
+is ~5.5 months for a p75 member and ~2 for the chat's busiest — and 15 for somebody who
+never writes. Fights land at **~20 blows, ten a side, at every level**: measured medians
+10/10/10 at levels 1/40/80. Holding that flat is why `HP_PER_POINT` (19) so far outruns
+`DAMAGE_PER_POINT` (2.2) — dodge and crit both grow with level, so HP has to grow faster
+than damage just to keep the length constant.
 
-Adding an item is appending one `Item(...)` to `ITEMS`; there is no slot logic, stat
-plumbing or migration to touch. Retuning the economy is editing constants and nothing else.
+The item catalogue is **deliberately unbalanced for now** — the right shape with
+placeholder numbers. Adding one is appending an `Item(...)` to `ITEMS`; there is no slot
+logic, stat plumbing or migration to touch. Retuning the economy is editing constants and nothing else.
 **[`PETS_BALANCE.md`](PETS_BALANCE.md)** has the full tables, the reasoning, and the honest
-list of what is still wrong — starting with the fact that the arena is ~85% of the faucet,
-so a member who never writes earns nearly as much as one who does.
+list of what is still wrong.
 
 Split the way `cabinet.py` and `poker.py` already are: `pets_config.py` (numbers),
 `pets.py` (state, storage, wallet), `pets_combat.py` (the fight, deterministic given a

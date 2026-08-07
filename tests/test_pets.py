@@ -248,10 +248,10 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         with patch("random.random", return_value=1.0):  # never drop, keep it simple
             pets.record_fight(entry, "1", "2", result, day1)
 
-        self.assertEqual(pets.fights_left(entry, "1", day1), pets_config.DAILY_FIGHTS - 1)
+        self.assertEqual(pets.fights_left(entry, "1", day1), pets.daily_allowance(entry, '1', day1) - 1)
 
         day2 = day1 + timedelta(days=1)
-        self.assertEqual(pets.fights_left(entry, "1", day2), pets_config.DAILY_FIGHTS)
+        self.assertEqual(pets.fights_left(entry, "1", day2), pets.daily_allowance(entry, '1', day2))
 
     def test_find_opponent_respects_the_window_and_never_returns_the_seeker(self):
         entry = "chat"
@@ -307,7 +307,10 @@ class RecordFightTests(PetsTestCase):
             outcome = pets.record_fight(entry, "1", "2", result, today)
 
         # Attacker's daily budget went down by exactly one.
-        self.assertEqual(pets.fights_left(entry, "1", today), pets_config.DAILY_FIGHTS - 1)
+        self.assertEqual(
+            pets.fights_left(entry, "1", today),
+            pets.daily_allowance(entry, "1", today) - 1,
+        )
         # Defender's own budget is completely untouched.
         self.assertEqual(pets.get_pet(entry, "2")["fights_today"], defender_fights_today_before)
 
