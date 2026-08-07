@@ -561,6 +561,18 @@ def fight_report_keyboard(user_id) -> dict:
     ]}
 
 
+def group_fight_result_view(
+    result, attacker_id: str, attacker_name: str, defender_name: str, arena_url: str,
+) -> tuple[str, dict]:
+    """One-line public result; detailed receipts stay with the two fighters in private."""
+    if result.is_draw:
+        text = f"🤝 <b>{escape(attacker_name)} и {escape(defender_name)} сыграли вничью.</b>"
+    else:
+        winner_name = attacker_name if result.winner == str(attacker_id) else defender_name
+        text = f"🏆 <b>{escape(winner_name)} побеждает!</b>"
+    return text, {"inline_keyboard": [[{"text": "⚔️ Открыть арену", "url": arena_url}]]}
+
+
 # -------------------------------------------------------------------------- history
 
 

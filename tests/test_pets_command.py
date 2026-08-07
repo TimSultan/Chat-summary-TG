@@ -66,11 +66,12 @@ class FakeApi:
         return item
 
     async def send_photo_file(self, chat_id, path, caption=None, reply_to_message_id=None,
-                              reply_markup=None, parse_mode=None):
+                              reply_markup=None, parse_mode=None, disable_notification=False):
         self.calls.append("send_photo_file")
         item = {
             "message_id": 300 + len(self.photo_files), "chat_id": chat_id,
             "caption": caption, "reply_markup": reply_markup, "size": Path(path).stat().st_size,
+            "disable_notification": disable_notification,
         }
         self.photo_files.append(item)
         return item
@@ -338,6 +339,8 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(defender_copy["chat_id"], 43)
         self.assertIn("Вас атаковал Player", defender_copy["caption"])
         self.assertIsNone(defender_copy["reply_markup"])
+        self.assertTrue(api.photo_files[0]["disable_notification"])
+        self.assertTrue(defender_copy["disable_notification"])
 
     def test_opponent_rerolls_are_limited_to_three(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -435,11 +438,15 @@ class PetsCommandTests(unittest.TestCase):
         api = FakeApi()
         challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
         target = SimpleNamespace(user_id=43, display_name="Bob")
+        deletions = []
 
         async def resolve(*args, **kwargs):
             return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
 
-        with patch.object(stats, "resolve_stat_target", resolve):
+        with patch.object(stats, "resolve_stat_target", resolve), patch.object(
+            bot_listener, "schedule_bot_delete",
+            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
+        ):
             _run(bot_listener.handle_duel_command(
                 api, None, None, _message(PLAYER, "/duel @bob", "group"), CHAT,
                 "/duel @bob", BOT, set(), log=lambda *_: None,
@@ -451,9 +458,21 @@ class PetsCommandTests(unittest.TestCase):
             [MAIN_CHAT_ID, PLAYER["id"], target.user_id],
         )
         self.assertEqual(api.sent, [])
+        group_result = api.photo_files[0]
+        self.assertIn("побеждает!", group_result["caption"])
+        self.assertNotIn("Победа", group_result["caption"])
+        button = _buttons(group_result)[0]
+        self.assertEqual(button["text"], "⚔️ Открыть арену")
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")
+        self.assertTrue(all(item["disable_notification"] for item in api.photo_files))
         defender_copy = api.photo_files[-1]
         self.assertIn("Вас атаковал @player", defender_copy["caption"])
         self.assertIsNone(defender_copy["reply_markup"])
+        self.assertTrue(any(
+            args[3] == bot_listener.DUEL_RESULT_DELETE_AFTER
+            and kwargs.get("trigger_message_id") == 5
+            for args, kwargs in deletions
+        ))
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
     def test_exhausted_group_duel_sends_arena_to_dm_and_short_notice_to_group(self):

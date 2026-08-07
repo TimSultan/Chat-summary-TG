@@ -26,16 +26,15 @@ pays (LOSS_GOLD_SHARE), so part of every fight is paid by a player rather than m
 Both together are what make chat activity actually decide income:
 
     profile      msgs/day  fights  arena/wk  +chat  total/wk  3 stats -> 80
-    lurker              1       2       315      3       318      15 months
-    median             14       3       472     25       498      9.6 months
-    p75                41       5       788     80       868      5.5 months
-    p90                89       9     1,418    150     1,568      3.0 months
-    p95               166      12     1,890    233     2,123      2.2 months
+    lurker              1       2        52      3        55      7.2 years
+    median             14       3        79     25       104      3.8 years
+    p75                41       5       131     80       211      1.9 years
+    p90                89       9       236    150       386      1.0 years
+    p95               166      12       315    233       548      8 months
 
 Against that, STAT_COST_EXPONENT = 1.2 puts one stat at 1 -> 80 at 6,896 gold and three
-at 20,688 -- about five months for a solidly active member, and level 40 in a stat
-(1,481 gold) inside the first two weeks. That is the shape asked for: an active member
-reaches a high level in three stats, and nobody maxes all four quickly.
+at 20,688. Arena gold stays comparable to, rather than overpowering, coins earned from
+ordinary chat activity; cage bonuses remain the game-specific progression path.
 
 Worth knowing before re-tuning: this replaced a flat 5 fights a day with a free loss,
 which paid everybody ~1,575/week regardless of whether they ever wrote a word -- a 1.3x
@@ -241,8 +240,8 @@ POWER_RATING_WEIGHTS = {
 OPPONENT_POWER_WINDOW = 125
 MAX_OPPONENT_REROLLS = 3
 
-WIN_GOLD_MIN = 30           # "случайно 30-60 голды"
-WIN_GOLD_MAX = 60
+WIN_GOLD_MIN = 5            # "случайно 5-10 голды"
+WIN_GOLD_MAX = 10
 # The loser pays 30% of what the winner just took. This replaces the original "проигравший
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.

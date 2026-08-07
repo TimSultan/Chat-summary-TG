@@ -170,6 +170,7 @@ class TelegramBotAPI:
         reply_to_message_id: int | None = None,
         reply_markup: dict | None = None,
         parse_mode: str | None = None,
+        disable_notification: bool = False,
     ) -> dict:
         """Upload a picture from disk and post it with an optional caption.
 
@@ -191,6 +192,8 @@ class TelegramBotAPI:
             form.add_field("reply_parameters", json.dumps(
                 {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
             ))
+        if disable_notification:
+            form.add_field("disable_notification", "true")
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         form.add_field("photo", path.read_bytes(), filename=path.name, content_type=content_type)
         return await self._upload("sendPhoto", form)

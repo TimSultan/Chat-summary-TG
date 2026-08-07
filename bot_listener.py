@@ -5525,7 +5525,7 @@ DUEL_COMMANDS = ("/duel", "/дуэль")
 PETS_ARENA_DELETE_AFTER = 3 * 60
 PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
 GROUP_PETS_DELETE_AFTER = 30
-DUEL_RESULT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
+DUEL_RESULT_DELETE_AFTER = 10
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_FLOW_TTL_SECONDS = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_INVALID_DELETE_AFTER = 5
@@ -5863,6 +5863,8 @@ async def handle_duel_command(
         persistent_recipient_ids=(challenger.user_id, target.user_id),
         enforce_arena_target_limit=False,
         attacker_username=actor.get("username"),
+        group_result=group_chat,
+        arena_url=f"https://t.me/{bot_username}?start=pets" if group_chat else None,
     )
 
 def _pets_fighter(entry: str, user_id, pet: dict):
@@ -6111,6 +6113,7 @@ async def _pets_run_fight(
     include_keyboard: bool = True, persistent_recipient_ids=None,
     enforce_arena_target_limit: bool = True,
     attacker_username: str | None = None, group_no_fights_notice: bool = False,
+    group_result: bool = False, arena_url: str | None = None,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6196,6 +6199,12 @@ async def _pets_run_fight(
             defender_reward,
         )
     )
+    group_report = None
+    if group_result and arena_url:
+        group_report = pets_ui.group_fight_result_view(
+            result, str(user_id), mine.get("name") or "Существо",
+            theirs.get("name") or "Существо", arena_url,
+        )
     image_path = None
     try:
         image_path = await _pets_render_result_image(
@@ -6203,15 +6212,22 @@ async def _pets_run_fight(
         )
         sent = None
         if image_path is not None:
+            caption, keyboard = group_report or (
+                report,
+                pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+            )
             sent = await api.send_photo_file(
-                chat_id, image_path, caption=report,
-                reply_markup=pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+                chat_id, image_path, caption=caption, reply_markup=keyboard,
                 parse_mode="HTML",
+                disable_notification=True,
             )
         else:
+            text, keyboard = group_report or (
+                report,
+                pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+            )
             sent = await api.send_message(
-                chat_id, report,
-                reply_markup=pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+                chat_id, text, reply_markup=keyboard,
                 parse_mode="HTML",
             )
     except Exception:
@@ -6233,6 +6249,7 @@ async def _pets_run_fight(
                         recipient_id, image_path,
                         caption=defender_report if str(recipient_id) == str(opponent_id) else report,
                         parse_mode="HTML",
+                        disable_notification=True,
                     )
                 except Exception:
                     # A bot cannot message a member who has not started it; their opponent
