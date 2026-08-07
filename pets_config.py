@@ -116,25 +116,25 @@ def total_stat_cost(target_level: int, from_level: int = STAT_MIN_LEVEL) -> int:
 
 
 # --------------------------------------------------------------------------- combat
-# Tuned so a fight is ~20 blows -- about ten from each side -- at EVERY level. That is
-# the target, and it is a tight one: the numbers below are what make it hold at level 1
-# and at level 80 alike, rather than starting long and getting shorter as stats climb.
+# Tuned so an even fight naturally runs for ~20 blows -- about ten from each side -- at
+# EVERY level. `MAX_ATTACKS_PER_FIGHTER` makes ten attacks each a hard ceiling; a fight
+# that reaches it is awarded by total damage rather than continuing past the limit.
 #
-#   HP     = BASE_HP + health * HP_PER_POINT           (500 + 19/pt -> 2,020 at 80)
-#   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT  (48 + 2.2/pt ->   224 at 80)
+#   HP     = BASE_HP + health * HP_PER_POINT             (500 + 19/pt -> 2,020 at 80)
+#   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT  (49.5 + 2.42/pt -> 243 at 80)
 #
 # The ratio is what matters, not either number alone. Blows to drop somebody is
 # HP / (damage * (1 - their dodge) * (1 + their crit rate)), and since dodge and crit both
 # grow with level, HP has to grow FASTER than damage just to stay level -- which is why
-# HP_PER_POINT (19) is so far above DAMAGE_PER_POINT (2.2) relative to their bases.
+# HP_PER_POINT (19) is far above DAMAGE_PER_POINT (2.42) relative to their bases.
 # Measured medians, 200 seeded fights per level: 10/10/10 blows per side at levels 1/40/80.
-# Armour from gear lengthens this by up to ~25%, which is the one thing that can push a
-# geared fight past 12 exchanges.
+# Armour from gear can make a fight reach the cap, but cannot give either pet an eleventh
+# attack.
 
 BASE_HP = 500               # "все начинают с 500"
 HP_PER_POINT = 19
-BASE_DAMAGE = 48
-DAMAGE_PER_POINT = 2.2
+BASE_DAMAGE = 49.5
+DAMAGE_PER_POINT = 2.42
 # Every blow is nudged by +-15% so two identical pets do not play out identically.
 DAMAGE_VARIANCE = 0.15
 
@@ -155,10 +155,9 @@ CRIT_MULTIPLIER = 2.0       # "критического удара (х2)"
 ARMOR_MAX = 0.60            # hard ceiling on damage reduction, so armor can never zero a hit
 ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 
-# A fight that somehow refuses to end is stopped and awarded on remaining HP share. With
-# the numbers above this never triggers; it exists so a future item can never hang a bot
-# thread in a while-loop.
-MAX_ROUNDS = 40
+# Each pet gets at most this many attacks. If neither side is knocked out by then, the
+# living pet that dealt more total damage wins; see pets_combat.simulate.
+MAX_ATTACKS_PER_FIGHTER = 10
 
 # ------------------------------------------------------------------ dominance bonus
 # "Если у героев значения каждых отдельных статов разнятся в пропорции 30% - то они
@@ -205,10 +204,18 @@ FIGHTS_PER_MESSAGE = 0.08
 FIGHTS_PER_FIGURINE = 0.5
 MAX_DAILY_FIGHTS = 12
 
-OPPONENT_LEVEL_WINDOW = 3   # "поиск по +- 3 уровня"
-# Widened one step at a time if nobody is in range, so a chat with four pets can still
-# fight. Set to () to make the window hard.
-OPPONENT_WINDOW_FALLBACKS = (6, 12, None)   # None = anybody at all
+# Matchmaking uses effective combat stats, including equipment and pet level, rather than
+# a level window that could pair two very differently geared creatures.
+POWER_RATING_BASE = 100
+POWER_RATING_WEIGHTS = {
+    "strength": 4,
+    "health": 4,
+    "agility": 2,
+    "luck": 2,
+    "armor": 3,
+}
+OPPONENT_POWER_WINDOW = 125
+MAX_OPPONENT_REROLLS = 3
 
 WIN_GOLD_MIN = 30           # "случайно 30-60 голды"
 WIN_GOLD_MAX = 60
@@ -230,7 +237,10 @@ LOSS_GOLD_SHARE = 0.5
 
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
+DRAW_XP = 50                # both sides spent a fight; no gold or win is awarded
 HISTORY_LIMIT = 10          # "список последних 10 боев"
+DUEL_DAILY_LIMIT = 5
+DUEL_COOLDOWN_SECONDS = 10 * 60
 
 
 def daily_fight_allowance(messages: int = 0, figurines: int = 0, cage_level: int = 1) -> int:

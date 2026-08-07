@@ -31,6 +31,7 @@ class TelegramBotAPI:
         if not token or not token.strip():
             raise ChatSummaryError("Telegram bot token is missing.")
         self._base_url = f"https://api.telegram.org/bot{token}"
+        self._file_base_url = f"https://api.telegram.org/file/bot{token}"
         self._session = session
 
     async def _call(self, method: str, _http_timeout: float = 20.0, **params) -> object:
@@ -75,6 +76,30 @@ class TelegramBotAPI:
 
     async def get_chat_member(self, chat_id, user_id: int) -> dict:
         return await self._call("getChatMember", chat_id=chat_id, user_id=user_id)
+
+    async def get_user_profile_photo(self, user_id) -> str | None:
+        """The largest available profile-photo file id, if Telegram exposes one to the bot."""
+        photos = await self._call("getUserProfilePhotos", user_id=user_id, limit=1)
+        groups = photos.get("photos") if isinstance(photos, dict) else None
+        if not groups or not groups[0]:
+            return None
+        return groups[0][-1].get("file_id")
+
+    async def download_file(self, file_id: str) -> bytes:
+        """Fetch a Bot API file by id for server-side composition into a new image."""
+        meta = await self._call("getFile", file_id=file_id)
+        file_path = meta.get("file_path") if isinstance(meta, dict) else None
+        if not file_path:
+            raise ChatSummaryError("Telegram did not return a file path")
+        try:
+            async with self._session.get(
+                f"{self._file_base_url}/{file_path}",
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.read()
+        except aiohttp.ClientError as e:
+            raise ChatSummaryError(f"Telegram file download failed: {e}") from e
 
     async def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict]:
         # HTTP read timeout must exceed Telegram's own long-poll `timeout` param below, or

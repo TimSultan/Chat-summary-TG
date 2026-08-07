@@ -30,7 +30,7 @@ appended once and `history()` filters by either role.
 
 import json
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import economy
 import pets_config as C
@@ -55,7 +55,7 @@ def _pets_path(entry: str):
 
 
 def _empty() -> dict:
-    return {"version": PETS_STORE_VERSION, "pets": {}, "fights": []}
+    return {"version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {}}
 
 
 def _load(entry: str) -> dict:
@@ -70,6 +70,7 @@ def _load(entry: str) -> dict:
         return _empty()
     data.setdefault("pets", {})
     data.setdefault("fights", [])
+    data.setdefault("duels", {})
     return data
 
 
@@ -335,7 +336,10 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
 
 
 def effective_stats(entry, user_id) -> dict:
-    record = _tamed_record(_load(entry), user_id) or {}
+    return _effective_stats_for(_tamed_record(_load(entry), user_id) or {})
+
+
+def _effective_stats_for(record: dict) -> dict:
     stat_levels = record.get("stats") or {}
     pet_level = record.get("level", 1)
     equipped = record.get("equipped") or {}
@@ -358,6 +362,26 @@ def effective_stats(entry, user_id) -> dict:
     }
     result["armor"] = max(0, armor)
     return result
+
+
+def power_rating(entry, user_id) -> int:
+    """A comparable combat score from the stats that actually enter a fight.
+
+    It intentionally is not a win/loss Elo score: new gear or a pet level-up must affect
+    matchmaking immediately instead of requiring several unfair calibration fights.
+    """
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return 0
+    return _power_rating_for(record)
+
+
+def _power_rating_for(record: dict) -> int:
+    stats = _effective_stats_for(record)
+    return C.POWER_RATING_BASE + sum(
+        stats.get(key, 0) * C.POWER_RATING_WEIGHTS[key]
+        for key in (*C.STAT_KEYS, "armor")
+    )
 
 
 # --- inventory & equipment -------------------------------------------------------------
@@ -482,37 +506,100 @@ def fights_left(entry, user_id, today) -> int:
     return max(0, allowance - record.get("fights_today", 0))
 
 
-def find_opponent(entry, user_id, rng=None) -> str | None:
+def claim_duel(entry, user_id, now=None) -> tuple[bool, str]:
+    """Atomically reserve one public duel, enforcing the daily and ten-minute limits."""
+    now = now or app_now()
+    data = _load(entry)
+    uid = str(user_id)
+    record = data.setdefault("duels", {}).setdefault(uid, {})
+    today_key = now.date().isoformat()
+    if record.get("day") != today_key:
+        record.update({"day": today_key, "uses": 0, "last_at": None})
+    last_at = record.get("last_at")
+    if last_at:
+        try:
+            elapsed = (now - datetime.fromisoformat(last_at)).total_seconds()
+        except (TypeError, ValueError):
+            elapsed = C.DUEL_COOLDOWN_SECONDS
+        if elapsed < C.DUEL_COOLDOWN_SECONDS:
+            left = max(1, round(C.DUEL_COOLDOWN_SECONDS - elapsed))
+            return False, f"До следующего дуэля {left // 60}:{left % 60:02d}."
+    if record.get("uses", 0) >= C.DUEL_DAILY_LIMIT:
+        return False, f"На сегодня дуэли закончились ({C.DUEL_DAILY_LIMIT}/{C.DUEL_DAILY_LIMIT})."
+    record["uses"] = record.get("uses", 0) + 1
+    record["last_at"] = now.isoformat()
+    _save(entry, data)
+    return True, f"Дуэлей осталось: {C.DUEL_DAILY_LIMIT - record['uses']}."
+
+
+def find_opponent(entry, user_id, rng=None, exclude_ids=None) -> str | None:
     rng = rng or random
     data = _load(entry)
     seeker = _tamed_record(data, user_id)
     if seeker is None:
         return None
-    seeker_level = seeker.get("level", 1)
+    uid = str(user_id)
+    excluded = {str(other_id) for other_id in (exclude_ids or ())}
+    candidates = [
+        other_id for other_id, record in data["pets"].items()
+        if other_id != uid and other_id not in excluded and record.get("name")
+    ]
+    if not candidates:
+        return None
+
+    seeker_power = _power_rating_for(seeker)
+    differences = {
+        other_id: abs(_power_rating_for(data["pets"][other_id]) - seeker_power)
+        for other_id in candidates
+    }
+    in_window = [
+        other_id for other_id in candidates
+        if differences[other_id] <= C.OPPONENT_POWER_WINDOW
+    ]
+    if in_window:
+        return rng.choice(in_window)
+
+    # A small arena still needs a match. When no fair-range opponent exists, choose only
+    # among the nearest candidates rather than widening to an arbitrary power gap.
+    nearest_gap = min(differences.values())
+    nearest = [other_id for other_id in candidates if differences[other_id] == nearest_gap]
+    return rng.choice(nearest)
+
+
+def opponent_cycle(entry, user_id, seed: int) -> list[str]:
+    """A deterministic, power-first list for one opponent-search session.
+
+    The listener uses positions 0 through 3 from this list, so reroll buttons can never
+    repeat an earlier candidate while still working after a bot restart.
+    """
+    data = _load(entry)
+    seeker = _tamed_record(data, user_id)
+    if seeker is None:
+        return []
     uid = str(user_id)
     candidates = [
         other_id for other_id, record in data["pets"].items()
         if other_id != uid and record.get("name")
     ]
-    if not candidates:
-        return None
-
-    for window in (C.OPPONENT_LEVEL_WINDOW,) + C.OPPONENT_WINDOW_FALLBACKS:
-        if window is None:
-            pool = candidates
-        else:
-            pool = [
-                other_id for other_id in candidates
-                if abs(data["pets"][other_id].get("level", 1) - seeker_level) <= window
-            ]
-        if pool:
-            return rng.choice(pool)
-    # Only reachable if OPPONENT_WINDOW_FALLBACKS was customised to never widen to
-    # "anybody" -- the contract guarantees None only when there is truly nobody else.
-    return rng.choice(candidates)
+    seeker_power = _power_rating_for(seeker)
+    differences = {
+        other_id: abs(_power_rating_for(data["pets"][other_id]) - seeker_power)
+        for other_id in candidates
+    }
+    picker = random.Random(seed)
+    picker.shuffle(candidates)
+    return sorted(
+        candidates,
+        key=lambda other_id: (
+            differences[other_id] > C.OPPONENT_POWER_WINDOW,
+            differences[other_id],
+        ),
+    )
 
 
-def record_fight(entry, attacker_id, defender_id, result, today, attacker_xp=None) -> dict:
+def record_fight(
+    entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
+) -> dict:
     data = _load(entry)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
@@ -525,6 +612,41 @@ def record_fight(entry, attacker_id, defender_id, result, today, attacker_xp=Non
     attacker["fights_today"] = attacker.get("fights_today", 0) + 1
     attacker["fights"] = attacker.get("fights", 0) + 1
     defender["fights"] = defender.get("fights", 0) + 1
+
+    is_draw = bool(getattr(result, "is_draw", False))
+    if is_draw:
+        _, attacker_levels_gained = _apply_xp(attacker, C.DRAW_XP)
+        _, defender_levels_gained = _apply_xp(defender, C.DRAW_XP)
+        data["fights"].append({
+            "ts": app_now().isoformat(),
+            "date": today.isoformat(),
+            "attacker_id": attacker_uid,
+            "defender_id": defender_uid,
+            "winner_id": None,
+            "loser_id": None,
+            "draw": True,
+            "attacker_name": attacker.get("name"),
+            "defender_name": defender.get("name"),
+            "attacker_owner": attacker.get("owner_name"),
+            "defender_owner": defender.get("owner_name"),
+            "gold": 0,
+            "loss_gold": 0,
+            "dropped_item": None,
+            "combat_seed": getattr(result, "seed", None),
+            "total_damage": dict(getattr(result, "total_damage", {})),
+            "combat_snapshot": combat_snapshot,
+        })
+        _save(entry, data)
+        return {
+            "draw": True,
+            "gold": 0,
+            "loss_gold": 0,
+            "xp": C.DRAW_XP,
+            "levels_gained": attacker_levels_gained,
+            "level": attacker.get("level", 1),
+            "dropped_item": None,
+            "opponent_levels_gained": defender_levels_gained,
+        }
 
     winner_uid = str(result.winner)
     loser_uid = str(result.loser)
@@ -580,6 +702,7 @@ def record_fight(entry, attacker_id, defender_id, result, today, attacker_xp=Non
         "defender_id": defender_uid,
         "winner_id": winner_uid,
         "loser_id": loser_uid,
+        "draw": False,
         "attacker_name": attacker.get("name"),
         "defender_name": defender.get("name"),
         "attacker_owner": attacker.get("owner_name"),
@@ -590,11 +713,15 @@ def record_fight(entry, attacker_id, defender_id, result, today, attacker_xp=Non
         # number rather than recomputing an amount that was never charged.
         "loss_gold": paid,
         "dropped_item": dropped_code,
+        "combat_seed": getattr(result, "seed", None),
+        "total_damage": dict(getattr(result, "total_damage", {})),
+        "combat_snapshot": combat_snapshot,
     })
     _save(entry, data)
 
     attacker_won = winner_uid == attacker_uid
     return {
+        "draw": False,
         "gold": gold if attacker_won else 0,
         "loss_gold": 0 if attacker_won else paid,
         "xp": C.WIN_XP if attacker_won else C.LOSS_XP,

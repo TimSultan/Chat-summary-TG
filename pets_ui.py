@@ -47,6 +47,23 @@ def parse_callback(data: str) -> tuple[str, str, str] | None:
     return parts[1], parts[2], parts[3] if len(parts) > 3 else ""
 
 
+def search_argument(rerolls_used: int, search_seed: int) -> str:
+    """Carry a deterministic opponent-cycle token within Telegram's callback cap."""
+    return f"{rerolls_used},{search_seed}"
+
+
+def parse_search_argument(argument: str) -> tuple[int, int | None]:
+    if not argument:
+        return 0, None
+    try:
+        count_text, seed_text = argument.split(",", 1)
+        count = int(count_text)
+        seed = int(seed_text)
+    except (TypeError, ValueError):
+        return 0, None
+    return max(0, count), seed if seed >= 0 else None
+
+
 def _back_row(owner_id) -> list:
     return [{"text": BACK_BUTTON, "callback_data": callback_data(owner_id, "main")}]
 
@@ -359,8 +376,8 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f" работ — {figurines}.</i>"
     )
     lines.append(
-        f"\nСоперник подбирается случайно среди существ"
-        f" ±{C.OPPONENT_LEVEL_WINDOW} уровня."
+        f"\nСоперник подбирается по боевому рейтингу:"
+        f" учитываются статы, уровень существа и снаряжение."
     )
     lines.append(
         f"Победа: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет."
@@ -380,7 +397,10 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
-def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]:
+def opponent_view(
+    entry: str, user_id, opponent_id, xp: int, rerolls_used: int = 0,
+    rerolls_allowed: int = C.MAX_OPPONENT_REROLLS, search_seed: int = 0,
+) -> tuple[str, dict]:
     """The found opponent, with Напасть as a separate tap. Searching and attacking are two
     steps because the daily fight is spent by attacking, not by looking -- a player who
     searched and walked away has lost nothing."""
@@ -389,6 +409,8 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
     if not mine or not theirs:
         return fight_view(entry, user_id, xp)
     their_stats = pets.effective_stats(entry, opponent_id)
+    my_power = pets.power_rating(entry, user_id)
+    their_power = pets.power_rating(entry, opponent_id)
 
     lines = ["🔍 <b>Соперник найден</b>\n"]
     lines.append(f"🐾 <b>{_name(theirs)}</b> — уровень {theirs.get('level', 1)}")
@@ -396,6 +418,7 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
     lines.append(
         f"Боёв: {theirs.get('fights', 0)} / побед: {theirs.get('wins', 0)}"
     )
+    lines.append(f"Боевой рейтинг: {their_power} <i>(у тебя {my_power})</i>")
     lines.append("")
     for key in C.STAT_KEYS:
         lines.append(f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]}: {their_stats.get(key, 1)}")
@@ -406,33 +429,42 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
             "text": "⚔️ Напасть",
             "callback_data": callback_data(user_id, "attack", str(opponent_id)),
         }],
-        [{"text": "🔍 Другой соперник", "callback_data": callback_data(user_id, "search")}],
         _back_row(user_id),
     ]
+    if rerolls_used < rerolls_allowed:
+        left = rerolls_allowed - rerolls_used
+        rows.insert(1, [{
+            "text": f"🔍 Другой соперник ({left})",
+            "callback_data": callback_data(
+                user_id, "search", search_argument(rerolls_used + 1, search_seed),
+            ),
+        }])
+    else:
+        lines.append(f"\n<i>Новых соперников: максимум {rerolls_allowed}.</i>")
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str:
-    """The blow-by-blow. Every round is one line of flavour, then the outcome and what it
-    paid. Long by design -- the log IS the game, the numbers are the receipt."""
-    lines = [f"⚔️ <b>{escape(result.opening)}</b>\n"]
-    for round_ in result.rounds:
-        lines.append(escape(round_.text))
-    lines.append("")
+    """Short caption for the composite result image; the image carries the full receipt."""
+    lines = [f"<b>{escape(result.closing)}</b>"]
     if result.stopped_early:
-        lines.append("<i>Судья остановил бой: слишком долго.</i>")
-    lines.append(f"<b>{escape(result.closing)}</b>")
+        lines.append("<i>Решение по урону после 10 атак.</i>")
 
     won = result.winner == mine_key
-    lines.append("")
-    lines.append("🏆 <b>Победа</b>" if won else "💀 <b>Поражение</b>")
+    if result.is_draw:
+        lines.append("🤝 <b>Ничья</b>")
+    else:
+        lines.append("🏆 <b>Победа</b>" if won else "💀 <b>Поражение</b>")
     if reward:
-        if reward.get("gold"):
-            lines.append(f"🪙 +{_coins(reward['gold'])}")
-        if reward.get("loss_gold"):
-            lines.append(f"🪙 −{_coins(reward['loss_gold'])}")
-        if reward.get("xp"):
+        if reward.get("draw"):
             lines.append(f"✨ +{reward['xp']} опыта")
+        else:
+            if reward.get("gold"):
+                lines.append(f"🪙 +{_coins(reward['gold'])}")
+            if reward.get("loss_gold"):
+                lines.append(f"🪙 −{_coins(reward['loss_gold'])}")
+            if reward.get("xp"):
+                lines.append(f"✨ +{reward['xp']} опыта")
         if reward.get("levels_gained"):
             lines.append(
                 f"⬆️ Новый уровень: {reward.get('level')} — +{reward['levels_gained']} ко всем статам"
@@ -466,16 +498,19 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
         lines.append("Боёв пока не было.")
     for record in rows_data:
         attacked = str(record.get("attacker_id")) == str(user_id)
+        draw = bool(record.get("draw"))
         won = str(record.get("winner_id")) == str(user_id)
         other = record.get("defender_name") if attacked else record.get("attacker_name")
         owner = record.get("defender_owner") if attacked else record.get("attacker_owner")
         who = f"{escape(owner or '?')} — {escape(other or '?')}"
-        outcome = "Победа" if won else "Поражение"
+        outcome = "Ничья" if draw else ("Победа" if won else "Поражение")
         gold = record.get("gold") or 0
         lost = record.get("loss_gold") or 0
         # Bare numbers here, with no noun to agree with -- the line is already dense and
         # "(Победа, +45)" reads fine next to a column of them.
-        if won and gold:
+        if draw:
+            outcome += f", +{C.DRAW_XP} опыта"
+        elif won and gold:
             outcome += f", +{_money(gold)}"
         elif lost:
             outcome += f", −{_money(lost)}"

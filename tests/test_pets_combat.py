@@ -1,8 +1,7 @@
 """pets_combat.py is a pure simulation, so its tests are the balance proof: they check
-that the numbers in pets_config.py actually produce the fight shape the module's own
-comments promise (6-12 rounds at every level, a stat lead that reliably wins), not just
-that the code runs. See PETS_CONTRACT.md for the exact list this file is required to
-cover.
+that the numbers in pets_config.py keep an even fight near an 85% knockout rate within
+the ten-attack cap, and that a stat lead reliably wins, not just that the code runs. See
+PETS_CONTRACT.md for the exact list this file is required to cover.
 """
 
 import random
@@ -10,6 +9,7 @@ import statistics
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -89,19 +89,22 @@ class DeriveTests(unittest.TestCase):
 class SimulateTests(unittest.TestCase):
     def test_same_seed_replays_the_identical_fight(self):
         a, b = _fighter("a", 40, name="Alpha"), _fighter("b", 40, name="Beta")
-        result_1 = combat.simulate(a, b, rng=random.Random(12345))
-        result_2 = combat.simulate(a, b, rng=random.Random(12345))
+        result_1 = combat.simulate(a, b, seed=12345)
+        result_2 = combat.simulate(a, b, seed=12345)
         self.assertEqual(result_1, result_2)
+        self.assertEqual(result_1.seed, 12345)
 
-    def test_fights_always_terminate_within_max_rounds(self):
+    def test_fights_allow_no_more_than_ten_attacks_per_fighter(self):
         # A round is a full exchange (leader strikes, follower counters back in the same
-        # round unless already dead), so it produces one or two Round entries -- the round
-        # NUMBER is capped at MAX_ROUNDS, the blow count can run up to twice that.
+        # round unless already dead). The cap applies to each pet, not merely to total
+        # blows, so a future change cannot let the opening attacker get an extra strike.
         a, b = _fighter("a", 40), _fighter("b", 40)
         for seed in range(200):
             result = combat.simulate(a, b, rng=random.Random(seed))
-            self.assertLessEqual(result.rounds[-1].number, C.MAX_ROUNDS)
-            self.assertLessEqual(len(result.rounds), 2 * C.MAX_ROUNDS)
+            attacks = {key: sum(rnd.attacker == key for rnd in result.rounds) for key in (a.key, b.key)}
+            self.assertLessEqual(result.rounds[-1].number, C.MAX_ATTACKS_PER_FIGHTER)
+            self.assertLessEqual(attacks[a.key], C.MAX_ATTACKS_PER_FIGHTER)
+            self.assertLessEqual(attacks[b.key], C.MAX_ATTACKS_PER_FIGHTER)
             self.assertGreater(len(result.rounds), 0)
 
     def test_hp_is_never_negative_in_any_round(self):
@@ -116,28 +119,26 @@ class SimulateTests(unittest.TestCase):
         a, b = _fighter("a", 40), _fighter("b", 40)
         for seed in range(50):
             result = combat.simulate(a, b, rng=random.Random(seed))
-            self.assertIn(result.winner, (a.key, b.key))
-            self.assertIn(result.loser, (a.key, b.key))
-            self.assertNotEqual(result.winner, result.loser)
+            if result.is_draw:
+                self.assertIsNone(result.winner)
+                self.assertIsNone(result.loser)
+            else:
+                self.assertIn(result.winner, (a.key, b.key))
+                self.assertIn(result.loser, (a.key, b.key))
+                self.assertNotEqual(result.winner, result.loser)
 
-    def test_round_count_median_lands_in_the_6_to_12_range_at_every_level(self):
-        # pets_config's own balance comment: "6-12 rounds at EVERY level ... a level-1
-        # pair trade ~11 blows, a maxed pair ~8". A "round" is the exchange (leader strikes,
-        # follower counters back in the same round) -- the round NUMBER the fight ends on,
-        # not the raw blow count, which runs roughly double. This is the test that proves
-        # the tuning actually lands where the config's own comment says it does.
-        medians = {}
+    def test_even_fights_knock_out_about_eighty_five_percent_of_the_time(self):
+        rates = {}
         for level in (1, 40, 80):
             a, b = _fighter("a", level, name="A"), _fighter("b", level, name="B")
-            lengths = [
-                combat.simulate(a, b, rng=random.Random(seed)).rounds[-1].number
-                for seed in range(200)
-            ]
-            median = statistics.median(lengths)
-            medians[level] = median
-            self.assertGreaterEqual(median, 6, f"level {level}: median {median}")
-            self.assertLessEqual(median, 12, f"level {level}: median {median}")
-        print(f"\n  measured round-length medians: {medians}")
+            rate = sum(
+                not combat.simulate(a, b, seed=seed).stopped_early
+                for seed in range(1_000)
+            ) / 1_000
+            rates[level] = rate
+            self.assertGreaterEqual(rate, 0.80, f"level {level}: knockout rate {rate}")
+            self.assertLessEqual(rate, 0.92, f"level {level}: knockout rate {rate}")
+        self.assertAlmostEqual(statistics.mean(rates.values()), 0.85, delta=0.04)
 
     def test_a_vastly_stronger_fighter_wins_at_least_90_percent_of_the_time(self):
         strong = Fighter(key="strong", name="Strong", strength=80, health=80,
@@ -151,19 +152,47 @@ class SimulateTests(unittest.TestCase):
         print(f"\n  measured win rate (strong vs weak): {wins / 200:.3f}")
         self.assertGreaterEqual(wins / 200, 0.90, f"win rate {wins / 200}")
 
-    def test_stopped_early_fights_award_the_higher_remaining_hp_fraction(self):
-        # Two fighters so evenly matched combat cannot resolve them inside MAX_ROUNDS is
-        # not reachable with these constants (see pets_config), so this exercises the
-        # award logic directly by shrinking the round budget via a monkeypatched cap.
-        a, b = _fighter("a", 40), _fighter("b", 40)
-        original_max_rounds = C.MAX_ROUNDS
-        C.MAX_ROUNDS = 1
-        try:
-            result = combat.simulate(a, b, rng=random.Random(7))
-            self.assertTrue(result.stopped_early)
-            self.assertIn(result.winner, (a.key, b.key))
-        finally:
-            C.MAX_ROUNDS = original_max_rounds
+    def test_capped_fight_awards_the_living_pet_with_more_damage(self):
+        a = Fighter(key="a", name="A", strength=10, health=100, agility=1, luck=1, armor=0)
+        b = Fighter(key="b", name="B", strength=1, health=100, agility=1, luck=1, armor=0)
+
+        def fixed_blow(attacker, defender, rng):
+            return "hit", 20 if attacker["damage"] > defender["damage"] else 10
+
+        with patch.object(combat, "_resolve_blow", side_effect=fixed_blow):
+            result = combat.simulate(a, b, rng=random.Random(1))
+
+        self.assertTrue(result.stopped_early)
+        self.assertEqual(len(result.rounds), 2 * C.MAX_ATTACKS_PER_FIGHTER)
+        self.assertEqual(result.total_damage, {"a": 200, "b": 100})
+        self.assertEqual(result.winner, "a")
+
+    def test_a_knockout_wins_even_when_the_loser_dealt_more_damage(self):
+        a = Fighter(key="a", name="A", strength=10, health=1, agility=1, luck=1, armor=0)
+        b = Fighter(key="b", name="B", strength=1, health=100, agility=1, luck=1, armor=0)
+
+        def fixed_blow(attacker, defender, rng):
+            return "hit", 700 if attacker["damage"] > defender["damage"] else 600
+
+        with patch.object(combat, "_resolve_blow", side_effect=fixed_blow):
+            result = combat.simulate(a, b, rng=random.Random(1))
+
+        self.assertFalse(result.stopped_early)
+        self.assertEqual(result.total_damage, {"a": 700, "b": 600})
+        self.assertEqual(result.winner, "b")
+
+    def test_equal_damage_at_the_cap_is_a_draw(self):
+        a = Fighter(key="a", name="A", strength=10, health=100, agility=1, luck=1, armor=0)
+        b = Fighter(key="b", name="B", strength=1, health=100, agility=1, luck=1, armor=0)
+
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 20)):
+            result = combat.simulate(a, b, seed=1)
+
+        self.assertTrue(result.stopped_early)
+        self.assertTrue(result.is_draw)
+        self.assertIsNone(result.winner)
+        self.assertIsNone(result.loser)
+        self.assertEqual(result.total_damage, {"a": 200, "b": 200})
 
 
 if __name__ == "__main__":

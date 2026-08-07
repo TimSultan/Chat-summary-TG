@@ -50,6 +50,7 @@ alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
 import asyncio
 import html
 import re
+import secrets
 import sys
 import time
 import traceback
@@ -68,6 +69,8 @@ import economy
 import history
 import pets
 import pets_combat
+import pets_config as C
+import pets_image
 import pets_ui
 import poker
 import preview
@@ -334,6 +337,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
     {"command": "pet", "description": "Существо участника"},
+    {"command": "duel", "description": "Дуэль с участником"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -5512,13 +5516,15 @@ def _message_content(message: dict | None) -> str:
 # What is left here is what can only live here: Telegram I/O, working out who pressed a
 # button, and the two flows that need free text or a photo back.
 #
-# "/arena" used to open the second VOTING system; that moved to "/vote2" (see
-# ARENA_COMMANDS) and the name was handed to this. The two share nothing but the word.
+# "/arena" is the private setup menu. Public pet interactions use /pet and /duel.
 PETS_COMMANDS = ("/arena", "/арена")
 # Works in the group as well as the DM -- it is the one screen meant to be shown off, so
 # refusing it in front of everybody would defeat the point.
 PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
 PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
+DUEL_COMMANDS = ("/duel", "/дуэль")
+PET_NOTICE_DELETE_AFTER = 60
+DUEL_RESULT_DELETE_AFTER = 3 * 60
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5602,24 +5608,6 @@ async def handle_pets_command(
     actor = message.get("from") or {}
 
     if chat.get("type") != "private":
-        try:
-            sent = await api.send_message(
-                chat_id, PETS_DM_ONLY_NOTICE,
-                reply_to_message_id=message["message_id"], parse_mode=None,
-                reply_markup=(
-                    {"inline_keyboard": [[{
-                        "text": "🏟 Открыть арену",
-                        "url": f"https://t.me/{bot_username}?start=pets",
-                    }]]} if bot_username else None
-                ),
-            )
-            if sent and "message_id" in sent:
-                schedule_bot_delete(
-                    api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log,
-                    background_tasks, trigger_message_id=message["message_id"],
-                )
-        except Exception:
-            log(f"[pets] failed to point a group at the DM:\n{traceback.format_exc()}")
         return
 
     user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
@@ -5648,6 +5636,7 @@ async def handle_pet_card_command(
     entry: str,
     command_text: str,
     background_tasks: set,
+    bot_username: str | None = None,
     log=print,
 ) -> None:
     """"/pet" -- the creature's card, with its picture, in a DM or in the group.
@@ -5668,26 +5657,24 @@ async def handle_pet_card_command(
     if not argument and replied and not replied.get("is_bot"):
         argument = replied.get("username") or _display_name(replied)
 
-    async def deliver(text: str, photo_file_id: str | None) -> None:
+    async def deliver(text: str, photo_file_id: str | None, reply_markup=None) -> None:
         try:
             if photo_file_id:
                 sent = await api.send_photo(
                     chat_id, photo_file_id, caption=text,
-                    reply_to_message_id=message["message_id"], parse_mode="HTML",
+                    reply_to_message_id=message["message_id"], reply_markup=reply_markup, parse_mode="HTML",
                 )
             else:
                 sent = await api.send_message(
                     chat_id, text, reply_to_message_id=message["message_id"],
-                    parse_mode="HTML",
+                    reply_markup=reply_markup, parse_mode="HTML",
                 )
         except Exception:
             log(f"[pets] failed to send a pet card:\n{traceback.format_exc()}")
             return
-        # Auto-deleted in groups on the same timer every other stats reply uses, so a
-        # chat full of creature cards still reads as a chat. Never in a DM.
-        if sent and "message_id" in sent and chat.get("type") != "private":
+        if sent and "message_id" in sent:
             schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log,
+                api, chat_id, [sent["message_id"]], PET_NOTICE_DELETE_AFTER, log,
                 background_tasks, trigger_message_id=message["message_id"],
             )
 
@@ -5705,15 +5692,86 @@ async def handle_pet_card_command(
 
     pet = pets.get_pet(entry, user.user_id)
     if not pet:
-        mine = str(user.user_id) == str(actor.get("id"))
-        await deliver(
-            "У тебя ещё нет существа. Заводится в личке с ботом: /arena"
-            if mine else
-            f"У {html.escape(user.display_name)} пока нет существа.",
-            None,
-        )
+        if str(user.user_id) == str(actor.get("id")):
+            button = ({"inline_keyboard": [[{
+                "text": "Призвать Существо",
+                "url": f"https://t.me/{bot_username}?start=pets",
+            }]]} if bot_username else None)
+            await deliver("У тебя ещё нет существа.", None, button)
+        else:
+            await deliver(f"У {html.escape(user.display_name)} пока нет существа.", None)
         return
     await deliver(pets_ui.pet_card(entry, user.user_id, pet), pet.get("photo_file_id"))
+
+
+async def handle_duel_command(
+    api: TelegramBotAPI, telethon_client, tz, message: dict, entry: str, command_text: str,
+    bot_username: str | None, background_tasks: set, log=print,
+) -> None:
+    """Run a public duel. The challenger alone spends a duel use and cooldown."""
+    chat = message["chat"]
+    if chat.get("type") == "private":
+        return
+    chat_id = chat["id"]
+    actor = message.get("from") or {}
+    argument = command_text.split(maxsplit=1)[1].strip() if len(command_text.split(maxsplit=1)) == 2 else ""
+    replied = (message.get("reply_to_message") or {}).get("from") or {}
+    if not argument and replied and not replied.get("is_bot"):
+        argument = replied.get("username") or _display_name(replied)
+
+    async def notice(text: str, summon: bool = False) -> None:
+        markup = None
+        if summon and bot_username:
+            markup = {"inline_keyboard": [[{
+                "text": "Призвать Существо", "url": f"https://t.me/{bot_username}?start=pets",
+            }]]}
+        sent = await api.send_message(
+            chat_id, text, reply_to_message_id=message["message_id"],
+            reply_markup=markup, parse_mode="HTML",
+        )
+        if sent and "message_id" in sent:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], PET_NOTICE_DELETE_AFTER, log,
+                background_tasks, trigger_message_id=message["message_id"],
+            )
+
+    if not argument:
+        await notice("Укажи соперника: <code>/duel @user</code>.")
+        return
+    challenger, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
+    if challenger is None:
+        await notice("Ты ещё не отслеживаешься в этом чате.")
+        return
+    try:
+        target, _, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client, entry, entry, argument,
+            actor.get("username"), _display_name(actor), tz, log=log,
+        )
+    except Exception:
+        log(f"[pets] failed to resolve duel target:\n{traceback.format_exc()}")
+        await notice("Не удалось найти соперника.")
+        return
+    if target is None:
+        await notice("Не нашёл такого участника.")
+        return
+    if str(target.user_id) == str(challenger.user_id):
+        await notice("С собой дуэлиться нельзя.")
+        return
+    if not pets.get_pet(entry, challenger.user_id):
+        await notice("У тебя ещё нет существа.", summon=True)
+        return
+    if not pets.get_pet(entry, target.user_id):
+        await notice(f"У {html.escape(target.display_name)} пока нет существа.")
+        return
+    ok, reason = pets.claim_duel(entry, challenger.user_id)
+    if not ok:
+        await notice(html.escape(reason))
+        return
+    await _pets_run_fight(
+        api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
+        xp, log, background_tasks=background_tasks, delete_after=DUEL_RESULT_DELETE_AFTER,
+        include_keyboard=False,
+    )
 
 def _pets_fighter(entry: str, user_id, pet: dict):
     """A pets_combat.Fighter built from EFFECTIVE stats -- purchased levels plus the pet's
@@ -5876,8 +5934,16 @@ async def handle_pets_callback(
                     message_id=message_id, log=log,
                 )
                 return
-            opponent_id = pets.find_opponent(entry, user_id)
-            if opponent_id is None:
+            rerolls_used, search_seed = pets_ui.parse_search_argument(argument)
+            search_seed = search_seed if search_seed is not None else secrets.randbits(32)
+            if rerolls_used > C.MAX_OPPONENT_REROLLS:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+                    message_id=message_id, log=log,
+                )
+                return
+            candidates = pets.opponent_cycle(entry, user_id, search_seed)
+            if rerolls_used >= len(candidates):
                 await _send_pets_view(
                     api, chat_id,
                     pets_ui.notice_view(
@@ -5888,8 +5954,14 @@ async def handle_pets_callback(
                     message_id=message_id, log=log,
                 )
                 return
+            opponent_id = candidates[rerolls_used]
+            rerolls_allowed = min(C.MAX_OPPONENT_REROLLS, len(candidates) - 1)
             await _send_pets_view(
-                api, chat_id, pets_ui.opponent_view(entry, user_id, opponent_id, xp),
+                api, chat_id,
+                pets_ui.opponent_view(
+                    entry, user_id, opponent_id, xp, rerolls_used=rerolls_used,
+                    rerolls_allowed=rerolls_allowed, search_seed=search_seed,
+                ),
                 message_id=message_id, log=log,
             )
             return
@@ -5937,7 +6009,8 @@ async def _pets_toast_and_redraw(api, chat_id, message_id, note: str, rendered, 
 
 async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
-    xp: int, log,
+    xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
+    include_keyboard: bool = True,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -5960,28 +6033,119 @@ async def _pets_run_fight(
         )
         return
 
-    result = pets_combat.simulate(
-        _pets_fighter(entry, user_id, mine),
-        _pets_fighter(entry, opponent_id, theirs),
-    )
+    attacker_fighter = _pets_fighter(entry, user_id, mine)
+    defender_fighter = _pets_fighter(entry, opponent_id, theirs)
+    seed = secrets.randbits(63)
+    result = pets_combat.simulate(attacker_fighter, defender_fighter, seed=seed)
+    combat_snapshot = {
+        "seed": seed,
+        "fighters": {
+            str(user_id): _pets_fighter_snapshot(attacker_fighter),
+            str(opponent_id): _pets_fighter_snapshot(defender_fighter),
+        },
+    }
     reward = pets.record_fight(
         entry, user_id, opponent_id, result, pets.today(), attacker_xp=xp,
+        combat_snapshot=combat_snapshot,
     )
     report = pets_ui.fight_report(
         result, str(user_id),
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},
         reward,
     )
-    # Sent as a NEW message rather than edited over the menu: the log is the thing worth
-    # scrolling back to, and editing it away on the next tap would delete the only record
-    # of the fight the player actually watched.
+    image_path = None
     try:
-        await api.send_message(
-            chat_id, report, reply_markup=pets_ui.fight_report_keyboard(user_id),
-            parse_mode="HTML",
+        image_path = await _pets_render_result_image(
+            api, result, entry, user_id, opponent_id, mine, theirs, log,
         )
+        if image_path is not None:
+            sent = await api.send_photo_file(
+                chat_id, image_path, caption=report,
+                reply_markup=pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+                parse_mode="HTML",
+            )
+        else:
+            sent = await api.send_message(
+                chat_id, report,
+                reply_markup=pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+                parse_mode="HTML",
+            )
+        if delete_after and background_tasks and sent and "message_id" in sent:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
+                trigger_message_id=message_id,
+            )
     except Exception:
         log(f"[pets] failed to send a fight report:\n{traceback.format_exc()}")
+    finally:
+        if image_path is not None:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _pets_fighter_snapshot(fighter: pets_combat.Fighter) -> dict:
+    return {
+        key: getattr(fighter, key)
+        for key in ("key", "name", "strength", "health", "agility", "luck", "armor")
+    }
+
+
+async def _pets_download_media(api, file_id, log) -> bytes | None:
+    if not file_id or not hasattr(api, "download_file"):
+        return None
+    try:
+        return await api.download_file(file_id)
+    except Exception:
+        log("[pets] could not fetch fight-result media")
+        return None
+
+
+async def _pets_owner_avatar(api, user_id, log) -> bytes | None:
+    if not hasattr(api, "get_user_profile_photo"):
+        return None
+    try:
+        file_id = await api.get_user_profile_photo(user_id)
+    except Exception:
+        log("[pets] could not fetch owner avatar")
+        return None
+    return await _pets_download_media(api, file_id, log)
+
+
+async def _pets_render_result_image(
+    api, result, entry: str, attacker_id, defender_id, attacker: dict, defender: dict, log,
+):
+    attacker_stats = pets.effective_stats(entry, attacker_id)
+    defender_stats = pets.effective_stats(entry, defender_id)
+    pet_a, pet_b, avatar_a, avatar_b = await asyncio.gather(
+        _pets_download_media(api, attacker.get("photo_file_id"), log),
+        _pets_download_media(api, defender.get("photo_file_id"), log),
+        _pets_owner_avatar(api, attacker_id, log),
+        _pets_owner_avatar(api, defender_id, log),
+    )
+    path = pets_image.temporary_result_path()
+    try:
+        return pets_image.render_fight_result(path, result, {
+            "id": str(attacker_id),
+            "pet_name": attacker.get("name"),
+            "owner_name": attacker.get("owner_name"),
+            "stats": attacker_stats,
+            "power": pets.power_rating(entry, attacker_id),
+            "pet_photo": pet_a,
+            "owner_avatar": avatar_a,
+        }, {
+            "id": str(defender_id),
+            "pet_name": defender.get("name"),
+            "owner_name": defender.get("owner_name"),
+            "stats": defender_stats,
+            "power": pets.power_rating(entry, defender_id),
+            "pet_photo": pet_b,
+            "owner_avatar": avatar_b,
+        })
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
 
 async def handle_pets_rename_command(
@@ -6548,6 +6712,8 @@ async def _dispatch_update(
         re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
         for spelling in PETS_COMMANDS
     ):
+        if chat.get("type") != "private":
+            return
         pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
         if pets_entry is None:
             return
@@ -6568,6 +6734,19 @@ async def _dispatch_update(
             return
         await handle_pet_card_command(
             api, telethon_client, tz, message, pets_entry, command_text,
+            background_tasks, bot_username=bot_username, log=log,
+        )
+        return
+
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in DUEL_COMMANDS
+    ):
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_duel_command(
+            api, telethon_client, tz, message, pets_entry, command_text, bot_username,
             background_tasks, log=log,
         )
         return

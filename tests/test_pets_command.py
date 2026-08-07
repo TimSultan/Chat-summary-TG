@@ -42,6 +42,7 @@ class FakeApi:
         self.sent = []
         self.edits = []
         self.photos = []
+        self.photo_files = []
         self.answered = []
         # Every call is appended here in order, which is how the "answer the tap first"
         # test can assert on ORDERING rather than just on the fact that both happened.
@@ -61,6 +62,16 @@ class FakeApi:
         item = {"message_id": 200 + len(self.photos), "chat_id": chat_id,
                 "photo": photo, "caption": caption}
         self.photos.append(item)
+        return item
+
+    async def send_photo_file(self, chat_id, path, caption=None, reply_to_message_id=None,
+                              reply_markup=None, parse_mode=None):
+        self.calls.append("send_photo_file")
+        item = {
+            "message_id": 300 + len(self.photo_files), "chat_id": chat_id,
+            "caption": caption, "size": Path(path).stat().st_size,
+        }
+        self.photo_files.append(item)
         return item
 
     async def edit_message_text(self, chat_id, message_id, text,
@@ -163,16 +174,9 @@ class PetsCommandTests(unittest.TestCase):
         actions = {pets_ui.parse_callback(b["callback_data"])[1] for b in _buttons(api.sent[0])}
         self.assertIn("cage", actions)
 
-    def test_a_group_gets_a_pointer_and_a_deep_link_not_the_menu(self):
-        """The menu spends the presser's coins and would show one member's wallet to 190
-        people, so the group gets a link into the DM instead -- a url button, because a
-        web_app button is private-chat only."""
+    def test_arena_command_is_ignored_in_a_group(self):
         api = self._type(chat_type="group")
-        self.assertEqual(len(api.sent), 1)
-        buttons = _buttons(api.sent[0])
-        self.assertEqual(len(buttons), 1)
-        self.assertEqual(buttons[0]["url"], f"https://t.me/{BOT}?start=pets")
-        self.assertNotIn("callback_data", buttons[0])
+        self.assertEqual(api.sent, [])
 
     def test_somebody_the_chat_has_never_seen_is_turned_away(self):
         api = self._type(found=False)
@@ -202,6 +206,17 @@ class PetsCommandTests(unittest.TestCase):
             ))
         self.assertEqual(api.photos, [])
         self.assertIn("нет существа", api.sent[0]["text"])
+
+    def test_pet_card_offers_to_summon_when_the_owner_has_no_pet(self):
+        api = FakeApi()
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)):
+            _run(bot_listener.handle_pet_card_command(
+                api, None, None, _message(PLAYER, "/pet", "group"), CHAT, "/pet",
+                set(), bot_username=BOT, log=lambda *_: None,
+            ))
+        button = _buttons(api.sent[0])[0]
+        self.assertEqual(button["text"], "Призвать Существо")
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")
 
     # --------------------------------------------------------------------- callbacks
 
@@ -272,6 +287,62 @@ class PetsCommandTests(unittest.TestCase):
                 api.edits or api.sent,
                 f"action {action!r} drew nothing at all",
             )
+
+    def test_fight_posts_one_composite_result_image(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+
+        _run(bot_listener._pets_run_fight(
+            api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP, log=lambda *_: None,
+        ))
+
+        self.assertEqual(len(api.photo_files), 1)
+        self.assertGreater(api.photo_files[0]["size"], 1_000)
+        self.assertTrue(any(
+            outcome in api.photo_files[0]["caption"]
+            for outcome in ("Победа", "Поражение", "Ничья")
+        ))
+
+    def test_opponent_rerolls_are_limited_to_three(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+
+        _, keyboard = pets_ui.opponent_view(CHAT, PLAYER["id"], "43", RICH_XP)
+        search = next(b for b in _buttons({"reply_markup": keyboard}) if b["text"].startswith("🔍"))
+        _, action, argument = pets_ui.parse_callback(search["callback_data"])
+        self.assertEqual(action, "search")
+        self.assertEqual(pets_ui.parse_search_argument(argument), (1, 0))
+
+        _, capped = pets_ui.opponent_view(
+            CHAT, PLAYER["id"], "43", RICH_XP, rerolls_used=C.MAX_OPPONENT_REROLLS,
+        )
+        self.assertFalse(any(b["text"].startswith("🔍") for b in _buttons({"reply_markup": capped})))
+
+    def test_group_duel_posts_a_result_image_and_claims_a_use(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+        challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        target = SimpleNamespace(user_id=43, display_name="Bob")
+
+        async def resolve(*args, **kwargs):
+            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
+
+        with patch.object(stats, "resolve_stat_target", resolve):
+            _run(bot_listener.handle_duel_command(
+                api, None, None, _message(PLAYER, "/duel @bob", "group"), CHAT,
+                "/duel @bob", BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertEqual(len(api.photo_files), 1)
+        self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
 
 if __name__ == "__main__":

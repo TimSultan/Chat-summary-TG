@@ -33,6 +33,10 @@ _EMOJI_RE = re.compile(
 
 
 class EventCoverageTests(unittest.TestCase):
+    def test_result_line_has_three_hundred_unique_variants(self):
+        self.assertEqual(len(flavor.RESULT_VARIANTS), 300)
+        self.assertEqual(len(flavor.RESULT_VARIANTS), len(set(flavor.RESULT_VARIANTS)))
+
     def test_events_tuple_matches_variants_keys(self):
         self.assertEqual(flavor.EVENTS, tuple(flavor.VARIANTS))
 
@@ -58,6 +62,9 @@ class EventCoverageTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    def test_result_and_draw_lines_are_filled(self):
+        self.assertNotIn("{", flavor.result_line("Мурзик", "Плюшка", rng=random.Random(1)))
+        self.assertNotIn("{", flavor.draw_line("Мурзик", "Плюшка", rng=random.Random(1)))
     def test_every_template_formats_without_keyerror(self):
         for event, variants in flavor.VARIANTS.items():
             for template in variants:

@@ -313,6 +313,47 @@ _ROUND_FLAVOR = (
     "{defender} косится на {attacker}, прикидывая, стоило ли вообще выходить сегодня на арену.",
 )
 
+# A short post-fight line is distinct from the detailed blow log. Thirty winning beats
+# crossed with ten losing beats give 300 unique, gender-neutral result variants without
+# coupling combat rules to the text bank.
+_RESULT_WINS = (
+    "{attacker} забирает арену.", "{attacker} сегодня слишком хорош.",
+    "{attacker} уносит победу в лапах.", "{attacker} оставляет трибуны довольными.",
+    "{attacker} проводит вечер как победитель.", "{attacker} забирает этот раунд себе.",
+    "{attacker} получает право на победный круг.", "{attacker} оказывается главным на арене.",
+    "{attacker} завершает бой на высокой ноте.", "{attacker} забирает заслуженное первое место.",
+    "{attacker} получает аплодисменты судьи.", "{attacker} выходит из боя с трофеем.",
+    "{attacker} оставляет за собой последнее слово.", "{attacker} празднует без лишней скромности.",
+    "{attacker} превращает арену в личную сцену.", "{attacker} ловит удачный день.",
+    "{attacker} забирает момент славы.", "{attacker} становится главным сюжетом вечера.",
+    "{attacker} добирается до победной точки.", "{attacker} берёт бой уверенно.",
+    "{attacker} уходит под одобрительный гул.", "{attacker} выигрывает этот спор лапами.",
+    "{attacker} показывает, кто тут подготовился.", "{attacker} получает законный повод хвастаться.",
+    "{attacker} делает арену своей территорией.", "{attacker} забирает лучший кадр боя.",
+    "{attacker} получает золото и уважение трибун.", "{attacker} ставит красивую точку.",
+    "{attacker} завершает бой в свою пользу.", "{attacker} забирает победу без обсуждений.",
+)
+
+_RESULT_LOSSES = (
+    "{defender} уже планирует реванш.", "{defender} берёт паузу на тактику.",
+    "{defender} ищет, куда делся план боя.", "{defender} требует повтор после перекуса.",
+    "{defender} уходит проверять экипировку.", "{defender} делает вид, что так и было задумано.",
+    "{defender} сохраняет лицо почти идеально.", "{defender} записывает это в список уроков.",
+    "{defender} обещает вернуться подготовленнее.", "{defender} временно уступает арену.",
+)
+
+RESULT_VARIANTS: tuple[str, ...] = tuple(
+    f"{win} {loss}" for win in _RESULT_WINS for loss in _RESULT_LOSSES
+)
+
+_DRAW = (
+    "{attacker} и {defender} расходятся без победителя.",
+    "Ничья: {attacker} и {defender} оставляют спор на реванш.",
+    "Судья фиксирует равенство между {attacker} и {defender}.",
+    "{attacker} и {defender} делят этот бой поровну.",
+    "Арена не выбирает между {attacker} и {defender}: ничья.",
+)
+
 # Minimums are the contract; every event here clears its floor with a small margin so a
 # future trim (cutting one bad joke) doesn't need a matching new one just to stay legal.
 VARIANTS: dict[str, tuple[str, ...]] = {
@@ -345,3 +386,13 @@ def line(event: str, attacker: str, defender: str = "", amount: int = 0, rng=Non
         raise ValueError(f"unknown flavor event: {event!r}") from None
     template = picker.choice(variants)
     return template.format(attacker=attacker, defender=defender, amount=amount)
+
+
+def result_line(winner: str, loser: str, rng=None) -> str:
+    picker = rng if rng is not None else random
+    return picker.choice(RESULT_VARIANTS).format(attacker=winner, defender=loser)
+
+
+def draw_line(first: str, second: str, rng=None) -> str:
+    picker = rng if rng is not None else random
+    return picker.choice(_DRAW).format(attacker=first, defender=second)

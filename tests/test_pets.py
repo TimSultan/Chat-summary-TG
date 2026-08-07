@@ -1,7 +1,7 @@
 import random
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -238,6 +238,20 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
 
 
 class DailyFightsAndOpponentTests(PetsTestCase):
+    def test_duels_have_a_ten_minute_cooldown_and_daily_cap(self):
+        entry = "chat"
+        base = datetime(2026, 8, 1, 12, 0, 0)
+        ok, _ = pets.claim_duel(entry, "1", base)
+        self.assertTrue(ok)
+        ok, note = pets.claim_duel(entry, "1", base + timedelta(minutes=9, seconds=59))
+        self.assertFalse(ok)
+        self.assertIn("0:01", note)
+        for index in range(1, pets_config.DUEL_DAILY_LIMIT):
+            ok, _ = pets.claim_duel(entry, "1", base + timedelta(minutes=10 * index))
+            self.assertTrue(ok)
+        ok, _ = pets.claim_duel(entry, "1", base + timedelta(minutes=60))
+        self.assertFalse(ok)
+
     def test_daily_counter_resets_on_a_new_date(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
@@ -253,15 +267,15 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         day2 = day1 + timedelta(days=1)
         self.assertEqual(pets.fights_left(entry, "1", day2), pets.daily_allowance(entry, '1', day2))
 
-    def test_find_opponent_respects_the_window_and_never_returns_the_seeker(self):
+    def test_find_opponent_prefers_candidates_inside_the_power_window(self):
         entry = "chat"
         self._tame(entry, "1")
         self._tame(entry, "2")
         self._tame(entry, "3")
         data = pets._load(entry)
-        data["pets"]["1"]["level"] = 10
-        data["pets"]["2"]["level"] = 10 + pets_config.OPPONENT_LEVEL_WINDOW       # just inside
-        data["pets"]["3"]["level"] = 10 + pets_config.OPPONENT_LEVEL_WINDOW + 1   # just outside
+        data["pets"]["1"]["stats"]["strength"] = 20
+        data["pets"]["2"]["stats"]["strength"] = 22
+        data["pets"]["3"]["stats"]["strength"] = 80
         pets._save(entry, data)
 
         rng = random.Random(1)
@@ -273,17 +287,36 @@ class DailyFightsAndOpponentTests(PetsTestCase):
             seen.add(opponent)
         self.assertEqual(seen, {"2"})
 
-    def test_find_opponent_widens_through_the_fallbacks_when_nobody_is_in_window(self):
+    def test_find_opponent_uses_the_nearest_power_when_nobody_is_in_window(self):
         entry = "chat"
         self._tame(entry, "1")
         self._tame(entry, "2")
+        self._tame(entry, "3")
         data = pets._load(entry)
-        data["pets"]["1"]["level"] = 1
-        data["pets"]["2"]["level"] = 1 + pets_config.OPPONENT_LEVEL_WINDOW + 1  # just outside
+        data["pets"]["1"]["stats"]["strength"] = 1
+        data["pets"]["2"]["stats"]["strength"] = 70
+        data["pets"]["3"]["stats"]["strength"] = 80
         pets._save(entry, data)
 
         opponent = pets.find_opponent(entry, "1", rng=random.Random(1))
-        self.assertEqual(opponent, "2")  # found via the widened fallback window
+        self.assertEqual(opponent, "2")
+
+    def test_find_opponent_excludes_the_current_card_when_rerolling(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        self._tame(entry, "2")
+        self._tame(entry, "3")
+        opponent = pets.find_opponent(entry, "1", rng=random.Random(1), exclude_ids={"2"})
+        self.assertEqual(opponent, "3")
+
+    def test_opponent_cycle_is_seeded_and_never_repeats(self):
+        entry = "chat"
+        for user_id in ("1", "2", "3", "4", "5"):
+            self._tame(entry, user_id)
+        first = pets.opponent_cycle(entry, "1", 123)
+        second = pets.opponent_cycle(entry, "1", 123)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), len(set(first)))
 
     def test_find_opponent_returns_none_only_when_the_chat_has_no_other_pet(self):
         entry = "chat"
@@ -292,6 +325,27 @@ class DailyFightsAndOpponentTests(PetsTestCase):
 
 
 class RecordFightTests(PetsTestCase):
+    def test_draw_consumes_one_fight_without_gold_or_a_win(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        result = SimpleNamespace(
+            winner=None, loser=None, is_draw=True, seed=123,
+            total_damage={"1": 200, "2": 200},
+        )
+
+        outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertTrue(outcome["draw"])
+        self.assertEqual(outcome["gold"], 0)
+        self.assertEqual(outcome["loss_gold"], 0)
+        self.assertEqual(outcome["xp"], pets_config.DRAW_XP)
+        self.assertEqual(pets.get_pet(entry, "1")["wins"], 0)
+        self.assertEqual(pets.get_pet(entry, "2")["wins"], 0)
+        row = pets.history(entry, "1")[0]
+        self.assertTrue(row["draw"])
+        self.assertEqual(row["combat_seed"], 123)
+
     def test_attacker_alone_consumes_a_fight_and_defender_still_gets_loss_xp(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
