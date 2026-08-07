@@ -5523,8 +5523,9 @@ PETS_COMMANDS = ("/arena", "/арена")
 PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
 PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
-PET_NOTICE_DELETE_AFTER = 60
-DUEL_RESULT_DELETE_AFTER = 3 * 60
+PETS_ARENA_DELETE_AFTER = 3 * 60
+PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
+DUEL_RESULT_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5556,7 +5557,8 @@ async def _pets_context(telethon_client, entry: str, tz, actor: dict, log=print)
 
 
 async def _send_pets_view(
-    api: TelegramBotAPI, chat_id, rendered, reply_to_message_id=None, message_id=None, log=print,
+    api: TelegramBotAPI, chat_id, rendered, reply_to_message_id=None, message_id=None,
+    background_tasks: set | None = None, delete_after: int | None = None, log=print,
 ):
     """Draw a screen, editing the message the button was on when there is one.
 
@@ -5575,10 +5577,15 @@ async def _send_pets_view(
         except Exception:
             pass
     try:
-        await api.send_message(
+        sent = await api.send_message(
             chat_id, text, reply_to_message_id=reply_to_message_id,
             reply_markup=keyboard, parse_mode="HTML",
         )
+        if delete_after and background_tasks and sent and "message_id" in sent:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
+                trigger_message_id=reply_to_message_id,
+            )
     except Exception:
         log(f"[pets] failed to send a view:\n{traceback.format_exc()}")
 
@@ -5641,7 +5648,8 @@ async def handle_pets_command(
 
     await _send_pets_view(
         api, chat_id, pets_ui.main_view(entry, user.user_id, xp),
-        reply_to_message_id=message["message_id"], log=log,
+        reply_to_message_id=message["message_id"], background_tasks=background_tasks,
+        delete_after=PETS_ARENA_DELETE_AFTER, log=log,
     )
 
 
