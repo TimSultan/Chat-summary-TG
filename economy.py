@@ -201,6 +201,22 @@ def refund(entry: str, user_id, xp: int, amount: int, reason: str) -> int:
     return _balance_from(data, user_id, xp)
 
 
+def refund_once(entry: str, user_id, xp: int, amount: int, reason: str) -> bool:
+    """Refund one named migration only once, atomically with its economy record."""
+    if amount <= 0:
+        return False
+    data = _load(entry)
+    record = _record(data, user_id)
+    migrations = _effects(record).setdefault("refunds", {})
+    if migrations.get(reason):
+        return False
+    record["spent"] = max(0, record.get("spent", 0) - amount)
+    migrations[reason] = True
+    _append_log(data, user_id, amount, f"refund:{reason}")
+    _save(entry, data)
+    return True
+
+
 def grant(entry: str, user_id, amount: int, reason: str) -> None:
     """Credit coins that did not come from XP (an administrator award, a contest prize)."""
     data = _load(entry)

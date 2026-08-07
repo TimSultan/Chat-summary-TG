@@ -50,7 +50,8 @@ levels cheaper raises everybody equally and widens nothing. See PETS_BALANCE.md.
 # the coin economy a real sink -- see economy.py's note that, with one rentable title as
 # the only drain, balances only grow.
 
-CAGE_PRICE = 50             # buying the cage at all -- the entry ticket
+CAGE_PRICE = 100            # buying the cage at all -- the entry ticket
+LEGACY_CAGE_PRICE = 50      # one-time refund for cages bought before the price change
 TAME_PRICE = 50             # taming the creature that lives in it
 # Renaming is free, and making it cost something is NOT just a matter of raising this:
 # pets.rename does not take the member's xp, and economy.balance needs it to price

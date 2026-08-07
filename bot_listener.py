@@ -323,10 +323,11 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "pet", "description": "Моё существо"},
 )
-# Telegram appends @bot_username to group-menu suggestions. The bot still recognises all
-# group commands when typed normally, but intentionally publishes no group menu entries
-# so typing a slash does not fill the composer with that suffix.
-GROUP_CHAT_COMMANDS = ()
+GROUP_CHAT_COMMANDS = (
+    {"command": "arena", "description": "Арена: клетка, существо, бои"},
+    {"command": "pet", "description": "Моё существо"},
+    {"command": "duel", "description": "Вызвать существо на дуэль"},
+)
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
 # cooldown only stops a burst of messages producing a wall of identical menus; set it to
@@ -7284,6 +7285,9 @@ async def run_bot_listener(
         me = await api.get_me()
         bot_username = me.get("username")
         await register_bot_menu(api, log=log)
+        refunded_cages = pets.refund_legacy_cages(cfg.listener_allowed_chats)
+        if refunded_cages:
+            log(f"[pets] refunded {refunded_cages} legacy cage purchases")
         if home_chat_ref:
             # So the «Диллер» badge is already in the /badgeadmin list waiting to be
             # given, rather than something an administrator has to know to create first.

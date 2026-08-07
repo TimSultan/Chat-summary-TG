@@ -62,6 +62,21 @@ class CageAndTamingTests(PetsTestCase):
         self.assertFalse(ok)
         self.assertIsNone(pets.get_pet("chat", "1"))
 
+    def test_legacy_cages_are_refunded_once(self):
+        entry = "chat"
+        economy.grant(entry, "1", pets_config.LEGACY_CAGE_PRICE, "legacy_cage_funds")
+        ok, _ = economy.spend(entry, "1", 0, pets_config.LEGACY_CAGE_PRICE, "buy:pet_cage")
+        self.assertTrue(ok)
+        data = pets._empty()
+        data["pets"]["1"] = pets._new_record()
+        data["pets"]["1"].pop("cage_price_paid")
+        pets._save(entry, data)
+
+        self.assertEqual(pets.refund_legacy_cages([entry]), 1)
+        self.assertEqual(pets.refund_legacy_cages([entry]), 0)
+        self.assertEqual(economy.balance(entry, "1", 0), pets_config.LEGACY_CAGE_PRICE)
+        self.assertEqual(pets._load(entry)["pets"]["1"]["cage_price_paid"], pets_config.LEGACY_CAGE_PRICE)
+
     def test_duplicate_name_refuses_case_insensitively(self):
         entry = "chat"
         for uid in ("1", "2"):

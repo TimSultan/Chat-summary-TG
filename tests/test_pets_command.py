@@ -203,9 +203,10 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(all(args[3] == bot_listener.GROUP_PETS_DELETE_AFTER for args, _ in deletions))
         self.assertTrue(any(kwargs.get("trigger_message_id") == 5 for _, kwargs in deletions))
 
-    def test_duel_is_not_advertised_in_the_group_command_menu(self):
-        self.assertNotIn(
-            "duel", {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
+    def test_pet_commands_are_advertised_in_the_group_command_menu(self):
+        self.assertEqual(
+            {"arena", "pet", "duel"},
+            {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
         )
 
     def test_somebody_the_chat_has_never_seen_is_turned_away(self):

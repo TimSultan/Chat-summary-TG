@@ -88,6 +88,7 @@ def _new_record() -> dict:
         "photo_file_id": None,
         "owner_name": None,
         "owner_username": None,
+        "cage_price_paid": C.CAGE_PRICE,
         "cage_level": 1,
         "stats": {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS},
         "equipped": {slot: None for slot in C.SLOT_KEYS},
@@ -179,6 +180,26 @@ def buy_cage(entry, user_id, xp) -> tuple[bool, str]:
     data["pets"][uid] = _new_record()
     _save(entry, data)
     return True, f"Клетка куплена за {C.CAGE_PRICE} монет. Теперь найди, кого туда поселить."
+
+
+def refund_legacy_cages(entries) -> int:
+    """Refund the old cage price once for every cage created before the price increase."""
+    refunded = 0
+    for entry in entries:
+        data = _load(entry)
+        changed = False
+        for user_id, record in data["pets"].items():
+            if record.get("cage_price_paid") is not None:
+                continue
+            if economy.refund_once(
+                entry, user_id, 0, C.LEGACY_CAGE_PRICE, "pet_cage_price_202608",
+            ):
+                refunded += 1
+            record["cage_price_paid"] = C.LEGACY_CAGE_PRICE
+            changed = True
+        if changed:
+            _save(entry, data)
+    return refunded
 
 
 def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
