@@ -5524,9 +5524,9 @@ PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
 PETS_ARENA_DELETE_AFTER = 3 * 60
 PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
-DUEL_RESULT_DELETE_AFTER = 5 * 60
-DUEL_COMMAND_DELETE_AFTER = 5
-DUEL_TARGET_PROMPT_DELETE_AFTER = 10
+GROUP_PETS_DELETE_AFTER = 30
+DUEL_RESULT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
+DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5615,6 +5615,10 @@ async def handle_pets_command(
     actor = message.get("from") or {}
 
     if chat.get("type") != "private":
+        schedule_bot_delete(
+            api, chat_id, [], GROUP_PETS_DELETE_AFTER, log, background_tasks,
+            trigger_message_id=message["message_id"],
+        )
         try:
             sent = await api.send_message(
                 chat_id, PETS_DM_ONLY_NOTICE,
@@ -5628,8 +5632,8 @@ async def handle_pets_command(
             )
             if sent and "message_id" in sent:
                 schedule_bot_delete(
-                    api, chat_id, [sent["message_id"]], PET_NOTICE_DELETE_AFTER, log,
-                    background_tasks, trigger_message_id=message["message_id"],
+                    api, chat_id, [sent["message_id"]], GROUP_PETS_DELETE_AFTER, log,
+                    background_tasks,
                 )
         except Exception:
             log(f"[pets] failed to point a group at the DM:\n{traceback.format_exc()}")
@@ -5674,6 +5678,12 @@ async def handle_pet_card_command(
     chat = message["chat"]
     chat_id = chat["id"]
     actor = message.get("from") or {}
+    group_chat = chat.get("type") != "private"
+    if group_chat:
+        schedule_bot_delete(
+            api, chat_id, [], GROUP_PETS_DELETE_AFTER, log, background_tasks,
+            trigger_message_id=message["message_id"],
+        )
     argument = ""
     for spelling in PET_CARD_COMMANDS:
         if command_text.lower().startswith(spelling):
@@ -5700,8 +5710,9 @@ async def handle_pet_card_command(
             return
         if sent and "message_id" in sent:
             schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], PET_NOTICE_DELETE_AFTER, log,
-                background_tasks, trigger_message_id=message["message_id"],
+                api, chat_id, [sent["message_id"]],
+                GROUP_PETS_DELETE_AFTER if group_chat else PET_NOTICE_DELETE_AFTER,
+                log, background_tasks,
             )
 
     try:
@@ -5740,14 +5751,18 @@ async def handle_duel_command(
         return
     chat_id = chat["id"]
     actor = message.get("from") or {}
+    schedule_bot_delete(
+        api, chat_id, [], GROUP_PETS_DELETE_AFTER, log, background_tasks,
+        trigger_message_id=message["message_id"],
+    )
     argument = command_text.split(maxsplit=1)[1].strip() if len(command_text.split(maxsplit=1)) == 2 else ""
     replied = (message.get("reply_to_message") or {}).get("from") or {}
     if not argument and replied and not replied.get("is_bot"):
         argument = replied.get("username") or _display_name(replied)
 
     async def notice(
-        text: str, summon: bool = False, delete_after: int = PET_NOTICE_DELETE_AFTER,
-        trigger_delete_after: int | None = PET_NOTICE_DELETE_AFTER,
+        text: str, summon: bool = False, delete_after: int = GROUP_PETS_DELETE_AFTER,
+        trigger_delete_after: int | None = None,
     ) -> None:
         markup = None
         if summon and bot_username:
@@ -5769,10 +5784,6 @@ async def handle_duel_command(
                 )
 
     if not argument:
-        schedule_bot_delete(
-            api, chat_id, [], DUEL_COMMAND_DELETE_AFTER, log, background_tasks,
-            trigger_message_id=message["message_id"],
-        )
         await notice(
             "Укажи соперника: /duel @user.",
             delete_after=DUEL_TARGET_PROMPT_DELETE_AFTER,

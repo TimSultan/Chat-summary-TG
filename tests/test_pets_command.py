@@ -185,11 +185,19 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("30%", api.edits[0]["text"])
 
     def test_group_arena_command_points_to_the_private_bot_menu(self):
-        api = self._type(chat_type="group")
+        deletions = []
+        with patch.object(
+            bot_listener, "schedule_bot_delete",
+            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
+        ):
+            api = self._type(chat_type="group")
         self.assertEqual(api.sent[0]["text"], "Приручить и прокачать существо можно в личке бота.")
         button = _buttons(api.sent[0])[0]
         self.assertEqual(button["text"], "Открыть Арену")
         self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")
+        self.assertEqual(len(deletions), 2)
+        self.assertTrue(all(args[3] == bot_listener.GROUP_PETS_DELETE_AFTER for args, _ in deletions))
+        self.assertTrue(any(kwargs.get("trigger_message_id") == 5 for _, kwargs in deletions))
 
     def test_duel_is_not_advertised_in_the_group_command_menu(self):
         self.assertNotIn(
