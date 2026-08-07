@@ -5739,14 +5739,14 @@ async def handle_duel_command(
 ) -> None:
     """Run a public duel. The challenger alone spends a duel use and cooldown."""
     chat = message["chat"]
-    if chat.get("type") == "private":
-        return
     chat_id = chat["id"]
+    group_chat = chat.get("type") != "private"
     actor = message.get("from") or {}
-    schedule_bot_delete(
-        api, chat_id, [], GROUP_PETS_DELETE_AFTER, log, background_tasks,
-        trigger_message_id=message["message_id"],
-    )
+    if group_chat:
+        schedule_bot_delete(
+            api, chat_id, [], GROUP_PETS_DELETE_AFTER, log, background_tasks,
+            trigger_message_id=message["message_id"],
+        )
     argument = command_text.split(maxsplit=1)[1].strip() if len(command_text.split(maxsplit=1)) == 2 else ""
     replied = (message.get("reply_to_message") or {}).get("from") or {}
     if not argument and replied and not replied.get("is_bot"):
@@ -5765,7 +5765,7 @@ async def handle_duel_command(
             chat_id, text, reply_to_message_id=message["message_id"],
             reply_markup=markup, parse_mode="HTML",
         )
-        if sent and "message_id" in sent:
+        if group_chat and sent and "message_id" in sent:
             schedule_bot_delete(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
             )
@@ -5792,7 +5792,7 @@ async def handle_duel_command(
                 "prompt_message_id": prompt["message_id"],
                 "created_at": time.monotonic(),
             }
-        if prompt and "message_id" in prompt:
+        if group_chat and prompt and "message_id" in prompt:
             schedule_bot_delete(
                 api, chat_id, [prompt["message_id"]], DUEL_TARGET_PROMPT_DELETE_AFTER,
                 log, background_tasks,
@@ -5835,7 +5835,8 @@ async def handle_duel_command(
         return
     await _pets_run_fight(
         api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
-        xp, log, background_tasks=background_tasks, delete_after=DUEL_RESULT_DELETE_AFTER,
+        xp, log, background_tasks=background_tasks,
+        delete_after=DUEL_RESULT_DELETE_AFTER if group_chat else None,
         include_keyboard=False,
         persistent_recipient_ids=(challenger.user_id, target.user_id),
         enforce_arena_target_limit=False,
@@ -5859,7 +5860,7 @@ def _pets_fighter(entry: str, user_id, pet: dict):
 
 async def _pets_start_flow(
     api: TelegramBotAPI, pets_flows: dict, chat_id, user_id, entry: str,
-    awaiting: str, prompt_text: str, reply_to_message_id,
+    awaiting: str, prompt_text: str, reply_to_message_id, owner_username: str | None = None,
 ) -> None:
     prompt = await api.send_message(
         chat_id, prompt_text, reply_to_message_id=reply_to_message_id,
@@ -5872,6 +5873,7 @@ async def _pets_start_flow(
         "entry": entry,
         "awaiting": awaiting,
         "photo_file_id": None,
+        "owner_username": owner_username,
         "prompt_message_id": prompt.get("message_id") if prompt else None,
     }
 
@@ -5945,7 +5947,7 @@ async def handle_pets_callback(
             await _pets_start_flow(
                 api, pets_flows, chat_id, actor.get("id"), entry,
                 "name" if action == "rename" else f"photo_{action}",
-                prompts[action], message_id,
+                prompts[action], message_id, actor.get("username"),
             )
             return
 
@@ -6049,6 +6051,9 @@ async def handle_pets_callback(
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
             "history": lambda: pets_ui.history_view(entry, user_id),
+            "leaderboard": lambda: pets_ui.leaderboard_view(
+                entry, user_id, int(argument) if argument.isdigit() else 0,
+            ),
             "pet": lambda: pets_ui.pet_view(entry, user_id),
             "slot": lambda: pets_ui.slot_view(entry, user_id, xp, argument),
         }
@@ -6313,6 +6318,7 @@ async def maybe_handle_pets_flow_message(
     if duel_pair is not None:
         flow_id, flow = duel_pair
         pets_flows.pop(flow_id, None)
+        group_chat = message["chat"].get("type") != "private"
         target = (message.get("text") or "").strip()
         cleanup_ids = [
             flow.get("command_message_id"), flow.get("prompt_message_id"), message.get("message_id"),
@@ -6325,14 +6331,16 @@ async def maybe_handle_pets_flow_message(
             )
             if sent and "message_id" in sent:
                 cleanup_ids.append(sent["message_id"])
-            schedule_bot_delete(
-                api, chat_id, cleanup_ids, DUEL_TARGET_INVALID_DELETE_AFTER, log,
-                background_tasks if background_tasks is not None else set(),
-            )
+            if group_chat:
+                schedule_bot_delete(
+                    api, chat_id, cleanup_ids, DUEL_TARGET_INVALID_DELETE_AFTER, log,
+                    background_tasks if background_tasks is not None else set(),
+                )
             return True
 
-        for message_id in cleanup_ids:
-            await api.delete_message(chat_id, message_id)
+        if group_chat:
+            for message_id in cleanup_ids:
+                await api.delete_message(chat_id, message_id)
         await handle_duel_command(
             api, telethon_client, tz, message, flow["entry"], f"/duel {target}",
             bot_username, background_tasks if background_tasks is not None else set(),
@@ -6406,7 +6414,7 @@ async def maybe_handle_pets_flow_message(
             else:
                 ok, note = pets.tame(
                     entry, user.user_id, xp, raw,
-                    flow.get("photo_file_id"), _display_name(actor),
+                    flow.get("photo_file_id"), _display_name(actor), flow.get("owner_username"),
                 )
             await _send_pets_view(
                 api, chat_id,

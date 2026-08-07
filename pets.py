@@ -87,6 +87,7 @@ def _new_record() -> dict:
         "name": None,
         "photo_file_id": None,
         "owner_name": None,
+        "owner_username": None,
         "cage_level": 1,
         "stats": {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS},
         "equipped": {slot: None for slot in C.SLOT_KEYS},
@@ -197,7 +198,9 @@ def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
     return True, f"Клетка прокачана до {level + 1} уровня за {cost} монет."
 
 
-def tame(entry, user_id, xp, name, photo_file_id, owner_name) -> tuple[bool, str]:
+def tame(
+    entry, user_id, xp, name, photo_file_id, owner_name, owner_username: str | None = None,
+) -> tuple[bool, str]:
     data = _load(entry)
     uid = str(user_id)
     record = data["pets"].get(uid)
@@ -217,6 +220,7 @@ def tame(entry, user_id, xp, name, photo_file_id, owner_name) -> tuple[bool, str
     record["name"] = clean_name
     record["photo_file_id"] = photo_file_id
     record["owner_name"] = owner_name
+    record["owner_username"] = (owner_username or "").lstrip("@") or None
     record["level"] = 1
     record["xp"] = 0
     record["created_at"] = app_now().isoformat()
@@ -382,6 +386,27 @@ def _power_rating_for(record: dict) -> int:
         stats.get(key, 0) * C.POWER_RATING_WEIGHTS[key]
         for key in (*C.STAT_KEYS, "armor")
     )
+
+
+def pet_leaderboard(entry: str) -> list[dict]:
+    """All tamed creatures in a chat, strongest first.
+
+    The returned records are copies so callers can render them without mutating persisted
+    game state. A stable user-id tie-breaker keeps the order predictable for equal power.
+    """
+    data = _load(entry)
+    rows = [
+        {
+            "user_id": user_id,
+            "name": record["name"],
+            "owner_name": record.get("owner_name") or "кто-то",
+            "owner_username": record.get("owner_username"),
+            "power": _power_rating_for(record),
+        }
+        for user_id, record in data["pets"].items()
+        if record.get("name")
+    ]
+    return sorted(rows, key=lambda row: (-row["power"], row["user_id"]))
 
 
 # --- inventory & equipment -------------------------------------------------------------

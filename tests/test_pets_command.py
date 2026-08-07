@@ -450,6 +450,27 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.sent, [])
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
+    def test_private_duel_posts_the_result_in_the_bot_chat(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+        challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        target = SimpleNamespace(user_id=43, display_name="Bob")
+
+        async def resolve(*args, **kwargs):
+            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
+
+        with patch.object(stats, "resolve_stat_target", resolve):
+            _run(bot_listener.handle_duel_command(
+                api, None, None, _message(PLAYER, "/duel @bob", "private"), CHAT,
+                "/duel @bob", BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [DM_CHAT_ID, PLAYER["id"], target.user_id])
+        self.assertEqual(api.deleted, [])
+
 
 if __name__ == "__main__":
     unittest.main()

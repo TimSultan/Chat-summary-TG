@@ -30,6 +30,7 @@ CALLBACK_PREFIX = "pet"
 MAX_CALLBACK_BYTES = 64
 
 BACK_BUTTON = "◀️ Назад"
+LEADERBOARD_PAGE_SIZE = 20
 
 
 def callback_data(owner_id, action: str, argument: str = "") -> str:
@@ -125,6 +126,7 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     rows = [
         [{"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")}],
+        [{"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")}],
     ]
     if pet:
         rows.append([
@@ -144,6 +146,41 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     rows.append([{"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")}])
     rows.append([{"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")}])
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def leaderboard_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
+    """A paginated server roster, ordered by the combat score matchmaking uses."""
+    rows = pets.pet_leaderboard(entry)
+    total_pages = max(1, (len(rows) + LEADERBOARD_PAGE_SIZE - 1) // LEADERBOARD_PAGE_SIZE)
+    page = min(max(0, page), total_pages - 1)
+    start = page * LEADERBOARD_PAGE_SIZE
+    visible = rows[start:start + LEADERBOARD_PAGE_SIZE]
+    lines = ["🏆 <b>Существа сервера</b>\n"]
+    if not visible:
+        lines.append("На сервере ещё никто не приручил существо.")
+    else:
+        for position, row in enumerate(visible, start=start + 1):
+            username = row.get("owner_username")
+            owner = f"@{username}" if username else row["owner_name"]
+            lines.append(
+                f"{position}. {escape(owner)} — <b>{escape(row['name'])}</b> — {row['power']}"
+            )
+    lines.append(f"\n<i>{page + 1}/{total_pages}</i>")
+
+    keyboard = []
+    navigation = []
+    if page > 0:
+        navigation.append({
+            "text": "◀️", "callback_data": callback_data(user_id, "leaderboard", str(page - 1)),
+        })
+    if page + 1 < total_pages:
+        navigation.append({
+            "text": "▶️", "callback_data": callback_data(user_id, "leaderboard", str(page + 1)),
+        })
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
 def info_view(user_id) -> tuple[str, dict]:
@@ -170,7 +207,7 @@ def info_view(user_id) -> tuple[str, dict]:
         "Сила наносит мощный стартовый удар, Здоровье гасит первый удар, Ловкость уклоняется или отвечает, "
         "Броня блокирует удар, а Удача даёт сильный, но не смертельный стартовый эффект."
     )
-    lines.append("\n<b>Дуэли</b>: в общем чате напиши /duel @user. Одного и того же соперника можно вызвать раз в день.")
+    lines.append("\n<b>Дуэли</b>: напиши /duel @user в общем чате или в личке бота. Одного и того же соперника можно вызвать раз в день.")
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 

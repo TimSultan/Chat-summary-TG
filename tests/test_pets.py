@@ -9,6 +9,7 @@ from unittest.mock import patch
 import economy
 import pets
 import pets_config
+import pets_ui
 import stats
 
 
@@ -319,6 +320,39 @@ class DailyFightsAndOpponentTests(PetsTestCase):
 
         opponent = pets.find_opponent(entry, "1", rng=random.Random(1))
         self.assertEqual(opponent, "2")
+
+    def test_pet_leaderboard_lists_tamed_pets_by_power(self):
+        entry = "chat"
+        self._tame(entry, "1", "Первый")
+        self._tame(entry, "2", "Второй")
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"]["strength"] = 20
+        data["pets"]["2"]["stats"]["strength"] = 50
+        data["pets"]["2"]["owner_username"] = "second"
+        pets._save(entry, data)
+
+        rows = pets.pet_leaderboard(entry)
+
+        self.assertEqual([row["name"] for row in rows], ["Второй", "Первый"])
+        self.assertEqual(rows[0]["owner_username"], "second")
+        self.assertGreater(rows[0]["power"], rows[1]["power"])
+
+    def test_leaderboard_view_shows_owner_pet_and_power(self):
+        entry = "chat"
+        self._tame(entry, "1", "Первый")
+        data = pets._load(entry)
+        data["pets"]["1"]["owner_username"] = "first"
+        pets._save(entry, data)
+
+        text, keyboard = pets_ui.leaderboard_view(entry, "1")
+
+        self.assertIn("@first", text)
+        self.assertIn("Первый", text)
+        self.assertIn(str(pets.power_rating(entry, "1")), text)
+        self.assertEqual(
+            pets_ui.parse_callback(keyboard["inline_keyboard"][-1][0]["callback_data"])[1],
+            "main",
+        )
 
     def test_find_opponent_excludes_the_current_card_when_rerolling(self):
         entry = "chat"
