@@ -5796,6 +5796,7 @@ async def handle_duel_command(
         api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
         xp, log, background_tasks=background_tasks, delete_after=DUEL_RESULT_DELETE_AFTER,
         include_keyboard=False,
+        persistent_recipient_ids=(challenger.user_id, target.user_id),
     )
 
 def _pets_fighter(entry: str, user_id, pet: dict):
@@ -6035,7 +6036,7 @@ async def _pets_toast_and_redraw(api, chat_id, message_id, note: str, rendered, 
 async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
-    include_keyboard: bool = True,
+    include_keyboard: bool = True, persistent_recipient_ids=None,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6083,6 +6084,7 @@ async def _pets_run_fight(
         image_path = await _pets_render_result_image(
             api, result, entry, user_id, opponent_id, mine, theirs, log,
         )
+        sent = None
         if image_path is not None:
             sent = await api.send_photo_file(
                 chat_id, image_path, caption=report,
@@ -6095,14 +6097,25 @@ async def _pets_run_fight(
                 reply_markup=pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
                 parse_mode="HTML",
             )
+    except Exception:
+        log(f"[pets] failed to send a fight report:\n{traceback.format_exc()}")
+    else:
         if delete_after and background_tasks and sent and "message_id" in sent:
             schedule_bot_delete(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
                 trigger_message_id=message_id,
             )
-    except Exception:
-        log(f"[pets] failed to send a fight report:\n{traceback.format_exc()}")
     finally:
+        if image_path is not None:
+            for recipient_id in dict.fromkeys(persistent_recipient_ids or ()):
+                try:
+                    await api.send_photo_file(
+                        recipient_id, image_path, caption=report, parse_mode="HTML",
+                    )
+                except Exception:
+                    # A bot cannot message a member who has not started it; their opponent
+                    # should still receive the report.
+                    log(f"[pets] could not deliver the duel image to {recipient_id}")
         if image_path is not None:
             try:
                 image_path.unlink(missing_ok=True)

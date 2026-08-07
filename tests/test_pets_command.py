@@ -326,7 +326,7 @@ class PetsCommandTests(unittest.TestCase):
         )
         self.assertFalse(any(b["text"].startswith("🔍") for b in _buttons({"reply_markup": capped})))
 
-    def test_group_duel_posts_a_result_image_and_claims_a_use(self):
+    def test_group_duel_posts_a_result_image_and_keeps_copies_for_both_players(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -344,7 +344,11 @@ class PetsCommandTests(unittest.TestCase):
                 "/duel @bob", BOT, set(), log=lambda *_: None,
             ))
 
-        self.assertEqual(len(api.photo_files), 1)
+        self.assertEqual(len(api.photo_files), 3)
+        self.assertEqual(
+            [item["chat_id"] for item in api.photo_files],
+            [MAIN_CHAT_ID, PLAYER["id"], target.user_id],
+        )
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
 
