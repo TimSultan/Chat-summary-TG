@@ -29,6 +29,7 @@ from telethon.tl.functions.messages import GetMessageReactionsListRequest, SendR
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 import history
+import economy
 import stats
 import tree
 from config import SUMMARY_COMMAND, build_session, load_config
@@ -1225,6 +1226,9 @@ async def run_listener(
                     entry, datetime.now(tz).date(), msg.sender_id,
                     getattr(sender, "username", None), sender_display_name(sender),
                     message_id=msg.id, log=log,
+                )
+                economy.grant(
+                    entry, msg.sender_id, economy.FIGURINE_COIN_REWARD, "figurine_painted",
                 )
                 log(f"[listener] figurine painted by {sender_display_name(sender)} in '{entry}' (today: {count})")
                 if bot_takeover:

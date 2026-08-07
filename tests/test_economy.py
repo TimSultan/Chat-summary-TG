@@ -17,6 +17,9 @@ class LedgerTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.addCleanup(self._temporary.cleanup)
 
+    def test_figurine_reward_is_five_hundred_coins(self):
+        self.assertEqual(economy.FIGURINE_COIN_REWARD, 500)
+
     def test_opening_balance_is_the_coins_stat_already_showed(self):
         # The chosen migration: nobody's visible number changes on deploy. It falls out
         # of the formula rather than needing a backfill script, because `spent` starts at

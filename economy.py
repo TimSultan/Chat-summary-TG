@@ -36,6 +36,7 @@ ECONOMY_STORE_VERSION = 1
 # Rolling audit trail only -- per-user totals above it are what balances are computed
 # from, so trimming this can never change anybody's balance.
 LOG_LIMIT = 1_000
+FIGURINE_COIN_REWARD = 500
 
 # Member-to-member transfers were removed. `received` is still read by balance() and
 # reputation_for() so that any ledger written while they existed keeps computing exactly
