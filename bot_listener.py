@@ -5518,6 +5518,10 @@ DUEL_RESULT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_FLOW_TTL_SECONDS = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_INVALID_DELETE_AFTER = 5
+DUEL_NO_FIGHTS_GROUP_DELETE_AFTER = 10
+DUEL_NO_FIGHTS_GROUP_NOTICE = (
+    "У вас закончились бои, покрасы добавляют количество боев. Сначала красим, потом деремся"
+)
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5829,6 +5833,13 @@ async def handle_duel_command(
     if not pets.get_pet(entry, target.user_id):
         await notice(f"У {html.escape(target.display_name)} пока нет существа.")
         return
+    if pets.fights_left(entry, challenger.user_id, pets.today()) <= 0:
+        await _pets_run_fight(
+            api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
+            xp, log, background_tasks=background_tasks,
+            group_no_fights_notice=group_chat,
+        )
+        return
     ok, reason = pets.claim_duel(entry, challenger.user_id, target.user_id)
     if not ok:
         await notice(html.escape(reason))
@@ -6096,7 +6107,7 @@ async def _pets_run_fight(
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
     include_keyboard: bool = True, persistent_recipient_ids=None,
     enforce_arena_target_limit: bool = True, consume_daily_fight: bool = True,
-    attacker_username: str | None = None,
+    attacker_username: str | None = None, group_no_fights_notice: bool = False,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6123,6 +6134,20 @@ async def _pets_run_fight(
         )
         return
     if consume_daily_fight and pets.fights_left(entry, user_id, pets.today()) <= 0:
+        if group_no_fights_notice:
+            sent = await api.send_message(
+                chat_id, DUEL_NO_FIGHTS_GROUP_NOTICE, reply_to_message_id=message_id,
+                parse_mode=None,
+            )
+            if sent and "message_id" in sent and background_tasks is not None:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], DUEL_NO_FIGHTS_GROUP_DELETE_AFTER,
+                    log, background_tasks, trigger_message_id=message_id,
+                )
+            await _send_pets_view(
+                api, user_id, pets_ui.fight_view(entry, user_id, xp), log=log,
+            )
+            return
         await _send_pets_view(
             api, chat_id, pets_ui.fight_view(entry, user_id, xp),
             message_id=message_id, log=log,

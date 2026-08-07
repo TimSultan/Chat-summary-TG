@@ -460,6 +460,43 @@ class PetsCommandTests(unittest.TestCase):
         ))
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
+    def test_exhausted_group_duel_sends_arena_to_dm_and_short_notice_to_group(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fights_today"] = 99
+        data["pets"][str(PLAYER["id"])]["fights_day"] = pets.today().isoformat()
+        pets._save(CHAT, data)
+        api = FakeApi()
+        challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        target = SimpleNamespace(user_id=43, display_name="Bob")
+        deletions = []
+
+        async def resolve(*args, **kwargs):
+            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
+
+        with patch.object(stats, "resolve_stat_target", resolve), patch.object(
+            bot_listener, "schedule_bot_delete",
+            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
+        ):
+            _run(bot_listener.handle_duel_command(
+                api, None, None, _message(PLAYER, "/duel @bob", "group"), CHAT,
+                "/duel @bob", BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertEqual(api.sent[0]["text"], bot_listener.DUEL_NO_FIGHTS_GROUP_NOTICE)
+        self.assertEqual(api.sent[0]["chat_id"], MAIN_CHAT_ID)
+        self.assertEqual(api.sent[1]["chat_id"], PLAYER["id"])
+        self.assertIn("На сегодня всё", api.sent[1]["text"])
+        self.assertTrue(any(
+            args[3] == bot_listener.DUEL_NO_FIGHTS_GROUP_DELETE_AFTER
+            and kwargs.get("trigger_message_id") == 5
+            for args, kwargs in deletions
+        ))
+        self.assertNotIn(str(PLAYER["id"]), pets._load(CHAT)["duels"])
+
     def test_private_duel_posts_the_result_in_the_bot_chat(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
