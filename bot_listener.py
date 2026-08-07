@@ -323,21 +323,10 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "pet", "description": "Моё существо"},
 )
-# Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
-# and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
-# be a button that answers "напиши мне в личку".
-#
-# "/topall" and "/toppokras" are spelled without a space because Telegram only accepts
-# [a-z0-9_] in a registered command name: "/top all" cannot be a menu entry at all. Both
-# spellings work when typed (see parse_top_argument).
-GROUP_CHAT_COMMANDS = (
-    {"command": "stat", "description": "Статистика участника"},
-    {"command": "topall", "description": "Рейтинг чата"},
-    {"command": "toppokras", "description": "Топ прокрастинаторов"},
-    {"command": "tree", "description": "Наше дерево ЕПХ"},
-    {"command": "vote", "description": "Голосование за итоги недели"},
-    {"command": "pet", "description": "Существо участника"},
-)
+# Telegram appends @bot_username to group-menu suggestions. The bot still recognises all
+# group commands when typed normally, but intentionally publishes no group menu entries
+# so typing a slash does not fill the composer with that suffix.
+GROUP_CHAT_COMMANDS = ()
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
 # cooldown only stops a burst of messages producing a wall of identical menus; set it to

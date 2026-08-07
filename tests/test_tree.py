@@ -890,11 +890,11 @@ class TreeCommandTests(unittest.TestCase):
             self.assertIn(line, status)
             self.assertIn(line, morning)
 
-    def test_it_is_offered_in_both_menus(self):
+    def test_it_is_offered_in_the_private_menu(self):
         import bot_listener
 
-        for menu in (bot_listener.PRIVATE_CHAT_COMMANDS, bot_listener.GROUP_CHAT_COMMANDS):
-            self.assertIn("tree", {command["command"] for command in menu})
+        self.assertIn("tree", {command["command"] for command in bot_listener.PRIVATE_CHAT_COMMANDS})
+        self.assertEqual(bot_listener.GROUP_CHAT_COMMANDS, ())
 
 
 class ScheduleTests(unittest.TestCase):

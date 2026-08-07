@@ -962,13 +962,8 @@ class MenuRegistrationTests(unittest.TestCase):
                 self.assertRegex(command["command"], allowed)
                 self.assertTrue(command["description"].strip())
 
-    def test_the_group_menu_drops_cabinet_and_offers_the_top_aliases(self):
-        group = {c["command"]: c["description"] for c in bot_listener.GROUP_CHAT_COMMANDS}
-        # /cabinet only works in a DM, so a group button for it would just say "напиши в личку".
-        self.assertNotIn("cabinet", group)
-        self.assertEqual(group.get("topall"), "Рейтинг чата")
-        self.assertIn("toppokras", group)
-        # It is still offered in the DM, where it does work.
+    def test_group_menu_is_empty_but_the_dm_menu_still_has_cabinet(self):
+        self.assertEqual(bot_listener.GROUP_CHAT_COMMANDS, ())
         self.assertIn("cabinet", {c["command"] for c in bot_listener.PRIVATE_CHAT_COMMANDS})
 
     def test_top_arguments_resolve_the_same_spaced_or_not(self):
