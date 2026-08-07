@@ -436,6 +436,23 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(pets.get_pet(entry, "2")["wins"], 1)
         self.assertEqual(pets.get_pet(entry, "1")["wins"], 0)
 
+    def test_retaliation_does_not_consume_a_daily_fight(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        today = date(2026, 8, 1)
+        data = pets._load(entry)
+        data["pets"]["2"]["fights_today"] = 99
+        data["pets"]["2"]["fights_day"] = today.isoformat()
+        pets._save(entry, data)
+        result = SimpleNamespace(winner="2", loser="1", is_draw=False)
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=1.0):
+            pets.record_fight(entry, "2", "1", result, today, consume_daily_fight=False)
+
+        self.assertEqual(pets.get_pet(entry, "2")["fights_today"], 99)
+
     def test_record_fight_can_roll_a_drop_item_for_the_winner_only(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")

@@ -650,6 +650,7 @@ def opponent_cycle(entry, user_id, seed: int) -> list[str]:
 
 def record_fight(
     entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
+    consume_daily_fight: bool = True,
 ) -> dict:
     data = _load(entry)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
@@ -659,8 +660,9 @@ def record_fight(
     # Only the attacker spends a daily fight. The defender did not choose this fight, so
     # it must not come out of the budget they earned by chatting -- the loss penalty below
     # is the only thing a defender can be made to pay.
-    _reset_if_new_day(attacker, today)
-    attacker["fights_today"] = attacker.get("fights_today", 0) + 1
+    if consume_daily_fight:
+        _reset_if_new_day(attacker, today)
+        attacker["fights_today"] = attacker.get("fights_today", 0) + 1
     attacker["fights"] = attacker.get("fights", 0) + 1
     defender["fights"] = defender.get("fights", 0) + 1
 
@@ -697,6 +699,7 @@ def record_fight(
             "level": attacker.get("level", 1),
             "dropped_item": None,
             "opponent_levels_gained": defender_levels_gained,
+            "opponent_level": defender.get("level", 1),
         }
 
     winner_uid = str(result.winner)
@@ -779,6 +782,12 @@ def record_fight(
         "levels_gained": winner_levels_gained if attacker_won else loser_levels_gained,
         "level": attacker.get("level", 1),
         "dropped_item": dropped_code if attacker_won else None,
+        "opponent_gold": gold if not attacker_won else 0,
+        "opponent_loss_gold": paid if attacker_won else 0,
+        "opponent_xp": C.LOSS_XP if attacker_won else C.WIN_XP,
+        "opponent_levels_gained": loser_levels_gained if attacker_won else winner_levels_gained,
+        "opponent_level": defender.get("level", 1),
+        "opponent_dropped_item": dropped_code if not attacker_won else None,
     }
 
 

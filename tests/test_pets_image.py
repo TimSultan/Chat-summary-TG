@@ -24,6 +24,9 @@ class FightImageTests(unittest.TestCase):
     def test_winner_name_uses_green(self):
         self.assertEqual(pets_image.WINNER_NAME_COLOR, "#147a59")
 
+    def test_loser_name_uses_red(self):
+        self.assertEqual(pets_image.LOSER_NAME_COLOR, "#b83e58")
+
     def test_renderer_creates_a_shareable_result_board(self):
         result = SimpleNamespace(
             winner="a", is_draw=False, stopped_early=False,

@@ -70,7 +70,7 @@ class FakeApi:
         self.calls.append("send_photo_file")
         item = {
             "message_id": 300 + len(self.photo_files), "chat_id": chat_id,
-            "caption": caption, "size": Path(path).stat().st_size,
+            "caption": caption, "reply_markup": reply_markup, "size": Path(path).stat().st_size,
         }
         self.photo_files.append(item)
         return item
@@ -329,12 +329,17 @@ class PetsCommandTests(unittest.TestCase):
             api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP, log=lambda *_: None,
         ))
 
-        self.assertEqual(len(api.photo_files), 1)
+        self.assertEqual(len(api.photo_files), 2)
         self.assertGreater(api.photo_files[0]["size"], 1_000)
         self.assertTrue(any(
             outcome in api.photo_files[0]["caption"]
             for outcome in ("Победа", "Поражение", "Ничья")
         ))
+        defender_copy = api.photo_files[1]
+        self.assertEqual(defender_copy["chat_id"], 43)
+        self.assertIn("Вас атаковал Player", defender_copy["caption"])
+        retaliation = next(button for button in _buttons(defender_copy) if button["text"] == "⚔️ Напасть в ответ")
+        self.assertEqual(pets_ui.parse_callback(retaliation["callback_data"]), ("43", "retaliate", "42"))
 
     def test_opponent_rerolls_are_limited_to_three(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -448,6 +453,11 @@ class PetsCommandTests(unittest.TestCase):
             [MAIN_CHAT_ID, PLAYER["id"], target.user_id],
         )
         self.assertEqual(api.sent, [])
+        defender_copy = api.photo_files[-1]
+        self.assertIn("Вас атаковал @player", defender_copy["caption"])
+        self.assertTrue(any(
+            button["text"] == "⚔️ Напасть в ответ" for button in _buttons(defender_copy)
+        ))
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
     def test_private_duel_posts_the_result_in_the_bot_chat(self):

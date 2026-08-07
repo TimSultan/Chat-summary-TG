@@ -5840,6 +5840,7 @@ async def handle_duel_command(
         include_keyboard=False,
         persistent_recipient_ids=(challenger.user_id, target.user_id),
         enforce_arena_target_limit=False,
+        attacker_username=actor.get("username"),
     )
 
 def _pets_fighter(entry: str, user_id, pet: dict):
@@ -6038,7 +6039,16 @@ async def handle_pets_callback(
 
         if action == "attack":
             await _pets_run_fight(
-                api, chat_id, message_id, entry, user_id, argument, xp, log
+                api, chat_id, message_id, entry, user_id, argument, xp, log,
+                attacker_username=actor.get("username"),
+            )
+            return
+
+        if action == "retaliate":
+            await _pets_run_fight(
+                api, chat_id, message_id, entry, user_id, argument, xp, log,
+                enforce_arena_target_limit=False, consume_daily_fight=False,
+                attacker_username=actor.get("username"),
             )
             return
 
@@ -6085,7 +6095,8 @@ async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
     include_keyboard: bool = True, persistent_recipient_ids=None,
-    enforce_arena_target_limit: bool = True,
+    enforce_arena_target_limit: bool = True, consume_daily_fight: bool = True,
+    attacker_username: str | None = None,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6111,7 +6122,7 @@ async def _pets_run_fight(
             message_id=message_id, log=log,
         )
         return
-    if pets.fights_left(entry, user_id, pets.today()) <= 0:
+    if consume_daily_fight and pets.fights_left(entry, user_id, pets.today()) <= 0:
         await _send_pets_view(
             api, chat_id, pets_ui.fight_view(entry, user_id, xp),
             message_id=message_id, log=log,
@@ -6131,12 +6142,31 @@ async def _pets_run_fight(
     }
     reward = pets.record_fight(
         entry, user_id, opponent_id, result, pets.today(), attacker_xp=xp,
-        combat_snapshot=combat_snapshot,
+        combat_snapshot=combat_snapshot, consume_daily_fight=consume_daily_fight,
     )
     report = pets_ui.fight_report(
         result, str(user_id),
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},
         reward,
+    )
+    attacker_username = (attacker_username or mine.get("owner_username") or "").lstrip("@")
+    attacker_label = f"@{attacker_username}" if attacker_username else mine.get("owner_name") or "соперник"
+    defender_reward = {
+        "draw": reward.get("draw", False),
+        "gold": reward.get("opponent_gold", 0),
+        "loss_gold": reward.get("opponent_loss_gold", 0),
+        "xp": reward.get("opponent_xp", reward.get("xp", 0) if reward.get("draw") else 0),
+        "levels_gained": reward.get("opponent_levels_gained", 0),
+        "level": reward.get("opponent_level", pets.get_pet(entry, opponent_id).get("level", 1)),
+        "dropped_item": reward.get("opponent_dropped_item"),
+    }
+    defender_report = (
+        f"<b>Вас атаковал {html.escape(attacker_label)}</b>\n\n"
+        + pets_ui.fight_report(
+            result, str(opponent_id),
+            {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},
+            defender_reward,
+        )
     )
     image_path = None
     try:
@@ -6166,10 +6196,19 @@ async def _pets_run_fight(
             )
     finally:
         if image_path is not None:
-            for recipient_id in dict.fromkeys(persistent_recipient_ids or ()):
+            recipients = list(dict.fromkeys((*((persistent_recipient_ids or ())), opponent_id)))
+            for recipient_id in recipients:
+                if str(recipient_id) == str(chat_id):
+                    continue
                 try:
                     await api.send_photo_file(
-                        recipient_id, image_path, caption=report, parse_mode="HTML",
+                        recipient_id, image_path,
+                        caption=defender_report if str(recipient_id) == str(opponent_id) else report,
+                        reply_markup=(
+                            pets_ui.attacked_report_keyboard(opponent_id, user_id)
+                            if str(recipient_id) == str(opponent_id) else None
+                        ),
+                        parse_mode="HTML",
                     )
                 except Exception:
                     # A bot cannot message a member who has not started it; their opponent

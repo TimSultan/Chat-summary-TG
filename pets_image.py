@@ -25,6 +25,7 @@ _BOLD_FONT_PATHS = (
     "C:/Windows/Fonts/ARIALBD.TTF",
 )
 WINNER_NAME_COLOR = "#147a59"
+LOSER_NAME_COLOR = "#b83e58"
 _UNRENDERABLE_PROBE = "͸"
 
 
@@ -98,8 +99,8 @@ def _center(draw: ImageDraw.ImageDraw, y: int, text: str, font, fill) -> None:
 def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     panel_width = 550
     panel_color = "#e4f2eb" if side == "left" else "#f8e6e8"
-    accent = "#14805e" if side == "left" else "#b83e58"
     border = "#0e553f" if winner else "#c1c9c5"
+    name_color = WINNER_NAME_COLOR if winner else LOSER_NAME_COLOR
     draw.rounded_rectangle((x, 110, x + panel_width, 780), radius=8, fill=panel_color, outline=border, width=6)
 
     pet = _photo(fighter.get("pet_photo"), (470, 270), (43, 111, 82) if side == "left" else (151, 57, 78))
@@ -109,11 +110,11 @@ def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     draw.ellipse((x + 38, 433, x + 120, 515), outline="#ffffff", width=4)
     draw.text(
         (x + 135, 444), _short(fighter.get("owner_name"), 24, size=25, bold=False), font=_font(25),
-        fill=WINNER_NAME_COLOR if winner else "#243039",
+        fill=name_color,
     )
     draw.text(
         (x + 40, 525), _short(fighter.get("pet_name"), 24), font=_font(39, bold=True),
-        fill=WINNER_NAME_COLOR if winner else accent,
+        fill=name_color,
     )
     draw.text((x + 40, 580), f"РЕЙТИНГ  {fighter.get('power', 0)}", font=_font(22, bold=True), fill="#37434c")
 
