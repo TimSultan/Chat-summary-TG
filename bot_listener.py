@@ -72,7 +72,6 @@ import pets_combat
 import pets_config as C
 import pets_image
 import pets_ui
-import poker
 import preview
 import stats
 import vote_image
@@ -176,12 +175,6 @@ PLANT_REMINDER_COMMANDS = ("/напомнить_посадку", "/plantreminder
 # The real planting button, as opposed to preview.SAMPLE_CALLBACK, which looks identical
 # and does nothing.
 PLANT_CALLBACK_PREFIX = "plant"
-
-# Opens a poker table. Same two-spelling rule as the planting command; "/покер" is the one
-# people actually type, "/poker" is the one Telegram can highlight.
-POKER_COMMANDS = (poker.COMMAND, "/покер")
-# "/poker стоп" closes a table whose buttons have scrolled out of reach.
-POKER_STOP_WORDS = frozenset({"стоп", "закрыть", "заверши", "завершить", "stop", "close", "end"})
 
 # Explicit bot-management delegates. These users may use the DM-only management
 # commands even without Telegram administrator status in the configured home chat.
@@ -317,7 +310,6 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "stat", "description": "Моя статистика"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
-    {"command": "coins", "description": "Мой баланс"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
@@ -327,13 +319,8 @@ GROUP_CHAT_COMMANDS = (
     {"command": "stat", "description": "Моя статистика"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
-    {"command": "coins", "description": "Мой баланс"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
-    {"command": "vote2", "description": "Арена голосований"},
-    {"command": "poker", "description": "Открыть стол покера"},
-    {"command": "plant", "description": "Посадить семечко"},
-    {"command": "plantreminder", "description": "Напомнить о посадке"},
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "pet", "description": "Моё существо"},
     {"command": "duel", "description": "Вызвать существо на дуэль"},
@@ -1359,112 +1346,6 @@ async def handle_plant_reminder_command(
         return
 
     await reply("Напоминание о посадке отправлено.")
-
-
-# --- Покер ----------------------------------------------------------------------------
-#
-# The rules, the pot maths and every rendered string live in poker.py; everything here is
-# Telegram. One table per chat, its state on disk, so a redeploy mid-hand does not eat
-# anybody's chips.
-
-
-def _poker_live_message(table: dict) -> int | None:
-    """The id of the message that currently carries the table's buttons.
-
-    Newest first: a finished hand's showdown message owns them, otherwise the street being
-    played, otherwise the lobby. Getting this order wrong leaves a live keyboard on a
-    message the game has already moved past.
-    """
-    hand = table.get("hand") or {}
-    return (
-        hand.get("showdown_message_id")
-        or hand.get("message_id")
-        or table.get("lobby_message_id")
-    )
-
-
-async def _poker_deal_cards(api: TelegramBotAPI, table: dict, log=print) -> list[dict]:
-    """DM each player their two cards. Returns whoever could not be reached.
-
-    A private chat's id IS the user id, so no lookup is needed -- but a bot cannot open a
-    conversation the member has never started, which is why joining the table checks
-    reachability up front. Getting here with an unreachable player means they blocked the
-    bot mid-session; the group message names them rather than letting them play blind.
-    """
-    unreachable = []
-    for player in table["players"]:
-        try:
-            await api.send_message(
-                int(player["user_id"]),
-                poker.format_hole_cards(table, player["user_id"]),
-                parse_mode="HTML",
-            )
-        except Exception:
-            unreachable.append(player)
-            log(f"[bot_listener] could not deal cards to {player['user_id']}:\n{traceback.format_exc()}")
-    return unreachable
-
-
-async def _poker_post_street(api: TelegramBotAPI, entry: str, table: dict, log=print) -> None:
-    """Send the message a street is played on and remember it for in-place edits.
-
-    A new message per street rather than one edited all hand: an edit is silent, and a
-    table where the flop arrives without anything appearing in the chat is a table nobody
-    notices it is their turn at.
-    """
-    sent = await api.send_message(
-        table["chat_id"],
-        poker.format_hand(table),
-        parse_mode="HTML",
-        reply_markup=poker.action_keyboard(table),
-    )
-    table["hand"]["message_id"] = sent.get("message_id")
-    poker.save_table(entry, table)
-
-
-async def _poker_retire_message(api: TelegramBotAPI, chat_id, message_id, log=print) -> None:
-    """Leave a finished round's message exactly as it is but take its buttons away, so a
-    scroll back up cannot offer a live action on a hand that has moved on.
-
-    Buttons only, never the text: rewriting it would mean reproducing what that message
-    said at the time, and the state it was rendered from has already moved on.
-    """
-    if not message_id:
-        return
-    try:
-        await api.edit_message_reply_markup(chat_id, message_id, poker.no_keyboard())
-    except Exception:
-        log(f"[bot_listener] failed to retire a poker message:\n{traceback.format_exc()}")
-
-
-async def _poker_start_hand(api: TelegramBotAPI, entry: str, table: dict, log=print) -> None:
-    """Deal, DM the cards, and open the first betting round in the chat."""
-    poker.start_hand(table)
-    poker.save_table(entry, table)
-    unreachable = await _poker_deal_cards(api, table, log=log)
-    if unreachable:
-        names = ", ".join(poker.player_label(player) for player in unreachable)
-        try:
-            await api.send_message(
-                table["chat_id"],
-                f"Не удалось отправить карты в личку: {names}. Откройте чат с ботом и нажмите Start.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            log(f"[bot_listener] failed to report undelivered poker cards:\n{traceback.format_exc()}")
-    await _poker_post_street(api, entry, table, log=log)
-
-
-async def _poker_close_table(api: TelegramBotAPI, entry: str, table: dict, note: str, log=print) -> None:
-    """Forget the table, take the live keyboard away, and post the session's standings."""
-    poker.clear_table(entry)
-    await _poker_retire_message(api, table["chat_id"], _poker_live_message(table), log=log)
-    try:
-        await api.send_message(
-            table["chat_id"], poker.format_session_over(table, note), parse_mode="HTML",
-        )
-    except Exception:
-        log(f"[bot_listener] failed to post the poker session summary:\n{traceback.format_exc()}")
 
 
 async def handle_poker_command(
@@ -5503,7 +5384,7 @@ def _message_content(message: dict | None) -> str:
 # ------------------------------------------------------------- the pet game (/arena)
 #
 # The third game in this bot, and the first one that spends coins on something permanent.
-# Its pure halves live outside this file the way cabinet.py's and poker.py's do:
+# Its pure halves live outside this file the way cabinet.py's does:
 #
 #   pets_config.py   every tunable number, and nothing else -- re-balancing is editing
 #                    that file and only that file
@@ -6585,10 +6466,6 @@ async def _dispatch_update(
             await handle_badge_callback(api, callback, badge_flows)
         elif callback_data.startswith(f"{PLANT_CALLBACK_PREFIX}:"):
             await handle_plant_callback(api, callback, home_chat_ref, log=log)
-        elif callback_data.startswith(f"{poker.CALLBACK_PREFIX}:"):
-            # No chat resolution here: the table carries its own chat id, so not one of
-            # these buttons ever touches the Telethon session.
-            await handle_poker_callback(api, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{button_builder.CALLBACK_PREFIX}:"):
             await handle_button_builder_callback(
                 api, callback, home_chat_ref, button_builder_flows, log=log
@@ -6756,21 +6633,6 @@ async def _dispatch_update(
         )
         await handle_plant_reminder_command(
             api, message, home_chat_ref, admin_chat_id, log=log
-        )
-        return
-    if any(
-        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
-        for spelling in POKER_COMMANDS
-    ):
-        # Not DM-only: the table is a group event, and the dealer opens it in front of
-        # everybody. Typed in the DM it still posts to the chat, like /plant.
-        admin_chat_id = (
-            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
-            if home_chat_ref
-            else None
-        )
-        await handle_poker_command(
-            api, message, command_text, home_chat_ref, admin_chat_id, log=log
         )
         return
     if re.match(rf"^{re.escape(SEND_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
@@ -7303,14 +7165,6 @@ async def run_bot_listener(
         refunded_cages = pets.refund_legacy_cages(cfg.listener_allowed_chats)
         if refunded_cages:
             log(f"[pets] refunded {refunded_cages} legacy cage purchases")
-        if home_chat_ref:
-            # So the «Диллер» badge is already in the /badgeadmin list waiting to be
-            # given, rather than something an administrator has to know to create first.
-            try:
-                if poker.ensure_dealer_badge(home_chat_ref):
-                    log(f"[bot_listener] created the {poker.DEALER_BADGE_EMOJI} {poker.DEALER_BADGE_NAME} badge")
-            except Exception:
-                log(f"[bot_listener] could not ensure the dealer badge:\n{traceback.format_exc()}")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
             f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "
