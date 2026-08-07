@@ -354,6 +354,35 @@ _DRAW = (
     "Арена не выбирает между {attacker} и {defender}: ничья.",
 )
 
+_SIGNATURE_STRENGTH = (
+    "{attacker} заряжает валик и вдавливает его в арену: {amount} урона {defender}.",
+    "Тяжёлая кисть {attacker} оставляет на {defender} особенно плотный слой: {amount} урона.",
+)
+_SIGNATURE_HEALTH = (
+    "Грунтовка {defender} принимает удар {attacker} на себя: проходит только {amount} урона.",
+    "{defender} выдерживает удар {attacker} на запасе прочности: {amount} урона.",
+)
+_SIGNATURE_AGILITY = (
+    "{defender} ускользает от фирменного выпада {attacker}, оставляя на месте только блик.",
+    "{defender} успевает отдёрнуть мольберт: удар {attacker} проходит мимо.",
+)
+_SIGNATURE_AGILITY_COUNTER = (
+    "{defender} уворачивается от {attacker} и тут же отвечает аэрографом: {amount} урона.",
+    "{defender} исчезает из-под удара {attacker} и возвращает мазок на {amount} урона.",
+)
+_SIGNATURE_LUCK = (
+    "Случайная капля от {attacker} попадает идеально: {defender} теряет {amount} HP.",
+    "Удачный блик ослепляет {defender}: открывающий удар {attacker} на {amount} урона.",
+)
+_SIGNATURE_ARMOR = (
+    "Защита {defender} съедает почти весь удар {attacker}: остаётся {amount} урона.",
+    "{defender} подставляет палитру под удар {attacker}: проходит лишь {amount} урона.",
+)
+_SIGNATURE_ARMOR_RECOIL = (
+    "Удар {defender} не пробивает покрытие и отдачей возвращает {amount} урона {attacker}.",
+    "Броня {defender} отражает выпад {attacker}; отдача наносит {amount} урона.",
+)
+
 # Minimums are the contract; every event here clears its floor with a small margin so a
 # future trim (cutting one bad joke) doesn't need a matching new one just to stay legal.
 VARIANTS: dict[str, tuple[str, ...]] = {
@@ -365,6 +394,13 @@ VARIANTS: dict[str, tuple[str, ...]] = {
     "opening": _OPENING,
     "victory": _VICTORY,
     "round_flavor": _ROUND_FLAVOR,
+    "signature_strength": _SIGNATURE_STRENGTH,
+    "signature_health": _SIGNATURE_HEALTH,
+    "signature_agility": _SIGNATURE_AGILITY,
+    "signature_agility_counter": _SIGNATURE_AGILITY_COUNTER,
+    "signature_luck": _SIGNATURE_LUCK,
+    "signature_armor": _SIGNATURE_ARMOR,
+    "signature_armor_recoil": _SIGNATURE_ARMOR_RECOIL,
 }
 
 EVENTS: tuple[str, ...] = tuple(VARIANTS)

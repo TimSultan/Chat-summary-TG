@@ -337,7 +337,6 @@ GROUP_CHAT_COMMANDS = (
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
     {"command": "pet", "description": "Существо участника"},
-    {"command": "duel", "description": "Дуэль с участником"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -5526,6 +5525,8 @@ DUEL_COMMANDS = ("/duel", "/дуэль")
 PETS_ARENA_DELETE_AFTER = 3 * 60
 PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
 DUEL_RESULT_DELETE_AFTER = 5 * 60
+DUEL_COMMAND_DELETE_AFTER = 5
+DUEL_TARGET_PROMPT_DELETE_AFTER = 10
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5744,7 +5745,10 @@ async def handle_duel_command(
     if not argument and replied and not replied.get("is_bot"):
         argument = replied.get("username") or _display_name(replied)
 
-    async def notice(text: str, summon: bool = False) -> None:
+    async def notice(
+        text: str, summon: bool = False, delete_after: int = PET_NOTICE_DELETE_AFTER,
+        trigger_delete_after: int | None = PET_NOTICE_DELETE_AFTER,
+    ) -> None:
         markup = None
         if summon and bot_username:
             markup = {"inline_keyboard": [[{
@@ -5756,12 +5760,24 @@ async def handle_duel_command(
         )
         if sent and "message_id" in sent:
             schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], PET_NOTICE_DELETE_AFTER, log,
-                background_tasks, trigger_message_id=message["message_id"],
+                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
             )
+            if trigger_delete_after is not None:
+                schedule_bot_delete(
+                    api, chat_id, [], trigger_delete_after, log, background_tasks,
+                    trigger_message_id=message["message_id"],
+                )
 
     if not argument:
-        await notice("Укажи соперника: <code>/duel @user</code>.")
+        schedule_bot_delete(
+            api, chat_id, [], DUEL_COMMAND_DELETE_AFTER, log, background_tasks,
+            trigger_message_id=message["message_id"],
+        )
+        await notice(
+            "Укажи соперника: /duel @user.",
+            delete_after=DUEL_TARGET_PROMPT_DELETE_AFTER,
+            trigger_delete_after=None,
+        )
         return
     challenger, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
     if challenger is None:
@@ -6002,6 +6018,7 @@ async def handle_pets_callback(
         # --- plain redraws -------------------------------------------------------------
         views = {
             "main": lambda: pets_ui.main_view(entry, user_id, xp),
+            "info": lambda: pets_ui.info_view(user_id),
             "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),

@@ -4,6 +4,8 @@ from io import BytesIO
 import os
 from pathlib import Path
 import tempfile
+import unicodedata
+from functools import lru_cache
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -11,21 +13,58 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 WIDTH = 1280
 HEIGHT = 1020
 _FONT_PATHS = (
-    "C:/Windows/Fonts/arial.ttf",
-    "C:/Windows/Fonts/ARIALBD.TTF",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/arial.ttf",
 )
+_BOLD_FONT_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "C:/Windows/Fonts/segoeuib.ttf",
+    "C:/Windows/Fonts/ARIALBD.TTF",
+)
+WINNER_NAME_COLOR = "#147a59"
+_UNRENDERABLE_PROBE = "͸"
 
 
+@lru_cache(maxsize=None)
 def _font(size: int, bold: bool = False):
-    paths = _FONT_PATHS[::-1] if bold else _FONT_PATHS
+    paths = _BOLD_FONT_PATHS if bold else _FONT_PATHS
     for path in paths:
         try:
             return ImageFont.truetype(path, size)
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+@lru_cache(maxsize=None)
+def _notdef_bitmap(size: int, bold: bool) -> bytes | None:
+    try:
+        return bytes(_font(size, bold).getmask(_UNRENDERABLE_PROBE))
+    except Exception:
+        return None
+
+
+def _renders(character: str, size: int, bold: bool) -> bool:
+    notdef = _notdef_bitmap(size, bold)
+    if notdef is None:
+        return True
+    try:
+        return bytes(_font(size, bold).getmask(character)) != notdef
+    except Exception:
+        return False
+
+
+def legible(value, size: int, bold: bool = False) -> str:
+    """Normalize names and remove glyphs the result-image font cannot render."""
+    normalized = unicodedata.normalize("NFKC", str(value or "").strip())
+    return "".join(
+        character
+        for character in normalized
+        if character.isspace() or _renders(character, size, bold)
+    ).strip()
 
 
 def _photo(data: bytes | None, size: tuple[int, int], fallback: tuple[int, int, int]) -> Image.Image:
@@ -46,8 +85,8 @@ def _circle(image: Image.Image, diameter: int) -> Image.Image:
     return image
 
 
-def _short(value, limit: int = 19) -> str:
-    value = str(value or "Без имени").strip()
+def _short(value, limit: int = 19, size: int = 39, bold: bool = True) -> str:
+    value = legible(value, size, bold=bold) or "Без имени"
     return value if len(value) <= limit else f"{value[:limit - 1]}..."
 
 
@@ -68,8 +107,14 @@ def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     avatar = _circle(_photo(fighter.get("owner_avatar"), (90, 90), (82, 97, 108)), 78)
     image.paste(avatar, (x + 40, 435), avatar)
     draw.ellipse((x + 38, 433, x + 120, 515), outline="#ffffff", width=4)
-    draw.text((x + 135, 444), _short(fighter.get("owner_name"), 24), font=_font(25), fill="#243039")
-    draw.text((x + 40, 525), _short(fighter.get("pet_name"), 24), font=_font(39, bold=True), fill=accent)
+    draw.text(
+        (x + 135, 444), _short(fighter.get("owner_name"), 24, size=25, bold=False), font=_font(25),
+        fill=WINNER_NAME_COLOR if winner else "#243039",
+    )
+    draw.text(
+        (x + 40, 525), _short(fighter.get("pet_name"), 24), font=_font(39, bold=True),
+        fill=WINNER_NAME_COLOR if winner else accent,
+    )
     draw.text((x + 40, 580), f"РЕЙТИНГ  {fighter.get('power', 0)}", font=_font(22, bold=True), fill="#37434c")
 
     rows = (
@@ -112,7 +157,10 @@ def render_fight_result(path, result, attacker: dict, defender: dict) -> Path:
 
     if winner:
         winner_name = attacker.get("pet_name") if winner == attacker.get("id") else defender.get("pet_name")
-        _center(draw, 965, f"ПОБЕДИТЕЛЬ: {_short(winner_name, 22).upper()}", _font(25, bold=True), "#26343a")
+        _center(
+            draw, 965, f"ПОБЕДИТЕЛЬ: {_short(winner_name, 22, size=25).upper()}",
+            _font(25, bold=True), WINNER_NAME_COLOR,
+        )
     else:
         _center(draw, 965, "ОДИНАКОВЫЙ УРОН", _font(25, bold=True), "#26343a")
 

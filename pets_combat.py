@@ -34,6 +34,7 @@ import pets_config as C
 import pets_flavor
 
 _STATS = ("strength", "health", "agility", "luck")
+_SIGNATURE_STATS = _STATS + ("armor",)
 
 
 @dataclass(frozen=True)
@@ -88,14 +89,21 @@ def _dominant(mine: float, theirs: float) -> bool:
     return mine >= theirs * C.DOMINANCE_RATIO
 
 
-def _luck_tier(luck: float, opponent_luck: float) -> int:
-    if luck <= 0 or opponent_luck <= 0:
-        return 0
-    if luck >= opponent_luck * C.LUCK_OVERWHELMING_RATIO:
-        return 3
-    if luck >= opponent_luck * C.LUCK_ADVANTAGE_RATIO:
-        return 2
-    return 0
+def _signature(fighter: "Fighter", opponent: "Fighter") -> tuple[str, int] | None:
+    """The single highest 2x/3x stat advantage that may create a signature move."""
+    candidates = []
+    for stat in _SIGNATURE_STATS:
+        mine, theirs = getattr(fighter, stat), getattr(opponent, stat)
+        if mine <= 0 or theirs <= 0:
+            continue
+        ratio = mine / theirs
+        tier = 3 if ratio >= C.STAT_OVERWHELMING_RATIO else 2 if ratio >= C.STAT_ADVANTAGE_RATIO else 0
+        if tier:
+            candidates.append((ratio, tier, stat))
+    if not candidates:
+        return None
+    _, tier, stat = max(candidates, key=lambda candidate: candidate[0])
+    return stat, tier
 
 
 def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
@@ -119,17 +127,15 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     damage = C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT * factor("strength")
     dodge = _saturate(C.DODGE_MAX, C.DODGE_K, fighter.agility * factor("agility"))
     crit = C.CRIT_BASE + _saturate(C.CRIT_MAX, C.CRIT_K, fighter.luck * factor("luck"))
-    luck_tier = _luck_tier(fighter.luck, opponent.luck)
+    signature = _signature(fighter, opponent)
+    luck_tier = signature[1] if signature and signature[0] == "luck" else 0
     accuracy = 1.0
-    accident_chance = 0.0
     if luck_tier == 3:
         dodge = C.LUCK_OVERWHELMING_DODGE_CHANCE
         crit = C.LUCK_OVERWHELMING_CRIT_CHANCE
-        accident_chance = C.LUCK_OVERWHELMING_ACCIDENT_CHANCE
     elif luck_tier == 2:
         crit = min(1.0, crit + C.LUCK_ADVANTAGE_CRIT_BONUS)
         accuracy = C.LUCK_ADVANTAGE_MISS_MULTIPLIER
-        accident_chance = C.LUCK_ADVANTAGE_ACCIDENT_CHANCE
     reduction = _saturate(C.ARMOR_MAX, C.ARMOR_K, fighter.armor)  # never dominance-boosted
 
     return {
@@ -139,7 +145,7 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         "crit": crit,
         "accuracy": accuracy,
         "luck_tier": luck_tier,
-        "accident_chance": accident_chance,
+        "signature": signature,
         "reduction": reduction,
         "dominance": dominance,
     }
@@ -187,32 +193,67 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     opening = pets_flavor.line("opening", fighters[order[0]].name, fighters[order[1]].name, rng=rng)
 
     rounds = []
+    signatures = {}
+    for key in (a.key, b.key):
+        signature = derived[key]["signature"]
+        if signature and rng.random() < C.SIGNATURE_TRIGGER_CHANCES[signature[0]][signature[1]]:
+            signatures[key] = signature
 
-    for winner_key, loser_key in ((a.key, b.key), (b.key, a.key)):
-        accident_chance = derived[winner_key]["accident_chance"]
-        if accident_chance and rng.random() < accident_chance:
-            accident = pets_flavor.accident_line(
-                fighters[winner_key].name, fighters[loser_key].name, rng=rng,
-            )
+    def signature_round(attacker_key: str, defender_key: str, event: str, damage: int) -> bool:
+        hp[defender_key] = max(0.0, hp[defender_key] - damage)
+        total_damage[attacker_key] += damage
+        rounds.append(Round(
+            number=0, attacker=attacker_key, event=event, damage=damage,
+            attacker_hp=round(hp[attacker_key]), defender_hp=round(hp[defender_key]),
+            text=pets_flavor.line(event, fighters[attacker_key].name, fighters[defender_key].name, damage, rng=rng),
+        ))
+        return hp[defender_key] <= 0
+
+    for attacker_key, defender_key in ((a.key, b.key), (b.key, a.key)):
+        signature = signatures.get(attacker_key)
+        if not signature or signature[0] not in ("strength", "luck"):
+            continue
+        stat, tier = signatures.pop(attacker_key)
+        if stat == "strength":
+            multiplier = 2.0 if tier == 3 else 1.5
+            damage = max(1, round(derived[attacker_key]["damage"] * multiplier * (1 - derived[defender_key]["reduction"])))
+        else:
+            damage = max(1, round(hp[defender_key] * C.LUCK_OPENING_DAMAGE_SHARE))
+        if signature_round(attacker_key, defender_key, f"signature_{stat}", damage):
             return FightResult(
-                winner=winner_key,
-                loser=loser_key,
-                rounds=(),
-                opening=opening,
-                closing=pets_flavor.result_line(
-                    fighters[winner_key].name, fighters[loser_key].name, rng=rng,
-                ),
-                total_damage=total_damage,
-                stopped_early=False,
-                is_draw=False,
-                seed=seed,
-                accident=accident,
+                winner=attacker_key, loser=defender_key, rounds=tuple(rounds), opening=opening,
+                closing=pets_flavor.result_line(fighters[attacker_key].name, fighters[defender_key].name, rng=rng),
+                total_damage=total_damage, stopped_early=False, is_draw=False, seed=seed, accident=None,
             )
 
-    def strike(attacker_key: str, defender_key: str, round_number: int) -> bool:
-        """One blow, appended as a Round. Returns whether the defender went down."""
+    def strike(attacker_key: str, defender_key: str, round_number: int) -> str | None:
+        """One blow, appended as a Round. Returns the key of a fighter knocked out."""
         attacker, defender = fighters[attacker_key], fighters[defender_key]
+        signature = signatures.pop(defender_key, None)
+        if signature and signature[0] == "agility":
+            if signature[1] == 3:
+                counter_damage = max(1, round(derived[defender_key]["damage"] * 0.5))
+                return defender_key if signature_round(
+                    defender_key, attacker_key, "signature_agility_counter", counter_damage,
+                ) else None
+            rounds.append(Round(
+                number=round_number, attacker=attacker_key, event="signature_agility", damage=0,
+                attacker_hp=round(hp[attacker_key]), defender_hp=round(hp[defender_key]),
+                text=pets_flavor.line("signature_agility", attacker.name, defender.name, rng=rng),
+            ))
+            return None
         event, damage = _resolve_blow(derived[attacker_key], derived[defender_key], rng)
+        if signature and signature[0] == "health":
+            damage = 0 if signature[1] == 3 else round(damage * 0.5)
+            event = "signature_health"
+        elif signature and signature[0] == "armor":
+            if signature[1] == 3:
+                recoil = max(1, round(hp[attacker_key] * 0.10))
+                return defender_key if signature_round(
+                    defender_key, attacker_key, "signature_armor_recoil", recoil,
+                ) else None
+            damage = round(damage * 0.3)
+            event = "signature_armor"
         hp[defender_key] = max(0.0, hp[defender_key] - damage)
         total_damage[attacker_key] += damage
         text = pets_flavor.line(event, attacker.name, defender.name, damage, rng=rng)
@@ -225,7 +266,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             defender_hp=round(hp[defender_key]),
             text=text,
         ))
-        return hp[defender_key] <= 0
+        return attacker_key if hp[defender_key] <= 0 else None
 
     stopped_early = False
     winner_key = loser_key = None
@@ -235,11 +276,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         leader_key = order[(round_number - 1) % 2]
         follower_key = order[round_number % 2]
 
-        if strike(leader_key, follower_key, round_number):
-            winner_key, loser_key = leader_key, follower_key
+        winner_key = strike(leader_key, follower_key, round_number)
+        if winner_key:
+            loser_key = follower_key if winner_key == leader_key else leader_key
             break
-        if strike(follower_key, leader_key, round_number):
-            winner_key, loser_key = follower_key, leader_key
+        winner_key = strike(follower_key, leader_key, round_number)
+        if winner_key:
+            loser_key = leader_key if winner_key == follower_key else follower_key
             break
     else:
         # The attack budget is exhausted. A knockout always wins. If both pets are still

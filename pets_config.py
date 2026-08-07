@@ -21,9 +21,9 @@ earn rate is already measured rather than guessed: over a 34-day window the most
 members earned 60-233 coins/week, the p90 member ~55/week, the median ~3/week.
 
 Arena income is NOT flat. How many fights somebody gets is earned from what they did in
-the chat yesterday (see daily_fight_allowance), and losing costs half of what winning
-pays (LOSS_GOLD_SHARE), so the losing half of every fight is paid by a player rather than
-minted. Both together are what make chat activity actually decide income:
+the chat yesterday (see daily_fight_allowance), and losing costs a share of what winning
+pays (LOSS_GOLD_SHARE), so part of every fight is paid by a player rather than minted.
+Both together are what make chat activity actually decide income:
 
     profile      msgs/day  fights  arena/wk  +chat  total/wk  3 stats -> 80
     lurker              1       2       315      3       318      15 months
@@ -152,16 +152,27 @@ CRIT_MAX = 0.35
 CRIT_K = 70.0               # luck 40 -> 16%, luck 80 -> 22%
 CRIT_MULTIPLIER = 2.0       # "критического удара (х2)"
 
-# Luck has two deliberately exceptional tiers above its normal saturating crit curve.
-# They compare the EFFECTIVE luck values at the start of a fight.
-LUCK_ADVANTAGE_RATIO = 2.0
-LUCK_OVERWHELMING_RATIO = 3.0
-LUCK_ADVANTAGE_ACCIDENT_CHANCE = 0.10
-LUCK_OVERWHELMING_ACCIDENT_CHANCE = 0.50
-LUCK_ADVANTAGE_CRIT_BONUS = 0.50       # percentage points, not a multiplier
-LUCK_ADVANTAGE_MISS_MULTIPLIER = 0.50  # the lucky attacker's misses are halved
-LUCK_OVERWHELMING_CRIT_CHANCE = 0.75
-LUCK_OVERWHELMING_DODGE_CHANCE = 0.75  # opponent attacks miss three times in four
+# A fighter whose strongest comparable stat is 2x or 3x their opponent's gets one
+# signature moment per fight at most. It is intentionally one stat, not a stack: a pet
+# that outscales in several places is formidable without becoming an automatic victory.
+STAT_ADVANTAGE_RATIO = 2.0
+STAT_OVERWHELMING_RATIO = 3.0
+SIGNATURE_TRIGGER_CHANCES = {
+    "strength": (0.0, 0.0, 0.20, 0.35),
+    "health": (0.0, 0.0, 1.00, 1.00),
+    "agility": (0.0, 0.0, 0.25, 0.45),
+    "luck": (0.0, 0.0, 0.10, 0.20),
+    "armor": (0.0, 0.0, 0.25, 0.35),
+}
+
+# Luck keeps a high crit rate, but the old accident was an instant win. Its signature
+# now deals only 40% of the opponent's current health as an opening hit; at 3x Luck its
+# dodge is deliberately low, so crit, dodge, and an instant kill cannot stack.
+LUCK_ADVANTAGE_CRIT_BONUS = 0.25       # percentage points, not a multiplier
+LUCK_ADVANTAGE_MISS_MULTIPLIER = 0.75  # the lucky attacker's misses are reduced
+LUCK_OVERWHELMING_CRIT_CHANCE = 0.30
+LUCK_OVERWHELMING_DODGE_CHANCE = 0.05
+LUCK_OPENING_DAMAGE_SHARE = 0.40
 
 ARMOR_MAX = 0.60            # hard ceiling on damage reduction, so armor can never zero a hit
 ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
@@ -231,7 +242,7 @@ MAX_OPPONENT_REROLLS = 3
 
 WIN_GOLD_MIN = 30           # "случайно 30-60 голды"
 WIN_GOLD_MAX = 60
-# The loser pays half of what the winner just took. This replaces the original "проигравший
+# The loser pays 30% of what the winner just took. This replaces the original "проигравший
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.
 #
@@ -240,9 +251,8 @@ WIN_GOLD_MAX = 60
 # nobody can pick a target, so there is no way to farm one person down. If matchmaking
 # ever lets somebody choose, this rule has to be revisited at the same time.
 #
-# It also roughly halves the faucet: gold minted per fight is now (win - loss), ~23 instead
-# of ~45, because the losing half is paid by a player rather than by the economy.
-LOSS_GOLD_SHARE = 0.5
+# It reduces the faucet without making a passive defender lose too much gold.
+LOSS_GOLD_SHARE = 0.3
 # A debt is never created: somebody with less than this in their wallet simply pays what
 # they have. economy.balance clamps at zero anyway, and a member who cannot see why they
 # owe money is worse than one who got off lightly.

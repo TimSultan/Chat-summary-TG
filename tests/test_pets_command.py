@@ -173,6 +173,13 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("Арена", api.sent[0]["text"])
         actions = {pets_ui.parse_callback(b["callback_data"])[1] for b in _buttons(api.sent[0])}
         self.assertIn("cage", actions)
+        self.assertIn("info", actions)
+
+    def test_how_to_play_button_opens_the_arena_rules(self):
+        api = self._tap("info")
+        self.assertIn("Как играть", api.edits[0]["text"])
+        self.assertIn("Особые преимущества", api.edits[0]["text"])
+        self.assertIn("30%", api.edits[0]["text"])
 
     def test_group_arena_command_points_to_the_private_bot_menu(self):
         api = self._type(chat_type="group")
@@ -180,6 +187,11 @@ class PetsCommandTests(unittest.TestCase):
         button = _buttons(api.sent[0])[0]
         self.assertEqual(button["text"], "Открыть Арену")
         self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")
+
+    def test_duel_is_not_advertised_in_the_group_command_menu(self):
+        self.assertNotIn(
+            "duel", {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
+        )
 
     def test_somebody_the_chat_has_never_seen_is_turned_away(self):
         api = self._type(found=False)

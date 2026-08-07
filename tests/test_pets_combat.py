@@ -95,6 +95,7 @@ class DeriveTests(unittest.TestCase):
         doubled_rates = combat.derive(doubled, weak)
         tripled_rates = combat.derive(tripled, weak)
 
+        self.assertEqual(doubled_rates["signature"], ("luck", 2))
         self.assertEqual(doubled_rates["luck_tier"], 2)
         self.assertAlmostEqual(
             doubled_rates["crit"],
@@ -107,6 +108,12 @@ class DeriveTests(unittest.TestCase):
         self.assertEqual(tripled_rates["crit"], C.LUCK_OVERWHELMING_CRIT_CHANCE)
         self.assertEqual(tripled_rates["dodge"], C.LUCK_OVERWHELMING_DODGE_CHANCE)
 
+    def test_strongest_two_x_stat_is_the_only_signature(self):
+        strong = Fighter(key="strong", name="Strong", strength=30, health=20,
+                         agility=10, luck=10, armor=0)
+        weak = _fighter("weak", 10)
+        self.assertEqual(combat.derive(strong, weak)["signature"], ("strength", 3))
+
 
 class SimulateTests(unittest.TestCase):
     def test_same_seed_replays_the_identical_fight(self):
@@ -116,18 +123,37 @@ class SimulateTests(unittest.TestCase):
         self.assertEqual(result_1, result_2)
         self.assertEqual(result_1.seed, 12345)
 
-    def test_luck_advantage_can_end_a_fight_with_an_accident(self):
+    def test_luck_signature_is_a_survivable_opening_hit(self):
         lucky = Fighter(key="lucky", name="Lucky", strength=10, health=10,
                         agility=10, luck=20, armor=0)
         unlucky = _fighter("unlucky", 10, name="Unlucky")
-        with patch.object(C, "LUCK_ADVANTAGE_ACCIDENT_CHANCE", 1.0):
+        chances = dict(C.SIGNATURE_TRIGGER_CHANCES)
+        chances["luck"] = (0.0, 0.0, 1.0, 1.0)
+        with patch.object(C, "SIGNATURE_TRIGGER_CHANCES", chances):
             result = combat.simulate(lucky, unlucky, seed=123)
 
-        self.assertEqual(result.winner, "lucky")
-        self.assertEqual(result.loser, "unlucky")
-        self.assertEqual(result.rounds, ())
-        self.assertIn("Lucky", result.accident)
-        self.assertIn("Unlucky", result.accident)
+        self.assertIsNone(result.accident)
+        self.assertEqual(result.rounds[0].event, "signature_luck")
+        self.assertGreater(result.rounds[0].damage, 0)
+
+    def test_agility_counter_knockout_awards_the_defender(self):
+        attacker = Fighter(key="attacker", name="Attacker", strength=10, health=0,
+                           agility=10, luck=10, armor=0)
+        agile = Fighter(key="agile", name="Agile", strength=400, health=10,
+                        agility=30, luck=10, armor=0)
+        chances = dict(C.SIGNATURE_TRIGGER_CHANCES)
+        chances["agility"] = (0.0, 0.0, 1.0, 1.0)
+
+        def signatures(fighter, opponent):
+            return ("agility", 3) if fighter.key == "agile" else None
+
+        with patch.object(C, "SIGNATURE_TRIGGER_CHANCES", chances), \
+                patch.object(combat, "_signature", side_effect=signatures):
+            result = combat.simulate(attacker, agile, seed=1)
+
+        self.assertEqual(result.winner, "agile")
+        self.assertEqual(result.loser, "attacker")
+        self.assertEqual(result.rounds[0].event, "signature_agility_counter")
 
     def test_fights_allow_no_more_than_ten_attacks_per_fighter(self):
         # A round is a full exchange (leader strikes, follower counters back in the same
@@ -194,7 +220,8 @@ class SimulateTests(unittest.TestCase):
         def fixed_blow(attacker, defender, rng):
             return "hit", 20 if attacker["damage"] > defender["damage"] else 10
 
-        with patch.object(combat, "_resolve_blow", side_effect=fixed_blow):
+        with patch.object(combat, "_resolve_blow", side_effect=fixed_blow), \
+            patch.object(combat, "_signature", return_value=None):
             result = combat.simulate(a, b, rng=random.Random(1))
 
         self.assertTrue(result.stopped_early)
@@ -209,7 +236,8 @@ class SimulateTests(unittest.TestCase):
         def fixed_blow(attacker, defender, rng):
             return "hit", 700 if attacker["damage"] > defender["damage"] else 600
 
-        with patch.object(combat, "_resolve_blow", side_effect=fixed_blow):
+        with patch.object(combat, "_resolve_blow", side_effect=fixed_blow), \
+            patch.object(combat, "_signature", return_value=None):
             result = combat.simulate(a, b, rng=random.Random(1))
 
         self.assertFalse(result.stopped_early)
@@ -220,7 +248,8 @@ class SimulateTests(unittest.TestCase):
         a = Fighter(key="a", name="A", strength=10, health=100, agility=1, luck=1, armor=0)
         b = Fighter(key="b", name="B", strength=1, health=100, agility=1, luck=1, armor=0)
 
-        with patch.object(combat, "_resolve_blow", return_value=("hit", 20)):
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 20)), \
+            patch.object(combat, "_signature", return_value=None):
             result = combat.simulate(a, b, seed=1)
 
         self.assertTrue(result.stopped_early)

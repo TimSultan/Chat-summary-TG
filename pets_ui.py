@@ -141,8 +141,36 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"🐣 Приручить существо — {_money(C.TAME_PRICE)}",
             "callback_data": callback_data(user_id, "tame"),
         }])
+    rows.append([{"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")}])
     rows.append([{"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")}])
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def info_view(user_id) -> tuple[str, dict]:
+    """A compact rules reference available before and after getting a pet."""
+    lines = ["ℹ️ <b>Как играть</b>\n"]
+    lines.append(
+        f"1. Купи клетку за {_coins(C.CAGE_PRICE)}, затем приручи существо за {_coins(C.TAME_PRICE)}."
+    )
+    lines.append("2. Прокачивай Силу, Здоровье, Ловкость и Удачу; экипировка добавляет статы и Броню.")
+    lines.append("3. В Арене соперник подбирается по боевому рейтингу. Боёв больше за активность в чате и клетку.")
+    lines.append(
+        f"4. Победа приносит {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и опыт. "
+        f"Поражение забирает только {round(C.LOSS_GOLD_SHARE * 100)}% награды, без долгов."
+    )
+    lines.append("\n<b>Статы</b>")
+    lines.append("Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. Удача повышает шанс крита.")
+    lines.append("\n<b>Особые преимущества</b>")
+    lines.append(
+        "Если один стат в 2 раза выше, чем у соперника, он иногда срабатывает как фирменный приём; "
+        "в 3 раза — сильнее. За бой срабатывает только один такой приём на существо."
+    )
+    lines.append(
+        "Сила наносит мощный стартовый удар, Здоровье гасит первый удар, Ловкость уклоняется или отвечает, "
+        "Броня блокирует удар, а Удача даёт сильный, но не смертельный стартовый эффект."
+    )
+    lines.append("\n<b>Дуэли</b>: /duel @user в общем чате. Одного и того же соперника можно вызвать раз в день.")
+    return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 
 # ----------------------------------------------------------------------------- cage
@@ -381,7 +409,7 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     )
     lines.append(
         f"Победа: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет."
-        f" Поражение: минус половина от этого."
+        f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
     )
     if left <= 0:
         lines.append("\nНа сегодня всё. Пиши в чат — завтра боёв будет больше.")
@@ -447,8 +475,6 @@ def opponent_view(
 def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str:
     """Short caption for the composite result image; the image carries the full receipt."""
     lines = [f"<b>{escape(result.closing)}</b>"]
-    if result.accident:
-        lines.append(f"<b>{escape(result.accident)}</b>")
     if result.stopped_early:
         lines.append("<i>Решение по урону после 10 атак.</i>")
 
@@ -484,8 +510,9 @@ def battle_log(result) -> str:
     lines = ["<b>Лог боя</b>", escape(result.opening)]
     if result.accident:
         lines.append(f"<b>{escape(result.accident)}</b>")
-    lines.extend(escape(round_.text) for round_ in result.rounds)
-    lines.append(f"<b>{escape(result.closing)}</b>")
+    else:
+        lines.extend(escape(round_.text) for round_ in result.rounds)
+        lines.append(f"<b>{escape(result.closing)}</b>")
     return "\n".join(lines)
 
 

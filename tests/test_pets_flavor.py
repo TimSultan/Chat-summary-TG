@@ -16,6 +16,13 @@ _MIN_VARIANTS = {
     "opening": 20,
     "victory": 25,
     "round_flavor": 25,
+    "signature_strength": 2,
+    "signature_health": 2,
+    "signature_agility": 2,
+    "signature_agility_counter": 2,
+    "signature_luck": 2,
+    "signature_armor": 2,
+    "signature_armor_recoil": 2,
 }
 
 # A very small set of the reactions Telegram/most fonts render as emoji-ish glyphs.
