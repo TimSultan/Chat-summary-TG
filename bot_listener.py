@@ -5525,7 +5525,7 @@ PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
 PETS_ARENA_DELETE_AFTER = 3 * 60
 PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
-DUEL_RESULT_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
+DUEL_RESULT_DELETE_AFTER = 5 * 60
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
