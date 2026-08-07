@@ -69,6 +69,7 @@ class FightResult:
     stopped_early: bool   # attack cap hit, awarded by damage among living fighters
     is_draw: bool
     seed: int | None
+    accident: str | None
 
 
 def _saturate(mx: float, k: float, s: float) -> float:
@@ -85,6 +86,16 @@ def _saturate(mx: float, k: float, s: float) -> float:
 def _dominant(mine: float, theirs: float) -> bool:
     """"30% ahead gives 30% more" -- compared per stat, effective values, at fight start."""
     return mine >= theirs * C.DOMINANCE_RATIO
+
+
+def _luck_tier(luck: float, opponent_luck: float) -> int:
+    if luck <= 0 or opponent_luck <= 0:
+        return 0
+    if luck >= opponent_luck * C.LUCK_OVERWHELMING_RATIO:
+        return 3
+    if luck >= opponent_luck * C.LUCK_ADVANTAGE_RATIO:
+        return 2
+    return 0
 
 
 def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
@@ -108,6 +119,17 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     damage = C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT * factor("strength")
     dodge = _saturate(C.DODGE_MAX, C.DODGE_K, fighter.agility * factor("agility"))
     crit = C.CRIT_BASE + _saturate(C.CRIT_MAX, C.CRIT_K, fighter.luck * factor("luck"))
+    luck_tier = _luck_tier(fighter.luck, opponent.luck)
+    accuracy = 1.0
+    accident_chance = 0.0
+    if luck_tier == 3:
+        dodge = C.LUCK_OVERWHELMING_DODGE_CHANCE
+        crit = C.LUCK_OVERWHELMING_CRIT_CHANCE
+        accident_chance = C.LUCK_OVERWHELMING_ACCIDENT_CHANCE
+    elif luck_tier == 2:
+        crit = min(1.0, crit + C.LUCK_ADVANTAGE_CRIT_BONUS)
+        accuracy = C.LUCK_ADVANTAGE_MISS_MULTIPLIER
+        accident_chance = C.LUCK_ADVANTAGE_ACCIDENT_CHANCE
     reduction = _saturate(C.ARMOR_MAX, C.ARMOR_K, fighter.armor)  # never dominance-boosted
 
     return {
@@ -115,6 +137,9 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         "damage": damage,
         "dodge": dodge,
         "crit": crit,
+        "accuracy": accuracy,
+        "luck_tier": luck_tier,
+        "accident_chance": accident_chance,
         "reduction": reduction,
         "dominance": dominance,
     }
@@ -122,7 +147,7 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
 
 def _resolve_blow(attacker: dict, defender: dict, rng) -> tuple:
     """One blow, in the fixed order the contract pins down. Returns (event, damage)."""
-    if rng.random() < defender["dodge"]:
+    if rng.random() < defender["dodge"] * attacker["accuracy"]:
         return "dodge", 0
 
     raw = attacker["damage"]
@@ -162,6 +187,27 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     opening = pets_flavor.line("opening", fighters[order[0]].name, fighters[order[1]].name, rng=rng)
 
     rounds = []
+
+    for winner_key, loser_key in ((a.key, b.key), (b.key, a.key)):
+        accident_chance = derived[winner_key]["accident_chance"]
+        if accident_chance and rng.random() < accident_chance:
+            accident = pets_flavor.accident_line(
+                fighters[winner_key].name, fighters[loser_key].name, rng=rng,
+            )
+            return FightResult(
+                winner=winner_key,
+                loser=loser_key,
+                rounds=(),
+                opening=opening,
+                closing=pets_flavor.result_line(
+                    fighters[winner_key].name, fighters[loser_key].name, rng=rng,
+                ),
+                total_damage=total_damage,
+                stopped_early=False,
+                is_draw=False,
+                seed=seed,
+                accident=accident,
+            )
 
     def strike(attacker_key: str, defender_key: str, round_number: int) -> bool:
         """One blow, appended as a Round. Returns whether the defender went down."""
@@ -228,4 +274,5 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         stopped_early=stopped_early,
         is_draw=is_draw,
         seed=seed,
+        accident=None,
     )

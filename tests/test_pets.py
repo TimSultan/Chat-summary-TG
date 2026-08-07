@@ -241,16 +241,35 @@ class DailyFightsAndOpponentTests(PetsTestCase):
     def test_duels_have_a_ten_minute_cooldown_and_daily_cap(self):
         entry = "chat"
         base = datetime(2026, 8, 1, 12, 0, 0)
-        ok, _ = pets.claim_duel(entry, "1", base)
+        ok, _ = pets.claim_duel(entry, "1", "2", base)
         self.assertTrue(ok)
-        ok, note = pets.claim_duel(entry, "1", base + timedelta(minutes=9, seconds=59))
+        ok, note = pets.claim_duel(entry, "1", "3", base + timedelta(minutes=9, seconds=59))
         self.assertFalse(ok)
         self.assertIn("0:01", note)
         for index in range(1, pets_config.DUEL_DAILY_LIMIT):
-            ok, _ = pets.claim_duel(entry, "1", base + timedelta(minutes=10 * index))
+            ok, _ = pets.claim_duel(entry, "1", str(index + 2), base + timedelta(minutes=10 * index))
             self.assertTrue(ok)
-        ok, _ = pets.claim_duel(entry, "1", base + timedelta(minutes=60))
+        ok, _ = pets.claim_duel(entry, "1", "99", base + timedelta(minutes=60))
         self.assertFalse(ok)
+
+    def test_same_opponent_limits_reset_on_the_next_day(self):
+        entry = "chat"
+        base = datetime(2026, 8, 1, 12, 0, 0)
+        self.assertTrue(pets.claim_duel(entry, "1", "2", base)[0])
+        ok, note = pets.claim_duel(entry, "1", "2", base + timedelta(minutes=10))
+        self.assertFalse(ok)
+        self.assertIn("этим соперником", note)
+        self.assertTrue(pets.claim_duel(entry, "1", "2", base + timedelta(days=1))[0])
+
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        result = SimpleNamespace(winner="1", loser="2")
+        day = base.date()
+        with patch("random.random", return_value=1.0):
+            for _ in range(pets_config.ARENA_SAME_OPPONENT_DAILY_LIMIT):
+                pets.record_fight(entry, "1", "2", result, day)
+        self.assertFalse(pets.can_attack_in_arena(entry, "1", "2", day))
+        self.assertTrue(pets.can_attack_in_arena(entry, "1", "2", day + timedelta(days=1)))
 
     def test_daily_counter_resets_on_a_new_date(self):
         entry = "chat"

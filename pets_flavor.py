@@ -369,6 +369,38 @@ VARIANTS: dict[str, tuple[str, ...]] = {
 
 EVENTS: tuple[str, ...] = tuple(VARIANTS)
 
+# Ten mishaps times ten consequences make one hundred distinct instant-win reports.
+# Kept outside VARIANTS because an accident ends the fight before a normal round exists.
+_ACCIDENT_MISHAPS = (
+    "аэрограф {attacker} чихнул струёй краски",
+    "банка с wash у {attacker} решила опрокинуться",
+    "мокрая палитра {attacker} устроила мини-наводнение",
+    "компрессор {attacker} чихнул облаком грунта",
+    "кисть {attacker} зацепила стакан для промывки",
+    "фен {attacker} сдул незакреплённую декорацию",
+    "малярный скотч {attacker} приклеился к реальности",
+    "лак {attacker} высох с характером",
+    "светильник {attacker} ослепил судью бликом",
+    "кот с трибуны утащил главную кисть {attacker}",
+)
+_ACCIDENT_CONSEQUENCES = (
+    "и {defender} поскользнулся на идеальном градиенте.",
+    "и {defender} получил незапланированный слой базового цвета.",
+    "и {defender} убежал спасать недокрашенную миниатюру.",
+    "и {defender} исчез за облаком пигмента.",
+    "и {defender} объявил технический перерыв, который стал поражением.",
+    "и {defender} застрял в свежем слое varnish.",
+    "и {defender} перепутал арену с сушилкой для кистей.",
+    "и {defender} принял это за знак срочно помыть баночки.",
+    "и {defender} отвлёкся на падающую каплю Metallic.",
+    "и {defender} капитулировал перед силой художественного хаоса.",
+)
+ACCIDENT_VARIANTS: tuple[str, ...] = tuple(
+    f"Игроку повезло: {mishap}, {consequence}"
+    for mishap in _ACCIDENT_MISHAPS
+    for consequence in _ACCIDENT_CONSEQUENCES
+)
+
 
 def line(event: str, attacker: str, defender: str = "", amount: int = 0, rng=None) -> str:
     """One ready Russian sentence for `event`, names and number already filled in.
@@ -396,3 +428,8 @@ def result_line(winner: str, loser: str, rng=None) -> str:
 def draw_line(first: str, second: str, rng=None) -> str:
     picker = rng if rng is not None else random
     return picker.choice(_DRAW).format(attacker=first, defender=second)
+
+
+def accident_line(winner: str, loser: str, rng=None) -> str:
+    picker = rng if rng is not None else random
+    return picker.choice(ACCIDENT_VARIANTS).format(attacker=winner, defender=loser)

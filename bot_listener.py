@@ -5788,7 +5788,7 @@ async def handle_duel_command(
     if not pets.get_pet(entry, target.user_id):
         await notice(f"У {html.escape(target.display_name)} пока нет существа.")
         return
-    ok, reason = pets.claim_duel(entry, challenger.user_id)
+    ok, reason = pets.claim_duel(entry, challenger.user_id, target.user_id)
     if not ok:
         await notice(html.escape(reason))
         return
@@ -5797,6 +5797,7 @@ async def handle_duel_command(
         xp, log, background_tasks=background_tasks, delete_after=DUEL_RESULT_DELETE_AFTER,
         include_keyboard=False,
         persistent_recipient_ids=(challenger.user_id, target.user_id),
+        enforce_arena_target_limit=False,
     )
 
 def _pets_fighter(entry: str, user_id, pet: dict):
@@ -6037,6 +6038,7 @@ async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
     include_keyboard: bool = True, persistent_recipient_ids=None,
+    enforce_arena_target_limit: bool = True,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6049,6 +6051,16 @@ async def _pets_run_fight(
     if not mine or not theirs:
         await _send_pets_view(
             api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+            message_id=message_id, log=log,
+        )
+        return
+    if enforce_arena_target_limit and not pets.can_attack_in_arena(entry, user_id, opponent_id):
+        await _send_pets_view(
+            api, chat_id,
+            pets_ui.notice_view(
+                user_id,
+                f"Этого соперника можно атаковать не больше {C.ARENA_SAME_OPPONENT_DAILY_LIMIT} раз в день.",
+            ),
             message_id=message_id, log=log,
         )
         return
@@ -6079,6 +6091,7 @@ async def _pets_run_fight(
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},
         reward,
     )
+    transcript = pets_ui.battle_log(result)
     image_path = None
     try:
         image_path = await _pets_render_result_image(
@@ -6105,6 +6118,11 @@ async def _pets_run_fight(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
                 trigger_message_id=message_id,
             )
+        if sent and not persistent_recipient_ids:
+            try:
+                await api.send_message(chat_id, transcript, parse_mode="HTML")
+            except Exception:
+                log("[pets] could not deliver the arena battle log")
     finally:
         if image_path is not None:
             for recipient_id in dict.fromkeys(persistent_recipient_ids or ()):
@@ -6112,6 +6130,7 @@ async def _pets_run_fight(
                     await api.send_photo_file(
                         recipient_id, image_path, caption=report, parse_mode="HTML",
                     )
+                    await api.send_message(recipient_id, transcript, parse_mode="HTML")
                 except Exception:
                     # A bot cannot message a member who has not started it; their opponent
                     # should still receive the report.

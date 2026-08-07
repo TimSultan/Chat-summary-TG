@@ -447,6 +447,8 @@ def opponent_view(
 def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str:
     """Short caption for the composite result image; the image carries the full receipt."""
     lines = [f"<b>{escape(result.closing)}</b>"]
+    if result.accident:
+        lines.append(f"<b>{escape(result.accident)}</b>")
     if result.stopped_early:
         lines.append("<i>Решение по урону после 10 атак.</i>")
 
@@ -474,6 +476,16 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
             item = C.find_item(dropped)
             if item:
                 lines.append(f"🎁 Выпало: <b>{escape(item.name)}</b> — {_bonus_text(item)}")
+    return "\n".join(lines)
+
+
+def battle_log(result) -> str:
+    """The complete readable fight transcript sent after a persistent result image."""
+    lines = ["<b>Лог боя</b>", escape(result.opening)]
+    if result.accident:
+        lines.append(f"<b>{escape(result.accident)}</b>")
+    lines.extend(escape(round_.text) for round_ in result.rounds)
+    lines.append(f"<b>{escape(result.closing)}</b>")
     return "\n".join(lines)
 
 

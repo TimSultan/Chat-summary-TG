@@ -78,12 +78,34 @@ class DeriveTests(unittest.TestCase):
             )["reduction"], C.ARMOR_MAX)
 
     def test_dodge_and_crit_never_exceed_their_config_ceiling(self):
-        opponent = _fighter("o", 1)
+        opponent = _fighter("o", 10_000)
         for stat in (0, 40, 80, 10_000):
             f = Fighter(key="f", name="f", strength=1, health=1, agility=stat, luck=stat, armor=0)
             derived = combat.derive(f, opponent)
             self.assertLessEqual(derived["dodge"], C.DODGE_MAX)
             self.assertLessEqual(derived["crit"], C.CRIT_BASE + C.CRIT_MAX)
+
+    def test_luck_advantage_and_overwhelming_tiers_override_normal_rates(self):
+        weak = _fighter("weak", 10)
+        doubled = Fighter(key="doubled", name="doubled", strength=10, health=10,
+                          agility=10, luck=20, armor=0)
+        tripled = Fighter(key="tripled", name="tripled", strength=10, health=10,
+                          agility=10, luck=30, armor=0)
+
+        doubled_rates = combat.derive(doubled, weak)
+        tripled_rates = combat.derive(tripled, weak)
+
+        self.assertEqual(doubled_rates["luck_tier"], 2)
+        self.assertAlmostEqual(
+            doubled_rates["crit"],
+            C.CRIT_BASE + C.LUCK_ADVANTAGE_CRIT_BONUS
+            + C.CRIT_MAX * (20 * (1 + C.DOMINANCE_BONUS))
+            / (20 * (1 + C.DOMINANCE_BONUS) + C.CRIT_K),
+        )
+        self.assertEqual(doubled_rates["accuracy"], C.LUCK_ADVANTAGE_MISS_MULTIPLIER)
+        self.assertEqual(tripled_rates["luck_tier"], 3)
+        self.assertEqual(tripled_rates["crit"], C.LUCK_OVERWHELMING_CRIT_CHANCE)
+        self.assertEqual(tripled_rates["dodge"], C.LUCK_OVERWHELMING_DODGE_CHANCE)
 
 
 class SimulateTests(unittest.TestCase):
@@ -93,6 +115,19 @@ class SimulateTests(unittest.TestCase):
         result_2 = combat.simulate(a, b, seed=12345)
         self.assertEqual(result_1, result_2)
         self.assertEqual(result_1.seed, 12345)
+
+    def test_luck_advantage_can_end_a_fight_with_an_accident(self):
+        lucky = Fighter(key="lucky", name="Lucky", strength=10, health=10,
+                        agility=10, luck=20, armor=0)
+        unlucky = _fighter("unlucky", 10, name="Unlucky")
+        with patch.object(C, "LUCK_ADVANTAGE_ACCIDENT_CHANCE", 1.0):
+            result = combat.simulate(lucky, unlucky, seed=123)
+
+        self.assertEqual(result.winner, "lucky")
+        self.assertEqual(result.loser, "unlucky")
+        self.assertEqual(result.rounds, ())
+        self.assertIn("Lucky", result.accident)
+        self.assertIn("Unlucky", result.accident)
 
     def test_fights_allow_no_more_than_ten_attacks_per_fighter(self):
         # A round is a full exchange (leader strikes, follower counters back in the same

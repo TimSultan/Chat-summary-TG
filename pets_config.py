@@ -51,7 +51,7 @@ levels cheaper raises everybody equally and widens nothing. See PETS_BALANCE.md.
 # the only drain, balances only grow.
 
 CAGE_PRICE = 50             # buying the cage at all -- the entry ticket
-TAME_PRICE = 100            # taming the creature that lives in it
+TAME_PRICE = 50             # taming the creature that lives in it
 # Renaming is free, and making it cost something is NOT just a matter of raising this:
 # pets.rename does not take the member's xp, and economy.balance needs it to price
 # anything at all. Charging for a rename means widening that signature first. Left here as
@@ -152,6 +152,17 @@ CRIT_MAX = 0.35
 CRIT_K = 70.0               # luck 40 -> 16%, luck 80 -> 22%
 CRIT_MULTIPLIER = 2.0       # "критического удара (х2)"
 
+# Luck has two deliberately exceptional tiers above its normal saturating crit curve.
+# They compare the EFFECTIVE luck values at the start of a fight.
+LUCK_ADVANTAGE_RATIO = 2.0
+LUCK_OVERWHELMING_RATIO = 3.0
+LUCK_ADVANTAGE_ACCIDENT_CHANCE = 0.10
+LUCK_OVERWHELMING_ACCIDENT_CHANCE = 0.50
+LUCK_ADVANTAGE_CRIT_BONUS = 0.50       # percentage points, not a multiplier
+LUCK_ADVANTAGE_MISS_MULTIPLIER = 0.50  # the lucky attacker's misses are halved
+LUCK_OVERWHELMING_CRIT_CHANCE = 0.75
+LUCK_OVERWHELMING_DODGE_CHANCE = 0.75  # opponent attacks miss three times in four
+
 ARMOR_MAX = 0.60            # hard ceiling on damage reduction, so armor can never zero a hit
 ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 
@@ -203,6 +214,7 @@ FIGHTS_PER_MESSAGE = 0.08
 # worth roughly eight messages.
 FIGHTS_PER_FIGURINE = 0.5
 MAX_DAILY_FIGHTS = 12
+ARENA_SAME_OPPONENT_DAILY_LIMIT = 3
 
 # Matchmaking uses effective combat stats, including equipment and pet level, rather than
 # a level window that could pair two very differently geared creatures.
@@ -241,6 +253,7 @@ DRAW_XP = 50                # both sides spent a fight; no gold or win is awarde
 HISTORY_LIMIT = 10          # "список последних 10 боев"
 DUEL_DAILY_LIMIT = 5
 DUEL_COOLDOWN_SECONDS = 10 * 60
+DUEL_SAME_OPPONENT_DAILY_LIMIT = 1
 
 
 def daily_fight_allowance(messages: int = 0, figurines: int = 0, cage_level: int = 1) -> int:

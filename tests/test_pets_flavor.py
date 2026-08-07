@@ -33,6 +33,10 @@ _EMOJI_RE = re.compile(
 
 
 class EventCoverageTests(unittest.TestCase):
+    def test_accident_pool_has_one_hundred_unique_variants(self):
+        self.assertEqual(len(flavor.ACCIDENT_VARIANTS), 100)
+        self.assertEqual(len(flavor.ACCIDENT_VARIANTS), len(set(flavor.ACCIDENT_VARIANTS)))
+
     def test_result_line_has_three_hundred_unique_variants(self):
         self.assertEqual(len(flavor.RESULT_VARIANTS), 300)
         self.assertEqual(len(flavor.RESULT_VARIANTS), len(set(flavor.RESULT_VARIANTS)))
@@ -62,6 +66,12 @@ class EventCoverageTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    def test_accident_line_is_filled(self):
+        text = flavor.accident_line("Мурзик", "Плюшка", rng=random.Random(1))
+        self.assertIn("Мурзик", text)
+        self.assertIn("Плюшка", text)
+        self.assertNotIn("{", text)
+
     def test_result_and_draw_lines_are_filled(self):
         self.assertNotIn("{", flavor.result_line("Мурзик", "Плюшка", rng=random.Random(1)))
         self.assertNotIn("{", flavor.draw_line("Мурзик", "Плюшка", rng=random.Random(1)))

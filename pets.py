@@ -506,15 +506,16 @@ def fights_left(entry, user_id, today) -> int:
     return max(0, allowance - record.get("fights_today", 0))
 
 
-def claim_duel(entry, user_id, now=None) -> tuple[bool, str]:
-    """Atomically reserve one public duel, enforcing the daily and ten-minute limits."""
+def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
+    """Atomically reserve one public duel, including its once-per-target daily limit."""
     now = now or app_now()
     data = _load(entry)
-    uid = str(user_id)
+    uid, opponent_uid = str(user_id), str(opponent_id)
     record = data.setdefault("duels", {}).setdefault(uid, {})
     today_key = now.date().isoformat()
     if record.get("day") != today_key:
-        record.update({"day": today_key, "uses": 0, "last_at": None})
+        record.update({"day": today_key, "uses": 0, "last_at": None, "targets": {}})
+    targets = record.setdefault("targets", {})
     last_at = record.get("last_at")
     if last_at:
         try:
@@ -526,10 +527,33 @@ def claim_duel(entry, user_id, now=None) -> tuple[bool, str]:
             return False, f"До следующего дуэля {left // 60}:{left % 60:02d}."
     if record.get("uses", 0) >= C.DUEL_DAILY_LIMIT:
         return False, f"На сегодня дуэли закончились ({C.DUEL_DAILY_LIMIT}/{C.DUEL_DAILY_LIMIT})."
+    if targets.get(opponent_uid, 0) >= C.DUEL_SAME_OPPONENT_DAILY_LIMIT:
+        return False, "С этим соперником на сегодня уже был дуэль."
     record["uses"] = record.get("uses", 0) + 1
+    targets[opponent_uid] = targets.get(opponent_uid, 0) + 1
     record["last_at"] = now.isoformat()
     _save(entry, data)
     return True, f"Дуэлей осталось: {C.DUEL_DAILY_LIMIT - record['uses']}."
+
+
+def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
+    """How often this attacker has already selected this defender on `day`."""
+    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
+    return sum(
+        1
+        for fight in _load(entry).get("fights", [])
+        if fight.get("date") == day.isoformat()
+        and fight.get("attacker_id") == attacker_uid
+        and fight.get("defender_id") == defender_uid
+    )
+
+
+def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None) -> bool:
+    day = day or today()
+    return (
+        arena_attacks_against(entry, attacker_id, defender_id, day)
+        < C.ARENA_SAME_OPPONENT_DAILY_LIMIT
+    )
 
 
 def find_opponent(entry, user_id, rng=None, exclude_ids=None) -> str | None:
@@ -579,7 +603,9 @@ def opponent_cycle(entry, user_id, seed: int) -> list[str]:
     uid = str(user_id)
     candidates = [
         other_id for other_id, record in data["pets"].items()
-        if other_id != uid and record.get("name")
+        if other_id != uid
+        and record.get("name")
+        and can_attack_in_arena(entry, uid, other_id)
     ]
     seeker_power = _power_rating_for(seeker)
     differences = {
