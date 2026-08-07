@@ -174,9 +174,12 @@ class PetsCommandTests(unittest.TestCase):
         actions = {pets_ui.parse_callback(b["callback_data"])[1] for b in _buttons(api.sent[0])}
         self.assertIn("cage", actions)
 
-    def test_arena_command_is_ignored_in_a_group(self):
+    def test_group_arena_command_points_to_the_private_bot_menu(self):
         api = self._type(chat_type="group")
-        self.assertEqual(api.sent, [])
+        self.assertEqual(api.sent[0]["text"], "Приручить и прокачать существо можно в личке бота.")
+        button = _buttons(api.sent[0])[0]
+        self.assertEqual(button["text"], "Открыть Арену")
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")
 
     def test_somebody_the_chat_has_never_seen_is_turned_away(self):
         api = self._type(found=False)

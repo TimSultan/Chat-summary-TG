@@ -5530,8 +5530,7 @@ DUEL_RESULT_DELETE_AFTER = 3 * 60
 # owner id, so navigation itself survives a restart.
 PETS_FLOW_TTL_SECONDS = 10 * 60
 PETS_DM_ONLY_NOTICE = (
-    "Арена живёт в личке с ботом: напиши мне /arena.\n"
-    "Показать существо можно и здесь: /pet"
+    "Приручить и прокачать существо можно в личке бота."
 )
 
 
@@ -5608,6 +5607,24 @@ async def handle_pets_command(
     actor = message.get("from") or {}
 
     if chat.get("type") != "private":
+        try:
+            sent = await api.send_message(
+                chat_id, PETS_DM_ONLY_NOTICE,
+                reply_to_message_id=message["message_id"], parse_mode=None,
+                reply_markup=(
+                    {"inline_keyboard": [[{
+                        "text": "Открыть Арену",
+                        "url": f"https://t.me/{bot_username}?start=pets",
+                    }]]} if bot_username else None
+                ),
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], PET_NOTICE_DELETE_AFTER, log,
+                    background_tasks, trigger_message_id=message["message_id"],
+                )
+        except Exception:
+            log(f"[pets] failed to point a group at the DM:\n{traceback.format_exc()}")
         return
 
     user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
@@ -6712,8 +6729,6 @@ async def _dispatch_update(
         re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
         for spelling in PETS_COMMANDS
     ):
-        if chat.get("type") != "private":
-            return
         pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
         if pets_entry is None:
             return
