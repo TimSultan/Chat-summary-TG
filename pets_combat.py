@@ -84,9 +84,13 @@ def _saturate(mx: float, k: float, s: float) -> float:
     return mx * s / (s + k)
 
 
-def _dominant(mine: float, theirs: float) -> bool:
-    """"30% ahead gives 30% more" -- compared per stat, effective values, at fight start."""
-    return mine >= theirs * C.DOMINANCE_RATIO
+def _stat_lead_bonus(mine: float, theirs: float) -> float:
+    """The stronger stat gets its proportional lead as a bonus, capped at 30%."""
+    if mine <= theirs:
+        return 0.0
+    if theirs <= 0:
+        return C.DOMINANCE_BONUS
+    return min(C.DOMINANCE_BONUS, mine / theirs - 1.0)
 
 
 def _signature(fighter: "Fighter", opponent: "Fighter") -> tuple[str, int] | None:
@@ -109,19 +113,19 @@ def _signature(fighter: "Fighter", opponent: "Fighter") -> tuple[str, int] | Non
 def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     """The fight-start numbers for one side.
 
-    Only the stat-derived part of `max_hp`/`damage` is multiplied by the dominance
+    Only the stat-derived part of `max_hp`/`damage` is multiplied by the stat-lead
     factor -- BASE_HP and BASE_DAMAGE are floors everybody gets, not a reward for
     out-scaling somebody (see pets_config). Armor is equipment-only and is deliberately
     excluded from the dominance comparison, so gear can never trigger someone else's bonus
     or lose its own.
     """
-    dominance = {
-        stat: _dominant(getattr(fighter, stat), getattr(opponent, stat))
+    stat_bonus = {
+        stat: _stat_lead_bonus(getattr(fighter, stat), getattr(opponent, stat))
         for stat in _STATS
     }
 
     def factor(stat: str) -> float:
-        return 1.0 + C.DOMINANCE_BONUS if dominance[stat] else 1.0
+        return 1.0 + stat_bonus[stat]
 
     max_hp = C.BASE_HP + fighter.health * C.HP_PER_POINT * factor("health")
     damage = C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT * factor("strength")
@@ -147,7 +151,8 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         "luck_tier": luck_tier,
         "signature": signature,
         "reduction": reduction,
-        "dominance": dominance,
+        "dominance": {stat: bool(bonus) for stat, bonus in stat_bonus.items()},
+        "stat_bonus": stat_bonus,
     }
 
 

@@ -181,14 +181,14 @@ ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 # living pet that dealt more total damage wins; see pets_combat.simulate.
 MAX_ATTACKS_PER_FIGHTER = 10
 
-# ------------------------------------------------------------------ dominance bonus
-# "Если у героев значения каждых отдельных статов разнятся в пропорции 30% - то они
-# начинают давать на 30% больше бонусов." Compared per stat, at the start of the fight,
-# on EFFECTIVE stats (levels + pet level + equipment). Only the stat-derived part of a
-# value is boosted -- BASE_HP and BASE_DAMAGE are floors everybody gets, not a reward for
+# ------------------------------------------------------------------ stat lead bonus
+# Every lead matters: a stat that is 10% higher contributes 10% more, rising linearly to
+# the 30% cap once it is 30% ahead. Compared per stat at the start of the fight, on
+# EFFECTIVE stats (levels + pet level + equipment). Only the stat-derived part of a value
+# is boosted -- BASE_HP and BASE_DAMAGE are floors everybody gets, not a reward for
 # out-scaling somebody.
-DOMINANCE_RATIO = 1.30      # how far ahead counts as dominant
-DOMINANCE_BONUS = 0.30      # how much more that stat then gives
+DOMINANCE_RATIO = 1.30      # ratio where the gradual bonus reaches its ceiling
+DOMINANCE_BONUS = 0.30      # maximum bonus to one stat's contribution
 
 # ------------------------------------------------------------------------ the arena
 #

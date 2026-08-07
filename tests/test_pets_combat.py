@@ -36,24 +36,28 @@ class DeriveTests(unittest.TestCase):
         self.assertEqual(derived["max_hp"], C.BASE_HP + 40 * C.HP_PER_POINT)
         self.assertEqual(derived["damage"], C.BASE_DAMAGE + 40 * C.DAMAGE_PER_POINT)
 
-    def test_dominance_bonus_applies_at_exactly_the_ratio_and_not_one_point_short(self):
-        # theirs = 100 -> dominant threshold is exactly 130 (100 * DOMINANCE_RATIO).
+    def test_stat_lead_bonus_scales_until_its_thirty_percent_cap(self):
+        # Theirs = 100: a 10-point lead gives 10%, and the cap starts at 130.
         theirs = _fighter("theirs", 100)
-        at_threshold = Fighter(key="mine", name="mine", strength=130, health=100,
-                                agility=100, luck=100, armor=0)
-        below_threshold = Fighter(key="mine", name="mine", strength=129, health=100,
-                                   agility=100, luck=100, armor=0)
+        small_lead = Fighter(key="mine", name="mine", strength=110, health=100,
+                             agility=100, luck=100, armor=0)
+        at_cap = Fighter(key="mine", name="mine", strength=130, health=100,
+                         agility=100, luck=100, armor=0)
+        above_cap = Fighter(key="mine", name="mine", strength=200, health=100,
+                            agility=100, luck=100, armor=0)
 
-        derived_at = combat.derive(at_threshold, theirs)
-        derived_below = combat.derive(below_threshold, theirs)
+        derived_small = combat.derive(small_lead, theirs)
+        derived_at_cap = combat.derive(at_cap, theirs)
+        derived_above_cap = combat.derive(above_cap, theirs)
 
-        self.assertTrue(derived_at["dominance"]["strength"])
-        self.assertFalse(derived_below["dominance"]["strength"])
+        self.assertAlmostEqual(derived_small["stat_bonus"]["strength"], 0.10)
+        self.assertAlmostEqual(derived_at_cap["stat_bonus"]["strength"], C.DOMINANCE_BONUS)
+        self.assertAlmostEqual(derived_above_cap["stat_bonus"]["strength"], C.DOMINANCE_BONUS)
 
-        expected_bonus_damage = C.BASE_DAMAGE + 130 * C.DAMAGE_PER_POINT * (1 + C.DOMINANCE_BONUS)
-        expected_plain_damage = C.BASE_DAMAGE + 129 * C.DAMAGE_PER_POINT
-        self.assertAlmostEqual(derived_at["damage"], expected_bonus_damage)
-        self.assertAlmostEqual(derived_below["damage"], expected_plain_damage)
+        expected_small_damage = C.BASE_DAMAGE + 110 * C.DAMAGE_PER_POINT * 1.10
+        expected_cap_damage = C.BASE_DAMAGE + 130 * C.DAMAGE_PER_POINT * (1 + C.DOMINANCE_BONUS)
+        self.assertAlmostEqual(derived_small["damage"], expected_small_damage)
+        self.assertAlmostEqual(derived_at_cap["damage"], expected_cap_damage)
 
     def test_base_floors_are_not_multiplied_by_the_dominance_factor(self):
         # A fighter with 0 in the dominant stat still gets BASE_HP/BASE_DAMAGE untouched.
