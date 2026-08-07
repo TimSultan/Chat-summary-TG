@@ -23,6 +23,7 @@ from html import escape
 
 import pets
 import pets_config as C
+import pets_flavor
 
 CALLBACK_PREFIX = "pet"
 # Telegram caps callback_data at 64 bytes. "pet:" + a 19-digit id + ":" + the longest
@@ -562,14 +563,21 @@ def fight_report_keyboard(user_id) -> dict:
 
 
 def group_fight_result_view(
-    result, attacker_id: str, attacker_name: str, defender_name: str, arena_url: str,
+    result, attacker_id: str, attacker_name: str, defender_name: str, reward: dict, arena_url: str,
 ) -> tuple[str, dict]:
     """One-line public result; detailed receipts stay with the two fighters in private."""
     if result.is_draw:
         text = f"🤝 <b>{escape(attacker_name)} и {escape(defender_name)} сыграли вничью.</b>"
     else:
         winner_name = attacker_name if result.winner == str(attacker_id) else defender_name
-        text = f"🏆 <b>{escape(winner_name)} побеждает!</b>"
+        winner_reward = reward if result.winner == str(attacker_id) else {
+            "gold": reward.get("opponent_gold", 0),
+            "xp": reward.get("opponent_xp", 0),
+        }
+        text = (
+            f"🏆 <b>{escape(pets_flavor.public_result_line(winner_name))}</b>\n"
+            f"🪙 +{_coins(winner_reward.get('gold', 0))}  ✨ +{winner_reward.get('xp', 0)} опыта"
+        )
     return text, {"inline_keyboard": [[{"text": "⚔️ Открыть арену", "url": arena_url}]]}
 
 

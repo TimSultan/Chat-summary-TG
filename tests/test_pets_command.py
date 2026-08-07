@@ -459,8 +459,9 @@ class PetsCommandTests(unittest.TestCase):
         )
         self.assertEqual(api.sent, [])
         group_result = api.photo_files[0]
-        self.assertIn("побеждает!", group_result["caption"])
-        self.assertNotIn("Победа", group_result["caption"])
+        self.assertIn("Кабанчик", group_result["caption"])
+        self.assertIn("🪙 +", group_result["caption"])
+        self.assertIn("✨ +100 опыта", group_result["caption"])
         button = _buttons(group_result)[0]
         self.assertEqual(button["text"], "⚔️ Открыть арену")
         self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")

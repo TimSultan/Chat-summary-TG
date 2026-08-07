@@ -6084,7 +6084,7 @@ async def _pets_run_fight(
     if group_result and arena_url:
         group_report = pets_ui.group_fight_result_view(
             result, str(user_id), mine.get("name") or "Существо",
-            theirs.get("name") or "Существо", arena_url,
+            theirs.get("name") or "Существо", reward, arena_url,
         )
     image_path = None
     try:

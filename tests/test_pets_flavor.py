@@ -48,6 +48,10 @@ class EventCoverageTests(unittest.TestCase):
         self.assertEqual(len(flavor.RESULT_VARIANTS), 300)
         self.assertEqual(len(flavor.RESULT_VARIANTS), len(set(flavor.RESULT_VARIANTS)))
 
+    def test_public_result_pool_has_distinct_variants(self):
+        self.assertGreaterEqual(len(flavor.PUBLIC_RESULT_VARIANTS), 30)
+        self.assertEqual(len(flavor.PUBLIC_RESULT_VARIANTS), len(set(flavor.PUBLIC_RESULT_VARIANTS)))
+
     def test_events_tuple_matches_variants_keys(self):
         self.assertEqual(flavor.EVENTS, tuple(flavor.VARIANTS))
 
@@ -82,6 +86,11 @@ class FormattingTests(unittest.TestCase):
     def test_result_and_draw_lines_are_filled(self):
         self.assertNotIn("{", flavor.result_line("Мурзик", "Плюшка", rng=random.Random(1)))
         self.assertNotIn("{", flavor.draw_line("Мурзик", "Плюшка", rng=random.Random(1)))
+
+    def test_public_result_line_is_filled(self):
+        text = flavor.public_result_line("Мурзик", rng=random.Random(1))
+        self.assertIn("Мурзик", text)
+        self.assertNotIn("{", text)
     def test_every_template_formats_without_keyerror(self):
         for event, variants in flavor.VARIANTS.items():
             for template in variants:

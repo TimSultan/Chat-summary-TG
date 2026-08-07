@@ -346,6 +346,41 @@ RESULT_VARIANTS: tuple[str, ...] = tuple(
     f"{win} {loss}" for win in _RESULT_WINS for loss in _RESULT_LOSSES
 )
 
+# Group announcements need to be shorter and louder than the detailed battle log. Kept
+# separate so a new public quip never changes the combat receipt stored for either player.
+PUBLIC_RESULT_VARIANTS = (
+    "{winner} забирает арену. Без вариантов.",
+    "{winner} устроил разнос и забрал победу.",
+    "{winner} оставляет соперника в слое пыли и славы.",
+    "{winner} кладёт этот бой в витрину трофеев.",
+    "{winner} наносит финальный мазок. Картина готова.",
+    "{winner} сегодня красит только в цвет победы.",
+    "{winner} превращает арену в личный мольберт.",
+    "{winner} выдал такой слой, что спорить уже поздно.",
+    "{winner} оставляет после себя только аплодисменты и грунт.",
+    "{winner} забирает раунд жёстко и красиво.",
+    "{winner} устроил критический покрас соперника.",
+    "{winner} ставит точку. Жирную, акриловую.",
+    "{winner} выбивает победу кистью уверенной руки.",
+    "{winner} выносит арену. Судья ищет, что записать в протокол.",
+    "{winner} сегодня не боец, а стихийное бедствие.",
+    "{winner} оформляет победу без скидок и компромиссов.",
+    "{winner} забирает бой, палитру и уважение трибун.",
+    "{winner} делает из этого боя учебный пример.",
+    "{winner} выдал мощный контраст. Победа на месте.",
+    "{winner} закрывает вопрос одним финальным штрихом.",
+    "{winner} превращает соперничество в выставку достижений.",
+    "{winner} забирает победу так уверенно, будто так и было задумано.",
+    "{winner} наносит бойцам и зрителям неизгладимое впечатление.",
+    "{winner} идёт в атаку как свежий баллон аэрографа.",
+    "{winner} оставляет арену в идеальном состоянии. Почти.",
+    "{winner} берёт верх. Палитра одобряет.",
+    "{winner} оформляет нокаут с выставочной подачей.",
+    "{winner} делает победный мазок прямо по протоколу.",
+    "{winner} сегодня главный экспонат арены.",
+    "{winner} завершает бой громко, чисто и по делу.",
+)
+
 _DRAW = (
     "{attacker} и {defender} расходятся без победителя.",
     "Ничья: {attacker} и {defender} оставляют спор на реванш.",
@@ -469,3 +504,9 @@ def draw_line(first: str, second: str, rng=None) -> str:
 def accident_line(winner: str, loser: str, rng=None) -> str:
     picker = rng if rng is not None else random
     return picker.choice(ACCIDENT_VARIANTS).format(attacker=winner, defender=loser)
+
+
+def public_result_line(winner: str, rng=None) -> str:
+    """A compact random winner announcement for the temporary group result card."""
+    picker = rng if rng is not None else random
+    return picker.choice(PUBLIC_RESULT_VARIANTS).format(winner=winner)
