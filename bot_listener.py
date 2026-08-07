@@ -66,6 +66,9 @@ import cabinet
 import button_builder
 import economy
 import history
+import pets
+import pets_combat
+import pets_ui
 import poker
 import preview
 import stats
@@ -241,26 +244,32 @@ VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "cancel")
 # arena_core.py, arena_web.py). It shares this file's admin/membership checks and the web
 # server's port, and NOTHING else -- separate storage, separate media, separate moderation,
 # separate commands. Both can run in the same week; neither can break the other.
-ARENA_COMMANDS = ("/arena", "/арена", "/vote2")
+# Spelled "/vote2" and nothing else. "/arena" and "/арена" used to reach this system and
+# now belong to the pet game (pets.py) -- the name was reassigned deliberately, and the
+# voting system it used to open is unchanged underneath, only re-spelled. Old chat posts
+# still carry a "?start=arena" deep link, which is why that payload keeps pointing here
+# (see _dispatch_update): a button already sitting in the group must not start opening a
+# different feature than the message around it describes.
+ARENA_COMMANDS = ("/vote2", "/голосование2")
 ARENA_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
 ARENA_MODERATE_WORDS = frozenset({"выбрать", "модерация", "moderate", "admin"})
 ARENA_IMPORT_WORDS = frozenset({"импорт", "import", "изv1", "изv1"})
 ARENA_RESULTS_WORDS = frozenset({"итоги", "результаты", "standings", "results"})
 ARENA_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
-# "/arena chat" -- the arena's own announcement, drafted and posted through the SAME flow
+# "/vote2 chat" -- the arena's own announcement, drafted and posted through the SAME flow
 # v1's uses (vote_chat_flows, tagged with which system asked for it). The two systems keep
 # their data apart; a composer that asks for a line of text and offers two groups to post
 # it into is not either system's data, and two copies of it would drift.
 ARENA_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
 ARENA_OPEN_BUTTON_TEXT = "⚔️ Открыть арену"
-# Buttons on the /arena status message, same synthetic-message trick as VOTE_ACTIONS.
+# Buttons on the /vote2 status message, same synthetic-message trick as VOTE_ACTIONS.
 ARENA_ACTION_CALLBACK_PREFIX = "arenaaction"
 ARENA_ACTIONS = {
-    "collect": "/arena собрать",
-    "import": "/arena импорт",
-    "chat": "/arena chat",
-    "results": "/arena итоги",
-    "clear": "/arena очистить",
+    "collect": "/vote2 собрать",
+    "import": "/vote2 импорт",
+    "chat": "/vote2 chat",
+    "results": "/vote2 итоги",
+    "clear": "/vote2 очистить",
 }
 
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
@@ -308,6 +317,8 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "coins", "description": "Мой баланс"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "arena", "description": "Арена: клетка, существо, бои"},
+    {"command": "pet", "description": "Моё существо"},
 )
 # Shorter in groups: the wallet actions belong in the DM, where a balance isn't public,
 # and /cabinet is deliberately absent -- it only works in a DM, so offering it here would
@@ -322,6 +333,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "toppokras", "description": "Топ прокрастинаторов"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "pet", "description": "Существо участника"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -3770,13 +3782,13 @@ def _arena_page_url(cfg) -> str | None:
 def _arena_group_button_url(cfg, bot_username: str | None) -> str | None:
     """What the arena button links to in a message that lands in a GROUP -- the same
     constraint as v1's (a web_app button is private-chat only), and the same deep link the
-    group /arena reply already leaves behind.
+    group /vote2 reply already leaves behind.
 
     No Direct Link Mini App branch, unlike _vote_group_button_url: a short name is
     registered against ONE url in BotFather, VOTE_MINIAPP_SHORT_NAME points at v1's page,
     and sending arena voters there with ?startapp=arena would open the wrong ballot.
     """
-    return f"https://t.me/{bot_username}?start=arena" if bot_username else None
+    return f"https://t.me/{bot_username}?start=vote2" if bot_username else None
 
 
 def _announce_button(cfg, bot_username: str | None, system: str) -> dict | None:
@@ -3803,7 +3815,7 @@ async def _start_announcement_draft(
     log=print,
 ) -> None:
     """Open the force-reply draft an announcement starts as -- for "/vote chat" and for
-    "/arena chat" alike, tagged with which of them asked.
+    "/vote2 chat" alike, tagged with which of them asked.
 
     One pending draft per (chat, admin), across BOTH systems on purpose: they share the
     prompt convention, so two live drafts would both be waiting on a reply to a message and
@@ -3835,12 +3847,12 @@ async def _start_announcement_draft(
 
 
 def _arena_status_text(entry: str) -> str:
-    """The arena's own status block for its /arena menu -- deliberately NOT v1's numbers.
+    """The arena's own status block for its /vote2 menu -- deliberately NOT v1's numbers.
     Two systems reporting one another's progress is how somebody ends up announcing the
     wrong result."""
     tournament = arena.latest_tournament(entry)
     if tournament is None:
-        return "Арена ещё не создана. Собери работы: /arena собрать (или возьми их из v1: /arena импорт)."
+        return "Арена ещё не создана. Собери работы: /vote2 собрать (или возьми их из v1: /vote2 импорт)."
 
     progress = tournament.progress()
     lines = [
@@ -3871,7 +3883,7 @@ def _arena_status_text(entry: str) -> str:
     elif tournament.approved:
         lines.append("Пока никто не голосовал.")
     else:
-        lines.append("Работы ещё не допущены -- /arena выбрать.")
+        lines.append("Работы ещё не допущены -- /vote2 выбрать.")
     return "\n".join(lines)
 
 
@@ -3901,7 +3913,7 @@ async def handle_arena_action_callback(
     vote_chat_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
-    """The /arena menu's buttons, built the same way v1's are: the tap is answered first,
+    """The /vote2 menu's buttons, built the same way v1's are: the tap is answered first,
     then a synthetic message goes through handle_arena_command so the admin/DM gate and
     the work itself live in exactly one place."""
     parsed = _parse_arena_action_callback(callback.get("data"))
@@ -3946,23 +3958,23 @@ async def handle_arena_command(
     log=print,
     vote_chat_flows: dict[str, dict] | None = None,
 ) -> None:
-    """/arena -- the second voting system, with the same shape as /vote so an admin who
+    """/vote2 -- the second voting system, with the same shape as /vote so an admin who
     knows one knows the other:
 
-    - "/arena собрать" (DM, admin) scans #итогинедели into the ARENA's own store, with its
+    - "/vote2 собрать" (DM, admin) scans #итогинедели into the ARENA's own store, with its
       own copy of the photos. It never reads or writes a poll.
-    - "/arena импорт" (DM, admin) copies the works v1 has ADMITTED into the arena, so a
+    - "/vote2 импорт" (DM, admin) copies the works v1 has ADMITTED into the arena, so a
       week already moderated in v1 doesn't have to be moderated from scratch here. One
       way, on demand, by copy: v1 is not touched. They still arrive unadmitted -- this
       system's moderation is its own.
-    - "/arena выбрать" (DM, admin) opens the arena's moderation screen: admit works, set
+    - "/vote2 выбрать" (DM, admin) opens the arena's moderation screen: admit works, set
       pairs per voter and the pairing mode, open or close it.
-    - "/arena chat" (DM, admin) drafts an announcement for the group with the arena's own
+    - "/vote2 chat" (DM, admin) drafts an announcement for the group with the arena's own
       button on it, through the same composer "/vote chat" uses (see
       _start_announcement_draft) -- tagged "arena", so the button leads here and not to v1.
-    - "/arena итоги" (DM, admin) prints the fitted table.
-    - "/arena очистить" (DM, admin) deletes the arena and nothing else.
-    - bare "/arena" opens the duels for everyone, and is the status/control panel for an
+    - "/vote2 итоги" (DM, admin) prints the fitted table.
+    - "/vote2 очистить" (DM, admin) deletes the arena and nothing else.
+    - bare "/vote2" opens the duels for everyone, and is the status/control panel for an
       administrator. A voter who is not one gets a single button and no panel: every other
       button here is an administrator's, and one they cannot use is one that only lies.
     """
@@ -4045,7 +4057,7 @@ async def handle_arena_command(
         arena.save_tournament(tournament)
         arena.invalidate_standings(tournament_id)
         if not all_entries:
-            await reply("Постов с #итогинедели не нашлось. Можно взять работы из v1: /arena импорт")
+            await reply("Постов с #итогинедели не нашлось. Можно взять работы из v1: /vote2 импорт")
             return
         await reply(
             f"Новых работ: {len(new_entries)} (всего {len(all_entries)}). "
@@ -4147,7 +4159,7 @@ async def handle_arena_command(
         )
         return
 
-    # Bare "/arena": the duels for everyone, plus a control panel for an administrator.
+    # Bare "/vote2": the duels for everyone, plus a control panel for an administrator.
     if is_private:
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
@@ -5485,6 +5497,635 @@ def _message_content(message: dict | None) -> str:
     return ""
 
 
+# ------------------------------------------------------------- the pet game (/arena)
+#
+# The third game in this bot, and the first one that spends coins on something permanent.
+# Its pure halves live outside this file the way cabinet.py's and poker.py's do:
+#
+#   pets_config.py   every tunable number, and nothing else -- re-balancing is editing
+#                    that file and only that file
+#   pets.py          state, storage and the wallet (economy.py, NOT a second currency)
+#   pets_combat.py   the fight, deterministic given a seeded rng
+#   pets_flavor.py   the joke library the fight log is written out of
+#   pets_ui.py       every screen, as pure (text, keyboard) functions
+#
+# What is left here is what can only live here: Telegram I/O, working out who pressed a
+# button, and the two flows that need free text or a photo back.
+#
+# "/arena" used to open the second VOTING system; that moved to "/vote2" (see
+# ARENA_COMMANDS) and the name was handed to this. The two share nothing but the word.
+PETS_COMMANDS = ("/arena", "/арена")
+# Works in the group as well as the DM -- it is the one screen meant to be shown off, so
+# refusing it in front of everybody would defeat the point.
+PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
+PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
+# Same ten-minute window the cabinet flows use, and for the same reason: only naming and
+# re-photographing a creature need server-side state at all. Every button carries its own
+# owner id, so navigation itself survives a restart.
+PETS_FLOW_TTL_SECONDS = 10 * 60
+PETS_DM_ONLY_NOTICE = (
+    "Арена живёт в личке с ботом: напиши мне /arena.\n"
+    "Показать существо можно и здесь: /pet"
+)
+
+
+async def _pets_context(telethon_client, entry: str, tz, actor: dict, log=print):
+    """(user, xp) for whoever is playing, or (None, None) if the chat has never seen them.
+
+    The pet game rides on the same coin ledger as /shop, and economy.balance derives the
+    earned half from live XP (see its docstring), so nothing here can be priced without
+    first resolving the member -- which is also, conveniently, the check that stops
+    somebody who has never written in the chat from farming the arena.
+    """
+    try:
+        user, _, _, xp, _, _ = await stats.resolve_stat_target(
+            telethon_client, entry, entry, "",
+            actor.get("username"), _display_name(actor), tz, log=log,
+        )
+    except Exception:
+        log(f"[pets] failed to resolve the player:\n{traceback.format_exc()}")
+        return None, None
+    if user is None:
+        return None, None
+    return user, xp
+
+
+async def _send_pets_view(
+    api: TelegramBotAPI, chat_id, rendered, reply_to_message_id=None, message_id=None, log=print,
+):
+    """Draw a screen, editing the message the button was on when there is one.
+
+    Editing rather than sending is what keeps the menu to a single message in the DM
+    instead of a growing column of near-identical screens. A failed edit is not an error
+    worth telling the player about -- Telegram rejects an edit whose text and keyboard are
+    both unchanged, which is exactly what pressing "Обновить" twice does.
+    """
+    text, keyboard = rendered
+    if message_id is not None:
+        try:
+            await api.edit_message_text(
+                chat_id, message_id, text, reply_markup=keyboard, parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+    try:
+        await api.send_message(
+            chat_id, text, reply_to_message_id=reply_to_message_id,
+            reply_markup=keyboard, parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[pets] failed to send a view:\n{traceback.format_exc()}")
+
+
+async def handle_pets_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str,
+    bot_username: str | None,
+    background_tasks: set,
+    pets_flows: dict,
+    log=print,
+) -> None:
+    """"/arena" -- the pet game's menu.
+
+    DM-only, for the same reason /cabinet is: every button on it spends the presser's
+    coins, and a menu posted in the group would put one member's wallet in front of 190
+    people and offer buttons the other 189 cannot use. The group gets a pointer and a deep
+    link instead (a web_app button is private-chat only; a url button is not).
+    """
+    chat = message["chat"]
+    chat_id = chat["id"]
+    actor = message.get("from") or {}
+
+    if chat.get("type") != "private":
+        try:
+            sent = await api.send_message(
+                chat_id, PETS_DM_ONLY_NOTICE,
+                reply_to_message_id=message["message_id"], parse_mode=None,
+                reply_markup=(
+                    {"inline_keyboard": [[{
+                        "text": "🏟 Открыть арену",
+                        "url": f"https://t.me/{bot_username}?start=pets",
+                    }]]} if bot_username else None
+                ),
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log,
+                    background_tasks, trigger_message_id=message["message_id"],
+                )
+        except Exception:
+            log(f"[pets] failed to point a group at the DM:\n{traceback.format_exc()}")
+        return
+
+    user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
+    if user is None:
+        try:
+            await api.send_message(
+                chat_id,
+                "Ты ещё не отслеживаешься -- напиши что-нибудь в чат и попробуй снова.",
+                reply_to_message_id=message["message_id"], parse_mode=None,
+            )
+        except Exception:
+            pass
+        return
+
+    await _send_pets_view(
+        api, chat_id, pets_ui.main_view(entry, user.user_id, xp),
+        reply_to_message_id=message["message_id"], log=log,
+    )
+
+
+async def handle_pet_card_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str,
+    command_text: str,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """"/pet" -- the creature's card, with its picture, in a DM or in the group.
+
+    Takes the same target argument /stat does (a @username or a name fragment) and falls
+    back to a replied-to message, so "show me yours" works without anybody having to type
+    a username exactly.
+    """
+    chat = message["chat"]
+    chat_id = chat["id"]
+    actor = message.get("from") or {}
+    argument = ""
+    for spelling in PET_CARD_COMMANDS:
+        if command_text.lower().startswith(spelling):
+            argument = command_text[len(spelling):].strip()
+            break
+    replied = (message.get("reply_to_message") or {}).get("from") or {}
+    if not argument and replied and not replied.get("is_bot"):
+        argument = replied.get("username") or _display_name(replied)
+
+    async def deliver(text: str, photo_file_id: str | None) -> None:
+        try:
+            if photo_file_id:
+                sent = await api.send_photo(
+                    chat_id, photo_file_id, caption=text,
+                    reply_to_message_id=message["message_id"], parse_mode="HTML",
+                )
+            else:
+                sent = await api.send_message(
+                    chat_id, text, reply_to_message_id=message["message_id"],
+                    parse_mode="HTML",
+                )
+        except Exception:
+            log(f"[pets] failed to send a pet card:\n{traceback.format_exc()}")
+            return
+        # Auto-deleted in groups on the same timer every other stats reply uses, so a
+        # chat full of creature cards still reads as a chat. Never in a DM.
+        if sent and "message_id" in sent and chat.get("type") != "private":
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], STATS_DELETE_AFTER, log,
+                background_tasks, trigger_message_id=message["message_id"],
+            )
+
+    try:
+        user, _, _, _, _, _ = await stats.resolve_stat_target(
+            telethon_client, entry, entry, argument,
+            actor.get("username"), _display_name(actor), tz, log=log,
+        )
+    except Exception:
+        log(f"[pets] failed to resolve a /pet target:\n{traceback.format_exc()}")
+        return
+    if user is None:
+        await deliver("Не нашёл такого участника.", None)
+        return
+
+    pet = pets.get_pet(entry, user.user_id)
+    if not pet:
+        mine = str(user.user_id) == str(actor.get("id"))
+        await deliver(
+            "У тебя ещё нет существа. Заводится в личке с ботом: /arena"
+            if mine else
+            f"У {html.escape(user.display_name)} пока нет существа.",
+            None,
+        )
+        return
+    await deliver(pets_ui.pet_card(entry, user.user_id, pet), pet.get("photo_file_id"))
+
+def _pets_fighter(entry: str, user_id, pet: dict):
+    """A pets_combat.Fighter built from EFFECTIVE stats -- purchased levels plus the pet's
+    own level plus whatever it is wearing. Combat never reads the store itself, which is
+    what lets a fight be replayed from a seed in a test."""
+    effective = pets.effective_stats(entry, user_id)
+    return pets_combat.Fighter(
+        key=str(user_id),
+        name=pet.get("name") or "Существо",
+        strength=effective.get("strength", 1),
+        health=effective.get("health", 1),
+        agility=effective.get("agility", 1),
+        luck=effective.get("luck", 1),
+        armor=effective.get("armor", 0),
+    )
+
+
+async def _pets_start_flow(
+    api: TelegramBotAPI, pets_flows: dict, chat_id, user_id, entry: str,
+    awaiting: str, prompt_text: str, reply_to_message_id,
+) -> None:
+    prompt = await api.send_message(
+        chat_id, prompt_text, reply_to_message_id=reply_to_message_id,
+        reply_markup={"force_reply": True, "selective": True}, parse_mode=None,
+    )
+    pets_flows[uuid.uuid4().hex[:10]] = {
+        "created_at": time.monotonic(),
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "entry": entry,
+        "awaiting": awaiting,
+        "photo_file_id": None,
+        "prompt_message_id": prompt.get("message_id") if prompt else None,
+    }
+
+
+async def handle_pets_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    pets_flows: dict,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """Every button in the pet menu.
+
+    The tap is answered BEFORE anything that can block. _pets_context goes through
+    Telethon to resolve the member, and a Telethon call made before answerCallbackQuery
+    leaves the button spinning on the client until it times out -- a bug this codebase has
+    already been bitten by once.
+    """
+    parsed = pets_ui.parse_callback(callback.get("data"))
+    if parsed is None:
+        return
+    owner_id, action, argument = parsed
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    actor = callback.get("from") or {}
+
+    # The owner id rides inside the button, so a forwarded menu cannot be used to spend
+    # somebody else's coins.
+    if str(actor.get("id")) != str(owner_id):
+        await api.answer_callback_query(callback_id, "Это чужая арена.")
+        return
+    if entry is None:
+        await api.answer_callback_query(callback_id, "Основной чат не настроен.")
+        return
+    if action == "noop":
+        await api.answer_callback_query(callback_id, "Уже максимум.")
+        return
+    await api.answer_callback_query(callback_id)
+
+    user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
+    if user is None:
+        await _send_pets_view(
+            api, chat_id,
+            ("Ты ещё не отслеживаешься -- напиши что-нибудь в чат и попробуй снова.",
+             {"inline_keyboard": []}),
+            message_id=message_id, log=log,
+        )
+        return
+    user_id = user.user_id
+
+    try:
+        # --- the two flows that need something back from the player ------------------
+        if action in ("tame", "rename", "photo"):
+            if action == "tame" and not pets.has_cage(entry, user_id):
+                await _send_pets_view(
+                    api, chat_id, pets_ui.cage_view(entry, user_id, xp),
+                    message_id=message_id, log=log,
+                )
+                return
+            prompts = {
+                "tame": "Пришли фото будущего существа (картинкой, не файлом).",
+                "photo": "Пришли новое фото существа (картинкой, не файлом).",
+                "rename": "Ответь на это сообщение новым именем существа.",
+            }
+            await _pets_start_flow(
+                api, pets_flows, chat_id, actor.get("id"), entry,
+                "name" if action == "rename" else f"photo_{action}",
+                prompts[action], message_id,
+            )
+            return
+
+        # --- purchases ---------------------------------------------------------------
+        if action == "buycage":
+            ok, note = pets.buy_cage(entry, user_id, xp)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.cage_view(entry, user_id, xp), log
+            )
+            return
+        if action == "upcage":
+            ok, note = pets.upgrade_cage(entry, user_id, xp)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.cage_view(entry, user_id, xp), log
+            )
+            return
+        if action in ("up", "up10"):
+            ok, note, _ = pets.upgrade_stat(
+                entry, user_id, xp, argument, times=10 if action == "up10" else 1
+            )
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.train_view(entry, user_id, xp), log
+            )
+            return
+        if action == "buy":
+            ok, note = pets.buy_item(entry, user_id, xp, argument)
+            slot = pets_ui.slot_of(argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.slot_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "equip":
+            ok, note = pets.equip(entry, user_id, argument)
+            slot = pets_ui.slot_of(argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.slot_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "unequip":
+            ok, note = pets.unequip(entry, user_id, argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.slot_view(entry, user_id, xp, argument), log
+            )
+            return
+
+        # --- the arena ---------------------------------------------------------------
+        if action == "search":
+            if pets.fights_left(entry, user_id, pets.today()) <= 0:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+                    message_id=message_id, log=log,
+                )
+                return
+            opponent_id = pets.find_opponent(entry, user_id)
+            if opponent_id is None:
+                await _send_pets_view(
+                    api, chat_id,
+                    pets_ui.notice_view(
+                        user_id,
+                        "Соперников пока нет: ты единственный, кто завёл существо. "
+                        "Позови кого-нибудь в чат.",
+                    ),
+                    message_id=message_id, log=log,
+                )
+                return
+            await _send_pets_view(
+                api, chat_id, pets_ui.opponent_view(entry, user_id, opponent_id, xp),
+                message_id=message_id, log=log,
+            )
+            return
+
+        if action == "attack":
+            await _pets_run_fight(
+                api, chat_id, message_id, entry, user_id, argument, xp, log
+            )
+            return
+
+        # --- plain redraws -------------------------------------------------------------
+        views = {
+            "main": lambda: pets_ui.main_view(entry, user_id, xp),
+            "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
+            "train": lambda: pets_ui.train_view(entry, user_id, xp),
+            "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
+            "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
+            "history": lambda: pets_ui.history_view(entry, user_id),
+            "pet": lambda: pets_ui.pet_view(entry, user_id),
+            "slot": lambda: pets_ui.slot_view(entry, user_id, xp, argument),
+        }
+        render = views.get(action)
+        if render is None:
+            return
+        await _send_pets_view(api, chat_id, render(), message_id=message_id, log=log)
+    except Exception:
+        log(f"[pets] callback '{action}' failed:\n{traceback.format_exc()}")
+        await _send_pets_view(
+            api, chat_id,
+            pets_ui.notice_view(user_id, "Что-то сломалось. Попробуй ещё раз: /arena"),
+            message_id=message_id, log=log,
+        )
+
+
+async def _pets_toast_and_redraw(api, chat_id, message_id, note: str, rendered, log) -> None:
+    """A purchase's answer belongs ON the screen it changed, not in a toast that vanishes:
+    the note is prepended to the redrawn view so "не хватает 40 монет" is still readable a
+    minute later, next to the price that caused it."""
+    text, keyboard = rendered
+    await _send_pets_view(
+        api, chat_id, (f"{html.escape(note)}\n\n{text}", keyboard),
+        message_id=message_id, log=log,
+    )
+
+
+async def _pets_run_fight(
+    api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
+    xp: int, log,
+) -> None:
+    """One duel, start to finish: simulate, record, print.
+
+    The daily fight is spent inside pets.record_fight, together with the payout, so a
+    crash between "fought" and "paid" cannot exist -- there is one write, not two.
+    """
+    mine = pets.get_pet(entry, user_id)
+    opponent_id = (opponent_raw or "").strip()
+    theirs = pets.get_pet(entry, opponent_id) if opponent_id else None
+    if not mine or not theirs:
+        await _send_pets_view(
+            api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+            message_id=message_id, log=log,
+        )
+        return
+    if pets.fights_left(entry, user_id, pets.today()) <= 0:
+        await _send_pets_view(
+            api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+            message_id=message_id, log=log,
+        )
+        return
+
+    result = pets_combat.simulate(
+        _pets_fighter(entry, user_id, mine),
+        _pets_fighter(entry, opponent_id, theirs),
+    )
+    reward = pets.record_fight(entry, user_id, opponent_id, result, pets.today())
+    report = pets_ui.fight_report(
+        result, str(user_id),
+        {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},
+        reward,
+    )
+    # Sent as a NEW message rather than edited over the menu: the log is the thing worth
+    # scrolling back to, and editing it away on the next tap would delete the only record
+    # of the fight the player actually watched.
+    try:
+        await api.send_message(
+            chat_id, report, reply_markup=pets_ui.fight_report_keyboard(user_id),
+            parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[pets] failed to send a fight report:\n{traceback.format_exc()}")
+
+
+async def handle_pets_rename_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    entry: str,
+    command_text: str,
+    log=print,
+) -> None:
+    """"/переименовать <имя>" -- the typed spelling of the pet menu's rename button.
+
+    Shares pets.rename with the button, so the name rules (length, duplicates, the angle
+    brackets that would break the HTML the card is sent with) are enforced in exactly one
+    place no matter which way somebody asks.
+    """
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    argument = ""
+    for spelling in PETS_RENAME_COMMANDS:
+        if command_text.lower().startswith(spelling):
+            argument = command_text[len(spelling):].strip()
+            break
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(
+                chat_id, text, reply_to_message_id=message["message_id"], parse_mode=None,
+            )
+        except Exception:
+            log(f"[pets] failed to answer a rename:\n{traceback.format_exc()}")
+
+    if not argument:
+        await reply("Формат: /переименовать <новое имя>")
+        return
+    user, _ = await _pets_context(telethon_client, entry, tz, actor, log=log)
+    if user is None:
+        await reply("Ты ещё не отслеживаешься -- напиши что-нибудь в чат и попробуй снова.")
+        return
+    _, note = pets.rename(entry, user.user_id, argument)
+    await reply(note)
+
+
+async def maybe_handle_pets_flow_message(
+    api: TelegramBotAPI,
+    telethon_client,
+    tz,
+    message: dict,
+    pets_flows: dict,
+    log=print,
+) -> bool:
+    """The photo or the name a pet flow is waiting for. True when this message was one.
+
+    Matched on the force-reply it answers, exactly as the cabinet and button-builder flows
+    are, so two people naming creatures in their own DMs at the same time cannot collide.
+    """
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    replied_message_id = (message.get("reply_to_message") or {}).get("message_id")
+    pair = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in pets_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") == replied_message_id
+            and time.monotonic() - flow["created_at"] <= PETS_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if pair is None:
+        return False
+    flow_id, flow = pair
+    entry = flow["entry"]
+    raw = (message.get("text") or message.get("caption") or "").strip()
+    if raw.lower() in ("/cancel", "отмена"):
+        pets_flows.pop(flow_id, None)
+        await api.send_message(chat_id, "Отменил.", parse_mode=None)
+        return True
+
+    user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
+    if user is None:
+        pets_flows.pop(flow_id, None)
+        return True
+
+    awaiting = flow.get("awaiting")
+    try:
+        if awaiting in ("photo_tame", "photo_photo"):
+            photos = message.get("photo") or []
+            if not photos:
+                await api.send_message(
+                    chat_id, "Нужна именно картинка. Пришли фото ещё раз, ответом на тот же вопрос.",
+                    parse_mode=None,
+                )
+                return True
+            # The largest size Telegram offers. Only the file_id is stored -- the picture
+            # itself stays on Telegram's servers, so a creature costs this bot no disk.
+            file_id = photos[-1]["file_id"]
+            if awaiting == "photo_photo":
+                pets_flows.pop(flow_id, None)
+                ok, note = pets.set_photo(entry, user.user_id, file_id)
+                await _send_pets_view(
+                    api, chat_id, pets_ui.notice_view(user.user_id, note), log=log
+                )
+                return True
+            flow["photo_file_id"] = file_id
+            flow["awaiting"] = "name_tame"
+            prompt = await api.send_message(
+                chat_id, "Отлично. Теперь ответь на это сообщение именем существа.",
+                reply_markup={"force_reply": True, "selective": True}, parse_mode=None,
+            )
+            flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+            return True
+
+        if awaiting in ("name", "name_tame"):
+            if not raw:
+                await api.send_message(chat_id, "Пустое имя не подойдёт.", parse_mode=None)
+                return True
+            pets_flows.pop(flow_id, None)
+            if awaiting == "name":
+                ok, note = pets.rename(entry, user.user_id, raw)
+            else:
+                ok, note = pets.tame(
+                    entry, user.user_id, xp, raw,
+                    flow.get("photo_file_id"), _display_name(actor),
+                )
+            await _send_pets_view(
+                api, chat_id,
+                pets_ui.main_view(entry, user.user_id, xp) if ok
+                else pets_ui.notice_view(user.user_id, note),
+                log=log,
+            )
+            if ok:
+                await api.send_message(chat_id, note, parse_mode=None)
+            return True
+    except Exception:
+        log(f"[pets] flow step '{awaiting}' failed:\n{traceback.format_exc()}")
+        pets_flows.pop(flow_id, None)
+        await api.send_message(
+            chat_id, "Не получилось. Начни заново: /arena", parse_mode=None,
+        )
+        return True
+    return False
+
+
 async def _handle_one_update(dispatch, update_id, log=print) -> None:
     """Await one update's handling, and never let it stop the poll loop.
 
@@ -5527,6 +6168,7 @@ async def _dispatch_update(
     button_builder_flows: dict[str, dict] | None = None,
     vote_chat_flows: dict[str, dict] | None = None,
     vote_result_flows: dict[str, dict] | None = None,
+    pets_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -5541,6 +6183,7 @@ async def _dispatch_update(
     button_builder_flows = button_builder_flows if button_builder_flows is not None else {}
     vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
     vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
+    pets_flows = pets_flows if pets_flows is not None else {}
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
@@ -5585,6 +6228,15 @@ async def _dispatch_update(
             await handle_vote_chat_destination_callback(
                 api, cfg, callback, vote_chat_flows, bot_username, log=log,
             )
+        elif callback_data.startswith(f"{pets_ui.CALLBACK_PREFIX}:"):
+            # The pet menu. No chat resolution in the argument list: every button carries
+            # its owner's id, and the member lookup happens inside, AFTER the spinner is
+            # stopped.
+            await handle_pets_callback(
+                api, telethon_client, cfg, tz, callback,
+                _stats_entry_for(callback.get("message", {}).get("chat", {}), None, home_chat_ref),
+                pets_flows, background_tasks, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_RESULT_CALLBACK_PREFIX}:"):
             # No chat resolution here either: the draft already carries the main chat's id
             # (resolved when the vote was closed), so pressing Отправить never waits on the
@@ -5626,9 +6278,19 @@ async def _dispatch_update(
         if chat.get("type") != "private":
             return
         start_payload = (start_match.group(1) or "").lower()
-        # The arena's own deep link, from the url button a group /arena leaves behind
-        # (a web_app button is private-chat only, exactly as for v1).
-        if start_payload == "arena":
+        # The arena's own deep link, from the url button a group /vote2 leaves behind
+        # (a web_app button is private-chat only, exactly as for v1). "arena" is still
+        # accepted because announcements posted before the command was renamed are still
+        # sitting in the group with that payload baked into their button.
+        if start_payload == "pets":
+            pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+            if pets_entry is not None:
+                await handle_pets_command(
+                    api, telethon_client, cfg, tz, message, pets_entry, bot_username,
+                    background_tasks, pets_flows, log=log,
+                )
+            return
+        if start_payload in ("vote2", "arena"):
             await handle_arena_command(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
@@ -5848,6 +6510,13 @@ async def _dispatch_update(
     ):
         return
 
+    # Before any command match: a creature's name is free text and could easily be
+    # something starting with a slash.
+    if await maybe_handle_pets_flow_message(
+        api, telethon_client, tz, message, pets_flows, log=log
+    ):
+        return
+
     text_lower = message_text.lower()
 
     # Shop and wallet commands (see economy.py). Same chat gating as /stat: they read and
@@ -5868,9 +6537,55 @@ async def _dispatch_update(
         task.add_done_callback(background_tasks.discard)
         return
 
-    # "/arena" / "/арена" / "/vote2" -- the second voting system. Checked BEFORE /vote so
+    # "/vote2" -- the second voting system. Checked BEFORE /vote so
     # "/vote2" reaches the arena rather than being swallowed by "/vote"'s prefix match and
     # opening v1's ballot with a stray "2" as its argument.
+    # "/arena" -- the pet game. Nothing to do with ARENA_COMMANDS below, which is the
+    # voting system that used to answer to this word and now answers to "/vote2".
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in PETS_COMMANDS
+    ):
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_pets_command(
+            api, telethon_client, cfg, tz, message, pets_entry, bot_username,
+            background_tasks, pets_flows, log=log,
+        )
+        return
+
+    # "/pet" works in the group as well as the DM -- it is the one screen meant to be
+    # shown off.
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in PET_CARD_COMMANDS
+    ):
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_pet_card_command(
+            api, telethon_client, tz, message, pets_entry, command_text,
+            background_tasks, log=log,
+        )
+        return
+
+    # "/переименовать <имя>" -- the same rename the pet menu's button does, for somebody
+    # who would rather type it. DM-only, like the rest of the menu.
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in PETS_RENAME_COMMANDS
+    ):
+        if chat.get("type") != "private":
+            return
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_pets_rename_command(
+            api, telethon_client, tz, message, pets_entry, command_text, log=log,
+        )
+        return
+
     if any(command_text.lower().startswith(c) for c in ARENA_COMMANDS):
         arena_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
         if arena_entry is None:
@@ -6160,6 +6875,10 @@ async def run_bot_listener(
     # produced, not when it is posted -- so losing this on a restart costs the admin their
     # wording and one "подведи итоги" again, never the week's result.
     vote_result_flows: dict[str, dict] = {}
+    # Short-lived taming/renaming prompts for the pet game. Everything a creature IS lives
+    # on disk (pets.py); only the half-finished "send me a photo, now send me a name"
+    # conversation is here, so losing it on a restart costs one re-press.
+    pets_flows: dict[str, dict] = {}
     # Last time the fallback menu was sent per DM chat_id, so a burst of messages
     # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
     menu_last_sent: dict[int, float] = {}
@@ -6214,7 +6933,7 @@ async def run_bot_listener(
                             known_chat_ids, badge_flows,
                             cabinet_flows, menu_last_sent,
                             button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows,
-                            vote_result_flows=vote_result_flows, log=log,
+                            vote_result_flows=vote_result_flows, pets_flows=pets_flows, log=log,
                         ),
                         update.get("update_id"),
                         log=log,

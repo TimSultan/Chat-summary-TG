@@ -283,12 +283,12 @@ class ArenaAnnouncementTests(unittest.TestCase):
         self.assertEqual(posted["text"], "Открылась арена")
         button = posted["reply_markup"]["inline_keyboard"][0][0]
         self.assertEqual(button["text"], bot_listener.ARENA_OPEN_BUTTON_TEXT)
-        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=arena")
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=vote2")
 
     def test_a_v1_short_name_does_not_hijack_the_arenas_button(self):
         api = self._tap("main", {"f1": self._arena_flow()}, cfg=_cfg(short_name="vote"))
         button = api.posts_to(MAIN_CHAT_ID)[0]["reply_markup"]["inline_keyboard"][0][0]
-        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=arena")
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=vote2")
 
     def test_it_reaches_both_groups_like_v1s_does(self):
         api = self._tap("both", {"f1": self._arena_flow()})

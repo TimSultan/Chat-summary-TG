@@ -1,4 +1,4 @@
-"""What "/arena" puts in front of whoever typed it.
+"""What "/vote2" puts in front of whoever typed it.
 
 The gate itself (_can_manage_chat) has its own tests elsewhere and is stubbed here; what
 these pin is the consequence of its answer -- an administrator gets the control panel, and
@@ -56,7 +56,7 @@ class FakeApi:
         pass
 
 
-def _message(user, text="/arena", chat_type="private"):
+def _message(user, text="/vote2", chat_type="private"):
     return {
         "message_id": 5,
         "chat": {"id": DM_CHAT_ID if chat_type == "private" else MAIN_CHAT_ID, "type": chat_type},
@@ -90,7 +90,7 @@ class ArenaPanelTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.addCleanup(self._temporary.cleanup)
 
-    def _type(self, user, manager, text="/arena", chat_type="private", flows=None):
+    def _type(self, user, manager, text="/vote2", chat_type="private", flows=None):
         api = FakeApi()
         with patch.object(bot_listener, "_can_manage_chat", _Manager(manager)), \
                 patch.object(bot_listener, "_resolve_chat_id", _resolves):
@@ -149,27 +149,27 @@ class ArenaPanelTests(unittest.TestCase):
 
     def test_in_a_group_everybody_gets_the_same_deep_link_and_nothing_else(self):
         """A web_app button is private-chat only, so a group can only carry the url -- and
-        an administrator typing /arena in the group is not in their DM, so they get no
+        an administrator typing /vote2 in the group is not in their DM, so they get no
         panel there either."""
         for user, manager in ((VOTER, False), (ADMIN, True)):
             api = self._type(user, manager=manager, chat_type="group")
             buttons = _buttons(api.sent[0])
             self.assertEqual(len(buttons), 1)
-            self.assertEqual(buttons[0]["url"], f"https://t.me/{BOT}?start=arena")
+            self.assertEqual(buttons[0]["url"], f"https://t.me/{BOT}?start=vote2")
             self.assertNotIn("web_app", buttons[0])
 
     def test_an_admin_only_subcommand_from_a_voter_is_refused(self):
-        for text in ("/arena собрать", "/arena итоги", "/arena chat", "/arena очистить"):
+        for text in ("/vote2 собрать", "/vote2 итоги", "/vote2 chat", "/vote2 очистить"):
             api = self._type(VOTER, manager=False, text=text, flows={})
             self.assertIn("администратор", api.sent[0]["text"], text)
 
     def test_an_admin_only_subcommand_in_a_group_is_sent_to_the_dm(self):
-        api = self._type(ADMIN, manager=True, text="/arena chat", chat_type="group", flows={})
+        api = self._type(ADMIN, manager=True, text="/vote2 chat", chat_type="group", flows={})
         self.assertIn("только в личке", api.sent[0]["text"])
 
 
 class ArenaAnnouncementDraftTests(unittest.TestCase):
-    """"/arena chat" opens the same composer "/vote chat" does -- tagged so the button it
+    """"/vote2 chat" opens the same composer "/vote chat" does -- tagged so the button it
     finally posts leads to the arena and not to v1."""
 
     def setUp(self):
@@ -191,7 +191,7 @@ class ArenaAnnouncementDraftTests(unittest.TestCase):
         return api, flows
 
     def test_the_draft_is_parked_tagged_as_the_arenas(self):
-        api, flows = self._draft("/arena chat")
+        api, flows = self._draft("/vote2 chat")
         self.assertTrue(api.sent[0]["reply_markup"]["force_reply"])
         self.assertIn("объявлении об арене", api.sent[0]["text"])
         flow = next(iter(flows.values()))
@@ -200,14 +200,14 @@ class ArenaAnnouncementDraftTests(unittest.TestCase):
         self.assertEqual(flow["prompt_message_id"], api.sent[0]["message_id"])
 
     def test_every_spelling_of_the_subcommand_opens_it(self):
-        for command in ("/arena chat", "/arena объявление", "/arena announce"):
+        for command in ("/vote2 chat", "/vote2 объявление", "/vote2 announce"):
             _, flows = self._draft(command)
             self.assertEqual(len(flows), 1, command)
 
     def test_starting_a_second_draft_abandons_the_first(self):
-        _, flows = self._draft("/arena chat")
+        _, flows = self._draft("/vote2 chat")
         first = next(iter(flows))
-        self._draft("/arena chat", flows=flows)
+        self._draft("/vote2 chat", flows=flows)
         self.assertEqual(len(flows), 1)
         self.assertNotIn(first, flows)
 
@@ -219,7 +219,7 @@ class ArenaAnnouncementDraftTests(unittest.TestCase):
             "system": "vote", "admin_chat_id": MAIN_CHAT_ID, "prompt_message_id": 3,
             "created_at": 0.0,
         }}
-        self._draft("/arena chat", flows=flows)
+        self._draft("/vote2 chat", flows=flows)
         self.assertEqual(len(flows), 1)
         self.assertEqual(next(iter(flows.values()))["system"], "arena")
 
@@ -228,7 +228,7 @@ class AnnouncementButtonTests(unittest.TestCase):
     def test_the_arenas_button_leads_to_the_arena(self):
         button = bot_listener._announce_button(_cfg(), BOT, "arena")
         self.assertEqual(button["text"], bot_listener.ARENA_OPEN_BUTTON_TEXT)
-        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=arena")
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=vote2")
 
     def test_a_v1_mini_app_short_name_never_leaks_into_the_arenas_button(self):
         """VOTE_MINIAPP_SHORT_NAME is registered against v1's page in BotFather. Reusing it
@@ -237,7 +237,7 @@ class AnnouncementButtonTests(unittest.TestCase):
         cfg.vote_miniapp_short_name = "vote"
         self.assertEqual(
             bot_listener._announce_button(cfg, BOT, "arena")["url"],
-            f"https://t.me/{BOT}?start=arena",
+            f"https://t.me/{BOT}?start=vote2",
         )
 
     def test_an_untagged_flow_still_means_v1(self):

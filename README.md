@@ -792,13 +792,13 @@ by default — an `@username` is all Telegram's `sendMessage` needs, so no numer
 is involved) and `VOTE_MINIAPP_SHORT_NAME` (BotFather's `/newapp` short name, which has to
 be created by hand once, pointing at `WEBAPP_PUBLIC_URL` + `/vote`).
 
-### `/arena` — the second voting system (v2), running beside the first
+### `/vote2` — the second voting system (v2), running beside the first
 
 A **separate** system, not a replacement: `/vote` keeps working exactly as it did, and both
 can run in the same week. Instead of a grid where you tick favourites, the arena shows
 **two works at a time** and asks which is better — ten duels per voter by default.
 `arena_core.py` (pure logic), `arena.py` (storage and session rules), `arena_web.py` (its
-own Mini App at `/arena`, mounted onto the same server v1 uses via
+own Mini App at the `/arena` route, mounted onto the same server v1 uses via
 `create_app(..., attach=...)`).
 
 There is **no "Ничья" button**: it made not choosing the easiest answer on the screen, and a
@@ -815,7 +815,7 @@ is the code**. There are no codes to hand out or lose.
 **Ranking is Bradley-Terry**, fitted by MM iteration and reported on the chess scale (1500
 is the field average, +400 ≈ ten times more likely to win). A win counts for more when the
 opponent is strong, so the table can rank two works that were never shown against each
-other, and every row carries a **margin** — roughly one standard error. `/arena итоги` says
+other, and every row carries a **margin** — roughly one standard error. `/vote2 итоги` says
 outright when first and second are not separated by more than noise, because a rating
 without its error bar invites reading a 12-point gap as a result. The fit is
 **order-independent by construction**: it refits from the whole vote table every time, so
@@ -853,14 +853,19 @@ administrators-only `/api/standings` and opens only once *your own* ballot is cl
 running ranking in front of an unfinished voter is exactly the bias the pairing exists to
 avoid, but behind a closed ballot it can no longer reach any of their picks.
 
-Commands mirror `/vote` so knowing one is knowing the other — `/arena` (duels, plus a
-status panel for an administrator), `/arena выбрать` (moderation: admit works, pairs per
-voter, pairing mode, open/closed), `/arena собрать` (scan `#итогинедели` into the arena's
-**own** store and media), `/arena chat` (draft an announcement for the group), `/arena итоги`
-(the table), `/arena очистить` (delete the arena and nothing else). `/vote2` and `/арена` are
-accepted spellings.
+Commands mirror `/vote` so knowing one is knowing the other — `/vote2` (duels, plus a
+status panel for an administrator), `/vote2 выбрать` (moderation: admit works, pairs per
+voter, pairing mode, open/closed), `/vote2 собрать` (scan `#итогинедели` into the arena's
+**own** store and media), `/vote2 chat` (draft an announcement for the group), `/vote2 итоги`
+(the table), `/vote2 очистить` (delete the arena and nothing else). `/голосование2` is
+accepted too.
 
-**What a plain voter sees is one button.** Bare `/arena` in a DM gives an administrator the
+**This used to be `/arena`,** and that word now belongs to the pet game below. The voting
+system underneath is unchanged — only re-spelled. Announcements already sitting in the
+group carry a `?start=arena` deep link, so that payload still opens *this*: a button in a
+message must not start opening a different feature than the text around it describes.
+
+**What a plain voter sees is one button.** Bare `/vote2` in a DM gives an administrator the
 status panel — standings, «Открыть арену», «Модерация», «Собрать», «Взять из v1»,
 «Объявление», «Рейтинг», «Очистить» — and gives everybody else «Открыть арену» and nothing
 else: no callback buttons, no `?mode=admin` link, not even the top three from the status
@@ -873,7 +878,7 @@ Administrator here means a Telegram admin of the home chat, a runtime delegate, 
 group, everybody (administrators included) gets the same `?start=arena` deep link, since a
 `web_app` button is private-chat only.
 
-`/arena chat` reuses **v1's announcement composer** rather than growing a second one: the
+`/vote2 chat` reuses **v1's announcement composer** rather than growing a second one: the
 draft is parked in the same `vote_chat_flows` dict, tagged `system: "arena"`, and only the
 button on the finished post differs (`_announce_button`). One pending draft per admin across
 both systems — they share the force-reply convention, so two live drafts would both be
@@ -884,12 +889,72 @@ Direct Link short name is registered against one url in BotFather, and that one 
 **What the two systems share is a process, a port, the admin/membership checks and the
 announcement composer.**
 Separate directory (`DATA_DIR/arena`), separate files, separate photos, separate
-moderation, separate commands. `/arena импорт` is the only bridge and it runs one way, on
+moderation, separate commands. `/vote2 импорт` is the only bridge and it runs one way, on
 demand, **by copying**: it takes the works v1 has *admitted* into the arena (with their
 photos), leaves v1's poll untouched, and they arrive **unadmitted** — this system moderates
 for itself, and inheriting an admit decision made for a different vote is exactly the quiet
 coupling that turns two systems into one. Clearing either one leaves the other whole;
 there are tests for both directions.
+
+### `/arena` — the pet game
+
+A creature you buy, name, dress and level up, and send at other people's creatures. The
+third game in the bot and the first one that spends coins on something **permanent** —
+which is also why it exists: `economy.py` notes that with one rentable title as the only
+drain, balances only ever grew. This is the sink.
+
+**It spends the same coins `/stat` and `/shop` show, not a second currency.** That is the
+whole reason chat activity funds the game rather than sitting beside it.
+
+The loop is: buy a **клетка** (100), **приручить** a creature by sending a photo and a name
+(100), spend coins on **Сила / Здоровье / Ловкость / Удача** (1–80 each), buy **оружие,
+амулет, перчатки, сапоги**, then fight — five duels a day, opponent drawn at random from
+creatures within ±3 levels. A win pays 30–60 coins and XP; the loser **loses nothing**. Each
+creature level gives **+1 to every stat**, on top of whatever was bought.
+
+`/pet` prints the card — photo, level, stats, gear, fights and wins — and works **in the
+group as well as the DM**, since it is the one screen meant to be shown off. `/arena` itself
+is DM-only: every button on it spends the presser's coins, and a menu posted in the group
+would put one member's wallet in front of 190 people.
+
+**The fight is the point, and the fight is written out.** Every blow is a line from a bank
+of ~240 variants — dodges where the creature is distracted by a butterfly, crits it did not
+see coming, blocks the armour ate. Those lines are the deliverable, so they carry two rules
+the tests enforce: **no emoji** (the persona voice), and **no grammatical gender** — names
+are user-supplied, so every template is written to read correctly whatever it is handed.
+Numerals are the same trap: `92 очков` is wrong Russian, so a damage figure may only be
+followed by a word that does not decline.
+
+The maths lives in **one file**, `pets_config.py`, and nothing is duplicated out of it:
+
+```text
+cost(L -> L+1) = round(STAT_COST_BASE * L ** STAT_COST_EXPONENT)   # 1 coin -> 189
+HP             = BASE_HP     + health   * HP_PER_POINT   * dominance
+damage         = BASE_DAMAGE + strength * DAMAGE_PER_POINT * dominance
+dodge/crit/armor = MAX * stat / (stat + K)                          # saturating, never 100%
+```
+
+Saturating curves rather than linear ones, because a linear chance either does nothing at
+level 5 or hits 100% long before level 80. The **dominance bonus** is the asked-for rule: a
+stat 30% above the opponent's gives 30% more — compared per stat, once, at the start, and
+applied **only to the stat-derived part**, since `BASE_HP` and `BASE_DAMAGE` are a floor
+everybody gets rather than a reward for out-scaling somebody.
+
+Tuned against the chat's **measured** earn rate (60–233 coins/week for the most active,
+~55 at p90), so three stats to level 80 is ~20,700 coins ≈ five months of playing daily,
+and a stat to 40 is inside a fortnight. Fights stay **6–12 rounds at every level** — measured
+medians 11/8/7 at levels 1/40/80 — because a longer log stops being read.
+
+Adding an item is appending one `Item(...)` to `ITEMS`; there is no slot logic, stat
+plumbing or migration to touch. Retuning the economy is editing constants and nothing else.
+**[`PETS_BALANCE.md`](PETS_BALANCE.md)** has the full tables, the reasoning, and the honest
+list of what is still wrong — starting with the fact that the arena is ~85% of the faucet,
+so a member who never writes earns nearly as much as one who does.
+
+Split the way `cabinet.py` and `poker.py` already are: `pets_config.py` (numbers),
+`pets.py` (state, storage, wallet), `pets_combat.py` (the fight, deterministic given a
+seed), `pets_flavor.py` (the jokes), `pets_ui.py` (every screen as a pure
+`(text, keyboard)`), and only Telegram I/O in `bot_listener.py`.
 
 ### Coins, the shop, and anti-farming
 

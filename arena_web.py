@@ -1212,7 +1212,7 @@ async function load() {
     if (!state.tournament_id) {
       $("sub").textContent = "";
       $("msg").hidden = false;
-      $("msg").textContent = "Арена ещё не создана. Собери работы: /arena собрать";
+      $("msg").textContent = "Арена ещё не создана. Собери работы: /vote2 собрать";
       $("go").hidden = true;
       return;
     }
@@ -1250,7 +1250,7 @@ async function load() {
       return;
     }
     $("go").hidden = true;
-    if (state.can_moderate) $("sub").textContent = "модерация: /arena выбрать";
+    if (state.can_moderate) $("sub").textContent = "модерация: /vote2 выбрать";
     // Somebody coming back to a ballot they already closed is told so, and shown the top of
     // the table -- asked for a session they would get a 409 and read it as a fault.
     if (state.ballot && state.ballot.status === "done") {
