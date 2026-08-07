@@ -5516,6 +5516,8 @@ PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
 GROUP_PETS_DELETE_AFTER = 30
 DUEL_RESULT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
+DUEL_TARGET_FLOW_TTL_SECONDS = GROUP_PETS_DELETE_AFTER
+DUEL_TARGET_INVALID_DELETE_AFTER = 5
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5732,7 +5734,8 @@ async def handle_pet_card_command(
 
 async def handle_duel_command(
     api: TelegramBotAPI, telethon_client, tz, message: dict, entry: str, command_text: str,
-    bot_username: str | None, background_tasks: set, log=print,
+    bot_username: str | None, background_tasks: set, pets_flows: dict | None = None, log=print,
+    target_from_followup: bool = False,
 ) -> None:
     """Run a public duel. The challenger alone spends a duel use and cooldown."""
     chat = message["chat"]
@@ -5773,11 +5776,27 @@ async def handle_duel_command(
                 )
 
     if not argument:
-        await notice(
-            "Укажи соперника: /duel @user.",
-            delete_after=DUEL_TARGET_PROMPT_DELETE_AFTER,
-            trigger_delete_after=None,
+        username = actor.get("username")
+        challenger_name = f"@{username}" if username else html.escape(_display_name(actor))
+        prompt = await api.send_message(
+            chat_id, f"{challenger_name}, на кого нападаем?",
+            reply_to_message_id=message["message_id"], parse_mode="HTML",
         )
+        if pets_flows is not None and prompt and "message_id" in prompt:
+            pets_flows[uuid.uuid4().hex[:10]] = {
+                "awaiting": "duel_target",
+                "chat_id": chat_id,
+                "user_id": actor.get("id"),
+                "entry": entry,
+                "command_message_id": message["message_id"],
+                "prompt_message_id": prompt["message_id"],
+                "created_at": time.monotonic(),
+            }
+        if prompt and "message_id" in prompt:
+            schedule_bot_delete(
+                api, chat_id, [prompt["message_id"]], DUEL_TARGET_PROMPT_DELETE_AFTER,
+                log, background_tasks,
+            )
         return
     challenger, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
     if challenger is None:
@@ -5790,10 +5809,16 @@ async def handle_duel_command(
         )
     except Exception:
         log(f"[pets] failed to resolve duel target:\n{traceback.format_exc()}")
-        await notice("Не удалось найти соперника.")
+        await notice(
+            "Пользователь не найден." if target_from_followup else "Не удалось найти соперника.",
+            delete_after=DUEL_TARGET_INVALID_DELETE_AFTER if target_from_followup else GROUP_PETS_DELETE_AFTER,
+        )
         return
     if target is None:
-        await notice("Не нашёл такого участника.")
+        await notice(
+            "Пользователь не найден." if target_from_followup else "Не нашёл такого участника.",
+            delete_after=DUEL_TARGET_INVALID_DELETE_AFTER if target_from_followup else GROUP_PETS_DELETE_AFTER,
+        )
         return
     if str(target.user_id) == str(challenger.user_id):
         await notice("С собой дуэлиться нельзя.")
@@ -6263,6 +6288,8 @@ async def maybe_handle_pets_flow_message(
     tz,
     message: dict,
     pets_flows: dict,
+    bot_username: str | None = None,
+    background_tasks: set | None = None,
     log=print,
 ) -> bool:
     """The photo or the name a pet flow is waiting for. True when this message was one.
@@ -6272,6 +6299,47 @@ async def maybe_handle_pets_flow_message(
     """
     chat_id = message["chat"]["id"]
     actor = message.get("from") or {}
+    duel_pair = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in pets_flows.items()
+            if flow.get("awaiting") == "duel_target"
+            and flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and time.monotonic() - flow["created_at"] <= DUEL_TARGET_FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if duel_pair is not None:
+        flow_id, flow = duel_pair
+        pets_flows.pop(flow_id, None)
+        target = (message.get("text") or "").strip()
+        cleanup_ids = [
+            flow.get("command_message_id"), flow.get("prompt_message_id"), message.get("message_id"),
+        ]
+        cleanup_ids = [message_id for message_id in cleanup_ids if message_id is not None]
+        if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", target):
+            sent = await api.send_message(
+                chat_id, "Пользователь не найден.",
+                reply_to_message_id=message["message_id"], parse_mode=None,
+            )
+            if sent and "message_id" in sent:
+                cleanup_ids.append(sent["message_id"])
+            schedule_bot_delete(
+                api, chat_id, cleanup_ids, DUEL_TARGET_INVALID_DELETE_AFTER, log,
+                background_tasks if background_tasks is not None else set(),
+            )
+            return True
+
+        for message_id in cleanup_ids:
+            await api.delete_message(chat_id, message_id)
+        await handle_duel_command(
+            api, telethon_client, tz, message, flow["entry"], f"/duel {target}",
+            bot_username, background_tasks if background_tasks is not None else set(),
+            pets_flows=pets_flows, log=log, target_from_followup=True,
+        )
+        return True
+
     replied_message_id = (message.get("reply_to_message") or {}).get("message_id")
     pair = next(
         (
@@ -6746,7 +6814,8 @@ async def _dispatch_update(
     # Before any command match: a creature's name is free text and could easily be
     # something starting with a slash.
     if await maybe_handle_pets_flow_message(
-        api, telethon_client, tz, message, pets_flows, log=log
+        api, telethon_client, tz, message, pets_flows,
+        bot_username=bot_username, background_tasks=background_tasks, log=log,
     ):
         return
 
@@ -6812,7 +6881,7 @@ async def _dispatch_update(
             return
         await handle_duel_command(
             api, telethon_client, tz, message, pets_entry, command_text, bot_username,
-            background_tasks, log=log,
+            background_tasks, pets_flows=pets_flows, log=log,
         )
         return
 

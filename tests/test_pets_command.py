@@ -44,6 +44,7 @@ class FakeApi:
         self.photos = []
         self.photo_files = []
         self.answered = []
+        self.deleted = []
         # Every call is appended here in order, which is how the "answer the tap first"
         # test can assert on ORDERING rather than just on the fact that both happened.
         self.calls = []
@@ -83,6 +84,9 @@ class FakeApi:
     async def answer_callback_query(self, callback_id, text=None):
         self.calls.append("answer_callback_query")
         self.answered.append(text)
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
 
 
 class _Resolver:
@@ -348,6 +352,77 @@ class PetsCommandTests(unittest.TestCase):
             CHAT, PLAYER["id"], "43", RICH_XP, rerolls_used=C.MAX_OPPONENT_REROLLS,
         )
         self.assertFalse(any(b["text"].startswith("🔍") for b in _buttons({"reply_markup": capped})))
+
+    def test_bare_group_duel_starts_a_target_flow(self):
+        api = FakeApi()
+        flows = {}
+
+        _run(bot_listener.handle_duel_command(
+            api, None, None, _message(PLAYER, "/duel", "group"), CHAT,
+            "/duel", BOT, set(), pets_flows=flows, log=lambda *_: None,
+        ))
+
+        self.assertEqual(api.sent[0]["text"], "@player, на кого нападаем?")
+        flow = next(iter(flows.values()))
+        self.assertEqual(flow["awaiting"], "duel_target")
+        self.assertEqual(flow["command_message_id"], 5)
+        self.assertEqual(flow["prompt_message_id"], api.sent[0]["message_id"])
+
+    def test_invalid_duel_target_is_removed_with_the_prompt_after_five_seconds(self):
+        api = FakeApi()
+        flows = {
+            "duel": {
+                "awaiting": "duel_target", "chat_id": MAIN_CHAT_ID,
+                "user_id": PLAYER["id"], "entry": CHAT,
+                "command_message_id": 5, "prompt_message_id": 100,
+                "created_at": 0,
+            },
+        }
+        reply = _message(PLAYER, "not a user", "group")
+        reply["message_id"] = 6
+        deletions = []
+
+        with patch.object(
+            bot_listener, "schedule_bot_delete",
+            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
+        ), patch.object(bot_listener.time, "monotonic", return_value=1):
+            handled = _run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, reply, flows, BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertTrue(handled)
+        self.assertEqual(flows, {})
+        self.assertEqual(api.sent[-1]["text"], "Пользователь не найден.")
+        self.assertEqual(deletions[0][0][3], bot_listener.DUEL_TARGET_INVALID_DELETE_AFTER)
+        self.assertEqual(set(deletions[0][0][2]), {5, 6, 100, 101})
+
+    def test_valid_duel_target_deletes_the_exchange_before_starting_the_duel(self):
+        api = FakeApi()
+        flows = {
+            "duel": {
+                "awaiting": "duel_target", "chat_id": MAIN_CHAT_ID,
+                "user_id": PLAYER["id"], "entry": CHAT,
+                "command_message_id": 5, "prompt_message_id": 100,
+                "created_at": 0,
+            },
+        }
+        reply = _message(PLAYER, "@bob", "group")
+        reply["message_id"] = 6
+        started = []
+
+        async def start_duel(*args, **kwargs):
+            started.append((args, kwargs))
+
+        with patch.object(bot_listener.time, "monotonic", return_value=1), \
+                patch.object(bot_listener, "handle_duel_command", side_effect=start_duel):
+            handled = _run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, reply, flows, BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertTrue(handled)
+        self.assertEqual(api.deleted, [(MAIN_CHAT_ID, 5), (MAIN_CHAT_ID, 100), (MAIN_CHAT_ID, 6)])
+        self.assertEqual(started[0][0][5], "/duel @bob")
+        self.assertTrue(started[0][1]["target_from_followup"])
 
     def test_group_duel_posts_a_result_image_and_keeps_copies_for_both_players(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
