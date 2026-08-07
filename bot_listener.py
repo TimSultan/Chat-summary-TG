@@ -6066,14 +6066,6 @@ async def handle_pets_callback(
             )
             return
 
-        if action == "retaliate":
-            await _pets_run_fight(
-                api, chat_id, message_id, entry, user_id, argument, xp, log,
-                enforce_arena_target_limit=False, consume_daily_fight=False,
-                attacker_username=actor.get("username"),
-            )
-            return
-
         # --- plain redraws -------------------------------------------------------------
         views = {
             "main": lambda: pets_ui.main_view(entry, user_id, xp),
@@ -6117,7 +6109,7 @@ async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
     include_keyboard: bool = True, persistent_recipient_ids=None,
-    enforce_arena_target_limit: bool = True, consume_daily_fight: bool = True,
+    enforce_arena_target_limit: bool = True,
     attacker_username: str | None = None, group_no_fights_notice: bool = False,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
@@ -6144,7 +6136,7 @@ async def _pets_run_fight(
             message_id=message_id, log=log,
         )
         return
-    if consume_daily_fight and pets.fights_left(entry, user_id, pets.today()) <= 0:
+    if pets.fights_left(entry, user_id, pets.today()) <= 0:
         if group_no_fights_notice:
             sent = await api.send_message(
                 chat_id, DUEL_NO_FIGHTS_GROUP_NOTICE, reply_to_message_id=message_id,
@@ -6178,7 +6170,7 @@ async def _pets_run_fight(
     }
     reward = pets.record_fight(
         entry, user_id, opponent_id, result, pets.today(), attacker_xp=xp,
-        combat_snapshot=combat_snapshot, consume_daily_fight=consume_daily_fight,
+        combat_snapshot=combat_snapshot,
     )
     report = pets_ui.fight_report(
         result, str(user_id),
@@ -6240,10 +6232,6 @@ async def _pets_run_fight(
                     await api.send_photo_file(
                         recipient_id, image_path,
                         caption=defender_report if str(recipient_id) == str(opponent_id) else report,
-                        reply_markup=(
-                            pets_ui.attacked_report_keyboard(opponent_id, user_id)
-                            if str(recipient_id) == str(opponent_id) else None
-                        ),
                         parse_mode="HTML",
                     )
                 except Exception:

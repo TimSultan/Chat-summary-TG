@@ -671,7 +671,6 @@ def opponent_cycle(entry, user_id, seed: int) -> list[str]:
 
 def record_fight(
     entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
-    consume_daily_fight: bool = True,
 ) -> dict:
     data = _load(entry)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
@@ -681,9 +680,8 @@ def record_fight(
     # Only the attacker spends a daily fight. The defender did not choose this fight, so
     # it must not come out of the budget they earned by chatting -- the loss penalty below
     # is the only thing a defender can be made to pay.
-    if consume_daily_fight:
-        _reset_if_new_day(attacker, today)
-        attacker["fights_today"] = attacker.get("fights_today", 0) + 1
+    _reset_if_new_day(attacker, today)
+    attacker["fights_today"] = attacker.get("fights_today", 0) + 1
     attacker["fights"] = attacker.get("fights", 0) + 1
     defender["fights"] = defender.get("fights", 0) + 1
 

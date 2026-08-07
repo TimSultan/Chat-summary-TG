@@ -561,17 +561,6 @@ def fight_report_keyboard(user_id) -> dict:
     ]}
 
 
-def attacked_report_keyboard(user_id, attacker_id) -> dict:
-    return {"inline_keyboard": [
-        [{
-            "text": "⚔️ Напасть в ответ",
-            "callback_data": callback_data(user_id, "retaliate", str(attacker_id)),
-        }],
-        [{"text": "⚔️ Ещё бой", "callback_data": callback_data(user_id, "search")}],
-        _back_row(user_id),
-    ]}
-
-
 # -------------------------------------------------------------------------- history
 
 

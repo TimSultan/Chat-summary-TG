@@ -337,8 +337,7 @@ class PetsCommandTests(unittest.TestCase):
         defender_copy = api.photo_files[1]
         self.assertEqual(defender_copy["chat_id"], 43)
         self.assertIn("Вас атаковал Player", defender_copy["caption"])
-        retaliation = next(button for button in _buttons(defender_copy) if button["text"] == "⚔️ Напасть в ответ")
-        self.assertEqual(pets_ui.parse_callback(retaliation["callback_data"]), ("43", "retaliate", "42"))
+        self.assertIsNone(defender_copy["reply_markup"])
 
     def test_opponent_rerolls_are_limited_to_three(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -454,9 +453,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.sent, [])
         defender_copy = api.photo_files[-1]
         self.assertIn("Вас атаковал @player", defender_copy["caption"])
-        self.assertTrue(any(
-            button["text"] == "⚔️ Напасть в ответ" for button in _buttons(defender_copy)
-        ))
+        self.assertIsNone(defender_copy["reply_markup"])
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
     def test_exhausted_group_duel_sends_arena_to_dm_and_short_notice_to_group(self):
