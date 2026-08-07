@@ -563,8 +563,9 @@ def fight_report_keyboard(user_id) -> dict:
 
 
 def group_fight_result_view(
-    result, attacker_id: str, attacker_name: str, defender_name: str, reward: dict, arena_url: str,
-) -> tuple[str, dict]:
+    result, attacker_id: str, attacker_name: str, defender_name: str, reward: dict,
+    arena_url: str | None,
+) -> tuple[str, dict | None]:
     """One-line public result; detailed receipts stay with the two fighters in private."""
     if result.is_draw:
         text = f"🤝 <b>{escape(attacker_name)} и {escape(defender_name)} сыграли вничью.</b>"
@@ -578,7 +579,8 @@ def group_fight_result_view(
             f"🏆 <b>{escape(pets_flavor.public_result_line(winner_name))}</b>\n"
             f"🪙 +{_coins(winner_reward.get('gold', 0))}  ✨ +{winner_reward.get('xp', 0)} опыта"
         )
-    return text, {"inline_keyboard": [[{"text": "⚔️ Открыть арену", "url": arena_url}]]}
+    keyboard = {"inline_keyboard": [[{"text": "⚔️ Открыть арену", "url": arena_url}]]} if arena_url else None
+    return text, keyboard
 
 
 # -------------------------------------------------------------------------- history

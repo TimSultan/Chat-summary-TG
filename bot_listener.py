@@ -5793,6 +5793,8 @@ async def handle_pets_callback(
     entry: str | None,
     pets_flows: dict,
     background_tasks: set,
+    bot_username: str | None = None,
+    known_chat_ids: dict[str, int] | None = None,
     log=print,
 ) -> None:
     """Every button in the pet menu.
@@ -5943,9 +5945,22 @@ async def handle_pets_callback(
             return
 
         if action == "attack":
+            result_chat_id = chat_id
+            if (message.get("chat") or {}).get("type") == "private":
+                result_chat_id = await _resolve_chat_id(
+                    telethon_client, entry, known_chat_ids if known_chat_ids is not None else {}, log=log,
+                )
+            if result_chat_id is None:
+                result_chat_id = chat_id
             await _pets_run_fight(
-                api, chat_id, message_id, entry, user_id, argument, xp, log,
+                api, result_chat_id, message_id, entry, user_id, argument, xp, log,
                 attacker_username=actor.get("username"),
+                background_tasks=background_tasks,
+                delete_after=DUEL_RESULT_DELETE_AFTER if result_chat_id != chat_id else None,
+                persistent_recipient_ids=(user_id, argument),
+                group_result=result_chat_id != chat_id,
+                arena_url=(f"https://t.me/{bot_username}?start=pets" if bot_username else None),
+                delete_trigger=result_chat_id == chat_id,
             )
             return
 
@@ -5995,6 +6010,7 @@ async def _pets_run_fight(
     enforce_arena_target_limit: bool = True,
     attacker_username: str | None = None, group_no_fights_notice: bool = False,
     group_result: bool = False, arena_url: str | None = None,
+    delete_trigger: bool = True,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6081,7 +6097,7 @@ async def _pets_run_fight(
         )
     )
     group_report = None
-    if group_result and arena_url:
+    if group_result:
         group_report = pets_ui.group_fight_result_view(
             result, str(user_id), mine.get("name") or "Существо",
             theirs.get("name") or "Существо", reward, arena_url,
@@ -6117,7 +6133,7 @@ async def _pets_run_fight(
         if delete_after and background_tasks and sent and "message_id" in sent:
             schedule_bot_delete(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
-                trigger_message_id=message_id,
+                trigger_message_id=message_id if delete_trigger else None,
             )
     finally:
         if image_path is not None:
@@ -6501,7 +6517,8 @@ async def _dispatch_update(
             await handle_pets_callback(
                 api, telethon_client, cfg, tz, callback,
                 _stats_entry_for(callback.get("message", {}).get("chat", {}), None, home_chat_ref),
-                pets_flows, background_tasks, log=log,
+                pets_flows, background_tasks, bot_username=bot_username,
+                known_chat_ids=known_chat_ids, log=log,
             )
         elif callback_data.startswith(f"{VOTE_RESULT_CALLBACK_PREFIX}:"):
             # No chat resolution here either: the draft already carries the main chat's id

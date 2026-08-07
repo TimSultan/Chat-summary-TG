@@ -342,6 +342,36 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(api.photo_files[0]["disable_notification"])
         self.assertTrue(defender_copy["disable_notification"])
 
+    def test_private_arena_attack_posts_the_public_result_to_the_group(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+        deletions = []
+
+        async def resolve_group(*args, **kwargs):
+            return MAIN_CHAT_ID
+
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)), patch.object(
+            bot_listener, "_resolve_chat_id", resolve_group,
+        ), patch.object(
+            bot_listener, "schedule_bot_delete",
+            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
+        ):
+            _run(bot_listener.handle_pets_callback(
+                api, None, _cfg(), None, _callback(PLAYER, "attack", "43"), CHAT,
+                {}, set(), bot_username=BOT, known_chat_ids={CHAT: MAIN_CHAT_ID}, log=lambda *_: None,
+            ))
+
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [MAIN_CHAT_ID, PLAYER["id"], 43])
+        self.assertIn("🪙 +", api.photo_files[0]["caption"])
+        self.assertTrue(any(
+            args[1] == MAIN_CHAT_ID and args[3] == bot_listener.DUEL_RESULT_DELETE_AFTER
+            and kwargs.get("trigger_message_id") is None
+            for args, kwargs in deletions
+        ))
+
     def test_opponent_rerolls_are_limited_to_three(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
