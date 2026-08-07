@@ -6108,7 +6108,6 @@ async def _pets_run_fight(
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},
         reward,
     )
-    transcript = pets_ui.battle_log(result)
     image_path = None
     try:
         image_path = await _pets_render_result_image(
@@ -6135,11 +6134,6 @@ async def _pets_run_fight(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
                 trigger_message_id=message_id,
             )
-        if sent and not persistent_recipient_ids:
-            try:
-                await api.send_message(chat_id, transcript, parse_mode="HTML")
-            except Exception:
-                log("[pets] could not deliver the arena battle log")
     finally:
         if image_path is not None:
             for recipient_id in dict.fromkeys(persistent_recipient_ids or ()):
@@ -6147,7 +6141,6 @@ async def _pets_run_fight(
                     await api.send_photo_file(
                         recipient_id, image_path, caption=report, parse_mode="HTML",
                     )
-                    await api.send_message(recipient_id, transcript, parse_mode="HTML")
                 except Exception:
                     # A bot cannot message a member who has not started it; their opponent
                     # should still receive the report.

@@ -178,6 +178,9 @@ class PetsCommandTests(unittest.TestCase):
     def test_how_to_play_button_opens_the_arena_rules(self):
         api = self._tap("info")
         self.assertIn("Как играть", api.edits[0]["text"])
+        self.assertIn("/arena в личке бота", api.edits[0]["text"])
+        self.assertIn("своего покраса", api.edits[0]["text"])
+        self.assertIn("/duel @user", api.edits[0]["text"])
         self.assertIn("Особые преимущества", api.edits[0]["text"])
         self.assertIn("30%", api.edits[0]["text"])
 
@@ -361,11 +364,7 @@ class PetsCommandTests(unittest.TestCase):
             [item["chat_id"] for item in api.photo_files],
             [MAIN_CHAT_ID, PLAYER["id"], target.user_id],
         )
-        self.assertEqual(
-            [item["chat_id"] for item in api.sent],
-            [PLAYER["id"], target.user_id],
-        )
-        self.assertTrue(all("Лог боя" in item["text"] for item in api.sent))
+        self.assertEqual(api.sent, [])
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
 
