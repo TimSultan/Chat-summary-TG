@@ -204,10 +204,8 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(any(kwargs.get("trigger_message_id") == 5 for _, kwargs in deletions))
 
     def test_pet_commands_are_advertised_in_the_group_command_menu(self):
-        self.assertEqual(
-            {"arena", "pet", "duel"},
-            {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
-        )
+        commands = {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS}
+        self.assertTrue({"arena", "pet", "duel"} <= commands)
 
     def test_somebody_the_chat_has_never_seen_is_turned_away(self):
         api = self._type(found=False)

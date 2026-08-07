@@ -894,7 +894,7 @@ class TreeCommandTests(unittest.TestCase):
         import bot_listener
 
         self.assertIn("tree", {command["command"] for command in bot_listener.PRIVATE_CHAT_COMMANDS})
-        self.assertNotIn("tree", {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS})
+        self.assertIn("tree", {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS})
 
 
 class ScheduleTests(unittest.TestCase):

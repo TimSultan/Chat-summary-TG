@@ -324,6 +324,16 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "pet", "description": "Моё существо"},
 )
 GROUP_CHAT_COMMANDS = (
+    {"command": "stat", "description": "Моя статистика"},
+    {"command": "top", "description": "Рейтинг чата"},
+    {"command": "shop", "description": "Магазин"},
+    {"command": "coins", "description": "Мой баланс"},
+    {"command": "tree", "description": "Наше дерево ЕПХ"},
+    {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "vote2", "description": "Арена голосований"},
+    {"command": "poker", "description": "Открыть стол покера"},
+    {"command": "plant", "description": "Посадить семечко"},
+    {"command": "plantreminder", "description": "Напомнить о посадке"},
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "pet", "description": "Моё существо"},
     {"command": "duel", "description": "Вызвать существо на дуэль"},

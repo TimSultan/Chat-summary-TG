@@ -962,9 +962,12 @@ class MenuRegistrationTests(unittest.TestCase):
                 self.assertRegex(command["command"], allowed)
                 self.assertTrue(command["description"].strip())
 
-    def test_group_menu_has_pet_commands_and_dm_menu_still_has_cabinet(self):
+    def test_group_menu_has_public_commands_and_dm_menu_still_has_cabinet(self):
         self.assertEqual(
-            {"arena", "pet", "duel"},
+            {
+                "stat", "top", "shop", "coins", "tree", "vote", "vote2", "poker",
+                "plant", "plantreminder", "arena", "pet", "duel",
+            },
             {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
         )
         self.assertIn("cabinet", {c["command"] for c in bot_listener.PRIVATE_CHAT_COMMANDS})
