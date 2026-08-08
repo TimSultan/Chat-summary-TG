@@ -370,6 +370,7 @@ PAGE_HTML = """<!doctype html>
 
   var PREFIX = "__PREFIX__";
   var TOKEN_STORAGE_KEY = "poststats_token";
+  var CHAT_LOCKED_STORAGE_KEY = "poststats_chat_locked";
 
   var TOKEN = null;
   var allPosts = [];
@@ -479,7 +480,9 @@ PAGE_HTML = """<!doctype html>
 
   function reflectUrl(chat) {
     var params = new URLSearchParams(location.search);
-    params.set("chat", chat);
+    // Omitted rather than set to "" for a locked/scoped token: there is nothing to
+    // choose, so a bare, chat-less link is the honest shareable state.
+    if (chat) { params.set("chat", chat); } else { params.delete("chat"); }
     var range = $("rangeSelect").value;
     if (range === "custom") {
       params.delete("range");
@@ -508,6 +511,25 @@ PAGE_HTML = """<!doctype html>
 
   function clearStoredToken() {
     try { localStorage.removeItem(TOKEN_STORAGE_KEY); }
+    catch (e) { /* nothing to clear */ }
+  }
+
+  // Remembered across visits so a scoped-token holder (see post_stats_web._authorize --
+  // a token locked server-side to one specific chat, handed out to someone for THEIR
+  // group rather than the free-choice owner token) never has to see or fill in the chat
+  // field at all: the very next visit already knows to hide it and load straight away.
+  function readStoredChatLocked() {
+    try { return localStorage.getItem(CHAT_LOCKED_STORAGE_KEY) === "1"; }
+    catch (e) { return false; }
+  }
+
+  function storeChatLocked(locked) {
+    try { localStorage.setItem(CHAT_LOCKED_STORAGE_KEY, locked ? "1" : "0"); }
+    catch (e) { /* best-effort only */ }
+  }
+
+  function clearStoredChatLocked() {
+    try { localStorage.removeItem(CHAT_LOCKED_STORAGE_KEY); }
     catch (e) { /* nothing to clear */ }
   }
 
@@ -544,6 +566,10 @@ PAGE_HTML = """<!doctype html>
     storeToken(value);
     closeSettingsModal();
     $("controls").hidden = false;
+    // Best-effort: works immediately for a scoped token (empty chat is fine -- the
+    // server ignores it and uses the locked one) and otherwise just tells the visitor
+    // to fill in a chat, via the normal error banner.
+    loadData();
   }
 
   function init() {
@@ -583,7 +609,14 @@ PAGE_HTML = """<!doctype html>
       return;
     }
     $("controls").hidden = false;
-    if (chat) loadData();
+    if (readStoredChatLocked()) {
+      // A previous visit already learned this token is locked to one chat -- skip
+      // showing the (now pointless) chat field and load straight away.
+      $("chatInput").hidden = true;
+      loadData();
+    } else if (chat) {
+      loadData();
+    }
   }
 
   function wireEvents() {
@@ -634,8 +667,11 @@ PAGE_HTML = """<!doctype html>
     hideError();
     if (!TOKEN) return;
 
+    // Not required client-side: a scoped token (see post_stats_web._authorize) ignores
+    // whatever chat is sent and always uses the one it's locked to, so an empty box is
+    // valid there. The server is the source of truth -- it replies "chat is required"
+    // (shown via the normal error banner below) for the unscoped/owner token instead.
     var chat = $("chatInput").value.trim();
-    if (!chat) { showError("Enter a chat username, ID, or title."); return; }
 
     var range = $("rangeSelect").value;
     var params = new URLSearchParams();
@@ -663,6 +699,8 @@ PAGE_HTML = """<!doctype html>
             // again rather than leaving the page stuck failing silently forever.
             TOKEN = null;
             clearStoredToken();
+            clearStoredChatLocked();  // described the OLD token, not whatever comes next
+            $("chatInput").hidden = false;
             $("controls").hidden = true;
             openSettingsModal("Invalid or expired token -- please re-enter it.");
             throw new Error("__handled_401__");
@@ -678,6 +716,9 @@ PAGE_HTML = """<!doctype html>
         allPosts = Array.isArray(data.posts) ? data.posts : [];
         chatTitleValue = data.chat_title || chat;
         periodLabelValue = data.period_label || "";
+        var locked = !!data.chat_locked;
+        storeChatLocked(locked);
+        $("chatInput").hidden = locked;
         updateMeta();
         sortState = { key: METRIC_COLUMN[$("metricSelect").value] || "views", dir: "desc" };
 

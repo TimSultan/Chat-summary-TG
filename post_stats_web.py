@@ -4,7 +4,10 @@ chosen time range, as an interactive chart + table.
 
 Unlike vote_web's and arena_web's Mini Apps, this page is a plain bookmarkable URL
 opened in an ordinary browser -- there is no Telegram initData to verify here, so the
-gate is a single shared-secret token instead (see _check_token). The page shell itself
+gate is a bearer token instead (see _authorize). Two kinds: the unscoped "owner" token
+may ask for any chat the account can see; a scoped token is locked server-side to
+exactly the one chat it was issued for, for handing someone read access to their own
+group without exposing every other chat the owner token can reach. The page shell itself
 is not gated (same reasoning as the other two: it's empty markup without data, nothing
 sensitive in serving it) -- every API call under it is what's actually gated.
 
@@ -53,18 +56,46 @@ def _json_error(message: str, status: int) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
-def _check_token(request: web.Request) -> None:
-    """Constant-time compare against the configured bearer secret. Fails closed when the
-    token isn't configured at all -- attach() is only called by bot_listener.py once a
-    token is set, but a unit test or future caller shouldn't get a route that silently
-    accepts anything just because it's unset."""
+def _unauthorized() -> web.HTTPUnauthorized:
+    return web.HTTPUnauthorized(
+        text=json.dumps({"error": "unauthorized"}), content_type="application/json"
+    )
+
+
+def _authorize(request: web.Request) -> str | None:
+    """Checks the bearer token and says which chat it's allowed to see.
+
+    Two kinds of token, both constant-time compared: the single "owner" token
+    (post_stats_access_token) may ask for ANY chat -- this returns None, meaning "let the
+    caller's own chat= param through unchanged". A scoped token (one of
+    post_stats_scoped_tokens) is locked to exactly the one chat_ref it was issued for --
+    this returns that chat_ref, and the caller must use it INSTEAD OF whatever chat= the
+    request itself carries, so a scoped token can never be used to reach a different chat
+    no matter what the request asks for.
+
+    Fails closed (raises HTTPUnauthorized) when neither is configured at all, when the
+    token is missing, or when it matches nothing -- a unit test or future caller
+    shouldn't get a route that silently accepts anything just because nothing is set.
+    """
     cfg = request.app[_CFG_KEY]
-    expected = getattr(cfg, "post_stats_access_token", None)
     provided = request.query.get("token", "")
-    if not expected or not hmac.compare_digest(provided, expected):
-        raise web.HTTPUnauthorized(
-            text=json.dumps({"error": "unauthorized"}), content_type="application/json"
-        )
+    if not provided:
+        raise _unauthorized()
+
+    owner_token = getattr(cfg, "post_stats_access_token", None)
+    if owner_token and hmac.compare_digest(provided, owner_token):
+        return None
+
+    # Checked against every scoped token, not returned on first match -- so which
+    # (if any) scoped token exists is never distinguishable from response timing alone.
+    matched_chat_ref = None
+    for candidate_token, chat_ref in (getattr(cfg, "post_stats_scoped_tokens", None) or {}).items():
+        if hmac.compare_digest(provided, candidate_token):
+            matched_chat_ref = chat_ref
+    if matched_chat_ref is not None:
+        return matched_chat_ref
+
+    raise _unauthorized()
 
 
 async def handle_page(request: web.Request) -> web.Response:
@@ -75,9 +106,9 @@ async def handle_page(request: web.Request) -> web.Response:
 
 
 async def handle_data(request: web.Request) -> web.Response:
-    _check_token(request)
-
-    chat = request.query.get("chat", "").strip()
+    forced_chat_ref = _authorize(request)
+    chat_locked = forced_chat_ref is not None
+    chat = forced_chat_ref if chat_locked else request.query.get("chat", "").strip()
     if not chat:
         return _json_error("chat is required", 400)
 
@@ -129,6 +160,7 @@ async def handle_data(request: web.Request) -> web.Response:
     prefix = request.app[_PREFIX_KEY]
     return web.json_response({
         "chat_title": chat_title,
+        "chat_locked": chat_locked,
         "period_label": period_label(start_day, end_day),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "posts": [

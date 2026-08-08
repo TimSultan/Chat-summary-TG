@@ -26,8 +26,8 @@ from errors import ChatSummaryError
 TOKEN = "secret123"
 
 
-def _fake_cfg(token=TOKEN):
-    return SimpleNamespace(post_stats_access_token=token)
+def _fake_cfg(token=TOKEN, scoped=None):
+    return SimpleNamespace(post_stats_access_token=token, post_stats_scoped_tokens=scoped or {})
 
 
 def _fake_entity(id=42, title="Test Chat", username=None):
@@ -147,6 +147,121 @@ class PostStatsWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(second["thumbnail_url"])
         self.assertEqual(first["views"], 101)
         self.assertEqual(first["reactions_breakdown"], {"👍": 2})
+        self.assertFalse(data["chat_locked"])
+
+    # ---- scoped tokens ----------------------------------------------------------------
+
+    async def _app_with_scoped_token(self, scoped_token, chat_ref, owner_token=TOKEN):
+        app = web.Application()
+        post_stats_web.attach(
+            app, client=object(),
+            cfg=_fake_cfg(token=owner_token, scoped={scoped_token: chat_ref}),
+            log=lambda *_: None,
+        )
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def test_scoped_token_forces_its_own_chat_ignoring_chat_param(self):
+        client = await self._app_with_scoped_token("friendtok", "@theirgroup")
+        entity = _fake_entity(title="Their Group")
+        seen_chat_refs = []
+
+        async def fake_resolve(client_arg, chat):
+            seen_chat_refs.append(chat)
+            return entity
+
+        async def fake_fetch(client_arg, ent, start, end, thumb_dir, log=print):
+            return []
+
+        with patch("post_stats_web.resolve_chat", side_effect=fake_resolve), \
+             patch("post_stats_web.fetch_post_stats", side_effect=fake_fetch):
+            # Asks for a DIFFERENT chat -- the scoped token must override it regardless.
+            response = await client.get(post_stats_web.ROUTE_PREFIX + "/api/data", params={
+                "token": "friendtok", "chat": "some-other-chat-entirely", "range": "today",
+            })
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertEqual(seen_chat_refs, ["@theirgroup"])
+        self.assertEqual(data["chat_title"], "Their Group")
+        self.assertTrue(data["chat_locked"])
+
+    async def test_scoped_token_with_no_chat_param_still_works(self):
+        client = await self._app_with_scoped_token("friendtok", "@theirgroup")
+        entity = _fake_entity(title="Their Group")
+
+        async def fake_resolve(client_arg, chat):
+            return entity
+
+        async def fake_fetch(client_arg, ent, start, end, thumb_dir, log=print):
+            return []
+
+        with patch("post_stats_web.resolve_chat", side_effect=fake_resolve), \
+             patch("post_stats_web.fetch_post_stats", side_effect=fake_fetch):
+            response = await client.get(post_stats_web.ROUTE_PREFIX + "/api/data", params={
+                "token": "friendtok", "range": "today",
+            })
+        self.assertEqual(response.status, 200)
+
+    async def test_scoped_token_wrong_value_is_unauthorized(self):
+        client = await self._app_with_scoped_token("friendtok", "@theirgroup")
+        response = await client.get(post_stats_web.ROUTE_PREFIX + "/api/data", params={
+            "token": "not-quite-friendtok", "chat": "foo", "range": "today",
+        })
+        self.assertEqual(response.status, 401)
+
+    async def test_owner_token_unaffected_by_scoped_tokens(self):
+        client = await self._app_with_scoped_token("friendtok", "@theirgroup")
+        entity = _fake_entity(title="Whatever I Ask For")
+
+        async def fake_resolve(client_arg, chat):
+            return entity
+
+        async def fake_fetch(client_arg, ent, start, end, thumb_dir, log=print):
+            return []
+
+        with patch("post_stats_web.resolve_chat", side_effect=fake_resolve), \
+             patch("post_stats_web.fetch_post_stats", side_effect=fake_fetch):
+            response = await client.get(post_stats_web.ROUTE_PREFIX + "/api/data", params={
+                "token": TOKEN, "chat": "anything-i-want", "range": "today",
+            })
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertFalse(data["chat_locked"])
+
+    async def test_only_scoped_tokens_configured_no_owner_token(self):
+        app = web.Application()
+        post_stats_web.attach(
+            app, client=object(),
+            cfg=_fake_cfg(token=None, scoped={"friendtok": "@theirgroup"}),
+            log=lambda *_: None,
+        )
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+
+        entity = _fake_entity(title="Their Group")
+
+        async def fake_resolve(client_arg, chat):
+            return entity
+
+        async def fake_fetch(client_arg, ent, start, end, thumb_dir, log=print):
+            return []
+
+        with patch("post_stats_web.resolve_chat", side_effect=fake_resolve), \
+             patch("post_stats_web.fetch_post_stats", side_effect=fake_fetch):
+            scoped_response = await client.get(post_stats_web.ROUTE_PREFIX + "/api/data", params={
+                "token": "friendtok", "range": "today",
+            })
+        self.assertEqual(scoped_response.status, 200)
+
+        unrelated_response = await client.get(post_stats_web.ROUTE_PREFIX + "/api/data", params={
+            "token": "some-owner-token-that-doesnt-exist", "chat": "foo", "range": "today",
+        })
+        self.assertEqual(unrelated_response.status, 401)
 
     # ---- validation -----------------------------------------------------------------
 

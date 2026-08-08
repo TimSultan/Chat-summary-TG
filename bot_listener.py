@@ -7456,7 +7456,7 @@ async def run_bot_listener(
                 # the two above, it needs no admin/membership callables: it isn't a
                 # Telegram Mini App, and reuses THIS process's already-connected
                 # telethon_client rather than opening a session of its own.
-                if cfg.post_stats_access_token:
+                if cfg.post_stats_access_token or cfg.post_stats_scoped_tokens:
                     post_stats_web.attach(app, telethon_client, cfg, log=log)
 
             tasks.append(

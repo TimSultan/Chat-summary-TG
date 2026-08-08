@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 
@@ -54,6 +55,7 @@ class Config:
     stats_top_limit: int
     stats_catchup_days: int
     post_stats_access_token: str | None
+    post_stats_scoped_tokens: dict[str, str]
 
 
 def build_session(cfg: "Config"):
@@ -163,6 +165,29 @@ def load_config() -> Config:
     # between deploying this feature and actually setting a token.
     post_stats_access_token = os.getenv("POST_STATS_ACCESS_TOKEN", "").strip() or None
 
+    # Additional tokens, each locked server-side to exactly ONE chat -- for handing
+    # someone read access to their own group's stats without also exposing every other
+    # chat POST_STATS_ACCESS_TOKEN's holder (you) can see. A JSON object of
+    # {"token": "chat_ref"} -- chat_ref is whatever resolve_chat accepts (@username,
+    # numeric id, or exact title), same as the free-text "chat" field the unscoped token
+    # uses. post_stats_web.py ignores any "chat" the request itself asks for once a
+    # scoped token matches, so holding one of these can never reach a different chat no
+    # matter what the page (or a hand-crafted request) sends.
+    scoped_tokens_raw = os.getenv("POST_STATS_SCOPED_TOKENS", "").strip()
+    post_stats_scoped_tokens: dict[str, str] = {}
+    if scoped_tokens_raw:
+        try:
+            parsed_scoped_tokens = json.loads(scoped_tokens_raw)
+        except json.JSONDecodeError as e:
+            raise ChatSummaryError(f"POST_STATS_SCOPED_TOKENS must be valid JSON: {e}")
+        if not isinstance(parsed_scoped_tokens, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in parsed_scoped_tokens.items()
+        ):
+            raise ChatSummaryError(
+                'POST_STATS_SCOPED_TOKENS must be a JSON object of "token": "chat_ref" strings.'
+            )
+        post_stats_scoped_tokens = parsed_scoped_tokens
+
     stats_enabled = os.getenv("STATS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "10")
@@ -206,4 +231,5 @@ def load_config() -> Config:
         stats_top_limit=stats_top_limit,
         stats_catchup_days=stats_catchup_days,
         post_stats_access_token=post_stats_access_token,
+        post_stats_scoped_tokens=post_stats_scoped_tokens,
     )
