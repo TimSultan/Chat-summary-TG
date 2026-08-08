@@ -332,7 +332,7 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         day2 = day1 + timedelta(days=1)
         self.assertEqual(pets.fights_left(entry, "1", day2), pets.daily_allowance(entry, '1', day2))
 
-    def test_find_opponent_prefers_candidates_inside_the_power_window(self):
+    def test_find_opponent_draws_uniformly_from_all_pets_regardless_of_power_gap(self):
         entry = "chat"
         self._tame(entry, "1")
         self._tame(entry, "2")
@@ -343,6 +343,8 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         data["pets"]["3"]["stats"]["strength"] = 80
         pets._save(entry, data)
 
+        # The finder must not quietly funnel players back into a power band: both the
+        # near and wildly stronger pet belong to the same draw pool.
         rng = random.Random(1)
         seen = set()
         for _ in range(25):
@@ -350,9 +352,9 @@ class DailyFightsAndOpponentTests(PetsTestCase):
             self.assertIsNotNone(opponent)
             self.assertNotEqual(opponent, "1")
             seen.add(opponent)
-        self.assertEqual(seen, {"2"})
+        self.assertEqual(seen, {"2", "3"})
 
-    def test_find_opponent_uses_the_nearest_power_when_nobody_is_in_window(self):
+    def test_find_opponent_does_not_fall_back_to_the_nearest_power(self):
         entry = "chat"
         self._tame(entry, "1")
         self._tame(entry, "2")
@@ -363,8 +365,10 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         data["pets"]["3"]["stats"]["strength"] = 80
         pets._save(entry, data)
 
-        opponent = pets.find_opponent(entry, "1", rng=random.Random(1))
-        self.assertEqual(opponent, "2")
+        # This seeded draw selects id 3.  The old finder would return id 2 because it
+        # was the nearest power match, even though both were outside the old window.
+        opponent = pets.find_opponent(entry, "1", rng=random.Random(0))
+        self.assertEqual(opponent, "3")
 
     def test_pet_leaderboard_lists_tamed_pets_by_power(self):
         entry = "chat"
@@ -425,10 +429,316 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         )
         self.assertEqual(opponent, "2")
 
+    def test_attackable_finder_hides_daily_capped_targets_instead_of_reporting_them_later(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        self._tame(entry, "2")
+        self._tame(entry, "3")
+        result = SimpleNamespace(winner="1", loser="2")
+        today = pets.today()
+        with patch("random.random", return_value=1.0):
+            for _ in range(pets_config.ARENA_SAME_OPPONENT_DAILY_LIMIT):
+                pets.record_fight(entry, "1", "2", result, today)
+
+        self.assertEqual(
+            pets.find_opponent(entry, "1", rng=random.Random(1), attackable_only=True),
+            "3",
+        )
+
     def test_find_opponent_returns_none_only_when_the_chat_has_no_other_pet(self):
         entry = "chat"
         self._tame(entry, "1")
         self.assertIsNone(pets.find_opponent(entry, "1", rng=random.Random(1)))
+
+
+class HamsteratorTests(PetsTestCase):
+    def _build_level_one(self, entry="chat", user_id="1", now=None):
+        economy.grant(
+            entry, user_id,
+            pets_config.CAGE_PRICE + pets_config.HAMSTERATOR_UPGRADE_COSTS[0], "test",
+        )
+        ok, message = pets.buy_cage(entry, user_id, 0)
+        self.assertTrue(ok, message)
+        ok, message = pets.upgrade_hamsterator(entry, user_id, 0, now=now)
+        self.assertTrue(ok, message)
+        self.assertIn("Хомяколатор", message)
+
+    def test_income_only_credits_complete_elapsed_hours_and_keeps_fraction(self):
+        start = datetime(2026, 8, 8, 14, 55)
+        self._build_level_one(now=start)
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=start + timedelta(minutes=6))["credited"], 0)
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=start + timedelta(hours=1, minutes=5))["credited"], 1)
+        # The five-minute remainder is retained, so another 55 minutes completes hour 2.
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=start + timedelta(hours=2))["credited"], 1)
+        self.assertEqual(economy.balance("chat", "1", 0), 2)
+
+    def test_income_cap_and_restart_retry_do_not_double_credit(self):
+        start = datetime(2026, 8, 8, 10)
+        self._build_level_one(now=start)
+        later = start + timedelta(days=10)
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], pets_config.HAMSTERATOR_STORAGE_CAP[1])
+        # New loads (the same path a process restart takes) see the advanced checkpoint.
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], 0)
+        self.assertEqual(economy.balance("chat", "1", 0), pets_config.HAMSTERATOR_STORAGE_CAP[1])
+
+    def test_corrupt_income_checkpoint_is_reset_without_crashing(self):
+        self._build_level_one(now=datetime(2026, 8, 8, 10))
+        data = economy._load("chat")
+        data["users"]["1"]["effects"]["pet_hamsterator"]["last_hour"] = "not-a-date"
+        economy._save("chat", data)
+        result = pets.settle_passive_income("chat", "1", now=datetime(2026, 8, 8, 12))
+        self.assertEqual(result["credited"], 0)
+        repaired = economy._load("chat")["users"]["1"]["effects"]["pet_hamsterator"]["last_hour"]
+        self.assertEqual(repaired, "2026-08-08T12:00:00")
+
+    def test_upgrade_settles_old_rate_and_refuses_without_money(self):
+        start = datetime(2026, 8, 8, 10)
+        self._build_level_one(now=start)
+        later = start + timedelta(hours=3)
+        ok, message = pets.upgrade_hamsterator("chat", "1", 0, now=later)
+        self.assertFalse(ok)
+        self.assertIn("Нужно", message)
+        self.assertEqual(economy.balance("chat", "1", 0), 3)
+        economy.grant("chat", "1", pets_config.HAMSTERATOR_UPGRADE_COSTS[1], "test")
+        ok, message = pets.upgrade_hamsterator("chat", "1", 0, now=later)
+        self.assertTrue(ok, message)
+        self.assertEqual(pets.hamsterator_level("chat", "1"), 2)
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=later + timedelta(hours=2))["credited"], 4)
+
+    def test_facility_view_has_upgrade_callback_and_russian_copy(self):
+        entry = "chat"
+        economy.grant(entry, "1", pets_config.CAGE_PRICE, "test")
+        self.assertTrue(pets.buy_cage(entry, "1", 0)[0])
+        text, keyboard = pets_ui.hamsterator_view(entry, "1", 0)
+        self.assertIn("Хомяколатор", text)
+        callbacks = [pets_ui.parse_callback(button["callback_data"])[1]
+                     for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("uphamsterator", callbacks)
+
+
+class EquipmentTradingTests(PetsTestCase):
+    def _two_pets(self, entry="chat"):
+        self._tame(entry, "1", "One")
+        self._tame(entry, "2", "Two")
+        data = pets._load(entry)
+        data["pets"]["1"]["level"] = pets_config.GIFT_MIN_PET_LEVEL
+        pets._save(entry, data)
+
+    def test_legacy_codes_and_duplicates_canonicalize_on_read(self):
+        self._two_pets()
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = ["stick", "stick", "fork"]
+        data["pets"]["1"]["equipped"]["weapon"] = "bone"
+        pets._save("chat", data)
+        pet = pets.get_pet("chat", "1")
+        self.assertEqual(pet["inventory"], ["w001", "w002", "w003"])
+        self.assertEqual(pet["equipped"]["weapon"], "w003")
+
+    def test_sell_refuses_equipped_and_pays_explicit_resale(self):
+        self._two_pets()
+        item = pets_config.find_item("w001")
+        economy.grant("chat", "1", item.price, "test")
+        self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
+        self.assertTrue(pets.equip("chat", "1", item.code)[0])
+        self.assertFalse(pets.sell_item("chat", "1", item.code)[0])
+        self.assertTrue(pets.unequip("chat", "1", "weapon")[0])
+        ok, _, value = pets.sell_item("chat", "1", item.code)
+        self.assertTrue(ok)
+        self.assertEqual(value, pets_config.resale_value(item))
+        self.assertNotIn(item.code, pets.get_pet("chat", "1")["inventory"])
+
+    def test_gift_is_unique_atomic_and_refuses_equipped_or_receiver_duplicate(self):
+        self._two_pets()
+        item = pets_config.find_item("w001")
+        economy.grant("chat", "1", item.price, "test")
+        self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
+        self.assertTrue(pets.equip("chat", "1", item.code)[0])
+        self.assertFalse(pets.gift_item("chat", "1", "2", item.code)[0])
+        self.assertTrue(pets.unequip("chat", "1", "weapon")[0])
+        data = pets._load("chat")
+        data["pets"]["2"]["inventory"].append(item.code)
+        pets._save("chat", data)
+        self.assertFalse(pets.gift_item("chat", "1", "2", item.code)[0])
+        data = pets._load("chat")
+        data["pets"]["2"]["inventory"].remove(item.code)
+        pets._save("chat", data)
+        self.assertTrue(pets.gift_item("chat", "1", "2", item.code)[0])
+        self.assertNotIn(item.code, pets.get_pet("chat", "1")["inventory"])
+        self.assertIn(item.code, pets.get_pet("chat", "2")["inventory"])
+        self.assertFalse(pets.gift_item("chat", "2", "2", item.code)[0])
+
+    def test_weapon_catalogue_is_paginated_with_compact_callbacks(self):
+        self._two_pets()
+        text, keyboard = pets_ui.slot_view("chat", "1", 0, "weapon", 1)
+        self.assertIn("2/", text)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertTrue(any(":slot:weapon," in data for data in callbacks))
+        self.assertTrue(all(len(data.encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES for data in callbacks))
+
+    def test_owned_late_catalogue_weapon_is_promoted_to_first_page(self):
+        self._two_pets()
+        late = pets_config.find_item("w500")
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"].append(late.code)
+        pets._save("chat", data)
+
+        text, keyboard = pets_ui.slot_view("chat", "1", 0, "weapon", 0)
+
+        self.assertIn(late.name, text)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn(pets_ui.callback_data("1", "gift", late.code), callbacks)
+        self.assertIn(pets_ui.callback_data("1", "sell", late.code), callbacks)
+
+    def test_equipment_hub_routes_to_owned_bag_and_daily_shop(self):
+        self._two_pets()
+        text, keyboard = pets_ui.bag_view("chat", "1", 0)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn("Снаряжение", text)
+        self.assertIn(pets_ui.callback_data("1", "bagitems", "weapon,0"), callbacks)
+        self.assertIn(pets_ui.callback_data("1", "store"), callbacks)
+        self.assertIn(pets_ui.callback_data("1", "collection"), callbacks)
+        self.assertNotIn(pets_ui.callback_data("1", "slot", "weapon"), callbacks)
+
+        _, store_keyboard = pets_ui.store_view("chat", "1", 0)
+        store_callbacks = [
+            button["callback_data"]
+            for row in store_keyboard["inline_keyboard"]
+            for button in row
+        ]
+        for slot in ("amulet", "gloves", "boots"):
+            self.assertIn(
+                pets_ui.callback_data("1", "slot", pets_ui.slot_argument(slot)),
+                store_callbacks,
+            )
+
+    def test_owned_bag_is_paginated_without_catalogue_noise(self):
+        self._two_pets()
+        owned = [item.code for item in pets_config.items_for_slot("weapon")[:7]]
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = owned
+        pets._save("chat", data)
+
+        text, keyboard = pets_ui.bag_items_view("chat", "1", 0, "weapon", 1)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn("2/2", text)
+        self.assertIn(pets_config.find_item(owned[-1]).name, text)
+        self.assertNotIn(pets_config.find_item("w100").name, text)
+        self.assertTrue(any(":bagitems:weapon,0" in data for data in callbacks))
+        self.assertTrue(all(len(data.encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES for data in callbacks))
+
+    def test_locked_item_hides_gift_and_sale_from_owned_bag(self):
+        self._two_pets()
+        item = pets_config.find_item("w001")
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [item.code]
+        data["pets"]["1"]["locked_items"] = [item.code]
+        pets._save("chat", data)
+
+        _, keyboard = pets_ui.bag_items_view("chat", "1", 0, "weapon")
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn(pets_ui.callback_data("1", "lock", item.code), callbacks)
+        self.assertNotIn(pets_ui.callback_data("1", "gift", item.code), callbacks)
+        self.assertNotIn(pets_ui.callback_data("1", "sell", item.code), callbacks)
+
+
+class StorefrontAndCollectionTests(PetsTestCase):
+    def _two_pets(self, entry="shop-chat"):
+        self._tame(entry, "1", "One")
+        self._tame(entry, "2", "Two")
+        data = pets._load(entry)
+        data["pets"]["1"]["level"] = pets_config.GIFT_MIN_PET_LEVEL
+        pets._save(entry, data)
+
+    def test_daily_storefront_is_stable_sized_and_changes_tomorrow(self):
+        day = date(2026, 8, 8)
+        first = pets_config.daily_storefront_weapons("shop-chat", day)
+        again = pets_config.daily_storefront_weapons("shop-chat", day)
+        tomorrow = pets_config.daily_storefront_weapons("shop-chat", day + timedelta(days=1))
+        self.assertEqual(first, again)
+        self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertNotEqual([item.code for item in first], [item.code for item in tomorrow])
+        self.assertTrue(all(item.source == "shop" and item.slot == "weapon" for item in first))
+
+    def test_core_purchase_refuses_weapon_outside_daily_window(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        offered = next(item for item in pets_config.daily_storefront_weapons(entry, pets.today())
+                       if item.rarity not in {"rare", "legendary"})
+        outside = next(item for item in pets_config.items_for_slot("weapon", "shop")
+                       if item.code not in {offered.code for offered in pets_config.daily_storefront_weapons(entry, pets.today())})
+        economy.grant(entry, "1", offered.price + outside.price, "test")
+        self.assertTrue(pets.buy_item(entry, "1", 0, offered.code)[0])
+        ok, note = pets.buy_item(entry, "1", 0, outside.code)
+        self.assertFalse(ok)
+        self.assertIn("витрин", note)
+
+    def test_discovery_survives_sale_and_gift_and_old_inventory_migrates(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        first, second = [item for item in pets_config.daily_storefront_weapons(entry, pets.today())
+                         if item.rarity not in {"rare", "legendary"}][:2]
+        economy.grant(entry, "1", first.price + second.price, "test")
+        self.assertTrue(pets.buy_item(entry, "1", 0, first.code)[0])
+        self.assertTrue(pets.buy_item(entry, "1", 0, second.code)[0])
+        self.assertTrue(pets.sell_item(entry, "1", first.code)[0])
+        self.assertTrue(pets.gift_item(entry, "1", "2", second.code)[0])
+        giver = pets.get_pet(entry, "1")
+        receiver = pets.get_pet(entry, "2")
+        self.assertIn(first.code, giver["discovered"])
+        self.assertIn(second.code, giver["discovered"])
+        self.assertIn(second.code, receiver["discovered"])
+        self.assertIn("Открыто", pets_ui.collection_view(entry, "1", 0)[0])
+
+    def test_lock_blocks_sale_and_gift(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        item = next(item for item in pets_config.daily_storefront_weapons(entry, pets.today())
+                    if item.rarity not in {"rare", "legendary"})
+        economy.grant(entry, "1", item.price, "test")
+        self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
+        self.assertTrue(pets.toggle_item_lock(entry, "1", item.code)[0])
+        self.assertFalse(pets.sell_item(entry, "1", item.code)[0])
+        self.assertFalse(pets.gift_item(entry, "1", "2", item.code)[0])
+        self.assertTrue(pets.toggle_item_lock(entry, "1", item.code)[0])
+        self.assertTrue(pets.gift_item(entry, "1", "2", item.code)[0])
+
+    def test_rare_actions_require_one_time_server_confirmation(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        rare = next(item for item in pets_config.items_for_slot("weapon") if item.rarity == "rare")
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"].append(rare.code)
+        pets._save(entry, data)
+        self.assertFalse(pets.sell_item(entry, "1", rare.code)[0])
+        ok, _, token = pets.begin_item_confirmation(entry, "1", "sell", rare.code)
+        self.assertTrue(ok)
+        self.assertTrue(pets.sell_item(entry, "1", rare.code, token)[0])
+        self.assertFalse(pets.sell_item(entry, "1", rare.code, token)[0])
+
+    def test_store_collection_filters_and_callbacks_fit_telegram_limit(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        screens = [
+            pets_ui.store_view(entry, "1", 0),
+            pets_ui.store_view(entry, "1", 0, "common"),
+            pets_ui.collection_view(entry, "1", 0, "rare,1"),
+        ]
+        for _, keyboard in screens:
+            callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+            self.assertTrue(all(len(value.encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES for value in callbacks))
+        rare = next(item for item in pets_config.items_for_slot("weapon") if item.rarity == "rare")
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"].append(rare.code)
+        pets._save(entry, data)
+        ok, _, token = pets.begin_item_confirmation(entry, "1", "sell", rare.code)
+        self.assertTrue(ok)
+        _, keyboard = pets_ui.item_confirmation_view(entry, "1", 0, "sell", rare.code, token)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertTrue(all(len(value.encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES for value in callbacks))
 
 
 class RecordFightTests(PetsTestCase):
@@ -557,6 +867,27 @@ class RecordFightTests(PetsTestCase):
         self.assertIn(drop_item.code, pets.get_pet(entry, "1")["inventory"])
         self.assertNotIn(drop_item.code, pets.get_pet(entry, "2")["inventory"])
 
+    def test_drop_pool_excludes_owned_code_and_awards_a_different_unique_item(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        first, second = [item for item in pets_config.ITEMS if item.source == "drop"][:2]
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"] = [first.code]
+        pets._save(entry, data)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=0.0), \
+             patch("random.choice", return_value=second) as choose:
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(outcome["dropped_item"], second.code)
+        self.assertNotIn(first, choose.call_args.args[0])
+        inventory = pets.get_pet(entry, "1")["inventory"]
+        self.assertEqual(inventory.count(first.code), 1)
+        self.assertEqual(inventory.count(second.code), 1)
+
     def test_history_snapshots_names_and_owners_and_zeroes_gold_on_the_losers_row(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
@@ -603,6 +934,115 @@ class RecordFightTests(PetsTestCase):
         # Newest first: the last recorded date sorts to index 0.
         dates = [row["date"] for row in rows]
         self.assertEqual(dates, sorted(dates, reverse=True))
+
+
+class PityGiftAndTelemetryTests(PetsTestCase):
+    def _two_pets(self, entry="chat"):
+        self._tame(entry, "1", "One")
+        self._tame(entry, "2", "Two")
+
+    def _level(self, entry, user_id, level):
+        data = pets._load(entry)
+        data["pets"][str(user_id)]["level"] = level
+        data["pets"][str(user_id)]["xp"] = 0
+        pets._save(entry, data)
+
+    def test_pity_forces_an_unowned_legendary_at_the_documented_ceiling(self):
+        self._two_pets()
+        threshold = pets_config.LEGENDARY_PITY_ELIGIBLE_WINS
+        data = pets._load("chat")
+        data["pets"]["1"]["legendary_pity_wins"] = threshold - 1
+        pets._save("chat", data)
+        legendary = next(
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.rarity == "legendary"
+        )
+        result = SimpleNamespace(winner="1", loser="2")
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.choice", return_value=legendary):
+            outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 1))
+        self.assertEqual(outcome["dropped_item"], legendary.code)
+        self.assertEqual(pets.legendary_pity_progress("chat", "1")["wins_without_legend"], 0)
+        self.assertEqual(pets.economy_telemetry("chat")["drops_by_rarity"]["legendary"], 1)
+
+    def test_completed_legendary_set_keeps_normal_drops_and_clears_unreachable_pity(self):
+        self._two_pets()
+        legends = [item for item in pets_config.ITEMS if item.source == "drop" and item.rarity == "legendary"]
+        ordinary = next(item for item in pets_config.ITEMS if item.source == "drop" and item.rarity != "legendary")
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [item.code for item in legends]
+        data["pets"]["1"]["legendary_pity_wins"] = 123
+        pets._save("chat", data)
+        result = SimpleNamespace(winner="1", loser="2")
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=0.0), \
+             patch("random.choice", return_value=ordinary):
+            outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 1))
+        self.assertEqual(outcome["dropped_item"], ordinary.code)
+        progress = pets.legendary_pity_progress("chat", "1")
+        self.assertFalse(progress["eligible"])
+        self.assertEqual(progress["wins_without_legend"], 0)
+
+    def test_gift_requires_level_records_audit_and_enforces_daily_cooldown(self):
+        self._two_pets()
+        self._level("chat", "1", pets_config.GIFT_MIN_PET_LEVEL - 1)
+        item = pets_config.find_item("w001")
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [item.code]
+        pets._save("chat", data)
+        before = list(pets.get_pet("chat", "1")["inventory"])
+        ok, message = pets.gift_item("chat", "1", "2", item.code)
+        self.assertFalse(ok)
+        self.assertIn(str(pets_config.GIFT_MIN_PET_LEVEL), message)
+        self.assertEqual(pets.get_pet("chat", "1")["inventory"], before)
+
+        self._level("chat", "1", pets_config.GIFT_MIN_PET_LEVEL)
+        moment = datetime(2026, 8, 8, 12)
+        self.assertTrue(pets.gift_item("chat", "1", "2", item.code, now=moment)[0])
+        audit = pets.gift_history("chat")
+        self.assertEqual(audit[0]["giver_id"], "1")
+        self.assertEqual(audit[0]["receiver_id"], "2")
+        self.assertEqual(audit[0]["item_code"], item.code)
+        self.assertEqual(pets.economy_telemetry("chat")["gifts"], 1)
+
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"].append(item.code)
+        data["pets"]["2"]["inventory"].remove(item.code)
+        pets._save("chat", data)
+        ok, message = pets.gift_item("chat", "1", "2", item.code, now=moment + timedelta(hours=1))
+        self.assertFalse(ok)
+        self.assertIn("Следующий подарок", message)
+        self.assertIn(item.code, pets.get_pet("chat", "1")["inventory"])
+
+    def test_telemetry_tracks_sale_arena_gold_and_guard(self):
+        self._two_pets()
+        self._level("chat", "1", pets_config.GIFT_MIN_PET_LEVEL)
+        item = pets_config.find_item("w001")
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [item.code]
+        pets._save("chat", data)
+        self.assertTrue(pets.sell_item("chat", "1", item.code)[0])
+        result = SimpleNamespace(winner="1", loser="2")
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=1.0):
+            outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 8))
+        pets.record_guardian_intervention("chat", "1", "2", date(2026, 8, 8))
+        metrics = pets.economy_telemetry("chat")
+        self.assertEqual(metrics["item_sale_gold"], pets_config.resale_value(item))
+        self.assertEqual(metrics["arena_reward_gold"], outcome["gold"])
+        self.assertEqual(metrics["guardian_interventions"], 1)
+
+    def test_passive_telemetry_credits_once_per_settled_hour(self):
+        start = datetime(2026, 8, 8, 10)
+        economy.grant(
+            "chat", "1", pets_config.CAGE_PRICE + pets_config.HAMSTERATOR_UPGRADE_COSTS[0], "test",
+        )
+        self.assertTrue(pets.buy_cage("chat", "1", 0)[0])
+        self.assertTrue(pets.upgrade_hamsterator("chat", "1", 0, now=start)[0])
+        later = start + timedelta(hours=2)
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], 2)
+        self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], 0)
+        self.assertEqual(pets.economy_telemetry("chat")["passive_gold_minted"], 2)
 
 
 class MiscApiTests(PetsTestCase):

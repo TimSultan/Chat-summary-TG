@@ -18,13 +18,17 @@ PANEL_BOTTOM = 790
 PANEL_PADDING_X = 40
 PET_IMAGE_SIZE = (470, 365)
 PET_IMAGE_TOP = PANEL_TOP + 25
-AVATAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] + 15
-PET_NAME_TOP = AVATAR_TOP + 93
-RATING_TOP = PET_NAME_TOP + 49
-STATS_BOTTOM_PADDING = 18
-STAT_ROW_HEIGHT = 20
-STAT_LABEL_FONT_SIZE = 16
-STAT_VALUE_FONT_SIZE = 18
+# The HP strip sits directly below the un-cropped pet image.  The compact profile and
+# stat rows below it deliberately reserve the lower part of the panel for readability.
+HP_BAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] + 8
+HP_BAR_HEIGHT = 24
+AVATAR_TOP = HP_BAR_TOP + HP_BAR_HEIGHT + 10
+PET_NAME_TOP = AVATAR_TOP + 88
+RATING_TOP = PET_NAME_TOP + 43
+STATS_BOTTOM_PADDING = 17
+STAT_ROW_HEIGHT = 18
+STAT_LABEL_FONT_SIZE = 14
+STAT_VALUE_FONT_SIZE = 16
 _FONT_PATHS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -128,6 +132,48 @@ def _stats_top(row_count: int) -> int:
     return PANEL_BOTTOM - STATS_BOTTOM_PADDING - row_count * STAT_ROW_HEIGHT
 
 
+def _hp_values(fighter: dict) -> tuple[int, int] | None:
+    """Return safe display HP when the combat receipt supplied it.
+
+    Older receipts and image unit tests may not carry a health snapshot; leaving the
+    strip out is more honest than inventing a value from potentially post-level-up
+    stats.
+    """
+    try:
+        remaining = round(float(fighter["remaining_hp"]))
+        maximum = round(float(fighter["max_hp"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if maximum <= 0:
+        return None
+    return max(0, min(remaining, maximum)), maximum
+
+
+def _draw_hp_bar(draw: ImageDraw.ImageDraw, x: int, fighter: dict) -> None:
+    values = _hp_values(fighter)
+    if values is None:
+        return
+    remaining, maximum = values
+    left = x + PANEL_PADDING_X
+    right = left + PET_IMAGE_SIZE[0]
+    top = HP_BAR_TOP
+    bottom = top + HP_BAR_HEIGHT
+    draw.rounded_rectangle((left, top, right, bottom), radius=7, fill="#aeb6b5")
+    filled_right = left + round((right - left) * remaining / maximum)
+    if filled_right > left:
+        draw.rounded_rectangle((left, top, filled_right, bottom), radius=7, fill="#c8444b")
+    draw.rounded_rectangle((left, top, right, bottom), radius=7, outline="#7f8987", width=1)
+    label = f"{remaining} / {maximum} HP"
+    # The result is usually viewed at roughly half its source resolution in Telegram;
+    # 16 px here remains readable after that downscale.
+    font = _font(16, bold=True)
+    box = draw.textbbox((0, 0), label, font=font)
+    draw.text(
+        (left + ((right - left) - (box[2] - box[0])) / 2, top + 1),
+        label, font=font, fill="#ffffff",
+    )
+
+
 def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     panel_color = "#e4f2eb" if side == "left" else "#f8e6e8"
     border = "#0e553f" if winner else "#c1c9c5"
@@ -145,6 +191,7 @@ def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
         (43, 111, 82) if side == "left" else (151, 57, 78), crop=False,
     )
     image.paste(pet, (x + PANEL_PADDING_X, PET_IMAGE_TOP))
+    _draw_hp_bar(draw, x, fighter)
     avatar = _circle(_photo(fighter.get("owner_avatar"), (90, 90), (82, 97, 108)), 78)
     image.paste(avatar, (x + PANEL_PADDING_X, AVATAR_TOP), avatar)
     draw.ellipse(
@@ -161,7 +208,7 @@ def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     )
     draw.text(
         (x + PANEL_PADDING_X, RATING_TOP), f"РЕЙТИНГ  {fighter.get('power', 0)}",
-        font=_font(20, bold=True), fill="#37434c",
+        font=_font(16, bold=True), fill="#37434c",
     )
 
     rows = (

@@ -43,6 +43,9 @@ further, the levers are BASE_DAILY_FIGHTS and WIN_GOLD_*, not the stat costs: ma
 levels cheaper raises everybody equally and widens nothing. See PETS_BALANCE.md.
 """
 
+import hashlib
+from datetime import date as _date
+
 # --------------------------------------------------------------------------- currency
 # The pet game spends the SAME coins /stat and /shop already show. That is deliberate:
 # it makes chat activity fund the game (which is what was asked for) and finally gives
@@ -74,6 +77,17 @@ CAGE_UPGRADE_COSTS = (0, 100, 100, 100, 100)         # index = level - 1
 CAGE_UPGRADE_REFUND = 350
 CAGE_BONUS_FIGHTS = (0, 1, 2, 3, 4)                  # extra fights/day at that level
 CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
+
+# ------------------------------------------------------------- passive facility
+# "Хомяколатор" is separate from combat. Its marginal payback rises from about
+# 10, 31, 63, 125 to 250 days, making it a long-term coin sink rather than a
+# replacement for chat activity or arena wins.
+HAMSTERATOR_MAX_LEVEL = 5
+# Index is the level being left, so [0] buys level 1.
+HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
+HAMSTERATOR_GOLD_PER_HOUR = (0, 1, 2, 3, 4, 5)
+# 24, 36, 48, 60, and 72 hours of storage at each active level.
+HAMSTERATOR_STORAGE_CAP = (0, 24, 72, 144, 240, 360)
 
 # ---------------------------------------------------------------------- stat upgrades
 # cost(L -> L+1) = round(STAT_COST_BASE * L ** STAT_COST_EXPONENT), so the first point
@@ -266,6 +280,12 @@ LOSS_GOLD_SHARE = 0.3
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
 DRAW_XP = 50                # both sides spent a fight; no gold or win is awarded
+# A grown creature is not allowed to farm a new one.  This is deliberately based on pet
+# level rather than combat power: gear can make a low-level pet dangerous, but it should
+# not turn a playground rule into a hidden matchmaking restriction.
+GUARDIAN_LEVEL_GAP = 7
+GUARDIAN_XP = 5
+GUARDIAN_INTERVENTION_TEXT = "Негоже взрослому с детьми драться. Вас отпиздил охранник."
 # Winning against a pet several levels below yours is less valuable, while an upset is
 # worth more. The delta is loser level minus winner level, capped at three levels so a
 # rare lopsided match cannot turn into a punitive tax or an outsized reward. Cage gold
@@ -366,9 +386,15 @@ SLOT_EMOJI = {
 class Item:
     """One equippable thing. `bonuses` maps any of STAT_KEYS or "armor" to a flat add."""
 
-    __slots__ = ("code", "name", "slot", "price", "source", "bonuses", "description")
+    __slots__ = (
+        "code", "name", "slot", "price", "source", "bonuses", "description",
+        "rarity", "resale_price", "drop_weight",
+    )
 
-    def __init__(self, code, name, slot, price, source, bonuses, description=""):
+    def __init__(
+        self, code, name, slot, price, source, bonuses, description="", rarity="common",
+        resale_price=None, drop_weight=1,
+    ):
         self.code = code
         self.name = name
         self.slot = slot
@@ -376,6 +402,9 @@ class Item:
         self.source = source
         self.bonuses = dict(bonuses)
         self.description = description
+        self.rarity = rarity
+        self.resale_price = resale_price
+        self.drop_weight = drop_weight
 
 
 # Starter catalogue. Prices sit between a few wins and a few weeks so that gear is a
@@ -402,12 +431,109 @@ ITEMS = (
         "Шуршат шариками внутри и ускоряют путь к столу."),
 )
 
+# The large weapon catalogue is intentionally data-only so balancing/plumbing stays
+# here.  During partial deployments its absence leaves the compact starter catalogue
+# usable; when present it replaces the three starter weapons while preserving the six
+# non-weapon starters.
+try:
+    from pets_weapon_catalog import RAW_ITEMS as _RAW_WEAPON_ITEMS
+except ImportError:
+    _RAW_WEAPON_ITEMS = ()
+
+
+def _catalog_item(spec):
+    if isinstance(spec, Item):
+        return spec
+    if not isinstance(spec, dict):
+        raise TypeError("weapon catalogue entries must be Item objects or dicts")
+    return Item(
+        spec["code"], spec["name"], spec["slot"], spec.get("price", spec.get("buy_price", 0)),
+        spec.get("source", "shop"), spec.get("bonuses", {}),
+        spec.get("description", ""), spec.get("rarity", "common"),
+        spec.get("resale_price"), spec.get("drop_weight", 1),
+    )
+
+
+if _RAW_WEAPON_ITEMS:
+    _catalogue_weapons = tuple(_catalog_item(spec) for spec in _RAW_WEAPON_ITEMS)
+    if len(_catalogue_weapons) != 500 or any(item.slot != "weapon" for item in _catalogue_weapons):
+        raise ValueError("weapon catalogue must contain exactly 500 weapon entries")
+    _codes = [item.code for item in _catalogue_weapons]
+    if len(set(_codes)) != len(_codes):
+        raise ValueError("weapon catalogue contains duplicate item codes")
+    ITEMS = _catalogue_weapons + tuple(item for item in ITEMS if item.slot != "weapon")
+
+# Save files from the starter catalogue keep working after the 500-weapon replacement.
+LEGACY_ITEM_CODES = {"stick": "w001", "fork": "w002", "bone": "w003"} if _RAW_WEAPON_ITEMS else {}
+
+
+# Shop gear pays back only 20%; drop-only trophies have an explicit salvage value in
+# catalogue data or a conservative value based on their stat impact.
+ITEM_RESALE_SHARE = 0.20
+RARITY_LABELS = {
+    "cursed": "☠️ Проклятое",
+    "common": "⚪ Обычное",
+    "uncommon": "🟢 Необычное",
+    "rare": "🔵 Редкое",
+    "legendary": "🟣 Легендарное",
+}
+
+
+def resale_value(item: Item) -> int:
+    if item.resale_price is not None:
+        return max(1, int(item.resale_price))
+    if item.price > 0:
+        return max(1, round(item.price * ITEM_RESALE_SHARE))
+    impact = sum(abs(int(value)) for value in item.bonuses.values())
+    return max(5, impact * 3)
+
+
 # How often a win drops an item at all, and from which pool.
 DROP_CHANCE = 0.08
+
+# A normal win has roughly 0.088% chance to produce a legendary weapon
+# (DROP_CHANCE multiplied by the catalogue's weighted legendary share).  That is one
+# natural legendary per ~1,136 wins on average, much too volatile for a 500-item
+# collection.  A 500-win ceiling is deliberately conservative: luck still matters,
+# but an active player cannot miss every legendary forever.
+LEGENDARY_PITY_ELIGIBLE_WINS = 500
+
+# Gifts are social rather than a fast alt-account funnel.  The giver needs a creature
+# with a little arena history, and each giver can move only one item per day.  The
+# values live here so they are visible alongside the rest of the economy knobs.
+GIFT_MIN_PET_LEVEL = 3
+GIFT_COOLDOWN_SECONDS = 24 * 60 * 60
+GIFT_AUDIT_LIMIT = 500
+
+# The shop deliberately has a small, changing window instead of asking players to
+# scroll through 450 purchasable weapons.  The offset is chat-specific, while moving
+# it by one full window per calendar day guarantees that tomorrow cannot be the same
+# window as today (as long as there are more than 16 shop weapons).
+DAILY_STOREFRONT_SIZE = 16
+
+
+def daily_storefront_weapons(entry: str, day: _date | None = None) -> tuple[Item, ...]:
+    """The stable daily set of purchasable weapons for one chat.
+
+    This is intentionally a pure function: a restart, a second button tap, or two
+    players opening the shop must all see the same stock.  `day` makes balance tests
+    and previews deterministic without changing the server clock.
+    """
+    today = day or _date.today()
+    if isinstance(today, str):
+        today = _date.fromisoformat(today)
+    pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
+    if len(pool) <= DAILY_STOREFRONT_SIZE:
+        return pool
+    digest = hashlib.sha256(str(entry).encode("utf-8")).digest()
+    initial_offset = int.from_bytes(digest[:8], "big") % len(pool)
+    offset = (initial_offset + today.toordinal() * DAILY_STOREFRONT_SIZE) % len(pool)
+    return tuple(pool[(offset + index) % len(pool)] for index in range(DAILY_STOREFRONT_SIZE))
 
 
 def find_item(code: str):
     needle = (code or "").strip().lower()
+    needle = LEGACY_ITEM_CODES.get(needle, needle)
     return next((item for item in ITEMS if item.code == needle), None)
 
 

@@ -971,6 +971,11 @@ class MenuRegistrationTests(unittest.TestCase):
         )
         self.assertIn("cabinet", {c["command"] for c in bot_listener.PRIVATE_CHAT_COMMANDS})
 
+    def test_arena_is_the_first_command_in_every_menu(self):
+        """The primary game entry point should be immediately visible in Telegram's menu."""
+        self.assertEqual(bot_listener.PRIVATE_CHAT_COMMANDS[0]["command"], "arena")
+        self.assertEqual(bot_listener.GROUP_CHAT_COMMANDS[0]["command"], "arena")
+
     def test_top_arguments_resolve_the_same_spaced_or_not(self):
         self.assertEqual(stats.parse_top_argument("all"), "all")
         self.assertEqual(stats.parse_top_argument("week"), "week")

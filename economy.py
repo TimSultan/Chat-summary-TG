@@ -258,6 +258,72 @@ def _effects(record: dict) -> dict:
     return record.setdefault("effects", {})
 
 
+# --- pet passive income -----------------------------------------------------------
+
+
+def passive_income_status(entry: str, user_id, hourly_rate: int, storage_cap: int,
+                          now: datetime | None = None) -> dict:
+    """Preview collectable facility gold without changing the ledger.
+
+    A missing checkpoint is intentionally worth zero: pets created before this feature
+    begin at their first interaction rather than receiving retrospective income.
+    """
+    moment = now or app_now()
+    data = _load(entry)
+    effect = ((data["users"].get(str(user_id)) or {}).get("effects", {})
+              .get("pet_hamsterator", {}))
+    raw = effect.get("last_hour")
+    if hourly_rate <= 0 or storage_cap <= 0 or not raw:
+        next_hour = moment + timedelta(hours=1) if hourly_rate > 0 and storage_cap > 0 else moment
+        return {"stored": 0, "hours": 0, "last_hour": raw, "next_hour": next_hour}
+    try:
+        previous = datetime.fromisoformat(raw)
+        elapsed = max(0, int((moment - previous).total_seconds() // 3600))
+    except (TypeError, ValueError):
+        previous = moment
+        elapsed = 0
+    return {
+        "stored": min(storage_cap, elapsed * hourly_rate), "hours": elapsed,
+        "last_hour": raw, "next_hour": previous + timedelta(hours=elapsed + 1),
+    }
+
+
+def settle_passive_income(entry: str, user_id, hourly_rate: int, storage_cap: int,
+                           now: datetime | None = None) -> dict:
+    """Atomically credit completed facility hours and move their checkpoint.
+
+    The checkpoint and ``bonus`` share a ledger write, so restart/retry sees the already
+    advanced hour and cannot credit it twice.  Overflow beyond storage is discarded.
+    """
+    moment = now or app_now()
+    data = _load(entry)
+    record = _record(data, user_id)
+    effect = _effects(record).setdefault("pet_hamsterator", {})
+    raw = effect.get("last_hour")
+    if not raw:
+        effect["last_hour"] = moment.isoformat()
+        _save(entry, data)
+        return {"credited": 0, "hours": 0, "initialized": True}
+    try:
+        previous = datetime.fromisoformat(raw)
+        elapsed = max(0, int((moment - previous).total_seconds() // 3600))
+    except (TypeError, ValueError):
+        previous = moment
+        elapsed = 0
+    cap = max(0, int(storage_cap))
+    produced = elapsed * max(0, int(hourly_rate))
+    credit = min(cap, produced)
+    # Keep an unfinished fraction when there was room; otherwise full storage would
+    # leave a fractional tail that effectively grants post-cap production later.
+    checkpoint = moment if produced > cap else previous + timedelta(hours=elapsed)
+    effect["last_hour"] = checkpoint.isoformat()
+    if credit:
+        record["bonus"] = record.get("bonus", 0) + credit
+        _append_log(data, user_id, credit, "pet:hamsterator_income", ref=str(elapsed))
+    _save(entry, data)
+    return {"credited": credit, "hours": elapsed, "initialized": False}
+
+
 def last_purchased_at(entry: str, user_id, code: str) -> datetime | None:
     record = _load(entry)["users"].get(str(user_id)) or {}
     stamp = (record.get("effects") or {}).get("last_purchase", {}).get(code)

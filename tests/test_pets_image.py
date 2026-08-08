@@ -4,7 +4,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import pets_image
 
@@ -62,11 +62,13 @@ class FightImageTests(unittest.TestCase):
             "id": "a", "pet_name": "Альфа", "owner_name": "Alice",
             "stats": {"strength": 12, "health": 11, "agility": 10, "luck": 9, "armor": 5},
             "power": 250, "pet_photo": _png("green"), "owner_avatar": _png("blue"),
+            "remaining_hp": 66, "max_hp": 100,
         }
         defender = {
             "id": "b", "pet_name": "Бета", "owner_name": "Bob",
             "stats": {"strength": 10, "health": 14, "agility": 8, "luck": 11, "armor": 7},
             "power": 248, "pet_photo": _png("red"), "owner_avatar": _png("yellow"),
+            "remaining_hp": 0, "max_hp": 120,
         }
         with tempfile.TemporaryDirectory() as directory:
             path = pets_image.render_fight_result(Path(directory) / "fight.jpg", result, attacker, defender)
@@ -75,6 +77,17 @@ class FightImageTests(unittest.TestCase):
                 self.assertEqual(image.size, (pets_image.WIDTH, pets_image.HEIGHT))
                 self.assertEqual(image.format, "JPEG")
                 self.assertNotEqual(image.getpixel((100, 200)), image.getpixel((700, 200)))
+
+    def test_hp_bar_is_red_for_remaining_health_and_grey_when_empty(self):
+        image = Image.new("RGB", (pets_image.WIDTH, pets_image.HEIGHT), "white")
+        draw = ImageDraw.Draw(image)
+        living = {"remaining_hp": 50, "max_hp": 100}
+        empty = {"remaining_hp": 0, "max_hp": 100}
+        pets_image._draw_hp_bar(draw, 45, living)
+        pets_image._draw_hp_bar(draw, 685, empty)
+        y = pets_image.HP_BAR_TOP + pets_image.HP_BAR_HEIGHT // 2
+        self.assertEqual(image.getpixel((45 + pets_image.PANEL_PADDING_X + 50, y)), (200, 68, 75))
+        self.assertEqual(image.getpixel((685 + pets_image.PANEL_PADDING_X + 50, y)), (174, 182, 181))
 
 
 if __name__ == "__main__":

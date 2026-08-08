@@ -32,6 +32,14 @@ MAX_CALLBACK_BYTES = 64
 
 BACK_BUTTON = "◀️ Назад"
 LEADERBOARD_PAGE_SIZE = 20
+SLOT_PAGE_SIZE = 8
+INVENTORY_PAGE_SIZE = 6
+COLLECTION_PAGE_SIZE = 8
+RARITY_FILTERS = ("all", "cursed", "common", "uncommon", "rare", "legendary")
+RARITY_FILTER_NAMES = {
+    "all": "Все", "cursed": "Проклятые", "common": "Обычные",
+    "uncommon": "Необычные", "rare": "Редкие", "legendary": "Легендарные",
+}
 
 
 def callback_data(owner_id, action: str, argument: str = "") -> str:
@@ -124,6 +132,7 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows = [
+        [{"text": "🐹 Хомяколатор", "callback_data": callback_data(user_id, "hamsterator")}],
         [{"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")}],
         [{"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")}],
     ]
@@ -133,7 +142,11 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             {"text": "💪 Прокачка", "callback_data": callback_data(user_id, "train")},
         ])
         rows.append([
-            {"text": "🎒 Инвентарь", "callback_data": callback_data(user_id, "bag")},
+            {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
+            {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
+        ])
+        rows.append([
+            {"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")},
             {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
         ])
         rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
@@ -190,11 +203,13 @@ def info_view(user_id) -> tuple[str, dict]:
         f"1. Купи клетку за {_coins(C.CAGE_PRICE)}, затем приручи своего покраса за {_coins(C.TAME_PRICE)}."
     )
     lines.append("2. Прокачивай Силу, Здоровье, Ловкость и Удачу; экипировка добавляет статы и Броню.")
-    lines.append("3. Сражайся в боте через /arena: соперник подбирается по боевому рейтингу. Боёв больше за активность в чате и клетку.")
+    lines.append("3. Сражайся в боте через /arena: соперник выбирается случайно среди тех, кого сейчас можно атаковать. Боёв больше за активность в чате и клетку.")
     lines.append(
         f"4. Победа приносит {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и опыт. "
         f"Поражение забирает только {round(C.LOSS_GOLD_SHARE * 100)}% награды, без долгов."
     )
+    lines.append("5. Ненужную снятую экипировку можно продать или подарить владельцу другого существа.")
+    lines.append("6. Хомяколатор копит монеты за полностью прошедшие часы, пока его склад не заполнится.")
     lines.append("\n<b>Статы</b>")
     lines.append("Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. Удача повышает шанс крита.")
     lines.append("\n<b>Особые преимущества</b>")
@@ -253,6 +268,47 @@ def cage_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         rows.append([{
             "text": f"⬆️ Улучшить — {_money(C.CAGE_UPGRADE_COSTS[level])}",
             "callback_data": callback_data(user_id, "upcage"),
+        }])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+# -------------------------------------------------------------------- hamsterator
+
+
+def hamsterator_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    """Passive-income facility view; opening it collects any complete stored hours."""
+    before = pets.passive_income_status(entry, user_id)
+    coins = pets.balance_for(entry, user_id, xp)
+    level = pets.hamsterator_level(entry, user_id)
+    rate = C.HAMSTERATOR_GOLD_PER_HOUR[level]
+    cap = C.HAMSTERATOR_STORAGE_CAP[level]
+    lines = ["🐹 <b>Хомяколатор</b>\n"]
+    if not pets.has_cage(entry, user_id):
+        lines.append("Сначала нужна клетка: хомякам негде крутить монетный барабан.")
+    else:
+        lines.append(f"Уровень {level} из {C.HAMSTERATOR_MAX_LEVEL}.")
+        lines.append(f"🪙 Добыча: +{rate} монет/ч.")
+        lines.append(f"📦 Склад: до {_money(cap)} монет.")
+        if before.get("stored"):
+            lines.append(f"✅ Собрано сейчас: +{_money(before['stored'])}.")
+        elif level:
+            next_at = before["next_hour"].strftime("%H:%M")
+            lines.append(f"⏱ Следующая монета — в {next_at}.")
+        if level < C.HAMSTERATOR_MAX_LEVEL:
+            cost = C.HAMSTERATOR_UPGRADE_COSTS[level]
+            next_rate = C.HAMSTERATOR_GOLD_PER_HOUR[level + 1]
+            next_cap = C.HAMSTERATOR_STORAGE_CAP[level + 1]
+            lines.append(
+                f"\nСледующий уровень — {_coins(cost)}: +{next_rate} монет/ч, "
+                f"склад {_money(next_cap)}."
+            )
+    lines.append(f"\n🪙 У тебя: {_money(coins)}")
+    rows = []
+    if pets.has_cage(entry, user_id) and level < C.HAMSTERATOR_MAX_LEVEL:
+        rows.append([{
+            "text": f"⬆️ Улучшить — {_money(C.HAMSTERATOR_UPGRADE_COSTS[level])}",
+            "callback_data": callback_data(user_id, "uphamsterator"),
         }])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -318,6 +374,14 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
 
 def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    """The equipment hub, deliberately separate from the 500-item catalogue.
+
+    The old screen opened the full weapon catalogue from the only inventory button.
+    That made a player with two weapons wade through 60+ pages of things they did not
+    own.  The hub answers the useful questions first (what is worn, how many things
+    are in the bag), then makes the three destinations explicit: bag, daily shop, and
+    collection.
+    """
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
@@ -325,7 +389,8 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     equipped = pet.get("equipped", {})
     owned = pet.get("inventory", [])
 
-    lines = ["🎒 <b>Инвентарь</b>\n"]
+    effective = pets.effective_stats(entry, user_id)
+    lines = ["🎒 <b>Снаряжение</b>", "Выбирай вещи из своей сумки; новые — в магазине.", ""]
     for slot in C.SLOT_KEYS:
         code = equipped.get(slot)
         item = C.find_item(code) if code else None
@@ -333,14 +398,28 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             f"{C.SLOT_EMOJI[slot]} {C.SLOT_NAMES[slot]}: "
             + (f"<b>{escape(item.name)}</b> — {_bonus_text(item)}" if item else "пусто")
         )
-    lines.append(f"\n🪙 Монеты: {_money(coins)}")
+    lines.append(
+        "\n<i>Итог: " + " · ".join(
+            f"{C.STAT_EMOJI[key]} {effective.get(key, 1)}" for key in C.STAT_KEYS
+        ) + f" · {C.ARMOR_EMOJI} {effective.get('armor', 0)}</i>"
+    )
+    lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows = []
     for slot in C.SLOT_KEYS:
+        slot_owned = sum(
+            C.find_item(code) is not None and C.find_item(code).slot == slot
+            for code in owned
+        )
         rows.append([{
-            "text": f"{C.SLOT_EMOJI[slot]} {C.SLOT_NAMES[slot]}",
-            "callback_data": callback_data(user_id, "slot", slot),
+            "text": f"{C.SLOT_EMOJI[slot]} Моя сумка · {slot_owned}",
+            "callback_data": callback_data(user_id, "bagitems", slot_argument(slot)),
         }])
+    rows.append([{
+        "text": "🛒 Магазин дня", "callback_data": callback_data(user_id, "store"),
+    }, {
+        "text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection"),
+    }])
     if owned:
         lines.append(
             f"\n<i>В сумке: {_plural(len(owned), 'предмет', 'предмета', 'предметов')}.</i>"
@@ -349,7 +428,16 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
-def slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
+def slot_argument(slot: str, page: int = 0) -> str:
+    return f"{slot},{max(0, int(page))}"
+
+
+def parse_slot_argument(argument: str) -> tuple[str, int]:
+    slot, _, raw_page = str(argument or "").partition(",")
+    return slot, int(raw_page) if raw_page.isdecimal() else 0
+
+
+def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[str, dict]:
     """Everything that can go in one slot: what is worn, what is owned, what is for sale
     and what can only drop. The drop-only items are listed with no button on purpose --
     a player should be able to see that the good weapon exists and cannot be bought."""
@@ -360,19 +448,35 @@ def slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
         return main_view(entry, user_id, xp)
     coins = pets.balance_for(entry, user_id, xp)
     owned = set(pet.get("inventory", []))
+    locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
+    daily_weapon_codes = {item.code for item in C.daily_storefront_weapons(entry, pets.today())}
 
-    lines = [f"{C.SLOT_EMOJI[slot]} <b>{escape(C.SLOT_NAMES[slot])}</b>\n"]
+    # Owned gear must stay reachable even when its catalogue code lives on page 63.
+    # Equipped first, then the rest of the bag, then unowned catalogue stock.
+    all_items = sorted(
+        C.items_for_slot(slot),
+        key=lambda item: (item.code != worn, item.code not in owned, item.code),
+    )
+    total_pages = max(1, (len(all_items) + SLOT_PAGE_SIZE - 1) // SLOT_PAGE_SIZE)
+    page = min(max(0, page), total_pages - 1)
+    visible = all_items[page * SLOT_PAGE_SIZE:(page + 1) * SLOT_PAGE_SIZE]
+    lines = [f"{C.SLOT_EMOJI[slot]} <b>{escape(C.SLOT_NAMES[slot])}</b> · {page + 1}/{total_pages}\n"]
     rows = []
-    for item in C.items_for_slot(slot):
+    for item in visible:
         mark = " ✅" if item.code == worn else ""
+        lock_mark = " 🔒" if item.code in locked else ""
         if item.code in owned:
             state = "в сумке"
         elif item.source == "drop":
             state = "только из боёв"
+        elif item.slot == "weapon" and item.code not in daily_weapon_codes:
+            state = "не на витрине сегодня"
         else:
             state = _coins(item.price)
-        lines.append(f"<b>{escape(item.name)}</b>{mark} — {_bonus_text(item)} · {state}")
+        lines.append(f"<b>{escape(item.name)}</b>{mark}{lock_mark} — {_bonus_text(item)} · {state}")
+        rarity = C.RARITY_LABELS.get(getattr(item, "rarity", "common"), "⚪ Обычное")
+        lines[-1] = f"<b>{escape(item.name)}</b>{mark}{lock_mark} · {rarity} · {_bonus_text(item)} · {state}"
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
         lines.append("")
@@ -387,7 +491,20 @@ def slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
                 "text": f"Надеть {item.name}",
                 "callback_data": callback_data(user_id, "equip", item.code),
             }])
-        elif item.source == "shop":
+            rows.append([{
+                "text": "🔓 Открепить" if item.code in locked else "🔒 Закрепить",
+                "callback_data": callback_data(user_id, "lock", item.code),
+            }, {
+                "text": "🎁 Подарить",
+                "callback_data": callback_data(user_id, "gift", item.code),
+            }])
+            rows.append([{
+                "text": f"💰 Продать · {_money(C.resale_value(item))}",
+                "callback_data": callback_data(user_id, "sell", item.code),
+            }])
+        elif item.source == "shop" and (
+            item.slot != "weapon" or item.code in daily_weapon_codes
+        ):
             rows.append([{
                 "text": f"Купить {item.name} — {_money(item.price)}",
                 "callback_data": callback_data(user_id, "buy", item.code),
@@ -395,7 +512,105 @@ def slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows.append([{"text": "🎒 К инвентарю", "callback_data": callback_data(user_id, "bag")}])
+    navigation = []
+    if page:
+        navigation.append({"text": "◀️", "callback_data": callback_data(user_id, "slot", slot_argument(slot, page - 1))})
+    if page + 1 < total_pages:
+        navigation.append({"text": "▶️", "callback_data": callback_data(user_id, "slot", slot_argument(slot, page + 1))})
+    if navigation:
+        rows.append(navigation)
     rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[str, dict]:
+    """A practical, owned-items-only bag page.
+
+    ``slot_view`` remains as a compatibility catalogue for old messages and direct
+    callbacks, while every new route enters this view. It is intentionally compact:
+    equipment actions only appear for items the player actually owns.
+    """
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    if slot not in C.SLOT_KEYS:
+        return bag_view(entry, user_id, xp)
+
+    owned = [
+        item for code in pet.get("inventory", [])
+        if (item := C.find_item(code)) is not None and item.slot == slot
+    ]
+    locked = set(pet.get("locked_items", []))
+    worn = (pet.get("equipped") or {}).get(slot)
+    owned.sort(key=lambda item: (item.code != worn, item.code))
+    total_pages = max(1, (len(owned) + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
+    page = min(max(0, page), total_pages - 1)
+    visible = owned[page * INVENTORY_PAGE_SIZE:(page + 1) * INVENTORY_PAGE_SIZE]
+
+    noun = _plural(len(owned), "предмет", "предмета", "предметов").split(" ", 1)[1]
+    lines = [
+        f"🎒 <b>Моя сумка · {escape(C.SLOT_NAMES[slot])}</b>",
+        f"{len(owned)} {noun} · {page + 1}/{total_pages}",
+    ]
+    rows = []
+    if not visible:
+        lines.append("\nЗдесь пока пусто. Новое оружие появляется в магазине дня или после победы.")
+    for number, item in enumerate(visible, start=page * INVENTORY_PAGE_SIZE + 1):
+        is_worn = item.code == worn
+        mark = " ✅ надето" if is_worn else ""
+        lock_mark = " 🔒" if item.code in locked else ""
+        label = C.RARITY_LABELS.get(item.rarity, item.rarity)
+        lines.append(f"\n{number}. <b>{escape(item.name)}</b>{mark}{lock_mark}")
+        lines.append(f"{label} · {_bonus_text(item)}")
+        if item.description:
+            lines.append(f"<i>{escape(item.description)}</i>")
+
+        if is_worn:
+            rows.append([{
+                "text": f"Снять · {item.name}",
+                "callback_data": callback_data(user_id, "unequip", slot),
+            }])
+        else:
+            rows.append([{
+                "text": f"Надеть · {item.name}",
+                "callback_data": callback_data(user_id, "equip", item.code),
+            }])
+        rows.append([{
+            "text": "🔓 Открепить" if item.code in locked else "🔒 Закрепить",
+            "callback_data": callback_data(user_id, "lock", item.code),
+        }])
+        # A lock is a safety control, not merely a warning: keep destructive actions
+        # out of the convenient page as well as enforcing the same rule in pets.py.
+        if not is_worn and item.code not in locked:
+            rows.append([{
+                "text": "🎁 Подарить",
+                "callback_data": callback_data(user_id, "gift", item.code),
+            }])
+            rows.append([{
+                "text": f"💰 Продать · {_money(C.resale_value(item))}",
+                "callback_data": callback_data(user_id, "sell", item.code),
+            }])
+
+    navigation = []
+    if page:
+        navigation.append({
+            "text": "◀️", "callback_data": callback_data(
+                user_id, "bagitems", slot_argument(slot, page - 1),
+            ),
+        })
+    if page + 1 < total_pages:
+        navigation.append({
+            "text": "▶️", "callback_data": callback_data(
+                user_id, "bagitems", slot_argument(slot, page + 1),
+            ),
+        })
+    if navigation:
+        rows.append(navigation)
+    rows.extend([
+        [{"text": "🛒 В магазин дня", "callback_data": callback_data(user_id, "store")}],
+        [{"text": "🎒 К снаряжению", "callback_data": callback_data(user_id, "bag")}],
+        _back_row(user_id),
+    ])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -405,6 +620,156 @@ def slot_of(code: str) -> str:
     still has it in the bag, and a redraw must not blow up because of that."""
     item = C.find_item(code)
     return item.slot if item else C.SLOT_KEYS[0]
+
+
+def _rarity_argument(argument: str, with_page: bool = False) -> tuple[str, int]:
+    rarity, _, raw_page = str(argument or "").partition(",")
+    rarity = rarity if rarity in RARITY_FILTERS else "all"
+    page = int(raw_page) if with_page and raw_page.isdecimal() else 0
+    return rarity, max(0, page)
+
+
+def collection_argument(rarity: str = "all", page: int = 0) -> str:
+    return f"{rarity if rarity in RARITY_FILTERS else 'all'},{max(0, int(page))}"
+
+
+def confirmation_argument(code: str, token: str) -> str:
+    """Compact and callback-safe code/token pair for a one-time confirmation."""
+    return f"{code},{token}"
+
+
+def parse_confirmation_argument(argument: str) -> tuple[str, str]:
+    code, separator, token = str(argument or "").partition(",")
+    if not separator or not code.isalnum() or not token.isalnum() or len(token) > 16:
+        return "", ""
+    return code, token
+
+
+def _rarity_buttons(user_id, action: str, selected: str, *, paged: bool = False) -> list:
+    short = {"all": "Все", "cursed": "☠️", "common": "⚪", "uncommon": "🟢", "rare": "🔵", "legendary": "🟡"}
+    buttons = []
+    for rarity in RARITY_FILTERS:
+        text = short[rarity] + (" ✓" if rarity == selected else "")
+        argument = collection_argument(rarity, 0) if paged else rarity
+        buttons.append({"text": text, "callback_data": callback_data(user_id, action, argument)})
+    return [buttons[:3], buttons[3:]]
+
+
+def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, dict]:
+    """The 16-item daily weapon window plus direct routes to accessory shelves."""
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    rarity, _ = _rarity_argument(rarity)
+    owned = set(pet.get("inventory", []))
+    stock = C.daily_storefront_weapons(entry, pets.today())
+    visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
+    lines = ["🛒 <b>Витрина дня</b>", "Сегодня в продаже 16 оружий. Завтра ассортимент сменится."]
+    lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
+    if not visible:
+        lines.append("Сегодня оружия этой редкости не завезли.")
+    rows = _rarity_buttons(user_id, "store", rarity)
+    for item in visible:
+        state = "у тебя уже есть" if item.code in owned else _coins(item.price)
+        label = C.RARITY_LABELS.get(item.rarity, item.rarity)
+        lines.append(f"<b>{escape(item.name)}</b> · {label} · {_bonus_text(item)} · {state}")
+        if item.description:
+            lines.append(f"<i>{escape(item.description)}</i>")
+        if item.code not in owned:
+            rows.append([{
+                "text": f"Купить · {_money(item.price)}",
+                "callback_data": callback_data(user_id, "buy", item.code),
+            }])
+    lines.append(f"\n🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
+    rows.extend([
+        [{
+            "text": f"{C.SLOT_EMOJI['amulet']} {C.SLOT_NAMES['amulet']}",
+            "callback_data": callback_data(user_id, "slot", slot_argument("amulet")),
+        }, {
+            "text": f"{C.SLOT_EMOJI['gloves']} {C.SLOT_NAMES['gloves']}",
+            "callback_data": callback_data(user_id, "slot", slot_argument("gloves")),
+        }],
+        [{
+            "text": f"{C.SLOT_EMOJI['boots']} {C.SLOT_NAMES['boots']}",
+            "callback_data": callback_data(user_id, "slot", slot_argument("boots")),
+        }],
+        [{"text": "🎒 Моё снаряжение", "callback_data": callback_data(user_id, "bag")}],
+        [{"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")}],
+        _back_row(user_id),
+    ])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def collection_view(entry: str, user_id, xp: int, argument: str = "") -> tuple[str, dict]:
+    """A permanent 500-weapon book: owned, seen before, and still unknown."""
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    rarity, page = _rarity_argument(argument, with_page=True)
+    weapons = sorted(C.items_for_slot("weapon"), key=lambda item: item.code)
+    discovered = set(pet.get("discovered", []))
+    owned = set(pet.get("inventory", []))
+    lines = ["📚 <b>Книга оружия</b>"]
+    lines.append(f"Открыто: <b>{len(discovered & {item.code for item in weapons})}/{len(weapons)}</b> · в сумке: {len(owned & {item.code for item in weapons})}")
+    pity_progress = getattr(pets, "legendary_pity_progress", None)
+    if callable(pity_progress):
+        pity = pity_progress(entry, user_id)
+        if pity.get("eligible"):
+            lines.append(
+                f"🟡 До гарантированной легендарки: {pity['wins_without_legend']}/{pity['threshold']} побед "
+                f"(осталось {pity['remaining_wins']})."
+            )
+    for one_rarity in RARITY_FILTERS[1:]:
+        group = [item for item in weapons if item.rarity == one_rarity]
+        seen = sum(item.code in discovered for item in group)
+        lines.append(f"{C.RARITY_LABELS.get(one_rarity, one_rarity)}: {seen}/{len(group)}")
+    visible_all = [item for item in weapons if rarity == "all" or item.rarity == rarity]
+    total_pages = max(1, (len(visible_all) + COLLECTION_PAGE_SIZE - 1) // COLLECTION_PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    visible = visible_all[page * COLLECTION_PAGE_SIZE:(page + 1) * COLLECTION_PAGE_SIZE]
+    lines.append(f"\n<b>{RARITY_FILTER_NAMES[rarity]}</b> · {page + 1}/{total_pages}")
+    for item in visible:
+        state = "✅ в сумке" if item.code in owned else "👁 открыто" if item.code in discovered else "▫️ ???"
+        name = escape(item.name) if item.code in discovered else "Неизвестное оружие"
+        lines.append(f"{state} · <b>{name}</b> · {C.RARITY_LABELS.get(item.rarity, item.rarity)}")
+    rows = _rarity_buttons(user_id, "collection", rarity, paged=True)
+    navigation = []
+    if page:
+        navigation.append({"text": "◀️", "callback_data": callback_data(user_id, "collection", collection_argument(rarity, page - 1))})
+    if page + 1 < total_pages:
+        navigation.append({"text": "▶️", "callback_data": callback_data(user_id, "collection", collection_argument(rarity, page + 1))})
+    if navigation:
+        rows.append(navigation)
+    rows.append([{"text": "🛒 Витрина", "callback_data": callback_data(user_id, "store")}])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def valuable_item(item) -> bool:
+    return item is not None and item.rarity in {"rare", "legendary"}
+
+
+def item_confirmation_view(entry: str, user_id, xp: int, action: str, code: str, token: str) -> tuple[str, dict]:
+    """Second, deliberate tap before a rare item leaves the inventory."""
+    item = C.find_item(code)
+    pet = pets.get_pet(entry, user_id)
+    if not item or not pet or item.code not in pet.get("inventory", []):
+        return notice_view(user_id, "Этого предмета уже нет в сумке.")
+    verb = "продать" if action == "sell" else "подарить"
+    execute = "sellok" if action == "sell" else "giftok"
+    lines = [
+        "⚠️ <b>Подтверждение</b>",
+        f"{C.RARITY_LABELS.get(item.rarity, item.rarity)} «{escape(item.name)}».",
+        f"Точно {verb}? Это действие нельзя отменить.",
+    ]
+    rows = [[{
+        "text": f"Да, {verb}",
+        "callback_data": callback_data(user_id, execute, confirmation_argument(item.code, token)),
+    }, {
+        "text": "Отмена",
+        "callback_data": callback_data(user_id, "bagitems", slot_argument(slot_of(item.code))),
+    }]]
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def _bonus_text(item) -> str:
@@ -441,13 +806,17 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f" работ — {figurines}.</i>"
     )
     lines.append(
-        f"\nСоперник подбирается по боевому рейтингу:"
-        f" учитываются статы, уровень существа и снаряжение."
+        "\nСоперник выбирается случайно из всех существ, которых сейчас можно атаковать. "
+        "Ограничений по уровню и боевой силе нет."
     )
     lines.append(
         f"Базовая награда за победу: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и {C.WIN_XP} опыта;"
         f" за соперника ниже уровнем — меньше, выше — больше (до ±25%)."
         f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
+    )
+    lines.append(
+        "Если ты на 7+ уровней выше соперника, охранник остановит бой: "
+        "без золота и дропа, зато +5 опыта."
     )
     if left <= 0:
         lines.append("\nНа сегодня всё. Пиши в чат — завтра боёв будет больше.")
@@ -472,8 +841,6 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
     if not mine or not theirs:
         return fight_view(entry, user_id, xp)
     their_stats = pets.effective_stats(entry, opponent_id)
-    my_power = pets.power_rating(entry, user_id)
-    their_power = pets.power_rating(entry, opponent_id)
 
     lines = ["🔍 <b>Соперник найден</b>\n"]
     lines.append(f"🐾 <b>{_name(theirs)}</b> — уровень {theirs.get('level', 1)}")
@@ -481,7 +848,6 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
     lines.append(
         f"Боёв: {theirs.get('fights', 0)} / побед: {theirs.get('wins', 0)}"
     )
-    lines.append(f"Боевой рейтинг: {their_power} <i>(у тебя {my_power})</i>")
     lines.append("")
     for key in C.STAT_KEYS:
         lines.append(f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]}: {their_stats.get(key, 1)}")
@@ -587,12 +953,16 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
         lines.append("Боёв пока не было.")
     for record in rows_data:
         attacked = str(record.get("attacker_id")) == str(user_id)
+        guardian = bool(record.get("guardian_intervention"))
         draw = bool(record.get("draw"))
         won = str(record.get("winner_id")) == str(user_id)
         other = record.get("defender_name") if attacked else record.get("attacker_name")
         owner = record.get("defender_owner") if attacked else record.get("attacker_owner")
         who = f"{escape(owner or '?')} — {escape(other or '?')}"
-        outcome = "Ничья" if draw else ("Победа" if won else "Поражение")
+        outcome = (
+            f"Охранник вмешался, +{record.get('xp', C.GUARDIAN_XP)} опыта"
+            if guardian else "Ничья" if draw else ("Победа" if won else "Поражение")
+        )
         gold = record.get("gold") or 0
         lost = record.get("loss_gold") or 0
         # Bare numbers here, with no noun to agree with -- the line is already dense and

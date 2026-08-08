@@ -38,7 +38,7 @@ import pets_config as C
 import stats
 from app_time import now as app_now
 
-PETS_STORE_VERSION = 1
+PETS_STORE_VERSION = 3
 # Rolling fight log, capped independently of C.HISTORY_LIMIT (that constant bounds what
 # ONE player is shown per /history call, not how many chat-wide entries are kept on disk)
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
@@ -59,7 +59,24 @@ def _pets_path(entry: str):
 
 
 def _empty() -> dict:
-    return {"version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {}}
+    return {
+        "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
+        "gift_history": [], "economy_metrics": _new_economy_metrics(),
+    }
+
+
+def _new_economy_metrics() -> dict:
+    """Aggregate-only game-economy observability; never a second balance ledger."""
+    return {
+        "passive_gold_minted": 0,
+        "item_sale_gold": 0,
+        "gifts": 0,
+        "arena_reward_gold": 0,
+        "guardian_interventions": 0,
+        "drops_by_rarity": {
+            rarity: 0 for rarity in ("cursed", "common", "uncommon", "rare", "legendary")
+        },
+    }
 
 
 def _load(entry: str) -> dict:
@@ -75,7 +92,106 @@ def _load(entry: str) -> dict:
     data.setdefault("pets", {})
     data.setdefault("fights", [])
     data.setdefault("duels", {})
+    data.setdefault("gift_history", [])
+    _economy_metrics(data)
+    # Older saves used an append-only list.  Accept their duplicates while reading,
+    # then expose a canonical unique inventory to every game operation.
+    for record in data["pets"].values():
+        if not isinstance(record, dict):
+            continue
+        inventory = record.get("inventory")
+        if not isinstance(inventory, list):
+            inventory = []
+        seen = set()
+        unique = []
+        for code in inventory:
+            code = C.LEGACY_ITEM_CODES.get(code, code)
+            if isinstance(code, str) and code not in seen:
+                seen.add(code)
+                unique.append(code)
+        record["inventory"] = unique
+        equipped = record.get("equipped")
+        if not isinstance(equipped, dict):
+            equipped = {}
+            record["equipped"] = equipped
+        for slot in C.SLOT_KEYS:
+            equipped.setdefault(slot, None)
+            code = C.LEGACY_ITEM_CODES.get(equipped.get(slot), equipped.get(slot))
+            equipped[slot] = code
+            if code and code not in unique:
+                # A historic equipped object is still owned; preserve it rather than
+                # stripping it as a side effect of a duplicate-data migration.
+                unique.append(code)
+        # Discovery is permanent: selling or gifting something should not erase it
+        # from the collection book.  Older saves had no such field, so their current
+        # bag and worn equipment are the complete historic collection we can infer.
+        discovered = record.get("discovered")
+        if not isinstance(discovered, list):
+            discovered = []
+        discovered_unique = []
+        discovered_seen = set()
+        for code in discovered + unique:
+            code = C.LEGACY_ITEM_CODES.get(code, code)
+            if isinstance(code, str) and C.find_item(code) is not None and code not in discovered_seen:
+                discovered_seen.add(code)
+                discovered_unique.append(code)
+        record["discovered"] = discovered_unique
+        # A lock is a personal safety switch, not an item attribute.  Keep only locks
+        # for gear that is still in the player's bag; a transferred item must never
+        # arrive locked for its new owner.
+        locked = record.get("locked_items")
+        if not isinstance(locked, list):
+            locked = []
+        record["locked_items"] = [
+            code for code in dict.fromkeys(C.LEGACY_ITEM_CODES.get(code, code) for code in locked)
+            if code in unique
+        ]
+        pending = record.get("pending_item_actions")
+        # Confirmation secrets are only a short-lived UX/security handshake.  Bad or
+        # historic values are dropped instead of letting malformed saves block gear.
+        record["pending_item_actions"] = pending if isinstance(pending, dict) else {}
     return data
+
+
+def _economy_metrics(data: dict) -> dict:
+    """Return a repaired aggregate metrics record without retaining member profiles."""
+    metrics = data.setdefault("economy_metrics", {})
+    defaults = _new_economy_metrics()
+    for key, default in defaults.items():
+        if key == "drops_by_rarity":
+            drops = metrics.setdefault(key, {})
+            if not isinstance(drops, dict):
+                drops = metrics[key] = {}
+            for rarity in default:
+                drops[rarity] = max(0, int(drops.get(rarity, 0) or 0))
+        else:
+            metrics[key] = max(0, int(metrics.get(key, default) or 0))
+    return metrics
+
+
+def _metric_add(data: dict, key: str, amount: int = 1, *, rarity: str | None = None) -> None:
+    metrics = _economy_metrics(data)
+    if rarity is not None:
+        drops = metrics["drops_by_rarity"]
+        drops[rarity] = drops.get(rarity, 0) + max(0, int(amount))
+    else:
+        metrics[key] = metrics.get(key, 0) + max(0, int(amount))
+
+
+def economy_telemetry(entry: str) -> dict:
+    """Read-only aggregate counters for balancing; no names, messages, or wallets."""
+    metrics = _economy_metrics(_load(entry))
+    return {
+        key: (dict(value) if isinstance(value, dict) else value)
+        for key, value in metrics.items()
+    }
+
+
+def gift_history(entry: str) -> list[dict]:
+    """Newest-first audit of item handoffs, containing only IDs, code and timestamp."""
+    data = _load(entry)
+    rows = [row for row in data.get("gift_history", []) if isinstance(row, dict)]
+    return [dict(row) for row in reversed(rows[-C.GIFT_AUDIT_LIMIT:])]
 
 
 def _save(entry: str, data: dict) -> None:
@@ -97,6 +213,9 @@ def _new_record() -> dict:
         "stats": {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS},
         "equipped": {slot: None for slot in C.SLOT_KEYS},
         "inventory": [],
+        "discovered": [],
+        "locked_items": [],
+        "pending_item_actions": {},
         "level": 1,
         "xp": 0,
         "fights": 0,
@@ -168,8 +287,45 @@ def cage_level(entry, user_id) -> int:
     return record.get("cage_level", 0) if record else 0
 
 
+def hamsterator_level(entry, user_id) -> int:
+    """Level of the passive facility; zero means it has not been built."""
+    record = _load(entry)["pets"].get(str(user_id))
+    return record.get("hamsterator_level", 0) if record else 0
+
+
+def _hamsterator_terms(level: int) -> tuple[int, int]:
+    level = min(max(0, int(level)), C.HAMSTERATOR_MAX_LEVEL)
+    return C.HAMSTERATOR_GOLD_PER_HOUR[level], C.HAMSTERATOR_STORAGE_CAP[level]
+
+
+def settle_passive_income(entry, user_id, now: datetime | None = None) -> dict:
+    rate, cap = _hamsterator_terms(hamsterator_level(entry, user_id))
+    result = economy.settle_passive_income(entry, user_id, rate, cap, now=now)
+    # The underlying ledger advances its checkpoint atomically with the credit. A
+    # retry therefore reports zero and cannot inflate this aggregate counter either.
+    credited = max(0, int(result.get("credited", 0) or 0))
+    if credited:
+        data = _load(entry)
+        _metric_add(data, "passive_gold_minted", credited)
+        _save(entry, data)
+    return result
+
+
+def passive_income_status(entry, user_id, now: datetime | None = None) -> dict:
+    level = hamsterator_level(entry, user_id)
+    rate, cap = _hamsterator_terms(level)
+    return {
+        **economy.passive_income_status(entry, user_id, rate, cap, now=now),
+        "level": level, "rate": rate, "cap": cap,
+    }
+
+
 def balance_for(entry, user_id, xp) -> int:
     """Thin pass-through so pets_ui never has to import economy directly."""
+    # All arena balance views collect complete hours. The ledger's checkpoint and bonus
+    # are written together, so a redraw/retry is idempotent.
+    if has_cage(entry, user_id):
+        settle_passive_income(entry, user_id)
     return economy.balance(entry, user_id, xp)
 
 
@@ -251,6 +407,30 @@ def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
     record["cage_level"] = level + 1
     _save(entry, data)
     return True, f"Клетка прокачана до {level + 1} уровня за {cost} монет."
+
+
+def upgrade_hamsterator(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
+    """Upgrade passive income, first banking elapsed time at the old level's rate."""
+    data = _load(entry)
+    record = data["pets"].get(str(user_id))
+    if not record:
+        return False, "Сначала купи клетку."
+    level = min(max(0, int(record.get("hamsterator_level", 0))), C.HAMSTERATOR_MAX_LEVEL)
+    if level >= C.HAMSTERATOR_MAX_LEVEL:
+        return False, f"Хомяколатор уже максимального уровня ({C.HAMSTERATOR_MAX_LEVEL})."
+    settle_passive_income(entry, user_id, now=now)
+    # Settling may have written telemetry, so never overwrite that fresh store with the
+    # pre-settlement snapshot kept above.
+    data = _load(entry)
+    record = data["pets"][str(user_id)]
+    cost = C.HAMSTERATOR_UPGRADE_COSTS[level]
+    ok, balance = economy.spend(entry, user_id, xp, cost, "buy:pet_hamsterator")
+    if not ok:
+        return False, f"Нужно {cost} монет на Хомяколатор, у тебя {balance}."
+    record["hamsterator_level"] = level + 1
+    _save(entry, data)
+    rate, _ = _hamsterator_terms(level + 1)
+    return True, f"Хомяколатор прокачан до {level + 1} уровня: +{rate} монет/ч."
 
 
 def tame(
@@ -477,14 +657,173 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         return False, "Такого предмета не существует."
     if item.source != "shop":
         return False, f"«{item.name}» нельзя купить -- он выпадает только из боёв."
+    if item.slot == "weapon" and item.code not in {
+        offered.code for offered in C.daily_storefront_weapons(entry, today())
+    }:
+        return False, "Этого оружия сегодня нет на витрине. Загляни завтра."
     if item.code in record["inventory"]:
         return False, f"«{item.name}» у тебя уже есть."
     ok, balance = economy.spend(entry, user_id, xp, item.price, f"buy:pet_item:{item.code}")
     if not ok:
         return False, f"Нужно {item.price} монет, у тебя {balance}."
     record["inventory"].append(item.code)
+    _discover(record, item.code)
     _save(entry, data)
     return True, f"Куплено: «{item.name}» за {item.price} монет."
+
+
+def _discover(record: dict, code: str) -> None:
+    """Record a catalogue item once in the permanent collection book."""
+    if C.find_item(code) is None:
+        return
+    discovered = record.setdefault("discovered", [])
+    if code not in discovered:
+        discovered.append(code)
+
+
+def is_item_locked(record: dict, code: str) -> bool:
+    return code in (record.get("locked_items") or [])
+
+
+def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
+    """Lock/unlock an owned item; locked gear cannot be sold or gifted."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    item = C.find_item(code)
+    if record is None:
+        return False, "Сначала приручи существо.", False
+    if item is None or item.code not in record.get("inventory", []):
+        return False, "Этого предмета нет в сумке.", False
+    locked = record.setdefault("locked_items", [])
+    if item.code in locked:
+        locked.remove(item.code)
+        value = False
+        note = f"Снята защита: «{item.name}»."
+    else:
+        locked.append(item.code)
+        value = True
+        note = f"Предмет защищён: «{item.name}»."
+    _save(entry, data)
+    return True, note, value
+
+
+def begin_item_confirmation(entry, user_id, action: str, code: str) -> tuple[bool, str, str]:
+    """Create a one-time server-side token for a rare sale or gift."""
+    if action not in {"sell", "gift"}:
+        return False, "Неизвестное действие.", ""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    item = C.find_item(code)
+    if record is None or item is None or item.code not in record.get("inventory", []):
+        return False, "Этого предмета уже нет в сумке.", ""
+    if item.rarity not in {"rare", "legendary"}:
+        return False, "Подтверждение этому предмету не нужно.", ""
+    token = secrets.token_urlsafe(5).replace("-", "a").replace("_", "b")
+    record.setdefault("pending_item_actions", {})[f"{action}:{item.code}"] = token
+    _save(entry, data)
+    return True, "", token
+
+
+def _consume_item_confirmation(record: dict, action: str, code: str, token: str | None) -> bool:
+    """Consume, rather than merely check, a confirmation to prevent replay."""
+    pending = record.setdefault("pending_item_actions", {})
+    key = f"{action}:{code}"
+    if not token or pending.get(key) != token:
+        return False
+    pending.pop(key, None)
+    return True
+
+
+def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tuple[bool, str, int]:
+    """Sell one unequipped item for its deliberately modest stated resale value."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    item = C.find_item(code)
+    if record is None:
+        return False, "Сначала приручи существо.", 0
+    if item is None or item.code not in record.get("inventory", []):
+        return False, "Этого предмета нет в сумке.", 0
+    if item.code in (record.get("equipped") or {}).values():
+        return False, "Сначала сними этот предмет.", 0
+    if is_item_locked(record, item.code):
+        return False, "Предмет защищён. Сначала сними 🔒 в инвентаре.", 0
+    if item.rarity in {"rare", "legendary"} and not _consume_item_confirmation(
+        record, "sell", item.code, confirmation_token
+    ):
+        return False, "Редкий предмет нужно подтвердить отдельной кнопкой.", 0
+    value = C.resale_value(item)
+    record["inventory"].remove(item.code)
+    _metric_add(data, "item_sale_gold", value)
+    _save(entry, data)
+    economy.grant(entry, user_id, value, f"sell:pet_item:{item.code}")
+    return True, f"Продано: «{item.name}» за {value} монет.", value
+
+
+def _gift_cooldown_message(seconds: float) -> str:
+    remaining = max(1, int(seconds))
+    hours, remainder = divmod(remaining, 3600)
+    minutes = (remainder + 59) // 60
+    if hours:
+        return f"Следующий подарок можно отправить через {hours} ч. {minutes} мин."
+    return f"Следующий подарок можно отправить через {minutes} мин."
+
+
+def gift_item(
+    entry, giver_id, receiver_id, code, confirmation_token: str | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Atomically transfer an unequipped unique item between tamed pets."""
+    data = _load(entry)
+    giver = _tamed_record(data, giver_id)
+    receiver = _tamed_record(data, receiver_id)
+    item = C.find_item(code)
+    if str(giver_id) == str(receiver_id):
+        return False, "Себе подарить нельзя."
+    if giver is None:
+        return False, "У тебя нет приручённого существа."
+    if receiver is None:
+        return False, "У получателя нет приручённого существа."
+    if giver.get("level", 1) < C.GIFT_MIN_PET_LEVEL:
+        return False, f"Дарить можно с {C.GIFT_MIN_PET_LEVEL} уровня питомца."
+    if item is None or item.code not in giver.get("inventory", []):
+        return False, "Этого предмета нет в сумке."
+    if item.code in (giver.get("equipped") or {}).values():
+        return False, "Сначала сними этот предмет."
+    if is_item_locked(giver, item.code):
+        return False, "Предмет защищён. Сначала сними 🔒 в инвентаре."
+    # Apply cooldown before consuming a confirmation token. A rejected attempt must not
+    # make the player confirm the same rare item again.
+    moment = now or app_now()
+    last_gift = giver.get("gift_last_at")
+    if last_gift:
+        try:
+            elapsed = (moment - datetime.fromisoformat(last_gift)).total_seconds()
+        except (TypeError, ValueError):
+            elapsed = C.GIFT_COOLDOWN_SECONDS
+        if elapsed < C.GIFT_COOLDOWN_SECONDS:
+            return False, _gift_cooldown_message(C.GIFT_COOLDOWN_SECONDS - elapsed)
+    if item.rarity in {"rare", "legendary"} and not _consume_item_confirmation(
+        giver, "gift", item.code, confirmation_token
+    ):
+        return False, "Редкий предмет нужно подтвердить отдельной кнопкой."
+    if item.code in receiver.get("inventory", []):
+        return False, "У получателя уже есть такой предмет."
+    giver["inventory"].remove(item.code)
+    if item.code in giver.get("locked_items", []):
+        giver["locked_items"].remove(item.code)
+    receiver.setdefault("inventory", []).append(item.code)
+    _discover(receiver, item.code)
+    giver["gift_last_at"] = moment.isoformat()
+    audit = data.setdefault("gift_history", [])
+    audit.append({
+        "ts": moment.isoformat(), "giver_id": str(giver_id),
+        "receiver_id": str(receiver_id), "item_code": item.code,
+    })
+    if len(audit) > C.GIFT_AUDIT_LIMIT:
+        del audit[:-C.GIFT_AUDIT_LIMIT]
+    _metric_add(data, "gifts")
+    _save(entry, data)
+    return True, f"Подарено: «{item.name}»."
 
 
 def equip(entry, user_id, code) -> tuple[bool, str]:
@@ -639,7 +978,7 @@ def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None
 def find_opponent(
     entry, user_id, rng=None, exclude_ids=None, attackable_only: bool = False,
 ) -> str | None:
-    """Choose one fair opponent at random.
+    """Choose one attackable opponent uniformly at random.
 
     ``exclude_ids`` is a soft exclusion: it prevents the card currently on screen from
     being dealt again when another eligible opponent exists, but a one-person arena can
@@ -665,30 +1004,98 @@ def find_opponent(
     if not candidates:
         return None
 
-    # A reroll should deal a different card whenever there is one.  Do this before the
-    # power-window calculation so a reroll is never secretly pinned to the same target
-    # just because that target happened to be the closest match.
+    # A reroll should deal a different card whenever there is one.  The arena deliberately
+    # has no power or level window: a choice is made uniformly from every eligible pet.
     alternatives = [other_id for other_id in candidates if other_id not in excluded]
     if alternatives:
         candidates = alternatives
 
-    seeker_power = _power_rating_for(seeker)
-    differences = {
-        other_id: abs(_power_rating_for(data["pets"][other_id]) - seeker_power)
-        for other_id in candidates
-    }
-    in_window = [
-        other_id for other_id in candidates
-        if differences[other_id] <= C.OPPONENT_POWER_WINDOW
-    ]
-    if in_window:
-        return rng.choice(in_window)
+    return rng.choice(candidates)
 
-    # A small arena still needs a match. When no fair-range opponent exists, choose only
-    # among the nearest candidates rather than widening to an arbitrary power gap.
-    nearest_gap = min(differences.values())
-    nearest = [other_id for other_id in candidates if differences[other_id] == nearest_gap]
-    return rng.choice(nearest)
+
+def record_guardian_intervention(
+    entry, attacker_id, defender_id, today,
+) -> dict:
+    """Record the level-gap safety rule without running combat or touching either wallet.
+
+    The attacker did choose and spend a fight, while the defender did not fight at all.
+    Keeping a normal-looking history row (with an explicit marker) also makes the arena
+    per-target limit and audit trail agree with what the player saw.
+    """
+    data = _load(entry)
+    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
+    attacker = data["pets"][attacker_uid]
+    defender = data["pets"][defender_uid]
+    _reset_if_new_day(attacker, today)
+    attacker["fights_today"] = attacker.get("fights_today", 0) + 1
+    attacker["fights"] = attacker.get("fights", 0) + 1
+    _, levels_gained = _apply_xp(attacker, C.GUARDIAN_XP)
+    _metric_add(data, "guardian_interventions")
+    data["fights"].append({
+        "ts": app_now().isoformat(),
+        "date": today.isoformat(),
+        "attacker_id": attacker_uid,
+        "defender_id": defender_uid,
+        "winner_id": None,
+        "loser_id": None,
+        "draw": False,
+        "guardian_intervention": True,
+        "attacker_name": attacker.get("name"),
+        "defender_name": defender.get("name"),
+        "attacker_owner": attacker.get("owner_name"),
+        "defender_owner": defender.get("owner_name"),
+        "gold": 0,
+        "loss_gold": 0,
+        "dropped_item": None,
+        "xp": C.GUARDIAN_XP,
+        "combat_seed": None,
+        "total_damage": {},
+        "combat_snapshot": None,
+    })
+    _save(entry, data)
+    return {
+        "guardian_intervention": True,
+        "draw": False,
+        "gold": 0,
+        "loss_gold": 0,
+        "xp": C.GUARDIAN_XP,
+        "levels_gained": levels_gained,
+        "level": attacker.get("level", 1),
+        "dropped_item": None,
+        "opponent_gold": 0,
+        "opponent_loss_gold": 0,
+        "opponent_xp": 0,
+        "opponent_levels_gained": 0,
+        "opponent_level": defender.get("level", 1),
+        "opponent_dropped_item": None,
+    }
+
+
+def legendary_pity_progress(entry: str, user_id) -> dict:
+    """Progress toward the next guaranteed legendary drop for this pet.
+
+    Only wins while an unowned drop-only legendary still exists are eligible.  Once all
+    five are held, the counter is reset rather than promising an impossible duplicate.
+    """
+    record = _tamed_record(_load(entry), user_id)
+    threshold = C.LEGENDARY_PITY_ELIGIBLE_WINS
+    if record is None:
+        return {
+            "eligible": False, "wins_without_legend": 0,
+            "remaining_wins": threshold, "threshold": threshold,
+        }
+    owned = set(record.get("inventory", []))
+    eligible = any(
+        item.source == "drop" and item.rarity == "legendary" and item.code not in owned
+        for item in C.ITEMS
+    )
+    wins = max(0, int(record.get("legendary_pity_wins", 0) or 0)) if eligible else 0
+    return {
+        "eligible": eligible,
+        "wins_without_legend": wins,
+        "remaining_wins": max(0, threshold - wins),
+        "threshold": threshold,
+    }
 
 
 def record_fight(
@@ -760,6 +1167,7 @@ def record_fight(
         * reward_multiplier
     )
     economy.grant(entry, winner_uid, gold, "pet_fight_win")
+    _metric_add(data, "arena_reward_gold", gold)
 
     # The loser pays half of that. Charged as a spend rather than a negative grant so it
     # lands in the same ledger column as every other purchase -- and clamped to what they
@@ -785,12 +1193,45 @@ def record_fight(
             paid = affordable if ok else 0
 
     dropped_code = None
-    if random.random() < C.DROP_CHANCE:
-        drop_pool = [item for item in C.ITEMS if item.source == "drop"]
-        if drop_pool:
-            dropped = random.choice(drop_pool)
-            winner.setdefault("inventory", []).append(dropped.code)
-            dropped_code = dropped.code
+    # An item code represents one unique object. A full duplicate-proof pool also
+    # means a lucky winner can still receive a different drop. The pity counter is
+    # deliberately tied to wins, not merely to successful 8% drop rolls: the normal
+    # rate is about 0.088% for a legendary, so a 500-win ceiling removes a frustrating
+    # extreme tail while leaving almost every drop to the ordinary weighted table.
+    owned_codes = set(winner.get("inventory", []))
+    drop_pool = [
+        item for item in C.ITEMS
+        if item.source == "drop" and item.code not in owned_codes
+    ]
+    legendary_pool = [item for item in drop_pool if item.rarity == "legendary"]
+    pity_before = max(0, int(winner.get("legendary_pity_wins", 0) or 0))
+    force_legendary = bool(legendary_pool) and (
+        pity_before + 1 >= C.LEGENDARY_PITY_ELIGIBLE_WINS
+    )
+    dropped = None
+    if force_legendary:
+        dropped = random.choice(legendary_pool)
+    elif drop_pool and random.random() < C.DROP_CHANCE:
+        # Keep the selection inspectable/testable with random.choice while still
+        # honoring rarity weights. The catalogue's small integer weights keep this
+        # expanded pool tiny (and only build it on an actual drop).
+        weighted_pool = [
+            item for item in drop_pool
+            for _ in range(max(0, getattr(item, "drop_weight", 1)))
+        ]
+        dropped = random.choice(weighted_pool)
+    if dropped is not None:
+        winner.setdefault("inventory", []).append(dropped.code)
+        _discover(winner, dropped.code)
+        dropped_code = dropped.code
+        _metric_add(data, "drops_by_rarity", rarity=dropped.rarity)
+    if not legendary_pool:
+        # Do not carry an unreachable promise after the last legendary is collected.
+        winner["legendary_pity_wins"] = 0
+    else:
+        winner["legendary_pity_wins"] = (
+            0 if dropped is not None and dropped.rarity == "legendary" else pity_before + 1
+        )
 
     winner_xp = max(1, round(C.WIN_XP * reward_multiplier))
     _, winner_levels_gained = _apply_xp(winner, winner_xp)

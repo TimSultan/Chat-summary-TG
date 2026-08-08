@@ -189,6 +189,15 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("Особые преимущества", api.edits[0]["text"])
         self.assertIn("30%", api.edits[0]["text"])
 
+    def test_hamsterator_menu_and_upgrade_callback(self):
+        economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.HAMSTERATOR_UPGRADE_COSTS[0], "test")
+        self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
+        api = self._tap("hamsterator")
+        self.assertIn("Хомяколатор", api.edits[0]["text"])
+        api = self._tap("uphamsterator")
+        self.assertEqual(pets.hamsterator_level(CHAT, PLAYER["id"]), 1)
+        self.assertIn("Хомяколатор", api.edits[0]["text"])
+
     def test_group_arena_command_points_to_the_private_bot_menu(self):
         deletions = []
         with patch.object(
@@ -304,11 +313,142 @@ class PetsCommandTests(unittest.TestCase):
         self._tap("tame", flows=flows)
         self.assertEqual(flows, {})
 
+    def _tame_trade_pair(self):
+        for user_id, name in ((PLAYER["id"], "Giver"), (43, "Receiver")):
+            pets.buy_cage(CHAT, user_id, RICH_XP)
+            pets.tame(CHAT, user_id, RICH_XP, name, f"file_{user_id}", name)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["level"] = C.GIFT_MIN_PET_LEVEL
+        pets._save(CHAT, data)
+        # Store purchases are only valid for today's rotating 16-weapon window.
+        item = next(item for item in C.daily_storefront_weapons(CHAT, pets.today())
+                    if item.rarity not in {"rare", "legendary"})
+        economy.grant(CHAT, PLAYER["id"], item.price, "test")
+        self.assertTrue(pets.buy_item(CHAT, PLAYER["id"], RICH_XP, item.code)[0])
+        return item
+
+    @staticmethod
+    def _gift_reply(text, prompt_message_id):
+        message = _message(PLAYER, text)
+        message["message_id"] = 77
+        message["reply_to_message"] = {"message_id": prompt_message_id}
+        return message
+
+    def test_gift_button_binds_item_to_owner_flow_and_valid_reply_transfers_once(self):
+        item = self._tame_trade_pair()
+        api = FakeApi()
+        flows = {}
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)):
+            _run(bot_listener.handle_pets_callback(
+                api, None, _cfg(), None, _callback(PLAYER, "gift", item.code), CHAT,
+                flows, set(), log=lambda *_: None,
+            ))
+        flow = next(iter(flows.values()))
+        self.assertEqual(flow["awaiting"], "gift_target")
+        self.assertEqual(flow["item_code"], item.code)
+        self.assertEqual(flow["user_id"], PLAYER["id"])
+        self.assertTrue(api.sent[0]["reply_markup"]["force_reply"])
+
+        giver = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        receiver = SimpleNamespace(user_id=43, display_name="Receiver")
+
+        async def resolve(client, chat_ref, entry, arg, *args, **kwargs):
+            return (giver, 1, 1, RICH_XP, 0, RICH_XP) if not arg else (
+                receiver, 1, 1, RICH_XP, 0, RICH_XP
+            )
+
+        with patch.object(stats, "resolve_stat_target", resolve):
+            handled = _run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, self._gift_reply("@receiver", flow["prompt_message_id"]),
+                flows, BOT, set(), log=lambda *_: None,
+            ))
+        self.assertTrue(handled)
+        self.assertEqual(flows, {})
+        self.assertNotIn(item.code, pets.get_pet(CHAT, PLAYER["id"])["inventory"])
+        self.assertIn(item.code, pets.get_pet(CHAT, 43)["inventory"])
+        self.assertEqual(api.sent[-1]["chat_id"], 43)  # recipient DM attempt
+        self.assertFalse(_run(bot_listener.maybe_handle_pets_flow_message(
+            api, None, None, self._gift_reply("@receiver", flow["prompt_message_id"]),
+            flows, BOT, set(), log=lambda *_: None,
+        )))
+
+    def test_invalid_or_petless_gift_recipient_never_moves_the_item(self):
+        item = self._tame_trade_pair()
+        api = FakeApi()
+        flows = {}
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)):
+            _run(bot_listener.handle_pets_callback(
+                api, None, _cfg(), None, _callback(PLAYER, "gift", item.code), CHAT,
+                flows, set(), log=lambda *_: None,
+            ))
+        flow = next(iter(flows.values()))
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)):
+            self.assertTrue(_run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, self._gift_reply("not-a-user", flow["prompt_message_id"]),
+                flows, BOT, set(), log=lambda *_: None,
+            )))
+        self.assertIn(item.code, pets.get_pet(CHAT, PLAYER["id"])["inventory"])
+
+        # A syntactically valid name can resolve to a tracked member without a tamed pet.
+        petless = SimpleNamespace(user_id=88, display_name="Petless")
+        giver = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+
+        async def resolve(client, chat_ref, entry, arg, *args, **kwargs):
+            return (giver, 1, 1, RICH_XP, 0, RICH_XP) if not arg else (
+                petless, 1, 1, RICH_XP, 0, RICH_XP
+            )
+
+        with patch.object(stats, "resolve_stat_target", resolve):
+            self.assertTrue(_run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, self._gift_reply("@petless", flow["prompt_message_id"]),
+                flows, BOT, set(), log=lambda *_: None,
+            )))
+        self.assertEqual(flows, {})
+        self.assertIn(item.code, pets.get_pet(CHAT, PLAYER["id"])["inventory"])
+
+    def test_duplicate_receiver_rejects_gift_and_sell_callback_credits_redraw(self):
+        item = self._tame_trade_pair()
+        data = pets._load(CHAT)
+        data["pets"]["43"]["inventory"].append(item.code)
+        pets._save(CHAT, data)
+        api = FakeApi()
+        flows = {}
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)):
+            _run(bot_listener.handle_pets_callback(
+                api, None, _cfg(), None, _callback(PLAYER, "gift", item.code), CHAT,
+                flows, set(), log=lambda *_: None,
+            ))
+        flow = next(iter(flows.values()))
+        giver = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        receiver = SimpleNamespace(user_id=43, display_name="Receiver")
+
+        async def resolve(client, chat_ref, entry, arg, *args, **kwargs):
+            return (giver, 1, 1, RICH_XP, 0, RICH_XP) if not arg else (
+                receiver, 1, 1, RICH_XP, 0, RICH_XP
+            )
+
+        with patch.object(stats, "resolve_stat_target", resolve):
+            _run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, self._gift_reply("@receiver", flow["prompt_message_id"]),
+                flows, BOT, set(), log=lambda *_: None,
+            ))
+        self.assertIn(item.code, pets.get_pet(CHAT, PLAYER["id"])["inventory"])
+
+        # Remove the test-only duplicate then sell through the actual callback.
+        data = pets._load(CHAT)
+        data["pets"]["43"]["inventory"].remove(item.code)
+        pets._save(CHAT, data)
+        before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+        sell_api = self._tap("sell", item.code)
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + C.resale_value(item))
+        self.assertNotIn(item.code, pets.get_pet(CHAT, PLAYER["id"])["inventory"])
+        self.assertTrue(sell_api.edits)
+
     def test_every_menu_action_renders_without_blowing_up(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_abc", "Player")
         for action, argument in [
-            ("main", ""), ("cage", ""), ("train", ""), ("bag", ""), ("fight", ""),
+            ("main", ""), ("cage", ""), ("train", ""), ("bag", ""), ("bagitems", "weapon,0"), ("fight", ""),
             ("history", ""), ("pet", ""), ("slot", "weapon"), ("up", "strength"),
             ("up10", "luck"), ("search", ""),
         ]:
@@ -372,6 +512,77 @@ class PetsCommandTests(unittest.TestCase):
             for args, kwargs in deletions
         ))
 
+    def test_stale_daily_capped_arena_card_silently_deals_another_opponent(self):
+        """A card can become stale between search and tap; never publish that refusal."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
+        for opponent_id, name in ((43, "Capped"), (44, "Available")):
+            pets.buy_cage(CHAT, opponent_id, RICH_XP)
+            pets.tame(CHAT, opponent_id, RICH_XP, name, f"file_{opponent_id}", name)
+        result = SimpleNamespace(winner=str(PLAYER["id"]), loser="43")
+        with patch("random.random", return_value=1.0):
+            for _ in range(C.ARENA_SAME_OPPONENT_DAILY_LIMIT):
+                pets.record_fight(CHAT, PLAYER["id"], "43", result, pets.today())
+
+        api = self._tap("attack", "43")
+
+        self.assertEqual(api.sent, [])
+        self.assertEqual(api.photo_files, [])
+        self.assertTrue(api.edits)
+        self.assertIn("Available", api.edits[-1]["text"])
+        self.assertNotIn("можно атаковать", api.edits[-1]["text"])
+
+    def test_seven_level_advantage_is_stopped_by_guard_without_combat_or_gold(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Adult", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Child", "file_b", "Bob")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["level"] = 8
+        data["pets"]["43"]["level"] = 1
+        pets._save(CHAT, data)
+        api = FakeApi()
+        attacker_gold_before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+        defender_gold_before = economy.balance(CHAT, 43, 0)
+
+        with patch.object(bot_listener.pets_combat, "simulate", side_effect=AssertionError("must not fight")):
+            _run(bot_listener._pets_run_fight(
+                api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP,
+                log=lambda *_: None,
+            ))
+
+        attacker = pets.get_pet(CHAT, PLAYER["id"])
+        defender = pets.get_pet(CHAT, 43)
+        self.assertEqual(attacker["xp"], C.GUARDIAN_XP)
+        self.assertEqual(attacker["fights_today"], 1)
+        self.assertEqual(defender["fights"], 0)
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), attacker_gold_before)
+        self.assertEqual(economy.balance(CHAT, 43, 0), defender_gold_before)
+        self.assertTrue(pets.history(CHAT, PLAYER["id"])[0]["guardian_intervention"])
+        self.assertEqual(len(api.photo_files), 0)
+        self.assertIn(C.GUARDIAN_INTERVENTION_TEXT, api.sent[0]["text"])
+
+    def test_six_level_advantage_remains_a_normal_combat(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Adult", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Child", "file_b", "Bob")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["level"] = 7
+        data["pets"]["43"]["level"] = 1
+        pets._save(CHAT, data)
+        api = FakeApi()
+
+        with patch.object(bot_listener.pets_combat, "simulate", wraps=bot_listener.pets_combat.simulate) as simulate:
+            _run(bot_listener._pets_run_fight(
+                api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP,
+                log=lambda *_: None,
+            ))
+
+        simulate.assert_called_once()
+        self.assertFalse(pets.history(CHAT, PLAYER["id"])[0].get("guardian_intervention", False))
+        self.assertEqual(len(api.photo_files), 2)
+
     def test_opponent_rerolls_are_unlimited_and_keep_only_the_current_card_in_callback(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
@@ -394,6 +605,16 @@ class PetsCommandTests(unittest.TestCase):
         # there is no counter to cap after the third reroll.
         _, rerolled = pets_ui.opponent_view(CHAT, PLAYER["id"], "43", RICH_XP)
         self.assertTrue(any(b["text"].startswith("🔍") for b in _buttons({"reply_markup": rerolled})))
+
+    def test_opponent_card_does_not_reveal_power_rating(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+
+        text, _ = pets_ui.opponent_view(CHAT, PLAYER["id"], "43", RICH_XP)
+
+        self.assertNotIn("Боевой рейтинг", text)
 
     def test_reroll_never_immediately_repeats_when_another_valid_opponent_exists(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -451,6 +672,79 @@ class PetsCommandTests(unittest.TestCase):
         # 100 is the id FakeApi hands the "not found" reply -- the notice goes with the
         # command, the prompt and the answer rather than being left behind on its own.
         self.assertEqual(set(deletions[0][0][2]), {5, 6, 10, 100})
+
+    def test_direct_duel_refusal_is_removed_after_exactly_five_seconds(self):
+        """A public /duel rejection must not linger in the group for the normal 30s."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Defender", "file_b", "Bob")
+        api = FakeApi()
+        challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        target = SimpleNamespace(user_id=43, display_name="Bob")
+        deletions = []
+
+        async def resolve(*args, **kwargs):
+            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (
+                target, 1, 1, RICH_XP, 0, RICH_XP
+            )
+
+        with patch.object(stats, "resolve_stat_target", resolve), \
+                patch.object(pets, "claim_duel", return_value=(False, "already fought")), \
+                patch.object(bot_listener, "schedule_bot_delete",
+                             side_effect=lambda *args, **kwargs: deletions.append((args, kwargs))):
+            _run(bot_listener.handle_duel_command(
+                api, None, None, _message(PLAYER, "/duel @bobby", "group"), CHAT,
+                "/duel @bobby", BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual(deletions[-1][0][3], 5)
+        self.assertIn(
+            api.sent[0]["message_id"],
+            deletions[-1][0][2] + [deletions[-1][1].get("trigger_message_id")],
+        )
+
+    def test_force_reply_duel_refusal_is_removed_after_exactly_five_seconds(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Defender", "file_b", "Bob")
+        api = FakeApi()
+        flows = {
+            "duel": {
+                "awaiting": "duel_target", "chat_id": MAIN_CHAT_ID,
+                "user_id": PLAYER["id"], "entry": CHAT,
+                "command_message_id": 5, "prompt_message_id": 10, "created_at": 0,
+            },
+        }
+        reply = _message(PLAYER, "@bobby", "group")
+        reply["message_id"] = 6
+        challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
+        target = SimpleNamespace(user_id=43, display_name="Bob")
+        deletions = []
+
+        async def resolve(*args, **kwargs):
+            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (
+                target, 1, 1, RICH_XP, 0, RICH_XP
+            )
+
+        with patch.object(bot_listener.time, "monotonic", return_value=1), \
+                patch.object(stats, "resolve_stat_target", resolve), \
+                patch.object(pets, "claim_duel", return_value=(False, "already fought")), \
+                patch.object(bot_listener, "schedule_bot_delete",
+                             side_effect=lambda *args, **kwargs: deletions.append((args, kwargs))):
+            handled = _run(bot_listener.maybe_handle_pets_flow_message(
+                api, None, None, reply, flows, BOT, set(), log=lambda *_: None,
+            ))
+
+        self.assertTrue(handled)
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual(deletions[-1][0][3], 5)
+        self.assertIn(
+            api.sent[0]["message_id"],
+            deletions[-1][0][2] + [deletions[-1][1].get("trigger_message_id")],
+        )
 
     def test_valid_duel_target_deletes_the_exchange_before_starting_the_duel(self):
         api = FakeApi()
@@ -517,7 +811,11 @@ class PetsCommandTests(unittest.TestCase):
             any(name in group_result["caption"] for name in ("Кабанчик", "Тумблер")),
             group_result["caption"],
         )
-        self.assertIn("🪙 +", group_result["caption"])
+        if "ничью" in group_result["caption"]:
+            # Combat is intentionally random; a legitimate draw has no winner payout.
+            self.assertNotIn("🪙 +", group_result["caption"])
+        else:
+            self.assertIn("🪙 +", group_result["caption"])
         self.assertIn("✨ +100 опыта", group_result["caption"])
         button = _buttons(group_result)[0]
         self.assertEqual(button["text"], "⚔️ Открыть арену")

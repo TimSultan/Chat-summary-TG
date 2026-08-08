@@ -307,22 +307,22 @@ VOTE_RESULT_FLOW_TTL_SECONDS = 60 * 60
 # Deliberately excludes the admin-only DM commands (/badge, /weekwinner, /deletepokras):
 # advertising them to all 190 members would invite a wave of "нужны права администратора".
 PRIVATE_CHAT_COMMANDS = (
+    {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "cabinet", "description": "Личный кабинет"},
     {"command": "stat", "description": "Моя статистика"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
-    {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "pet", "description": "Моё существо"},
 )
 GROUP_CHAT_COMMANDS = (
+    {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "stat", "description": "Моя статистика"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
-    {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "pet", "description": "Моё существо"},
     {"command": "duel", "description": "Вызвать существо на дуэль"},
 )
@@ -5411,7 +5411,7 @@ DUEL_RESULT_DELETE_AFTER = 10
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_FLOW_TTL_SECONDS = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_INVALID_DELETE_AFTER = 5
-DUEL_NO_FIGHTS_GROUP_DELETE_AFTER = 10
+DUEL_NO_FIGHTS_GROUP_DELETE_AFTER = 5
 DUEL_NO_FIGHTS_GROUP_NOTICE = (
     "У вас закончились бои, покрасы добавляют количество боев. Сначала красим, потом деремся"
 )
@@ -5653,8 +5653,8 @@ async def handle_duel_command(
         argument = replied.get("username") or _display_name(replied)
 
     async def notice(
-        text: str, summon: bool = False, delete_after: int = GROUP_PETS_DELETE_AFTER,
-        trigger_delete_after: int | None = None,
+        text: str, summon: bool = False, delete_after: int = DUEL_TARGET_INVALID_DELETE_AFTER,
+        trigger_delete_after: int | None = DUEL_TARGET_INVALID_DELETE_AFTER,
     ) -> None:
         markup = None
         if summon and bot_username:
@@ -5667,13 +5667,11 @@ async def handle_duel_command(
         )
         if group_chat and sent and "message_id" in sent:
             schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
+                api, chat_id, [sent["message_id"]],
+                trigger_delete_after if trigger_delete_after is not None else delete_after,
+                log, background_tasks,
+                trigger_message_id=message["message_id"] if trigger_delete_after is not None else None,
             )
-            if trigger_delete_after is not None:
-                schedule_bot_delete(
-                    api, chat_id, [], trigger_delete_after, log, background_tasks,
-                    trigger_message_id=message["message_id"],
-                )
 
     if not argument:
         username = actor.get("username")
@@ -5711,13 +5709,11 @@ async def handle_duel_command(
         log(f"[pets] failed to resolve duel target:\n{traceback.format_exc()}")
         await notice(
             "Пользователь не найден." if target_from_followup else "Не удалось найти соперника.",
-            delete_after=DUEL_TARGET_INVALID_DELETE_AFTER if target_from_followup else GROUP_PETS_DELETE_AFTER,
         )
         return
     if target is None:
         await notice(
             "Пользователь не найден." if target_from_followup else "Не нашёл такого участника.",
-            delete_after=DUEL_TARGET_INVALID_DELETE_AFTER if target_from_followup else GROUP_PETS_DELETE_AFTER,
         )
         return
     if str(target.user_id) == str(challenger.user_id):
@@ -5738,7 +5734,12 @@ async def handle_duel_command(
         return
     ok, reason = pets.claim_duel(entry, challenger.user_id, target.user_id)
     if not ok:
-        await notice(html.escape(reason))
+        # A stale/repeated duel target is useful feedback, but it must not linger in the
+        # group. This applies to both a typed /duel and the force-reply target flow.
+        await notice(
+            html.escape(reason), delete_after=DUEL_TARGET_INVALID_DELETE_AFTER,
+            trigger_delete_after=DUEL_TARGET_INVALID_DELETE_AFTER,
+        )
         return
     await _pets_run_fight(
         api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
@@ -5776,7 +5777,7 @@ async def _pets_start_flow(
         chat_id, prompt_text, reply_to_message_id=reply_to_message_id,
         reply_markup={"force_reply": True, "selective": True}, parse_mode=None,
     )
-    pets_flows[uuid.uuid4().hex[:10]] = {
+    flow = {
         "created_at": time.monotonic(),
         "chat_id": chat_id,
         "user_id": user_id,
@@ -5786,6 +5787,8 @@ async def _pets_start_flow(
         "owner_username": owner_username,
         "prompt_message_id": prompt.get("message_id") if prompt else None,
     }
+    pets_flows[uuid.uuid4().hex[:10]] = flow
+    return flow
 
 
 async def handle_pets_callback(
@@ -5844,12 +5847,41 @@ async def handle_pets_callback(
 
     try:
         # --- the two flows that need something back from the player ------------------
-        if action in ("tame", "rename", "photo"):
+        if action in ("tame", "rename", "photo", "gift", "giftok"):
             if action == "tame" and not pets.has_cage(entry, user_id):
                 await _send_pets_view(
                     api, chat_id, pets_ui.cage_view(entry, user_id, xp),
                     message_id=message_id, log=log,
                 )
+                return
+            if action == "gift" and pets_ui.valuable_item(C.find_item(argument)):
+                ok, note, token = pets.begin_item_confirmation(entry, user_id, "gift", argument)
+                await _send_pets_view(
+                    api, chat_id,
+                    pets_ui.item_confirmation_view(entry, user_id, xp, "gift", argument, token)
+                    if ok else pets_ui.notice_view(user_id, note),
+                    message_id=message_id, log=log,
+                )
+                return
+            if action in ("gift", "giftok"):
+                item_code, confirmation_token = (
+                    pets_ui.parse_confirmation_argument(argument) if action == "giftok"
+                    else (argument, None)
+                )
+                if not item_code:
+                    await _send_pets_view(
+                        api, chat_id, pets_ui.notice_view(user_id, "Подтверждение устарело. Начни заново."),
+                        message_id=message_id, log=log,
+                    )
+                    return
+                gift_flow = await _pets_start_flow(
+                    api, pets_flows, chat_id, actor.get("id"), entry, "gift_target",
+                    "Ответь на это сообщение @username получателя.", message_id, actor.get("username"),
+                )
+                # The item code is server-side only; callbacks remain compact and cannot
+                # be replayed by another menu owner.
+                gift_flow["item_code"] = item_code
+                gift_flow["confirmation_token"] = confirmation_token
                 return
             prompts = {
                 "tame": "Пришли фото будущего существа (картинкой, не файлом).",
@@ -5876,6 +5908,12 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.cage_view(entry, user_id, xp), log
             )
             return
+        if action == "uphamsterator":
+            ok, note = pets.upgrade_hamsterator(entry, user_id, xp)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.hamsterator_view(entry, user_id, xp), log
+            )
+            return
         if action in ("up", "up10"):
             ok, note, _ = pets.upgrade_stat(
                 entry, user_id, xp, argument, times=10 if action == "up10" else 1
@@ -5889,7 +5927,60 @@ async def handle_pets_callback(
             slot = pets_ui.slot_of(argument)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.slot_view(entry, user_id, xp, slot), log
+                pets_ui.store_view(entry, user_id, xp) if slot == "weapon"
+                else pets_ui.slot_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "sell":
+            if pets_ui.valuable_item(C.find_item(argument)):
+                ok, note, token = pets.begin_item_confirmation(entry, user_id, "sell", argument)
+                await _send_pets_view(
+                    api, chat_id,
+                    pets_ui.item_confirmation_view(entry, user_id, xp, "sell", argument, token)
+                    if ok else pets_ui.notice_view(user_id, note),
+                    message_id=message_id, log=log,
+                )
+                return
+            ok, note, _ = pets.sell_item(entry, user_id, argument)
+            slot = pets_ui.slot_of(argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.bag_items_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "sellok":
+            item_code, confirmation_token = pets_ui.parse_confirmation_argument(argument)
+            if not item_code:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.notice_view(user_id, "Подтверждение устарело. Начни заново."),
+                    message_id=message_id, log=log,
+                )
+                return
+            ok, note, _ = pets.sell_item(entry, user_id, item_code, confirmation_token)
+            slot = pets_ui.slot_of(item_code)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.bag_items_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "lock":
+            ok, note, _ = pets.toggle_item_lock(entry, user_id, argument)
+            slot = pets_ui.slot_of(argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.bag_items_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "store":
+            await _send_pets_view(
+                api, chat_id, pets_ui.store_view(entry, user_id, xp, argument),
+                message_id=message_id, log=log,
+            )
+            return
+        if action == "collection":
+            await _send_pets_view(
+                api, chat_id, pets_ui.collection_view(entry, user_id, xp, argument),
+                message_id=message_id, log=log,
             )
             return
         if action == "equip":
@@ -5897,14 +5988,14 @@ async def handle_pets_callback(
             slot = pets_ui.slot_of(argument)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.slot_view(entry, user_id, xp, slot), log
+                pets_ui.bag_items_view(entry, user_id, xp, slot), log
             )
             return
         if action == "unequip":
             ok, note = pets.unequip(entry, user_id, argument)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.slot_view(entry, user_id, xp, argument), log
+                pets_ui.bag_items_view(entry, user_id, xp, argument), log
             )
             return
 
@@ -5958,6 +6049,8 @@ async def handle_pets_callback(
                 group_result=result_chat_id != chat_id,
                 arena_url=(f"https://t.me/{bot_username}?start=pets" if bot_username else None),
                 delete_trigger=result_chat_id == chat_id,
+                arena_menu_chat_id=chat_id,
+                arena_menu_message_id=message_id,
             )
             return
 
@@ -5966,6 +6059,7 @@ async def handle_pets_callback(
             "main": lambda: pets_ui.main_view(entry, user_id, xp),
             "info": lambda: pets_ui.info_view(user_id),
             "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
+            "hamsterator": lambda: pets_ui.hamsterator_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
@@ -5974,7 +6068,12 @@ async def handle_pets_callback(
                 entry, user_id, int(argument) if argument.isdigit() else 0,
             ),
             "pet": lambda: pets_ui.pet_view(entry, user_id),
-            "slot": lambda: pets_ui.slot_view(entry, user_id, xp, argument),
+            "slot": lambda: pets_ui.slot_view(
+                entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
+            ),
+            "bagitems": lambda: pets_ui.bag_items_view(
+                entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
+            ),
         }
         render = views.get(action)
         if render is None:
@@ -6008,6 +6107,7 @@ async def _pets_run_fight(
     attacker_username: str | None = None, group_no_fights_notice: bool = False,
     group_result: bool = False, arena_url: str | None = None,
     delete_trigger: bool = True,
+    arena_menu_chat_id=None, arena_menu_message_id=None,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
@@ -6018,20 +6118,59 @@ async def _pets_run_fight(
     opponent_id = (opponent_raw or "").strip()
     theirs = pets.get_pet(entry, opponent_id) if opponent_id else None
     if not mine or not theirs:
+        # A card can also become stale when its owner untames their creature. Treat it
+        # the same as a spent per-target card: redraw only the private arena menu.
+        if arena_menu_chat_id is not None:
+            replacement_id = pets.find_opponent(
+                entry, user_id, exclude_ids={opponent_id} if opponent_id else None,
+                attackable_only=True,
+            )
+            rendered = (
+                pets_ui.opponent_view(entry, user_id, replacement_id, xp)
+                if replacement_id is not None else pets_ui.fight_view(entry, user_id, xp)
+            )
+            await _send_pets_view(
+                api, arena_menu_chat_id, rendered,
+                message_id=arena_menu_message_id, log=log,
+            )
+            return
+        # Unlike an arena tap, a public /duel has no private menu to redraw. Its stale
+        # refusal is deliberately short-lived, including when the target came from the
+        # force-reply path.
+        if not enforce_arena_target_limit:
+            sent = await api.send_message(
+                chat_id, "Соперник больше недоступен для дуэли.",
+                reply_to_message_id=message_id, parse_mode=None,
+            )
+            if sent and "message_id" in sent and background_tasks is not None:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], DUEL_TARGET_INVALID_DELETE_AFTER,
+                    log, background_tasks, trigger_message_id=message_id,
+                )
+            return
         await _send_pets_view(
             api, chat_id, pets_ui.fight_view(entry, user_id, xp),
             message_id=message_id, log=log,
         )
         return
     if enforce_arena_target_limit and not pets.can_attack_in_arena(entry, user_id, opponent_id):
-        await _send_pets_view(
-            api, chat_id,
-            pets_ui.notice_view(
-                user_id,
-                f"Этого соперника можно атаковать не больше {C.ARENA_SAME_OPPONENT_DAILY_LIMIT} раз в день.",
-            ),
-            message_id=message_id, log=log,
-        )
+        # Cards can go stale between display and tap. Redraw privately with another
+        # attackable card; never leak this routine arena refusal into the group where the
+        # result would normally be announced.
+        if arena_menu_chat_id is not None:
+            replacement_id = pets.find_opponent(
+                entry, user_id, exclude_ids={opponent_id}, attackable_only=True,
+            )
+            rendered = (
+                pets_ui.opponent_view(entry, user_id, replacement_id, xp)
+                if replacement_id is not None else pets_ui.fight_view(entry, user_id, xp)
+            )
+            await _send_pets_view(
+                api, arena_menu_chat_id, rendered,
+                message_id=arena_menu_message_id, log=log,
+            )
+        # The only normal caller here is the arena button. Do not fall back to `chat_id`:
+        # it can be the public group selected for fight-result announcements.
         return
     if pets.fights_left(entry, user_id, pets.today()) <= 0:
         if group_no_fights_notice:
@@ -6054,10 +6193,43 @@ async def _pets_run_fight(
         )
         return
 
+    # The adult is the attacker. This safety valve intentionally happens after the fight
+    # budget check: a valid attempted attack consumes exactly one attempt, but cannot
+    # create gold, a loss debit, a drop, or a normal combat result.
+    if mine.get("level", 1) - theirs.get("level", 1) >= C.GUARDIAN_LEVEL_GAP:
+        reward = pets.record_guardian_intervention(entry, user_id, opponent_id, pets.today())
+        guardian_text = (
+            f"<b>{html.escape(C.GUARDIAN_INTERVENTION_TEXT)}</b>\n"
+            f"✨ +{reward['xp']} опыта"
+        )
+        sent = None
+        try:
+            sent = await api.send_message(chat_id, guardian_text, parse_mode="HTML")
+        except Exception:
+            log(f"[pets] failed to send guardian intervention:\n{traceback.format_exc()}")
+        else:
+            if delete_after and background_tasks is not None and sent and "message_id" in sent:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
+                    trigger_message_id=message_id if delete_trigger else None,
+                )
+        # The attacker still gets their own private receipt when this was initiated from
+        # the DM arena. The defender did not fight, so they receive no notification.
+        if persistent_recipient_ids and str(user_id) != str(chat_id):
+            try:
+                await api.send_message(user_id, guardian_text, parse_mode="HTML")
+            except Exception:
+                log(f"[pets] could not deliver guardian receipt to {user_id}")
+        return
+
     attacker_fighter = _pets_fighter(entry, user_id, mine)
     defender_fighter = _pets_fighter(entry, opponent_id, theirs)
     seed = secrets.randbits(63)
     result = pets_combat.simulate(attacker_fighter, defender_fighter, seed=seed)
+    fight_hp = {
+        str(user_id): _pets_fight_hp(result, attacker_fighter, defender_fighter),
+        str(opponent_id): _pets_fight_hp(result, defender_fighter, attacker_fighter),
+    }
     combat_snapshot = {
         "seed": seed,
         "fighters": {
@@ -6102,7 +6274,7 @@ async def _pets_run_fight(
     image_path = None
     try:
         image_path = await _pets_render_result_image(
-            api, result, entry, user_id, opponent_id, mine, theirs, log,
+            api, result, entry, user_id, opponent_id, mine, theirs, log, fight_hp=fight_hp,
         )
         sent = None
         if image_path is not None:
@@ -6169,6 +6341,23 @@ def _pets_fighter_snapshot(fighter: pets_combat.Fighter) -> dict:
     }
 
 
+def _pets_fight_hp(
+    result: pets_combat.FightResult,
+    fighter: pets_combat.Fighter,
+    opponent: pets_combat.Fighter,
+) -> dict[str, int]:
+    """Recover one fighter's final HP from the immutable combat transcript."""
+    maximum = round(pets_combat.derive(fighter, opponent)["max_hp"])
+    remaining = maximum
+    for round_result in result.rounds:
+        remaining = (
+            round_result.attacker_hp
+            if round_result.attacker == fighter.key
+            else round_result.defender_hp
+        )
+    return {"remaining_hp": max(0, round(remaining)), "max_hp": maximum}
+
+
 async def _pets_download_media(api, file_id, log) -> bytes | None:
     if not file_id or not hasattr(api, "download_file"):
         return None
@@ -6192,6 +6381,7 @@ async def _pets_owner_avatar(api, user_id, log) -> bytes | None:
 
 async def _pets_render_result_image(
     api, result, entry: str, attacker_id, defender_id, attacker: dict, defender: dict, log,
+    *, fight_hp: dict[str, dict[str, int]] | None = None,
 ):
     attacker_stats = pets.effective_stats(entry, attacker_id)
     defender_stats = pets.effective_stats(entry, defender_id)
@@ -6211,6 +6401,7 @@ async def _pets_render_result_image(
             "power": pets.power_rating(entry, attacker_id),
             "pet_photo": pet_a,
             "owner_avatar": avatar_a,
+            **((fight_hp or {}).get(str(attacker_id), {})),
         }, {
             "id": str(defender_id),
             "pet_name": defender.get("name"),
@@ -6219,6 +6410,7 @@ async def _pets_render_result_image(
             "power": pets.power_rating(entry, defender_id),
             "pet_photo": pet_b,
             "owner_avatar": avatar_b,
+            **((fight_hp or {}).get(str(defender_id), {})),
         })
     except Exception:
         path.unlink(missing_ok=True)
@@ -6357,6 +6549,47 @@ async def maybe_handle_pets_flow_message(
 
     awaiting = flow.get("awaiting")
     try:
+        if awaiting == "gift_target":
+            if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
+                await api.send_message(chat_id, "Нужен @username получателя.", parse_mode=None)
+                return True
+            try:
+                target, _, _, _, _, _ = await stats.resolve_stat_target(
+                    telethon_client, entry, entry, raw,
+                    actor.get("username"), _display_name(actor), tz, log=log,
+                )
+            except Exception:
+                target = None
+                log(f"[pets] failed to resolve gift recipient:\n{traceback.format_exc()}")
+            pets_flows.pop(flow_id, None)
+            if target is None:
+                await api.send_message(chat_id, "Получатель не найден.", parse_mode=None)
+                return True
+            ok, note = pets.gift_item(
+                entry, user.user_id, target.user_id, flow.get("item_code"),
+                flow.get("confirmation_token"),
+            )
+            await _send_pets_view(
+                api, chat_id,
+                pets_ui.bag_view(entry, user.user_id, xp) if ok
+                else pets_ui.notice_view(user.user_id, note),
+                log=log,
+            )
+            if ok:
+                await api.send_message(chat_id, note, parse_mode=None)
+                item = C.find_item(flow.get("item_code"))
+                giver_name = f"@{actor.get('username')}" if actor.get("username") else _display_name(actor)
+                try:
+                    await api.send_message(
+                        target.user_id,
+                        f"🎁 {giver_name} подарил(а) тебе «{item.name if item else flow.get('item_code')}».",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    # Telegram may not allow a DM until the recipient starts the bot;
+                    # the completed, atomic transfer must never be rolled back for it.
+                    log(f"[pets] failed to notify gift recipient:\n{traceback.format_exc()}")
+            return True
         if awaiting in ("photo_tame", "photo_photo"):
             photos = message.get("photo") or []
             if not photos:

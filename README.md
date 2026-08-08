@@ -907,11 +907,31 @@ drain, balances only ever grew. This is the sink.
 whole reason chat activity funds the game rather than sitting beside it.
 
 The loop is: buy a **клетка** (100), **приручить** a creature by sending a photo and a name
-(100), spend coins on **Сила / Здоровье / Ловкость / Удача** (1–80 each), buy **оружие,
-амулет, перчатки, сапоги**, then fight — opponent drawn at random from creatures within
-±3 levels. A win pays 30–60 coins and XP; **losing costs half of what the winner took**, so
-"напасть" is a decision rather than a reflex. Each creature level gives **+1 to every
-stat**, on top of whatever was bought.
+(50), spend coins on **Сила / Здоровье / Ловкость / Удача** (1–80 each), buy **оружие,
+амулет, перчатки, сапоги**, then fight. Opponents are drawn uniformly from every attackable
+pet, with unlimited rerolls and no level or combat-power window. A win starts at 5–10 coins
+and 100 pet XP, then moves from 75% for farming a pet 3+ levels below to 125% for beating
+one 3+ levels above. An attacker who is 7+ levels above the target is stopped by the guard
+instead: the attempt is spent, the attacker gets 5 pet XP, and no combat, gold, debit or
+drop occurs. **Losing costs 30% of what the winner took**, with no debt. Each creature level
+gives **+1 to every stat**, on top of whatever was bought.
+
+The equipment catalogue contains **exactly 500 unique weapons** plus the other slot gear:
+75 cursed, 250 common, 120 uncommon, 50 rare and 5 legendary. A bag cannot contain the
+same item twice; unequipped items can be gifted to another tracked pet or sold back for a
+modest amount, and arena drops skip anything the winner already owns. The daily storefront
+shows 16 rotating weapons with rarity filters, and a paginated permanent collection book
+tracks every weapon ever held. Items can be locked; rare and legendary sales/gifts require
+a one-time server confirmation, while gifts require pet level 3 and have a 24-hour sender
+cooldown plus an ID/code/timestamp audit trail.
+Rarity weights make a legendary about 1.1% of weapon drops; if an unowned legendary has
+not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
+telemetry tracks passive minting, sales, gifts, arena gold, guard actions and drops.
+
+The **Хомяколатор** is a second five-level facility beside the cage. It passively banks
+1–5 coins per complete hour with 24–72 hours of storage, depending on level. Collection is
+lazy (opening an arena balance screen settles it), but the checkpoint and credit share one
+atomic ledger write, so a retry or restart cannot pay the same hour twice.
 
 **Fights a day are earned, not granted.** `BASE_DAILY_FIGHTS` (2) plus 8% of yesterday's
 messages plus half a fight per `#япокрасил`, capped at 12, plus whatever the cage adds.
@@ -925,6 +945,11 @@ five-a-day with a free loss it replaced gave 1.3x.
 group as well as the DM**, since it is the one screen meant to be shown off. `/arena` itself
 is DM-only: every button on it spends the presser's coins, and a menu posted in the group
 would put one member's wallet in front of 190 people.
+
+Opponent cards show the creature and combat stats but deliberately omit its computed power
+rating. Fight results use the full uncropped pet images and put a red/grey `remaining / max
+HP` bar directly below each one, so the margin of victory is visible without reading the
+combat transcript.
 
 **The fight is the point, and the fight is written out.** Every blow is a line from a bank
 of ~240 variants — dodges where the creature is distracted by a butterfly, crits it did not
@@ -956,9 +981,9 @@ never writes. Fights land at **~20 blows, ten a side, at every level**: measured
 `DAMAGE_PER_POINT` (2.2) — dodge and crit both grow with level, so HP has to grow faster
 than damage just to keep the length constant.
 
-The item catalogue is **deliberately unbalanced for now** — the right shape with
-placeholder numbers. Adding one is appending an `Item(...)` to `ITEMS`; there is no slot
-logic, stat plumbing or migration to touch. Retuning the economy is editing constants and nothing else.
+The 500 weapons live as deterministic immutable data in `pets_weapon_catalog.py`; combat
+and trade plumbing remain in the existing pet modules. Retuning the economy is still
+editing constants and catalogue data rather than changing the fight engine.
 **[`PETS_BALANCE.md`](PETS_BALANCE.md)** has the full tables, the reasoning, and the honest
 list of what is still wrong.
 
@@ -1003,8 +1028,9 @@ Administrator commands, none of them advertised in the menu:
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
 client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
-command exists. Two scopes: DMs get `/cabinet /stat /top /shop /coins /tree`, groups get
-`/stat /topall /toppokras /tree`. Wallet actions belong in the DM where a balance isn't public,
+command exists. `/arena` is first in both scopes. DMs then get `/cabinet /stat /top /shop
+/tree /vote /pet`; groups then get `/stat /top /shop /tree /vote /pet /duel`. Wallet actions
+belong in the DM where a balance isn't public,
 and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a
 group button for it would just answer "напиши мне в личку".
 
