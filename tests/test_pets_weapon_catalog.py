@@ -30,14 +30,14 @@ def test_catalogue_is_immutable_and_can_adapt_to_existing_item_constructor():
 def test_first_three_ids_are_lossless_replacements_for_legacy_weapon_aliases():
     assert [(weapon.code, weapon.name, weapon.source, weapon.price, dict(weapon.bonuses), weapon.description)
             for weapon in catalogue.WEAPON_SPECS[:3]] == [
-        ("w001", "Тапок последнего предупреждения", "shop", 250, {"strength": 6},
-         "Мягкий, но убедительный. Второго не будет."),
-        ("w002", "Сковородка семейного совета", "shop", 900,
+        ("w001", "Мамин тапок", "shop", 250, {"strength": 6},
+         "Летит точнее, чем кажется."),
+        ("w002", "Мамина сковородка", "shop", 900,
          {"strength": 14, "luck": 4},
-         "Тяжёлая кухонная дипломатия. Решает голосованием."),
-        ("w003", "Швабра внеплановой проверки", "drop", 0,
+         "После неё спор окончен."),
+        ("w003", "Швабра на изоленте", "drop", 0,
          {"strength": 20, "agility": -3},
-         "Достаёт даже из угла. Находит нарушения."),
+         "Синяя. Значит, легендарная."),
     ]
 
 
@@ -88,7 +88,9 @@ def test_raw_items_expose_trade_schema_and_legendary_drop_weight_is_about_one_pe
     drop_records = [record for record in catalogue.RAW_ITEMS if record["source"] == "drop"]
     legendary_weight = sum(record["drop_weight"] for record in drop_records if record["rarity"] == "legendary")
     total_weight = sum(record["drop_weight"] for record in drop_records)
-    assert legendary_weight / total_weight == pytest.approx(5 / 455)
+    assert legendary_weight / total_weight == pytest.approx(5 / 530)
+    cursed = [record for record in catalogue.RAW_ITEMS if record["rarity"] == "cursed"]
+    assert cursed and all(record["source"] == "drop" for record in cursed)
 
 
 def test_names_are_clear_and_descriptions_are_short():
@@ -100,7 +102,9 @@ def test_names_are_clear_and_descriptions_are_short():
     assert all(len(description) <= 65 for description in descriptions)
     assert any(name.startswith("Тапок ") for name in names)
     assert any(name.startswith("Сковородка ") for name in names)
-    assert any("парковк" in name.lower() for name in names)
+    assert any("с авито" in name.lower() for name in names)
+    assert any("из гаража" in name.lower() for name in names)
+    assert not any(any(bad in name.lower() for bad in ("дедлайн", "созвон", "проверки")) for name in names)
     assert len(set(descriptions)) >= 100
 
 
@@ -113,5 +117,8 @@ def test_generated_rarities_are_interleaved_instead_of_front_loaded():
 def test_generated_names_are_plain_readable_noun_phrases():
     generated_names = [weapon.name for weapon in catalogue.WEAPON_SPECS[3:]]
     assert all(not name.startswith("«") and ":" not in name for name in generated_names)
-    assert all(any(name.endswith(suffix) for suffix, _ in catalogue._THEMES)
-               for name in generated_names)
+    legendary_names = {name for name, _ in catalogue._LEGENDARY_COPY}
+    assert all(
+        name in legendary_names or any(name.endswith(suffix) for suffix, _ in catalogue._THEMES)
+        for name in generated_names
+    )

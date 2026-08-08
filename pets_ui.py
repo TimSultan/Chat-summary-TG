@@ -645,10 +645,14 @@ def parse_confirmation_argument(argument: str) -> tuple[str, str]:
     return code, token
 
 
-def _rarity_buttons(user_id, action: str, selected: str, *, paged: bool = False) -> list:
+def _rarity_buttons(
+    user_id, action: str, selected: str, *, paged: bool = False, include_cursed: bool = True,
+) -> list:
     short = {"all": "Все", "cursed": "☠️", "common": "⚪", "uncommon": "🟢", "rare": "🔵", "legendary": "🟡"}
     buttons = []
     for rarity in RARITY_FILTERS:
+        if rarity == "cursed" and not include_cursed:
+            continue
         text = short[rarity] + (" ✓" if rarity == selected else "")
         argument = collection_argument(rarity, 0) if paged else rarity
         buttons.append({"text": text, "callback_data": callback_data(user_id, action, argument)})
@@ -656,19 +660,24 @@ def _rarity_buttons(user_id, action: str, selected: str, *, paged: bool = False)
 
 
 def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, dict]:
-    """The 16-item daily weapon window plus direct routes to accessory shelves."""
+    """The 10-item daily weapon window plus direct routes to accessory shelves."""
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
     rarity, _ = _rarity_argument(rarity)
+    if rarity == "cursed":
+        rarity = "all"
     owned = set(pet.get("inventory", []))
     stock = C.daily_storefront_weapons(entry, pets.today())
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
-    lines = ["🛒 <b>Витрина дня</b>", "Сегодня в продаже 16 оружий. Завтра ассортимент сменится."]
+    lines = [
+        "🛒 <b>Витрина дня</b>",
+        f"Сегодня в продаже {C.DAILY_STOREFRONT_SIZE} оружий. Завтра ассортимент сменится.",
+    ]
     lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
     if not visible:
         lines.append("Сегодня оружия этой редкости не завезли.")
-    rows = _rarity_buttons(user_id, "store", rarity)
+    rows = _rarity_buttons(user_id, "store", rarity, include_cursed=False)
     purchase_buttons = []
     for number, item in enumerate(visible, 1):
         state = "у тебя уже есть" if item.code in owned else _coins(item.price)
@@ -685,7 +694,7 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
             })
     if purchase_buttons:
         lines.append("Нажми номер оружия, чтобы купить.")
-        # The full 16-item window occupies exactly three compact rows (6 + 6 + 4).
+        # The full 10-item window occupies exactly three compact rows (4 + 4 + 2).
         # Filtered/partly-owned windows keep the same maximum of three rows.
         buttons_per_row = (len(purchase_buttons) + 2) // 3
         rows.extend(
@@ -713,37 +722,39 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
 
 
 def collection_view(entry: str, user_id, xp: int, argument: str = "") -> tuple[str, dict]:
-    """A permanent 500-weapon book: owned, seen before, and still unknown."""
+    """Chat-wide discovered weapons and their current owners; unknowns stay hidden."""
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
     rarity, page = _rarity_argument(argument, with_page=True)
-    weapons = sorted(C.items_for_slot("weapon"), key=lambda item: item.code)
-    discovered = set(pet.get("discovered", []))
-    owned = set(pet.get("inventory", []))
-    lines = ["📚 <b>Книга оружия</b>"]
-    lines.append(f"Открыто: <b>{len(discovered & {item.code for item in weapons})}/{len(weapons)}</b> · в сумке: {len(owned & {item.code for item in weapons})}")
-    pity_progress = getattr(pets, "legendary_pity_progress", None)
-    if callable(pity_progress):
-        pity = pity_progress(entry, user_id)
-        if pity.get("eligible"):
-            lines.append(
-                f"🟡 До гарантированной легендарки: {pity['wins_without_legend']}/{pity['threshold']} побед "
-                f"(осталось {pity['remaining_wins']})."
-            )
-    for one_rarity in RARITY_FILTERS[1:]:
-        group = [item for item in weapons if item.rarity == one_rarity]
-        seen = sum(item.code in discovered for item in group)
-        lines.append(f"{C.RARITY_LABELS.get(one_rarity, one_rarity)}: {seen}/{len(group)}")
-    visible_all = [item for item in weapons if rarity == "all" or item.rarity == rarity]
+    collection = []
+    for record in pets.discovered_weapon_collection(entry):
+        item = C.find_item(record["code"])
+        if item is not None and (rarity == "all" or item.rarity == rarity):
+            collection.append((item, record["owners"]))
+    lines = ["📚 <b>Открытое оружие этого чата</b>"]
+    visible_all = collection
     total_pages = max(1, (len(visible_all) + COLLECTION_PAGE_SIZE - 1) // COLLECTION_PAGE_SIZE)
     page = min(page, total_pages - 1)
     visible = visible_all[page * COLLECTION_PAGE_SIZE:(page + 1) * COLLECTION_PAGE_SIZE]
-    lines.append(f"\n<b>{RARITY_FILTER_NAMES[rarity]}</b> · {page + 1}/{total_pages}")
-    for item in visible:
-        state = "✅ в сумке" if item.code in owned else "👁 открыто" if item.code in discovered else "▫️ ???"
-        name = escape(item.name) if item.code in discovered else "Неизвестное оружие"
-        lines.append(f"{state} · <b>{name}</b> · {C.RARITY_LABELS.get(item.rarity, item.rarity)}")
+    lines.append(f"\n<b>{RARITY_FILTER_NAMES[rarity]}</b> · страница {page + 1}")
+    if not visible:
+        lines.append("Пока ничего не открыто.")
+    for number, (item, owners) in enumerate(visible, page * COLLECTION_PAGE_SIZE + 1):
+        labels = [
+            f"@{escape(owner['username'])}" if owner.get("username")
+            else escape(owner.get("name") or "кто-то")
+            for owner in owners
+        ]
+        shown = labels[:5]
+        if len(labels) > len(shown):
+            shown.append(f"ещё {len(labels) - len(shown)}")
+        owner_label = ", ".join(shown) if shown else "сейчас ни у кого"
+        owner_word = "Владелец" if len(labels) <= 1 else "Владельцы"
+        lines.append(
+            f"{number}. <b>{escape(item.name)}</b> · {C.RARITY_LABELS.get(item.rarity, item.rarity)}\n"
+            f"{owner_word}: {owner_label}"
+        )
     rows = _rarity_buttons(user_id, "collection", rarity, paged=True)
     navigation = []
     if page:

@@ -113,13 +113,17 @@ class PetsIntegrationTests(unittest.TestCase):
 
         # Gear: buying, equipping, and the stat actually landing on the creature.
         bare = pets.effective_stats(ENTRY, ALICE)
-        ok, note = pets.buy_item(ENTRY, ALICE, RICH_XP, "stick")
+        weapon = next(
+            item for item in C.daily_storefront_weapons(ENTRY, pets.today())
+            if "strength" in item.bonuses
+        )
+        ok, note = pets.buy_item(ENTRY, ALICE, RICH_XP, weapon.code)
         self.assertTrue(ok, note)
-        ok, note = pets.equip(ENTRY, ALICE, "stick")
+        ok, note = pets.equip(ENTRY, ALICE, weapon.code)
         self.assertTrue(ok, note)
         armed = pets.effective_stats(ENTRY, ALICE)
         self.assertEqual(
-            armed["strength"], bare["strength"] + C.find_item("stick").bonuses["strength"]
+            armed["strength"], bare["strength"] + weapon.bonuses["strength"]
         )
         self._render_every_screen(ALICE)
 

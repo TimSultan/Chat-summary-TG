@@ -220,7 +220,10 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
         data["pets"]["1"]["level"] = 3
         pets._save(entry, data)
 
-        item = pets_config.find_item("stick")  # weapon, +6 strength
+        item = next(
+            weapon for weapon in pets_config.daily_storefront_weapons(entry, pets.today())
+            if "strength" in weapon.bonuses
+        )
         economy.grant(entry, "1", item.price, "test")
         ok, msg = pets.buy_item(entry, "1", 0, item.code)
         self.assertTrue(ok, msg)
@@ -264,8 +267,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
     def test_equipping_a_second_weapon_replaces_the_first(self):
         entry = "chat"
         self._tame(entry, "1")
-        stick = pets_config.find_item("stick")
-        fork = pets_config.find_item("fork")
+        stick, fork = pets_config.daily_storefront_weapons(entry, pets.today())[:2]
         economy.grant(entry, "1", stick.price + fork.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, stick.code)[0])
         self.assertTrue(pets.buy_item(entry, "1", 0, fork.code)[0])
@@ -536,7 +538,10 @@ class EquipmentTradingTests(PetsTestCase):
 
     def test_sell_refuses_equipped_and_pays_explicit_resale(self):
         self._two_pets()
-        item = pets_config.find_item("w001")
+        item = next(
+            weapon for weapon in pets_config.daily_storefront_weapons("chat", pets.today())
+            if weapon.rarity not in {"rare", "legendary"}
+        )
         economy.grant("chat", "1", item.price, "test")
         self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
         self.assertTrue(pets.equip("chat", "1", item.code)[0])
@@ -549,7 +554,10 @@ class EquipmentTradingTests(PetsTestCase):
 
     def test_gift_is_unique_atomic_and_refuses_equipped_or_receiver_duplicate(self):
         self._two_pets()
-        item = pets_config.find_item("w001")
+        item = next(
+            weapon for weapon in pets_config.daily_storefront_weapons("chat", pets.today())
+            if weapon.rarity not in {"rare", "legendary"}
+        )
         economy.grant("chat", "1", item.price, "test")
         self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
         self.assertTrue(pets.equip("chat", "1", item.code)[0])
@@ -658,10 +666,12 @@ class StorefrontAndCollectionTests(PetsTestCase):
         again = pets_config.daily_storefront_weapons("shop-chat", day)
         tomorrow = pets_config.daily_storefront_weapons("shop-chat", day + timedelta(days=1))
         self.assertEqual(first, again)
+        self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 10)
         self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
         self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
         self.assertNotEqual([item.code for item in first], [item.code for item in tomorrow])
         self.assertTrue(all(item.source == "shop" and item.slot == "weapon" for item in first))
+        self.assertTrue(all(item.rarity != "cursed" for item in first))
 
     def test_core_purchase_refuses_weapon_outside_daily_window(self):
         entry = "shop-chat"
@@ -769,6 +779,33 @@ class StorefrontAndCollectionTests(PetsTestCase):
             [str(number) for number in range(1, len(stock) + 1)],
         )
         self.assertTrue(all(len(row) <= 6 for row in purchase_rows))
+
+    def test_collection_lists_only_chat_discoveries_and_their_current_owners(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        first, second = pets_config.daily_storefront_weapons(entry, pets.today())[:2]
+        hidden = next(
+            item for item in pets_config.items_for_slot("weapon")
+            if item.code not in {first.code, second.code}
+        )
+        data = pets._load(entry)
+        data["pets"]["1"]["owner_username"] = "alice"
+        data["pets"]["1"]["discovered"] = [first.code, second.code]
+        data["pets"]["1"]["inventory"] = [first.code]
+        data["pets"]["2"]["owner_username"] = "bob"
+        data["pets"]["2"]["discovered"] = [second.code]
+        data["pets"]["2"]["inventory"] = [second.code]
+        pets._save(entry, data)
+
+        text, _ = pets_ui.collection_view(entry, "1", 0)
+
+        self.assertIn(first.name, text)
+        self.assertIn(second.name, text)
+        self.assertIn("Владелец: @alice", text)
+        self.assertIn("Владелец: @bob", text)
+        self.assertNotIn(hidden.name, text)
+        self.assertNotIn(f"/{len(pets_config.items_for_slot('weapon'))}", text)
+        self.assertNotIn("Неизвестное оружие", text)
 
 
 class RecordFightTests(PetsTestCase):

@@ -506,10 +506,10 @@ GIFT_COOLDOWN_SECONDS = 24 * 60 * 60
 GIFT_AUDIT_LIMIT = 500
 
 # The shop deliberately has a small, changing window instead of asking players to
-# scroll through 450 purchasable weapons.  The offset is chat-specific, while moving
+# scroll through hundreds of purchasable weapons. The offset is chat-specific, while moving
 # it by one full window per calendar day guarantees that tomorrow cannot be the same
-# window as today (as long as there are more than 16 shop weapons).
-DAILY_STOREFRONT_SIZE = 16
+# window as today (as long as there are more than 10 shop weapons).
+DAILY_STOREFRONT_SIZE = 10
 
 
 def daily_storefront_weapons(entry: str, day: _date | None = None) -> tuple[Item, ...]:

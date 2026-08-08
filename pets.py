@@ -194,6 +194,41 @@ def gift_history(entry: str) -> list[dict]:
     return [dict(row) for row in reversed(rows[-C.GIFT_AUDIT_LIMIT:])]
 
 
+def discovered_weapon_collection(entry: str) -> list[dict]:
+    """Chat-wide discovered weapons with their current owner or owners.
+
+    Discovery survives sale, so a weapon remains visible even when nobody currently
+    carries it. Ownership is derived from live inventories rather than the audit log;
+    the same catalogue weapon can therefore correctly list several owners.
+    """
+    data = _load(entry)
+    discovered: set[str] = set()
+    owners: dict[str, list[dict]] = {}
+    for user_id, record in data.get("pets", {}).items():
+        if not isinstance(record, dict) or not record.get("name"):
+            continue
+        for code in record.get("discovered", []):
+            item = C.find_item(code)
+            if item is not None and item.slot == "weapon":
+                discovered.add(item.code)
+        owner = {
+            "user_id": str(user_id),
+            "name": record.get("owner_name") or "кто-то",
+            "username": (record.get("owner_username") or "").lstrip("@") or None,
+        }
+        for code in record.get("inventory", []):
+            item = C.find_item(code)
+            if item is None or item.slot != "weapon":
+                continue
+            discovered.add(item.code)
+            owners.setdefault(item.code, []).append(owner)
+    return [
+        {"code": item.code, "owners": tuple(owners.get(item.code, ()))}
+        for item in sorted(C.items_for_slot("weapon"), key=lambda candidate: candidate.code)
+        if item.code in discovered
+    ]
+
+
 def _save(entry: str, data: dict) -> None:
     data["version"] = PETS_STORE_VERSION
     if len(data.get("fights", [])) > FIGHT_LOG_LIMIT:

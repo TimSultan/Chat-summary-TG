@@ -83,10 +83,10 @@ class WeaponSpec:
         }
 
 
-# 50 familiar objects x 10 recognisable situations = 500 unique names.  Every name is
-# a plain Russian noun phrase: the joke should be understood immediately, not decoded
-# from two unrelated fantasy word banks.  The second tuple value is a deliberately short
-# shop description; item stats carry the detailed information.
+# 50 familiar objects x 10 concrete origins = 500 unique names.  These deliberately
+# sound like nicknames people would actually give a stupid improvised weapon: no
+# corporate jargon, random abstractions or fantasy-name soup.  The second tuple value is
+# a short physical joke about the object; stats carry the detailed information.
 _OBJECTS: Final = (
     ("Тапок", "Мягкий, но убедительный."),
     ("Сковородка", "Тяжёлая кухонная дипломатия."),
@@ -108,7 +108,7 @@ _OBJECTS: Final = (
     ("Гантеля", "Весомый аргумент."),
     ("Расчёска", "Наводит боевой порядок."),
     ("Зонт", "Прогнозирует удары."),
-    ("Костыль", "Поддерживает наступление."),
+    ("Арматура", "Кривая, тяжёлая и убедительная."),
     ("Табуретка", "Четыре ножки ярости."),
     ("Подушка", "Усыпляет без сказки."),
     ("Коврик", "Встречает без гостеприимства."),
@@ -141,16 +141,16 @@ _OBJECTS: Final = (
 )
 
 _THEMES: Final = (
-    ("последнего предупреждения", "Второго не будет."),
-    ("семейного совета", "Решает голосованием."),
-    ("внеплановой проверки", "Находит нарушения."),
-    ("пятничного созвона", "Заканчивает встречу."),
-    ("соседского ремонта", "Слышно через три этажа."),
-    ("битвы за парковку", "Место уже ваше."),
-    ("защиты диплома", "Вопросов больше нет."),
-    ("ночного дожора", "Крошек не оставляет."),
-    ("очереди в поликлинике", "Талончик не нужен."),
-    ("финального дедлайна", "Сдаёт раньше вас."),
+    ("с Авито", "Продавец удалил аккаунт."),
+    ("из гаража", "Пахнет бензином."),
+    ("на синей изоленте", "Значит, надёжно."),
+    ("без чека", "Возврат не примут."),
+    ("из общаги", "Комендант уже ищет."),
+    ("от соседа", "Он просил вернуть."),
+    ("с балкона", "Долетело не сразу."),
+    ("за триста рублей", "Торг был уместен."),
+    ("в аренду", "Плата за каждый промах."),
+    ("из 2007-го", "Пережило три ремонта."),
 )
 
 
@@ -249,19 +249,31 @@ _GENERATED_RARITIES: Final = _interleaved_rarities({
 _LEGACY_WEAPONS: Final = (
     # These IDs are the target of the stick/fork/bone migration aliases. Their prices
     # and stats remain lossless; display copy follows the clearer catalogue voice.
-    ("w001", "Тапок последнего предупреждения", "Мягкий, но убедительный. Второго не будет.",
+    ("w001", "Мамин тапок", "Летит точнее, чем кажется.",
      "common", "shop", 250, 50, 0, (("strength", 6),)),
-    ("w002", "Сковородка семейного совета", "Тяжёлая кухонная дипломатия. Решает голосованием.",
+    ("w002", "Мамина сковородка", "После неё спор окончен.",
      "uncommon", "shop", 900, 180, 0, (("strength", 14), ("luck", 4))),
-    ("w003", "Швабра внеплановой проверки", "Достаёт даже из угла. Находит нарушения.",
+    ("w003", "Швабра на изоленте", "Синяя. Значит, легендарная.",
      "legendary", "drop", 0, 220, 1, (("strength", 20), ("agility", -3))),
+)
+
+# Four generated legendary slots get actual punch-line names instead of inheriting a
+# catalogue suffix.  w003 above is the fifth legendary and remains migration-compatible.
+_LEGENDARY_COPY: Final = (
+    ("Пульт от реальности", "Кнопка выключения всё-таки нашлась."),
+    ("Табурет Судного дня", "Четыре ножки. Ни одной надежды."),
+    ("Красная кнопка", "Никто не знает, что она делает."),
+    ("Дедовский кипятильник", "Греет воду, воздух и обстановку."),
 )
 
 
 def _source_for(rarity: str, rarity_rank: int) -> str:
-    # The shop offers all entry/mid-game gear and some rare aspirational purchases.
-    # The remainder is arena loot, keeping truly strong weapons from being wallet-only.
-    if rarity in {"cursed", "common", "uncommon"}:
+    # Cursed junk belongs to arena drops, never a shop shelf. The shop offers normal
+    # entry/mid-game gear and a few rare aspirational purchases; stronger gear remains
+    # arena loot rather than wallet-only progression.
+    if rarity == "cursed":
+        return "drop"
+    if rarity in {"common", "uncommon"}:
         return "shop"
     if rarity == "rare":
         # A handful remain high-end shop goals; 45 are earned through arena drops.
@@ -273,7 +285,7 @@ def _prices(index: int, rarity: str, source: str) -> tuple[int, int]:
     """Return buy and deliberately modest resale prices."""
     if source == "drop":
         # Drops cannot be bought.  Their sale value is a consolation, not a gold faucet.
-        return 0, 220 if rarity == "legendary" else 110
+        return 0, 220 if rarity == "legendary" else 110 if rarity == "rare" else 10
     if rarity == "cursed":
         buy = 35 + (index % 6) * 10
     elif rarity == "common":
@@ -290,13 +302,13 @@ def _prices(index: int, rarity: str, source: str) -> tuple[int, int]:
 def _drop_weight(rarity: str, source: str) -> int:
     """Relative arena-drop chance; zero means this weapon is not in the drop pool.
 
-    Forty-five rare weapons at weight 10 and five legendary weapons at weight 1 make
-    legendary drops 5 / 455 (about 1.1%) of weapon drops.  This preserves a genuinely
-    exciting tier without making it a required progression path.
+    Forty-five rare weapons at weight 10, 75 cursed weapons at weight 1 and five
+    legendary weapons at weight 1 make legendary drops 5 / 530 (about 0.94%) of weapon
+    drops. Cursed junk stays noticeable without overwhelming useful rewards.
     """
     if source != "drop":
         return 0
-    return 1 if rarity == "legendary" else 10
+    return 10 if rarity == "rare" else 1
 
 
 def _build_catalogue() -> tuple[WeaponSpec, ...]:
@@ -307,9 +319,9 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             buy_price=buy_price, resale_price=resale_price, drop_weight=drop_weight, bonuses=bonuses,
         ))
     rarity_seen = {rarity: 0 for rarity in RARITIES}
-    # Adjacent codes intentionally rotate both object and situation.  Daily storefronts
+    # Adjacent codes intentionally rotate both object and concrete origin. Daily storefronts
     # use contiguous code windows, so a grouped Cartesian product would show sixteen
-    # near-identical "...дедлайна" names at once even though the full catalogue varied.
+    # near-identical "...с Авито" names at once even though the full catalogue varied.
     combinations = tuple(
         (*_OBJECTS[index % len(_OBJECTS)],
          *_THEMES[(index // len(_OBJECTS) + index % len(_OBJECTS)) % len(_THEMES)])
@@ -329,9 +341,12 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             if rarity == "cursed"
             else f"{object_description} {theme_description}"
         )
+        name = f"{object_name} {suffix}"
+        if rarity == "legendary":
+            name, description = _LEGENDARY_COPY[rarity_seen[rarity] - 1]
         entries.append(WeaponSpec(
             code=f"w{index + 1:03d}",
-            name=f"{object_name} {suffix}",
+            name=name,
             description=description,
             rarity=rarity,
             source=source,
