@@ -740,6 +740,17 @@ class StorefrontAndCollectionTests(PetsTestCase):
         callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
         self.assertTrue(all(len(value.encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES for value in callbacks))
 
+    def test_store_separates_each_weapon_with_a_blank_line(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        text, _ = pets_ui.store_view(entry, "1", 0)
+        visible_names = [
+            item.name for item in pets_config.daily_storefront_weapons(entry, pets.today())
+        ]
+        for current, following in zip(visible_names, visible_names[1:]):
+            separator = text.index("\n\n", text.index(current))
+            self.assertLess(separator, text.index(following))
+
 
 class RecordFightTests(PetsTestCase):
     def _set_pet_level(self, entry, user_id, level, cage_level=1):

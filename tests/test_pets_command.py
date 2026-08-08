@@ -180,6 +180,16 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("cage", actions)
         self.assertIn("info", actions)
 
+    def test_private_arena_menu_is_never_scheduled_for_deletion(self):
+        deletions = []
+        with patch.object(
+            bot_listener, "schedule_bot_delete",
+            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
+        ):
+            api = self._type()
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual(deletions, [])
+
     def test_how_to_play_button_opens_the_arena_rules(self):
         api = self._tap("info")
         self.assertIn("Как играть", api.edits[0]["text"])
@@ -559,8 +569,15 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), attacker_gold_before)
         self.assertEqual(economy.balance(CHAT, 43, 0), defender_gold_before)
         self.assertTrue(pets.history(CHAT, PLAYER["id"])[0]["guardian_intervention"])
-        self.assertEqual(len(api.photo_files), 0)
-        self.assertIn(C.GUARDIAN_INTERVENTION_TEXT, api.sent[0]["text"])
+        self.assertEqual(api.sent, [])
+        self.assertEqual(len(api.photo_files), 1)
+        caption = api.photo_files[0]["caption"]
+        self.assertIn(C.GUARDIAN_INTERVENTION_TEXT, caption)
+        self.assertIn("Атака:", caption)
+        self.assertIn("Adult", caption)
+        self.assertIn("Child", caption)
+        self.assertIn("Player", caption)
+        self.assertIn("Bob", caption)
 
     def test_six_level_advantage_remains_a_normal_combat(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -814,9 +831,10 @@ class PetsCommandTests(unittest.TestCase):
         if "ничью" in group_result["caption"]:
             # Combat is intentionally random; a legitimate draw has no winner payout.
             self.assertNotIn("🪙 +", group_result["caption"])
+            self.assertNotIn("✨ +100 опыта", group_result["caption"])
         else:
             self.assertIn("🪙 +", group_result["caption"])
-        self.assertIn("✨ +100 опыта", group_result["caption"])
+            self.assertIn("✨ +100 опыта", group_result["caption"])
         button = _buttons(group_result)[0]
         self.assertEqual(button["text"], "⚔️ Открыть арену")
         self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")

@@ -5404,8 +5404,10 @@ PETS_COMMANDS = ("/arena", "/арена")
 PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
 PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
-PETS_ARENA_DELETE_AFTER = 3 * 60
-PET_NOTICE_DELETE_AFTER = PETS_ARENA_DELETE_AFTER
+# Arena navigation is a persistent DM workspace: the same message is edited while the
+# player browses it, so scheduling its original message for deletion would destroy every
+# later screen too.  Standalone /pet cards remain temporary notices.
+PET_NOTICE_DELETE_AFTER = 3 * 60
 GROUP_PETS_DELETE_AFTER = 30
 DUEL_RESULT_DELETE_AFTER = 10
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
@@ -5544,8 +5546,7 @@ async def handle_pets_command(
 
     await _send_pets_view(
         api, chat_id, pets_ui.main_view(entry, user.user_id, xp),
-        reply_to_message_id=message["message_id"], background_tasks=background_tasks,
-        delete_after=PETS_ARENA_DELETE_AFTER, log=log,
+        reply_to_message_id=message["message_id"], log=log,
     )
 
 
@@ -6198,28 +6199,72 @@ async def _pets_run_fight(
     # create gold, a loss debit, a drop, or a normal combat result.
     if mine.get("level", 1) - theirs.get("level", 1) >= C.GUARDIAN_LEVEL_GAP:
         reward = pets.record_guardian_intervention(entry, user_id, opponent_id, pets.today())
+        attacker_owner = (
+            f"@{html.escape(str(mine.get('owner_username')).lstrip('@'))}"
+            if mine.get("owner_username") else html.escape(mine.get("owner_name") or "неизвестный хозяин")
+        )
+        defender_owner = (
+            f"@{html.escape(str(theirs.get('owner_username')).lstrip('@'))}"
+            if theirs.get("owner_username") else html.escape(theirs.get("owner_name") or "неизвестный хозяин")
+        )
         guardian_text = (
+            f"⚔️ <b>Атака:</b> <b>{html.escape(mine.get('name') or 'Существо')}</b> "
+            f"({attacker_owner}) → <b>{html.escape(theirs.get('name') or 'Существо')}</b> "
+            f"({defender_owner})\n\n"
             f"<b>{html.escape(C.GUARDIAN_INTERVENTION_TEXT)}</b>\n"
             f"✨ +{reward['xp']} опыта"
         )
+        image_path = None
+        try:
+            image_path = await _pets_render_guardian_image(
+                api, entry, user_id, opponent_id, mine, theirs, reward["xp"], log,
+            )
+        except Exception:
+            log(f"[pets] failed to render guardian intervention:\n{traceback.format_exc()}")
         sent = None
         try:
-            sent = await api.send_message(chat_id, guardian_text, parse_mode="HTML")
+            if image_path is not None:
+                sent = await api.send_photo_file(
+                    chat_id, image_path, caption=guardian_text, parse_mode="HTML",
+                    disable_notification=True,
+                )
+            else:
+                sent = await api.send_message(chat_id, guardian_text, parse_mode="HTML")
         except Exception:
             log(f"[pets] failed to send guardian intervention:\n{traceback.format_exc()}")
-        else:
-            if delete_after and background_tasks is not None and sent and "message_id" in sent:
-                schedule_bot_delete(
-                    api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
-                    trigger_message_id=message_id if delete_trigger else None,
-                )
+            if image_path is not None:
+                try:
+                    sent = await api.send_message(chat_id, guardian_text, parse_mode="HTML")
+                except Exception:
+                    log(f"[pets] failed to send guardian text fallback:\n{traceback.format_exc()}")
+        if delete_after and background_tasks is not None and sent and "message_id" in sent:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
+                trigger_message_id=message_id if delete_trigger else None,
+            )
         # The attacker still gets their own private receipt when this was initiated from
         # the DM arena. The defender did not fight, so they receive no notification.
         if persistent_recipient_ids and str(user_id) != str(chat_id):
             try:
-                await api.send_message(user_id, guardian_text, parse_mode="HTML")
+                if image_path is not None:
+                    await api.send_photo_file(
+                        user_id, image_path, caption=guardian_text, parse_mode="HTML",
+                        disable_notification=True,
+                    )
+                else:
+                    await api.send_message(user_id, guardian_text, parse_mode="HTML")
             except Exception:
                 log(f"[pets] could not deliver guardian receipt to {user_id}")
+                if image_path is not None:
+                    try:
+                        await api.send_message(user_id, guardian_text, parse_mode="HTML")
+                    except Exception:
+                        log(f"[pets] could not deliver guardian text receipt to {user_id}")
+        if image_path is not None:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return
 
     attacker_fighter = _pets_fighter(entry, user_id, mine)
@@ -6412,6 +6457,50 @@ async def _pets_render_result_image(
             "owner_avatar": avatar_b,
             **((fight_hp or {}).get(str(defender_id), {})),
         })
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+async def _pets_render_guardian_image(
+    api, entry: str, attacker_id, defender_id, attacker: dict, defender: dict, xp: int, log,
+):
+    """Build the two-pet receipt for a fight stopped before the first hit."""
+    attacker_stats = pets.effective_stats(entry, attacker_id)
+    defender_stats = pets.effective_stats(entry, defender_id)
+    attacker_fighter = _pets_fighter(entry, attacker_id, attacker)
+    defender_fighter = _pets_fighter(entry, defender_id, defender)
+    attacker_hp = round(pets_combat.derive(attacker_fighter, defender_fighter)["max_hp"])
+    defender_hp = round(pets_combat.derive(defender_fighter, attacker_fighter)["max_hp"])
+    pet_a, pet_b, avatar_a, avatar_b = await asyncio.gather(
+        _pets_download_media(api, attacker.get("photo_file_id"), log),
+        _pets_download_media(api, defender.get("photo_file_id"), log),
+        _pets_owner_avatar(api, attacker_id, log),
+        _pets_owner_avatar(api, defender_id, log),
+    )
+    path = pets_image.temporary_result_path()
+    try:
+        return pets_image.render_guardian_result(path, {
+            "id": str(attacker_id),
+            "pet_name": attacker.get("name"),
+            "owner_name": attacker.get("owner_name"),
+            "stats": attacker_stats,
+            "power": pets.power_rating(entry, attacker_id),
+            "pet_photo": pet_a,
+            "owner_avatar": avatar_a,
+            "remaining_hp": attacker_hp,
+            "max_hp": attacker_hp,
+        }, {
+            "id": str(defender_id),
+            "pet_name": defender.get("name"),
+            "owner_name": defender.get("owner_name"),
+            "stats": defender_stats,
+            "power": pets.power_rating(entry, defender_id),
+            "pet_photo": pet_b,
+            "owner_avatar": avatar_b,
+            "remaining_hp": defender_hp,
+            "max_hp": defender_hp,
+        }, xp=xp)
     except Exception:
         path.unlink(missing_ok=True)
         raise

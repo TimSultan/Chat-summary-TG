@@ -675,12 +675,14 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
         lines.append(f"<b>{escape(item.name)}</b> · {label} · {_bonus_text(item)} · {state}")
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
+        # Keep each weapon visually separate in Telegram's dense proportional font.
+        lines.append("")
         if item.code not in owned:
             rows.append([{
                 "text": f"Купить · {_money(item.price)}",
                 "callback_data": callback_data(user_id, "buy", item.code),
             }])
-    lines.append(f"\n🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
+    lines.append(f"🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
     rows.extend([
         [{
             "text": f"{C.SLOT_EMOJI['amulet']} {C.SLOT_NAMES['amulet']}",

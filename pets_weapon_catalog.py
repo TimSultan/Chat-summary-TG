@@ -1,4 +1,4 @@
-"""The deliberately strange, fixed weapon catalogue for the pet arena.
+"""The clear, comic, fixed weapon catalogue for the pet arena.
 
 This module owns *data*, rather than game logic.  ``WEAPON_SPECS`` is an immutable
 tuple of exactly 500 :class:`WeaponSpec` values.  It is safe for ``pets_config`` to
@@ -83,42 +83,74 @@ class WeaponSpec:
         }
 
 
-# 25 x 20 creates 500 names with no serial-number padding in the visible name.  The
-# vocabulary deliberately stays playful rather than cruel, hateful, or real-world
-# threatening; the fantasy is a tiny creature trying to win a duel with junk.
-_MODIFIERS: Final = (
-    "Призрак", "Бюджет", "Турборежим", "Подозрение", "Церемония",
-    "Лунный свет", "Лицензия", "Авария", "Сырость", "Дипломатия",
-    "Квант", "Вежливость", "Ферментация", "Карман", "Солнце",
-    "Лёгкое проклятие", "Бархат", "Бюрократия", "Реверс", "Диско",
-    "Комиссионка", "Астрал", "Разгон", "Разум", "Выходной",
+# 50 familiar objects x 10 recognisable situations = 500 unique names.  Every name is
+# a plain Russian noun phrase: the joke should be understood immediately, not decoded
+# from two unrelated fantasy word banks.  The second tuple value is a deliberately short
+# shop description; item stats carry the detailed information.
+_OBJECTS: Final = (
+    ("Тапок", "Мягкий, но убедительный."),
+    ("Сковородка", "Тяжёлая кухонная дипломатия."),
+    ("Швабра", "Достаёт даже из угла."),
+    ("Половник", "Черпает неприятности."),
+    ("Дуршлаг", "Защищает и унижает."),
+    ("Кабачок", "С виду овощ. Это ловушка."),
+    ("Багет", "Хрустит с угрозой."),
+    ("Пульт", "Всегда находит нужную кнопку."),
+    ("Клавиатура", "Печатает последний аргумент."),
+    ("Мышка", "Курсор навёлся сам."),
+    ("Степлер", "Скрепляет бой намертво."),
+    ("Дырокол", "Оставляет два вопроса."),
+    ("Калькулятор", "Считает шансы без жалости."),
+    ("Термос", "Долго держит удар."),
+    ("Чайник", "Закипает с пол-оборота."),
+    ("Веник", "Выметает с арены."),
+    ("Ёршик", "Лучше не уточнять."),
+    ("Гантеля", "Весомый аргумент."),
+    ("Расчёска", "Наводит боевой порядок."),
+    ("Зонт", "Прогнозирует удары."),
+    ("Костыль", "Поддерживает наступление."),
+    ("Табуретка", "Четыре ножки ярости."),
+    ("Подушка", "Усыпляет без сказки."),
+    ("Коврик", "Встречает без гостеприимства."),
+    ("Банка огурцов", "Открывается только в бою."),
+    ("Пакет с пакетами", "Внутри всё самое важное."),
+    ("Рулон обоев", "Ремонт переходит в атаку."),
+    ("Удлинитель", "Дотягивается до каждого."),
+    ("Зарядка", "Подходит не к тому порту."),
+    ("Селфи-палка", "Держит врага в кадре."),
+    ("Совок", "Собирает последствия."),
+    ("Грабли", "Работают повторно."),
+    ("Лопата", "Копает до победы."),
+    ("Щётка", "Счищает лишний пафос."),
+    ("Бутылка", "Пустая, зато звонкая."),
+    ("Кружка", "Полна решимости."),
+    ("Тостер", "Поджаривает аргументы."),
+    ("Миксер", "Взбивает обстановку."),
+    ("Фен", "Сдувает уверенность."),
+    ("Утюг", "Разглаживает конфликты."),
+    ("Пылесос", "Засасывает инициативу."),
+    ("Микроволновка", "Греет угрозы изнутри."),
+    ("Принтер", "Бьёт только после ошибки."),
+    ("Роутер", "Раздаёт по полной."),
+    ("Будильник", "Пробуждает инстинкты."),
+    ("Домофон", "Не пускает без боя."),
+    ("Чемодан", "Настроен на вылет."),
+    ("Вешалка", "Цепляется за победу."),
+    ("Кочерга", "Поддерживает жар."),
+    ("Клавиша Enter", "Подтверждает поражение."),
 )
-_ARTIFACTS: Final = (
-    "микроволновый скипетр", "зонтик для голубя", "трезубец налоговой декларации",
-    "алебарда бананового киоска", "сабля-половник", "лоза для поиска Wi-Fi",
-    "аккордеон сожалений", "катапульта для круассана", "рапира из дорожного конуса",
-    "двуручник-выпрямитель", "цеп для чайника", "копьё чекового принтера",
-    "боевой горн караоке", "бумеранг на липучке", "тактическая репа",
-    "сертифицированная ложка", "ланца из лавовой лампы", "булава из банки печенья",
-    "арбалет-кольцо настроения", "топор неоплаченной парковки",
-)
-_OPENERS: Final = (
-    "Гудит, когда его об этом никто не просил.",
-    "Выдан после инцидента с тремя голубями и колокольчиком.",
-    "В инструкции только рисунок тревожной картофелины.",
-    "Утверждает, что подходит для посудомойки; эмоционально — нет.",
-    "Внутри крошечный комитет голосует за каждый взмах.",
-    "Пахнет победой и старой принтерной краской.",
-    "Никто не помнит, кто это заказал, включая продавца.",
-    "Гарантия не покрывает погоду, гравитацию и вторники.",
-    "Его благословил волшебник с очень низкими стандартами.",
-    "Наклейка гласит: «почти профессионально» — и блестит.",
-)
-_CURSED_EFFECTS: Final = (
-    "Даёт отличный совет ровно на секунду позже нужного.",
-    "Уверено, что отступление — это продвинутая боевая стойка.",
-    "С тревожным восторгом аплодирует собственным промахам.",
-    "Проклятие почти целиком состоит из обязательной бумажной работы.",
+
+_THEMES: Final = (
+    ("последнего предупреждения", "Второго не будет."),
+    ("семейного совета", "Решает голосованием."),
+    ("внеплановой проверки", "Находит нарушения."),
+    ("пятничного созвона", "Заканчивает встречу."),
+    ("соседского ремонта", "Слышно через три этажа."),
+    ("битвы за парковку", "Место уже ваше."),
+    ("защиты диплома", "Вопросов больше нет."),
+    ("ночного дожора", "Крошек не оставляет."),
+    ("очереди в поликлинике", "Талончик не нужен."),
+    ("финального дедлайна", "Сдаёт раньше вас."),
 )
 
 
@@ -215,13 +247,13 @@ _GENERATED_RARITIES: Final = _interleaved_rarities({
 })
 
 _LEGACY_WEAPONS: Final = (
-    # These IDs are the target of the stick/fork/bone migration aliases.  Do not alter
-    # their display data: an existing owner's paid gear must retain its exact stats.
-    ("w001", "Кисть-щетина №8", "Жёсткая, уверенная, для смелых мазков.",
+    # These IDs are the target of the stick/fork/bone migration aliases. Their prices
+    # and stats remain lossless; display copy follows the clearer catalogue voice.
+    ("w001", "Тапок последнего предупреждения", "Мягкий, но убедительный. Второго не будет.",
      "common", "shop", 250, 50, 0, (("strength", 6),)),
-    ("w002", "Аэрограф Harder & Steenbeck", "Ровный факел краски и немного магии в триггере.",
+    ("w002", "Сковородка семейного совета", "Тяжёлая кухонная дипломатия. Решает голосованием.",
      "uncommon", "shop", 900, 180, 0, (("strength", 14), ("luck", 4))),
-    ("w003", "Компрессор старого мастера", "Тяжёлый, гудит и выдаёт идеальное давление.",
+    ("w003", "Швабра внеплановой проверки", "Достаёт даже из угла. Находит нарушения.",
      "legendary", "drop", 0, 220, 1, (("strength", 20), ("agility", -3))),
 )
 
@@ -275,8 +307,16 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             buy_price=buy_price, resale_price=resale_price, drop_weight=drop_weight, bonuses=bonuses,
         ))
     rarity_seen = {rarity: 0 for rarity in RARITIES}
-    for index, (modifier, artifact) in enumerate(
-        (pair for pair in ((m, a) for m in _MODIFIERS for a in _ARTIFACTS)), start=3
+    # Adjacent codes intentionally rotate both object and situation.  Daily storefronts
+    # use contiguous code windows, so a grouped Cartesian product would show sixteen
+    # near-identical "...дедлайна" names at once even though the full catalogue varied.
+    combinations = tuple(
+        (*_OBJECTS[index % len(_OBJECTS)],
+         *_THEMES[(index // len(_OBJECTS) + index % len(_OBJECTS)) % len(_THEMES)])
+        for index in range(len(_OBJECTS) * len(_THEMES))
+    )
+    for index, (object_name, object_description, suffix, theme_description) in enumerate(
+        combinations[3:], start=3
     ):
         if len(entries) == 500:
             break
@@ -284,15 +324,14 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
         rarity_seen[rarity] += 1
         source = _source_for(rarity, rarity_seen[rarity])
         buy_price, resale_price = _prices(index, rarity, source)
-        description = _OPENERS[index % len(_OPENERS)]
-        if rarity == "cursed":
-            description = f"{description} {_CURSED_EFFECTS[index % len(_CURSED_EFFECTS)]}"
+        description = (
+            f"{object_description} Есть подвох."
+            if rarity == "cursed"
+            else f"{object_description} {theme_description}"
+        )
         entries.append(WeaponSpec(
             code=f"w{index + 1:03d}",
-            # A quoted noun-label does not modify the artefact, so Russian feminine,
-            # masculine and neuter weapon names remain grammatical without losing the
-            # deliberately odd catalogue voice.
-            name=f"«{modifier}»: {artifact}",
+            name=f"{object_name} {suffix}",
             description=description,
             rarity=rarity,
             source=source,
@@ -301,7 +340,7 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             drop_weight=_drop_weight(rarity, source),
             bonuses=_bonus_tuple(index, rarity),
         ))
-    # There are 25 * 20 name combinations, of which the first three are replaced by
+    # There are 50 * 10 name combinations, of which the first three are replaced by
     # migration-safe legacy entries.  The early stop above keeps the public range w001..w500.
     return tuple(entries)
 

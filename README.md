@@ -924,6 +924,8 @@ shows 16 rotating weapons with rarity filters, and a paginated permanent collect
 tracks every weapon ever held. Items can be locked; rare and legendary sales/gifts require
 a one-time server confirmation, while gifts require pet level 3 and have a 24-hour sender
 cooldown plus an ID/code/timestamp audit trail.
+Weapon names use familiar household objects and recognisable situations, with one-line
+descriptions; storefront entries are separated by blank lines for quick scanning.
 Rarity weights make a legendary about 1.1% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
 telemetry tracks passive minting, sales, gifts, arena gold, guard actions and drops.
