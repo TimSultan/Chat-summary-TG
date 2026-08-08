@@ -289,7 +289,12 @@ def render_guardian_result(
     _center(draw, 905, f"+{max(0, int(xp))} ОПЫТА НАПАДАВШЕМУ", _font(25, bold=True), "#147a59")
     attack_name = _short(attacker.get("pet_name"), 18, size=22).upper()
     target_name = _short(defender.get("pet_name"), 18, size=22).upper()
-    _center(draw, 960, f"АТАКА: {attack_name}  >  {target_name}", _font(22, bold=True), "#26343a")
+    attack_level = max(1, int(attacker.get("level", 1)))
+    target_level = max(1, int(defender.get("level", 1)))
+    _center(
+        draw, 960, f"АТАКА: {attack_name} УР {attack_level}  >  {target_name} УР {target_level}",
+        _font(22, bold=True), "#26343a",
+    )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

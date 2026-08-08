@@ -285,7 +285,7 @@ DRAW_XP = 50                # both sides spent a fight; no gold or win is awarde
 # not turn a playground rule into a hidden matchmaking restriction.
 GUARDIAN_LEVEL_GAP = 7
 GUARDIAN_XP = 5
-GUARDIAN_INTERVENTION_TEXT = "Негоже взрослому с детьми драться. Вас отпиздил охранник."
+GUARDIAN_INTERVENTION_TEXT = "Негоже взрослому с детьми драться. {owner} отпиздил охранник."
 # Winning against a pet several levels below yours is less valuable, while an upset is
 # worth more. The delta is loser level minus winner level, capped at three levels so a
 # rare lopsided match cannot turn into a punitive tax or an outsized reward. Cage gold

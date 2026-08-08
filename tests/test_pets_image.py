@@ -92,12 +92,14 @@ class FightImageTests(unittest.TestCase):
     def test_guardian_renderer_contains_both_pet_panels(self):
         attacker = {
             "id": "a", "pet_name": "Взрослый", "owner_name": "Alice",
+            "level": 8,
             "stats": {"strength": 20, "health": 18, "agility": 14, "luck": 11, "armor": 5},
             "power": 321, "pet_photo": _png("green"), "owner_avatar": _png("blue"),
             "remaining_hp": 120, "max_hp": 120,
         }
         defender = {
             "id": "b", "pet_name": "Малыш", "owner_name": "Bob",
+            "level": 1,
             "stats": {"strength": 7, "health": 8, "agility": 6, "luck": 5, "armor": 1},
             "power": 90, "pet_photo": _png("red"), "owner_avatar": _png("yellow"),
             "remaining_hp": 80, "max_hp": 80,

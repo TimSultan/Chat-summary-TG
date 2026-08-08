@@ -6100,6 +6100,27 @@ async def _pets_toast_and_redraw(api, chat_id, message_id, note: str, rendered, 
     )
 
 
+def _pets_rare_drop_announcement(reward: dict, attacker: dict, defender: dict) -> str | None:
+    """Public chat line for a rare weapon awarded by an already-recorded fight."""
+    dropped_code = reward.get("dropped_item")
+    winner = attacker
+    if not dropped_code:
+        dropped_code = reward.get("opponent_dropped_item")
+        winner = defender
+    item = C.find_item(dropped_code) if dropped_code else None
+    if item is None or item.slot != "weapon" or item.rarity not in {"rare", "legendary"}:
+        return None
+
+    username = str(winner.get("owner_username") or "").strip().lstrip("@")
+    owner = f"@{html.escape(username)}" if username else html.escape(
+        winner.get("owner_name") or "Неизвестному игроку"
+    )
+    rarity = "редкое" if item.rarity == "rare" else "легендарное"
+    description = html.escape(str(item.description or "").strip())
+    suffix = f" — {description}" if description else ""
+    return f"{owner} выпало {rarity} оружие: <b>{html.escape(item.name)}</b>{suffix}"
+
+
 async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
@@ -6209,9 +6230,10 @@ async def _pets_run_fight(
         )
         guardian_text = (
             f"⚔️ <b>Атака:</b> <b>{html.escape(mine.get('name') or 'Существо')}</b> "
-            f"({attacker_owner}) → <b>{html.escape(theirs.get('name') or 'Существо')}</b> "
-            f"({defender_owner})\n\n"
-            f"<b>{html.escape(C.GUARDIAN_INTERVENTION_TEXT)}</b>\n"
+            f"ур {mine.get('level', 1)}({attacker_owner}) → "
+            f"<b>{html.escape(theirs.get('name') or 'Существо')}</b> "
+            f"ур {theirs.get('level', 1)}({defender_owner})\n\n"
+            f"<b>{C.GUARDIAN_INTERVENTION_TEXT.format(owner=attacker_owner)}</b>\n"
             f"✨ +{reward['xp']} опыта"
         )
         image_path = None
@@ -6350,6 +6372,14 @@ async def _pets_run_fight(
                 trigger_message_id=message_id if delete_trigger else None,
             )
     finally:
+        drop_announcement = _pets_rare_drop_announcement(reward, mine, theirs)
+        if drop_announcement:
+            try:
+                await api.send_message(chat_id, drop_announcement, parse_mode="HTML")
+            except Exception:
+                # The item is already safely stored by record_fight. A Telegram failure
+                # must not disrupt result delivery or try to award it a second time.
+                log("[pets] could not announce a rare arena drop")
         if image_path is not None:
             # Keyed by str: opponent_id arrives as text while the caller's ids are ints,
             # so a plain dict.fromkeys treats 43 and "43" as two people and DMs the
@@ -6483,6 +6513,7 @@ async def _pets_render_guardian_image(
         return pets_image.render_guardian_result(path, {
             "id": str(attacker_id),
             "pet_name": attacker.get("name"),
+            "level": attacker.get("level", 1),
             "owner_name": attacker.get("owner_name"),
             "stats": attacker_stats,
             "power": pets.power_rating(entry, attacker_id),
@@ -6493,6 +6524,7 @@ async def _pets_render_guardian_image(
         }, {
             "id": str(defender_id),
             "pet_name": defender.get("name"),
+            "level": defender.get("level", 1),
             "owner_name": defender.get("owner_name"),
             "stats": defender_stats,
             "power": pets.power_rating(entry, defender_id),

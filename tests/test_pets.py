@@ -751,6 +751,25 @@ class StorefrontAndCollectionTests(PetsTestCase):
             separator = text.index("\n\n", text.index(current))
             self.assertLess(separator, text.index(following))
 
+    def test_store_numbers_every_item_and_groups_purchase_numbers_in_three_rows(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        stock = pets_config.daily_storefront_weapons(entry, pets.today())
+        text, keyboard = pets_ui.store_view(entry, "1", 0)
+
+        for number, item in enumerate(stock, 1):
+            self.assertIn(f"<b>{number}. {item.name}</b>", text)
+        purchase_rows = [
+            row for row in keyboard["inline_keyboard"]
+            if row and all(":buy:" in button["callback_data"] for button in row)
+        ]
+        self.assertEqual(len(purchase_rows), 3)
+        self.assertEqual(
+            [button["text"] for row in purchase_rows for button in row],
+            [str(number) for number in range(1, len(stock) + 1)],
+        )
+        self.assertTrue(all(len(row) <= 6 for row in purchase_rows))
+
 
 class RecordFightTests(PetsTestCase):
     def _set_pet_level(self, entry, user_id, level, cage_level=1):

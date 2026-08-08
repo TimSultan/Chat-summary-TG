@@ -492,6 +492,52 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(api.photo_files[0]["disable_notification"])
         self.assertTrue(defender_copy["disable_notification"])
 
+    def test_rare_weapon_drop_is_announced_in_the_result_chat(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player", "player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Defender", "file_b", "Bob", "bob")
+        rare = next(
+            item for item in C.ITEMS
+            if item.slot == "weapon" and item.source == "drop" and item.rarity == "rare"
+        )
+        reward = {
+            "draw": False, "gold": 10, "loss_gold": 0, "xp": 25,
+            "levels_gained": 0, "level": 1, "dropped_item": rare.code,
+            "opponent_gold": 0, "opponent_loss_gold": 3, "opponent_xp": 5,
+            "opponent_levels_gained": 0, "opponent_level": 1,
+            "opponent_dropped_item": None,
+        }
+        api = FakeApi()
+
+        with patch.object(pets, "record_fight", return_value=reward):
+            _run(bot_listener._pets_run_fight(
+                api, MAIN_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP,
+                log=lambda *_: None,
+            ))
+
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual(api.sent[0]["chat_id"], MAIN_CHAT_ID)
+        self.assertIn("@player выпало редкое оружие:", api.sent[0]["text"])
+        self.assertIn(rare.name, api.sent[0]["text"])
+        self.assertIn(rare.description, api.sent[0]["text"])
+
+    def test_only_rare_and_legendary_weapon_drops_get_public_copy(self):
+        attacker = {"owner_username": "alice", "owner_name": "Alice"}
+        defender = {"owner_username": "bob", "owner_name": "Bob"}
+        uncommon = next(item for item in C.ITEMS if item.rarity == "uncommon")
+        legendary = next(item for item in C.ITEMS if item.rarity == "legendary")
+
+        self.assertIsNone(bot_listener._pets_rare_drop_announcement(
+            {"dropped_item": uncommon.code}, attacker, defender,
+        ))
+        text = bot_listener._pets_rare_drop_announcement(
+            {"opponent_dropped_item": legendary.code}, attacker, defender,
+        )
+        self.assertIn("@bob выпало легендарное оружие:", text)
+        self.assertIn(legendary.name, text)
+        self.assertIn(legendary.description, text)
+
     def test_private_arena_attack_posts_the_public_result_to_the_group(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
@@ -572,12 +618,8 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.sent, [])
         self.assertEqual(len(api.photo_files), 1)
         caption = api.photo_files[0]["caption"]
-        self.assertIn(C.GUARDIAN_INTERVENTION_TEXT, caption)
-        self.assertIn("Атака:", caption)
-        self.assertIn("Adult", caption)
-        self.assertIn("Child", caption)
-        self.assertIn("Player", caption)
-        self.assertIn("Bob", caption)
+        self.assertIn("Атака:</b> <b>Adult</b> ур 8(Player) → <b>Child</b> ур 1(Bob)", caption)
+        self.assertIn("Негоже взрослому с детьми драться. Player отпиздил охранник.", caption)
 
     def test_six_level_advantage_remains_a_normal_combat(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

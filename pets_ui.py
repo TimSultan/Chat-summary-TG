@@ -669,19 +669,29 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     if not visible:
         lines.append("Сегодня оружия этой редкости не завезли.")
     rows = _rarity_buttons(user_id, "store", rarity)
-    for item in visible:
+    purchase_buttons = []
+    for number, item in enumerate(visible, 1):
         state = "у тебя уже есть" if item.code in owned else _coins(item.price)
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
-        lines.append(f"<b>{escape(item.name)}</b> · {label} · {_bonus_text(item)} · {state}")
+        lines.append(f"<b>{number}. {escape(item.name)}</b> · {label} · {_bonus_text(item)} · {state}")
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
         # Keep each weapon visually separate in Telegram's dense proportional font.
         lines.append("")
         if item.code not in owned:
-            rows.append([{
-                "text": f"Купить · {_money(item.price)}",
+            purchase_buttons.append({
+                "text": str(number),
                 "callback_data": callback_data(user_id, "buy", item.code),
-            }])
+            })
+    if purchase_buttons:
+        lines.append("Нажми номер оружия, чтобы купить.")
+        # The full 16-item window occupies exactly three compact rows (6 + 6 + 4).
+        # Filtered/partly-owned windows keep the same maximum of three rows.
+        buttons_per_row = (len(purchase_buttons) + 2) // 3
+        rows.extend(
+            purchase_buttons[index:index + buttons_per_row]
+            for index in range(0, len(purchase_buttons), buttons_per_row)
+        )
     lines.append(f"🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
     rows.extend([
         [{
