@@ -53,6 +53,7 @@ class Config:
     stats_enabled: bool
     stats_top_limit: int
     stats_catchup_days: int
+    post_stats_access_token: str | None
 
 
 def build_session(cfg: "Config"):
@@ -154,6 +155,14 @@ def load_config() -> Config:
 
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or None
 
+    # Gates the /poststats page (post_stats_web.py): a plain shared-secret query-string
+    # token rather than Telegram Mini App auth, since this page is meant to be opened as a
+    # bookmarked link in an ordinary browser, not launched from inside Telegram. Unset
+    # (the default) means the route is never mounted at all -- see run_bot_listener --
+    # rather than mounting it wide open, so there is no accidental unauthenticated window
+    # between deploying this feature and actually setting a token.
+    post_stats_access_token = os.getenv("POST_STATS_ACCESS_TOKEN", "").strip() or None
+
     stats_enabled = os.getenv("STATS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     stats_top_limit_raw = os.getenv("STATS_TOP_LIMIT", "10")
@@ -196,4 +205,5 @@ def load_config() -> Config:
         stats_enabled=stats_enabled,
         stats_top_limit=stats_top_limit,
         stats_catchup_days=stats_catchup_days,
+        post_stats_access_token=post_stats_access_token,
     )

@@ -72,6 +72,7 @@ import pets_combat
 import pets_config as C
 import pets_image
 import pets_ui
+import post_stats_web
 import preview
 import stats
 import vote_image
@@ -7441,18 +7442,29 @@ async def run_bot_listener(
             # PORT is set by the host (Railway does this automatically for any service
             # with public networking on); off when running locally without it, same as
             # every other optional piece here.
+            def _attach_extra(app):
+                # The arena rides on the same server, under its own prefix. It reuses
+                # the two questions that need a Bot API client and shares nothing else
+                # -- v1 keeps its own routes, its own storage and its own rules.
+                arena_web.attach(
+                    app, cfg, home_chat_ref or "", _is_vote_admin,
+                    is_member=_is_vote_member, log=log,
+                )
+                # /poststats too, but only when a token is actually configured -- see
+                # config.py's post_stats_access_token docstring for why an unset token
+                # means "don't mount the route" rather than "mount it wide open". Unlike
+                # the two above, it needs no admin/membership callables: it isn't a
+                # Telegram Mini App, and reuses THIS process's already-connected
+                # telethon_client rather than opening a session of its own.
+                if cfg.post_stats_access_token:
+                    post_stats_web.attach(app, telethon_client, cfg, log=log)
+
             tasks.append(
                 vote_web.run_web_server(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
                     export=_deliver_vote_board,
-                    # The arena rides on the same server, under its own prefix. It reuses
-                    # the two questions that need a Bot API client and shares nothing else
-                    # -- v1 keeps its own routes, its own storage and its own rules.
-                    attach=lambda app: arena_web.attach(
-                        app, cfg, home_chat_ref or "", _is_vote_admin,
-                        is_member=_is_vote_member, log=log,
-                    ),
+                    attach=_attach_extra,
                 )
             )
         else:
