@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+ENV TZ=Europe/Moscow \
+    APP_TIMEZONE=Europe/Moscow \
+    DATA_DIR=/data \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8080
+
+# This image is for a separate Post Stats Railway service only. It does not start the
+# repository's existing summary listener or bot.
+CMD ["python", "poststats_server.py"]
