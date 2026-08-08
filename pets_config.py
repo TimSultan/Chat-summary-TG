@@ -245,7 +245,6 @@ POWER_RATING_WEIGHTS = {
     "armor": 3,
 }
 OPPONENT_POWER_WINDOW = 125
-MAX_OPPONENT_REROLLS = 3
 
 WIN_GOLD_MIN = 5            # "случайно 5-10 голды"
 WIN_GOLD_MAX = 10
@@ -253,10 +252,10 @@ WIN_GOLD_MAX = 10
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.
 #
-# It applies to whoever loses, INCLUDING a defender who never chose the fight. That is
-# safe here specifically because opponents are drawn at random within a level window --
-# nobody can pick a target, so there is no way to farm one person down. If matchmaking
-# ever lets somebody choose, this rule has to be revisited at the same time.
+# It applies to whoever loses, INCLUDING a defender who never chose the fight. Opponents
+# are dealt randomly inside the power window, but unlimited free rerolls still let a
+# determined attacker cherry-pick. The per-target daily cap and reduced rewards against
+# lower-level pets limit that pressure; passive losses should still be watched for abuse.
 #
 # It reduces the faucet without making a passive defender lose too much gold.
 LOSS_GOLD_SHARE = 0.3
@@ -267,6 +266,19 @@ LOSS_GOLD_SHARE = 0.3
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
 DRAW_XP = 50                # both sides spent a fight; no gold or win is awarded
+# Winning against a pet several levels below yours is less valuable, while an upset is
+# worth more. The delta is loser level minus winner level, capped at three levels so a
+# rare lopsided match cannot turn into a punitive tax or an outsized reward. Cage gold
+# is applied first, then this multiplier, so both progression bonuses compose.
+ARENA_LEVEL_REWARD_MULTIPLIERS = {
+    -3: 0.75,
+    -2: 0.85,
+    -1: 0.93,
+     0: 1.00,
+     1: 1.08,
+     2: 1.16,
+     3: 1.25,
+}
 HISTORY_LIMIT = 10          # "список последних 10 боев"
 DUEL_DAILY_LIMIT = 5
 DUEL_COOLDOWN_SECONDS = 10 * 60
@@ -291,6 +303,17 @@ def daily_fight_allowance(messages: int = 0, figurines: int = 0, cage_level: int
 def loss_gold_for(won_gold: int) -> int:
     """What the loser of a fight pays, given what the winner took."""
     return max(0, round(won_gold * LOSS_GOLD_SHARE))
+
+
+def arena_level_reward_multiplier(winner_level: int, loser_level: int) -> float:
+    """Return the capped win-reward multiplier for this level matchup.
+
+    Loss and draw XP stay flat: losing is still useful practice and a draw has no
+    winner to evaluate. Only the reward for defeating the opponent is scaled.
+    """
+    delta = max(-3, min(3, int(loser_level) - int(winner_level)))
+    return ARENA_LEVEL_REWARD_MULTIPLIERS[delta]
+
 
 # --------------------------------------------------------------------- pet levelling
 # Pet levels are separate from stat levels: "у существ отдельный свой опыт и уровни. За

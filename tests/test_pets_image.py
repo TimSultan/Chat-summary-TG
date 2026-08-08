@@ -9,8 +9,8 @@ from PIL import Image
 import pets_image
 
 
-def _png(color) -> bytes:
-    image = Image.new("RGB", (80, 60), color)
+def _png(color, size=(80, 60)) -> bytes:
+    image = Image.new("RGB", size, color)
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
@@ -26,6 +26,32 @@ class FightImageTests(unittest.TestCase):
 
     def test_loser_name_uses_red(self):
         self.assertEqual(pets_image.LOSER_NAME_COLOR, "#b83e58")
+
+    def test_pet_photo_is_contained_so_portraits_are_not_cropped(self):
+        """A tall image retains both ends and receives side letterboxing."""
+        portrait = Image.new("RGB", (100, 300), "red")
+        portrait.paste((0, 0, 255), (0, 150, 100, 300))
+        output = BytesIO()
+        portrait.save(output, format="PNG")
+
+        fitted = pets_image._photo(
+            output.getvalue(), pets_image.PET_IMAGE_SIZE, (20, 30, 40), crop=False,
+        )
+
+        centre = fitted.width // 2
+        self.assertEqual(fitted.getpixel((centre, 2)), (255, 0, 0))
+        self.assertEqual(fitted.getpixel((centre, fitted.height - 3)), (0, 0, 255))
+        self.assertEqual(fitted.getpixel((2, fitted.height // 2)), (20, 30, 40))
+
+    def test_layout_prioritizes_tall_images_and_bottom_aligned_stats(self):
+        self.assertGreaterEqual(pets_image.PET_IMAGE_SIZE[1], 360)
+        stats_top = pets_image._stats_top(5)
+        self.assertEqual(
+            pets_image.PANEL_BOTTOM - stats_top,
+            pets_image.STATS_BOTTOM_PADDING + 5 * pets_image.STAT_ROW_HEIGHT,
+        )
+        self.assertGreater(stats_top, pets_image.RATING_TOP)
+        self.assertLessEqual(pets_image.PANEL_BOTTOM, 800)
 
     def test_renderer_creates_a_shareable_result_board(self):
         result = SimpleNamespace(

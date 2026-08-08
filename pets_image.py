@@ -12,6 +12,19 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 WIDTH = 1280
 HEIGHT = 1020
+PANEL_WIDTH = 550
+PANEL_TOP = 100
+PANEL_BOTTOM = 790
+PANEL_PADDING_X = 40
+PET_IMAGE_SIZE = (470, 365)
+PET_IMAGE_TOP = PANEL_TOP + 25
+AVATAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] + 15
+PET_NAME_TOP = AVATAR_TOP + 93
+RATING_TOP = PET_NAME_TOP + 49
+STATS_BOTTOM_PADDING = 18
+STAT_ROW_HEIGHT = 20
+STAT_LABEL_FONT_SIZE = 16
+STAT_VALUE_FONT_SIZE = 18
 _FONT_PATHS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -68,11 +81,26 @@ def legible(value, size: int, bold: bool = False) -> str:
     ).strip()
 
 
-def _photo(data: bytes | None, size: tuple[int, int], fallback: tuple[int, int, int]) -> Image.Image:
+def _photo(
+    data: bytes | None,
+    size: tuple[int, int],
+    fallback: tuple[int, int, int],
+    *,
+    crop: bool = True,
+) -> Image.Image:
+    """Decode media into a fixed box, optionally preserving its full composition."""
     if data:
         try:
             image = Image.open(BytesIO(data)).convert("RGB")
-            return ImageOps.fit(image, size, method=Image.Resampling.LANCZOS)
+            if crop:
+                return ImageOps.fit(image, size, method=Image.Resampling.LANCZOS)
+            contained = ImageOps.contain(image, size, method=Image.Resampling.LANCZOS)
+            fitted = Image.new("RGB", size, fallback)
+            fitted.paste(
+                contained,
+                ((size[0] - contained.width) // 2, (size[1] - contained.height) // 2),
+            )
+            return fitted
         except Exception:
             pass
     return Image.new("RGB", size, fallback)
@@ -96,39 +124,61 @@ def _center(draw: ImageDraw.ImageDraw, y: int, text: str, font, fill) -> None:
     draw.text(((WIDTH - (box[2] - box[0])) / 2, y), text, font=font, fill=fill)
 
 
+def _stats_top(row_count: int) -> int:
+    return PANEL_BOTTOM - STATS_BOTTOM_PADDING - row_count * STAT_ROW_HEIGHT
+
+
 def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
-    panel_width = 550
     panel_color = "#e4f2eb" if side == "left" else "#f8e6e8"
     border = "#0e553f" if winner else "#c1c9c5"
     name_color = WINNER_NAME_COLOR if winner else LOSER_NAME_COLOR
-    draw.rounded_rectangle((x, 110, x + panel_width, 780), radius=8, fill=panel_color, outline=border, width=6)
+    draw.rounded_rectangle(
+        (x, PANEL_TOP, x + PANEL_WIDTH, PANEL_BOTTOM),
+        radius=8,
+        fill=panel_color,
+        outline=border,
+        width=6,
+    )
 
-    pet = _photo(fighter.get("pet_photo"), (470, 270), (43, 111, 82) if side == "left" else (151, 57, 78))
-    image.paste(pet, (x + 40, 145))
+    pet = _photo(
+        fighter.get("pet_photo"), PET_IMAGE_SIZE,
+        (43, 111, 82) if side == "left" else (151, 57, 78), crop=False,
+    )
+    image.paste(pet, (x + PANEL_PADDING_X, PET_IMAGE_TOP))
     avatar = _circle(_photo(fighter.get("owner_avatar"), (90, 90), (82, 97, 108)), 78)
-    image.paste(avatar, (x + 40, 435), avatar)
-    draw.ellipse((x + 38, 433, x + 120, 515), outline="#ffffff", width=4)
+    image.paste(avatar, (x + PANEL_PADDING_X, AVATAR_TOP), avatar)
+    draw.ellipse(
+        (x + PANEL_PADDING_X - 2, AVATAR_TOP - 2, x + PANEL_PADDING_X + 80, AVATAR_TOP + 80),
+        outline="#ffffff", width=4,
+    )
     draw.text(
-        (x + 135, 444), _short(fighter.get("owner_name"), 24, size=25, bold=False), font=_font(25),
+        (x + 135, AVATAR_TOP + 9), _short(fighter.get("owner_name"), 24, size=23, bold=False), font=_font(23),
         fill=name_color,
     )
     draw.text(
-        (x + 40, 525), _short(fighter.get("pet_name"), 24), font=_font(39, bold=True),
+        (x + PANEL_PADDING_X, PET_NAME_TOP), _short(fighter.get("pet_name"), 24, size=36), font=_font(36, bold=True),
         fill=name_color,
     )
-    draw.text((x + 40, 580), f"РЕЙТИНГ  {fighter.get('power', 0)}", font=_font(22, bold=True), fill="#37434c")
+    draw.text(
+        (x + PANEL_PADDING_X, RATING_TOP), f"РЕЙТИНГ  {fighter.get('power', 0)}",
+        font=_font(20, bold=True), fill="#37434c",
+    )
 
     rows = (
         ("СИЛА", "strength"), ("ЗДОРОВЬЕ", "health"), ("ЛОВКОСТЬ", "agility"),
         ("УДАЧА", "luck"), ("БРОНЯ", "armor"),
     )
     stats = fighter.get("stats") or {}
+    stats_top = _stats_top(len(rows))
     for index, (label, key) in enumerate(rows):
-        y = 620 + index * 27
-        draw.text((x + 40, y), label, font=_font(18), fill="#53606a")
+        y = stats_top + index * STAT_ROW_HEIGHT
+        draw.text((x + PANEL_PADDING_X, y), label, font=_font(STAT_LABEL_FONT_SIZE), fill="#53606a")
         value = str(stats.get(key, 0))
-        box = draw.textbbox((0, 0), value, font=_font(20, bold=True))
-        draw.text((x + 500 - (box[2] - box[0]), y - 2), value, font=_font(20, bold=True), fill="#20272c")
+        box = draw.textbbox((0, 0), value, font=_font(STAT_VALUE_FONT_SIZE, bold=True))
+        draw.text(
+            (x + PANEL_WIDTH - 50 - (box[2] - box[0]), y - 2), value,
+            font=_font(STAT_VALUE_FONT_SIZE, bold=True), fill="#20272c",
+        )
 
 
 def render_fight_result(path, result, attacker: dict, defender: dict) -> Path:

@@ -49,21 +49,19 @@ def parse_callback(data: str) -> tuple[str, str, str] | None:
     return parts[1], parts[2], parts[3] if len(parts) > 3 else ""
 
 
-def search_argument(rerolls_used: int, search_seed: int) -> str:
-    """Carry a deterministic opponent-cycle token within Telegram's callback cap."""
-    return f"{rerolls_used},{search_seed}"
+def search_argument(current_opponent_id) -> str:
+    """Remember only the current card, not an ever-growing reroll counter.
+
+    Telegram user ids have at most 19 decimal digits, so even the longest search
+    callback (owner id + action + opponent id) is safely below Telegram's 64-byte cap.
+    """
+    return str(current_opponent_id)
 
 
-def parse_search_argument(argument: str) -> tuple[int, int | None]:
-    if not argument:
-        return 0, None
-    try:
-        count_text, seed_text = argument.split(",", 1)
-        count = int(count_text)
-        seed = int(seed_text)
-    except (TypeError, ValueError):
-        return 0, None
-    return max(0, count), seed if seed >= 0 else None
+def parse_search_argument(argument: str) -> str | None:
+    """Return a previously displayed opponent id, accepting no unbounded state."""
+    candidate = str(argument or "")
+    return candidate if candidate.isdecimal() and len(candidate) <= 19 else None
 
 
 def _back_row(owner_id) -> list:
@@ -447,7 +445,8 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f" учитываются статы, уровень существа и снаряжение."
     )
     lines.append(
-        f"Победа: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет."
+        f"Базовая награда за победу: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и {C.WIN_XP} опыта;"
+        f" за соперника ниже уровнем — меньше, выше — больше (до ±25%)."
         f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
     )
     if left <= 0:
@@ -464,10 +463,7 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
-def opponent_view(
-    entry: str, user_id, opponent_id, xp: int, rerolls_used: int = 0,
-    rerolls_allowed: int = C.MAX_OPPONENT_REROLLS, search_seed: int = 0,
-) -> tuple[str, dict]:
+def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]:
     """The found opponent, with Напасть as a separate tap. Searching and attacking are two
     steps because the daily fight is spent by attacking, not by looking -- a player who
     searched and walked away has lost nothing."""
@@ -498,16 +494,10 @@ def opponent_view(
         }],
         _back_row(user_id),
     ]
-    if rerolls_used < rerolls_allowed:
-        left = rerolls_allowed - rerolls_used
-        rows.insert(1, [{
-            "text": f"🔍 Другой соперник ({left})",
-            "callback_data": callback_data(
-                user_id, "search", search_argument(rerolls_used + 1, search_seed),
-            ),
-        }])
-    else:
-        lines.append(f"\n<i>Новых соперников: максимум {rerolls_allowed}.</i>")
+    rows.insert(1, [{
+        "text": "🔍 Другой соперник",
+        "callback_data": callback_data(user_id, "search", search_argument(opponent_id)),
+    }])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 

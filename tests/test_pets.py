@@ -407,14 +407,23 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         opponent = pets.find_opponent(entry, "1", rng=random.Random(1), exclude_ids={"2"})
         self.assertEqual(opponent, "3")
 
-    def test_opponent_cycle_is_seeded_and_never_repeats(self):
+    def test_reroll_excludes_the_current_card_when_an_alternative_exists(self):
         entry = "chat"
-        for user_id in ("1", "2", "3", "4", "5"):
+        for user_id in ("1", "2", "3"):
             self._tame(entry, user_id)
-        first = pets.opponent_cycle(entry, "1", 123)
-        second = pets.opponent_cycle(entry, "1", 123)
-        self.assertEqual(first, second)
-        self.assertEqual(len(first), len(set(first)))
+        opponent = pets.find_opponent(
+            entry, "1", rng=random.Random(1), exclude_ids={"2"}, attackable_only=True,
+        )
+        self.assertEqual(opponent, "3")
+
+    def test_reroll_can_return_the_only_available_card(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        self._tame(entry, "2")
+        opponent = pets.find_opponent(
+            entry, "1", rng=random.Random(1), exclude_ids={"2"}, attackable_only=True,
+        )
+        self.assertEqual(opponent, "2")
 
     def test_find_opponent_returns_none_only_when_the_chat_has_no_other_pet(self):
         entry = "chat"
@@ -423,6 +432,57 @@ class DailyFightsAndOpponentTests(PetsTestCase):
 
 
 class RecordFightTests(PetsTestCase):
+    def _set_pet_level(self, entry, user_id, level, cage_level=1):
+        data = pets._load(entry)
+        record = data["pets"][str(user_id)]
+        record["level"] = level
+        record["xp"] = 0
+        record["cage_level"] = cage_level
+        pets._save(entry, data)
+
+    def test_win_rewards_follow_capped_level_difference_curve(self):
+        """Gold and XP reward a harder win, while weak-target farming is capped."""
+        cases = {
+            -3: (125, 12),
+            -2: (116, 12),
+             0: (100, 10),
+             2: (85, 8),
+             3: (75, 8),
+             9: (75, 8),  # the +3 stronger-winner penalty is the cap
+        }
+        result = SimpleNamespace(winner="1", loser="2")
+
+        for delta, (expected_xp, expected_gold) in cases.items():
+            with self.subTest(delta=delta):
+                entry = f"level-delta-{delta}"
+                self._tame(entry, "1", "Attacker")
+                self._tame(entry, "2", "Defender")
+                self._set_pet_level(entry, "1", 10 + delta)
+                self._set_pet_level(entry, "2", 10)
+
+                with patch("random.randint", return_value=pets_config.WIN_GOLD_MAX), \
+                     patch("random.random", return_value=1.0):
+                    outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+                self.assertEqual(outcome["xp"], expected_xp)
+                self.assertEqual(outcome["gold"], expected_gold)
+                self.assertEqual(pets.get_pet(entry, "1")["xp"], expected_xp)
+                self.assertEqual(economy.balance(entry, "1", 0), expected_gold)
+
+    def test_level_scaled_gold_composes_with_the_cage_bonus(self):
+        entry = "cage-and-level-reward"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        self._set_pet_level(entry, "1", 13, cage_level=5)
+        self._set_pet_level(entry, "2", 10)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MAX), \
+             patch("random.random", return_value=1.0):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(outcome["gold"], round(10 * 1.25 * 0.75))
+
     def test_draw_consumes_one_fight_without_gold_or_a_win(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")

@@ -372,7 +372,7 @@ class PetsCommandTests(unittest.TestCase):
             for args, kwargs in deletions
         ))
 
-    def test_opponent_rerolls_are_limited_to_three(self):
+    def test_opponent_rerolls_are_unlimited_and_keep_only_the_current_card_in_callback(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -382,12 +382,30 @@ class PetsCommandTests(unittest.TestCase):
         search = next(b for b in _buttons({"reply_markup": keyboard}) if b["text"].startswith("🔍"))
         _, action, argument = pets_ui.parse_callback(search["callback_data"])
         self.assertEqual(action, "search")
-        self.assertEqual(pets_ui.parse_search_argument(argument), (1, 0))
-
-        _, capped = pets_ui.opponent_view(
-            CHAT, PLAYER["id"], "43", RICH_XP, rerolls_used=C.MAX_OPPONENT_REROLLS,
+        self.assertEqual(pets_ui.parse_search_argument(argument), "43")
+        largest_callback = pets_ui.callback_data(
+            9_223_372_036_854_775_807,
+            "search",
+            pets_ui.search_argument(9_223_372_036_854_775_807),
         )
-        self.assertFalse(any(b["text"].startswith("🔍") for b in _buttons({"reply_markup": capped})))
+        self.assertLessEqual(len(largest_callback.encode("utf-8")), pets_ui.MAX_CALLBACK_BYTES)
+
+        # The next button has the same bounded shape regardless of how often it is used;
+        # there is no counter to cap after the third reroll.
+        _, rerolled = pets_ui.opponent_view(CHAT, PLAYER["id"], "43", RICH_XP)
+        self.assertTrue(any(b["text"].startswith("🔍") for b in _buttons({"reply_markup": rerolled})))
+
+    def test_reroll_never_immediately_repeats_when_another_valid_opponent_exists(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        for opponent_id, name in ((43, "Тумблер"), (44, "Лис")):
+            pets.buy_cage(CHAT, opponent_id, RICH_XP)
+            pets.tame(CHAT, opponent_id, RICH_XP, name, f"file_{opponent_id}", name)
+
+        api = self._tap("search", "43")
+
+        self.assertTrue(api.edits)
+        self.assertIn("Лис", api.edits[-1]["text"])
 
     def test_bare_group_duel_starts_a_target_flow(self):
         api = FakeApi()

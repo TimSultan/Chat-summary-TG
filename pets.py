@@ -30,6 +30,7 @@ appended once and `history()` filters by either role.
 
 import json
 import random
+import secrets
 from datetime import date, datetime, timedelta
 
 import economy
@@ -635,8 +636,20 @@ def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None
     )
 
 
-def find_opponent(entry, user_id, rng=None, exclude_ids=None) -> str | None:
-    rng = rng or random
+def find_opponent(
+    entry, user_id, rng=None, exclude_ids=None, attackable_only: bool = False,
+) -> str | None:
+    """Choose one fair opponent at random.
+
+    ``exclude_ids`` is a soft exclusion: it prevents the card currently on screen from
+    being dealt again when another eligible opponent exists, but a one-person arena can
+    still show its only opponent.  ``attackable_only`` is used by the arena UI so a
+    search never displays somebody the player has already reached the daily limit
+    against.
+    """
+    # The normal arena draw is fresh OS-backed randomness.  Tests and simulations can
+    # still inject a seeded RNG to make a particular draw reproducible.
+    rng = rng or secrets.SystemRandom()
     data = _load(entry)
     seeker = _tamed_record(data, user_id)
     if seeker is None:
@@ -645,10 +658,19 @@ def find_opponent(entry, user_id, rng=None, exclude_ids=None) -> str | None:
     excluded = {str(other_id) for other_id in (exclude_ids or ())}
     candidates = [
         other_id for other_id, record in data["pets"].items()
-        if other_id != uid and other_id not in excluded and record.get("name")
+        if other_id != uid
+        and record.get("name")
+        and (not attackable_only or can_attack_in_arena(entry, uid, other_id))
     ]
     if not candidates:
         return None
+
+    # A reroll should deal a different card whenever there is one.  Do this before the
+    # power-window calculation so a reroll is never secretly pinned to the same target
+    # just because that target happened to be the closest match.
+    alternatives = [other_id for other_id in candidates if other_id not in excluded]
+    if alternatives:
+        candidates = alternatives
 
     seeker_power = _power_rating_for(seeker)
     differences = {
@@ -667,39 +689,6 @@ def find_opponent(entry, user_id, rng=None, exclude_ids=None) -> str | None:
     nearest_gap = min(differences.values())
     nearest = [other_id for other_id in candidates if differences[other_id] == nearest_gap]
     return rng.choice(nearest)
-
-
-def opponent_cycle(entry, user_id, seed: int) -> list[str]:
-    """A deterministic, power-first list for one opponent-search session.
-
-    The listener uses positions 0 through 3 from this list, so reroll buttons can never
-    repeat an earlier candidate while still working after a bot restart.
-    """
-    data = _load(entry)
-    seeker = _tamed_record(data, user_id)
-    if seeker is None:
-        return []
-    uid = str(user_id)
-    candidates = [
-        other_id for other_id, record in data["pets"].items()
-        if other_id != uid
-        and record.get("name")
-        and can_attack_in_arena(entry, uid, other_id)
-    ]
-    seeker_power = _power_rating_for(seeker)
-    differences = {
-        other_id: abs(_power_rating_for(data["pets"][other_id]) - seeker_power)
-        for other_id in candidates
-    }
-    picker = random.Random(seed)
-    picker.shuffle(candidates)
-    return sorted(
-        candidates,
-        key=lambda other_id: (
-            differences[other_id] > C.OPPONENT_POWER_WINDOW,
-            differences[other_id],
-        ),
-    )
 
 
 def record_fight(
@@ -762,7 +751,14 @@ def record_fight(
 
     winner_cage_level = winner.get("cage_level", 1)
     bonus_pct = C.CAGE_GOLD_BONUS_PCT[winner_cage_level - 1]
-    gold = round(random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX) * (1 + bonus_pct / 100))
+    reward_multiplier = C.arena_level_reward_multiplier(
+        winner.get("level", 1), loser.get("level", 1)
+    )
+    gold = round(
+        random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        * (1 + bonus_pct / 100)
+        * reward_multiplier
+    )
     economy.grant(entry, winner_uid, gold, "pet_fight_win")
 
     # The loser pays half of that. Charged as a spend rather than a negative grant so it
@@ -796,7 +792,8 @@ def record_fight(
             winner.setdefault("inventory", []).append(dropped.code)
             dropped_code = dropped.code
 
-    _, winner_levels_gained = _apply_xp(winner, C.WIN_XP)
+    winner_xp = max(1, round(C.WIN_XP * reward_multiplier))
+    _, winner_levels_gained = _apply_xp(winner, winner_xp)
     _, loser_levels_gained = _apply_xp(loser, C.LOSS_XP)
 
     # Names/owners are snapshotted INTO the log entry rather than looked up when
@@ -830,13 +827,13 @@ def record_fight(
         "draw": False,
         "gold": gold if attacker_won else 0,
         "loss_gold": 0 if attacker_won else paid,
-        "xp": C.WIN_XP if attacker_won else C.LOSS_XP,
+        "xp": winner_xp if attacker_won else C.LOSS_XP,
         "levels_gained": winner_levels_gained if attacker_won else loser_levels_gained,
         "level": attacker.get("level", 1),
         "dropped_item": dropped_code if attacker_won else None,
         "opponent_gold": gold if not attacker_won else 0,
         "opponent_loss_gold": paid if attacker_won else 0,
-        "opponent_xp": C.LOSS_XP if attacker_won else C.WIN_XP,
+        "opponent_xp": C.LOSS_XP if attacker_won else winner_xp,
         "opponent_levels_gained": loser_levels_gained if attacker_won else winner_levels_gained,
         "opponent_level": defender.get("level", 1),
         "opponent_dropped_item": dropped_code if not attacker_won else None,

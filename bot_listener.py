@@ -5916,16 +5916,14 @@ async def handle_pets_callback(
                     message_id=message_id, log=log,
                 )
                 return
-            rerolls_used, search_seed = pets_ui.parse_search_argument(argument)
-            search_seed = search_seed if search_seed is not None else secrets.randbits(32)
-            if rerolls_used > C.MAX_OPPONENT_REROLLS:
-                await _send_pets_view(
-                    api, chat_id, pets_ui.fight_view(entry, user_id, xp),
-                    message_id=message_id, log=log,
-                )
-                return
-            candidates = pets.opponent_cycle(entry, user_id, search_seed)
-            if rerolls_used >= len(candidates):
+            current_opponent_id = pets_ui.parse_search_argument(argument)
+            opponent_id = pets.find_opponent(
+                entry,
+                user_id,
+                exclude_ids={current_opponent_id} if current_opponent_id else None,
+                attackable_only=True,
+            )
+            if opponent_id is None:
                 await _send_pets_view(
                     api, chat_id,
                     pets_ui.notice_view(
@@ -5936,14 +5934,9 @@ async def handle_pets_callback(
                     message_id=message_id, log=log,
                 )
                 return
-            opponent_id = candidates[rerolls_used]
-            rerolls_allowed = min(C.MAX_OPPONENT_REROLLS, len(candidates) - 1)
             await _send_pets_view(
                 api, chat_id,
-                pets_ui.opponent_view(
-                    entry, user_id, opponent_id, xp, rerolls_used=rerolls_used,
-                    rerolls_allowed=rerolls_allowed, search_seed=search_seed,
-                ),
+                pets_ui.opponent_view(entry, user_id, opponent_id, xp),
                 message_id=message_id, log=log,
             )
             return
