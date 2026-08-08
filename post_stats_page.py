@@ -122,6 +122,45 @@ PAGE_HTML = """<!doctype html>
   .banner.error { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
   .banner.notice { background: var(--surface-1); color: var(--text-secondary); border: 1px solid var(--border); }
 
+  .settings-btn {
+    font: inherit; cursor: pointer; background: transparent; color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 9px; font-size: 12px;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .settings-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+
+  /* ---------- settings modal (token entry) ---------- */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,.45);
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .modal-card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; max-width: 360px; width: 100%;
+    box-shadow: 0 12px 40px rgba(0,0,0,.25);
+  }
+  .modal-card h2 { margin: 0 0 6px; font-size: 15px; }
+  .modal-card p { margin: 0 0 14px; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+  .modal-card input[type="password"],
+  .modal-card input[type="text"] {
+    font: inherit; width: 100%; color: var(--text-primary); background: var(--page-bg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 9px 10px; margin-bottom: 10px;
+  }
+  .modal-card .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-card button {
+    font: inherit; font-weight: 600; cursor: pointer; border-radius: 6px; padding: 8px 16px; border: 0;
+  }
+  .modal-card .btn-primary { background: var(--series-1); color: #fff; }
+  .modal-card .btn-primary:hover { background: var(--series-1-hover); }
+  .modal-card .btn-secondary {
+    background: transparent; color: var(--text-secondary); border: 1px solid var(--border);
+  }
+  .modal-card .modal-error {
+    color: var(--danger); font-size: 12px; margin: -4px 0 10px; display: none;
+  }
+  .modal-card .modal-error.shown { display: block; }
+
   /* ---------- content ---------- */
   main { padding: 16px; max-width: 1180px; margin: 0 auto; }
   .empty-state {
@@ -211,9 +250,12 @@ PAGE_HTML = """<!doctype html>
 <header class="topbar">
   <div class="topbar-row">
     <h1>Post Stats</h1>
-    <div class="meta" id="chatMeta"></div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div class="meta" id="chatMeta"></div>
+      <button type="button" class="settings-btn" id="settingsBtn" title="Change access token">&#9881; Settings</button>
+    </div>
   </div>
-  <div class="controls" id="controls">
+  <div class="controls" id="controls" hidden>
     <input type="text" id="chatInput" placeholder="@username, ID, or title">
     <select id="rangeSelect">
       <option value="today">Today</option>
@@ -227,10 +269,20 @@ PAGE_HTML = """<!doctype html>
     <span class="loading" id="loadingIndicator" hidden><span class="spinner"></span>Loading&hellip;</span>
   </div>
   <div class="banner error" id="errorBanner" role="alert" hidden></div>
-  <div class="banner notice" id="tokenMissing" hidden>
-    Open this page via the link that includes your access token.
-  </div>
 </header>
+
+<div class="modal-overlay" id="settingsModal" hidden>
+  <div class="modal-card">
+    <h2>Access token</h2>
+    <p>Saved only in this browser (localStorage) -- never written to the address bar, and sent only to this page's own API.</p>
+    <div class="modal-error" id="tokenError">Enter a token.</div>
+    <input type="password" id="tokenInput" placeholder="Paste your access token" autocomplete="off">
+    <div class="modal-actions">
+      <button type="button" class="btn-secondary" id="tokenCancelBtn" hidden>Cancel</button>
+      <button type="button" class="btn-primary" id="tokenSaveBtn">Save</button>
+    </div>
+  </div>
+</div>
 
 <main>
   <div class="empty-state" id="emptyState" hidden>No posts found in this range.</div>
@@ -317,6 +369,7 @@ PAGE_HTML = """<!doctype html>
   "use strict";
 
   var PREFIX = "__PREFIX__";
+  var TOKEN_STORAGE_KEY = "poststats_token";
 
   var TOKEN = null;
   var allPosts = [];
@@ -441,14 +494,71 @@ PAGE_HTML = """<!doctype html>
     history.replaceState(null, "", newUrl);
   }
 
-  function init() {
-    var params = new URLSearchParams(location.search);
-    TOKEN = params.get("token");
-    if (!TOKEN) {
-      $("tokenMissing").hidden = false;
-      $("controls").hidden = true;
+  /* ---------------- token / settings modal ---------------- */
+
+  function readStoredToken() {
+    try { return localStorage.getItem(TOKEN_STORAGE_KEY) || null; }
+    catch (e) { return null; }  // private browsing / storage disabled
+  }
+
+  function storeToken(value) {
+    try { localStorage.setItem(TOKEN_STORAGE_KEY, value); }
+    catch (e) { /* storage unavailable -- TOKEN still works for this page load */ }
+  }
+
+  function clearStoredToken() {
+    try { localStorage.removeItem(TOKEN_STORAGE_KEY); }
+    catch (e) { /* nothing to clear */ }
+  }
+
+  function openSettingsModal(errorMessage) {
+    var modal = $("settingsModal");
+    var input = $("tokenInput");
+    var errorBox = $("tokenError");
+    input.value = TOKEN || "";
+    if (errorMessage) {
+      errorBox.textContent = errorMessage;
+      errorBox.classList.add("shown");
+    } else {
+      errorBox.classList.remove("shown");
+    }
+    // Only offer Cancel once a token already works -- on first visit there is nothing
+    // yet to cancel back to, and closing the modal would just strand the controls hidden.
+    $("tokenCancelBtn").hidden = !TOKEN;
+    modal.hidden = false;
+    input.focus();
+  }
+
+  function closeSettingsModal() {
+    $("settingsModal").hidden = true;
+  }
+
+  function saveTokenFromModal() {
+    var value = $("tokenInput").value.trim();
+    if (!value) {
+      $("tokenError").textContent = "Enter a token.";
+      $("tokenError").classList.add("shown");
       return;
     }
+    TOKEN = value;
+    storeToken(value);
+    closeSettingsModal();
+    $("controls").hidden = false;
+  }
+
+  function init() {
+    var params = new URLSearchParams(location.search);
+    var urlToken = params.get("token");
+    if (urlToken) {
+      // Migrate an old-style ?token=... link: save it and scrub it from the visible
+      // address bar immediately, so it doesn't linger in the URL, browser history, or
+      // anything a copied/shared link would carry from here on.
+      storeToken(urlToken);
+      params.delete("token");
+      var cleaned = location.pathname + (params.toString() ? "?" + params.toString() : "");
+      history.replaceState(null, "", cleaned);
+    }
+    TOKEN = urlToken || readStoredToken();
 
     var chat = params.get("chat") || "";
     $("chatInput").value = chat;
@@ -468,6 +578,11 @@ PAGE_HTML = """<!doctype html>
 
     wireEvents();
 
+    if (!TOKEN) {
+      openSettingsModal();
+      return;
+    }
+    $("controls").hidden = false;
     if (chat) loadData();
   }
 
@@ -476,6 +591,13 @@ PAGE_HTML = """<!doctype html>
     $("loadBtn").addEventListener("click", loadData);
     $("chatInput").addEventListener("keydown", function (e) {
       if (e.key === "Enter") { e.preventDefault(); loadData(); }
+    });
+
+    $("settingsBtn").addEventListener("click", function () { openSettingsModal(); });
+    $("tokenSaveBtn").addEventListener("click", saveTokenFromModal);
+    $("tokenCancelBtn").addEventListener("click", closeSettingsModal);
+    $("tokenInput").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); saveTokenFromModal(); }
     });
 
     $("metricSelect").addEventListener("change", function () {
@@ -536,6 +658,15 @@ PAGE_HTML = """<!doctype html>
     fetch(PREFIX + "/api/data?" + params.toString())
       .then(function (resp) {
         return resp.json().catch(function () { return null; }).then(function (data) {
+          if (resp.status === 401) {
+            // The saved token is wrong or was rotated server-side -- clear it and ask
+            // again rather than leaving the page stuck failing silently forever.
+            TOKEN = null;
+            clearStoredToken();
+            $("controls").hidden = true;
+            openSettingsModal("Invalid or expired token -- please re-enter it.");
+            throw new Error("__handled_401__");
+          }
           if (!resp.ok || !data || data.error) {
             var message = (data && data.error) || ("Request failed (" + resp.status + ")");
             throw new Error(message);
@@ -566,6 +697,7 @@ PAGE_HTML = """<!doctype html>
         reflectUrl(chat);
       })
       .catch(function (err) {
+        if (err && err.message === "__handled_401__") return;  // modal already explains it
         showError(err && err.message ? err.message : "Something went wrong.");
       })
       .then(function () { setLoading(false); }, function () { setLoading(false); });
