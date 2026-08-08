@@ -1388,6 +1388,30 @@ router's cleaned interpretation—and is told to prioritize the user's actual wo
 treat first-person pronouns relative to that sender. When the router selects the
 requester, the listener confirms that identity using Telegram's numeric sender ID.
 
+## Deploying `/poststats` to Railway
+
+`/poststats` is now a standalone deployment. It does not use your Telegram session,
+your group membership, OpenAI, BotFather, `LISTENER_ALLOWED_CHATS`, or Railway secret
+variables. Each person deploys their own copy and connects their own Telegram account
+through the setup page.
+
+1. Deploy the repository to a new Railway project. The included Dockerfile starts the
+   Post Stats service.
+2. Add a Railway Volume mounted at `/data`. This is where only that deployment stores
+   its Telegram session; without a Volume the owner must sign in again after a redeploy.
+3. Open `<their Railway domain>/poststats`. Copy the one-time setup code from the
+   Railway deploy logs, then paste it together with their Telegram API ID, API hash, and
+   phone number. The page sends the normal Telegram login code and, if enabled, asks for
+   their two-step-verification password.
+4. After login, `/poststats` opens normally. Its generated browser access token is saved
+   locally and never needs to be copied from your deployment. They can enter any chat
+   their own Telegram account can access.
+
+BotFather is not part of this flow: Telegram does not expose the historical post views,
+forwards, reactions, or comment counts on this page to bots. The API ID/hash come from
+`https://my.telegram.org/apps`; they identify the Telegram client app, while the phone
+login authorizes only the owner’s own account.
+
 ## Deploying the listener to Railway
 
 Only `listener.py` runs on a server -- `gui.py` needs a display, and `main.py` is a
