@@ -2,7 +2,6 @@ FROM python:3.12-slim
 
 ENV TZ=Europe/Moscow \
     APP_TIMEZONE=Europe/Moscow \
-    DATA_DIR=/data \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
@@ -24,7 +23,8 @@ COPY . .
 # whatever's declared here. No-op if WEBAPP_PUBLIC_URL/PORT are never set.
 EXPOSE 8080
 
-# /poststats is its own product: the owner completes Telegram's normal login in the
-# browser on their own deployment, with no shared Telegram session or configuration
-# variables. A Railway Volume mounted at DATA_DIR is required to retain that login.
-CMD ["python", "poststats_server.py"]
+# The listener is the only headless entry point -- gui.py needs a display and isn't
+# meant to run on a server. Config comes entirely from environment variables (Railway's
+# dashboard, or a local .env for other hosts); TELEGRAM_SESSION_STRING avoids needing a
+# persistent session file/volume (see generate_session_string.py).
+CMD ["python", "listener.py"]

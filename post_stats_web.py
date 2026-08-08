@@ -205,7 +205,7 @@ async def handle_thumb(request: web.Request) -> web.Response:
 
 
 def attach(app: web.Application, client, cfg, route_prefix: str = ROUTE_PREFIX,
-           log=print, page_handler=None) -> web.Application:
+           log=print) -> web.Application:
     """Adds the post-stats page to an existing aiohttp application -- the one vote_web
     builds, so all three systems answer on one port without any of them owning the
     others. Its own AppKeys throughout (post_stats_*), so nothing it stores can collide
@@ -217,8 +217,8 @@ def attach(app: web.Application, client, cfg, route_prefix: str = ROUTE_PREFIX,
     app[_LOG_KEY] = log
 
     app.add_routes([
-        web.get(prefix, page_handler or handle_page),
-        web.get(f"{prefix}/", page_handler or handle_page),
+        web.get(prefix, handle_page),
+        web.get(f"{prefix}/", handle_page),
         web.get(f"{prefix}/api/data", handle_data),
         web.get(prefix + "/thumb/{chat_id}/{name}", handle_thumb),
     ])
