@@ -410,7 +410,7 @@ class PetsCommandTests(unittest.TestCase):
             "duel": {
                 "awaiting": "duel_target", "chat_id": MAIN_CHAT_ID,
                 "user_id": PLAYER["id"], "entry": CHAT,
-                "command_message_id": 5, "prompt_message_id": 100,
+                "command_message_id": 5, "prompt_message_id": 10,
                 "created_at": 0,
             },
         }
@@ -430,7 +430,9 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(flows, {})
         self.assertEqual(api.sent[-1]["text"], "Пользователь не найден.")
         self.assertEqual(deletions[0][0][3], bot_listener.DUEL_TARGET_INVALID_DELETE_AFTER)
-        self.assertEqual(set(deletions[0][0][2]), {5, 6, 100, 101})
+        # 100 is the id FakeApi hands the "not found" reply -- the notice goes with the
+        # command, the prompt and the answer rather than being left behind on its own.
+        self.assertEqual(set(deletions[0][0][2]), {5, 6, 10, 100})
 
     def test_valid_duel_target_deletes_the_exchange_before_starting_the_duel(self):
         api = FakeApi()
@@ -442,7 +444,9 @@ class PetsCommandTests(unittest.TestCase):
                 "created_at": 0,
             },
         }
-        reply = _message(PLAYER, "@bob", "group")
+        # A real username, not "@bob": Telegram's own minimum is five characters and the
+        # flow rejects anything shorter as "user not found".
+        reply = _message(PLAYER, "@bobby", "group")
         reply["message_id"] = 6
         started = []
 
@@ -457,7 +461,7 @@ class PetsCommandTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(api.deleted, [(MAIN_CHAT_ID, 5), (MAIN_CHAT_ID, 100), (MAIN_CHAT_ID, 6)])
-        self.assertEqual(started[0][0][5], "/duel @bob")
+        self.assertEqual(started[0][0][5], "/duel @bobby")
         self.assertTrue(started[0][1]["target_from_followup"])
 
     def test_group_duel_posts_a_result_image_and_keeps_copies_for_both_players(self):
@@ -489,7 +493,12 @@ class PetsCommandTests(unittest.TestCase):
         )
         self.assertEqual(api.sent, [])
         group_result = api.photo_files[0]
-        self.assertIn("Кабанчик", group_result["caption"])
+        # The public line names the winner only -- which of the two that is depends on
+        # the roll, so assert that it names one of them rather than a fixed pet.
+        self.assertTrue(
+            any(name in group_result["caption"] for name in ("Кабанчик", "Тумблер")),
+            group_result["caption"],
+        )
         self.assertIn("🪙 +", group_result["caption"])
         self.assertIn("✨ +100 опыта", group_result["caption"])
         button = _buttons(group_result)[0]

@@ -5469,7 +5469,10 @@ async def _send_pets_view(
             chat_id, text, reply_to_message_id=reply_to_message_id,
             reply_markup=keyboard, parse_mode="HTML",
         )
-        if delete_after and background_tasks and sent and "message_id" in sent:
+        # `is not None`, not truthiness: background_tasks is the live set of RUNNING
+        # tasks, so it is empty almost every time we get here -- testing it for truth
+        # silently skipped the cleanup instead of scheduling it.
+        if delete_after and background_tasks is not None and sent and "message_id" in sent:
             schedule_bot_delete(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
                 trigger_message_id=reply_to_message_id,
@@ -6130,14 +6133,20 @@ async def _pets_run_fight(
     except Exception:
         log(f"[pets] failed to send a fight report:\n{traceback.format_exc()}")
     else:
-        if delete_after and background_tasks and sent and "message_id" in sent:
+        if delete_after and background_tasks is not None and sent and "message_id" in sent:
             schedule_bot_delete(
                 api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
                 trigger_message_id=message_id if delete_trigger else None,
             )
     finally:
         if image_path is not None:
-            recipients = list(dict.fromkeys((*((persistent_recipient_ids or ())), opponent_id)))
+            # Keyed by str: opponent_id arrives as text while the caller's ids are ints,
+            # so a plain dict.fromkeys treats 43 and "43" as two people and DMs the
+            # defender their report twice.
+            by_id: dict[str, int | str] = {}
+            for rid in (*(persistent_recipient_ids or ()), opponent_id):
+                by_id.setdefault(str(rid), int(rid) if str(rid).lstrip("-").isdigit() else rid)
+            recipients = list(by_id.values())
             for recipient_id in recipients:
                 if str(recipient_id) == str(chat_id):
                     continue
