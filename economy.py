@@ -217,6 +217,27 @@ def refund_once(entry: str, user_id, xp: int, amount: int, reason: str) -> bool:
     return True
 
 
+def grant_once(entry: str, user_id, amount: int, reason: str) -> bool:
+    """Grant one named migration only once, atomically with its economy record.
+
+    The `bonus` sibling of refund_once, for a payout that must land in full. refund_once
+    subtracts from `spent`, which is clamped at zero, so it silently pays out LESS than
+    `amount` to anyone who has not spent that much yet -- fine for undoing a specific
+    purchase, wrong for "everybody in this group gets N coins"."""
+    if amount <= 0:
+        return False
+    data = _load(entry)
+    record = _record(data, user_id)
+    migrations = _effects(record).setdefault("grants", {})
+    if migrations.get(reason):
+        return False
+    record["bonus"] = record.get("bonus", 0) + int(amount)
+    migrations[reason] = True
+    _append_log(data, user_id, int(amount), f"grant:{reason}")
+    _save(entry, data)
+    return True
+
+
 def grant(entry: str, user_id, amount: int, reason: str) -> None:
     """Credit coins that did not come from XP (an administrator award, a contest prize)."""
     data = _load(entry)

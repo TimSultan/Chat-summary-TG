@@ -7182,6 +7182,9 @@ async def run_bot_listener(
         refunded_cages = pets.refund_legacy_cages(cfg.listener_allowed_chats)
         if refunded_cages:
             log(f"[pets] refunded {refunded_cages} legacy cage purchases")
+        refunded_upgrades = pets.refund_cage_upgrades(cfg.listener_allowed_chats)
+        if refunded_upgrades:
+            log(f"[pets] refunded {refunded_upgrades} cage upgrades")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
             f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "

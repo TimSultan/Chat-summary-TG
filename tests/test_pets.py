@@ -77,6 +77,36 @@ class CageAndTamingTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "1", 0), pets_config.LEGACY_CAGE_PRICE)
         self.assertEqual(pets._load(entry)["pets"]["1"]["cage_price_paid"], pets_config.LEGACY_CAGE_PRICE)
 
+    def test_cage_upgrades_are_refunded_once(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        economy.grant(entry, "1", pets_config.CAGE_UPGRADE_COSTS[1], "upgrade_funds")
+        ok, msg = pets.upgrade_cage(entry, "1", 0)
+        self.assertTrue(ok, msg)
+        # A second owner who only ever bought the cage is not part of this refund.
+        self._tame(entry, "2")
+
+        self.assertEqual(pets.refund_cage_upgrades([entry]), 1)
+        self.assertEqual(pets.refund_cage_upgrades([entry]), 0)
+        # Paid in full: a `spent`-side refund would have been clamped to what this owner
+        # had actually spent, which is less than the flat payout.
+        self.assertEqual(economy.balance(entry, "1", 0), pets_config.CAGE_UPGRADE_REFUND)
+        self.assertEqual(economy.balance(entry, "2", 0), 0)
+
+    def test_cage_upgrades_bought_after_the_refund_are_not_paid_out(self):
+        """The window closes at the first run -- otherwise, with upgrades at 100 and the
+        payout at 350, upgrading after the migration would print coins."""
+        entry = "chat"
+        self._tame(entry, "1")
+        self.assertEqual(pets.refund_cage_upgrades([entry]), 0)
+
+        economy.grant(entry, "1", pets_config.CAGE_UPGRADE_COSTS[1], "upgrade_funds")
+        ok, msg = pets.upgrade_cage(entry, "1", 0)
+        self.assertTrue(ok, msg)
+
+        self.assertEqual(pets.refund_cage_upgrades([entry]), 0)
+        self.assertEqual(economy.balance(entry, "1", 0), 0)
+
     def test_duplicate_name_refuses_case_insensitively(self):
         entry = "chat"
         for uid in ("1", "2"):

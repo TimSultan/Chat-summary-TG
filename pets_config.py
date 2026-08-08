@@ -62,9 +62,16 @@ RENAME_PRICE = 0
 # The cage was asked for as "buy, then upgrade" without saying what an upgrade does, so
 # it is the game's convenience track: each level buys one more fight per day and a cut
 # of the winnings. Levels are cumulative -- CAGE_LEVELS[n] is what level n+1 costs.
+# The price is deliberately FLAT rather than escalating: the original curve
+# (400/1_200/3_000/7_000) put max cage out of reach of anyone but the top earners, and a
+# flat 100 was asked for instead, making the whole ladder cost 400 to climb.
 
 CAGE_MAX_LEVEL = 5
-CAGE_UPGRADE_COSTS = (0, 400, 1_200, 3_000, 7_000)   # index = level - 1
+CAGE_UPGRADE_COSTS = (0, 100, 100, 100, 100)         # index = level - 1
+# Flat one-time payout to everyone who ever bought an upgrade, regardless of how many
+# levels they bought -- a goodwill refund that was asked for as a single per-owner sum,
+# not a replay of what each of them actually paid out of CAGE_UPGRADE_COSTS.
+CAGE_UPGRADE_REFUND = 350
 CAGE_BONUS_FIGHTS = (0, 1, 2, 3, 4)                  # extra fights/day at that level
 CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
 

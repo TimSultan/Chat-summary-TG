@@ -43,6 +43,9 @@ PETS_STORE_VERSION = 1
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
 # never change anybody's stats, wins or gold, all of which live on the per-pet record.
 FIGHT_LOG_LIMIT = 2_000
+# Store-level marker: this chat's one-off cage-upgrade refund has already been paid out.
+# See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
+CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
 
 _NAME_MAX_LEN = 24
 
@@ -199,6 +202,36 @@ def refund_legacy_cages(entries) -> int:
             changed = True
         if changed:
             _save(entry, data)
+    return refunded
+
+
+def refund_cage_upgrades(entries) -> int:
+    """Pay C.CAGE_UPGRADE_REFUND once to everyone who bought a cage upgrade at the old,
+    escalating price -- called at boot, like refund_legacy_cages.
+
+    `cage_level > 1` is the signal rather than a `buy:pet_cage_upgrade` row in the economy
+    log: that log is capped (economy.LOG_LIMIT), so an early upgrade may already have been
+    trimmed out of it, while the level on the pet record never decreases.
+
+    Two locks, because one is not enough here. Per user, economy.grant_once keys on the
+    migration name, so a crash halfway through a chat cannot pay anybody twice. Per chat,
+    CAGE_UPGRADE_REFUND_FLAG closes the eligibility window at the first run: without it
+    every FUTURE upgrader would also collect 350, which at the new flat CAGE_UPGRADE_COSTS
+    of 100 turns "buy an upgrade" into a 250-coin profit on the next restart."""
+    refunded = 0
+    for entry in entries:
+        data = _load(entry)
+        if data.get(CAGE_UPGRADE_REFUND_FLAG):
+            continue
+        for user_id, record in data["pets"].items():
+            if record.get("cage_level", 1) <= 1:
+                continue
+            if economy.grant_once(
+                entry, user_id, C.CAGE_UPGRADE_REFUND, "pet_cage_upgrade_202608",
+            ):
+                refunded += 1
+        data[CAGE_UPGRADE_REFUND_FLAG] = True
+        _save(entry, data)
     return refunded
 
 
