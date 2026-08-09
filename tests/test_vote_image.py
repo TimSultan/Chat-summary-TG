@@ -376,7 +376,6 @@ class VoteImageButtonTests(unittest.TestCase):
     WORD_SET_ACTIONS = {
         "collect": "VOTE_COLLECT_WORDS",
         "chat": "VOTE_CHAT_WORDS",
-        "carryover": "VOTE_CARRYOVER_WORDS",
         "clear": "VOTE_CLEAR_WORDS",
     }
 

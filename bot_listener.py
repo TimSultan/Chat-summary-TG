@@ -192,7 +192,8 @@ CABINET_COMMAND = "/cabinet"
 # the same reason /plant has two: "/голосование" is what people type, "/vote" is what
 # Telegram can highlight and register in the menu.
 VOTE_COMMANDS = ("/vote", "/голосование")
-# Rebuilds the entry list from the last two days of #итогинедели posts. Admin-only and
+# Rebuilds the entry list from this contest week's #итогинедели posts -- Monday 00:00
+# through now, never the week before. Admin-only and
 # separate from opening the page: collecting downloads every photo in every nomination,
 # which is slow enough that it must be something somebody asks for, not something that
 # happens each time a voter taps a button.
@@ -219,10 +220,6 @@ VOTE_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
 # deliberately not offered to voters: it shows every vote count at once, which is exactly
 # what the page withholds from somebody who hasn't voted yet.
 VOTE_IMAGE_WORDS = frozenset({"картинка", "картинку", "изображение", "image", "png"})
-# "/vote перенос" -- shows what the next собрать would carry over from last week's poll
-# and whether it would fire at all. Read-only by design: it is the "check before you
-# commit to it" half of the carry-over, so it must never be able to cause one.
-VOTE_CARRYOVER_WORDS = frozenset({"перенос", "перенести", "carryover", "carry"})
 VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
 # The draft is written in the admin's DM but is almost never meant to stay there, so the
 # finished text is not sent anywhere until they say where it goes: the main chat, the
@@ -279,7 +276,6 @@ VOTE_ACTIONS = {
     # button rather than a setting, because "how wide" is the only choice the picture has
     # and a button that renders it is shorter than a menu that asks first.
     "image4": "/vote картинка 4",
-    "carryover": "/vote перенос",
     "clear": "/vote очистить",
 }
 
@@ -3462,67 +3458,6 @@ def _vote_status_text(entry: str) -> str:
     return "\n".join(lines)
 
 
-def _vote_carryover_preview_text(entry: str, poll_id: str) -> str:
-    """What the next "/vote собрать" would bring over from last week -- reported, not done.
-
-    Reads polls off disk and computes the same carry-over the collect step would (see
-    voting.carry_over_entries); it writes nothing, copies nothing and creates nothing, so
-    checking can never change the answer it is describing. Which is the point: the one
-    thing an administrator wants before a new week is to know what is about to appear,
-    and the only way to find that out otherwise is to make it happen.
-
-    It also says whether the carry-over would fire at all -- it only does for a week whose
-    poll does not exist yet, and "already collected today" is the likeliest reason for it
-    to look broken.
-    """
-    previous = voting.previous_poll(entry, poll_id)
-    if previous is None:
-        return (
-            "Прошлого голосования нет -- переносить нечего. "
-            "Первый /vote собрать соберёт заявки только из чата."
-        )
-
-    ranked = previous.tally()
-    retiring = [(e, v) for e, v in ranked[:voting.CARRY_OVER_SKIP_TOP] if v > 0]
-    carried = voting.carry_over_entries(previous)
-
-    lines = [
-        f"Прошлое голосование: {previous.poll_id} "
-        f"(допущено {len(previous.approved)}, проголосовало {len(previous.votes)} чел.)",
-        "",
-    ]
-    if retiring:
-        lines.append(f"Не переносятся (топ-{voting.CARRY_OVER_SKIP_TOP}):")
-        for medal, (e, v) in zip(_VOTE_MEDALS, retiring):
-            lines.append(f"{medal} {_vote_who(e)} — {v} голосов")
-    else:
-        lines.append("В прошлый раз никто не набрал голосов -- переносятся все работы.")
-    lines.append("")
-
-    if carried:
-        lines.append(f"Перенесётся работ: {len(carried)}")
-        # Bounded: twenty names is already a wall of text in a chat, and the exact tail
-        # matters less than the count and who is at the top of it.
-        for e in carried[:15]:
-            lines.append(f"• {_vote_who(e)}")
-        if len(carried) > 15:
-            lines.append(f"…и ещё {len(carried) - 15}")
-    else:
-        lines.append("Переносить нечего: кроме топа в прошлом голосовании работ не было.")
-    lines.append("")
-
-    current = voting.load_poll(entry, poll_id)
-    if current is None:
-        lines.append(f"Голосование на эту неделю ({poll_id}) ещё не создано -- перенос сработает при /vote собрать.")
-    else:
-        lines.append(
-            f"Голосование на эту неделю ({poll_id}) уже создано: работ {len(current.entries)}, "
-            f"допущено {len(current.approved)}. Перенос уже отработал и второй раз не повторится "
-            "-- иначе он вернул бы то, что ты снял с голосования."
-        )
-    return "\n".join(lines)
-
-
 def _current_vote_poll_id(tz) -> str:
     """Keyed by ISO week, not by today's date: собрать/выбрать/очистить all need to agree
     on which poll "this week" refers to regardless of which day of the week they're run,
@@ -3921,7 +3856,7 @@ async def handle_arena_command(
     if wants_collect:
         if not await require_admin_in_dm("Собирать работы могут только администраторы."):
             return
-        await reply("Собираю работы с #итогинедели в арену -- это займёт минуту.")
+        await reply("Собираю работы с #итогинедели за эту неделю (с понедельника) в арену -- это займёт минуту.")
         existing = arena.load_tournament(entry, tournament_id)
         known = {e.entry_id for e in existing.entries} if existing else set()
         try:
@@ -4168,7 +4103,6 @@ async def handle_vote_command(
         return
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
-    wants_carryover = False
     image_columns = vote_image.COLUMNS
     if forced_mode == "moderate":
         wants_moderate = True
@@ -4189,7 +4123,6 @@ async def handle_vote_command(
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
-        wants_carryover = normalized in VOTE_CARRYOVER_WORDS
         requested_columns = _vote_image_columns(normalized)
         wants_image = requested_columns is not None
         if requested_columns is not None:
@@ -4225,26 +4158,13 @@ async def handle_vote_command(
         if not await require_admin_in_dm("Собирать заявки могут только администраторы."):
             return
 
-        await reply("Собираю новые заявки с #итогинедели за сегодня и вчера -- это займёт минуту.")
+        await reply("Собираю заявки с #итогинедели за эту неделю (с понедельника) -- это займёт минуту.")
         poll_id = _current_vote_poll_id(tz)
         existing_poll = voting.load_poll(entry, poll_id)
 
-        # Starting a NEW week: last week's admitted works, minus its top 3, run again --
-        # the podium has had its week and everything below it deserves another (see
-        # voting.seed_poll_from_previous). Only when this week's poll doesn't exist yet:
-        # re-collecting an already-started week must not resurrect works the moderator
-        # has since un-admitted, which a carry-over on every /vote собрать would do.
-        carried = 0
-        if existing_poll is None:
-            last_week = voting.previous_poll(entry, poll_id)
-            if last_week is not None:
-                existing_poll = voting.seed_poll_from_previous(entry, poll_id, last_week)
-                carried = len(existing_poll.entries)
-                log(
-                    f"[bot_listener] vote poll {poll_id}: carried {carried} work(s) over from "
-                    f"{last_week.poll_id} (top {voting.CARRY_OVER_SKIP_TOP} retired)"
-                )
-
+        # Nothing is carried over from last week. A poll holds exactly what was nominated
+        # in its own Monday-to-Sunday window, which is what makes "очистить, then собрать"
+        # actually start from empty instead of immediately refilling with last week.
         known_ids = {e.entry_id for e in existing_poll.entries} if existing_poll else set()
         try:
             new_entries = await voting.collect_entries(
@@ -4269,21 +4189,12 @@ async def handle_vote_command(
         voting.save_poll(poll)
         log(f"[bot_listener] vote poll {poll_id}: {len(all_entries)} entries ({len(new_entries)} new), {len(poll.approved)} admitted")
         if not all_entries:
-            await reply("За сегодня и вчера постов с #итогинедели не нашлось.")
+            await reply("За эту неделю постов с #итогинедели не нашлось.")
             return
         summary = (
             f"Новых заявок: {len(new_entries)} (всего {len(all_entries)})." if new_entries
             else f"Новых заявок нет (всего {len(all_entries)})."
         )
-        if carried:
-            # Said out loud, and said first: the moderator is about to open a screen with
-            # works in it they did not collect today, already admitted. Unexplained, that
-            # reads as the bot having picked up something it shouldn't.
-            summary = (
-                f"Перенёс с прошлого голосования: {carried} работ "
-                f"(топ-{voting.CARRY_OVER_SKIP_TOP} не переносится, они уже допущены). "
-                + summary
-            )
         await reply(
             f"{summary} Открой модерацию и отметь, какие работы допустить.",
             reply_markup={"inline_keyboard": [[
@@ -4326,14 +4237,6 @@ async def handle_vote_command(
             "Какой текст написать в объявлении о голосовании? Ответь на это сообщение.",
             log=log,
         )
-        return
-
-    if wants_carryover:
-        if not await require_admin_in_dm("Смотреть перенос могут только администраторы."):
-            return
-        # Nothing but a read: no poll is created, nothing is saved, no photo is copied.
-        # Checking what will happen must not be a way of making it happen.
-        await reply(_vote_carryover_preview_text(entry, _current_vote_poll_id(tz)))
         return
 
     if wants_image:
@@ -4418,14 +4321,6 @@ async def handle_vote_command(
                         {
                             "text": "📣 Объявление",
                             "callback_data": _vote_action_callback_data("chat", chat_id, admin_user_id),
-                        },
-                    ],
-                    [
-                        # Reads and reports; changes nothing. Sits next to "Собрать заявки"
-                        # because it is a preview of exactly what that button would do.
-                        {
-                            "text": "🔁 Что перенесётся с прошлой недели",
-                            "callback_data": _vote_action_callback_data("carryover", chat_id, admin_user_id),
                         },
                     ],
                     [

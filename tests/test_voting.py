@@ -7,7 +7,7 @@ import json
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -154,6 +154,46 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.resolved, [3])
         self.assertEqual(client.downloads, [3])
 
+    async def test_posts_from_before_this_monday_are_left_in_their_own_week(self):
+        """The contest window is Monday..now, so last week's posts must not be pulled in.
+
+        Anchored to the real week start rather than a frozen clock: one message a second
+        before Monday 00:00 and one exactly on it, newest first the way iter_messages
+        yields them.
+        """
+        week_start = voting.contest_week_start(datetime.now(timezone.utc))
+        client = _FakeClient([
+            _FakeMessage(2, text="эта неделя #итогинедели", date=week_start,
+                         resolved=self.resolved),
+            _FakeMessage(1, text="прошлая неделя #итогинедели",
+                         date=week_start - timedelta(seconds=1), resolved=self.resolved),
+        ])
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir, log=lambda *_: None,
+        )
+
+        self.assertEqual([e.entry_id for e in entries], ["2"])
+        self.assertEqual(self.resolved, [2])
+
+    async def test_the_whole_week_is_collected_not_just_the_last_day_or_two(self):
+        """Collecting happens on Sunday; everything posted since Monday has to be found."""
+        week_start = voting.contest_week_start(datetime.now(timezone.utc))
+        client = _FakeClient([
+            _FakeMessage(day, text="работа #итогинедели",
+                         date=week_start + timedelta(days=day, hours=12),
+                         resolved=self.resolved)
+            for day in reversed(range(7))
+            if week_start + timedelta(days=day, hours=12) <= datetime.now(timezone.utc)
+        ])
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir, log=lambda *_: None,
+        )
+
+        self.assertEqual(len(entries), len(client._messages))
+        self.assertGreaterEqual(len(entries), 1)
+
     async def test_nothing_new_means_an_empty_list_not_an_error(self):
         client = _FakeClient(self._messages(1, 2))
         entries = await voting.collect_entries(
@@ -163,6 +203,43 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries, [])
         self.assertEqual(self.resolved, [])
         self.assertEqual(client.downloads, [])
+
+
+class ContestWeekStartTests(unittest.TestCase):
+    """Monday 00:00 of whatever week the moment falls in -- the contest's own boundary."""
+
+    def test_sunday_collection_reaches_back_to_that_weeks_monday(self):
+        # 2026-08-09 is a Sunday; its week began Monday 2026-08-03.
+        sunday = datetime(2026, 8, 9, 21, 30, tzinfo=timezone.utc)
+        self.assertEqual(
+            voting.contest_week_start(sunday),
+            datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_monday_is_its_own_week_start_and_never_reaches_back_seven_days(self):
+        """Collecting a few minutes after midnight must not swallow the week just ended."""
+        monday = datetime(2026, 8, 10, 0, 5, tzinfo=timezone.utc)
+        self.assertEqual(
+            voting.contest_week_start(monday),
+            datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_every_day_of_one_week_resolves_to_the_same_monday(self):
+        monday = datetime(2026, 8, 3, 0, 0, tzinfo=timezone.utc)
+        for offset in range(7):
+            moment = monday + timedelta(days=offset, hours=13, minutes=7)
+            with self.subTest(day=moment.strftime("%A")):
+                self.assertEqual(voting.contest_week_start(moment), monday)
+
+    def test_the_window_agrees_with_the_iso_week_the_poll_is_keyed_on(self):
+        """The poll id uses isocalendar(); a different week start would silently mismatch."""
+        for offset in range(21):
+            moment = datetime(2026, 8, 3, 12, tzinfo=timezone.utc) + timedelta(days=offset)
+            with self.subTest(day=moment.date()):
+                self.assertEqual(
+                    voting.contest_week_start(moment).isocalendar()[:2],
+                    moment.isocalendar()[:2],
+                )
 
 
 class InitDataTests(unittest.TestCase):
