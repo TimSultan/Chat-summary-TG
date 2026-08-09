@@ -965,7 +965,7 @@ class MenuRegistrationTests(unittest.TestCase):
     def test_group_menu_has_public_commands_and_dm_menu_still_has_cabinet(self):
         self.assertEqual(
             {
-                "stat", "top", "shop", "tree", "vote", "arena", "pet", "duel",
+                "stat", "top", "shop", "tree", "vote", "arena", "pet", "duel", "testfight",
             },
             {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
         )

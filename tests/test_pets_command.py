@@ -225,7 +225,68 @@ class PetsCommandTests(unittest.TestCase):
 
     def test_pet_commands_are_advertised_in_the_group_command_menu(self):
         commands = {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS}
-        self.assertTrue({"arena", "pet", "duel"} <= commands)
+        self.assertTrue({"arena", "pet", "duel", "testfight"} <= commands)
+
+    def test_admin_testfight_posts_not_silent_result_without_mutating_game(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        before = pets._load(CHAT)
+        api = FakeApi()
+
+        async def allowed(*args, **kwargs):
+            return True
+
+        with patch.object(bot_listener, "_is_chat_admin_or_privileged", new=allowed), \
+                patch.object(pets, "record_fight", side_effect=AssertionError("must not record")):
+            _run(bot_listener.handle_test_fight_command(
+                api, None, _message(PLAYER, "/testfight", "group"), CHAT,
+                CHAT, {CHAT: MAIN_CHAT_ID}, log=lambda *_: None,
+            ))
+
+        self.assertEqual(pets._load(CHAT), before)
+        self.assertEqual(len(api.photo_files), 1)
+        result = api.photo_files[0]
+        self.assertEqual(result["chat_id"], MAIN_CHAT_ID)
+        self.assertFalse(result["disable_notification"])
+        self.assertIn("Тестовый бой", result["caption"])
+        self.assertIn("Золото, опыт, дроп и количество боёв не изменены", result["caption"])
+
+    def test_non_admin_cannot_start_testfight(self):
+        api = FakeApi()
+
+        async def denied(*args, **kwargs):
+            return False
+
+        with patch.object(bot_listener, "_is_chat_admin_or_privileged", new=denied):
+            _run(bot_listener.handle_test_fight_command(
+                api, None, _message(STRANGER, "/testfight", "group"), CHAT,
+                CHAT, {CHAT: MAIN_CHAT_ID}, log=lambda *_: None,
+            ))
+
+        self.assertEqual(api.photo_files, [])
+        self.assertIn("только администраторам", api.sent[0]["text"])
+
+    def test_private_testfight_posts_to_home_chat_and_confirms_in_dm(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+
+        async def allowed(*args, **kwargs):
+            return True
+
+        with patch.object(bot_listener, "_is_chat_admin_or_privileged", new=allowed):
+            _run(bot_listener.handle_test_fight_command(
+                api, None, _message(PLAYER, "/testfight", "private"), CHAT,
+                CHAT, {CHAT: MAIN_CHAT_ID}, log=lambda *_: None,
+            ))
+
+        self.assertEqual(api.photo_files[0]["chat_id"], MAIN_CHAT_ID)
+        self.assertEqual(api.sent[-1]["chat_id"], DM_CHAT_ID)
+        self.assertIn("отправлен в основной чат", api.sent[-1]["text"])
 
     def test_somebody_the_chat_has_never_seen_is_turned_away(self):
         api = self._type(found=False)

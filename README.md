@@ -930,6 +930,10 @@ Arena drops automatically fill an empty equipment slot or replace a weaker item 
 same slot; the previous item stays in the bag. Fight-result images show each pet's weapon,
 rarity and icon-based bonuses directly under HP, followed by the equipped amulet and its
 passive effect, with dividers separating equipment from the base-stat receipt.
+Administrators can use `/testfight` from the group or the bot DM to pit their pet against
+a random existing opponent in the main chat. It runs the normal combat and result-image
+pipeline but deliberately records no fight, XP, gold, drop, loss debit or daily usage;
+the public caption labels it as a test and the message is sent with notifications enabled.
 Weapon names use familiar household junk and concrete origins such as «с Авито», «из
 гаража» and «на синей изоленте», with one-line descriptions; storefront entries are
 separated by blank lines for quick scanning.

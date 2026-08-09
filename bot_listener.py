@@ -308,6 +308,7 @@ VOTE_RESULT_FLOW_TTL_SECONDS = 60 * 60
 # advertising them to all 190 members would invite a wave of "нужны права администратора".
 PRIVATE_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
+    {"command": "testfight", "description": "Тестовый случайный бой"},
     {"command": "cabinet", "description": "Личный кабинет"},
     {"command": "stat", "description": "Моя статистика"},
     {"command": "top", "description": "Рейтинг чата"},
@@ -318,6 +319,7 @@ PRIVATE_CHAT_COMMANDS = (
 )
 GROUP_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
+    {"command": "testfight", "description": "Тестовый случайный бой"},
     {"command": "stat", "description": "Моя статистика"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
@@ -5404,6 +5406,7 @@ PETS_COMMANDS = ("/arena", "/арена")
 PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
 PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
+TEST_FIGHT_COMMAND = "/testfight"
 # Arena navigation is a persistent DM workspace: the same message is edited while the
 # player browses it, so scheduling its original message for deletion would destroy every
 # later screen too.  Standalone /pet cards remain temporary notices.
@@ -6136,6 +6139,126 @@ def _pets_rare_drop_announcement(reward: dict, attacker: dict, defender: dict) -
     description = html.escape(str(item.description or "").strip())
     suffix = f" — {description}" if description else ""
     return f"{owner} выпало {rarity} оружие: <b>{html.escape(item.name)}</b>{suffix}"
+
+
+async def handle_test_fight_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    entry: str,
+    home_chat_ref: str | None,
+    known_chat_ids: dict[str, int],
+    log=print,
+) -> None:
+    """Post a real combat simulation without changing any game or economy state."""
+    source_chat = message["chat"]
+    source_chat_id = source_chat["id"]
+    actor = message.get("from") or {}
+    if source_chat.get("type") == "private":
+        destination_chat_id = await _resolve_chat_id(
+            telethon_client, entry or home_chat_ref, known_chat_ids, log=log,
+        )
+    else:
+        destination_chat_id = source_chat_id
+
+    if destination_chat_id is None:
+        await api.send_message(
+            source_chat_id, "Не удалось найти основной чат для тестового боя.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        return
+    if not await _is_chat_admin_or_privileged(api, destination_chat_id, actor):
+        await api.send_message(
+            source_chat_id, "Тестовый бой доступен только администраторам чата.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        return
+
+    attacker_id = actor.get("id")
+    attacker = pets.get_pet(entry, attacker_id) if attacker_id is not None else None
+    if attacker is None:
+        await api.send_message(
+            source_chat_id, "Для тестового боя сначала приручи своего питомца.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        return
+    opponents = [
+        row for row in pets.pet_leaderboard(entry)
+        if str(row["user_id"]) != str(attacker_id)
+    ]
+    if not opponents:
+        await api.send_message(
+            source_chat_id, "Для тестового боя нужен хотя бы один чужой питомец.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        return
+
+    defender_row = secrets.SystemRandom().choice(opponents)
+    defender_id = defender_row["user_id"]
+    defender = pets.get_pet(entry, defender_id)
+    if defender is None:
+        await api.send_message(
+            source_chat_id, "Питомец исчез во время подготовки тестового боя. Попробуй ещё раз.",
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+        return
+
+    attacker_fighter = _pets_fighter(entry, attacker_id, attacker)
+    defender_fighter = _pets_fighter(entry, defender_id, defender)
+    result = pets_combat.simulate(
+        attacker_fighter, defender_fighter, seed=secrets.randbits(63),
+    )
+    fight_hp = {
+        str(attacker_id): _pets_fight_hp(result, attacker_fighter, defender_fighter),
+        str(defender_id): _pets_fight_hp(result, defender_fighter, attacker_fighter),
+    }
+    names = {
+        str(attacker_id): attacker.get("name"),
+        str(defender_id): defender.get("name"),
+    }
+    report = pets_ui.fight_report(result, str(attacker_id), names, None)
+    caption = (
+        "🧪 <b>Тестовый бой</b>\n"
+        f"{html.escape(attacker.get('name') or 'Существо')} → "
+        f"{html.escape(defender.get('name') or 'Существо')}\n\n"
+        f"{report}\n\n"
+        "🚫 Золото, опыт, дроп и количество боёв не изменены."
+    )
+
+    image_path = None
+    try:
+        image_path = await _pets_render_result_image(
+            api, result, entry, attacker_id, defender_id, attacker, defender, log,
+            fight_hp=fight_hp,
+        )
+        if image_path is not None:
+            await api.send_photo_file(
+                destination_chat_id, image_path, caption=caption, parse_mode="HTML",
+                disable_notification=False,
+            )
+        else:
+            await api.send_message(destination_chat_id, caption, parse_mode="HTML")
+    except Exception:
+        log(f"[pets] failed to send a test fight:\n{traceback.format_exc()}")
+        try:
+            await api.send_message(destination_chat_id, caption, parse_mode="HTML")
+        except Exception:
+            log(f"[pets] failed to send a test-fight fallback:\n{traceback.format_exc()}")
+            return
+    finally:
+        if image_path is not None:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if source_chat.get("type") == "private" and destination_chat_id != source_chat_id:
+        try:
+            await api.send_message(
+                source_chat_id, "🧪 Тестовый бой отправлен в основной чат.", parse_mode=None,
+            )
+        except Exception:
+            log("[pets] could not confirm the test fight in DM")
 
 
 async def _pets_run_fight(
@@ -7192,6 +7315,15 @@ async def _dispatch_update(
     # "/vote2" -- the second voting system. Checked BEFORE /vote so
     # "/vote2" reaches the arena rather than being swallowed by "/vote"'s prefix match and
     # opening v1's ballot with a stray "2" as its argument.
+    if re.match(rf"^{re.escape(TEST_FIGHT_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_test_fight_command(
+            api, telethon_client, message, pets_entry, home_chat_ref, known_chat_ids, log=log,
+        )
+        return
+
     # "/arena" -- the pet game. Nothing to do with ARENA_COMMANDS below, which is the
     # voting system that used to answer to this word and now answers to "/vote2".
     if any(
