@@ -77,9 +77,9 @@ LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 # A farm run is now a deliberate, player-chosen 1-8 hour shift: the pet cannot start a
 # fight while it works (but, unlike before, CAN still be attacked -- see _is_farming_record
 # call sites in claim_duel/can_attack_in_arena/find_opponent/record_fight), so the reward
-# needs to be useful without replacing the hourly arena loop. Level 1 is a small early
-# investment; level 10 plus every permanent facility costs 6,850 coins in total and pays
-# at most about 200 coins/day when collected on time at the six-hour anchor length.
+# needs to be useful without replacing the hourly arena loop. Level 10 plus every permanent
+# facility costs 6,785 coins in total and pays at most about 200 coins/day when collected
+# on time at the six-hour anchor length.
 FARM_MAX_LEVEL = 10
 # FARM_DURATION_HOURS is kept as the balance ANCHOR, not a default a player is steered
 # toward: FARM_GOLD_PER_RUN/FARM_XP_PER_RUN/FARM_DROP_CHANCE_BY_HOURS are all stated "per
@@ -97,7 +97,13 @@ FARM_HOUR_CHOICES = tuple(range(FARM_MIN_HOURS, FARM_MAX_HOURS + 1))
 # unused padding so FARM_DURATION_BONUS[hours] reads directly off the hour count.
 FARM_DURATION_BONUS = (0.0, 0.85, 0.88, 0.91, 0.94, 0.97, 1.00, 1.06, 1.15)
 # Index is the current level; index 0 builds the first level.
-FARM_UPGRADE_COSTS = (75, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
+#
+# Building at all costs 10 -- a token, not a gate. It was 75, which on top of the cage
+# (100) and taming (50) meant a new player spent 225 before the farm existed for them, and
+# the farm is the one part of the game that pays out while you are not playing it: the
+# thing a newcomer should reach first, not last. Every level after it keeps its old price,
+# so the ladder is unchanged for anybody already climbing it.
+FARM_UPGRADE_COSTS = (10, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
 # Six-hour REFERENCE payouts -- see farm_gold_for/farm_xp_for for how an actual `hours`
 # length is derived from them. Kept as the anchor rather than rescaled per-hour so
 # STARTER_WEAPON_MAX_PRICE below stays a meaningful, stated-once number.

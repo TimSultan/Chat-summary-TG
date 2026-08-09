@@ -1684,6 +1684,27 @@ class FarmTests(PetsTestCase):
         self.assertFalse(pets.mark_farm_notified(entry, "1", receipt["run_id"]))
         self.assertEqual(pets.pending_farm_notifications(entry), [])
 
+    def test_building_the_farm_is_repaid_by_its_own_first_shift(self):
+        """The farm is the one thing that pays while you are not playing, so it has to be
+        the first thing a newcomer reaches. Pinning it against the level-1 six-hour shift
+        rather than against a bare number keeps that true if either side is re-tuned."""
+        build_cost = pets_config.FARM_UPGRADE_COSTS[0]
+        self.assertLessEqual(
+            build_cost,
+            pets_config.farm_gold_for(1, pets_config.FARM_DURATION_HOURS),
+            "building the farm must cost no more than its first reference shift returns",
+        )
+
+        entry, start = "farm-entry", datetime(2026, 8, 1, 10)
+        self._tame(entry, "1")
+        economy.grant(entry, "1", build_cost, "farm-test-funds")
+        ok, message = pets.upgrade_farm(entry, "1", 0, now=start)
+        self.assertTrue(ok, message)
+        self.assertEqual(pets.farm_level(entry, "1"), 1)
+        # Exactly enough, not "enough with change": the entry price is the whole point.
+        self.assertEqual(economy.balance(entry, "1", 0), 0)
+        self.assertTrue(pets.start_farm(entry, "1", 6, now=start)[0])
+
     def test_first_basic_farm_run_buys_a_daily_starter_weapon(self):
         """A player need not wait for hourly passive gold before their first purchase."""
         entry, start = "farm-shop", datetime(2026, 8, 1, 10)
