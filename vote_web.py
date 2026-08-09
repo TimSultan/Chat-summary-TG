@@ -188,13 +188,12 @@ async def handle_poll(request: web.Request) -> web.Response:
     }
     if voted_already or not poll.open or admin_mode:
         payload["results"] = _results_payload(poll, base)
-    # Sent to EVERYONE, not just the admin. The framing an admin sets is how the work is
-    # meant to be seen, so the ballot has to show it too -- otherwise a work cropped in
-    # the editor still appears cover-cropped to voters, and the framing looks unsaved.
-    payload["crops"] = poll.crops
     if admin_mode:
         payload["approved"] = list(poll.approved)
         payload["counts"] = {e.entry_id: count for e, count in poll.tally()}
+        # Only in admin mode, and only because the cropping page (BOARD_HTML) is the one
+        # thing that reads it -- a voter's ballot has no use for how the export is framed.
+        payload["crops"] = poll.crops
     return web.json_response(payload)
 
 
@@ -698,14 +697,8 @@ PAGE_HTML = """<!doctype html>
      closely, which is what the reel below is. */
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
   .gcard { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
-  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block;
-           overflow: hidden; background: #1a2532; }
+  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  /* A work the admin has framed is positioned by applyCrop instead, in the photo's own
-     pixels -- same square the export draws. object-fit must go, or it would scale the
-     photo a second time on top of the crop. */
-  .thumb img.cropped { position: absolute; width: auto; height: auto;
-                       max-width: none; object-fit: none; }
   .count { position: absolute; right: 4px; top: 4px; background: rgba(0,0,0,.6);
            color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 8px; }
   .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
@@ -754,13 +747,12 @@ PAGE_HTML = """<!doctype html>
              background: transparent; color: var(--fg); cursor: pointer; }
   .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   .rcard.pending { opacity: .6; }
-  /* Directly under the admit button, in the grid cell and the reel card alike: admitting
-     is the decision this screen is for, framing is what you do to a work once it is in. */
-  .cropBtn { display: block; width: 100%; border: 0; padding: 6px 4px; font-size: 11px;
-             background: transparent; color: var(--muted); cursor: pointer;
-             border-top: 1px solid rgba(128,128,128,.25); }
-  .rcard .cropBtn { border: 1px solid rgba(128,128,128,.35); border-radius: 8px;
-                    padding: 8px; margin-top: 8px; font-size: 13px; color: var(--fg); }
+  /* Sits directly under the photos it frames, above the admit button: the order on screen
+     is the order of the decisions -- look at the work, frame it, then admit it. Quieter
+     than pickBtn because admitting is still the decision this screen exists for. */
+  .cropBtn { display: block; width: 100%; border: 1px solid rgba(128,128,128,.35);
+             border-radius: 8px; padding: 8px; margin-bottom: 8px; font-size: 13px;
+             background: transparent; color: var(--fg); cursor: pointer; }
   .cropBtn[disabled] { opacity: .45; cursor: default; }
   .bar {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
@@ -1045,39 +1037,6 @@ function maxAdminCount() {
   return poll.is_admin && poll.counts ? Math.max(1, ...Object.values(poll.counts)) : 1;
 }
 
-// Puts the admin's framing on one <img>, in the photo's own pixel coordinates -- the same
-// square vote_image draws, so the ballot and the exported picture show the same thing.
-// Mirrors BOARD_HTML's applyTo; a work with no saved crop is left to object-fit: cover.
-function applyCrop(img, entryId) {
-  const crop = (poll.crops || {})[entryId];
-  if (!img || !crop || !crop.size) return;
-  const frame = img.parentElement && img.parentElement.clientWidth;
-  const w = img.naturalWidth, h = img.naturalHeight;
-  if (!frame || !w || !h) return;
-  const scale = frame / crop.size;
-  img.classList.add("cropped");
-  img.style.width = (w * scale) + "px";
-  img.style.height = (h * scale) + "px";
-  img.style.left = (-crop.x * scale) + "px";
-  img.style.top = (-crop.y * scale) + "px";
-}
-
-// A photo is framed once it has both a saved crop and a known natural size, so this has
-// to run again when the picture finally arrives -- not only at render time.
-function bindCrop(img, entryId) {
-  if (!img) return;
-  const run = () => applyCrop(img, entryId);
-  if (img.complete && img.naturalWidth) run(); else img.addEventListener("load", run, { once: true });
-}
-
-// Rotating the phone changes every frame's width, and a crop is only pixels against that
-// width -- without this the photos keep the old scale and the grid goes visibly wrong.
-window.addEventListener("resize", () => {
-  for (const img of document.querySelectorAll("img[data-crop-for]")) {
-    applyCrop(img, img.dataset.cropFor);
-  }
-});
-
 function renderGrid() {
   const grid = $("grid");
   grid.innerHTML = "";
@@ -1100,18 +1059,15 @@ function renderGrid() {
 
     card.innerHTML =
       '<a class="thumb" href="#" data-open="' + esc(entry.id) + '">' +
-        '<img loading="lazy" data-crop-for="' + esc(entry.id) + '" src="' +
-          esc(entry.photos[0]) + '" alt="">' +
+        '<img loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' +
         more + votes +
       "</a>" +
       voteBarHtml(entry, maxCount) +
       '<div class="who">' + esc(who(entry)) + "</div>" +
       '<button class="pick" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
         pickLabel(entry.id, true) +
-      "</button>" +
-      cropButtonHtml(entry);
+      "</button>";
     grid.appendChild(card);
-    bindCrop(card.querySelector("img[data-crop-for]"), entry.id);
   }
 }
 
@@ -1175,12 +1131,10 @@ function renderReel() {
         entry.photos.map((p) => '<img loading="lazy" src="' + esc(p) + '" alt="">').join("") +
       "</div>" +
       voteBarHtml(entry, maxCount) +
+      cropButtonHtml(entry) +
       '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
         pickLabel(entry.id) +
-      "</button>" +
-      cropButtonHtml(entry);
-    // No crop applied here on purpose: the reel is the "look at the whole work" view, and
-    // a square frame is how it appears in the grid and the export, not what it IS.
+      "</button>";
     feed.appendChild(card);
   }
 }
