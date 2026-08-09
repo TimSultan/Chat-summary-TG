@@ -747,13 +747,6 @@ PAGE_HTML = """<!doctype html>
              background: transparent; color: var(--fg); cursor: pointer; }
   .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   .rcard.pending { opacity: .6; }
-  /* Sits directly under the photos it frames, above the admit button: the order on screen
-     is the order of the decisions -- look at the work, frame it, then admit it. Quieter
-     than pickBtn because admitting is still the decision this screen exists for. */
-  .cropBtn { display: block; width: 100%; border: 1px solid rgba(128,128,128,.35);
-             border-radius: 8px; padding: 8px; margin-bottom: 8px; font-size: 13px;
-             background: transparent; color: var(--fg); cursor: pointer; }
-  .cropBtn[disabled] { opacity: .45; cursor: default; }
   .bar {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom));
@@ -856,7 +849,6 @@ PAGE_HTML = """<!doctype html>
 <div class="results" id="results" hidden></div>
 <div class="bar" id="bar">
   <button class="go danger" id="clear" hidden>🗑 Очистить голосование</button>
-  <button class="go secondary" id="board" hidden>🖼 Кадрирование и выгрузка</button>
   <button class="go secondary" id="announce" hidden>Подвести итоги</button>
   <button class="go" id="go" disabled>Загружаю…</button>
 </div>
@@ -965,20 +957,12 @@ function renderResults() {
 function updateAdminButtons() {
   const announce = $("announce");
   const clear = $("clear");
-  const board = $("board");
-  if (!poll.is_admin) {
-    announce.hidden = true; clear.hidden = true; board.hidden = true;
-    return;
-  }
+  if (!poll.is_admin) { announce.hidden = true; clear.hidden = true; return; }
   announce.hidden = false;
   announce.disabled = false;
   announce.textContent = poll.open ? "Закрыть голосование и объявить победителя" : "Пересчитать победителя";
   clear.hidden = false;
   clear.disabled = false;
-  // The whole board at once, for framing several works in a row or just exporting. Until
-  // this existed the cropping page could only be reached by typing its URL by hand.
-  board.hidden = false;
-  board.disabled = false;
 }
 
 // True once a voter can no longer submit anything, either because voting closed or
@@ -1071,43 +1055,6 @@ function renderGrid() {
   }
 }
 
-// The crop button under each work's photos, in moderation only. It leads to the board
-// page (BOARD_HTML) rather than carrying an editor of its own: that page IS the export's
-// board, so framing there is framing the picture, and there is exactly one crop store
-// behind both (voting.Poll.crops) -- nothing has to be kept in sync by hand.
-//
-// Only an ADMITTED work can be framed, because only admitted works are in the exported
-// picture at all. The button stays visible while pending so the card's layout does not
-// jump when a work is admitted; it just says why it is not available yet.
-function cropButtonHtml(entry) {
-  if (!poll.is_admin) return "";
-  const ready = admitted.has(entry.id);
-  return '<button class="cropBtn" data-crop="' + esc(entry.id) + '"' +
-    (ready ? "" : " disabled") + ">" +
-    (ready ? "Кадрировать для картинки" : "Кадрирование - после допуска") +
-    "</button>";
-}
-
-// Admitting is a local draft until "Сохранить" -- but the board page asks the SERVER
-// which works are admitted, so a work ticked a second ago would not be there to frame.
-// Committing the moderation first is what makes the button mean what it says; it also
-// means walking off this screen can never lose the ticks that were made on it.
-async function openCropPage(button) {
-  const entryId = button.dataset.crop;
-  const original = button.textContent;
-  button.disabled = true;
-  button.textContent = "Сохраняю допуск…";
-  try {
-    await commitModeration();
-  } catch (e) {
-    button.textContent = String(e.message || e);
-    setTimeout(() => { button.textContent = original; button.disabled = false; }, 2500);
-    return;
-  }
-  // The board page opens the editor on this work directly (see its ?entry= handling).
-  window.location.href = PREFIX + "/board?entry=" + encodeURIComponent(entryId);
-}
-
 function renderReel() {
   const feed = $("feed");
   feed.innerHTML = "";
@@ -1131,7 +1078,6 @@ function renderReel() {
         entry.photos.map((p) => '<img loading="lazy" src="' + esc(p) + '" alt="">').join("") +
       "</div>" +
       voteBarHtml(entry, maxCount) +
-      cropButtonHtml(entry) +
       '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
         pickLabel(entry.id) +
       "</button>";
@@ -1153,13 +1099,6 @@ function syncPicks() {
     if (!card) continue;
     card.classList.toggle("on", isChosen(id));
     if (poll.is_admin) card.classList.toggle("pending", !admitted.has(id));
-  }
-  // Admitting a work is what makes it croppable, and admitting happens right here --
-  // without this the button would keep saying "после допуска" until the page reloaded.
-  for (const button of document.querySelectorAll("[data-crop]")) {
-    const ready = admitted.has(button.dataset.crop);
-    button.disabled = !ready;
-    button.textContent = ready ? "Кадрировать для картинки" : "Кадрирование - после допуска";
   }
   updateButton();
 }
@@ -1405,36 +1344,11 @@ async function onPickTap(id) {
 document.addEventListener("click", (event) => {
   const open = event.target.closest("[data-open]");
   if (open) { event.preventDefault(); openReel(open.dataset.open); return; }
-  const crop = event.target.closest("[data-crop]");
-  if (crop) {
-    if (crop.disabled) return;
-    event.preventDefault();
-    openCropPage(crop);
-    return;
-  }
   const pick = event.target.closest("[data-pick]");
   if (!pick || pick.disabled) return;
   event.preventDefault();
   onPickTap(pick.dataset.pick);
 });
-
-// The moderation write itself, with no button of its own to update: the bottom bar and
-// the per-work crop button both need to commit the same ticks, and only one of them owns
-// "go". Throws on failure so each caller reports it wherever the tap actually happened.
-async function commitModeration() {
-  const body = {
-    init_data: initData,
-    approved: [...admitted],
-    max_choices: $("maxChoices").value ? parseInt($("maxChoices").value, 10) : null,
-    allow_revote: $("allowRevote").checked,
-  };
-  const response = await api("/api/moderate", { method: "POST", body: JSON.stringify(body) });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "не получилось");
-  poll.max_choices = data.max_choices;
-  poll.allow_revote = data.allow_revote;
-  return data;
-}
 
 async function saveModeration() {
   const go = $("go");
@@ -1442,7 +1356,17 @@ async function saveModeration() {
   const original = go.textContent;
   go.textContent = "Отправляю…";
   try {
-    await commitModeration();
+    const body = {
+      init_data: initData,
+      approved: [...admitted],
+      max_choices: $("maxChoices").value ? parseInt($("maxChoices").value, 10) : null,
+      allow_revote: $("allowRevote").checked,
+    };
+    const response = await api("/api/moderate", { method: "POST", body: JSON.stringify(body) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось");
+    poll.max_choices = data.max_choices;
+    poll.allow_revote = data.allow_revote;
     go.textContent = "Сохранено";
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
     // Deferred, not immediate: render() would otherwise overwrite this confirmation text
@@ -1476,23 +1400,6 @@ async function finalizeBallot() {
 $("go").addEventListener("click", async () => {
   if (poll.is_admin) { await saveModeration(); return; }
   await finalizeBallot();
-});
-
-// Same commit-then-leave as the per-work crop button: the board renders whatever the
-// SERVER has admitted, so unsaved ticks would simply not be on it.
-$("board").addEventListener("click", async () => {
-  const button = $("board");
-  const original = button.textContent;
-  button.disabled = true;
-  button.textContent = "Сохраняю допуск…";
-  try {
-    await commitModeration();
-  } catch (e) {
-    button.textContent = String(e.message || e);
-    setTimeout(() => { button.textContent = original; button.disabled = false; }, 2500);
-    return;
-  }
-  window.location.href = PREFIX + "/board";
 });
 
 $("announce").addEventListener("click", async () => {
@@ -1811,10 +1718,6 @@ const initData = (tg && tg.initData) || "";
 
 let works = [];       // the ranked board: {id, author, username, votes, photo}
 let crops = {};       // id -> {x, y, size}: the square being framed, in photo pixels
-// Which work to open the editor on as soon as the board is ready, from ?entry= -- how
-// the moderation screen's per-work "Кадрировать" button lands straight on the right
-// photo instead of on a grid the admin then has to search through.
-const requestedEntry = new URLSearchParams(location.search).get("entry");
 let natural = {};     // id -> {w, h}: learned from each photo as it loads
 let dirty = false;    // something changed since the last successful save
 let editing = null;   // id of the work the editor is open on
@@ -1969,36 +1872,12 @@ function openEditor(id) {
   if (img.complete && img.naturalWidth) show(); else img.addEventListener("load", show, { once: true });
 }
 
-// Opens the editor on ?entry= once the board has rendered. The photo it needs may still
-// be downloading, and openEditor refuses without a natural size, so this waits for that
-// one image rather than firing blind and telling the admin to try again.
-function openRequestedEntry() {
-  if (!requestedEntry) return;
-  const work = works.find((w) => w.id === requestedEntry);
-  if (!work) {
-    // Admitted on the moderation screen but absent here means the board moved on --
-    // un-admitted from another device, or the work was dropped from the poll entirely.
-    status("Эта работа сейчас не в картинке. Выбери любую другую ниже.");
-    return;
-  }
-  const cell = document.querySelector('[data-cell="' + CSS.escape(requestedEntry) + '"]');
-  if (cell) cell.scrollIntoView({ block: "center" });
-  if (natural[requestedEntry]) { openEditor(requestedEntry); return; }
-  const img = cell && cell.querySelector("img");
-  if (!img) return;
-  // renderGrid's own load handler measures the photo and paints it; ours runs after and
-  // only opens the editor, so the two never race over who initialises the crop.
-  img.addEventListener("load", () => openEditor(requestedEntry), { once: true });
-}
-
 function closeEditor() {
   const id = editing;
   editing = null;
   $("editor").hidden = true;
   document.body.classList.remove("editing");
-  // Kept visible when this page was opened for one work from moderation: there the back
-  // arrow still has somewhere to go, and hiding it would strand the admin here.
-  if (tg && tg.BackButton && !requestedEntry) tg.BackButton.hide();
+  if (tg && tg.BackButton) tg.BackButton.hide();
   if (id) paint(id);
 }
 
@@ -2124,25 +2003,7 @@ $("doDone").addEventListener("click", closeEditor);
 $("editorClose").addEventListener("click", closeEditor);
 // Telegram's own back arrow closes the editor -- on a phone that is the gesture people
 // reach for first, and without this it would close the whole Mini App instead.
-//
-// Arrived from the moderation screen's per-work button? Then back once more returns
-// there, rather than leaving the admin on a board they did not ask to browse with no way
-// out but closing the app. Unsaved framing is confirmed first: the crop lives only in
-// this page until "Сохранить", so walking away silently would quietly discard it.
-function leaveForModeration() {
-  if (dirty && !confirm(
-    "Кадрирование не сохранено. Выйти и потерять изменения?"
-  )) return;
-  window.location.href = PREFIX + "?mode=admin";
-}
-
-if (tg && tg.BackButton) {
-  tg.BackButton.onClick(() => {
-    if (editing) { closeEditor(); return; }
-    if (requestedEntry) leaveForModeration();
-  });
-  if (requestedEntry) tg.BackButton.show();
-}
+if (tg && tg.BackButton) tg.BackButton.onClick(() => { if (editing) closeEditor(); });
 
 // Changing the column count changes the width of every frame, and a crop is only pixels
 // once it meets a frame width -- so every card has to be repainted, not just re-flowed.
@@ -2291,7 +2152,6 @@ window.addEventListener("beforeunload", (event) => {
     $("tools").hidden = false;
     renderGrid();
     setColumns(columns);  // publishes --cols and lights the matching chip
-    openRequestedEntry();
   } catch (e) {
     $("sub").textContent = "";
     $("msg").hidden = false;

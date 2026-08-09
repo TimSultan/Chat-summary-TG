@@ -734,47 +734,6 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(list(voting.load_poll(CHAT, "2026-08-02").crops), ["a"])
 
-    async def test_a_crop_saved_in_the_editor_is_the_crop_the_bot_export_draws(self):
-        """The whole point of one crop store: framing a work in the Mini App must change
-        the picture /vote картинка renders, without the two being wired together by hand.
-
-        Proved in pixels rather than by comparing dicts -- a shared field that some other
-        renderer path quietly ignores would pass an equality check and still ship the
-        wrong picture.
-        """
-        from PIL import Image, ImageDraw
-        import vote_image
-
-        wide = Image.new("RGB", (1500, 500), (30, 30, 30))
-        ImageDraw.Draw(wide).rectangle([0, 0, 499, 499], fill=(220, 20, 20))
-        ImageDraw.Draw(wide).rectangle([1000, 0, 1499, 499], fill=(20, 120, 220))
-        directory = voting.media_path(CHAT, "2026-08-02")
-        directory.mkdir(parents=True, exist_ok=True)
-        wide.save(directory / "a.jpg", "JPEG")
-        self._seed_poll()
-
-        # Exactly what the board page's "Сохранить" posts: the right-hand blue square.
-        response = await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/crops", json={
-            "init_data": _init_data(self.admin_id),
-            "crops": {"a": {"x": 1000, "y": 0, "size": 500}},
-        })
-        self.assertEqual(response.status, 200)
-
-        # ...and now the OTHER export path -- the one bot_listener's /vote картинка uses,
-        # which never saw that request and only reads the stored poll.
-        out = voting.export_image_path(CHAT, "2026-08-02")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        vote_image.render_poll_image(
-            voting.load_poll(CHAT, "2026-08-02"), out, title="", subtitle="",
-        )
-        with Image.open(out) as image:
-            pixel = image.convert("RGB").load()[
-                vote_image.MARGIN + 180, vote_image.MARGIN + vote_image.THUMB_HEIGHT // 2
-            ]
-
-        self.assertGreater(pixel[2], 200, "the export ignored the saved crop")
-        self.assertLess(pixel[0], 60)
-
     async def test_a_non_admin_cannot_export(self):
         self._seed_poll()
         response = await self.client.post(
@@ -886,42 +845,6 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         data = await response.json()
         self.assertEqual(response.status, 200)
         self.assertEqual(data["columns"], 3)
-
-    async def test_moderation_offers_a_crop_button_under_every_work(self):
-        """The crop editor used to be reachable only by typing the /board URL."""
-        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
-        self.assertIn("cropButtonHtml(entry)", page)
-        self.assertIn('data-crop="', page)
-        # It leads to the board page, on that one work, rather than carrying its own editor.
-        self.assertIn('PREFIX + "/board?entry=" + encodeURIComponent(entryId)', page)
-
-    async def test_the_crop_button_belongs_to_moderation_and_not_to_a_voter(self):
-        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
-        marker = page.index("function cropButtonHtml")
-        body = page[marker:marker + 400]
-        self.assertIn("if (!poll.is_admin) return \"\";", body)
-
-    async def test_tapping_crop_commits_the_admitting_before_leaving(self):
-        """The board shows works the SERVER thinks are admitted, so a tick made a moment
-        ago has to be saved or the work would not be there to frame."""
-        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
-        marker = page.index("async function openCropPage")
-        body = page[marker:page.index("function renderReel")]
-        self.assertIn("await commitModeration()", body)
-        self.assertLess(body.index("await commitModeration()"), body.index("window.location.href"))
-
-    async def test_moderation_also_offers_the_whole_board_at_once(self):
-        """Before this the cropping page could only be reached by typing its URL."""
-        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
-        self.assertIn('id="board"', page)
-        self.assertIn('window.location.href = PREFIX + "/board";', page)
-
-    async def test_the_board_page_can_open_straight_onto_one_work(self):
-        page = await (await self.client.get(f"{vote_web.ROUTE_PREFIX}/board")).text()
-        self.assertIn('new URLSearchParams(location.search).get("entry")', page)
-        self.assertIn("openRequestedEntry()", page)
-        # ...and the way back to moderation, or the admin is stranded on the board.
-        self.assertIn("leaveForModeration", page)
 
     async def test_the_board_page_hides_its_editor_until_a_card_is_tapped(self):
         """The crop editor sets `display: flex` to lay itself out, which outranks the UA
