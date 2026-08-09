@@ -393,10 +393,12 @@ def _farm_feature_status(status: dict, feature: str) -> dict:
 
 
 def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
-    """Six-hour expedition, its one active-run lock, and every permanent upgrade.
+    """A player-chosen 1-8 hour expedition, its one active-run lock, and every permanent
+    upgrade.
 
-    Rewards are deliberately settled by the background worker, not by rendering this
-    screen.  Opening the menu therefore cannot pay a run twice or make a DM notification
+    Rewards are deliberately settled by the background worker (or, for an early recall, by
+    cancel_farm handing off to that same settlement path) rather than by rendering this
+    screen. Opening the menu therefore cannot pay a run twice or make a DM notification
     disappear after a restart.
     """
     pet = pets.get_pet(entry, user_id)
@@ -424,28 +426,39 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     if active:
         remaining = _farm_seconds_left(status)
-        lines.append(f"\n⏳ Питомец на ферме. Вернётся через <b>{_farm_duration(remaining)}</b>.")
-        lines.append("Пока он работает, в бои его не пускаем.")
+        planned = int(status.get("planned_hours") or 0)
+        worked = int(status.get("worked_hours") or 0)
+        lines.append(
+            f"\n⏳ Питомец на ферме ({planned} ч). Вернётся через <b>{_farm_duration(remaining)}</b>."
+        )
+        # No more attack immunity: a farming pet cannot pick a fight itself, but it is an
+        # ordinary target for everyone else's.
+        lines.append("Сам он в бой не пойдёт, пока работает, — но напасть на него можно.")
+        lines.append(f"Полностью отработано: {worked} ч из {planned}.")
         reward = status.get("reward") or {}
         if reward:
             lines.append(
                 f"Смена принесёт: 🪙 {_money(int(reward.get('gold', 0) or 0))} · "
                 f"✨ {int(reward.get('xp', 0) or 0)} опыта."
             )
+        lines.append("Забрать раньше срока можно — но заплатит смена только за целые отработанные часы.")
     elif status.get("ready"):
         lines.append("\n✅ Смена закончилась. Награда уже едет в личные сообщения.")
     else:
-        duration_hours = int(status.get("duration_hours", 6) or 6)
-        gold = int(status.get("estimated_gold", status.get("gold_reward", 0)) or 0)
-        experience = int(status.get("estimated_xp", status.get("xp_reward", 0)) or 0)
         if level <= 0:
-            lines.append("\nСначала построй ферму. Первый уровень откроет шестичасовые смены.")
+            lines.append("\nСначала построй ферму. Первый уровень откроет смены от 1 до 8 часов.")
         else:
-            lines.append(f"\nОтправь питомца на {duration_hours} ч: он принесёт монеты и опыт.")
-        if gold or experience:
-            lines.append(f"Ожидаемо: 🪙 {_money(gold)} · ✨ {experience} опыта.")
-        drop_chance = round(float(status.get("drop_chance", 0.0) or 0.0) * 100)
-        lines.append(f"Шанс привезти случайную вещь из поля: {drop_chance}%.")
+            lines.append(
+                "\nВыбери длину смены: чем дольше пропадает питомец, тем больше монет, "
+                "опыта и шанс привезти находку получше."
+            )
+            lines.append("<i>смена — 🪙 монет · ✨ опыта · 🎁 шанс находки</i>")
+            for row in status.get("hour_previews", []):
+                drop_pct = float(row.get("drop_chance", 0.0) or 0.0) * 100
+                lines.append(
+                    f"{row['hours']} ч — 🪙 {_money(int(row['gold']))} · "
+                    f"✨ {int(row['xp'])} · 🎁 {drop_pct:g}%"
+                )
 
     next_cost = status.get("next_level_cost")
     if level < max_level:
@@ -472,9 +485,23 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines.append(f"\n🪙 У тебя: {_money(coins)}")
     rows = []
     if status.get("can_start"):
+        # Four per row -- two rows of four -- so all eight choices fit without a single
+        # row running past what Telegram comfortably shows on a phone.
+        hour_row = []
+        for hours in C.FARM_HOUR_CHOICES:
+            hour_row.append({
+                "text": f"{hours} ч",
+                "callback_data": callback_data(user_id, "farmstart", str(hours)),
+            })
+            if len(hour_row) == 4:
+                rows.append(hour_row)
+                hour_row = []
+        if hour_row:
+            rows.append(hour_row)
+    if status.get("can_cancel"):
         rows.append([{
-            "text": "🌾 Отправить на ферму — 6 ч",
-            "callback_data": callback_data(user_id, "farmstart"),
+            "text": "❌ Забрать сейчас",
+            "callback_data": callback_data(user_id, "farmcancel"),
         }])
     if level < max_level:
         cost_text = f" — {_money(int(next_cost))}" if next_cost is not None else ""
@@ -623,6 +650,17 @@ def parse_slot_argument(argument: str) -> tuple[str, int]:
     return slot, int(raw_page) if raw_page.isdecimal() else 0
 
 
+def _buyable_here(item, daily_weapon_codes) -> bool:
+    """Whether tapping "Купить" on this item would work right now.
+
+    Shared by the sort key below and the button-rendering loop so the two can never
+    disagree: a weapon is only really for sale while it sits in today's ten-item
+    window (see ``daily_storefront_weapons``); every other shop item is always for
+    sale, since amulets/gloves/boots have no rotating storefront.
+    """
+    return item.source == "shop" and (item.slot != "weapon" or item.code in daily_weapon_codes)
+
+
 def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[str, dict]:
     """Everything that can go in one slot: what is worn, what is owned, what is for sale
     and what can only drop. The drop-only items are listed with no button on purpose --
@@ -638,16 +676,35 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
     worn = (pet.get("equipped") or {}).get(slot)
     daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry, pets.today())}
 
-    # Owned gear must stay reachable even when its catalogue code lives on page 63.
-    # Equipped first, then the rest of the bag, then unowned catalogue stock.
+    # Owned gear must stay reachable even when its catalogue code lives on page 63, so it
+    # keeps the first two sort tiers. But an amulet/gloves/boots catalogue is otherwise
+    # ~30 drop-only trophies to 2 shop items, and those trophies' codes ("amulet_...",
+    # "bt..", "gl..") often sort ahead of the shop items' names -- "bead" and "springs"
+    # landed on page 4+ behind a wall of "только из боёв" entries nobody could buy, which
+    # read in production as "the shop only sells weapons". Buyable-right-now stock is now
+    # its own tier ahead of everything drop-only, so a player who taps into an empty slot
+    # always sees something with a working "Купить" button on page one.
     all_items = sorted(
         C.items_for_slot(slot),
-        key=lambda item: (item.code != worn, item.code not in owned, item.code),
+        key=lambda item: (
+            item.code != worn,
+            item.code not in owned,
+            not _buyable_here(item, daily_weapon_codes),
+            item.code,
+        ),
     )
     total_pages = max(1, (len(all_items) + SLOT_PAGE_SIZE - 1) // SLOT_PAGE_SIZE)
     page = min(max(0, page), total_pages - 1)
     visible = all_items[page * SLOT_PAGE_SIZE:(page + 1) * SLOT_PAGE_SIZE]
     lines = [f"{C.SLOT_EMOJI[slot]} <b>{escape(C.SLOT_NAMES[slot])}</b> · {page + 1}/{total_pages}\n"]
+    if not any(item.code not in owned and _buyable_here(item, daily_weapon_codes) for item in all_items):
+        # Everything purchasable is either already owned or (for weapons) off today's
+        # window -- say so once, up top, instead of letting a page full of "только из
+        # боёв" entries imply the shop sells nothing here at all.
+        lines.append(
+            "Сейчас купить здесь нечего: то, что продаётся, уже у тебя в сумке, "
+            "а остальное — трофеи только из боёв.\n"
+        )
     rows = []
     for item in visible:
         mark = " ✅" if item.code == worn else ""
@@ -688,9 +745,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
                 "text": f"💰 Продать · {_money(C.resale_value(item))}",
                 "callback_data": callback_data(user_id, "sell", item.code),
             }])
-        elif item.source == "shop" and (
-            item.slot != "weapon" or item.code in daily_weapon_codes
-        ):
+        elif _buyable_here(item, daily_weapon_codes):
             rows.append([{
                 "text": f"Купить {item.name} — {_money(item.price)}",
                 "callback_data": callback_data(user_id, "buy", item.code),
@@ -1053,7 +1108,10 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
     )
     if farming:
-        lines.append("\n🌾 Питомец на ферме — арена подождёт, пока он не вернётся.")
+        lines.append(
+            "\n🌾 Питомец на ферме — сам он подождёт с боями, но напасть на него "
+            "по-прежнему можно."
+        )
     elif left <= 0:
         lines.append(f"\n<b>{ARENA_NO_FIGHTS_NOTICE}</b>")
         lines.append("Следующий бой появится после указанного выше отсчёта.")

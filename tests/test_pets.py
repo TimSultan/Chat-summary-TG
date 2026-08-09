@@ -10,6 +10,7 @@ import economy
 import pets
 import pets_config
 import pets_ui
+import pets_weapon_catalog
 import stats
 
 
@@ -777,6 +778,40 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertIn(pets_ui.callback_data("1", "gift", late.code), callbacks)
         self.assertIn(pets_ui.callback_data("1", "sell", late.code), callbacks)
 
+    def test_accessory_slot_view_first_page_has_a_buy_button_when_nothing_is_owned(self):
+        """The production bug this guards: amulet/gloves/boots each have ~30 drop-only
+        catalogue entries against 2 purchasable shop items, and the drop-only codes
+        ("amulet_...", "bt..", "gl..") mostly sort ahead of the shop items' names. An
+        owner-less player opening any of the three tabs saw several pages of "только из
+        боёв" before ever reaching a working "Купить" button, which read like the shop
+        sold nothing but weapons. Purchasable stock must now win its own sort tier and
+        land on page one regardless of how its code compares to the drop-only pool."""
+        self._two_pets()
+        for slot in ("amulet", "gloves", "boots"):
+            self.assertTrue(pets_config.items_for_slot(slot, "shop"), slot)
+            text, keyboard = pets_ui.slot_view("chat", "1", 0, slot, 0)
+            buy_callbacks = [
+                button["callback_data"]
+                for row in keyboard["inline_keyboard"] for button in row
+                if pets_ui.parse_callback(button["callback_data"])[1] == "buy"
+            ]
+            self.assertTrue(buy_callbacks, f"no buy button on page 1 of the {slot} slot:\n{text}")
+            self.assertNotIn("Сейчас купить здесь нечего", text)
+
+    def test_buy_accessory_lands_in_inventory_for_every_non_weapon_slot(self):
+        """pets.buy_item's own logic already worked for accessories before this fix --
+        only slot_view's ordering hid the button. Exercise the full purchase path
+        end-to-end anyway, so a future change to buy_item's weapon-only branches (the
+        daily-window and single-owner checks) cannot silently break accessories again."""
+        self._two_pets()
+        for slot in ("amulet", "gloves", "boots"):
+            item = next(iter(pets_config.items_for_slot(slot, "shop")))
+            economy.grant("chat", "1", item.price, "test")
+            ok, note = pets.buy_item("chat", "1", 0, item.code)
+            self.assertTrue(ok, note)
+            self.assertIn(item.code, pets.get_pet("chat", "1")["inventory"])
+            self.assertTrue(pets.equip("chat", "1", item.code)[0])
+
     def test_equipment_hub_routes_to_owned_bag_and_daily_shop(self):
         self._two_pets()
         text, keyboard = pets_ui.bag_view("chat", "1", 0)
@@ -908,6 +943,28 @@ class StorefrontAndCollectionTests(PetsTestCase):
             item.source == "drop" and item.price == 0
             for item in weapons if item.rarity == "legendary"
         ))
+
+    def test_every_shop_item_prices_like_its_power_and_rarity_not_its_catalogue(self):
+        """Regression guard for the pre-2026-08 accessory prices: bead/acorn/mittens/
+        claws/slippers/springs were hand-picked numbers up to 1,100 coins against a
+        5-10 gold arena win, wildly out of scale with a comparable weapon. Every
+        source == "shop" item -- weapon or accessory -- must price exactly the way
+        pets_weapon_catalog.shop_price_for_bonuses would price a weapon of the same
+        rarity and the same stat bonuses, so a future hand-added item cannot silently
+        reintroduce a three-figure accessory."""
+        shop_items = [item for item in pets_config.ITEMS if item.source == "shop"]
+        self.assertTrue(shop_items)
+        # 6 accessories (bead/acorn/mittens/claws/slippers/springs) plus the weapon
+        # catalogue's 375 shop weapons (250 common + 120 uncommon + 5 rare).
+        self.assertEqual(len(shop_items), 381)
+        for item in shop_items:
+            expected = pets_weapon_catalog.shop_price_for_bonuses(item.rarity, item.bonuses.items())
+            self.assertEqual(
+                item.price, expected,
+                f"{item.code} costs {item.price}, expected {expected} for a "
+                f"{item.rarity} item with bonuses {item.bonuses}",
+            )
+            self.assertLessEqual(item.price, 195, f"{item.code} is priced off-scale")
 
     def test_core_purchase_refuses_weapon_outside_daily_window(self):
         entry = "shop-chat"
@@ -1626,36 +1683,241 @@ class FarmTests(PetsTestCase):
             self.assertFalse(pets.upgrade_farm_feature("farm", "1", 0, key)[0])
         status = pets.farm_status("farm", "1")
         self.assertTrue(all(spec["level"] == 1 for spec in status["features"].values()))
-        self.assertEqual(status["drop_chance"], pets_config.FARM_DROP_CHANCE + 0.05)
+        # `drop_chance` is the six-hour-anchor row of hour_previews, kept for backward
+        # compatibility -- beds' +0.05 still applies on top of that anchor's base rate.
+        self.assertEqual(status["drop_chance"], pets_config.FARM_DROP_CHANCE_BY_HOURS[6] + 0.05)
 
     def test_due_run_without_id_is_recovered_and_cannot_block_the_pet(self):
+        """A run that merely lost its `run_id` (hours/level/features intact) keeps its
+        full, normally-rolled payout -- only a run with nothing usable at all falls back
+        to a zeroed stub. See _repair_farm_run_id."""
         entry, start = "farm", datetime(2026, 8, 1, 10)
         self._build_farm(entry)
         self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
         data = pets._load(entry)
-        reward = dict(data["pets"]["1"]["farm_run"]["reward"])
-        data["pets"]["1"]["farm_run"].pop("run_id")
+        run = data["pets"]["1"]["farm_run"]
+        expected = pets._farm_reward(data, data["pets"]["1"], run)
+        del data["pets"]["1"]["farm_run"]["run_id"]
         pets._save(entry, data)
 
         receipt = pets.settle_completed_farms(entry, start + timedelta(hours=6))[0]
         self.assertTrue(receipt["run_id"].startswith("recovered-"))
-        self.assertEqual(receipt["gold"], reward["gold"])
+        self.assertEqual(receipt["gold"], expected["gold"])
+        self.assertEqual(receipt["hours"], 6)
         self.assertFalse(pets.farm_status(entry, "1", start + timedelta(hours=6))["running"])
         self.assertTrue(pets.start_farm(entry, "1", now=start + timedelta(hours=6))[0])
 
-    def test_farming_pet_cannot_attack_or_be_dealt_as_opponent(self):
+    def test_due_run_with_nothing_usable_settles_to_a_conservative_zero(self):
+        """The narrower case _repair_farm_run_id's docstring warns about: no run_id, no
+        reward, and no hours/level/features snapshot either -- genuinely blank, not just
+        missing an id. It must not invent a payout."""
+        entry, start = "farm", datetime(2026, 8, 1, 10)
+        self._build_farm(entry)
+        self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
+        data = pets._load(entry)
+        run = data["pets"]["1"]["farm_run"]
+        del run["run_id"]
+        run.pop("hours", None)
+        run.pop("level", None)
+        run.pop("features", None)
+        pets._save(entry, data)
+
+        before_gold = economy.balance(entry, "1", 0)
+        receipt = pets.settle_completed_farms(entry, start + timedelta(hours=6))[0]
+        self.assertEqual(receipt["gold"], 0)
+        self.assertIsNone(receipt["item_code"])
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold)
+
+    def test_farming_pet_cannot_attack_but_can_be_attacked(self):
+        """A farming pet lost its old, blanket attack immunity: it still cannot start a
+        fight itself, but it is now a perfectly ordinary, attackable defender -- see the
+        _is_farming_record call sites in claim_duel/can_attack_in_arena/find_opponent/
+        record_fight."""
         entry, start = "farm", datetime(2026, 8, 1, 10)
         self._build_farm(entry, "1")
         self._tame(entry, "2")
         self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
         with patch("pets.app_now", return_value=start):
+            # "1" is away: it cannot be the ATTACKER, in either pairing. `attackable_only`
+            # is what routes find_opponent through can_attack_in_arena for the SEEKER.
             self.assertFalse(pets.can_attack_in_arena(entry, "1", "2", start.date()))
-            self.assertFalse(pets.can_attack_in_arena(entry, "2", "1", start.date()))
-            self.assertIsNone(pets.find_opponent(entry, "2", rng=random.Random(1)))
+            self.assertIsNone(
+                pets.find_opponent(entry, "1", rng=random.Random(1), attackable_only=True)
+            )
             self.assertFalse(pets.claim_duel(entry, "1", "2", now=start)[0])
-            result = SimpleNamespace(winner="1", loser="2")
             with self.assertRaises(ValueError):
-                pets.record_fight(entry, "1", "2", result, start.date())
+                pets.record_fight(entry, "1", "2", SimpleNamespace(winner="1", loser="2"), start.date())
+
+            # "2" can still find, duel and defeat "1" while it is farming.
+            self.assertTrue(pets.can_attack_in_arena(entry, "2", "1", start.date()))
+            self.assertEqual(
+                pets.find_opponent(entry, "2", rng=random.Random(1), attackable_only=True), "1"
+            )
+            self.assertTrue(pets.claim_duel(entry, "2", "1", now=start)[0])
+            outcome = pets.record_fight(
+                entry, "2", "1", SimpleNamespace(winner="2", loser="1"), start.date(),
+            )
+            self.assertIsInstance(outcome, dict)
+            # The farm lock itself is untouched by having been attacked.
+            self.assertTrue(pets.is_farming(entry, "1", start))
+
+    # ---------------------------------------------------------- 1-8 hour duration choice
+
+    def test_gold_and_xp_formulas_are_monotonic_across_all_eight_durations(self):
+        """farm_gold_for/farm_xp_for are the one place the duration formula is written;
+        every level must see a longer shift pay at least as much as a shorter one, with
+        the two endpoints genuinely different (not a flat table)."""
+        for level in range(1, pets_config.FARM_MAX_LEVEL + 1):
+            gold = [pets_config.farm_gold_for(level, hours) for hours in pets_config.FARM_HOUR_CHOICES]
+            xp = [pets_config.farm_xp_for(level, hours) for hours in pets_config.FARM_HOUR_CHOICES]
+            self.assertEqual(gold, sorted(gold), f"gold not monotonic at level {level}: {gold}")
+            self.assertEqual(xp, sorted(xp), f"xp not monotonic at level {level}: {xp}")
+            self.assertLess(gold[0], gold[-1])
+            self.assertLess(xp[0], xp[-1])
+        # The six-hour anchor is untouched by the rebalance.
+        self.assertEqual(pets_config.farm_gold_for(1, 6), pets_config.FARM_GOLD_PER_RUN[1])
+        self.assertEqual(pets_config.farm_xp_for(1, 6), pets_config.FARM_XP_PER_RUN[1])
+
+    def test_hour_previews_are_monotonic_in_gold_xp_and_drop_chance(self):
+        entry = "farm-previews"
+        self._build_farm(entry, level=6)
+        total = sum(spec["cost"] for spec in pets_config.FARM_FEATURES.values())
+        economy.grant(entry, "1", total, "test")
+        for key in pets_config.FARM_FEATURES:
+            self.assertTrue(pets.upgrade_farm_feature(entry, "1", 0, key)[0])
+        previews = pets.farm_status(entry, "1")["hour_previews"]
+        self.assertEqual([row["hours"] for row in previews], list(pets_config.FARM_HOUR_CHOICES))
+        gold = [row["gold"] for row in previews]
+        xp = [row["xp"] for row in previews]
+        drop = [row["drop_chance"] for row in previews]
+        self.assertEqual(gold, sorted(gold))
+        self.assertEqual(xp, sorted(xp))
+        self.assertEqual(drop, sorted(drop))
+        self.assertLess(gold[0], gold[-1])
+        self.assertLess(xp[0], xp[-1])
+        self.assertLess(drop[0], drop[-1])
+
+    def test_drop_chance_table_rises_with_hours_and_keeps_the_six_hour_anchor(self):
+        chances = [pets_config.FARM_DROP_CHANCE_BY_HOURS[hours] for hours in pets_config.FARM_HOUR_CHOICES]
+        self.assertEqual(chances, sorted(chances))
+        self.assertLess(chances[0], chances[-1])
+        self.assertEqual(pets_config.FARM_DROP_CHANCE_BY_HOURS[6], 0.03)
+
+    def test_legendary_is_impossible_under_seven_hours_and_reachable_at_eight(self):
+        """FARM_LOOT_RARITY_WEIGHTS omits "legendary" below 7 hours entirely, so this is a
+        structural guarantee, not a probabilistic one -- checked here with enough seeds per
+        length to catch a regression that accidentally reintroduced it."""
+        entry = "farm-legendary"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        for hours in range(pets_config.FARM_MIN_HOURS, 7):
+            for seed in range(60):
+                # chance=1.0 forces the "something was found" branch every single call.
+                found = pets._farm_item_for(data, record, random.Random(seed), hours, 1.0)
+                self.assertFalse(
+                    found is not None and found.rarity == "legendary",
+                    f"legendary rolled at {hours}h, seed {seed}",
+                )
+        legendary_seen = any(
+            (found := pets._farm_item_for(data, record, random.Random(seed), 8, 1.0)) is not None
+            and found.rarity == "legendary"
+            for seed in range(500)
+        )
+        self.assertTrue(legendary_seen, "no legendary rolled across 500 seeds at 8 hours")
+
+    def test_farm_loot_can_include_a_weapon_never_owned_by_anyone_in_the_chat(self):
+        """The old restriction ("never a chat-unique weapon") is gone now that loot rolls
+        at settlement; the chat-wide ownership rule it was protecting is not."""
+        entry = "farm-weapon-loot"
+        self._tame(entry, "1")
+        self._tame(entry, "2")
+        data = pets._load(entry)
+        # Give "2" every legendary drop-only weapon (there are only 5) so any legendary
+        # roll for "1" is forced to fall back -- while the 45 drop-only rares stay free,
+        # so a weapon can still be found, just never one of these codes.
+        owned_elsewhere = [
+            item.code for item in pets_config.ITEMS
+            if item.source == "drop" and item.slot == "weapon" and item.rarity == "legendary"
+        ]
+        data["pets"]["2"]["inventory"] = owned_elsewhere
+        pets._save(entry, data)
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        found_any_weapon = False
+        for seed in range(400):
+            found = pets._farm_item_for(data, record, random.Random(seed), 8, 1.0)
+            if found is not None and found.slot == "weapon":
+                found_any_weapon = True
+                self.assertNotIn(found.code, owned_elsewhere)
+        self.assertTrue(found_any_weapon, "no weapon ever rolled across 400 seeds at 8 hours")
+
+    # -------------------------------------------------------------------- cancelling early
+
+    def test_cancel_at_two_hours_thirty_five_minutes_pays_exactly_two_hours(self):
+        entry, start = "farm-cancel", datetime(2026, 8, 1, 10)
+        self._build_farm(entry, level=3)
+        self.assertTrue(pets.start_farm(entry, "1", 6, now=start)[0])
+        cancel_at = start + timedelta(hours=2, minutes=35)
+        before_gold = economy.balance(entry, "1", 0)
+        ok, message = pets.cancel_farm(entry, "1", now=cancel_at)
+        self.assertTrue(ok, message)
+        self.assertIn("2 из 6 ч", message)
+        self.assertFalse(pets.is_farming(entry, "1", cancel_at))
+        self.assertFalse(pets.farm_status(entry, "1", cancel_at)["running"])
+        # Paid at the SHORT (2 h) rate, not a 2/6 proration of the 6 h payout.
+        expected_gold = pets_config.farm_gold_for(3, 2)
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold + expected_gold)
+
+    def test_cancel_under_one_hour_pays_nothing_but_still_ends_the_shift(self):
+        entry, start = "farm-cancel-short", datetime(2026, 8, 1, 10)
+        self._build_farm(entry, level=2)
+        self.assertTrue(pets.start_farm(entry, "1", 4, now=start)[0])
+        before_gold = economy.balance(entry, "1", 0)
+        ok, message = pets.cancel_farm(entry, "1", now=start + timedelta(minutes=45))
+        self.assertTrue(ok, message)
+        self.assertIn("меньше часа", message)
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold)
+        self.assertFalse(pets.is_farming(entry, "1", start + timedelta(minutes=45)))
+
+    def test_cancel_refuses_when_nothing_is_running_or_already_ready(self):
+        entry, start = "farm-cancel-refuse", datetime(2026, 8, 1, 10)
+        self._build_farm(entry)
+        self.assertFalse(pets.cancel_farm(entry, "1", now=start)[0])
+        self.assertTrue(pets.start_farm(entry, "1", 1, now=start)[0])
+        ready_at = start + timedelta(hours=1)
+        self.assertFalse(pets.cancel_farm(entry, "1", now=ready_at)[0])
+
+    # ------------------------------------------------------------------------- settlement
+
+    def test_settlement_is_idempotent_and_reproducible_for_an_hour_scaled_run(self):
+        """Two guarantees a retried settlement relies on: (1) recomputing a still-persisted
+        run's reward from scratch -- as a genuine crash-before-clear retry would -- must
+        reproduce the identical numbers rather than re-rolling, and (2) once the run is
+        cleared, calling settle_completed_farms again must mint nothing further."""
+        entry, start = "farm-idempotent", datetime(2026, 8, 1, 10)
+        self._build_farm(entry, level=4)
+        self.assertTrue(pets.start_farm(entry, "1", 5, now=start)[0])
+        finish = start + timedelta(hours=5)
+
+        data = pets._load(entry)
+        run = data["pets"]["1"]["farm_run"]
+        reroll = pets._farm_reward(pets._load(entry), pets._load(entry)["pets"]["1"], dict(run))
+
+        before_gold = economy.balance(entry, "1", 0)
+        receipts = pets.settle_completed_farms(entry, finish)
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertGreater(receipt["gold"], 0)
+        self.assertEqual(receipt["hours"], 5)
+        self.assertEqual(receipt["gold"], reroll["gold"])
+        self.assertEqual(receipt["xp"], reroll["xp"])
+        self.assertEqual(receipt["item_code"], reroll["item_code"])
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold + receipt["gold"])
+
+        # The run is now cleared; a repeat call must find nothing due and mint nothing more.
+        self.assertEqual(pets.settle_completed_farms(entry, finish + timedelta(hours=1)), [])
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold + receipt["gold"])
 
 
 class MiscApiTests(PetsTestCase):

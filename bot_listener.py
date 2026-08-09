@@ -5966,7 +5966,21 @@ async def handle_pets_callback(
             )
             return
         if action == "farmstart":
-            ok, note = pets.start_farm(entry, user_id)
+            # An unparseable/missing argument (a stale button from before this feature, a
+            # malformed replay) must not crash the callback -- fall back to the six-hour
+            # anchor rather than refusing the tap outright; start_farm still rejects
+            # anything outside 1-8 on its own.
+            try:
+                hours = int(argument)
+            except (TypeError, ValueError):
+                hours = C.FARM_DURATION_HOURS
+            ok, note = pets.start_farm(entry, user_id, hours)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
+        if action == "farmcancel":
+            ok, note = pets.cancel_farm(entry, user_id)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
@@ -6176,11 +6190,13 @@ async def _pets_toast_and_redraw(api, chat_id, message_id, note: str, rendered, 
 
 
 def _pets_farm_return_text(receipt: dict) -> str:
-    """Format a persistent private notification for a completed farm trip."""
+    """Format a persistent private notification for a completed (or cancelled) farm trip."""
     name = html.escape(str(receipt.get("pet_name") or "Ваш питомец"))
     gold = int(receipt.get("gold", receipt.get("coins", 0)) or 0)
     experience = int(receipt.get("xp", receipt.get("experience", 0)) or 0)
-    lines = [f"🌾 Ваш питомец <b>{name}</b> вернулся с фермы!"]
+    hours = int(receipt.get("hours", 0) or 0)
+    shift_label = f" ({hours} ч)" if hours else ""
+    lines = [f"🌾 Ваш питомец <b>{name}</b> вернулся с фермы{shift_label}!"]
     lines.append(f"Принёс: 🪙 {gold:,} · ✨ {experience} опыта.".replace(",", "."))
     item = receipt.get("item") or receipt.get("item_code") or receipt.get("dropped_item")
     if isinstance(item, dict):

@@ -696,51 +696,117 @@ def _farm_features(record: dict) -> dict[str, bool]:
     return {key: bool(raw.get(key)) for key in C.FARM_FEATURES}
 
 
-def _farm_multipliers(record: dict) -> tuple[float, float, float]:
-    """Gold, pet-XP and item-find terms for one farm run."""
-    gold, pet_xp, drop = 1.0, 1.0, C.FARM_DROP_CHANCE
-    for key, owned in _farm_features(record).items():
+def _farm_multipliers(features: dict, hours: int) -> tuple[float, float, float]:
+    """Gold, pet-XP and item-find terms for one farm run of the given length.
+
+    `features` is a plain {key: bool} mapping -- either the record's LIVE farm_features
+    (for a not-yet-started preview) or the SNAPSHOT stored on an active run (so an upgrade
+    bought while the pet is away affects only the next trip, not the one in progress).
+    """
+    gold, pet_xp = 1.0, 1.0
+    drop = C.FARM_DROP_CHANCE_BY_HOURS[max(0, min(C.FARM_MAX_HOURS, int(hours)))]
+    for key, owned in (features or {}).items():
         if not owned:
             continue
-        feature = C.FARM_FEATURES[key]
+        feature = C.FARM_FEATURES.get(key)
+        if not feature:
+            continue
         gold *= float(feature.get("gold_multiplier", 1.0))
         pet_xp *= float(feature.get("xp_multiplier", 1.0))
         drop += float(feature.get("drop_bonus", 0.0))
     return gold, pet_xp, min(1.0, drop)
 
 
-def _farm_item_for(data: dict, record: dict, rng: random.Random, chance: float):
-    """Pick a deterministic personal accessory find, never a chat-unique weapon.
+# Rarity is checked from richest to plainest so a fallback always lands on something more
+# common, never something rarer than what was actually rolled.
+_FARM_RARITY_FALLBACK_ORDER = ("legendary", "rare", "uncommon", "common")
 
-    A farm locks the pet out of arena drops, but equipment may still be gifted while it
-    is away.  Restricting finds to accessories keeps the reservation-free farm job from
-    racing the chat-wide one-copy weapon catalogue.
+
+def _farm_item_for(
+    data: dict, record: dict, rng: random.Random, hours: int, chance: float,
+    claimed_weapon_codes: frozenset[str] = frozenset(),
+):
+    """Roll a farm find: rarity first (hours-scaled), then an eligible item of that rarity.
+
+    Loot is now rolled at settlement time rather than pre-reserved at start_farm, so the
+    original reason weapons were excluded from farm drops -- avoiding a race with the
+    chat-wide one-copy weapon catalogue -- no longer applies. The uniqueness rule itself
+    still applies without exception: a weapon already owned by ANYONE in the chat, or
+    already claimed earlier in the SAME settlement batch (`claimed_weapon_codes`, since
+    settle_completed_farms can pay out several pets' runs in one pass before any of them
+    is saved), can never be handed out here.
     """
     if rng.random() >= chance:
         return None
-    owned = set(record.get("inventory", []))
-    pool = [
-        item for item in C.ITEMS
-        if item.source == "drop" and item.slot != "weapon" and item.code not in owned
-    ]
-    if not pool:
+    weights = C.FARM_LOOT_RARITY_WEIGHTS.get(int(hours))
+    if not weights:
         return None
-    weighted = [
-        item for item in pool for _ in range(max(0, int(getattr(item, "drop_weight", 1))))
-    ]
-    return rng.choice(weighted) if weighted else None
+    order = [rarity for rarity in _FARM_RARITY_FALLBACK_ORDER if rarity in weights]
+    if not order:
+        return None
+    picked = rng.choices(order, weights=[weights[rarity] for rarity in order], k=1)[0]
+    owned = set(record.get("inventory", []))
+    start = _FARM_RARITY_FALLBACK_ORDER.index(picked)
+    for rarity in _FARM_RARITY_FALLBACK_ORDER[start:]:
+        pool = [
+            item for item in C.ITEMS
+            if item.source == "drop" and item.rarity == rarity and item.code not in owned
+            and (
+                item.slot != "weapon"
+                or (item.code not in claimed_weapon_codes and not _weapon_owner_ids(data, item.code))
+            )
+        ]
+        if not pool:
+            continue
+        weighted = [
+            item for item in pool for _ in range(max(0, int(getattr(item, "drop_weight", 1))))
+        ]
+        if weighted:
+            return rng.choice(weighted)
+    return None
 
 
-def _farm_reward(data: dict, record: dict, run_id: str) -> dict:
-    level = min(max(1, int(record.get("farm_level", 0))), C.FARM_MAX_LEVEL)
-    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(record)
-    # The run id is persisted before the pet leaves.  Thus an interrupted poll/retry
-    # cannot reroll either rewards or the found item.
-    rng = random.Random(run_id)
-    found = _farm_item_for(data, record, rng, drop_chance)
+def _farm_run_hours(run: dict) -> int:
+    """The shift length this run pays for.
+
+    This is the field cancel_farm overwrites with the hours actually worked, so it is NOT
+    always the originally chosen length. It is missing entirely only on a run persisted
+    before this feature shipped, and every one of those was a fixed six-hour shift -- so a
+    missing field means exactly that, never "unknown".
+    """
+    try:
+        hours = int(run.get("hours", C.FARM_DURATION_HOURS))
+    except (TypeError, ValueError):
+        hours = C.FARM_DURATION_HOURS
+    return max(0, min(C.FARM_MAX_HOURS, hours))
+
+
+def _farm_reward(data: dict, record: dict, run: dict, claimed_weapon_codes: frozenset[str] = frozenset()) -> dict:
+    """Roll gold/xp/a find for one completed (or cancelled) shift.
+
+    `level` and `features` are read from the RUN, not the live record: start_farm snapshots
+    both when the pet leaves, so an upgrade bought while it is away changes only the next
+    trip. The RNG is seeded from (run_id, hours) rather than run_id alone -- cancel_farm
+    overwrites `hours` with whatever was actually worked, and that shorter shift must get
+    its OWN reproducible roll rather than replaying what the full planned shift would have
+    paid. Seeding this way (rather than storing the rolled reward up front, as before) is
+    what makes retrying a crashed settlement safe: reload the same run, get the same seed,
+    get the same gold/xp/item every time.
+    """
+    hours = _farm_run_hours(run)
+    if hours <= 0:
+        # Cancelling before a single whole hour has elapsed is allowed, but pays nothing --
+        # there is deliberately no partial-hour credit, and no loot roll to go with it.
+        return {"gold": 0, "xp": 0, "item_code": None}
+    run_id = str(run.get("run_id") or "")
+    level = min(max(1, int(run.get("level", 1) or 1)), C.FARM_MAX_LEVEL)
+    features = run.get("features") if isinstance(run.get("features"), dict) else {}
+    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours)
+    rng = random.Random(f"{run_id}:{hours}")
+    found = _farm_item_for(data, record, rng, hours, drop_chance, claimed_weapon_codes)
     return {
-        "gold": max(1, round(C.FARM_GOLD_PER_RUN[level] * gold_multiplier)),
-        "xp": max(1, round(C.FARM_XP_PER_RUN[level] * xp_multiplier)),
+        "gold": C.farm_gold_for(level, hours, gold_multiplier),
+        "xp": C.farm_xp_for(level, hours, xp_multiplier),
         "item_code": found.code if found is not None else None,
     }
 
@@ -757,19 +823,28 @@ def _repair_farm_run_id(user_id: str, run: dict) -> str:
     """Give a malformed historic run a stable id before any payout is attempted.
 
     A missing run id used to make a due job invisible forever.  This id is derived only
-    from persisted fields, so every retry chooses the same `grant_once` key.  A damaged
-    reward is conservatively repaired to zero rather than inventing a payout.
+    from persisted fields, so every retry chooses the same `grant_once` key.
+
+    What happens to the payout depends on what else survived. A pre-rebalance run always
+    carried a pre-rolled `reward` dict -- sanitise it (a damaged one is conservatively
+    repaired to zero rather than inventing a payout) and settle_completed_farms will pay it
+    verbatim, untouched by any later rebalance of the hour-scaled formula. A post-rebalance
+    run that merely lost its id still has its `hours`/`level`/`features` snapshot intact, so
+    it is left alone and rolls its reward normally at settlement. Only a run with NEITHER --
+    genuinely blank, not just missing an id -- falls back to a zeroed, six-hour-shaped stub.
     """
     material = "|".join((str(user_id), str(run.get("started_at") or ""), str(run.get("ready_at") or "")))
     run["run_id"] = "recovered-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
     reward = run.get("reward")
-    if not isinstance(reward, dict):
-        reward = {}
-    run["reward"] = {
-        "gold": max(0, int(reward.get("gold", 0) or 0)),
-        "xp": max(0, int(reward.get("xp", 0) or 0)),
-        "item_code": reward.get("item_code") if C.find_item(reward.get("item_code")) else None,
-    }
+    if isinstance(reward, dict):
+        run["reward"] = {
+            "gold": max(0, int(reward.get("gold", 0) or 0)),
+            "xp": max(0, int(reward.get("xp", 0) or 0)),
+            "item_code": reward.get("item_code") if C.find_item(reward.get("item_code")) else None,
+        }
+    elif "hours" not in run:
+        run["hours"] = C.FARM_DURATION_HOURS
+        run["reward"] = {"gold": 0, "xp": 0, "item_code": None}
     return run["run_id"]
 
 
@@ -781,19 +856,20 @@ def _is_farming_record(record: dict | None, moment: datetime | None = None) -> b
 
 
 def is_farming(entry, user_id, now: datetime | None = None) -> bool:
-    """Whether the pet is still inside its exact six-hour farm shift."""
+    """Whether the pet is still inside its current farm shift (any chosen length)."""
     return _is_farming_record(_tamed_record(_load(entry), user_id), now)
 
 
 def farm_status(entry, user_id, now: datetime | None = None) -> dict:
     """Read-only UI status for the Farm button and scheduler.
 
-    ``running`` means the six-hour lock is active. ``ready`` means a completed job is
-    awaiting settlement; callers should invoke :func:`settle_completed_farms` instead
-    of treating it as a second collect button.
+    ``running`` means the pet's current shift is still locked in. ``ready`` means a
+    completed job is awaiting settlement; callers should invoke
+    :func:`settle_completed_farms` instead of treating it as a second collect button.
     """
     moment = now or app_now()
-    record = _tamed_record(_load(entry), user_id)
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
     if record is None:
         return {"available": False, "level": 0, "running": False, "ready": False}
     level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
@@ -801,13 +877,23 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
     ready = bool(run) and _farm_run_ready(run, moment)
     ready_at = run.get("ready_at") if run else None
     seconds_left = 0
-    if run and not ready:
-        try:
-            seconds_left = max(0, int((datetime.fromisoformat(ready_at) - moment).total_seconds()))
-        except (TypeError, ValueError):
-            seconds_left = 0
+    planned_hours = None
+    worked_hours = 0
+    if run:
+        planned_hours = _farm_run_hours(run)
+        if not ready:
+            try:
+                seconds_left = max(0, int((datetime.fromisoformat(ready_at) - moment).total_seconds()))
+            except (TypeError, ValueError):
+                seconds_left = 0
+            try:
+                started_at = datetime.fromisoformat(str(run.get("started_at")))
+                worked_hours = max(0, min(
+                    planned_hours, int((moment - started_at).total_seconds() // 3600),
+                ))
+            except (TypeError, ValueError):
+                worked_hours = 0
     features = _farm_features(record)
-    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(record)
     estimate_level = max(1, level)
     feature_status = {
         key: {
@@ -823,38 +909,79 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         }
         for key, owned in features.items()
     }
+    # One row per selectable duration, priced at CURRENT level/features -- nothing is
+    # committed by looking, so unlike the frozen `reward` below this always reflects what
+    # tapping that button right now would actually pay.
+    hour_previews = []
+    for hours in C.FARM_HOUR_CHOICES:
+        gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours)
+        hour_previews.append({
+            "hours": hours,
+            "gold": C.farm_gold_for(estimate_level, hours, gold_multiplier),
+            "xp": C.farm_xp_for(estimate_level, hours, xp_multiplier),
+            "drop_chance": drop_chance,
+        })
+    six_hour_preview = next(row for row in hour_previews if row["hours"] == C.FARM_DURATION_HOURS)
+    # The active run's payout is projected from its OWN frozen level/features snapshot
+    # (or, for a legacy pre-rebalance run, the reward it pre-rolled up front) -- never from
+    # the live values above, for the same "upgrades affect only the next trip" reason.
+    projected_reward = None
+    if run:
+        legacy_reward = run.get("reward")
+        projected_reward = (
+            dict(legacy_reward) if isinstance(legacy_reward, dict) else _farm_reward(data, record, run)
+        )
     return {
         "available": True,
         "level": level,
         "max_level": C.FARM_MAX_LEVEL,
         "duration_hours": C.FARM_DURATION_HOURS,
+        "min_hours": C.FARM_MIN_HOURS,
+        "max_hours": C.FARM_MAX_HOURS,
         "running": bool(run) and not ready,
         # ``active`` is retained for the Telegram view's simple boolean contract.
         "active": bool(run) and not ready,
         "ready": ready,
         "can_start": level > 0 and not run,
+        "can_cancel": bool(run) and not ready,
         "started_at": run.get("started_at") if run else None,
         "ready_at": ready_at,
         "seconds_left": seconds_left,
-        "reward": dict(run.get("reward") or {}) if run else None,
+        "planned_hours": planned_hours,
+        "worked_hours": worked_hours,
+        "reward": projected_reward,
         "features": feature_status,
         "feature_costs": {key: int(spec["cost"]) for key, spec in C.FARM_FEATURES.items()},
         "next_level_cost": C.FARM_UPGRADE_COSTS[level] if level < C.FARM_MAX_LEVEL else None,
         "next_level_bonus": (
-            f"{C.FARM_GOLD_PER_RUN[level + 1]} монет · {C.FARM_XP_PER_RUN[level + 1]} опыта за рейс"
+            f"{C.FARM_GOLD_PER_RUN[level + 1]} монет · {C.FARM_XP_PER_RUN[level + 1]} опыта"
+            f" за {C.FARM_DURATION_HOURS}-часовую смену"
             if level < C.FARM_MAX_LEVEL else None
         ),
-        "estimated_gold": max(1, round(C.FARM_GOLD_PER_RUN[estimate_level] * gold_multiplier)),
-        "estimated_xp": max(1, round(C.FARM_XP_PER_RUN[estimate_level] * xp_multiplier)),
-        "drop_chance": drop_chance,
+        "hour_previews": hour_previews,
+        # Kept for backward compatibility with anything still reading a single number:
+        # the six-hour anchor row of hour_previews, byte-for-byte what these three fields
+        # meant before durations existed.
+        "estimated_gold": six_hour_preview["gold"],
+        "estimated_xp": six_hour_preview["xp"],
+        "drop_chance": six_hour_preview["drop_chance"],
     }
 
 
-def start_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
-    """Send a pet to the farm for exactly six hours, with reward fixed up front."""
+def start_farm(
+    entry, user_id, hours: int = C.FARM_DURATION_HOURS, now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Send a pet to the farm for a player-chosen 1-8 hour shift.
+
+    The run snapshots the CURRENT farm level and features onto itself, not the reward --
+    the reward is deliberately rolled later, at settlement, from this snapshot and however
+    many hours turn out to have actually been worked (see _farm_reward). Freezing level and
+    features here rather than reading them live at settlement is what still guarantees an
+    upgrade bought while the pet is away only affects the NEXT trip.
+    """
     moment = now or app_now()
-    # Finish a due run first so a user who opens the menu after six hours is not stuck
-    # waiting for the background poller before starting the next one.
+    # Finish a due run first so a user who opens the menu after their shift ends is not
+    # stuck waiting for the background poller before starting the next one.
     settle_completed_farms(entry, now=moment)
     data = _load(entry)
     record = _tamed_record(data, user_id)
@@ -865,16 +992,66 @@ def start_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
         return False, "Сначала построй ферму: прокачай её до 1 уровня."
     if isinstance(record.get("farm_run"), dict):
         return False, "Питомец уже работает на ферме."
+    try:
+        hours = int(hours)
+    except (TypeError, ValueError):
+        hours = C.FARM_DURATION_HOURS
+    if hours not in C.FARM_HOUR_CHOICES:
+        return False, f"Выбери смену от {C.FARM_MIN_HOURS} до {C.FARM_MAX_HOURS} часов."
     run_id = secrets.token_hex(16)
-    ready_at = moment + timedelta(hours=C.FARM_DURATION_HOURS)
+    ready_at = moment + timedelta(hours=hours)
     record["farm_run"] = {
         "run_id": run_id,
         "started_at": moment.isoformat(),
         "ready_at": ready_at.isoformat(),
-        "reward": _farm_reward(data, record, run_id),
+        "hours": hours,
+        "level": level,
+        "features": _farm_features(record),
     }
     _save(entry, data)
-    return True, "Питомец отправлен на ферму на 6 часов."
+    return True, f"Питомец отправлен на ферму на {hours} ч."
+
+
+def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
+    """Recall a farming pet early, paying only for whole hours actually worked.
+
+    This deliberately does NOT compute or grant a payout itself. It stamps the worked hour
+    count onto the run (overwriting the originally planned length) and marks the run ready
+    right now, then hands off to the ordinary settle_completed_farms path -- the same single
+    grant key, the same receipt shape, the same one place gold is ever minted for a farm
+    run. A cancelled run pays the SHORT-shift rate for those hours, not a prorated share of
+    the long shift that was originally chosen: quitting early genuinely costs the better
+    per-hour rate and rarity odds a longer stay would have earned (see FARM_DURATION_BONUS
+    and FARM_LOOT_RARITY_WEIGHTS), it does not just truncate them.
+    """
+    moment = now or app_now()
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    run = record.get("farm_run")
+    if not isinstance(run, dict):
+        return False, "Питомец сейчас не работает на ферме."
+    if _farm_run_ready(run, moment):
+        return False, "Смена уже закончилась — открой ферму, чтобы получить награду."
+    try:
+        started_at = datetime.fromisoformat(str(run.get("started_at")))
+    except (TypeError, ValueError):
+        started_at = moment
+    planned_hours = _farm_run_hours(run)
+    worked_hours = max(0, min(planned_hours, int((moment - started_at).total_seconds() // 3600)))
+    run["hours"] = worked_hours
+    # Only a run started before this feature shipped can be missing these -- fall back to
+    # the pet's current level/features for it, since no true start-of-shift snapshot exists.
+    run.setdefault("level", min(max(1, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL))
+    run.setdefault("features", _farm_features(record))
+    run.pop("reward", None)  # force a fresh, hours-scaled roll instead of a stale legacy one
+    run["ready_at"] = moment.isoformat()
+    _save(entry, data)
+    settle_completed_farms(entry, now=moment)
+    if worked_hours <= 0:
+        return True, "Питомец вернулся с фермы раньше времени: меньше часа работы награды не даёт."
+    return True, f"Питомец досрочно вернулся с фермы: засчитано {worked_hours} из {planned_hours} ч."
 
 
 def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
@@ -932,13 +1109,15 @@ def upgrade_farm_feature(entry, user_id, xp, feature: str) -> tuple[bool, str]:
     return True, f"На ферме появилась «{spec['name']}» за {cost} монет."
 
 
-def _farm_receipt(user_id: str, record: dict, run: dict, moment: datetime, levels_gained: int,
-                  item_code: str | None, auto_equipped: bool) -> dict:
-    reward = run.get("reward") if isinstance(run.get("reward"), dict) else {}
+def _farm_receipt(
+    user_id: str, record: dict, run_id: str, hours: int, moment: datetime, levels_gained: int,
+    reward: dict, item_code: str | None, auto_equipped: bool,
+) -> dict:
     return {
         "user_id": str(user_id),
-        "run_id": str(run.get("run_id") or ""),
+        "run_id": str(run_id or ""),
         "pet_name": record.get("name") or "Питомец",
+        "hours": max(0, int(hours or 0)),
         "gold": max(0, int(reward.get("gold", 0) or 0)),
         "xp": max(0, int(reward.get("xp", 0) or 0)),
         "levels_gained": max(0, int(levels_gained)),
@@ -954,9 +1133,15 @@ def _farm_receipt(user_id: str, record: dict, run: dict, moment: datetime, level
 def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
     """Idempotently settle every due farm run and return only newly completed receipts.
 
-    Gold is guarded by ``economy.grant_once(..., run_id)``.  The same-process lock
-    covers concurrent poll ticks/button requests, while a crash between the two stores
-    retries from the persisted reward and merely observes the existing ledger grant.
+    Gold is guarded by ``economy.grant_once(..., run_id)``. The same-process lock (held for
+    the whole function) covers concurrent poll ticks/button requests. Each due run's payout
+    is rolled exactly ONCE per call, here in the first pass over `initial` -- before
+    anything is mutated or saved -- so a crash between the grant and the final save simply
+    reloads the same still-untouched on-disk run on the next retry and reproduces the
+    identical numbers (see _farm_reward's seeding). A run that still carries a pre-rebalance
+    `reward` dict -- anything started before this feature shipped, or a corrupt run
+    `_repair_farm_run_id` just sanitised -- pays that dict verbatim instead of rolling a new
+    one, so an in-flight shift is never retroactively repriced by a later rebalance.
     """
     moment = now or app_now()
     receipts = []
@@ -964,6 +1149,10 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
         initial = _load(entry)
         due = []
         repaired = False
+        # Weapons chosen for an EARLIER due run in this same pass, before any of them is
+        # saved -- without this, two pets settling in the same tick could both roll the
+        # same still-technically-unowned weapon. See _farm_item_for's docstring.
+        claimed_weapons: set[str] = set()
         for user_id, record in initial.get("pets", {}).items():
             if not isinstance(record, dict) or not record.get("name"):
                 continue
@@ -973,14 +1162,29 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             if not str(run.get("run_id") or ""):
                 _repair_farm_run_id(str(user_id), run)
                 repaired = True
-            due.append((str(user_id), dict(run)))
+            legacy_reward = run.get("reward")
+            if isinstance(legacy_reward, dict):
+                reward = {
+                    "gold": max(0, int(legacy_reward.get("gold", 0) or 0)),
+                    "xp": max(0, int(legacy_reward.get("xp", 0) or 0)),
+                    "item_code": (
+                        legacy_reward.get("item_code")
+                        if C.find_item(legacy_reward.get("item_code")) else None
+                    ),
+                }
+            else:
+                reward = _farm_reward(initial, record, run, frozenset(claimed_weapons))
+            found = C.find_item(reward.get("item_code")) if reward.get("item_code") else None
+            if found is not None and found.slot == "weapon":
+                claimed_weapons.add(found.code)
+            due.append((str(user_id), dict(run), reward))
         if repaired:
             # Persist the deterministic recovery before `grant_once`; a crash after it
             # is therefore retried under exactly the same payout key.
             _save(entry, initial)
-        for user_id, snapshot_run in due:
+        for user_id, snapshot_run, reward in due:
             run_id = str(snapshot_run.get("run_id") or "")
-            reward = snapshot_run.get("reward") if isinstance(snapshot_run.get("reward"), dict) else {}
+            hours = _farm_run_hours(snapshot_run)
             gold = max(0, int(reward.get("gold", 0) or 0))
             if gold:
                 economy.grant_once(entry, user_id, gold, f"pet:farm:{run_id}")
@@ -991,10 +1195,15 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             run = record.get("farm_run") if record else None
             if not isinstance(run, dict) or str(run.get("run_id") or "") != run_id:
                 continue
-            reward = run.get("reward") if isinstance(run.get("reward"), dict) else {}
             _, levels_gained = _apply_xp(record, max(0, int(reward.get("xp", 0) or 0)))
             item_code = reward.get("item_code")
             item = C.find_item(item_code) if item_code else None
+            if item is not None and item.slot == "weapon" and _weapon_owner_ids(data, item.code):
+                # Somebody else claimed this exact weapon between the roll above and this
+                # reload (a purchase, an arena drop, another chat's settlement tick). Drop
+                # the find rather than mint a second copy; gold/xp are unaffected.
+                item = None
+                item_code = None
             auto_equipped = False
             if item is not None and item.code not in record.setdefault("inventory", []):
                 record["inventory"].append(item.code)
@@ -1008,7 +1217,7 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             else:
                 item_code = None
             receipt = _farm_receipt(
-                user_id, record, run, moment, levels_gained, item_code, auto_equipped,
+                user_id, record, run_id, hours, moment, levels_gained, reward, item_code, auto_equipped,
             )
             record.setdefault("farm_notifications", []).append(receipt)
             record["farm_notifications"] = record["farm_notifications"][-50:]
@@ -1714,14 +1923,17 @@ def _spend_arena_fight(record: dict, capacity: int, now: datetime) -> None:
 
 
 def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
-    """Atomically reserve one public duel, including its once-per-target daily limit."""
+    """Atomically reserve one public duel, including its once-per-target daily limit.
+
+    Only the CHALLENGER's own farm status is a block: a farming pet still cannot start a
+    fight (see the module-level note on _is_farming_record call sites), but it is a normal,
+    attackable target for somebody else's duel like it is for the arena.
+    """
     now = now or app_now()
     data = _load(entry)
     uid, opponent_uid = str(user_id), str(opponent_id)
     if _is_farming_record(_tamed_record(data, uid), now):
         return False, "Питомец сейчас работает на ферме и не может драться."
-    if _is_farming_record(_tamed_record(data, opponent_uid), now):
-        return False, "Этот питомец сейчас работает на ферме."
     record = data.setdefault("duels", {}).setdefault(uid, {})
     today_key = now.date().isoformat()
     if record.get("day") != today_key:
@@ -1760,11 +1972,15 @@ def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
 
 
 def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None) -> bool:
+    """Whether `attacker_id` may spend an arena fight on `defender_id` today.
+
+    Only the ATTACKER's farm status gates this: a farming pet cannot start a fight, but is
+    an ordinary, attackable defender -- the reason weapons used to be excluded from farm
+    drops was a reservation race, not a claim that farming should be a hiding place.
+    """
     day = day or today()
     data = _load(entry)
     if _is_farming_record(_tamed_record(data, attacker_id)):
-        return False
-    if _is_farming_record(_tamed_record(data, defender_id)):
         return False
     return (
         sum(
@@ -1802,7 +2018,9 @@ def find_opponent(
         other_id for other_id, record in data["pets"].items()
         if other_id != uid
         and record.get("name")
-        and not _is_farming_record(record)
+        # A farming pet is a normal defender: it cannot start a fight itself (that is what
+        # `attackable_only`'s can_attack_in_arena check enforces for the SEEKER), but it is
+        # not removed from the pool of pets somebody else can be shown as an opponent.
         and (not attackable_only or can_attack_in_arena(entry, uid, other_id))
     ]
     if not candidates:
@@ -1855,7 +2073,11 @@ def record_fight(
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
     defender = data["pets"][defender_uid]
-    if _is_farming_record(attacker) or _is_farming_record(defender):
+    # Only the ATTACKER's farm status is a hard stop here. This is the last-line safety net
+    # behind can_attack_in_arena/claim_duel's own attacker-only check (a stale UI tap could
+    # otherwise slip through); the defender being away farming is not a reason to block --
+    # it is a normal, attackable target now, same as everywhere else in the arena.
+    if _is_farming_record(attacker):
         raise ValueError("Питомец на ферме и не может участвовать в бою.")
 
     # Only the attacker spends an accumulated fight.  This happens inside the same

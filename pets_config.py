@@ -74,17 +74,56 @@ CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
 LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 
 # ------------------------------------------------------------------------------ farm
-# A farm run is a deliberate six-hour choice: the pet cannot enter the arena while it
-# works, so the reward needs to be useful without replacing the hourly arena loop. Level 1
-# is a small early investment; level 10 plus every permanent facility costs 6,850 coins
-# in total and pays at most about 200 coins/day when collected on time.
+# A farm run is now a deliberate, player-chosen 1-8 hour shift: the pet cannot start a
+# fight while it works (but, unlike before, CAN still be attacked -- see _is_farming_record
+# call sites in claim_duel/can_attack_in_arena/find_opponent/record_fight), so the reward
+# needs to be useful without replacing the hourly arena loop. Level 1 is a small early
+# investment; level 10 plus every permanent facility costs 6,850 coins in total and pays
+# at most about 200 coins/day when collected on time at the six-hour anchor length.
 FARM_MAX_LEVEL = 10
+# FARM_DURATION_HOURS is kept as the balance ANCHOR, not a default a player is steered
+# toward: FARM_GOLD_PER_RUN/FARM_XP_PER_RUN/FARM_DROP_CHANCE_BY_HOURS are all stated "per
+# six hours", the STARTER_WEAPON_MAX_PRICE invariant below is checked against exactly this
+# number, and any farm_run persisted before this feature shipped never recorded an explicit
+# hours field -- it was always exactly six, so that is what a missing field still means.
 FARM_DURATION_HOURS = 6
+FARM_MIN_HOURS = 1
+FARM_MAX_HOURS = 8
+FARM_HOUR_CHOICES = tuple(range(FARM_MIN_HOURS, FARM_MAX_HOURS + 1))
+# Index = hours. 6 h is the balance anchor at 1.00 so today's numbers are unchanged there;
+# shorter shifts pay slightly less per hour (less to supervise, less risk of the pet being
+# unavailable), longer shifts pay slightly more (tying up the pet -- and the arena-bank
+# slot it can't fill in the meantime -- for most of a day earns a premium). Index 0 is
+# unused padding so FARM_DURATION_BONUS[hours] reads directly off the hour count.
+FARM_DURATION_BONUS = (0.0, 0.85, 0.88, 0.91, 0.94, 0.97, 1.00, 1.06, 1.15)
 # Index is the current level; index 0 builds the first level.
 FARM_UPGRADE_COSTS = (75, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
+# Six-hour REFERENCE payouts -- see farm_gold_for/farm_xp_for for how an actual `hours`
+# length is derived from them. Kept as the anchor rather than rescaled per-hour so
+# STARTER_WEAPON_MAX_PRICE below stays a meaningful, stated-once number.
 FARM_GOLD_PER_RUN = (0, 14, 16, 18, 20, 22, 24, 26, 28, 30, 33)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
-FARM_DROP_CHANCE = 0.03
+# Index = hours; also six-hour-anchored at today's 0.03. A one-hour shift is barely worth
+# supervising for loot, so its chance is a token 0.5%; an eight-hour shift roughly doubles
+# the old rate, because 7-8 h are also the only lengths that can roll a legendary weapon
+# (see FARM_LOOT_RARITY_WEIGHTS below) -- the higher roll count is what actually gets
+# players there.
+FARM_DROP_CHANCE_BY_HOURS = (0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.06)
+# Rarity is now picked FIRST (from this hours-indexed table), and only then is an item of
+# that rarity drawn from the eligible pool. Legendary is deliberately absent below 7 h --
+# a farm shift is unattended and reservation-free, so the only lever keeping a legendary
+# WEAPON rare is gating which shifts can roll for one at all, same spirit as arena's
+# 500-win pity being a ceiling rather than the normal path.
+FARM_LOOT_RARITY_WEIGHTS = {
+    1: {"common": 80, "uncommon": 20},
+    2: {"common": 74, "uncommon": 26},
+    3: {"common": 66, "uncommon": 31, "rare": 3},
+    4: {"common": 60, "uncommon": 34, "rare": 6},
+    5: {"common": 54, "uncommon": 36, "rare": 10},
+    6: {"common": 46, "uncommon": 39, "rare": 15},
+    7: {"common": 38, "uncommon": 40, "rare": 21, "legendary": 1},
+    8: {"common": 28, "uncommon": 42, "rare": 27, "legendary": 4},
+}
 # Farm levels also generate passive gold. The top stays at the former 5 coins/hour so
 # merging the two buildings improves clarity without doubling the passive faucet.
 FARM_PASSIVE_GOLD_PER_HOUR = (0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5)
@@ -96,9 +135,30 @@ FARM_FEATURES = {
     "sprinkler": {"name": "Поливалка", "cost": 250, "xp_multiplier": 1.25},
     # Better beds are the only direct way to improve the small find chance.
     "beds": {"name": "Грядка", "cost": 400, "drop_bonus": 0.05},
-    # The tractor helps both yields, but never shortens the promised six-hour run.
+    # The tractor helps both yields; it has no effect on how long a shift is, because
+    # that choice now belongs to the player, not to any building.
     "tractor": {"name": "Трактор", "cost": 600, "gold_multiplier": 1.20, "xp_multiplier": 1.20},
 }
+
+
+def farm_gold_for(level: int, hours: int, gold_multiplier: float = 1.0) -> int:
+    """Gold for one farm shift. The one formula, so it is never re-typed in pets.py."""
+    level = min(max(1, int(level)), FARM_MAX_LEVEL)
+    hours = min(max(FARM_MIN_HOURS, int(hours)), FARM_MAX_HOURS)
+    return max(1, round(
+        FARM_GOLD_PER_RUN[level] * hours / FARM_DURATION_HOURS
+        * FARM_DURATION_BONUS[hours] * gold_multiplier
+    ))
+
+
+def farm_xp_for(level: int, hours: int, xp_multiplier: float = 1.0) -> int:
+    """Pet XP for one farm shift -- same shape as farm_gold_for, different table."""
+    level = min(max(1, int(level)), FARM_MAX_LEVEL)
+    hours = min(max(FARM_MIN_HOURS, int(hours)), FARM_MAX_HOURS)
+    return max(1, round(
+        FARM_XP_PER_RUN[level] * hours / FARM_DURATION_HOURS
+        * FARM_DURATION_BONUS[hours] * xp_multiplier
+    ))
 
 # ---------------------------------------------------------------------- stat upgrades
 # cost(L -> L+1) = round(STAT_COST_BASE * L ** STAT_COST_EXPONENT), so the first point
@@ -402,28 +462,58 @@ class Item:
         self.effect = dict(effect or {})
 
 
-# Starter catalogue. Prices sit between a few wins and a few weeks so that gear is a
-# real alternative to stat points rather than an afterthought, and every item is a
-# trade-off -- there is no strictly-best weapon.
+# Starter catalogue. Six of these nine entries are the original hand-written items; the
+# three weapons are legacy identifiers only -- once pets_weapon_catalog loads (see
+# below), stick/fork/bone are entirely REPLACED by w001/w002/w003 (their weapon-slot
+# entries get filtered out of ITEMS), LEGACY_ITEM_CODES redirects find_item() there, and
+# the prices below matter only for the degraded no-catalogue-module fallback. They are
+# kept numerically identical to w001/w002's real catalogue prices (10/65) so that
+# fallback path can never regress to the pre-rebalance 250/900 economy.
+#
+# The six accessories (bead/acorn/mittens/claws/slippers/springs) are NOT replaced by
+# anything: pets_amulet_catalog and pets_gear_catalog are entirely source="drop" (see
+# their own _validate_catalogue asserts), so these six are the ONLY amulet/gloves/boots
+# items anyone can ever buy. Unlike the weapons above, their prices were never touched by
+# the 2026-08 income rebalance and still assumed the old arena economy -- a 1,100-coin
+# amulet against a farm run that pays 14-33 gold is nonsense on that scale. Repriced here
+# exactly the way pets_weapon_catalog prices a weapon rather than by guessing: rarity is
+# picked from where each item's SHOP_PRICE_POWER_WEIGHTS-weighted power actually falls
+# relative to the generated weapon bands (common 24-48, uncommon 52-74, rare 86-116),
+# then shop_price_for_bonuses(rarity, bonuses) supplies the number -- so an accessory and
+# a weapon of comparable power now cost comparable money, and resale_value() (20% of
+# price) stops paying out three-digit refunds for a vial of paint.
 ITEMS = (
-    Item("stick", "Кисть-щетина №8", "weapon", 250, "shop", {"strength": 6},
+    # power 24 (str 6*4) -- the common floor. Identical shape to w001 ("+6 strength,
+    # nothing else"), so the price matches w001's real catalogue price exactly.
+    Item("stick", "Кисть-щетина №8", "weapon", 10, "shop", {"strength": 6},
         "Жёсткая, уверенная, для смелых мазков."),
-    Item("fork", "Аэрограф Harder & Steenbeck", "weapon", 900, "shop", {"strength": 14, "luck": 4},
+    # power 64 (str 14*4 + luck 4*2) -- uncommon band. Identical shape to w002, same price.
+    Item("fork", "Аэрограф Harder & Steenbeck", "weapon", 65, "shop", {"strength": 14, "luck": 4},
         "Ровный факел краски и немного магии в триггере."),
     Item("bone", "Компрессор старого мастера", "weapon", 0, "drop", {"strength": 20, "agility": -3},
         "Тяжёлый, гудит и выдаёт идеальное давление."),
-    Item("bead", "Флакон Nuln Oil", "amulet", 200, "shop", {"luck": 8},
+    # power 16 (luck 8*2) -- below even the weakest generated common weapon (24), so it
+    # sits at shop_price_for_bonuses' common floor: 10.
+    Item("bead", "Флакон Nuln Oil", "amulet", 10, "shop", {"luck": 8},
         "Одна капля на модель, другая непременно на стол."),
-    Item("acorn", "Набор Scale75 Artist", "amulet", 1_100, "shop", {"luck": 16, "health": 5},
-        "Пигмент настолько плотный, что вдохновляет на подвиги."),
-    Item("mittens", "Нитриловые перчатки", "gloves", 220, "shop", {"armor": 20},
-        "Защищают лапы от краски, грунта и внезапных проливов."),
-    Item("claws", "Перчатки сухой кисти", "gloves", 1_000, "shop", {"agility": 10, "armor": 25},
-        "Пыльные, ловкие и привычные к самым острым граням."),
-    Item("slippers", "Тапки из малярного скотча", "boots", 180, "shop", {"agility": 7},
+    # power 52 (luck 16*2 + health 5*4) lands inside the uncommon weapon band (52-74) --
+    # was the second-worst offender at 1,100, over fifty times its actual combat weight.
+    Item("acorn", "Набор Scale75 Artist", "amulet", 55, "shop", {"luck": 16, "health": 5},
+        "Пигмент настолько плотный, что вдохновляет на подвиги.", rarity="uncommon"),
+    # power 60 (armor 20*3) -- squarely uncommon, same tier and price as springs below.
+    Item("mittens", "Нитриловые перчатки", "gloves", 65, "shop", {"armor": 20},
+        "Защищают лапы от краски, грунта и внезапных проливов.", rarity="uncommon"),
+    # power 95 (agility 10*2 + armor 25*3) lands inside the rare weapon band (86-116) --
+    # the worst offender at the old 1,000; now priced like the shop's other aspirational
+    # rare weapons (160-195) instead of near the top of the entire economy.
+    Item("claws", "Перчатки сухой кисти", "gloves", 170, "shop", {"agility": 10, "armor": 25},
+        "Пыльные, ловкие и привычные к самым острым граням.", rarity="rare"),
+    # power 14 (agility 7*2) -- below the common floor, same as bead.
+    Item("slippers", "Тапки из малярного скотча", "boots", 10, "shop", {"agility": 7},
         "Лёгкие и липкие: ни одна база не убежит."),
-    Item("springs", "Ботинки с банками Vallejo", "boots", 1_000, "shop", {"agility": 15, "armor": 10},
-        "Шуршат шариками внутри и ускоряют путь к столу."),
+    # power 60 (agility 15*2 + armor 10*3) -- uncommon, same tier and price as mittens.
+    Item("springs", "Ботинки с банками Vallejo", "boots", 65, "shop", {"agility": 15, "armor": 10},
+        "Шуршат шариками внутри и ускоряют путь к столу.", rarity="uncommon"),
 )
 
 # The large weapon catalogue is intentionally data-only so balancing/plumbing stays
@@ -472,8 +562,13 @@ if _RAW_WEAPON_ITEMS:
     _codes = [item.code for item in _catalogue_weapons]
     if len(set(_codes)) != len(_codes):
         raise ValueError("weapon catalogue contains duplicate item codes")
+    # Checked against the six-hour REFERENCE payout, not against whatever the shortest
+    # 1 h shift would pay (FARM_DURATION_BONUS makes that deliberately less). The promise
+    # this protects is narrower than it used to read: a level-1 farm's six-hour shift can
+    # always afford the daily starter weapon, even before any passive gold is collected --
+    # a 1-4 h shift may need to be repeated, or topped up with passive income, first.
     if STARTER_WEAPON_MAX_PRICE > FARM_GOLD_PER_RUN[1]:
-        raise ValueError("the first farm run must afford the daily starter weapon")
+        raise ValueError("a reference six-hour level-1 farm shift must afford the daily starter weapon")
     ITEMS = _catalogue_weapons + tuple(item for item in ITEMS if item.slot != "weapon")
 
 _catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)

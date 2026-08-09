@@ -940,10 +940,14 @@ separated by blank lines for quick scanning.
 Shop weapon prices are tied to combat value rather than catalogue position: commons cost
 10–20 coins, uncommon weapons roughly 50–70, and the five shop rares 130–155.
 Every daily storefront injects an unowned 10-coin starter weapon when its normal rotation
-has none, so one basic six-hour level-1 farm harvest (14 coins) always buys a weapon;
-the hourly passive income is not needed for that promise. Higher rarities remain long-term
-goals, while resale stays at a low 20% (rounded down, including below five coins for the
-starter tier).
+has none, so the six-hour REFERENCE level-1 farm shift (14 coins) always buys one on its
+own; a shorter shift pays less and may need a repeat trip or the hourly passive income to
+top it up first. Higher rarities remain long-term goals, while resale stays at a low 20%
+(rounded down, including below five coins for the starter tier).
+The two purchasable accessories in each of the other three slots (amulet, gloves, boots)
+price the same way -- previously hand-picked numbers up to 1,100 coins that predated
+`shop_price_for_bonuses` and never followed the weapon rebalance; they now cost 10-170
+coins depending on the same power-and-rarity formula (see PETS_BALANCE.md 6.0.3).
 Rarity weights make a legendary about 0.94% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
 telemetry tracks passive minting, sales, gifts, arena gold and drops.
@@ -961,11 +965,25 @@ At startup, the one-time `unique_weapons_202608` migration removes «Швабр�
 duplicate weapon codes are reduced to one copy, preferring an equipped copy and refunding
 the removed copy at purchase price (shop) or resale value (drop).
 
-The **Farm** sends a pet away for exactly six hours, during which it cannot fight or be
-selected as an opponent. Its 10 levels yield 14–33 coins and 50–95 pet XP per trip. A
-well improves coins, a sprinkler improves XP, garden beds raise the accessory-find chance
-from 3% to 8%, and a tractor improves both rewards. Rewards are fixed when the trip starts,
-settled once after restarts, and announced persistently in the owner's bot DM.
+The **Farm** sends a pet away for a player-chosen **1-8 hour** shift, picked from eight
+buttons (four per row) when the run is started. While it is away the pet cannot start a
+fight of its own -- but, unlike before, it is no longer immune to attack: any other player
+can still find and fight it, same as any other pet. Its 10 levels yield 14–33 coins and
+50–95 pet XP at the six-hour reference length; a shorter shift pays a bit less per hour
+(0.85x at 1 h), a longer one a bit more (1.15x at 8 h), on top of scaling linearly with the
+hours chosen. The item-find chance also scales with hours, from 0.5% at 1 h up to 6% at
+8 h (6 h stays at the original 3%), and RARITY now scales with hours too: only 7-8 h shifts
+can roll a legendary, and -- now that loot is rolled at settlement rather than reserved up
+front -- a farm find can be a weapon, subject to the same chat-wide one-copy rule as every
+other weapon. A well improves coins, a sprinkler improves XP, garden beds raise the base
+find chance by +5 points at every length, and a tractor improves both rewards; none of them
+change how long a shift takes, since that is now the player's choice. A run can also be
+recalled early for a "❌ Забрать сейчас" button, which pays only for whole hours actually
+worked (a cancel under one hour pays nothing) at THAT shorter length's rate -- quitting
+early costs the long-run bonus, it does not just prorate it. Level and building bonuses are
+snapshotted when a shift starts (so buying an upgrade mid-shift only affects the next trip),
+while gold/XP/loot are rolled once, deterministically, at settlement -- reproducibly on a
+retry -- and settled once after restarts, then announced persistently in the owner's bot DM.
 The same 10 Farm levels now also passively bank 1–5 coins per complete hour with 24–480
 coins of storage. Collection is lazy (opening an arena balance screen settles it), but the
 checkpoint and credit share one atomic ledger write, so a retry or restart cannot pay the
