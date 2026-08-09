@@ -20,6 +20,20 @@ RARITIES: Final = ("cursed", "common", "uncommon", "rare", "legendary")
 SOURCES: Final = ("shop", "drop")
 STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
 
+# Shop prices follow the same relative combat weights as the arena power rating.  The
+# rarity base reflects scarcity/trade value; the multiplier prices actual usefulness.
+# Rounding to five keeps Telegram prices readable and prevents arbitrary catalogue IDs
+# from making two equally strong weapons cost hundreds of coins apart.
+SHOP_PRICE_POWER_WEIGHTS: Final = {
+    "strength": 4,
+    "health": 4,
+    "agility": 2,
+    "luck": 2,
+    "armor": 3,
+}
+SHOP_PRICE_RARITY_BASE: Final = {"common": 5, "uncommon": 30, "rare": 70}
+SHOP_PRICE_POWER_MULTIPLIER: Final = {"common": 1.5, "uncommon": 1.75, "rare": 2.0}
+
 
 @dataclass(frozen=True, slots=True)
 class WeaponSpec:
@@ -247,12 +261,12 @@ _GENERATED_RARITIES: Final = _interleaved_rarities({
 })
 
 _LEGACY_WEAPONS: Final = (
-    # These IDs are the target of the stick/fork/bone migration aliases. Their prices
-    # and stats remain lossless; display copy follows the clearer catalogue voice.
+    # These IDs are the target of the stick/fork/bone migration aliases. Their identity
+    # and stats remain lossless; prices use the current arena-income scale.
     ("w001", "Мамин тапок", "Летит точнее, чем кажется.",
-     "common", "shop", 250, 50, 0, (("strength", 6),)),
+     "common", "shop", 40, 8, 0, (("strength", 6),)),
     ("w002", "Мамина сковородка", "После неё спор окончен.",
-     "uncommon", "shop", 900, 180, 0, (("strength", 14), ("luck", 4))),
+     "uncommon", "shop", 140, 28, 0, (("strength", 14), ("luck", 4))),
     ("w003", "Швабра на изоленте", "Синяя. Значит, легендарная.",
      "legendary", "drop", 0, 220, 1, (("strength", 20), ("agility", -3))),
 )
@@ -281,22 +295,41 @@ def _source_for(rarity: str, rarity_rank: int) -> str:
     return "drop"
 
 
-def _prices(index: int, rarity: str, source: str) -> tuple[int, int]:
-    """Return buy and deliberately modest resale prices."""
+def shop_price_for_bonuses(rarity: str, bonuses) -> int:
+    """Value one shop weapon from its actual arena impact, rounded to five coins."""
+    base = SHOP_PRICE_RARITY_BASE[rarity]
+    power = max(0, sum(
+        SHOP_PRICE_POWER_WEIGHTS[key] * int(value) for key, value in bonuses
+    ))
+    raw = base + power * SHOP_PRICE_POWER_MULTIPLIER[rarity]
+    return max(5, int((raw + 2.5) // 5) * 5)
+
+
+def _prices(rarity: str, source: str, bonuses) -> tuple[int, int]:
+    """Return power-based buy and deliberately modest resale prices."""
     if source == "drop":
         # Drops cannot be bought.  Their sale value is a consolation, not a gold faucet.
         return 0, 220 if rarity == "legendary" else 110 if rarity == "rare" else 10
-    if rarity == "cursed":
-        buy = 35 + (index % 6) * 10
-    elif rarity == "common":
-        buy = 120 + (index % 13) * 30
-    elif rarity == "uncommon":
-        buy = 450 + (index % 11) * 50
-    else:
-        buy = 900 + (index % 6) * 100
+    buy = shop_price_for_bonuses(rarity, bonuses)
     # 20% (rounded down) makes selling a convenience and inventory sink, never an
-    # arbitrage route.  Even the cheapest cursed trinket stays below the 25% cap.
+    # arbitrage route.
     return buy, max(5, buy * 20 // 100)
+
+
+def _pre_rebalance_buy_price(code: str, rarity: str, source: str) -> int:
+    """Price paid before the 2026-08 income rebalance, retained for duplicate refunds."""
+    if source != "shop":
+        return 0
+    if code == "w001":
+        return 250
+    if code == "w002":
+        return 900
+    index = int(code[1:]) - 1
+    if rarity == "common":
+        return 120 + (index % 13) * 30
+    if rarity == "uncommon":
+        return 450 + (index % 11) * 50
+    return 900 + (index % 6) * 100
 
 
 def _drop_weight(rarity: str, source: str) -> int:
@@ -335,7 +368,8 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
         rarity = _rarity_for(index - 3)
         rarity_seen[rarity] += 1
         source = _source_for(rarity, rarity_seen[rarity])
-        buy_price, resale_price = _prices(index, rarity, source)
+        bonuses = _bonus_tuple(index, rarity)
+        buy_price, resale_price = _prices(rarity, source, bonuses)
         description = (
             f"{object_description} Есть подвох."
             if rarity == "cursed"
@@ -353,7 +387,7 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             buy_price=buy_price,
             resale_price=resale_price,
             drop_weight=_drop_weight(rarity, source),
-            bonuses=_bonus_tuple(index, rarity),
+            bonuses=bonuses,
         ))
     # There are 50 * 10 name combinations, of which the first three are replaced by
     # migration-safe legacy entries.  The early stop above keeps the public range w001..w500.
@@ -367,6 +401,10 @@ WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = _build_catalogue()
 RAW_ITEMS: Final[tuple[dict[str, object], ...]] = tuple(item.raw_item() for item in WEAPON_SPECS)
 WEAPON_COUNT: Final = len(WEAPON_SPECS)
 RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in WEAPON_SPECS) for rarity in RARITIES}
+PRE_REBALANCE_BUY_PRICES: Final = {
+    item.code: _pre_rebalance_buy_price(item.code, item.rarity, item.source)
+    for item in WEAPON_SPECS if item.source == "shop"
+}
 
 
 def _validate_catalogue() -> None:
@@ -392,5 +430,5 @@ _validate_catalogue()
 
 __all__ = [
     "RARITIES", "SOURCES", "STAT_KEYS", "WeaponSpec", "WEAPON_SPECS", "RAW_ITEMS", "WEAPON_COUNT",
-    "RARITY_COUNTS",
+    "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "shop_price_for_bonuses",
 ]

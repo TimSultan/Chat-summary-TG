@@ -27,12 +27,12 @@ def test_catalogue_is_immutable_and_can_adapt_to_existing_item_constructor():
     assert arguments[5] is not weapon.bonus_dict()
 
 
-def test_first_three_ids_are_lossless_replacements_for_legacy_weapon_aliases():
+def test_first_three_ids_preserve_legacy_identity_stats_and_descriptions():
     assert [(weapon.code, weapon.name, weapon.source, weapon.price, dict(weapon.bonuses), weapon.description)
             for weapon in catalogue.WEAPON_SPECS[:3]] == [
-        ("w001", "Мамин тапок", "shop", 250, {"strength": 6},
+        ("w001", "Мамин тапок", "shop", 40, {"strength": 6},
          "Летит точнее, чем кажется."),
-        ("w002", "Мамина сковородка", "shop", 900,
+        ("w002", "Мамина сковородка", "shop", 140,
          {"strength": 14, "luck": 4},
          "После неё спор окончен."),
         ("w003", "Швабра на изоленте", "drop", 0,
@@ -76,6 +76,31 @@ def test_sources_prices_and_bonuses_are_sensible_for_the_current_combat_scale():
     assert min(ordinary_shop_strengths) >= 6
     assert max(ordinary_shop_strengths) <= 18
     assert max(dict(weapon.bonuses).get("strength", 0) for weapon in catalogue.WEAPON_SPECS) == 20
+
+
+def test_shop_prices_match_fight_income_and_actual_combat_power():
+    expected_bands = {
+        "common": (40, 75),
+        "uncommon": (105, 145),
+        "rare": (195, 240),
+    }
+    for rarity, (minimum, maximum) in expected_bands.items():
+        weapons = [
+            weapon for weapon in catalogue.WEAPON_SPECS
+            if weapon.source == "shop" and weapon.rarity == rarity
+        ]
+        assert min(weapon.buy_price for weapon in weapons) == minimum
+        assert max(weapon.buy_price for weapon in weapons) == maximum
+        for weapon in weapons:
+            assert weapon.buy_price == catalogue.shop_price_for_bonuses(
+                rarity, weapon.bonuses,
+            )
+            assert weapon.resale_price == max(5, weapon.buy_price * 20 // 100)
+
+    # The cleanup migration still refunds what an old duplicate actually cost before
+    # this rebalance, rather than today's much lower replacement price.
+    assert catalogue.PRE_REBALANCE_BUY_PRICES["w001"] == 250
+    assert catalogue.PRE_REBALANCE_BUY_PRICES["w002"] == 900
 
 
 def test_raw_items_expose_trade_schema_and_legendary_drop_weight_is_about_one_percent():

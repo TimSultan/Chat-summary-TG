@@ -929,6 +929,10 @@ cooldown plus an ID/code/timestamp audit trail.
 Weapon names use familiar household junk and concrete origins such as «с Авито», «из
 гаража» and «на синей изоленте», with one-line descriptions; storefront entries are
 separated by blank lines for quick scanning.
+Shop weapon prices are tied to combat value rather than catalogue position: common
+weapons cost 40–75 coins, uncommon 105–145, and the five shop rares 195–240. This puts
+the three tiers at roughly several days, one to two weeks, and two to three weeks for a
+median active player at current `5–10` win rewards. Resale remains 20%.
 Rarity weights make a legendary about 0.94% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
 telemetry tracks passive minting, sales, gifts, arena gold, guard actions and drops.

@@ -556,7 +556,8 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(report["removed_mops"], 2)
         self.assertEqual(report["mop_grants"], 2)
         self.assertEqual(report["deduplicated"], 1)
-        self.assertEqual(economy.balance("chat", "1", 0), 100 + duplicate.price)
+        old_duplicate_price = pets_config.PRE_REBALANCE_WEAPON_BUY_PRICES[duplicate.code]
+        self.assertEqual(economy.balance("chat", "1", 0), 100 + old_duplicate_price)
         self.assertEqual(economy.balance("chat", "2", 0), 100)
         first = pets.get_pet("chat", "1")
         second = pets.get_pet("chat", "2")
@@ -570,7 +571,7 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertIn(mop.code, first["discovered"])
 
         self.assertEqual(pets.enforce_unique_weapons(["chat"])["removed_mops"], 0)
-        self.assertEqual(economy.balance("chat", "1", 0), 100 + duplicate.price)
+        self.assertEqual(economy.balance("chat", "1", 0), 100 + old_duplicate_price)
         self.assertEqual(economy.balance("chat", "2", 0), 100)
 
     def test_sell_refuses_equipped_and_pays_explicit_resale(self):

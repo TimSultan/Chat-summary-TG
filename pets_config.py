@@ -436,9 +436,13 @@ ITEMS = (
 # usable; when present it replaces the three starter weapons while preserving the six
 # non-weapon starters.
 try:
-    from pets_weapon_catalog import RAW_ITEMS as _RAW_WEAPON_ITEMS
+    from pets_weapon_catalog import (
+        PRE_REBALANCE_BUY_PRICES as PRE_REBALANCE_WEAPON_BUY_PRICES,
+        RAW_ITEMS as _RAW_WEAPON_ITEMS,
+    )
 except ImportError:
     _RAW_WEAPON_ITEMS = ()
+    PRE_REBALANCE_WEAPON_BUY_PRICES = {}
 
 
 def _catalog_item(spec):

@@ -525,7 +525,11 @@ def enforce_unique_weapons(entries) -> dict:
                 code not in (pair[1].get("equipped") or {}).values(), pair[0],
             ))
             item = C.find_item(code)
-            refund = item.price if item.source == "shop" else C.resale_value(item)
+            refund = (
+                C.PRE_REBALANCE_WEAPON_BUY_PRICES.get(code, item.price)
+                if item.source == "shop"
+                else C.resale_value(item)
+            )
             for user_id, record in owners[1:]:
                 reason = f"pet_weapon_duplicate_202608:{code}"
                 if refund > 0 and economy.grant_once(entry, user_id, refund, reason):
