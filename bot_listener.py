@@ -6086,6 +6086,16 @@ async def handle_pets_callback(
             )
             return
 
+        if action == "fightnotify":
+            enabled = pets.toggle_fight_result_notifications(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id,
+                "Уведомления о результатах боёв включены."
+                if enabled else "Уведомления о результатах боёв выключены.",
+                pets_ui.main_view(entry, user_id, xp), log,
+            )
+            return
+
         # --- plain redraws -------------------------------------------------------------
         if action == "updates":
             # Opening the log, rather than merely seeing the menu button, acknowledges
@@ -6480,6 +6490,8 @@ async def _pets_run_fight(
 
     async def deliver_result(recipient_id, text: str, keyboard=None) -> None:
         """Combat logs, including drops, are private to the two participants."""
+        if not pets.fight_result_notifications_enabled(entry, recipient_id):
+            return
         try:
             if image_path is not None:
                 await api.send_photo_file(

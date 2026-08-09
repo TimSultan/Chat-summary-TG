@@ -136,36 +136,50 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"🏆 Боёв: {pet.get('fights', 0)} / побед: {pet.get('wins', 0)}")
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
-    rows = [
-        [{"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")}],
-        [{"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")}],
-    ]
+    rows = [[
+        {"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")},
+        {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
+    ]]
     if pet:
         rows.append([
             {"text": "🐾 Существо", "callback_data": callback_data(user_id, "pet")},
             {"text": "💪 Прокачка", "callback_data": callback_data(user_id, "train")},
         ])
-        rows.append([{
-            "text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")
-        }])
         rows.append([
+            {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")},
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
-            {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
         ])
         rows.append([
+            {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
             {"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")},
-            {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
         ])
-        rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
+        rows.append([
+            {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
+            {"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")},
+        ])
+        notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
+        rows.append([
+            {
+                "text": "🔔 Результаты: вкл." if notifications_enabled else "🔕 Результаты: выкл.",
+                "callback_data": callback_data(user_id, "fightnotify"),
+            },
+            {
+                "text": "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления",
+                "callback_data": callback_data(user_id, "updates"),
+            },
+        ])
     elif cage:
         rows.append([{
             "text": f"🐣 Приручить свою фигурку — {_money(C.TAME_PRICE)}",
             "callback_data": callback_data(user_id, "tame"),
         }])
-    rows.append([{"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")}])
-    rows.append([{"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")}])
-    updates_button = "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
-    rows.append([{"text": updates_button, "callback_data": callback_data(user_id, "updates")}])
+    if not pet:
+        updates_button = "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
+        rows.append([{"text": updates_button, "callback_data": callback_data(user_id, "updates")}])
+    rows.append([
+        {"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")},
+        {"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")},
+    ])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 

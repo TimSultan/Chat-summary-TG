@@ -191,6 +191,27 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("cage", actions)
         self.assertIn("info", actions)
 
+    def test_tamed_pet_menu_uses_two_button_rows_including_fight_notifications(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
+
+        _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
+
+        self.assertTrue(all(len(row) == 2 for row in keyboard["inline_keyboard"]))
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertIn("fightnotify", actions)
+
+    def test_fight_result_notifications_can_be_disabled_from_the_menu(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
+
+        self._tap("fightnotify")
+
+        self.assertFalse(pets.fight_result_notifications_enabled(CHAT, PLAYER["id"]))
+
     def test_private_arena_menu_is_never_scheduled_for_deletion(self):
         deletions = []
         with patch.object(
@@ -664,6 +685,20 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIsNone(defender_copy["reply_markup"])
         self.assertTrue(api.photo_files[0]["disable_notification"])
         self.assertTrue(defender_copy["disable_notification"])
+
+    def test_opted_out_player_does_not_receive_a_private_fight_result(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        pets.toggle_fight_result_notifications(CHAT, 43)
+        api = FakeApi()
+
+        _run(bot_listener._pets_run_fight(
+            api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP, log=lambda *_: None,
+        ))
+
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"]])
 
     def test_rare_weapon_drop_stays_in_the_winner_private_result(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

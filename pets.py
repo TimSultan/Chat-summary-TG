@@ -169,6 +169,9 @@ def _load(entry: str) -> dict:
             [row for row in notifications if isinstance(row, dict)][-50:]
             if isinstance(notifications, list) else []
         )
+        record["fight_result_notifications"] = bool(
+            record.get("fight_result_notifications", True)
+        )
     return data
 
 
@@ -285,6 +288,7 @@ def _new_record() -> dict:
         "farm_features": {},
         "farm_run": None,
         "farm_notifications": [],
+        "fight_result_notifications": True,
     }
 
 
@@ -498,6 +502,25 @@ def fight_refresh_seconds(now: datetime | None = None) -> int:
 
 def get_pet(entry, user_id) -> dict | None:
     return _tamed_record(_load(entry), user_id)
+
+
+def fight_result_notifications_enabled(entry, user_id) -> bool:
+    """Whether this player wants private arena fight receipts."""
+    pet = get_pet(entry, user_id)
+    return bool(pet and pet.get("fight_result_notifications", True))
+
+
+def toggle_fight_result_notifications(entry, user_id) -> bool:
+    """Flip private arena fight receipts and return the new enabled state."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False
+    record["fight_result_notifications"] = not bool(
+        record.get("fight_result_notifications", True)
+    )
+    _save(entry, data)
+    return record["fight_result_notifications"]
 
 
 def has_cage(entry, user_id) -> bool:
