@@ -105,6 +105,10 @@ def _entry_payload(entry: voting.Entry, poll: voting.Poll, base: str) -> dict:
         "text": entry.text,
         "posted_at": entry.posted_at,
         "photos": [f"{base}/media/{poll.poll_id}/{name}" for name in entry.media],
+    # The board editor stores the crop in the source photo's coordinates. Expose it
+    # with the entry so both the moderation grid and the public ballot can render the
+    # same first-photo framing as the exported board.
+    "crop": poll.crops.get(entry.entry_id),
     }
 
 
@@ -697,8 +701,10 @@ PAGE_HTML = """<!doctype html>
      closely, which is what the reel below is. */
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
   .gcard { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
-  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; }
+  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; overflow: hidden;
+           background: rgba(128,128,128,.2); }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb img.framed { position: absolute; max-width: none; max-height: none; object-fit: fill; }
   .count { position: absolute; right: 4px; top: 4px; background: rgba(0,0,0,.6);
            color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 8px; }
   .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
@@ -1021,6 +1027,33 @@ function maxAdminCount() {
   return poll.is_admin && poll.counts ? Math.max(1, ...Object.values(poll.counts)) : 1;
 }
 
+// Crops are square coordinates in the source image, just like the editor and the export
+// renderer use. A crop can extend outside the photo for a fitted, letterboxed frame, so
+// this cannot use object-position: size and offset both come from the saved square.
+function applyFrame(img) {
+  const crop = img.crop;
+  const frame = img.closest(".thumb");
+  if (!crop || !frame || !img.naturalWidth || !img.naturalHeight || !Number(crop.size)) return;
+  const scale = frame.clientWidth / Number(crop.size);
+  if (!Number.isFinite(scale) || scale <= 0) return;
+  img.classList.add("framed");
+  img.style.width = (img.naturalWidth * scale) + "px";
+  img.style.height = (img.naturalHeight * scale) + "px";
+  img.style.left = (-Number(crop.x) * scale) + "px";
+  img.style.top = (-Number(crop.y) * scale) + "px";
+}
+
+function applyEntryFrame(img, crop) {
+  if (!crop) return;
+  img.crop = crop;
+  if (img.complete) applyFrame(img);
+  else img.addEventListener("load", () => applyFrame(img), { once: true });
+}
+
+window.addEventListener("resize", () => {
+  document.querySelectorAll(".thumb img.framed").forEach(applyFrame);
+});
+
 function renderGrid() {
   const grid = $("grid");
   grid.innerHTML = "";
@@ -1052,6 +1085,7 @@ function renderGrid() {
         pickLabel(entry.id, true) +
       "</button>";
     grid.appendChild(card);
+    applyEntryFrame(card.querySelector(".thumb img"), entry.crop);
   }
 }
 

@@ -108,7 +108,9 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
     # ---- an ordinary voter only ever sees admitted entries -----------------------------
 
     async def test_a_voter_sees_only_admitted_entries(self):
-        self._seed_poll(approved=("a",))
+        poll = self._seed_poll(approved=("a",))
+        voting.set_crops(poll, {"a": {"x": 12, "y": 34, "size": 56}})
+        voting.save_poll(poll)
         response = await self.client.get(
             f"{vote_web.ROUTE_PREFIX}/api/poll",
             headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
@@ -117,6 +119,7 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertFalse(data["is_admin"])
         self.assertEqual([e["id"] for e in data["entries"]], ["a"])
+        self.assertEqual(data["entries"][0]["crop"], {"x": 12.0, "y": 34.0, "size": 56.0})
         self.assertNotIn("counts", data)  # only the admin gets live counts
 
     async def test_an_unmoderated_poll_shows_a_voter_nothing(self):
@@ -798,6 +801,7 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )).json()
 
         self.assertEqual(admin["crops"], {"a": {"x": 1.0, "y": 2.0, "size": 3.0}})
+        self.assertEqual(admin["entries"][0]["crop"], {"x": 1.0, "y": 2.0, "size": 3.0})
         self.assertNotIn("crops", voter)
 
     async def test_the_board_page_loads_without_auth_and_talks_to_the_admin_api(self):
