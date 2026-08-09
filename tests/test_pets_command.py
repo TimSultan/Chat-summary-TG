@@ -21,6 +21,7 @@ import bot_listener
 import economy
 import pets
 import pets_config as C
+import pets_image
 import pets_ui
 import pets_updates
 import stats
@@ -44,6 +45,7 @@ class FakeApi:
         self.edits = []
         self.photos = []
         self.photo_files = []
+        self.media_groups = []
         self.answered = []
         self.deleted = []
         # Every call is appended here in order, which is how the "answer the tap first"
@@ -51,10 +53,11 @@ class FakeApi:
         self.calls = []
 
     async def send_message(self, chat_id, text, reply_to_message_id=None,
-                           reply_markup=None, parse_mode=None):
+                           reply_markup=None, parse_mode=None, disable_notification=False):
         self.calls.append("send_message")
         item = {"message_id": 100 + len(self.sent), "chat_id": chat_id,
-                "text": text, "reply_markup": reply_markup}
+                "text": text, "reply_markup": reply_markup,
+                "disable_notification": disable_notification}
         self.sent.append(item)
         return item
 
@@ -75,6 +78,28 @@ class FakeApi:
             "disable_notification": disable_notification,
         }
         self.photo_files.append(item)
+        return item
+
+    async def send_media_group_files(self, chat_id, paths, caption=None, parse_mode=None,
+                                     disable_notification=False):
+        """One album is one receipt, so it lands in photo_files like a single photo.
+
+        The per-album detail (how many pictures, which paths) is kept separately in
+        media_groups for the tests that care that the log ships with the result.
+        """
+        self.calls.append("send_media_group_files")
+        paths = list(paths)
+        item = {
+            "message_id": 300 + len(self.photo_files), "chat_id": chat_id,
+            "caption": caption, "reply_markup": None,
+            "size": sum(Path(path).stat().st_size for path in paths),
+            "disable_notification": disable_notification,
+        }
+        self.photo_files.append(item)
+        self.media_groups.append({
+            "chat_id": chat_id, "paths": [str(path) for path in paths],
+            "caption": caption, "count": len(paths),
+        })
         return item
 
     async def edit_message_text(self, chat_id, message_id, text,
@@ -686,6 +711,65 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(api.photo_files[0]["disable_notification"])
         self.assertTrue(defender_copy["disable_notification"])
 
+    def test_battle_log_ships_in_the_same_album_as_the_result_board(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+
+        _run(bot_listener._pets_run_fight(
+            api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP, log=lambda *_: None,
+        ))
+
+        # Both participants get one album carrying the result board and the log, in that
+        # order -- never the result alone and never the log as a stray second message.
+        self.assertEqual([group["chat_id"] for group in api.media_groups], [PLAYER["id"], 43])
+        for group in api.media_groups:
+            self.assertEqual(group["count"], 2)
+            self.assertNotEqual(group["paths"][0], group["paths"][1])
+        self.assertNotIn("send_photo_file", api.calls)
+
+    def test_the_attacker_keeps_action_buttons_that_an_album_cannot_carry(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+
+        _run(bot_listener._pets_run_fight(
+            api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP, log=lambda *_: None,
+        ))
+
+        # sendMediaGroup takes no reply_markup, so the "another fight" loop would quietly
+        # disappear if the buttons were not sent separately to the attacker alone.
+        follow_ups = [item for item in api.sent if item["reply_markup"]]
+        self.assertEqual(len(follow_ups), 1)
+        self.assertEqual(follow_ups[0]["chat_id"], PLAYER["id"])
+        # Silent like the album it follows -- the arena never pings for a result.
+        self.assertTrue(follow_ups[0]["disable_notification"])
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in follow_ups[0]["reply_markup"]["inline_keyboard"] for button in row
+        }
+        self.assertIn("search", actions)
+
+    def test_a_failed_log_render_still_delivers_the_result_board(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
+        api = FakeApi()
+
+        with patch.object(pets_image, "render_fight_log", side_effect=RuntimeError("boom")):
+            _run(bot_listener._pets_run_fight(
+                api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP, log=lambda *_: None,
+            ))
+
+        # The transcript is a companion picture; losing it must not cost the receipt.
+        self.assertEqual(api.media_groups, [])
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], 43])
+
     def test_opted_out_player_does_not_receive_a_private_fight_result(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
@@ -724,7 +808,11 @@ class PetsCommandTests(unittest.TestCase):
                 log=lambda *_: None,
             ))
 
-        self.assertEqual(api.sent, [])
+        # The receipts are an album now, so the winner's action buttons follow in their
+        # own DM message. What must stay true is that nothing reaches the group and that
+        # the dropped item is never named outside the private receipt.
+        self.assertFalse(any(item["chat_id"] == MAIN_CHAT_ID for item in api.sent))
+        self.assertNotIn(rare.name, "".join(item["text"] for item in api.sent))
         self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], 43])
         self.assertIn(rare.name, api.photo_files[0]["caption"])
 

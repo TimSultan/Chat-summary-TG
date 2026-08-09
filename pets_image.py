@@ -371,3 +371,199 @@ def temporary_result_path() -> Path:
     descriptor, path = tempfile.mkstemp(prefix="pet_fight_", suffix=".jpg")
     os.close(descriptor)
     return Path(path)
+
+
+# ------------------------------------------------------------------- the battle log
+
+# The transcript board is a second picture posted alongside the result. Its only job is
+# to make "who hit whom" readable at a glance, so the two fighters are told apart by
+# colour rather than by reading names: the attacker (whoever opened the fight) is red
+# and the defender blue -- stripe, name and damage all agree. The header repeats both
+# names in those colours, which doubles as the legend.
+LOG_ATTACKER_COLOR = "#b3382c"
+LOG_DEFENDER_COLOR = "#2f5d9e"
+LOG_ATTACKER_TINT = "#fbeeec"
+LOG_DEFENDER_TINT = "#ecf1fa"
+LOG_MARGIN_X = 60
+LOG_HEADER_HEIGHT = 84
+LOG_TITLE_TOP = 19
+LOG_LEGEND_TOP = LOG_HEADER_HEIGHT + 26
+LOG_OPENING_TOP = LOG_LEGEND_TOP + 40
+LOG_ROWS_TOP = LOG_OPENING_TOP + 40
+# The gap the rows are separated by, so consecutive blows never read as one block.
+LOG_ROW_GAP = 14
+LOG_ROW_PADDING = 13
+LOG_STRIPE_WIDTH = 6
+LOG_TEXT_LINE_HEIGHT = 21
+LOG_RIGHT_COLUMN = 190
+LOG_BOTTOM_PADDING = 34
+# A ten-round fight where both pets carry a per-turn passive can produce fifty-odd
+# transcript rows, and a contrived one nearly a hundred -- enough to push the board past
+# Telegram's 10000px sum-of-sides limit, which would fail the send and cost the player
+# the result board too. Keeping the opening and the finish and eliding the middle bounds
+# the height while preserving both parts anyone actually reads.
+LOG_MAX_ROWS = 26
+
+
+def _wrap(draw: ImageDraw.ImageDraw, value, font, max_width: int) -> list[str]:
+    """Break one transcript line into as many rows as it needs, on word boundaries."""
+    text = legible(value, getattr(font, "size", 16))
+    if not text:
+        return []
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}".strip()
+        if current and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _log_entries(result, attacker: dict, defender: dict) -> list[dict]:
+    """Flatten the combat transcript into rows ready to draw, in fight order."""
+    attacker_key = str(attacker.get("id"))
+    entries = []
+    for round_ in result.rounds:
+        key = str(round_.attacker)
+        is_attacker = key == attacker_key
+        owner = attacker if is_attacker else defender
+        # An amulet or weapon proc belongs to whoever triggered it, so its remaining
+        # health is the interesting number; a blow's is the target's.
+        passive = str(round_.event or "").startswith("amulet_")
+        entries.append({
+            "color": LOG_ATTACKER_COLOR if is_attacker else LOG_DEFENDER_COLOR,
+            "tint": LOG_ATTACKER_TINT if is_attacker else LOG_DEFENDER_TINT,
+            "name": _short(owner.get("pet_name"), 22, size=17),
+            "round": round_.number,
+            "damage": int(round_.damage or 0),
+            "health": round_.attacker_hp if passive else round_.defender_hp,
+            "passive": passive,
+            "text": round_.text,
+        })
+    if len(entries) > LOG_MAX_ROWS:
+        head, tail = LOG_MAX_ROWS // 2, LOG_MAX_ROWS - LOG_MAX_ROWS // 2
+        hidden = len(entries) - LOG_MAX_ROWS
+        entries = [
+            *entries[:head],
+            {"elision": f"пропущено событий: {hidden}"},
+            *entries[-tail:],
+        ]
+    return entries
+
+
+def render_fight_log(path, result, attacker: dict, defender: dict) -> Path:
+    """Write the round-by-round transcript board and return its path.
+
+    Sized to its content rather than to a fixed canvas: a fight runs anywhere from one
+    blow to twenty plus procs, and a fixed height would either clip the long ones or
+    leave the short ones mostly empty.
+    """
+    ruler = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    name_font, text_font = _font(17, bold=True), _font(16)
+    meta_font, damage_font = _font(13), _font(20, bold=True)
+    content_width = WIDTH - 2 * LOG_MARGIN_X
+    text_width = content_width - LOG_STRIPE_WIDTH - 2 * LOG_ROW_PADDING - LOG_RIGHT_COLUMN
+
+    entries = _log_entries(result, attacker, defender)
+    for entry in entries:
+        if entry.get("elision"):
+            entry["height"] = LOG_TEXT_LINE_HEIGHT + 8
+            continue
+        entry["lines"] = _wrap(ruler, entry["text"], text_font, text_width) or ["—"]
+        entry["height"] = (
+            2 * LOG_ROW_PADDING + 24 + len(entry["lines"]) * LOG_TEXT_LINE_HEIGHT
+        )
+
+    closing = _wrap(ruler, result.closing, text_font, content_width - 2 * LOG_ROW_PADDING)
+    rows_height = sum(entry["height"] + LOG_ROW_GAP for entry in entries)
+    height = (
+        LOG_ROWS_TOP + rows_height
+        + (len(closing) * LOG_TEXT_LINE_HEIGHT + 20 if closing else 0)
+        + LOG_BOTTOM_PADDING
+    )
+
+    image = Image.new("RGB", (WIDTH, int(height)), "#f6f2ea")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, WIDTH, LOG_HEADER_HEIGHT), fill="#17372f")
+    _center(draw, LOG_TITLE_TOP, "ХОД БОЯ", _font(34, bold=True), "#ffffff")
+
+    # Both names in their own colour: the legend and the first data point at once.
+    left_name = _short(attacker.get("pet_name"), 22, size=20)
+    right_name = _short(defender.get("pet_name"), 22, size=20)
+    legend_font = _font(20, bold=True)
+    separator = "  против  "
+    widths = [
+        draw.textbbox((0, 0), part, font=legend_font)[2]
+        for part in (left_name, separator, right_name)
+    ]
+    cursor = (WIDTH - sum(widths)) / 2
+    for part, width, colour in zip(
+        (left_name, separator, right_name), widths,
+        (LOG_ATTACKER_COLOR, "#53606a", LOG_DEFENDER_COLOR),
+    ):
+        draw.text((cursor, LOG_LEGEND_TOP), part, font=legend_font, fill=colour)
+        cursor += width
+
+    opening = _fit_text(draw, result.opening, _font(16), content_width)
+    _center(draw, LOG_OPENING_TOP, opening, _font(16), "#53606a")
+
+    y = LOG_ROWS_TOP
+    for entry in entries:
+        left, right = LOG_MARGIN_X, WIDTH - LOG_MARGIN_X
+        bottom = y + entry["height"]
+        if entry.get("elision"):
+            _center(draw, y + 4, entry["elision"], meta_font, "#8b959a")
+            y = bottom + LOG_ROW_GAP
+            continue
+        draw.rectangle((left, y, right, bottom), fill=entry["tint"])
+        draw.rectangle((left, y, left + LOG_STRIPE_WIDTH, bottom), fill=entry["color"])
+
+        text_left = left + LOG_STRIPE_WIDTH + LOG_ROW_PADDING
+        heading = f"РАУНД {entry['round']}  ·  {entry['name']}" if entry["round"] else entry["name"]
+        draw.text(
+            (text_left, y + LOG_ROW_PADDING),
+            f"♦ {heading}" if entry["passive"] else heading,
+            font=name_font, fill=entry["color"],
+        )
+        for index, line in enumerate(entry["lines"]):
+            draw.text(
+                (text_left, y + LOG_ROW_PADDING + 24 + index * LOG_TEXT_LINE_HEIGHT),
+                line, font=text_font, fill="#3a464d",
+            )
+
+        # Only a blow gets the big damage figure. A proc's number is a shield, a heal or
+        # a reflect just as often as damage, so rendering it as "-164" would say the
+        # opposite of what happened; its own line already carries the signed amount.
+        if not entry["passive"]:
+            damage = f"-{entry['damage']}" if entry["damage"] > 0 else "—"
+            box = draw.textbbox((0, 0), damage, font=damage_font)
+            draw.text(
+                (right - LOG_ROW_PADDING - (box[2] - box[0]), y + LOG_ROW_PADDING),
+                damage, font=damage_font, fill=entry["color"],
+            )
+        health = f"HP {max(0, int(entry['health']))}"
+        box = draw.textbbox((0, 0), health, font=meta_font)
+        draw.text(
+            (right - LOG_ROW_PADDING - (box[2] - box[0]), y + LOG_ROW_PADDING + 27),
+            health, font=meta_font, fill="#53606a",
+        )
+        y = bottom + LOG_ROW_GAP
+
+    for index, line in enumerate(closing):
+        _center(draw, y + 8 + index * LOG_TEXT_LINE_HEIGHT, line, text_font, "#53606a")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="JPEG", quality=91, optimize=True)
+    return path
+
+
+def temporary_log_path() -> Path:
+    descriptor, path = tempfile.mkstemp(prefix="pet_fight_log_", suffix=".jpg")
+    os.close(descriptor)
+    return Path(path)

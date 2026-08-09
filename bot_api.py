@@ -120,6 +120,7 @@ class TelegramBotAPI:
         reply_to_message_id: int | None = None,
         reply_markup: dict | None = None,
         parse_mode: str | None = "Markdown",
+        disable_notification: bool = False,
     ) -> dict:
         # parse_mode=None (plain text) is for callers echoing uncontrolled text (e.g.
         # someone's display name) straight into the message -- Telegram's legacy
@@ -134,6 +135,8 @@ class TelegramBotAPI:
             "link_preview_options": {"is_disabled": True},
             "reply_markup": reply_markup,
         }
+        if disable_notification:
+            params["disable_notification"] = True
         if reply_to_message_id is not None:
             params["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
         return await self._call("sendMessage", **params)
@@ -197,6 +200,45 @@ class TelegramBotAPI:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         form.add_field("photo", path.read_bytes(), filename=path.name, content_type=content_type)
         return await self._upload("sendPhoto", form)
+
+    async def send_media_group_files(
+        self,
+        chat_id,
+        paths,
+        caption: str | None = None,
+        parse_mode: str | None = None,
+        disable_notification: bool = False,
+    ) -> dict:
+        """Upload several pictures from disk as ONE album message.
+
+        The arena posts a result board and its battle log together; two sendPhoto calls
+        would arrive as two separate messages that Telegram is free to interleave with
+        anything else. An album keeps them in one bubble, in order.
+
+        The caption goes on the first photo, which is how Telegram shows an album's
+        caption. Note that sendMediaGroup accepts no reply_markup at all -- a caller that
+        needs buttons has to send them separately.
+        """
+        paths = [Path(path) for path in paths]
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if disable_notification:
+            form.add_field("disable_notification", "true")
+        media = []
+        for index, path in enumerate(paths):
+            attachment = f"file{index}"
+            item = {"type": "photo", "media": f"attach://{attachment}"}
+            if index == 0 and caption:
+                item["caption"] = caption
+                if parse_mode:
+                    item["parse_mode"] = parse_mode
+            media.append(item)
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            form.add_field(
+                attachment, path.read_bytes(), filename=path.name, content_type=content_type,
+            )
+        form.add_field("media", json.dumps(media))
+        return await self._upload("sendMediaGroup", form)
 
     async def send_document_file(
         self,

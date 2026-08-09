@@ -114,5 +114,93 @@ class FightImageTests(unittest.TestCase):
         self.assertEqual(image.getpixel((45 + pets_image.PANEL_PADDING_X + 50, y)), (200, 68, 75))
         self.assertEqual(image.getpixel((685 + pets_image.PANEL_PADDING_X + 50, y)), (174, 182, 181))
 
+class BattleLogImageTests(unittest.TestCase):
+    ATTACKER = {"id": "a", "pet_name": "Альфа"}
+    DEFENDER = {"id": "b", "pet_name": "Бета"}
+
+    def _round(self, attacker, number=1, damage=100, event="hit", text="Удар."):
+        return SimpleNamespace(
+            number=number, attacker=attacker, event=event, damage=damage,
+            attacker_hp=400, defender_hp=300, text=text,
+        )
+
+    def _result(self, rounds):
+        return SimpleNamespace(
+            rounds=tuple(rounds), opening="Бой начинается.", closing="Бой окончен.",
+            winner="a", loser="b", total_damage={"a": 1, "b": 0},
+            stopped_early=False, is_draw=False, seed=1, accident=None,
+        )
+
+    def _render(self, result):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return pets_image.render_fight_log(
+            Path(directory.name) / "log.jpg", result, self.ATTACKER, self.DEFENDER,
+        )
+
+    def test_attacker_rows_are_red_and_defender_rows_are_blue(self):
+        entries = pets_image._log_entries(
+            self._result([self._round("a"), self._round("b")]), self.ATTACKER, self.DEFENDER,
+        )
+        self.assertEqual(entries[0]["color"], pets_image.LOG_ATTACKER_COLOR)
+        self.assertEqual(entries[1]["color"], pets_image.LOG_DEFENDER_COLOR)
+
+    def test_board_grows_with_the_transcript_instead_of_clipping_it(self):
+        short = self._render(self._result([self._round("a")]))
+        longer = self._render(self._result([self._round("a")] * 6))
+        with Image.open(short) as small, Image.open(longer) as big:
+            self.assertEqual(small.size[0], pets_image.WIDTH)
+            self.assertGreater(big.size[1], small.size[1])
+
+    def test_consecutive_attacks_are_separated_by_a_margin(self):
+        """The gap is the whole point of the row layout: two blows must not read as one.
+
+        Asserted through the colour stripe rather than a single pixel: scanning down the
+        stripe column must find two separate dark bands, not one continuous block.
+        """
+        path = self._render(self._result([self._round("a"), self._round("a")]))
+        with Image.open(path) as image:
+            column = pets_image.LOG_MARGIN_X + pets_image.LOG_STRIPE_WIDTH // 2
+            dark = [
+                sum(image.getpixel((column, y))) < 550
+                for y in range(pets_image.LOG_ROWS_TOP, image.size[1])
+            ]
+        bands = sum(1 for index, value in enumerate(dark) if value and not dark[index - 1])
+        self.assertEqual(bands, 2)
+        self.assertGreaterEqual(sum(1 for value in dark if not value), pets_image.LOG_ROW_GAP)
+
+    def test_a_long_fight_stays_inside_telegram_photo_limits(self):
+        rounds = [self._round("a" if index % 2 else "b", number=index) for index in range(120)]
+        path = self._render(self._result(rounds))
+        with Image.open(path) as image:
+            self.assertLess(sum(image.size), 10_000)
+            self.assertLess(max(image.size) / min(image.size), 20)
+
+    def test_an_elided_middle_reports_how_much_it_hid(self):
+        rounds = [self._round("a", number=index) for index in range(pets_image.LOG_MAX_ROWS + 9)]
+        entries = pets_image._log_entries(self._result(rounds), self.ATTACKER, self.DEFENDER)
+        elisions = [entry for entry in entries if entry.get("elision")]
+        self.assertEqual(len(elisions), 1)
+        self.assertIn("9", elisions[0]["elision"])
+        self.assertEqual(len(entries), pets_image.LOG_MAX_ROWS + 1)
+
+    def test_a_passive_proc_never_renders_its_amount_as_damage(self):
+        """A +164 shield displayed as "-164" would state the opposite of what happened."""
+        entries = pets_image._log_entries(
+            self._result([self._round("a", event="amulet_opening_shield", damage=164)]),
+            self.ATTACKER, self.DEFENDER,
+        )
+        self.assertTrue(entries[0]["passive"])
+        # A proc reports the owner's own health, not the target's.
+        self.assertEqual(entries[0]["health"], 400)
+
+    def test_a_blow_reports_the_health_of_whoever_took_it(self):
+        entries = pets_image._log_entries(
+            self._result([self._round("a")]), self.ATTACKER, self.DEFENDER,
+        )
+        self.assertFalse(entries[0]["passive"])
+        self.assertEqual(entries[0]["health"], 300)
+
+
 if __name__ == "__main__":
     unittest.main()

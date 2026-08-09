@@ -6300,18 +6300,18 @@ async def handle_test_fight_command(
     )
 
     image_path = None
+    log_path = None
     try:
         image_path = await _pets_render_result_image(
             api, result, entry, attacker_id, defender_id, attacker, defender, log,
             fight_hp=fight_hp,
         )
-        if image_path is not None:
-            await api.send_photo_file(
-                destination_chat_id, image_path, caption=caption, parse_mode="HTML",
-                disable_notification=False,
-            )
-        else:
-            await api.send_message(destination_chat_id, caption, parse_mode="HTML")
+        log_path = _pets_render_log_image(
+            result, attacker_id, defender_id, attacker, defender, log,
+        )
+        await _pets_send_fight_images(
+            api, destination_chat_id, (image_path, log_path), caption,
+        )
     except Exception:
         log(f"[pets] failed to send a test fight:\n{traceback.format_exc()}")
         try:
@@ -6320,11 +6320,12 @@ async def handle_test_fight_command(
             log(f"[pets] failed to send a test-fight fallback:\n{traceback.format_exc()}")
             return
     finally:
-        if image_path is not None:
-            try:
-                image_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        for temporary in (image_path, log_path):
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     if source_chat.get("type") == "private" and destination_chat_id != source_chat_id:
         try:
@@ -6487,21 +6488,17 @@ async def _pets_run_fight(
         )
     except Exception:
         log(f"[pets] failed to render a fight result:\n{traceback.format_exc()}")
+    log_path = _pets_render_log_image(result, user_id, opponent_id, mine, theirs, log)
 
     async def deliver_result(recipient_id, text: str, keyboard=None) -> None:
         """Combat logs, including drops, are private to the two participants."""
         if not pets.fight_result_notifications_enabled(entry, recipient_id):
             return
         try:
-            if image_path is not None:
-                await api.send_photo_file(
-                    recipient_id, image_path, caption=text, reply_markup=keyboard,
-                    parse_mode="HTML", disable_notification=True,
-                )
-            else:
-                await api.send_message(
-                    recipient_id, text, reply_markup=keyboard, parse_mode="HTML",
-                )
+            await _pets_send_fight_images(
+                api, recipient_id, (image_path, log_path), text,
+                reply_markup=keyboard, disable_notification=True,
+            )
         except Exception:
             # A bot cannot message a member who has not started it; this must never turn
             # into a public fallback that leaks combat or a reward to the group.
@@ -6527,11 +6524,12 @@ async def _pets_run_fight(
             except Exception:
                 log(f"[pets] could not deliver the duel receipt to {recipient_id}")
     finally:
-        if image_path is not None:
-            try:
-                image_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        for temporary in (image_path, log_path):
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _pets_fighter_snapshot(fighter: pets_combat.Fighter) -> dict:
@@ -6619,6 +6617,57 @@ async def _pets_render_result_image(
     except Exception:
         path.unlink(missing_ok=True)
         raise
+
+
+def _pets_render_log_image(result, attacker_id, defender_id, attacker: dict, defender: dict, log):
+    """Render the round-by-round board, or None when it cannot be drawn.
+
+    Deliberately separate from the result board and never fatal: the transcript is a
+    companion picture, so losing it must still leave the result itself deliverable.
+    It needs no Telegram media, only the two names, so there is nothing to download.
+    """
+    path = pets_image.temporary_log_path()
+    try:
+        return pets_image.render_fight_log(
+            path, result,
+            {"id": str(attacker_id), "pet_name": attacker.get("name")},
+            {"id": str(defender_id), "pet_name": defender.get("name")},
+        )
+    except Exception:
+        path.unlink(missing_ok=True)
+        log(f"[pets] failed to render a fight log:\n{traceback.format_exc()}")
+        return None
+
+
+async def _pets_send_fight_images(
+    api, chat_id, paths, caption: str, *, reply_markup=None, disable_notification=False,
+):
+    """Post the result board and its battle log as one album.
+
+    sendMediaGroup carries no reply_markup, so when buttons are needed they follow in
+    their own small message -- losing the "another fight" button would break the loop
+    the arena runs on.
+    """
+    paths = [path for path in paths if path is not None]
+    if len(paths) > 1 and hasattr(api, "send_media_group_files"):
+        await api.send_media_group_files(
+            chat_id, paths, caption=caption, parse_mode="HTML",
+            disable_notification=disable_notification,
+        )
+        if reply_markup:
+            # Matches the album's own silence: the arena never pings for a fight result.
+            await api.send_message(
+                chat_id, "Что дальше?", reply_markup=reply_markup, parse_mode="HTML",
+                disable_notification=disable_notification,
+            )
+        return
+    if paths:
+        await api.send_photo_file(
+            chat_id, paths[0], caption=caption, reply_markup=reply_markup,
+            parse_mode="HTML", disable_notification=disable_notification,
+        )
+        return
+    await api.send_message(chat_id, caption, reply_markup=reply_markup, parse_mode="HTML")
 
 
 async def handle_pets_rename_command(
