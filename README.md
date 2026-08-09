@@ -930,6 +930,14 @@ Arena drops automatically fill an empty equipment slot or replace a weaker item 
 same slot; the previous item stays in the bag. Fight-result images show each pet's weapon,
 rarity and icon-based bonuses directly under HP, followed by the equipped amulet and its
 passive effect, with dividers separating equipment from the base-stat receipt.
+The arena keeps an append-only changelog behind the 📰 Обновления button, which shows a red
+dot until a member opens it. Entries shipped in `pets_updates.UPDATES` need a deploy;
+administrators can append one from Telegram instead with `/arenanews` (or `/аренановости`),
+which works in the group or the bot DM and takes a headline on the first line and an
+optional body on the rest. Those entries are stored per chat, always sort after the shipped
+ones, and are escaped rather than rendered as HTML, so typed markup cannot break the send.
+Publishing one restores the red dot for everybody. The command is deliberately absent from
+the registered Telegram command menu, like the other admin-only commands.
 Administrators can use `/testfight` from the group or the bot DM to pit their pet against
 a random existing opponent in the main chat. It runs the normal combat and result-image
 pipeline but deliberately records no fight, XP, gold, drop, loss debit or banked-fight use;

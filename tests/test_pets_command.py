@@ -1256,5 +1256,63 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.deleted, [])
 
 
+class ArenaNewsCommandTests(unittest.TestCase):
+    """"/arenanews" -- the only way to add a changelog entry without a deploy."""
+
+    def setUp(self):
+        self._dir = TemporaryDirectory()
+        path = Path(self._dir.name)
+        real = stats._stats_dir
+        stats._stats_dir = lambda: path
+        self.addCleanup(self._dir.cleanup)
+        self.addCleanup(lambda: setattr(stats, "_stats_dir", real))
+
+    def _write(self, text, user=PLAYER, admin=True, chat_type="group"):
+        api = FakeApi()
+
+        async def is_admin(*_args, **_kwargs):
+            return admin
+
+        with patch.object(bot_listener, "_is_chat_admin_or_privileged", is_admin):
+            _run(bot_listener.handle_arena_news_command(
+                api, None, _message(user, text, chat_type), CHAT, text, None, {},
+                log=lambda *_: None,
+            ))
+        return api
+
+    def test_an_admin_publishes_a_headline_and_a_body(self):
+        before = len(pets_updates.all_updates(CHAT))
+        api = self._write("/arenanews 🌾 Ферма\nСмена теперь от 1 до 8 часов.")
+
+        published = pets_updates.latest(CHAT)
+        self.assertEqual(published.title, "🌾 Ферма")
+        self.assertEqual(published.text, "Смена теперь от 1 до 8 часов.")
+        self.assertEqual(len(pets_updates.all_updates(CHAT)), before + 1)
+        self.assertIn("Опубликовано", api.sent[-1]["text"])
+        self.assertIn("Обновления", pets_ui.updates_view(CHAT, PLAYER["id"], 0)[0])
+
+    def test_a_multi_line_body_keeps_its_line_breaks(self):
+        self._write("/arenanews Итоги\nПервый абзац.\n\nВторой абзац.")
+        self.assertEqual(pets_updates.latest(CHAT).text, "Первый абзац.\n\nВторой абзац.")
+
+    def test_a_non_admin_publishes_nothing(self):
+        before = len(pets_updates.all_updates(CHAT))
+        api = self._write("/arenanews Что-нибудь", user=STRANGER, admin=False)
+
+        self.assertEqual(len(pets_updates.all_updates(CHAT)), before)
+        self.assertIn("только администраторы", api.sent[-1]["text"])
+
+    def test_a_bare_command_explains_the_format_instead_of_publishing_a_blank(self):
+        before = len(pets_updates.all_updates(CHAT))
+        api = self._write("/arenanews")
+
+        self.assertEqual(len(pets_updates.all_updates(CHAT)), before)
+        self.assertIn("Формат:", api.sent[-1]["text"])
+
+    def test_the_russian_spelling_reaches_the_same_handler(self):
+        self._write("/аренановости Привет\nТекст.")
+        self.assertEqual(pets_updates.latest(CHAT).title, "Привет")
+
+
 if __name__ == "__main__":
     unittest.main()

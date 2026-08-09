@@ -5434,6 +5434,9 @@ PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
 PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
 TEST_FIGHT_COMMAND = "/testfight"
+# Writing to the changelog without a deploy. Admin-only, because the entry it appends is
+# permanent and shows up with a red dot for every member of the chat.
+ARENA_NEWS_COMMANDS = ("/arenanews", "/аренановости")
 # Arena navigation is a persistent DM workspace: the same message is edited while the
 # player browses it, so scheduling its original message for deletion would destroy every
 # later screen too.  Standalone /pet cards remain temporary notices.
@@ -6255,6 +6258,84 @@ async def _pets_deliver_farm_returns(api, entries, log=print) -> None:
             except Exception:
                 # It is safe to retry an already sent receipt; settlement remains complete.
                 log(f"[pets] could not mark farm return {run_id} delivered:\n{traceback.format_exc()}")
+
+
+ARENA_NEWS_USAGE = (
+    "Формат: /arenanews заголовок, дальше с новой строки — текст.\n\n"
+    "Пример:\n"
+    "/arenanews 🌾 Ферма стала быстрее\n"
+    "Смена теперь приносит на 20% больше монет.\n\n"
+    "Одной строкой тоже можно — она станет заголовком. "
+    "Запись попадёт в «📰 Обновления» и покажется всем с красной точкой. "
+    "Разметка не поддерживается: текст публикуется как есть."
+)
+
+
+async def handle_arena_news_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    entry: str,
+    command_text: str,
+    home_chat_ref: str | None,
+    known_chat_ids: dict[str, int],
+    log=print,
+) -> None:
+    """Append one entry to the arena changelog straight from Telegram.
+
+    The shipped entries in pets_updates.UPDATES need a deploy; this does not, which is the
+    whole point -- a balance change announced days after the release that caused it should
+    not have to wait for the next one.
+    """
+    source_chat = message["chat"]
+    source_chat_id = source_chat["id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        await api.send_message(
+            source_chat_id, text,
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+
+    # Admin rights belong to the game's chat, not to the DM the command may be typed in.
+    if source_chat.get("type") == "private":
+        destination_chat_id = await _resolve_chat_id(
+            telethon_client, entry or home_chat_ref, known_chat_ids, log=log,
+        )
+    else:
+        destination_chat_id = source_chat_id
+    if destination_chat_id is None:
+        await reply("Не удалось найти основной чат, чтобы проверить права.")
+        return
+    if not await _is_chat_admin_or_privileged(api, destination_chat_id, actor):
+        await reply("Писать в обновления могут только администраторы чата.")
+        return
+
+    body = ""
+    for spelling in ARENA_NEWS_COMMANDS:
+        if command_text.lower().startswith(spelling):
+            # Only the ends are stripped: the newline between headline and note is the
+            # one piece of structure this command has.
+            body = command_text[len(spelling):].strip()
+            break
+    if not body:
+        await reply(ARENA_NEWS_USAGE)
+        return
+    # First line is the headline, the rest is the note. A one-line message is all
+    # headline: that is the shape of most small announcements.
+    title, _, text = body.partition("\n")
+    try:
+        update = pets_updates.add(entry, title, text, author_id=actor.get("id"))
+    except ValueError:
+        await reply(ARENA_NEWS_USAGE)
+        return
+
+    total = len(pets_updates.all_updates(entry))
+    log(f"[pets] {actor.get('id')} added arena update {update.id} to '{entry}'")
+    await reply(
+        f"Опубликовано в «📰 Обновления» ({total}-я запись).\n"
+        "Игроки увидят красную точку в меню /arena."
+    )
 
 
 async def handle_test_fight_command(
@@ -7346,6 +7427,22 @@ async def _dispatch_update(
             return
         await handle_test_fight_command(
             api, telethon_client, message, pets_entry, home_chat_ref, known_chat_ids, log=log,
+        )
+        return
+
+    # "/arenanews" -- writing to the changelog. Kept next to "/arena" it extends, and
+    # ahead of it: the menu's own regex demands whitespace after "/arena" so it cannot
+    # swallow this today, but a future spelling added without that guard would.
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in ARENA_NEWS_COMMANDS
+    ):
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_arena_news_command(
+            api, telethon_client, message, pets_entry, command_text, home_chat_ref,
+            known_chat_ids, log=log,
         )
         return
 

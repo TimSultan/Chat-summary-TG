@@ -250,13 +250,22 @@ def info_view(user_id) -> tuple[str, dict]:
 
 def updates_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
     """Newest-first, one concise release note per screen."""
-    update, page, total = pets_updates.page(page)
+    update, page, total = pets_updates.page(entry, page)
     if update is None:
         return "📰 <b>Обновления</b>\n\nПока нет опубликованных обновлений.", {
             "inline_keyboard": [_back_row(user_id)],
         }
 
-    lines = [f"📰 <b>Обновления</b>", "", f"<b>{update.title}</b>", update.text]
+    # Escaped, not trusted as markup: an entry written in chat with "/arenanews" is
+    # whatever an admin typed, and a single stray "<" would fail the whole HTML send.
+    # The shipped entries are plain text too, so nothing is lost by escaping both.
+    lines = [f"📰 <b>Обновления</b>", ""]
+    # A chat-authored entry may be title-only or body-only; neither should leave an empty
+    # bold line or a stray blank behind.
+    if update.title:
+        lines.append(f"<b>{escape(update.title)}</b>")
+    if update.text:
+        lines.append(escape(update.text))
     lines.append(f"\n<i>{page + 1}/{total}</i>")
     navigation = []
     if page + 1 < total:
