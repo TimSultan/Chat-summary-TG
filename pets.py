@@ -51,8 +51,17 @@ FIGHT_LOG_LIMIT = 2_000
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
 UNIQUE_WEAPONS_MIGRATION_FLAG = "unique_weapons_202608"
 HAMSTERATOR_RETIREMENT_REASON = "pet_hamsterator_retirement_202608"
+# w003 was the mop when that migration stripped it from every owner; it has since been
+# renamed back to Старый компрессор. The code and the payout reason below are historical
+# identifiers -- changing either would re-run a migration that has already been paid.
 REMOVED_MOP_CODE = "w003"
 REMOVED_MOP_COMPENSATION = 100
+# Same two-lock shape as the cage refund above, for the farm's 75 -> 10 build price.
+FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
+# One free common weapon for anybody who never got one. Also two-locked: the per-chat flag
+# is what stops a player who sells their only weapon from being handed another on the next
+# restart, forever.
+STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
 
 _NAME_MAX_LEN = 24
 # The poller and a button press can settle the same finished run in one process.  The
@@ -638,6 +647,92 @@ def refund_cage_upgrades(entries) -> int:
     return refunded
 
 
+def refund_farm_builds(entries) -> int:
+    """Pay back C.FARM_BUILD_REFUND once to everybody who built a farm at the old 75.
+
+    Same two locks and the same reasoning as refund_cage_upgrades: economy.grant_once
+    keys per user so a crash mid-chat cannot pay twice, and FARM_BUILD_REFUND_FLAG closes
+    the eligibility window at the first run -- otherwise every player who builds a farm
+    AFTER this deploy would also collect 65 on the next restart, turning a 10-coin
+    building into a 55-coin profit.
+
+    `farm_level >= 1` is the signal rather than a `buy:pet_farm_upgrade` row in the
+    economy log, because that log is capped (economy.LOG_LIMIT) and an early build may
+    already have been trimmed out of it, while the level on the pet record never
+    decreases. At the moment this ships, having a farm at all means having paid 75 for it.
+    """
+    refunded = 0
+    for entry in entries:
+        data = _load(entry)
+        if data.get(FARM_BUILD_REFUND_FLAG):
+            continue
+        for user_id, record in data.get("pets", {}).items():
+            if not isinstance(record, dict):
+                continue
+            if int(record.get("farm_level", 0) or 0) < 1:
+                continue
+            if economy.grant_once(
+                entry, user_id, C.FARM_BUILD_REFUND, "pet_farm_build_202608",
+            ):
+                refunded += 1
+        data[FARM_BUILD_REFUND_FLAG] = True
+        _save(entry, data)
+    return refunded
+
+
+def grant_starter_weapons(entries) -> int:
+    """Hand one free common weapon to every pet that owns no weapon at all.
+
+    Weapons are chat-unique objects, so this cannot just pick any common: it has to skip
+    everything already claimed in this chat, including what an earlier pet in this very
+    loop was just given (nothing is saved until the end). The choice is seeded per
+    chat+player so an interrupted run re-picks the same weapon rather than wandering
+    through the catalogue on each retry.
+
+    Locked per chat rather than per user: "owns no weapon" is a condition a player can
+    re-enter by selling or gifting, and without the flag every restart would refill them.
+    """
+    granted = 0
+    for entry in entries:
+        data = _load(entry)
+        if data.get(STARTER_WEAPON_GIFT_FLAG):
+            continue
+        taken = {
+            code for record in data.get("pets", {}).values()
+            if isinstance(record, dict)
+            for code in record.get("inventory", [])
+        }
+        pool = sorted(
+            (item for item in C.ITEMS if item.slot == "weapon" and item.rarity == "common"),
+            key=lambda item: item.code,
+        )
+        for user_id, record in sorted(data.get("pets", {}).items()):
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            owned = record.setdefault("inventory", [])
+            if any(
+                (item := C.find_item(code)) is not None and item.slot == "weapon"
+                for code in owned
+            ):
+                continue
+            available = [item for item in pool if item.code not in taken]
+            if not available:
+                # 250 commons against one chat's players makes this unreachable in
+                # practice; exhausting it is not a reason to hand out a duplicate.
+                break
+            gift = random.Random(f"{entry}:{user_id}:starter-weapon").choice(available)
+            owned.append(gift.code)
+            taken.add(gift.code)
+            _discover(record, gift.code)
+            # Their weapon slot is empty by definition, so there is nothing to compare
+            # against and nothing to displace.
+            record.setdefault("equipped", {})["weapon"] = gift.code
+            granted += 1
+        data[STARTER_WEAPON_GIFT_FLAG] = True
+        _save(entry, data)
+    return granted
+
+
 def retire_hamsterators(entries) -> dict:
     """Remove the retired building and refund every historic upgrade exactly once."""
     players = 0
@@ -696,12 +791,17 @@ def _farm_features(record: dict) -> dict[str, bool]:
     return {key: bool(raw.get(key)) for key in C.FARM_FEATURES}
 
 
-def _farm_multipliers(features: dict, hours: int) -> tuple[float, float, float]:
+def _farm_multipliers(features: dict, hours: int, luck: int = 0) -> tuple[float, float, float]:
     """Gold, pet-XP and item-find terms for one farm run of the given length.
 
     `features` is a plain {key: bool} mapping -- either the record's LIVE farm_features
     (for a not-yet-started preview) or the SNAPSHOT stored on an active run (so an upgrade
     bought while the pet is away affects only the next trip, not the one in progress).
+    `luck` is snapshotted the same way and for the same reason.
+
+    Luck multiplies the finished chance, beds included: a player who has bought both the
+    beds and the luck deserves them to compound, and multiplying only the base would make
+    the building progressively less worth owning the luckier the pet got.
     """
     gold, pet_xp = 1.0, 1.0
     drop = C.FARM_DROP_CHANCE_BY_HOURS[max(0, min(C.FARM_MAX_HOURS, int(hours)))]
@@ -714,7 +814,7 @@ def _farm_multipliers(features: dict, hours: int) -> tuple[float, float, float]:
         gold *= float(feature.get("gold_multiplier", 1.0))
         pet_xp *= float(feature.get("xp_multiplier", 1.0))
         drop += float(feature.get("drop_bonus", 0.0))
-    return gold, pet_xp, min(1.0, drop)
+    return gold, pet_xp, min(1.0, drop * C.luck_drop_multiplier(luck))
 
 
 # Rarity is checked from richest to plainest so a fallback always lands on something more
@@ -801,7 +901,10 @@ def _farm_reward(data: dict, record: dict, run: dict, claimed_weapon_codes: froz
     run_id = str(run.get("run_id") or "")
     level = min(max(1, int(run.get("level", 1) or 1)), C.FARM_MAX_LEVEL)
     features = run.get("features") if isinstance(run.get("features"), dict) else {}
-    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours)
+    # A run started before luck affected drops has no snapshot; zero reproduces exactly
+    # the chance it was promised when the pet left.
+    luck = max(0, int(run.get("luck", 0) or 0))
+    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours, luck)
     rng = random.Random(f"{run_id}:{hours}")
     found = _farm_item_for(data, record, rng, hours, drop_chance, claimed_weapon_codes)
     return {
@@ -909,12 +1012,13 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         }
         for key, owned in features.items()
     }
-    # One row per selectable duration, priced at CURRENT level/features -- nothing is
+    # One row per selectable duration, priced at CURRENT level/features/luck -- nothing is
     # committed by looking, so unlike the frozen `reward` below this always reflects what
     # tapping that button right now would actually pay.
+    live_luck = int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0)
     hour_previews = []
     for hours in C.FARM_HOUR_CHOICES:
-        gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours)
+        gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours, live_luck)
         hour_previews.append({
             "hours": hours,
             "gold": C.farm_gold_for(estimate_level, hours, gold_multiplier),
@@ -1007,6 +1111,7 @@ def start_farm(
         "hours": hours,
         "level": level,
         "features": _farm_features(record),
+        "luck": int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0),
     }
     _save(entry, data)
     return True, f"Питомец отправлен на ферму на {hours} ч."
@@ -1045,6 +1150,7 @@ def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]
     # the pet's current level/features for it, since no true start-of-shift snapshot exists.
     run.setdefault("level", min(max(1, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL))
     run.setdefault("features", _farm_features(record))
+    run.setdefault("luck", int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0))
     run.pop("reward", None)  # force a fresh, hours-scaled roll instead of a stale legacy one
     run["ready_at"] = moment.isoformat()
     _save(entry, data)
@@ -2198,7 +2304,12 @@ def record_fight(
     dropped = None
     auto_equipped = False
     collector_bonus = _effect_fraction(_equipped_effect(winner, "collector"))
-    drop_chance = min(1.0, C.DROP_CHANCE * (1 + collector_bonus))
+    # Only the winner rolls, so it is the winner's luck that pays -- the same pet whose
+    # luck already bought the crits that probably won the fight.
+    luck_bonus = C.luck_drop_multiplier(
+        (winner.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL)
+    )
+    drop_chance = min(1.0, C.DROP_CHANCE * (1 + collector_bonus) * luck_bonus)
     if force_legendary:
         dropped = random.choice(legendary_pool)
     elif drop_pool and random.random() < drop_chance:

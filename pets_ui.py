@@ -157,6 +157,9 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
             {"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")},
         ])
+        rows.append([
+            {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
+        ])
         notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
         rows.append([
             {
@@ -234,7 +237,11 @@ def info_view(user_id) -> tuple[str, dict]:
     lines.append("5. Ненужную снятую экипировку можно продать или подарить владельцу другого существа.")
     lines.append("6. Каждый второй уровень фермы добавляет место в запасе боёв; все уровни улучшают смены и пассивную добычу монет.")
     lines.append("\n<b>Статы</b>")
-    lines.append("Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. Удача повышает шанс крита.")
+    lines.append(
+        "Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. "
+        "Удача повышает шанс крита и шанс найти вещь — в бою и на ферме "
+        f"(до +{round(C.LUCK_DROP_BONUS_MAX * 100)}% на максимуме)."
+    )
     lines.append("\n<b>Особые преимущества</b>")
     lines.append(
         "Если один стат в 2 раза выше, чем у соперника, он иногда срабатывает как фирменный приём; "
@@ -245,6 +252,20 @@ def info_view(user_id) -> tuple[str, dict]:
         "Броня блокирует удар, а Удача даёт сильный, но не смертельный стартовый эффект."
     )
     lines.append("\n<b>Дуэли</b>: напиши /duel @user в общем чате или в личке бота. Одного и того же соперника можно вызвать раз в день.")
+    return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+
+def casino_view(entry: str, user_id) -> tuple[str, dict]:
+    """A placeholder with a real button behind it, on purpose.
+
+    The button ships before the game does so the idea can be announced and reacted to
+    without a half-built gambling loop being live in a chat where coins are already tight.
+    Nothing here reads or writes the ledger.
+    """
+    lines = [
+        "🎰 <b>Казино</b>\n",
+        "Казик строится, заходите позже.",
+    ]
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 
@@ -562,6 +583,13 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             f" <i>(в бою {effective.get(key, level)})</i>"
         )
     lines.append(f"{C.ARMOR_EMOJI} {C.ARMOR_NAME}: {effective.get('armor', 0)} <i>(из снаряжения)</i>")
+    # Luck is the one stat whose payoff is invisible in a fight log, so its current find
+    # bonus is spelled out where the points are actually bought.
+    luck_bonus = C.luck_drop_multiplier(effective.get("luck", levels.get("luck", C.STAT_MIN_LEVEL))) - 1
+    lines.append(
+        f"\n🍀 Удача сейчас даёт <b>+{luck_bonus * 100:.0f}%</b> к шансу найти вещь"
+        " — и в бою, и на ферме."
+    )
     lines.append(f"\n🪙 Монеты: {_money(coins)}")
     lines.append(f"\n<i>Уровни: {C.STAT_MIN_LEVEL}–{C.STAT_MAX_LEVEL}. Чем выше, тем дороже следующий пункт.</i>")
 

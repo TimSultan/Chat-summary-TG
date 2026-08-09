@@ -28,10 +28,13 @@ def test_catalogue_is_immutable_and_can_adapt_to_existing_item_constructor():
 
 
 def test_first_three_ids_preserve_legacy_identity_and_descriptions():
-    """Codes, names, sources and descriptions are the migration contract.
+    """Codes, sources and prices are the migration contract; names and stats are not.
 
-    Stats are not: they track the live balance, so w003 moved to the legendary band
-    with the rest of its tier rather than staying pinned to the original +20.
+    w003 has now been through three identities: «Кость прадеда», then «Компрессор старого
+    мастера» when the game was rethemed around painting, then «Швабра на изоленте» when the
+    500-weapon catalogue overwrote it. It is now back to the compressor by request, with
+    the description recovered from the commit that first wrote it, and +21 strength -- close
+    to the +20 it carried for both of its earlier lives.
     """
     assert [(weapon.code, weapon.name, weapon.source, weapon.price, dict(weapon.bonuses), weapon.description)
             for weapon in catalogue.WEAPON_SPECS[:3]] == [
@@ -40,9 +43,9 @@ def test_first_three_ids_preserve_legacy_identity_and_descriptions():
         ("w002", "Мамина сковородка", "shop", 65,
          {"strength": 14, "luck": 4},
          "После неё спор окончен."),
-        ("w003", "Швабра на изоленте", "drop", 0,
-         {"strength": 30, "agility": -3},
-         "Синяя. Значит, легендарная."),
+        ("w003", "Старый компрессор", "drop", 0,
+         {"strength": 21, "agility": -3},
+         "Тяжёлый, гудит и выдаёт идеальное давление."),
     ]
 
 
@@ -56,11 +59,18 @@ def test_rarity_distribution_has_bad_average_good_and_few_legendary_items():
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in cursed)
     assert all(max(value for _, value in weapon.bonuses) >= 20 for weapon in rares)
     assert len(legendary) == 5
-    assert all(dict(weapon.bonuses)["strength"] >= 28 for weapon in legendary)
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in legendary)
-    # A legendary must clearly out-hit the best rare, or the rarest drop in the game
-    # is a coin flip against a weapon anyone can buy.
-    assert min(dict(weapon.bonuses)["strength"] for weapon in legendary) > max(
+
+    # w003 is a deliberate, requested exception to the two rules below: at +21 strength it
+    # is the antique of the tier, weaker on paper than the best rare (+24) and out-scored
+    # by 13 of the 50 rares. It keeps its legendary passive and its 220-coin salvage. The
+    # rules still bind the four generated legendaries, which are the ones a player is
+    # actually chasing -- widening the exception past this single hand-written entry is
+    # what would make the rarest drop in the game a coin flip.
+    generated = [weapon for weapon in legendary if weapon.code != "w003"]
+    assert len(generated) == 4
+    assert all(dict(weapon.bonuses)["strength"] >= 28 for weapon in generated)
+    assert min(dict(weapon.bonuses)["strength"] for weapon in generated) > max(
         dict(weapon.bonuses)["strength"] for weapon in rares
     )
 

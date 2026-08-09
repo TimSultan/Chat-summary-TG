@@ -6168,6 +6168,7 @@ async def handle_pets_callback(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),
             "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
+            "casino": lambda: pets_ui.casino_view(entry, user_id),
             "bagitems": lambda: pets_ui.bag_items_view(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),
@@ -7835,6 +7836,14 @@ async def run_bot_listener(
         weapon_migration = pets.enforce_unique_weapons(cfg.listener_allowed_chats)
         if weapon_migration["removed_mops"] or weapon_migration["deduplicated"]:
             log(f"[pets] unique weapon migration: {weapon_migration}")
+        refunded_farms = pets.refund_farm_builds(cfg.listener_allowed_chats)
+        if refunded_farms:
+            log(f"[pets] refunded {refunded_farms} farm builds at {C.FARM_BUILD_REFUND} coins")
+        # After enforce_unique_weapons, so a chat still holding duplicates cannot have one
+        # of them counted as "already has a weapon" and skip somebody who is about to lose it.
+        starter_weapons = pets.grant_starter_weapons(cfg.listener_allowed_chats)
+        if starter_weapons:
+            log(f"[pets] gave {starter_weapons} players a free common weapon")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
             f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "

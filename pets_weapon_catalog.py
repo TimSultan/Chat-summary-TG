@@ -343,8 +343,12 @@ _LEGACY_WEAPONS: Final = (
      "common", "shop", 10, 2, 0, (("strength", 6),)),
     ("w002", "Мамина сковородка", "После неё спор окончен.",
      "uncommon", "shop", 65, 13, 0, (("strength", 14), ("luck", 4))),
-    ("w003", "Швабра на изоленте", "Синяя. Значит, легендарная.",
-     "legendary", "drop", 0, 220, 1, (("strength", 30), ("agility", -3))),
+    # Renamed back to the compressor it was before the 500-weapon catalogue overwrote it
+    # with a mop; the description is the original one, recovered from f52cb1e. Its stats
+    # are deliberately below the other four legendaries -- this is the one legendary that
+    # is a heavy, awkward antique rather than a punch line about power.
+    ("w003", "Старый компрессор", "Тяжёлый, гудит и выдаёт идеальное давление.",
+     "legendary", "drop", 0, 220, 1, (("strength", 21), ("agility", -3))),
 )
 
 # Four generated legendary slots get actual punch-line names instead of inheriting a

@@ -104,6 +104,10 @@ FARM_DURATION_BONUS = (0.0, 0.85, 0.88, 0.91, 0.94, 0.97, 1.00, 1.06, 1.15)
 # thing a newcomer should reach first, not last. Every level after it keeps its old price,
 # so the ladder is unchanged for anybody already climbing it.
 FARM_UPGRADE_COSTS = (10, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
+# The difference, paid back once to everybody who already built at 75. See
+# pets.refund_farm_builds -- and note this is the gap, not the old price: they keep the
+# farm they paid for, they just end up having paid today's price for it.
+FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # Six-hour REFERENCE payouts -- see farm_gold_for/farm_xp_for for how an actual `hours`
 # length is derived from them. Kept as the anchor rather than rescaled per-hour so
 # STARTER_WEAPON_MAX_PRICE below stays a meaningful, stated-once number.
@@ -323,8 +327,12 @@ POWER_RATING_WEIGHTS = {
 }
 OPPONENT_POWER_WINDOW = 125
 
-WIN_GOLD_MIN = 5            # "случайно 5-10 голды"
-WIN_GOLD_MAX = 10
+# Was 5-10 ("случайно 5-10 голды"). Tripled because the arena was not paying for itself:
+# ten fights a day at a 50% win rate netted about 26 coins after losses, against 1,481 for
+# one stat to level 40 -- roughly a month of daily play for a single stat, which is what
+# "everyone is poor" actually measured. At 15-30 the same day nets about 79.
+WIN_GOLD_MIN = 15
+WIN_GOLD_MAX = 30
 # The loser pays 30% of what the winner just took. This replaces the original "проигравший
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.
@@ -663,6 +671,35 @@ def resale_value(item: Item) -> int:
 # casual player at roughly one item every three days while leaving the *conditional*
 # rarity split (which item, once a drop happens) completely untouched.
 DROP_CHANCE = 0.15
+
+# Luck is now the "find things" stat as well as the crit stat: it multiplies the chance of
+# an item dropping, in the arena and on the farm alike.
+#
+#     multiplier = 1 + LUCK_DROP_BONUS_MAX * luck / (luck + LUCK_DROP_K)
+#
+# Same saturating shape as DODGE/CRIT above, and chosen for the same reason: a linear bonus
+# either does nothing at luck 10 or doubles drops before luck 40, whereas this pays a
+# luck-focused build the whole way up without any single point being a cliff. K is the luck
+# at which half the maximum bonus is reached.
+#
+#     luck    1     10     20     40     60     80
+#     bonus  +2%   +13%   +23%   +36%   +44%   +49%
+#     arena  15.2% 17.0%  18.4%  20.3%  21.5%  22.4%   (from a 15% base)
+#     farm 8h 6.1%  6.8%   7.4%   8.1%   8.6%   9.0%   (from a 6% base)
+#
+# Deliberately a multiplier on the base rather than a flat addition: a one-hour farm shift
+# is meant to be a poor way to hunt for loot, and a flat bonus would make luck turn it into
+# the best one. Half the maximum by luck 50 also means the bonus is real for somebody who
+# merely favours luck, not only for the 6,896 coins it costs to take it to 80.
+LUCK_DROP_BONUS_MAX = 0.80
+LUCK_DROP_K = 50.0
+
+
+def luck_drop_multiplier(luck: int) -> float:
+    """How much one pet's luck multiplies its item-find chance. 1.0 at zero luck."""
+    value = max(0, int(luck or 0))
+    return 1.0 + LUCK_DROP_BONUS_MAX * value / (value + LUCK_DROP_K)
+
 
 # A normal win has roughly 0.05% chance to produce a legendary of any kind -- the
 # weighted pool grew once gear and amulets joined it, so natural legendaries are far

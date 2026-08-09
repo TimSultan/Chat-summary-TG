@@ -108,6 +108,78 @@ class CageAndTamingTests(PetsTestCase):
         self.assertEqual(pets.refund_cage_upgrades([entry]), 0)
         self.assertEqual(economy.balance(entry, "1", 0), 0)
 
+    def test_farm_builders_are_refunded_the_gap_exactly_once(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        economy.grant(entry, "1", pets_config.FARM_UPGRADE_COSTS[0], "build_funds")
+        self.assertTrue(pets.upgrade_farm(entry, "1", 0)[0])
+        # Somebody who never built a farm is not part of this refund.
+        self._tame(entry, "2")
+
+        self.assertEqual(pets.refund_farm_builds([entry]), 1)
+        self.assertEqual(pets.refund_farm_builds([entry]), 0)
+        self.assertEqual(economy.balance(entry, "1", 0), pets_config.FARM_BUILD_REFUND)
+        self.assertEqual(economy.balance(entry, "2", 0), 0)
+
+    def test_farms_built_after_the_refund_do_not_print_coins(self):
+        """The window has to close at the first run: the payout (65) is larger than the
+        new build price (10), so a still-open window would make building profitable."""
+        entry = "chat"
+        self._tame(entry, "1")
+        self.assertEqual(pets.refund_farm_builds([entry]), 0)
+
+        economy.grant(entry, "1", pets_config.FARM_UPGRADE_COSTS[0], "build_funds")
+        self.assertTrue(pets.upgrade_farm(entry, "1", 0)[0])
+
+        self.assertEqual(pets.refund_farm_builds([entry]), 0)
+        self.assertEqual(economy.balance(entry, "1", 0), 0)
+        self.assertGreater(pets_config.FARM_BUILD_REFUND, pets_config.FARM_UPGRADE_COSTS[0])
+
+    def test_weaponless_pets_each_get_a_different_free_common_weapon(self):
+        entry = "chat"
+        for uid in ("1", "2", "3"):
+            self._tame(entry, uid)
+        # This one already has a weapon and must be left alone.
+        armed = next(iter(pets_config.items_for_slot("weapon", "shop")))
+        pets._load(entry)
+        data = pets._load(entry)
+        data["pets"]["3"]["inventory"].append(armed.code)
+        pets._save(entry, data)
+
+        self.assertEqual(pets.grant_starter_weapons([entry]), 2)
+
+        gifts = []
+        for uid in ("1", "2"):
+            pet = pets.get_pet(entry, uid)
+            weapons = [
+                item for code in pet["inventory"]
+                if (item := pets_config.find_item(code)) is not None and item.slot == "weapon"
+            ]
+            self.assertEqual(len(weapons), 1, uid)
+            self.assertEqual(weapons[0].rarity, "common")
+            # Nothing was in the slot, so the gift is worn rather than left in the bag.
+            self.assertEqual(pet["equipped"]["weapon"], weapons[0].code)
+            self.assertIn(weapons[0].code, pet["discovered"])
+            gifts.append(weapons[0].code)
+
+        # Weapons are chat-unique objects: two players cannot be handed the same one.
+        self.assertEqual(len(set(gifts)), 2)
+        self.assertNotIn(armed.code, gifts)
+        self.assertEqual(pets.get_pet(entry, "3")["inventory"], [armed.code])
+
+    def test_selling_the_gift_later_does_not_earn_a_second_one(self):
+        """The per-chat flag is the only thing standing between "owns no weapon" and an
+        infinite weapon faucet, since a player can re-enter that state at will."""
+        entry = "chat"
+        self._tame(entry, "1")
+        self.assertEqual(pets.grant_starter_weapons([entry]), 1)
+
+        gift = pets.get_pet(entry, "1")["equipped"]["weapon"]
+        self.assertTrue(pets.unequip(entry, "1", "weapon")[0])
+        self.assertTrue(pets.sell_item(entry, "1", gift)[0])
+        self.assertEqual(pets.grant_starter_weapons([entry]), 0)
+        self.assertEqual(pets.get_pet(entry, "1")["inventory"], [])
+
     def test_duplicate_name_refuses_case_insensitively(self):
         entry = "chat"
         for uid in ("1", "2"):
@@ -1201,14 +1273,23 @@ class RecordFightTests(PetsTestCase):
         pets._save(entry, data)
 
     def test_win_rewards_follow_capped_level_difference_curve(self):
-        """Gold and XP reward a harder win, while weak-target farming is capped."""
+        """Gold and XP reward a harder win, while weak-target farming is capped.
+
+        Gold is derived from WIN_GOLD_MAX and the shared multiplier table rather than
+        written out, so re-tuning the arena payout (5-10 -> 15-30, and whatever comes
+        after) re-states this test instead of breaking it. The multiplier CURVE is what is
+        being pinned here; the size of the pot is a balance knob.
+        """
         cases = {
-            -3: (125, 12),
-            -2: (116, 12),
-             0: (100, 10),
-             2: (85, 8),
-             3: (75, 8),
-             9: (75, 8),  # the +3 stronger-winner penalty is the cap
+            delta: (
+                expected_xp,
+                round(pets_config.WIN_GOLD_MAX
+                      * pets_config.arena_level_reward_multiplier(10 + delta, 10)),
+            )
+            for delta, expected_xp in {
+                -3: 125, -2: 116, 0: 100, 2: 85, 3: 75,
+                9: 75,  # the +3 stronger-winner penalty is the cap
+            }.items()
         }
         result = SimpleNamespace(winner="1", loser="2")
 
@@ -1241,7 +1322,63 @@ class RecordFightTests(PetsTestCase):
              patch("random.random", return_value=1.0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        self.assertEqual(outcome["gold"], round(10 * 1.25 * 0.75))
+        # Cage bonus (+25% at level 5) composes with the +3 level-difference penalty.
+        # Both factors are named rather than folded into a literal, so the arena payout
+        # can be re-tuned without this test having to be re-derived by hand.
+        self.assertEqual(
+            outcome["gold"],
+            round(pets_config.WIN_GOLD_MAX
+                  * (1 + pets_config.CAGE_GOLD_BONUS_PCT[4] / 100)
+                  * pets_config.arena_level_reward_multiplier(13, 10)),
+        )
+
+    def test_luck_raises_the_find_chance_on_a_saturating_curve(self):
+        """The shape is the point, not any single number.
+
+        Monotonic so a point of luck is never wasted, saturating so it cannot run away,
+        and worth having at a level somebody actually reaches -- half the maximum bonus
+        by luck 50, not only at the 6,896 coins it costs to reach 80.
+        """
+        curve = [pets_config.luck_drop_multiplier(luck) for luck in range(0, 81)]
+        self.assertEqual(curve[0], 1.0)
+        self.assertTrue(all(b >= a for a, b in zip(curve, curve[1:])))
+        self.assertLess(curve[-1], 1 + pets_config.LUCK_DROP_BONUS_MAX)
+        # Half the maximum bonus is reached exactly at K, by construction.
+        self.assertAlmostEqual(
+            pets_config.luck_drop_multiplier(pets_config.LUCK_DROP_K),
+            1 + pets_config.LUCK_DROP_BONUS_MAX / 2,
+        )
+        # "Considerable, not a lot": a dedicated luck build lands between +40% and +60%
+        # relative, and a starting pet gets effectively nothing.
+        self.assertLess(curve[1] - 1, 0.05)
+        self.assertGreater(curve[80] - 1, 0.40)
+        self.assertLess(curve[80] - 1, 0.60)
+
+    def test_luck_lifts_the_arena_drop_rate_measurably(self):
+        """A behavioural check, not just arithmetic: the winner's luck is what pays."""
+        entry = "luck-drops"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        result = SimpleNamespace(winner="1", loser="2")
+        base = pets_config.DROP_CHANCE
+        lucky = base * pets_config.luck_drop_multiplier(pets_config.STAT_MAX_LEVEL)
+        self.assertGreater(lucky, base)
+
+        # A roll that lands between the two thresholds drops for a lucky pet and not for
+        # an unlucky one -- the cleanest statement that luck is actually consulted.
+        between = (base + lucky) / 2
+        with patch("random.random", return_value=between), \
+             patch("random.randint", return_value=pets_config.WIN_GOLD_MAX):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+        self.assertIsNone(outcome.get("dropped_item"))
+
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"]["luck"] = pets_config.STAT_MAX_LEVEL
+        pets._save(entry, data)
+        with patch("random.random", return_value=between), \
+             patch("random.randint", return_value=pets_config.WIN_GOLD_MAX):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 2))
+        self.assertIsNotNone(outcome.get("dropped_item"))
 
     def test_draw_consumes_one_fight_without_gold_or_a_win(self):
         entry = "chat"
@@ -1640,6 +1777,33 @@ class FarmTests(PetsTestCase):
             self.assertTrue(ok, message)
             self.assertEqual(pets.farm_level(entry, uid), expected_level)
 
+    def test_farm_luck_is_frozen_at_the_start_of_the_shift(self):
+        """Same rule as farm level and buildings: what the pet had when it left is what
+        the shift pays, so buying luck mid-shift cannot re-roll a run already in flight."""
+        entry, start = "farm-luck", datetime(2026, 8, 1, 10)
+        self._build_farm(entry)
+        self.assertTrue(pets.start_farm(entry, "1", 8, now=start)[0])
+
+        data = pets._load(entry)
+        run_luck = data["pets"]["1"]["farm_run"]["luck"]
+        data["pets"]["1"]["stats"]["luck"] = pets_config.STAT_MAX_LEVEL
+        pets._save(entry, data)
+        self.assertEqual(run_luck, pets_config.STAT_MIN_LEVEL)
+
+        status = pets.farm_status(entry, "1", start)
+        self.assertTrue(status["running"])
+        # The preview for the NEXT shift moves with the new luck...
+        self.assertGreater(
+            status["hour_previews"][-1]["drop_chance"],
+            pets_config.FARM_DROP_CHANCE_BY_HOURS[8],
+        )
+        # ...while the shift already running keeps the odds it was promised.
+        self.assertAlmostEqual(
+            pets._farm_multipliers({}, 8, run_luck)[2],
+            pets_config.FARM_DROP_CHANCE_BY_HOURS[8]
+            * pets_config.luck_drop_multiplier(pets_config.STAT_MIN_LEVEL),
+        )
+
     def test_farm_requires_construction_and_has_ten_priced_levels(self):
         self._tame("farm", "1")
         ok, _ = pets.start_farm("farm", "1", now=datetime(2026, 8, 1, 10))
@@ -1758,7 +1922,13 @@ class FarmTests(PetsTestCase):
         self.assertTrue(all(spec["level"] == 1 for spec in status["features"].values()))
         # `drop_chance` is the six-hour-anchor row of hour_previews, kept for backward
         # compatibility -- beds' +0.05 still applies on top of that anchor's base rate.
-        self.assertEqual(status["drop_chance"], pets_config.FARM_DROP_CHANCE_BY_HOURS[6] + 0.05)
+        # Luck multiplies the finished chance, so the beds bonus is read through the
+        # pet's current luck rather than compared against the raw table.
+        self.assertAlmostEqual(
+            status["drop_chance"],
+            (pets_config.FARM_DROP_CHANCE_BY_HOURS[6] + 0.05)
+            * pets_config.luck_drop_multiplier(pets.stat_level("farm", "1", "luck")),
+        )
 
     def test_due_run_without_id_is_recovered_and_cannot_block_the_pet(self):
         """A run that merely lost its `run_id` (hours/level/features intact) keeps its

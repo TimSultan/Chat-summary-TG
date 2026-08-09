@@ -227,7 +227,15 @@ class PetsCommandTests(unittest.TestCase):
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
-        self.assertTrue(all(len(row) == 2 for row in keyboard["inline_keyboard"]))
+        # Paired rows throughout, with one deliberate exception: the casino gets a
+        # full-width row of its own so a newly announced feature is not one of two
+        # equal-looking halves. Pinning the exception by name keeps a THIRD lone button
+        # from appearing by accident.
+        lone = [
+            pets_ui.parse_callback(row[0]["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] if len(row) != 2
+        ]
+        self.assertEqual(lone, ["casino"])
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
