@@ -36,6 +36,7 @@ LEADERBOARD_PAGE_SIZE = 20
 SLOT_PAGE_SIZE = 8
 INVENTORY_PAGE_SIZE = 6
 COLLECTION_PAGE_SIZE = 8
+ARENA_NO_FIGHTS_NOTICE = "🚫 Бои на сегодня закончились."
 RARITY_FILTERS = ("all", "cursed", "common", "uncommon", "rare", "legendary")
 RARITY_FILTER_NAMES = {
     "all": "Все", "cursed": "Проклятые", "common": "Обычные",
@@ -1012,7 +1013,8 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if farming:
         lines.append("\n🌾 Питомец на ферме — арена подождёт, пока он не вернётся.")
     elif left <= 0:
-        lines.append("\nНа сегодня всё. Ферма и клетка увеличивают лимит боёв.")
+        lines.append(f"\n<b>{ARENA_NO_FIGHTS_NOTICE}</b>")
+        lines.append("Новые попытки появятся после указанного выше обновления.")
 
     rows = []
     if left > 0 and not farming:

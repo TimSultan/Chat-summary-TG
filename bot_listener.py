@@ -5416,10 +5416,6 @@ DUEL_RESULT_DELETE_AFTER = 10
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_FLOW_TTL_SECONDS = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_INVALID_DELETE_AFTER = 5
-DUEL_NO_FIGHTS_GROUP_DELETE_AFTER = 5
-DUEL_NO_FIGHTS_GROUP_NOTICE = (
-    "У вас закончились бои, покрасы добавляют количество боев. Сначала красим, потом деремся"
-)
 # Same ten-minute window the cabinet flows use, and for the same reason: only naming and
 # re-photographing a creature need server-side state at all. Every button carries its own
 # owner id, so navigation itself survives a restart.
@@ -5733,7 +5729,7 @@ async def handle_duel_command(
         await _pets_run_fight(
             api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
             xp, log, background_tasks=background_tasks,
-            group_no_fights_notice=group_chat,
+            no_fights_to_user_dm=group_chat,
         )
         return
     ok, reason = pets.claim_duel(entry, challenger.user_id, target.user_id)
@@ -5853,7 +5849,13 @@ async def handle_pets_callback(
     if action == "noop":
         await api.answer_callback_query(callback_id, "Уже максимум.")
         return
-    await api.answer_callback_query(callback_id)
+    no_arena_fights = (
+        action in {"search", "attack"}
+        and pets.fights_left(entry, owner_id, pets.today()) <= 0
+    )
+    await api.answer_callback_query(
+        callback_id, pets_ui.ARENA_NO_FIGHTS_NOTICE if no_arena_fights else None,
+    )
 
     user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
     if user is None:
@@ -5865,6 +5867,14 @@ async def handle_pets_callback(
         )
         return
     user_id = user.user_id
+    if no_arena_fights:
+        # Exhaustion is private player state. Do not resolve or write to the public
+        # result chat merely because the tap came from an old opponent card.
+        await _send_pets_view(
+            api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+            message_id=message_id, log=log,
+        )
+        return
 
     try:
         # --- the two flows that need something back from the player ------------------
@@ -6344,7 +6354,7 @@ async def _pets_run_fight(
     xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
     include_keyboard: bool = True, persistent_recipient_ids=None,
     enforce_arena_target_limit: bool = True,
-    attacker_username: str | None = None, group_no_fights_notice: bool = False,
+    attacker_username: str | None = None, no_fights_to_user_dm: bool = False,
     group_result: bool = False, arena_url: str | None = None,
     delete_trigger: bool = True,
     arena_menu_chat_id=None, arena_menu_message_id=None,
@@ -6413,16 +6423,15 @@ async def _pets_run_fight(
         # it can be the public group selected for fight-result announcements.
         return
     if pets.fights_left(entry, user_id, pets.today()) <= 0:
-        if group_no_fights_notice:
-            sent = await api.send_message(
-                chat_id, DUEL_NO_FIGHTS_GROUP_NOTICE, reply_to_message_id=message_id,
-                parse_mode=None,
+        if arena_menu_chat_id is not None:
+            # The fight destination can already be the public result chat. Always redraw
+            # the original DM arena menu when the daily budget runs out in the meantime.
+            await _send_pets_view(
+                api, arena_menu_chat_id, pets_ui.fight_view(entry, user_id, xp),
+                message_id=arena_menu_message_id, log=log,
             )
-            if sent and "message_id" in sent and background_tasks is not None:
-                schedule_bot_delete(
-                    api, chat_id, [sent["message_id"]], DUEL_NO_FIGHTS_GROUP_DELETE_AFTER,
-                    log, background_tasks, trigger_message_id=message_id,
-                )
+            return
+        if no_fights_to_user_dm:
             await _send_pets_view(
                 api, user_id, pets_ui.fight_view(entry, user_id, xp), log=log,
             )

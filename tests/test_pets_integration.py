@@ -342,6 +342,7 @@ class PetsIntegrationTests(unittest.TestCase):
         with patch("pets.app_now", return_value=datetime(2026, 8, 9, 22, 41)):
             text, keyboard = pets_ui.fight_view(ENTRY, ALICE, RICH_XP)
         self.assertIn("Обновление боёв через: 1 ч 19 мин", text)
+        self.assertIn(pets_ui.ARENA_NO_FIGHTS_NOTICE, text)
         actions = {
             pets_ui.parse_callback(b["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for b in row if b.get("callback_data")
