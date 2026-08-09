@@ -805,6 +805,10 @@ def _bonus_text(item) -> str:
     for key, value in item.bonuses.items():
         label = C.ARMOR_NAME if key == "armor" else C.STAT_NAMES.get(key, key)
         parts.append(f"{value:+d} {label}")
+    effect = getattr(item, "effect", None)
+    effect_text = effect.get("text") if isinstance(effect, dict) else None
+    if effect_text:
+        parts.append(f"🧿 {escape(str(effect_text))}")
     return ", ".join(parts) or "без бонусов"
 
 
@@ -814,6 +818,8 @@ def _bonus_icon_text(item) -> str:
     for key, value in item.bonuses.items():
         emoji = C.ARMOR_EMOJI if key == "armor" else C.STAT_EMOJI.get(key, "•")
         parts.append(f"{emoji} {value:+d}")
+    if isinstance(getattr(item, "effect", None), dict) and item.effect.get("code"):
+        parts.append("🧿")
     return "  ".join(parts) or "—"
 
 
@@ -932,6 +938,8 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
             item = C.find_item(dropped)
             if item:
                 lines.append(f"🎁 Выпало: <b>{escape(item.name)}</b> — {_bonus_text(item)}")
+                if reward.get("auto_equipped"):
+                    lines.append(f"⚡ Автоматически надето в слот «{escape(C.SLOT_NAMES[item.slot])}».")
     return "\n".join(lines)
 
 

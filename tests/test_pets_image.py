@@ -50,8 +50,30 @@ class FightImageTests(unittest.TestCase):
             pets_image.PANEL_BOTTOM - stats_top,
             pets_image.STATS_BOTTOM_PADDING + 5 * pets_image.STAT_ROW_HEIGHT,
         )
-        self.assertGreater(stats_top, pets_image.RATING_TOP)
+        self.assertGreater(stats_top, pets_image.STATS_DIVIDER_TOP)
+        self.assertLess(pets_image.WEAPON_NAME_TOP, pets_image.AMULET_NAME_TOP)
+        self.assertLess(pets_image.AMULET_EFFECT_TOP, pets_image.EQUIPMENT_DIVIDER_TOP)
+        self.assertLess(pets_image.EQUIPMENT_DIVIDER_TOP, pets_image.PET_NAME_TOP)
         self.assertLessEqual(pets_image.PANEL_BOTTOM, 800)
+
+    def test_equipment_helpers_show_rarity_and_icon_stats(self):
+        weapon = {
+            "name": "Сковородка",
+            "rarity": "rare",
+            "bonuses": {"strength": 6, "luck": 2, "armor": -1},
+        }
+        amulet = {
+            "name": "Чайный пакетик",
+            "rarity": "uncommon",
+            "bonuses": {"health": 3},
+            "effect": "В бою +14 здоровья.",
+        }
+        self.assertEqual(pets_image.RARITY_SYMBOLS[weapon["rarity"]][0], "♦")
+        self.assertEqual(pets_image.RARITY_SYMBOLS[amulet["rarity"]][0], "●")
+        bonuses = pets_image._equipment_bonus_text(weapon)
+        self.assertIn("† +6", bonuses)
+        self.assertIn("♣ +2", bonuses)
+        self.assertIn("■ -1", bonuses)
 
     def test_renderer_creates_a_shareable_result_board(self):
         result = SimpleNamespace(
@@ -63,6 +85,9 @@ class FightImageTests(unittest.TestCase):
             "stats": {"strength": 12, "health": 11, "agility": 10, "luck": 9, "armor": 5},
             "power": 250, "pet_photo": _png("green"), "owner_avatar": _png("blue"),
             "remaining_hp": 66, "max_hp": 100,
+            "weapon": {"name": "Сковородка", "rarity": "rare", "bonuses": {"strength": 6}},
+            "amulet": {"name": "Чайный пакетик", "rarity": "uncommon", "bonuses": {"health": 3},
+                       "effect": "В бою +14 здоровья."},
         }
         defender = {
             "id": "b", "pet_name": "Бета", "owner_name": "Bob",

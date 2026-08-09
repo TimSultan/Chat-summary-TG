@@ -5767,7 +5767,24 @@ def _pets_fighter(entry: str, user_id, pet: dict):
         agility=effective.get("agility", 1),
         luck=effective.get("luck", 1),
         armor=effective.get("armor", 0),
+        effects=pets.equipped_combat_effects(entry, user_id),
+        level=pet.get("level", 1),
     )
+
+
+def _pets_image_item(pet: dict, slot: str) -> dict | None:
+    """Small, serialization-safe equipment receipt for the result-image renderer."""
+    code = (pet.get("equipped") or {}).get(slot)
+    item = C.find_item(code) if code else None
+    if item is None:
+        return None
+    effect = getattr(item, "effect", None)
+    return {
+        "name": item.name,
+        "rarity": item.rarity,
+        "bonuses": dict(item.bonuses),
+        "effect": str(effect.get("text") or "") if isinstance(effect, dict) else "",
+    }
 
 
 async def _pets_start_flow(
@@ -6323,6 +6340,7 @@ async def _pets_run_fight(
         "levels_gained": reward.get("opponent_levels_gained", 0),
         "level": reward.get("opponent_level", pets.get_pet(entry, opponent_id).get("level", 1)),
         "dropped_item": reward.get("opponent_dropped_item"),
+        "auto_equipped": reward.get("opponent_auto_equipped", False),
     }
     defender_report = (
         f"<b>Вас атаковал {html.escape(attacker_label)}</b>\n\n"
@@ -6412,7 +6430,7 @@ async def _pets_run_fight(
 def _pets_fighter_snapshot(fighter: pets_combat.Fighter) -> dict:
     return {
         key: getattr(fighter, key)
-        for key in ("key", "name", "strength", "health", "agility", "luck", "armor")
+        for key in ("key", "name", "strength", "health", "agility", "luck", "armor", "effects", "level")
     }
 
 
@@ -6476,6 +6494,8 @@ async def _pets_render_result_image(
             "power": pets.power_rating(entry, attacker_id),
             "pet_photo": pet_a,
             "owner_avatar": avatar_a,
+            "weapon": _pets_image_item(attacker, "weapon"),
+            "amulet": _pets_image_item(attacker, "amulet"),
             **((fight_hp or {}).get(str(attacker_id), {})),
         }, {
             "id": str(defender_id),
@@ -6485,6 +6505,8 @@ async def _pets_render_result_image(
             "power": pets.power_rating(entry, defender_id),
             "pet_photo": pet_b,
             "owner_avatar": avatar_b,
+            "weapon": _pets_image_item(defender, "weapon"),
+            "amulet": _pets_image_item(defender, "amulet"),
             **((fight_hp or {}).get(str(defender_id), {})),
         })
     except Exception:
@@ -6519,6 +6541,8 @@ async def _pets_render_guardian_image(
             "power": pets.power_rating(entry, attacker_id),
             "pet_photo": pet_a,
             "owner_avatar": avatar_a,
+            "weapon": _pets_image_item(attacker, "weapon"),
+            "amulet": _pets_image_item(attacker, "amulet"),
             "remaining_hp": attacker_hp,
             "max_hp": attacker_hp,
         }, {
@@ -6530,6 +6554,8 @@ async def _pets_render_guardian_image(
             "power": pets.power_rating(entry, defender_id),
             "pet_photo": pet_b,
             "owner_avatar": avatar_b,
+            "weapon": _pets_image_item(defender, "weapon"),
+            "amulet": _pets_image_item(defender, "amulet"),
             "remaining_hp": defender_hp,
             "max_hp": defender_hp,
         }, xp=xp)

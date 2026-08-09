@@ -22,9 +22,17 @@ PET_IMAGE_TOP = PANEL_TOP + 25
 # stat rows below it deliberately reserve the lower part of the panel for readability.
 HP_BAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] + 8
 HP_BAR_HEIGHT = 24
-AVATAR_TOP = HP_BAR_TOP + HP_BAR_HEIGHT + 10
-PET_NAME_TOP = AVATAR_TOP + 88
-RATING_TOP = PET_NAME_TOP + 43
+AVATAR_DIAMETER = 58
+AVATAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] - AVATAR_DIAMETER - 10
+WEAPON_NAME_TOP = HP_BAR_TOP + HP_BAR_HEIGHT + 8
+WEAPON_STATS_TOP = WEAPON_NAME_TOP + 20
+WEAPON_DIVIDER_TOP = WEAPON_STATS_TOP + 20
+AMULET_NAME_TOP = WEAPON_DIVIDER_TOP + 7
+AMULET_EFFECT_TOP = AMULET_NAME_TOP + 20
+EQUIPMENT_DIVIDER_TOP = AMULET_EFFECT_TOP + 23
+PET_NAME_TOP = EQUIPMENT_DIVIDER_TOP + 7
+OWNER_NAME_TOP = PET_NAME_TOP + 27
+STATS_DIVIDER_TOP = OWNER_NAME_TOP + 21
 STATS_BOTTOM_PADDING = 17
 STAT_ROW_HEIGHT = 18
 STAT_LABEL_FONT_SIZE = 14
@@ -44,6 +52,20 @@ _BOLD_FONT_PATHS = (
 WINNER_NAME_COLOR = "#147a59"
 LOSER_NAME_COLOR = "#b83e58"
 _UNRENDERABLE_PROBE = "͸"
+RARITY_SYMBOLS = {
+    "cursed": ("♠", "#5e5367"),
+    "common": ("○", "#7b8589"),
+    "uncommon": ("●", "#3a8b58"),
+    "rare": ("♦", "#3179b8"),
+    "legendary": ("▲", "#d19a24"),
+}
+STAT_SYMBOLS = {
+    "strength": "†",
+    "health": "♥",
+    "agility": "→",
+    "luck": "♣",
+    "armor": "■",
+}
 
 
 @lru_cache(maxsize=None)
@@ -132,6 +154,60 @@ def _stats_top(row_count: int) -> int:
     return PANEL_BOTTOM - STATS_BOTTOM_PADDING - row_count * STAT_ROW_HEIGHT
 
 
+def _fit_text(draw: ImageDraw.ImageDraw, value, font, max_width: int) -> str:
+    """Keep one equipment line inside its panel without wrapping into the next block."""
+    text = legible(value, getattr(font, "size", 14)) or "—"
+    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+        return text
+    suffix = "..."
+    while text and draw.textbbox((0, 0), text + suffix, font=font)[2] > max_width:
+        text = text[:-1]
+    return (text.rstrip() + suffix) if text else suffix
+
+
+def _equipment_bonus_text(item: dict | None) -> str:
+    if not item:
+        return "—"
+    bonuses = item.get("bonuses") or {}
+    parts = [
+        f"{STAT_SYMBOLS.get(key, '•')} {int(value):+d}"
+        for key, value in bonuses.items()
+        if key in STAT_SYMBOLS
+    ]
+    return "   ".join(parts) or "—"
+
+
+def _draw_item_title(draw, left: int, y: int, label: str, item: dict | None) -> None:
+    rarity = str((item or {}).get("rarity") or "common")
+    symbol, color = RARITY_SYMBOLS.get(rarity, RARITY_SYMBOLS["common"])
+    symbol_font = _font(16, bold=True)
+    draw.text((left, y - 1), symbol, font=symbol_font, fill=color)
+    name = (item or {}).get("name") or "не надето"
+    font = _font(15, bold=True)
+    text = _fit_text(draw, f"{label}  {name}", font, PET_IMAGE_SIZE[0] - 25)
+    draw.text((left + 23, y), text, font=font, fill="#273137")
+
+
+def _draw_equipment(draw, x: int, fighter: dict) -> None:
+    left = x + PANEL_PADDING_X
+    right = left + PET_IMAGE_SIZE[0]
+    weapon = fighter.get("weapon")
+    amulet = fighter.get("amulet")
+
+    _draw_item_title(draw, left, WEAPON_NAME_TOP, "ОРУЖИЕ", weapon)
+    weapon_stats = _fit_text(
+        draw, _equipment_bonus_text(weapon), _font(14, bold=True), PET_IMAGE_SIZE[0],
+    )
+    draw.text((left, WEAPON_STATS_TOP), weapon_stats, font=_font(14, bold=True), fill="#53606a")
+    draw.line((left, WEAPON_DIVIDER_TOP, right, WEAPON_DIVIDER_TOP), fill="#c4cbc8", width=1)
+
+    _draw_item_title(draw, left, AMULET_NAME_TOP, "ТАЛИСМАН", amulet)
+    effect = (amulet or {}).get("effect") or "без эффекта"
+    effect_text = _fit_text(draw, f"♦ {effect}", _font(13), PET_IMAGE_SIZE[0])
+    draw.text((left, AMULET_EFFECT_TOP), effect_text, font=_font(13), fill="#53606a")
+    draw.line((left, EQUIPMENT_DIVIDER_TOP, right, EQUIPMENT_DIVIDER_TOP), fill="#9ca8a4", width=2)
+
+
 def _hp_values(fighter: dict) -> tuple[int, int] | None:
     """Return safe display HP when the combat receipt supplied it.
 
@@ -192,23 +268,31 @@ def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     )
     image.paste(pet, (x + PANEL_PADDING_X, PET_IMAGE_TOP))
     _draw_hp_bar(draw, x, fighter)
-    avatar = _circle(_photo(fighter.get("owner_avatar"), (90, 90), (82, 97, 108)), 78)
-    image.paste(avatar, (x + PANEL_PADDING_X, AVATAR_TOP), avatar)
+    avatar_left = x + PANEL_PADDING_X + PET_IMAGE_SIZE[0] - AVATAR_DIAMETER - 10
+    avatar = _circle(
+        _photo(fighter.get("owner_avatar"), (AVATAR_DIAMETER, AVATAR_DIAMETER), (82, 97, 108)),
+        AVATAR_DIAMETER,
+    )
+    image.paste(avatar, (avatar_left, AVATAR_TOP), avatar)
     draw.ellipse(
-        (x + PANEL_PADDING_X - 2, AVATAR_TOP - 2, x + PANEL_PADDING_X + 80, AVATAR_TOP + 80),
-        outline="#ffffff", width=4,
+        (avatar_left - 2, AVATAR_TOP - 2, avatar_left + AVATAR_DIAMETER + 2,
+         AVATAR_TOP + AVATAR_DIAMETER + 2), outline="#ffffff", width=3,
     )
+    _draw_equipment(draw, x, fighter)
     draw.text(
-        (x + 135, AVATAR_TOP + 9), _short(fighter.get("owner_name"), 24, size=23, bold=False), font=_font(23),
+        (x + PANEL_PADDING_X, PET_NAME_TOP), _short(fighter.get("pet_name"), 27, size=23),
+        font=_font(23, bold=True),
         fill=name_color,
     )
     draw.text(
-        (x + PANEL_PADDING_X, PET_NAME_TOP), _short(fighter.get("pet_name"), 24, size=36), font=_font(36, bold=True),
-        fill=name_color,
+        (x + PANEL_PADDING_X, OWNER_NAME_TOP),
+        f"ХОЗЯИН  {_short(fighter.get('owner_name'), 28, size=14, bold=False)}",
+        font=_font(14), fill="#53606a",
     )
-    draw.text(
-        (x + PANEL_PADDING_X, RATING_TOP), f"РЕЙТИНГ  {fighter.get('power', 0)}",
-        font=_font(16, bold=True), fill="#37434c",
+    draw.line(
+        (x + PANEL_PADDING_X, STATS_DIVIDER_TOP,
+         x + PANEL_PADDING_X + PET_IMAGE_SIZE[0], STATS_DIVIDER_TOP),
+        fill="#c4cbc8", width=1,
     )
 
     rows = (
@@ -219,7 +303,11 @@ def _fighter_panel(draw, image, x, fighter, side: str, winner: bool) -> None:
     stats_top = _stats_top(len(rows))
     for index, (label, key) in enumerate(rows):
         y = stats_top + index * STAT_ROW_HEIGHT
-        draw.text((x + PANEL_PADDING_X, y), label, font=_font(STAT_LABEL_FONT_SIZE), fill="#53606a")
+        icon = STAT_SYMBOLS.get(key, "•")
+        draw.text(
+            (x + PANEL_PADDING_X, y), f"{icon}  {label}",
+            font=_font(STAT_LABEL_FONT_SIZE), fill="#53606a",
+        )
         value = str(stats.get(key, 0))
         box = draw.textbbox((0, 0), value, font=_font(STAT_VALUE_FONT_SIZE, bold=True))
         draw.text(

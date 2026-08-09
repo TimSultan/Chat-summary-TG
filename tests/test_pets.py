@@ -536,6 +536,31 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(pet["inventory"], ["w001", "w002", "w003"])
         self.assertEqual(pet["equipped"]["weapon"], "w003")
 
+    def test_new_drop_catalogues_are_integrated_into_all_three_equipment_slots(self):
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "amulet"]), 32)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 32)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 32)
+        new_drops = [
+            item for item in pets_config.ITEMS
+            if item.code.startswith(("amulet_", "bt", "gl"))
+        ]
+        self.assertEqual(len(new_drops), 90)
+        self.assertTrue(all(item.source == "drop" and item.drop_weight > 0 for item in new_drops))
+        self.assertEqual(len([item for item in new_drops if item.effect]), 30)
+
+    def test_equipped_amulet_passive_reaches_combat_and_is_visible_in_the_bag(self):
+        self._two_pets()
+        amulet = next(item for item in pets_config.ITEMS if item.effect)
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [amulet.code]
+        pets._save("chat", data)
+
+        self.assertTrue(pets.equip("chat", "1", amulet.code)[0])
+
+        self.assertEqual(pets.equipped_combat_effects("chat", "1"), (amulet.effect,))
+        text, _ = pets_ui.bag_items_view("chat", "1", 0, "amulet")
+        self.assertIn(amulet.effect["text"], text)
+
     def test_unique_weapon_migration_removes_every_mop_and_deduplicates_once(self):
         self._two_pets()
         mop = pets_config.find_item("w003")
@@ -1009,6 +1034,106 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(outcome["dropped_item"], drop_item.code)
         self.assertIn(drop_item.code, pets.get_pet(entry, "1")["inventory"])
         self.assertNotIn(drop_item.code, pets.get_pet(entry, "2")["inventory"])
+
+    def test_collector_amulet_increases_item_drop_chance_by_twenty_five_percent(self):
+        entry = "collector-chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        collector = next(
+            item for item in pets_config.ITEMS
+            if getattr(item, "effect", {}).get("code") == "collector"
+        )
+        drop_item = next(
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.slot == "boots"
+        )
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"] = [collector.code]
+        data["pets"]["1"]["equipped"]["amulet"] = collector.code
+        pets._save(entry, data)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        # 9% misses the ordinary 8% roll but lands inside Collector's 10% roll.
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=0.09), \
+             patch("random.choice", return_value=drop_item):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(outcome["dropped_item"], drop_item.code)
+
+    def test_survivor_amulet_preserves_thirty_percent_of_loss_penalty(self):
+        entry = "survivor-chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        survivor = next(
+            item for item in pets_config.ITEMS
+            if getattr(item, "effect", {}).get("code") == "survivor"
+        )
+        data = pets._load(entry)
+        data["pets"]["2"]["inventory"] = [survivor.code]
+        data["pets"]["2"]["equipped"]["amulet"] = survivor.code
+        pets._save(entry, data)
+        economy.grant(entry, "2", 100, "test")
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with patch("random.randint", return_value=10), patch("random.random", return_value=1.0):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(pets_config.loss_gold_for(10), 3)
+        self.assertEqual(outcome["opponent_loss_gold"], 2)
+        self.assertEqual(economy.balance(entry, "2", 0), 98)
+
+    def test_drop_pool_excludes_accessory_already_owned_by_winner(self):
+        entry = "accessory-drop-chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        first, second = [
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.slot == "boots"
+        ][:2]
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"] = [first.code]
+        pets._save(entry, data)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=0.0), \
+             patch("random.choice", return_value=second) as choose:
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(outcome["dropped_item"], second.code)
+        self.assertNotIn(first, choose.call_args.args[0])
+
+    def test_drop_auto_equips_empty_or_better_slot_but_keeps_stronger_item(self):
+        weak = pets_config.find_item("bt01")
+        strong = pets_config.find_item("bt30")
+        self.assertGreater(pets_config.equipment_score(strong), pets_config.equipment_score(weak))
+        result = SimpleNamespace(winner="1", loser="2")
+
+        for entry, current, dropped, expected, auto_equipped in (
+            ("empty-slot", None, weak, weak, True),
+            ("better-drop", weak, strong, strong, True),
+            ("worse-drop", strong, weak, strong, False),
+        ):
+            with self.subTest(entry=entry):
+                self._tame(entry, "1", "Attacker")
+                self._tame(entry, "2", "Defender")
+                if current:
+                    data = pets._load(entry)
+                    data["pets"]["1"]["inventory"] = [current.code]
+                    data["pets"]["1"]["equipped"]["boots"] = current.code
+                    pets._save(entry, data)
+                with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+                     patch("random.random", return_value=0.0), \
+                     patch("random.choice", return_value=dropped):
+                    outcome = pets.record_fight(
+                        entry, "1", "2", result, date(2026, 8, 1),
+                    )
+
+                pet = pets.get_pet(entry, "1")
+                self.assertEqual(pet["equipped"]["boots"], expected.code)
+                self.assertIn(dropped.code, pet["inventory"])
+                self.assertEqual(outcome["auto_equipped"], auto_equipped)
 
     def test_drop_pool_excludes_code_owned_by_another_player(self):
         entry = "chat"

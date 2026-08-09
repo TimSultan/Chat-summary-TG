@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pets_config as C
 import pets_combat as combat
+from pets_amulet_catalog import AMULET_SPECS
 from pets_combat import Fighter
 
 
@@ -261,6 +262,77 @@ class SimulateTests(unittest.TestCase):
         self.assertIsNone(result.winner)
         self.assertIsNone(result.loser)
         self.assertEqual(result.total_damage, {"a": 200, "b": 200})
+
+
+class AmuletEffectTests(unittest.TestCase):
+    def _fighter_with(self, effect):
+        return Fighter(
+            key="a", name="Amulet", strength=40, health=40, agility=40, luck=40,
+            armor=0, effects=(effect,), level=3,
+        )
+
+    def test_empty_effect_snapshot_is_exactly_the_legacy_fight(self):
+        bare = _fighter("a", 40, name="A")
+        explicit_empty = Fighter(
+            key="a", name="A", strength=40, health=40, agility=40, luck=40,
+            armor=0, effects=(), level=1,
+        )
+        opponent = _fighter("b", 40, name="B")
+        self.assertEqual(
+            combat.simulate(bare, opponent, seed=917),
+            combat.simulate(explicit_empty, opponent, seed=917),
+        )
+
+    def test_economy_only_effects_do_not_change_combat_replay(self):
+        bare = _fighter("a", 40, name="A")
+        opponent = _fighter("b", 40, name="B")
+        expected = combat.simulate(bare, opponent, seed=918)
+        for code in ("collector", "survivor"):
+            with self.subTest(effect=code):
+                equipped = Fighter(
+                    key="a", name="A", strength=40, health=40, agility=40, luck=40,
+                    armor=0, effects=({"code": code, "value": 25},), level=1,
+                )
+                self.assertEqual(expected, combat.simulate(equipped, opponent, seed=918))
+
+    def test_all_catalogue_effects_are_seeded_and_safe_to_replay(self):
+        """A malformed metadata deployment must not make one arena click non-replayable."""
+        self.assertEqual(
+            {spec.effect_dict()["code"] for spec in AMULET_SPECS},
+            set(combat._EFFECT_DEFAULTS),
+        )
+        opponent = Fighter(
+            key="b", name="Opponent", strength=40, health=40, agility=40, luck=40,
+            armor=0, level=8,
+        )
+        for spec in AMULET_SPECS:
+            with self.subTest(effect=spec.effect_dict()["code"]):
+                fighter = self._fighter_with(spec.effect_dict())
+                first = combat.simulate(fighter, opponent, seed=41)
+                self.assertEqual(first, combat.simulate(fighter, opponent, seed=41))
+                self.assertGreater(len(first.rounds), 0)
+
+    def test_start_stats_and_visible_procs_use_catalogue_percentages(self):
+        opponent = _fighter("b", 40, name="B")
+        base = _fighter("a", 40, name="A")
+        vitality = self._fighter_with({"code": "vitality", "value": 14})
+        ferocity = self._fighter_with({"code": "ferocity", "value": 3})
+        self.assertEqual(combat.derive(vitality, opponent)["max_hp"], combat.derive(base, opponent)["max_hp"] + 14)
+        self.assertEqual(combat.derive(ferocity, opponent)["damage"], combat.derive(base, opponent)["damage"] + 3)
+
+        for effect in (
+            {"code": "opening_shield", "value": 3},
+            {"code": "opening_blast", "value": 4},
+            {"code": "vampiric", "value": 9},
+            {"code": "poison", "value": 3},
+            {"code": "thorns", "value": 7},
+            {"code": "regen", "value": 4},
+        ):
+            result = combat.simulate(self._fighter_with(effect), opponent, seed=7)
+            self.assertTrue(
+                any(round_.event == f"amulet_{effect['code']}" for round_ in result.rounds),
+                effect["code"],
+            )
 
 
 if __name__ == "__main__":

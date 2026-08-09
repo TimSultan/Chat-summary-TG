@@ -729,6 +729,44 @@ def effective_stats(entry, user_id) -> dict:
     return _effective_stats_for(_tamed_record(_load(entry), user_id) or {})
 
 
+def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
+    """Immutable item-effect snapshots for the pure combat engine.
+
+    Effects never participate in normal stat arithmetic or the power-rating shortcut;
+    combat receives the catalogue metadata explicitly with its fighter snapshot instead.
+    Returning copies prevents a caller from mutating the global item catalogue.
+    """
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return ()
+    effects = []
+    for code in (record.get("equipped") or {}).values():
+        item = C.find_item(code) if code else None
+        effect = getattr(item, "effect", None) if item else None
+        if isinstance(effect, dict) and effect.get("code"):
+            effects.append(dict(effect))
+    return tuple(effects)
+
+
+def _equipped_effect(record: dict, effect_code: str) -> dict | None:
+    """Read one equipped passive without reloading the chat during fight settlement."""
+    for code in (record.get("equipped") or {}).values():
+        item = C.find_item(code) if code else None
+        effect = getattr(item, "effect", None) if item else None
+        if isinstance(effect, dict) and effect.get("code") == effect_code:
+            return effect
+    return None
+
+
+def _effect_fraction(effect: dict | None) -> float:
+    if not effect:
+        return 0.0
+    try:
+        return max(0.0, float(effect.get("value", 0))) / 100
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _effective_stats_for(record: dict) -> dict:
     stat_levels = record.get("stats") or {}
     pet_level = record.get("level", 1)
@@ -1244,7 +1282,8 @@ def legendary_pity_progress(entry: str, user_id) -> dict:
         }
     owned = _owned_weapon_codes(data)
     eligible = any(
-        item.source == "drop" and item.rarity == "legendary" and item.code not in owned
+        item.slot == "weapon" and item.source == "drop"
+        and item.rarity == "legendary" and item.code not in owned
         for item in C.ITEMS
     )
     wins = max(0, int(record.get("legendary_pity_wins", 0) or 0)) if eligible else 0
@@ -1334,6 +1373,11 @@ def record_fight(
     # chat XP, which the caller cannot supply for a defender who is not the one playing,
     # so it is read from the same aggregate economy.balance itself uses.
     penalty = C.loss_gold_for(gold)
+    # «Последний чек» keeps part of the loser's coins. It changes only the amount paid;
+    # the winner's already-calculated reward is never reduced by somebody else's gear.
+    survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
+    if survivor_share:
+        penalty = max(0, round(penalty * (1 - min(1.0, survivor_share))))
     paid = 0
     if penalty > 0:
         # Prefer the caller's own figure for the attacker: it is the live, today-inclusive
@@ -1356,20 +1400,31 @@ def record_fight(
     # deliberately tied to wins, not merely to successful 8% drop rolls: the normal
     # rate is about 0.088% for a legendary, so a 500-win ceiling removes a frustrating
     # extreme tail while leaving almost every drop to the ordinary weighted table.
-    owned_codes = _owned_weapon_codes(data)
+    # Weapons are unique chat-wide; accessories are unique inside the winner's own bag.
+    # Excluding both sets prevents a successful 8% roll from reporting a duplicate that
+    # `_load` would silently collapse on the next read.
+    owned_codes = _owned_weapon_codes(data) | set(winner.get("inventory", []))
     drop_pool = [
         item for item in C.ITEMS
         if item.source == "drop" and item.code not in owned_codes
     ]
-    legendary_pool = [item for item in drop_pool if item.rarity == "legendary"]
+    # The 500-win pity contract is specifically for the five legendary weapons. New
+    # legendary amulets/boots/gloves remain exciting normal rolls, not substitutes for
+    # the promised weapon.
+    legendary_pool = [
+        item for item in drop_pool if item.slot == "weapon" and item.rarity == "legendary"
+    ]
     pity_before = max(0, int(winner.get("legendary_pity_wins", 0) or 0))
     force_legendary = bool(legendary_pool) and (
         pity_before + 1 >= C.LEGENDARY_PITY_ELIGIBLE_WINS
     )
     dropped = None
+    auto_equipped = False
+    collector_bonus = _effect_fraction(_equipped_effect(winner, "collector"))
+    drop_chance = min(1.0, C.DROP_CHANCE * (1 + collector_bonus))
     if force_legendary:
         dropped = random.choice(legendary_pool)
-    elif drop_pool and random.random() < C.DROP_CHANCE:
+    elif drop_pool and random.random() < drop_chance:
         # Keep the selection inspectable/testable with random.choice while still
         # honoring rarity weights. The catalogue's small integer weights keep this
         # expanded pool tiny (and only build it on an actual drop).
@@ -1382,6 +1437,11 @@ def record_fight(
         winner.setdefault("inventory", []).append(dropped.code)
         _discover(winner, dropped.code)
         dropped_code = dropped.code
+        equipped = winner.setdefault("equipped", {})
+        current = C.find_item(equipped.get(dropped.slot))
+        if current is None or C.equipment_score(dropped) > C.equipment_score(current):
+            equipped[dropped.slot] = dropped.code
+            auto_equipped = True
         _metric_add(data, "drops_by_rarity", rarity=dropped.rarity)
     if not legendary_pool:
         # Do not carry an unreachable promise after the last legendary is collected.
@@ -1415,6 +1475,7 @@ def record_fight(
         # number rather than recomputing an amount that was never charged.
         "loss_gold": paid,
         "dropped_item": dropped_code,
+        "auto_equipped": auto_equipped,
         "combat_seed": getattr(result, "seed", None),
         "total_damage": dict(getattr(result, "total_damage", {})),
         "combat_snapshot": combat_snapshot,
@@ -1430,12 +1491,14 @@ def record_fight(
         "levels_gained": winner_levels_gained if attacker_won else loser_levels_gained,
         "level": attacker.get("level", 1),
         "dropped_item": dropped_code if attacker_won else None,
+        "auto_equipped": auto_equipped if attacker_won else False,
         "opponent_gold": gold if not attacker_won else 0,
         "opponent_loss_gold": paid if attacker_won else 0,
         "opponent_xp": C.LOSS_XP if attacker_won else winner_xp,
         "opponent_levels_gained": loser_levels_gained if attacker_won else winner_levels_gained,
         "opponent_level": defender.get("level", 1),
         "opponent_dropped_item": dropped_code if not attacker_won else None,
+        "opponent_auto_equipped": auto_equipped if not attacker_won else False,
     }
 
 

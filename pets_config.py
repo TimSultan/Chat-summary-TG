@@ -388,12 +388,12 @@ class Item:
 
     __slots__ = (
         "code", "name", "slot", "price", "source", "bonuses", "description",
-        "rarity", "resale_price", "drop_weight",
+        "rarity", "resale_price", "drop_weight", "effect",
     )
 
     def __init__(
         self, code, name, slot, price, source, bonuses, description="", rarity="common",
-        resale_price=None, drop_weight=1,
+        resale_price=None, drop_weight=1, effect=None,
     ):
         self.code = code
         self.name = name
@@ -405,6 +405,7 @@ class Item:
         self.rarity = rarity
         self.resale_price = resale_price
         self.drop_weight = drop_weight
+        self.effect = dict(effect or {})
 
 
 # Starter catalogue. Prices sit between a few wins and a few weeks so that gear is a
@@ -444,6 +445,16 @@ except ImportError:
     _RAW_WEAPON_ITEMS = ()
     PRE_REBALANCE_WEAPON_BUY_PRICES = {}
 
+try:
+    from pets_amulet_catalog import RAW_ITEMS as _RAW_AMULET_ITEMS
+except ImportError:
+    _RAW_AMULET_ITEMS = ()
+
+try:
+    from pets_gear_catalog import RAW_ITEMS as _RAW_GEAR_ITEMS
+except ImportError:
+    _RAW_GEAR_ITEMS = ()
+
 
 def _catalog_item(spec):
     if isinstance(spec, Item):
@@ -454,7 +465,7 @@ def _catalog_item(spec):
         spec["code"], spec["name"], spec["slot"], spec.get("price", spec.get("buy_price", 0)),
         spec.get("source", "shop"), spec.get("bonuses", {}),
         spec.get("description", ""), spec.get("rarity", "common"),
-        spec.get("resale_price"), spec.get("drop_weight", 1),
+        spec.get("resale_price"), spec.get("drop_weight", 1), spec.get("effect"),
     )
 
 
@@ -466,6 +477,28 @@ if _RAW_WEAPON_ITEMS:
     if len(set(_codes)) != len(_codes):
         raise ValueError("weapon catalogue contains duplicate item codes")
     ITEMS = _catalogue_weapons + tuple(item for item in ITEMS if item.slot != "weapon")
+
+_catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)
+_catalogue_gear = tuple(_catalog_item(spec) for spec in _RAW_GEAR_ITEMS)
+if _RAW_AMULET_ITEMS and (
+    len(_catalogue_amulets) != 30
+    or any(item.slot != "amulet" or item.source != "drop" for item in _catalogue_amulets)
+):
+    raise ValueError("amulet catalogue must contain exactly 30 drop-only amulets")
+if _RAW_GEAR_ITEMS and (
+    len(_catalogue_gear) != 60
+    or sum(item.slot == "boots" for item in _catalogue_gear) != 30
+    or sum(item.slot == "gloves" for item in _catalogue_gear) != 30
+    or any(item.source != "drop" for item in _catalogue_gear)
+):
+    raise ValueError("gear catalogue must contain 30 drop-only boots and 30 gloves")
+_new_catalogue_items = _catalogue_amulets + _catalogue_gear
+if _new_catalogue_items:
+    existing_codes = {item.code for item in ITEMS}
+    new_codes = [item.code for item in _new_catalogue_items]
+    if len(set(new_codes)) != len(new_codes) or existing_codes.intersection(new_codes):
+        raise ValueError("equipment catalogues contain duplicate item codes")
+    ITEMS = ITEMS + _new_catalogue_items
 
 # Save files from the starter catalogue keep working after the 500-weapon replacement.
 LEGACY_ITEM_CODES = {"stick": "w001", "fork": "w002", "bone": "w003"} if _RAW_WEAPON_ITEMS else {}
@@ -481,6 +514,39 @@ RARITY_LABELS = {
     "rare": "🔵 Редкое",
     "legendary": "🟣 Легендарное",
 }
+
+# Automatic drop equipment compares actual combat contribution, then adds a modest
+# premium for rarity and for an amulet passive.  Rarity is deliberately not an absolute
+# ordering: a genuinely stronger old shop item should not be replaced by a shiny but
+# numerically worse trophy.
+AUTO_EQUIP_RARITY_BONUS = {
+    "cursed": -20,
+    "common": 0,
+    "uncommon": 10,
+    "rare": 25,
+    "legendary": 40,
+}
+AUTO_EQUIP_EFFECT_BONUS = {
+    "cursed": 0,
+    "common": 8,
+    "uncommon": 15,
+    "rare": 22,
+    "legendary": 25,
+}
+
+
+def equipment_score(item: Item | None) -> int:
+    """One deterministic comparison score for auto-equipping a same-slot drop."""
+    if item is None:
+        return -10_000
+    score = sum(
+        int(value) * POWER_RATING_WEIGHTS.get(key, 0)
+        for key, value in item.bonuses.items()
+    )
+    score += AUTO_EQUIP_RARITY_BONUS.get(item.rarity, 0)
+    if getattr(item, "effect", None):
+        score += AUTO_EQUIP_EFFECT_BONUS.get(item.rarity, 0)
+    return score
 
 
 def resale_value(item: Item) -> int:

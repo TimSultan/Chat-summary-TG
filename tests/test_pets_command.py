@@ -468,6 +468,24 @@ class PetsCommandTests(unittest.TestCase):
                 f"action {action!r} drew nothing at all",
             )
 
+    def test_result_image_item_receipt_contains_weapon_stats_and_amulet_effect(self):
+        pet = {
+            "equipped": {
+                "weapon": "w001",
+                "amulet": "amulet_left_sock",
+            },
+        }
+
+        weapon = bot_listener._pets_image_item(pet, "weapon")
+        amulet = bot_listener._pets_image_item(pet, "amulet")
+
+        self.assertEqual(weapon["name"], C.find_item("w001").name)
+        self.assertEqual(weapon["rarity"], C.find_item("w001").rarity)
+        self.assertEqual(weapon["bonuses"], dict(C.find_item("w001").bonuses))
+        self.assertTrue(amulet["effect"])
+        self.assertEqual(amulet["bonuses"], dict(C.find_item("amulet_left_sock").bonuses))
+        self.assertIsNone(bot_listener._pets_image_item(pet, "boots"))
+
     def test_fight_posts_one_composite_result_image(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")

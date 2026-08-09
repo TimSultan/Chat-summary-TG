@@ -926,6 +926,10 @@ only chat-wide discoveries and their current owner, never the
 catalogue's total size or unknown placeholders. Items can be locked; rare and legendary sales/gifts require
 a one-time server confirmation, while gifts require pet level 3 and have a 24-hour sender
 cooldown plus an ID/code/timestamp audit trail.
+Arena drops automatically fill an empty equipment slot or replace a weaker item in the
+same slot; the previous item stays in the bag. Fight-result images show each pet's weapon,
+rarity and icon-based bonuses directly under HP, followed by the equipped amulet and its
+passive effect, with dividers separating equipment from the base-stat receipt.
 Weapon names use familiar household junk and concrete origins such as «с Авито», «из
 гаража» and «на синей изоленте», with one-line descriptions; storefront entries are
 separated by blank lines for quick scanning.
@@ -936,6 +940,14 @@ median active player at current `5–10` win rewards. Resale remains 20%.
 Rarity weights make a legendary about 0.94% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
 telemetry tracks passive minting, sales, gifts, arena gold, guard actions and drops.
+
+The accessory drop catalogue adds 30 amulets, 30 boots and 30 gloves. Boots and gloves
+use ordinary stat trade-offs; every amulet has a separate machine-readable passive shown
+in the equipment UI and replayed deterministically from the fight seed. Passives cover
+opening, attack, defence, healing and comeback hooks. Two legendary utility effects act
+at settlement: Collector raises the item-drop chance from 8% to 10%, while Survivor
+keeps 30% of the normal loss penalty. All 90 additions are drop-only. They share the
+existing 8% item roll without replacing the five-weapon legendary pity pool.
 
 At startup, the one-time `unique_weapons_202608` migration removes «Швабра на изоленте»
 (`w003`) from every old inventory and grants each former owner 100 coins. Other historic
