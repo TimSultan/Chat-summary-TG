@@ -1462,6 +1462,10 @@ class MiscApiTests(PetsTestCase):
         self.assertEqual(pets.balance_for(entry, "1", 0), 42)
         self.assertEqual(pets.balance_for(entry, "1", 0), economy.balance(entry, "1", 0))
 
+    def test_fight_refresh_uses_the_same_local_midnight_as_daily_reset(self):
+        moment = datetime(2026, 8, 9, 18, 35, 20)
+        self.assertEqual(pets.fight_refresh_seconds(moment), 5 * 3600 + 24 * 60 + 40)
+
     def test_award_xp_reports_level_ups(self):
         entry = "chat"
         self._tame(entry, "1")

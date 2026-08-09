@@ -350,6 +350,18 @@ def _farm_duration(seconds: int) -> str:
     return f"{minutes} мин"
 
 
+def _fight_refresh_duration(seconds: int) -> str:
+    """Round upward so a positive remainder is never displayed as zero minutes."""
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return "меньше минуты"
+    total_minutes = (seconds + 59) // 60
+    hours, minutes = divmod(total_minutes, 60)
+    if hours:
+        return f"{hours} ч {minutes:02d} мин"
+    return f"{minutes} мин"
+
+
 def _farm_seconds_left(status: dict) -> int:
     """Read both the public core status and older/recovered timestamp-shaped records."""
     direct = status.get("seconds_left")
@@ -1001,6 +1013,9 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines = ["⚔️ <b>Арена</b>\n"]
     lines.append(f"{_name(pet)} — уровень {pet.get('level', 1)}")
     lines.append(f"Боёв сегодня осталось: {left} из {allowance}")
+    lines.append(
+        f"🔄 Обновление боёв через: {_fight_refresh_duration(pets.fight_refresh_seconds())}"
+    )
     lines.append(
         "\n<b>Лимит боёв:</b> "
         f"{breakdown['base']} база"

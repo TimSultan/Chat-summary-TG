@@ -363,6 +363,14 @@ def today() -> date:
     return app_now().date()
 
 
+def fight_refresh_seconds(now: datetime | None = None) -> int:
+    """Whole seconds until the next local midnight, when daily fights reset."""
+    moment = now or app_now()
+    next_day = moment.date() + timedelta(days=1)
+    midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=moment.tzinfo)
+    return max(0, round((midnight - moment).total_seconds()))
+
+
 def get_pet(entry, user_id) -> dict | None:
     return _tamed_record(_load(entry), user_id)
 
