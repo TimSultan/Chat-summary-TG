@@ -512,7 +512,11 @@ GIFT_AUDIT_LIMIT = 500
 DAILY_STOREFRONT_SIZE = 10
 
 
-def daily_storefront_weapons(entry: str, day: _date | None = None) -> tuple[Item, ...]:
+def daily_storefront_weapons(
+    entry: str,
+    day: _date | None = None,
+    excluded_codes: set[str] | frozenset[str] | None = None,
+) -> tuple[Item, ...]:
     """The stable daily set of purchasable weapons for one chat.
 
     This is intentionally a pure function: a restart, a second button tap, or two
@@ -523,12 +527,24 @@ def daily_storefront_weapons(entry: str, day: _date | None = None) -> tuple[Item
     if isinstance(today, str):
         today = _date.fromisoformat(today)
     pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
+    excluded = excluded_codes or set()
     if len(pool) <= DAILY_STOREFRONT_SIZE:
-        return pool
+        return tuple(item for item in pool if item.code not in excluded)
     digest = hashlib.sha256(str(entry).encode("utf-8")).digest()
     initial_offset = int.from_bytes(digest[:8], "big") % len(pool)
     offset = (initial_offset + today.toordinal() * DAILY_STOREFRONT_SIZE) % len(pool)
-    return tuple(pool[(offset + index) % len(pool)] for index in range(DAILY_STOREFRONT_SIZE))
+    # Walk the whole deterministic rotation, rather than slicing first and filtering
+    # afterwards. A weapon already owned somewhere in the chat disappears from the
+    # shared shop permanently, and the next free code fills its place on the counter.
+    stock = []
+    for index in range(len(pool)):
+        item = pool[(offset + index) % len(pool)]
+        if item.code in excluded:
+            continue
+        stock.append(item)
+        if len(stock) >= DAILY_STOREFRONT_SIZE:
+            break
+    return tuple(stock)
 
 
 def find_item(code: str):

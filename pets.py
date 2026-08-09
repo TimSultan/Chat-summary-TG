@@ -47,6 +47,9 @@ FIGHT_LOG_LIMIT = 2_000
 # Store-level marker: this chat's one-off cage-upgrade refund has already been paid out.
 # See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
+UNIQUE_WEAPONS_MIGRATION_FLAG = "unique_weapons_202608"
+REMOVED_MOP_CODE = "w003"
+REMOVED_MOP_COMPENSATION = 100
 
 _NAME_MAX_LEN = 24
 
@@ -195,11 +198,12 @@ def gift_history(entry: str) -> list[dict]:
 
 
 def discovered_weapon_collection(entry: str) -> list[dict]:
-    """Chat-wide discovered weapons with their current owner or owners.
+    """Chat-wide discovered weapons with their current owner.
 
     Discovery survives sale, so a weapon remains visible even when nobody currently
     carries it. Ownership is derived from live inventories rather than the audit log;
-    the same catalogue weapon can therefore correctly list several owners.
+    Every catalogue weapon is a single chat-wide object, so at most one current owner
+    is expected after the startup migration.
     """
     data = _load(entry)
     discovered: set[str] = set()
@@ -264,6 +268,38 @@ def _new_record() -> dict:
 def _tamed_record(data: dict, user_id) -> dict | None:
     record = data["pets"].get(str(user_id))
     return record if record and record.get("name") else None
+
+
+def _owned_weapon_codes(data: dict) -> set[str]:
+    """All weapon objects currently owned anywhere in one chat."""
+    owned = set()
+    for record in data.get("pets", {}).values():
+        if not isinstance(record, dict):
+            continue
+        for code in record.get("inventory", []):
+            item = C.find_item(code)
+            if item is not None and item.slot == "weapon":
+                owned.add(item.code)
+    return owned
+
+
+def _weapon_owner_ids(data: dict, code: str) -> list[str]:
+    return [
+        str(user_id)
+        for user_id, record in data.get("pets", {}).items()
+        if isinstance(record, dict) and code in record.get("inventory", [])
+    ]
+
+
+def _daily_storefront_weapons(data: dict, entry: str, day: date | None = None):
+    return C.daily_storefront_weapons(
+        entry, day or today(), excluded_codes=_owned_weapon_codes(data),
+    )
+
+
+def daily_storefront_weapons(entry: str, day: date | None = None):
+    """The shared daily stock, excluding every weapon already owned in this chat."""
+    return _daily_storefront_weapons(_load(entry), entry, day)
 
 
 def _name_taken(data: dict, name: str, exclude_uid: str | None = None) -> bool:
@@ -425,6 +461,82 @@ def refund_cage_upgrades(entries) -> int:
         data[CAGE_UPGRADE_REFUND_FLAG] = True
         _save(entry, data)
     return refunded
+
+
+def _remove_weapon_from_record(record: dict, code: str) -> None:
+    record["inventory"] = [owned for owned in record.get("inventory", []) if owned != code]
+    for slot, equipped_code in (record.get("equipped") or {}).items():
+        if equipped_code == code:
+            record["equipped"][slot] = None
+    record["locked_items"] = [
+        locked for locked in record.get("locked_items", []) if locked != code
+    ]
+    pending = record.get("pending_item_actions") or {}
+    record["pending_item_actions"] = {
+        key: token for key, token in pending.items() if not key.endswith(f":{code}")
+    }
+
+
+def enforce_unique_weapons(entries) -> dict:
+    """One-time cleanup that turns catalogue codes into chat-wide unique objects.
+
+    ``w003`` is deliberately removed from every old owner and pays the requested fixed
+    100 coins. For other historic duplicates, one copy remains (an equipped copy wins
+    the deterministic tie-break); removed shop copies receive their purchase price and
+    removed drops receive their normal resale value. Every grant is independently
+    idempotent, so a crash before the pets save cannot pay anyone twice on restart.
+    """
+    report = {
+        "removed_mops": 0,
+        "mop_grants": 0,
+        "deduplicated": 0,
+        "duplicate_refunds": 0,
+        "duplicate_refund_gold": 0,
+    }
+    for entry in entries:
+        data = _load(entry)
+        if data.get(UNIQUE_WEAPONS_MIGRATION_FLAG):
+            continue
+
+        for user_id, record in data.get("pets", {}).items():
+            if not isinstance(record, dict) or REMOVED_MOP_CODE not in record.get("inventory", []):
+                continue
+            if economy.grant_once(
+                entry, user_id, REMOVED_MOP_COMPENSATION, "pet_w003_removal_202608",
+            ):
+                report["mop_grants"] += 1
+            _remove_weapon_from_record(record, REMOVED_MOP_CODE)
+            report["removed_mops"] += 1
+
+        claims: dict[str, list[tuple[str, dict]]] = {}
+        for user_id, record in data.get("pets", {}).items():
+            if not isinstance(record, dict):
+                continue
+            for code in record.get("inventory", []):
+                item = C.find_item(code)
+                if item is not None and item.slot == "weapon":
+                    claims.setdefault(item.code, []).append((str(user_id), record))
+
+        for code, owners in claims.items():
+            if len(owners) <= 1:
+                continue
+            # Prefer somebody actively using the object, then use a stable id tie-break.
+            owners.sort(key=lambda pair: (
+                code not in (pair[1].get("equipped") or {}).values(), pair[0],
+            ))
+            item = C.find_item(code)
+            refund = item.price if item.source == "shop" else C.resale_value(item)
+            for user_id, record in owners[1:]:
+                reason = f"pet_weapon_duplicate_202608:{code}"
+                if refund > 0 and economy.grant_once(entry, user_id, refund, reason):
+                    report["duplicate_refunds"] += 1
+                    report["duplicate_refund_gold"] += refund
+                _remove_weapon_from_record(record, code)
+                report["deduplicated"] += 1
+
+        data[UNIQUE_WEAPONS_MIGRATION_FLAG] = True
+        _save(entry, data)
+    return report
 
 
 def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
@@ -692,8 +804,14 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         return False, "Такого предмета не существует."
     if item.source != "shop":
         return False, f"«{item.name}» нельзя купить -- он выпадает только из боёв."
+    if item.slot == "weapon":
+        owners = _weapon_owner_ids(data, item.code)
+        if str(user_id) in owners:
+            return False, f"«{item.name}» у тебя уже есть."
+        if owners:
+            return False, f"«{item.name}» уже принадлежит другому игроку."
     if item.slot == "weapon" and item.code not in {
-        offered.code for offered in C.daily_storefront_weapons(entry, today())
+        offered.code for offered in _daily_storefront_weapons(data, entry, today())
     }:
         return False, "Этого оружия сегодня нет на витрине. Загляни завтра."
     if item.code in record["inventory"]:
@@ -1112,14 +1230,15 @@ def legendary_pity_progress(entry: str, user_id) -> dict:
     Only wins while an unowned drop-only legendary still exists are eligible.  Once all
     five are held, the counter is reset rather than promising an impossible duplicate.
     """
-    record = _tamed_record(_load(entry), user_id)
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
     threshold = C.LEGENDARY_PITY_ELIGIBLE_WINS
     if record is None:
         return {
             "eligible": False, "wins_without_legend": 0,
             "remaining_wins": threshold, "threshold": threshold,
         }
-    owned = set(record.get("inventory", []))
+    owned = _owned_weapon_codes(data)
     eligible = any(
         item.source == "drop" and item.rarity == "legendary" and item.code not in owned
         for item in C.ITEMS
@@ -1233,7 +1352,7 @@ def record_fight(
     # deliberately tied to wins, not merely to successful 8% drop rolls: the normal
     # rate is about 0.088% for a legendary, so a 500-win ceiling removes a frustrating
     # extreme tail while leaving almost every drop to the ordinary weighted table.
-    owned_codes = set(winner.get("inventory", []))
+    owned_codes = _owned_weapon_codes(data)
     drop_pool = [
         item for item in C.ITEMS
         if item.source == "drop" and item.code not in owned_codes

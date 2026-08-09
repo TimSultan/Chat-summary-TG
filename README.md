@@ -917,11 +917,12 @@ drop occurs. **Losing costs 30% of what the winner took**, with no debt. Each cr
 gives **+1 to every stat**, on top of whatever was bought.
 
 The equipment catalogue contains **exactly 500 unique weapons** plus the other slot gear:
-75 cursed, 250 common, 120 uncommon, 50 rare and 5 legendary. A bag cannot contain the
-same item twice; unequipped items can be gifted to another tracked pet or sold back for a
-modest amount, and arena drops skip anything the winner already owns. The daily storefront
-shows 10 rotating non-cursed weapons with rarity filters. Cursed weapons only drop in the
-arena. The collection shows only chat-wide discoveries and their current owners, never the
+75 cursed, 250 common, 120 uncommon, 50 rare and 5 legendary. Each weapon code has at most
+one owner in the entire chat; unequipped items can be gifted to another tracked pet or sold
+back for a modest amount. Shared shop stock, arena drops and legendary pity all skip codes
+already held by anyone in the chat. The daily storefront shows 10 rotating non-cursed
+weapons with rarity filters. Cursed weapons only drop in the arena. The collection shows
+only chat-wide discoveries and their current owner, never the
 catalogue's total size or unknown placeholders. Items can be locked; rare and legendary sales/gifts require
 a one-time server confirmation, while gifts require pet level 3 and have a 24-hour sender
 cooldown plus an ID/code/timestamp audit trail.
@@ -931,6 +932,11 @@ separated by blank lines for quick scanning.
 Rarity weights make a legendary about 0.94% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
 telemetry tracks passive minting, sales, gifts, arena gold, guard actions and drops.
+
+At startup, the one-time `unique_weapons_202608` migration removes «Швабра на изоленте»
+(`w003`) from every old inventory and grants each former owner 100 coins. Other historic
+duplicate weapon codes are reduced to one copy, preferring an equipped copy and refunding
+the removed copy at purchase price (shop) or resale value (drop).
 
 The **Хомяколатор** is a second five-level facility beside the cage. It passively banks
 1–5 coins per complete hour with 24–72 hours of storage, depending on level. Collection is

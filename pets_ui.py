@@ -450,7 +450,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
     owned = set(pet.get("inventory", []))
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
-    daily_weapon_codes = {item.code for item in C.daily_storefront_weapons(entry, pets.today())}
+    daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry, pets.today())}
 
     # Owned gear must stay reachable even when its catalogue code lives on page 63.
     # Equipped first, then the rest of the bag, then unowned catalogue stock.
@@ -668,7 +668,7 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     if rarity == "cursed":
         rarity = "all"
     owned = set(pet.get("inventory", []))
-    stock = C.daily_storefront_weapons(entry, pets.today())
+    stock = pets.daily_storefront_weapons(entry, pets.today())
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
     lines = [
         "🛒 <b>Витрина дня</b>",
@@ -680,9 +680,12 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     rows = _rarity_buttons(user_id, "store", rarity, include_cursed=False)
     purchase_buttons = []
     for number, item in enumerate(visible, 1):
-        state = "у тебя уже есть" if item.code in owned else _coins(item.price)
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
-        lines.append(f"<b>{number}. {escape(item.name)}</b> · {label} · {_bonus_text(item)} · {state}")
+        lines.append(f"<b>{number}. {escape(item.name)}</b> · {label}")
+        lines.append(_bonus_icon_text(item))
+        lines.append(
+            "✅ Уже у тебя" if item.code in owned else f"🪙 {_money(item.price)}"
+        )
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
         # Keep each weapon visually separate in Telegram's dense proportional font.
@@ -803,6 +806,15 @@ def _bonus_text(item) -> str:
         label = C.ARMOR_NAME if key == "armor" else C.STAT_NAMES.get(key, key)
         parts.append(f"{value:+d} {label}")
     return ", ".join(parts) or "без бонусов"
+
+
+def _bonus_icon_text(item) -> str:
+    """Compact stat-only spelling used by the numbered daily storefront."""
+    parts = []
+    for key, value in item.bonuses.items():
+        emoji = C.ARMOR_EMOJI if key == "armor" else C.STAT_EMOJI.get(key, "•")
+        parts.append(f"{emoji} {value:+d}")
+    return "  ".join(parts) or "—"
 
 
 # ---------------------------------------------------------------------------- arena

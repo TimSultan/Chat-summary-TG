@@ -7542,6 +7542,9 @@ async def run_bot_listener(
         refunded_upgrades = pets.refund_cage_upgrades(cfg.listener_allowed_chats)
         if refunded_upgrades:
             log(f"[pets] refunded {refunded_upgrades} cage upgrades")
+        weapon_migration = pets.enforce_unique_weapons(cfg.listener_allowed_chats)
+        if weapon_migration["removed_mops"] or weapon_migration["deduplicated"]:
+            log(f"[pets] unique weapon migration: {weapon_migration}")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
             f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "

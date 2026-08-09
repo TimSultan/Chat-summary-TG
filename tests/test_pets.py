@@ -536,6 +536,43 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(pet["inventory"], ["w001", "w002", "w003"])
         self.assertEqual(pet["equipped"]["weapon"], "w003")
 
+    def test_unique_weapon_migration_removes_every_mop_and_deduplicates_once(self):
+        self._two_pets()
+        mop = pets_config.find_item("w003")
+        duplicate = pets_config.find_item("w001")
+        data = pets._load("chat")
+        for user_id in ("1", "2"):
+            data["pets"][user_id]["inventory"] = [mop.code, duplicate.code]
+            data["pets"][user_id]["discovered"] = [mop.code, duplicate.code]
+        data["pets"]["1"]["equipped"]["weapon"] = mop.code
+        data["pets"]["1"]["locked_items"] = [mop.code]
+        data["pets"]["1"]["pending_item_actions"] = {f"gift:{mop.code}": "token"}
+        # The equipped duplicate is the copy the deterministic migration preserves.
+        data["pets"]["2"]["equipped"]["weapon"] = duplicate.code
+        pets._save("chat", data)
+
+        report = pets.enforce_unique_weapons(["chat"])
+
+        self.assertEqual(report["removed_mops"], 2)
+        self.assertEqual(report["mop_grants"], 2)
+        self.assertEqual(report["deduplicated"], 1)
+        self.assertEqual(economy.balance("chat", "1", 0), 100 + duplicate.price)
+        self.assertEqual(economy.balance("chat", "2", 0), 100)
+        first = pets.get_pet("chat", "1")
+        second = pets.get_pet("chat", "2")
+        self.assertNotIn(mop.code, first["inventory"])
+        self.assertNotIn(mop.code, second["inventory"])
+        self.assertIsNone(first["equipped"]["weapon"])
+        self.assertNotIn(mop.code, first["locked_items"])
+        self.assertNotIn(f"gift:{mop.code}", first["pending_item_actions"])
+        self.assertNotIn(duplicate.code, first["inventory"])
+        self.assertIn(duplicate.code, second["inventory"])
+        self.assertIn(mop.code, first["discovered"])
+
+        self.assertEqual(pets.enforce_unique_weapons(["chat"])["removed_mops"], 0)
+        self.assertEqual(economy.balance("chat", "1", 0), 100 + duplicate.price)
+        self.assertEqual(economy.balance("chat", "2", 0), 100)
+
     def test_sell_refuses_equipped_and_pays_explicit_resale(self):
         self._two_pets()
         item = next(
@@ -686,6 +723,25 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertFalse(ok)
         self.assertIn("витрин", note)
 
+    def test_shop_weapon_can_have_only_one_owner_in_the_chat(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        item = next(
+            weapon for weapon in pets.daily_storefront_weapons(entry, pets.today())
+            if weapon.rarity not in {"rare", "legendary"}
+        )
+        economy.grant(entry, "1", item.price, "test")
+        economy.grant(entry, "2", item.price, "test")
+
+        self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
+        remaining_stock = pets.daily_storefront_weapons(entry, pets.today())
+        self.assertEqual(len(remaining_stock), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertNotIn(item.code, {weapon.code for weapon in remaining_stock})
+        ok, note = pets.buy_item(entry, "2", 0, item.code)
+        self.assertFalse(ok)
+        self.assertIn("принадлежит другому игроку", note)
+        self.assertEqual(economy.balance(entry, "2", 0), item.price)
+
     def test_discovery_survives_sale_and_gift_and_old_inventory_migrates(self):
         entry = "shop-chat"
         self._two_pets(entry)
@@ -779,6 +835,25 @@ class StorefrontAndCollectionTests(PetsTestCase):
             [str(number) for number in range(1, len(stock) + 1)],
         )
         self.assertTrue(all(len(row) <= 6 for row in purchase_rows))
+
+    def test_store_uses_stat_and_coin_icons_with_price_on_its_own_line(self):
+        entry = "shop-chat"
+        self._two_pets(entry)
+        item = pets_config.daily_storefront_weapons(entry, pets.today())[0]
+        text, _ = pets_ui.store_view(entry, "1", 0)
+        item_start = text.index(item.name)
+        item_end = text.find("\n\n", item_start)
+        block = text[item_start:item_end]
+
+        self.assertIn(f"🪙 {pets_ui._money(item.price)}", block)
+        self.assertNotIn(f"{item.price} монет", block)
+        for key, value in item.bonuses.items():
+            emoji = pets_config.ARMOR_EMOJI if key == "armor" else pets_config.STAT_EMOJI[key]
+            self.assertIn(f"{emoji} {value:+d}", block)
+            label = pets_config.ARMOR_NAME if key == "armor" else pets_config.STAT_NAMES[key]
+            self.assertNotIn(label, block)
+        lines = block.splitlines()
+        self.assertTrue(any(line.startswith("🪙 ") for line in lines[1:]))
 
     def test_collection_lists_only_chat_discoveries_and_their_current_owners(self):
         entry = "shop-chat"
@@ -934,13 +1009,13 @@ class RecordFightTests(PetsTestCase):
         self.assertIn(drop_item.code, pets.get_pet(entry, "1")["inventory"])
         self.assertNotIn(drop_item.code, pets.get_pet(entry, "2")["inventory"])
 
-    def test_drop_pool_excludes_owned_code_and_awards_a_different_unique_item(self):
+    def test_drop_pool_excludes_code_owned_by_another_player(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
         first, second = [item for item in pets_config.ITEMS if item.source == "drop"][:2]
         data = pets._load(entry)
-        data["pets"]["1"]["inventory"] = [first.code]
+        data["pets"]["2"]["inventory"] = [first.code]
         pets._save(entry, data)
         result = SimpleNamespace(winner="1", loser="2")
 
@@ -951,9 +1026,10 @@ class RecordFightTests(PetsTestCase):
 
         self.assertEqual(outcome["dropped_item"], second.code)
         self.assertNotIn(first, choose.call_args.args[0])
-        inventory = pets.get_pet(entry, "1")["inventory"]
-        self.assertEqual(inventory.count(first.code), 1)
-        self.assertEqual(inventory.count(second.code), 1)
+        winner_inventory = pets.get_pet(entry, "1")["inventory"]
+        self.assertNotIn(first.code, winner_inventory)
+        self.assertEqual(winner_inventory.count(second.code), 1)
+        self.assertEqual(pets.get_pet(entry, "2")["inventory"].count(first.code), 1)
 
     def test_history_snapshots_names_and_owners_and_zeroes_gold_on_the_losers_row(self):
         entry = "chat"
@@ -1047,6 +1123,23 @@ class PityGiftAndTelemetryTests(PetsTestCase):
             outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 1))
         self.assertEqual(outcome["dropped_item"], ordinary.code)
         progress = pets.legendary_pity_progress("chat", "1")
+        self.assertFalse(progress["eligible"])
+        self.assertEqual(progress["wins_without_legend"], 0)
+
+    def test_legendaries_owned_across_the_chat_exhaust_the_shared_pity_pool(self):
+        self._two_pets()
+        legends = [
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.rarity == "legendary"
+        ]
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [item.code for item in legends[::2]]
+        data["pets"]["2"]["inventory"] = [item.code for item in legends[1::2]]
+        data["pets"]["1"]["legendary_pity_wins"] = 123
+        pets._save("chat", data)
+
+        progress = pets.legendary_pity_progress("chat", "1")
+
         self.assertFalse(progress["eligible"])
         self.assertEqual(progress["wins_without_legend"], 0)
 
