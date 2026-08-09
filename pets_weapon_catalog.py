@@ -16,6 +16,13 @@ from dataclasses import dataclass
 from typing import Final
 
 
+try:
+    # Weapon passives reuse the amulet engine's hook names verbatim -- there is exactly
+    # one effect vocabulary.  The fallback keeps this data module importable on its own.
+    from pets_amulet_catalog import EFFECT_HOOKS
+except ImportError:  # pragma: no cover - standalone import of the data module
+    EFFECT_HOOKS = {}
+
 RARITIES: Final = ("cursed", "common", "uncommon", "rare", "legendary")
 SOURCES: Final = ("shop", "drop")
 STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
@@ -58,6 +65,10 @@ class WeaponSpec:
     resale_price: int
     drop_weight: int
     bonuses: tuple[tuple[str, int], ...]
+    # Optional passive, in exactly the shape ``pets_amulet_catalog`` already uses.  The
+    # combat engine reads effects off every equipped slot, so a weapon needs no new
+    # resolver -- only this field and its place in ``raw_item``.  Empty means flat stats.
+    effect: tuple[tuple[str, str | int | bool], ...] = ()
     slot: str = "weapon"
 
     @property
@@ -68,6 +79,10 @@ class WeaponSpec:
     def bonus_dict(self) -> dict[str, int]:
         """Return a fresh mutable copy for combat/configuration consumers."""
         return dict(self.bonuses)
+
+    def effect_dict(self) -> dict[str, str | int | bool]:
+        """Return a fresh mutable copy; empty for a plain flat-stat weapon."""
+        return dict(self.effect)
 
     def item_arguments(self) -> tuple[str, str, str, int, str, dict[str, int], str]:
         """Arguments in the order accepted by ``pets_config.Item``."""
@@ -99,6 +114,7 @@ class WeaponSpec:
             "rarity": self.rarity,
             "resale_price": self.resale_price,
             "drop_weight": self.drop_weight,
+            "effect": self.effect_dict(),
         }
 
 
@@ -196,7 +212,7 @@ def _bonus_tuple(index: int, rarity: str) -> tuple[tuple[str, int], ...]:
         )
         return patterns[variant]
     if rarity == "uncommon":
-        strength = 10 + (index % 5)  # +10..14, useful but still shop-scale
+        strength = 12 + (index % 5)  # +12..16, clear of the common ceiling of +10
         patterns = (
             (("strength", strength), ("luck", 2)),
             (("strength", strength), ("agility", 2)),
@@ -206,7 +222,7 @@ def _bonus_tuple(index: int, rarity: str) -> tuple[tuple[str, int], ...]:
         )
         return patterns[variant]
     if rarity == "rare":
-        strength = 15 + (index % 4)  # +15..18, below the present +20 trophy
+        strength = 20 + (index % 5)  # lands on +21..24, a real step over uncommon's +16
         patterns = (
             (("strength", strength), ("luck", 4), ("agility", -1)),
             (("strength", strength), ("agility", 4), ("armor", -2)),
@@ -215,16 +231,71 @@ def _bonus_tuple(index: int, rarity: str) -> tuple[tuple[str, int], ...]:
             (("strength", strength), ("agility", 2), ("luck", 2), ("armor", -2)),
         )
         return patterns[variant]
-    # Legendary weapons deliberately top out at the existing drop's +20 strength;
-    # their secondary stat comes with a meaningful negative rather than raw power creep.
+    # Legendary weapons used to top out at the same +20 the very first drop had, which
+    # left the best rare weapon -- buyable outright -- a coin flip against a trophy that
+    # takes hundreds of wins to earn.  The +30..32 these actually land on restores a
+    # premium the holder can feel, and each still carries a real negative rather than
+    # pure power creep.  Every legendary also carries a passive (see _LEGENDARY_EFFECTS).
     patterns = (
-        (("strength", 20), ("luck", 5), ("agility", -3)),
-        (("strength", 20), ("agility", 5), ("armor", -3)),
-        (("strength", 20), ("armor", 12), ("luck", -3)),
-        (("strength", 19), ("health", 10), ("agility", -3)),
-        (("strength", 20), ("agility", 3), ("luck", 3), ("armor", -3)),
+        (("strength", 30), ("luck", 5), ("agility", -3)),
+        (("strength", 32), ("agility", 5), ("armor", -3)),
+        (("strength", 28), ("armor", 12), ("luck", -3)),
+        (("strength", 29), ("health", 10), ("agility", -3)),
+        (("strength", 31), ("agility", 3), ("luck", 3), ("armor", -3)),
     )
     return patterns[variant]
+
+
+def _effect(code: str, text: str, value: int, **params: int | bool) -> tuple[tuple[str, str | int | bool], ...]:
+    """Build one passive in the shared catalogue shape (see ``pets_amulet_catalog``)."""
+    return tuple({"code": code, "text": text, "value": value, **params}.items())
+
+
+# Every legendary weapon carries a passive.  The values below are not guesses: each was
+# measured in a mirror match (identical stats, one side with the passive, 4,000 seeded
+# fights) and tuned to land at 59-62%.  Codes that read well but proved inert there were
+# rejected -- notably first_strike, which moves initiative but not outcomes over ten
+# rounds, and piercing/gambler, which barely register even when scaled up.
+# Order matches the names: w003 first, then _LEGENDARY_COPY.
+_LEGENDARY_EFFECTS: Final = (
+    # Швабра на изоленте -- the angry mop swings harder the worse it is going.
+    _effect("berserker", "Ниже 45% HP: +28% урона.", 28, threshold=45),
+    # Пульт от реальности -- the off button cancels the enemy's best moment.
+    _effect("crit_guard", "Первый крит врага слабее на 40%.", 40),
+    # Табурет Судного дня -- four legs that answer back.
+    _effect("thorns", "Возвращает 12% полученного урона.", 12),
+    # Красная кнопка -- nobody knows what it does, so it goes off immediately.
+    _effect("opening_blast", "В начале наносит 12% текущего HP врага.", 12),
+    # Дедовский кипятильник -- heats the water, the air, and the holder.
+    _effect("vampiric", "Лечит 10% нанесённого урона.", 10),
+)
+
+# Exactly half of the rare weapons get a passive, tuned the same way to 53-55% -- a
+# visible edge that stays clearly under the legendary band.  One-shot heals (second_wind,
+# last_stand) are deliberately absent: they measured 63-72% and cannot be tuned down,
+# which would make a rare drop hit harder than a legendary one.
+_RARE_EFFECTS: Final = (
+    _effect("focused", "После промаха: +18% урона следующей атаке.", 18),
+    _effect("momentum", "Каждый раунд: +3% урона, максимум +18%.", 3, cap=18),
+    _effect("combo", "Попадания: до +16% урона серией.", 5, cap=16),
+    _effect("regen", "В конце раунда лечит 6 HP.", 6),
+    _effect("retaliation", "После удара: +6 урона следующей атаке.", 6),
+)
+
+
+def _effect_for(rarity: str, rarity_rank: int) -> tuple[tuple[str, str | int | bool], ...]:
+    """The passive for one generated weapon, or ``()`` when it stays flat-stat only.
+
+    Legendaries are keyed by rank so the passive matches the hand-written punch-line
+    name.  Rares alternate by rank -- every odd one earns a passive, which makes "half of
+    rare" exact (25 of 50) without hand-listing codes -- and step through the five rare
+    passives in turn so all five actually appear in the catalogue.
+    """
+    if rarity == "legendary":
+        return _LEGENDARY_EFFECTS[rarity_rank % len(_LEGENDARY_EFFECTS)]
+    if rarity == "rare" and rarity_rank % 2 == 1:
+        return _RARE_EFFECTS[(rarity_rank // 2) % len(_RARE_EFFECTS)]
+    return ()
 
 
 def _rarity_for(index: int) -> str:
@@ -273,7 +344,7 @@ _LEGACY_WEAPONS: Final = (
     ("w002", "Мамина сковородка", "После неё спор окончен.",
      "uncommon", "shop", 65, 13, 0, (("strength", 14), ("luck", 4))),
     ("w003", "Швабра на изоленте", "Синяя. Значит, легендарная.",
-     "legendary", "drop", 0, 220, 1, (("strength", 20), ("agility", -3))),
+     "legendary", "drop", 0, 220, 1, (("strength", 30), ("agility", -3))),
 )
 
 # Four generated legendary slots get actual punch-line names instead of inheriting a
@@ -362,6 +433,9 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
         entries.append(WeaponSpec(
             code=code, name=name, description=description, rarity=rarity, source=source,
             buy_price=buy_price, resale_price=resale_price, drop_weight=drop_weight, bonuses=bonuses,
+            # w003 is the fifth legendary and takes the first passive; the generated
+            # four take the rest.  The other legacy entries are ordinary shop weapons.
+            effect=_LEGENDARY_EFFECTS[0] if rarity == "legendary" else (),
         ))
     rarity_seen = {rarity: 0 for rarity in RARITIES}
     # Adjacent codes intentionally rotate both object and concrete origin. Daily storefronts
@@ -400,6 +474,7 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             resale_price=resale_price,
             drop_weight=_drop_weight(rarity, source),
             bonuses=bonuses,
+            effect=_effect_for(rarity, rarity_seen[rarity]),
         ))
     # There are 50 * 10 name combinations, of which the first three are replaced by
     # migration-safe legacy entries.  The early stop above keeps the public range w001..w500.
@@ -435,6 +510,23 @@ def _validate_catalogue() -> None:
     assert all(item.drop_weight == 0 for item in WEAPON_SPECS if item.source == "shop")
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
     assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 50, "legendary": 5}
+    # Every legendary and exactly half the rares carry a passive; nothing below rare does.
+    with_effect = [item for item in WEAPON_SPECS if item.effect]
+    assert all(item.rarity in {"rare", "legendary"} for item in with_effect)
+    assert all(item.effect for item in WEAPON_SPECS if item.rarity == "legendary")
+    assert sum(1 for item in WEAPON_SPECS if item.rarity == "rare" and item.effect) == 25
+    # Guarded: EFFECT_HOOKS is empty when this data module is imported on its own, and
+    # the fallback must stay a fallback rather than becoming an import-time failure.
+    assert not EFFECT_HOOKS or all(
+        item.effect_dict()["code"] in EFFECT_HOOKS for item in with_effect
+    )
+    assert all(isinstance(item.effect_dict()["value"], int) for item in with_effect)
+    assert all(str(item.effect_dict()["text"]) for item in with_effect)
+    # Every declared passive must actually reach the catalogue.  An earlier keying bug
+    # silently shipped only three of the five rare passives, which no other check caught.
+    for rarity, declared in (("rare", _RARE_EFFECTS), ("legendary", _LEGENDARY_EFFECTS)):
+        used = {item.effect_dict()["code"] for item in with_effect if item.rarity == rarity}
+        assert used == {dict(effect)["code"] for effect in declared}
     starter_shop_items = [
         item for item in WEAPON_SPECS
         if item.source == "shop" and item.price <= STARTER_WEAPON_MAX_PRICE

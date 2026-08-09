@@ -295,6 +295,25 @@ class AmuletEffectTests(unittest.TestCase):
                 )
                 self.assertEqual(expected, combat.simulate(equipped, opponent, seed=918))
 
+    def test_a_weapon_and_amulet_sharing_a_code_keep_the_stronger_passive(self):
+        """Weapons carry amulet-vocabulary passives, so both slots can collide.
+
+        The hook lookups read the first match, so without deduplication the weaker of
+        the two would win purely on equip order and the other would silently vanish.
+        """
+        fighter = Fighter(
+            key="a", name="A", strength=40, health=40, agility=40, luck=40, armor=0,
+            effects=(
+                {"code": "vampiric", "text": "weapon", "value": 6},
+                {"code": "vampiric", "text": "amulet", "value": 14},
+            ),
+            level=1,
+        )
+        specs = combat._effect_specs(fighter)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["value"], 14)
+        self.assertEqual(specs[0]["text"], "amulet")
+
     def test_all_catalogue_effects_are_seeded_and_safe_to_replay(self):
         """A malformed metadata deployment must not make one arena click non-replayable."""
         self.assertEqual(

@@ -134,8 +134,13 @@ def _effect_specs(fighter: "Fighter") -> tuple[dict, ...]:
     ``Item.effect`` is intentionally data, not executable logic.  Keeping the parser
     here means tests and old fight snapshots can pass either a compact string or the
     full mapping stored by the catalogue.
+
+    Two equipped items can now carry the same code -- weapons gained passives drawn from
+    the same vocabulary as amulets, which a single amulet slot could never collide with.
+    The lookups below read the first match, so a duplicate would silently do nothing;
+    keeping the strongest instead makes that case deterministic and never a downgrade.
     """
-    specs = []
+    specs: list[dict] = []
     raw_effects = fighter.effects
     if isinstance(raw_effects, (str, Mapping)):
         raw_effects = (raw_effects,)
@@ -156,7 +161,11 @@ def _effect_specs(fighter: "Fighter") -> tuple[dict, ...]:
             value = _EFFECT_DEFAULTS[code]
         spec = dict(raw) if isinstance(raw, Mapping) else {}
         spec.update({"code": code, "value": value})
-        specs.append(spec)
+        existing = next((other for other in specs if other["code"] == code), None)
+        if existing is None:
+            specs.append(spec)
+        elif abs(spec["value"]) > abs(existing["value"]):
+            specs[specs.index(existing)] = spec
     return tuple(specs)
 
 

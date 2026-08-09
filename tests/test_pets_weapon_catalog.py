@@ -27,7 +27,12 @@ def test_catalogue_is_immutable_and_can_adapt_to_existing_item_constructor():
     assert arguments[5] is not weapon.bonus_dict()
 
 
-def test_first_three_ids_preserve_legacy_identity_stats_and_descriptions():
+def test_first_three_ids_preserve_legacy_identity_and_descriptions():
+    """Codes, names, sources and descriptions are the migration contract.
+
+    Stats are not: they track the live balance, so w003 moved to the legendary band
+    with the rest of its tier rather than staying pinned to the original +20.
+    """
     assert [(weapon.code, weapon.name, weapon.source, weapon.price, dict(weapon.bonuses), weapon.description)
             for weapon in catalogue.WEAPON_SPECS[:3]] == [
         ("w001", "Мамин тапок", "shop", 10, {"strength": 6},
@@ -36,7 +41,7 @@ def test_first_three_ids_preserve_legacy_identity_stats_and_descriptions():
          {"strength": 14, "luck": 4},
          "После неё спор окончен."),
         ("w003", "Швабра на изоленте", "drop", 0,
-         {"strength": 20, "agility": -3},
+         {"strength": 30, "agility": -3},
          "Синяя. Значит, легендарная."),
     ]
 
@@ -49,10 +54,15 @@ def test_rarity_distribution_has_bad_average_good_and_few_legendary_items():
     rares = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "rare"]
     legendary = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "legendary"]
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in cursed)
-    assert all(max(value for _, value in weapon.bonuses) >= 15 for weapon in rares)
+    assert all(max(value for _, value in weapon.bonuses) >= 20 for weapon in rares)
     assert len(legendary) == 5
-    assert all(dict(weapon.bonuses)["strength"] >= 19 for weapon in legendary)
+    assert all(dict(weapon.bonuses)["strength"] >= 28 for weapon in legendary)
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in legendary)
+    # A legendary must clearly out-hit the best rare, or the rarest drop in the game
+    # is a coin flip against a weapon anyone can buy.
+    assert min(dict(weapon.bonuses)["strength"] for weapon in legendary) > max(
+        dict(weapon.bonuses)["strength"] for weapon in rares
+    )
 
 
 def test_sources_prices_and_bonuses_are_sensible_for_the_current_combat_scale():
@@ -74,15 +84,15 @@ def test_sources_prices_and_bonuses_are_sensible_for_the_current_combat_scale():
         if weapon.rarity in {"common", "uncommon", "rare"} and weapon.source == "shop"
     ]
     assert min(ordinary_shop_strengths) >= 6
-    assert max(ordinary_shop_strengths) <= 18
-    assert max(dict(weapon.bonuses).get("strength", 0) for weapon in catalogue.WEAPON_SPECS) == 20
+    assert max(ordinary_shop_strengths) <= 24
+    assert max(dict(weapon.bonuses).get("strength", 0) for weapon in catalogue.WEAPON_SPECS) == 32
 
 
 def test_shop_prices_match_fight_income_and_actual_combat_power():
     expected_bands = {
         "common": (10, 20),
-        "uncommon": (50, 70),
-        "rare": (130, 155),
+        "uncommon": (55, 75),
+        "rare": (160, 195),
     }
     for rarity, (minimum, maximum) in expected_bands.items():
         weapons = [
@@ -106,7 +116,7 @@ def test_shop_prices_match_fight_income_and_actual_combat_power():
 def test_raw_items_expose_trade_schema_and_legendary_drop_weight_is_about_one_percent():
     required = {
         "code", "name", "slot", "price", "source", "bonuses", "description", "rarity",
-        "resale_price", "drop_weight",
+        "resale_price", "drop_weight", "effect",
     }
     assert len(catalogue.RAW_ITEMS) == 500
     assert all(required == set(record) for record in catalogue.RAW_ITEMS)
@@ -116,6 +126,40 @@ def test_raw_items_expose_trade_schema_and_legendary_drop_weight_is_about_one_pe
     assert legendary_weight / total_weight == pytest.approx(5 / 530)
     cursed = [record for record in catalogue.RAW_ITEMS if record["rarity"] == "cursed"]
     assert cursed and all(record["source"] == "drop" for record in cursed)
+
+
+def test_every_legendary_and_half_of_rare_carry_a_passive_effect():
+    import pets_amulet_catalog
+
+    by_rarity = {rarity: [] for rarity in catalogue.RARITIES}
+    for weapon in catalogue.WEAPON_SPECS:
+        by_rarity[weapon.rarity].append(weapon)
+
+    assert all(weapon.effect for weapon in by_rarity["legendary"])
+    rare_with_effect = [weapon for weapon in by_rarity["rare"] if weapon.effect]
+    assert len(rare_with_effect) == len(by_rarity["rare"]) // 2 == 25
+    # Nothing below rare gets one, so a passive stays a mark of a real find.
+    assert not any(
+        weapon.effect
+        for rarity in ("cursed", "common", "uncommon")
+        for weapon in by_rarity[rarity]
+    )
+
+    # Weapons reuse the amulet engine's vocabulary rather than inventing a second one.
+    for weapon in by_rarity["legendary"] + rare_with_effect:
+        effect = weapon.effect_dict()
+        assert effect["code"] in pets_amulet_catalog.EFFECT_HOOKS
+        assert isinstance(effect["value"], int)
+        assert effect["text"] and effect["text"].endswith(".")
+
+
+def test_weapon_passives_reach_the_item_record_combat_reads():
+    import pets_config
+
+    mop = pets_config.find_item("w003")
+    assert mop.rarity == "legendary"
+    assert mop.effect["code"] == "berserker"
+    assert mop.effect["threshold"] == 45
 
 
 def test_names_are_clear_and_descriptions_are_short():

@@ -663,7 +663,11 @@ class EquipmentTradingTests(PetsTestCase):
 
     def test_equipped_amulet_passive_reaches_combat_and_is_visible_in_the_bag(self):
         self._two_pets()
-        amulet = next(item for item in pets_config.ITEMS if item.effect)
+        # Weapons carry passives too now, so this must pick an amulet explicitly --
+        # the bag view below is filtered to the amulet slot.
+        amulet = next(
+            item for item in pets_config.ITEMS if item.slot == "amulet" and item.effect
+        )
         data = pets._load("chat")
         data["pets"]["1"]["inventory"] = [amulet.code]
         pets._save("chat", data)
@@ -897,8 +901,8 @@ class StorefrontAndCollectionTests(PetsTestCase):
             for rarity in ("common", "uncommon", "rare")
         }
         self.assertEqual((min(prices["common"]), max(prices["common"])), (10, 20))
-        self.assertEqual((min(prices["uncommon"]), max(prices["uncommon"])), (50, 70))
-        self.assertEqual((min(prices["rare"]), max(prices["rare"])), (130, 155))
+        self.assertEqual((min(prices["uncommon"]), max(prices["uncommon"])), (55, 75))
+        self.assertEqual((min(prices["rare"]), max(prices["rare"])), (160, 195))
         self.assertTrue(all(item.resale_price <= item.price // 5 for item in shop))
         self.assertTrue(all(
             item.source == "drop" and item.price == 0

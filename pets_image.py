@@ -24,15 +24,22 @@ HP_BAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] + 8
 HP_BAR_HEIGHT = 24
 AVATAR_DIAMETER = 58
 AVATAR_TOP = PET_IMAGE_TOP + PET_IMAGE_SIZE[1] - AVATAR_DIAMETER - 10
-WEAPON_NAME_TOP = HP_BAR_TOP + HP_BAR_HEIGHT + 8
-WEAPON_STATS_TOP = WEAPON_NAME_TOP + 20
-WEAPON_DIVIDER_TOP = WEAPON_STATS_TOP + 20
-AMULET_NAME_TOP = WEAPON_DIVIDER_TOP + 7
-AMULET_EFFECT_TOP = AMULET_NAME_TOP + 20
-EQUIPMENT_DIVIDER_TOP = AMULET_EFFECT_TOP + 23
+# Rare and legendary weapons carry a passive just like an amulet does, so the weapon
+# block needs its own effect line -- otherwise the receipt shows flat stats only and the
+# passive that decided the fight is invisible.  The panel cannot simply grow: the stat
+# rows are anchored up from PANEL_BOTTOM and the outcome caption sits right below it.
+# The extra line is paid for by trimming a few points from each gap in this block, so
+# STATS_DIVIDER_TOP lands exactly where it did before.
+WEAPON_NAME_TOP = HP_BAR_TOP + HP_BAR_HEIGHT + 4
+WEAPON_STATS_TOP = WEAPON_NAME_TOP + 18
+WEAPON_EFFECT_TOP = WEAPON_STATS_TOP + 18
+WEAPON_DIVIDER_TOP = WEAPON_EFFECT_TOP + 18
+AMULET_NAME_TOP = WEAPON_DIVIDER_TOP + 5
+AMULET_EFFECT_TOP = AMULET_NAME_TOP + 18
+EQUIPMENT_DIVIDER_TOP = AMULET_EFFECT_TOP + 19
 PET_NAME_TOP = EQUIPMENT_DIVIDER_TOP + 7
 OWNER_NAME_TOP = PET_NAME_TOP + 27
-STATS_DIVIDER_TOP = OWNER_NAME_TOP + 21
+STATS_DIVIDER_TOP = OWNER_NAME_TOP + 19
 STATS_BOTTOM_PADDING = 17
 STAT_ROW_HEIGHT = 18
 STAT_LABEL_FONT_SIZE = 14
@@ -199,6 +206,10 @@ def _draw_equipment(draw, x: int, fighter: dict) -> None:
         draw, _equipment_bonus_text(weapon), _font(14, bold=True), PET_IMAGE_SIZE[0],
     )
     draw.text((left, WEAPON_STATS_TOP), weapon_stats, font=_font(14, bold=True), fill="#53606a")
+    weapon_effect = (weapon or {}).get("effect")
+    if weapon_effect:
+        effect_line = _fit_text(draw, f"♦ {weapon_effect}", _font(13), PET_IMAGE_SIZE[0])
+        draw.text((left, WEAPON_EFFECT_TOP), effect_line, font=_font(13), fill="#53606a")
     draw.line((left, WEAPON_DIVIDER_TOP, right, WEAPON_DIVIDER_TOP), fill="#c4cbc8", width=1)
 
     _draw_item_title(draw, left, AMULET_NAME_TOP, "ТАЛИСМАН", amulet)

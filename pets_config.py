@@ -556,15 +556,19 @@ def resale_value(item: Item) -> int:
     return max(5, impact * 3)
 
 
-# How often a win drops an item at all, and from which pool.
-DROP_CHANCE = 0.08
+# How often a win drops an item at all, and from which pool.  Only the winner rolls,
+# so at the old 8% a player on the base five-fight bank saw an item about once every
+# five days -- long enough that most fights felt like they paid nothing.  15% puts a
+# casual player at roughly one item every three days while leaving the *conditional*
+# rarity split (which item, once a drop happens) completely untouched.
+DROP_CHANCE = 0.15
 
-# A normal win has roughly 0.088% chance to produce a legendary weapon
-# (DROP_CHANCE multiplied by the catalogue's weighted legendary share).  That is one
-# natural legendary per ~1,136 wins on average, much too volatile for a 500-item
-# collection.  A 500-win ceiling is deliberately conservative: luck still matters,
-# but an active player cannot miss every legendary forever.
-LEGENDARY_PITY_ELIGIBLE_WINS = 500
+# A normal win has roughly 0.05% chance to produce a legendary of any kind -- the
+# weighted pool grew once gear and amulets joined it, so natural legendaries are far
+# rarer than the raw drop rate suggests and the ceiling is what most players actually
+# reach.  300 wins is deliberately conservative: luck still matters, but an active
+# player cannot miss every legendary forever.
+LEGENDARY_PITY_ELIGIBLE_WINS = 300
 
 # Gifts are social rather than a fast alt-account funnel.  The giver needs a creature
 # with a little arena history, and each giver can move only one item per day.  The
