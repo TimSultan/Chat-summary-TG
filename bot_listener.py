@@ -5929,12 +5929,6 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.cage_view(entry, user_id, xp), log
             )
             return
-        if action == "uphamsterator":
-            ok, note = pets.upgrade_hamsterator(entry, user_id, xp)
-            await _pets_toast_and_redraw(
-                api, chat_id, message_id, note, pets_ui.hamsterator_view(entry, user_id, xp), log
-            )
-            return
         if action == "farmstart":
             ok, note = pets.start_farm(entry, user_id)
             await _pets_toast_and_redraw(
@@ -6098,7 +6092,6 @@ async def handle_pets_callback(
             "main": lambda: pets_ui.main_view(entry, user_id, xp),
             "info": lambda: pets_ui.info_view(user_id),
             "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
-            "hamsterator": lambda: pets_ui.hamsterator_view(entry, user_id, xp),
             "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
@@ -7785,6 +7778,12 @@ async def run_bot_listener(
         refunded_upgrades = pets.refund_cage_upgrades(cfg.listener_allowed_chats)
         if refunded_upgrades:
             log(f"[pets] refunded {refunded_upgrades} cage upgrades")
+        retired_hamsterators = pets.retire_hamsterators(cfg.listener_allowed_chats)
+        if retired_hamsterators["players"]:
+            log(
+                f"[pets] retired hamsterators: refunded {retired_hamsterators['gold']} gold "
+                f"to {retired_hamsterators['players']} players"
+            )
         weapon_migration = pets.enforce_unique_weapons(cfg.listener_allowed_chats)
         if weapon_migration["removed_mops"] or weapon_migration["deduplicated"]:
             log(f"[pets] unique weapon migration: {weapon_migration}")

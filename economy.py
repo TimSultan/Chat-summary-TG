@@ -258,7 +258,10 @@ def _effects(record: dict) -> dict:
     return record.setdefault("effects", {})
 
 
-# --- pet passive income -----------------------------------------------------------
+# --- farm passive income ----------------------------------------------------------
+
+
+FARM_PASSIVE_EFFECT_KEY = "pet_farm_income"
 
 
 def passive_income_status(entry: str, user_id, hourly_rate: int, storage_cap: int,
@@ -271,7 +274,7 @@ def passive_income_status(entry: str, user_id, hourly_rate: int, storage_cap: in
     moment = now or app_now()
     data = _load(entry)
     effect = ((data["users"].get(str(user_id)) or {}).get("effects", {})
-              .get("pet_hamsterator", {}))
+              .get(FARM_PASSIVE_EFFECT_KEY, {}))
     raw = effect.get("last_hour")
     if hourly_rate <= 0 or storage_cap <= 0 or not raw:
         next_hour = moment + timedelta(hours=1) if hourly_rate > 0 and storage_cap > 0 else moment
@@ -298,7 +301,7 @@ def settle_passive_income(entry: str, user_id, hourly_rate: int, storage_cap: in
     moment = now or app_now()
     data = _load(entry)
     record = _record(data, user_id)
-    effect = _effects(record).setdefault("pet_hamsterator", {})
+    effect = _effects(record).setdefault(FARM_PASSIVE_EFFECT_KEY, {})
     raw = effect.get("last_hour")
     if not raw:
         effect["last_hour"] = moment.isoformat()
@@ -319,7 +322,7 @@ def settle_passive_income(entry: str, user_id, hourly_rate: int, storage_cap: in
     effect["last_hour"] = checkpoint.isoformat()
     if credit:
         record["bonus"] = record.get("bonus", 0) + credit
-        _append_log(data, user_id, credit, "pet:hamsterator_income", ref=str(elapsed))
+        _append_log(data, user_id, credit, "pet:farm_passive_income", ref=str(elapsed))
     _save(entry, data)
     return {"credited": credit, "hours": elapsed, "initialized": False}
 

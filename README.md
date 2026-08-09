@@ -958,16 +958,16 @@ At startup, the one-time `unique_weapons_202608` migration removes «Швабр�
 duplicate weapon codes are reduced to one copy, preferring an equipped copy and refunding
 the removed copy at purchase price (shop) or resale value (drop).
 
-The **Хомяколатор** is a second five-level facility beside the cage. It passively banks
-1–5 coins per complete hour with 24–72 hours of storage, depending on level. Collection is
-lazy (opening an arena balance screen settles it), but the checkpoint and credit share one
-atomic ledger write, so a retry or restart cannot pay the same hour twice.
-
 The **Farm** sends a pet away for exactly six hours, during which it cannot fight or be
 selected as an opponent. Its 10 levels yield 14–33 coins and 50–95 pet XP per trip. A
 well improves coins, a sprinkler improves XP, garden beds raise the accessory-find chance
 from 3% to 8%, and a tractor improves both rewards. Rewards are fixed when the trip starts,
 settled once after restarts, and announced persistently in the owner's bot DM.
+The same 10 Farm levels now also passively bank 1–5 coins per complete hour with 24–480
+coins of storage. Collection is lazy (opening an arena balance screen settles it), but the
+checkpoint and credit share one atomic ledger write, so a retry or restart cannot pay the
+same hour twice. The retired separate passive facility is removed from the menu; its old
+upgrade costs are refunded once in full at startup.
 
 **Everyone starts with 10 fights a day.** The cage adds up to 4, every two Farm levels add
 one (up to 5), and each qualifying `#япокрасил` adds 2 fights per day for the next seven

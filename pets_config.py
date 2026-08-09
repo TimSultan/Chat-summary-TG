@@ -68,16 +68,9 @@ CAGE_UPGRADE_REFUND = 350
 CAGE_BONUS_FIGHTS = (0, 1, 2, 3, 4)                  # extra fights/day at that level
 CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
 
-# ------------------------------------------------------------- passive facility
-# "Хомяколатор" is separate from combat. Its marginal payback rises from about
-# 10, 31, 63, 125 to 250 days, making it a long-term coin sink rather than a
-# replacement for chat activity or arena wins.
-HAMSTERATOR_MAX_LEVEL = 5
-# Index is the level being left, so [0] buys level 1.
-HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
-HAMSTERATOR_GOLD_PER_HOUR = (0, 1, 2, 3, 4, 5)
-# 24, 36, 48, 60, and 72 hours of storage at each active level.
-HAMSTERATOR_STORAGE_CAP = (0, 24, 72, 144, 240, 360)
+# Historic prices are retained only for the one-time retirement refund. There is no
+# longer a separate passive-income building or any way to buy these levels.
+LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 
 # ------------------------------------------------------------------------------ farm
 # A farm run is a deliberate six-hour choice: the pet cannot enter the arena while it
@@ -91,6 +84,10 @@ FARM_UPGRADE_COSTS = (75, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
 FARM_GOLD_PER_RUN = (0, 14, 16, 18, 20, 22, 24, 26, 28, 30, 33)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
 FARM_DROP_CHANCE = 0.03
+# Farm levels also generate passive gold. The top stays at the former 5 coins/hour so
+# merging the two buildings improves clarity without doubling the passive faucet.
+FARM_PASSIVE_GOLD_PER_HOUR = (0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5)
+FARM_PASSIVE_STORAGE_CAP = (0, 24, 36, 72, 96, 144, 180, 240, 288, 360, 480)
 FARM_FEATURES = {
     # A well makes every harvest reliably more valuable.
     "well": {"name": "Колодец", "cost": 150, "gold_multiplier": 1.25},

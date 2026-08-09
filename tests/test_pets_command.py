@@ -199,15 +199,6 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("Особые преимущества", api.edits[0]["text"])
         self.assertIn("30%", api.edits[0]["text"])
 
-    def test_hamsterator_menu_and_upgrade_callback(self):
-        economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.HAMSTERATOR_UPGRADE_COSTS[0], "test")
-        self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
-        api = self._tap("hamsterator")
-        self.assertIn("Хомяколатор", api.edits[0]["text"])
-        api = self._tap("uphamsterator")
-        self.assertEqual(pets.hamsterator_level(CHAT, PLAYER["id"]), 1)
-        self.assertIn("Хомяколатор", api.edits[0]["text"])
-
     def test_farm_menu_builds_then_starts_a_single_six_hour_shift(self):
         economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.FARM_UPGRADE_COSTS[0], "test")
         self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
@@ -224,8 +215,10 @@ class PetsCommandTests(unittest.TestCase):
         api = self._tap("upfarm")
         self.assertEqual(pets.farm_level(CHAT, PLAYER["id"]), 1)
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
+        self.assertIn("Пассивно: +1 монет/ч", rendered[0])
         actions = {pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})}
         self.assertIn("farmstart", actions)
+        self.assertNotIn("uphamsterator", actions)
 
         api = self._tap("farmstart")
         self.assertTrue(pets.is_farming(CHAT, PLAYER["id"]))

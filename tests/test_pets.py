@@ -453,21 +453,20 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         self.assertIsNone(pets.find_opponent(entry, "1", rng=random.Random(1)))
 
 
-class HamsteratorTests(PetsTestCase):
-    def _build_level_one(self, entry="chat", user_id="1", now=None):
+class FarmPassiveIncomeTests(PetsTestCase):
+    def _build_farm(self, entry="chat", user_id="1", level=1, now=None):
+        self._tame(entry, user_id)
         economy.grant(
-            entry, user_id,
-            pets_config.CAGE_PRICE + pets_config.HAMSTERATOR_UPGRADE_COSTS[0], "test",
+            entry, user_id, sum(pets_config.FARM_UPGRADE_COSTS[:level]), "test",
         )
-        ok, message = pets.buy_cage(entry, user_id, 0)
-        self.assertTrue(ok, message)
-        ok, message = pets.upgrade_hamsterator(entry, user_id, 0, now=now)
-        self.assertTrue(ok, message)
-        self.assertIn("Хомяколатор", message)
+        for expected_level in range(1, level + 1):
+            ok, message = pets.upgrade_farm(entry, user_id, 0, now=now)
+            self.assertTrue(ok, message)
+            self.assertEqual(pets.farm_level(entry, user_id), expected_level)
 
     def test_income_only_credits_complete_elapsed_hours_and_keeps_fraction(self):
         start = datetime(2026, 8, 8, 14, 55)
-        self._build_level_one(now=start)
+        self._build_farm(now=start)
         self.assertEqual(pets.settle_passive_income("chat", "1", now=start + timedelta(minutes=6))["credited"], 0)
         self.assertEqual(pets.settle_passive_income("chat", "1", now=start + timedelta(hours=1, minutes=5))["credited"], 1)
         # The five-minute remainder is retained, so another 55 minutes completes hour 2.
@@ -476,46 +475,67 @@ class HamsteratorTests(PetsTestCase):
 
     def test_income_cap_and_restart_retry_do_not_double_credit(self):
         start = datetime(2026, 8, 8, 10)
-        self._build_level_one(now=start)
+        self._build_farm(now=start)
         later = start + timedelta(days=10)
-        self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], pets_config.HAMSTERATOR_STORAGE_CAP[1])
+        self.assertEqual(
+            pets.settle_passive_income("chat", "1", now=later)["credited"],
+            pets_config.FARM_PASSIVE_STORAGE_CAP[1],
+        )
         # New loads (the same path a process restart takes) see the advanced checkpoint.
         self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], 0)
-        self.assertEqual(economy.balance("chat", "1", 0), pets_config.HAMSTERATOR_STORAGE_CAP[1])
+        self.assertEqual(
+            economy.balance("chat", "1", 0), pets_config.FARM_PASSIVE_STORAGE_CAP[1],
+        )
 
     def test_corrupt_income_checkpoint_is_reset_without_crashing(self):
-        self._build_level_one(now=datetime(2026, 8, 8, 10))
+        self._build_farm(now=datetime(2026, 8, 8, 10))
         data = economy._load("chat")
-        data["users"]["1"]["effects"]["pet_hamsterator"]["last_hour"] = "not-a-date"
+        data["users"]["1"]["effects"][economy.FARM_PASSIVE_EFFECT_KEY]["last_hour"] = "not-a-date"
         economy._save("chat", data)
         result = pets.settle_passive_income("chat", "1", now=datetime(2026, 8, 8, 12))
         self.assertEqual(result["credited"], 0)
-        repaired = economy._load("chat")["users"]["1"]["effects"]["pet_hamsterator"]["last_hour"]
+        repaired = economy._load("chat")["users"]["1"]["effects"][economy.FARM_PASSIVE_EFFECT_KEY]["last_hour"]
         self.assertEqual(repaired, "2026-08-08T12:00:00")
 
     def test_upgrade_settles_old_rate_and_refuses_without_money(self):
         start = datetime(2026, 8, 8, 10)
-        self._build_level_one(now=start)
+        self._build_farm(level=2, now=start)
         later = start + timedelta(hours=3)
-        ok, message = pets.upgrade_hamsterator("chat", "1", 0, now=later)
+        ok, message = pets.upgrade_farm("chat", "1", 0, now=later)
         self.assertFalse(ok)
         self.assertIn("Нужно", message)
         self.assertEqual(economy.balance("chat", "1", 0), 3)
-        economy.grant("chat", "1", pets_config.HAMSTERATOR_UPGRADE_COSTS[1], "test")
-        ok, message = pets.upgrade_hamsterator("chat", "1", 0, now=later)
+        economy.grant("chat", "1", pets_config.FARM_UPGRADE_COSTS[2], "test")
+        ok, message = pets.upgrade_farm("chat", "1", 0, now=later)
         self.assertTrue(ok, message)
-        self.assertEqual(pets.hamsterator_level("chat", "1"), 2)
+        self.assertEqual(pets.farm_level("chat", "1"), 3)
         self.assertEqual(pets.settle_passive_income("chat", "1", now=later + timedelta(hours=2))["credited"], 4)
 
-    def test_facility_view_has_upgrade_callback_and_russian_copy(self):
-        entry = "chat"
-        economy.grant(entry, "1", pets_config.CAGE_PRICE, "test")
-        self.assertTrue(pets.buy_cage(entry, "1", 0)[0])
-        text, keyboard = pets_ui.hamsterator_view(entry, "1", 0)
-        self.assertIn("Хомяколатор", text)
+    def test_farm_view_shows_passive_rate_and_upgrade_callback(self):
+        self._build_farm()
+        text, keyboard = pets_ui.farm_view("chat", "1", 0)
+        self.assertIn("Пассивно: +1 монет/ч", text)
         callbacks = [pets_ui.parse_callback(button["callback_data"])[1]
                      for row in keyboard["inline_keyboard"] for button in row]
-        self.assertIn("uphamsterator", callbacks)
+        self.assertIn("upfarm", callbacks)
+        self.assertNotIn("uphamsterator", callbacks)
+
+    def test_retired_facility_is_removed_and_refunded_exactly_once(self):
+        self._tame("chat", "1")
+        data = pets._load("chat")
+        data["pets"]["1"]["hamsterator_level"] = 3
+        pets._save("chat", data)
+
+        expected = sum(pets_config.LEGACY_HAMSTERATOR_UPGRADE_COSTS[:3])
+        self.assertEqual(
+            pets.retire_hamsterators(["chat"]), {"players": 1, "gold": expected},
+        )
+        self.assertNotIn("hamsterator_level", pets._load("chat")["pets"]["1"])
+        self.assertEqual(economy.balance("chat", "1", 0), expected)
+        self.assertEqual(
+            pets.retire_hamsterators(["chat"]), {"players": 0, "gold": 0},
+        )
+        self.assertEqual(economy.balance("chat", "1", 0), expected)
 
 
 class EquipmentTradingTests(PetsTestCase):
@@ -1320,11 +1340,9 @@ class PityGiftAndTelemetryTests(PetsTestCase):
 
     def test_passive_telemetry_credits_once_per_settled_hour(self):
         start = datetime(2026, 8, 8, 10)
-        economy.grant(
-            "chat", "1", pets_config.CAGE_PRICE + pets_config.HAMSTERATOR_UPGRADE_COSTS[0], "test",
-        )
-        self.assertTrue(pets.buy_cage("chat", "1", 0)[0])
-        self.assertTrue(pets.upgrade_hamsterator("chat", "1", 0, now=start)[0])
+        self._tame("chat", "1")
+        economy.grant("chat", "1", pets_config.FARM_UPGRADE_COSTS[0], "test")
+        self.assertTrue(pets.upgrade_farm("chat", "1", 0, now=start)[0])
         later = start + timedelta(hours=2)
         self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], 2)
         self.assertEqual(pets.settle_passive_income("chat", "1", now=later)["credited"], 0)

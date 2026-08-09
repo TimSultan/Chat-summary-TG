@@ -133,7 +133,6 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows = [
-        [{"text": "🐹 Хомяколатор", "callback_data": callback_data(user_id, "hamsterator")}],
         [{"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")}],
         [{"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")}],
     ]
@@ -207,13 +206,13 @@ def info_view(user_id) -> tuple[str, dict]:
         f"1. Купи клетку за {_coins(C.CAGE_PRICE)}, затем приручи своего покраса за {_coins(C.TAME_PRICE)}."
     )
     lines.append("2. Прокачивай Силу, Здоровье, Ловкость и Удачу; экипировка добавляет статы и Броню.")
-    lines.append("3. Сражайся в боте через /arena: соперник выбирается случайно среди тех, кого сейчас можно атаковать. Боёв больше за активность в чате и клетку.")
+    lines.append("3. Сражайся через /arena: соперник выбирается случайно. Боёв больше за клетку, ферму и свежие #япокрасил.")
     lines.append(
         f"4. Победа приносит {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и опыт. "
         f"Поражение забирает только {round(C.LOSS_GOLD_SHARE * 100)}% награды, без долгов."
     )
     lines.append("5. Ненужную снятую экипировку можно продать или подарить владельцу другого существа.")
-    lines.append("6. Хомяколатор копит монеты за полностью прошедшие часы, пока его склад не заполнится.")
+    lines.append("6. Каждый уровень фермы улучшает смены, пассивную добычу монет и дневной лимит боёв.")
     lines.append("\n<b>Статы</b>")
     lines.append("Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. Удача повышает шанс крита.")
     lines.append("\n<b>Особые преимущества</b>")
@@ -272,47 +271,6 @@ def cage_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         rows.append([{
             "text": f"⬆️ Улучшить — {_money(C.CAGE_UPGRADE_COSTS[level])}",
             "callback_data": callback_data(user_id, "upcage"),
-        }])
-    rows.append(_back_row(user_id))
-    return "\n".join(lines), {"inline_keyboard": rows}
-
-
-# -------------------------------------------------------------------- hamsterator
-
-
-def hamsterator_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
-    """Passive-income facility view; opening it collects any complete stored hours."""
-    before = pets.passive_income_status(entry, user_id)
-    coins = pets.balance_for(entry, user_id, xp)
-    level = pets.hamsterator_level(entry, user_id)
-    rate = C.HAMSTERATOR_GOLD_PER_HOUR[level]
-    cap = C.HAMSTERATOR_STORAGE_CAP[level]
-    lines = ["🐹 <b>Хомяколатор</b>\n"]
-    if not pets.has_cage(entry, user_id):
-        lines.append("Сначала нужна клетка: хомякам негде крутить монетный барабан.")
-    else:
-        lines.append(f"Уровень {level} из {C.HAMSTERATOR_MAX_LEVEL}.")
-        lines.append(f"🪙 Добыча: +{rate} монет/ч.")
-        lines.append(f"📦 Склад: до {_money(cap)} монет.")
-        if before.get("stored"):
-            lines.append(f"✅ Собрано сейчас: +{_money(before['stored'])}.")
-        elif level:
-            next_at = before["next_hour"].strftime("%H:%M")
-            lines.append(f"⏱ Следующая монета — в {next_at}.")
-        if level < C.HAMSTERATOR_MAX_LEVEL:
-            cost = C.HAMSTERATOR_UPGRADE_COSTS[level]
-            next_rate = C.HAMSTERATOR_GOLD_PER_HOUR[level + 1]
-            next_cap = C.HAMSTERATOR_STORAGE_CAP[level + 1]
-            lines.append(
-                f"\nСледующий уровень — {_coins(cost)}: +{next_rate} монет/ч, "
-                f"склад {_money(next_cap)}."
-            )
-    lines.append(f"\n🪙 У тебя: {_money(coins)}")
-    rows = []
-    if pets.has_cage(entry, user_id) and level < C.HAMSTERATOR_MAX_LEVEL:
-        rows.append([{
-            "text": f"⬆️ Улучшить — {_money(C.HAMSTERATOR_UPGRADE_COSTS[level])}",
-            "callback_data": callback_data(user_id, "uphamsterator"),
         }])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -403,6 +361,7 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         return no_pet_view(user_id)
 
     status = pets.farm_status(entry, user_id)
+    passive_before = pets.passive_income_status(entry, user_id)
     coins = pets.balance_for(entry, user_id, xp)
     level = int(status.get("level", status.get("farm_level", 0)) or 0)
     max_level = int(status.get("max_level", 10) or 10)
@@ -410,6 +369,15 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines = ["🌾 <b>Ферма</b>\n"]
     lines.append(f"🐾 Работник: <b>{_name(pet)}</b>")
     lines.append(f"🏡 Уровень фермы: {level} из {max_level}.")
+    if level > 0:
+        lines.append(
+            f"🪙 Пассивно: +{passive_before['rate']} монет/ч · "
+            f"склад до {_money(passive_before['cap'])}."
+        )
+        if passive_before.get("stored"):
+            lines.append(f"✅ Пассивно собрано сейчас: +{_money(passive_before['stored'])}.")
+        else:
+            lines.append(f"⏱ Следующее начисление — в {passive_before['next_hour'].strftime('%H:%M')}.")
 
     if active:
         remaining = _farm_seconds_left(status)

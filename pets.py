@@ -50,6 +50,7 @@ FIGHT_LOG_LIMIT = 2_000
 # See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
 UNIQUE_WEAPONS_MIGRATION_FLAG = "unique_weapons_202608"
+HAMSTERATOR_RETIREMENT_REASON = "pet_hamsterator_retirement_202608"
 REMOVED_MOP_CODE = "w003"
 REMOVED_MOP_COMPENSATION = 100
 
@@ -386,19 +387,19 @@ def cage_level(entry, user_id) -> int:
     return record.get("cage_level", 0) if record else 0
 
 
-def hamsterator_level(entry, user_id) -> int:
-    """Level of the passive facility; zero means it has not been built."""
-    record = _load(entry)["pets"].get(str(user_id))
-    return record.get("hamsterator_level", 0) if record else 0
-
-
-def _hamsterator_terms(level: int) -> tuple[int, int]:
-    level = min(max(0, int(level)), C.HAMSTERATOR_MAX_LEVEL)
-    return C.HAMSTERATOR_GOLD_PER_HOUR[level], C.HAMSTERATOR_STORAGE_CAP[level]
+def _farm_passive_terms(record: dict | None) -> tuple[int, int, int]:
+    level = min(
+        max(0, int((record or {}).get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL,
+    )
+    return (
+        level,
+        C.FARM_PASSIVE_GOLD_PER_HOUR[level],
+        C.FARM_PASSIVE_STORAGE_CAP[level],
+    )
 
 
 def settle_passive_income(entry, user_id, now: datetime | None = None) -> dict:
-    rate, cap = _hamsterator_terms(hamsterator_level(entry, user_id))
+    level, rate, cap = _farm_passive_terms(_tamed_record(_load(entry), user_id))
     result = economy.settle_passive_income(entry, user_id, rate, cap, now=now)
     # The underlying ledger advances its checkpoint atomically with the credit. A
     # retry therefore reports zero and cannot inflate this aggregate counter either.
@@ -407,12 +408,11 @@ def settle_passive_income(entry, user_id, now: datetime | None = None) -> dict:
         data = _load(entry)
         _metric_add(data, "passive_gold_minted", credited)
         _save(entry, data)
-    return result
+    return {**result, "level": level, "rate": rate, "cap": cap}
 
 
 def passive_income_status(entry, user_id, now: datetime | None = None) -> dict:
-    level = hamsterator_level(entry, user_id)
-    rate, cap = _hamsterator_terms(level)
+    level, rate, cap = _farm_passive_terms(_tamed_record(_load(entry), user_id))
     return {
         **economy.passive_income_status(entry, user_id, rate, cap, now=now),
         "level": level, "rate": rate, "cap": cap,
@@ -489,6 +489,33 @@ def refund_cage_upgrades(entries) -> int:
         data[CAGE_UPGRADE_REFUND_FLAG] = True
         _save(entry, data)
     return refunded
+
+
+def retire_hamsterators(entries) -> dict:
+    """Remove the retired building and refund every historic upgrade exactly once."""
+    players = 0
+    refunded_gold = 0
+    for entry in entries:
+        data = _load(entry)
+        changed = False
+        for user_id, record in data.get("pets", {}).items():
+            if not isinstance(record, dict) or "hamsterator_level" not in record:
+                continue
+            level = min(
+                max(0, int(record.get("hamsterator_level", 0) or 0)),
+                len(C.LEGACY_HAMSTERATOR_UPGRADE_COSTS),
+            )
+            refund = sum(C.LEGACY_HAMSTERATOR_UPGRADE_COSTS[:level])
+            if refund and economy.grant_once(
+                entry, user_id, refund, HAMSTERATOR_RETIREMENT_REASON,
+            ):
+                players += 1
+                refunded_gold += refund
+            record.pop("hamsterator_level", None)
+            changed = True
+        if changed:
+            _save(entry, data)
+    return {"players": players, "gold": refunded_gold}
 
 
 def _remove_weapon_from_record(record: dict, code: str) -> None:
@@ -703,8 +730,8 @@ def start_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
     return True, "Питомец отправлен на ферму на 6 часов."
 
 
-def upgrade_farm(entry, user_id, xp) -> tuple[bool, str]:
-    """Build/upgrade the farm one level, charging the shared coin wallet once."""
+def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
+    """Upgrade the farm after banking passive gold at the old level's rate."""
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -712,6 +739,12 @@ def upgrade_farm(entry, user_id, xp) -> tuple[bool, str]:
     level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
     if level >= C.FARM_MAX_LEVEL:
         return False, f"Ферма уже максимального уровня ({C.FARM_MAX_LEVEL})."
+    settle_passive_income(entry, user_id, now=now)
+    # Settlement writes economy and telemetry independently. Reload so the farm upgrade
+    # cannot overwrite a freshly updated metrics record with the stale snapshot above.
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
     cost = C.FARM_UPGRADE_COSTS[level]
     ok, balance = economy.spend(entry, user_id, xp, cost, "buy:pet_farm_upgrade")
     if not ok:
@@ -947,30 +980,6 @@ def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
     record["cage_level"] = level + 1
     _save(entry, data)
     return True, f"Клетка прокачана до {level + 1} уровня за {cost} монет."
-
-
-def upgrade_hamsterator(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
-    """Upgrade passive income, first banking elapsed time at the old level's rate."""
-    data = _load(entry)
-    record = data["pets"].get(str(user_id))
-    if not record:
-        return False, "Сначала купи клетку."
-    level = min(max(0, int(record.get("hamsterator_level", 0))), C.HAMSTERATOR_MAX_LEVEL)
-    if level >= C.HAMSTERATOR_MAX_LEVEL:
-        return False, f"Хомяколатор уже максимального уровня ({C.HAMSTERATOR_MAX_LEVEL})."
-    settle_passive_income(entry, user_id, now=now)
-    # Settling may have written telemetry, so never overwrite that fresh store with the
-    # pre-settlement snapshot kept above.
-    data = _load(entry)
-    record = data["pets"][str(user_id)]
-    cost = C.HAMSTERATOR_UPGRADE_COSTS[level]
-    ok, balance = economy.spend(entry, user_id, xp, cost, "buy:pet_hamsterator")
-    if not ok:
-        return False, f"Нужно {cost} монет на Хомяколатор, у тебя {balance}."
-    record["hamsterator_level"] = level + 1
-    _save(entry, data)
-    rate, _ = _hamsterator_terms(level + 1)
-    return True, f"Хомяколатор прокачан до {level + 1} уровня: +{rate} монет/ч."
 
 
 def tame(
