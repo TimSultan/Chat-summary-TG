@@ -670,6 +670,57 @@ def _buyable_here(item, daily_weapon_codes) -> bool:
     return item.source == "shop" and (item.slot != "weapon" or item.code in daily_weapon_codes)
 
 
+def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
+    """The shop's shelf for one non-weapon slot: what is on sale, and nothing else.
+
+    ``slot_view`` is the full catalogue for a slot -- hundreds of entries, most of them
+    drop-only trophies -- and reaching it from the 🛒 shop was the whole problem: whether
+    the two buyable accessories landed on page one depended on how much the player already
+    owned, so an active player still opened the shop onto a wall of "только из боёв" with
+    no button anywhere. Weapons never had that problem because they have their own
+    storefront (``store_view``). This is the same thing for the other three slots: a short,
+    unpaginated shelf, so "buy an amulet" is always exactly two taps.
+    """
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    if slot not in C.SLOT_KEYS or slot == "weapon":
+        return store_view(entry, user_id, xp)
+    owned = set(pet.get("inventory", []))
+    stock = sorted(C.items_for_slot(slot, "shop"), key=lambda item: (item.price, item.code))
+
+    lines = [f"🛒 <b>{escape(C.SLOT_NAMES[slot])}</b> {C.SLOT_EMOJI[slot]}\n"]
+    rows = []
+    if not stock:
+        lines.append("Этот слот целиком выпадает из боёв — купить его нельзя.")
+    for number, item in enumerate(stock, 1):
+        label = C.RARITY_LABELS.get(getattr(item, "rarity", "common"), "⚪ Обычное")
+        lines.append(f"<b>{number}. {escape(item.name)}</b> · {label}")
+        lines.append(_bonus_icon_text(item))
+        lines.append("✅ Уже у тебя" if item.code in owned else f"🪙 {_money(item.price)}")
+        if item.description:
+            lines.append(f"<i>{escape(item.description)}</i>")
+        lines.append("")
+        if item.code not in owned:
+            rows.append([{
+                "text": f"Купить {item.name} — {_money(item.price)}",
+                "callback_data": callback_data(user_id, "buy", item.code),
+            }])
+    if stock and all(item.code in owned for item in stock):
+        lines.append("Здесь всё уже куплено. Остальное в этом слоте выпадает только из боёв.")
+    lines.append(f"🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
+
+    rows.append([{
+        # The full catalogue stays one tap away: seeing the trophy you cannot buy is the
+        # point of that screen, it just should not be what the shop opens onto.
+        "text": "📖 Весь каталог слота",
+        "callback_data": callback_data(user_id, "slot", slot_argument(slot)),
+    }])
+    rows.append([{"text": "🛒 К витрине оружия", "callback_data": callback_data(user_id, "store")}])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
 def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[str, dict]:
     """Everything that can go in one slot: what is worn, what is owned, what is for sale
     and what can only drop. The drop-only items are listed with no button on purpose --
@@ -956,16 +1007,18 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
         )
     lines.append(f"🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
     rows.extend([
+        # These lead to the shop SHELF for each slot, not to the slot's full catalogue:
+        # a button on the 🛒 screen has to open something you can actually buy.
         [{
             "text": f"{C.SLOT_EMOJI['amulet']} {C.SLOT_NAMES['amulet']}",
-            "callback_data": callback_data(user_id, "slot", slot_argument("amulet")),
+            "callback_data": callback_data(user_id, "shopslot", "amulet"),
         }, {
             "text": f"{C.SLOT_EMOJI['gloves']} {C.SLOT_NAMES['gloves']}",
-            "callback_data": callback_data(user_id, "slot", slot_argument("gloves")),
+            "callback_data": callback_data(user_id, "shopslot", "gloves"),
         }],
         [{
             "text": f"{C.SLOT_EMOJI['boots']} {C.SLOT_NAMES['boots']}",
-            "callback_data": callback_data(user_id, "slot", slot_argument("boots")),
+            "callback_data": callback_data(user_id, "shopslot", "boots"),
         }],
         [{"text": "🎒 Моё снаряжение", "callback_data": callback_data(user_id, "bag")}],
         [{"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")}],

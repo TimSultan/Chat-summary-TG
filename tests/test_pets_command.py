@@ -105,7 +105,12 @@ class FakeApi:
     async def edit_message_text(self, chat_id, message_id, text,
                                 reply_markup=None, parse_mode=None):
         self.calls.append("edit_message_text")
-        self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text})
+        # reply_markup is recorded because a redraw's BUTTONS are half of what a screen
+        # is: a test that only sees the text cannot tell a working shelf from a dead end.
+        self.edits.append({
+            "chat_id": chat_id, "message_id": message_id, "text": text,
+            "reply_markup": reply_markup,
+        })
         return {"message_id": message_id}
 
     async def answer_callback_query(self, callback_id, text=None):
@@ -530,6 +535,23 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(flow["awaiting"], "photo_tame")
         self.assertTrue(api.sent[0]["reply_markup"]["force_reply"])
         self.assertIn("собственная раскрашенная фигурка", api.sent[0]["text"])
+
+    def test_the_shop_accessory_tab_opens_a_shelf_with_a_working_buy_button(self):
+        """End-to-end through the callback router, not just the view function: the tab
+        was previously wired to the slot catalogue, where the buy button's page depended
+        on how much the player already owned."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Бублик", "file_a", "Player")
+
+        api = self._tap("shopslot", "amulet")
+
+        self.assertTrue(api.edits)
+        buttons = _buttons(api.edits[-1])
+        self.assertNotIn("только из боёв", api.edits[-1]["text"])
+        self.assertTrue(
+            [b for b in buttons if pets_ui.parse_callback(b["callback_data"])[1] == "buy"],
+            api.edits[-1]["text"],
+        )
 
     def test_opening_updates_marks_the_latest_entry_read_and_redraws_the_log(self):
         self.assertTrue(pets_updates.has_unread(CHAT, PLAYER["id"]))

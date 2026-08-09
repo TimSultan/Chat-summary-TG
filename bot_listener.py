@@ -6011,10 +6011,13 @@ async def handle_pets_callback(
         if action == "buy":
             ok, note = pets.buy_item(entry, user_id, xp, argument)
             slot = pets_ui.slot_of(argument)
+            # Redraw the shelf the purchase was made from, not the slot's full catalogue:
+            # landing on page one of ~30 drop-only trophies after buying is exactly what
+            # made the shop look like it sold nothing but weapons.
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
                 pets_ui.store_view(entry, user_id, xp) if slot == "weapon"
-                else pets_ui.slot_view(entry, user_id, xp, slot), log
+                else pets_ui.shop_slot_view(entry, user_id, xp, slot), log
             )
             return
         if action == "sell":
@@ -6164,6 +6167,7 @@ async def handle_pets_callback(
             "slot": lambda: pets_ui.slot_view(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),
+            "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
             "bagitems": lambda: pets_ui.bag_items_view(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),

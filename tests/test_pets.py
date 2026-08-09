@@ -798,6 +798,59 @@ class EquipmentTradingTests(PetsTestCase):
             self.assertTrue(buy_callbacks, f"no buy button on page 1 of the {slot} slot:\n{text}")
             self.assertNotIn("Сейчас купить здесь нечего", text)
 
+    def test_shop_opens_accessory_shelves_that_sell_rather_than_the_full_catalogue(self):
+        """The sort-tier fix above was not enough on its own, and this is why.
+
+        Owned gear keeps the first sort tiers in slot_view, so once a player owns a dozen
+        drop accessories -- routine for anyone who has been fighting -- the two buyable
+        items get pushed off page one again and the shop looks exactly as broken as it did
+        before. The 🛒 buttons therefore open a dedicated shelf that lists only what is on
+        sale, so "buy an amulet" stays two taps no matter how full the bag is.
+        """
+        self._two_pets()
+        data = pets._load("chat")
+        for slot in ("amulet", "gloves", "boots"):
+            drops = [item.code for item in pets_config.items_for_slot(slot, "drop")][:12]
+            self.assertTrue(drops, slot)
+            data["pets"]["1"]["inventory"].extend(drops)
+            data["pets"]["1"].setdefault("equipped", {})[slot] = drops[0]
+        pets._save("chat", data)
+
+        _, storefront = pets_ui.store_view("chat", "1", 0)
+        routes = {
+            pets_ui.parse_callback(button["callback_data"])[2]:
+                pets_ui.parse_callback(button["callback_data"])[1]
+            for row in storefront["inline_keyboard"] for button in row
+        }
+        for slot in ("amulet", "gloves", "boots"):
+            self.assertEqual(routes.get(slot), "shopslot", f"{slot} tab must open the shelf")
+            text, keyboard = pets_ui.shop_slot_view("chat", "1", 0, slot)
+            buys = [
+                button for row in keyboard["inline_keyboard"] for button in row
+                if pets_ui.parse_callback(button["callback_data"])[1] == "buy"
+            ]
+            # Every purchasable item in the slot, with no paging to reach any of them.
+            self.assertEqual(len(buys), len(pets_config.items_for_slot(slot, "shop")))
+            self.assertNotIn("только из боёв", text)
+            # The full catalogue stays reachable, it is just not what the shop opens onto.
+            self.assertIn("slot", [
+                pets_ui.parse_callback(button["callback_data"])[1]
+                for row in keyboard["inline_keyboard"] for button in row
+            ])
+
+    def test_an_accessory_shelf_says_so_once_everything_on_it_is_bought(self):
+        self._two_pets()
+        for item in pets_config.items_for_slot("boots", "shop"):
+            economy.grant("chat", "1", item.price, "test")
+            self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
+
+        text, keyboard = pets_ui.shop_slot_view("chat", "1", 0, "boots")
+        self.assertIn("уже куплено", text)
+        self.assertFalse([
+            button for row in keyboard["inline_keyboard"] for button in row
+            if pets_ui.parse_callback(button["callback_data"])[1] == "buy"
+        ])
+
     def test_buy_accessory_lands_in_inventory_for_every_non_weapon_slot(self):
         """pets.buy_item's own logic already worked for accessories before this fix --
         only slot_view's ordering hid the button. Exercise the full purchase path
@@ -829,11 +882,10 @@ class EquipmentTradingTests(PetsTestCase):
             for row in store_keyboard["inline_keyboard"]
             for button in row
         ]
+        # Each accessory tab opens that slot's shop SHELF, not its full catalogue: see
+        # test_shop_opens_accessory_shelves_that_sell_rather_than_the_full_catalogue.
         for slot in ("amulet", "gloves", "boots"):
-            self.assertIn(
-                pets_ui.callback_data("1", "slot", pets_ui.slot_argument(slot)),
-                store_callbacks,
-            )
+            self.assertIn(pets_ui.callback_data("1", "shopslot", slot), store_callbacks)
 
     def test_owned_bag_is_paginated_without_catalogue_noise(self):
         self._two_pets()

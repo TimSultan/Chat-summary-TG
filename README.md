@@ -945,6 +945,12 @@ the public caption labels it as a test and the message is sent with notification
 Weapon names use familiar household junk and concrete origins such as «с Авито», «из
 гаража» and «на синей изоленте», with one-line descriptions; storefront entries are
 separated by blank lines for quick scanning.
+The shop's amulet/gloves/boots tabs open that slot's shop shelf — only the items actually
+on sale, unpaginated, each with a buy button — rather than the slot's full catalogue. The
+catalogue (`slot_view`, reachable from the shelf) mixes ~30 drop-only trophies with the two
+purchasable items and sorts owned gear first, so which page the buy button landed on
+depended on how much the player already owned; that is what made the shop look like it
+sold nothing but weapons.
 Shop weapon prices are tied to combat value rather than catalogue position: commons cost
 10–20 coins, uncommon weapons roughly 50–70, and the five shop rares 130–155.
 Every daily storefront injects an unowned 10-coin starter weapon when its normal rotation
