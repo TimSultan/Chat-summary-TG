@@ -208,6 +208,68 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(pets.hamsterator_level(CHAT, PLAYER["id"]), 1)
         self.assertIn("Хомяколатор", api.edits[0]["text"])
 
+    def test_farm_menu_builds_then_starts_a_single_six_hour_shift(self):
+        economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.FARM_UPGRADE_COSTS[0], "test")
+        self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
+        self.assertTrue(pets.tame(CHAT, PLAYER["id"], RICH_XP, "Фермер", "file", "Player")[0])
+
+        rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
+        self.assertIn("Шанс привезти случайную вещь из поля: 3%", rendered[0])
+        initial_actions = {
+            pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})
+        }
+        self.assertIn("upfarm", initial_actions)
+        self.assertNotIn("farmstart", initial_actions)
+
+        api = self._tap("upfarm")
+        self.assertEqual(pets.farm_level(CHAT, PLAYER["id"]), 1)
+        rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
+        actions = {pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})}
+        self.assertIn("farmstart", actions)
+
+        api = self._tap("farmstart")
+        self.assertTrue(pets.is_farming(CHAT, PLAYER["id"]))
+        self.assertIn("Питомец на ферме", api.edits[0]["text"])
+        rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
+        actions = {pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})}
+        self.assertNotIn("farmstart", actions)
+
+    def test_farm_return_notification_marks_only_successful_dm(self):
+        receipt = {
+            "user_id": str(PLAYER["id"]), "run_id": "run-1", "pet_name": "Фермер",
+            "gold": 24, "xp": 75, "levels_gained": 1, "level": 3,
+            "item_code": "amulet_red_button", "auto_equipped": True,
+        }
+        api = FakeApi()
+        with patch.object(pets, "settle_completed_farms", return_value=[]), \
+                patch.object(pets, "pending_farm_notifications", return_value=[receipt]), \
+                patch.object(pets, "mark_farm_notified", return_value=True) as marked:
+            _run(bot_listener._pets_deliver_farm_returns(api, [CHAT], log=lambda *_: None))
+
+        self.assertEqual(api.sent[0]["chat_id"], PLAYER["id"])
+        self.assertIn("Ваш питомец <b>Фермер</b> вернулся с фермы", api.sent[0]["text"])
+        self.assertIn("Амулет красной кнопки", api.sent[0]["text"])
+        self.assertIn("автоматически", api.sent[0]["text"])
+        marked.assert_called_once_with(CHAT, str(PLAYER["id"]), "run-1")
+
+    def test_failed_farm_return_dm_stays_pending_for_retry(self):
+        receipt = {
+            "user_id": str(PLAYER["id"]), "run_id": "retry-me", "pet_name": "Фермер",
+            "gold": 14, "xp": 50,
+        }
+
+        class ClosedDmApi(FakeApi):
+            async def send_message(self, *args, **kwargs):
+                raise RuntimeError("user has not started the bot")
+
+        api = ClosedDmApi()
+        with patch.object(pets, "settle_completed_farms", return_value=[]), \
+                patch.object(pets, "pending_farm_notifications", return_value=[receipt]), \
+                patch.object(pets, "mark_farm_notified") as marked:
+            _run(bot_listener._pets_deliver_farm_returns(api, [CHAT], log=lambda *_: None))
+
+        marked.assert_not_called()
+
     def test_group_arena_command_points_to_the_private_bot_menu(self):
         deletions = []
         with patch.object(

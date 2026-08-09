@@ -28,9 +28,11 @@ be online, and still shows up correctly in their own /history because the fight 
 appended once and `history()` filters by either role.
 """
 
+import hashlib
 import json
 import random
 import secrets
+import threading
 from datetime import date, datetime, timedelta
 
 import economy
@@ -52,6 +54,9 @@ REMOVED_MOP_CODE = "w003"
 REMOVED_MOP_COMPENSATION = 100
 
 _NAME_MAX_LEN = 24
+# The poller and a button press can settle the same finished run in one process.  The
+# run id also keys the economy grant, so a process restart cannot mint a second payout.
+_farm_settlement_lock = threading.RLock()
 
 
 # --- storage -----------------------------------------------------------------------
@@ -72,6 +77,8 @@ def _new_economy_metrics() -> dict:
     """Aggregate-only game-economy observability; never a second balance ledger."""
     return {
         "passive_gold_minted": 0,
+        "farm_gold_minted": 0,
+        "farm_runs": 0,
         "item_sale_gold": 0,
         "gifts": 0,
         "arena_reward_gold": 0,
@@ -153,6 +160,15 @@ def _load(entry: str) -> dict:
         # Confirmation secrets are only a short-lived UX/security handshake.  Bad or
         # historic values are dropped instead of letting malformed saves block gear.
         record["pending_item_actions"] = pending if isinstance(pending, dict) else {}
+        # A farm job is intentionally stored on the pet, not in a transient scheduler:
+        # bot restarts must not bring a pet home early or lose its reward.
+        farm_run = record.get("farm_run")
+        record["farm_run"] = farm_run if isinstance(farm_run, dict) else None
+        notifications = record.get("farm_notifications")
+        record["farm_notifications"] = (
+            [row for row in notifications if isinstance(row, dict)][-50:]
+            if isinstance(notifications, list) else []
+        )
     return data
 
 
@@ -262,6 +278,10 @@ def _new_record() -> dict:
         "created_at": app_now().isoformat(),
         "fights_today": 0,
         "fights_day": app_now().date().isoformat(),
+        "farm_level": 0,
+        "farm_features": {},
+        "farm_run": None,
+        "farm_notifications": [],
     }
 
 
@@ -475,6 +495,367 @@ def _remove_weapon_from_record(record: dict, code: str) -> None:
     record["pending_item_actions"] = {
         key: token for key, token in pending.items() if not key.endswith(f":{code}")
     }
+
+
+# --- farm --------------------------------------------------------------------------
+
+
+def farm_level(entry, user_id) -> int:
+    """Current farm level, with zero meaning that it has not been built yet."""
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return 0
+    return min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
+
+
+def _farm_features(record: dict) -> dict[str, bool]:
+    raw = record.get("farm_features")
+    raw = raw if isinstance(raw, dict) else {}
+    return {key: bool(raw.get(key)) for key in C.FARM_FEATURES}
+
+
+def _farm_multipliers(record: dict) -> tuple[float, float, float]:
+    """Gold, pet-XP and item-find terms for one farm run."""
+    gold, pet_xp, drop = 1.0, 1.0, C.FARM_DROP_CHANCE
+    for key, owned in _farm_features(record).items():
+        if not owned:
+            continue
+        feature = C.FARM_FEATURES[key]
+        gold *= float(feature.get("gold_multiplier", 1.0))
+        pet_xp *= float(feature.get("xp_multiplier", 1.0))
+        drop += float(feature.get("drop_bonus", 0.0))
+    return gold, pet_xp, min(1.0, drop)
+
+
+def _farm_item_for(data: dict, record: dict, rng: random.Random, chance: float):
+    """Pick a deterministic personal accessory find, never a chat-unique weapon.
+
+    A farm locks the pet out of arena drops, but equipment may still be gifted while it
+    is away.  Restricting finds to accessories keeps the reservation-free farm job from
+    racing the chat-wide one-copy weapon catalogue.
+    """
+    if rng.random() >= chance:
+        return None
+    owned = set(record.get("inventory", []))
+    pool = [
+        item for item in C.ITEMS
+        if item.source == "drop" and item.slot != "weapon" and item.code not in owned
+    ]
+    if not pool:
+        return None
+    weighted = [
+        item for item in pool for _ in range(max(0, int(getattr(item, "drop_weight", 1))))
+    ]
+    return rng.choice(weighted) if weighted else None
+
+
+def _farm_reward(data: dict, record: dict, run_id: str) -> dict:
+    level = min(max(1, int(record.get("farm_level", 0))), C.FARM_MAX_LEVEL)
+    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(record)
+    # The run id is persisted before the pet leaves.  Thus an interrupted poll/retry
+    # cannot reroll either rewards or the found item.
+    rng = random.Random(run_id)
+    found = _farm_item_for(data, record, rng, drop_chance)
+    return {
+        "gold": max(1, round(C.FARM_GOLD_PER_RUN[level] * gold_multiplier)),
+        "xp": max(1, round(C.FARM_XP_PER_RUN[level] * xp_multiplier)),
+        "item_code": found.code if found is not None else None,
+    }
+
+
+def _farm_run_ready(run: dict, moment: datetime) -> bool:
+    try:
+        return moment >= datetime.fromisoformat(str(run.get("ready_at")))
+    except (TypeError, ValueError):
+        # Corrupt historic state must never hold a pet hostage indefinitely.
+        return True
+
+
+def _repair_farm_run_id(user_id: str, run: dict) -> str:
+    """Give a malformed historic run a stable id before any payout is attempted.
+
+    A missing run id used to make a due job invisible forever.  This id is derived only
+    from persisted fields, so every retry chooses the same `grant_once` key.  A damaged
+    reward is conservatively repaired to zero rather than inventing a payout.
+    """
+    material = "|".join((str(user_id), str(run.get("started_at") or ""), str(run.get("ready_at") or "")))
+    run["run_id"] = "recovered-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    reward = run.get("reward")
+    if not isinstance(reward, dict):
+        reward = {}
+    run["reward"] = {
+        "gold": max(0, int(reward.get("gold", 0) or 0)),
+        "xp": max(0, int(reward.get("xp", 0) or 0)),
+        "item_code": reward.get("item_code") if C.find_item(reward.get("item_code")) else None,
+    }
+    return run["run_id"]
+
+
+def _is_farming_record(record: dict | None, moment: datetime | None = None) -> bool:
+    if not isinstance(record, dict):
+        return False
+    run = record.get("farm_run")
+    return isinstance(run, dict) and not _farm_run_ready(run, moment or app_now())
+
+
+def is_farming(entry, user_id, now: datetime | None = None) -> bool:
+    """Whether the pet is still inside its exact six-hour farm shift."""
+    return _is_farming_record(_tamed_record(_load(entry), user_id), now)
+
+
+def farm_status(entry, user_id, now: datetime | None = None) -> dict:
+    """Read-only UI status for the Farm button and scheduler.
+
+    ``running`` means the six-hour lock is active. ``ready`` means a completed job is
+    awaiting settlement; callers should invoke :func:`settle_completed_farms` instead
+    of treating it as a second collect button.
+    """
+    moment = now or app_now()
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return {"available": False, "level": 0, "running": False, "ready": False}
+    level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
+    run = record.get("farm_run") if isinstance(record.get("farm_run"), dict) else None
+    ready = bool(run) and _farm_run_ready(run, moment)
+    ready_at = run.get("ready_at") if run else None
+    seconds_left = 0
+    if run and not ready:
+        try:
+            seconds_left = max(0, int((datetime.fromisoformat(ready_at) - moment).total_seconds()))
+        except (TypeError, ValueError):
+            seconds_left = 0
+    features = _farm_features(record)
+    gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(record)
+    estimate_level = max(1, level)
+    feature_status = {
+        key: {
+            "level": int(owned), "max_level": 1,
+            "cost": int(C.FARM_FEATURES[key]["cost"]),
+            "next_cost": None if owned else int(C.FARM_FEATURES[key]["cost"]),
+            "effect": (
+                "+25% монет" if key == "well" else
+                "+25% опыта" if key == "sprinkler" else
+                "шанс вещи 3% → 8%" if key == "beds" else
+                "+20% монет и опыта"
+            ),
+        }
+        for key, owned in features.items()
+    }
+    return {
+        "available": True,
+        "level": level,
+        "max_level": C.FARM_MAX_LEVEL,
+        "duration_hours": C.FARM_DURATION_HOURS,
+        "running": bool(run) and not ready,
+        # ``active`` is retained for the Telegram view's simple boolean contract.
+        "active": bool(run) and not ready,
+        "ready": ready,
+        "can_start": level > 0 and not run,
+        "started_at": run.get("started_at") if run else None,
+        "ready_at": ready_at,
+        "seconds_left": seconds_left,
+        "reward": dict(run.get("reward") or {}) if run else None,
+        "features": feature_status,
+        "feature_costs": {key: int(spec["cost"]) for key, spec in C.FARM_FEATURES.items()},
+        "next_level_cost": C.FARM_UPGRADE_COSTS[level] if level < C.FARM_MAX_LEVEL else None,
+        "next_level_bonus": (
+            f"{C.FARM_GOLD_PER_RUN[level + 1]} монет · {C.FARM_XP_PER_RUN[level + 1]} опыта за рейс"
+            if level < C.FARM_MAX_LEVEL else None
+        ),
+        "estimated_gold": max(1, round(C.FARM_GOLD_PER_RUN[estimate_level] * gold_multiplier)),
+        "estimated_xp": max(1, round(C.FARM_XP_PER_RUN[estimate_level] * xp_multiplier)),
+        "drop_chance": drop_chance,
+    }
+
+
+def start_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
+    """Send a pet to the farm for exactly six hours, with reward fixed up front."""
+    moment = now or app_now()
+    # Finish a due run first so a user who opens the menu after six hours is not stuck
+    # waiting for the background poller before starting the next one.
+    settle_completed_farms(entry, now=moment)
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
+    if level <= 0:
+        return False, "Сначала построй ферму: прокачай её до 1 уровня."
+    if isinstance(record.get("farm_run"), dict):
+        return False, "Питомец уже работает на ферме."
+    run_id = secrets.token_hex(16)
+    ready_at = moment + timedelta(hours=C.FARM_DURATION_HOURS)
+    record["farm_run"] = {
+        "run_id": run_id,
+        "started_at": moment.isoformat(),
+        "ready_at": ready_at.isoformat(),
+        "reward": _farm_reward(data, record, run_id),
+    }
+    _save(entry, data)
+    return True, "Питомец отправлен на ферму на 6 часов."
+
+
+def upgrade_farm(entry, user_id, xp) -> tuple[bool, str]:
+    """Build/upgrade the farm one level, charging the shared coin wallet once."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
+    if level >= C.FARM_MAX_LEVEL:
+        return False, f"Ферма уже максимального уровня ({C.FARM_MAX_LEVEL})."
+    cost = C.FARM_UPGRADE_COSTS[level]
+    ok, balance = economy.spend(entry, user_id, xp, cost, "buy:pet_farm_upgrade")
+    if not ok:
+        return False, f"Нужно {cost} монет на ферму, у тебя {balance}."
+    record["farm_level"] = level + 1
+    _save(entry, data)
+    return True, f"Ферма прокачана до {level + 1} уровня за {cost} монет."
+
+
+def upgrade_farm_feature(entry, user_id, xp, feature: str) -> tuple[bool, str]:
+    """Buy one permanent farm feature (well, sprinkler, beds or tractor)."""
+    key = str(feature or "").strip().lower()
+    spec = C.FARM_FEATURES.get(key)
+    if spec is None:
+        return False, "Такого улучшения фермы нет."
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    if int(record.get("farm_level", 0) or 0) <= 0:
+        return False, "Сначала построй ферму."
+    features = record.setdefault("farm_features", {})
+    if features.get(key):
+        return False, f"«{spec['name']}» уже установлена."
+    cost = int(spec["cost"])
+    ok, balance = economy.spend(entry, user_id, xp, cost, f"buy:pet_farm_feature:{key}")
+    if not ok:
+        return False, f"Нужно {cost} монет на «{spec['name']}», у тебя {balance}."
+    features[key] = True
+    _save(entry, data)
+    return True, f"На ферме появилась «{spec['name']}» за {cost} монет."
+
+
+def _farm_receipt(user_id: str, record: dict, run: dict, moment: datetime, levels_gained: int,
+                  item_code: str | None, auto_equipped: bool) -> dict:
+    reward = run.get("reward") if isinstance(run.get("reward"), dict) else {}
+    return {
+        "user_id": str(user_id),
+        "run_id": str(run.get("run_id") or ""),
+        "pet_name": record.get("name") or "Питомец",
+        "gold": max(0, int(reward.get("gold", 0) or 0)),
+        "xp": max(0, int(reward.get("xp", 0) or 0)),
+        "levels_gained": max(0, int(levels_gained)),
+        "level": int(record.get("level", 1) or 1),
+        "item_code": item_code,
+        "item": item_code,
+        "auto_equipped": bool(auto_equipped),
+        "settled_at": moment.isoformat(),
+        "notified_at": None,
+    }
+
+
+def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
+    """Idempotently settle every due farm run and return only newly completed receipts.
+
+    Gold is guarded by ``economy.grant_once(..., run_id)``.  The same-process lock
+    covers concurrent poll ticks/button requests, while a crash between the two stores
+    retries from the persisted reward and merely observes the existing ledger grant.
+    """
+    moment = now or app_now()
+    receipts = []
+    with _farm_settlement_lock:
+        initial = _load(entry)
+        due = []
+        repaired = False
+        for user_id, record in initial.get("pets", {}).items():
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            run = record.get("farm_run")
+            if not isinstance(run, dict) or not _farm_run_ready(run, moment):
+                continue
+            if not str(run.get("run_id") or ""):
+                _repair_farm_run_id(str(user_id), run)
+                repaired = True
+            due.append((str(user_id), dict(run)))
+        if repaired:
+            # Persist the deterministic recovery before `grant_once`; a crash after it
+            # is therefore retried under exactly the same payout key.
+            _save(entry, initial)
+        for user_id, snapshot_run in due:
+            run_id = str(snapshot_run.get("run_id") or "")
+            reward = snapshot_run.get("reward") if isinstance(snapshot_run.get("reward"), dict) else {}
+            gold = max(0, int(reward.get("gold", 0) or 0))
+            if gold:
+                economy.grant_once(entry, user_id, gold, f"pet:farm:{run_id}")
+            # Reload after the independent economy write.  Do not overwrite a change
+            # made by arena/UI code while this particular job was being paid.
+            data = _load(entry)
+            record = _tamed_record(data, user_id)
+            run = record.get("farm_run") if record else None
+            if not isinstance(run, dict) or str(run.get("run_id") or "") != run_id:
+                continue
+            reward = run.get("reward") if isinstance(run.get("reward"), dict) else {}
+            _, levels_gained = _apply_xp(record, max(0, int(reward.get("xp", 0) or 0)))
+            item_code = reward.get("item_code")
+            item = C.find_item(item_code) if item_code else None
+            auto_equipped = False
+            if item is not None and item.code not in record.setdefault("inventory", []):
+                record["inventory"].append(item.code)
+                _discover(record, item.code)
+                equipped = record.setdefault("equipped", {})
+                current = C.find_item(equipped.get(item.slot))
+                if current is None or C.equipment_score(item) > C.equipment_score(current):
+                    equipped[item.slot] = item.code
+                    auto_equipped = True
+                _metric_add(data, "drops_by_rarity", rarity=item.rarity)
+            else:
+                item_code = None
+            receipt = _farm_receipt(
+                user_id, record, run, moment, levels_gained, item_code, auto_equipped,
+            )
+            record.setdefault("farm_notifications", []).append(receipt)
+            record["farm_notifications"] = record["farm_notifications"][-50:]
+            record["farm_run"] = None
+            _metric_add(data, "farm_gold_minted", gold)
+            _metric_add(data, "farm_runs")
+            _save(entry, data)
+            receipts.append(dict(receipt))
+    return receipts
+
+
+def pending_farm_notifications(entry) -> list[dict]:
+    """Receipts whose direct-message delivery still needs a retry."""
+    data = _load(entry)
+    pending = []
+    for user_id, record in data.get("pets", {}).items():
+        if not isinstance(record, dict):
+            continue
+        for receipt in record.get("farm_notifications", []):
+            if isinstance(receipt, dict) and not receipt.get("notified_at"):
+                row = dict(receipt)
+                row["user_id"] = str(user_id)
+                pending.append(row)
+    return pending
+
+
+def mark_farm_notified(entry, user_id, run_id, now: datetime | None = None) -> bool:
+    """Mark one receipt delivered only after a successful Telegram private message."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False
+        for receipt in record.get("farm_notifications", []):
+            if str(receipt.get("run_id") or "") != str(run_id):
+                continue
+            if receipt.get("notified_at"):
+                return False
+            receipt["notified_at"] = (now or app_now()).isoformat()
+            _save(entry, data)
+            return True
+    return False
 
 
 def enforce_unique_weapons(entries) -> dict:
@@ -1101,12 +1482,39 @@ def yesterday_activity(entry, user_id, today) -> tuple[int, int]:
 
 def daily_allowance(entry, user_id, today) -> int:
     """Today's fight budget for one member, before anything they have already spent."""
+    return fight_allowance_breakdown(entry, user_id, today)["allowance"]
+
+
+def fight_allowance_breakdown(entry, user_id, today) -> dict:
+    """Public, display-ready components of today's fixed arena-fight allowance.
+
+    The paint component is derived from stats rather than saved on the pet.  That makes
+    a qualifying post grant its bonus immediately, lets it expire with the rolling
+    seven-day window, and ensures a deleted post disappears from the allowance too.
+    """
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
-        return 0
-    messages, figurines = yesterday_activity(entry, user_id, today)
-    return C.daily_fight_allowance(messages, figurines, record.get("cage_level", 1))
+        return {
+            "allowance": 0, "base": 0, "cage_bonus": 0, "farm_bonus": 0,
+            "paint_bonus": 0, "recent_figurines": 0,
+        }
+    cage = min(max(int(record.get("cage_level", 1) or 1), 1), C.CAGE_MAX_LEVEL)
+    farm = max(0, int(record.get("farm_level", 0) or 0))
+    recent_figurines = stats.recent_figurine_fight_bonus_count(
+        entry, user_id, today, C.RECENT_FIGURINE_FIGHT_BUFF_DAYS,
+    )
+    cage_bonus = C.CAGE_BONUS_FIGHTS[cage - 1]
+    farm_bonus = farm // C.FARM_LEVELS_PER_FIGHT
+    paint_bonus = recent_figurines * C.FIGHTS_PER_RECENT_FIGURINE
+    return {
+        "allowance": C.daily_fight_allowance(cage, farm, recent_figurines),
+        "base": C.BASE_DAILY_FIGHTS,
+        "cage_bonus": cage_bonus,
+        "farm_bonus": farm_bonus,
+        "paint_bonus": paint_bonus,
+        "recent_figurines": recent_figurines,
+    }
 
 
 def fights_left(entry, user_id, today) -> int:
@@ -1115,8 +1523,7 @@ def fights_left(entry, user_id, today) -> int:
     if record is None:
         return 0
     _reset_if_new_day(record, today)  # in-memory only; nothing to persist on a pure read
-    messages, figurines = yesterday_activity(entry, user_id, today)
-    allowance = C.daily_fight_allowance(messages, figurines, record.get("cage_level", 1))
+    allowance = fight_allowance_breakdown(entry, user_id, today)["allowance"]
     return max(0, allowance - record.get("fights_today", 0))
 
 
@@ -1125,6 +1532,10 @@ def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
     now = now or app_now()
     data = _load(entry)
     uid, opponent_uid = str(user_id), str(opponent_id)
+    if _is_farming_record(_tamed_record(data, uid), now):
+        return False, "Питомец сейчас работает на ферме и не может драться."
+    if _is_farming_record(_tamed_record(data, opponent_uid), now):
+        return False, "Этот питомец сейчас работает на ферме."
     record = data.setdefault("duels", {}).setdefault(uid, {})
     today_key = now.date().isoformat()
     if record.get("day") != today_key:
@@ -1164,8 +1575,19 @@ def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
 
 def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None) -> bool:
     day = day or today()
+    data = _load(entry)
+    if _is_farming_record(_tamed_record(data, attacker_id)):
+        return False
+    if _is_farming_record(_tamed_record(data, defender_id)):
+        return False
     return (
-        arena_attacks_against(entry, attacker_id, defender_id, day)
+        sum(
+            1
+            for fight in data.get("fights", [])
+            if fight.get("date") == day.isoformat()
+            and fight.get("attacker_id") == str(attacker_id)
+            and fight.get("defender_id") == str(defender_id)
+        )
         < C.ARENA_SAME_OPPONENT_DAILY_LIMIT
     )
 
@@ -1194,6 +1616,7 @@ def find_opponent(
         other_id for other_id, record in data["pets"].items()
         if other_id != uid
         and record.get("name")
+        and not _is_farming_record(record)
         and (not attackable_only or can_attack_in_arena(entry, uid, other_id))
     ]
     if not candidates:
@@ -1221,6 +1644,8 @@ def record_guardian_intervention(
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
     defender = data["pets"][defender_uid]
+    if _is_farming_record(attacker) or _is_farming_record(defender):
+        raise ValueError("Питомец на ферме и не может участвовать в бою.")
     _reset_if_new_day(attacker, today)
     attacker["fights_today"] = attacker.get("fights_today", 0) + 1
     attacker["fights"] = attacker.get("fights", 0) + 1
@@ -1302,6 +1727,8 @@ def record_fight(
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
     defender = data["pets"][defender_uid]
+    if _is_farming_record(attacker) or _is_farming_record(defender):
+        raise ValueError("Питомец на ферме и не может участвовать в бою.")
 
     # Only the attacker spends a daily fight. The defender did not choose this fight, so
     # it must not come out of the budget they earned by chatting -- the loss penalty below

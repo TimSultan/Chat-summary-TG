@@ -20,27 +20,17 @@ The wallet is the chat's existing coin ledger (economy.py), not a second currenc
 earn rate is already measured rather than guessed: over a 34-day window the most active
 members earned 60-233 coins/week, the p90 member ~55/week, the median ~3/week.
 
-Arena income is NOT flat. How many fights somebody gets is earned from what they did in
-the chat yesterday (see daily_fight_allowance), and losing costs a share of what winning
-pays (LOSS_GOLD_SHARE), so part of every fight is paid by a player rather than minted.
-Both together are what make chat activity actually decide income:
-
-    profile      msgs/day  fights  arena/wk  +chat  total/wk  3 stats -> 80
-    lurker              1       2        52      3        55      7.2 years
-    median             14       3        79     25       104      3.8 years
-    p75                41       5       131     80       211      1.9 years
-    p90                89       9       236    150       386      1.0 years
-    p95               166      12       315    233       548      8 months
+Arena income starts at a predictable 10 fights per day. Progression adds fights only
+through the cage, farm and recent painted miniatures (see daily_fight_allowance); losing
+costs a share of what winning pays (LOSS_GOLD_SHARE), so part of every fight is paid by a
+player rather than minted.
 
 Against that, STAT_COST_EXPONENT = 1.2 puts one stat at 1 -> 80 at 6,896 gold and three
 at 20,688. Arena gold stays comparable to, rather than overpowering, coins earned from
 ordinary chat activity; cage bonuses remain the game-specific progression path.
 
-Worth knowing before re-tuning: this replaced a flat 5 fights a day with a free loss,
-which paid everybody ~1,575/week regardless of whether they ever wrote a word -- a 1.3x
-spread between a lurker and the chat's busiest member. It is now 6.2x. If it should move
-further, the levers are BASE_DAILY_FIGHTS and WIN_GOLD_*, not the stat costs: making
-levels cheaper raises everybody equally and widens nothing. See PETS_BALANCE.md.
+If it should move further, the levers are BASE_DAILY_FIGHTS and WIN_GOLD_*, not the stat
+costs: making levels cheaper raises everybody equally. See PETS_BALANCE.md.
 """
 
 import hashlib
@@ -88,6 +78,29 @@ HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 HAMSTERATOR_GOLD_PER_HOUR = (0, 1, 2, 3, 4, 5)
 # 24, 36, 48, 60, and 72 hours of storage at each active level.
 HAMSTERATOR_STORAGE_CAP = (0, 24, 72, 144, 240, 360)
+
+# ------------------------------------------------------------------------------ farm
+# A farm run is a deliberate six-hour choice: the pet cannot enter the arena while it
+# works, so the reward needs to be useful without replacing ten daily fights.  Level 1
+# is a small early investment; level 10 plus every permanent facility costs 6,850 coins
+# in total and pays at most about 200 coins/day when collected on time.
+FARM_MAX_LEVEL = 10
+FARM_DURATION_HOURS = 6
+# Index is the current level; index 0 builds the first level.
+FARM_UPGRADE_COSTS = (75, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
+FARM_GOLD_PER_RUN = (0, 14, 16, 18, 20, 22, 24, 26, 28, 30, 33)
+FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
+FARM_DROP_CHANCE = 0.03
+FARM_FEATURES = {
+    # A well makes every harvest reliably more valuable.
+    "well": {"name": "Колодец", "cost": 150, "gold_multiplier": 1.25},
+    # A sprinkler gives practice value without inflating the coin faucet.
+    "sprinkler": {"name": "Поливалка", "cost": 250, "xp_multiplier": 1.25},
+    # Better beds are the only direct way to improve the small find chance.
+    "beds": {"name": "Грядка", "cost": 400, "drop_bonus": 0.05},
+    # The tractor helps both yields, but never shortens the promised six-hour run.
+    "tractor": {"name": "Трактор", "cost": 600, "gold_multiplier": 1.20, "xp_multiplier": 1.20},
+}
 
 # ---------------------------------------------------------------------- stat upgrades
 # cost(L -> L+1) = round(STAT_COST_BASE * L ** STAT_COST_EXPONENT), so the first point
@@ -213,39 +226,23 @@ DOMINANCE_BONUS = 0.30      # maximum bonus to one stat's contribution
 
 # ------------------------------------------------------------------------ the arena
 #
-# How many fights a day somebody gets is EARNED, not granted flat:
+# Everybody receives ten fights each calendar day. The additions deliberately have no
+# global cap: each qualifying painting is explicitly promised to grant its own temporary
+# +2 bonus, and the remaining two tracks are bounded by their upgrade caps.
 #
 #     allowance = BASE_DAILY_FIGHTS
-#               + messages_yesterday  * FIGHTS_PER_MESSAGE
-#               + figurines_yesterday * FIGHTS_PER_FIGURINE
 #               + CAGE_BONUS_FIGHTS[cage_level - 1]
+#               + floor(farm_level / FARM_LEVELS_PER_FIGHT)
+#               + recent_figurines * FIGHTS_PER_RECENT_FIGURINE
 #
-# floored to a whole number and capped at MAX_DAILY_FIGHTS. Yesterday rather than today
-# because a closed day is a finished, recorded fact -- pricing off a day still in progress
-# would mean the allowance moved every time somebody typed, and a fight taken at noon
-# could be un-taken by evening.
-#
-# Calibrated against the real chat, not guessed. Measured over 162 user-days in
-# cache/stats: the median poster writes 14 messages a day, p75 writes 41, p90 writes 89,
-# p95 writes 166, and the busiest single day by one person was 412. So at 8% a message:
-#
-#     lurker (0-1 msgs)   2 fights      p90  (89 msgs)    9 fights
-#     median (14 msgs)    3 fights      p95  (166 msgs)  12 fights (the cap)
-#     p75    (41 msgs)    5 fights      busiest (412)    12 fights (the cap)
-#
-# The rate is 8% rather than something rounder because of the median specifically: at 6%
-# the median poster earned 0.84 of a fight, floored to zero, and got exactly what somebody
-# who never wrote anything got. A rate that cannot tell the typical member apart from a
-# lurker is not doing the job this formula exists for.
-#
-# The cap exists because the top of this distribution is very long -- uncapped, the busiest
-# poster would open with 35 fights a day and out-earn everybody else on volume alone.
-BASE_DAILY_FIGHTS = 2
-FIGHTS_PER_MESSAGE = 0.08
-# A painted figurine is the rarest and most valued thing anybody posts here, so it is
-# worth roughly eight messages.
-FIGHTS_PER_FIGURINE = 0.5
-MAX_DAILY_FIGHTS = 12
+# `recent_figurines` means qualifying #япокрасил posts in the rolling inclusive seven
+# calendar-day window. Thus a post increases the allowance immediately and expires at
+# the next midnight after seven calendar days. It is derived from stats' canonical
+# records rather than stored as a mutable counter, so retries cannot grant the buff twice.
+BASE_DAILY_FIGHTS = 10
+FARM_LEVELS_PER_FIGHT = 2
+FIGHTS_PER_RECENT_FIGURINE = 2
+RECENT_FIGURINE_FIGHT_BUFF_DAYS = 7
 ARENA_SAME_OPPONENT_DAILY_LIMIT = 3
 
 # Matchmaking uses effective combat stats, including equipment and pet level, rather than
@@ -305,19 +302,22 @@ DUEL_COOLDOWN_SECONDS = 10 * 60
 DUEL_SAME_OPPONENT_DAILY_LIMIT = 1
 
 
-def daily_fight_allowance(messages: int = 0, figurines: int = 0, cage_level: int = 1) -> int:
-    """How many fights one member gets today, from what they did in the chat YESTERDAY.
+def daily_fight_allowance(
+    cage_level: int = 1, farm_level: int = 0, recent_figurines: int = 0,
+) -> int:
+    """How many arena fights a member can start today before spent fights.
 
-    Floored rather than rounded: half a fight is not a fight, and rounding up would hand a
-    lurker who wrote three messages the same allowance as somebody who wrote ten.
+    This is intentionally a pure, integer-only formula. The caller obtains the rolling
+    paint count from ``stats.recent_figurine_fight_bonus_count`` so the allowance cannot
+    drift from a duplicated delivery or a deleted painting.
     """
-    earned = (
-        BASE_DAILY_FIGHTS
-        + max(0, messages) * FIGHTS_PER_MESSAGE
-        + max(0, figurines) * FIGHTS_PER_FIGURINE
-    )
     level = min(max(cage_level, 1), CAGE_MAX_LEVEL)
-    return min(MAX_DAILY_FIGHTS + CAGE_BONUS_FIGHTS[level - 1], int(earned) + CAGE_BONUS_FIGHTS[level - 1])
+    return (
+        BASE_DAILY_FIGHTS
+        + CAGE_BONUS_FIGHTS[level - 1]
+        + max(0, int(farm_level)) // FARM_LEVELS_PER_FIGHT
+        + max(0, int(recent_figurines)) * FIGHTS_PER_RECENT_FIGURINE
+    )
 
 
 def loss_gold_for(won_gold: int) -> int:

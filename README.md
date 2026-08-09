@@ -908,7 +908,7 @@ whole reason chat activity funds the game rather than sitting beside it.
 
 The loop is: buy a **клетка** (100), **приручить** a creature by sending a photo and a name
 (50), spend coins on **Сила / Здоровье / Ловкость / Удача** (1–80 each), buy **оружие,
-амулет, перчатки, сапоги**, then fight. Opponents are drawn uniformly from every attackable
+амулет, перчатки, сапоги**, build the **Ферма**, then fight. Opponents are drawn uniformly from every attackable
 pet, with unlimited rerolls and no level or combat-power window. A win starts at 5–10 coins
 and 100 pet XP, then moves from 75% for farming a pet 3+ levels below to 125% for beating
 one 3+ levels above. An attacker who is 7+ levels above the target is stopped by the guard
@@ -963,13 +963,17 @@ The **Хомяколатор** is a second five-level facility beside the cage. 
 lazy (opening an arena balance screen settles it), but the checkpoint and credit share one
 atomic ledger write, so a retry or restart cannot pay the same hour twice.
 
-**Fights a day are earned, not granted.** `BASE_DAILY_FIGHTS` (2) plus 8% of yesterday's
-messages plus half a fight per `#япокрасил`, capped at 12, plus whatever the cage adds.
-Yesterday rather than today, because a closed day is a finished fact — pricing off a day
-still running would move the allowance every time somebody typed. Calibrated on 162 real
-user-days: a lurker gets 2 fights, the median poster 3, p75 five, p90 nine, p95 the cap.
-That is a **6.2x** income spread between lurking and carrying the chat, where the flat
-five-a-day with a free loss it replaced gave 1.3x.
+The **Farm** sends a pet away for exactly six hours, during which it cannot fight or be
+selected as an opponent. Its 10 levels yield 14–33 coins and 50–95 pet XP per trip. A
+well improves coins, a sprinkler improves XP, garden beds raise the accessory-find chance
+from 3% to 8%, and a tractor improves both rewards. Rewards are fixed when the trip starts,
+settled once after restarts, and announced persistently in the owner's bot DM.
+
+**Everyone starts with 10 fights a day.** The cage adds up to 4, every two Farm levels add
+one (up to 5), and each qualifying `#япокрасил` adds 2 fights per day for the next seven
+calendar days. Ordinary message volume no longer affects this limit. Telegram replays do
+not duplicate a painting buff, delayed daily rollover keeps it, and `/deletepokras`
+removes it.
 
 `/pet` prints the card — photo, level, stats, gear, fights and wins — and works **in the
 group as well as the DM**, since it is the one screen meant to be shown off. `/arena` itself

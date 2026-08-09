@@ -5935,6 +5935,24 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.hamsterator_view(entry, user_id, xp), log
             )
             return
+        if action == "farmstart":
+            ok, note = pets.start_farm(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
+        if action == "upfarm":
+            ok, note = pets.upgrade_farm(entry, user_id, xp)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
+        if action == "farmup":
+            ok, note = pets.upgrade_farm_feature(entry, user_id, xp, argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
         if action in ("up", "up10"):
             ok, note, _ = pets.upgrade_stat(
                 entry, user_id, xp, argument, times=10 if action == "up10" else 1
@@ -6081,6 +6099,7 @@ async def handle_pets_callback(
             "info": lambda: pets_ui.info_view(user_id),
             "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
             "hamsterator": lambda: pets_ui.hamsterator_view(entry, user_id, xp),
+            "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
@@ -6118,6 +6137,72 @@ async def _pets_toast_and_redraw(api, chat_id, message_id, note: str, rendered, 
         api, chat_id, (f"{html.escape(note)}\n\n{text}", keyboard),
         message_id=message_id, log=log,
     )
+
+
+def _pets_farm_return_text(receipt: dict) -> str:
+    """Format a persistent private notification for a completed farm trip."""
+    name = html.escape(str(receipt.get("pet_name") or "Ваш питомец"))
+    gold = int(receipt.get("gold", receipt.get("coins", 0)) or 0)
+    experience = int(receipt.get("xp", receipt.get("experience", 0)) or 0)
+    lines = [f"🌾 Ваш питомец <b>{name}</b> вернулся с фермы!"]
+    lines.append(f"Принёс: 🪙 {gold:,} · ✨ {experience} опыта.".replace(",", "."))
+    item = receipt.get("item") or receipt.get("item_code") or receipt.get("dropped_item")
+    if isinstance(item, dict):
+        item_name = item.get("name")
+        item_description = item.get("description")
+    else:
+        found = C.find_item(item) if item else None
+        item_name = found.name if found else None
+        item_description = found.description if found else None
+    if item_name:
+        suffix = f" — {html.escape(str(item_description))}" if item_description else ""
+        rarity = getattr(found, "rarity", None) if not isinstance(item, dict) else item.get("rarity")
+        rarity_icons = {
+            "cursed": "♠", "common": "○", "uncommon": "●", "rare": "♦", "legendary": "▲",
+        }
+        lines.append(
+            f"🎁 Нашёл: {rarity_icons.get(rarity, '•')} <b>{html.escape(str(item_name))}</b>{suffix}"
+        )
+        if receipt.get("auto_equipped"):
+            lines.append("⚡ Предмет оказался лучше и был надет автоматически.")
+    levels_gained = int(receipt.get("levels_gained", 0) or 0)
+    if levels_gained:
+        lines.append(f"⬆️ Новый уровень питомца: {receipt.get('level', 1)} (+{levels_gained}).")
+    return "\n".join(lines)
+
+
+async def _pets_deliver_farm_returns(api, entries, log=print) -> None:
+    """Settle due runs, then deliver receipt DMs without ever duplicating a payout."""
+    for entry in entries:
+        try:
+            # The core settles each run exactly once.  Notification acknowledgement is
+            # separate, so a restart/closed DM merely retries delivery on the next pass.
+            pets.settle_completed_farms(entry)
+            receipts = pets.pending_farm_notifications(entry)
+        except Exception:
+            log(f"[pets] farm settlement failed for '{entry}':\n{traceback.format_exc()}")
+            continue
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                log(f"[pets] ignoring malformed farm receipt for '{entry}': {receipt!r}")
+                continue
+            owner_id = receipt.get("user_id", receipt.get("owner_id"))
+            run_id = receipt.get("run_id")
+            if owner_id is None or not run_id:
+                log(f"[pets] ignoring farm receipt without owner/run id for '{entry}': {receipt!r}")
+                continue
+            chat_id = int(owner_id) if str(owner_id).lstrip("-").isdigit() else owner_id
+            try:
+                # No deletion timer: this is the requested personal completion notice.
+                await api.send_message(chat_id, _pets_farm_return_text(receipt), parse_mode="HTML")
+            except Exception:
+                log(f"[pets] farm return DM to {owner_id} failed; will retry:\n{traceback.format_exc()}")
+                continue
+            try:
+                pets.mark_farm_notified(entry, owner_id, run_id)
+            except Exception:
+                # It is safe to retry an already sent receipt; settlement remains complete.
+                log(f"[pets] could not mark farm return {run_id} delivered:\n{traceback.format_exc()}")
 
 
 def _pets_rare_drop_announcement(reward: dict, attacker: dict, defender: dict) -> str | None:
@@ -7865,6 +7950,17 @@ async def run_bot_listener(
                 # dismissal while one is still pending.
                 schedule_bot_delete(api, chat_id, [message_id], DISMISS_DELETE_AFTER, log, background_tasks)
 
+        async def _farm_returns_loop():
+            """Recover farm completions after every restart and retry closed personal DMs.
+
+            There is no in-memory timer per expedition: persisted timestamps are scanned
+            immediately at boot and then once a minute, so downtime only delays a return
+            notice and cannot strand it forever.
+            """
+            while True:
+                await _pets_deliver_farm_returns(api, cfg.listener_allowed_chats, log=log)
+                await asyncio.sleep(60)
+
         async def _is_vote_admin(user: dict) -> bool:
             """Who may admit nominations, see live counts, and close the vote on the
             voting page -- reuses the same "chat admin or delegate" rule as every other
@@ -7936,6 +8032,7 @@ async def run_bot_listener(
         tasks = [
             _poll_loop(),
             _consume_summaries(),
+            _farm_returns_loop(),
             _button_counter_refresh_loop(api, home_chat_ref, log=log),
         ]
         if figurine_ack_queue is not None:

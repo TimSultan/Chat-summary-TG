@@ -1331,6 +1331,124 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         self.assertEqual(pets.economy_telemetry("chat")["passive_gold_minted"], 2)
 
 
+class FarmTests(PetsTestCase):
+    def _build_farm(self, entry="farm", uid="1", level=1):
+        self._tame(entry, uid)
+        total = sum(pets_config.FARM_UPGRADE_COSTS[:level])
+        economy.grant(entry, uid, total, "farm-test-funds")
+        for expected_level in range(1, level + 1):
+            ok, message = pets.upgrade_farm(entry, uid, 0)
+            self.assertTrue(ok, message)
+            self.assertEqual(pets.farm_level(entry, uid), expected_level)
+
+    def test_farm_requires_construction_and_has_ten_priced_levels(self):
+        self._tame("farm", "1")
+        ok, _ = pets.start_farm("farm", "1", now=datetime(2026, 8, 1, 10))
+        self.assertFalse(ok)
+
+        total = sum(pets_config.FARM_UPGRADE_COSTS)
+        economy.grant("farm", "1", total, "farm-test-funds")
+        for level in range(1, pets_config.FARM_MAX_LEVEL + 1):
+            ok, message = pets.upgrade_farm("farm", "1", 0)
+            self.assertTrue(ok, message)
+            self.assertEqual(pets.farm_level("farm", "1"), level)
+        self.assertFalse(pets.upgrade_farm("farm", "1", 0)[0])
+        self.assertEqual(economy.balance("farm", "1", 0), 0)
+
+    def test_six_hour_run_is_fixed_idempotent_and_delivers_notification(self):
+        entry, start = "farm", datetime(2026, 8, 1, 10, 15)
+        self._build_farm(entry)
+        ok, message = pets.start_farm(entry, "1", now=start)
+        self.assertTrue(ok, message)
+        status = pets.farm_status(entry, "1", start)
+        self.assertTrue(status["running"])
+        self.assertEqual(status["ready_at"], (start + timedelta(hours=6)).isoformat())
+        reward = dict(status["reward"])
+        self.assertTrue(pets.is_farming(entry, "1", start + timedelta(hours=5, minutes=59)))
+        self.assertFalse(pets.is_farming(entry, "1", start + timedelta(hours=6)))
+        self.assertEqual(pets.settle_completed_farms(entry, start + timedelta(hours=5, minutes=59)), [])
+
+        before_gold = economy.balance(entry, "1", 0)
+        before_xp = pets.get_pet(entry, "1")["xp"]
+        receipts = pets.settle_completed_farms(entry, start + timedelta(hours=6))
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertEqual(receipt["user_id"], "1")
+        self.assertEqual(receipt["gold"], reward["gold"])
+        self.assertEqual(receipt["xp"], reward["xp"])
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold + reward["gold"])
+        self.assertGreaterEqual(pets.get_pet(entry, "1")["xp"], before_xp)
+        self.assertEqual(pets.settle_completed_farms(entry, start + timedelta(hours=7)), [])
+        self.assertEqual(economy.balance(entry, "1", 0), before_gold + reward["gold"])
+        self.assertEqual(pets.pending_farm_notifications(entry)[0]["run_id"], receipt["run_id"])
+        self.assertTrue(pets.mark_farm_notified(entry, "1", receipt["run_id"], now=start + timedelta(hours=6)))
+        self.assertFalse(pets.mark_farm_notified(entry, "1", receipt["run_id"]))
+        self.assertEqual(pets.pending_farm_notifications(entry), [])
+
+    def test_farm_reward_is_snapshotted_and_auto_equips_a_found_item(self):
+        entry, start = "farm", datetime(2026, 8, 1, 10)
+        self._build_farm(entry, level=1)
+        self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
+        before = pets.farm_status(entry, "1", start)["reward"]
+        # Buying an upgrade while the pet is away affects only the next run.
+        economy.grant(entry, "1", pets_config.FARM_UPGRADE_COSTS[1], "farm-test-funds")
+        self.assertTrue(pets.upgrade_farm(entry, "1", 0)[0])
+        self.assertEqual(pets.farm_status(entry, "1", start)["reward"], before)
+
+        data = pets._load(entry)
+        data["pets"]["1"]["farm_run"]["reward"] = {"gold": 17, "xp": 23, "item_code": "bt01"}
+        pets._save(entry, data)
+        receipt = pets.settle_completed_farms(entry, start + timedelta(hours=6))[0]
+        self.assertEqual(receipt["gold"], 17)
+        self.assertEqual(receipt["item_code"], "bt01")
+        self.assertTrue(receipt["auto_equipped"])
+        pet = pets.get_pet(entry, "1")
+        self.assertIn("bt01", pet["inventory"])
+        self.assertEqual(pet["equipped"]["boots"], "bt01")
+
+    def test_features_have_single_purchase_and_visible_effects(self):
+        self._build_farm("farm")
+        total = sum(spec["cost"] for spec in pets_config.FARM_FEATURES.values())
+        economy.grant("farm", "1", total, "farm-test-funds")
+        for key, spec in pets_config.FARM_FEATURES.items():
+            ok, message = pets.upgrade_farm_feature("farm", "1", 0, key)
+            self.assertTrue(ok, message)
+            self.assertIn(spec["name"], message)
+            self.assertFalse(pets.upgrade_farm_feature("farm", "1", 0, key)[0])
+        status = pets.farm_status("farm", "1")
+        self.assertTrue(all(spec["level"] == 1 for spec in status["features"].values()))
+        self.assertEqual(status["drop_chance"], pets_config.FARM_DROP_CHANCE + 0.05)
+
+    def test_due_run_without_id_is_recovered_and_cannot_block_the_pet(self):
+        entry, start = "farm", datetime(2026, 8, 1, 10)
+        self._build_farm(entry)
+        self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
+        data = pets._load(entry)
+        reward = dict(data["pets"]["1"]["farm_run"]["reward"])
+        data["pets"]["1"]["farm_run"].pop("run_id")
+        pets._save(entry, data)
+
+        receipt = pets.settle_completed_farms(entry, start + timedelta(hours=6))[0]
+        self.assertTrue(receipt["run_id"].startswith("recovered-"))
+        self.assertEqual(receipt["gold"], reward["gold"])
+        self.assertFalse(pets.farm_status(entry, "1", start + timedelta(hours=6))["running"])
+        self.assertTrue(pets.start_farm(entry, "1", now=start + timedelta(hours=6))[0])
+
+    def test_farming_pet_cannot_attack_or_be_dealt_as_opponent(self):
+        entry, start = "farm", datetime(2026, 8, 1, 10)
+        self._build_farm(entry, "1")
+        self._tame(entry, "2")
+        self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
+        with patch("pets.app_now", return_value=start):
+            self.assertFalse(pets.can_attack_in_arena(entry, "1", "2", start.date()))
+            self.assertFalse(pets.can_attack_in_arena(entry, "2", "1", start.date()))
+            self.assertIsNone(pets.find_opponent(entry, "2", rng=random.Random(1)))
+            self.assertFalse(pets.claim_duel(entry, "1", "2", now=start)[0])
+            result = SimpleNamespace(winner="1", loser="2")
+            with self.assertRaises(ValueError):
+                pets.record_fight(entry, "1", "2", result, start.date())
+
+
 class MiscApiTests(PetsTestCase):
     def test_today_cage_level_and_balance_for(self):
         entry = "chat"

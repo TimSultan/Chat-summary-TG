@@ -1901,10 +1901,18 @@ def record_figurine_live(
         u["username"] = username
     if display_name:
         u["display_name"] = display_name
-    u["count"] += 1
-    u["recent_posts"] = _merge_post_refs(
-        [tuple(p) for p in u.get("recent_posts", [])], [(app_now().isoformat(), message_id)]
+    existing_posts = [tuple(p) for p in u.get("recent_posts", [])]
+    # Listener deliveries are normally exactly once, but reconnects can replay an
+    # update.  A message id is the stable event identity, so a replay must neither add
+    # another figurine nor another temporary arena-buff source.
+    already_counted = message_id is not None and any(
+        len(post) >= 2 and str(post[1]) == str(message_id) for post in existing_posts
     )
+    if not already_counted:
+        u["count"] += 1
+        u["recent_posts"] = _merge_post_refs(
+            existing_posts, [(app_now().isoformat(), message_id)]
+        )
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     log(f"[stats] figurine recorded live for '{entry}' user {key}: {u['count']} today")
     return u["count"]
@@ -1918,6 +1926,48 @@ def _load_live_figurines(entry: str, day: date) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def recent_figurine_fight_bonus_count(
+    entry: str, user_id: int | str, today: date, window_days: int,
+) -> int:
+    """Number of valid recent #япокрасил posts for the temporary arena-fight buff.
+
+    Finalised days come from ``aggregate`` so an administrator's figurine tombstone is
+    applied exactly as it is for XP and the cabinet.  Today is read from the live ledger,
+    which makes the +2 fights visible immediately after the listener sees the message.
+    The live ledger's post ids, rather than its mutable counter, are authoritative when
+    present; this keeps replayed updates idempotent even for data written before the
+    duplicate-delivery guard above existed.
+    """
+    days = max(1, int(window_days))
+    start = today - timedelta(days=days - 1)
+    key = str(user_id)
+    deleted = set((_load_deleted_figurines(entry).get("posts") or {}).keys())
+    count = 0
+    day = start
+    while day <= today:
+        # A finalised day is authoritative and already knows how to subtract deleted
+        # paintings. If midnight processing is late (or the process restarted), its
+        # separate live ledger is still accepted instead -- one source per day, never
+        # both, so the same post cannot be double counted during hand-over.
+        if _load_day(entry, day) is not None:
+            user = aggregate(entry, day, day).get(key)
+            count += max(0, int(user.figurines_painted)) if user is not None else 0
+        else:
+            live = _load_live_figurines(entry, day).get(key) or {}
+            posts = live.get("recent_posts") or []
+            if posts:
+                count += sum(
+                    1 for post in posts
+                    if len(post) >= 2 and str(post[1]) not in deleted
+                )
+            else:
+                # Old live files predate recent_posts. Their count remains a safe
+                # fallback; all new events carry Telegram's message id above.
+                count += max(0, int(live.get("count", 0) or 0))
+        day += timedelta(days=1)
+    return count
 
 
 def _clear_live_figurines(entry: str, day: date) -> None:

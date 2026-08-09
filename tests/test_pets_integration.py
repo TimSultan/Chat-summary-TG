@@ -244,54 +244,67 @@ class PetsIntegrationTests(unittest.TestCase):
         stats._path(ENTRY, day).write_text(json.dumps(payload), encoding="utf-8")
 
     def test_chatting_yesterday_buys_fights_today(self):
-        """The whole point of the earned allowance: a lurker and a regular must not get
-        the same number of fights."""
-        self._found(ALICE, "Кабанчик", "Alice")
-        lurker = pets.daily_allowance(ENTRY, ALICE, pets.today())
-        self.assertEqual(lurker, C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0])
-
-        # p75 of the real chat is 41 messages a day (measured over 162 user-days).
-        self._record_yesterday(ALICE, messages=41)
-        regular = pets.daily_allowance(ENTRY, ALICE, pets.today())
-        self.assertGreater(regular, lurker)
-        self.assertEqual(
-            regular,
-            C.BASE_DAILY_FIGHTS + int(41 * C.FIGHTS_PER_MESSAGE) + C.CAGE_BONUS_FIGHTS[0],
-        )
-
-        # A painted figurine is worth about eight messages.
-        self._record_yesterday(ALICE, messages=41, figurines=4)
-        painter = pets.daily_allowance(ENTRY, ALICE, pets.today())
-        self.assertGreater(painter, regular)
-
-    def test_the_allowance_is_capped_so_the_busiest_poster_cannot_run_away_with_it(self):
-        self._found(ALICE, "Кабанчик", "Alice")
-        # The busiest single user-day measured in the real chat was 412 messages.
-        self._record_yesterday(ALICE, messages=412, figurines=20)
-        self.assertEqual(
-            pets.daily_allowance(ENTRY, ALICE, pets.today()),
-            C.MAX_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0],
-        )
-
-    def test_yesterday_is_what_counts_not_today(self):
-        """Pricing off a day still in progress would move the allowance every time
-        somebody typed, and a fight taken at noon could be un-taken by evening."""
-        self._found(ALICE, "Кабанчик", "Alice")
-        day = pets.today()
+        # The fixed budget deliberately ignores ordinary chat-message volume.
+        self._found(ALICE, "Pet", "Alice")
+        day = pets.today() - timedelta(days=1)
         payload = {
             "entry": ENTRY, "day": day.isoformat(), "recorded_at": day.isoformat(),
-            "users": {str(ALICE): {
-                "display_name": "Alice", "username": "alice", "messages": 400,
-                "chars": 8000, "media": 0, "replies": 0, "hours": {},
-                "figurines": 0,
-            }},
+            "users": {str(ALICE): {"display_name": "Alice", "username": "alice",
+                "messages": 412, "chars": 8240, "media": 0, "replies": 0,
+                "hours": {}, "figurines": 0}},
         }
         stats._path(ENTRY, day).write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, pets.today()), C.BASE_DAILY_FIGHTS)
+
+    def test_duplicate_live_paint_is_counted_once_and_deletion_removes_buff(self):
+        self._found(ALICE, "Pet", "Alice")
+        today = pets.today()
+        stats.record_figurine_live(ENTRY, today, ALICE, "alice", "Alice", message_id=77)
+        stats.record_figurine_live(ENTRY, today, ALICE, "alice", "Alice", message_id=77)
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS + 2)
+        stats.delete_figurine_submission(ENTRY, ALICE, 77, "admin", "Admin")
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS)
+
+    def test_cage_farm_and_recent_paint_bonuses_compose(self):
+        self._found(ALICE, "Pet", "Alice")
+        today = pets.today()
+        six_days_ago = today - timedelta(days=6)
+        payload = {
+            "entry": ENTRY, "day": six_days_ago.isoformat(), "recorded_at": six_days_ago.isoformat(),
+            "users": {str(ALICE): {"display_name": "Alice", "username": "alice",
+                "messages": 0, "chars": 0, "media": 2, "replies": 0, "hours": {},
+                "figurines": 2, "figurine_posts": [["2026-08-01T10:00:00", 101], ["2026-08-01T11:00:00", 102]]}},
+        }
+        stats._path(ENTRY, six_days_ago).write_text(json.dumps(payload), encoding="utf-8")
+        data = pets._load(ENTRY)
+        data["pets"][str(ALICE)]["cage_level"] = 3
+        data["pets"][str(ALICE)]["farm_level"] = 5
+        pets._save(ENTRY, data)
         self.assertEqual(
-            pets.daily_allowance(ENTRY, ALICE, day),
-            C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0],
-            "today's messages must not count towards today's allowance",
+            pets.daily_allowance(ENTRY, ALICE, today),
+            C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[2] + 5 // C.FARM_LEVELS_PER_FIGHT + 4,
         )
+
+    def test_paint_buff_expires_after_seven_calendar_days(self):
+        self._found(ALICE, "Pet", "Alice")
+        today = pets.today()
+        expired_day = today - timedelta(days=C.RECENT_FIGURINE_FIGHT_BUFF_DAYS)
+        payload = {
+            "entry": ENTRY, "day": expired_day.isoformat(), "recorded_at": expired_day.isoformat(),
+            "users": {str(ALICE): {"display_name": "Alice", "username": "alice",
+                "messages": 0, "chars": 0, "media": 1, "replies": 0, "hours": {},
+                "figurines": 1, "figurine_posts": [["2026-08-01T10:00:00", 103]]}},
+        }
+        stats._path(ENTRY, expired_day).write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS)
+
+    def test_unfinalized_prior_day_live_painting_still_grants_its_buff(self):
+        self._found(ALICE, "Pet", "Alice")
+        today = pets.today()
+        stats.record_figurine_live(
+            ENTRY, today - timedelta(days=1), ALICE, "alice", "Alice", message_id=104,
+        )
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS + 2)
 
     def test_history_survives_a_rename(self):
         """The card shows the creature's name NOW; a fight that already happened keeps the

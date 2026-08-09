@@ -19,6 +19,7 @@ above all, since players choose it -- goes through html.escape here rather than 
 call site.
 """
 
+from datetime import datetime, timezone
 from html import escape
 
 import pets
@@ -141,6 +142,9 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             {"text": "🐾 Существо", "callback_data": callback_data(user_id, "pet")},
             {"text": "💪 Прокачка", "callback_data": callback_data(user_id, "train")},
         ])
+        rows.append([{
+            "text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")
+        }])
         rows.append([
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
             {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
@@ -309,6 +313,165 @@ def hamsterator_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         rows.append([{
             "text": f"⬆️ Улучшить — {_money(C.HAMSTERATOR_UPGRADE_COSTS[level])}",
             "callback_data": callback_data(user_id, "uphamsterator"),
+        }])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+# ----------------------------------------------------------------------------- farm
+
+
+FARM_FEATURE_LABELS = {
+    "well": "🪣 Колодец",
+    "sprinkler": "💦 Поливалка",
+    "beds": "🥕 Грядки",
+    "tractor": "🚜 Трактор",
+}
+FARM_FEATURE_EFFECTS = {
+    "well": "+25% монет с каждой смены",
+    "sprinkler": "+25% опыта с каждой смены",
+    "beds": "+5% к шансу найти вещь",
+    "tractor": "+20% монет и опыта",
+}
+
+
+def _farm_duration(seconds: int) -> str:
+    """A short, stable Russian countdown for a farm run.
+
+    The core persists UTC timestamps, whereas this screen is intentionally a pure view;
+    accepting an already rounded number of seconds keeps timezone conversion and payout
+    decisions out of the Telegram layer.
+    """
+    seconds = max(0, int(seconds or 0))
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    if hours:
+        return f"{hours} ч {minutes:02d} мин"
+    return f"{minutes} мин"
+
+
+def _farm_seconds_left(status: dict) -> int:
+    """Read both the public core status and older/recovered timestamp-shaped records."""
+    direct = status.get("seconds_left")
+    if direct is not None:
+        return max(0, int(direct))
+    ends_at = status.get("ends_at")
+    if isinstance(ends_at, datetime):
+        if ends_at.tzinfo is None:
+            ends_at = ends_at.replace(tzinfo=timezone.utc)
+        return max(0, int((ends_at - datetime.now(timezone.utc)).total_seconds()))
+    return 0
+
+
+def _farm_feature_status(status: dict, feature: str) -> dict:
+    """Normalise the small presentation shape while farm records stay backward-compatible."""
+    features = status.get("features") or status.get("upgrades") or {}
+    raw = features.get(feature, {}) if isinstance(features, dict) else {}
+    if isinstance(raw, bool):
+        costs = status.get("feature_costs") or {}
+        raw = {
+            "level": int(raw), "max_level": 1,
+            "next_cost": (costs.get(feature) if not raw else None),
+            "effect": FARM_FEATURE_EFFECTS.get(feature, ""),
+        }
+    elif isinstance(raw, int):
+        raw = {"level": raw}
+    return raw if isinstance(raw, dict) else {}
+
+
+def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    """Six-hour expedition, its one active-run lock, and every permanent upgrade.
+
+    Rewards are deliberately settled by the background worker, not by rendering this
+    screen.  Opening the menu therefore cannot pay a run twice or make a DM notification
+    disappear after a restart.
+    """
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+
+    status = pets.farm_status(entry, user_id)
+    coins = pets.balance_for(entry, user_id, xp)
+    level = int(status.get("level", status.get("farm_level", 0)) or 0)
+    max_level = int(status.get("max_level", 10) or 10)
+    active = bool(status.get("running"))
+    lines = ["🌾 <b>Ферма</b>\n"]
+    lines.append(f"🐾 Работник: <b>{_name(pet)}</b>")
+    lines.append(f"🏡 Уровень фермы: {level} из {max_level}.")
+
+    if active:
+        remaining = _farm_seconds_left(status)
+        lines.append(f"\n⏳ Питомец на ферме. Вернётся через <b>{_farm_duration(remaining)}</b>.")
+        lines.append("Пока он работает, в бои его не пускаем.")
+        reward = status.get("reward") or {}
+        if reward:
+            lines.append(
+                f"Смена принесёт: 🪙 {_money(int(reward.get('gold', 0) or 0))} · "
+                f"✨ {int(reward.get('xp', 0) or 0)} опыта."
+            )
+    elif status.get("ready"):
+        lines.append("\n✅ Смена закончилась. Награда уже едет в личные сообщения.")
+    else:
+        duration_hours = int(status.get("duration_hours", 6) or 6)
+        gold = int(status.get("estimated_gold", status.get("gold_reward", 0)) or 0)
+        experience = int(status.get("estimated_xp", status.get("xp_reward", 0)) or 0)
+        if level <= 0:
+            lines.append("\nСначала построй ферму. Первый уровень откроет шестичасовые смены.")
+        else:
+            lines.append(f"\nОтправь питомца на {duration_hours} ч: он принесёт монеты и опыт.")
+        if gold or experience:
+            lines.append(f"Ожидаемо: 🪙 {_money(gold)} · ✨ {experience} опыта.")
+        drop_chance = round(float(status.get("drop_chance", 0.0) or 0.0) * 100)
+        lines.append(f"Шанс привезти случайную вещь из поля: {drop_chance}%.")
+
+    next_cost = status.get("next_level_cost")
+    if level < max_level:
+        next_level = level + 1
+        bonus = status.get("next_level_bonus")
+        suffix = f" · {escape(str(bonus))}" if bonus else ""
+        lines.append(
+            f"\nСледующий уровень: {next_level}"
+            + (f" — {_coins(int(next_cost))}" if next_cost is not None else "")
+            + suffix
+        )
+    else:
+        lines.append("\n🏆 Ферма прокачана полностью.")
+
+    lines.append("\n<b>Апгрейды участка</b>")
+    for feature, label in FARM_FEATURE_LABELS.items():
+        data = _farm_feature_status(status, feature)
+        feature_level = int(data.get("level", 0) or 0)
+        feature_max = int(data.get("max_level", 1) or 1)
+        effect = data.get("effect") or data.get("description") or ""
+        effect_text = f" — {escape(str(effect))}" if effect else ""
+        lines.append(f"{label}: {feature_level}/{feature_max}{effect_text}")
+
+    lines.append(f"\n🪙 У тебя: {_money(coins)}")
+    rows = []
+    if status.get("can_start"):
+        rows.append([{
+            "text": "🌾 Отправить на ферму — 6 ч",
+            "callback_data": callback_data(user_id, "farmstart"),
+        }])
+    if level < max_level:
+        cost_text = f" — {_money(int(next_cost))}" if next_cost is not None else ""
+        rows.append([{
+            "text": f"🏡 {'Построить ферму' if level == 0 else 'Улучшить ферму'}{cost_text}",
+            "callback_data": callback_data(user_id, "upfarm"),
+        }])
+    for feature, label in FARM_FEATURE_LABELS.items():
+        if level <= 0:
+            break
+        data = _farm_feature_status(status, feature)
+        feature_level = int(data.get("level", 0) or 0)
+        feature_max = int(data.get("max_level", 1) or 1)
+        if feature_level >= feature_max:
+            continue
+        cost = data.get("next_cost", data.get("cost"))
+        cost_text = f" — {_money(int(cost))}" if cost is not None else ""
+        rows.append([{
+            "text": f"⬆️ {label}{cost_text}",
+            "callback_data": callback_data(user_id, "farmup", feature),
         }])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -831,20 +994,24 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if not pet:
         return no_pet_view(user_id)
     left = pets.fights_left(entry, user_id, pets.today())
-
-    messages, figurines = pets.yesterday_activity(entry, user_id, pets.today())
-    allowance = pets.daily_allowance(entry, user_id, pets.today())
+    breakdown = pets.fight_allowance_breakdown(entry, user_id, pets.today())
+    allowance = breakdown["allowance"]
+    farming = pets.is_farming(entry, user_id)
 
     lines = ["⚔️ <b>Арена</b>\n"]
     lines.append(f"{_name(pet)} — уровень {pet.get('level', 1)}")
     lines.append(f"Боёв сегодня осталось: {left} из {allowance}")
-    # Spelled out rather than left as a number, because the allowance is the one thing in
-    # the game that rewards chatting, and a limit nobody understands reads as arbitrary.
     lines.append(
-        f"\n<i>Бои начисляются за вчерашний день: {C.BASE_DAILY_FIGHTS} базовых"
-        f" + за сообщения + {C.FIGHTS_PER_FIGURINE} за каждый #япокрасил."
-        f" Вчера у тебя: {_plural(messages, 'сообщение', 'сообщения', 'сообщений')},"
-        f" работ — {figurines}.</i>"
+        "\n<b>Лимит боёв:</b> "
+        f"{breakdown['base']} база"
+        f" + {breakdown['cage_bonus']} клетка"
+        f" + {breakdown['farm_bonus']} ферма"
+        f" + {breakdown['paint_bonus']} #япокрасил"
+        f" = {allowance}."
+    )
+    lines.append(
+        f"<i>Каждая #япокрасил даёт +{C.FIGHTS_PER_RECENT_FIGURINE} боя в день на 7 дней. "
+        f"Активных работ: {breakdown['recent_figurines']}.</i>"
     )
     lines.append(
         "\nСоперник выбирается случайно из всех существ, которых сейчас можно атаковать. "
@@ -859,11 +1026,13 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         "Если ты на 7+ уровней выше соперника, охранник остановит бой: "
         "без золота и дропа, зато +5 опыта."
     )
-    if left <= 0:
-        lines.append("\nНа сегодня всё. Пиши в чат — завтра боёв будет больше.")
+    if farming:
+        lines.append("\n🌾 Питомец на ферме — арена подождёт, пока он не вернётся.")
+    elif left <= 0:
+        lines.append("\nНа сегодня всё. Ферма и клетка увеличивают лимит боёв.")
 
     rows = []
-    if left > 0:
+    if left > 0 and not farming:
         rows.append([{
             "text": "🔍 Найти соперника",
             "callback_data": callback_data(user_id, "search"),
