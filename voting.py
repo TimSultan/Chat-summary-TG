@@ -150,6 +150,7 @@ async def collect_entries(
     media_dir: Path,
     hashtag: str = CONTEST_HASHTAG,
     skip_entry_ids=frozenset(),
+    progress=None,
     log=print,
 ) -> list[Entry]:
     """Reads the CURRENT CONTEST WEEK of `chat_ref` -- Monday 00:00 local through now --
@@ -181,13 +182,29 @@ async def collect_entries(
     start_local = contest_week_start(now_local)
     start_utc = start_local.astimezone(timezone.utc)
 
+    async def report(stage: str, done: int, total: int) -> None:
+        """Tell the caller how far along this is, without letting that stop the scan.
+
+        A whole week of a busy chat is thousands of messages and every nomination's photos
+        on top, which takes minutes -- long enough that a silent bot reads as a hung one.
+        """
+        if progress is None:
+            return
+        try:
+            await progress(stage, done, total)
+        except Exception as e:
+            log(f"[voting] progress report failed: {e}")
+
     messages = []
+    await report("scan", 0, 0)
     async for message in client.iter_messages(entity, reverse=False):
         if message.date < start_utc:
             break
         if message.action is not None:
             continue  # service message (join/leave/pin)
         messages.append(message)
+        if len(messages) % 250 == 0:
+            await report("scan", len(messages), 0)
 
     groups = group_into_entries(messages, hashtag)
     log(f"[voting] {len(messages)} message(s) since {start_local.date()} -> {len(groups)} nomination(s)")
@@ -195,7 +212,8 @@ async def collect_entries(
     media_dir.mkdir(parents=True, exist_ok=True)
     entries: list[Entry] = []
     skipped = 0
-    for group in groups:
+    for position, group in enumerate(groups, start=1):
+        await report("download", position, len(groups))
         head = group[0]
         if str(head.id) in skip_entry_ids:
             skipped += 1
@@ -448,6 +466,63 @@ def delete_poll(entry: str, poll_id: str) -> bool:
     if media_dir.exists():
         shutil.rmtree(media_dir)
     return existed
+
+
+def poll_ids(entry: str) -> list[str]:
+    """Every poll id this chat has on disk, oldest id first.
+
+    Read from the filenames rather than by parsing each poll, so a week whose JSON no
+    longer loads is still listed -- clearing and archiving both need to see it.
+    """
+    directory = _voting_dir()
+    if not directory.exists():
+        return []
+    prefix = f"{_poll_key(entry)}_"
+    return sorted(path.stem[len(prefix):] for path in directory.glob(f"{prefix}*.json"))
+
+
+def archive_dir() -> Path:
+    """Where cleared polls are kept. A SUBDIRECTORY on purpose: _all_polls globs the
+    voting directory itself and does not recurse, so an archived week is invisible to
+    latest_poll and the page while its file still exists."""
+    return _voting_dir() / "archive"
+
+
+def archive_all_polls(entry: str) -> int:
+    """Clears the contest: every poll leaves the live set, and its photos are deleted.
+
+    "Очистить" means the contest starts over, so it cannot leave last week's poll behind
+    to become `latest_poll` the moment this week's is gone -- clearing once and finding
+    the previous week in its place is indistinguishable from the clear not having worked.
+    Returns how many polls were cleared.
+
+    NOTHING RECORDED IS DESTROYED. The poll file is MOVED into archive_dir() rather than
+    unlinked, and the announced results (results_path) and rendered boards
+    (export_image_path) are left where they are -- clearing is "let me collect a new
+    vote", never "erase what the contest has already decided". Only the collected photos
+    go, because they are the bulk on disk and the boards have already been rendered from
+    them (see bot_listener._archive_vote_boards).
+    """
+    cleared = 0
+    destination_dir = archive_dir()
+    for poll_id in poll_ids(entry):
+        path = poll_path(entry, poll_id)
+        destination = destination_dir / path.name
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                # Cleared twice with a re-collect in between: keep both rather than let
+                # the second clear silently overwrite the first week's record.
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                destination = destination_dir / f"{path.stem}_{stamp}{path.suffix}"
+            path.replace(destination)
+            cleared += 1
+        except OSError:
+            continue
+        media_directory = media_path(entry, poll_id)
+        if media_directory.exists():
+            shutil.rmtree(media_directory, ignore_errors=True)
+    return cleared
 
 
 def load_poll(entry: str, poll_id: str) -> Poll | None:

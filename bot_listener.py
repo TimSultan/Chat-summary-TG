@@ -3502,19 +3502,116 @@ async def handle_vote_clear_callback(
         await api.answer_callback_query(callback["id"], text="Только администраторы.")
         return
 
-    poll_id = _current_vote_poll_id(tz)
-    existed = voting.delete_poll(entry, poll_id)
-    await api.answer_callback_query(callback["id"], text="Очищено" if existed else "Уже пусто")
-    log(f"[bot_listener] {clicker.get('username') or target_user_id} cleared vote poll {poll_id} (existed={existed})")
+    # Every week, not just the current one. Clearing one week at a time meant the previous
+    # week immediately became the latest poll, so the admin saw old works right after
+    # clearing and tapped again -- eating one more week per tap.
+    await api.answer_callback_query(callback["id"], text="Очищаю")
+    # Rendering a board per week is seconds of Pillow each, so say what is happening
+    # before starting rather than going quiet on the one action that deletes things.
+    pending = len(voting.poll_ids(entry))
+    if pending:
+        try:
+            await api.send_message(
+                chat_id,
+                f"Сохраняю итоги картинками ({pending} нед.), потом очищаю. Секунду.",
+                parse_mode=None,
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to announce the vote clear: {e}")
+    # Pictures first: the boards are rendered from the photos the clear is about to
+    # delete, so archiving afterwards would find nothing left to draw.
+    archived = await _archive_vote_boards(entry, log=log)
+    cleared = voting.archive_all_polls(entry)
+    log(f"[bot_listener] {clicker.get('username') or target_user_id} cleared ALL vote polls ({cleared}, boards {archived})")
     try:
         await api.send_message(
             chat_id,
-            "Голосование очищено. Собери заново: /vote собрать" if existed
-            else "Голосование за эту неделю уже было пустым.",
+            (
+                f"Голосование очищено полностью: снято с показа — {cleared}.\n"
+                f"Сохранено картинками: {archived}. Итоги, статистика и сами голосования "
+                "убраны в архив, а не удалены.\n"
+                "Собери заново: /vote собрать"
+            ) if cleared else "Голосований и так нет.",
             parse_mode=None,
         )
     except Exception as e:
         log(f"[bot_listener] failed to confirm the vote clear: {e}")
+
+
+# One collection per chat per system at a time. Scanning a whole contest week and
+# downloading every nominated photo takes minutes, and the bot says "собираю" and then
+# nothing -- so the button gets pressed again. Without this that second press starts a
+# SECOND full scan against the same chat: nothing has been saved yet, so it re-downloads
+# everything the first one is still working through, and the two race each other into
+# Telegram's rate limiter, which makes the stall dramatically worse rather than better.
+_VOTE_COLLECTIONS_IN_PROGRESS: set[tuple[str, str]] = set()
+# How often the "собираю" message may be rewritten with its progress. Telegram rate-limits
+# edits to the same message, and the point is only to prove the bot is still alive.
+VOTE_PROGRESS_EDIT_SECONDS = 4.0
+
+
+def _vote_progress_reporter(api, chat_id, message_id, log=print):
+    """An async progress callback for voting.collect_entries that edits one message.
+
+    Throttled, and every failure is swallowed: this exists to show the collection is alive,
+    so it must never be able to be the reason one dies.
+    """
+    state = {"last": 0.0}
+
+    async def report(stage: str, done: int, total: int) -> None:
+        if message_id is None:
+            return
+        now = time.monotonic()
+        if now - state["last"] < VOTE_PROGRESS_EDIT_SECONDS:
+            return
+        state["last"] = now
+        if stage == "scan":
+            text = f"Читаю чат за эту неделю… просмотрено сообщений: {done}"
+        else:
+            text = f"Скачиваю работы: {done} из {total}…"
+        try:
+            await api.edit_message_text(chat_id, message_id, text, parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] vote progress edit failed: {e}")
+
+    return report
+
+
+async def _archive_vote_boards(entry: str, log=print) -> int:
+    """Render every poll's board picture before clearing throws its photos away.
+
+    Clearing keeps the announced results (voting.save_results) but those are numbers and
+    names; the pictures live in the poll's media directory and go with it. Rendering first
+    is what makes "очистить" safe to run on a contest with history -- afterwards the week
+    still exists as a JPEG under the exports directory even though nothing can rebuild it.
+
+    Best-effort per poll: a week whose photos are already gone, or that never admitted
+    anything, simply has no board to draw and must not stop the clear.
+    """
+    saved = 0
+    for poll_id in voting.poll_ids(entry):
+        destination = voting.export_image_path(entry, poll_id)
+        if destination.exists():
+            saved += 1
+            continue  # already archived, and re-rendering would only cost time
+        poll = voting.load_poll(entry, poll_id)
+        if poll is None or not poll.tally():
+            continue
+        subtitle = (
+            f"Проголосовало: {len(poll.votes)} чел. · работ: {len(poll.tally())} · "
+            f"архив от очистки"
+        )
+        try:
+            # Threaded for the same reason /vote картинка is: Pillow re-encodes every
+            # photo in the poll, and several weeks of that would stall the whole bot.
+            await asyncio.to_thread(
+                vote_image.render_poll_image, poll, destination, subtitle=subtitle,
+            )
+            saved += 1
+            log(f"[bot_listener] archived vote board for {poll_id} -> {destination}")
+        except Exception:
+            log(f"[bot_listener] could not archive vote board for {poll_id}:\n{traceback.format_exc()}")
+    return saved
 
 
 def _vote_image_columns(argument: str) -> int | None:
@@ -3856,9 +3953,21 @@ async def handle_arena_command(
     if wants_collect:
         if not await require_admin_in_dm("Собирать работы могут только администраторы."):
             return
-        await reply("Собираю работы с #итогинедели за эту неделю (с понедельника) в арену -- это займёт минуту.")
+        lock_key = ("arena", entry)
+        if lock_key in _VOTE_COLLECTIONS_IN_PROGRESS:
+            await reply(
+                "Уже собираю -- подожди, пожалуйста. Второй запуск только замедлит первый: "
+                "он полез бы качать те же фотографии заново."
+            )
+            return
+
+        status = await reply(
+            "Собираю работы с #итогинедели за эту неделю (с понедельника) в арену. "
+            "Это может занять несколько минут -- буду показывать прогресс здесь."
+        )
         existing = arena.load_tournament(entry, tournament_id)
         known = {e.entry_id for e in existing.entries} if existing else set()
+        _VOTE_COLLECTIONS_IN_PROGRESS.add(lock_key)
         try:
             new_entries = await voting.collect_entries(
                 client=telethon_client,
@@ -3868,12 +3977,17 @@ async def handle_arena_command(
                 # either system cannot delete the other's pictures.
                 media_dir=arena.media_path(entry, tournament_id),
                 skip_entry_ids=known,
+                progress=_vote_progress_reporter(
+                    api, chat_id, (status or {}).get("message_id"), log=log,
+                ),
                 log=log,
             )
         except Exception:
             log(f"[arena] collecting failed:\n{traceback.format_exc()}")
-            await reply("Не получилось собрать работы.")
+            await reply("Не получилось собрать работы -- смотри логи.")
             return
+        finally:
+            _VOTE_COLLECTIONS_IN_PROGRESS.discard(lock_key)
 
         all_entries = (existing.entries if existing else []) + new_entries
         tournament = arena.build_tournament(entry, tournament_id, all_entries, existing=existing)
@@ -3971,14 +4085,14 @@ async def handle_arena_command(
     if wants_clear:
         if not await require_admin_in_dm("Очищать арену могут только администраторы."):
             return
-        tournament = arena.latest_tournament(entry)
-        if tournament is None:
-            await reply("Арена ещё не создана -- нечего очищать.")
-            return
-        existed = arena.delete_tournament(entry, tournament.tournament_id)
-        arena.invalidate_standings(tournament.tournament_id)
+        # Every tournament, not just the newest. Clearing only latest_tournament made a
+        # second tap eat the week before the one the admin meant to clear.
+        cleared = arena.archive_all_tournaments(entry)
         await reply(
-            "Арена очищена. Голосование v1 не тронуто." if existed else "Арена уже пуста."
+            f"Арена очищена полностью: снято с показа турниров — {cleared}. "
+            "Сами турниры со статистикой убраны в архив, а не удалены. "
+            "Голосование v1 не тронуто."
+            if cleared else "Арена уже пуста."
         )
         return
 
@@ -4158,7 +4272,18 @@ async def handle_vote_command(
         if not await require_admin_in_dm("Собирать заявки могут только администраторы."):
             return
 
-        await reply("Собираю заявки с #итогинедели за эту неделю (с понедельника) -- это займёт минуту.")
+        lock_key = ("vote", entry)
+        if lock_key in _VOTE_COLLECTIONS_IN_PROGRESS:
+            await reply(
+                "Уже собираю -- подожди, пожалуйста. Второй запуск только замедлит первый: "
+                "он полез бы качать те же фотографии заново."
+            )
+            return
+
+        status = await reply(
+            "Собираю заявки с #итогинедели за эту неделю (с понедельника). "
+            "Это может занять несколько минут -- буду показывать прогресс здесь."
+        )
         poll_id = _current_vote_poll_id(tz)
         existing_poll = voting.load_poll(entry, poll_id)
 
@@ -4166,6 +4291,7 @@ async def handle_vote_command(
         # in its own Monday-to-Sunday window, which is what makes "очистить, then собрать"
         # actually start from empty instead of immediately refilling with last week.
         known_ids = {e.entry_id for e in existing_poll.entries} if existing_poll else set()
+        _VOTE_COLLECTIONS_IN_PROGRESS.add(lock_key)
         try:
             new_entries = await voting.collect_entries(
                 client=telethon_client,
@@ -4173,12 +4299,17 @@ async def handle_vote_command(
                 tz=tz,
                 media_dir=voting.media_path(entry, poll_id),
                 skip_entry_ids=known_ids,
+                progress=_vote_progress_reporter(
+                    api, chat_id, (status or {}).get("message_id"), log=log,
+                ),
                 log=log,
             )
         except Exception:
             log(f"[bot_listener] collecting vote entries failed:\n{traceback.format_exc()}")
-            await reply("Не получилось собрать заявки.")
+            await reply("Не получилось собрать заявки -- смотри логи.")
             return
+        finally:
+            _VOTE_COLLECTIONS_IN_PROGRESS.discard(lock_key)
 
         # Already-known entries are carried over as-is, not re-fetched -- collect_entries
         # only ever resolves and returns what's new (see its docstring). Concatenating

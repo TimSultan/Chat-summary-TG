@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import arena
 import bot_listener
 import voting
 
@@ -158,6 +159,214 @@ class CollectWindowTests(unittest.TestCase):
         again = self._collect()
 
         self.assertEqual(again.votes, {"42": ["90"]})
+
+
+class ConcurrentCollectTests(unittest.TestCase):
+    """A slow collection must not be turned into two slow collections by an impatient tap."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("voting._voting_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        bot_listener._VOTE_COLLECTIONS_IN_PROGRESS.clear()
+        self.addCleanup(bot_listener._VOTE_COLLECTIONS_IN_PROGRESS.clear)
+
+    def test_a_second_collect_is_refused_while_the_first_is_still_running(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        scans = []
+        api = CollectWindowTests.FakeApi()
+
+        async def collect_entries(**kwargs):
+            scans.append(kwargs)
+            started.set()
+            await release.wait()
+            return []
+
+        async def resolve(*args, **kwargs):
+            return -100
+
+        async def can_manage(*args, **kwargs):
+            return True
+
+        message = {
+            "message_id": 1,
+            "chat": {"id": 5, "type": "private"},
+            "from": {"id": 7, "username": "admin"},
+            "text": "/vote собрать",
+        }
+        cfg = SimpleNamespace(
+            webapp_public_url="https://example.com",
+            vote_miniapp_short_name=None,
+            vote_announce_extra_chat=None,
+        )
+
+        async def scenario():
+            with patch.object(bot_listener, "_resolve_chat_id", resolve), \
+                 patch.object(bot_listener, "_can_manage_chat", can_manage), \
+                 patch.object(voting, "collect_entries", collect_entries), \
+                 patch.object(bot_listener, "_current_vote_poll_id", lambda tz: THIS_WEEK):
+                first = asyncio.create_task(bot_listener.handle_vote_command(
+                    api, None, cfg, None, message, CHAT, "testbot", set(), log=lambda *_: None,
+                ))
+                await started.wait()
+                # The impatient second tap, while the first is mid-scan.
+                await bot_listener.handle_vote_command(
+                    api, None, cfg, None, message, CHAT, "testbot", set(), log=lambda *_: None,
+                )
+                release.set()
+                await first
+
+        asyncio.run(scenario())
+
+        self.assertEqual(len(scans), 1, "the second tap started a second full scan")
+        self.assertTrue(any("Уже собираю" in text for text in api.sent))
+
+    def test_the_lock_is_released_even_when_the_scan_blows_up(self):
+        api = CollectWindowTests.FakeApi()
+
+        async def exploding(**kwargs):
+            raise RuntimeError("telegram said no")
+
+        async def resolve(*args, **kwargs):
+            return -100
+
+        async def can_manage(*args, **kwargs):
+            return True
+
+        message = {
+            "message_id": 1,
+            "chat": {"id": 5, "type": "private"},
+            "from": {"id": 7, "username": "admin"},
+            "text": "/vote собрать",
+        }
+        cfg = SimpleNamespace(
+            webapp_public_url="https://example.com",
+            vote_miniapp_short_name=None,
+            vote_announce_extra_chat=None,
+        )
+        with patch.object(bot_listener, "_resolve_chat_id", resolve), \
+             patch.object(bot_listener, "_can_manage_chat", can_manage), \
+             patch.object(voting, "collect_entries", exploding), \
+             patch.object(bot_listener, "_current_vote_poll_id", lambda tz: THIS_WEEK):
+            asyncio.run(bot_listener.handle_vote_command(
+                api, None, cfg, None, message, CHAT, "testbot", set(), log=lambda *_: None,
+            ))
+
+        # A failed collect that left the lock behind would wedge the command forever.
+        self.assertEqual(bot_listener._VOTE_COLLECTIONS_IN_PROGRESS, set())
+        self.assertTrue(any("Не получилось" in text for text in api.sent))
+
+
+class ClearingTests(unittest.TestCase):
+    """"Очистить" empties the contest without destroying what it recorded."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("voting._voting_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+        for poll_id in (LAST_WEEK, THIS_WEEK):
+            poll = voting.Poll(
+                poll_id=poll_id, entry=CHAT, created_at=f"2026-07-2{poll_id[-1]}",
+                entries=[_entry("1")],
+            )
+            voting.set_approved(poll, ["1"])
+            voting.save_poll(poll)
+            media = voting.media_path(CHAT, poll_id)
+            media.mkdir(parents=True)
+            (media / "a.jpg").write_bytes(b"jpeg-ish")
+            results = voting.results_path(CHAT, poll_id)
+            results.parent.mkdir(parents=True, exist_ok=True)
+            results.write_text('{"announced": true}', encoding="utf-8")
+            export = voting.export_image_path(CHAT, poll_id)
+            export.parent.mkdir(parents=True, exist_ok=True)
+            export.write_bytes(b"rendered-board")
+
+    def test_one_clear_empties_every_week_not_just_the_newest(self):
+        """The reported bug: clearing removed one week and left the one before it live."""
+        cleared = voting.archive_all_polls(CHAT)
+
+        self.assertEqual(cleared, 2)
+        self.assertEqual(voting.poll_ids(CHAT), [])
+        self.assertIsNone(voting.latest_poll(CHAT))
+
+    def test_the_announced_results_and_rendered_boards_survive(self):
+        voting.archive_all_polls(CHAT)
+
+        for poll_id in (LAST_WEEK, THIS_WEEK):
+            with self.subTest(poll_id=poll_id):
+                self.assertTrue(voting.results_path(CHAT, poll_id).exists())
+                self.assertTrue(voting.export_image_path(CHAT, poll_id).exists())
+
+    def test_the_polls_are_archived_rather_than_destroyed(self):
+        voting.archive_all_polls(CHAT)
+
+        archived = sorted(path.name for path in voting.archive_dir().glob("*.json"))
+        self.assertEqual(len(archived), 2)
+        # ...and the archive is invisible to everything that reads the live contest.
+        self.assertEqual(voting.poll_ids(CHAT), [])
+
+    def test_the_collected_photos_are_the_one_thing_actually_deleted(self):
+        voting.archive_all_polls(CHAT)
+
+        for poll_id in (LAST_WEEK, THIS_WEEK):
+            with self.subTest(poll_id=poll_id):
+                self.assertFalse(voting.media_path(CHAT, poll_id).exists())
+
+    def test_clearing_twice_keeps_both_records_instead_of_overwriting(self):
+        voting.archive_all_polls(CHAT)
+        poll = voting.Poll(poll_id=THIS_WEEK, entry=CHAT, created_at="2026-08-01",
+                           entries=[_entry("2")])
+        voting.save_poll(poll)
+
+        voting.archive_all_polls(CHAT)
+
+        archived = list(voting.archive_dir().glob("*.json"))
+        self.assertEqual(len(archived), 3)
+
+    def test_clearing_an_empty_contest_is_zero_rather_than_an_error(self):
+        voting.archive_all_polls(CHAT)
+        self.assertEqual(voting.archive_all_polls(CHAT), 0)
+
+
+class ArenaClearingTests(unittest.TestCase):
+    """The arena keeps no separate results file, so its record IS the tournament."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("arena._arena_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+        for tournament_id in (LAST_WEEK, THIS_WEEK):
+            tournament = arena.Tournament(
+                tournament_id=tournament_id, entry=CHAT,
+                created_at=f"2026-07-2{tournament_id[-1]}", entries=[_entry("1")],
+            )
+            arena.save_tournament(tournament)
+            media = arena.media_path(CHAT, tournament_id)
+            media.mkdir(parents=True)
+            (media / "a.jpg").write_bytes(b"jpeg-ish")
+
+    def test_one_clear_empties_every_tournament(self):
+        cleared = arena.archive_all_tournaments(CHAT)
+
+        self.assertEqual(cleared, 2)
+        self.assertEqual(arena.tournament_ids(CHAT), [])
+        self.assertIsNone(arena.latest_tournament(CHAT))
+
+    def test_the_tournaments_are_archived_because_they_hold_their_own_statistics(self):
+        arena.archive_all_tournaments(CHAT)
+
+        archived = list(arena.archive_dir().glob("*.json"))
+        self.assertEqual(len(archived), 2)
+        self.assertIsNone(arena.latest_tournament(CHAT))
 
 
 class CarryOverIsGoneTests(unittest.TestCase):

@@ -234,6 +234,55 @@ def delete_tournament(entry: str, tournament_id: str) -> bool:
     return existed
 
 
+def archive_dir() -> Path:
+    """Where cleared tournaments are kept. A SUBDIRECTORY on purpose: latest_tournament
+    globs the arena directory itself and does not recurse, so an archived week is
+    invisible to the arena while its file still exists."""
+    return _arena_dir() / "archive"
+
+
+def tournament_ids(entry: str) -> list[str]:
+    """Every tournament id on disk for this chat, read from filenames so a week whose
+    JSON no longer parses is still listed."""
+    directory = _arena_dir()
+    if not directory.exists():
+        return []
+    prefix = f"{_key(entry)}_"
+    return sorted(path.stem[len(prefix):] for path in directory.glob(f"{prefix}*.json"))
+
+
+def archive_all_tournaments(entry: str) -> int:
+    """Clears the arena: every tournament leaves the live set, its photos are deleted.
+
+    Clearing one week at a time made "очистить" look broken -- it removed whatever
+    latest_tournament pointed at, so a second tap silently ate the week BEFORE the one the
+    admin meant. Starting over clears the lot. Returns how many were cleared.
+
+    The tournament file is MOVED into archive_dir(), not unlinked. Unlike v1 the arena
+    keeps no separate results record: its entries, ballots and standings all live in that
+    one file, so deleting it really would erase the week's statistics.
+    """
+    cleared = 0
+    destination_dir = archive_dir()
+    for tournament_id in tournament_ids(entry):
+        path = tournament_path(entry, tournament_id)
+        destination = destination_dir / path.name
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                destination = destination_dir / f"{path.stem}_{stamp}{path.suffix}"
+            path.replace(destination)
+            cleared += 1
+        except OSError:
+            continue
+        media_directory = media_path(entry, tournament_id)
+        if media_directory.exists():
+            shutil.rmtree(media_directory, ignore_errors=True)
+        invalidate_standings(tournament_id)
+    return cleared
+
+
 def build_tournament(
     entry: str, tournament_id: str, entries: list, existing: Tournament | None = None
 ) -> Tournament:
