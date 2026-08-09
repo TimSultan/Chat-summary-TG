@@ -824,7 +824,10 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 409)
 
-    async def test_the_admin_payload_carries_the_crops_and_a_voter_payload_does_not(self):
+    async def test_the_crops_reach_the_voter_too_so_the_ballot_shows_the_framing(self):
+        """The framing an admin sets is how the work is meant to be seen. Withholding it
+        from voters meant a cropped work still appeared cover-cropped on the ballot, which
+        reads as the cropping simply not having saved."""
         poll = self._seed_poll()
         voting.set_crops(poll, {"a": {"x": 1, "y": 2, "size": 3}})
         voting.save_poll(poll)
@@ -838,8 +841,23 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
             headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
         )).json()
 
-        self.assertEqual(admin["crops"], {"a": {"x": 1.0, "y": 2.0, "size": 3.0}})
-        self.assertNotIn("crops", voter)
+        expected = {"a": {"x": 1.0, "y": 2.0, "size": 3.0}}
+        self.assertEqual(admin["crops"], expected)
+        self.assertEqual(voter["crops"], expected)
+
+    async def test_the_ballot_grid_draws_the_saved_crop_instead_of_cover(self):
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn("function applyCrop(img, entryId)", page)
+        self.assertIn('data-crop-for="', page)
+        # object-fit would scale the photo a second time on top of the crop.
+        self.assertIn("object-fit: none", page)
+
+    async def test_the_crop_button_sits_under_the_admit_button(self):
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        grid = page[page.index("function renderGrid"):page.index("function cropButtonHtml")]
+        self.assertLess(grid.index('data-pick="'), grid.index("cropButtonHtml(entry)"))
+        reel = page[page.index("function renderReel"):page.index("function syncPicks")]
+        self.assertLess(reel.index('data-pick="'), reel.index("cropButtonHtml(entry)"))
 
     async def test_the_board_page_loads_without_auth_and_talks_to_the_admin_api(self):
         """The HTML shell is public like the ballot's; what makes it admin-only is that
