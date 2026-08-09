@@ -83,7 +83,6 @@ def _new_economy_metrics() -> dict:
         "item_sale_gold": 0,
         "gifts": 0,
         "arena_reward_gold": 0,
-        "guardian_interventions": 0,
         "drops_by_rarity": {
             rarity: 0 for rarity in ("cursed", "common", "uncommon", "rare", "legendary")
         },
@@ -1793,43 +1792,6 @@ def find_opponent(
         candidates = alternatives
 
     return rng.choice(candidates)
-
-
-def record_guardian_intervention(
-    entry, attacker_id, defender_id, today, now: datetime | None = None,
-) -> dict:
-    """Record the level-gap safety rule and atomically spend one banked fight."""
-    moment = now or app_now()
-    data = _load(entry)
-    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
-    attacker = data["pets"][attacker_uid]
-    defender = data["pets"][defender_uid]
-    if _is_farming_record(attacker) or _is_farming_record(defender):
-        raise ValueError("Питомец на ферме и не может участвовать в бою.")
-    capacity, *_ = _fight_bank_components(entry, attacker_uid, attacker, moment)
-    _spend_arena_fight(attacker, capacity, moment)
-    attacker["fights"] = attacker.get("fights", 0) + 1
-    _, levels_gained = _apply_xp(attacker, C.GUARDIAN_XP)
-    _metric_add(data, "guardian_interventions")
-    data["fights"].append({
-        "ts": moment.isoformat(), "date": today.isoformat(),
-        "attacker_id": attacker_uid, "defender_id": defender_uid,
-        "winner_id": None, "loser_id": None, "draw": False,
-        "guardian_intervention": True,
-        "attacker_name": attacker.get("name"), "defender_name": defender.get("name"),
-        "attacker_owner": attacker.get("owner_name"), "defender_owner": defender.get("owner_name"),
-        "gold": 0, "loss_gold": 0, "dropped_item": None, "xp": C.GUARDIAN_XP,
-        "combat_seed": None, "total_damage": {}, "combat_snapshot": None,
-    })
-    _save(entry, data)
-    return {
-        "guardian_intervention": True, "draw": False, "gold": 0, "loss_gold": 0,
-        "xp": C.GUARDIAN_XP, "levels_gained": levels_gained,
-        "level": attacker.get("level", 1), "dropped_item": None,
-        "opponent_gold": 0, "opponent_loss_gold": 0, "opponent_xp": 0,
-        "opponent_levels_gained": 0, "opponent_level": defender.get("level", 1),
-        "opponent_dropped_item": None,
-    }
 
 
 def legendary_pity_progress(entry: str, user_id) -> dict:

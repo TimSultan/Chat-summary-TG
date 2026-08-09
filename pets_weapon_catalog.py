@@ -21,8 +21,9 @@ SOURCES: Final = ("shop", "drop")
 STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
 
 # Shop prices follow the same relative combat weights as the arena power rating.  The
-# rarity base reflects scarcity/trade value; the multiplier prices actual usefulness.
-# Rounding to five keeps Telegram prices readable and prevents arbitrary catalogue IDs
+# entry tier is intentionally cheap enough for a first level-1 farm harvest (14 coins):
+# a player gets a useful choice immediately, while uncommon and rare gear stay goals.
+# Rounding to five keeps larger prices readable and prevents arbitrary catalogue IDs
 # from making two equally strong weapons cost hundreds of coins apart.
 SHOP_PRICE_POWER_WEIGHTS: Final = {
     "strength": 4,
@@ -31,8 +32,12 @@ SHOP_PRICE_POWER_WEIGHTS: Final = {
     "luck": 2,
     "armor": 3,
 }
-SHOP_PRICE_RARITY_BASE: Final = {"common": 5, "uncommon": 30, "rare": 70}
-SHOP_PRICE_POWER_MULTIPLIER: Final = {"common": 1.5, "uncommon": 1.75, "rare": 2.0}
+# A daily shelf must always contain at least one item at or below this cost whenever an
+# unowned starter weapon remains.  It deliberately equals the guaranteed gold from a
+# level-1 farm run; the passive +1/hour is a pleasant extra, never a requirement.
+STARTER_WEAPON_MAX_PRICE: Final = 14
+SHOP_PRICE_RARITY_BASE: Final = {"common": 5, "uncommon": 18, "rare": 55}
+SHOP_PRICE_POWER_MULTIPLIER: Final = {"common": 0.30, "uncommon": 0.75, "rare": 1.20}
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,9 +269,9 @@ _LEGACY_WEAPONS: Final = (
     # These IDs are the target of the stick/fork/bone migration aliases. Their identity
     # and stats remain lossless; prices use the current arena-income scale.
     ("w001", "Мамин тапок", "Летит точнее, чем кажется.",
-     "common", "shop", 40, 8, 0, (("strength", 6),)),
+     "common", "shop", 10, 2, 0, (("strength", 6),)),
     ("w002", "Мамина сковородка", "После неё спор окончен.",
-     "uncommon", "shop", 140, 28, 0, (("strength", 14), ("luck", 4))),
+     "uncommon", "shop", 65, 13, 0, (("strength", 14), ("luck", 4))),
     ("w003", "Швабра на изоленте", "Синяя. Значит, легендарная.",
      "legendary", "drop", 0, 220, 1, (("strength", 20), ("agility", -3))),
 )
@@ -302,7 +307,13 @@ def shop_price_for_bonuses(rarity: str, bonuses) -> int:
         SHOP_PRICE_POWER_WEIGHTS[key] * int(value) for key, value in bonuses
     ))
     raw = base + power * SHOP_PRICE_POWER_MULTIPLIER[rarity]
-    return max(5, int((raw + 2.5) // 5) * 5)
+    # The first common weapon is the onboarding purchase: pure +6 strength costs ten.
+    # Other commons remain only slightly dearer (10/15/20), while the two higher shop
+    # tiers retain a visible scarcity premium.
+    rounded = int((raw + 2.5) // 5) * 5
+    if rarity == "common":
+        return max(10, min(20, rounded))
+    return max(5, rounded)
 
 
 def _prices(rarity: str, source: str, bonuses) -> tuple[int, int]:
@@ -312,8 +323,9 @@ def _prices(rarity: str, source: str, bonuses) -> tuple[int, int]:
         return 0, 220 if rarity == "legendary" else 110 if rarity == "rare" else 10
     buy = shop_price_for_bonuses(rarity, bonuses)
     # 20% (rounded down) makes selling a convenience and inventory sink, never an
-    # arbitrage route.
-    return buy, max(5, buy * 20 // 100)
+    # arbitrage route.  The old 5-coin floor became too generous once starter weapons
+    # cost ten, so cheap gear can now be sold for its actual low fraction.
+    return buy, max(1, buy * 20 // 100)
 
 
 def _pre_rebalance_buy_price(code: str, rarity: str, source: str) -> int:
@@ -423,6 +435,11 @@ def _validate_catalogue() -> None:
     assert all(item.drop_weight == 0 for item in WEAPON_SPECS if item.source == "shop")
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
     assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 50, "legendary": 5}
+    starter_shop_items = [
+        item for item in WEAPON_SPECS
+        if item.source == "shop" and item.price <= STARTER_WEAPON_MAX_PRICE
+    ]
+    assert starter_shop_items
 
 
 _validate_catalogue()
@@ -430,5 +447,5 @@ _validate_catalogue()
 
 __all__ = [
     "RARITIES", "SOURCES", "STAT_KEYS", "WeaponSpec", "WEAPON_SPECS", "RAW_ITEMS", "WEAPON_COUNT",
-    "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "shop_price_for_bonuses",
+    "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "STARTER_WEAPON_MAX_PRICE", "shop_price_for_bonuses",
 ]

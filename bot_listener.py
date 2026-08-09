@@ -72,6 +72,7 @@ import pets_combat
 import pets_config as C
 import pets_image
 import pets_ui
+import pets_updates
 import post_stats_web
 import preview
 import stats
@@ -5412,7 +5413,6 @@ TEST_FIGHT_COMMAND = "/testfight"
 # later screen too.  Standalone /pet cards remain temporary notices.
 PET_NOTICE_DELETE_AFTER = 3 * 60
 GROUP_PETS_DELETE_AFTER = 30
-DUEL_RESULT_DELETE_AFTER = 10
 DUEL_TARGET_PROMPT_DELETE_AFTER = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_FLOW_TTL_SECONDS = GROUP_PETS_DELETE_AFTER
 DUEL_TARGET_INVALID_DELETE_AFTER = 5
@@ -5637,7 +5637,7 @@ async def handle_duel_command(
     bot_username: str | None, background_tasks: set, pets_flows: dict | None = None, log=print,
     target_from_followup: bool = False,
 ) -> None:
-    """Run a public duel. The challenger alone spends a duel use and cooldown."""
+    """Run a duel. The challenger alone spends a duel use and cooldown."""
     chat = message["chat"]
     chat_id = chat["id"]
     group_chat = chat.get("type") != "private"
@@ -5744,13 +5744,10 @@ async def handle_duel_command(
     await _pets_run_fight(
         api, chat_id, message["message_id"], entry, challenger.user_id, str(target.user_id),
         xp, log, background_tasks=background_tasks,
-        delete_after=DUEL_RESULT_DELETE_AFTER if group_chat else None,
         include_keyboard=False,
         persistent_recipient_ids=(challenger.user_id, target.user_id),
         enforce_arena_target_limit=False,
         attacker_username=actor.get("username"),
-        group_result=group_chat,
-        arena_url=f"https://t.me/{bot_username}?start=pets" if group_chat else None,
     )
 
 def _pets_fighter(entry: str, user_id, pet: dict):
@@ -5915,7 +5912,10 @@ async def handle_pets_callback(
                 gift_flow["confirmation_token"] = confirmation_token
                 return
             prompts = {
-                "tame": "Пришли фото будущего существа (картинкой, не файлом).",
+                "tame": (
+                    "Пришли фото будущего существа — это должна быть твоя собственная "
+                    "раскрашенная фигурка (картинкой, не файлом)."
+                ),
                 "photo": "Пришли новое фото существа (картинкой, не файлом).",
                 "rename": "Ответь на это сообщение новым именем существа.",
             }
@@ -6076,28 +6076,22 @@ async def handle_pets_callback(
             return
 
         if action == "attack":
-            result_chat_id = chat_id
-            if (message.get("chat") or {}).get("type") == "private":
-                result_chat_id = await _resolve_chat_id(
-                    telethon_client, entry, known_chat_ids if known_chat_ids is not None else {}, log=log,
-                )
-            if result_chat_id is None:
-                result_chat_id = chat_id
             await _pets_run_fight(
-                api, result_chat_id, message_id, entry, user_id, argument, xp, log,
+                api, chat_id, message_id, entry, user_id, argument, xp, log,
                 attacker_username=actor.get("username"),
                 background_tasks=background_tasks,
-                delete_after=DUEL_RESULT_DELETE_AFTER if result_chat_id != chat_id else None,
                 persistent_recipient_ids=(user_id, argument),
-                group_result=result_chat_id != chat_id,
-                arena_url=(f"https://t.me/{bot_username}?start=pets" if bot_username else None),
-                delete_trigger=result_chat_id == chat_id,
                 arena_menu_chat_id=chat_id,
                 arena_menu_message_id=message_id,
             )
             return
 
         # --- plain redraws -------------------------------------------------------------
+        if action == "updates":
+            # Opening the log, rather than merely seeing the menu button, acknowledges
+            # the newest release.  Navigation is intentionally the same action so old
+            # buttons remain safe across a restart.
+            pets_updates.mark_latest_read(entry, user_id)
         views = {
             "main": lambda: pets_ui.main_view(entry, user_id, xp),
             "info": lambda: pets_ui.info_view(user_id),
@@ -6107,6 +6101,9 @@ async def handle_pets_callback(
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
             "history": lambda: pets_ui.history_view(entry, user_id),
+            "updates": lambda: pets_ui.updates_view(
+                entry, user_id, int(argument) if argument.isdigit() else 0,
+            ),
             "leaderboard": lambda: pets_ui.leaderboard_view(
                 entry, user_id, int(argument) if argument.isdigit() else 0,
             ),
@@ -6206,27 +6203,6 @@ async def _pets_deliver_farm_returns(api, entries, log=print) -> None:
             except Exception:
                 # It is safe to retry an already sent receipt; settlement remains complete.
                 log(f"[pets] could not mark farm return {run_id} delivered:\n{traceback.format_exc()}")
-
-
-def _pets_rare_drop_announcement(reward: dict, attacker: dict, defender: dict) -> str | None:
-    """Public chat line for a rare weapon awarded by an already-recorded fight."""
-    dropped_code = reward.get("dropped_item")
-    winner = attacker
-    if not dropped_code:
-        dropped_code = reward.get("opponent_dropped_item")
-        winner = defender
-    item = C.find_item(dropped_code) if dropped_code else None
-    if item is None or item.slot != "weapon" or item.rarity not in {"rare", "legendary"}:
-        return None
-
-    username = str(winner.get("owner_username") or "").strip().lstrip("@")
-    owner = f"@{html.escape(username)}" if username else html.escape(
-        winner.get("owner_name") or "Неизвестному игроку"
-    )
-    rarity = "редкое" if item.rarity == "rare" else "легендарное"
-    description = html.escape(str(item.description or "").strip())
-    suffix = f" — {description}" if description else ""
-    return f"{owner} выпало {rarity} оружие: <b>{html.escape(item.name)}</b>{suffix}"
 
 
 async def handle_test_fight_command(
@@ -6351,12 +6327,10 @@ async def handle_test_fight_command(
 
 async def _pets_run_fight(
     api: TelegramBotAPI, chat_id, message_id, entry: str, user_id, opponent_raw: str,
-    xp: int, log, background_tasks: set | None = None, delete_after: int | None = None,
+    xp: int, log, background_tasks: set | None = None,
     include_keyboard: bool = True, persistent_recipient_ids=None,
     enforce_arena_target_limit: bool = True,
     attacker_username: str | None = None, no_fights_to_user_dm: bool = False,
-    group_result: bool = False, arena_url: str | None = None,
-    delete_trigger: bool = True,
     arena_menu_chat_id=None, arena_menu_message_id=None,
 ) -> None:
     """One duel, start to finish: simulate, record, print.
@@ -6446,86 +6420,6 @@ async def _pets_run_fight(
         await redraw_empty_fight_bank()
         return
 
-    # The adult is the attacker. This safety valve intentionally happens after the fight
-    # budget check: a valid attempted attack consumes exactly one attempt, but cannot
-    # create gold, a loss debit, a drop, or a normal combat result.
-    if mine.get("level", 1) - theirs.get("level", 1) >= C.GUARDIAN_LEVEL_GAP:
-        try:
-            reward = pets.record_guardian_intervention(entry, user_id, opponent_id, pets.today())
-        except ValueError:
-            # Another simultaneous tap may have spent the final banked fight between the
-            # check above and this authoritative mutation.  Never announce that race.
-            await redraw_empty_fight_bank()
-            return
-        attacker_owner = (
-            f"@{html.escape(str(mine.get('owner_username')).lstrip('@'))}"
-            if mine.get("owner_username") else html.escape(mine.get("owner_name") or "неизвестный хозяин")
-        )
-        defender_owner = (
-            f"@{html.escape(str(theirs.get('owner_username')).lstrip('@'))}"
-            if theirs.get("owner_username") else html.escape(theirs.get("owner_name") or "неизвестный хозяин")
-        )
-        guardian_text = (
-            f"⚔️ <b>Атака:</b> <b>{html.escape(mine.get('name') or 'Существо')}</b> "
-            f"ур {mine.get('level', 1)}({attacker_owner}) → "
-            f"<b>{html.escape(theirs.get('name') or 'Существо')}</b> "
-            f"ур {theirs.get('level', 1)}({defender_owner})\n\n"
-            f"<b>{C.GUARDIAN_INTERVENTION_TEXT.format(owner=attacker_owner)}</b>\n"
-            f"✨ +{reward['xp']} опыта"
-        )
-        image_path = None
-        try:
-            image_path = await _pets_render_guardian_image(
-                api, entry, user_id, opponent_id, mine, theirs, reward["xp"], log,
-            )
-        except Exception:
-            log(f"[pets] failed to render guardian intervention:\n{traceback.format_exc()}")
-        sent = None
-        try:
-            if image_path is not None:
-                sent = await api.send_photo_file(
-                    chat_id, image_path, caption=guardian_text, parse_mode="HTML",
-                    disable_notification=True,
-                )
-            else:
-                sent = await api.send_message(chat_id, guardian_text, parse_mode="HTML")
-        except Exception:
-            log(f"[pets] failed to send guardian intervention:\n{traceback.format_exc()}")
-            if image_path is not None:
-                try:
-                    sent = await api.send_message(chat_id, guardian_text, parse_mode="HTML")
-                except Exception:
-                    log(f"[pets] failed to send guardian text fallback:\n{traceback.format_exc()}")
-        if delete_after and background_tasks is not None and sent and "message_id" in sent:
-            schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
-                trigger_message_id=message_id if delete_trigger else None,
-            )
-        # The attacker still gets their own private receipt when this was initiated from
-        # the DM arena. The defender did not fight, so they receive no notification.
-        if persistent_recipient_ids and str(user_id) != str(chat_id):
-            try:
-                if image_path is not None:
-                    await api.send_photo_file(
-                        user_id, image_path, caption=guardian_text, parse_mode="HTML",
-                        disable_notification=True,
-                    )
-                else:
-                    await api.send_message(user_id, guardian_text, parse_mode="HTML")
-            except Exception:
-                log(f"[pets] could not deliver guardian receipt to {user_id}")
-                if image_path is not None:
-                    try:
-                        await api.send_message(user_id, guardian_text, parse_mode="HTML")
-                    except Exception:
-                        log(f"[pets] could not deliver guardian text receipt to {user_id}")
-        if image_path is not None:
-            try:
-                image_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        return
-
     attacker_fighter = _pets_fighter(entry, user_id, mine)
     defender_fighter = _pets_fighter(entry, opponent_id, theirs)
     seed = secrets.randbits(63)
@@ -6547,8 +6441,8 @@ async def _pets_run_fight(
             combat_snapshot=combat_snapshot,
         )
     except ValueError:
-        # See the guardian branch above: record_fight is the authority on spending the
-        # bank, and a stale final tap stays entirely in the attacker's private UI.
+        # record_fight is the authority on spending the bank, and a stale final tap
+        # stays entirely in the attacker's private UI.
         await redraw_empty_fight_bank()
         return
     report = pets_ui.fight_report(
@@ -6576,76 +6470,51 @@ async def _pets_run_fight(
             defender_reward,
         )
     )
-    group_report = None
-    if group_result:
-        group_report = pets_ui.group_fight_result_view(
-            result, str(user_id), mine.get("name") or "Существо",
-            theirs.get("name") or "Существо", reward, arena_url,
-        )
     image_path = None
     try:
         image_path = await _pets_render_result_image(
             api, result, entry, user_id, opponent_id, mine, theirs, log, fight_hp=fight_hp,
         )
-        sent = None
-        if image_path is not None:
-            caption, keyboard = group_report or (
-                report,
-                pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
-            )
-            sent = await api.send_photo_file(
-                chat_id, image_path, caption=caption, reply_markup=keyboard,
-                parse_mode="HTML",
-                disable_notification=True,
-            )
-        else:
-            text, keyboard = group_report or (
-                report,
-                pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
-            )
-            sent = await api.send_message(
-                chat_id, text, reply_markup=keyboard,
-                parse_mode="HTML",
-            )
     except Exception:
-        log(f"[pets] failed to send a fight report:\n{traceback.format_exc()}")
-    else:
-        if delete_after and background_tasks is not None and sent and "message_id" in sent:
-            schedule_bot_delete(
-                api, chat_id, [sent["message_id"]], delete_after, log, background_tasks,
-                trigger_message_id=message_id if delete_trigger else None,
-            )
-    finally:
-        drop_announcement = _pets_rare_drop_announcement(reward, mine, theirs)
-        if drop_announcement:
+        log(f"[pets] failed to render a fight result:\n{traceback.format_exc()}")
+
+    async def deliver_result(recipient_id, text: str, keyboard=None) -> None:
+        """Combat logs, including drops, are private to the two participants."""
+        try:
+            if image_path is not None:
+                await api.send_photo_file(
+                    recipient_id, image_path, caption=text, reply_markup=keyboard,
+                    parse_mode="HTML", disable_notification=True,
+                )
+            else:
+                await api.send_message(
+                    recipient_id, text, reply_markup=keyboard, parse_mode="HTML",
+                )
+        except Exception:
+            # A bot cannot message a member who has not started it; this must never turn
+            # into a public fallback that leaks combat or a reward to the group.
+            log(f"[pets] could not deliver private fight result to {recipient_id}")
+
+    try:
+        await deliver_result(
+            user_id, report, pets_ui.fight_report_keyboard(user_id) if include_keyboard else None,
+        )
+        # Keyed by str: opponent_id arrives as text while callers can pass integer ids.
+        # This preserves one receipt per person, never a second attacker copy.
+        by_id: dict[str, int | str] = {}
+        for rid in (*(persistent_recipient_ids or ()), opponent_id):
+            by_id.setdefault(str(rid), int(rid) if str(rid).lstrip("-").isdigit() else rid)
+        for recipient_id in by_id.values():
+            if str(recipient_id) == str(user_id):
+                continue
             try:
-                await api.send_message(chat_id, drop_announcement, parse_mode="HTML")
+                await deliver_result(
+                    recipient_id,
+                    defender_report if str(recipient_id) == str(opponent_id) else report,
+                )
             except Exception:
-                # The item is already safely stored by record_fight. A Telegram failure
-                # must not disrupt result delivery or try to award it a second time.
-                log("[pets] could not announce a rare arena drop")
-        if image_path is not None:
-            # Keyed by str: opponent_id arrives as text while the caller's ids are ints,
-            # so a plain dict.fromkeys treats 43 and "43" as two people and DMs the
-            # defender their report twice.
-            by_id: dict[str, int | str] = {}
-            for rid in (*(persistent_recipient_ids or ()), opponent_id):
-                by_id.setdefault(str(rid), int(rid) if str(rid).lstrip("-").isdigit() else rid)
-            recipients = list(by_id.values())
-            for recipient_id in recipients:
-                if str(recipient_id) == str(chat_id):
-                    continue
-                try:
-                    await api.send_photo_file(
-                        recipient_id, image_path,
-                        caption=defender_report if str(recipient_id) == str(opponent_id) else report,
-                        parse_mode="HTML",
-                        disable_notification=True,
-                    )
-                except Exception:
-                    # A bot cannot message a member who has not started it; their opponent
-                    # should still receive the report.
-                    log(f"[pets] could not deliver the duel image to {recipient_id}")
+                log(f"[pets] could not deliver the duel receipt to {recipient_id}")
+    finally:
         if image_path is not None:
             try:
                 image_path.unlink(missing_ok=True)
@@ -6735,56 +6604,6 @@ async def _pets_render_result_image(
             "amulet": _pets_image_item(defender, "amulet"),
             **((fight_hp or {}).get(str(defender_id), {})),
         })
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-
-
-async def _pets_render_guardian_image(
-    api, entry: str, attacker_id, defender_id, attacker: dict, defender: dict, xp: int, log,
-):
-    """Build the two-pet receipt for a fight stopped before the first hit."""
-    attacker_stats = pets.effective_stats(entry, attacker_id)
-    defender_stats = pets.effective_stats(entry, defender_id)
-    attacker_fighter = _pets_fighter(entry, attacker_id, attacker)
-    defender_fighter = _pets_fighter(entry, defender_id, defender)
-    attacker_hp = round(pets_combat.derive(attacker_fighter, defender_fighter)["max_hp"])
-    defender_hp = round(pets_combat.derive(defender_fighter, attacker_fighter)["max_hp"])
-    pet_a, pet_b, avatar_a, avatar_b = await asyncio.gather(
-        _pets_download_media(api, attacker.get("photo_file_id"), log),
-        _pets_download_media(api, defender.get("photo_file_id"), log),
-        _pets_owner_avatar(api, attacker_id, log),
-        _pets_owner_avatar(api, defender_id, log),
-    )
-    path = pets_image.temporary_result_path()
-    try:
-        return pets_image.render_guardian_result(path, {
-            "id": str(attacker_id),
-            "pet_name": attacker.get("name"),
-            "level": attacker.get("level", 1),
-            "owner_name": attacker.get("owner_name"),
-            "stats": attacker_stats,
-            "power": pets.power_rating(entry, attacker_id),
-            "pet_photo": pet_a,
-            "owner_avatar": avatar_a,
-            "weapon": _pets_image_item(attacker, "weapon"),
-            "amulet": _pets_image_item(attacker, "amulet"),
-            "remaining_hp": attacker_hp,
-            "max_hp": attacker_hp,
-        }, {
-            "id": str(defender_id),
-            "pet_name": defender.get("name"),
-            "level": defender.get("level", 1),
-            "owner_name": defender.get("owner_name"),
-            "stats": defender_stats,
-            "power": pets.power_rating(entry, defender_id),
-            "pet_photo": pet_b,
-            "owner_avatar": avatar_b,
-            "weapon": _pets_image_item(defender, "weapon"),
-            "amulet": _pets_image_item(defender, "amulet"),
-            "remaining_hp": defender_hp,
-            "max_hp": defender_hp,
-        }, xp=xp)
     except Exception:
         path.unlink(missing_ok=True)
         raise

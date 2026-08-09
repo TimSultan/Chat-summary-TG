@@ -22,6 +22,7 @@ import economy
 import pets
 import pets_config as C
 import pets_ui
+import pets_updates
 import stats
 
 DM_CHAT_ID = 555
@@ -460,6 +461,16 @@ class PetsCommandTests(unittest.TestCase):
         flow = next(iter(flows.values()))
         self.assertEqual(flow["awaiting"], "photo_tame")
         self.assertTrue(api.sent[0]["reply_markup"]["force_reply"])
+        self.assertIn("собственная раскрашенная фигурка", api.sent[0]["text"])
+
+    def test_opening_updates_marks_the_latest_entry_read_and_redraws_the_log(self):
+        self.assertTrue(pets_updates.has_unread(CHAT, PLAYER["id"]))
+
+        api = self._tap("updates")
+
+        self.assertFalse(pets_updates.has_unread(CHAT, PLAYER["id"]))
+        self.assertTrue(api.edits)
+        self.assertIn("Обновления", api.edits[-1]["text"])
 
     def test_taming_without_a_cage_shows_the_cage_screen_rather_than_a_prompt(self):
         flows = {}
@@ -641,6 +652,7 @@ class PetsCommandTests(unittest.TestCase):
         ))
 
         self.assertEqual(len(api.photo_files), 2)
+        self.assertEqual(api.photo_files[0]["chat_id"], PLAYER["id"])
         self.assertGreater(api.photo_files[0]["size"], 1_000)
         self.assertTrue(any(
             outcome in api.photo_files[0]["caption"]
@@ -653,7 +665,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(api.photo_files[0]["disable_notification"])
         self.assertTrue(defender_copy["disable_notification"])
 
-    def test_rare_weapon_drop_is_announced_in_the_result_chat(self):
+    def test_rare_weapon_drop_stays_in_the_winner_private_result(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player", "player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -677,29 +689,11 @@ class PetsCommandTests(unittest.TestCase):
                 log=lambda *_: None,
             ))
 
-        self.assertEqual(len(api.sent), 1)
-        self.assertEqual(api.sent[0]["chat_id"], MAIN_CHAT_ID)
-        self.assertIn("@player выпало редкое оружие:", api.sent[0]["text"])
-        self.assertIn(rare.name, api.sent[0]["text"])
-        self.assertIn(rare.description, api.sent[0]["text"])
+        self.assertEqual(api.sent, [])
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], 43])
+        self.assertIn(rare.name, api.photo_files[0]["caption"])
 
-    def test_only_rare_and_legendary_weapon_drops_get_public_copy(self):
-        attacker = {"owner_username": "alice", "owner_name": "Alice"}
-        defender = {"owner_username": "bob", "owner_name": "Bob"}
-        uncommon = next(item for item in C.ITEMS if item.rarity == "uncommon")
-        legendary = next(item for item in C.ITEMS if item.rarity == "legendary")
-
-        self.assertIsNone(bot_listener._pets_rare_drop_announcement(
-            {"dropped_item": uncommon.code}, attacker, defender,
-        ))
-        text = bot_listener._pets_rare_drop_announcement(
-            {"opponent_dropped_item": legendary.code}, attacker, defender,
-        )
-        self.assertIn("@bob выпало легендарное оружие:", text)
-        self.assertIn(legendary.name, text)
-        self.assertIn(legendary.description, text)
-
-    def test_private_arena_attack_posts_the_public_result_to_the_group(self):
+    def test_private_arena_attack_keeps_results_with_the_two_players(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -707,27 +701,14 @@ class PetsCommandTests(unittest.TestCase):
         api = FakeApi()
         deletions = []
 
-        async def resolve_group(*args, **kwargs):
-            return MAIN_CHAT_ID
-
-        with patch.object(stats, "resolve_stat_target", _Resolver(api)), patch.object(
-            bot_listener, "_resolve_chat_id", resolve_group,
-        ), patch.object(
-            bot_listener, "schedule_bot_delete",
-            side_effect=lambda *args, **kwargs: deletions.append((args, kwargs)),
-        ):
+        with patch.object(stats, "resolve_stat_target", _Resolver(api)):
             _run(bot_listener.handle_pets_callback(
                 api, None, _cfg(), None, _callback(PLAYER, "attack", "43"), CHAT,
                 {}, set(), bot_username=BOT, known_chat_ids={CHAT: MAIN_CHAT_ID}, log=lambda *_: None,
             ))
 
-        self.assertEqual([item["chat_id"] for item in api.photo_files], [MAIN_CHAT_ID, PLAYER["id"], 43])
-        self.assertIn("🪙 +", api.photo_files[0]["caption"])
-        self.assertTrue(any(
-            args[1] == MAIN_CHAT_ID and args[3] == bot_listener.DUEL_RESULT_DELETE_AFTER
-            and kwargs.get("trigger_message_id") is None
-            for args, kwargs in deletions
-        ))
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], 43])
+        self.assertFalse(any(item["chat_id"] == MAIN_CHAT_ID for item in api.photo_files))
 
     def test_stale_daily_capped_arena_card_silently_deals_another_opponent(self):
         """A card can become stale between search and tap; never publish that refusal."""
@@ -775,7 +756,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.edits[-1]["chat_id"], DM_CHAT_ID)
         self.assertIn(pets_ui.ARENA_NO_FIGHTS_NOTICE, api.edits[-1]["text"])
 
-    def test_seven_level_advantage_is_stopped_by_guard_without_combat_or_gold(self):
+    def test_seven_level_advantage_is_a_normal_combat(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Adult", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -785,28 +766,14 @@ class PetsCommandTests(unittest.TestCase):
         data["pets"]["43"]["level"] = 1
         pets._save(CHAT, data)
         api = FakeApi()
-        attacker_gold_before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
-        defender_gold_before = economy.balance(CHAT, 43, 0)
-
-        with patch.object(bot_listener.pets_combat, "simulate", side_effect=AssertionError("must not fight")):
+        with patch.object(bot_listener.pets_combat, "simulate", wraps=bot_listener.pets_combat.simulate) as simulate:
             _run(bot_listener._pets_run_fight(
                 api, DM_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP,
                 log=lambda *_: None,
             ))
 
-        attacker = pets.get_pet(CHAT, PLAYER["id"])
-        defender = pets.get_pet(CHAT, 43)
-        self.assertEqual(attacker["xp"], C.GUARDIAN_XP)
-        self.assertEqual(attacker["fight_bank"], 4)
-        self.assertEqual(defender["fights"], 0)
-        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), attacker_gold_before)
-        self.assertEqual(economy.balance(CHAT, 43, 0), defender_gold_before)
-        self.assertTrue(pets.history(CHAT, PLAYER["id"])[0]["guardian_intervention"])
-        self.assertEqual(api.sent, [])
-        self.assertEqual(len(api.photo_files), 1)
-        caption = api.photo_files[0]["caption"]
-        self.assertIn("Атака:</b> <b>Adult</b> ур 8(Player) → <b>Child</b> ур 1(Bob)", caption)
-        self.assertIn("Негоже взрослому с детьми драться. Player отпиздил охранник.", caption)
+        simulate.assert_called_once()
+        self.assertEqual(len(api.photo_files), 2)
 
     def test_six_level_advantage_remains_a_normal_combat(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -826,7 +793,6 @@ class PetsCommandTests(unittest.TestCase):
             ))
 
         simulate.assert_called_once()
-        self.assertFalse(pets.history(CHAT, PLAYER["id"])[0].get("guardian_intervention", False))
         self.assertEqual(len(api.photo_files), 2)
 
     def test_opponent_rerolls_are_unlimited_and_keep_only_the_current_card_in_callback(self):
@@ -1022,7 +988,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(started[0][0][5], "/duel @bobby")
         self.assertTrue(started[0][1]["target_from_followup"])
 
-    def test_group_duel_posts_a_result_image_and_keeps_copies_for_both_players(self):
+    def test_group_duel_keeps_results_with_both_players(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -1044,38 +1010,14 @@ class PetsCommandTests(unittest.TestCase):
                 "/duel @bob", BOT, set(), log=lambda *_: None,
             ))
 
-        self.assertEqual(len(api.photo_files), 3)
-        self.assertEqual(
-            [item["chat_id"] for item in api.photo_files],
-            [MAIN_CHAT_ID, PLAYER["id"], target.user_id],
-        )
+        self.assertEqual(len(api.photo_files), 2)
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], target.user_id])
         self.assertEqual(api.sent, [])
-        group_result = api.photo_files[0]
-        # The public line names the winner only -- which of the two that is depends on
-        # the roll, so assert that it names one of them rather than a fixed pet.
-        self.assertTrue(
-            any(name in group_result["caption"] for name in ("Кабанчик", "Тумблер")),
-            group_result["caption"],
-        )
-        if "ничью" in group_result["caption"]:
-            # Combat is intentionally random; a legitimate draw has no winner payout.
-            self.assertNotIn("🪙 +", group_result["caption"])
-            self.assertNotIn("✨ +100 опыта", group_result["caption"])
-        else:
-            self.assertIn("🪙 +", group_result["caption"])
-            self.assertIn("✨ +100 опыта", group_result["caption"])
-        button = _buttons(group_result)[0]
-        self.assertEqual(button["text"], "⚔️ Открыть арену")
-        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=pets")
         self.assertTrue(all(item["disable_notification"] for item in api.photo_files))
         defender_copy = api.photo_files[-1]
         self.assertIn("Вас атаковал @player", defender_copy["caption"])
         self.assertIsNone(defender_copy["reply_markup"])
-        self.assertTrue(any(
-            args[3] == bot_listener.DUEL_RESULT_DELETE_AFTER
-            and kwargs.get("trigger_message_id") == 5
-            for args, kwargs in deletions
-        ))
+        self.assertFalse(any(item["chat_id"] == MAIN_CHAT_ID for item in api.photo_files))
         self.assertEqual(pets._load(CHAT)["duels"][str(PLAYER["id"])]["uses"], 1)
 
     def test_exhausted_group_duel_sends_arena_to_dm_without_group_notice(self):
@@ -1147,7 +1089,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.photo_files, [])
         self.assertEqual(api.edits[-1]["chat_id"], DM_CHAT_ID)
 
-    def test_private_duel_posts_the_result_in_the_bot_chat(self):
+    def test_private_duel_posts_one_result_to_each_player(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
@@ -1165,7 +1107,7 @@ class PetsCommandTests(unittest.TestCase):
                 "/duel @bob", BOT, set(), log=lambda *_: None,
             ))
 
-        self.assertEqual([item["chat_id"] for item in api.photo_files], [DM_CHAT_ID, PLAYER["id"], target.user_id])
+        self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], target.user_id])
         self.assertEqual(api.deleted, [])
 
 

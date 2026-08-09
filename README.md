@@ -937,13 +937,16 @@ the public caption labels it as a test and the message is sent with notification
 Weapon names use familiar household junk and concrete origins such as «с Авито», «из
 гаража» and «на синей изоленте», with one-line descriptions; storefront entries are
 separated by blank lines for quick scanning.
-Shop weapon prices are tied to combat value rather than catalogue position: common
-weapons cost 40–75 coins, uncommon 105–145, and the five shop rares 195–240. This puts
-the three tiers at roughly several days, one to two weeks, and two to three weeks for a
-median active player at current `5–10` win rewards. Resale remains 20%.
+Shop weapon prices are tied to combat value rather than catalogue position: commons cost
+10–20 coins, uncommon weapons roughly 50–70, and the five shop rares 130–155.
+Every daily storefront injects an unowned 10-coin starter weapon when its normal rotation
+has none, so one basic six-hour level-1 farm harvest (14 coins) always buys a weapon;
+the hourly passive income is not needed for that promise. Higher rarities remain long-term
+goals, while resale stays at a low 20% (rounded down, including below five coins for the
+starter tier).
 Rarity weights make a legendary about 0.94% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
-telemetry tracks passive minting, sales, gifts, arena gold, guard actions and drops.
+telemetry tracks passive minting, sales, gifts, arena gold and drops.
 
 The accessory drop catalogue adds 30 amulets, 30 boots and 30 gloves. Boots and gloves
 use ordinary stat trade-offs; every amulet has a separate machine-readable passive shown

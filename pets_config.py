@@ -277,12 +277,6 @@ LOSS_GOLD_SHARE = 0.3
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
 DRAW_XP = 50                # both sides spent a fight; no gold or win is awarded
-# A grown creature is not allowed to farm a new one.  This is deliberately based on pet
-# level rather than combat power: gear can make a low-level pet dangerous, but it should
-# not turn a playground rule into a hidden matchmaking restriction.
-GUARDIAN_LEVEL_GAP = 7
-GUARDIAN_XP = 5
-GUARDIAN_INTERVENTION_TEXT = "Негоже взрослому с детьми драться. {owner} отпиздил охранник."
 # Winning against a pet several levels below yours is less valuable, while an upset is
 # worth more. The delta is loser level minus winner level, capped at three levels so a
 # rare lopsided match cannot turn into a punitive tax or an outsized reward. Cage gold
@@ -440,10 +434,12 @@ try:
     from pets_weapon_catalog import (
         PRE_REBALANCE_BUY_PRICES as PRE_REBALANCE_WEAPON_BUY_PRICES,
         RAW_ITEMS as _RAW_WEAPON_ITEMS,
+        STARTER_WEAPON_MAX_PRICE,
     )
 except ImportError:
     _RAW_WEAPON_ITEMS = ()
     PRE_REBALANCE_WEAPON_BUY_PRICES = {}
+    STARTER_WEAPON_MAX_PRICE = FARM_GOLD_PER_RUN[1]
 
 try:
     from pets_amulet_catalog import RAW_ITEMS as _RAW_AMULET_ITEMS
@@ -476,6 +472,8 @@ if _RAW_WEAPON_ITEMS:
     _codes = [item.code for item in _catalogue_weapons]
     if len(set(_codes)) != len(_codes):
         raise ValueError("weapon catalogue contains duplicate item codes")
+    if STARTER_WEAPON_MAX_PRICE > FARM_GOLD_PER_RUN[1]:
+        raise ValueError("the first farm run must afford the daily starter weapon")
     ITEMS = _catalogue_weapons + tuple(item for item in ITEMS if item.slot != "weapon")
 
 _catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)
@@ -614,6 +612,19 @@ def daily_storefront_weapons(
         stock.append(item)
         if len(stock) >= DAILY_STOREFRONT_SIZE:
             break
+    # The shop is the farm's first tangible reward.  A rotation may otherwise contain
+    # only mid-tier gear, so replace its final slot with an unowned starter item.  The
+    # choice is deterministic per chat/day and does not create a duplicate object.
+    if stock and not any(item.price <= STARTER_WEAPON_MAX_PRICE for item in stock):
+        starters = [
+            item for item in pool
+            if item.code not in excluded
+            and item.code not in {offered.code for offered in stock}
+            and item.price <= STARTER_WEAPON_MAX_PRICE
+        ]
+        if starters:
+            starter_offset = (initial_offset + today.toordinal()) % len(starters)
+            stock[-1] = starters[starter_offset]
     return tuple(stock)
 
 

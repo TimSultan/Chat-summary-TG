@@ -24,7 +24,7 @@ from html import escape
 
 import pets
 import pets_config as C
-import pets_flavor
+import pets_updates
 
 CALLBACK_PREFIX = "pet"
 # Telegram caps callback_data at 64 bytes. "pet:" + a 19-digit id + ":" + the longest
@@ -125,6 +125,7 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     elif not pet:
         lines.append(f"🏠 Клетка: уровень {cage} — пустая.")
         lines.append(f"Осталось приручить существо за {_coins(C.TAME_PRICE)}.")
+        lines.append("Существо должно быть твоей собственной раскрашенной фигуркой.")
     else:
         fights = pets.fight_allowance_breakdown(entry, user_id, pets.today())
         left = fights["available"]
@@ -158,11 +159,13 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
     elif cage:
         rows.append([{
-            "text": f"🐣 Приручить существо — {_money(C.TAME_PRICE)}",
+            "text": f"🐣 Приручить свою фигурку — {_money(C.TAME_PRICE)}",
             "callback_data": callback_data(user_id, "tame"),
         }])
     rows.append([{"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")}])
     rows.append([{"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")}])
+    updates_button = "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
+    rows.append([{"text": updates_button, "callback_data": callback_data(user_id, "updates")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -229,6 +232,30 @@ def info_view(user_id) -> tuple[str, dict]:
     )
     lines.append("\n<b>Дуэли</b>: напиши /duel @user в общем чате или в личке бота. Одного и того же соперника можно вызвать раз в день.")
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+
+def updates_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
+    """Newest-first, one concise release note per screen."""
+    update, page, total = pets_updates.page(page)
+    if update is None:
+        return "📰 <b>Обновления</b>\n\nПока нет опубликованных обновлений.", {
+            "inline_keyboard": [_back_row(user_id)],
+        }
+
+    lines = [f"📰 <b>Обновления</b>", "", f"<b>{update.title}</b>", update.text]
+    lines.append(f"\n<i>{page + 1}/{total}</i>")
+    navigation = []
+    if page + 1 < total:
+        navigation.append({
+            "text": "◀️", "callback_data": callback_data(user_id, "updates", str(page + 1)),
+        })
+    if page > 0:
+        navigation.append({
+            "text": "▶️", "callback_data": callback_data(user_id, "updates", str(page - 1)),
+        })
+    keyboard = [navigation] if navigation else []
+    keyboard.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
 # ----------------------------------------------------------------------------- cage
@@ -1011,10 +1038,6 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f" за соперника ниже уровнем — меньше, выше — больше (до ±25%)."
         f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
     )
-    lines.append(
-        "Если ты на 7+ уровней выше соперника, охранник остановит бой: "
-        "без золота и дропа, зато +5 опыта."
-    )
     if farming:
         lines.append("\n🌾 Питомец на ферме — арена подождёт, пока он не вернётся.")
     elif left <= 0:
@@ -1120,27 +1143,6 @@ def fight_report_keyboard(user_id) -> dict:
     ]}
 
 
-def group_fight_result_view(
-    result, attacker_id: str, attacker_name: str, defender_name: str, reward: dict,
-    arena_url: str | None,
-) -> tuple[str, dict | None]:
-    """One-line public result; detailed receipts stay with the two fighters in private."""
-    if result.is_draw:
-        text = f"🤝 <b>{escape(attacker_name)} и {escape(defender_name)} сыграли вничью.</b>"
-    else:
-        winner_name = attacker_name if result.winner == str(attacker_id) else defender_name
-        winner_reward = reward if result.winner == str(attacker_id) else {
-            "gold": reward.get("opponent_gold", 0),
-            "xp": reward.get("opponent_xp", 0),
-        }
-        text = (
-            f"🏆 <b>{escape(pets_flavor.public_result_line(winner_name))}</b>\n"
-            f"🪙 +{_coins(winner_reward.get('gold', 0))}  ✨ +{winner_reward.get('xp', 0)} опыта"
-        )
-    keyboard = {"inline_keyboard": [[{"text": "⚔️ Открыть арену", "url": arena_url}]]} if arena_url else None
-    return text, keyboard
-
-
 # -------------------------------------------------------------------------- history
 
 
@@ -1155,16 +1157,12 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
         lines.append("Боёв пока не было.")
     for record in rows_data:
         attacked = str(record.get("attacker_id")) == str(user_id)
-        guardian = bool(record.get("guardian_intervention"))
         draw = bool(record.get("draw"))
         won = str(record.get("winner_id")) == str(user_id)
         other = record.get("defender_name") if attacked else record.get("attacker_name")
         owner = record.get("defender_owner") if attacked else record.get("attacker_owner")
         who = f"{escape(owner or '?')} — {escape(other or '?')}"
-        outcome = (
-            f"Охранник вмешался, +{record.get('xp', C.GUARDIAN_XP)} опыта"
-            if guardian else "Ничья" if draw else ("Победа" if won else "Поражение")
-        )
+        outcome = "Ничья" if draw else ("Победа" if won else "Поражение")
         gold = record.get("gold") or 0
         lost = record.get("loss_gold") or 0
         # Bare numbers here, with no noun to agree with -- the line is already dense and
@@ -1247,7 +1245,8 @@ def no_pet_view(user_id) -> tuple[str, dict]:
     text = (
         "У тебя ещё нет существа.\n\n"
         f"Сначала клетка ({_coins(C.CAGE_PRICE)}), потом приручение"
-        f" ({_coins(C.TAME_PRICE)})."
+        f" ({_coins(C.TAME_PRICE)}).\n"
+        "Существо должно быть твоей собственной раскрашенной фигуркой."
     )
     return text, {"inline_keyboard": [_back_row(user_id)]}
 

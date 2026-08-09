@@ -849,6 +849,62 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertTrue(all(item.source == "shop" and item.slot == "weapon" for item in first))
         self.assertTrue(all(item.rarity != "cursed" for item in first))
 
+    def test_every_daily_storefront_has_a_weapon_from_one_basic_farm_run(self):
+        """The shop's onboarding promise cannot depend on a lucky daily rotation."""
+        budget = pets_config.FARM_GOLD_PER_RUN[1]
+        self.assertGreaterEqual(budget, pets_config.STARTER_WEAPON_MAX_PRICE)
+        # The rotation advances in ten-code windows; a full year also guards against a
+        # future catalogue/offset change silently removing the injected starter slot.
+        for entry in ("shop-chat", "other-chat", "-100123"):
+            for offset in range(366):
+                stock = pets_config.daily_storefront_weapons(
+                    entry, date(2026, 1, 1) + timedelta(days=offset),
+                )
+                self.assertTrue(
+                    any(item.price <= budget for item in stock),
+                    (entry, offset, [(item.code, item.price) for item in stock]),
+                )
+
+    def test_starter_weapon_resale_stays_low(self):
+        starters = [
+            item for item in pets_config.items_for_slot("weapon", "shop")
+            if item.price <= pets_config.STARTER_WEAPON_MAX_PRICE
+        ]
+        self.assertTrue(starters)
+        self.assertTrue(all(item.resale_price <= item.price // 5 for item in starters))
+
+    def test_storefront_keeps_the_last_unowned_starter_affordable(self):
+        starters = [
+            item for item in pets_config.items_for_slot("weapon", "shop")
+            if item.price <= pets_config.STARTER_WEAPON_MAX_PRICE
+        ]
+        last_starter = starters[-1]
+        stock = pets_config.daily_storefront_weapons(
+            "shop-chat", date(2026, 8, 8),
+            excluded_codes={item.code for item in starters[:-1]},
+        )
+        self.assertIn(last_starter.code, {item.code for item in stock})
+        self.assertTrue(any(item.price <= pets_config.FARM_GOLD_PER_RUN[1] for item in stock))
+
+    def test_weapon_price_bands_keep_500_unique_weapons_and_rare_goals(self):
+        weapons = pets_config.items_for_slot("weapon")
+        self.assertEqual(len(weapons), 500)
+        self.assertEqual(len({item.code for item in weapons}), 500)
+        self.assertEqual(len({item.name for item in weapons}), 500)
+        shop = [item for item in weapons if item.source == "shop"]
+        prices = {
+            rarity: [item.price for item in shop if item.rarity == rarity]
+            for rarity in ("common", "uncommon", "rare")
+        }
+        self.assertEqual((min(prices["common"]), max(prices["common"])), (10, 20))
+        self.assertEqual((min(prices["uncommon"]), max(prices["uncommon"])), (50, 70))
+        self.assertEqual((min(prices["rare"]), max(prices["rare"])), (130, 155))
+        self.assertTrue(all(item.resale_price <= item.price // 5 for item in shop))
+        self.assertTrue(all(
+            item.source == "drop" and item.price == 0
+            for item in weapons if item.rarity == "legendary"
+        ))
+
     def test_core_purchase_refuses_weapon_outside_daily_window(self):
         entry = "shop-chat"
         self._two_pets(entry)
@@ -1132,7 +1188,7 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(pets.get_pet(entry, "2")["wins"], 1)
         self.assertEqual(pets.get_pet(entry, "1")["wins"], 0)
 
-    def test_empty_bank_rejects_normal_and_guardian_fights_without_mutation(self):
+    def test_empty_bank_rejects_fights_without_mutation(self):
         entry = "empty-bank"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -1147,11 +1203,6 @@ class RecordFightTests(PetsTestCase):
 
         with self.assertRaisesRegex(ValueError, "No accumulated"):
             pets.record_fight(entry, "1", "2", result, moment.date(), now=moment)
-        with self.assertRaisesRegex(ValueError, "No accumulated"):
-            pets.record_guardian_intervention(
-                entry, "1", "2", moment.date(), now=moment,
-            )
-
         self.assertEqual(pets.get_pet(entry, "1")["fights"], 0)
         self.assertEqual(pets.get_pet(entry, "2")["fights"], 0)
         self.assertEqual(pets.history(entry, "1"), [])
@@ -1439,7 +1490,7 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         self.assertIn("Следующий подарок", message)
         self.assertIn(item.code, pets.get_pet("chat", "1")["inventory"])
 
-    def test_telemetry_tracks_sale_arena_gold_and_guard(self):
+    def test_telemetry_tracks_sale_and_arena_gold(self):
         self._two_pets()
         self._level("chat", "1", pets_config.GIFT_MIN_PET_LEVEL)
         item = pets_config.find_item("w001")
@@ -1451,11 +1502,9 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
              patch("random.random", return_value=1.0):
             outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 8))
-        pets.record_guardian_intervention("chat", "1", "2", date(2026, 8, 8))
         metrics = pets.economy_telemetry("chat")
         self.assertEqual(metrics["item_sale_gold"], pets_config.resale_value(item))
         self.assertEqual(metrics["arena_reward_gold"], outcome["gold"])
-        self.assertEqual(metrics["guardian_interventions"], 1)
 
     def test_passive_telemetry_credits_once_per_settled_hour(self):
         start = datetime(2026, 8, 8, 10)
@@ -1521,6 +1570,25 @@ class FarmTests(PetsTestCase):
         self.assertTrue(pets.mark_farm_notified(entry, "1", receipt["run_id"], now=start + timedelta(hours=6)))
         self.assertFalse(pets.mark_farm_notified(entry, "1", receipt["run_id"]))
         self.assertEqual(pets.pending_farm_notifications(entry), [])
+
+    def test_first_basic_farm_run_buys_a_daily_starter_weapon(self):
+        """A player need not wait for hourly passive gold before their first purchase."""
+        entry, start = "farm-shop", datetime(2026, 8, 1, 10)
+        self._tame(entry, "1")
+        economy.grant(entry, "1", pets_config.FARM_UPGRADE_COSTS[0], "farm-test-funds")
+        self.assertTrue(pets.upgrade_farm(entry, "1", 0, now=start)[0])
+        self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
+        finish = start + timedelta(hours=pets_config.FARM_DURATION_HOURS)
+        receipt = pets.settle_completed_farms(entry, finish)[0]
+        self.assertEqual(receipt["gold"], pets_config.FARM_GOLD_PER_RUN[1])
+
+        with patch("pets.app_now", return_value=finish):
+            starter = next(
+                item for item in pets.daily_storefront_weapons(entry, finish.date())
+                if item.price <= receipt["gold"]
+            )
+            ok, message = pets.buy_item(entry, "1", 0, starter.code)
+        self.assertTrue(ok, message)
 
     def test_farm_reward_is_snapshotted_and_auto_equips_a_found_item(self):
         entry, start = "farm", datetime(2026, 8, 1, 10)

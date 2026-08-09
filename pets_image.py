@@ -356,40 +356,6 @@ def render_fight_result(path, result, attacker: dict, defender: dict) -> Path:
     return path
 
 
-def render_guardian_result(
-    path, attacker: dict, defender: dict, xp: int = 5,
-) -> Path:
-    """Render a stopped fight with both pet photos and an explicit attack direction."""
-    image = Image.new("RGB", (WIDTH, HEIGHT), "#f6f2ea")
-    draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, WIDTH, 84), fill="#17372f")
-    _center(draw, 19, "АРЕНА", _font(34, bold=True), "#ffffff")
-
-    # The attacker is marked red; the protected target is marked green.  Both keep full
-    # HP because the guard stopped the fight before the combat engine ran.
-    _fighter_panel(draw, image, 45, attacker, "left", False)
-    _fighter_panel(draw, image, 685, defender, "right", True)
-    draw.ellipse((548, 348, 732, 532), fill="#f4b63f", outline="#ffffff", width=7)
-    _center(draw, 394, "СТОП", _font(36, bold=True), "#26343a")
-
-    _center(draw, 812, "ОХРАННИК ВМЕШАЛСЯ", _font(34, bold=True), LOSER_NAME_COLOR)
-    _center(draw, 858, "БОЙ НЕ СОСТОЯЛСЯ", _font(18, bold=True), "#5c666c")
-    _center(draw, 905, f"+{max(0, int(xp))} ОПЫТА НАПАДАВШЕМУ", _font(25, bold=True), "#147a59")
-    attack_name = _short(attacker.get("pet_name"), 18, size=22).upper()
-    target_name = _short(defender.get("pet_name"), 18, size=22).upper()
-    attack_level = max(1, int(attacker.get("level", 1)))
-    target_level = max(1, int(defender.get("level", 1)))
-    _center(
-        draw, 960, f"АТАКА: {attack_name} УР {attack_level}  >  {target_name} УР {target_level}",
-        _font(22, bold=True), "#26343a",
-    )
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(path, format="JPEG", quality=91, optimize=True)
-    return path
-
-
 def temporary_result_path() -> Path:
     descriptor, path = tempfile.mkstemp(prefix="pet_fight_", suffix=".jpg")
     os.close(descriptor)
