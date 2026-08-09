@@ -142,7 +142,9 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(client.downloads), [1, 2])
 
     async def test_already_known_entries_are_never_resolved_or_downloaded(self):
-        client = _FakeClient(self._messages(1, 2, 3))
+        # Newest first, as iter_messages(reverse=False) really yields: the new work sits
+        # above the two the poll already has.
+        client = _FakeClient(self._messages(3, 2, 1))
         entries = await voting.collect_entries(
             client, object(), timezone.utc, self.media_dir,
             skip_entry_ids={"1", "2"}, log=lambda *_: None,
@@ -193,6 +195,56 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(entries), len(client._messages))
         self.assertGreaterEqual(len(entries), 1)
+
+    async def test_a_recollect_stops_at_the_first_work_it_already_has(self):
+        """Adding a late entry must not re-read the week. Newest-first, so everything
+        past an already-collected work was already collected too."""
+        client = _FakeClient(self._messages(5, 4, 3, 2, 1))
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir,
+            skip_entry_ids={"3", "2", "1"}, log=lambda *_: None,
+        )
+
+        self.assertEqual([e.entry_id for e in entries], ["5", "4"])
+        # The scan never even looked at 2 and 1 -- it stopped on reaching 3.
+        self.assertEqual(self.resolved, [5, 4])
+        self.assertEqual(client.downloads, [5, 4])
+
+    async def test_stopping_early_does_not_re_collect_a_half_seen_album(self):
+        """An album's entry id is its FIRST message's, which arrives LAST newest-first.
+
+        The caption is not necessarily on that first message -- group_into_entries looks
+        for the hashtag anywhere in the group precisely because it moves around. So an
+        album can be recognised from a message the scan meets before its head. Stop
+        without keeping the head and the rest regroup under a different first id: an id
+        skip_entry_ids has never heard of, so the post is collected a second time.
+        """
+        album = [
+            _FakeMessage(12, text="работа #итогинедели", grouped_id=77, resolved=self.resolved),
+            _FakeMessage(11, text="", grouped_id=77, resolved=self.resolved),
+            _FakeMessage(10, text="", grouped_id=77, resolved=self.resolved),
+        ]
+        client = _FakeClient([*self._messages(20), *album, *self._messages(9)])
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir,
+            skip_entry_ids={"10", "9"}, log=lambda *_: None,
+        )
+
+        # Only the genuinely new work. The album stays the one entry it already was.
+        self.assertEqual([e.entry_id for e in entries], ["20"])
+        self.assertNotIn(12, client.downloads)
+        self.assertNotIn(11, client.downloads)
+
+    async def test_a_first_collection_still_reads_the_whole_week(self):
+        client = _FakeClient(self._messages(5, 4, 3, 2, 1))
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir, log=lambda *_: None,
+        )
+
+        self.assertEqual({e.entry_id for e in entries}, {"1", "2", "3", "4", "5"})
 
     async def test_nothing_new_means_an_empty_list_not_an_error(self):
         client = _FakeClient(self._messages(1, 2))

@@ -163,12 +163,20 @@ async def collect_entries(
     it reaches back into the previous week and pulls its works into the new poll.
 
     `skip_entry_ids` -- entry ids (message ids, as strings) already known from a previous
-    collection -- are recognized from the message listing alone (needed either way, to
-    find anything new) but never resolved further: no get_sender() round trip, no photo
-    download, no Entry built. Re-collecting a poll that already has a dozen entries would
-    otherwise redo all of that work for every one of them just to end up with the same
-    Entry again. The caller is responsible for keeping those already-known entries around
-    (see bot_listener.handle_vote_command) -- this function only ever reports what's new.
+    collection -- do two things. They are never resolved further (no get_sender() round
+    trip, no photo download, no Entry built), and, more importantly, THE SCAN STOPS at the
+    first one it meets. The listing is newest-first, so everything past a work that was
+    already collected was already collected too; a re-collect that only wants today's
+    additions has no reason to read back to Monday. A first collection (no skip ids) still
+    reads the whole week.
+
+    The caller is responsible for keeping those already-known entries around (see
+    bot_listener.handle_vote_command) -- this function only ever reports what's new.
+
+    The cost of stopping early: a post that gained the hashtag AFTER it was first passed
+    over -- edited days later -- sits below the newest known work and is not picked up.
+    Clearing and collecting again finds it, and that is rarer than adding a few late
+    entries to a poll, which is the case this is for.
 
     Uses the Telethon session directly rather than telegram_fetch's cache: that cache
     stores plain text dicts, and this needs the media and the grouped_id, neither of which
@@ -196,6 +204,7 @@ async def collect_entries(
             log(f"[voting] progress report failed: {e}")
 
     messages = []
+    stopped_at_known = False
     await report("scan", 0, 0)
     async for message in client.iter_messages(entity, reverse=False):
         if message.date < start_utc:
@@ -203,11 +212,28 @@ async def collect_entries(
         if message.action is not None:
             continue  # service message (join/leave/pin)
         messages.append(message)
+        # Reaching a nomination that was already collected means everything below it was
+        # too: the listing is newest-first, so a re-collect only has to walk back as far
+        # as the first thing it recognises. Without this, adding one late entry re-read
+        # the whole week every time.
+        #
+        # The known message is kept rather than dropped, and the break happens after
+        # appending it: in an album the entry id is the FIRST message's, which arrives
+        # last here, so stopping before it would leave the album's other messages behind
+        # as a headless group -- which reads as a brand-new nomination and gets collected
+        # a second time.
+        if skip_entry_ids and str(message.id) in skip_entry_ids:
+            stopped_at_known = True
+            break
         if len(messages) % 250 == 0:
             await report("scan", len(messages), 0)
 
     groups = group_into_entries(messages, hashtag)
-    log(f"[voting] {len(messages)} message(s) since {start_local.date()} -> {len(groups)} nomination(s)")
+    log(
+        f"[voting] {len(messages)} message(s) "
+        f"{'back to the first already-collected work' if stopped_at_known else f'since {start_local.date()}'}"
+        f" -> {len(groups)} nomination(s)"
+    )
 
     media_dir.mkdir(parents=True, exist_ok=True)
     entries: list[Entry] = []
