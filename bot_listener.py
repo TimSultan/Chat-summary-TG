@@ -6361,12 +6361,30 @@ async def _pets_run_fight(
 ) -> None:
     """One duel, start to finish: simulate, record, print.
 
-    The daily fight is spent inside pets.record_fight, together with the payout, so a
+    One banked fight is spent inside pets.record_fight, together with the payout, so a
     crash between "fought" and "paid" cannot exist -- there is one write, not two.
     """
     mine = pets.get_pet(entry, user_id)
     opponent_id = (opponent_raw or "").strip()
     theirs = pets.get_pet(entry, opponent_id) if opponent_id else None
+
+    async def redraw_empty_fight_bank() -> None:
+        """Keep a last-fight race private instead of leaking a refusal to the group."""
+        if arena_menu_chat_id is not None:
+            await _send_pets_view(
+                api, arena_menu_chat_id, pets_ui.fight_view(entry, user_id, xp),
+                message_id=arena_menu_message_id, log=log,
+            )
+        elif no_fights_to_user_dm:
+            await _send_pets_view(
+                api, user_id, pets_ui.fight_view(entry, user_id, xp), log=log,
+            )
+        else:
+            await _send_pets_view(
+                api, chat_id, pets_ui.fight_view(entry, user_id, xp),
+                message_id=message_id, log=log,
+            )
+
     if not mine or not theirs:
         # A card can also become stale when its owner untames their creature. Treat it
         # the same as a spent per-target card: redraw only the private arena menu.
@@ -6423,30 +6441,22 @@ async def _pets_run_fight(
         # it can be the public group selected for fight-result announcements.
         return
     if pets.fights_left(entry, user_id, pets.today()) <= 0:
-        if arena_menu_chat_id is not None:
-            # The fight destination can already be the public result chat. Always redraw
-            # the original DM arena menu when the daily budget runs out in the meantime.
-            await _send_pets_view(
-                api, arena_menu_chat_id, pets_ui.fight_view(entry, user_id, xp),
-                message_id=arena_menu_message_id, log=log,
-            )
-            return
-        if no_fights_to_user_dm:
-            await _send_pets_view(
-                api, user_id, pets_ui.fight_view(entry, user_id, xp), log=log,
-            )
-            return
-        await _send_pets_view(
-            api, chat_id, pets_ui.fight_view(entry, user_id, xp),
-            message_id=message_id, log=log,
-        )
+        # The fight destination can already be the public result chat. Always redraw the
+        # original DM arena menu (or send the duellist a DM) when the bank is empty.
+        await redraw_empty_fight_bank()
         return
 
     # The adult is the attacker. This safety valve intentionally happens after the fight
     # budget check: a valid attempted attack consumes exactly one attempt, but cannot
     # create gold, a loss debit, a drop, or a normal combat result.
     if mine.get("level", 1) - theirs.get("level", 1) >= C.GUARDIAN_LEVEL_GAP:
-        reward = pets.record_guardian_intervention(entry, user_id, opponent_id, pets.today())
+        try:
+            reward = pets.record_guardian_intervention(entry, user_id, opponent_id, pets.today())
+        except ValueError:
+            # Another simultaneous tap may have spent the final banked fight between the
+            # check above and this authoritative mutation.  Never announce that race.
+            await redraw_empty_fight_bank()
+            return
         attacker_owner = (
             f"@{html.escape(str(mine.get('owner_username')).lstrip('@'))}"
             if mine.get("owner_username") else html.escape(mine.get("owner_name") or "неизвестный хозяин")
@@ -6531,10 +6541,16 @@ async def _pets_run_fight(
             str(opponent_id): _pets_fighter_snapshot(defender_fighter),
         },
     }
-    reward = pets.record_fight(
-        entry, user_id, opponent_id, result, pets.today(), attacker_xp=xp,
-        combat_snapshot=combat_snapshot,
-    )
+    try:
+        reward = pets.record_fight(
+            entry, user_id, opponent_id, result, pets.today(), attacker_xp=xp,
+            combat_snapshot=combat_snapshot,
+        )
+    except ValueError:
+        # See the guardian branch above: record_fight is the authority on spending the
+        # bank, and a stale final tap stays entirely in the attacker's private UI.
+        await redraw_empty_fight_bank()
+        return
     report = pets_ui.fight_report(
         result, str(user_id),
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},

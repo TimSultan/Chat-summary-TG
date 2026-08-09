@@ -285,7 +285,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
         self.assertIsNone(pets.get_pet(entry, "1")["equipped"]["weapon"])
 
 
-class DailyFightsAndOpponentTests(PetsTestCase):
+class FightBankAndOpponentTests(PetsTestCase):
     def test_duels_have_a_ten_minute_cooldown_and_daily_cap(self):
         entry = "chat"
         base = datetime(2026, 8, 1, 12, 0, 0)
@@ -319,20 +319,113 @@ class DailyFightsAndOpponentTests(PetsTestCase):
         self.assertFalse(pets.can_attack_in_arena(entry, "1", "2", day))
         self.assertTrue(pets.can_attack_in_arena(entry, "1", "2", day + timedelta(days=1)))
 
-    def test_daily_counter_resets_on_a_new_date(self):
+    def test_fight_bank_recharges_one_per_complete_hour_and_keeps_fraction(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
-        self._tame(entry, "2", "Defender")
-        day1 = date(2026, 8, 1)
-        result = SimpleNamespace(winner="1", loser="2")
+        start = datetime(2026, 8, 1, 12, 0)
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        record.update({"fight_bank": 0, "fight_bank_cap": 5, "fight_bank_checkpoint": start.isoformat()})
+        pets._save(entry, data)
 
-        with patch("random.random", return_value=1.0):  # never drop, keep it simple
-            pets.record_fight(entry, "1", "2", result, day1)
+        self.assertEqual(pets.fights_left(entry, "1", now=start + timedelta(minutes=59, seconds=59)), 0)
+        self.assertEqual(pets.fights_left(entry, "1", now=start + timedelta(hours=1)), 1)
+        self.assertEqual(pets.fights_left(entry, "1", now=start + timedelta(hours=2, minutes=59)), 2)
+        status = pets.fight_allowance_breakdown(entry, "1", now=start + timedelta(hours=2, minutes=59))
+        self.assertEqual(status["seconds_until_next"], 60)
 
-        self.assertEqual(pets.fights_left(entry, "1", day1), pets.daily_allowance(entry, '1', day1) - 1)
+    def test_fight_bank_caps_overflow_and_legacy_daily_state_migrates_conservatively(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        now = datetime(2026, 8, 1, 12, 0)
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        record.update({"fight_bank": 0, "fight_bank_cap": 5, "fight_bank_checkpoint": now.isoformat()})
+        pets._save(entry, data)
+        self.assertEqual(pets.fights_left(entry, "1", now=now + timedelta(hours=20)), 5)
+        # Overflow is discarded at the cap: spending much later starts a fresh hour.
+        capped = pets._load(entry)
+        capped["pets"]["1"]["fight_bank"] = 4
+        pets._save(entry, capped)
+        self.assertEqual(pets.fights_left(entry, "1", now=now + timedelta(hours=20, minutes=59)), 4)
 
-        day2 = day1 + timedelta(days=1)
-        self.assertEqual(pets.fights_left(entry, "1", day2), pets.daily_allowance(entry, '1', day2))
+        legacy = pets._load(entry)
+        legacy["pets"]["1"].pop("fight_bank", None)
+        legacy["pets"]["1"].pop("fight_bank_cap", None)
+        legacy["pets"]["1"].pop("fight_bank_checkpoint", None)
+        legacy["pets"]["1"].update({"fights_today": 8, "fights_day": now.date().isoformat()})
+        pets._save(entry, legacy)
+        self.assertEqual(pets.fights_left(entry, "1", now=now), 2)
+        migrated = pets.get_pet(entry, "1")
+        self.assertNotIn("fights_today", migrated)
+        self.assertNotIn("fights_day", migrated)
+
+    def test_fight_bank_does_not_reset_at_midnight(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        start = datetime(2026, 8, 1, 23, 30)
+        data = pets._load(entry)
+        data["pets"]["1"].update({
+            "fight_bank": 0, "fight_bank_cap": 5,
+            "fight_bank_checkpoint": start.isoformat(),
+        })
+        pets._save(entry, data)
+
+        self.assertEqual(pets.fights_left(entry, "1", now=start + timedelta(minutes=59)), 0)
+        self.assertEqual(pets.fights_left(entry, "1", now=start + timedelta(hours=1)), 1)
+
+    def test_corrupt_fight_bank_is_repaired_without_minting_old_hours(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        now = datetime(2026, 8, 2, 12, 0)
+        data = pets._load(entry)
+        data["pets"]["1"].update({
+            "fight_bank": "broken", "fight_bank_cap": 5,
+            "fight_bank_checkpoint": (now - timedelta(days=30)).isoformat(),
+        })
+        pets._save(entry, data)
+
+        status = pets.fight_allowance_breakdown(entry, "1", now=now)
+        self.assertEqual(status["fights_left"], 0)
+        repaired = pets.get_pet(entry, "1")
+        self.assertEqual(repaired["fight_bank"], 0)
+        self.assertEqual(repaired["fight_bank_checkpoint"], now.isoformat())
+
+    def test_legacy_migration_preserves_the_old_double_paint_remainder(self):
+        entry = "paint-migration"
+        self._tame(entry, "1", "Attacker")
+        now = datetime(2026, 8, 1, 12, 0)
+        stats.record_figurine_live(
+            entry, now.date(), "1", "owner", "Owner", message_id=77,
+        )
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        record.pop("fight_bank", None)
+        record.pop("fight_bank_cap", None)
+        record.pop("fight_bank_checkpoint", None)
+        # Old allowance: 10 base + 2 for this paint. Eleven were spent, so one remains.
+        record.update({"fights_today": 11, "fights_day": now.date().isoformat()})
+        pets._save(entry, data)
+
+        status = pets.fight_allowance_breakdown(entry, "1", now=now)
+        self.assertEqual((status["fights_left"], status["capacity"]), (1, 6))
+
+    def test_capacity_upgrade_does_not_retroactively_credit_old_hours(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        start = datetime(2026, 8, 1, 12, 0)
+        data = pets._load(entry)
+        data["pets"]["1"].update({
+            "fight_bank": 0, "fight_bank_cap": 5, "fight_bank_checkpoint": start.isoformat(),
+        })
+        pets._save(entry, data)
+        economy.grant(entry, "1", pets_config.CAGE_UPGRADE_COSTS[1], "test_upgrade")
+        ok, note = pets.upgrade_cage(entry, "1", 0, now=start + timedelta(hours=3))
+        self.assertTrue(ok, note)
+        # Three old-cap hours were collected; the extra capacity slot itself is empty.
+        status = pets.fight_allowance_breakdown(entry, "1", now=start + timedelta(hours=3))
+        self.assertEqual((status["fights_left"], status["capacity"]), (3, 6))
+        self.assertEqual(pets.fights_left(entry, "1", now=start + timedelta(hours=4)), 4)
 
     def test_find_opponent_draws_uniformly_from_all_pets_regardless_of_power_gap(self):
         entry = "chat"
@@ -1008,7 +1101,7 @@ class RecordFightTests(PetsTestCase):
         self._tame(entry, "2", "Defender")
         today = date(2026, 8, 1)
 
-        defender_fights_today_before = pets.get_pet(entry, "2")["fights_today"]
+        defender_fight_bank_before = pets.get_pet(entry, "2")["fight_bank"]
         defender_xp_before = pets.get_pet(entry, "2")["xp"]
         result = SimpleNamespace(winner="2", loser="1")  # attacker loses this one
 
@@ -1016,13 +1109,13 @@ class RecordFightTests(PetsTestCase):
              patch("random.random", return_value=1.0):  # no item drop
             outcome = pets.record_fight(entry, "1", "2", result, today)
 
-        # Attacker's daily budget went down by exactly one.
+        # Attacker's accumulated bank went down by exactly one.
         self.assertEqual(
             pets.fights_left(entry, "1", today),
             pets.daily_allowance(entry, "1", today) - 1,
         )
-        # Defender's own budget is completely untouched.
-        self.assertEqual(pets.get_pet(entry, "2")["fights_today"], defender_fights_today_before)
+        # Defender's own bank is completely untouched.
+        self.assertEqual(pets.get_pet(entry, "2")["fight_bank"], defender_fight_bank_before)
 
         # The returned dict is the ATTACKER's own outcome; attacker lost here.
         self.assertEqual(outcome["gold"], 0)
@@ -1038,6 +1131,30 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "2", 0), pets_config.WIN_GOLD_MIN)
         self.assertEqual(pets.get_pet(entry, "2")["wins"], 1)
         self.assertEqual(pets.get_pet(entry, "1")["wins"], 0)
+
+    def test_empty_bank_rejects_normal_and_guardian_fights_without_mutation(self):
+        entry = "empty-bank"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        moment = datetime(2026, 8, 1, 12, 0)
+        data = pets._load(entry)
+        data["pets"]["1"].update({
+            "fight_bank": 0, "fight_bank_cap": 5,
+            "fight_bank_checkpoint": moment.isoformat(),
+        })
+        pets._save(entry, data)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with self.assertRaisesRegex(ValueError, "No accumulated"):
+            pets.record_fight(entry, "1", "2", result, moment.date(), now=moment)
+        with self.assertRaisesRegex(ValueError, "No accumulated"):
+            pets.record_guardian_intervention(
+                entry, "1", "2", moment.date(), now=moment,
+            )
+
+        self.assertEqual(pets.get_pet(entry, "1")["fights"], 0)
+        self.assertEqual(pets.get_pet(entry, "2")["fights"], 0)
+        self.assertEqual(pets.history(entry, "1"), [])
 
     def test_record_fight_can_roll_a_drop_item_for_the_winner_only(self):
         entry = "chat"
@@ -1212,10 +1329,12 @@ class RecordFightTests(PetsTestCase):
         self._tame(entry, "2", "Defender")
         result = SimpleNamespace(winner="1", loser="2")
 
+        start = datetime(2026, 8, 1, 12, 0)
         with patch("random.random", return_value=1.0):
             for day_offset in range(pets_config.HISTORY_LIMIT + 3):
                 pets.record_fight(
-                    entry, "1", "2", result, date(2026, 8, 1) + timedelta(days=day_offset)
+                    entry, "1", "2", result, date(2026, 8, 1) + timedelta(days=day_offset),
+                    now=start + timedelta(hours=day_offset),
                 )
 
         rows = pets.history(entry, "1")
@@ -1480,9 +1599,9 @@ class MiscApiTests(PetsTestCase):
         self.assertEqual(pets.balance_for(entry, "1", 0), 42)
         self.assertEqual(pets.balance_for(entry, "1", 0), economy.balance(entry, "1", 0))
 
-    def test_fight_refresh_uses_the_same_local_midnight_as_daily_reset(self):
+    def test_fight_refresh_counts_to_the_next_hour(self):
         moment = datetime(2026, 8, 9, 18, 35, 20)
-        self.assertEqual(pets.fight_refresh_seconds(moment), 5 * 3600 + 24 * 60 + 40)
+        self.assertEqual(pets.fight_refresh_seconds(moment), 24 * 60 + 40)
 
     def test_award_xp_reports_level_ups(self):
         entry = "chat"

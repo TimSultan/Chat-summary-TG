@@ -170,6 +170,16 @@ class PetsCommandTests(unittest.TestCase):
             ))
         return api
 
+    def _empty_fight_bank(self, user_id):
+        """Put one pet at an empty, freshly checkpointed hourly fight bank."""
+        capacity = pets.fight_allowance_breakdown(CHAT, user_id, pets.today())["capacity"]
+        data = pets._load(CHAT)
+        record = data["pets"][str(user_id)]
+        record["fight_bank"] = 0
+        record["fight_bank_checkpoint"] = pets.app_now().isoformat()
+        record["fight_bank_cap"] = capacity
+        pets._save(CHAT, data)
+
     # ---------------------------------------------------------------------- commands
 
     def test_the_menu_opens_in_a_dm(self):
@@ -198,6 +208,23 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("/duel @user", api.edits[0]["text"])
         self.assertIn("Особые преимущества", api.edits[0]["text"])
         self.assertIn("30%", api.edits[0]["text"])
+
+    def test_arena_screen_shows_empty_bank_capacity_and_hourly_countdown(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
+        self._empty_fight_bank(PLAYER["id"])
+
+        text, keyboard = pets_ui.fight_view(CHAT, PLAYER["id"], RICH_XP)
+
+        self.assertIn("В запасе боёв: <b>0 из 5</b>", text)
+        self.assertIn("Следующий +1 бой через:", text)
+        self.assertIn(pets_ui.ARENA_NO_FIGHTS_NOTICE, text)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for button in _buttons({"reply_markup": keyboard})
+            if button.get("callback_data")
+        }
+        self.assertNotIn("search", actions)
 
     def test_farm_menu_builds_then_starts_a_single_six_hour_shift(self):
         economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.FARM_UPGRADE_COSTS[0], "test")
@@ -727,10 +754,7 @@ class PetsCommandTests(unittest.TestCase):
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
         pets.tame(CHAT, 43, RICH_XP, "Opponent", "file_b", "Bob")
-        data = pets._load(CHAT)
-        data["pets"][str(PLAYER["id"])]["fights_today"] = 99
-        data["pets"][str(PLAYER["id"])]["fights_day"] = pets.today().isoformat()
-        pets._save(CHAT, data)
+        self._empty_fight_bank(PLAYER["id"])
         api = FakeApi()
 
         async def must_not_resolve_group(*args, **kwargs):
@@ -773,7 +797,7 @@ class PetsCommandTests(unittest.TestCase):
         attacker = pets.get_pet(CHAT, PLAYER["id"])
         defender = pets.get_pet(CHAT, 43)
         self.assertEqual(attacker["xp"], C.GUARDIAN_XP)
-        self.assertEqual(attacker["fights_today"], 1)
+        self.assertEqual(attacker["fight_bank"], 4)
         self.assertEqual(defender["fights"], 0)
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), attacker_gold_before)
         self.assertEqual(economy.balance(CHAT, 43, 0), defender_gold_before)
@@ -1059,10 +1083,7 @@ class PetsCommandTests(unittest.TestCase):
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
         pets.tame(CHAT, 43, RICH_XP, "Тумблер", "file_b", "Bob")
-        data = pets._load(CHAT)
-        data["pets"][str(PLAYER["id"])]["fights_today"] = 99
-        data["pets"][str(PLAYER["id"])]["fights_day"] = pets.today().isoformat()
-        pets._save(CHAT, data)
+        self._empty_fight_bank(PLAYER["id"])
         api = FakeApi()
         challenger = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
         target = SimpleNamespace(user_id=43, display_name="Bob")
@@ -1093,10 +1114,7 @@ class PetsCommandTests(unittest.TestCase):
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
         pets.buy_cage(CHAT, 43, RICH_XP)
         pets.tame(CHAT, 43, RICH_XP, "Opponent", "file_b", "Bob")
-        data = pets._load(CHAT)
-        data["pets"][str(PLAYER["id"])]["fights_today"] = 99
-        data["pets"][str(PLAYER["id"])]["fights_day"] = pets.today().isoformat()
-        pets._save(CHAT, data)
+        self._empty_fight_bank(PLAYER["id"])
         api = FakeApi()
 
         _run(bot_listener._pets_run_fight(
@@ -1109,6 +1127,25 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(api.photo_files, [])
         self.assertEqual(api.edits[-1]["chat_id"], DM_CHAT_ID)
         self.assertIn(pets_ui.ARENA_NO_FIGHTS_NOTICE, api.edits[-1]["text"])
+
+    def test_last_fight_race_from_authoritative_write_stays_in_arena_dm(self):
+        """A concurrent tap may drain the bank after the UI precheck but before save."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
+        pets.buy_cage(CHAT, 43, RICH_XP)
+        pets.tame(CHAT, 43, RICH_XP, "Opponent", "file_b", "Bob")
+        api = FakeApi()
+
+        with patch.object(pets, "record_fight", side_effect=ValueError("bank was spent")):
+            _run(bot_listener._pets_run_fight(
+                api, MAIN_CHAT_ID, 900, CHAT, PLAYER["id"], "43", RICH_XP,
+                log=lambda *_: None, arena_menu_chat_id=DM_CHAT_ID,
+                arena_menu_message_id=900,
+            ))
+
+        self.assertEqual(api.sent, [])
+        self.assertEqual(api.photo_files, [])
+        self.assertEqual(api.edits[-1]["chat_id"], DM_CHAT_ID)
 
     def test_private_duel_posts_the_result_in_the_bot_chat(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

@@ -40,7 +40,7 @@ import pets_config as C
 import stats
 from app_time import now as app_now
 
-PETS_STORE_VERSION = 3
+PETS_STORE_VERSION = 4
 # Rolling fight log, capped independently of C.HISTORY_LIMIT (that constant bounds what
 # ONE player is shown per /history call, not how many chat-wide entries are kept on disk)
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
@@ -277,8 +277,11 @@ def _new_record() -> dict:
         "fights": 0,
         "wins": 0,
         "created_at": app_now().isoformat(),
-        "fights_today": 0,
-        "fights_day": app_now().date().isoformat(),
+        # New pets enter the arena with a full basic bank.  The checkpoint is per pet,
+        # rather than a midnight-wide reset, so partial hours survive restarts.
+        "fight_bank": C.BASE_FIGHT_BANK_CAPACITY,
+        "fight_bank_cap": C.BASE_FIGHT_BANK_CAPACITY,
+        "fight_bank_checkpoint": app_now().isoformat(),
         "farm_level": 0,
         "farm_features": {},
         "farm_run": None,
@@ -334,10 +337,130 @@ def _name_taken(data: dict, name: str, exclude_uid: str | None = None) -> bool:
     return False
 
 
-def _reset_if_new_day(record: dict, today: date) -> None:
-    if record.get("fights_day") != today.isoformat():
-        record["fights_day"] = today.isoformat()
-        record["fights_today"] = 0
+def _safe_nonnegative_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _checkpoint_at(value, now: datetime) -> datetime | None:
+    """Parse a persisted fight-bank checkpoint without trusting malformed saves."""
+    if not isinstance(value, str):
+        return None
+    try:
+        checkpoint = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # Historic/manual saves can contain a naive ISO timestamp.  Treat it in the same
+    # local timezone as ``now`` rather than raising on an aware/naive subtraction.
+    if checkpoint.tzinfo is None and now.tzinfo is not None:
+        checkpoint = checkpoint.replace(tzinfo=now.tzinfo)
+    elif checkpoint.tzinfo is not None and now.tzinfo is None:
+        checkpoint = checkpoint.replace(tzinfo=None)
+    return checkpoint
+
+
+def _legacy_fights_remaining(record: dict, capacity: int, now: datetime) -> int:
+    """Safely turn a pre-v4 daily counter into one initial bank balance.
+
+    A prior calendar day had already earned its normal reset, so it starts full under
+    the new rules.  For the current day, preserve only unspent legacy fights and clamp
+    them to the smaller new capacity.  No old elapsed time is converted into hourly
+    credits: migration's checkpoint is always ``now``.
+    """
+    if record.get("fights_day") != now.date().isoformat():
+        return capacity
+    cage = min(max(_safe_nonnegative_int(record.get("cage_level", 1), 1), 1), C.CAGE_MAX_LEVEL)
+    farm = _safe_nonnegative_int(record.get("farm_level", 0))
+    cage_bonus = C.CAGE_BONUS_FIGHTS[cage - 1]
+    farm_bonus = farm // C.FARM_LEVELS_PER_FIGHT
+    # The new capacity contains one slot per active paint, so its live paint count can
+    # be recovered after subtracting the base/cage/farm terms. The retired daily system
+    # granted two attempts per paint; include those when preserving today's remainder.
+    recent_paints = max(0, capacity - C.BASE_FIGHT_BANK_CAPACITY - cage_bonus - farm_bonus)
+    legacy_allowance = 10 + cage_bonus + farm_bonus + recent_paints * 2
+    remaining = max(0, legacy_allowance - _safe_nonnegative_int(record.get("fights_today")))
+    return min(capacity, remaining)
+
+
+def _settle_fight_bank(record: dict, capacity: int, now: datetime) -> tuple[int, datetime, bool]:
+    """Settle whole elapsed recharge hours in-place and return bank/checkpoint/changed.
+
+    The previous stored cap is deliberately used while settling.  Therefore buying an
+    upgrade never turns time before that purchase into extra fights.  Conversely, once a
+    bank reaches either cap, overflow and the old fractional remainder are discarded;
+    spending later cannot instantly refill from an old timestamp.
+    """
+    capacity = max(0, int(capacity))
+    changed = False
+    if "fight_bank" not in record:
+        bank = _legacy_fights_remaining(record, capacity, now)
+        checkpoint = now
+        record["fight_bank"] = bank
+        record["fight_bank_checkpoint"] = checkpoint.isoformat()
+        record["fight_bank_cap"] = capacity
+        record.pop("fights_today", None)
+        record.pop("fights_day", None)
+        return bank, checkpoint, True
+
+    raw_bank = record.get("fight_bank")
+    raw_cap = record.get("fight_bank_cap")
+    try:
+        bank = int(raw_bank)
+        old_cap = int(raw_cap)
+        numeric_state_valid = bank >= 0 and old_cap > 0
+    except (TypeError, ValueError):
+        bank, old_cap, numeric_state_valid = 0, capacity, False
+    if not numeric_state_valid:
+        # A damaged bank must not turn an ancient otherwise-valid checkpoint into a
+        # windfall. Repair conservatively and start its recharge clock now.
+        bank = min(max(0, bank), capacity)
+        old_cap = capacity
+        checkpoint = now
+        changed = True
+    else:
+        checkpoint = _checkpoint_at(record.get("fight_bank_checkpoint"), now)
+    # A missing/malformed cap is trusted no more than today's current capacity.  This
+    # avoids a corrupt value becoming an unbounded historical-recharge multiplier.
+    if old_cap <= 0:
+        old_cap = capacity
+    bank = min(bank, old_cap)
+    if checkpoint is None or checkpoint > now:
+        checkpoint = now
+        changed = True
+    else:
+        elapsed = max(0.0, (now - checkpoint).total_seconds())
+        completed = int(elapsed // C.FIGHT_BANK_RECHARGE_SECONDS)
+        if bank >= old_cap:
+            # The bank was already full: elapsed time cannot be stored as credit.
+            checkpoint = now
+            changed = True
+        elif completed:
+            bank = min(old_cap, bank + completed)
+            if bank >= old_cap:
+                checkpoint = now
+            else:
+                checkpoint += timedelta(seconds=completed * C.FIGHT_BANK_RECHARGE_SECONDS)
+            changed = True
+
+    # Now apply capacity changes.  Increasing capacity creates room only; it never
+    # creates a fight.  Losing a temporary/upgrade bonus trims an overfull bank.
+    if bank > capacity:
+        bank = capacity
+        checkpoint = now
+        changed = True
+    if record.get("fight_bank") != bank:
+        record["fight_bank"] = bank
+        changed = True
+    if record.get("fight_bank_cap") != capacity:
+        record["fight_bank_cap"] = capacity
+        changed = True
+    checkpoint_text = checkpoint.isoformat()
+    if record.get("fight_bank_checkpoint") != checkpoint_text:
+        record["fight_bank_checkpoint"] = checkpoint_text
+        changed = True
+    return bank, checkpoint, changed
 
 
 def _apply_xp(record: dict, amount: int) -> tuple[int, int]:
@@ -359,17 +482,19 @@ def _apply_xp(record: dict, amount: int) -> tuple[int, int]:
 
 
 def today() -> date:
-    """The one clock the whole game reads (`fights_left`, `record_fight`, ...), so the UI
-    and this module can never disagree about what day it is."""
+    """Application-local calendar date, retained for history and duel limits."""
     return app_now().date()
 
 
 def fight_refresh_seconds(now: datetime | None = None) -> int:
-    """Whole seconds until the next local midnight, when daily fights reset."""
+    """Whole seconds until the next wall-clock hour (legacy display helper).
+
+    A pet's exact recharge can differ by its persisted fractional checkpoint; callers
+    rendering an arena card should use ``fight_allowance_breakdown()['seconds_until_next']``.
+    """
     moment = now or app_now()
-    next_day = moment.date() + timedelta(days=1)
-    midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=moment.tzinfo)
-    return max(0, round((midnight - moment).total_seconds()))
+    next_hour = moment.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return max(0, round((next_hour - moment).total_seconds()))
 
 
 def get_pet(entry, user_id) -> dict | None:
@@ -732,6 +857,7 @@ def start_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
 
 def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
     """Upgrade the farm after banking passive gold at the old level's rate."""
+    moment = now or app_now()
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -739,7 +865,13 @@ def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool,
     level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
     if level >= C.FARM_MAX_LEVEL:
         return False, f"Ферма уже максимального уровня ({C.FARM_MAX_LEVEL})."
-    settle_passive_income(entry, user_id, now=now)
+    # Settle the arena bank against the PRE-upgrade cap before this farm opens a new
+    # capacity slot.  The new slot is room, not retroactive hourly credit.
+    old_capacity, *_ = _fight_bank_components(entry, user_id, record, moment)
+    _, _, bank_changed = _settle_fight_bank(record, old_capacity, moment)
+    if bank_changed:
+        _save(entry, data)
+    settle_passive_income(entry, user_id, now=moment)
     # Settlement writes economy and telemetry independently. Reload so the farm upgrade
     # cannot overwrite a freshly updated metrics record with the stale snapshot above.
     data = _load(entry)
@@ -965,7 +1097,7 @@ def enforce_unique_weapons(entries) -> dict:
     return report
 
 
-def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
+def upgrade_cage(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
     data = _load(entry)
     record = data["pets"].get(str(user_id))
     if not record:
@@ -973,6 +1105,11 @@ def upgrade_cage(entry, user_id, xp) -> tuple[bool, str]:
     level = record.get("cage_level", 1)
     if level >= C.CAGE_MAX_LEVEL:
         return False, f"Клетка уже максимального уровня ({C.CAGE_MAX_LEVEL})."
+    moment = now or app_now()
+    old_capacity, *_ = _fight_bank_components(entry, user_id, record, moment)
+    _, _, bank_changed = _settle_fight_bank(record, old_capacity, moment)
+    if bank_changed:
+        _save(entry, data)
     cost = C.CAGE_UPGRADE_COSTS[level]
     ok, balance = economy.spend(entry, user_id, xp, cost, "buy:pet_cage_upgrade")
     if not ok:
@@ -1476,72 +1613,82 @@ def _chat_xp_for(entry, user_id) -> int:
     return user.xp(wpp) if user is not None else 0
 
 
-def yesterday_activity(entry, user_id, today) -> tuple[int, int]:
-    """(messages, figurines) this member posted YESTERDAY, from the recorded day file.
-
-    A closed day, deliberately -- see C.daily_fight_allowance. It is also the only reason
-    this is cheap enough to call on every menu draw: yesterday is already finalised on
-    disk, so this is one local JSON read and never a Telegram fetch, unlike anything that
-    has to know about today.
-
-    Returns (0, 0) when there is no file for yesterday at all -- a chat whose stats
-    tracking started this morning, or a midnight rollover that did not run. Everybody then
-    falls back to the base allowance, which is the right failure: fewer fights than earned,
-    never more.
-    """
-    day = today - timedelta(days=1)
-    users = stats.aggregate(entry, day, day)
-    user = users.get(str(user_id))
-    if user is None:
-        return 0, 0
-    return user.messages, user.figurines_painted
+def daily_allowance(entry, user_id, today=None) -> int:
+    """Compatibility accessor for the maximum accumulated-fight capacity."""
+    return fight_allowance_breakdown(entry, user_id, today)["capacity"]
 
 
-def daily_allowance(entry, user_id, today) -> int:
-    """Today's fight budget for one member, before anything they have already spent."""
-    return fight_allowance_breakdown(entry, user_id, today)["allowance"]
-
-
-def fight_allowance_breakdown(entry, user_id, today) -> dict:
-    """Public, display-ready components of today's fixed arena-fight allowance.
-
-    The paint component is derived from stats rather than saved on the pet.  That makes
-    a qualifying post grant its bonus immediately, lets it expire with the rolling
-    seven-day window, and ensures a deleted post disappears from the allowance too.
-    """
-    data = _load(entry)
-    record = _tamed_record(data, user_id)
-    if record is None:
-        return {
-            "allowance": 0, "base": 0, "cage_bonus": 0, "farm_bonus": 0,
-            "paint_bonus": 0, "recent_figurines": 0,
-        }
+def _fight_bank_components(entry, user_id, record: dict, now: datetime) -> tuple[int, int, int, int, int]:
+    """Return current (capacity, cage, farm, paint, recent painting count)."""
     cage = min(max(int(record.get("cage_level", 1) or 1), 1), C.CAGE_MAX_LEVEL)
     farm = max(0, int(record.get("farm_level", 0) or 0))
     recent_figurines = stats.recent_figurine_fight_bonus_count(
-        entry, user_id, today, C.RECENT_FIGURINE_FIGHT_BUFF_DAYS,
+        entry, user_id, now.date(), C.RECENT_FIGURINE_FIGHT_BUFF_DAYS,
     )
     cage_bonus = C.CAGE_BONUS_FIGHTS[cage - 1]
     farm_bonus = farm // C.FARM_LEVELS_PER_FIGHT
     paint_bonus = recent_figurines * C.FIGHTS_PER_RECENT_FIGURINE
+    return (
+        C.daily_fight_allowance(cage, farm, recent_figurines),
+        cage_bonus, farm_bonus, paint_bonus, recent_figurines,
+    )
+
+
+def fight_allowance_breakdown(entry, user_id, today=None, now: datetime | None = None) -> dict:
+    """Public, display-ready state of the accumulated arena-fight bank.
+
+    ``today`` is accepted for old callers but does not influence the bank.  The paint
+    component remains live-derived, so posts grant capacity immediately and expiry only
+    reduces capacity (never yields a duplicate credit).
+    """
+    now = now or app_now()
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return {
+            "allowance": 0, "capacity": 0, "available": 0, "fights_left": 0, "bank": 0,
+            "base": 0, "cage_bonus": 0, "farm_bonus": 0, "paint_bonus": 0,
+            "recent_figurines": 0, "seconds_until_next": None, "next_fight_at": None,
+        }
+    capacity, cage_bonus, farm_bonus, paint_bonus, recent_figurines = _fight_bank_components(
+        entry, user_id, record, now,
+    )
+    bank, checkpoint, changed = _settle_fight_bank(record, capacity, now)
+    if changed:
+        _save(entry, data)
+    if bank >= capacity:
+        seconds_until_next = None
+        next_fight_at = None
+    else:
+        elapsed = max(0.0, (now - checkpoint).total_seconds())
+        remainder = elapsed % C.FIGHT_BANK_RECHARGE_SECONDS
+        seconds_until_next = max(1, int(C.FIGHT_BANK_RECHARGE_SECONDS - remainder + 0.999999))
+        next_fight_at = (checkpoint + timedelta(seconds=C.FIGHT_BANK_RECHARGE_SECONDS)).isoformat()
     return {
-        "allowance": C.daily_fight_allowance(cage, farm, recent_figurines),
-        "base": C.BASE_DAILY_FIGHTS,
+        # `allowance` stays as a UI-friendly alias while old callers move to capacity.
+        "allowance": capacity, "capacity": capacity, "available": bank,
+        "fights_left": bank, "bank": bank,
+        "base": C.BASE_FIGHT_BANK_CAPACITY,
         "cage_bonus": cage_bonus,
         "farm_bonus": farm_bonus,
         "paint_bonus": paint_bonus,
         "recent_figurines": recent_figurines,
+        "seconds_until_next": seconds_until_next,
+        "next_fight_at": next_fight_at,
     }
 
 
-def fights_left(entry, user_id, today) -> int:
-    data = _load(entry)
-    record = _tamed_record(data, user_id)
-    if record is None:
-        return 0
-    _reset_if_new_day(record, today)  # in-memory only; nothing to persist on a pure read
-    allowance = fight_allowance_breakdown(entry, user_id, today)["allowance"]
-    return max(0, allowance - record.get("fights_today", 0))
+def fights_left(entry, user_id, today=None, now: datetime | None = None) -> int:
+    """Current whole fights in the member's settled bank."""
+    return fight_allowance_breakdown(entry, user_id, today, now)["available"]
+
+
+def _spend_arena_fight(record: dict, capacity: int, now: datetime) -> None:
+    """Settle and reserve one fight inside the same saved arena transaction."""
+    bank, _, _ = _settle_fight_bank(record, capacity, now)
+    if bank <= 0:
+        raise ValueError("No accumulated arena fights available.")
+    record["fight_bank"] = bank - 1
 
 
 def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
@@ -1649,61 +1796,38 @@ def find_opponent(
 
 
 def record_guardian_intervention(
-    entry, attacker_id, defender_id, today,
+    entry, attacker_id, defender_id, today, now: datetime | None = None,
 ) -> dict:
-    """Record the level-gap safety rule without running combat or touching either wallet.
-
-    The attacker did choose and spend a fight, while the defender did not fight at all.
-    Keeping a normal-looking history row (with an explicit marker) also makes the arena
-    per-target limit and audit trail agree with what the player saw.
-    """
+    """Record the level-gap safety rule and atomically spend one banked fight."""
+    moment = now or app_now()
     data = _load(entry)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
     defender = data["pets"][defender_uid]
     if _is_farming_record(attacker) or _is_farming_record(defender):
         raise ValueError("Питомец на ферме и не может участвовать в бою.")
-    _reset_if_new_day(attacker, today)
-    attacker["fights_today"] = attacker.get("fights_today", 0) + 1
+    capacity, *_ = _fight_bank_components(entry, attacker_uid, attacker, moment)
+    _spend_arena_fight(attacker, capacity, moment)
     attacker["fights"] = attacker.get("fights", 0) + 1
     _, levels_gained = _apply_xp(attacker, C.GUARDIAN_XP)
     _metric_add(data, "guardian_interventions")
     data["fights"].append({
-        "ts": app_now().isoformat(),
-        "date": today.isoformat(),
-        "attacker_id": attacker_uid,
-        "defender_id": defender_uid,
-        "winner_id": None,
-        "loser_id": None,
-        "draw": False,
+        "ts": moment.isoformat(), "date": today.isoformat(),
+        "attacker_id": attacker_uid, "defender_id": defender_uid,
+        "winner_id": None, "loser_id": None, "draw": False,
         "guardian_intervention": True,
-        "attacker_name": attacker.get("name"),
-        "defender_name": defender.get("name"),
-        "attacker_owner": attacker.get("owner_name"),
-        "defender_owner": defender.get("owner_name"),
-        "gold": 0,
-        "loss_gold": 0,
-        "dropped_item": None,
-        "xp": C.GUARDIAN_XP,
-        "combat_seed": None,
-        "total_damage": {},
-        "combat_snapshot": None,
+        "attacker_name": attacker.get("name"), "defender_name": defender.get("name"),
+        "attacker_owner": attacker.get("owner_name"), "defender_owner": defender.get("owner_name"),
+        "gold": 0, "loss_gold": 0, "dropped_item": None, "xp": C.GUARDIAN_XP,
+        "combat_seed": None, "total_damage": {}, "combat_snapshot": None,
     })
     _save(entry, data)
     return {
-        "guardian_intervention": True,
-        "draw": False,
-        "gold": 0,
-        "loss_gold": 0,
-        "xp": C.GUARDIAN_XP,
-        "levels_gained": levels_gained,
-        "level": attacker.get("level", 1),
-        "dropped_item": None,
-        "opponent_gold": 0,
-        "opponent_loss_gold": 0,
-        "opponent_xp": 0,
-        "opponent_levels_gained": 0,
-        "opponent_level": defender.get("level", 1),
+        "guardian_intervention": True, "draw": False, "gold": 0, "loss_gold": 0,
+        "xp": C.GUARDIAN_XP, "levels_gained": levels_gained,
+        "level": attacker.get("level", 1), "dropped_item": None,
+        "opponent_gold": 0, "opponent_loss_gold": 0, "opponent_xp": 0,
+        "opponent_levels_gained": 0, "opponent_level": defender.get("level", 1),
         "opponent_dropped_item": None,
     }
 
@@ -1739,7 +1863,9 @@ def legendary_pity_progress(entry: str, user_id) -> dict:
 
 def record_fight(
     entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
+    now: datetime | None = None,
 ) -> dict:
+    moment = now or app_now()
     data = _load(entry)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
@@ -1747,11 +1873,11 @@ def record_fight(
     if _is_farming_record(attacker) or _is_farming_record(defender):
         raise ValueError("Питомец на ферме и не может участвовать в бою.")
 
-    # Only the attacker spends a daily fight. The defender did not choose this fight, so
-    # it must not come out of the budget they earned by chatting -- the loss penalty below
-    # is the only thing a defender can be made to pay.
-    _reset_if_new_day(attacker, today)
-    attacker["fights_today"] = attacker.get("fights_today", 0) + 1
+    # Only the attacker spends an accumulated fight.  This happens inside the same
+    # state mutation as rewards/history, so an exhausted stale callback cannot mint a
+    # result even if it passed an earlier UI check.
+    capacity, *_ = _fight_bank_components(entry, attacker_uid, attacker, moment)
+    _spend_arena_fight(attacker, capacity, moment)
     attacker["fights"] = attacker.get("fights", 0) + 1
     defender["fights"] = defender.get("fights", 0) + 1
 
@@ -1760,7 +1886,7 @@ def record_fight(
         _, attacker_levels_gained = _apply_xp(attacker, C.DRAW_XP)
         _, defender_levels_gained = _apply_xp(defender, C.DRAW_XP)
         data["fights"].append({
-            "ts": app_now().isoformat(),
+            "ts": moment.isoformat(),
             "date": today.isoformat(),
             "attacker_id": attacker_uid,
             "defender_id": defender_uid,
@@ -1902,7 +2028,7 @@ def record_fight(
     # Names/owners are snapshotted INTO the log entry rather than looked up when
     # history() is read, so a later rename does not rewrite what already happened.
     data["fights"].append({
-        "ts": app_now().isoformat(),
+        "ts": moment.isoformat(),
         "date": today.isoformat(),
         "attacker_id": attacker_uid,
         "defender_id": defender_uid,

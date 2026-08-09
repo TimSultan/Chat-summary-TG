@@ -36,7 +36,7 @@ LEADERBOARD_PAGE_SIZE = 20
 SLOT_PAGE_SIZE = 8
 INVENTORY_PAGE_SIZE = 6
 COLLECTION_PAGE_SIZE = 8
-ARENA_NO_FIGHTS_NOTICE = "🚫 Бои на сегодня закончились."
+ARENA_NO_FIGHTS_NOTICE = "🚫 В запасе нет боёв."
 RARITY_FILTERS = ("all", "cursed", "common", "uncommon", "rare", "legendary")
 RARITY_FILTER_NAMES = {
     "all": "Все", "cursed": "Проклятые", "common": "Обычные",
@@ -126,10 +126,12 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"🏠 Клетка: уровень {cage} — пустая.")
         lines.append(f"Осталось приручить существо за {_coins(C.TAME_PRICE)}.")
     else:
-        left = pets.fights_left(entry, user_id, pets.today())
+        fights = pets.fight_allowance_breakdown(entry, user_id, pets.today())
+        left = fights["available"]
+        capacity = fights["capacity"]
         lines.append(f"🐾 {_name(pet)} — уровень {pet.get('level', 1)}")
         lines.append(f"🏠 Клетка: уровень {cage}")
-        lines.append(f"⚔️ Боёв сегодня осталось: {left}")
+        lines.append(f"⚔️ Боёв в запасе: {left} из {capacity}")
         lines.append(f"🏆 Боёв: {pet.get('fights', 0)} / побед: {pet.get('wins', 0)}")
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
@@ -207,13 +209,13 @@ def info_view(user_id) -> tuple[str, dict]:
         f"1. Купи клетку за {_coins(C.CAGE_PRICE)}, затем приручи своего покраса за {_coins(C.TAME_PRICE)}."
     )
     lines.append("2. Прокачивай Силу, Здоровье, Ловкость и Удачу; экипировка добавляет статы и Броню.")
-    lines.append("3. Сражайся через /arena: соперник выбирается случайно. Боёв больше за клетку, ферму и свежие #япокрасил.")
+    lines.append("3. Сражайся через /arena: соперник выбирается случайно. В запас приходит +1 бой каждый час; его максимум увеличивают клетка, ферма и свежие #япокрасил.")
     lines.append(
         f"4. Победа приносит {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и опыт. "
         f"Поражение забирает только {round(C.LOSS_GOLD_SHARE * 100)}% награды, без долгов."
     )
     lines.append("5. Ненужную снятую экипировку можно продать или подарить владельцу другого существа.")
-    lines.append("6. Каждый уровень фермы улучшает смены, пассивную добычу монет и дневной лимит боёв.")
+    lines.append("6. Каждый второй уровень фермы добавляет место в запасе боёв; все уровни улучшают смены и пассивную добычу монет.")
     lines.append("\n<b>Статы</b>")
     lines.append("Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. Удача повышает шанс крита.")
     lines.append("\n<b>Особые преимущества</b>")
@@ -246,16 +248,15 @@ def cage_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"\nПокупка: {_coins(C.CAGE_PRICE)}.")
     else:
         lines.append(f"Уровень {level} из {C.CAGE_MAX_LEVEL}.")
-        # The cage adds fights on top of what activity earned, so it is shown as a bonus
-        # rather than as a total -- a total here would contradict the number on the arena
-        # screen, which knows yesterday's activity and this screen does not.
-        lines.append(f"⚔️ Боёв в день: +{C.CAGE_BONUS_FIGHTS[level - 1]}")
+        # The cage expands the shared fight bank; the arena screen shows its actual
+        # current fill, while this screen only promises the permanent extra capacity.
+        lines.append(f"⚔️ Мест в запасе боёв: +{C.CAGE_BONUS_FIGHTS[level - 1]}")
         lines.append(f"🪙 Прибавка к добыче: +{C.CAGE_GOLD_BONUS_PCT[level - 1]}%")
         if level < C.CAGE_MAX_LEVEL:
             nxt = C.CAGE_UPGRADE_COSTS[level]
             lines.append(
                 f"\nСледующий уровень — {_coins(nxt)}:"
-                f" боёв в день +{C.CAGE_BONUS_FIGHTS[level]},"
+                f" мест в запасе +{C.CAGE_BONUS_FIGHTS[level]},"
                 f" добыча +{C.CAGE_GOLD_BONUS_PCT[level]}%."
             )
         else:
@@ -974,27 +975,31 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
-    left = pets.fights_left(entry, user_id, pets.today())
     breakdown = pets.fight_allowance_breakdown(entry, user_id, pets.today())
-    allowance = breakdown["allowance"]
+    left = breakdown["available"]
+    capacity = breakdown["capacity"]
     farming = pets.is_farming(entry, user_id)
 
     lines = ["⚔️ <b>Арена</b>\n"]
     lines.append(f"{_name(pet)} — уровень {pet.get('level', 1)}")
-    lines.append(f"Боёв сегодня осталось: {left} из {allowance}")
+    lines.append(f"⚔️ В запасе боёв: <b>{left} из {capacity}</b>")
+    if left >= capacity:
+        lines.append("✅ Запас полный.")
+    else:
+        lines.append(
+            f"⏳ Следующий +1 бой через: "
+            f"{_fight_refresh_duration(breakdown['seconds_until_next'])}"
+        )
     lines.append(
-        f"🔄 Обновление боёв через: {_fight_refresh_duration(pets.fight_refresh_seconds())}"
-    )
-    lines.append(
-        "\n<b>Лимит боёв:</b> "
+        "\n<b>Максимум запаса:</b> "
         f"{breakdown['base']} база"
         f" + {breakdown['cage_bonus']} клетка"
         f" + {breakdown['farm_bonus']} ферма"
         f" + {breakdown['paint_bonus']} #япокрасил"
-        f" = {allowance}."
+        f" = {capacity}."
     )
     lines.append(
-        f"<i>Каждая #япокрасил даёт +{C.FIGHTS_PER_RECENT_FIGURINE} боя в день на 7 дней. "
+        f"<i>Каждая #япокрасил даёт +1 к максимуму на 7 дней. "
         f"Активных работ: {breakdown['recent_figurines']}.</i>"
     )
     lines.append(
@@ -1014,7 +1019,7 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append("\n🌾 Питомец на ферме — арена подождёт, пока он не вернётся.")
     elif left <= 0:
         lines.append(f"\n<b>{ARENA_NO_FIGHTS_NOTICE}</b>")
-        lines.append("Новые попытки появятся после указанного выше обновления.")
+        lines.append("Следующий бой появится после указанного выше отсчёта.")
 
     rows = []
     if left > 0 and not farming:
@@ -1029,7 +1034,7 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
 def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]:
     """The found opponent, with Напасть as a separate tap. Searching and attacking are two
-    steps because the daily fight is spent by attacking, not by looking -- a player who
+    steps because a banked fight is spent by attacking, not by looking -- a player who
     searched and walked away has lost nothing."""
     mine = pets.get_pet(entry, user_id)
     theirs = pets.get_pet(entry, opponent_id)

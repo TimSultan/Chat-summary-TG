@@ -144,7 +144,7 @@ class PetsIntegrationTests(unittest.TestCase):
             ENTRY, ALICE, BOB, result, pets.today(), attacker_xp=RICH_XP,
         )
 
-        # The daily allowance is spent by the ATTACKER only.
+        # The accumulated fight is spent by the ATTACKER only.
         self.assertEqual(pets.fights_left(ENTRY, ALICE, pets.today()), left_before - 1)
         self.assertEqual(
             pets.fights_left(ENTRY, BOB, pets.today()),
@@ -226,25 +226,7 @@ class PetsIntegrationTests(unittest.TestCase):
         self.assertEqual(economy.balance(ENTRY, loser, 0), 0)
         self.assertGreaterEqual(reward["loss_gold"], 0)
 
-    def _record_yesterday(self, user_id, messages=0, figurines=0):
-        """Write a finalised day file for yesterday, the same shape stats.record_day
-        writes, so the allowance has real activity to price off."""
-        day = pets.today() - timedelta(days=1)
-        payload = {
-            "entry": ENTRY,
-            "day": day.isoformat(),
-            "recorded_at": day.isoformat(),
-            "users": {
-                str(user_id): {
-                    "display_name": "Alice", "username": "alice",
-                    "messages": messages, "chars": messages * 20, "media": 0,
-                    "replies": 0, "hours": {}, "figurines": figurines,
-                }
-            },
-        }
-        stats._path(ENTRY, day).write_text(json.dumps(payload), encoding="utf-8")
-
-    def test_chatting_yesterday_buys_fights_today(self):
+    def test_ordinary_chatting_does_not_expand_the_fight_bank(self):
         # The fixed budget deliberately ignores ordinary chat-message volume.
         self._found(ALICE, "Pet", "Alice")
         day = pets.today() - timedelta(days=1)
@@ -255,16 +237,28 @@ class PetsIntegrationTests(unittest.TestCase):
                 "hours": {}, "figurines": 0}},
         }
         stats._path(ENTRY, day).write_text(json.dumps(payload), encoding="utf-8")
-        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, pets.today()), C.BASE_DAILY_FIGHTS)
+        self.assertEqual(
+            pets.daily_allowance(ENTRY, ALICE, pets.today()), C.BASE_FIGHT_BANK_CAPACITY,
+        )
 
     def test_duplicate_live_paint_is_counted_once_and_deletion_removes_buff(self):
         self._found(ALICE, "Pet", "Alice")
         today = pets.today()
         stats.record_figurine_live(ENTRY, today, ALICE, "alice", "Alice", message_id=77)
         stats.record_figurine_live(ENTRY, today, ALICE, "alice", "Alice", message_id=77)
-        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS + 2)
+        self.assertEqual(
+            pets.daily_allowance(ENTRY, ALICE, today),
+            C.BASE_FIGHT_BANK_CAPACITY + C.FIGHTS_PER_RECENT_FIGURINE,
+        )
+        # A new buff opens room but does not retroactively fill it.
+        self.assertEqual(pets.fights_left(ENTRY, ALICE, today), C.BASE_FIGHT_BANK_CAPACITY)
+        data = pets._load(ENTRY)
+        data["pets"][str(ALICE)]["fight_bank"] = 6
+        data["pets"][str(ALICE)]["fight_bank_cap"] = 6
+        pets._save(ENTRY, data)
         stats.delete_figurine_submission(ENTRY, ALICE, 77, "admin", "Admin")
-        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS)
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_FIGHT_BANK_CAPACITY)
+        self.assertEqual(pets.fights_left(ENTRY, ALICE, today), C.BASE_FIGHT_BANK_CAPACITY)
 
     def test_cage_farm_and_recent_paint_bonuses_compose(self):
         self._found(ALICE, "Pet", "Alice")
@@ -283,7 +277,8 @@ class PetsIntegrationTests(unittest.TestCase):
         pets._save(ENTRY, data)
         self.assertEqual(
             pets.daily_allowance(ENTRY, ALICE, today),
-            C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[2] + 5 // C.FARM_LEVELS_PER_FIGHT + 4,
+            C.BASE_FIGHT_BANK_CAPACITY + C.CAGE_BONUS_FIGHTS[2]
+            + 5 // C.FARM_LEVELS_PER_FIGHT + 2 * C.FIGHTS_PER_RECENT_FIGURINE,
         )
 
     def test_paint_buff_expires_after_seven_calendar_days(self):
@@ -297,7 +292,7 @@ class PetsIntegrationTests(unittest.TestCase):
                 "figurines": 1, "figurine_posts": [["2026-08-01T10:00:00", 103]]}},
         }
         stats._path(ENTRY, expired_day).write_text(json.dumps(payload), encoding="utf-8")
-        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS)
+        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_FIGHT_BANK_CAPACITY)
 
     def test_unfinalized_prior_day_live_painting_still_grants_its_buff(self):
         self._found(ALICE, "Pet", "Alice")
@@ -305,7 +300,10 @@ class PetsIntegrationTests(unittest.TestCase):
         stats.record_figurine_live(
             ENTRY, today - timedelta(days=1), ALICE, "alice", "Alice", message_id=104,
         )
-        self.assertEqual(pets.daily_allowance(ENTRY, ALICE, today), C.BASE_DAILY_FIGHTS + 2)
+        self.assertEqual(
+            pets.daily_allowance(ENTRY, ALICE, today),
+            C.BASE_FIGHT_BANK_CAPACITY + C.FIGHTS_PER_RECENT_FIGURINE,
+        )
 
     def test_history_survives_a_rename(self):
         """The card shows the creature's name NOW; a fight that already happened keeps the
@@ -326,9 +324,7 @@ class PetsIntegrationTests(unittest.TestCase):
         self._found(ALICE, "Кабанчик", "Alice")
         self._found(BOB, "Тумблер", "Bob")
         allowance = pets.fights_left(ENTRY, ALICE, pets.today())
-        # No recorded day file in this fixture, so yesterday's activity is nothing at all
-        # and everybody falls back to the base allowance.
-        self.assertEqual(allowance, C.BASE_DAILY_FIGHTS + C.CAGE_BONUS_FIGHTS[0])
+        self.assertEqual(allowance, C.BASE_FIGHT_BANK_CAPACITY + C.CAGE_BONUS_FIGHTS[0])
 
         for index in range(allowance):
             result = pets_combat.simulate(
@@ -338,10 +334,10 @@ class PetsIntegrationTests(unittest.TestCase):
             pets.record_fight(ENTRY, ALICE, BOB, result, pets.today())
         self.assertEqual(pets.fights_left(ENTRY, ALICE, pets.today()), 0)
 
-        # And the screen says so rather than offering a button that cannot work.
-        with patch("pets.app_now", return_value=datetime(2026, 8, 9, 22, 41)):
+        # The screen makes the empty bank state explicit and has no stale attack action.
+        with patch("pets.app_now", return_value=datetime(2026, 8, 9, 12, 41)):
             text, keyboard = pets_ui.fight_view(ENTRY, ALICE, RICH_XP)
-        self.assertIn("Обновление боёв через: 1 ч 19 мин", text)
+        self.assertIn("В запасе боёв: <b>0 из 5</b>", text)
         self.assertIn(pets_ui.ARENA_NO_FIGHTS_NOTICE, text)
         actions = {
             pets_ui.parse_callback(b["callback_data"])[1]

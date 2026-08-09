@@ -20,17 +20,18 @@ The wallet is the chat's existing coin ledger (economy.py), not a second currenc
 earn rate is already measured rather than guessed: over a 34-day window the most active
 members earned 60-233 coins/week, the p90 member ~55/week, the median ~3/week.
 
-Arena income starts at a predictable 10 fights per day. Progression adds fights only
-through the cage, farm and recent painted miniatures (see daily_fight_allowance); losing
-costs a share of what winning pays (LOSS_GOLD_SHARE), so part of every fight is paid by a
-player rather than minted.
+Arena income is paced by one accumulated fight per hour and a five-fight base capacity.
+The cage, farm and recent painted miniatures expand that bank (see
+daily_fight_allowance); losing costs a share of what winning pays (LOSS_GOLD_SHARE), so
+part of every fight is paid by a player rather than minted.
 
 Against that, STAT_COST_EXPONENT = 1.2 puts one stat at 1 -> 80 at 6,896 gold and three
 at 20,688. Arena gold stays comparable to, rather than overpowering, coins earned from
 ordinary chat activity; cage bonuses remain the game-specific progression path.
 
-If it should move further, the levers are BASE_DAILY_FIGHTS and WIN_GOLD_*, not the stat
-costs: making levels cheaper raises everybody equally. See PETS_BALANCE.md.
+If it should move further, the levers are BASE_FIGHT_BANK_CAPACITY,
+FIGHT_BANK_RECHARGE_SECONDS and WIN_GOLD_*, not the stat costs: making levels cheaper
+raises everybody equally. See PETS_BALANCE.md.
 """
 
 import hashlib
@@ -53,7 +54,7 @@ RENAME_PRICE = 0
 
 # --------------------------------------------------------------------------- the cage
 # The cage was asked for as "buy, then upgrade" without saying what an upgrade does, so
-# it is the game's convenience track: each level buys one more fight per day and a cut
+# it is the game's convenience track: each level buys one more fight-bank slot and a cut
 # of the winnings. Levels are cumulative -- CAGE_LEVELS[n] is what level n+1 costs.
 # The price is deliberately FLAT rather than escalating: the original curve
 # (400/1_200/3_000/7_000) put max cage out of reach of anyone but the top earners, and a
@@ -65,7 +66,7 @@ CAGE_UPGRADE_COSTS = (0, 100, 100, 100, 100)         # index = level - 1
 # levels they bought -- a goodwill refund that was asked for as a single per-owner sum,
 # not a replay of what each of them actually paid out of CAGE_UPGRADE_COSTS.
 CAGE_UPGRADE_REFUND = 350
-CAGE_BONUS_FIGHTS = (0, 1, 2, 3, 4)                  # extra fights/day at that level
+CAGE_BONUS_FIGHTS = (0, 1, 2, 3, 4)                  # extra bank capacity at that level
 CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
 
 # Historic prices are retained only for the one-time retirement refund. There is no
@@ -74,7 +75,7 @@ LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 
 # ------------------------------------------------------------------------------ farm
 # A farm run is a deliberate six-hour choice: the pet cannot enter the arena while it
-# works, so the reward needs to be useful without replacing ten daily fights.  Level 1
+# works, so the reward needs to be useful without replacing the hourly arena loop. Level 1
 # is a small early investment; level 10 plus every permanent facility costs 6,850 coins
 # in total and pays at most about 200 coins/day when collected on time.
 FARM_MAX_LEVEL = 10
@@ -223,23 +224,25 @@ DOMINANCE_BONUS = 0.30      # maximum bonus to one stat's contribution
 
 # ------------------------------------------------------------------------ the arena
 #
-# Everybody receives ten fights each calendar day. The additions deliberately have no
-# global cap: each qualifying painting is explicitly promised to grant its own temporary
-# +2 bonus, and the remaining two tracks are bounded by their upgrade caps.
+# Arena fights live in a per-pet bank, not a daily counter. A complete elapsed hour
+# credits one fight, up to the current capacity. Every existing bonus unit adds one slot:
 #
-#     allowance = BASE_DAILY_FIGHTS
+#     capacity = BASE_FIGHT_BANK_CAPACITY
 #               + CAGE_BONUS_FIGHTS[cage_level - 1]
 #               + floor(farm_level / FARM_LEVELS_PER_FIGHT)
 #               + recent_figurines * FIGHTS_PER_RECENT_FIGURINE
 #
-# `recent_figurines` means qualifying #япокрасил posts in the rolling inclusive seven
-# calendar-day window. Thus a post increases the allowance immediately and expires at
-# the next midnight after seven calendar days. It is derived from stats' canonical
-# records rather than stored as a mutable counter, so retries cannot grant the buff twice.
-BASE_DAILY_FIGHTS = 10
+# `recent_figurines` means qualifying #япокрасил posts in the rolling seven-day window.
+# It is derived from stats' canonical records rather than stored as a mutable counter,
+# so retries cannot grant the buff twice. Expiry only clamps the bank to its new cap.
+BASE_FIGHT_BANK_CAPACITY = 5
+# Compatibility name for integrations which still call daily_allowance. It now means
+# bank capacity; fights do not reset at midnight.
+BASE_DAILY_FIGHTS = BASE_FIGHT_BANK_CAPACITY
 FARM_LEVELS_PER_FIGHT = 2
-FIGHTS_PER_RECENT_FIGURINE = 2
+FIGHTS_PER_RECENT_FIGURINE = 1
 RECENT_FIGURINE_FIGHT_BUFF_DAYS = 7
+FIGHT_BANK_RECHARGE_SECONDS = 60 * 60
 ARENA_SAME_OPPONENT_DAILY_LIMIT = 3
 
 # Matchmaking uses effective combat stats, including equipment and pet level, rather than
@@ -302,7 +305,7 @@ DUEL_SAME_OPPONENT_DAILY_LIMIT = 1
 def daily_fight_allowance(
     cage_level: int = 1, farm_level: int = 0, recent_figurines: int = 0,
 ) -> int:
-    """How many arena fights a member can start today before spent fights.
+    """The maximum number of arena fights a member can bank at once.
 
     This is intentionally a pure, integer-only formula. The caller obtains the rolling
     paint count from ``stats.recent_figurine_fight_bonus_count`` so the allowance cannot
@@ -310,7 +313,7 @@ def daily_fight_allowance(
     """
     level = min(max(cage_level, 1), CAGE_MAX_LEVEL)
     return (
-        BASE_DAILY_FIGHTS
+        BASE_FIGHT_BANK_CAPACITY
         + CAGE_BONUS_FIGHTS[level - 1]
         + max(0, int(farm_level)) // FARM_LEVELS_PER_FIGHT
         + max(0, int(recent_figurines)) * FIGHTS_PER_RECENT_FIGURINE

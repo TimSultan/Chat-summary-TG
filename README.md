@@ -932,7 +932,7 @@ rarity and icon-based bonuses directly under HP, followed by the equipped amulet
 passive effect, with dividers separating equipment from the base-stat receipt.
 Administrators can use `/testfight` from the group or the bot DM to pit their pet against
 a random existing opponent in the main chat. It runs the normal combat and result-image
-pipeline but deliberately records no fight, XP, gold, drop, loss debit or daily usage;
+pipeline but deliberately records no fight, XP, gold, drop, loss debit or banked-fight use;
 the public caption labels it as a test and the message is sent with notifications enabled.
 Weapon names use familiar household junk and concrete origins such as «с Авито», «из
 гаража» and «на синей изоленте», with one-line descriptions; storefront entries are
@@ -969,11 +969,12 @@ checkpoint and credit share one atomic ledger write, so a retry or restart canno
 same hour twice. The retired separate passive facility is removed from the menu; its old
 upgrade costs are refunded once in full at startup.
 
-**Everyone starts with 10 fights a day.** The cage adds up to 4, every two Farm levels add
-one (up to 5), and each qualifying `#япокрасил` adds 2 fights per day for the next seven
-calendar days. Ordinary message volume no longer affects this limit. Telegram replays do
-not duplicate a painting buff, delayed daily rollover keeps it, and `/deletepokras`
-removes it.
+**Everyone starts with room for 5 fights.** The bank gains **one fight every hour** until
+it reaches that capacity. The cage adds up to 4 spaces, every two Farm levels add one (up
+to 5), and each qualifying `#япокрасил` adds one space for the next seven calendar days.
+Ordinary message volume never changes this. Telegram replays do not duplicate a painting
+buff, and `/deletepokras` removes it. The arena always shows the current bank, its maximum
+and the countdown to the next +1 fight; when full, it says so instead of showing a reset.
 
 `/pet` prints the card — photo, level, stats, gear, fights and wins — and works **in the
 group as well as the DM**, since it is the one screen meant to be shown off. `/arena` itself
