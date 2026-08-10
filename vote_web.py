@@ -745,6 +745,37 @@ PAGE_HTML = """<!doctype html>
   /* cursor, because tapping the picture is what closes the reel (see the #feed tap
      handler) -- without it nothing says the biggest thing on the screen is a control. */
   .rcard .photos img { width: 100%; border-radius: 10px; display: block; cursor: pointer; }
+  .shot { position: relative; }
+  /* An explicit button rather than a zoom GESTURE on the photo itself. Telegram's Android
+     WebView does not give the page pinch-to-zoom the way iOS does, which is why only
+     Android users reported the pictures as un-zoomable -- and the reflex gesture there,
+     double-tap, is already spoken for: one tap on a photo closes the reel. A button
+     conflicts with neither, and says out loud that a closer look is available.
+     Spelled ⛶ to match the arena's own zoom button (arena_web.py), which solved the same
+     problem for the duel view -- two voting systems in one bot should not disagree about
+     what "look closer" looks like. */
+  .zoomBtn { position: absolute; right: 8px; bottom: 8px; z-index: 2;
+             border: 0; border-radius: 50%; width: 36px; height: 36px;
+             background: rgba(0,0,0,.55); color: #fff; font-size: 16px; line-height: 1;
+             display: flex; align-items: center; justify-content: center; cursor: pointer; }
+
+  /* The lens: one photo, zoomable, over everything else. Its gestures are handled in JS
+     rather than left to the browser (touch-action: none) precisely because the browser's
+     own zoom is what is missing on Android -- so the same code runs on every client. */
+  /* 30, above the vote bar's 20: a photo opened to be looked at closely should not have
+     the submit button lying across it. Stated rather than left to source order, which is
+     what decides it when two layers claim the same z-index. */
+  .lens { position: fixed; inset: 0; z-index: 30; background: #000;
+          touch-action: none; overscroll-behavior: contain; }
+  .lensStage { position: absolute; inset: 0; overflow: hidden; touch-action: none; }
+  .lensStage img { position: absolute; left: 0; top: 0; transform-origin: 0 0;
+                   max-width: none; display: block; user-select: none;
+                   -webkit-user-drag: none; -webkit-user-select: none; }
+  .lensHint { position: fixed; left: 0; right: 0; pointer-events: none;
+              bottom: calc(12px + env(safe-area-inset-bottom));
+              text-align: center; color: #fff; opacity: .7; font-size: 12px;
+              text-shadow: 0 1px 3px rgba(0,0,0,.9); transition: opacity .3s; }
+  .lensHint.gone { opacity: 0; }
   .rcard .votebar { margin: 0 0 10px; }
   .votesBadge { margin-left: 6px; background: var(--accent); color: var(--accent-fg);
                 font-size: 11px; padding: 1px 6px; border-radius: 8px; }
@@ -862,6 +893,12 @@ PAGE_HTML = """<!doctype html>
 <div class="reel" id="reel" hidden>
   <button class="reelClose" id="reelClose" aria-label="Закрыть">✕</button>
   <div class="feed" id="feed"></div>
+</div>
+
+<div class="lens" id="lens" hidden>
+  <div class="lensStage" id="lensStage"><img id="lensImg" alt=""></div>
+  <button class="reelClose" id="lensClose" aria-label="Закрыть">✕</button>
+  <div class="lensHint" id="lensHint">Щипок или двойное касание — приблизить</div>
 </div>
 
 <script>
@@ -1109,7 +1146,11 @@ function renderReel() {
       '<div class="who">' + esc(who(entry)) + votes + "</div>" +
       (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
       '<div class="photos">' +
-        entry.photos.map((p) => '<img loading="lazy" src="' + esc(p) + '" alt="">').join("") +
+        entry.photos.map((p) =>
+          '<div class="shot"><img loading="lazy" src="' + esc(p) + '" alt="">' +
+          '<button type="button" class="zoomBtn" aria-label="Увеличить" ' +
+          'data-zoom="' + esc(p) + '">⛶</button></div>'
+        ).join("") +
       "</div>" +
       voteBarHtml(entry, maxCount) +
       '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
@@ -1250,6 +1291,11 @@ function openReel(id) {
 }
 
 function closeReel() {
+  // The lens sits on top of the reel, so it goes first -- otherwise a render that empties
+  // the poll (or any other closeReel from code) would leave a photo floating over a page
+  // with nothing behind it. Called while the reel is still visible, so closeLens leaves
+  // the body lock and the back arrow to the lines below.
+  if (!$("lens").hidden) closeLens();
   $("reel").hidden = true;
   document.body.classList.remove("reelOpen");
   if (tg && tg.BackButton) tg.BackButton.hide();
@@ -1265,9 +1311,167 @@ function closeReelAt(entryId) {
   if (card) card.scrollIntoView({ block: "center" });
 }
 
+// ---------------------------------------------------------------------------- the lens
+//
+// One photo, as large as it will go, with zoom and pan of our own.
+//
+// Not the browser's zoom: Telegram's Android WebView does not offer the page pinch-to-zoom
+// that iOS does, so on Android the pictures simply could not be examined -- reported from
+// the chat, 2026-08-10. Handling the gestures here means every client behaves the same,
+// and it costs nothing on the ones where pinch already worked.
+//
+// Geometry: the image is positioned at its natural size with transform-origin 0 0 and
+// moved by `translate(x, y) scale(s)`. Zooming about a point keeps whatever is under the
+// fingers under the fingers -- solve `px = x + u*s` for the image coordinate u and put it
+// back at the new scale.
+const LENS_MAX_ZOOM = 8;     // times the fit-to-screen scale
+const LENS_TAP_ZOOM = 3;     // what a double tap jumps to
+const LENS_TAP_MS = 260;     // wait this long for a second tap before treating one as one
+let lens = { scale: 1, fit: 1, x: 0, y: 0 };
+let lensPointers = new Map();
+let lensPinch = null;
+let lensTapTimer = null;
+
+function lensViewport() {
+  const stage = $("lensStage");
+  return { w: stage.clientWidth, h: stage.clientHeight };
+}
+
+function lensApply() {
+  const view = lensViewport();
+  const img = $("lensImg");
+  const width = img.naturalWidth * lens.scale;
+  const height = img.naturalHeight * lens.scale;
+  // Centred while it fits, held inside the edges once it doesn't -- so a pan can never
+  // fling the picture off the screen and leave the viewer looking at black.
+  lens.x = width <= view.w ? (view.w - width) / 2 : Math.min(0, Math.max(view.w - width, lens.x));
+  lens.y = height <= view.h ? (view.h - height) / 2 : Math.min(0, Math.max(view.h - height, lens.y));
+  img.style.transform = "translate(" + lens.x + "px," + lens.y + "px) scale(" + lens.scale + ")";
+}
+
+function lensFit() {
+  const view = lensViewport();
+  const img = $("lensImg");
+  if (!img.naturalWidth || !img.naturalHeight) return;
+  lens.fit = Math.min(view.w / img.naturalWidth, view.h / img.naturalHeight);
+  lens.scale = lens.fit;
+  lensApply();
+}
+
+function lensZoomTo(scale, px, py) {
+  const next = Math.max(lens.fit, Math.min(lens.fit * LENS_MAX_ZOOM, scale));
+  lens.x = px - (px - lens.x) * (next / lens.scale);
+  lens.y = py - (py - lens.y) * (next / lens.scale);
+  lens.scale = next;
+  lensApply();
+}
+
+function openLens(src) {
+  const img = $("lensImg");
+  $("lens").hidden = false;
+  $("lensHint").classList.remove("gone");
+  document.body.classList.add("reelOpen");
+  img.style.transform = "";
+  img.src = src;
+  if (img.complete && img.naturalWidth) lensFit();
+  else img.addEventListener("load", lensFit, { once: true });
+  // The hint has said its piece by the time anyone has looked at the picture.
+  setTimeout(() => $("lensHint").classList.add("gone"), 2500);
+  if (tg && tg.BackButton) tg.BackButton.show();
+}
+
+function closeLens() {
+  $("lens").hidden = true;
+  $("lensImg").removeAttribute("src");
+  lensPointers.clear();
+  lensPinch = null;
+  // The reel is still open underneath, and it wants both the body lock and the back arrow.
+  if (!$("reel").hidden) return;
+  document.body.classList.remove("reelOpen");
+  if (tg && tg.BackButton) tg.BackButton.hide();
+}
+
+const lensStageEl = $("lensStage");
+lensStageEl.addEventListener("pointerdown", (event) => {
+  lensStageEl.setPointerCapture(event.pointerId);
+  lensPointers.set(event.pointerId, { x: event.clientX, y: event.clientY,
+                                      startX: event.clientX, startY: event.clientY,
+                                      at: Date.now() });
+  if (lensPointers.size === 2) {
+    const [a, b] = [...lensPointers.values()];
+    lensPinch = {
+      distance: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      scale: lens.scale,
+    };
+  }
+});
+
+lensStageEl.addEventListener("pointermove", (event) => {
+  const pointer = lensPointers.get(event.pointerId);
+  if (!pointer) return;
+  const previous = { x: pointer.x, y: pointer.y };
+  pointer.x = event.clientX;
+  pointer.y = event.clientY;
+
+  if (lensPointers.size >= 2 && lensPinch) {
+    const [a, b] = [...lensPointers.values()];
+    const distance = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    lensZoomTo(lensPinch.scale * (distance / lensPinch.distance),
+               (a.x + b.x) / 2, (a.y + b.y) / 2);
+    return;
+  }
+  // One finger pans, but only when there is something to pan: at fit scale the whole
+  // picture is already on screen, and dragging it around would just be a way to lose it.
+  if (lens.scale > lens.fit * 1.001) {
+    lens.x += pointer.x - previous.x;
+    lens.y += pointer.y - previous.y;
+    lensApply();
+  }
+});
+
+function lensPointerDone(event) {
+  const pointer = lensPointers.get(event.pointerId);
+  lensPointers.delete(event.pointerId);
+  if (lensPointers.size < 2) lensPinch = null;
+  if (!pointer || event.type !== "pointerup") return;
+  const moved = Math.hypot(pointer.x - pointer.startX, pointer.y - pointer.startY);
+  if (moved > 10 || Date.now() - pointer.at > 600) return;   // a drag, not a tap
+
+  if (lensTapTimer) {           // the second tap of a double
+    clearTimeout(lensTapTimer);
+    lensTapTimer = null;
+    const zoomed = lens.scale > lens.fit * 1.05;
+    if (zoomed) lensFit();
+    else lensZoomTo(lens.fit * LENS_TAP_ZOOM, pointer.x, pointer.y);
+    return;
+  }
+  lensTapTimer = setTimeout(() => {
+    lensTapTimer = null;
+    // A single tap closes -- but only when nothing is magnified. Mid-examination it is far
+    // more likely to be a misplaced finger than a request to leave.
+    if (lens.scale <= lens.fit * 1.05) closeLens();
+  }, LENS_TAP_MS);
+}
+lensStageEl.addEventListener("pointerup", lensPointerDone);
+lensStageEl.addEventListener("pointercancel", lensPointerDone);
+
+// Desktop: the wheel zooms about the cursor, since there are no fingers to pinch with.
+lensStageEl.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  lensZoomTo(lens.scale * (event.deltaY < 0 ? 1.15 : 1 / 1.15), event.clientX, event.clientY);
+}, { passive: false });
+
+window.addEventListener("resize", () => { if (!$("lens").hidden) lensFit(); });
+$("lensClose").addEventListener("click", closeLens);
+
 // Telegram's own back arrow closes the reel too -- on a phone that is the gesture people
-// reach for first, and without this it would close the whole Mini App instead.
-if (tg && tg.BackButton) tg.BackButton.onClick(closeReel);
+// reach for first, and without this it would close the whole Mini App instead. With the
+// lens open it takes that first: one arrow, one step back, whichever layer is on top.
+function goBack() {
+  if (!$("lens").hidden) closeLens();
+  else closeReel();
+}
+if (tg && tg.BackButton) tg.BackButton.onClick(goBack);
 $("reelClose").addEventListener("click", closeReel);
 
 // A tap on a picture closes the reel as well: while reading down the feed the picture is
@@ -1295,6 +1499,14 @@ $("feed").addEventListener("pointerdown", (event) => {
 $("feed").addEventListener("pointercancel", () => { reelTap = { cancelled: true }; });
 
 $("feed").addEventListener("click", (event) => {
+  // The magnifier first: it sits ON the photo, and tapping a photo closes the reel.
+  const zoom = event.target.closest("[data-zoom]");
+  if (zoom) {
+    event.preventDefault();
+    reelTap = null;
+    openLens(zoom.dataset.zoom);
+    return;
+  }
   if (event.target.tagName !== "IMG") return;
   const start = reelTap;
   reelTap = null;

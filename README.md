@@ -631,6 +631,19 @@ page that changes shape depending on who opens it:
   same code path as typing the
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
+
+  On the page itself, tapping a thumbnail opens the **reel** — every work in one continuous
+  scroll, full width, starting at the one that was tapped — and tapping a photo there goes
+  back to the grid, at the entry that was being read. Each photo also carries a **⛶ button
+  that opens the lens**: that one photo, full screen, with pinch, double-tap and
+  drag-to-pan, capped at 8× fit. The gestures are handled by hand (`touch-action: none`,
+  pointer events) rather than left to the browser, because **Telegram's Android WebView
+  does not offer the page pinch-zoom that iOS does** — which is why only Android users
+  reported the pictures as impossible to examine (2026-08-10). A button rather than a
+  gesture on the photo: double-tap is the reflex, and a tap on a photo already means
+  "close the reel". Same ⛶ and the same reasoning as the arena's duel view
+  (`arena_web.py`), so the bot's two voting systems agree on what "look closer" looks like.
+  Telegram's back arrow steps out of the lens first and the reel second.
 - **`/vote собрать`** (DM, administrators only) scans the contest week for `#итогинедели`
   posts and adds any that aren't already in the poll.
 

@@ -911,6 +911,37 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("function closeReelAt(", page)
         self.assertIn("closeReelAt(card && card.dataset.entry)", page)
 
+    async def test_every_reel_photo_carries_its_own_way_to_zoom(self):
+        """Reported from the chat, 2026-08-10: on Android the pictures could not be
+        zoomed. Telegram's Android WebView withholds the page pinch-zoom that iOS allows,
+        so the page has to bring its own -- a button per photo opening the lens."""
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn('class="zoomBtn"', page)
+        self.assertIn('data-zoom="', page)
+        self.assertIn('const zoom = event.target.closest("[data-zoom]")', page)
+        self.assertIn("openLens(zoom.dataset.zoom)", page)
+
+    async def test_the_lens_handles_its_own_gestures_rather_than_the_browsers(self):
+        """touch-action: none is the whole point -- with the browser still owning the
+        touches there is nothing to fall back on where its own zoom is missing."""
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn(".lens { position: fixed", page)
+        self.assertIn("touch-action: none", page)
+        for handler in ("pointerdown", "pointermove", "pointerup", "pointercancel", "wheel"):
+            with self.subTest(handler=handler):
+                self.assertIn(f'lensStageEl.addEventListener("{handler}"', page)
+        # Pinch, double-tap and the cap on how far in it goes.
+        self.assertIn("LENS_MAX_ZOOM", page)
+        self.assertIn("function lensZoomTo(", page)
+
+    async def test_the_back_arrow_closes_the_lens_before_the_reel(self):
+        """One arrow, one step back. Without this the lens would stay open over a closed
+        reel, or Telegram would close the whole Mini App from inside a photo."""
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn("function goBack()", page)
+        self.assertIn('if (!$("lens").hidden) closeLens();', page)
+        self.assertIn("tg.BackButton.onClick(goBack)", page)
+
 
 if __name__ == "__main__":
     unittest.main()
