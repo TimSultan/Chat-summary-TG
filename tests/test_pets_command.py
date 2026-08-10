@@ -226,7 +226,12 @@ class PetsCommandTests(unittest.TestCase):
         api = self._type()
         self.assertEqual(len(api.sent), 1)
         self.assertIn("Арена", api.sent[0]["text"])
-        actions = {pets_ui.parse_callback(b["callback_data"])[1] for b in _buttons(api.sent[0])}
+        # web_app buttons carry a url instead of callback data (the Mini App opener, see
+        # pets_ui.main_view) -- they are not callbacks and have nothing to parse.
+        actions = {
+            pets_ui.parse_callback(b["callback_data"])[1]
+            for b in _buttons(api.sent[0]) if "callback_data" in b
+        }
         self.assertIn("cage", actions)
         self.assertIn("info", actions)
 

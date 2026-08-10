@@ -74,6 +74,7 @@ import pets_config as C
 import pets_image
 import pets_ui
 import pets_updates
+import pets_web
 import post_stats_web
 import preview
 import stats
@@ -3497,6 +3498,12 @@ async def handle_tree_command(
         log(f"[bot_listener] failed to send the tree status:\n{traceback.format_exc()}")
 
 
+def _pets_page_url(cfg) -> str | None:
+    """The pet game's Mini App (pets_web.py), or None when no public URL is configured --
+    in which case the menu simply doesn't offer it and the buttons remain the whole game."""
+    return f"{cfg.webapp_public_url}{pets_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
+
+
 def _vote_page_url(cfg) -> str | None:
     return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
 
@@ -5742,7 +5749,8 @@ async def handle_pets_command(
         return
 
     await _send_pets_view(
-        api, chat_id, pets_ui.main_view(entry, user.user_id, xp),
+        api, chat_id,
+        pets_ui.main_view(entry, user.user_id, xp, webapp_url=_pets_page_url(cfg)),
         reply_to_message_id=message["message_id"], log=log,
     )
 
@@ -6032,6 +6040,12 @@ async def handle_pets_callback(
     chat_id = (message.get("chat") or {}).get("id")
     message_id = message.get("message_id")
     actor = callback.get("from") or {}
+    # Only in a DM: Telegram rejects a web_app button anywhere else, and the whole menu is
+    # DM-only anyway (see handle_pets_command) -- checked rather than assumed, because a
+    # rejected button would cost the entire redraw, not just the one row.
+    pets_webapp_url = (
+        _pets_page_url(cfg) if (message.get("chat") or {}).get("type") == "private" else None
+    )
 
     # The owner id rides inside the button, so a forwarded menu cannot be used to spend
     # somebody else's coins.
@@ -6307,7 +6321,7 @@ async def handle_pets_callback(
                 api, chat_id, message_id,
                 "Уведомления о результатах боёв включены."
                 if enabled else "Уведомления о результатах боёв выключены.",
-                pets_ui.main_view(entry, user_id, xp), log,
+                pets_ui.main_view(entry, user_id, xp, webapp_url=pets_webapp_url), log,
             )
             return
 
@@ -6332,7 +6346,7 @@ async def handle_pets_callback(
             # buttons remain safe across a restart.
             pets_updates.mark_latest_read(entry, user_id)
         views = {
-            "main": lambda: pets_ui.main_view(entry, user_id, xp),
+            "main": lambda: pets_ui.main_view(entry, user_id, xp, webapp_url=pets_webapp_url),
             "info": lambda: pets_ui.info_view(user_id),
             "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
             "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
@@ -8390,6 +8404,20 @@ async def run_bot_listener(
                 arena_web.attach(
                     app, cfg, home_chat_ref or "", _is_vote_admin,
                     is_member=_is_vote_member, log=log,
+                )
+                # The pet game's own page. It needs one thing the other two don't: the
+                # player's live chat XP, because the coin balance is derived from it and
+                # nothing in that game can be priced without it. Resolving that needs the
+                # Telethon client and the timezone, both of which live out here, so it goes
+                # in as a callable exactly like the membership check does.
+                async def _resolve_pet_player(user: dict):
+                    if not home_chat_ref:
+                        return None, None
+                    return await _pets_context(telethon_client, home_chat_ref, tz, user, log=log)
+
+                pets_web.attach(
+                    app, cfg, home_chat_ref or "",
+                    is_member=_is_vote_member, resolve_player=_resolve_pet_player, log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token

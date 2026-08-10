@@ -111,10 +111,17 @@ def _name(pet: dict) -> str:
 # ------------------------------------------------------------------------ main menu
 
 
-def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+def main_view(entry: str, user_id, xp: int, webapp_url: str | None = None) -> tuple[str, dict]:
     """The landing screen. Deliberately shows the whole state of the account in six lines
     -- cage, creature, level, coins, fights left -- because every other screen is one tap
-    away and re-reading this one is how a player checks whether anything changed."""
+    away and re-reading this one is how a player checks whether anything changed.
+
+    `webapp_url` puts the Mini App (pets_web.py) at the top as a web_app button. Passed in
+    rather than built here because only the caller knows both the configured public URL and
+    that this particular message is going to a PRIVATE chat -- Telegram rejects a web_app
+    button anywhere else. Absent, the menu is exactly what it was: the whole game is still
+    playable from these buttons, and the page is an alternative, not a replacement.
+    """
     coins = pets.balance_for(entry, user_id, xp)
     pet = pets.get_pet(entry, user_id)
     cage = pets.cage_level(entry, user_id)
@@ -137,10 +144,14 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"🏆 Боёв: {pet.get('fights', 0)} / побед: {pet.get('wins', 0)}")
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
-    rows = [[
+    rows = []
+    if webapp_url:
+        # First, and alone on its row: it is the whole game rather than one more screen.
+        rows.append([{"text": "🎮 Открыть игру", "web_app": {"url": webapp_url}}])
+    rows.append([
         {"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")},
         {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
-    ]]
+    ])
     # Chat activity is most members' income, full stop -- the majority never buy a cage.
     # Every other row below this point is gated on `pet` in one way or another, so the
     # daily bonus gets its own row up here, outside all of that, to stay reachable by

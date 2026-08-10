@@ -937,6 +937,12 @@ there are tests for both directions.
 
 ### `/arena` — the pet game
 
+> **Two interfaces, one game.** The chat menu (`pets_ui.py`, inline buttons) and the
+> **Mini App** (`pets_web.py`, a real page — see "The pet game as a Mini App" below) drive
+> exactly the same `pets.py` state through the same functions. Neither is a copy of the
+> other's layout, and nothing is playable in only one of them except taming and changing
+> the pet's photo, which need a Telegram photo and therefore stay in the chat.
+
 A creature you buy, name, dress and level up, and send at other people's creatures. The
 third game in the bot and the first one that spends coins on something **permanent** —
 which is also why it exists: `economy.py` notes that with one rentable title as the only
@@ -1099,7 +1105,48 @@ list of what is still wrong.
 Split the way `cabinet.py` and `poker.py` already are: `pets_config.py` (numbers),
 `pets.py` (state, storage, wallet), `pets_combat.py` (the fight, deterministic given a
 seed), `pets_flavor.py` (the jokes), `pets_ui.py` (every screen as a pure
-`(text, keyboard)`), and only Telegram I/O in `bot_listener.py`.
+`(text, keyboard)`), `pets_web.py` (the Mini App), and only Telegram I/O in
+`bot_listener.py`.
+
+#### The pet game as a Mini App (`pets_web.py`)
+
+Mounted at **`/pets`** on the same aiohttp server the voting page runs (`_attach_extra` in
+`run_bot_listener`), opened by the **🎮 Открыть игру** button at the top of `/arena` in a
+DM. It is a *client*, not a transcription of the button menu — the button layout is shaped
+by what a Telegram message can do, and none of those constraints apply to a page:
+
+| The chat menu does this… | …because | The page does this |
+|---|---|---|
+| one screen at a time, always back through the hub | a message is one message | six tabs — Герой / Сумка / Лавка / Арена / Ферма / Ещё — with a pinned HUD carrying coins, fights and the XP bar |
+| three separate screens per equipment slot (`shop_slot_view`, `bag_items_view`, `slot_view`) | a keyboard cannot filter | one bag, filtered by slot and rarity, sorted by either |
+| 6–20 rows a page, everywhere | a keyboard is small | scrolling lists |
+| one opponent per tap, rerolled blind | one message to draw in | the whole field, sorted by how close each is to your power |
+| a verdict and two rendered PNGs | a chat cannot animate | the fight **plays out** — HP bars and blows in the order they landed |
+| gift by typing an exact `@username` | no picker exists in a keyboard | pick the recipient from a list |
+| two shops behind different buttons | they were built at different times | one shop, tabbed by slot |
+
+**One state call, one action endpoint.** `GET /api/state` returns everything a screen
+draws, and *every* mutation (`POST /api/action`) returns the same payload freshly computed
+— so the client holds no model of the rules and no screen can drift out of step with the
+server. `POST /api/attack` runs `pets_combat.simulate` + `pets.record_fight` exactly as the
+bot does and hands back the rounds to replay.
+
+**Item art is a placeholder, by design.** `GET /pets/img/<code>.svg` serves a real file
+from `DATA_DIR/pets/items/<code>.png|webp|jpg` when one exists, and otherwise generates a
+**210×210** SVG keyed on the item's own code — rarity colour, slot glyph, a stable speckle
+pattern, so an item looks the same everywhere and can be learned by sight before any art
+exists. Dropping files into that directory replaces placeholders with no code change.
+There are 596 items, which is why they are generated rather than shipped.
+
+**What is deliberately not there:** taming and changing the photo, which need a Telegram
+`file_id` a Mini App cannot produce — those send you back to the DM. Casino and quests are
+stubs in `pets_ui.py` too; they are not reproduced here rather than being reproduced as
+dead ends.
+
+Authentication, mounting and the "pictures need no header" exception are vote_web's,
+unchanged. The one dependency it cannot supply itself is the player's live chat XP (the
+coin balance derives from it) — injected as a `resolve_player` callable, the same way
+`is_member` is.
 
 ### Coins, the shop, and anti-farming
 
