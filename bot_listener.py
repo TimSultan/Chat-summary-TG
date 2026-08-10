@@ -6968,12 +6968,19 @@ def _pets_fight_hp(
 
 
 async def _pets_download_media(api, file_id, log) -> bytes | None:
-    if not file_id or not hasattr(api, "download_file"):
+    """Fetch a pet's picture from Telegram. Used by the fight-result renderer and by the
+    Mini App's portrait route, so the failure it logs says WHICH picture and WHY -- it used
+    to blame "fight-result media" for both, which made a portrait that never loaded look
+    like a rendering problem."""
+    if not file_id:
+        return None
+    if not hasattr(api, "download_file"):
+        log("[pets] no Bot API client to download media with")
         return None
     try:
         return await api.download_file(file_id)
-    except Exception:
-        log("[pets] could not fetch fight-result media")
+    except Exception as e:
+        log(f"[pets] could not download media {str(file_id)[:16]}…: {e}")
         return None
 
 

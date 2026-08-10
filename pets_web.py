@@ -34,11 +34,13 @@ _attach_extra), with its own AppKey namespace, the same signed-initData authenti
 the same "photos need no header" exception for the art route.
 """
 
+import asyncio
 import hashlib
 import json
 import os
 import re
 import secrets
+import time
 import traceback
 from datetime import date, datetime
 from io import BytesIO
@@ -86,7 +88,10 @@ RARITY_COLOURS = {
     "rare": "#3390ec",
     "legendary": "#b06be0",
 }
-SLOT_GLYPHS = {"weapon": "⚔", "amulet": "◈", "gloves": "✋", "boots": "▲"}
+# The game's own slot emoji (pets_config.SLOT_EMOJI), not lookalike typographic symbols:
+# ⚔ ◈ ▲ render as flat text glyphs in the same tile where 🧤 renders in colour, which read
+# as three broken icons next to one working one.
+SLOT_GLYPHS = dict(C.SLOT_EMOJI)
 
 
 def _json_error(message: str, status: int = 400, code: str = "ERROR") -> web.Response:
@@ -257,38 +262,54 @@ async def handle_portrait(request: web.Request) -> web.Response:
     the roster of opponents must render even when one player's picture is unavailable.
     """
     raw = request.match_info["user_id"]
+    log = request.app[_LOG_KEY]
     if not _SAFE_CODE.match(raw or ""):
         raise web.HTTPNotFound()
     entry = request.app[_ENTRY_KEY]
     record = pets.get_pet(entry, raw) or {}
     file_id = record.get("photo_file_id")
 
-    def placeholder() -> web.Response:
+    def placeholder(why: str) -> web.Response:
+        # Logged with the REASON, because every one of these looks identical on screen: a
+        # pet nobody photographed, a chat the lookup missed, and a download that failed all
+        # render the same grey tile. Without the reason in the log there is nothing to tell
+        # a working game from a broken one.
+        log(f"[pets_web] portrait {raw}: placeholder ({why})")
         return web.Response(
             text=portrait_placeholder_svg(raw, (record.get("name") or "")[:1]),
             content_type="image/svg+xml",
             headers={"Cache-Control": "public, max-age=300"},
         )
 
+    if not record:
+        return placeholder(f"no pet under entry {entry!r}")
     if not file_id:
-        return placeholder()
+        return placeholder("pet has no photo_file_id")
 
     cached = portrait_cache_path(file_id)
     if not cached.is_file():
         fetch = request.app[_FETCH_PHOTO_KEY]
+        started = time.monotonic()
         try:
             data = await fetch(file_id)
         except Exception:
+            log(f"[pets_web] portrait {raw}: fetch raised:\n{traceback.format_exc()}")
             data = None
         if not data:
-            return placeholder()
+            return placeholder("download returned nothing")
         try:
-            _write_portrait(cached, data)
+            # Decoding and re-encoding a photo is real CPU work, and this process also
+            # serves the ballot and answers the bot. Off the loop it goes, the same way
+            # vote_image's renders do -- a burst of portraits opening the arena must not
+            # stall everything else the server is in the middle of.
+            await asyncio.to_thread(_write_portrait, cached, data)
         except Exception:
-            request.app[_LOG_KEY](
-                f"[pets_web] could not store a portrait:\n{traceback.format_exc()}"
-            )
-            return placeholder()
+            log(f"[pets_web] portrait {raw}: could not store:\n{traceback.format_exc()}")
+            return placeholder("could not store")
+        log(
+            f"[pets_web] portrait {raw}: fetched {len(data)} bytes -> "
+            f"{cached.stat().st_size} on disk in {time.monotonic() - started:.1f}s"
+        )
     # Immutable: the name is a hash of the file id, so this exact URL can never point at
     # different pixels. A changed photo is a changed file_id and therefore a changed URL.
     return web.FileResponse(cached, headers={"Cache-Control": "public, max-age=604800"})
@@ -372,20 +393,27 @@ async def handle_portrait_upload(request: web.Request) -> web.Response:
     # Decoded here, before Telegram ever sees it: a refusal should say "это не картинка"
     # rather than arriving as a failed upload two round trips later, and nothing should be
     # able to use this route to push arbitrary bytes through the bot.
-    photo = _normalise_photo(body)
+    log = request.app[_LOG_KEY]
+    photo = await asyncio.to_thread(_normalise_photo, body)
     if photo is None:
+        log(f"[pets_web] portrait upload from {user['id']}: not an image ({len(body)} bytes)")
         return _json_error("Это не картинка.", code="NOT_AN_IMAGE")
 
     save = request.app[_SAVE_PHOTO_KEY]
     try:
         file_id = await save(user["id"], photo)
     except Exception:
-        request.app[_LOG_KEY](f"[pets_web] portrait upload failed:\n{traceback.format_exc()}")
+        log(f"[pets_web] portrait upload failed:\n{traceback.format_exc()}")
         file_id = None
     if not file_id:
+        log(f"[pets_web] portrait upload from {user['id']}: Telegram gave no file_id")
         return _json_error("Не получилось сохранить фото.", status=502, code="UPLOAD_FAILED")
 
     ok, message = pets.set_photo(entry, user["id"], file_id)
+    log(
+        f"[pets_web] portrait upload from {user['id']}: {len(body)} -> {len(photo)} bytes, "
+        f"file_id {file_id[:16]}…, stored={ok}"
+    )
     return _ok({
         "ok": ok,
         "message": message,
@@ -833,10 +861,19 @@ async def handle_action(request: web.Request) -> web.Response:
 
     try:
         ok, message = action(entry, user["id"], xp, body)
+        # Every state change the game makes, with who made it and whether it took. This is
+        # the record that says what a player actually did when they report that something
+        # went wrong -- the alternative is asking them to remember.
+        request.app[_LOG_KEY](
+            f"[pets_web] {user['id']} {body.get('action')}"
+            f"{' ' + str(body.get('code') or body.get('stat') or body.get('feature') or '')}".rstrip()
+            + f" -> {'ok' if ok else 'refused'}: {message}"
+        )
     except ValueError as e:
         # pets.py raises this for a race the UI already gated on -- a stale tab pressing a
         # button whose precondition has since gone. It is a refusal, not a crash.
         ok, message = False, str(e)
+        request.app[_LOG_KEY](f"[pets_web] {user['id']} {body.get('action')} -> race: {e}")
     except Exception:
         # log is print-shaped here (see attach), so the traceback is formatted in rather
         # than passed as a keyword -- an exc_info= would raise inside the error handler.
@@ -939,6 +976,12 @@ async def handle_attack(request: web.Request) -> web.Response:
 
     dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
     prefix = request.app[_PREFIX_KEY]
+    request.app[_LOG_KEY](
+        f"[pets_web] fight {me} vs {opponent_id}: "
+        f"{'draw' if result.is_draw else ('win' if result.winner == me else 'loss')}, "
+        f"{len(result.rounds)} rounds, gold {reward.get('gold') or -reward.get('loss_gold', 0)}, "
+        f"xp {reward.get('xp')}, drop {reward.get('dropped_item')}"
+    )
     return _ok({
         "ok": True,
         "you": me,
@@ -1046,6 +1089,10 @@ async def handle_updates(request: web.Request) -> web.Response:
 
 
 async def handle_page(request: web.Request) -> web.Response:
+    # Unauthenticated (the page itself is just markup; every route it calls is gated), so
+    # this is the only place that records that somebody opened the game at all -- which is
+    # the first thing worth knowing when a player says nothing works.
+    request.app[_LOG_KEY]("[pets_web] page opened")
     return web.Response(
         text=PAGE_HTML.replace("__PREFIX__", request.app[_PREFIX_KEY]),
         content_type="text/html",
@@ -2021,6 +2068,52 @@ function openItem(code) {
   );
 }
 
+// Tapping a slot on the paperdoll asks "what can go here?", not "what is here?" -- so it
+// opens everything that FITS, with what is worn at the top and every alternative one tap
+// from being worn instead. Opening only the equipped item's card (which is what it used to
+// do) answered a question nobody standing in front of an equipment screen is asking.
+function openSlot(slotKey) {
+  const slot = (S.equipment || []).find((s) => s.slot === slotKey);
+  if (!slot) return;
+  const worn = slot.item;
+  const others = (S.bag || []).filter((i) => i.slot === slotKey && !i.equipped);
+
+  const delta = (item) => {
+    // Against what is worn right now, because that is the actual trade being considered.
+    const parts = [];
+    for (const key of ["strength", "health", "agility", "luck", "armor"]) {
+      const change = (item.bonuses[key] || 0) - ((worn && worn.bonuses[key]) || 0);
+      if (change) parts.push('<span class="' + (change > 0 ? "gain" : "loss") + '">' +
+        (STAT_ICON[key] || key) + (change > 0 ? "+" : "") + change + "</span>");
+    }
+    return parts.join(" ") || '<span class="muted">без изменений</span>';
+  };
+
+  sheet(
+    "<h3>" + slot.emoji + " " + esc(slot.name) + "</h3>" +
+    (worn
+      ? '<div class="hd"><img src="' + esc(worn.art) + '" alt="">' +
+        "<div><div class='tiny muted'>надето</div><b>" + esc(worn.name) + "</b>" +
+        '<div class="small" style="color:var(--r-' + worn.rarity + ')">' + esc(worn.rarity_name) + "</div>" +
+        '<div class="small">' + bonusText(worn.bonuses) + "</div></div></div>" +
+        '<button class="go sec" data-act="unequip" data-code="' + esc(slot.slot) + '">Снять</button>'
+      : '<div class="small muted">Слот пустой.</div>') +
+    (others.length
+      ? '<div class="panel" style="margin-top:12px"><h2>Надеть вместо ' +
+        (worn ? "этого" : "пустого") + " · " + others.length + "</h2>" +
+        '<div class="items">' + others.map((item) =>
+          '<button class="item r-' + item.rarity + '" data-equipnow="' + esc(item.code) + '">' +
+          itemArt(item, item.locked ? '<span class="lockmark">🔒</span>' : "") +
+          '<span class="nm">' + esc(item.name) + "</span>" +
+          '<span class="meta">' + delta(item) + "</span></button>").join("") +
+        "</div></div>"
+      : '<div class="panel" style="margin-top:12px"><div class="empty">' +
+        "Больше ничего для этого слота нет.</div>" +
+        '<button class="go sec" data-shoptab="' + esc(slotKey) +
+        '">🛒 Посмотреть в лавке</button></div>')
+  );
+}
+
 function btn(label, action, argument, kind) {
   return '<button class="go ' + (kind || "") + '" data-act="' + action + '" data-code="' +
     esc(argument) + '">' + label + "</button>";
@@ -2366,16 +2459,16 @@ $("tabs").addEventListener("click", (event) => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
-    "[data-farmstart],[data-feature],[data-gift]");
+    "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab]");
   if (!target) return;
   const d = target.dataset;
 
+  // Equipping straight from the slot sheet: one tap, no detour through the item's own
+  // card. Choosing between two swords is the whole point of that screen.
+  if (d.equipnow) { closeSheet(); await act("equip", { code: d.equipnow }); return; }
+  if (d.shoptab) { closeSheet(); TAB = "shop"; shopSlot = d.shoptab; render(); return; }
   if (d.item) { openItem(d.item); return; }
-  if (d.slot !== undefined && d.slot && !d.act) {
-    if (d.code) openItem(d.code);
-    else { TAB = "bag"; bagSlot = d.slot; render(); }
-    return;
-  }
+  if (d.slot !== undefined && d.slot && !d.act) { openSlot(d.slot); return; }
   if (d.bagslot) { bagSlot = d.bagslot; render(); return; }
   if (d.bagrarity) { bagRarity = d.bagrarity; render(); return; }
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
