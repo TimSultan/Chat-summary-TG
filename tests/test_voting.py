@@ -180,13 +180,19 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_whole_week_is_collected_not_just_the_last_day_or_two(self):
         """Collecting happens on Sunday; everything posted since Monday has to be found."""
-        week_start = voting.contest_week_start(datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        week_start = voting.contest_week_start(now)
+        # Spread the seven posts across however much of the contest week has actually
+        # elapsed, rather than pinning them to noon on each day. The old version placed
+        # them at week_start + N days + 12h and then dropped the ones still in the future,
+        # so running before noon on Monday collected NOTHING and the test failed on the
+        # wall clock rather than on anything voting.py did.
+        elapsed = now - week_start
         client = _FakeClient([
             _FakeMessage(day, text="работа #итогинедели",
-                         date=week_start + timedelta(days=day, hours=12),
+                         date=week_start + elapsed * (day + 1) / 8,
                          resolved=self.resolved)
             for day in reversed(range(7))
-            if week_start + timedelta(days=day, hours=12) <= datetime.now(timezone.utc)
         ])
 
         entries = await voting.collect_entries(

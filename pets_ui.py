@@ -22,6 +22,7 @@ call site.
 from datetime import datetime, timezone
 from html import escape
 
+import economy
 import pets
 import pets_config as C
 import pets_updates
@@ -140,6 +141,14 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         {"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")},
         {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
     ]]
+    # Chat activity is most members' income, full stop -- the majority never buy a cage.
+    # Every other row below this point is gated on `pet` in one way or another, so the
+    # daily bonus gets its own row up here, outside all of that, to stay reachable by
+    # someone who has never tamed anything.
+    rows.append([{
+        "text": "🎁 Ежедневный бонус",
+        "callback_data": callback_data(user_id, "dailybonus"),
+    }])
     if pet:
         rows.append([
             {"text": "🐾 Существо", "callback_data": callback_data(user_id, "pet")},
@@ -157,8 +166,13 @@ def main_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
             {"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")},
         ])
+        # Both placeholders for the same reason (see casino_view/quests_view): announced
+        # before they are built. Paired together rather than each getting the lone
+        # full-width row casino used to have alone -- two "soon" buttons side by side read
+        # as one coming-soon shelf, not as two half-finished features competing for space.
         rows.append([
             {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
+            {"text": "📜 Квесты", "callback_data": callback_data(user_id, "quests")},
         ])
         notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
         rows.append([
@@ -267,6 +281,70 @@ def casino_view(entry: str, user_id) -> tuple[str, dict]:
         "Казик строится, заходите позже.",
     ]
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+
+def quests_view(entry: str, user_id) -> tuple[str, dict]:
+    """casino_view's sibling: same reason (announce the button before the feature exists),
+    same shape (nothing read, nothing written). Kept as its own function rather than a
+    parameterised copy of casino_view so each placeholder's copy can diverge later without
+    the two screens having to stay in lockstep."""
+    lines = [
+        "📜 <b>Квесты</b>\n",
+        "Квесты скоро будут.",
+        "Мастер пока грунтует доску под список поручений.",
+    ]
+    return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+
+def daily_bonus_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    """The one screen on this menu that owes nothing to having a pet: chat activity is
+    most members' only income, so this reads/writes the shared coin ledger in economy.py
+    directly rather than going through pets.py's balance_for/spend wrappers, which all
+    assume a cage exists.
+
+    economy.daily_bonus_status() already carries both "what today is worth" and "what
+    tomorrow is worth" in the same call regardless of whether today has been claimed yet
+    (see its docstring) -- that symmetry is why this view needs no branching to decide
+    WHICH number to show where, only whether the claim button should be there at all.
+    """
+    status = economy.daily_bonus_status(entry, user_id)
+    coins = pets.balance_for(entry, user_id, xp)
+
+    lines = ["🎁 <b>Ежедневный бонус</b>\n", "Мастерская платит просто за то, что ты заглянул."]
+    if status["can_claim"]:
+        lines.append(f"\nСегодня ещё не забрано: <b>{_coins(status['amount'])}</b>.")
+        if status["streak"]:
+            lines.append(
+                f"Серия — {_plural(status['streak'], 'день', 'дня', 'дней')} подряд:"
+                f" заберёшь сегодня, станет {status['next_streak']}."
+            )
+    else:
+        lines.append(
+            f"\nСегодня уже забрано: <b>{_coins(status['amount'])}</b>."
+            f" Серия — {_plural(status['next_streak'], 'день', 'дня', 'дней')}."
+        )
+        lines.append("Пропустишь день — серия смоется, как непросохший грунт под дождём.")
+    lines.append(f"Завтра: {_coins(status['tomorrow'])}.")
+
+    lines.append("\n<b>Серия по дням</b>")
+    # The table exists to make the streak feel worth protecting, not just to list numbers
+    # -- so it always marks where THIS visit sits, even past day 7 where the payout is
+    # already flat (min() below pins the marker to the last row instead of falling off it).
+    marked_day = min(status["next_streak"], len(economy.DAILY_BONUS_BY_STREAK))
+    for day, amount in enumerate(economy.DAILY_BONUS_BY_STREAK, start=1):
+        marker = " ← сегодня" if day == marked_day else ""
+        lines.append(f"{day} д. — {_money(amount)}{marker}")
+    lines.append("<i>Дальше — потолок серии, дальше он не растёт.</i>")
+    lines.append(f"\n🪙 Монеты: {_money(coins)}")
+
+    rows = []
+    if status["can_claim"]:
+        rows.append([{
+            "text": f"🎁 Забрать {_money(status['amount'])}",
+            "callback_data": callback_data(user_id, "dailybonusclaim"),
+        }])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def updates_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
@@ -1271,6 +1349,10 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
                 lines.append(f"🪙 +{_coins(reward['gold'])}")
             if reward.get("loss_gold"):
                 lines.append(f"🪙 −{_coins(reward['loss_gold'])}")
+            # A defender never chose this fight, so losing it pays a small consolation
+            # instead of taking coins. Only one of the two lines can ever appear.
+            if reward.get("consolation_gold"):
+                lines.append(f"🪙 +{_coins(reward['consolation_gold'])} за стойкость")
             if reward.get("xp"):
                 lines.append(f"✨ +{reward['xp']} опыта")
         if reward.get("levels_gained"):
@@ -1327,6 +1409,7 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
         outcome = "Ничья" if draw else ("Победа" if won else "Поражение")
         gold = record.get("gold") or 0
         lost = record.get("loss_gold") or 0
+        consolation = record.get("consolation_gold") or 0
         # Bare numbers here, with no noun to agree with -- the line is already dense and
         # "(Победа, +45)" reads fine next to a column of them.
         if draw:
@@ -1335,6 +1418,10 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
             outcome += f", +{_money(gold)}"
         elif lost:
             outcome += f", −{_money(lost)}"
+        elif consolation:
+            # A defeated defender is up, not down: showing nothing here used to make the
+            # line look like the fight simply cost them their time.
+            outcome += f", +{_money(consolation)}"
         if attacked:
             lines.append(f"⚔️ Вы напали: {who} ({outcome})")
         else:

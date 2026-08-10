@@ -258,6 +258,137 @@ def _effects(record: dict) -> dict:
     return record.setdefault("effects", {})
 
 
+# --- daily bonus --------------------------------------------------------------------
+#
+# The one coin faucet that asks for nothing but showing up. It lives here rather than in
+# pets.py on purpose: most members do not own a pet, chat activity is their only income,
+# and a reward for turning up should not be gated behind an arena they never entered.
+#
+# The streak table is the whole design. A flat daily payout is worth claiming whenever you
+# remember; a rising one is worth NOT breaking, which is the habit actually being bought.
+# Day 7 onward stays at the top value -- an unbounded streak would quietly become the
+# largest faucet in the game for whoever automated it best.
+
+DAILY_BONUS_EFFECT_KEY = "daily_bonus"
+DAILY_BONUS_BY_STREAK = (25, 35, 45, 60, 75, 90, 100)
+
+
+def daily_bonus_amount(streak: int) -> int:
+    """Payout for the Nth consecutive day, counting from 1 and flat after the table ends."""
+    index = max(1, int(streak or 1)) - 1
+    return DAILY_BONUS_BY_STREAK[min(index, len(DAILY_BONUS_BY_STREAK) - 1)]
+
+
+def _daily_bonus_effect(data: dict, user_id) -> dict:
+    effect = ((data["users"].get(str(user_id)) or {}).get("effects", {})
+              .get(DAILY_BONUS_EFFECT_KEY, {}))
+    return effect if isinstance(effect, dict) else {}
+
+
+def _next_streak(effect: dict, today: date) -> int:
+    """What today's claim would be worth, in consecutive days.
+
+    Yesterday continues the run; anything older starts over. A `last` in the FUTURE (a
+    clock correction, a timezone change) is treated as already claimed by the caller, so
+    it never lands here as a silently reset streak.
+    """
+    try:
+        previous = date.fromisoformat(str(effect.get("last")))
+    except (TypeError, ValueError):
+        return 1
+    if previous == today - timedelta(days=1):
+        return max(1, int(effect.get("streak", 0) or 0)) + 1
+    return 1
+
+
+def daily_bonus_status(entry: str, user_id, today: date | None = None) -> dict:
+    """Read-only view for the button: what is claimable now and what it is worth."""
+    day = today or app_now().date()
+    effect = _daily_bonus_effect(_load(entry), user_id)
+    try:
+        previous = date.fromisoformat(str(effect.get("last")))
+    except (TypeError, ValueError):
+        previous = None
+    claimed_today = previous is not None and previous >= day
+    streak = max(0, int(effect.get("streak", 0) or 0))
+    next_streak = streak if claimed_today else _next_streak(effect, day)
+    return {
+        "can_claim": not claimed_today,
+        "streak": streak if claimed_today else max(0, next_streak - 1),
+        "next_streak": next_streak,
+        "amount": daily_bonus_amount(next_streak),
+        "tomorrow": daily_bonus_amount(next_streak + 1),
+        "max_amount": DAILY_BONUS_BY_STREAK[-1],
+        "streak_days": len(DAILY_BONUS_BY_STREAK),
+        "last": effect.get("last"),
+    }
+
+
+def claim_daily_bonus(entry: str, user_id, today: date | None = None) -> tuple[bool, int, int]:
+    """Credit today's bonus once. Returns (claimed, amount, streak).
+
+    The checkpoint and the coins share one ledger write, so a crash cannot pay without
+    recording the day -- the same guarantee settle_passive_income relies on below.
+    """
+    day = today or app_now().date()
+    data = _load(entry)
+    record = _record(data, user_id)
+    effect = _effects(record).setdefault(DAILY_BONUS_EFFECT_KEY, {})
+    try:
+        previous = date.fromisoformat(str(effect.get("last")))
+    except (TypeError, ValueError):
+        previous = None
+    if previous is not None and previous >= day:
+        return False, 0, max(0, int(effect.get("streak", 0) or 0))
+    streak = _next_streak(effect, day)
+    amount = daily_bonus_amount(streak)
+    effect["last"] = day.isoformat()
+    effect["streak"] = streak
+    record["bonus"] = record.get("bonus", 0) + amount
+    _append_log(data, user_id, amount, "daily_bonus")
+    _save(entry, data)
+    return True, amount, streak
+
+
+# --- daily chatter prize ------------------------------------------------------------
+#
+# Paid for YESTERDAY, never for today: a day's stats are only final once it is over, and
+# a running total would let somebody watch the standings and pad them before midnight.
+#
+# Ranked on messages alone rather than the composite /top score, because this prize is
+# explicitly for talking -- the score mixes in figurines and active days, which are earned
+# on a different timescale and would let a single #япокрасил post outrank a day of chat.
+
+DAILY_CHATTER_PRIZES = (200, 100, 50)
+
+
+def daily_chatter_prizes(entry: str, day: date) -> list[dict]:
+    """Pay the top three talkers of `day` once. Returns only newly paid rows.
+
+    Idempotent through grant_once on a reason that carries the date, so re-running for a
+    day already paid is a no-op even if the ranking has since changed (a late-recorded
+    day file, a backfill). Ties are broken by user id so two runs cannot disagree.
+    """
+    ranked = sorted(
+        (row for row in stats.aggregate(entry, day, day).values() if row.messages > 0),
+        key=lambda row: (-row.messages, str(row.user_id)),
+    )
+    paid = []
+    for place, row in enumerate(ranked[:len(DAILY_CHATTER_PRIZES)]):
+        amount = DAILY_CHATTER_PRIZES[place]
+        if not grant_once(entry, row.user_id, amount, f"daily_chatter:{day.isoformat()}"):
+            continue
+        paid.append({
+            "user_id": str(row.user_id),
+            "username": row.username,
+            "display_name": row.display_name,
+            "messages": row.messages,
+            "place": place + 1,
+            "amount": amount,
+        })
+    return paid
+
+
 # --- farm passive income ----------------------------------------------------------
 
 

@@ -25,35 +25,39 @@ class LedgerTests(unittest.TestCase):
         # of the formula rather than needing a backfill script, because `spent` starts at
         # zero for everyone.
         self.assertEqual(economy.balance("chat", "1", 6_910), stats.coins_for_xp(6_910))
-        self.assertEqual(economy.balance("chat", "1", 6_910), 691)
 
     def test_spend_refund_and_running_balance(self):
-        # 5_000 XP -> 500 coins earned.
-        self.assertEqual(economy.balance("chat", "1", 5_000), 500)
+        # XP amounts are expressed in whole coins rather than as literals: XP_PER_COIN is
+        # a live balance knob (halved to 5 to lift the floor for members who only chat),
+        # and none of the arithmetic being pinned here depends on the rate itself.
+        xp = stats.XP_PER_COIN * 500          # exactly 500 coins earned
+        more_xp = stats.XP_PER_COIN * 600     # exactly 600
+        self.assertEqual(economy.balance("chat", "1", xp), 500)
 
-        ok, remaining = economy.spend("chat", "1", 5_000, 200, "buy:freeze")
+        ok, remaining = economy.spend("chat", "1", xp, 200, "buy:freeze")
         self.assertTrue(ok)
         self.assertEqual(remaining, 300)
-        self.assertEqual(economy.balance("chat", "1", 5_000), 300)
+        self.assertEqual(economy.balance("chat", "1", xp), 300)
 
         # Earning more XP later adds on top of what is already spent.
-        self.assertEqual(economy.balance("chat", "1", 6_000), 400)
+        self.assertEqual(economy.balance("chat", "1", more_xp), 400)
 
-        refused, unchanged = economy.spend("chat", "1", 5_000, 10_000, "buy:impossible")
+        refused, unchanged = economy.spend("chat", "1", xp, 10_000, "buy:impossible")
         self.assertFalse(refused)
         self.assertEqual(unchanged, 300)
-        self.assertEqual(economy.balance("chat", "1", 5_000), 300)
+        self.assertEqual(economy.balance("chat", "1", xp), 300)
 
         # A refund undoes the debit rather than granting a bonus, so a purchase that was
         # never delivered leaves no trace in lifetime spend.
-        self.assertEqual(economy.refund("chat", "1", 5_000, 200, "freeze"), 500)
+        self.assertEqual(economy.refund("chat", "1", xp, 200, "freeze"), 500)
 
     def test_balance_never_goes_negative_when_xp_is_clawed_back(self):
-        # /deletepokras removes a figurine and its 200 XP (20 coins) -- possibly after
-        # those coins were already spent.
-        economy.spend("chat", "1", 1_000, 100, "buy:roast")
-        self.assertEqual(economy.balance("chat", "1", 1_000), 0)
-        self.assertEqual(economy.balance("chat", "1", 800), 0)
+        # /deletepokras removes a figurine and its XP -- possibly after the coins it was
+        # worth have already been spent. Spend the whole balance, then claw back XP.
+        xp = stats.XP_PER_COIN * 100
+        economy.spend("chat", "1", xp, 100, "buy:roast")
+        self.assertEqual(economy.balance("chat", "1", xp), 0)
+        self.assertEqual(economy.balance("chat", "1", xp - stats.XP_PER_COIN * 20), 0)
 
     def test_catalogue_is_the_title_alone(self):
         self.assertEqual([item.code for item in economy.SHOP_ITEMS], ["title"])
@@ -69,12 +73,13 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("100", refusal)
 
-        ok, refusal, remaining = economy.purchase("chat", "1", 5_000, item)
+        funded = stats.XP_PER_COIN * 500      # exactly 500 coins, whatever the rate is
+        ok, refusal, remaining = economy.purchase("chat", "1", funded, item)
         self.assertTrue(ok, refusal)
         self.assertEqual(remaining, 400)
 
         # Bought again immediately: refused by the cooldown, and no second debit.
-        ok, refusal, unchanged = economy.purchase("chat", "1", 5_000, item)
+        ok, refusal, unchanged = economy.purchase("chat", "1", funded, item)
         self.assertFalse(ok)
         self.assertIn("Ещё рано", refusal)
         self.assertEqual(unchanged, 400)
@@ -390,6 +395,146 @@ class AntiFarmingTests(unittest.TestCase):
         # ...but it is still a message that happened.
         self.assertEqual(computed["20"]["messages"], 3)
         self.assertEqual(sum(computed["20"]["hours"].values()), 3)
+
+
+class DailyBonusTests(unittest.TestCase):
+    """The one faucet that asks for nothing but showing up."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_an_unbroken_week_walks_up_the_table_and_then_stays_flat(self):
+        day = date(2026, 8, 1)
+        for offset, expected in enumerate(economy.DAILY_BONUS_BY_STREAK):
+            claimed, amount, streak = economy.claim_daily_bonus(
+                "chat", "1", day + timedelta(days=offset),
+            )
+            self.assertTrue(claimed)
+            self.assertEqual(amount, expected)
+            self.assertEqual(streak, offset + 1)
+
+        # Day 8 and beyond stay at the top of the table rather than growing forever --
+        # an unbounded streak would become the largest faucet in the game.
+        top = economy.DAILY_BONUS_BY_STREAK[-1]
+        claimed, amount, streak = economy.claim_daily_bonus(
+            "chat", "1", day + timedelta(days=len(economy.DAILY_BONUS_BY_STREAK)),
+        )
+        self.assertTrue(claimed)
+        self.assertEqual(amount, top)
+        self.assertEqual(streak, len(economy.DAILY_BONUS_BY_STREAK) + 1)
+
+    def test_a_missed_day_sends_the_streak_back_to_the_start(self):
+        economy.claim_daily_bonus("chat", "1", date(2026, 8, 1))
+        economy.claim_daily_bonus("chat", "1", date(2026, 8, 2))
+        # 3 August skipped entirely.
+        claimed, amount, streak = economy.claim_daily_bonus("chat", "1", date(2026, 8, 4))
+
+        self.assertTrue(claimed)
+        self.assertEqual(streak, 1)
+        self.assertEqual(amount, economy.DAILY_BONUS_BY_STREAK[0])
+
+    def test_a_second_claim_the_same_day_pays_nothing(self):
+        day = date(2026, 8, 1)
+        _, first, _ = economy.claim_daily_bonus("chat", "1", day)
+        balance_after_first = economy.balance("chat", "1", 0)
+
+        claimed, amount, _ = economy.claim_daily_bonus("chat", "1", day)
+
+        self.assertFalse(claimed)
+        self.assertEqual(amount, 0)
+        self.assertEqual(economy.balance("chat", "1", 0), balance_after_first)
+        self.assertEqual(balance_after_first, first)
+
+    def test_status_promises_exactly_what_a_claim_then_pays(self):
+        day = date(2026, 8, 1)
+        for offset in range(4):
+            moment = day + timedelta(days=offset)
+            promised = economy.daily_bonus_status("chat", "1", moment)
+            self.assertTrue(promised["can_claim"])
+            claimed, amount, streak = economy.claim_daily_bonus("chat", "1", moment)
+            self.assertTrue(claimed)
+            self.assertEqual(amount, promised["amount"])
+            self.assertEqual(streak, promised["next_streak"])
+
+            settled = economy.daily_bonus_status("chat", "1", moment)
+            self.assertFalse(settled["can_claim"])
+            self.assertEqual(settled["streak"], streak)
+
+    def test_a_clock_that_jumped_backwards_cannot_reclaim(self):
+        """A `last` in the future must read as "already claimed", never as a broken
+        streak that quietly pays again -- otherwise a timezone correction is a faucet."""
+        economy.claim_daily_bonus("chat", "1", date(2026, 8, 10))
+        funded = economy.balance("chat", "1", 0)
+
+        status = economy.daily_bonus_status("chat", "1", date(2026, 8, 9))
+        self.assertFalse(status["can_claim"])
+        claimed, amount, _ = economy.claim_daily_bonus("chat", "1", date(2026, 8, 9))
+        self.assertFalse(claimed)
+        self.assertEqual(amount, 0)
+        self.assertEqual(economy.balance("chat", "1", 0), funded)
+
+
+class DailyChatterPrizeTests(unittest.TestCase):
+    """Top three talkers of YESTERDAY, paid once."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.day = date(2026, 8, 1)
+
+    def _record(self, counts: dict[int, int]):
+        """Record one day in which each sender_id posted `counts[sender_id]` messages."""
+        start = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+        messages, index = [], 0
+        for sender_id, count in counts.items():
+            for _ in range(count):
+                index += 1
+                messages.append(SimpleNamespace(
+                    sender_id=sender_id, sender_name=f"U{sender_id}",
+                    sender_username=f"u{sender_id}",
+                    text="достаточно длинное сообщение для подсчёта",
+                    dt_local=start + timedelta(minutes=index), message_id=index,
+                    is_reply=False,
+                ))
+        stats.record_day("chat", self.day, messages)
+
+    def test_the_three_loudest_are_paid_in_order_and_only_once(self):
+        self._record({1: 30, 2: 20, 3: 10, 4: 5})
+
+        paid = economy.daily_chatter_prizes("chat", self.day)
+
+        self.assertEqual([row["user_id"] for row in paid], ["1", "2", "3"])
+        self.assertEqual([row["amount"] for row in paid], list(economy.DAILY_CHATTER_PRIZES))
+        self.assertEqual([row["place"] for row in paid], [1, 2, 3])
+        for row in paid:
+            self.assertEqual(economy.balance("chat", row["user_id"], 0), row["amount"])
+        # Fourth place gets nothing at all.
+        self.assertEqual(economy.balance("chat", "4", 0), 0)
+
+        # Re-running the same day is a no-op: the loop that calls this runs hourly.
+        self.assertEqual(economy.daily_chatter_prizes("chat", self.day), [])
+        self.assertEqual(economy.balance("chat", "1", 0), economy.DAILY_CHATTER_PRIZES[0])
+
+    def test_a_tie_is_broken_the_same_way_every_run(self):
+        self._record({7: 10, 3: 10, 5: 10})
+        first = [row["user_id"] for row in economy.daily_chatter_prizes("chat", self.day)]
+        self.assertEqual(first, ["3", "5", "7"])
+
+    def test_a_quiet_day_pays_only_the_people_who_actually_talked(self):
+        self._record({1: 4})
+        paid = economy.daily_chatter_prizes("chat", self.day)
+        self.assertEqual([row["user_id"] for row in paid], ["1"])
+        self.assertEqual(paid[0]["amount"], economy.DAILY_CHATTER_PRIZES[0])
+
+    def test_an_unrecorded_day_pays_nobody_rather_than_raising(self):
+        self.assertEqual(economy.daily_chatter_prizes("chat", date(2020, 1, 1)), [])
 
 
 if __name__ == "__main__":

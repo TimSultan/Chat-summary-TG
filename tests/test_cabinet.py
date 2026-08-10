@@ -10,6 +10,16 @@ import economy
 import stats
 
 
+def _coins_text(xp: int, spent: int = 0) -> str:
+    """The rendered coin line for a member with `xp` who has spent `spent`.
+
+    Derived rather than written out because XP_PER_COIN is a live balance knob (halved to
+    5 to lift the floor for members who only chat); these tests are about the cabinet
+    rendering a CURRENT balance, not about the conversion rate.
+    """
+    return f"🪙 Монеты: {stats.coins_for_xp(xp) - spent:,}".replace(",", ".")
+
+
 def _user(**kwargs):
     defaults = dict(user_id="20", username="user", display_name="Tester", messages=500)
     defaults.update(kwargs)
@@ -30,7 +40,7 @@ class ViewTests(unittest.TestCase):
         text, keyboard = cabinet.main_view("chat", _user(), 5_000, rank=3, total=190, streak=4)
 
         self.assertIn("Личный кабинет", text)
-        self.assertIn("🪙 Монеты: 500", text)
+        self.assertIn(_coins_text(5_000), text)
         self.assertIn("📈 Место в рейтинге: 3 из 190", text)
         self.assertIn("🔥 Серия: 4 дня", text)
 
@@ -771,7 +781,7 @@ class MenuFallbackTests(unittest.TestCase):
                     self._send(self._message(), entry="chat")
 
         self.assertIn("Личный кабинет", self.api.sent[0]["text"])
-        self.assertIn("🪙 Монеты: 500", self.api.sent[0]["text"])
+        self.assertIn(_coins_text(5_000), self.api.sent[0]["text"])
 
     def test_it_stays_quiet_while_a_cabinet_answer_is_awaited(self):
         flows = {
@@ -934,8 +944,8 @@ class RenderCostTests(unittest.TestCase):
         economy.purchase("chat", user.user_id, 5_000, economy.find_item("title"))
         after, _ = cabinet.main_view("chat", user, 5_000, 1, 1, 0)
 
-        self.assertIn("🪙 Монеты: 500", before)
-        self.assertIn("🪙 Монеты: 100", after)
+        self.assertIn(_coins_text(5_000), before)
+        self.assertIn(_coins_text(5_000, economy.find_item("title").price), after)
 
 
 class MenuRegistrationTests(unittest.TestCase):

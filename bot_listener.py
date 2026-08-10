@@ -6142,6 +6142,20 @@ async def handle_pets_callback(
             )
             return
 
+        if action == "dailybonusclaim":
+            # economy owns this ledger entirely -- unlike almost every other purchase in
+            # this handler, there is no pets.py wrapper to call, because the whole point of
+            # this button is that it works for someone who has never bought a cage.
+            claimed, amount, streak = economy.claim_daily_bonus(entry, user_id)
+            note = (
+                f"🎁 +{amount} монет! Серия — день {streak}."
+                if claimed else "Бонус за сегодня уже забран. Заходи завтра."
+            )
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.daily_bonus_view(entry, user_id, xp), log
+            )
+            return
+
         # --- plain redraws -------------------------------------------------------------
         if action == "updates":
             # Opening the log, rather than merely seeing the menu button, acknowledges
@@ -6169,6 +6183,8 @@ async def handle_pets_callback(
             ),
             "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
             "casino": lambda: pets_ui.casino_view(entry, user_id),
+            "quests": lambda: pets_ui.quests_view(entry, user_id),
+            "dailybonus": lambda: pets_ui.daily_bonus_view(entry, user_id, xp),
             "bagitems": lambda: pets_ui.bag_items_view(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),
@@ -6263,6 +6279,79 @@ async def _pets_deliver_farm_returns(api, entries, log=print) -> None:
             except Exception:
                 # It is safe to retry an already sent receipt; settlement remains complete.
                 log(f"[pets] could not mark farm return {run_id} delivered:\n{traceback.format_exc()}")
+
+
+DAILY_CHATTER_MEDALS = ("🥇", "🥈", "🥉")
+
+
+def _pets_chatter_prize_text(day, paid: list[dict]) -> str:
+    """One compact chat announcement for yesterday's three most active talkers.
+
+    `paid` is exactly what economy.daily_chatter_prizes returned -- already ordered by
+    place, already carrying only the rows that were newly credited -- so this only has to
+    format it, never decide who won.
+    """
+    lines = [f"🖌 <b>Болтуны у мольберта — {day.strftime('%d.%m')}</b>"]
+    for row in paid:
+        place = int(row.get("place") or 0)
+        medal = DAILY_CHATTER_MEDALS[place - 1] if 1 <= place <= len(DAILY_CHATTER_MEDALS) else "🎖"
+        username = row.get("username")
+        name = f"@{username}" if username else (row.get("display_name") or "кто-то")
+        # "142 сообщения", not "142 сообщений" -- the count is known here, so decline it
+        # properly with the same helper the rest of the game's copy uses.
+        messages = pets_ui._plural(
+            int(row.get("messages", 0) or 0), "сообщение", "сообщения", "сообщений",
+        )
+        coins = pets_ui._plural(
+            int(row.get("amount", 0) or 0), "монета", "монеты", "монет",
+        )
+        lines.append(f"{medal} {html.escape(str(name))} — {messages}, +{coins}")
+    lines.append("Кисть в руки — и защищать место в тройке до завтра.")
+    return "\n".join(lines)
+
+
+async def _pets_announce_daily_chatter_prizes(
+    api, telethon_client, entries, known_chat_ids: dict[str, int], tz, log=print,
+) -> None:
+    """Pay yesterday's top three talkers, chat by chat, and announce it where it happened.
+
+    Mirrors _pets_deliver_farm_returns immediately above: one chat's failure (an
+    unresolved chat_id, a blocked send) is logged and skipped rather than taking the whole
+    loop -- and therefore every other chat's payout -- down with it.
+
+    Yesterday, never today: a day's message count is only final once the day is over (see
+    economy.daily_chatter_prizes). `tz` is the app-wide configured timezone the rest of
+    this file already threads through for exactly this "what calendar day is it" question
+    -- a naive datetime.now() would drift the cutover away from what /tree and /stat show.
+
+    economy.daily_chatter_prizes is idempotent per (chat, day) via grant_once, so calling
+    this once an hour or once a minute costs nothing extra: a chat already paid for
+    yesterday simply returns an empty list and this function does nothing, not even a log
+    line, for it.
+    """
+    yesterday = datetime.now(tz).date() - timedelta(days=1)
+    for entry in entries:
+        try:
+            paid = economy.daily_chatter_prizes(entry, yesterday)
+        except Exception:
+            log(f"[pets] daily chatter prize payout failed for '{entry}':\n{traceback.format_exc()}")
+            continue
+        if not paid:
+            continue
+        try:
+            chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+            if chat_id is None:
+                log(
+                    f"[pets] paid daily chatter prizes for '{entry}' but could not resolve "
+                    "its chat_id to announce them"
+                )
+                continue
+            await api.send_message(chat_id, _pets_chatter_prize_text(yesterday, paid), parse_mode="HTML")
+        except Exception:
+            # The grant already landed (grant_once committed before this function was even
+            # called) -- a failed announcement is cosmetic and must never be retried in a
+            # way that could re-trigger the payout.
+            log(f"[pets] failed to announce daily chatter prizes for '{entry}':\n{traceback.format_exc()}")
 
 
 ARENA_NEWS_USAGE = (
@@ -6595,6 +6684,9 @@ async def _pets_run_fight(
         "draw": reward.get("draw", False),
         "gold": reward.get("opponent_gold", 0),
         "loss_gold": reward.get("opponent_loss_gold", 0),
+        # The defender is the side that can be paid a consolation, so this is the report
+        # that actually needs it -- without it their DM shows a loss and no coins at all.
+        "consolation_gold": reward.get("opponent_consolation_gold", 0),
         "xp": reward.get("opponent_xp", reward.get("xp", 0) if reward.get("draw") else 0),
         "levels_gained": reward.get("opponent_levels_gained", 0),
         "level": reward.get("opponent_level", pets.get_pet(entry, opponent_id).get("level", 1)),
@@ -8017,6 +8109,19 @@ async def run_bot_listener(
                 await _pets_deliver_farm_returns(api, cfg.listener_allowed_chats, log=log)
                 await asyncio.sleep(60)
 
+        async def _daily_chatter_prize_loop():
+            """Pay and announce yesterday's top three talkers, safe to run on every
+            restart and on a tight interval: _pets_announce_daily_chatter_prizes is a
+            no-op the moment a chat's payout for yesterday has already gone out (see its
+            docstring), so polling hourly costs nothing beyond a cheap empty scan on every
+            pass after the first.
+            """
+            while True:
+                await _pets_announce_daily_chatter_prizes(
+                    api, telethon_client, cfg.listener_allowed_chats, known_chat_ids, tz, log=log,
+                )
+                await asyncio.sleep(3600)
+
         async def _is_vote_admin(user: dict) -> bool:
             """Who may admit nominations, see live counts, and close the vote on the
             voting page -- reuses the same "chat admin or delegate" rule as every other
@@ -8089,6 +8194,7 @@ async def run_bot_listener(
             _poll_loop(),
             _consume_summaries(),
             _farm_returns_loop(),
+            _daily_chatter_prize_loop(),
             _button_counter_refresh_loop(api, home_chat_ref, log=log),
         ]
         if figurine_ack_queue is not None:

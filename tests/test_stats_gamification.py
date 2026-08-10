@@ -19,8 +19,12 @@ class GamificationTests(unittest.TestCase):
             active_days=11,
         )
         self.assertEqual(user.xp(5.0), 1_000)
-        self.assertEqual(stats.coins_for_xp(1_009), 100)
-        self.assertEqual(stats.coins_for_xp(1_010), 101)
+        # Stated against the rate rather than a literal: XP_PER_COIN is a balance knob
+        # (halved to 5 to lift the floor for members who only chat), and what is being
+        # pinned here is the floor-division contract, not the rate of the day.
+        self.assertEqual(stats.coins_for_xp(stats.XP_PER_COIN * 101 - 1), 100)
+        self.assertEqual(stats.coins_for_xp(stats.XP_PER_COIN * 101), 101)
+        self.assertEqual(stats.coins_for_xp(stats.XP_PER_COIN - 1), 0)
 
         self.assertEqual(stats.level_for_progress(2_500, 2)[0].label, "🩶 Серый новичок")
         self.assertEqual(stats.level_for_progress(2_499, 3)[0].label, "🩶 Серый новичок")
@@ -312,8 +316,9 @@ class GamificationTests(unittest.TestCase):
             custom_badges=[custom],
         )
 
-        # XP and coins share one line now.
-        self.assertIn("⭐️ XP: 1.234 🪙 Монеты: 123", text)
+        # XP and coins share one line now. The coin figure is derived from the rate, not
+        # written out, so re-tuning XP_PER_COIN does not have to be re-typed here.
+        self.assertIn(f"⭐️ XP: 1.234 🪙 Монеты: {stats.coins_for_xp(1_234)}", text)
         # Chat level moves on XP alone; the painting rank is its own separate track.
         self.assertIn("🧩 Уровень: 🗣️ Голос чата 11", text)
         self.assertIn("🎨 Звание: 🩶 Серый новичок", text)

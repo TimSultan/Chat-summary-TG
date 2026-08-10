@@ -337,16 +337,24 @@ WIN_GOLD_MAX = 30
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.
 #
-# It applies to whoever loses, INCLUDING a defender who never chose the fight. Opponents
-# are dealt randomly inside the power window, but unlimited free rerolls still let a
-# determined attacker cherry-pick. The per-target daily cap and reduced rewards against
-# lower-level pets limit that pressure; passive losses should still be watched for abuse.
-#
-# It reduces the faucet without making a passive defender lose too much gold.
+# That reasoning is entirely about the ATTACKER's incentives -- it says nothing about a
+# defender, who never pressed anything and is simply dealt out of the power window. Charging
+# them for someone else's decision to fight is exactly the "free-for-the-house" cost this
+# constant exists to close, just aimed at the wrong person -- sharper now that a farming pet
+# can be picked too, so a passive player can be charged while away from the keyboard.
+# So LOSS_GOLD_SHARE is charged only when the LOSER IS THE ATTACKER. See
+# DEFENDER_CONSOLATION_SHARE below for what a losing defender gets instead.
 LOSS_GOLD_SHARE = 0.3
 # A debt is never created: somebody with less than this in their wallet simply pays what
 # they have. economy.balance clamps at zero anyway, and a member who cannot see why they
 # owe money is worse than one who got off lightly.
+
+# A losing DEFENDER pays nothing -- they never chose this fight -- and instead receives this
+# share of the winner's gold, minted onto their balance rather than taken from the winner
+# (the same way LOSS_GOLD_SHARE above is never paid TO the winner). Deliberately smaller
+# than LOSS_GOLD_SHARE: this only needs to turn an uninvited loss from a pure cost into a
+# wash, not to make getting attacked something worth hoping for.
+DEFENDER_CONSOLATION_SHARE = 0.20
 
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
@@ -389,8 +397,16 @@ def daily_fight_allowance(
 
 
 def loss_gold_for(won_gold: int) -> int:
-    """What the loser of a fight pays, given what the winner took."""
+    """What an ATTACKER who loses pays, given what the winner took. Never charged to a
+    defender -- see defender_consolation_for for what they get instead."""
     return max(0, round(won_gold * LOSS_GOLD_SHARE))
+
+
+def defender_consolation_for(won_gold: int) -> int:
+    """What a DEFENDER who loses receives, given what the winner took. Mirrors
+    loss_gold_for's rounding and floor, but this amount is minted onto the loser's
+    balance (economy.grant) rather than spent out of it (economy.spend)."""
+    return max(0, round(won_gold * DEFENDER_CONSOLATION_SHARE))
 
 
 def arena_level_reward_multiplier(winner_level: int, loser_level: int) -> float:

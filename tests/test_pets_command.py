@@ -10,6 +10,7 @@ the client until it times out.
 import asyncio
 import sys
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import app_time
 import bot_listener
 import economy
 import pets
@@ -227,20 +229,65 @@ class PetsCommandTests(unittest.TestCase):
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
-        # Paired rows throughout, with one deliberate exception: the casino gets a
-        # full-width row of its own so a newly announced feature is not one of two
-        # equal-looking halves. Pinning the exception by name keeps a THIRD lone button
-        # from appearing by accident.
+        # Paired rows throughout, with one deliberate exception: the daily bonus is
+        # reachable without a pet (see the no-pet test below) and so cannot share a row
+        # with anything pet-gated, and gets a full-width row of its own instead. Casino
+        # and Квесты -- two coming-soon placeholders announced the same way -- now pair
+        # with each other rather than casino standing alone. Pinning the exception by
+        # name keeps a THIRD lone button from appearing by accident.
         lone = [
             pets_ui.parse_callback(row[0]["callback_data"])[1]
             for row in keyboard["inline_keyboard"] if len(row) != 2
         ]
-        self.assertEqual(lone, ["casino"])
+        self.assertEqual(lone, ["dailybonus"])
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
         self.assertIn("fightnotify", actions)
+        self.assertIn("casino", actions)
+        self.assertIn("quests", actions)
+
+    def test_daily_bonus_button_is_offered_without_a_pet(self):
+        # The one row on this menu that must survive every `if pet:` gate: chat activity,
+        # not the arena, is most members' only income.
+        _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], 0)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertIn("dailybonus", actions)
+        self.assertNotIn("casino", actions)
+        self.assertNotIn("quests", actions)
+
+    def test_daily_bonus_claims_once_a_day_and_refuses_a_second_tap(self):
+        before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+
+        api = self._tap("dailybonusclaim")
+        self.assertIn("+25", api.edits[0]["text"])
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + 25)
+        # The claim button itself must be gone now that today is used up -- otherwise a
+        # second tap of the same button would look like it ought to pay again.
+        self.assertIn("Ежедневный бонус", api.edits[0]["text"])
+        claim_actions = {
+            pets_ui.parse_callback(b["callback_data"])[1]
+            for row in api.edits[0]["reply_markup"]["inline_keyboard"] for b in row
+        }
+        self.assertNotIn("dailybonusclaim", claim_actions)
+
+        api = self._tap("dailybonusclaim")
+        self.assertIn("уже забран", api.edits[0]["text"])
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + 25)
+
+    def test_quests_screen_is_a_stateless_placeholder(self):
+        text, keyboard = pets_ui.quests_view(CHAT, PLAYER["id"])
+        self.assertIn("Квесты скоро будут.", text)
+        # No button here changes anything -- the only way off this screen is back.
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(actions, {"main"})
 
     def test_fight_result_notifications_can_be_disabled_from_the_menu(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -371,6 +418,48 @@ class PetsCommandTests(unittest.TestCase):
             _run(bot_listener._pets_deliver_farm_returns(api, [CHAT], log=lambda *_: None))
 
         marked.assert_not_called()
+
+    def test_daily_chatter_prize_loop_pays_and_announces_once(self):
+        # economy.daily_chatter_prizes is the other agent's territory and is idempotent by
+        # construction (grant_once) -- this test is not re-proving that, it is proving the
+        # loop body only announces when a payout actually happened, and does not re-announce
+        # on the next pass once the (mocked) ledger call reports nothing new.
+        paid = [
+            {"user_id": "1", "username": "artist", "display_name": "Artist", "messages": 40, "place": 1, "amount": 200},
+            {"user_id": "2", "username": None, "display_name": "Второй", "messages": 30, "place": 2, "amount": 100},
+            {"user_id": "3", "username": "c", "display_name": "C", "messages": 20, "place": 3, "amount": 50},
+        ]
+        api = FakeApi()
+        known_chat_ids = {CHAT: MAIN_CHAT_ID}
+        tz = app_time.resolve_timezone()
+        with patch.object(economy, "daily_chatter_prizes", side_effect=[paid, []]) as mocked:
+            _run(bot_listener._pets_announce_daily_chatter_prizes(
+                api, None, [CHAT], known_chat_ids, tz, log=lambda *_: None,
+            ))
+            _run(bot_listener._pets_announce_daily_chatter_prizes(
+                api, None, [CHAT], known_chat_ids, tz, log=lambda *_: None,
+            ))
+
+        self.assertEqual(mocked.call_count, 2)
+        # Always yesterday IN THE APP TIMEZONE, never the day the loop happens to run on
+        # and never a naive local date that could disagree with it near midnight.
+        yesterday = app_time.now(tz).date() - timedelta(days=1)
+        for call in mocked.call_args_list:
+            self.assertEqual(call.args, (CHAT, yesterday))
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual(api.sent[0]["chat_id"], MAIN_CHAT_ID)
+        self.assertIn("@artist", api.sent[0]["text"])
+        self.assertIn("200", api.sent[0]["text"])
+        self.assertIn("Второй", api.sent[0]["text"])
+
+    def test_daily_chatter_prize_loop_announces_nothing_when_nobody_is_newly_paid(self):
+        api = FakeApi()
+        with patch.object(economy, "daily_chatter_prizes", return_value=[]):
+            _run(bot_listener._pets_announce_daily_chatter_prizes(
+                api, None, [CHAT], {CHAT: MAIN_CHAT_ID}, app_time.resolve_timezone(),
+                log=lambda *_: None,
+            ))
+        self.assertEqual(api.sent, [])
 
     def test_group_arena_command_points_to_the_private_bot_menu(self):
         deletions = []

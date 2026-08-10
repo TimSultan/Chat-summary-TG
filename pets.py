@@ -576,7 +576,13 @@ def passive_income_status(entry, user_id, now: datetime | None = None) -> dict:
 
 
 def balance_for(entry, user_id, xp) -> int:
-    """Thin pass-through so pets_ui never has to import economy directly."""
+    """Thin pass-through so a balance read also settles the pet's passive income.
+
+    It is no longer true that pets_ui never touches economy: the daily bonus screen calls
+    economy directly, because that faucet deliberately works for members with no pet at
+    all and routing it through this module would invent a dependency it does not have.
+    What this wrapper still owns is the pet-specific part below.
+    """
     # All arena balance views collect complete hours. The ledger's checkpoint and bonus
     # are written together, so a redraw/retry is idempotent.
     if has_cage(entry, user_id):
@@ -2212,6 +2218,7 @@ def record_fight(
             "defender_owner": defender.get("owner_name"),
             "gold": 0,
             "loss_gold": 0,
+            "consolation_gold": 0,
             "dropped_item": None,
             "combat_seed": getattr(result, "seed", None),
             "total_damage": dict(getattr(result, "total_damage", {})),
@@ -2222,6 +2229,7 @@ def record_fight(
             "draw": True,
             "gold": 0,
             "loss_gold": 0,
+            "consolation_gold": 0,
             "xp": C.DRAW_XP,
             "levels_gained": attacker_levels_gained,
             "level": attacker.get("level", 1),
@@ -2249,33 +2257,46 @@ def record_fight(
     economy.grant(entry, winner_uid, gold, "pet_fight_win")
     _metric_add(data, "arena_reward_gold", gold)
 
-    # The loser pays half of that. Charged as a spend rather than a negative grant so it
-    # lands in the same ledger column as every other purchase -- and clamped to what they
-    # actually hold, because economy.balance floors at zero and a debt nobody can see the
-    # cause of is worse than a bill that got rounded down. `loser_xp` is the loser's live
-    # chat XP, which the caller cannot supply for a defender who is not the one playing,
-    # so it is read from the same aggregate economy.balance itself uses.
-    penalty = C.loss_gold_for(gold)
-    # «Последний чек» keeps part of the loser's coins. It changes only the amount paid;
-    # the winner's already-calculated reward is never reduced by somebody else's gear.
-    survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
-    if survivor_share:
-        penalty = max(0, round(penalty * (1 - min(1.0, survivor_share))))
+    # Only the ATTACKER pays a penalty for losing -- they are the one who pressed "напасть".
+    # A losing DEFENDER never chose this fight (opponents are dealt out of the power window,
+    # and a farming pet is now a valid target too), so they pay nothing and instead receive
+    # a small consolation minted onto their balance. See LOSS_GOLD_SHARE and
+    # DEFENDER_CONSOLATION_SHARE in pets_config.py for why the two are different numbers.
+    attacker_lost = loser_uid == attacker_uid
     paid = 0
-    if penalty > 0:
-        # Prefer the caller's own figure for the attacker: it is the live, today-inclusive
-        # XP economy.balance wants, whereas _chat_xp_for can only see closed days. The
-        # fallback is for the defender, whose XP the caller has no way to know.
-        if loser_uid == attacker_uid and attacker_xp is not None:
-            loser_xp = attacker_xp
-        else:
-            loser_xp = _chat_xp_for(entry, loser_uid)
-        affordable = min(penalty, economy.balance(entry, loser_uid, loser_xp))
-        if affordable > 0:
-            ok, _ = economy.spend(
-                entry, loser_uid, loser_xp, affordable, "pet_fight_loss", ref=winner_uid
-            )
-            paid = affordable if ok else 0
+    consolation = 0
+    if attacker_lost:
+        # Charged as a spend rather than a negative grant so it lands in the same ledger
+        # column as every other purchase -- and clamped to what they actually hold, because
+        # economy.balance floors at zero and a debt nobody can see the cause of is worse
+        # than a bill that got rounded down.
+        penalty = C.loss_gold_for(gold)
+        # «Последний чек» keeps part of the loser's coins. It changes only the amount paid;
+        # the winner's already-calculated reward is never reduced by somebody else's gear.
+        survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
+        if survivor_share:
+            penalty = max(0, round(penalty * (1 - min(1.0, survivor_share))))
+        if penalty > 0:
+            # Prefer the caller's own figure: it is the live, today-inclusive XP
+            # economy.balance wants, whereas _chat_xp_for can only see closed days. Only
+            # the attacker can reach this branch (loser_uid == attacker_uid was just
+            # checked above), so attacker_xp is always the right source when supplied; the
+            # fallback covers a caller that omitted it (most tests do).
+            loser_xp = attacker_xp if attacker_xp is not None else _chat_xp_for(entry, loser_uid)
+            affordable = min(penalty, economy.balance(entry, loser_uid, loser_xp))
+            if affordable > 0:
+                ok, _ = economy.spend(
+                    entry, loser_uid, loser_xp, affordable, "pet_fight_loss", ref=winner_uid
+                )
+                paid = affordable if ok else 0
+    else:
+        # The defender branch needs no XP lookup at all: economy.grant only credits a
+        # balance, unlike economy.spend/economy.balance it never has to read one first.
+        # That is also why this never needed the `_chat_xp_for` fallback the old shared
+        # penalty path carried for a defender it could not get live XP for.
+        consolation = C.defender_consolation_for(gold)
+        if consolation > 0:
+            economy.grant(entry, loser_uid, consolation, "pet_fight_defender_consolation")
 
     dropped_code = None
     # An item code represents one unique object. A full duplicate-proof pool also
@@ -2360,8 +2381,11 @@ def record_fight(
         "gold": gold,
         # What the LOSER actually paid, which is not always C.loss_gold_for(gold): an
         # empty wallet pays what it has. Stored so a history line can show the real
-        # number rather than recomputing an amount that was never charged.
+        # number rather than recomputing an amount that was never charged. Exactly one of
+        # loss_gold/consolation_gold can be non-zero: an attacker-loser pays, a
+        # defender-loser is paid, never both on the same fight.
         "loss_gold": paid,
+        "consolation_gold": consolation,
         "dropped_item": dropped_code,
         "auto_equipped": auto_equipped,
         "combat_seed": getattr(result, "seed", None),
@@ -2375,13 +2399,21 @@ def record_fight(
         "draw": False,
         "gold": gold if attacker_won else 0,
         "loss_gold": 0 if attacker_won else paid,
+        # An attacker never gets a consolation -- only a losing defender does, below. Kept
+        # as an explicit field (not a sign-flipped loss_gold) so a reader can tell "paid a
+        # penalty" and "was minted a consolation" apart instead of inferring it from sign.
+        "consolation_gold": 0,
         "xp": winner_xp if attacker_won else C.LOSS_XP,
         "levels_gained": winner_levels_gained if attacker_won else loser_levels_gained,
         "level": attacker.get("level", 1),
         "dropped_item": dropped_code if attacker_won else None,
         "auto_equipped": auto_equipped if attacker_won else False,
         "opponent_gold": gold if not attacker_won else 0,
-        "opponent_loss_gold": paid if attacker_won else 0,
+        # A losing defender never pays anymore -- see opponent_consolation_gold for what
+        # they receive instead. Left in place (rather than dropped) so any reader still
+        # asking "did the opponent lose money" gets a correct zero, not a missing key.
+        "opponent_loss_gold": 0,
+        "opponent_consolation_gold": consolation if attacker_won else 0,
         "opponent_xp": C.LOSS_XP if attacker_won else winner_xp,
         "opponent_levels_gained": loser_levels_gained if attacker_won else winner_levels_gained,
         "opponent_level": defender.get("level", 1),
@@ -2398,12 +2430,14 @@ def history(entry, user_id) -> list[dict]:
         if fight.get("attacker_id") != uid and fight.get("defender_id") != uid:
             continue
         row = dict(fight)
-        # Both money columns are rewritten from the READER's side: "gold" is what the
-        # winner received and "loss_gold" what the loser paid, so exactly one of them can
-        # be non-zero on any one person's line.
+        # Money columns are rewritten from the READER's side: "gold" is what the winner
+        # received, "loss_gold" what an attacker-loser paid and "consolation_gold" what a
+        # defender-loser was paid instead -- a fight has exactly one winner and one loser
+        # (or a draw), so at most one of the three is non-zero on any one person's line.
         won = fight.get("winner_id") == uid
         row["gold"] = fight.get("gold", 0) if won else 0
         row["loss_gold"] = 0 if won else fight.get("loss_gold", 0)
+        row["consolation_gold"] = 0 if won else fight.get("consolation_gold", 0)
         mine.append(row)
     mine.reverse()  # stored oldest -> newest, so reverse for "newest first"
     return mine[:C.HISTORY_LIMIT]

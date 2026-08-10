@@ -83,7 +83,12 @@ XP_PER_MEDIA_MESSAGE = 1
 XP_PER_REPLY = 1
 XP_PER_ACTIVE_DAY = 5
 XP_PER_FIGURINE = 200
-XP_PER_COIN = 10
+# Halved from 10. Coins are DERIVED from XP (see economy.balance), never stored, so this
+# is not only a better rate going forward -- it retroactively doubles what everybody has
+# already earned, in one step, with no migration. That is the intended effect: the arena
+# is not most members' income, chat activity is, and at 10 XP per coin a normal chatter
+# earned about 5 coins a day against stat upgrades priced in the thousands.
+XP_PER_COIN = 5
 
 # Anti-farming limits, applied when a day is COMPUTED (compute_day_stats) rather than
 # when it is scored, so they can never reach back and reprice a day that was already
