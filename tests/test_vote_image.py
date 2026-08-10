@@ -371,10 +371,9 @@ class VoteImageCommandTests(unittest.TestCase):
 
 
 class VoteImageButtonTests(unittest.TestCase):
-    # The картинка actions are parsed by _vote_image_columns rather than by a word set,
-    # since the column count rides on the same command.
+    # The картинка and собрать actions are parsed by a helper rather than by a plain word
+    # set, since the column count / the week both ride on the same command word.
     WORD_SET_ACTIONS = {
-        "collect": "VOTE_COLLECT_WORDS",
         "chat": "VOTE_CHAT_WORDS",
         "clear": "VOTE_CLEAR_WORDS",
     }
@@ -388,11 +387,22 @@ class VoteImageButtonTests(unittest.TestCase):
             if action in self.WORD_SET_ACTIONS:
                 words = getattr(bot_listener, self.WORD_SET_ACTIONS[action])
                 self.assertIn(argument, words, f"{action}: {command} is unparseable")
+            elif action.startswith("collect"):
+                self.assertIsNotNone(
+                    bot_listener._vote_collect_weeks_ago(argument),
+                    f"{action}: {command} is unparseable",
+                )
             else:
                 self.assertIsNotNone(
                     bot_listener._vote_image_columns(argument),
                     f"{action}: {command} is unparseable",
                 )
+
+    def test_the_two_collect_buttons_ask_for_this_week_and_the_previous_one(self):
+        this_week = bot_listener.VOTE_ACTIONS["collect"][len("/vote"):].strip()
+        previous = bot_listener.VOTE_ACTIONS["collectprev"][len("/vote"):].strip()
+        self.assertEqual(bot_listener._vote_collect_weeks_ago(this_week), 0)
+        self.assertEqual(bot_listener._vote_collect_weeks_ago(previous), 1)
 
     def test_the_two_picture_buttons_ask_for_three_and_four_columns(self):
         three = bot_listener.VOTE_ACTIONS["image"][len("/vote"):].strip()

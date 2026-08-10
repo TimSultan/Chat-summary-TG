@@ -150,12 +150,18 @@ async def collect_entries(
     media_dir: Path,
     hashtag: str = CONTEST_HASHTAG,
     skip_entry_ids=frozenset(),
+    weeks_ago: int = 0,
     progress=None,
     log=print,
 ) -> list[Entry]:
-    """Reads the CURRENT CONTEST WEEK of `chat_ref` -- Monday 00:00 local through now --
-    and returns one Entry per NEWLY found nominated post, downloading every attached photo
-    into `media_dir`.
+    """Reads one CONTEST WEEK of `chat_ref` and returns one Entry per NEWLY found nominated
+    post, downloading every attached photo into `media_dir`.
+
+    `weeks_ago` picks the week: 0 is the one in progress (Monday 00:00 local through now),
+    1 is the week before it -- closed at BOTH ends, Monday 00:00 through the following
+    Monday 00:00, so a poll for a finished week never swallows what has been posted since.
+    The Monday case is what it exists for: the voting for a week happens after that week is
+    over, and on Monday "this week" is a few hours old and empty.
 
     The window is the week rather than a rolling span of days on purpose: collecting runs
     on Sunday, so a rolling window is simultaneously too short (it misses everything posted
@@ -187,8 +193,13 @@ async def collect_entries(
     entity = chat_ref if not isinstance(chat_ref, str) else await resolve_chat(client, chat_ref)
 
     now_local = datetime.now(tz)
-    start_local = contest_week_start(now_local)
+    # Shift "now" back whole weeks and take THAT week's Monday, rather than subtracting
+    # days from the current Monday -- the two agree, and this one keeps working when the
+    # shift crosses a DST change or a year boundary.
+    start_local = contest_week_start(now_local - timedelta(weeks=weeks_ago))
     start_utc = start_local.astimezone(timezone.utc)
+    # A past week is closed at the far end too; the week in progress runs up to now.
+    end_utc = (start_local + timedelta(weeks=1)).astimezone(timezone.utc) if weeks_ago else None
 
     async def report(stage: str, done: int, total: int) -> None:
         """Tell the caller how far along this is, without letting that stop the scan.
@@ -205,10 +216,19 @@ async def collect_entries(
 
     messages = []
     stopped_at_known = False
+    scanned = 0
     await report("scan", 0, 0)
     async for message in client.iter_messages(entity, reverse=False):
+        scanned += 1
+        # Counted on every message read, not on every message kept: collecting a PAST week
+        # walks back through the current one first, and progress that sat at zero for that
+        # whole stretch reads as a hung collection -- which is what the reporter is for.
+        if scanned % 250 == 0:
+            await report("scan", scanned, 0)
         if message.date < start_utc:
             break
+        if end_utc is not None and message.date >= end_utc:
+            continue  # newer than the week being collected -- belongs to a different poll
         if message.action is not None:
             continue  # service message (join/leave/pin)
         messages.append(message)
@@ -225,13 +245,15 @@ async def collect_entries(
         if skip_entry_ids and str(message.id) in skip_entry_ids:
             stopped_at_known = True
             break
-        if len(messages) % 250 == 0:
-            await report("scan", len(messages), 0)
 
     groups = group_into_entries(messages, hashtag)
+    window = (
+        f"since {start_local.date()}" if end_utc is None
+        else f"for the week of {start_local.date()}"
+    )
     log(
-        f"[voting] {len(messages)} message(s) "
-        f"{'back to the first already-collected work' if stopped_at_known else f'since {start_local.date()}'}"
+        f"[voting] {len(messages)} message(s) of {scanned} read "
+        f"{'back to the first already-collected work' if stopped_at_known else window}"
         f" -> {len(groups)} nomination(s)"
     )
 
@@ -580,9 +602,32 @@ def _all_polls(entry: str) -> list[Poll]:
 
 
 def latest_poll(entry: str) -> Poll | None:
-    """The most recently created poll for this chat -- what /vote and the page open."""
+    """What /vote and the page open: the newest poll that actually holds works, and only
+    if none of them do, the newest poll outright.
+
+    "Newest" alone is not enough, because an EMPTY poll is written routinely -- collecting
+    a week that turned out to have no nominations still saves the week's file, and on a
+    Monday that is the normal outcome for the week just begun. Being the newest file on
+    disk, it would then hide the week people are actually voting in. Nobody opening a
+    ballot wants the empty week; if every week is empty it makes no difference which one
+    they get.
+    """
     polls = _all_polls(entry)
-    return polls[0] if polls else None
+    return next((poll for poll in polls if poll.entries), polls[0] if polls else None)
+
+
+def make_current(poll: Poll) -> Poll:
+    """Marks `poll` as the one /vote and the page open, by making it the newest.
+
+    `created_at` is what `latest_poll` orders on, and "newest created" only means "the week
+    being worked on" while weeks are collected in order. Collecting the PREVIOUS week --
+    the Monday case, where the finished week is the one that still has to be voted on --
+    breaks that: its poll may well be older than an empty poll for the week just started.
+    So the collect says outright which week is current instead of leaving it to the
+    timestamps. For the current week this changes nothing; its poll is already the newest.
+    """
+    poll.created_at = datetime.now(timezone.utc).isoformat()
+    return poll
 
 
 def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | None = None) -> Poll:

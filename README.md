@@ -627,11 +627,27 @@ page that changes shape depending on who opens it:
   many voted, the top 3 so far) and a button per command — the written-out list of the same
   commands used to sit above them and is gone, since every line of it was a slower way to
   press the button underneath. "Открыть голосование"/"Модерация" open the Mini App directly, while
-  "Собрать заявки"/"Объявление"/"Картинка итогов"/"Очистить" run the exact same code path as typing the
+  "Заявки за эту неделю"/"За прошлую неделю"/"Объявление"/"Картинка итогов"/"Очистить" run the exact
+  same code path as typing the
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
-- **`/vote собрать`** (DM, administrators only) scans today and yesterday for
-  `#итогинедели` posts and adds any that aren't already in the poll.
+- **`/vote собрать`** (DM, administrators only) scans the contest week for `#итогинедели`
+  posts and adds any that aren't already in the poll.
+
+  **Which week is a choice, and it is two buttons rather than a picker** — "Заявки за эту
+  неделю" and "За прошлую неделю" (`/vote собрать` and `/vote собрать прошлая`,
+  `_vote_collect_weeks_ago` parses both). The vote for a week is run once that week is
+  over, so on a Monday the default window is a few hours old and empty while every work
+  worth voting on sits in the week just ended. The previous week's window is closed at
+  **both** ends — Monday 00:00 through the following Monday 00:00 — so collecting it never
+  drags in what has been posted since; each week's works stay in that week's own poll.
+  Collecting also makes the week it collected **the current poll** (`voting.make_current`):
+  the page and `/vote` open `latest_poll`, which orders on `created_at`, and without that
+  an empty poll for the week that has only just begun would outrank the one just filled.
+  From the other side, `latest_poll` skips **empty** weeks entirely and opens the newest
+  one that actually holds works (falling back to the newest outright only when they are
+  all empty) — collecting a week nobody posted in still writes that week's file, and on a
+  Monday that is the normal outcome for the week in progress.
 
   **Starting a new week carries last week's field over**, minus its top 3: the podium has
   had its week, everything below it runs again, and the reply says how many came across.

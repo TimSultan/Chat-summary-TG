@@ -29,6 +29,13 @@ LAST_WEEK = "2026-W30"
 THIS_WEEK = "2026-W31"
 
 
+def _fake_poll_id(tz, weeks_ago=0):
+    """Stands in for bot_listener._current_vote_poll_id so the tests don't depend on which
+    ISO week they happen to run in -- and, since собрать now takes a window, on which week
+    the command asked for."""
+    return LAST_WEEK if weeks_ago else THIS_WEEK
+
+
 def _entry(entry_id, name=None, media=("a.jpg",)):
     return voting.Entry(
         entry_id=entry_id, message_id=int(entry_id), author_id=int(entry_id),
@@ -72,7 +79,7 @@ class CollectWindowTests(unittest.TestCase):
         for index in range(5):
             (media / f"{index}.jpg").write_bytes(b"jpeg-ish")
 
-    def _collect(self, new_entries=()):
+    def _collect(self, new_entries=(), text="/vote собрать", poll_id=THIS_WEEK):
         async def collect_entries(**kwargs):
             self.collect_kwargs = kwargs
             return list(new_entries)
@@ -87,7 +94,7 @@ class CollectWindowTests(unittest.TestCase):
             "message_id": 1,
             "chat": {"id": 5, "type": "private"},
             "from": {"id": 7, "username": "admin"},
-            "text": "/vote собрать",
+            "text": text,
         }
         cfg = SimpleNamespace(
             webapp_public_url="https://example.com",
@@ -97,12 +104,12 @@ class CollectWindowTests(unittest.TestCase):
         with patch.object(bot_listener, "_resolve_chat_id", resolve), \
              patch.object(bot_listener, "_can_manage_chat", can_manage), \
              patch.object(voting, "collect_entries", collect_entries), \
-             patch.object(bot_listener, "_current_vote_poll_id", lambda tz: THIS_WEEK):
+             patch.object(bot_listener, "_current_vote_poll_id", _fake_poll_id):
             asyncio.run(bot_listener.handle_vote_command(
                 self.api, None, cfg, None, message, CHAT, "testbot", set(),
                 log=lambda *_: None,
             ))
-        return voting.load_poll(CHAT, THIS_WEEK)
+        return voting.load_poll(CHAT, poll_id)
 
     def test_a_new_week_starts_empty_instead_of_inheriting_last_weeks_works(self):
         poll = self._collect()
@@ -146,6 +153,62 @@ class CollectWindowTests(unittest.TestCase):
 
         self.assertEqual(again.approved, ["90"])
         self.assertEqual([e.entry_id for e in again.entries], ["90", "91"])
+
+    def test_the_default_collect_still_asks_for_the_week_in_progress(self):
+        self._collect()
+
+        self.assertEqual(self.collect_kwargs["weeks_ago"], 0)
+
+    def test_the_previous_week_button_collects_into_the_previous_weeks_poll(self):
+        """It is Monday: the works people have to vote on are all in the week just ended,
+        and "this week" is a few hours old and empty."""
+        poll = self._collect(
+            new_entries=[_entry("90", media=["90.jpg"])],
+            text="/vote собрать прошлая", poll_id=LAST_WEEK,
+        )
+
+        self.assertEqual(self.collect_kwargs["weeks_ago"], 1)
+        self.assertIn("90", [e.entry_id for e in poll.entries])
+        # ...merged into that week rather than replacing it: what it already held is still
+        # there, still admitted, and its votes are still counted.
+        self.assertEqual(len(poll.entries), 6)
+        self.assertEqual(sorted(poll.approved), ["0", "1", "2", "3", "4"])
+        self.assertEqual(len(poll.votes), 10)
+        self.assertIsNone(voting.load_poll(CHAT, THIS_WEEK))  # untouched, not created
+
+    def test_collecting_the_previous_week_makes_it_the_poll_the_page_opens(self):
+        """The reported bug, in full: the week just collected is the week the moderator is
+        working on, so it has to be the one the ballot and the moderation screen open --
+        even when the week in progress has works of its own and is therefore the newer
+        poll. Otherwise what was just collected is invisible."""
+        self._collect(new_entries=[_entry("80", media=["80.jpg"])])
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, THIS_WEEK)
+
+        self._collect(
+            new_entries=[_entry("90", media=["90.jpg"])],
+            text="/vote собрать прошлая", poll_id=LAST_WEEK,
+        )
+
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+
+    def test_the_empty_week_just_begun_does_not_hide_the_week_being_voted_in(self):
+        """Monday, the other way round: the previous week is collected and open, and then
+        somebody presses "за эту неделю". Nothing has been posted yet, and the empty poll
+        that writes must not become what the ballot opens."""
+        self._collect(
+            new_entries=[_entry("90", media=["90.jpg"])],
+            text="/vote собрать прошлая", poll_id=LAST_WEEK,
+        )
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+
+        self._collect()
+
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+
+    def test_the_previous_week_scan_is_told_what_that_week_already_holds(self):
+        self._collect(text="/vote собрать прошлая", poll_id=LAST_WEEK)
+
+        self.assertEqual(self.collect_kwargs["skip_entry_ids"], {"0", "1", "2", "3", "4"})
 
     def test_votes_already_cast_this_week_survive_a_second_collect(self):
         self._collect(new_entries=[_entry("90")])
@@ -207,7 +270,7 @@ class ConcurrentCollectTests(unittest.TestCase):
             with patch.object(bot_listener, "_resolve_chat_id", resolve), \
                  patch.object(bot_listener, "_can_manage_chat", can_manage), \
                  patch.object(voting, "collect_entries", collect_entries), \
-                 patch.object(bot_listener, "_current_vote_poll_id", lambda tz: THIS_WEEK):
+                 patch.object(bot_listener, "_current_vote_poll_id", _fake_poll_id):
                 first = asyncio.create_task(bot_listener.handle_vote_command(
                     api, None, cfg, None, message, CHAT, "testbot", set(), log=lambda *_: None,
                 ))
@@ -250,7 +313,7 @@ class ConcurrentCollectTests(unittest.TestCase):
         with patch.object(bot_listener, "_resolve_chat_id", resolve), \
              patch.object(bot_listener, "_can_manage_chat", can_manage), \
              patch.object(voting, "collect_entries", exploding), \
-             patch.object(bot_listener, "_current_vote_poll_id", lambda tz: THIS_WEEK):
+             patch.object(bot_listener, "_current_vote_poll_id", _fake_poll_id):
             asyncio.run(bot_listener.handle_vote_command(
                 api, None, cfg, None, message, CHAT, "testbot", set(), log=lambda *_: None,
             ))
