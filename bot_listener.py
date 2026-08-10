@@ -50,13 +50,16 @@ alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
 
 import asyncio
 import html
+import os
 import re
 import secrets
 import sys
+import tempfile
 import time
 import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import aiohttp
 from telethon import utils as tl_utils
@@ -6974,6 +6977,38 @@ async def _pets_download_media(api, file_id, log) -> bytes | None:
         return None
 
 
+async def _pets_upload_photo(api, user_id, data: bytes, log=print) -> str | None:
+    """Push a picture the Mini App produced to Telegram and report the file_id it minted.
+
+    Telegram assigns a file_id only to a photo it has actually delivered, so the picture
+    has to be SENT somewhere -- the owner's own DM, which is both the least intrusive
+    destination and a useful receipt ("this is what your creature looks like now").
+
+    Written to a temporary file because send_photo_file takes a path: the Bot API wants
+    multipart form data, and the bytes came off an HTTP request rather than off disk.
+    """
+    if not hasattr(api, "send_photo_file"):
+        return None
+    handle, temporary = tempfile.mkstemp(suffix=".jpg", prefix="pet-portrait-")
+    path = Path(temporary)
+    try:
+        with os.fdopen(handle, "wb") as file:
+            file.write(data)
+        message = await api.send_photo_file(
+            user_id, path, caption="Новое фото существа.", disable_notification=True,
+        )
+        sizes = (message or {}).get("photo") or []
+        return sizes[-1]["file_id"] if sizes else None
+    except Exception:
+        log(f"[pets] could not upload a portrait:\n{traceback.format_exc()}")
+        return None
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 async def _pets_owner_avatar(api, user_id, log) -> bytes | None:
     if not hasattr(api, "get_user_profile_photo"):
         return None
@@ -8415,9 +8450,23 @@ async def run_bot_listener(
                         return None, None
                     return await _pets_context(telethon_client, home_chat_ref, tz, user, log=log)
 
+                async def _fetch_pet_photo(file_id: str):
+                    return await _pets_download_media(api, file_id, log)
+
+                async def _save_pet_photo(user_id, data: bytes):
+                    """Bytes from the page -> a Telegram file_id.
+
+                    Sent to the player's own chat with the bot: Telegram only mints a
+                    file_id for a picture it has actually delivered somewhere, and the
+                    owner's DM is the one place that is not noise -- they get their new
+                    portrait back as a receipt.
+                    """
+                    return await _pets_upload_photo(api, user_id, data, log=log)
+
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
-                    is_member=_is_vote_member, resolve_player=_resolve_pet_player, log=log,
+                    is_member=_is_vote_member, resolve_player=_resolve_pet_player,
+                    fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo, log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token

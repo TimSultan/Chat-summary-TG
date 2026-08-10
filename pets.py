@@ -1515,8 +1515,42 @@ def set_photo(entry, user_id, photo_file_id) -> tuple[bool, str]:
     if record is None:
         return False, "Сначала приручи существо."
     record["photo_file_id"] = photo_file_id
+    # A new picture is a new composition, so the old framing cannot survive it -- the
+    # square that centred somebody's last figurine would land anywhere on this one.
+    record.pop("portrait_crop", None)
     _save(entry, data)
     return True, "Фото обновлено."
+
+
+def set_portrait_crop(entry, user_id, crop: dict | None) -> tuple[bool, str]:
+    """How the pet's photo is framed into a square: {x, y, size} in the PHOTO'S OWN pixels.
+
+    The rectangle is stored rather than the cut pixels, the same way voting.py stores an
+    entry's framing (see vote_image._crop_to_square): the picture itself lives on
+    Telegram's servers and is re-rendered from a file_id every time, so a framing baked
+    into pixels could never be adjusted afterwards, and every place that draws the pet
+    would have to agree on which of two images was the real one.
+
+    `None` clears it, which means "fit the whole photo" -- the same default an untouched
+    pet has always had.
+    """
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    if crop is None:
+        record.pop("portrait_crop", None)
+        _save(entry, data)
+        return True, "Кадрирование сброшено."
+    try:
+        x, y, size = float(crop["x"]), float(crop["y"]), float(crop["size"])
+    except (KeyError, TypeError, ValueError):
+        return False, "Не понял кадрирование."
+    if not (size > 0) or size > 100_000 or abs(x) > 100_000 or abs(y) > 100_000:
+        return False, "Кадрирование вне допустимых границ."
+    record["portrait_crop"] = {"x": x, "y": y, "size": size}
+    _save(entry, data)
+    return True, "Кадр сохранён."
 
 
 def validate_name(name) -> str:

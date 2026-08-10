@@ -1136,12 +1136,44 @@ from `DATA_DIR/pets/items/<code>.png|webp|jpg` when one exists, and otherwise ge
 **210×210** SVG keyed on the item's own code — rarity colour, slot glyph, a stable speckle
 pattern, so an item looks the same everywhere and can be learned by sight before any art
 exists. Dropping files into that directory replaces placeholders with no code change.
-There are 596 items, which is why they are generated rather than shipped.
+There are 596 items, which is why they are generated rather than shipped. The tile is
+**always square** (`aspect-ratio: 1`) whatever the source turns out to be, and the name
+under it **wraps instead of being clipped** — an item you cannot read the name of is not
+one you can choose between.
 
-**What is deliberately not there:** taming and changing the photo, which need a Telegram
-`file_id` a Mini App cannot produce — those send you back to the DM. Casino and quests are
-stubs in `pets_ui.py` too; they are not reproduced here rather than being reproduced as
-dead ends.
+**Pet photos.** A pet's picture lives on Telegram's servers as a `file_id` and nowhere
+else, so the page cannot point an `<img>` at it. `GET /pets/img/pet/<user id>.jpg` fetches
+it through the Bot API **once per file_id**, stores it under `DATA_DIR/pets/portraits/`
+(named after a hash of the id, so a new photo is a new URL and the cache never needs
+invalidating) and serves it from disk thereafter. A pet with no photo, an unknown id, or a
+download that fails all return a **coloured placeholder with the creature's initial**,
+keyed on its id so the colour is stable — a roster of opponents has to render even when one
+picture is missing. Portraits appear in the HUD, the hero paperdoll, every arena opponent
+and the ranking.
+
+**Framing is a rectangle, not a cut.** Tapping the portrait opens a cropper — drag to pan,
+pinch or slider to zoom — and what is saved is `{x, y, size}` in the photo's own pixels
+(`pets.set_portrait_crop`), applied as CSS. Identical model and formula to the vote board's
+cropper (`vote_web.applyFrame`), deliberately: the picture is re-rendered from a `file_id`
+every time, so pixels cut here could never be un-cut. A crop may hang off the photo's edge —
+that is how "show the whole thing, letterboxed" is expressed, and why this cannot be
+`object-fit`. Changing the photo **clears** the crop; a square that centred one figurine
+would land anywhere on the next.
+
+**Changing the photo works from the page.** A Mini App *can* produce a picture — a file
+input and a canvas is all it takes; what it cannot produce is a `file_id`. So the page
+re-encodes the pick to ≤1280px and POSTs the bytes to `/api/portrait`, which decodes them
+through Pillow (proving they are an image, dropping EXIF, bounding the size) **before**
+handing them to Telegram as a photo sent to the owner's own chat — the one destination that
+is not noise, and doubles as their receipt. The id Telegram mints is what gets stored, so
+the chat menu's pet card shows exactly what the page does. That route reads its body off
+the stream against its own 8 MB ceiling rather than through `request.read()`: the
+application-wide `client_max_size` is 1 MB, and an ordinary phone photo is two or three
+times that.
+
+**What is deliberately not there:** taming (it needs a photo *and* a name in one flow, and
+the chat already has it), and casino/quests, which are stubs in `pets_ui.py` too — absent
+rather than reproduced as dead ends.
 
 Authentication, mounting and the "pictures need no header" exception are vote_web's,
 unchanged. The one dependency it cannot supply itself is the player's live chat XP (the

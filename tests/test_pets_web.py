@@ -11,16 +11,19 @@ coexists with the rest of the server without colliding.
 import hashlib
 import hmac
 import json
+import os
 import sys
 import tempfile
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlencode
 
 from aiohttp.test_utils import TestClient, TestServer
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -58,6 +61,28 @@ def _init_data(user_id: int) -> str:
     })
 
 
+def _jpeg_bytes(size=(64, 64), colour=(200, 30, 30)) -> bytes:
+    """A tiny, real JPEG -- for tests that just need something _normalise_photo accepts."""
+    buffer = BytesIO()
+    Image.new("RGB", size, colour).save(buffer, "JPEG")
+    return buffer.getvalue()
+
+
+def _large_jpeg_bytes(edge: int = 2000, quality: int = 95) -> bytes:
+    """A JPEG well above PORTRAIT_MAX_EDGE (1280) on a side, textured enough that shrinking
+    it to 1280px actually costs bytes -- unlike a flat colour, which a JPEG encoder already
+    squashes to almost nothing regardless of pixel count. Upscaled from real randomness
+    (rather than randomised pixel-by-pixel, which is both slow to generate at this size and
+    -- as pure noise -- sometimes RE-encodes larger after a small resize, the opposite of
+    what this helper needs to demonstrate) so it stays well under aiohttp's request-body
+    ceiling too.
+    """
+    small = Image.frombytes("RGB", (60, 60), os.urandom(60 * 60 * 3))
+    buffer = BytesIO()
+    small.resize((edge, edge), Image.Resampling.BICUBIC).save(buffer, "JPEG", quality=quality)
+    return buffer.getvalue()
+
+
 class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -68,6 +93,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             # rather than relying on DATA_DIR/pets/items not existing, so the placeholder
             # path is what every test exercises regardless of where it runs.
             patch("pets_web.art_dir", return_value=root / "art"),
+            # portrait_dir() reads DATA_DIR itself at call time rather than being patched
+            # directly -- steer it into the tempdir the same way production steers it, or
+            # every portrait test would litter DATA_DIR/pets/portraits in the real repo.
+            patch.dict(os.environ, {"DATA_DIR": str(root)}),
         ]
         for patcher in self._patchers:
             patcher.start()
@@ -85,12 +114,33 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 return None, None
             return None, RICH_XP
 
+        # fetch_photo/save_photo stand in for the Bot API client production wires in --
+        # keyed and recorded so a test can both script a download and assert on what the
+        # route actually asked for.
+        self.fetch_calls: list[str] = []
+        self._photos: dict[str, object] = {}
+
+        async def fetch_photo(file_id):
+            self.fetch_calls.append(file_id)
+            result = self._photos.get(file_id)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        self.save_calls: list[tuple] = []
+        self.next_saved_file_id = "uploaded_file_id"
+
+        async def save_photo(user_id, data):
+            self.save_calls.append((user_id, data))
+            return self.next_saved_file_id
+
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
         app = vote_web.create_app(
             cfg, CHAT, is_admin, log=lambda *_: None,
             attach=lambda a: pets_web.attach(
                 a, cfg, CHAT, is_member=is_member, resolve_player=resolve_player,
+                fetch_photo=fetch_photo, save_photo=save_photo,
                 log=lambda *_: None,
             ),
         )
@@ -129,6 +179,15 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(response.status, 200, await response.text())
         return await response.json()
+
+    async def _upload_portrait(self, user, data: bytes):
+        """POST raw bytes to /api/portrait the way the page's canvas upload does -- the
+        body IS the image, so initData travels in the header instead of the JSON payload
+        every other mutation uses."""
+        return await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/portrait", data=data,
+            headers={**self._auth(user), "Content-Type": "image/jpeg"},
+        )
 
     # ---- authentication -----------------------------------------------------------------
 
@@ -347,6 +406,229 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         ids = {row["user_id"] for row in body["opponents"]}
         self.assertNotIn(str(PLAYER["id"]), ids)
         self.assertEqual(ids, {str(OPPONENT["id"]), str(THIRD["id"])})
+
+    # ---- portrait: the image route ---------------------------------------------------
+
+    async def test_portrait_route_serves_the_photo_and_downloads_it_only_once(self):
+        """An <img> tag cannot carry the initData header, so this route has to work
+        unauthenticated -- and the Bot API call behind it is not free, so the same
+        file_id must cost exactly one download no matter how many times the picture is
+        requested; every later request is served off the disk cache."""
+        self._tame(PLAYER)  # _tame always uses photo_file_id "file_id"
+        self._photos["file_id"] = _jpeg_bytes()
+
+        first = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{PLAYER['id']}.jpg")
+        self.assertEqual(first.status, 200)
+        self.assertEqual(first.content_type, "image/jpeg")
+
+        second = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{PLAYER['id']}.jpg")
+        self.assertEqual(second.status, 200)
+        self.assertEqual(second.content_type, "image/jpeg")
+
+        self.assertEqual(self.fetch_calls, ["file_id"])
+
+    async def test_no_photo_and_an_unowned_id_both_render_the_svg_placeholder(self):
+        """A roster of opponents has to render even when one player's picture is missing
+        -- a pet with no photo, and a user id nobody owns, are both a 200 placeholder,
+        never a 404 or a broken image."""
+        self._tame(PLAYER)
+        ok, _ = pets.set_photo(CHAT, PLAYER["id"], None)
+        self.assertTrue(ok)
+
+        no_photo = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{PLAYER['id']}.jpg")
+        self.assertEqual(no_photo.status, 200)
+        self.assertEqual(no_photo.content_type, "image/svg+xml")
+
+        nobody = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{NONMEMBER['id']}.jpg")
+        self.assertEqual(nobody.status, 200)
+        self.assertEqual(nobody.content_type, "image/svg+xml")
+
+        # Neither case has a file_id to fetch in the first place.
+        self.assertEqual(self.fetch_calls, [])
+
+    async def test_a_failed_download_falls_back_to_the_placeholder_not_a_500(self):
+        """A Bot API call is a network call, and a network call fails in two shapes --
+        reporting nothing back, or raising outright. Both must land on the same
+        placeholder a missing photo does, not on a crash that takes the whole roster
+        down with it."""
+        self._tame(PLAYER)
+        pets.set_photo(CHAT, PLAYER["id"], "fails_quietly")
+        self._photos["fails_quietly"] = None
+
+        quiet = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{PLAYER['id']}.jpg")
+        self.assertEqual(quiet.status, 200)
+        self.assertEqual(quiet.content_type, "image/svg+xml")
+
+        self._tame(OPPONENT, name="Соперник")
+        pets.set_photo(CHAT, OPPONENT["id"], "fails_loudly")
+        self._photos["fails_loudly"] = RuntimeError("Bot API is down")
+
+        loud = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{OPPONENT['id']}.jpg")
+        self.assertEqual(loud.status, 200)
+        self.assertEqual(loud.content_type, "image/svg+xml")
+
+        # Both were actually attempted, not skipped -- the placeholder is a fallback,
+        # not a shortcut around ever calling fetch_photo.
+        self.assertEqual(self.fetch_calls, ["fails_quietly", "fails_loudly"])
+
+    async def test_the_cache_is_keyed_on_file_id_not_on_the_player(self):
+        """The cache path is a hash of the file_id, never of the owner -- so a changed
+        photo must not keep serving yesterday's picture from disk, and must cost a fresh
+        download that returns the new pixels."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = _jpeg_bytes(colour=(200, 30, 30))
+        first = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{PLAYER['id']}.jpg")
+        first_bytes = await first.read()
+
+        pets.set_photo(CHAT, PLAYER["id"], "file_id_v2")
+        self._photos["file_id_v2"] = _jpeg_bytes(colour=(30, 200, 30))
+        second = await self.client.get(pets_web.ROUTE_PREFIX + f"/img/pet/{PLAYER['id']}.jpg")
+        second_bytes = await second.read()
+
+        self.assertEqual(self.fetch_calls, ["file_id", "file_id_v2"])
+        self.assertNotEqual(first_bytes, second_bytes)
+
+    # ---- portrait: uploading -----------------------------------------------------------
+
+    async def test_uploading_a_photo_re_encodes_it_smaller_and_bounded(self):
+        """The upload path exists so a phone's multi-megabyte original never leaves the
+        server unbounded -- everything is re-encoded and capped at 1280px on the long
+        edge before it is handed to Telegram, and the state in the response has to show
+        the new photo immediately."""
+        self._tame(PLAYER)
+        self.next_saved_file_id = "fresh_file_id"
+        original = _large_jpeg_bytes()
+
+        response = await self._upload_portrait(PLAYER, original)
+        self.assertEqual(response.status, 200, await response.text())
+        body = await response.json()
+        self.assertTrue(body["ok"], body["message"])
+        self.assertTrue(body["state"]["pet"]["has_photo"])
+
+        self.assertEqual(len(self.save_calls), 1)
+        saved_user_id, saved_bytes = self.save_calls[0]
+        self.assertEqual(saved_user_id, PLAYER["id"])
+        self.assertLess(len(saved_bytes), len(original))
+        self.assertLessEqual(max(Image.open(BytesIO(saved_bytes)).size), 1280)
+
+        # The id save_photo returned -- not the original "file_id" from taming -- is what
+        # actually got stored.
+        self.assertEqual(pets.get_pet(CHAT, PLAYER["id"])["photo_file_id"], "fresh_file_id")
+
+    async def test_uploading_non_image_bytes_is_refused_before_telegram_sees_them(self):
+        """_normalise_photo runs before save_photo is ever called -- nothing unvalidated
+        should be forwarded to Telegram through the bot, so bytes that are not a picture
+        must be refused right here, with save_photo never even reached."""
+        self._tame(PLAYER)
+        response = await self._upload_portrait(PLAYER, b"not actually a jpeg")
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"], "NOT_AN_IMAGE")
+        self.assertEqual(self.save_calls, [])
+
+    async def test_a_real_phone_photo_is_bigger_than_the_servers_default_body_limit(self):
+        """aiohttp caps a request body at 1 MB for the whole application, and an ordinary
+        phone picture is two or three times that. Read through request.read() the upload
+        would die on aiohttp's own generic 413 before this route ran, telling the player
+        nothing -- so the route counts the bytes itself against its own ceiling."""
+        self._tame(PLAYER)
+        photo = _large_jpeg_bytes(edge=3000, quality=97)
+        self.assertGreater(len(photo), 1024 * 1024, "the point of this test is a >1MB body")
+
+        response = await self._upload_portrait(PLAYER, photo)
+
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(len(self.save_calls), 1)
+
+    async def test_an_upload_past_the_routes_own_ceiling_is_refused_as_such(self):
+        """...and the ceiling is still a ceiling: past it the answer is this module's own
+        TOO_BIG, not a generic transport error, and nothing is buffered whole to find out."""
+        self._tame(PLAYER)
+        response = await self._upload_portrait(PLAYER, b"x" * (pets_web.PORTRAIT_MAX_BYTES + 1))
+        self.assertEqual(response.status, 413)
+        self.assertEqual((await response.json())["error"], "TOO_BIG")
+        self.assertEqual(self.save_calls, [])
+
+    async def test_upload_is_gated_like_every_other_mutation(self):
+        """A picture upload is still a mutation of the pet, so it inherits the same three
+        gates the rest of the game enforces: something to attach the photo to, membership
+        to be allowed to act at all, and a signed caller in the first place."""
+        no_pet = await self._upload_portrait(PLAYER, _jpeg_bytes())
+        self.assertEqual(no_pet.status, 409)
+        self.assertEqual((await no_pet.json())["error"], "NO_PET")
+
+        self._tame(PLAYER)
+        non_member = await self._upload_portrait(NONMEMBER, _jpeg_bytes())
+        self.assertEqual(non_member.status, 403)
+
+        unsigned = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/portrait", data=_jpeg_bytes(),
+            headers={"Content-Type": "image/jpeg"},
+        )
+        self.assertEqual(unsigned.status, 401)
+
+    # ---- portrait: cropping -------------------------------------------------------------
+
+    async def test_portrait_crop_action_stores_reads_back_and_rejects_nonsense(self):
+        """The crop is a rectangle the player chose, not a free-form blob -- a valid one
+        round-trips through state exactly, `crop: null` is the documented way back to
+        "fit the whole photo", and anything that is not a real rectangle (a missing side,
+        a size that cannot enclose anything, a square bigger than any photo could be) has
+        to be refused rather than stored."""
+        self._tame(PLAYER)
+        saved = await self._action(PLAYER, "portrait_crop", crop={"x": 10, "y": 20, "size": 50})
+        self.assertTrue(saved["ok"], saved["message"])
+        self.assertEqual(saved["state"]["pet"]["crop"], {"x": 10.0, "y": 20.0, "size": 50.0})
+
+        cleared = await self._action(PLAYER, "portrait_crop", crop=None)
+        self.assertTrue(cleared["ok"], cleared["message"])
+        self.assertIsNone(cleared["state"]["pet"]["crop"])
+
+        for bad in (
+            {"x": 1, "y": 2},                     # no "size" at all
+            {"x": 1, "y": 2, "size": 0},           # cannot enclose anything
+            {"x": 1, "y": 2, "size": -5},          # negative
+            {"x": 1, "y": 2, "size": 1_000_000},   # absurdly large
+        ):
+            refused = await self._action(PLAYER, "portrait_crop", crop=bad)
+            self.assertFalse(refused["ok"], bad)
+            self.assertIsNone(refused["state"]["pet"]["crop"])
+
+    async def test_changing_the_photo_clears_the_stored_crop(self):
+        """A crop is a rectangle chosen for ONE composition -- pets.set_photo pops it the
+        moment the picture underneath changes, so a frame that used to centre the old
+        figurine can never be silently reapplied to a different one."""
+        self._tame(PLAYER)
+        cropped = await self._action(PLAYER, "portrait_crop", crop={"x": 1, "y": 2, "size": 10})
+        self.assertIsNotNone(cropped["state"]["pet"]["crop"])
+
+        response = await self._upload_portrait(PLAYER, _jpeg_bytes())
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body["ok"], body["message"])
+        self.assertIsNone(body["state"]["pet"]["crop"])
+
+    # ---- portrait: everywhere a pet is listed --------------------------------------------
+
+    async def test_opponents_and_leaderboard_rows_each_carry_a_portrait_url(self):
+        """Every list of pets is a list of faces, not just names -- opponents and the
+        leaderboard are two separate payloads built by two separate handlers, and both
+        have to carry the same portrait URL shape the page's <img> tags rely on."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opponents = await (await self._get("/api/opponents", PLAYER)).json()
+        self.assertTrue(opponents["opponents"])
+        for row in opponents["opponents"]:
+            self.assertEqual(
+                row["portrait"], f"{pets_web.ROUTE_PREFIX}/img/pet/{row['user_id']}.jpg"
+            )
+
+        leaderboard = await (await self._get("/api/leaderboard", PLAYER)).json()
+        self.assertTrue(leaderboard["rows"])
+        for row in leaderboard["rows"]:
+            self.assertEqual(
+                row["portrait"], f"{pets_web.ROUTE_PREFIX}/img/pet/{row['user_id']}.jpg"
+            )
 
 
 if __name__ == "__main__":

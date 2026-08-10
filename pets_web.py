@@ -41,6 +41,7 @@ import re
 import secrets
 import traceback
 from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -60,6 +61,8 @@ _CFG_KEY = web.AppKey("pets_cfg")
 _ENTRY_KEY = web.AppKey("pets_entry", str)
 _IS_MEMBER_KEY = web.AppKey("pets_is_member", Callable[[dict], Awaitable[bool]])
 _RESOLVE_KEY = web.AppKey("pets_resolve_player")
+_FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
+_SAVE_PHOTO_KEY = web.AppKey("pets_save_photo")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
 
@@ -204,6 +207,190 @@ def placeholder_svg(code: str, rarity: str = "common", slot: str = "weapon") -> 
         f'font-size="15" fill="{colour}" opacity="0.5">{code}</text>'
         f"</svg>"
     )
+
+
+# A pet's picture lives on Telegram's servers as a file_id and nowhere else, so the page
+# cannot point an <img> at it. It is fetched once through the Bot API and kept here, keyed
+# on the FILE ID rather than on the player: a new photo is a new id, so the cache never
+# needs invalidating and two pets that somehow share a picture share one file.
+PORTRAIT_MAX_BYTES = 8 * 1024 * 1024
+PORTRAIT_MAX_EDGE = 1280        # what gets stored; the crop is applied on top of it
+
+
+def portrait_dir() -> Path:
+    return Path(os.getenv("DATA_DIR", ".")) / "pets" / "portraits"
+
+
+def portrait_cache_path(file_id: str) -> Path:
+    return portrait_dir() / f"{hashlib.sha256(file_id.encode('utf-8')).hexdigest()[:32]}.jpg"
+
+
+def portrait_placeholder_svg(seed: str, letter: str = "") -> str:
+    """What stands in for a pet with no photo -- a coloured tile with its initial.
+
+    Keyed on the pet's own id so the colour is stable: in a list of opponents, a consistent
+    colour per creature is most of what "recognising" one is, before any photo exists.
+    """
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    hue = digest[0] * 360 // 256
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{ART_SIZE}" height="{ART_SIZE}" '
+        f'viewBox="0 0 {ART_SIZE} {ART_SIZE}">'
+        f'<rect width="{ART_SIZE}" height="{ART_SIZE}" fill="hsl({hue} 42% 26%)"/>'
+        f'<text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle" '
+        f'font-size="96" fill="hsl({hue} 55% 72%)" font-family="sans-serif">'
+        f'{esc_xml(letter) or "🐾"}</text></svg>'
+    )
+
+
+def esc_xml(text: str) -> str:
+    return (str(text or "")[:1]
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+async def handle_portrait(request: web.Request) -> web.Response:
+    """A pet's photo, by owner id. Unauthenticated, like every other picture route here:
+    an <img> cannot carry the initData header, and this photo was posted to the chat.
+
+    Downloaded from Telegram at most once per file_id, then served off disk. A pet with no
+    photo (or a download that fails) gets the placeholder rather than a broken image --
+    the roster of opponents must render even when one player's picture is unavailable.
+    """
+    raw = request.match_info["user_id"]
+    if not _SAFE_CODE.match(raw or ""):
+        raise web.HTTPNotFound()
+    entry = request.app[_ENTRY_KEY]
+    record = pets.get_pet(entry, raw) or {}
+    file_id = record.get("photo_file_id")
+
+    def placeholder() -> web.Response:
+        return web.Response(
+            text=portrait_placeholder_svg(raw, (record.get("name") or "")[:1]),
+            content_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    if not file_id:
+        return placeholder()
+
+    cached = portrait_cache_path(file_id)
+    if not cached.is_file():
+        fetch = request.app[_FETCH_PHOTO_KEY]
+        try:
+            data = await fetch(file_id)
+        except Exception:
+            data = None
+        if not data:
+            return placeholder()
+        try:
+            _write_portrait(cached, data)
+        except Exception:
+            request.app[_LOG_KEY](
+                f"[pets_web] could not store a portrait:\n{traceback.format_exc()}"
+            )
+            return placeholder()
+    # Immutable: the name is a hash of the file id, so this exact URL can never point at
+    # different pixels. A changed photo is a changed file_id and therefore a changed URL.
+    return web.FileResponse(cached, headers={"Cache-Control": "public, max-age=604800"})
+
+
+def _normalise_photo(data: bytes) -> bytes | None:
+    """Prove the bytes are an image, then bound and re-encode them. None if they are not.
+
+    Everything a picture goes through here passes this: whatever arrives is decoded before
+    it is stored or forwarded, EXIF (the orientation a browser would ignore and the
+    location the owner did not mean to publish) is dropped, and an enormous original is
+    brought down to something a phone can load. It also keeps the bot from being used to
+    push arbitrary bytes at Telegram's servers -- the upload path calls this BEFORE
+    handing anything over, not after.
+    """
+    from PIL import Image, ImageOps
+
+    try:
+        image = Image.open(BytesIO(data))
+        image = ImageOps.exif_transpose(image).convert("RGB")
+    except Exception:
+        return None
+    image.thumbnail((PORTRAIT_MAX_EDGE, PORTRAIT_MAX_EDGE), Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    image.save(buffer, "JPEG", quality=88, optimize=True)
+    return buffer.getvalue()
+
+
+def _write_portrait(path: Path, data: bytes) -> None:
+    normalised = _normalise_photo(data)
+    if normalised is None:
+        raise ValueError("not an image")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(normalised)
+    temporary.replace(path)
+
+
+async def _read_bounded(request: web.Request, limit: int) -> bytes | None:
+    """The request body, or None if it runs past `limit`.
+
+    Read off the stream rather than through request.read(), which enforces the
+    APPLICATION's client_max_size -- 1 MB by default, set once for the whole server by
+    vote_web.create_app. A photo route needs its own ceiling and its own refusal: at the
+    shared default an ordinary phone picture dies on aiohttp's generic 413 before this
+    handler runs, and the player is told nothing useful. Counting the bytes here keeps
+    both the limit and the message where the rule actually lives, and still refuses early
+    rather than buffering something enormous.
+    """
+    chunks, total = [], 0
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def handle_portrait_upload(request: web.Request) -> web.Response:
+    """Replace the pet's photo from the page: raw image bytes in, new file_id out.
+
+    The Mini App CAN produce a picture -- it is a web page, and a file input plus a canvas
+    is all it takes. What it cannot produce is a Telegram file_id, so the bytes are handed
+    to Telegram here (as a photo sent to the player's own chat, which doubles as their
+    receipt) and the id that comes back is what gets stored. One picture, one id, and the
+    chat menu's pet card shows exactly what the page does.
+    """
+    user, xp = await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Только участники чата.", status=403, code="NOT_A_MEMBER")
+    if pets.get_pet(entry, user["id"]) is None:
+        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+
+    body = await _read_bounded(request, PORTRAIT_MAX_BYTES)
+    if body is None:
+        return _json_error("Файл слишком большой.", status=413, code="TOO_BIG")
+    if not body:
+        return _json_error("Пустой файл.", code="EMPTY")
+
+    # Decoded here, before Telegram ever sees it: a refusal should say "это не картинка"
+    # rather than arriving as a failed upload two round trips later, and nothing should be
+    # able to use this route to push arbitrary bytes through the bot.
+    photo = _normalise_photo(body)
+    if photo is None:
+        return _json_error("Это не картинка.", code="NOT_AN_IMAGE")
+
+    save = request.app[_SAVE_PHOTO_KEY]
+    try:
+        file_id = await save(user["id"], photo)
+    except Exception:
+        request.app[_LOG_KEY](f"[pets_web] portrait upload failed:\n{traceback.format_exc()}")
+        file_id = None
+    if not file_id:
+        return _json_error("Не получилось сохранить фото.", status=502, code="UPLOAD_FAILED")
+
+    ok, message = pets.set_photo(entry, user["id"], file_id)
+    return _ok({
+        "ok": ok,
+        "message": message,
+        "state": _state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY]),
+    })
 
 
 async def handle_item_art(request: web.Request) -> web.Response:
@@ -355,6 +542,10 @@ def _combat_payload(entry: str, user_id, record: dict) -> dict:
     }
 
 
+def _portrait_url(prefix: str, user_id) -> str:
+    return f"{prefix}/img/pet/{user_id}.jpg"
+
+
 def _pet_payload(entry: str, user_id, record: dict, prefix: str) -> dict:
     level = int(record.get("level", 1))
     return {
@@ -371,7 +562,11 @@ def _pet_payload(entry: str, user_id, record: dict, prefix: str) -> dict:
         "owner_username": record.get("owner_username"),
         "created_at": record.get("created_at"),
         "notifications": bool(record.get("fight_result_notifications", True)),
-        "portrait": f"{prefix}/img/pet-{user_id}.svg",
+        "portrait": _portrait_url(prefix, user_id),
+        "has_photo": bool(record.get("photo_file_id")),
+        # The framing square, in the photo's own pixels, or null for "fit the whole thing".
+        # Applied as CSS by the page and stored as numbers (see pets.set_portrait_crop).
+        "crop": record.get("portrait_crop"),
     }
 
 
@@ -581,6 +776,11 @@ def _action_daily_bonus(entry, user_id, xp, payload):
     return True, f"+{amount} монет. Серия: {streak}."
 
 
+def _action_portrait_crop(entry, user_id, xp, payload):
+    crop = payload.get("crop")
+    return pets.set_portrait_crop(entry, user_id, crop if isinstance(crop, dict) else None)
+
+
 def _action_notifications(entry, user_id, xp, payload):
     enabled = pets.toggle_fight_result_notifications(entry, user_id)
     return True, "Отчёты о боях включены." if enabled else "Отчёты о боях выключены."
@@ -603,6 +803,7 @@ _ACTIONS = {
     "farm_feature": _action_farm_feature,
     "daily_bonus": _action_daily_bonus,
     "notifications": _action_notifications,
+    "portrait_crop": _action_portrait_crop,
 }
 
 
@@ -670,6 +871,8 @@ async def handle_opponents(request: web.Request) -> web.Response:
         record = pets.get_pet(entry, row["user_id"]) or {}
         opponents.append({
             "user_id": str(row["user_id"]),
+            "portrait": _portrait_url(request.app[_PREFIX_KEY], row["user_id"]),
+            "crop": record.get("portrait_crop"),
             "name": row.get("name"),
             "owner_name": row.get("owner_name"),
             "owner_username": row.get("owner_username"),
@@ -771,7 +974,8 @@ async def handle_leaderboard(request: web.Request) -> web.Response:
         "rows": [
             {"rank": index, "user_id": str(row["user_id"]), "name": row.get("name"),
              "owner_name": row.get("owner_name"), "owner_username": row.get("owner_username"),
-             "power": row.get("power", 0)}
+             "power": row.get("power", 0),
+             "portrait": _portrait_url(request.app[_PREFIX_KEY], row["user_id"])}
             for index, row in enumerate(rows, start=1)
         ],
     })
@@ -848,27 +1052,47 @@ async def handle_page(request: web.Request) -> web.Response:
     )
 
 
+async def _default_fetch_photo(file_id: str):
+    return None
+
+
+async def _default_save_photo(user_id, data: bytes):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
     entry: str,
     is_member=None,
     resolve_player=None,
+    fetch_photo=None,
+    save_photo=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
     """Mount the pet game onto an existing application (see bot_listener's _attach_extra).
 
-    `resolve_player(user) -> (member, xp)` is the one dependency this module cannot supply
-    itself: pricing needs the player's live chat XP, and resolving that needs the Telethon
-    client and the timezone that live in the listener. Same shape as `is_member` -- an
-    async callable taking the verified Telegram user, injected rather than imported.
+    Three injected callables, all async, all taking what the listener has and this module
+    does not -- the same convention `is_member` follows:
+
+      resolve_player(user) -> (member, xp)   the player's live chat XP. Pricing needs it,
+          and resolving it needs the Telethon client and the timezone.
+      fetch_photo(file_id) -> bytes | None   a pet's picture, for the portrait route. Needs
+          a Bot API client.
+      save_photo(user_id, bytes) -> file_id | None   the reverse, for an upload from the
+          page: hands the bytes to Telegram and reports the id it assigned.
+
+    Each has a default that simply declines, so the module stays constructible (and
+    testable) without a bot -- a missing photo shows a placeholder rather than an error.
     """
     prefix = route_prefix.rstrip("/")
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
     app[_RESOLVE_KEY] = resolve_player or _default_resolve_player
+    app[_FETCH_PHOTO_KEY] = fetch_photo or _default_fetch_photo
+    app[_SAVE_PHOTO_KEY] = save_photo or _default_save_photo
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     app.add_routes([
@@ -883,6 +1107,9 @@ def attach(
         web.get(prefix + "/api/history", handle_history),
         web.get(prefix + "/api/collection", handle_collection),
         web.get(prefix + "/api/updates", handle_updates),
+        web.post(prefix + "/api/portrait", handle_portrait_upload),
+        # Before the item route: "pet/12.jpg" must not be read as an item code.
+        web.get(prefix + "/img/pet/{user_id}.jpg", handle_portrait),
         web.get(prefix + "/img/{code}.svg", handle_item_art),
     ])
     log(f"[pets_web] pet game mounted at {prefix}")
@@ -1013,12 +1240,23 @@ PAGE_HTML = """<!doctype html>
   .doll .portrait {
     aspect-ratio: 1; border-radius: 18px; background: var(--sunken);
     display: flex; align-items: center; justify-content: center; font-size: 46px;
-    border: 2px solid var(--line); position: relative; overflow: hidden;
+    border: 2px solid var(--accent); position: relative; overflow: hidden; padding: 0;
   }
   .doll .portrait .pw {
-    position: absolute; bottom: 6px; left: 0; right: 0; text-align: center;
+    position: absolute; bottom: 0; left: 0; right: 0; text-align: center;
     font-size: 11px; font-weight: 700; color: var(--gold);
+    background: linear-gradient(transparent, rgba(0,0,0,.75)); padding: 12px 0 5px;
   }
+  .doll .portrait .edit {
+    position: absolute; top: 5px; right: 5px; font-size: 12px; background: rgba(0,0,0,.55);
+    color: #fff; border-radius: 8px; padding: 2px 6px;
+  }
+  /* A framed photo is positioned by its crop, not by object-fit -- the square can hang off
+     the edge of the picture (that is how "fit the whole thing" is expressed), and
+     object-position cannot say that. Same model as vote_web's applyFrame. */
+  .shot { position: relative; width: 100%; height: 100%; overflow: hidden; }
+  .shot img { position: absolute; left: 0; top: 0; max-width: none; display: block; }
+  .shot img.cover { width: 100%; height: 100%; object-fit: cover; }
   .slot {
     aspect-ratio: 1; border-radius: 14px; border: 1.5px dashed var(--line);
     background: var(--sunken); display: flex; align-items: center; justify-content: center;
@@ -1051,19 +1289,29 @@ PAGE_HTML = """<!doctype html>
   .loss { color: var(--hp); font-weight: 600; }
 
   /* -------------------------------------------------------------------- item grid
-     210px art, so a phone shows three across and a tablet five. Rarity is the border --
-     in a bag of forty things it is the only property you scan by. */
-  .items { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 9px; }
+     The art is a SQUARE, always: 210x210 is what the placeholder draws and what real art
+     is expected to be, and `aspect-ratio: 1` on the tile holds that whatever the source
+     turns out to be, so a grid of items reads as a grid rather than a ragged column.
+     Rarity is the border -- in a bag of forty things it is the only property you scan by.
+     Cards are a touch wider than the minimum a square needs, because the NAME has to fit:
+     "Ржавая вилка прадеда" told as "Ржавая вил…" is not an item you can choose between. */
+  .items { display: grid; grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); gap: 9px; }
   .item {
     border: 1.5px solid var(--line); background: var(--sunken); border-radius: 12px;
-    padding: 0; overflow: hidden; text-align: left; position: relative; display: block;
+    padding: 0; overflow: hidden; text-align: left; position: relative;
+    display: flex; flex-direction: column;
   }
-  .item img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
+  .item .art { width: 100%; aspect-ratio: 1; display: block; position: relative;
+               background: var(--card); overflow: hidden; }
+  .item .art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* Wrapped, not clipped: up to three lines, and the row stretches to the tallest card so
+     the grid still lines up. An ellipsis here hides the one thing the card is for. */
   .item .nm {
     display: block; font-size: 11px; line-height: 1.25; padding: 5px 6px 2px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    overflow-wrap: anywhere; hyphens: auto;
   }
-  .item .meta { display: block; font-size: 10px; padding: 0 6px 6px; color: var(--muted); }
+  .item .meta { display: block; font-size: 10px; padding: 0 6px 6px; color: var(--muted);
+                margin-top: auto; }
   .item .flag {
     position: absolute; top: 5px; left: 5px; font-size: 10px; font-weight: 700;
     background: rgba(0,0,0,.6); color: #fff; border-radius: 6px; padding: 2px 5px;
@@ -1083,9 +1331,10 @@ PAGE_HTML = """<!doctype html>
          text-align: left; }
   .foe + .foe { margin-top: 8px; }
   .foe .av {
-    width: 42px; height: 42px; border-radius: 11px; background: var(--card);
-    display: flex; align-items: center; justify-content: center; font-size: 20px; flex: none;
+    width: 46px; height: 46px; border-radius: 11px; background: var(--card);
+    overflow: hidden; flex: none; position: relative;
   }
+  .foe .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .foe.out { opacity: .45; }
   .pw { color: var(--gold); font-weight: 700; }
 
@@ -1132,6 +1381,26 @@ PAGE_HTML = """<!doctype html>
   .loot { display: flex; gap: 10px; align-items: center; background: var(--card);
           border-radius: 12px; padding: 10px; margin-bottom: 10px; }
   .loot img { width: 62px; height: 62px; border-radius: 10px; }
+
+  /* ------------------------------------------------------------- the portrait editor
+     The same square-frame model the vote board's cropper uses: the stage is a fixed
+     square viewport, the photo is absolutely positioned inside it, and the crop is
+     {x, y, size} in the photo's own pixels. touch-action: none, or the first drag is
+     taken by the page as a scroll and the photo never moves -- which reads as broken. */
+  .stage { position: relative; width: 100%; aspect-ratio: 1; overflow: hidden;
+           background: var(--sunken); border-radius: 14px; touch-action: none;
+           cursor: grab; user-select: none; }
+  .stage img { position: absolute; left: 0; top: 0; max-width: none; display: block;
+               pointer-events: none; -webkit-user-drag: none; visibility: hidden; }
+  .stage img.ready { visibility: visible; }
+  .stage::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: 14px;
+    box-shadow: inset 0 0 0 2px rgba(255,255,255,.28);
+  }
+  .zoomrow { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .zoomrow input[type="range"] { flex: 1; accent-color: var(--accent); }
+  .zoomrow button { border: 1px solid var(--line); background: transparent; color: var(--fg);
+                    border-radius: 9px; width: 38px; height: 34px; font-size: 17px; }
 </style>
 </head>
 <body>
@@ -1253,13 +1522,54 @@ function bonusText(bonuses) {
 
 function affordable(price) { return S && S.coins >= price; }
 
+// ------------------------------------------------------------------------- portraits
+// A crop is {x, y, size} in the photo's own pixels and may hang off its edges -- that is
+// how "show the whole thing, letterboxed" is expressed, and it is why this cannot be
+// object-fit. Identical model and formula to vote_web's applyFrame, deliberately: the two
+// croppers must agree, or a square framed in one would sit differently in the other.
+function applyCrop(img, crop, framePx) {
+  if (!img || !crop || !framePx || !img.naturalWidth || !Number(crop.size)) return false;
+  const scale = framePx / Number(crop.size);
+  if (!isFinite(scale) || scale <= 0) return false;
+  img.classList.remove("cover");
+  img.style.width = (img.naturalWidth * scale) + "px";
+  img.style.height = (img.naturalHeight * scale) + "px";
+  img.style.left = (-Number(crop.x) * scale) + "px";
+  img.style.top = (-Number(crop.y) * scale) + "px";
+  return true;
+}
+
+// Framed photos are painted after layout, because the crop needs both the photo's natural
+// size (which arrives with the load event) and the frame's width (which needs a layout).
+function paintShots(root) {
+  for (const box of (root || document).querySelectorAll(".shot[data-crop]")) {
+    const img = box.querySelector("img");
+    if (!img) continue;
+    let crop = null;
+    try { crop = JSON.parse(box.dataset.crop || "null"); } catch (e) { crop = null; }
+    const draw = () => {
+      // No crop, or a photo that has not loaded: cover is the honest default -- it fills
+      // the square and never leaves a hole, which is what an un-framed pet had before.
+      if (!crop || !applyCrop(img, crop, box.clientWidth)) img.classList.add("cover");
+    };
+    if (img.complete && img.naturalWidth) draw();
+    else img.addEventListener("load", draw, { once: true });
+  }
+}
+
+function shot(url, crop, extra) {
+  return '<span class="shot"' + (crop ? " data-crop='" + esc(JSON.stringify(crop)) + "'" : "") +
+    '><img src="' + esc(url) + '" alt="" class="cover" loading="lazy">' + (extra || "") + "</span>";
+}
+
 // ---------------------------------------------------------------------------- the HUD
 function renderHud() {
   const pet = S && S.pet;
   $("hudName").textContent = pet ? pet.name : "Без существа";
   $("hudLevel").textContent = pet ? pet.level : "—";
   $("hudCoins").textContent = money(S ? S.coins : 0);
-  $("hudFace").textContent = pet ? "🐾" : "🥚";
+  $("hudFace").innerHTML = pet ? shot(pet.portrait, pet.crop) : "🥚";
+  if (pet) paintShots($("hudFace"));
   const arena = (S && S.arena) || {};
   $("hudFights").textContent = (arena.available != null ? arena.available : 0) +
     "/" + (arena.capacity != null ? arena.capacity : 0);
@@ -1291,7 +1601,12 @@ function renderHero() {
     '<div class="panel">' +
       '<div class="doll">' +
         "<div>" + slot(worn.weapon) + "</div>" +
-        '<div class="portrait">🐾<span class="pw">⚡ ' + money(combat.power) + "</span></div>" +
+        // Tapping the portrait is how you change and frame the photo. It is the one thing
+        // on this screen that is a picture, so it is where a hand goes looking.
+        '<button class="portrait" data-do="portrait">' +
+          shot(pet.portrait, pet.crop) +
+          '<span class="edit">✏️</span>' +
+          '<span class="pw">⚡ ' + money(combat.power) + "</span></button>" +
         "<div>" + slot(worn.amulet) + "</div>" +
         "<div>" + slot(worn.gloves) + "</div>" +
         '<div class="tiny muted" style="text-align:center">' +
@@ -1318,6 +1633,7 @@ function renderHero() {
 
     cagePanel() + dailyPanel() +
     '<button class="go sec" data-do="rename">✏️ Переименовать</button>';
+  paintShots(box);
 }
 
 function tile(label, value) {
@@ -1433,11 +1749,17 @@ function rarityChips(active, key) {
     label + "</button>").join("");
 }
 
+function itemArt(item, marks) {
+  return '<span class="art"><img src="' + esc(item.art) +
+    '" alt="" width="210" height="210" loading="lazy">' + (marks || "") + "</span>";
+}
+
 function itemCard(item, flag) {
-  const marks = (item.equipped ? '<span class="flag">равно</span>' : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
+  const marks = (item.equipped ? '<span class="flag">надето</span>'
+                               : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
                 (item.locked ? '<span class="lockmark">🔒</span>' : "");
   return '<button class="item r-' + item.rarity + '" data-item="' + esc(item.code) + '">' +
-    '<img src="' + esc(item.art) + '" alt="" width="210" height="210" loading="lazy">' + marks +
+    itemArt(item, marks) +
     '<span class="nm">' + esc(item.name) + "</span>" +
     '<span class="meta">' + bonusText(item.bonuses) + "</span></button>";
 }
@@ -1447,8 +1769,7 @@ function shopCard(item) {
   const can = affordable(item.price) && !owned;
   return '<button class="item r-' + item.rarity + (can || owned ? "" : " dim") +
     '" data-item="' + esc(item.code) + '">' +
-    '<img src="' + esc(item.art) + '" alt="" width="210" height="210" loading="lazy">' +
-    (owned ? '<span class="flag">есть</span>' : "") +
+    itemArt(item, owned ? '<span class="flag">есть</span>' : "") +
     '<span class="nm">' + esc(item.name) + "</span>" +
     '<span class="meta">' + bonusText(item.bonuses) + " · 💰" + money(item.price) + "</span></button>";
 }
@@ -1502,13 +1823,14 @@ async function renderArena() {
         ? FOES.opponents.map((foe) => foeRow(foe, !blocked)).join("")
         : '<div class="empty">Больше ни у кого нет существа.</div>') +
     "</div>";
+  paintShots(box);
 }
 
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
   return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
     (usable ? "" : " disabled") + '>' +
-    '<span class="av">🐾</span>' +
+    '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
     "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
       "</span><br><span class='tiny muted'>" + esc(foe.owner_name || "") +
       " · побед " + foe.wins + " из " + foe.fights +
@@ -1609,8 +1931,9 @@ async function renderMore() {
     const data = await api("/api/leaderboard");
     body = '<div class="panel"><h2>Рейтинг</h2>' + (data.rows.length
       ? data.rows.map((row) =>
-          '<div class="row spread" style="margin-bottom:7px"><span class="small">' +
-          "<b>" + row.rank + ".</b> " + esc(row.name || "—") +
+          '<div class="foe" style="cursor:default">' +
+          '<span class="av">' + shot(row.portrait, null) + "</span>" +
+          "<span class='small'><b>" + row.rank + ".</b> " + esc(row.name || "—") +
           (row.user_id === data.me ? " <span class='tiny muted'>(ты)</span>" : "") +
           "<br><span class='tiny muted'>" + esc(row.owner_name || "") + "</span></span>" +
           "<span class='pw'>⚡ " + money(row.power) + "</span></div>").join("")
@@ -1634,6 +1957,7 @@ async function renderMore() {
       "</div></div>").join("") || '<div class="empty">Пока тихо.</div>';
   }
   box.innerHTML = '<button class="go sec" data-more="menu">◀️ Назад</button>' + body;
+  paintShots(box);
 }
 
 function historyRow(row) {
@@ -1730,6 +2054,206 @@ async function giftPicker(code) {
   sheet("<h3>Кому подарить?</h3>" + others.map((row) =>
     '<button class="go sec" style="margin-bottom:8px" data-gift="' + esc(row.user_id) + '" ' +
     'data-code="' + esc(code) + '">' + esc(row.owner_name || row.name) + "</button>").join(""));
+}
+
+// -------------------------------------------------------------------- portrait editor
+//
+// Change the picture, then frame it. The crop is stored as {x, y, size} in the photo's own
+// pixels rather than cut out of it, which is this codebase's convention (see
+// pets.set_portrait_crop): the picture itself lives on Telegram's servers and is
+// re-rendered from a file_id every time, so pixels cut here could never be un-cut.
+//
+// A Mini App CAN produce a picture -- a file input and a canvas is all it takes. What it
+// cannot produce is a file_id, so the upload posts bytes and the server does that half.
+let crop = null, natural = null, cropDirty = false;
+
+function minSize() { return Math.max(16, Math.min(natural.w, natural.h) / 8); }
+function maxSize() { return Math.max(natural.w, natural.h) * 1.8; }
+
+function fitCrop(size) {
+  // The smallest square that holds the whole photo -- letterboxed on the short side, and
+  // the same default an un-framed pet has always rendered with.
+  const side = Math.max(size.w, size.h);
+  return { x: (size.w - side) / 2, y: (size.h - side) / 2, size: side };
+}
+
+function clampCrop() {
+  crop.size = Math.min(maxSize(), Math.max(minSize(), crop.size));
+  // Keep a fifth of the frame on the picture whichever way it is dragged, or the photo can
+  // be shoved off its own square and the portrait renders as an empty box.
+  const keepX = Math.min(crop.size, natural.w) * 0.2;
+  const keepY = Math.min(crop.size, natural.h) * 0.2;
+  crop.x = Math.min(Math.max(crop.x, -crop.size + keepX), natural.w - keepX);
+  crop.y = Math.min(Math.max(crop.y, -crop.size + keepY), natural.h - keepY);
+}
+
+function paintCrop() {
+  const stage = $("cropStage"), img = $("cropImg");
+  if (!stage || !img || !natural) return;
+  clampCrop();
+  applyCrop(img, crop, stage.clientWidth);
+  img.classList.add("ready");
+  const low = minSize(), high = maxSize();
+  $("cropZoom").value = String(Math.round(1000 * Math.log(high / crop.size) / Math.log(high / low)));
+}
+
+// Zooms to `size` photo-pixels across while keeping whatever is under (ax, ay) where it
+// is -- what makes a pinch feel like pulling the photo rather than re-centring it.
+function cropZoomTo(size, ax, ay) {
+  const stage = $("cropStage");
+  const px = stage.clientWidth || 1;
+  const bounded = Math.min(maxSize(), Math.max(minSize(), size));
+  crop.x = crop.x + (ax / px) * crop.size - (ax / px) * bounded;
+  crop.y = crop.y + (ay / px) * crop.size - (ay / px) * bounded;
+  crop.size = bounded;
+  cropDirty = true;
+  paintCrop();
+}
+
+function openPortrait() {
+  const pet = S.pet;
+  cropDirty = false;
+  sheet(
+    "<h3>Фото существа</h3>" +
+    '<div class="stage" id="cropStage"><img id="cropImg" alt=""></div>' +
+    '<div class="zoomrow"><button id="cropOut">−</button>' +
+      '<input type="range" id="cropZoom" min="0" max="1000" value="0">' +
+      '<button id="cropIn">+</button></div>' +
+    '<div class="small muted" style="margin-top:8px">Тяни, чтобы двигать. Щипок или ползунок — приблизить.</div>' +
+    '<input type="file" id="cropFile" accept="image/*" hidden>' +
+    '<div class="acts">' +
+      '<button class="go" id="cropSave">Сохранить кадр</button>' +
+      '<button class="go sec" id="cropPick">🖼 Выбрать другое фото</button>' +
+      (pet.crop ? '<button class="go sec" id="cropReset">Показать фото целиком</button>' : "") +
+    "</div>"
+  );
+
+  const img = $("cropImg");
+  img.src = pet.portrait;
+  const ready = () => {
+    natural = { w: img.naturalWidth, h: img.naturalHeight };
+    crop = pet.crop ? { x: +pet.crop.x, y: +pet.crop.y, size: +pet.crop.size } : fitCrop(natural);
+    paintCrop();
+  };
+  if (img.complete && img.naturalWidth) ready(); else img.addEventListener("load", ready, { once: true });
+
+  wireCropGestures();
+  $("cropSave").onclick = async () => {
+    const value = crop && { x: crop.x, y: crop.y, size: crop.size };
+    closeSheet();
+    await act("portrait_crop", { crop: value });
+  };
+  $("cropPick").onclick = () => $("cropFile").click();
+  $("cropFile").onchange = () => uploadPortrait($("cropFile").files[0]);
+  if ($("cropReset")) $("cropReset").onclick = async () => {
+    closeSheet();
+    await act("portrait_crop", { crop: null });
+  };
+}
+
+function wireCropGestures() {
+  const stage = $("cropStage");
+  const pointers = new Map();
+  let pinch = null;
+  const at = (event) => {
+    const box = stage.getBoundingClientRect();
+    return { x: event.clientX - box.left, y: event.clientY - box.top };
+  };
+  stage.addEventListener("pointerdown", (event) => {
+    if (!natural) return;
+    stage.setPointerCapture(event.pointerId);
+    pointers.set(event.pointerId, at(event));
+    if (pointers.size === 2) {
+      const two = [...pointers.values()];
+      pinch = { distance: Math.hypot(two[0].x - two[1].x, two[0].y - two[1].y), size: crop.size };
+    }
+  });
+  stage.addEventListener("pointermove", (event) => {
+    if (!natural || !pointers.has(event.pointerId)) return;
+    const previous = pointers.get(event.pointerId);
+    const current = at(event);
+    pointers.set(event.pointerId, current);
+    if (pointers.size >= 2 && pinch) {
+      const two = [...pointers.values()];
+      const distance = Math.hypot(two[0].x - two[1].x, two[0].y - two[1].y);
+      // Fingers apart => a smaller square of the photo fills the frame => zoomed in.
+      if (distance > 0 && pinch.distance > 0) {
+        cropZoomTo(pinch.size * (pinch.distance / distance),
+                   (two[0].x + two[1].x) / 2, (two[0].y + two[1].y) / 2);
+      }
+      return;
+    }
+    const perPixel = crop.size / (stage.clientWidth || 1);
+    crop.x -= (current.x - previous.x) * perPixel;
+    crop.y -= (current.y - previous.y) * perPixel;
+    cropDirty = true;
+    paintCrop();
+  });
+  const done = (event) => {
+    pointers.delete(event.pointerId);
+    // The pinch ends the moment either finger leaves: measuring the next one-finger drag
+    // against a stale two-finger distance is how a crop jumps for no reason.
+    if (pointers.size < 2) pinch = null;
+  };
+  stage.addEventListener("pointerup", done);
+  stage.addEventListener("pointercancel", done);
+  const nudge = (factor) => {
+    const centre = (stage.clientWidth || 1) / 2;
+    cropZoomTo(crop.size * factor, centre, centre);
+  };
+  $("cropIn").onclick = () => nudge(1 / 1.2);
+  $("cropOut").onclick = () => nudge(1.2);
+  $("cropZoom").addEventListener("input", () => {
+    if (!natural) return;
+    const low = minSize(), high = maxSize(), centre = (stage.clientWidth || 1) / 2;
+    cropZoomTo(high * Math.pow(low / high, Number($("cropZoom").value) / 1000), centre, centre);
+  });
+}
+
+// The picked file is re-encoded through a canvas before it leaves the phone: a modern
+// camera photo is several megabytes of detail nobody will ever see at 210 pixels, and the
+// upload is the slowest thing in this whole page over a mobile connection.
+const UPLOAD_EDGE = 1280;
+
+async function uploadPortrait(file) {
+  if (!file) return;
+  toast("Загружаю фото…");
+  try {
+    const bitmap = await loadImage(file);
+    const scale = Math.min(1, UPLOAD_EDGE / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+    if (!blob) throw new Error("Не получилось прочитать картинку");
+
+    const response = await fetch(PREFIX + "/api/portrait", {
+      method: "POST",
+      headers: { "Content-Type": "image/jpeg", "X-Telegram-Init-Data": initData },
+      body: blob,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || "Не получилось загрузить");
+    S = data.state;
+    closeSheet();
+    haptic("ok");
+    toast(data.message || "Фото обновлено");
+    render();
+  } catch (e) {
+    haptic("no");
+    toast(e.message);
+  }
+}
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Это не картинка")); };
+    image.src = url;
+  });
 }
 
 // ------------------------------------------------------------------------- the duel
@@ -1886,6 +2410,7 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "notify") { await act("notifications"); }
   else if (d.do === "farmup") { await act("farm_upgrade"); }
   else if (d.do === "farmcancel") { await act("farm_cancel"); }
+  else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }
   else if (d.do === "rename") {
     sheet("<h3>Новое имя</h3><input id='newName' class='go sec' style='text-align:left' " +
