@@ -41,6 +41,13 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _async_return(value):
+    """Stand in for an awaitable stats lookup (words_per_point) with a fixed answer."""
+    async def _call(*args, **kwargs):
+        return value
+    return _call
+
+
 class FakeApi:
     def __init__(self):
         self.sent = []
@@ -425,14 +432,15 @@ class PetsCommandTests(unittest.TestCase):
         # loop body only announces when a payout actually happened, and does not re-announce
         # on the next pass once the (mocked) ledger call reports nothing new.
         paid = [
-            {"user_id": "1", "username": "artist", "display_name": "Artist", "messages": 40, "place": 1, "amount": 200},
-            {"user_id": "2", "username": None, "display_name": "Второй", "messages": 30, "place": 2, "amount": 100},
-            {"user_id": "3", "username": "c", "display_name": "C", "messages": 20, "place": 3, "amount": 50},
+            {"user_id": "1", "username": "artist", "display_name": "Artist", "xp": 410, "messages": 40, "place": 1, "amount": 200},
+            {"user_id": "2", "username": None, "display_name": "Второй", "xp": 260, "messages": 30, "place": 2, "amount": 100},
+            {"user_id": "3", "username": "c", "display_name": "C", "xp": 95, "messages": 20, "place": 3, "amount": 50},
         ]
         api = FakeApi()
         known_chat_ids = {CHAT: MAIN_CHAT_ID}
         tz = app_time.resolve_timezone()
-        with patch.object(economy, "daily_chatter_prizes", side_effect=[paid, []]) as mocked:
+        with patch.object(economy, "daily_chatter_prizes", side_effect=[paid, []]) as mocked, \
+             patch.object(stats, "words_per_point", new=_async_return(5.0)):
             _run(bot_listener._pets_announce_daily_chatter_prizes(
                 api, None, [CHAT], known_chat_ids, tz, log=lambda *_: None,
             ))
@@ -442,10 +450,13 @@ class PetsCommandTests(unittest.TestCase):
 
         self.assertEqual(mocked.call_count, 2)
         # Always yesterday IN THE APP TIMEZONE, never the day the loop happens to run on
-        # and never a naive local date that could disagree with it near midnight.
+        # and never a naive local date that could disagree with it near midnight. The
+        # chat's words-per-point calibration is threaded through as the third argument --
+        # ranking is by earned XP, exactly as the ЕПХ tree ranks the same day.
         yesterday = app_time.now(tz).date() - timedelta(days=1)
         for call in mocked.call_args_list:
-            self.assertEqual(call.args, (CHAT, yesterday))
+            self.assertEqual(call.args, (CHAT, yesterday, 5.0))
+        self.assertIn("410 XP", api.sent[0]["text"])
         self.assertEqual(len(api.sent), 1)
         self.assertEqual(api.sent[0]["chat_id"], MAIN_CHAT_ID)
         self.assertIn("@artist", api.sent[0]["text"])
@@ -454,7 +465,8 @@ class PetsCommandTests(unittest.TestCase):
 
     def test_daily_chatter_prize_loop_announces_nothing_when_nobody_is_newly_paid(self):
         api = FakeApi()
-        with patch.object(economy, "daily_chatter_prizes", return_value=[]):
+        with patch.object(economy, "daily_chatter_prizes", return_value=[]), \
+             patch.object(stats, "words_per_point", new=_async_return(5.0)):
             _run(bot_listener._pets_announce_daily_chatter_prizes(
                 api, None, [CHAT], {CHAT: MAIN_CHAT_ID}, app_time.resolve_timezone(),
                 log=lambda *_: None,

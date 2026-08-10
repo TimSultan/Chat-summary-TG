@@ -355,34 +355,41 @@ def claim_daily_bonus(entry: str, user_id, today: date | None = None) -> tuple[b
 # Paid for YESTERDAY, never for today: a day's stats are only final once it is over, and
 # a running total would let somebody watch the standings and pad them before midnight.
 #
-# Ranked on messages alone rather than the composite /top score, because this prize is
-# explicitly for talking -- the score mixes in figurines and active days, which are earned
-# on a different timescale and would let a single #япокрасил post outrank a day of chat.
+# Ranked on the XP that day earned, through the very same stats.day_xp_ranking the ЕПХ
+# tree's morning digest uses, so the two can never disagree about who moved the needle
+# yesterday. That means a long message counts for more than a short one, and a
+# #япокрасил post counts heavily -- the same trade the tree already makes, rather than a
+# second, competing definition of "active" living in the ledger.
 
 DAILY_CHATTER_PRIZES = (200, 100, 50)
 
 
-def daily_chatter_prizes(entry: str, day: date) -> list[dict]:
-    """Pay the top three talkers of `day` once. Returns only newly paid rows.
+def daily_chatter_prizes(entry: str, day: date, words_per_point: float) -> list[dict]:
+    """Pay the top three earners of `day` once. Returns only newly paid rows.
+
+    `words_per_point` is a required argument for the same reason UserStats.xp takes one:
+    it is calibrated per chat rather than being a universal constant, and guessing it here
+    would silently reprice everybody's day. The caller has the Telethon client needed to
+    resolve it (see stats.words_per_point); this module deliberately does not.
 
     Idempotent through grant_once on a reason that carries the date, so re-running for a
-    day already paid is a no-op even if the ranking has since changed (a late-recorded
-    day file, a backfill). Ties are broken by user id so two runs cannot disagree.
+    day already paid is a no-op even if the ranking has since changed (a late-recorded day
+    file, a backfill).
     """
-    ranked = sorted(
-        (row for row in stats.aggregate(entry, day, day).values() if row.messages > 0),
-        key=lambda row: (-row.messages, str(row.user_id)),
-    )
+    ranked = [
+        row for row in stats.day_xp_ranking(entry, day, words_per_point) if row[2] > 0
+    ]
     paid = []
-    for place, row in enumerate(ranked[:len(DAILY_CHATTER_PRIZES)]):
+    for place, (user_id, user, earned) in enumerate(ranked[:len(DAILY_CHATTER_PRIZES)]):
         amount = DAILY_CHATTER_PRIZES[place]
-        if not grant_once(entry, row.user_id, amount, f"daily_chatter:{day.isoformat()}"):
+        if not grant_once(entry, user_id, amount, f"daily_chatter:{day.isoformat()}"):
             continue
         paid.append({
-            "user_id": str(row.user_id),
-            "username": row.username,
-            "display_name": row.display_name,
-            "messages": row.messages,
+            "user_id": user_id,
+            "username": user.username,
+            "display_name": user.display_name,
+            "xp": earned,
+            "messages": user.messages,
             "place": place + 1,
             "amount": amount,
         })

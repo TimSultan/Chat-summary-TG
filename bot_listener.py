@@ -6297,15 +6297,14 @@ def _pets_chatter_prize_text(day, paid: list[dict]) -> str:
         medal = DAILY_CHATTER_MEDALS[place - 1] if 1 <= place <= len(DAILY_CHATTER_MEDALS) else "🎖"
         username = row.get("username")
         name = f"@{username}" if username else (row.get("display_name") or "кто-то")
-        # "142 сообщения", not "142 сообщений" -- the count is known here, so decline it
-        # properly with the same helper the rest of the game's copy uses.
-        messages = pets_ui._plural(
-            int(row.get("messages", 0) or 0), "сообщение", "сообщения", "сообщений",
-        )
+        # XP, not raw messages: the same figure the tree's morning digest reports, so a
+        # member who reads both sees one number describing their day rather than two.
         coins = pets_ui._plural(
             int(row.get("amount", 0) or 0), "монета", "монеты", "монет",
         )
-        lines.append(f"{medal} {html.escape(str(name))} — {messages}, +{coins}")
+        lines.append(
+            f"{medal} {html.escape(str(name))} — {int(row.get('xp', 0) or 0)} XP, +{coins}"
+        )
     lines.append("Кисть в руки — и защищать место в тройке до завтра.")
     return "\n".join(lines)
 
@@ -6319,10 +6318,15 @@ async def _pets_announce_daily_chatter_prizes(
     unresolved chat_id, a blocked send) is logged and skipped rather than taking the whole
     loop -- and therefore every other chat's payout -- down with it.
 
-    Yesterday, never today: a day's message count is only final once the day is over (see
+    Yesterday, never today: a day's XP is only final once the day is over (see
     economy.daily_chatter_prizes). `tz` is the app-wide configured timezone the rest of
     this file already threads through for exactly this "what calendar day is it" question
     -- a naive datetime.now() would drift the cutover away from what /tree and /stat show.
+
+    The chat's words-per-point calibration is resolved here, the same way the tree digest
+    resolves it, because it needs the Telethon client that economy.py deliberately has no
+    access to. It is cached to disk after the first calibration, so this is a file read on
+    every run but the very first.
 
     economy.daily_chatter_prizes is idempotent per (chat, day) via grant_once, so calling
     this once an hour or once a minute costs nothing extra: a chat already paid for
@@ -6332,7 +6336,8 @@ async def _pets_announce_daily_chatter_prizes(
     yesterday = datetime.now(tz).date() - timedelta(days=1)
     for entry in entries:
         try:
-            paid = economy.daily_chatter_prizes(entry, yesterday)
+            wpp = await stats.words_per_point(telethon_client, entry, entry, tz, log=log)
+            paid = economy.daily_chatter_prizes(entry, yesterday, wpp)
         except Exception:
             log(f"[pets] daily chatter prize payout failed for '{entry}':\n{traceback.format_exc()}")
             continue

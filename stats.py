@@ -2298,6 +2298,26 @@ class UserStats:
         return self.xp(words_per_point)
 
 
+def day_xp_ranking(entry: str, day: date, words_per_point: float) -> list[tuple[str, UserStats, int]]:
+    """Everyone active on `day` as (user_id, stats, XP earned that day), highest first.
+
+    One implementation for "who moved the needle yesterday", shared by the ЕПХ tree's
+    morning digest and the daily chatter prize so the two can never rank the same day
+    differently. Deleted figurines are subtracted first, exactly as the tree expects.
+
+    Ties break on user id so two runs of the same day agree -- the prize pays real coins
+    off this order, and a coin flip between two people on equal XP is not something a
+    restart should be able to re-decide.
+    """
+    users = aggregate(entry, day, day)
+    _apply_deleted_figurines(entry, users)
+    ranked = [
+        (str(user_id), user, user.xp(words_per_point)) for user_id, user in users.items()
+    ]
+    ranked.sort(key=lambda row: (-row[2], row[0]))
+    return ranked
+
+
 def _apply_deleted_figurines(entry: str, users: dict[str, UserStats]) -> None:
     """Remove tombstoned posts and their one-per-post figurine credit in-place."""
     records = _load_deleted_figurines(entry).get("posts", {})
@@ -3118,13 +3138,8 @@ async def chat_tree_totals(
         _apply_deleted_figurines(entry, grown)
         total_xp = sum(user.xp(wpp) for user in grown.values())
 
-    day_users = aggregate(entry, day, day)
-    _apply_deleted_figurines(entry, day_users)
-    contributors = sorted(
-        ((user.display_name, user.username, user.xp(wpp)) for user in day_users.values()),
-        key=lambda item: item[2],
-        reverse=True,
-    )
+    ranked = day_xp_ranking(entry, day, wpp)
+    contributors = [(user.display_name, user.username, xp) for _, user, xp in ranked]
     return total_xp, sum(item[2] for item in contributors), contributors
 
 

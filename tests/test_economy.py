@@ -478,8 +478,14 @@ class DailyBonusTests(unittest.TestCase):
         self.assertEqual(economy.balance("chat", "1", 0), funded)
 
 
+# Any fixed calibration works here: what matters is that the SAME one is used to rank
+# everybody, which is exactly why economy.daily_chatter_prizes demands it as an argument
+# instead of guessing one.
+WPP = 5.0
+
+
 class DailyChatterPrizeTests(unittest.TestCase):
-    """Top three talkers of YESTERDAY, paid once."""
+    """Top three earners of YESTERDAY, paid once, ranked the way the tree ranks."""
 
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -508,7 +514,7 @@ class DailyChatterPrizeTests(unittest.TestCase):
     def test_the_three_loudest_are_paid_in_order_and_only_once(self):
         self._record({1: 30, 2: 20, 3: 10, 4: 5})
 
-        paid = economy.daily_chatter_prizes("chat", self.day)
+        paid = economy.daily_chatter_prizes("chat", self.day, WPP)
 
         self.assertEqual([row["user_id"] for row in paid], ["1", "2", "3"])
         self.assertEqual([row["amount"] for row in paid], list(economy.DAILY_CHATTER_PRIZES))
@@ -519,22 +525,65 @@ class DailyChatterPrizeTests(unittest.TestCase):
         self.assertEqual(economy.balance("chat", "4", 0), 0)
 
         # Re-running the same day is a no-op: the loop that calls this runs hourly.
-        self.assertEqual(economy.daily_chatter_prizes("chat", self.day), [])
+        self.assertEqual(economy.daily_chatter_prizes("chat", self.day, WPP), [])
         self.assertEqual(economy.balance("chat", "1", 0), economy.DAILY_CHATTER_PRIZES[0])
+
+    def test_ranking_follows_earned_xp_rather_than_the_raw_message_count(self):
+        """The distinguishing case, and the reason this was changed.
+
+        One member posts many one-word messages, another posts a few substantial ones.
+        Counting messages crowns the first; counting XP -- the same figure the ЕПХ tree
+        reports for the same day -- crowns the second.
+        """
+        start = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+        messages, index = [], 0
+        for sender_id, count, text in (
+            (1, 30, "ага"),
+            (2, 6, "а вот с металликами у меня совсем другая история получилась " * 6),
+        ):
+            for _ in range(count):
+                index += 1
+                messages.append(SimpleNamespace(
+                    sender_id=sender_id, sender_name=f"U{sender_id}",
+                    sender_username=f"u{sender_id}", text=text,
+                    dt_local=start + timedelta(minutes=index), message_id=index,
+                    is_reply=False,
+                ))
+        stats.record_day("chat", self.day, messages)
+
+        paid = economy.daily_chatter_prizes("chat", self.day, WPP)
+
+        self.assertEqual([row["user_id"] for row in paid], ["2", "1"])
+        self.assertGreater(paid[0]["xp"], paid[1]["xp"])
+        # The loud one really did send more messages -- this is not an accident of setup.
+        self.assertLess(paid[0]["messages"], paid[1]["messages"])
+
+    def test_the_prize_ranks_a_day_exactly_as_the_tree_ranks_it(self):
+        """One implementation, so the morning tree post and the prize cannot disagree."""
+        self._record({1: 30, 2: 20, 3: 10})
+        ranked = stats.day_xp_ranking("chat", self.day, WPP)
+
+        paid = economy.daily_chatter_prizes("chat", self.day, WPP)
+
+        self.assertEqual(
+            [row["user_id"] for row in paid],
+            [user_id for user_id, _, _ in ranked[:len(economy.DAILY_CHATTER_PRIZES)]],
+        )
+        self.assertEqual([row["xp"] for row in paid], [xp for _, _, xp in ranked[:3]])
 
     def test_a_tie_is_broken_the_same_way_every_run(self):
         self._record({7: 10, 3: 10, 5: 10})
-        first = [row["user_id"] for row in economy.daily_chatter_prizes("chat", self.day)]
+        first = [row["user_id"] for row in economy.daily_chatter_prizes("chat", self.day, WPP)]
         self.assertEqual(first, ["3", "5", "7"])
 
     def test_a_quiet_day_pays_only_the_people_who_actually_talked(self):
         self._record({1: 4})
-        paid = economy.daily_chatter_prizes("chat", self.day)
+        paid = economy.daily_chatter_prizes("chat", self.day, WPP)
         self.assertEqual([row["user_id"] for row in paid], ["1"])
         self.assertEqual(paid[0]["amount"], economy.DAILY_CHATTER_PRIZES[0])
 
     def test_an_unrecorded_day_pays_nobody_rather_than_raising(self):
-        self.assertEqual(economy.daily_chatter_prizes("chat", date(2020, 1, 1)), [])
+        self.assertEqual(economy.daily_chatter_prizes("chat", date(2020, 1, 1), WPP), [])
 
 
 if __name__ == "__main__":
