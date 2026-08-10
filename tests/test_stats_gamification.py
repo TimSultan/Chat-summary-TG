@@ -634,6 +634,34 @@ class GamificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "эмодзи"):
             stats.parse_custom_badge_spec("VIP Пользователь")
 
+    def test_emoji_outside_the_pictograph_block_are_still_emoji(self):
+        """Reported from the chat, 2026-08-10: "⭐ Майор" was refused as "not an emoji".
+
+        The star is U+2B50 and the hourglass U+231B -- both outside the ranges the old
+        hand-written block list named, and both things people actually pick for a badge.
+        """
+        for spec, expected in (
+            ("⭐ Майор", "⭐"),          # star
+            ("⌛ Терпеливый", "⌛"),      # hourglass
+            ("⏰ Ранняя пташка", "⏰"),   # alarm clock
+            ("⭕ Меткий", "⭕"),          # heavy large circle
+            ("↔️ Связной", "↔️"),  # arrow, emoji presentation
+            ("1️⃣ Первый", "1️⃣"),  # keycap
+            ("\U0001F3AF Меткий глаз", "\U0001F3AF"),   # a pictograph, as before
+        ):
+            with self.subTest(spec=spec):
+                emoji, name = stats.parse_custom_badge_spec(spec)
+                self.assertEqual(emoji, expected)
+                self.assertTrue(name)
+
+    def test_a_bare_symbol_is_still_not_an_emoji(self):
+        """The check must stay tight enough to catch a missing emoji: these are the first
+        tokens somebody types when they have simply written a name."""
+        for spec in ("VIP Пользователь", "+ Майор", "5 Майор", "- Майор", "Майор Иванов"):
+            with self.subTest(spec=spec):
+                with self.assertRaisesRegex(ValueError, "эмодзи"):
+                    stats.parse_custom_badge_spec(spec)
+
     def test_most_improved_compares_equal_windows_by_xp_delta(self):
         current = {
             "1": stats.UserStats(user_id="1", display_name="A", legacy_message_points=100),
@@ -1246,6 +1274,130 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(api.sent, [])
         self.assertEqual(flows, {})
+
+
+class BadgeBackButtonTests(unittest.IsolatedAsyncioTestCase):
+    """Every screen below the badge menu has a way back to it.
+
+    Reported from the chat, 2026-08-10 ("не везде есть кнопка Назад"): the flow had none
+    at all, so a mistaken tap could only be escaped by abandoning the menu and typing
+    /badge again -- and the delete confirmation offered "Да, удалить" as its only button.
+    """
+
+    ADMIN = {"id": 10, "first_name": "Admin"}
+
+    async def _menu(self, api, flows):
+        await bot_listener.handle_badge_command(
+            api,
+            {"message_id": 1, "chat": {"id": 10, "type": "private"},
+             "from": self.ADMIN, "text": "/badge"},
+            "chat", -1001, flows,
+        )
+        return next(iter(flows))
+
+    async def _tap(self, api, flows, flow_id, action, badge_id=None):
+        await bot_listener.handle_badge_callback(
+            api,
+            {"id": "cb", "from": self.ADMIN, "message": api.sent[-1][0],
+             "data": bot_listener._badge_callback_data(action, flow_id, badge_id)},
+            flows,
+        )
+        return api.sent[-1]
+
+    def _buttons(self, sent_call):
+        markup = sent_call[1].get("reply_markup") or {}
+        return [b for row in markup.get("inline_keyboard", []) for b in row]
+
+    async def test_every_screen_below_the_menu_offers_a_way_back(self):
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                badge = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                flow_id = await self._menu(api, flows)
+
+                for action, badge_id in (
+                    ("list", None), ("listq", None), ("revlist", None),
+                    ("dellist", None), ("del", badge.badge_id),
+                ):
+                    with self.subTest(action=action):
+                        sent = await self._tap(api, flows, flow_id, action, badge_id)
+                        labels = [b["text"] for b in self._buttons(sent)]
+                        self.assertIn(bot_listener.BADGE_BACK_BUTTON_TEXT, labels)
+
+    async def test_the_irreversible_delete_confirmation_can_be_backed_out_of(self):
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                badge = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                flow_id = await self._menu(api, flows)
+                await self._tap(api, flows, flow_id, "dellist")
+                await self._tap(api, flows, flow_id, "del", badge.badge_id)
+
+                await self._tap(api, flows, flow_id, "menu")
+
+                # Back on the menu, and the badge is still there.
+                self.assertIn(bot_listener.BADGE_CREATE_BUTTON_TEXT,
+                              [b["text"] for b in self._buttons(api.sent[-1])])
+                self.assertEqual(len(stats.list_custom_badges("chat")), 1)
+
+    async def test_going_back_forgets_what_the_abandoned_step_had_selected(self):
+        """Otherwise Назад out of "выдать" and into "удалить" would still be carrying the
+        badge and the quiet flag the previous step had set."""
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                badge = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                flow_id = await self._menu(api, flows)
+                await self._tap(api, flows, flow_id, "listq")
+                await self._tap(api, flows, flow_id, "give", badge.badge_id)
+                self.assertEqual(flows[flow_id]["selected_badge_id"], badge.badge_id)
+                self.assertTrue(flows[flow_id]["silent"])
+
+                await self._tap(api, flows, flow_id, "menu")
+
+                self.assertIsNone(flows[flow_id]["selected_badge_id"])
+                self.assertIsNone(flows[flow_id]["awaiting"])
+                self.assertFalse(flows[flow_id]["silent"])
+
+    async def test_answering_a_text_step_with_nazad_returns_to_the_menu(self):
+        """A force-reply message cannot carry an inline keyboard, so on the steps that ask
+        for text the way back is the word -- and the flow survives it, unlike "отмена"."""
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                flow_id = await self._menu(api, flows)
+                prompt = (await self._tap(api, flows, flow_id, "create"))[0]
+                self.assertIn(bot_listener.BADGE_BACK_HINT, prompt["text"])
+
+                consumed = await bot_listener.handle_badge_text_input(
+                    api, None,
+                    {"message_id": 5, "chat": {"id": 10, "type": "private"},
+                     "from": self.ADMIN, "text": "назад", "reply_to_message": prompt},
+                    timezone.utc, flows,
+                )
+
+                self.assertTrue(consumed)
+                self.assertIn(flow_id, flows)  # still alive, unlike "отмена"
+                self.assertIsNone(flows[flow_id]["awaiting"])
+                self.assertIn(bot_listener.BADGE_CREATE_BUTTON_TEXT,
+                              [b["text"] for b in self._buttons(api.sent[-1])])
+                self.assertEqual(stats.list_custom_badges("chat"), [])
+
+    async def test_otmena_still_drops_the_flow_entirely(self):
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                flow_id = await self._menu(api, flows)
+                prompt = (await self._tap(api, flows, flow_id, "create"))[0]
+
+                await bot_listener.handle_badge_text_input(
+                    api, None,
+                    {"message_id": 5, "chat": {"id": 10, "type": "private"},
+                     "from": self.ADMIN, "text": "отмена", "reply_to_message": prompt},
+                    timezone.utc, flows,
+                )
+
+                self.assertEqual(flows, {})
 
 
 if __name__ == "__main__":

@@ -154,6 +154,15 @@ BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
 BADGE_GIVE_QUIET_BUTTON_TEXT = "🤫 Выдать без уведомления"
 BADGE_REVOKE_BUTTON_TEXT = "➖ Забрать у участника"
 BADGE_DELETE_BUTTON_TEXT = "🗑 Удалить значок совсем"
+# Same label the pet game and the cabinet use (pets_ui.BACK_BUTTON, cabinet.BACK_BUTTON):
+# every menu in the bot should get out the same way, whichever one you are standing in.
+BADGE_BACK_BUTTON_TEXT = "◀️ Назад"
+# The way back from a step that asked for TEXT. A force-reply prompt cannot also carry an
+# inline keyboard -- Telegram allows one reply_markup per message -- so on those steps the
+# button is a word instead, named in the prompt itself. "отмена" already dropped the flow;
+# "назад" returns to the menu, which is what somebody who mistyped an emoji wants.
+BADGE_BACK_WORDS = frozenset({"назад", "back", "меню", "menu"})
+BADGE_BACK_HINT = "Ответьте «назад», чтобы вернуться в меню."
 # One reply can name several recipients. Bounded so a pasted wall of text turns into one
 # clear refusal instead of a few dozen resolve_stat_target lookups and a summary message
 # too long for Telegram to accept.
@@ -372,6 +381,40 @@ def _badge_callback_data(action: str, flow_id: str, badge_id: str | None = None)
     return ":".join(parts)
 
 
+def _badge_menu_keyboard(flow_id: str) -> dict:
+    """The root badge menu. One definition, shown both by /badge and by every Назад --
+    two copies would drift the moment a sixth action is added."""
+    return {
+        "inline_keyboard": [
+            [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
+            [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
+            [{"text": BADGE_GIVE_QUIET_BUTTON_TEXT, "callback_data": _badge_callback_data("listq", flow_id)}],
+            [{"text": BADGE_REVOKE_BUTTON_TEXT, "callback_data": _badge_callback_data("revlist", flow_id)}],
+            [{"text": BADGE_DELETE_BUTTON_TEXT, "callback_data": _badge_callback_data("dellist", flow_id)}],
+        ]
+    }
+
+
+def _badge_back_row(flow_id: str) -> list[dict]:
+    """The Назад row appended to every screen below the root."""
+    return [{"text": BADGE_BACK_BUTTON_TEXT, "callback_data": _badge_callback_data("menu", flow_id)}]
+
+
+def _reset_badge_flow_step(flow: dict) -> None:
+    """Forgets what the current step had gathered, so Назад really goes back.
+
+    Without this, leaving the "give" step half-done and choosing Удалить would still be
+    carrying a selected badge and a recipient, and the next confirmation would act on
+    them."""
+    flow["awaiting"] = None
+    flow["selected_badge_id"] = None
+    flow["prompt_message_id"] = None
+    flow["silent"] = False
+    # `target` is a preset recipient (/badge in reply to somebody). It belongs to the flow
+    # as a whole rather than to a step, so it survives -- going back to the menu must not
+    # silently turn "give this badge to Петя" into "give this badge to nobody in particular".
+
+
 def _parse_badge_recipients(text: str) -> list[str]:
     """Split one force-reply into the names it lists.
 
@@ -547,15 +590,7 @@ async def handle_badge_command(
         dm_chat_id,
         "🏅 Управление значками\nРаботает только в этой личной переписке.",
         reply_to_message_id=message["message_id"],
-        reply_markup={
-            "inline_keyboard": [
-                [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
-                [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
-                [{"text": BADGE_GIVE_QUIET_BUTTON_TEXT, "callback_data": _badge_callback_data("listq", flow_id)}],
-                [{"text": BADGE_REVOKE_BUTTON_TEXT, "callback_data": _badge_callback_data("revlist", flow_id)}],
-                [{"text": BADGE_DELETE_BUTTON_TEXT, "callback_data": _badge_callback_data("dellist", flow_id)}],
-            ]
-        },
+        reply_markup=_badge_menu_keyboard(flow_id),
         parse_mode=None,
     )
 
@@ -681,11 +716,27 @@ async def handle_badge_callback(
         return
 
     await api.answer_callback_query(callback_id)
+    if action == "menu":
+        # Every screen below the root comes back here. The step's half-finished state goes
+        # with it, so the menu is a real starting point rather than the same dead end
+        # wearing a different message.
+        _reset_badge_flow_step(flow)
+        flow["created_at"] = time.monotonic()  # navigating is using it -- don't time out
+        await api.send_message(
+            flow["chat_id"],
+            "🏅 Управление значками",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup=_badge_menu_keyboard(flow_id),
+            parse_mode=None,
+        )
+        return
+
     if action == "create":
         flow["awaiting"] = "create_spec"
         prompt = await api.send_message(
             flow["chat_id"],
-            "Ответьте на это сообщение: сначала эмодзи, затем название.\nНапример: 🎯 Меткий глаз",
+            "Ответьте на это сообщение: сначала эмодзи, затем название.\nНапример: 🎯 Меткий глаз"
+            f"\n\n{BADGE_BACK_HINT}",
             reply_to_message_id=message.get("message_id"),
             reply_markup={"force_reply": True, "selective": True},
             parse_mode=None,
@@ -703,6 +754,7 @@ async def handle_badge_callback(
                 flow["chat_id"],
                 "Пока нет пользовательских значков. Сначала создайте первый.",
                 reply_to_message_id=message.get("message_id"),
+                reply_markup={"inline_keyboard": [_badge_back_row(flow_id)]},
                 parse_mode=None,
             )
             return
@@ -710,6 +762,7 @@ async def handle_badge_callback(
             [{"text": badge.label, "callback_data": _badge_callback_data("give", flow_id, badge.badge_id)}]
             for badge in badges
         ]
+        keyboard.append(_badge_back_row(flow_id))
         await api.send_message(
             flow["chat_id"],
             "Выберите значок (без объявления в чате):" if flow["silent"] else "Выберите значок:",
@@ -733,7 +786,8 @@ async def handle_badge_callback(
                 "Ответьте на это сообщение именем или @username получателя.\n"
                 "Можно сразу несколько — через запятую или с новой строки.\n"
                 "Участник должен уже присутствовать в статистике основного чата."
-                + ("\n\n🤫 Объявления в чате не будет." if flow.get("silent") else ""),
+                + ("\n\n🤫 Объявления в чате не будет." if flow.get("silent") else "")
+                + f"\n\n{BADGE_BACK_HINT}",
                 reply_to_message_id=message.get("message_id"),
                 reply_markup={"force_reply": True, "selective": True},
                 parse_mode=None,
@@ -747,7 +801,9 @@ async def handle_badge_callback(
         if not badges:
             await api.send_message(
                 flow["chat_id"], "Пока нет пользовательских значков.",
-                reply_to_message_id=message.get("message_id"), parse_mode=None,
+                reply_to_message_id=message.get("message_id"),
+                reply_markup={"inline_keyboard": [_badge_back_row(flow_id)]},
+                parse_mode=None,
             )
             return
         next_action = "del" if action == "dellist" else "rev"
@@ -762,7 +818,7 @@ async def handle_badge_callback(
                 [{"text": badge.label,
                   "callback_data": _badge_callback_data(next_action, flow_id, badge.badge_id)}]
                 for badge in badges
-            ]},
+            ] + [_badge_back_row(flow_id)]},
             parse_mode=None,
         )
         return
@@ -777,7 +833,9 @@ async def handle_badge_callback(
         if badge is None:
             await api.send_message(
                 flow["chat_id"], "Этот значок уже удалён.",
-                reply_to_message_id=message.get("message_id"), parse_mode=None,
+                reply_to_message_id=message.get("message_id"),
+                reply_markup={"inline_keyboard": [_badge_back_row(flow_id)]},
+                parse_mode=None,
             )
             return
         holders = stats.custom_badge_holder_count(flow["entry"], badge_id)
@@ -786,9 +844,14 @@ async def handle_badge_callback(
             flow["chat_id"],
             f"Удалить значок {badge.label} совсем?{note}\nОтменить будет нельзя.",
             reply_to_message_id=message.get("message_id"),
+            # The way OUT of an irreversible confirmation is a button too. Leaving only
+            # "Да, удалить" meant the only way not to delete was to ignore the message,
+            # which is a poor thing to ask of somebody who has just been told the action
+            # cannot be undone.
             reply_markup={"inline_keyboard": [
                 [{"text": "🗑 Да, удалить",
                   "callback_data": _badge_callback_data("delok", flow_id, badge_id)}],
+                _badge_back_row(flow_id),
             ]},
             parse_mode=None,
         )
@@ -809,7 +872,8 @@ async def handle_badge_callback(
         flow["awaiting"] = "revoke_target"
         prompt = await api.send_message(
             flow["chat_id"],
-            "Ответьте на это сообщение именем или @username участника, у которого забрать значок.",
+            "Ответьте на это сообщение именем или @username участника, у которого забрать значок."
+            f"\n\n{BADGE_BACK_HINT}",
             reply_to_message_id=message.get("message_id"),
             reply_markup={"force_reply": True, "selective": True},
             parse_mode=None,
@@ -853,6 +917,20 @@ async def handle_badge_text_input(
             chat_id, "Действие отменено.", reply_to_message_id=message["message_id"], parse_mode=None
         )
         return True
+    # The Назад of a step that asked for text: back to the menu with the flow intact,
+    # rather than dropped like "отмена" does. A force-reply message cannot carry an inline
+    # keyboard, so this word is the button (see BADGE_BACK_WORDS).
+    if text.lower() in BADGE_BACK_WORDS:
+        _reset_badge_flow_step(flow)
+        flow["created_at"] = time.monotonic()
+        await api.send_message(
+            chat_id,
+            "🏅 Управление значками",
+            reply_to_message_id=message["message_id"],
+            reply_markup=_badge_menu_keyboard(flow_id),
+            parse_mode=None,
+        )
+        return True
     if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         badge_flows.pop(flow_id, None)
         return True
@@ -866,7 +944,7 @@ async def handle_badge_text_input(
         except ValueError as e:
             prompt = await api.send_message(
                 chat_id,
-                str(e),
+                f"{e}\n\n{BADGE_BACK_HINT}",
                 reply_to_message_id=message["message_id"],
                 reply_markup={"force_reply": True, "selective": True},
                 parse_mode=None,
@@ -889,7 +967,7 @@ async def handle_badge_text_input(
         if target is None:
             prompt = await api.send_message(
                 chat_id,
-                "Участник не найден в статистике. Попробуйте точный @username.",
+                f"Участник не найден в статистике. Попробуйте точный @username.\n\n{BADGE_BACK_HINT}",
                 reply_to_message_id=message["message_id"],
                 reply_markup={"force_reply": True, "selective": True},
                 parse_mode=None,
@@ -965,7 +1043,7 @@ async def handle_badge_text_input(
     except ValueError as e:
         prompt = await api.send_message(
             chat_id,
-            str(e),
+            f"{e}\n\n{BADGE_BACK_HINT}",
             reply_to_message_id=message["message_id"],
             reply_markup={"force_reply": True, "selective": True},
             parse_mode=None,

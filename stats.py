@@ -63,6 +63,7 @@ import json
 import os
 import random
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -981,13 +982,33 @@ def _save_custom_badge_data(entry: str, data: dict) -> None:
     _write_json_atomic(path, data)
 
 
+# Emoji that are punctuation or digits by Unicode category and so are invisible to the
+# "So" test below: the keycap mark that turns "1" into 1️⃣, the variation selector that
+# turns a plain sign into its emoji form (↔️, ⌨️), and a handful of legacy symbols.
+_EMOJI_CODEPOINTS = frozenset({
+    0x20E3,  # combining enclosing keycap
+    0xFE0F,  # variation selector-16 -- "render the previous character as an emoji"
+    0x203C, 0x2049, 0x3030, 0x303D,
+})
+
+
 def _contains_emoji(text: str) -> bool:
-    """Practical stdlib-only check covering the emoji blocks Telegram commonly renders."""
+    """Whether `text` holds at least one character Telegram would render as an emoji.
+
+    Asks Unicode for the character's CATEGORY rather than matching a hand-written list of
+    blocks. "So" (symbol, other) is where the pictographs live -- 🎯 and ⭐ alike -- and
+    the block list this replaces kept missing whole neighbourhoods of it: the star is
+    U+2B50 and the hourglass U+231B, both outside every range it named, so "⭐ Майор" was
+    refused with "отправьте эмодзи и название". Reported from the chat, 2026-08-10.
+
+    Deliberately does NOT accept "Sm" (mathematical symbols) on its own -- that would make
+    "+ Майор" a valid badge. An arrow only counts when it carries U+FE0F, which is the
+    author saying "this one is an emoji".
+    """
     return any(
-        0x1F000 <= ord(char) <= 0x1FAFF
-        or 0x2600 <= ord(char) <= 0x27BF
-        or 0x1F1E6 <= ord(char) <= 0x1F1FF
-        or ord(char) in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299)
+        unicodedata.category(char) == "So"
+        or 0x1F000 <= ord(char) <= 0x1FAFF
+        or ord(char) in _EMOJI_CODEPOINTS
         for char in text
     )
 

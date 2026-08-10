@@ -1372,7 +1372,12 @@ acting, so a menu left open after a revoke cannot still hand out badges.
 
 `/badge` itself: The bot shows these inline options:
 
-- **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`.
+- **Создать значок** asks for `<emoji> <name>`, for example `🎯 Меткий глаз`. What counts
+  as an emoji is the character's Unicode **category** (`So`), plus the keycap and
+  variation-selector marks — not a hand-written list of blocks, which is what refused
+  `⭐ Майор` (U+2B50 sits outside every range that list named, as do ⌛, ⏰ and ⭕).
+  `Sm` (`+`, `=`) deliberately does not qualify on its own, so a missing emoji is still
+  caught.
 - **Выдать значок** shows the chat's saved custom badges, then asks for the recipients.
 - **🤫 Выдать без уведомления** is the same award with **no group announcement**. A
   separate button rather than a toggle on the menu: a toggle carries a state the
@@ -1387,6 +1392,16 @@ acting, so a menu left open after a revoke cannot still hand out badges.
   confirmation that spells out how many members currently hold it. Assignments are
   cleared rather than left dangling — a leftover would be invisible but would still count
   towards somebody's collection total and would come back if the id were reused.
+
+**Every screen below the menu has ◀️ Назад** — the same label the pet game and the cabinet
+use, so every menu in the bot gets out the same way. It returns to the root menu *and*
+forgets what the abandoned step had gathered (selected badge, the quiet flag), so backing
+out of Выдать and into Удалить cannot act on what the previous step chose. The
+irreversible delete confirmation carries it too: leaving `🗑 Да, удалить` as the only
+button meant the only way *not* to delete was to ignore the message. On the steps that ask
+for **text** the way back is the word `назад` rather than a button, because Telegram allows
+one `reply_markup` per message and a force-reply cannot also carry an inline keyboard; the
+prompt says so. `отмена` still drops the flow entirely — `назад` keeps it.
 
 Custom definitions and assignments are persisted per chat under the existing stats
 cache. Awarding the same badge to the same member twice is idempotent.
