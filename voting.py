@@ -601,30 +601,54 @@ def _all_polls(entry: str) -> list[Poll]:
     return polls
 
 
-def latest_poll(entry: str) -> Poll | None:
-    """What /vote and the page open: the newest poll that actually holds works, and only
-    if none of them do, the newest poll outright.
+def _ballot_rank(poll: Poll) -> int:
+    """How much of a ballot a poll is -- 0 is the most, and wins. See latest_poll."""
+    if poll.approved:
+        return 0  # works admitted: people can vote in this one, and may be doing so now
+    if poll.entries:
+        return 1  # collected, nothing admitted yet: waiting on a moderator
+    return 2      # empty: a week nobody nominated anything in
 
-    "Newest" alone is not enough, because an EMPTY poll is written routinely -- collecting
-    a week that turned out to have no nominations still saves the week's file, and on a
-    Monday that is the normal outcome for the week just begun. Being the newest file on
-    disk, it would then hide the week people are actually voting in. Nobody opening a
-    ballot wants the empty week; if every week is empty it makes no difference which one
-    they get.
+
+def latest_poll(entry: str) -> Poll | None:
+    """What /vote and the page open: the most recent poll that is actually a BALLOT --
+    one with admitted works -- falling back to the most recent collected-but-unmoderated
+    week, and only then to the most recent poll outright.
+
+    Recency alone is not enough, and both weaker weeks get written routinely. An EMPTY
+    poll is saved even for a week nobody nominated anything in, which on a Monday is the
+    normal outcome for the week just begun. And a week that has been collected but not yet
+    moderated has no ballot in it either: every work in it is pending, so opening it shows
+    a voter nothing to vote for.
+
+    Either would otherwise be the newest file on disk and would take the page away from
+    the week people are voting in -- which is exactly what happened in production on
+    2026-08-10: last week's poll was open with 15 admitted works and 34 ballots cast, a
+    routine "собрать за эту неделю" found one new nomination for the week in progress, and
+    that one pending work moved the ballot to a poll with nothing admitted in it. Nobody
+    lost a vote (they are all in their own week's file), but the ballot showed no
+    candidates until this ordering was fixed.
     """
     polls = _all_polls(entry)
-    return next((poll for poll in polls if poll.entries), polls[0] if polls else None)
+    if not polls:
+        return None
+    # min() returns the FIRST of an equally-ranked group and _all_polls is newest-first, so
+    # the tie-break within a rank stays "most recently made current" (see make_current).
+    return min(polls, key=_ballot_rank)
 
 
 def make_current(poll: Poll) -> Poll:
-    """Marks `poll` as the one /vote and the page open, by making it the newest.
+    """Marks `poll` as the newest, which is how latest_poll breaks a tie in rank.
 
-    `created_at` is what `latest_poll` orders on, and "newest created" only means "the week
+    `created_at` is what polls are ordered on, and "newest created" only means "the week
     being worked on" while weeks are collected in order. Collecting the PREVIOUS week --
     the Monday case, where the finished week is the one that still has to be voted on --
-    breaks that: its poll may well be older than an empty poll for the week just started.
-    So the collect says outright which week is current instead of leaving it to the
-    timestamps. For the current week this changes nothing; its poll is already the newest.
+    breaks that: its poll may well be older than the poll of the week just started.
+
+    This only settles a tie. It cannot promote a week PAST a live ballot: a poll with no
+    admitted works ranks below one that has them however recently it was collected (see
+    _ballot_rank), so collecting mid-vote can no longer take the page away from the week
+    people are voting in.
     """
     poll.created_at = datetime.now(timezone.utc).isoformat()
     return poll

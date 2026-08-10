@@ -177,10 +177,19 @@ class CollectWindowTests(unittest.TestCase):
         self.assertIsNone(voting.load_poll(CHAT, THIS_WEEK))  # untouched, not created
 
     def test_collecting_the_previous_week_makes_it_the_poll_the_page_opens(self):
-        """The reported bug, in full: the week just collected is the week the moderator is
-        working on, so it has to be the one the ballot and the moderation screen open --
-        even when the week in progress has works of its own and is therefore the newer
-        poll. Otherwise what was just collected is invisible."""
+        """Monday morning, nothing moderated yet: the week just collected is the week the
+        moderator is working on, so it has to be the one the page opens even though the
+        week in progress has works of its own and is the newer poll.
+
+        Both weeks are left unmoderated on purpose. A week with admitted works is a live
+        ballot and outranks both regardless of when it was collected -- that is
+        latest_poll's own rule, tested separately, and it would mask the tie-break here.
+        """
+        finished = voting.load_poll(CHAT, LAST_WEEK)
+        voting.set_approved(finished, [])
+        finished.votes = {}
+        voting.save_poll(finished)
+
         self._collect(new_entries=[_entry("80", media=["80.jpg"])])
         self.assertEqual(voting.latest_poll(CHAT).poll_id, THIS_WEEK)
 
@@ -190,6 +199,23 @@ class CollectWindowTests(unittest.TestCase):
         )
 
         self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+
+    def test_a_collect_mid_vote_does_not_move_the_ballot_off_the_running_week(self):
+        """Production, 2026-08-10: the previous week's vote was running -- 15 works
+        admitted, 34 ballots cast -- when "за эту неделю" was pressed. It found one new
+        nomination, and that single pending work took the page away from the live vote,
+        which then showed no candidates at all."""
+        self._collect(
+            new_entries=[_entry("90", media=["90.jpg"])],
+            text="/vote собрать прошлая", poll_id=LAST_WEEK,
+        )
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+
+        self._collect(new_entries=[_entry("80", media=["80.jpg"])])  # one post today
+
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+        # ...and the work found today is still collected, waiting in its own week.
+        self.assertEqual(len(voting.load_poll(CHAT, THIS_WEEK).entries), 1)
 
     def test_the_empty_week_just_begun_does_not_hide_the_week_being_voted_in(self):
         """Monday, the other way round: the previous week is collected and open, and then

@@ -555,6 +555,42 @@ class StorageTests(unittest.TestCase):
         latest = voting.latest_poll("Chat")
         self.assertEqual(latest.poll_id, "2026-08-02")
 
+    def _poll(self, poll_id, created_at, entries=1, admitted=0):
+        poll = voting.Poll(
+            poll_id=poll_id, entry="Chat", created_at=created_at,
+            entries=[voting.Entry(entry_id=f"{poll_id}-{i}", message_id=i, author_id=i,
+                                  author_name="A", author_username="a", text="",
+                                  media=[f"{i}.jpg"])
+                     for i in range(entries)],
+        )
+        voting.set_approved(poll, [e.entry_id for e in poll.entries[:admitted]])
+        voting.save_poll(poll)
+        return poll
+
+    def test_a_live_ballot_is_not_displaced_by_a_freshly_collected_week(self):
+        """The 2026-08-10 incident: last week's vote was running (15 admitted, 34 ballots)
+        when a routine collect of the week in progress found ONE new nomination. That one
+        pending work was the newest poll, so the ballot opened it and showed no candidates.
+        A week with nothing admitted is not a ballot and cannot take the page."""
+        self._poll("2026-W32", "2026-08-10T08:48:00+00:00", entries=21, admitted=15)
+        self._poll("2026-W33", "2026-08-10T09:59:51+00:00", entries=1, admitted=0)
+
+        self.assertEqual(voting.latest_poll("Chat").poll_id, "2026-W32")
+
+    def test_the_new_week_takes_over_once_its_works_are_admitted(self):
+        """...and the previous week must not keep the page forever: admitting works in the
+        newer poll is what hands it over, whether or not the old one was ever closed."""
+        self._poll("2026-W32", "2026-08-10T08:48:00+00:00", entries=21, admitted=15)
+        self._poll("2026-W33", "2026-08-17T09:00:00+00:00", entries=12, admitted=12)
+
+        self.assertEqual(voting.latest_poll("Chat").poll_id, "2026-W33")
+
+    def test_between_two_unmoderated_weeks_the_most_recent_one_wins(self):
+        self._poll("2026-W32", "2026-08-10T08:48:00+00:00", entries=21, admitted=0)
+        self._poll("2026-W33", "2026-08-17T09:00:00+00:00", entries=12, admitted=0)
+
+        self.assertEqual(voting.latest_poll("Chat").poll_id, "2026-W33")
+
     def test_latest_poll_skips_an_empty_week_in_favour_of_one_with_works(self):
         """Monday: collecting the week just begun writes an empty poll for it, which is
         the newest file on disk. Opening THAT rather than the week people are voting in is

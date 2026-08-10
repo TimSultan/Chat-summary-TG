@@ -4388,9 +4388,22 @@ async def handle_vote_command(
             f"Новых заявок: {len(new_entries)} (всего {len(all_entries)})." if new_entries
             else f"Новых заявок нет (всего {len(all_entries)})."
         )
+        # Collecting a week does not necessarily hand it the page: a vote already running
+        # in another week keeps it (voting.latest_poll). Said outright, because otherwise
+        # the admin opens модерация, sees a different week, and concludes the collect
+        # failed -- and, worse, might clear a live vote trying to fix it.
+        shown = voting.latest_poll(entry)
+        elsewhere = (
+            ""
+            if shown is None or shown.poll_id == poll_id else
+            f"\n\nНо открыта пока другая неделя -- {shown.poll_id}: там идёт голосование "
+            f"({len(shown.votes)} голосов, работ допущено {len(shown.approved)}). "
+            "Оно и остаётся на странице. Подведи в нём итоги или очисти голосование, "
+            "чтобы перейти к этой неделе -- заявки уже собраны и никуда не денутся."
+        )
         await reply(
             f"{summary} Неделя: {poll_id} ({week_label}). "
-            "Открой модерацию и отметь, какие работы допустить.",
+            f"Открой модерацию и отметь, какие работы допустить.{elsewhere}",
             reply_markup={"inline_keyboard": [[
                 {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
             ]]},

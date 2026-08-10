@@ -641,13 +641,23 @@ page that changes shape depending on who opens it:
   worth voting on sits in the week just ended. The previous week's window is closed at
   **both** ends — Monday 00:00 through the following Monday 00:00 — so collecting it never
   drags in what has been posted since; each week's works stay in that week's own poll.
-  Collecting also makes the week it collected **the current poll** (`voting.make_current`):
-  the page and `/vote` open `latest_poll`, which orders on `created_at`, and without that
-  an empty poll for the week that has only just begun would outrank the one just filled.
-  From the other side, `latest_poll` skips **empty** weeks entirely and opens the newest
-  one that actually holds works (falling back to the newest outright only when they are
-  all empty) — collecting a week nobody posted in still writes that week's file, and on a
-  Monday that is the normal outcome for the week in progress.
+  Collecting also makes the week it collected **the newest** poll (`voting.make_current`),
+  which is how `latest_poll` breaks a tie — without it an untouched poll for the week that
+  has only just begun would outrank the week just filled.
+
+  **Which week the page opens is a rank, not a timestamp** (`voting.latest_poll`,
+  `_ballot_rank`): a poll with **admitted** works outranks one that is merely collected,
+  which outranks an **empty** one; `created_at` only breaks ties inside a rank. Both of
+  the weaker kinds get written routinely — collecting a week nobody posted in still saves
+  that week's file — and on a Monday that is the normal state of the week in progress. The
+  rank is what stops a collect from taking the page away from a vote that is running: on
+  2026-08-10 last week's poll was open with 15 admitted works and 34 ballots cast when a
+  routine "за эту неделю" found one new nomination, and that single pending work moved the
+  ballot to a poll with nothing admitted in it. No vote was lost (each week's are in its
+  own file), but the ballot showed no candidates until the ordering was fixed. The
+  consequence to know about: while a vote is running, a week you collect **stays behind
+  it** — the collect reply says so outright — and takes the page once that vote is
+  announced or cleared. There is no week picker; one contest is live at a time.
 
   **Starting a new week carries last week's field over**, minus its top 3: the podium has
   had its week, everything below it runs again, and the reply says how many came across.
