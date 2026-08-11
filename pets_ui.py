@@ -112,7 +112,9 @@ def _name(pet: dict) -> str:
 # ------------------------------------------------------------------------ main menu
 
 
-def main_view(entry: str, user_id, xp: int, webapp_url: str | None = None) -> tuple[str, dict]:
+def main_view(
+    entry: str, user_id, xp: int, webapp_url: str | None = None, quest_mod: bool = False,
+) -> tuple[str, dict]:
     """The landing screen. Deliberately shows the whole state of the account in six lines
     -- cage, creature, level, coins, fights left -- because every other screen is one tap
     away and re-reading this one is how a player checks whether anything changed.
@@ -209,6 +211,14 @@ def main_view(entry: str, user_id, xp: int, webapp_url: str | None = None) -> tu
     if not pet:
         updates_button = "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
         rows.append([{"text": updates_button, "callback_data": callback_data(user_id, "updates")}])
+    if quest_mod:
+        # Only drawn for somebody who can actually review. Whether that is true needs a
+        # Telegram round trip, so the CALLER decides and passes it in -- this module stays
+        # pure, and the routes behind the button re-check for themselves regardless.
+        rows.append([{
+            "text": "🛡 Модераторы квестов",
+            "callback_data": callback_data(user_id, "questmods"),
+        }])
     rows.append([
         {"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")},
         {"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")},
@@ -393,6 +403,52 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "questreroll", kind),
         }])
     rows.append([other_button])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def quest_mods_view(entry: str, user_id, can_appoint: bool) -> tuple[str, dict]:
+    """Who may review quests here, and -- for a full admin -- how to change that.
+
+    `can_appoint` is threaded in rather than worked out here because the answer needs a
+    Telegram round trip (is this person a chat administrator?) and this module is pure.
+    It draws the LINE this screen exists to hold: a delegated moderator can review, and
+    can see who else can, but cannot appoint further moderators. Only a chat admin or a
+    hardcoded delegate can widen the list -- otherwise one appointment quietly becomes
+    the power to hand out the same appointment forever.
+    """
+    listed = quests.moderators(entry)
+    lines = ["🛡 <b>Модераторы квестов</b>\n"]
+    lines.append(
+        "Могут принимать и отклонять работы по квестам в мини-приложении. "
+        "Больше ничего: ни значков, ни настроек чата."
+    )
+    if listed:
+        lines.append("\n<b>Назначенные:</b>")
+        for row in listed:
+            handle = f" (@{escape(row['username'])})" if row.get("username") else ""
+            lines.append(f"• {escape(row.get('display_name') or row['user_id'])}{handle}")
+    else:
+        lines.append("\nПока никого не назначили.")
+    lines.append(
+        "\n<i>Администраторы чата и так могут проверять квесты — их сюда добавлять "
+        "не нужно.</i>"
+    )
+
+    rows = []
+    if can_appoint:
+        rows.append([{
+            "text": "➕ Добавить модератора",
+            "callback_data": callback_data(user_id, "questmodadd"),
+        }])
+        for row in listed[:8]:
+            name = row.get("display_name") or row["user_id"]
+            rows.append([{
+                "text": f"➖ Убрать: {name}"[:60],
+                "callback_data": callback_data(user_id, "questmoddel", str(row["user_id"])),
+            }])
+    else:
+        lines.append("\nДобавлять и убирать может только администратор чата.")
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 

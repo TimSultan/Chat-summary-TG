@@ -5702,6 +5702,7 @@ async def handle_pets_command(
     bot_username: str | None,
     background_tasks: set,
     pets_flows: dict,
+    known_chat_ids: dict[str, int] | None = None,
     log=print,
 ) -> None:
     """"/arena" -- the pet game's menu.
@@ -5739,6 +5740,16 @@ async def handle_pets_command(
         except Exception:
             log(f"[pets] failed to point a group at the DM:\n{traceback.format_exc()}")
         return
+
+    quest_admin_chat_id = await _resolve_chat_id(
+        telethon_client, entry, known_chat_ids or {}, log=log,
+    ) if entry else None
+    can_appoint_mods = bool(quest_admin_chat_id) and await _can_manage_chat(
+        api, quest_admin_chat_id, actor, entry,
+    )
+    is_quest_mod = can_appoint_mods or quests.is_moderator(
+        entry, actor.get("id"), actor.get("username"),
+    )
 
     user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
     if user is None:
@@ -6169,6 +6180,30 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action in ("questmodadd", "questmoddel"):
+            # Re-checked here, not trusted from the button: an old keyboard survives a
+            # restart and a demotion, and this one hands out a permission.
+            if not can_appoint_mods:
+                await _send_pets_view(
+                    api, chat_id,
+                    pets_ui.notice_view(user_id, "Это может только администратор чата."),
+                    message_id=message_id, log=log,
+                )
+                return
+            if action == "questmoddel":
+                _ok, note = quests.remove_moderator(entry, argument)
+                log(f"[pets] quest moderator removed by {user_id}: {argument} -- {note}")
+                await _pets_toast_and_redraw(
+                    api, chat_id, message_id, note,
+                    pets_ui.quest_mods_view(entry, user_id, can_appoint_mods), log,
+                )
+                return
+            await _pets_start_flow(
+                api, pets_flows, chat_id, actor.get("id"), entry, "quest_mod_target",
+                "Кого сделать модератором квестов? Ответь @username.",
+                message_id, owner_username=actor.get("username"),
+            )
+            return
         if action == "mob":
             block = pets.roll_mob(entry, user_id)
             await _send_pets_view(
@@ -6382,7 +6417,9 @@ async def handle_pets_callback(
                 api, chat_id, message_id,
                 "Уведомления о результатах боёв включены."
                 if enabled else "Уведомления о результатах боёв выключены.",
-                pets_ui.main_view(entry, user_id, xp, webapp_url=pets_webapp_url), log,
+                pets_ui.main_view(
+                    entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
+                ), log,
             )
             return
 
@@ -6407,7 +6444,10 @@ async def handle_pets_callback(
             # buttons remain safe across a restart.
             pets_updates.mark_latest_read(entry, user_id)
         views = {
-            "main": lambda: pets_ui.main_view(entry, user_id, xp, webapp_url=pets_webapp_url),
+            "main": lambda: pets_ui.main_view(
+                entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
+            ),
+            "questmods": lambda: pets_ui.quest_mods_view(entry, user_id, can_appoint_mods),
             "info": lambda: pets_ui.info_view(user_id),
             "cage": lambda: pets_ui.cage_view(entry, user_id, xp),
             "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
@@ -7237,6 +7277,7 @@ async def maybe_handle_pets_flow_message(
     pets_flows: dict,
     bot_username: str | None = None,
     background_tasks: set | None = None,
+    known_chat_ids: dict[str, int] | None = None,
     log=print,
 ) -> bool:
     """The photo or the name a pet flow is waiting for. True when this message was one.
@@ -7319,6 +7360,53 @@ async def maybe_handle_pets_flow_message(
 
     awaiting = flow.get("awaiting")
     try:
+        if awaiting == "quest_mod_target":
+            if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
+                await api.send_message(
+                    chat_id, "Нужен @username. Или напиши «отмена».", parse_mode=None,
+                )
+                return True
+            # Re-checked at the moment of the WRITE, not when the prompt was sent: a
+            # force-reply survives for as long as the person takes to type, and this is
+            # the step that actually grants the permission.
+            mod_chat_id = await _resolve_chat_id(
+                telethon_client, entry, known_chat_ids or {}, log=log,
+            )
+            if mod_chat_id is None or not await _can_manage_chat(
+                api, mod_chat_id, actor, entry
+            ):
+                pets_flows.pop(flow_id, None)
+                await api.send_message(
+                    chat_id, "Это может только администратор чата.", parse_mode=None,
+                )
+                return True
+            try:
+                target, _, _, _, _, _ = await stats.resolve_stat_target(
+                    telethon_client, entry, entry, raw,
+                    actor.get("username"), _display_name(actor), tz, log=log,
+                )
+            except Exception:
+                target = None
+                log(f"[pets] failed to resolve quest moderator:\n{traceback.format_exc()}")
+            pets_flows.pop(flow_id, None)
+            if target is None:
+                await api.send_message(
+                    chat_id, "Не нашёл такого участника в статистике чата.", parse_mode=None,
+                )
+                return True
+            _ok, note = quests.add_moderator(
+                entry, target.user_id, target.username, target.display_name,
+                actor.get("id"), _display_name(actor),
+            )
+            log(f"[pets] quest moderator added by {actor.get('id')}: {target.user_id} -- {note}")
+            await _send_pets_view(
+                api, chat_id,
+                (html.escape(note) + "\n\n"
+                 + pets_ui.quest_mods_view(entry, actor.get("id"), True)[0],
+                 pets_ui.quest_mods_view(entry, actor.get("id"), True)[1]),
+                log=log,
+            )
+            return True
         if awaiting == "gift_target":
             if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
                 await api.send_message(chat_id, "Нужен @username получателя.", parse_mode=None)
@@ -7576,7 +7664,7 @@ async def _dispatch_update(
             if pets_entry is not None:
                 await handle_pets_command(
                     api, telethon_client, cfg, tz, message, pets_entry, bot_username,
-                    background_tasks, pets_flows, log=log,
+                    background_tasks, pets_flows, known_chat_ids=known_chat_ids, log=log,
                 )
             return
         if start_payload in ("vote2", "arena"):
@@ -7788,7 +7876,8 @@ async def _dispatch_update(
     # something starting with a slash.
     if await maybe_handle_pets_flow_message(
         api, telethon_client, tz, message, pets_flows,
-        bot_username=bot_username, background_tasks=background_tasks, log=log,
+        bot_username=bot_username, background_tasks=background_tasks,
+        known_chat_ids=known_chat_ids, log=log,
     ):
         return
 
@@ -8432,6 +8521,23 @@ async def run_bot_listener(
                 return False
             return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
 
+        async def _is_quest_moderator(user: dict) -> bool:
+            """Who may accept or reject a quest submission.
+
+            Three ways in, cheapest first: somebody an admin delegated with «Модераторы
+            квестов» (a local file read), the hardcoded delegates (a string compare), and
+            finally a chat administrator (a Telegram round trip).
+
+            Wider than _is_vote_admin on purpose. Judging a painting is a different job
+            from closing the weekly vote, and it needs a different -- larger -- set of
+            people, which is the whole reason the delegated list exists.
+            """
+            if home_chat_ref and quests.is_moderator(
+                home_chat_ref, user.get("id"), user.get("username")
+            ):
+                return True
+            return await _is_vote_admin(user)
+
         async def _is_vote_member(user: dict) -> bool:
             """The "голосовать могут только подписчики" gate: only members of the home
             chat may cast a ballot. Fails closed -- an unresolvable home chat blocks
@@ -8540,9 +8646,10 @@ async def run_bot_listener(
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
                     is_member=_is_vote_member,
-                    # Quest review only, and deliberately the SAME gate the voting page
-                    # moderates with: chat admins plus whoever /badgeadmin has delegated.
-                    is_admin=_is_vote_admin,
+                    # Quest review only -- a WIDER gate than the voting page's, and
+                    # deliberately so: reviewing a painting is "does this look like NMM",
+                    # which any trusted painter can do, while closing a vote is not.
+                    is_admin=_is_quest_moderator,
                     resolve_player=_resolve_pet_player,
                     fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo, log=log,
                 )

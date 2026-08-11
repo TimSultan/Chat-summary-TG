@@ -7,9 +7,30 @@ from unittest.mock import patch
 import economy
 import pets
 import pets_config
+import pets_ui
 import pets_quest_catalog as catalog
 import stats
 import quests
+
+
+def _a_real_quest(*, repeatable):
+    """One real quest picked by the property under test, never by name.
+
+    The catalogue is meant to be edited -- that is the whole point of it being data -- so
+    a test that hard-codes "magnifier" fails the day somebody swaps that quest out, and
+    the failure says nothing about the behaviour it was guarding.
+    """
+    for quest in catalog.REAL_QUESTS:
+        if repeatable == (quest.cooldown_days > 0):
+            return quest
+    raise AssertionError(
+        f"the catalogue has no {'repeatable' if repeatable else 'once-ever'} real quest"
+    )
+
+
+_ONCE = _a_real_quest(repeatable=False)
+_REPEATABLE = _a_real_quest(repeatable=True)
+_BADGED = next((q for q in catalog.REAL_QUESTS if q.badge), _REPEATABLE)
 
 
 class QuestsTestCase(unittest.TestCase):
@@ -207,7 +228,8 @@ class ParseHashtagTests(unittest.TestCase):
                         "status": "open", "submission_id": None,
                     }},
                     "real_assignments": {}, "submissions": [], "history": [], "rewards": {},
-                    "done": {"1": {"magnifier": day.isoformat(), "run-6km": day.isoformat()}},
+                    "done": {"1": {_ONCE.code.replace("_", "-"): day.isoformat(),
+                                   _REPEATABLE.code.replace("_", "-"): day.isoformat()}},
                     "disabled": ["nmm-gold"],
                 }), encoding="utf-8")
 
@@ -216,13 +238,13 @@ class ParseHashtagTests(unittest.TestCase):
                 self.assertEqual(board["quest"]["hashtag"], "#quest_anime_eyes")
 
                 data = quests._load("chat")
-                self.assertEqual(set(data["done"]["1"]), {"magnifier", "run_6km"})
+                self.assertEqual(set(data["done"]["1"]), {_ONCE.code, _REPEATABLE.code})
                 self.assertEqual(data["disabled"], ["nmm_gold"])
                 # The cooldowns those stamps stand for are still being served.
-                once = catalog.find_quest("magnifier")
+                once = _ONCE
                 self.assertFalse(quests._is_offerable(
                     once, data, "1", day + timedelta(days=999)))
-                repeatable = catalog.find_quest("run_6km")
+                repeatable = _REPEATABLE
                 self.assertFalse(quests._is_offerable(repeatable, data, "1", day))
                 self.assertTrue(quests._is_offerable(
                     repeatable, data, "1", day + timedelta(days=repeatable.cooldown_days + 1)))
@@ -360,7 +382,7 @@ class RealQuestTests(QuestsTestCase):
         a quest that is resting."""
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
-        once = catalog.find_quest("magnifier")
+        once = _ONCE
         self.assertEqual(once.cooldown_days, 0)
 
         data = quests._load(entry)
@@ -383,7 +405,7 @@ class RealQuestTests(QuestsTestCase):
     def test_a_repeatable_quest_comes_back_after_its_own_cooldown(self):
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
-        quest = catalog.find_quest("workspace")
+        quest = _REPEATABLE
         self.assertGreater(quest.cooldown_days, 0)
         data = quests._load(entry)
         data["done"] = {"1": {quest.code: day.isoformat()}}
@@ -398,7 +420,7 @@ class RealQuestTests(QuestsTestCase):
         fortnightly quest across the chat instead of handing it to everybody at once."""
         entry = "chat"
         start = datetime(2026, 8, 9, 9, 0)
-        quest = catalog.find_quest("workspace")
+        quest = _REPEATABLE
         data = quests._load(entry)
         data["done"] = {
             "1": {quest.code: start.isoformat()},
@@ -412,11 +434,12 @@ class RealQuestTests(QuestsTestCase):
         self.assertFalse(quests._is_offerable(quest, loaded, "2", checked))
 
     def test_finishing_a_real_quest_awards_its_badge_once(self):
-        """The badge is the point of the workspace quest -- the coins are the same as any
-        other difficulty 5. Awarding it must survive being handed out twice."""
+        """A badge is the point of the quests that carry one -- the coins are the same as
+        any other quest at that difficulty. Awarding it must survive being handed out
+        twice, which is what the cooldown makes possible."""
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
-        quest = catalog.find_quest("workspace")
+        quest = _BADGED
         self.assertTrue(quest.badge)
 
         def deal_and_finish(when):
@@ -664,3 +687,84 @@ class StorageRobustnessTests(QuestsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuestModeratorTests(QuestsTestCase):
+    """Quest review is its own small delegation. It is NOT chat admin and NOT the badge
+    manager list: judging a painting is "does this look like NMM", which any trusted
+    painter can do, while the other two carry the ban button and the badge cupboard."""
+
+    def test_a_moderator_is_matched_by_id_or_by_username(self):
+        """Somebody can be appointed from a @username before they have ever opened the
+        Mini App, and the signed initData the page verifies carries a username too. If
+        only the id matched, an appointment would not take effect until their next visit
+        -- which looks exactly like the button being broken."""
+        entry = "chat"
+        self.assertFalse(quests.is_moderator(entry, "77", "vasya"))
+
+        ok, message = quests.add_moderator(entry, "77", "vasya", "Вася", "1", "Админ")
+        self.assertTrue(ok, message)
+        self.assertTrue(quests.is_moderator(entry, "77"))
+        self.assertTrue(quests.is_moderator(entry, None, "@VASYA"))
+        self.assertTrue(quests.is_moderator(entry, None, "vasya"))
+        # And nobody else is swept in by either route.
+        self.assertFalse(quests.is_moderator(entry, "99", "petya"))
+        self.assertFalse(quests.is_moderator(entry, None, ""))
+        self.assertFalse(quests.is_moderator(entry, None, None))
+
+    def test_appointing_the_same_person_twice_says_so_and_changes_nothing(self):
+        entry = "chat"
+        self.assertTrue(quests.add_moderator(entry, "77", "vasya", "Вася", "1", "Админ")[0])
+        again, message = quests.add_moderator(entry, "77", "vasya", "Вася", "1", "Админ")
+        self.assertFalse(again)
+        self.assertIn("и так", message)
+        self.assertEqual(len(quests.moderators(entry)), 1)
+
+    def test_removing_a_moderator_takes_the_permission_away_by_both_routes(self):
+        entry = "chat"
+        quests.add_moderator(entry, "77", "vasya", "Вася", "1", "Админ")
+        ok, message = quests.remove_moderator(entry, "77")
+        self.assertTrue(ok, message)
+        self.assertFalse(quests.is_moderator(entry, "77"))
+        self.assertFalse(quests.is_moderator(entry, None, "vasya"))
+        self.assertFalse(quests.remove_moderator(entry, "77")[0])
+
+    def test_moderators_are_per_chat(self):
+        quests.add_moderator("chat-a", "77", "vasya", "Вася", "1", "Админ")
+        self.assertTrue(quests.is_moderator("chat-a", "77"))
+        self.assertFalse(quests.is_moderator("chat-b", "77"))
+
+    def test_a_delegated_moderator_is_never_shown_the_appointment_buttons(self):
+        """The line this screen exists to hold: a moderator can review, and can see who
+        else can, but cannot widen the list. Otherwise one appointment quietly becomes the
+        power to hand out the same appointment forever."""
+        entry = "chat"
+        quests.add_moderator(entry, "77", "vasya", "Вася", "1", "Админ")
+
+        _text, keyboard = pets_ui.quest_mods_view(entry, "77", can_appoint=False)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(actions, {"main"})
+
+        _text, keyboard = pets_ui.quest_mods_view(entry, "1", can_appoint=True)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(actions, {"main", "questmodadd", "questmoddel"})
+
+    def test_the_arena_menu_only_offers_the_screen_to_somebody_who_can_use_it(self):
+        entry = "chat"
+        economy.grant(entry, "1", pets_config.CAGE_PRICE + pets_config.TAME_PRICE, "test")
+        self._tame(entry, "1")
+        for allowed in (False, True):
+            with self.subTest(quest_mod=allowed):
+                _text, keyboard = pets_ui.main_view(entry, "1", 0, quest_mod=allowed)
+                actions = {
+                    pets_ui.parse_callback(button["callback_data"])[1]
+                    for row in keyboard["inline_keyboard"] for button in row
+                    if "callback_data" in button
+                }
+                self.assertEqual("questmods" in actions, allowed)

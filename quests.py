@@ -138,6 +138,7 @@ def _empty() -> dict:
         "rewards": {},         # difficulty -> partial override of REWARDS_BY_DIFFICULTY
         "real_assignments": {},  # user_id -> the one live Квест в реале
         "done": {},            # user_id -> {quest code: when it was last finished}
+        "moderators": {},      # user_id -> who may review, delegated by an admin
         "disabled": [],        # quest codes a moderator has taken out of rotation
     }
 
@@ -175,6 +176,9 @@ def _load(entry: str) -> dict:
             row["code"] = catalog.normalise_code(row["code"])
     base["submissions"] = [row for row in base["submissions"] if isinstance(row, dict)]
     base["history"] = [row for row in base["history"] if isinstance(row, dict)]
+    base["moderators"] = {
+        str(uid): row for uid, row in base["moderators"].items() if isinstance(row, dict)
+    }
     base["disabled"] = [catalog.normalise_code(code) for code in base["disabled"]]
     return base
 
@@ -184,6 +188,90 @@ def _save(entry: str, data: dict) -> None:
     data["submissions"] = data["submissions"][-SUBMISSION_LIMIT:]
     data["history"] = data["history"][-HISTORY_LIMIT:]
     stats._write_json_atomic(_path(entry), data)
+
+
+# --- who may review -------------------------------------------------------------------
+#
+# A quest moderator is NOT a chat administrator and not a badge manager. It is its own
+# small delegation, because the two jobs need different trust: reviewing a painting is
+# "does this look like NMM", which any experienced painter in the chat can do, while
+# chat admin carries the ban button and /badgeadmin hands out badges. Keeping the list
+# separate means an admin can hand out review duty without handing out anything else.
+#
+# The list lives in the quest store rather than in stats.py for the same reason: it is a
+# quest-shaped permission, and it should disappear with the quest data if this feature
+# ever does.
+
+
+def _moderator_rows(data: dict) -> dict:
+    rows = data.setdefault("moderators", {})
+    if not isinstance(rows, dict):
+        rows = data["moderators"] = {}
+    return rows
+
+
+def is_moderator(entry: str, user_id=None, username: str | None = None) -> bool:
+    """Whether this person has been delegated quest review in this chat.
+
+    Matched on id OR username. The id is the reliable key, but somebody can be appointed
+    from a Telegram username before they have ever opened the Mini App, and the signed
+    initData the page verifies carries a username too -- so accepting either is what makes
+    "add @vasya" work immediately rather than after Vasya's next visit.
+    """
+    rows = _moderator_rows(_load(entry))
+    if user_id is not None and str(user_id) in rows:
+        return True
+    handle = str(username or "").strip().lstrip("@").lower()
+    if not handle:
+        return False
+    return any(
+        str(row.get("username") or "").lower() == handle
+        for row in rows.values() if isinstance(row, dict)
+    )
+
+
+def moderators(entry: str) -> list[dict]:
+    """Everyone delegated quest review here, newest first."""
+    rows = _moderator_rows(_load(entry))
+    listed = [
+        {"user_id": uid, **row} for uid, row in rows.items() if isinstance(row, dict)
+    ]
+    listed.sort(key=lambda row: str(row.get("added_at") or ""), reverse=True)
+    return listed
+
+
+def add_moderator(
+    entry: str, user_id, username: str | None, display_name: str,
+    added_by_id=None, added_by_name: str = "",
+) -> tuple[bool, str]:
+    """Delegate quest review. False when they already had it, so callers can say so."""
+    if not str(user_id or "").strip():
+        return False, "Не понял, кого добавлять."
+    with _lock:
+        data = _load(entry)
+        rows = _moderator_rows(data)
+        if str(user_id) in rows:
+            return False, f"{display_name} и так может проверять квесты."
+        rows[str(user_id)] = {
+            "username": (username or "").lstrip("@") or None,
+            "display_name": display_name,
+            "added_at": app_now().isoformat(),
+            "added_by_id": str(added_by_id or ""),
+            "added_by_name": added_by_name,
+        }
+        _save(entry, data)
+    return True, f"{display_name} теперь может проверять квесты."
+
+
+def remove_moderator(entry: str, user_id) -> tuple[bool, str]:
+    with _lock:
+        data = _load(entry)
+        rows = _moderator_rows(data)
+        row = rows.pop(str(user_id), None)
+        if row is None:
+            return False, "Этот человек и так не модератор квестов."
+        _save(entry, data)
+    return True, f"{row.get('display_name') or user_id} больше не проверяет квесты."
 
 
 # --- the reward table -----------------------------------------------------------------
