@@ -785,6 +785,154 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh.status, 200)
         self.assertNotEqual(await fresh.read(), await first.read())
 
+    # ---- replaying a recorded fight -----------------------------------------------------
+
+    async def test_a_replay_is_the_same_fight_blow_for_blow(self):
+        """Not "a fight like that one" -- that one. The stored seed and the two stored
+        fighters go back through the same pure simulate(), so every round, every flavour
+        line and the verdict have to come back identical. If this ever drifts, the page is
+        showing players a fight that never happened."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        live = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })).json()
+
+        fight_id = (await (await self._get("/api/history", PLAYER)).json())["rows"][0]["id"]
+        again = await (await self._get(f"/api/replay?id={fight_id}", PLAYER)).json()
+
+        self.assertTrue(again["replay"])
+        self.assertEqual(again["winner"], live["winner"])
+        self.assertEqual(again["draw"], live["draw"])
+        self.assertEqual(again["opening"], live["opening"])
+        self.assertEqual(again["closing"], live["closing"])
+        self.assertEqual(again["rounds"], live["rounds"])
+        self.assertEqual(again["max_hp"], live["max_hp"])
+
+    async def test_a_replay_pays_nothing_and_reports_what_was_paid(self):
+        """Watching a fight again must not re-run it: no coins, no XP, no fight spent, and
+        the money on screen is what the ledger recorded at the time rather than today's
+        prices applied to an old result."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        live = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })).json()
+        after_fight = await (await self._get("/api/state", PLAYER)).json()
+
+        fight_id = (await (await self._get("/api/history", PLAYER)).json())["rows"][0]["id"]
+        replayed = await (await self._get(f"/api/replay?id={fight_id}", PLAYER)).json()
+
+        settled = await (await self._get("/api/state", PLAYER)).json()
+        self.assertEqual(settled["coins"], after_fight["coins"])
+        self.assertEqual(settled["arena"]["available"], after_fight["arena"]["available"])
+        self.assertEqual(len((await (await self._get("/api/history", PLAYER)).json())["rows"]), 1)
+        # A replay carries no fresh state to apply, either -- the client must not be able
+        # to mistake it for something that changed the game.
+        self.assertNotIn("state", replayed)
+
+        won = live["winner"] == str(PLAYER["id"])
+        self.assertEqual(replayed["reward"]["gold"], live["reward"]["gold"] if won else 0)
+
+    async def test_the_defender_can_replay_the_fight_from_their_own_side(self):
+        """A fight has two participants and one transcript. The defender never pressed
+        anything, so their mailbox is the only place they will ever see it -- and it has to
+        play from their side, with them on the left."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+
+        rows = (await (await self._get("/api/mail", OPPONENT)).json())["rows"]
+        self.assertEqual(rows[0]["kind"], "defense")
+        self.assertTrue(rows[0]["replayable"])
+
+        replayed = await (await self._get(
+            f"/api/replay?id={rows[0]['fight_id']}", OPPONENT)).json()
+        self.assertEqual(replayed["you"], str(OPPONENT["id"]))
+        self.assertEqual(replayed["opponent"]["user_id"], str(PLAYER["id"]))
+        # Same transcript as the attacker sees, only read from the other chair.
+        attacker_rows = (await (await self._get("/api/history", PLAYER)).json())["rows"]
+        mine = await (await self._get(
+            f"/api/replay?id={attacker_rows[0]['id']}", PLAYER)).json()
+        self.assertEqual(replayed["rounds"], mine["rounds"])
+
+    async def test_a_stranger_cannot_replay_a_fight_they_were_not_in(self):
+        """The fight log is chat-wide on disk. Participation is the whole access rule, and
+        a timestamp is guessable, so it is enforced at the lookup rather than by whichever
+        list happened to hand out the id."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._tame(THIRD, name="Третий")
+
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+        fight_id = (await (await self._get("/api/history", PLAYER)).json())["rows"][0]["id"]
+
+        outsider = await self._get(f"/api/replay?id={fight_id}", THIRD)
+        self.assertEqual(outsider.status, 404)
+        missing = await self._get("/api/replay?id=2020-01-01T00:00:00", PLAYER)
+        self.assertEqual(missing.status, 404)
+
+    async def test_a_fight_from_before_snapshots_says_so_instead_of_faking_one(self):
+        """Fights recorded before the snapshot was kept have nothing to replay from. The
+        list marks them unplayable so they never become a button, and the route refuses
+        rather than re-rolling a plausible-looking fight that is not the one that
+        happened."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+
+        data = pets._load(CHAT)
+        data["fights"][0]["combat_snapshot"] = None
+        pets._save(CHAT, data)
+
+        row = (await (await self._get("/api/history", PLAYER)).json())["rows"][0]
+        self.assertFalse(row["replayable"])
+        refused = await self._get(f"/api/replay?id={row['id']}", PLAYER)
+        self.assertEqual(refused.status, 409)
+        self.assertEqual((await refused.json())["error"], "NO_REPLAY")
+
+    async def test_a_fight_whose_rules_have_changed_is_not_replayed_as_if_they_had_not(self):
+        """A replay is trustworthy only while the simulator still agrees with the recorded
+        verdict. If a rebalance changes who would win, the stored transcript is no longer
+        this fight -- and a confident animation ending on the wrong winner is a worse
+        answer than admitting it."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+
+        data = pets._load(CHAT)
+        recorded = data["fights"][0]
+        # Stand in for "the rules moved" by flipping the recorded winner: the check is
+        # simulate-vs-record, so either side of it drifting trips the same wire.
+        recorded["winner_id"], recorded["loser_id"] = recorded["loser_id"], recorded["winner_id"]
+        pets._save(CHAT, data)
+
+        refused = await self._get(f"/api/replay?id={pets.fight_id(recorded)}", PLAYER)
+        self.assertEqual(refused.status, 409)
+        self.assertEqual((await refused.json())["error"], "RULES_CHANGED")
+        self.assertTrue(self._logged("drifted"))
+
+    async def test_the_page_turns_a_logged_fight_into_a_button(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("async function replay(id)", page)
+        self.assertIn("function playDuel(data)", page)
+        self.assertIn("data-replay=", page)
+        self.assertIn("if (d.replay) { haptic(); replay(d.replay); return; }", page)
+        # The live fight and the replay must go through one playback, or they drift.
+        self.assertEqual(page.count("function playDuel("), 1)
+        self.assertIn(".duel .rerun", page)
+
     # ---- the mailbox --------------------------------------------------------------------
 
     async def test_mail_returns_the_readers_own_feed_with_server_side_times(self):

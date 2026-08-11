@@ -984,10 +984,22 @@ async def handle_attack(request: web.Request) -> web.Response:
             level=int(record.get("level", 1)),
         )
 
-    result = pets_combat.simulate(fighter(me, mine), fighter(opponent_id, theirs),
-                                  seed=secrets.randbits(63))
+    attacker, defender = fighter(me, mine), fighter(opponent_id, theirs)
+    seed = secrets.randbits(63)
+    result = pets_combat.simulate(attacker, defender, seed=seed)
+    # The seed plus both fighters as they stood is the entire fight -- simulate() reads
+    # nothing else. Recorded so /api/replay can play this one back later; without it a
+    # fight fought from the page would be the one kind nobody could watch again.
+    combat_snapshot = {
+        "seed": seed,
+        "fighters": {
+            me: pets_combat.snapshot(attacker),
+            opponent_id: pets_combat.snapshot(defender),
+        },
+    }
     try:
-        reward = pets.record_fight(entry, me, opponent_id, result, pets.today(), attacker_xp=xp)
+        reward = pets.record_fight(entry, me, opponent_id, result, pets.today(),
+                                   attacker_xp=xp, combat_snapshot=combat_snapshot)
     except ValueError as e:
         # The bank emptied, or the pet went to the farm, between drawing the page and
         # pressing the button. Nothing has been recorded -- say so and let the client
@@ -1004,21 +1016,119 @@ async def handle_attack(request: web.Request) -> web.Response:
     )
     return _ok({
         "ok": True,
+        **_playback_payload(result, me, attacker, opponent_id, defender, theirs.get("name")),
+        "reward": reward,
+        "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
+        "state": _state_payload(entry, me, xp, prefix),
+    })
+
+
+def _playback_payload(result, me: str, mine, opponent_id: str, theirs, opponent_name) -> dict:
+    """The part of a fight the page animates, blow by blow.
+
+    Shared by the live fight and by /api/replay, so a replay is not a second, subtly
+    different rendering of the same thing -- it is the same payload, and the client
+    cannot tell them apart except by what it is told.
+
+    `max_hp` is per side. The bars used to divide both fighters' HP by the READER's
+    maximum, which is only right when the two pets happen to be equally tough: against a
+    frailer opponent their bar started full and then fell off a cliff, and against a
+    tougher one it never emptied.
+    """
+    return {
         "you": me,
-        "opponent": {"user_id": opponent_id, "name": theirs.get("name")},
+        "opponent": {"user_id": opponent_id, "name": opponent_name},
         "winner": result.winner,
         "draw": result.is_draw,
         "stopped_early": result.stopped_early,
         "opening": result.opening,
         "closing": result.closing,
+        "max_hp": {
+            me: round(pets_combat.derive(mine, theirs)["max_hp"]),
+            opponent_id: round(pets_combat.derive(theirs, mine)["max_hp"]),
+        },
         "rounds": [
             {"number": r.number, "attacker": r.attacker, "event": r.event, "damage": r.damage,
              "attacker_hp": r.attacker_hp, "defender_hp": r.defender_hp, "text": r.text}
             for r in result.rounds
         ],
-        "reward": reward,
+    }
+
+
+async def handle_replay(request: web.Request) -> web.Response:
+    """Play a recorded fight again, exactly as it happened.
+
+    Nothing about the fight is re-rolled and nothing is re-decided: the stored seed and
+    the two stored fighters go back into the same pure simulate() that produced the
+    original, and it returns the identical transcript. The money shown is what was
+    actually paid at the time, read off the recorded row from this reader's side -- never
+    recomputed, because prices change.
+
+    Two fights cannot be replayed and say so plainly rather than inventing something. One
+    recorded before this shipped has no snapshot to replay from. One whose re-simulation
+    disagrees with the recorded winner was fought under rules that have since changed --
+    showing that transcript would be showing a fight that never took place.
+    """
+    user, _xp = await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    log = request.app[_LOG_KEY]
+    me = str(user["id"])
+    fight = pets.find_fight(entry, me, request.query.get("id"))
+    if fight is None:
+        return _json_error("Этот бой не найден.", status=404, code="NO_FIGHT")
+
+    snapshot = fight.get("combat_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    fighters = snapshot.get("fighters") if isinstance(snapshot.get("fighters"), dict) else {}
+    seed = snapshot.get("seed")
+    attacker_id, defender_id = str(fight.get("attacker_id")), str(fight.get("defender_id"))
+    attacker = pets_combat.restore(fighters.get(attacker_id))
+    defender = pets_combat.restore(fighters.get(defender_id))
+    if attacker is None or defender is None or not isinstance(seed, int):
+        log(f"[pets_web] replay {me} {fight.get('ts')}: no snapshot to replay from")
+        return _json_error(
+            "Этот бой прошёл до того, как появились повторы.", status=409, code="NO_REPLAY",
+        )
+
+    # Attacker first, exactly as the original call ordered them: simulate() picks the
+    # first mover with the rng's very first roll, and swapping the arguments would swap
+    # who wins the initiative and replay a different fight from the same seed.
+    result = pets_combat.simulate(attacker, defender, seed=seed)
+    if str(result.winner or "") != str(fight.get("winner_id") or ""):
+        log(
+            f"[pets_web] replay {me} {fight.get('ts')}: drifted -- recorded "
+            f"{fight.get('winner_id')!r}, replays as {result.winner!r}"
+        )
+        return _json_error(
+            "Бой шёл по прежним правилам — точный повтор уже не воспроизвести.",
+            status=409, code="RULES_CHANGED",
+        )
+
+    attacked = attacker_id == me
+    opponent_id = defender_id if attacked else attacker_id
+    opponent_name = fight.get("defender_name") if attacked else fight.get("attacker_name")
+    won = str(fight.get("winner_id") or "") == me
+    # Money as recorded, from this reader's side -- the same rewrite pets.history does.
+    # No xp or level-ups: a fight row has never stored them per side, and a plausible
+    # number invented here would be indistinguishable from a real one.
+    dropped = C.find_item(fight.get("dropped_item")) if won and fight.get("dropped_item") else None
+    prefix = request.app[_PREFIX_KEY]
+    return _ok({
+        "ok": True,
+        "replay": True,
+        "at": fight.get("ts"),
+        **_playback_payload(
+            result, me,
+            attacker if attacked else defender, opponent_id,
+            defender if attacked else attacker, opponent_name,
+        ),
+        "reward": {
+            "gold": fight.get("gold", 0) if won else 0,
+            "loss_gold": 0 if won else fight.get("loss_gold", 0),
+            "consolation_gold": 0 if won else fight.get("consolation_gold", 0),
+            "auto_equipped": bool(fight.get("auto_equipped")) if won else False,
+        },
         "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
-        "state": _state_payload(entry, me, xp, prefix),
     })
 
 
@@ -1072,6 +1182,12 @@ async def handle_history(request: web.Request) -> web.Response:
             "won": won,
             "coins": coins,
             "at": fight.get("ts"),
+            # The timestamp is also the replay key (see pets.find_fight). `replayable`
+            # spares the client a request that can only fail: a fight recorded before
+            # snapshots existed has nothing to replay from, and a row that cannot be
+            # watched should not look like a button.
+            "id": pets.fight_id(fight),
+            "replayable": bool(fight.get("combat_snapshot")),
         })
     return _ok({"rows": rows})
 
@@ -1190,6 +1306,7 @@ def attach(
         web.get(prefix + "/api/leaderboard", handle_leaderboard),
         web.get(prefix + "/api/history", handle_history),
         web.get(prefix + "/api/mail", handle_mail),
+        web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/collection", handle_collection),
         web.get(prefix + "/api/updates", handle_updates),
         web.post(prefix + "/api/portrait", handle_portrait_upload),
@@ -1468,6 +1585,20 @@ PAGE_HTML = """<!doctype html>
   .mail .find { border: 1px solid currentColor; border-radius: 999px; padding: 1px 8px;
                 font-weight: 600; }
 
+  /* A row that replays a fight. It is a <button>, so it has to be talked back down to
+     being a row: a button brings its own font, background, border and centred text, none
+     of which a feed line wants. The ▶ is the whole affordance -- these rows are dense,
+     and a frame around each one would turn a feed into a grid of boxes. */
+  .rerunable { width: 100%; text-align: left; font: inherit; color: inherit;
+               background: none; border: 0; padding: 0; margin-bottom: 7px;
+               cursor: pointer; }
+  .rerunable:active { opacity: .55; }
+  /* A mail row is a .rerunable too when its fight can be replayed, and the reset above
+     would strip the card and the coloured stripe that carry its meaning. */
+  button.mail { background: var(--sunken); border-left: 3px solid var(--k);
+                padding: 9px 10px; }
+  .play { color: var(--accent); font-weight: 700; }
+
   /* ----------------------------------------------------------- sheets and overlays */
   .veil {
     position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.6);
@@ -1508,6 +1639,13 @@ PAGE_HTML = """<!doctype html>
   .duel .blow.dodge { border-left-color: var(--muted); opacity: .8; }
   .duel .blow.mine { border-left-color: var(--accent); }
   .duel .verdict { text-align: center; font-size: 20px; font-weight: 700; margin: 6px 0; }
+  /* A replay is pixel-for-pixel the live fight, which is the point -- and exactly why it
+     has to say so somewhere, or a rerun of an old defeat reads as a fresh one. */
+  .duel .rerun {
+    align-self: center; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 999px; padding: 3px 11px; margin-bottom: 8px;
+  }
   .loot { display: flex; gap: 10px; align-items: center; background: var(--card);
           border-radius: 12px; padding: 10px; margin-bottom: 10px; }
   .loot img { width: 62px; height: 62px; border-radius: 10px; }
@@ -2159,12 +2297,18 @@ function mailRow(row) {
   } else {
     title = "На тебя напал " + mailWho(row);
   }
-  return '<div class="mail ' + mailTone(row) + '">' +
+  // A fight in the mailbox opens the same replay the fight log does -- it is the same
+  // fight, and "what happened there?" is the question a one-line summary provokes.
+  const tag = row.replayable ? "button" : "div";
+  const open = '<' + tag + ' class="mail ' + mailTone(row) + (row.replayable ? " rerunable" : "") +
+    '"' + (row.replayable ? ' data-replay="' + esc(row.fight_id) + '"' : "") + ">";
+  if (row.replayable) meta.push("<span class='play'>▶ повтор</span>");
+  return open +
     "<span class='mt'>" + esc(row.at || "") + "</span>" +
     "<span class='mi'>" + (MAIL_ICONS[row.kind] || "•") + "</span>" +
     "<div class='mb'>" + title +
     (meta.length ? "<div class='meta'>" + meta.join("") + "</div>" : "") +
-    "</div></div>";
+    "</div></" + tag + ">";
 }
 
 function historyRow(row) {
@@ -2172,9 +2316,16 @@ function historyRow(row) {
     ? " · <span class='" + (row.coins > 0 ? "gain" : "loss") + "'>💰" +
       (row.coins > 0 ? "+" : "") + row.coins + "</span>"
     : "";
-  return '<div class="row spread small" style="margin-bottom:7px"><span>' +
+  // A replayable fight is a button; one from before snapshots were kept stays plain
+  // text, because a control that can only apologise is worse than no control.
+  const open = row.replayable
+    ? '<button class="row spread small rerunable" data-replay="' + esc(row.id) + '">'
+    : '<div class="row spread small" style="margin-bottom:7px">';
+  return open + "<span>" +
     (row.attacked ? "Ты напал на " : "На тебя напал ") + "<b>" + esc(row.opponent) + "</b>" +
-    "</span><span class='tiny'>" + esc(row.outcome) + coins + "</span></div>";
+    "</span><span class='tiny'>" + esc(row.outcome) + coins +
+    (row.replayable ? " <span class='play'>▶</span>" : "") + "</span>" +
+    (row.replayable ? "</button>" : "</div>");
 }
 
 // -------------------------------------------------------------------------- item sheet
@@ -2518,10 +2669,29 @@ async function fight(opponentId) {
 
   S = data.state;
   FOES = null;
+  playDuel(data);
+}
+
+// Watching a recorded fight is the same screen, because it is the same fight: the server
+// puts the stored seed and the two stored fighters back through the same simulator and
+// returns the same payload. Nothing here is a second rendering of it.
+async function replay(id) {
+  let data;
+  try {
+    data = await api("/api/replay?id=" + encodeURIComponent(id));
+  } catch (e) { haptic("no"); toast(e.message); return; }
+  playDuel(data);
+}
+
+function playDuel(data) {
   const me = data.you;
+  const maxHp = data.max_hp || {};
   const mineName = (S.pet && S.pet.name) || "Ты";
   const theirName = data.opponent.name || "Соперник";
-  const startHp = S.combat ? S.combat.max_hp : 100;
+  // Each bar against its OWN maximum. Falling back to the reader's own is what the whole
+  // duel used to do, and it made a frailer opponent look untouched until they died.
+  const mineMax = Math.max(1, maxHp[me] || (S.combat ? S.combat.max_hp : 100));
+  const theirMax = Math.max(1, maxHp[data.opponent.user_id] || mineMax);
 
   const view = document.createElement("div");
   view.className = "duel";
@@ -2531,6 +2701,8 @@ async function fight(opponentId) {
       '</b><span id="hpMine"></span></div><div class="hpbar"><i id="barMine" style="width:100%"></i></div></div>' +
     '<div class="side"><div class="row spread small"><b>' + esc(theirName) +
       '</b><span id="hpTheirs"></span></div><div class="hpbar"><i id="barTheirs" style="width:100%"></i></div></div>' +
+    (data.replay ? '<div class="rerun">↺ Повтор боя' +
+      (data.at ? " · " + esc(String(data.at).slice(11, 16).replace(":", ".")) : "") + "</div>" : "") +
     '<div class="small muted">' + esc(data.opening || "") + "</div>" +
     '<div class="log" id="duelLog"></div>' +
     '<button class="go" id="duelDone">Пропустить</button>';
@@ -2570,8 +2742,8 @@ async function fight(opponentId) {
     const attackerHp = Math.max(0, round.attacker_hp), defenderHp = Math.max(0, round.defender_hp);
     const mineHp = mineTurn ? attackerHp : defenderHp;
     const theirsHp = mineTurn ? defenderHp : attackerHp;
-    $("barMine").style.width = Math.min(100, (mineHp / Math.max(1, startHp)) * 100) + "%";
-    $("barTheirs").style.width = Math.min(100, (theirsHp / Math.max(1, startHp)) * 100) + "%";
+    $("barMine").style.width = Math.min(100, (mineHp / mineMax) * 100) + "%";
+    $("barTheirs").style.width = Math.min(100, (theirsHp / theirMax) * 100) + "%";
     $("hpMine").textContent = mineHp;
     $("hpTheirs").textContent = theirsHp;
     const kind = round.event.indexOf("crit") >= 0 ? "crit"
@@ -2629,7 +2801,7 @@ $("hudMail").addEventListener("click", () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
-    "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab]");
+    "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]");
   if (!target) return;
   const d = target.dataset;
 
@@ -2644,6 +2816,7 @@ document.addEventListener("click", async (event) => {
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   if (d.more) { moreView = d.more; render(); return; }
+  if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.foe) { haptic(); fight(d.foe); return; }
   if (d.farmstart) { await act("farm_start", { hours: Number(d.farmstart) }); return; }
   if (d.feature) { await act("farm_feature", { feature: d.feature }); return; }

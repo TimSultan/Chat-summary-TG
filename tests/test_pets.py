@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 import economy
 import pets
@@ -2061,6 +2062,38 @@ class MailTests(PetsTestCase):
             if "callback_data" in button
         ]
         self.assertIn("history", fight_actions)
+
+
+class FightLookupTests(PetsTestCase):
+    def test_a_fight_id_is_url_safe_and_only_its_participants_can_read_it(self):
+        """The id travels in a query string, and a raw "+" from the timezone offset would
+        decode there as a space -- a silent miss for any caller that forgot to encode it.
+        And a fight belongs to two people: the chat-wide log must not be readable by
+        guessing a timestamp."""
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+        self._tame(entry, "3", "Третий")
+        result = SimpleNamespace(winner="1", loser="2")
+        with patch("random.random", return_value=1.0):
+            pets.record_fight(entry, "1", "2", result, date(2026, 8, 9))
+
+        stored = pets._load(entry)["fights"][0]
+        wire_id = pets.fight_id(stored)
+        # Not "needs no escaping at all" -- a colon is legal in a query and survives
+        # verbatim. The characters that would come back as something else are the ones
+        # that must not appear: "+" reads as a space, and the rest end the value.
+        for hostile in "+&=#%?":
+            self.assertNotIn(hostile, wire_id)
+        self.assertEqual(parse_qs(f"id={wire_id}")["id"], [wire_id])
+
+        for participant in ("1", "2"):
+            found = pets.find_fight(entry, participant, wire_id)
+            self.assertIsNotNone(found)
+            self.assertEqual(found["ts"], stored["ts"])
+        self.assertIsNone(pets.find_fight(entry, "3", wire_id))
+        self.assertIsNone(pets.find_fight(entry, "1", ""))
+        self.assertIsNone(pets.find_fight(entry, "1", "2020-01-01T00:00:00"))
 
 
 class FarmTests(PetsTestCase):

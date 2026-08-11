@@ -6945,10 +6945,9 @@ async def _pets_run_fight(
 
 
 def _pets_fighter_snapshot(fighter: pets_combat.Fighter) -> dict:
-    return {
-        key: getattr(fighter, key)
-        for key in ("key", "name", "strength", "health", "agility", "luck", "armor", "effects", "level")
-    }
+    # Defined in pets_combat next to the Fighter it records and the simulate() that reads
+    # it back, so the writer here and the replay in pets_web cannot drift apart.
+    return pets_combat.snapshot(fighter)
 
 
 def _pets_fight_hp(

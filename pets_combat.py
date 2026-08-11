@@ -128,6 +128,67 @@ _EFFECT_TEXT = {
 }
 
 
+def snapshot(fighter: "Fighter") -> dict:
+    """A JSON-safe record of one fighter exactly as they entered the ring.
+
+    Stored alongside the fight and its seed, which together are the whole of a replay:
+    simulate() reads nothing but its arguments, so the same snapshot and the same seed
+    reproduce the same fight blow for blow, forever. That is why the stats are stored
+    rather than looked up when a replay is asked for -- a sold amulet, a shop rotation or
+    a rebalanced catalogue must not be able to rewrite a fight that already happened.
+    """
+    return {
+        "key": str(fighter.key),
+        "name": fighter.name,
+        "strength": fighter.strength,
+        "health": fighter.health,
+        "agility": fighter.agility,
+        "luck": fighter.luck,
+        "armor": fighter.armor,
+        # Tuple -> list, and each effect copied: this goes through json, and a stored
+        # effect must not stay a reference into the live catalogue.
+        "effects": [
+            dict(effect) if isinstance(effect, Mapping) else str(effect)
+            for effect in (fighter.effects or ())
+        ],
+        "level": fighter.level,
+    }
+
+
+def _stored_number(value, default):
+    """Keep a stored stat's exact value; fall back only when it is not a number at all."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+
+def restore(data) -> "Fighter | None":
+    """Rebuild a Fighter from `snapshot`, or None if the record cannot be trusted.
+
+    None rather than a repaired guess: a replay assembled from defaults would play out a
+    fight that never happened, which is worse than telling the player this one cannot be
+    replayed.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    key = str(data.get("key") or "")
+    if not key:
+        return None
+    return Fighter(
+        key=key,
+        name=str(data.get("name") or "Существо"),
+        strength=_stored_number(data.get("strength"), 1),
+        health=_stored_number(data.get("health"), 1),
+        agility=_stored_number(data.get("agility"), 1),
+        luck=_stored_number(data.get("luck"), 1),
+        armor=_stored_number(data.get("armor"), 0),
+        effects=tuple(
+            dict(effect) if isinstance(effect, Mapping) else str(effect)
+            for effect in (data.get("effects") or ())
+            if isinstance(effect, (Mapping, str))
+        ),
+        level=_stored_number(data.get("level"), 1),
+    )
+
+
 def _effect_specs(fighter: "Fighter") -> tuple[dict, ...]:
     """Normalize catalogue metadata without letting malformed data into combat.
 

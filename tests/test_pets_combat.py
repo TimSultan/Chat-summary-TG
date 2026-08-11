@@ -4,6 +4,7 @@ the ten-attack cap, and that a stat lead reliably wins, not just that the code r
 PETS_CONTRACT.md for the exact list this file is required to cover.
 """
 
+import json
 import random
 import statistics
 import sys
@@ -118,6 +119,43 @@ class DeriveTests(unittest.TestCase):
                          agility=10, luck=10, armor=0)
         weak = _fighter("weak", 10)
         self.assertEqual(combat.derive(strong, weak)["signature"], ("strength", 3))
+
+
+class SnapshotTests(unittest.TestCase):
+    """A stored fight is a seed plus two snapshots, and nothing else. These prove the
+    round trip is lossless, because a replay assembled from a lossy one would play out a
+    fight that never happened."""
+
+    def test_a_snapshot_survives_json_and_replays_the_identical_fight(self):
+        a = Fighter(key="a", name="Альфа", strength=31, health=27, agility=14, luck=9,
+                    armor=4, effects=({"code": "vampiric", "value": 12}, "thorns"), level=7)
+        b = _fighter("b", 22, armor=1, name="Бета")
+
+        restored_a = combat.restore(json.loads(json.dumps(combat.snapshot(a))))
+        restored_b = combat.restore(json.loads(json.dumps(combat.snapshot(b))))
+        self.assertEqual(restored_a, a)
+        self.assertEqual(restored_b, b)
+        # The point of all of it: same snapshot, same seed, same fight.
+        self.assertEqual(combat.simulate(restored_a, restored_b, seed=99),
+                         combat.simulate(a, b, seed=99))
+
+    def test_argument_order_is_part_of_the_replay(self):
+        """simulate() spends the rng's first roll picking who moves first, so replaying
+        with the fighters swapped is a different fight from the same seed. Anything
+        rebuilding a stored fight has to put the attacker back in the first argument."""
+        a, b = _fighter("a", 30, name="Альфа"), _fighter("b", 30, name="Бета")
+        self.assertNotEqual(combat.simulate(a, b, seed=7).rounds,
+                            combat.simulate(b, a, seed=7).rounds)
+
+    def test_an_unusable_snapshot_is_refused_rather_than_repaired(self):
+        for broken in (None, {}, {"name": "Без ключа"}, "not a mapping", []):
+            with self.subTest(broken=broken):
+                self.assertIsNone(combat.restore(broken))
+        # A partial record still yields a usable fighter: the key is the only field whose
+        # absence makes the record meaningless.
+        salvaged = combat.restore({"key": "a", "name": "Альфа"})
+        self.assertEqual(salvaged.key, "a")
+        self.assertEqual(salvaged.effects, ())
 
 
 class SimulateTests(unittest.TestCase):

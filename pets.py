@@ -2477,6 +2477,40 @@ def history(entry, user_id) -> list[dict]:
     return mine[:C.HISTORY_LIMIT]
 
 
+def fight_id(fight: dict) -> str:
+    """A URL-safe id for one recorded fight.
+
+    The timestamp IS the identity: a fight row has never carried an id of its own, the
+    log is trimmed from the front (FIGHT_LOG_LIMIT) so a position would point at a
+    different fight after the next two thousand, and `ts` comes from app_now() with
+    microseconds. Only the timezone's "+" is a problem -- in a query string a raw plus
+    decodes to a space, which would turn "forgot to percent-encode this" into a silent
+    miss instead of an error. "~" is unreserved in a URL and needs no encoding anywhere,
+    and the swap is undone on lookup, so what is stored stays a plain ISO timestamp.
+    """
+    return str((fight or {}).get("ts") or "").replace("+", "~")
+
+
+def find_fight(entry, user_id, wire_id) -> dict | None:
+    """One recorded fight this player took part in, by the id `fight_id` gave out.
+
+    Participation is checked HERE rather than by the caller, because this is the only
+    function that can: a fight belongs to exactly two people, and nobody else gets to
+    read one back out of a chat-wide log by guessing a timestamp.
+    """
+    uid = str(user_id)
+    wanted = str(wire_id or "").replace("~", "+")
+    if not wanted:
+        return None
+    for fight in _load(entry).get("fights", []):
+        if not isinstance(fight, dict) or str(fight.get("ts") or "") != wanted:
+            continue
+        if uid not in (str(fight.get("attacker_id")), str(fight.get("defender_id"))):
+            continue
+        return dict(fight)
+    return None
+
+
 # --- mailbox -------------------------------------------------------------------------
 
 
@@ -2561,6 +2595,12 @@ def mail(entry, user_id, limit: int | None = None) -> list[dict]:
             "kind": "attack" if attacked else "defense",
             "outcome": "draw" if draw else ("win" if won else "loss"),
             "coins": coins,
+            # Derived from the RAW stored timestamp -- not from the normalised `ts` add()
+            # writes below, which may have gained a timezone that find_fight would then
+            # fail to match. Only a fight carrying a combat snapshot can be replayed; the
+            # rest are from before snapshots were kept.
+            "fight_id": fight_id(fight),
+            "replayable": bool(fight.get("combat_snapshot")),
             # Snapshotted at fight time, so a later rename does not rewrite the past.
             "pet_name": fight.get("defender_name") if attacked else fight.get("attacker_name"),
             "owner_name": fight.get("defender_owner") if attacked else fight.get("attacker_owner"),
