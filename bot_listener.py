@@ -6081,15 +6081,21 @@ async def handle_pets_callback(
         callback_id, pets_ui.ARENA_NO_FIGHTS_NOTICE if no_arena_fights else None,
     )
 
-    # Both need a Telegram round trip, so they are resolved once per tap and threaded
-    # into the pure views below. AFTER answer_callback_query, never before -- a blocking
-    # call ahead of it leaves the button spinning until the client gives up.
-    quest_admin_chat_id = await _resolve_chat_id(
-        telethon_client, entry, known_chat_ids or {}, log=log,
-    ) if entry else None
-    can_appoint_mods = bool(quest_admin_chat_id) and await _can_manage_chat(
-        api, quest_admin_chat_id, actor, entry,
-    )
+    # "Is this person a chat administrator" is an uncached getChatAdministrators call, so
+    # it is made only for the four screens that actually ask -- the menu, which decides
+    # whether to draw the moderator button, and the three that manage the list. Every
+    # other button (equip, buy, farm, fight) is untouched by it.
+    #
+    # AFTER answer_callback_query, never before: a blocking call ahead of it leaves the
+    # button spinning until the client gives up.
+    can_appoint_mods = False
+    if entry and action in ("main", "questmods", "questmodadd", "questmoddel"):
+        quest_admin_chat_id = await _resolve_chat_id(
+            telethon_client, entry, known_chat_ids or {}, log=log,
+        )
+        can_appoint_mods = bool(quest_admin_chat_id) and await _can_manage_chat(
+            api, quest_admin_chat_id, actor, entry,
+        )
     is_quest_mod = can_appoint_mods or quests.is_moderator(
         entry, actor.get("id"), actor.get("username"),
     )
