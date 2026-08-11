@@ -1263,9 +1263,34 @@ def _quest_board_payload(entry: str, me: str) -> dict:
     return _jsonable({
         **quests.daily_quest(entry, me),
         "rerolls_total": quests.REROLLS_PER_QUEST,
+        # The shelf, always sent whole: real quests are listed rather than dealt, so
+        # there is no second slot to leave standing empty.
+        "real": quests.real_quests(entry, me),
         "stats": quests.stats_for(entry, me),
         "history": quests.history(entry, me, limit=20),
     })
+
+
+async def handle_quest_take(request: web.Request) -> web.Response:
+    """Take a real quest off the shelf, or put one back."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    user, _xp = await _player(request, body)
+    entry = request.app[_ENTRY_KEY]
+    me = str(user["id"])
+    code = str(body.get("code") or "")
+    drop = bool(body.get("drop"))
+    ok, message = await asyncio.to_thread(
+        quests.drop_quest if drop else quests.take_quest, entry, me, code,
+    )
+    request.app[_LOG_KEY](
+        f"[pets_web] quest {'drop' if drop else 'take'} {me} {code}: "
+        f"{'ok' if ok else 'refused'} -- {message}"
+    )
+    return _ok({"ok": ok, "message": message,
+                "board": await asyncio.to_thread(_quest_board_payload, entry, me)})
 
 
 async def handle_quest_reroll(request: web.Request) -> web.Response:
@@ -1477,6 +1502,7 @@ def attach(
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
         web.post(prefix + "/api/quests/reroll", handle_quest_reroll),
+        web.post(prefix + "/api/quests/take", handle_quest_take),
         # Moderator-only, all three (see _quest_admin).
         web.get(prefix + "/api/quests/review", handle_quest_review_queue),
         web.post(prefix + "/api/quests/review", handle_quest_review),
@@ -1754,6 +1780,18 @@ PAGE_HTML = """<!doctype html>
           padding: 8px 10px; font-size: 12px; text-align: center; }
   .qtag b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .qtag.review { border-style: solid; border-color: var(--gold); color: var(--gold); }
+  /* The reroll trade-off, said next to the button rather than discovered after it: a
+     reroll climbs a difficulty, so it is a choice and not a free respin. */
+  .warn-note { margin-top: 7px; font-size: 11px; line-height: 1.4; color: var(--gold);
+               text-align: center; }
+  /* One row on the real-quest shelf. Separated by a card rather than a rule, because
+     each one is a decision (take it or not), not an item in a list you scan past. */
+  .realq { background: var(--sunken); border-radius: 11px; padding: 10px; margin-bottom: 8px; }
+  .realq.off { opacity: .5; }
+  .realq .qtag { margin-top: 7px; }
+  .qbadge { flex: none; font-size: 10px; font-weight: 700; color: var(--r-legendary);
+            border: 1px solid var(--r-legendary); border-radius: 999px; padding: 2px 8px;
+            white-space: nowrap; align-self: flex-start; }
 
   /* One pending submission. Three columns so the verdict buttons keep a fixed home no
      matter how long a title or a painter's name turns out to be. */
@@ -2533,9 +2571,9 @@ function questBoard(data) {
   const board = data || {};
   const quest = board.quest;
   const done = (board.stats || {}).done || 0;
-  let head = '<div class="panel"><h2>🎯 Квест дня</h2>';
+  let head = '<div class="panel"><h2>🎯 Челлендж дня · покрас</h2>';
   if (!quest) {
-    head += "<div class='empty'>На сегодня всё — квест уже сдан.<br>" +
+    head += "<div class='empty'>На сегодня всё — челлендж уже сдан.<br>" +
       "Новый придёт завтра.</div></div>";
   } else {
     const reviewing = board.status === "review";
@@ -2560,8 +2598,45 @@ function questBoard(data) {
         '<button class="go sec" data-quest="reroll"' +
           (board.rerolls_left && !reviewing ? "" : " disabled") + ">🎲 Реролл · " +
           (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
-      "</div></div>";
+      "</div>" +
+      (board.rerolls_left && !reviewing
+        ? "<div class='warn-note'>⚠️ Реролл даёт челлендж на ступень сложнее" +
+          (quest.difficulty >= 5 ? " — но выше пятой ступени уже некуда, придёт другой такой же."
+                                 : " — и награда тоже вырастет.") + "</div>"
+        : "") +
+      "</div>";
   }
+  // The shelf. Always drawn whole, never as a slot -- a real quest is taken, not dealt,
+  // so there is nothing here to stand empty on a day when nobody holds one.
+  const shelf = board.real || [];
+  head += '<div class="panel"><h2>🌍 Квесты в реале · ' + shelf.length + "</h2>" +
+    "<div class='tiny muted' style='margin-bottom:9px'>Бери сколько хочешь — они не " +
+    "занимают место челленджа дня.</div>" +
+    shelf.map((quest) => {
+      const held = quest.status === "open" || quest.status === "review";
+      return '<div class="realq' + (quest.available || held ? "" : " off") + '">' +
+        '<div class="row spread"><span class="small"><b>' + esc(quest.title) + "</b><br>" +
+          "<span class='tiny muted'>" + pips(quest.difficulty) + " · " +
+          esc(quest.proof) + "</span></span>" +
+        (quest.badge ? "<span class='qbadge'>🧽 " + esc(quest.badge) + "</span>" : "") +
+        "</div>" +
+        "<div class='tiny' style='margin-top:5px'>" + rewardLine(quest.reward) + "</div>" +
+        (held
+          ? '<div class="qtag' + (quest.status === "review" ? " review" : "") + '">' +
+            (quest.status === "review"
+              ? "На проверке"
+              : "Взят — выложи " + esc(quest.proof) + " с хештегом <b>" +
+                esc(quest.hashtag) + "</b>") + "</div>" +
+            (quest.status === "review" ? "" :
+              '<button class="go sec" style="margin-top:7px" data-questdrop="' +
+              esc(quest.code) + '">Отложить</button>')
+          : (quest.available
+            ? '<button class="go sec" style="margin-top:7px" data-questtake="' +
+              esc(quest.code) + '">Взять</button>'
+            : "<div class='tiny muted' style='margin-top:7px'>" + esc(quest.reason) + "</div>")) +
+        "</div>";
+    }).join("") + "</div>";
+
   const rows = board.history || [];
   return head +
     '<div class="panel"><h2>Сдано квестов · ' + done + "</h2>" + (rows.length
@@ -3267,7 +3342,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-accept],[data-reject],[data-queston]");
+    "[data-quest],[data-questtake],[data-questdrop],[data-accept],[data-reject],[data-queston]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3284,6 +3359,11 @@ document.addEventListener("click", async (event) => {
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.quest === "reroll") { await questCall("/api/quests/reroll", {}); return; }
+  if (d.questtake) { await questCall("/api/quests/take", { code: d.questtake }); return; }
+  if (d.questdrop) {
+    await questCall("/api/quests/take", { code: d.questdrop, drop: true });
+    return;
+  }
   if (d.accept || d.reject) {
     // A verdict pays real coins, so it is the one moderator action that asks twice.
     const id = d.accept || d.reject;

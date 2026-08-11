@@ -299,6 +299,10 @@ def casino_view(entry: str, user_id) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 
+# Telegram keyboards get unusable past a handful of full-width rows, and the shelf is 35
+# quests long. The rest are one tap away in the Mini App, which is where browsing belongs.
+REAL_QUEST_BUTTONS = 8
+
 QUEST_DIFFICULTY_NAMES = {1: "новичок", 2: "просто", 3: "средне", 4: "сложно", 5: "жёстко"}
 QUEST_TOOL_NAMES = {"brush": "кисть", "airbrush": "аэрограф", "any": "кисть или аэрограф"}
 
@@ -319,7 +323,7 @@ def quests_view(entry: str, user_id) -> tuple[str, dict]:
     quest = board.get("quest")
     lines = ["🎯 <b>Квест дня</b>\n"]
     if not quest:
-        lines.append("На сегодня всё — квест уже сдан. Новый придёт завтра.")
+        lines.append("На сегодня всё — челлендж уже сдан. Новый придёт завтра.")
         return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
     reward = quest.get("reward") or {}
@@ -356,12 +360,87 @@ def quests_view(entry: str, user_id) -> tuple[str, dict]:
     rows = []
     rerolls = int(board.get("rerolls_left", 0) or 0)
     if rerolls and board.get("status") != "review":
+        # The warning goes in the TEXT, not on the button: a callback label is one short
+        # line and this is a trade-off, not a name. Rerolling costs difficulty, so it has
+        # to be readable before the tap rather than explained by the result.
+        top = int(quest.get("difficulty", 1) or 1) >= max(catalog_difficulties())
+        lines.append(
+            "\n⚠️ Реролл даёт челлендж на ступень сложнее"
+            + (" — но выше пятой ступени некуда, придёт другой такой же."
+               if top else " — и награда тоже вырастет.")
+        )
         rows.append([{
-            "text": f"🎲 Реролл ({rerolls})",
+            "text": f"🎲 Реролл, сложнее ({rerolls})",
             "callback_data": callback_data(user_id, "questreroll"),
         }])
+    rows.append([{"text": "🌍 Квесты в реале", "callback_data": callback_data(user_id, "realquests")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def catalog_difficulties():
+    """The difficulty ladder, so the reroll warning knows where the top rung is."""
+    return quests.DIFFICULTIES
+
+
+def real_quests_view(entry: str, user_id) -> tuple[str, dict]:
+    """The shelf of Квесты в реале: everything on offer, and what it takes to close it.
+
+    A list rather than a dealt slot, so a player can hold several at once and nothing
+    here is ever empty-by-design -- see quests.py's module docstring.
+    """
+    rows_data = quests.real_quests(entry, user_id)
+    held = [row for row in rows_data if row.get("status") in ("open", "review")]
+    free = [row for row in rows_data if row.get("available") and row not in held]
+    locked = [row for row in rows_data if row not in held and row not in free]
+
+    lines = ["🌍 <b>Квесты в реале</b>\n",
+             "Не про покрас — про всё вокруг него. Бери сколько хочешь: "
+             "челлендж дня они не занимают."]
+
+    # Taken ones IN FULL -- they are the only rows with something to do right now, and
+    # the hashtag is the one string a player has to copy.
+    if held:
+        lines.append("\n<b>Взятые</b>")
+        for quest in held:
+            lines.append(f"<b>{escape(quest['title'])}</b> — {quest_pips(quest['difficulty'])}")
+            if quest.get("status") == "review":
+                lines.append("⏳ На проверке.")
+            else:
+                lines.append(f"Нужно: {escape(quest['proof'])}")
+                lines.append(f"Хештег: <code>{escape(quest['hashtag'])}</code>")
+
+    # The rest one line each. Thirty-five full cards do not fit in a Telegram message,
+    # and the Mini App is where you browse; here you want to spot one and take it.
+    if free:
+        lines.append("\n<b>Можно взять</b>")
+        for quest in free:
+            reward = quest.get("reward") or {}
+            badge = f" · значок «{escape(quest['badge'])}»" if quest.get("badge") else ""
+            lines.append(
+                f"{quest_pips(quest['difficulty'])} <b>{escape(quest['title'])}</b>"
+                f" — 🪙 {_money(int(reward.get('gold', 0)))}{badge}"
+            )
+    if locked:
+        lines.append(f"\n<i>Ещё {len(locked)} ждут своего часа.</i>")
+
+    buttons = [
+        {"text": f"Взять: {quest['title']}"[:60],
+         "callback_data": callback_data(user_id, "questtake", quest["code"])}
+        for quest in free
+    ]
+    keyboard = [[button] for button in buttons[:REAL_QUEST_BUTTONS]]
+    if len(buttons) > REAL_QUEST_BUTTONS:
+        lines.append(
+            f"\n<i>Кнопок на всех не хватает — остальные {len(buttons) - REAL_QUEST_BUTTONS} "
+            f"бери в мини-приложении.</i>"
+        )
+    keyboard.append([{"text": "🎯 Челлендж дня", "callback_data": callback_data(user_id, "quests")}])
+    keyboard.append(_back_row(user_id))
+    text = "\n".join(lines)
+    if len(text) > MAIL_MAX_CHARS:
+        text = text[:MAIL_MAX_CHARS].rsplit("\n", 1)[0] + "\n\n<i>…показаны не все квесты.</i>"
+    return text, {"inline_keyboard": keyboard}
 
 
 def daily_bonus_view(entry: str, user_id, xp: int) -> tuple[str, dict]:

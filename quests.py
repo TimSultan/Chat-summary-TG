@@ -1,9 +1,16 @@
-"""Daily painting quests: assignment, submission, review and history.
+"""Quests: assignment, submission, review and history.
 
-One quest per player per day, drawn from pets_quest_catalog.py -- "paint one small thing
-in this technique". The player paints it for real, posts a photo in the chat with the
-quest's own hashtag (`#quest-nmm`), and a moderator accepts or rejects it from the Mini
-App. Only an accepted submission pays.
+Two kinds, both from pets_quest_catalog.py, both proved the same way -- post a photo in
+the chat with the quest's own hashtag (`#quest-nmm`), and a moderator accepts or rejects
+it from the Mini App. Only an accepted submission pays.
+
+  PAINTING CHALLENGES are DEALT. One per player per day, "paint one small thing in this
+  technique", and the reroll below is how you trade the one you were given.
+
+  КВЕСТЫ В РЕАЛЕ are TAKEN. Tidy the bench, walk six kilometres, buy a loupe. They sit in
+  a list the player picks from and can hold several of at once, which is deliberate: a
+  second dealt slot would stand visibly empty on every day nobody had one. Adding a real
+  quest is a row in the catalogue and nothing else.
 
 THREE RULES THAT SHAPE EVERYTHING HERE
 
@@ -33,12 +40,13 @@ per chat, so tuning one chat's economy never touches another's.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import economy
 import pets
@@ -54,6 +62,8 @@ _lock = threading.RLock()
 # takes three days over the result should not come back to a fresh pair of rerolls on a
 # quest they have already started.
 REROLLS_PER_QUEST = 2
+# Every difficulty a painting challenge can sit at, for reroll's climb.
+DIFFICULTIES = catalog.DIFFICULTIES
 
 # What an accepted quest pays, by difficulty 1-5.
 #
@@ -111,6 +121,7 @@ def _empty() -> dict:
         "submissions": [],     # newest last; a rolling audit of every photo sent in
         "history": [],         # newest last; one row per finished quest
         "rewards": {},         # difficulty -> partial override of REWARDS_BY_DIFFICULTY
+        "taken": {},           # user_id -> real quests they have picked up
         "disabled": [],        # quest codes a moderator has taken out of rotation
     }
 
@@ -130,6 +141,10 @@ def _load(entry: str) -> dict:
         base[key] = value if isinstance(value, type(blank)) else blank
     base["assignments"] = {
         str(uid): row for uid, row in base["assignments"].items() if isinstance(row, dict)
+    }
+    base["taken"] = {
+        str(uid): [row for row in rows if isinstance(row, dict)]
+        for uid, rows in base["taken"].items() if isinstance(rows, list)
     }
     base["submissions"] = [row for row in base["submissions"] if isinstance(row, dict)]
     base["history"] = [row for row in base["history"] if isinstance(row, dict)]
@@ -227,10 +242,11 @@ def set_quest_enabled(entry: str, code: str, enabled: bool) -> tuple[bool, str]:
 
 
 def available_quests(entry: str, data: dict | None = None) -> tuple:
+    """Painting challenges still in rotation. Real quests are never dealt, only taken."""
     data = data if data is not None else _load(entry)
     disabled = set(data.get("disabled", []))
-    pool = tuple(quest for quest in catalog.QUESTS if quest.code not in disabled)
-    return pool or catalog.QUESTS
+    pool = tuple(quest for quest in catalog.PAINT_QUESTS if quest.code not in disabled)
+    return pool or catalog.PAINT_QUESTS
 
 
 # --- assignment -----------------------------------------------------------------------
@@ -250,15 +266,26 @@ def _quest_payload(entry: str, quest, data: dict) -> dict:
     }
 
 
-def _pick(entry: str, user_id, data: dict, exclude: set[str]) -> object:
-    """A random quest this player is not already looking at.
+def _pick(entry: str, user_id, data: dict, exclude: set[str], difficulty: int | None = None):
+    """A random painting challenge this player is not already looking at.
 
     Weighted by nothing: every technique in rotation is equally likely, and difficulty is
     what the reward scales on rather than what the odds do. Falls back to the full pool if
     the exclusions would empty it -- a player who has rerolled everything still gets a
     quest rather than an error.
+
+    `difficulty` pins the rung, which is what makes a reroll cost something (see reroll).
+    If a moderator has disabled every quest at that level, it widens rather than failing:
+    a harder quest than asked for is still a quest, an exception is a broken button.
     """
     pool = [quest for quest in available_quests(entry, data) if quest.code not in exclude]
+    if difficulty is not None:
+        at_level = [quest for quest in pool if quest.difficulty == difficulty]
+        if at_level:
+            return random.choice(at_level)
+        harder = [quest for quest in pool if quest.difficulty >= difficulty]
+        if harder:
+            return random.choice(harder)
     if not pool:
         pool = list(available_quests(entry, data))
     return random.choice(pool)
@@ -322,7 +349,17 @@ def daily_quest(entry: str, user_id, now: datetime | None = None) -> dict:
 
 
 def reroll(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]:
-    """Swap the current quest for a different one, twice per quest."""
+    """Swap the daily challenge for a HARDER one, twice per quest.
+
+    A reroll costs something. Without that it is just a free "spin until I get an easy
+    one", and the reward table -- which pays by difficulty -- would be handing out the
+    top payouts for the least work. Each reroll therefore climbs one rung, so two of them
+    turn a level-1 challenge into a level-3 one, with the money to match.
+
+    At difficulty 5 there is nowhere higher to go, so a reroll there simply deals another
+    5. That is deliberate rather than a refusal: somebody who cannot paint THIS hard
+    technique should still be able to trade it for a different hard one.
+    """
     moment = now or app_now()
     with _lock:
         data = _load(entry)
@@ -334,7 +371,9 @@ def reroll(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]
         used = int(live.get("rerolls_used", 0) or 0)
         if used >= REROLLS_PER_QUEST:
             return False, "Реролов больше нет."
-        quest = _pick(entry, user_id, data, exclude={live["code"]})
+        current = catalog.find_quest(live["code"])
+        harder = min(max(1, int(getattr(current, "difficulty", 1) or 1)) + 1, max(DIFFICULTIES))
+        quest = _pick(entry, user_id, data, exclude={live["code"]}, difficulty=harder)
         live["code"] = quest.code
         live["rerolls_used"] = used + 1
         live["assigned_at"] = moment.isoformat()
@@ -342,10 +381,160 @@ def reroll(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]
         live["status"] = "open"
         _save(entry, data)
     left = REROLLS_PER_QUEST - (used + 1)
-    return True, f"Новый квест: «{quest.title}». Реролов осталось: {left}."
+    return True, (
+        f"Новый квест: «{quest.title}» (сложность {quest.difficulty}). "
+        f"Реролов осталось: {left}."
+    )
 
 
 # --- submissions ----------------------------------------------------------------------
+
+
+# --- Квесты в реале -------------------------------------------------------------------
+#
+# Listed, not dealt. The daily painting challenge is a slot that always holds something;
+# these are a shelf a player takes from, which is why there is no second slot standing
+# empty on the days nobody has a real quest -- and why adding one is a row in the
+# catalogue and nothing else.
+
+
+def _moment_like(value, reference: datetime) -> datetime | None:
+    """Parse a stored timestamp so it can be compared with `reference`.
+
+    Stored times are written by app_now() and are timezone-aware; a caller (a test, a
+    replayed fixture) may hand in a naive one. Python refuses to compare the two, so the
+    parsed value is matched to whatever the reference is -- the same accommodation
+    pets._checkpoint_at makes, and for the same reason: a cooldown must never raise.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None and reference.tzinfo is not None:
+        return moment.replace(tzinfo=reference.tzinfo)
+    if moment.tzinfo is not None and reference.tzinfo is None:
+        return moment.replace(tzinfo=None)
+    return moment
+
+
+def _taken_rows(data: dict, user_id) -> list[dict]:
+    rows = data.setdefault("taken", {})
+    if not isinstance(rows, dict):
+        rows = data["taken"] = {}
+    mine = rows.setdefault(str(user_id), [])
+    if not isinstance(mine, list):
+        mine = rows[str(user_id)] = []
+    return [row for row in mine if isinstance(row, dict)]
+
+
+def _live_taken(data: dict, user_id, code: str) -> dict | None:
+    for row in _taken_rows(data, user_id):
+        if row.get("code") == code and row.get("status") in ("open", "review"):
+            return row
+    return None
+
+
+def _cooldown_until(quest, data: dict, user_id, reference: datetime) -> datetime | str | None:
+    """When this player may take `quest` again.
+
+    None means now, "never" means it is a once-ever quest already done, and a datetime is
+    the moment the cooldown lifts. A cooldown of 0 IS once-ever: buying a loupe cannot be
+    repeated, while tidying the bench is worth doing again in a fortnight.
+
+    Counted from THIS PLAYER'S own completion, which is also what spreads a fortnightly
+    quest across the chat instead of handing it to everybody on the 1st and the 15th:
+    finish on the 3rd and it returns on the 17th, finish on the 9th and it returns on the
+    23rd. No separate staggering machinery, and -- more importantly -- one source of
+    truth, so the list and `take_quest` can never disagree about whether it is available.
+    """
+    finished = [
+        row for row in _taken_rows(data, user_id)
+        if row.get("code") == quest.code and row.get("status") == "done"
+    ]
+    if not finished:
+        return None
+    if quest.cooldown_days <= 0:
+        return "never"
+    stamps = [_moment_like(row.get("finished_at"), reference) for row in finished]
+    last = max((stamp for stamp in stamps if stamp is not None), default=None)
+    return last + timedelta(days=quest.cooldown_days) if last else None
+
+
+def real_quests(entry: str, user_id, now: datetime | None = None) -> list[dict]:
+    """The shelf: every real quest, with whether this player can take it right now."""
+    moment = now or app_now()
+    data = _load(entry)
+    disabled = set(data.get("disabled", []))
+    rows = []
+    for quest in catalog.REAL_QUESTS:
+        if quest.code in disabled:
+            continue
+        taken = _live_taken(data, user_id, quest.code)
+        until = _cooldown_until(quest, data, user_id, moment)
+        available, reason = True, ""
+        if taken is not None:
+            available, reason = False, ("на проверке" if taken.get("status") == "review" else "взят")
+        elif until == "never":
+            available, reason = False, "уже сдан"
+        elif isinstance(until, datetime) and moment < until:
+            available, reason = False, f"снова с {until.date().isoformat()}"
+        rows.append({
+            **_quest_payload(entry, quest, data),
+            "proof": quest.proof,
+            "badge": quest.badge,
+            "cooldown_days": quest.cooldown_days,
+            "available": available,
+            "reason": reason,
+            "status": (taken or {}).get("status", ""),
+        })
+    rows.sort(key=lambda row: (not row["available"], row["difficulty"]))
+    return rows
+
+
+def take_quest(entry: str, user_id, code: str, now: datetime | None = None) -> tuple[bool, str]:
+    """Put one real quest on this player's list. Painting challenges are not takeable."""
+    moment = now or app_now()
+    quest = catalog.find_quest(code)
+    if quest is None or quest.kind != "real":
+        return False, "Такого квеста в реале нет."
+    with _lock:
+        data = _load(entry)
+        if quest.code in set(data.get("disabled", [])):
+            return False, "Этот квест сейчас выключен."
+        if _live_taken(data, user_id, quest.code) is not None:
+            return False, "Этот квест уже взят."
+        until = _cooldown_until(quest, data, user_id, moment)
+        if until == "never":
+            return False, "Этот квест уже сдан — его проходят один раз."
+        if isinstance(until, datetime) and moment < until:
+            return False, f"Снова можно будет взять {until.date().isoformat()}."
+        data.setdefault("taken", {}).setdefault(str(user_id), []).append({
+            "code": quest.code,
+            "taken_at": moment.isoformat(),
+            "status": "open",
+            "submission_id": None,
+        })
+        _save(entry, data)
+    return True, f"Квест взят: «{quest.title}». Хештег — {catalog.hashtag(quest.code)}."
+
+
+def drop_quest(entry: str, user_id, code: str) -> tuple[bool, str]:
+    """Put a taken quest back on the shelf, as long as nothing is under review for it."""
+    with _lock:
+        data = _load(entry)
+        row = _live_taken(data, user_id, code)
+        if row is None:
+            return False, "Этот квест не взят."
+        if row.get("status") == "review":
+            return False, "Работа уже на проверке — дождись ответа."
+        data["taken"][str(user_id)] = [
+            other for other in _taken_rows(data, user_id) if other is not row
+        ]
+        _save(entry, data)
+    quest = catalog.find_quest(code)
+    return True, f"Квест отложен: «{quest.title if quest else code}»."
 
 
 def _find_submission(data: dict, submission_id) -> dict | None:
@@ -384,19 +573,32 @@ def submit(
         return False, "Такого квеста нет."
     with _lock:
         data = _load(entry)
-        live = _live_assignment(data, user_id)
-        if live is None:
-            return False, "У тебя нет активного квеста — открой «Квесты» в /arena."
-        if live["code"] != quest.code:
-            active = catalog.find_quest(live["code"])
-            return False, (
-                f"Сейчас у тебя другой квест: «{active.title}». "
-                f"Его хештег — {catalog.hashtag(active.code)}."
-            )
+        # A real quest is proved against the row the player TOOK; a painting challenge
+        # against the one slot they were dealt. Either way the hashtag has to match
+        # something they actually hold -- otherwise the tag alone would be the whole game.
+        if quest.kind == "real":
+            live = _live_taken(data, user_id, quest.code)
+            if live is None:
+                return False, (
+                    f"Этот квест не взят. Открой «Квесты в реале» и возьми "
+                    f"«{quest.title}»."
+                )
+        else:
+            live = _live_assignment(data, user_id)
+            if live is None:
+                return False, "У тебя нет активного квеста — открой «Квесты» в /arena."
+            if live["code"] != quest.code:
+                active = catalog.find_quest(live["code"])
+                return False, (
+                    f"Сейчас у тебя другой челлендж: «{active.title}». "
+                    f"Его хештег — {catalog.hashtag(active.code)}."
+                )
         if live.get("status") == "review":
             return False, "Работа по этому квесту уже на проверке."
         row = {
             "id": f"{moment.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}",
+            "kind": quest.kind,
+            "proof": quest.proof,
             "user_id": str(user_id),
             "author_name": str(author_name or ""),
             "author_username": str(author_username or "").lstrip("@"),
@@ -505,12 +707,17 @@ def review(
         row["reviewed_at"] = moment.isoformat()
         row["note"] = str(note or "")[:300]
 
-        live = data.get("assignments", {}).get(str(row["user_id"]))
+        live = (
+            _live_taken(data, row["user_id"], quest.code) if quest.kind == "real"
+            else data.get("assignments", {}).get(str(row["user_id"]))
+        )
         if accept:
             reward = rewards_for(entry, quest.difficulty, data)
             receipt = {
                 "user_id": row["user_id"], "code": quest.code, "title": quest.title,
-                "difficulty": quest.difficulty, **reward,
+                "difficulty": quest.difficulty, "kind": quest.kind,
+                "badge": quest.badge, "author_name": row.get("author_name", ""),
+                **reward,
             }
             row["paid"] = dict(reward)
             if isinstance(live, dict) and live.get("submission_id") == row["id"]:
@@ -538,12 +745,48 @@ def review(
     # cannot pay twice -- it can only fail to pay, which the receipt makes visible.
     paid = _pay(entry, receipt, submission_id)
     receipt.update(paid)
+    if receipt.get("badge"):
+        receipt["badge_given"] = _award_badge(
+            entry, receipt["user_id"], receipt["badge"], receipt.get("author_name", ""),
+        )
     message = f"Принято. Начислено: {paid['gold']} монет"
     if paid["xp"]:
         message += f", {paid['xp']} опыта"
     if not paid["has_pet"]:
         message += " (опыт и находка не начислены — у игрока нет существа)"
     return True, message + ".", receipt
+
+
+# A quest badge is the bot's own, like the founder badge stats.py already keeps: created
+# on first award with a FIXED id derived from the quest code, so it survives restarts,
+# never duplicates, and is exempt from a chat's custom-badge budget -- somebody who tidied
+# their bench must not miss out because the moderators had used up their badge slots.
+QUEST_BADGE_EMOJI = "🧽"
+
+
+def _award_badge(entry: str, user_id, name: str, display_name: str) -> bool:
+    """Create this quest's badge if needed and give it. True if it was newly awarded."""
+    badge_id = "quest-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    try:
+        data = stats._load_custom_badge_data(entry)
+        if badge_id not in data["badges"]:
+            data["badges"][badge_id] = {
+                "id": badge_id,
+                "emoji": QUEST_BADGE_EMOJI,
+                "name": name,
+                "created_at": app_now().isoformat(),
+                "created_by_id": "bot",
+                "created_by_name": "ЕПХ-бот",
+            }
+            stats._save_custom_badge_data(entry, data)
+        _badge, newly = stats.give_custom_badge(
+            entry, badge_id, user_id, display_name or str(user_id), "bot", "ЕПХ-бот",
+        )
+        return newly
+    except (OSError, ValueError, KeyError):
+        # A badge is the garnish on a reward that has already been paid. Losing it must
+        # never turn an accepted quest into an error the moderator has to retry.
+        return False
 
 
 def _pay(entry: str, receipt: dict, submission_id) -> dict:

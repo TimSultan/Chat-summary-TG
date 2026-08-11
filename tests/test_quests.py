@@ -8,6 +8,7 @@ import economy
 import pets
 import pets_config
 import pets_quest_catalog as catalog
+import stats
 import quests
 
 
@@ -174,6 +175,169 @@ class ParseHashtagTests(unittest.TestCase):
         swallows a trailing "-v2" into the same match, so a caption tagged for a different,
         unknown variant must not silently credit the base quest."""
         self.assertIsNone(quests.parse_hashtag("работа по технике #quest-nmm-v2"))
+
+
+class EscalatingRerollTests(QuestsTestCase):
+    """A reroll climbs a difficulty. Without that it is a free respin, and since the
+    reward table pays BY difficulty, a player would simply spin until the easiest quest
+    came up and collect the same money for less work."""
+
+    def test_each_reroll_hands_out_a_harder_challenge(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        first = quests.daily_quest(entry, "1", now=day)["quest"]
+        levels = [first["difficulty"]]
+        for _ in range(quests.REROLLS_PER_QUEST):
+            ok, message = quests.reroll(entry, "1", now=day)
+            self.assertTrue(ok, message)
+            levels.append(quests.daily_quest(entry, "1", now=day)["quest"]["difficulty"])
+
+        # Every step goes up, and never past the top rung.
+        for lower, higher in zip(levels, levels[1:]):
+            self.assertGreater(higher, lower, levels)
+        self.assertLessEqual(max(levels), max(catalog.DIFFICULTIES))
+
+    def test_a_reroll_at_the_top_deals_another_hard_one_rather_than_refusing(self):
+        """Somebody who cannot paint THIS brutal technique should still be able to trade
+        it for a different brutal one -- the climb is a price, not a dead end."""
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        hardest = catalog.quests_by_difficulty(max(catalog.DIFFICULTIES))[0]
+        quests.daily_quest(entry, "1", now=day)
+        data = quests._load(entry)
+        data["assignments"]["1"]["code"] = hardest.code
+        quests._save(entry, data)
+
+        ok, message = quests.reroll(entry, "1", now=day)
+        self.assertTrue(ok, message)
+        swapped = quests.daily_quest(entry, "1", now=day)["quest"]
+        self.assertNotEqual(swapped["code"], hardest.code)
+        self.assertEqual(swapped["difficulty"], max(catalog.DIFFICULTIES))
+
+    def test_a_reroll_never_deals_a_real_quest(self):
+        """Квесты в реале are taken from a shelf, never dealt -- a reroll that handed
+        somebody "buy a loupe" instead of a painting technique would be a category error
+        and would also skip the taking rules entirely."""
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        real_codes = {quest.code for quest in catalog.REAL_QUESTS}
+        for _ in range(quests.REROLLS_PER_QUEST):
+            quests.reroll(entry, "1", now=day)
+        board = quests.daily_quest(entry, "1", now=day)
+        self.assertNotIn(board["quest"]["code"], real_codes)
+
+
+class RealQuestTests(QuestsTestCase):
+    """Квесты в реале are LISTED, not dealt: the player takes what they like and can hold
+    several at once. That is what keeps a second daily slot from standing empty."""
+
+    def test_the_shelf_lists_every_real_quest_and_none_of_the_painting_ones(self):
+        rows = quests.real_quests("chat", "1")
+        self.assertEqual(len(rows), catalog.REAL_COUNT)
+        codes = {row["code"] for row in rows}
+        self.assertEqual(codes, {quest.code for quest in catalog.REAL_QUESTS})
+        self.assertTrue(all(row["available"] for row in rows))
+        # Every one says what a moderator has to be shown, since it is never a painted model.
+        self.assertTrue(all(row["proof"] for row in rows))
+
+    def test_several_real_quests_can_be_held_at_once_alongside_the_daily_challenge(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        daily = quests.daily_quest(entry, "1", now=day)["quest"]["code"]
+        for code in ("wet-palette", "workspace", "run-6km"):
+            ok, message = quests.take_quest(entry, "1", code, now=day)
+            self.assertTrue(ok, message)
+
+        held = {row["code"] for row in quests.real_quests(entry, "1", now=day)
+                if row["status"] == "open"}
+        self.assertEqual(held, {"wet-palette", "workspace", "run-6km"})
+        # And the painting challenge is untouched by any of it.
+        self.assertEqual(quests.daily_quest(entry, "1", now=day)["quest"]["code"], daily)
+
+    def test_a_real_quest_must_be_taken_before_its_hashtag_counts(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        ok, message = quests.submit(entry, "1", "workspace", now=day)
+        self.assertFalse(ok)
+        self.assertIn("не взят", message)
+
+        self.assertTrue(quests.take_quest(entry, "1", "workspace", now=day)[0])
+        self.assertTrue(quests.submit(entry, "1", "workspace", now=day)[0])
+
+    def test_a_painting_challenge_cannot_be_taken_from_the_shelf(self):
+        ok, message = quests.take_quest("chat", "1", "nmm")
+        self.assertFalse(ok)
+        self.assertIn("в реале", message)
+
+    def test_a_once_ever_quest_never_returns_and_a_repeatable_one_comes_back(self):
+        """A cooldown of 0 means once ever -- you cannot buy the same loupe twice. A
+        positive one is a habit, and counting it from THIS player's own completion is
+        also what staggers a fortnightly quest across the chat instead of handing it to
+        everybody on the same morning."""
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        once = catalog.find_quest("magnifier")
+        repeatable = catalog.find_quest("workspace")
+        self.assertEqual(once.cooldown_days, 0)
+        self.assertGreater(repeatable.cooldown_days, 0)
+
+        for code in (once.code, repeatable.code):
+            self.assertTrue(quests.take_quest(entry, "1", code, now=day)[0])
+            self.assertTrue(quests.submit(entry, "1", code, now=day)[0])
+        for row in quests.pending(entry):
+            quests.review(entry, row["id"], "mod1", True, now=day)
+
+        later = day + timedelta(days=repeatable.cooldown_days + 1)
+        rows = {row["code"]: row for row in quests.real_quests(entry, "1", now=later)}
+        self.assertFalse(rows[once.code]["available"])
+        self.assertTrue(rows[repeatable.code]["available"])
+        # The list and the take path must agree, or one of them is lying to the player.
+        self.assertFalse(quests.take_quest(entry, "1", once.code, now=later)[0])
+        self.assertTrue(quests.take_quest(entry, "1", repeatable.code, now=later)[0])
+
+    def test_two_players_who_finish_on_different_days_come_back_on_different_days(self):
+        entry = "chat"
+        start = datetime(2026, 8, 9, 9, 0)
+        for user_id, offset in (("1", 0), ("2", 6)):
+            when = start + timedelta(days=offset)
+            quests.take_quest(entry, user_id, "workspace", now=when)
+            quests.submit(entry, user_id, "workspace", now=when)
+            row = next(r for r in quests.pending(entry) if r["user_id"] == user_id)
+            quests.review(entry, row["id"], "mod1", True, now=when)
+
+        checked = start + timedelta(days=15)
+        first = {r["code"]: r for r in quests.real_quests(entry, "1", now=checked)}
+        second = {r["code"]: r for r in quests.real_quests(entry, "2", now=checked)}
+        self.assertTrue(first["workspace"]["available"])
+        self.assertFalse(second["workspace"]["available"])
+
+    def test_finishing_a_real_quest_awards_its_badge_once(self):
+        """The badge is the point of the workspace quest -- the coins are the same as any
+        other difficulty 5. Awarding it must survive being handed out twice."""
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        quest = catalog.find_quest("workspace")
+        self.assertTrue(quest.badge)
+
+        quests.take_quest(entry, "1", quest.code, now=day)
+        quests.submit(entry, "1", quest.code, now=day, author_name="Художник")
+        row = quests.pending(entry)[0]
+        _ok, _message, receipt = quests.review(entry, row["id"], "mod1", True, now=day)
+
+        self.assertEqual(receipt["badge"], quest.badge)
+        self.assertTrue(receipt["badge_given"])
+        names = [badge.name for badge in stats.custom_badges_for_user(entry, "1")]
+        self.assertEqual(names.count(quest.badge), 1)
+
+        # Doing it again a fortnight later re-pays the coins but cannot duplicate a badge.
+        later = day + timedelta(days=quest.cooldown_days + 1)
+        quests.take_quest(entry, "1", quest.code, now=later)
+        quests.submit(entry, "1", quest.code, now=later)
+        again = quests.pending(entry)[0]
+        _ok, _message, second = quests.review(entry, again["id"], "mod1", True, now=later)
+        self.assertFalse(second["badge_given"])
+        names = [badge.name for badge in stats.custom_badges_for_user(entry, "1")]
+        self.assertEqual(names.count(quest.badge), 1)
 
 
 class ReviewPaymentTests(QuestsTestCase):
