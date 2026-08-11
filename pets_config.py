@@ -373,6 +373,11 @@ ARENA_LEVEL_REWARD_MULTIPLIERS = {
      3: 1.25,
 }
 HISTORY_LIMIT = 10          # "список последних 10 боев"
+# The mailbox merges three feeds (fights, farm shifts, gifts) into one, so it is capped
+# at what one Telegram message can carry comfortably rather than at HISTORY_LIMIT: it is
+# a whole day of activity for an active player, and every older event is still in the
+# stores it was read from.
+MAIL_LIMIT = 30
 DUEL_DAILY_LIMIT = 5
 DUEL_COOLDOWN_SECONDS = 10 * 60
 DUEL_SAME_OPPONENT_DAILY_LIMIT = 1

@@ -55,7 +55,7 @@ import pets_combat
 import pets_config as C
 import pets_updates
 import voting
-from pets_ui import valuable_item  # the "needs confirming" rarity rule, defined once
+from pets_ui import mail_day_label, valuable_item  # rules defined once, used by both UIs
 
 ROUTE_PREFIX = "/pets"
 
@@ -1066,9 +1066,26 @@ async def handle_history(request: web.Request) -> web.Response:
             "outcome": outcome,
             "won": won,
             "coins": coins,
-            "at": fight.get("at") or fight.get("created_at"),
+            "at": fight.get("ts"),
         })
     return _ok({"rows": rows})
+
+
+async def handle_mail(request: web.Request) -> web.Response:
+    """The mailbox: fights, farm shifts and gifts in one feed, newest first.
+
+    Forwarded verbatim from pets.mail -- including the HH.MM it already formatted, and
+    the day heading. The page must not re-derive either from the ISO timestamp: the
+    browser would use the *device's* timezone, so a player travelling would see times
+    that disagree with the ones the bot sent them for the very same events, and a phone
+    an hour ahead would file this evening's fights under "Завтра".
+    """
+    user, _xp = await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    rows = []
+    for event in pets.mail(entry, user["id"]):
+        rows.append({**event, "day_label": mail_day_label(event.get("day") or "")})
+    return _ok({"rows": _jsonable(rows)})
 
 
 async def handle_collection(request: web.Request) -> web.Response:
@@ -1167,6 +1184,7 @@ def attach(
         web.get(prefix + "/api/shop", handle_shop),
         web.get(prefix + "/api/leaderboard", handle_leaderboard),
         web.get(prefix + "/api/history", handle_history),
+        web.get(prefix + "/api/mail", handle_mail),
         web.get(prefix + "/api/collection", handle_collection),
         web.get(prefix + "/api/updates", handle_updates),
         web.post(prefix + "/api/portrait", handle_portrait_upload),
@@ -1244,6 +1262,12 @@ PAGE_HTML = """<!doctype html>
   }
   .hud .purse { display: flex; gap: 12px; font-size: 13px; margin-top: 3px; }
   .hud .purse b { font-weight: 700; }
+  /* The mailbox is the one screen you check rather than play, so it gets a fixed corner
+     instead of a seventh tab -- six is already the width a phone can label. */
+  .hud .post {
+    flex: none; width: 42px; height: 42px; border-radius: 12px; font-size: 20px;
+    border: 1px solid var(--line); background: var(--sunken); line-height: 1;
+  }
   .bar { height: 5px; border-radius: 3px; background: var(--sunken); overflow: hidden; margin-top: 5px; }
   .bar > i { display: block; height: 100%; background: var(--xp); border-radius: 3px; transition: width .35s; }
 
@@ -1400,6 +1424,38 @@ PAGE_HTML = """<!doctype html>
   .foe.out { opacity: .45; }
   .pw { color: var(--gold); font-weight: 700; }
 
+  /* --------------------------------------------------------------------- the mailbox
+     Colour-coded by what HAPPENED, not by which subsystem wrote the row: green won, red
+     lost, gold earned on the farm, purple changed hands. The left stripe is the only
+     thing the eye needs for that, so the icon is free to say which kind of event it was
+     and the text is free to say nothing twice. Times are tabular so thirty of them line
+     up into a column you can read down. */
+  .mday { display: flex; align-items: center; gap: 9px; margin: 15px 0 8px; }
+  /* The feed is dropped straight after the panel's heading, so the first day must not
+     open a second gap under it. */
+  .mday:first-child, h2 + .mday { margin-top: 2px; }
+  .mday b { font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+            color: var(--muted); font-weight: 700; }
+  .mday i { flex: 1; height: 1px; background: var(--line); }
+  .mail {
+    --k: var(--muted);
+    display: grid; grid-template-columns: 40px 26px 1fr; align-items: start; gap: 8px;
+    background: var(--sunken); border-left: 3px solid var(--k); border-radius: 10px;
+    padding: 9px 10px; margin-bottom: 7px;
+  }
+  .mail.win { --k: var(--xp); }
+  .mail.loss { --k: var(--hp); }
+  .mail.gold { --k: var(--gold); }
+  .mail.give { --k: var(--r-legendary); }
+  .mail .mt { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .mail .mi { font-size: 16px; line-height: 1.3; text-align: center; }
+  .mail .mb { min-width: 0; font-size: 13px; }
+  .mail .meta { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 7px; font-size: 11px;
+                align-items: center; }
+  .mail .verdict { color: var(--k); font-weight: 700; }
+  .mail .find { border: 1px solid currentColor; border-radius: 999px; padding: 1px 8px;
+                font-weight: 600; }
+
   /* ----------------------------------------------------------- sheets and overlays */
   .veil {
     position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.6);
@@ -1477,6 +1533,7 @@ PAGE_HTML = """<!doctype html>
     </div>
     <div class="bar"><i id="hudXp" style="width:0%"></i></div>
   </div>
+  <button class="post" id="hudMail" title="Почта">📬</button>
 </header>
 
 <main id="main">
@@ -1973,7 +2030,7 @@ async function renderMore() {
   const box = $("scr-more");
   if (moreView === "menu") {
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
-      ["ranking:🏆 Рейтинг существ", "collection:📚 Коллекция оружия",
+      ["mail:📬 Почта", "ranking:🏆 Рейтинг существ", "collection:📚 Коллекция оружия",
        "history:📜 История боёв", "updates:📰 Обновления"].map((entry) => {
         const [key, label] = entry.split(":");
         return '<button class="go sec" style="margin-bottom:8px" data-more="' + key + '">' +
@@ -2006,6 +2063,9 @@ async function renderMore() {
       "</h2>" + (data.rows.length
         ? '<div class="items">' + data.rows.map((i) => itemCard(i)).join("") + "</div>"
         : '<div class="empty">Ещё ничего не найдено.</div>') + "</div>";
+  } else if (moreView === "mail") {
+    const data = await api("/api/mail");
+    body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
   } else if (moreView === "history") {
     const data = await api("/api/history");
     body = '<div class="panel"><h2>Последние бои</h2>' + (data.rows.length
@@ -2020,6 +2080,79 @@ async function renderMore() {
   }
   box.innerHTML = '<button class="go sec" data-more="menu">◀️ Назад</button>' + body;
   paintShots(box);
+}
+
+// ------------------------------------------------------------------------------ mail
+const MAIL_ICONS = { attack: "⚔️", defense: "🛡", farm: "🌾", gift_in: "🎁", gift_out: "🎁" };
+const MAIL_VERDICTS = { win: "Победа", loss: "Поражение", draw: "Ничья" };
+// The stripe colour, keyed on what the row means to the reader. A won defence is green
+// for the same reason a won attack is: the question is whether the day went well, not
+// who pressed the button.
+const MAIL_TONES = { win: "win", loss: "loss", draw: "" };
+
+function mailFeed(rows) {
+  if (!rows.length) {
+    return '<div class="empty">Пока пусто.<br>Здесь будут бои, смены на ферме и подарки.</div>';
+  }
+  let out = "", day = null;
+  for (const row of rows) {
+    if (row.day !== day) {
+      day = row.day;
+      out += '<div class="mday"><b>' + esc(row.day_label || day || "") + "</b><i></i></div>";
+    }
+    out += mailRow(row);
+  }
+  return out;
+}
+
+function mailTone(row) {
+  if (row.kind === "farm") return "gold";
+  if (row.kind === "gift_in" || row.kind === "gift_out") return "give";
+  return MAIL_TONES[row.outcome] || "";
+}
+
+function mailWho(row) {
+  const pet = esc(row.pet_name || "");
+  const owner = esc(row.owner_name || "");
+  if (pet && owner) return "<b>" + pet + "</b> <span class='muted'>(" + owner + ")</span>";
+  return "<b>" + (pet || owner || "?") + "</b>";
+}
+
+function mailRow(row) {
+  const coins = Number(row.coins || 0);
+  const meta = [];
+  if (row.kind !== "farm" && MAIL_VERDICTS[row.outcome]) {
+    meta.push("<span class='verdict'>" + MAIL_VERDICTS[row.outcome] + "</span>");
+  }
+  if (coins) {
+    meta.push("<span class='" + (coins > 0 ? "gain" : "loss") + "'>" +
+              (coins > 0 ? "+" : "−") + money(Math.abs(coins)) + " 💰</span>");
+  }
+  if (row.kind === "farm" && row.xp) meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
+  if (row.item_name) {
+    // Tinted by rarity, the same colour the item's own card is bordered with -- a
+    // legendary find should be legible as one from across the feed.
+    meta.push('<span class="find" style="color:var(--r-' + esc(row.item_rarity || "common") +
+              ')">' + esc(row.item_name) + (row.auto_equipped ? " · надето" : "") + "</span>");
+  }
+  let title;
+  if (row.kind === "farm") {
+    title = "Ферма — смена " + Number(row.hours || 0) + " ч";
+  } else if (row.kind === "gift_out") {
+    title = "Подарок для " + mailWho(row);
+  } else if (row.kind === "gift_in") {
+    title = "Подарок от " + mailWho(row);
+  } else if (row.kind === "attack") {
+    title = "Ты напал на " + mailWho(row);
+  } else {
+    title = "На тебя напал " + mailWho(row);
+  }
+  return '<div class="mail ' + mailTone(row) + '">' +
+    "<span class='mt'>" + esc(row.at || "") + "</span>" +
+    "<span class='mi'>" + (MAIL_ICONS[row.kind] || "•") + "</span>" +
+    "<div class='mb'>" + title +
+    (meta.length ? "<div class='meta'>" + meta.join("") + "</div>" : "") +
+    "</div></div>";
 }
 
 function historyRow(row) {
@@ -2464,6 +2597,16 @@ $("tabs").addEventListener("click", (event) => {
   if (!button) return;
   TAB = button.dataset.tab;
   if (TAB === "more") moreView = "menu";
+  haptic();
+  render();
+});
+
+// The mailbox lives in "Ещё" like every other read-only screen, but it is the one people
+// come back to between fights -- so the HUD keeps a permanent way in, and «Назад» from it
+// still lands on that menu rather than somewhere the tab bar disagrees with.
+$("hudMail").addEventListener("click", () => {
+  TAB = "more";
+  moreView = "mail";
   haptic();
   render();
 });

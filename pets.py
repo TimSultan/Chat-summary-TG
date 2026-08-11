@@ -2477,6 +2477,141 @@ def history(entry, user_id) -> list[dict]:
     return mine[:C.HISTORY_LIMIT]
 
 
+# --- mailbox -------------------------------------------------------------------------
+
+
+def _mail_moment(value, tz) -> datetime | None:
+    """Parse a stored timestamp for sorting, tolerating naive and damaged values."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=tz) if moment.tzinfo is None else moment
+
+
+def _mail_item(code) -> dict:
+    """The three fields every mail line needs about a find, or three Nones."""
+    item = C.find_item(code) if code else None
+    if item is None:
+        return {"item": None, "item_name": None, "item_rarity": None}
+    return {"item": item.code, "item_name": item.name, "item_rarity": item.rarity}
+
+
+def _mail_pet(data: dict, user_id) -> tuple[str | None, str | None]:
+    record = data.get("pets", {}).get(str(user_id))
+    if not isinstance(record, dict):
+        return None, None
+    return record.get("name"), record.get("owner_name")
+
+
+def mail(entry, user_id, limit: int | None = None) -> list[dict]:
+    """One merged, newest-first feed of everything that happened to this player.
+
+    Read-side only: no new store, nothing written, no migration. The three things worth
+    telling somebody about are already persisted by the code that performs them -- fights
+    in ``data["fights"]``, farm shifts in the pet's own ``farm_notifications``, gifts in
+    ``data["gift_history"]`` -- so the mailbox is a merge of records that already exist.
+    That is also why it is retroactive: the first player to open it sees their real
+    history rather than an empty box waiting for the next event.
+
+    A find is a property OF the fight or shift that produced it, so it rides on that
+    event instead of getting a line of its own -- "победа, +28, нашёл X" is one thing
+    that happened, and splitting it would double the length of a good day.
+
+    Every event carries ``coins`` signed from the reader's side (what their balance did),
+    ``at`` as HH.MM and ``day`` as an ISO date, both already in the chat's timezone: the
+    bot and the Mini App must not disagree about what time something happened, and the
+    page has no idea which timezone the chat lives in.
+    """
+    cap = C.MAIL_LIMIT if limit is None else max(0, int(limit))
+    data = _load(entry)
+    uid = str(user_id)
+    tz = app_now().tzinfo
+    events: list[tuple[datetime, dict]] = []
+
+    def add(ts, event: dict) -> None:
+        moment = _mail_moment(ts, tz)
+        if moment is None:
+            return
+        event["ts"] = moment.isoformat()
+        event["at"] = moment.strftime("%H.%M")
+        event["day"] = moment.date().isoformat()
+        events.append((moment, event))
+
+    for fight in data.get("fights", []):
+        if not isinstance(fight, dict):
+            continue
+        attacked = str(fight.get("attacker_id")) == uid
+        if not attacked and str(fight.get("defender_id")) != uid:
+            continue
+        draw = bool(fight.get("draw"))
+        won = str(fight.get("winner_id") or "") == uid
+        if won:
+            coins = int(fight.get("gold", 0) or 0)
+        elif draw:
+            coins = 0
+        elif int(fight.get("loss_gold", 0) or 0):
+            # An attacker who lost paid this; a defender never does (see record_fight).
+            coins = -int(fight.get("loss_gold", 0) or 0)
+        else:
+            coins = int(fight.get("consolation_gold", 0) or 0)
+        event = {
+            "kind": "attack" if attacked else "defense",
+            "outcome": "draw" if draw else ("win" if won else "loss"),
+            "coins": coins,
+            # Snapshotted at fight time, so a later rename does not rewrite the past.
+            "pet_name": fight.get("defender_name") if attacked else fight.get("attacker_name"),
+            "owner_name": fight.get("defender_owner") if attacked else fight.get("attacker_owner"),
+            # The drop belongs to the winner, always -- so a loser's line never claims one.
+            **_mail_item(fight.get("dropped_item") if won else None),
+            "auto_equipped": bool(fight.get("auto_equipped")) if won else False,
+        }
+        add(fight.get("ts"), event)
+
+    record = data.get("pets", {}).get(uid)
+    if isinstance(record, dict):
+        for receipt in record.get("farm_notifications", []):
+            if not isinstance(receipt, dict):
+                continue
+            add(receipt.get("settled_at"), {
+                "kind": "farm",
+                "outcome": "",
+                "coins": int(receipt.get("gold", 0) or 0),
+                "xp": int(receipt.get("xp", 0) or 0),
+                "hours": int(receipt.get("hours", 0) or 0),
+                "levels_gained": int(receipt.get("levels_gained", 0) or 0),
+                "pet_name": receipt.get("pet_name"),
+                "owner_name": None,
+                **_mail_item(receipt.get("item_code")),
+                "auto_equipped": bool(receipt.get("auto_equipped")),
+            })
+
+    for row in data.get("gift_history", []):
+        if not isinstance(row, dict):
+            continue
+        sent = str(row.get("giver_id")) == uid
+        if not sent and str(row.get("receiver_id")) != uid:
+            continue
+        # Gifts are audited by id only, so the names here are read live rather than
+        # snapshotted. A renamed pet therefore shows its current name -- acceptable, and
+        # better than showing an id, which is what the audit row actually holds.
+        pet_name, owner_name = _mail_pet(data, row.get("receiver_id") if sent else row.get("giver_id"))
+        add(row.get("ts"), {
+            "kind": "gift_out" if sent else "gift_in",
+            "outcome": "",
+            "coins": 0,
+            "pet_name": pet_name,
+            "owner_name": owner_name,
+            **_mail_item(row.get("item_code")),
+            "auto_equipped": False,
+        })
+
+    events.sort(key=lambda pair: pair[0], reverse=True)
+    return [event for _moment, event in events[:cap]]
+
+
 def award_xp(entry, user_id, amount) -> tuple[int, int]:
     data = _load(entry)
     record = data["pets"].get(str(user_id))

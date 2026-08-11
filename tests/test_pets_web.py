@@ -203,7 +203,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         for method, path in (
             ("get", "/api/state"), ("get", "/api/opponents"), ("get", "/api/shop"),
             ("get", "/api/leaderboard"), ("get", "/api/history"), ("get", "/api/collection"),
-            ("get", "/api/updates"), ("post", "/api/action"), ("post", "/api/attack"),
+            ("get", "/api/updates"), ("get", "/api/mail"),
+            ("post", "/api/action"), ("post", "/api/attack"),
         ):
             response = await getattr(self.client, method)(pets_web.ROUTE_PREFIX + path, json={})
             self.assertEqual(response.status, 401, f"{method} {path} let an unsigned caller in")
@@ -737,6 +738,55 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn("data-shoptab=", page)
         self.assertIn('if (d.shoptab) { closeSheet(); TAB = "shop";', page)
+
+    # ---- the mailbox --------------------------------------------------------------------
+
+    async def test_mail_returns_the_readers_own_feed_with_server_side_times(self):
+        """Fights, farm shifts and gifts in one list -- and the HH.MM and day heading come
+        from the server, because the page's only clock is the phone's and the chat's
+        timezone is what every other timestamp in the game is in."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+
+        rows = (await (await self._get("/api/mail", PLAYER)).json())["rows"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["kind"], "attack")
+        self.assertEqual(row["pet_name"], "Соперник")
+        self.assertIn(row["outcome"], ("win", "loss", "draw"))
+        self.assertRegex(row["at"], r"^\d{2}\.\d{2}$")
+        self.assertEqual(row["day_label"], "Сегодня")
+        self.assertIsInstance(row["ts"], str)
+
+        # The same fight, from the other side, is a defence -- one event, two mailboxes.
+        theirs = (await (await self._get("/api/mail", OPPONENT)).json())["rows"]
+        self.assertEqual(theirs[0]["kind"], "defense")
+
+    async def test_mail_is_gated_and_empty_for_a_player_with_nothing_yet(self):
+        unsigned = await self.client.get(pets_web.ROUTE_PREFIX + "/api/mail")
+        self.assertEqual(unsigned.status, 401)
+
+        # No cage, no pet, nothing ever happened: an empty feed, not an error.
+        rows = (await (await self._get("/api/mail", PLAYER)).json())["rows"]
+        self.assertEqual(rows, [])
+
+    async def test_the_page_colour_codes_the_feed_and_keeps_a_way_into_it(self):
+        """The mailbox is checked between fights rather than played, so it stays in «Ещё»
+        with the other read-only screens -- but the HUD keeps a permanent 📬 into it, and
+        the rows are striped by what happened rather than by which subsystem wrote them."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('id="hudMail"', page)
+        self.assertIn('moreView = "mail"', page)
+        self.assertIn("mail:📬 Почта", page)
+        self.assertIn("function mailFeed(", page)
+        for tone in (".mail.win", ".mail.loss", ".mail.gold", ".mail.give"):
+            self.assertIn(tone, page)
+        # A find is tinted with the same rarity colour its item card is bordered with.
+        self.assertIn('style="color:var(--r-', page)
 
     async def test_the_slot_placeholders_use_the_games_own_emoji(self):
         """⚔ ◈ ▲ are typographic lookalikes and render as flat text next to 🧤, which reads

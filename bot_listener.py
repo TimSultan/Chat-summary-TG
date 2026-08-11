@@ -6357,6 +6357,7 @@ async def handle_pets_callback(
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
             "history": lambda: pets_ui.history_view(entry, user_id),
+            "mail": lambda: pets_ui.mail_view(entry, user_id),
             "updates": lambda: pets_ui.updates_view(
                 entry, user_id, int(argument) if argument.isdigit() else 0,
             ),

@@ -1891,6 +1891,178 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         self.assertEqual(pets.economy_telemetry("chat")["passive_gold_minted"], 2)
 
 
+class MailTests(PetsTestCase):
+    """The mailbox is a READ over three stores that already exist, so these tests write
+    through the real game calls (record_fight / gift_item / a settled farm receipt) and
+    then assert on what one player is told -- never on a fourth store, because there
+    isn't one to get out of step."""
+
+    def _fight(self, entry, attacker, defender, winner, when, gold=None):
+        loser = defender if winner == attacker else attacker
+        result = SimpleNamespace(winner=winner, loser=loser)
+        with patch("random.randint", return_value=gold or pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=1.0):     # 1.0 == no drop
+            return pets.record_fight(
+                entry, attacker, defender, result, when.date(), now=when,
+            )
+
+    def test_mail_merges_fights_farm_and_gifts_newest_first_with_local_times(self):
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+
+        self._fight(entry, "1", "2", "1", datetime(2026, 8, 9, 10, 5))
+        self._fight(entry, "2", "1", "2", datetime(2026, 8, 9, 11, 30))
+        data = pets._load(entry)
+        data["pets"]["1"]["farm_notifications"] = [{
+            "run_id": "r1", "pet_name": "Мой", "hours": 6, "gold": 64, "xp": 40,
+            "levels_gained": 1, "item_code": "w001", "auto_equipped": True,
+            "settled_at": datetime(2026, 8, 9, 12, 15).isoformat(), "notified_at": None,
+        }]
+        data["gift_history"] = [{
+            "ts": datetime(2026, 8, 9, 13, 40).isoformat(),
+            "giver_id": "2", "receiver_id": "1", "item_code": "w002",
+        }]
+        pets._save(entry, data)
+
+        rows = pets.mail(entry, "1")
+        self.assertEqual([row["kind"] for row in rows],
+                         ["gift_in", "farm", "defense", "attack"])
+        self.assertEqual([row["at"] for row in rows],
+                         ["13.40", "12.15", "11.30", "10.05"])
+        self.assertTrue(all(row["day"] == "2026-08-09" for row in rows))
+
+        gift, farm, defense, attack = rows
+        self.assertEqual(gift["item_name"], pets_config.find_item("w002").name)
+        self.assertEqual(gift["pet_name"], "Чужой")
+        self.assertEqual(farm["hours"], 6)
+        self.assertEqual(farm["coins"], 64)
+        self.assertEqual(farm["xp"], 40)
+        self.assertTrue(farm["auto_equipped"])
+        self.assertEqual(attack["pet_name"], "Чужой")
+        self.assertEqual(attack["outcome"], "win")
+        self.assertEqual(defense["outcome"], "loss")
+
+        # The other player's mailbox is the same events from the other side.
+        theirs = pets.mail(entry, "2")
+        self.assertEqual([row["kind"] for row in theirs],
+                         ["gift_out", "attack", "defense"])
+        self.assertEqual(theirs[1]["outcome"], "win")
+
+    def test_coins_are_signed_from_the_readers_own_side(self):
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+        economy.grant(entry, "1", 500, "test")
+
+        # 1 attacks and loses: an attacker-loser is the only side that ever pays.
+        self._fight(entry, "1", "2", "2", datetime(2026, 8, 9, 10, 0))
+        mine = pets.mail(entry, "1")[0]
+        self.assertEqual(mine["kind"], "attack")
+        self.assertLess(mine["coins"], 0)
+        self.assertEqual(pets.mail(entry, "2")[0]["coins"], pets.history(entry, "2")[0]["gold"])
+
+        # 2 attacks and loses: 1 defended, lost, and is PAID a consolation rather than
+        # charged -- so their line has to read positive.
+        self._fight(entry, "2", "1", "2", datetime(2026, 8, 9, 11, 0))
+        defended = pets.mail(entry, "1")[0]
+        self.assertEqual(defended["kind"], "defense")
+        self.assertEqual(defended["outcome"], "loss")
+        self.assertGreater(defended["coins"], 0)
+
+    def test_a_find_rides_on_the_winners_row_and_never_the_losers(self):
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+        dropped = next(item for item in pets_config.ITEMS if item.source == "drop")
+        result = SimpleNamespace(winner="1", loser="2")
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=0.0), \
+             patch("random.choice", return_value=dropped):
+            pets.record_fight(entry, "1", "2", result, date(2026, 8, 9),
+                              now=datetime(2026, 8, 9, 10, 0))
+
+        winner_row = pets.mail(entry, "1")[0]
+        self.assertEqual(winner_row["item"], dropped.code)
+        self.assertEqual(winner_row["item_name"], dropped.name)
+        self.assertEqual(winner_row["item_rarity"], dropped.rarity)
+        loser_row = pets.mail(entry, "2")[0]
+        self.assertIsNone(loser_row["item"])
+        self.assertIsNone(loser_row["item_name"])
+
+    def test_mail_is_capped_and_survives_damaged_rows(self):
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+        start = datetime(2026, 8, 1, 9, 0)
+        for index in range(pets_config.MAIL_LIMIT + 5):
+            self._fight(entry, "1", "2", "1", start + timedelta(hours=index))
+
+        data = pets._load(entry)
+        # A row with no usable timestamp cannot be placed in a chronological feed, so it
+        # is dropped rather than sorted to an invented position.
+        data["fights"].append({"attacker_id": "1", "defender_id": "2", "ts": "not a date"})
+        data["gift_history"] = ["nonsense", {"ts": None, "giver_id": "1", "receiver_id": "2"}]
+        pets._save(entry, data)
+
+        rows = pets.mail(entry, "1")
+        self.assertEqual(len(rows), pets_config.MAIL_LIMIT)
+        times = [row["ts"] for row in rows]
+        self.assertEqual(times, sorted(times, reverse=True))
+        # Capped means the NEWEST kept, not the first thirty written.
+        self.assertEqual(rows[0]["at"], (start + timedelta(hours=pets_config.MAIL_LIMIT + 4)).strftime("%H.%M"))
+
+    def test_mail_view_groups_by_day_and_escapes_names(self):
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+        # validate_name refuses angle brackets in a PET name, but an owner name is
+        # whatever Telegram says the account is called -- so that is the one that has to
+        # be escaped, and the one this asserts on.
+        data = pets._load(entry)
+        data["pets"]["2"]["owner_name"] = "<b>Злой</b>"
+        pets._save(entry, data)
+        today = pets.today()
+        self._fight(entry, "2", "1", "2",
+                    datetime(today.year, today.month, today.day, 9, 15))
+        self._fight(entry, "1", "2", "1",
+                    datetime(today.year, today.month, today.day, 8, 0) - timedelta(days=1))
+
+        text, keyboard = pets_ui.mail_view(entry, "1")
+        self.assertIn("📬", text)
+        self.assertIn("Сегодня", text)
+        self.assertIn("Вчера", text)
+        self.assertIn("09.15", text)
+        self.assertIn("&lt;b&gt;Злой&lt;/b&gt;", text)
+        self.assertNotIn("<b>Злой</b>", text)
+        self.assertIn("На тебя напал", text)
+        self.assertIn("Ты напал на", text)
+        self.assertTrue(keyboard["inline_keyboard"])
+
+    def test_empty_mailbox_says_so_and_the_menu_links_to_it(self):
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        text, _ = pets_ui.mail_view(entry, "1")
+        self.assertIn("Пока пусто", text)
+
+        _menu, keyboard = pets_ui.main_view(entry, "1", 0)
+        actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+            if "callback_data" in button
+        ]
+        self.assertIn("mail", actions)
+        # The pure fight log did not disappear with the menu button -- it moved into the
+        # arena screen, which is the only other place it was ever linked from.
+        _fight_text, fight_keyboard = pets_ui.fight_view(entry, "1", 0)
+        fight_actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in fight_keyboard["inline_keyboard"] for button in row
+            if "callback_data" in button
+        ]
+        self.assertIn("history", fight_actions)
+
+
 class FarmTests(PetsTestCase):
     def _build_farm(self, entry="farm", uid="1", level=1):
         self._tame(entry, uid)

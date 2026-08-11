@@ -19,7 +19,7 @@ above all, since players choose it -- goes through html.escape here rather than 
 call site.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 
 import economy
@@ -173,9 +173,13 @@ def main_view(entry: str, user_id, xp: int, webapp_url: str | None = None) -> tu
             {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
             {"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")},
         ])
+        # Почта stands where «История боёв» used to: it contains those same fights and
+        # adds farm shifts and gifts, so keeping both here would be two buttons onto one
+        # feed. The pure fight log is unchanged and still one tap away -- inside ⚔️ Арена,
+        # which is where somebody asking "how did my last fights go" already is.
         rows.append([
             {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
-            {"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")},
+            {"text": "📬 Почта", "callback_data": callback_data(user_id, "mail")},
         ])
         # Both placeholders for the same reason (see casino_view/quests_view): announced
         # before they are built. Paired together rather than each getting the lone
@@ -1440,6 +1444,113 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
 
     rows = [[{"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")}], _back_row(user_id)]
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+# ----------------------------------------------------------------------------- mail
+
+# One Telegram message holds 4096 characters. Thirty events do not come close, but an
+# event's text is partly other people's names, so the whole thing is trimmed rather than
+# risking the API rejecting the send outright and showing nothing at all.
+MAIL_MAX_CHARS = 3800
+
+MAIL_ICONS = {
+    "attack": "⚔️", "defense": "🛡", "farm": "🌾", "gift_in": "🎁", "gift_out": "🎁",
+}
+MAIL_OUTCOMES = {"win": "победа", "loss": "поражение", "draw": "ничья"}
+
+
+def mail_day_label(day: str) -> str:
+    """"Сегодня" / "Вчера" / "09.08" for one ISO date, against the chat's calendar.
+
+    Public because the Mini App groups the same feed under the same headings, and the
+    page cannot work this out for itself: its idea of "today" is the phone's, which is
+    not necessarily the chat's (see pets_web.handle_mail).
+    """
+    today = pets.today()
+    if day == today.isoformat():
+        return "Сегодня"
+    if day == (today - timedelta(days=1)).isoformat():
+        return "Вчера"
+    try:
+        return date.fromisoformat(day).strftime("%d.%m")
+    except ValueError:
+        return day
+
+
+def _mail_who(event: dict) -> str:
+    """The other side, named the way the arena names things: creature first, owner after."""
+    pet = escape(event.get("pet_name") or "")
+    owner = escape(event.get("owner_name") or "")
+    if pet and owner:
+        return f"<b>{pet}</b> ({owner})"
+    return f"<b>{pet or owner or '?'}</b>"
+
+
+def _mail_find(event: dict) -> str:
+    if not event.get("item_name"):
+        return ""
+    return f", находка: «{escape(event['item_name'])}»"
+
+
+def _mail_line(event: dict) -> str:
+    kind = event.get("kind")
+    icon = MAIL_ICONS.get(kind, "•")
+    coins = int(event.get("coins", 0) or 0)
+    money = ""
+    if coins > 0:
+        money = f", +{_money(coins)} 🪙"
+    elif coins < 0:
+        money = f", −{_money(-coins)} 🪙"
+    if kind == "farm":
+        hours = int(event.get("hours", 0) or 0)
+        xp = int(event.get("xp", 0) or 0)
+        body = f"Ферма, {_plural(hours, 'час', 'часа', 'часов')}{money}"
+        if xp:
+            body += f", +{_money(xp)} опыта"
+        return f"{icon} {body}{_mail_find(event)}"
+    if kind in ("gift_in", "gift_out"):
+        item = escape(event.get("item_name") or "предмет")
+        verb = "Подарок для" if kind == "gift_out" else "Подарок от"
+        return f"{icon} {verb} {_mail_who(event)}: «{item}»"
+    # Both fight kinds. The verb carries who started it, which is the first thing anybody
+    # wants to know -- see history_view for the same reasoning at greater length.
+    lead = "Ты напал на" if kind == "attack" else "На тебя напал"
+    outcome = MAIL_OUTCOMES.get(event.get("outcome"), "")
+    tail = f" — {outcome}{money}" if outcome else money
+    return f"{icon} {lead} {_mail_who(event)}{tail}{_mail_find(event)}"
+
+
+def mail_view(entry: str, user_id) -> tuple[str, dict]:
+    """Everything that happened to this player, one screen, newest first.
+
+    Grouped by day with the time in front of every line, because the question the mailbox
+    answers is "what did I miss" -- and that is a question about when, not about which
+    subsystem produced the row. Fights, farm shifts and gifts therefore share one column
+    instead of living in three separate menus.
+    """
+    events = pets.mail(entry, user_id)
+    lines = ["📬 <b>Почта</b>\n"]
+    if not events:
+        lines.append("Пока пусто. Здесь будут бои, смены на ферме и подарки.")
+    current_day = None
+    for event in events:
+        day = event.get("day") or ""
+        if day != current_day:
+            # The title already leaves one blank line behind it; only later headings
+            # need to open their own gap.
+            gap = "" if current_day is None else "\n"
+            current_day = day
+            lines.append(f"{gap}<b>{mail_day_label(day)}</b>")
+        lines.append(f"<code>{escape(event.get('at') or '--.--')}</code> {_mail_line(event)}")
+    text = "\n".join(lines)
+    if len(text) > MAIL_MAX_CHARS:
+        text = text[:MAIL_MAX_CHARS].rsplit("\n", 1)[0] + "\n\n<i>…показаны не все события.</i>"
+    rows = [
+        [{"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
+         {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")}],
+        _back_row(user_id),
+    ]
+    return text, {"inline_keyboard": rows}
 
 
 # ------------------------------------------------------------------------- pet card
