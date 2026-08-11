@@ -140,6 +140,7 @@ def _empty() -> dict:
         "done": {},            # user_id -> {quest code: when it was last finished}
         "moderators": {},      # user_id -> who may review, delegated by an admin
         "disabled": [],        # quest codes a moderator has taken out of rotation
+        "overrides": {},       # quest code -> per-chat editable text fields
         "ideas": [],           # player-suggested quest ideas, newest last
     }
 
@@ -350,11 +351,69 @@ def set_quest_enabled(entry: str, code: str, enabled: bool) -> tuple[bool, str]:
             disabled.add(quest.code)
         # Never disable the whole board: an empty pool means nobody can be given a quest
         # at all, and the failure would show up a day later as silence.
-        if len(disabled) >= len(catalog.QUESTS):
-            return False, "Нельзя выключить все квесты сразу."
+        pool = catalog.PAINT_QUESTS if quest.kind == "paint" else catalog.REAL_QUESTS
+        if all(item.code in disabled for item in pool):
+            return False, "Нельзя выключить все квесты этого вида сразу."
         data["disabled"] = sorted(disabled)
         _save(entry, data)
     return True, ("Квест снова в ротации." if enabled else "Квест убран из ротации.")
+
+
+QUEST_TEXT_FIELDS = ("title", "subject", "technique", "hint", "proof")
+QUEST_TEXT_LIMITS = {
+    "title": 160, "subject": 500, "technique": 1_000, "hint": 1_000, "proof": 500,
+}
+
+
+def _quest_text(quest, data: dict) -> dict:
+    """The catalogue's text with this chat's moderator edits applied."""
+    changed = data.get("overrides", {}).get(quest.code, {})
+    return {
+        field: str(changed.get(field) or getattr(quest, field))
+        for field in QUEST_TEXT_FIELDS
+    }
+
+
+def set_quest_text(entry: str, code: str, text: dict) -> tuple[bool, str]:
+    """Save a per-chat edit of a quest brief; the global catalogue stays untouched."""
+    quest = catalog.find_quest(code)
+    if quest is None:
+        return False, "Такого квеста нет."
+    if not isinstance(text, dict):
+        return False, "Текст квеста передан неверно."
+    updated = {}
+    for field in QUEST_TEXT_FIELDS:
+        if field not in text:
+            continue
+        value = str(text.get(field) or "").strip()
+        if not value:
+            return False, "Все поля квеста должны быть заполнены."
+        if len(value) > QUEST_TEXT_LIMITS[field]:
+            return False, f"Поле «{field}» слишком длинное."
+        updated[field] = value
+    if not updated:
+        return False, "Нет изменений текста квеста."
+    with _lock:
+        data = _load(entry)
+        row = data.setdefault("overrides", {}).setdefault(quest.code, {})
+        row.update(updated)
+        _save(entry, data)
+    return True, "Текст квеста сохранён."
+
+
+def catalog_entries(entry: str) -> list[dict]:
+    """The complete editable catalogue for the moderation page."""
+    data = _load(entry)
+    disabled = set(data.get("disabled", []))
+    rows = []
+    for quest in catalog.QUESTS:
+        rows.append({
+            "code": quest.code, "difficulty": quest.difficulty, "tool": quest.tool,
+            "kind": quest.kind, "hashtag": catalog.hashtag(quest.code),
+            "enabled": quest.code not in disabled,
+            **_quest_text(quest, data),
+        })
+    return rows
 
 
 def available_quests(entry: str, data: dict | None = None, kind: str = "paint") -> tuple:
@@ -370,13 +429,11 @@ def available_quests(entry: str, data: dict | None = None, kind: str = "paint") 
 
 
 def _quest_payload(entry: str, quest, data: dict) -> dict:
+    text = _quest_text(quest, data)
     return {
         "code": quest.code,
         "hashtag": catalog.hashtag(quest.code),
-        "title": quest.title,
-        "subject": quest.subject,
-        "technique": quest.technique,
-        "hint": quest.hint,
+        **text,
         "tool": quest.tool,
         "difficulty": quest.difficulty,
         "kind": quest.kind,
@@ -726,8 +783,12 @@ def pending(entry: str) -> list[dict]:
     rows = [dict(row) for row in data.get("submissions", []) if row.get("status") == "pending"]
     for row in rows:
         quest = catalog.find_quest(row.get("code"))
-        row["title"] = quest.title if quest else row.get("code")
-        row["subject"] = quest.subject if quest else ""
+        text = _quest_text(quest, data) if quest else {}
+        row["title"] = text.get("title", row.get("code"))
+        row["subject"] = text.get("subject", "")
+        row["technique"] = text.get("technique", "")
+        row["hint"] = text.get("hint", "")
+        row["proof"] = text.get("proof", "")
         row["reward"] = rewards_for(entry, row.get("difficulty", 1), data)
     return rows
 

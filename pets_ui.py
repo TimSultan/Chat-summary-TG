@@ -406,6 +406,7 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         # to be readable before the tap rather than explained by the result.
         top = difficulty >= max(catalog_difficulties())
         lines.append(
+            "\nСначала покрась что-то новое: старые работы не подходят."
             "\n⚠️ Реролл даёт квест на ступень сложнее"
             + (" — но выше пятой ступени некуда, придёт другой такой же."
                if top else " — и награда тоже вырастет.")
@@ -432,6 +433,9 @@ def quest_review_view(entry: str, user_id) -> tuple[str, dict]:
         f"<b>{escape(str(author))}</b>",
         f"🎯 {escape(str(row.get('title') or row.get('code') or 'Квест'))}",
         escape(str(row.get("subject") or "")),
+        escape(str(row.get("technique") or "")),
+        f"💡 {escape(str(row.get('hint') or ''))}" if row.get("hint") else "",
+        f"<b>Показать:</b> {escape(str(row.get('proof') or ''))}" if row.get("proof") else "",
         "\nОткрой работу в чате и выбери решение.",
     ])
     keyboard = [[

@@ -916,6 +916,27 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         )).json()
         self.assertFalse(refused["ok"])
 
+    async def test_a_moderator_can_toggle_rotation_and_edit_the_full_quest_brief(self):
+        before = await (await self._get("/api/quests/review", MODERATOR)).json()
+        quest = before["catalog"][0]
+        switched = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/quests/config", json={
+            "init_data": _init_data(MODERATOR["id"]), "code": quest["code"], "enabled": False,
+        })).json()
+        self.assertTrue(switched["ok"], switched)
+        after_switch = await (await self._get("/api/quests/review", MODERATOR)).json()
+        self.assertFalse(next(row for row in after_switch["catalog"] if row["code"] == quest["code"])["enabled"])
+
+        edited = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/quests/config", json={
+            "init_data": _init_data(MODERATOR["id"]), "code": quest["code"],
+            "text": {"title": "Новый бриф", "subject": "Новая деталь", "technique": "Тонкие слои",
+                     "hint": "Не используй старую работу", "proof": "Фото новой детали"},
+        })).json()
+        self.assertTrue(edited["ok"], edited)
+        saved = next(row for row in (await (await self._get("/api/quests/review", MODERATOR)).json())["catalog"]
+                     if row["code"] == quest["code"])
+        self.assertEqual(saved["title"], "Новый бриф")
+        self.assertEqual(saved["proof"], "Фото новой детали")
+
     async def test_the_page_only_draws_the_review_tab_for_a_moderator(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn("function questBoard(", page)
@@ -924,6 +945,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="questReviewTab"', page)
         self.assertIn('data-questidea', page)
         self.assertIn('data-reviewideas', page)
+        self.assertIn('data-questedit', page)
         self.assertIn('Причина отклонения обязательна.', page)
         # A verdict spends coins, so it is confirmed rather than fired on one tap.
         self.assertIn("confirmThen(\"Принять работу и начислить награду?\"", page)

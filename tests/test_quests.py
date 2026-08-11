@@ -586,6 +586,36 @@ class QuestIdeaTests(QuestsTestCase):
         self.assertFalse(quests.suggest_idea("chat", "3", "   ")[0])
 
 
+class QuestCatalogueEditTests(QuestsTestCase):
+    def test_rotation_can_toggle_each_kind_without_falling_back_to_a_disabled_pool(self):
+        entry = "chat"
+        paint = catalog.PAINT_QUESTS[0]
+        real = catalog.REAL_QUESTS[0]
+        self.assertTrue(quests.set_quest_enabled(entry, paint.code, False)[0])
+        self.assertTrue(quests.set_quest_enabled(entry, real.code, False)[0])
+        states = {row["code"]: row["enabled"] for row in quests.catalog_entries(entry)}
+        self.assertFalse(states[paint.code])
+        self.assertFalse(states[real.code])
+        self.assertTrue(quests.set_quest_enabled(entry, paint.code, True)[0])
+        self.assertTrue({row["code"]: row["enabled"] for row in quests.catalog_entries(entry)}[paint.code])
+
+    def test_moderator_text_edits_are_used_on_the_board_and_in_the_review_queue(self):
+        entry = "chat"
+        quest = catalog.PAINT_QUESTS[0]
+        text = {
+            "title": "Новый бриф", "subject": "Новую деталь", "technique": "Тонкие слои.",
+            "hint": "Не используй старую работу.", "proof": "Фото новой детали.",
+        }
+        self.assertTrue(quests.set_quest_text(entry, quest.code, text)[0])
+        self.assertEqual(quests._quest_payload(entry, quest, quests._load(entry))["title"], text["title"])
+        with patch("random.choice", return_value=quest):
+            quests.daily_quest(entry, "1")
+        self.assertTrue(quests.submit(entry, "1", quest.code)[0])
+        row = quests.pending(entry)[0]
+        self.assertEqual(row["technique"], text["technique"])
+        self.assertEqual(row["proof"], text["proof"])
+
+
 class RewardTableTests(QuestsTestCase):
     def test_set_reward_clamps_out_of_range_values_to_the_configured_limits(self):
         """A moderator's fat-fingered 50000 must not become the chat's new gold reward --
@@ -636,11 +666,10 @@ class QuestRotationTests(QuestsTestCase):
         self.assertTrue(ok, msg)
         self.assertIn(code, {q.code for q in quests.available_quests(entry)})
 
-    def test_set_quest_enabled_refuses_to_disable_every_quest_at_once(self):
-        """The pool backing every assignment must never run dry. An empty pool would not
-        fail loudly -- it would just leave the next player silently unassigned."""
+    def test_set_quest_enabled_refuses_to_disable_every_quest_of_one_kind(self):
+        """Each assignment pool must keep at least one quest of its own kind alive."""
         entry = "chat"
-        codes = [quest.code for quest in catalog.QUESTS]
+        codes = [quest.code for quest in catalog.PAINT_QUESTS]
         for code in codes[:-1]:
             ok, msg = quests.set_quest_enabled(entry, code, False)
             self.assertTrue(ok, msg)

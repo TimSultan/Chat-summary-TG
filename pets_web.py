@@ -1407,6 +1407,7 @@ async def handle_quest_review_queue(request: web.Request) -> web.Response:
             "author": row.get("author_name") or row.get("author_username") or row["user_id"],
             "username": row.get("author_username") or "",
             "code": row["code"], "title": row["title"], "subject": row["subject"],
+            "technique": row["technique"], "hint": row["hint"], "proof": row["proof"],
             "difficulty": row["difficulty"], "reward": row["reward"],
             "at": row.get("ts"), "link": _submission_link(row),
             "portrait": _portrait_url(request.app[_PREFIX_KEY], row["user_id"]),
@@ -1414,13 +1415,7 @@ async def handle_quest_review_queue(request: web.Request) -> web.Response:
     return _ok({
         "rows": _jsonable(rows),
         "rewards": quests.reward_table(entry),
-        "catalog": [
-            {"code": quest.code, "title": quest.title, "subject": quest.subject,
-             "difficulty": quest.difficulty, "tool": quest.tool,
-             "hashtag": quests.catalog.hashtag(quest.code),
-             "enabled": quest.code in {q.code for q in quests.available_quests(entry)}}
-            for quest in quests.catalog.QUESTS
-        ],
+        "catalog": quests.catalog_entries(entry),
         "recent": _jsonable(quests.submissions(entry, limit=40)),
         "ideas": _jsonable(quests.ideas(entry)),
     })
@@ -1472,7 +1467,11 @@ async def handle_quest_config(request: web.Request) -> web.Response:
         return _json_error("malformed request body")
     user, _xp = await _quest_admin(request, body)
     entry = request.app[_ENTRY_KEY]
-    if "code" in body:
+    if isinstance(body.get("text"), dict):
+        ok, message = quests.set_quest_text(
+            entry, str(body.get("code") or ""), body["text"],
+        )
+    elif "code" in body:
         ok, message = quests.set_quest_enabled(
             entry, str(body.get("code") or ""), bool(body.get("enabled")),
         )
@@ -2805,7 +2804,8 @@ function questCard(board, kind) {
         (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
     "</div>" +
     (board.rerolls_left && !reviewing
-      ? "<div class='warn-note'>⚠️ Реролл даёт квест на ступень сложнее" +
+      ? "<div class='warn-note'>Сначала покрась что-то новое: старые работы не подходят." +
+        "<br>⚠️ Реролл даёт квест на ступень сложнее" +
         (quest.difficulty >= 5 ? " — но выше пятой ступени уже некуда, придёт другой такой же."
                                : " — и награда тоже вырастет.") + "</div>"
       : "") +
@@ -2832,7 +2832,9 @@ function questBoard(data) {
 
 // -------------------------------------------------------------------- quest review
 let reviewIdeasOpen = false;
+let QUEST_CATALOG = [];
 function reviewQueue(data) {
+  QUEST_CATALOG = data.catalog || [];
   const rows = data.rows || [];
   let out = '<div class="panel"><h2>🛡 На проверке · ' + rows.length + "</h2>" + (rows.length
     ? rows.map((row) =>
@@ -2842,6 +2844,9 @@ function reviewQueue(data) {
             (row.username ? " <span class='tiny muted'>@" + esc(row.username) + "</span>" : "") +
             "<div class='small'>" + pips(row.difficulty) + " " + esc(row.title) + "</div>" +
             "<div class='tiny muted'>" + esc(row.subject) + "</div>" +
+            "<div class='tiny' style='margin-top:4px'>" + esc(row.technique || "") + "</div>" +
+            (row.hint ? "<div class='tiny muted'>💡 " + esc(row.hint) + "</div>" : "") +
+            (row.proof ? "<div class='tiny muted'>Показать: " + esc(row.proof) + "</div>" : "") +
             "<div class='tiny' style='margin-top:4px'>" + rewardLine(row.reward) + "</div>" +
             (row.link ? '<a class="tiny" target="_blank" rel="noreferrer" href="' +
               esc(row.link) + '">Открыть пост в чате ↗</a>' : "") +
@@ -2877,8 +2882,10 @@ function reviewQueue(data) {
 
   out += '<div class="panel"><h2>Квесты в ротации</h2>' +
     (data.catalog || []).map((quest) =>
-      '<div class="row spread small" style="margin-bottom:6px"><span>' + pips(quest.difficulty) +
-      " " + esc(quest.title) + "<br><span class='tiny muted'>" + esc(quest.hashtag) + "</span></span>" +
+      '<div class="row spread small" style="margin-bottom:6px"><button class="go sec" ' +
+      'style="width:auto;text-align:left;padding:6px 8px" data-questedit="' + esc(quest.code) + '">' +
+      pips(quest.difficulty) + " " + esc(quest.title) + "<br><span class='tiny muted'>" +
+      esc(quest.hashtag) + "</span></button>" +
       '<button class="chip' + (quest.enabled ? " on" : "") + '" data-queston="' + esc(quest.code) +
       '" data-enabled="' + (quest.enabled ? "0" : "1") + '">' +
       (quest.enabled ? "в ротации" : "выключен") + "</button></div>").join("") + "</div>";
@@ -3546,7 +3553,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questidea],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob]");
+    "[data-quest],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3575,6 +3582,28 @@ document.addEventListener("click", async (event) => {
       if (!text) { toast("Напиши текст идеи."); return; }
       closeSheet();
       await questCall("/api/quests/ideas", { text });
+    };
+    return;
+  }
+  if (d.questedit) {
+    const quest = QUEST_CATALOG.find((row) => row.code === d.questedit);
+    if (!quest) { toast("Квест не найден. Обнови страницу."); return; }
+    const fields = [
+      ["title", "Название", 160], ["subject", "Что покрасить / сделать", 500],
+      ["technique", "Техника / описание", 1000], ["hint", "Подсказка", 1000],
+      ["proof", "Что нужно показать", 500],
+    ];
+    sheet("<h3>🎯 Редактирование квеста</h3>" + fields.map(([key, label, max]) =>
+      "<label class='small muted' style='display:block;margin:9px 0 3px'>" + label +
+      "</label><textarea class='go sec' style='min-height:64px;text-align:left' maxlength='" + max +
+      "' id='questEdit_" + key + "'>" + esc(quest[key] || "") + "</textarea>").join("") +
+      "<div class='acts'><button class='go' id='saveQuestEdit'>Сохранить</button></div>");
+    $("saveQuestEdit").onclick = async () => {
+      const text = {};
+      for (const [key] of fields) text[key] = $("questEdit_" + key).value.trim();
+      if (Object.values(text).some((value) => !value)) { toast("Заполни все поля квеста."); return; }
+      closeSheet();
+      await questCall("/api/quests/config", { code: quest.code, text });
     };
     return;
   }
