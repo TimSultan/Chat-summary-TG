@@ -1,0 +1,451 @@
+"""PVE (mobs, rubies) and Зеркало души, the two features layered on top of the arena's
+own duel/fight-bank/reward machinery.
+
+pets_mobs.py's module docstring is the spec these tests pin down: a mob is generated
+relative to the PLAYER who picked the fight (never a fixed stat block), it pays about
+half an arena win because nobody is on the other side to lose anything, and each mob's
+gold/loot/ruby fields are multipliers on that halved purse rather than second economy.
+Зеркало души is the other half of the file: it lets a strong pet fight a weak one
+without the fight being a foregone conclusion or the reward being docked for it.
+
+Fixture copied from tests/test_pets.py (PetsTestCase, `_tame`) rather than imported, so
+this file's storage setup matches the rest of the suite exactly.
+"""
+
+import random
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import economy
+import pets
+import pets_combat
+import pets_config
+import pets_mobs
+
+
+class PetsTestCase(unittest.TestCase):
+    """Base fixture: point stats._stats_dir (and therefore both economy's and pets'
+    storage) at a throwaway directory, the same way tests/test_pets.py does."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def _tame(self, entry, uid, name=None):
+        """Fund and walk one member all the way to a named pet."""
+        name = name or f"Питомец{uid}"
+        economy.grant(entry, uid, pets_config.CAGE_PRICE + pets_config.TAME_PRICE, "test")
+        ok, msg = pets.buy_cage(entry, uid, 0)
+        self.assertTrue(ok, msg)
+        ok, msg = pets.tame(entry, uid, 0, name, f"file{uid}", f"Owner{uid}")
+        self.assertTrue(ok, msg)
+
+
+class _NoJitter:
+    """A stand-in rng whose `.uniform` always lands dead centre -- isolates a formula
+    from the ± spread layered on top of it, the same way pinning `random.uniform` to
+    0.0 would if the target function read from the `random` module directly."""
+
+    def uniform(self, low, high):
+        return 0.0
+
+
+class MobRollAndBlockTests(PetsTestCase):
+    def test_roll_mob_scales_to_the_callers_own_stats_and_returns_none_without_a_pet(self):
+        entry = "chat"
+        self.assertIsNone(pets.roll_mob(entry, "nobody"))
+
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"] = {"strength": 20, "health": 22, "agility": 24, "luck": 26}
+        pets._save(entry, data)
+        mine = pets.effective_stats(entry, "1")
+
+        block = pets.roll_mob(entry, "1", rng=random.Random(3))
+        self.assertIsNotNone(block)
+        self.assertIn(block["code"], {mob.code for mob in pets_mobs.MOBS})
+        self.assertIn(block["tier"], pets_mobs.TIERS)
+        scale, spread = pets_mobs.TIER_SCALING[block["tier"]]
+        for key in pets_config.STAT_KEYS:
+            lo = max(1, round(mine[key] * scale * (1 - spread)))
+            hi = round(mine[key] * scale * (1 + spread))
+            self.assertGreaterEqual(block["stats"][key], lo)
+            self.assertLessEqual(block["stats"][key], hi)
+        self.assertEqual(block["level"], pets.get_pet(entry, "1")["level"])
+        self.assertEqual(block["power"], pets._power_from(block["stats"], mine["armor"]))
+
+    def test_each_tier_scales_the_players_stats_exactly_as_documented(self):
+        """The core of the feature, so this pins the actual numbers rather than just a
+        direction: with the jitter pinned to zero, easy is 20% below the player, medium
+        10% below, hard 15% above -- straight out of pets_mobs.TIER_SCALING."""
+        entry = "chat"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"] = {"strength": 40, "health": 50, "agility": 60, "luck": 70}
+        pets._save(entry, data)
+        mine = pets.effective_stats(entry, "1")
+        mob = pets_mobs.MOBS[0]
+
+        expected_scale = {"easy": 0.80, "medium": 0.90, "hard": 1.15}
+        for tier, scale in expected_scale.items():
+            self.assertEqual(pets_mobs.TIER_SCALING[tier][0], scale)
+            block = pets.mob_block(entry, "1", mob.code, tier, rng=_NoJitter())
+            for key in pets_config.STAT_KEYS:
+                self.assertEqual(
+                    block["stats"][key], max(1, round(mine[key] * scale)), (tier, key),
+                )
+
+    def test_mob_block_rebuilds_stats_from_code_and_tier_only(self):
+        """A client is handed a block and hands the code+tier back; this is what makes
+        that safe. Editing the stats -- or anything else -- in what it hands back must
+        not change what mob_block regenerates, because mob_block's signature never
+        accepts a stats argument at all: it always recomputes from the player's own
+        current numbers."""
+        entry = "chat"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"] = {"strength": 30, "health": 30, "agility": 30, "luck": 30}
+        pets._save(entry, data)
+        mine = pets.effective_stats(entry, "1")
+        mob = pets_mobs.MOBS[0]
+        scale = pets_mobs.TIER_SCALING["hard"][0]
+
+        shown = pets.mob_block(entry, "1", mob.code, "hard", rng=_NoJitter())
+        # A rogue client tries to hand back a weakened, higher-level forgery.
+        forged_stats = {key: 1 for key in pets_config.STAT_KEYS}
+        forged_level = 999
+
+        rebuilt = pets.mob_block(entry, "1", shown["code"], shown["tier"], rng=_NoJitter())
+        for key in pets_config.STAT_KEYS:
+            self.assertEqual(rebuilt["stats"][key], max(1, round(mine[key] * scale)))
+            self.assertNotEqual(rebuilt["stats"][key], forged_stats[key])
+        self.assertNotEqual(rebuilt["level"], forged_level)
+        self.assertEqual(rebuilt["level"], pets.get_pet(entry, "1")["level"])
+
+        # Two independent rebuilds of the same code+tier land in the identical band,
+        # regardless of anything else (a fresh rng here) passed alongside them.
+        again = pets.mob_block(entry, "1", mob.code, "hard", rng=random.Random(4))
+        for key in pets_config.STAT_KEYS:
+            lo = max(1, round(mine[key] * scale * 0.85))
+            hi = round(mine[key] * scale * 1.15)
+            self.assertLessEqual(lo, again["stats"][key])
+            self.assertLessEqual(again["stats"][key], hi)
+
+
+class MobFightBankAndRewardTests(PetsTestCase):
+    def test_mob_fights_spend_the_same_bank_a_duel_uses_and_refuse_when_its_empty(self):
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        now = datetime(2026, 8, 9, 9, 0)
+        self.assertEqual(pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY)
+
+        duel = SimpleNamespace(winner="1", loser="2", is_draw=False)
+        pets.record_fight(entry, "1", "2", duel, now.date(), now=now)
+        self.assertEqual(
+            pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY - 1,
+        )
+
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "medium", rng=random.Random(1))
+        loss = SimpleNamespace(winner=f"mob:{block['code']}", is_draw=False)
+        pets.record_mob_fight(entry, "1", block, loss, now=now)
+        self.assertEqual(
+            pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY - 2,
+        )
+
+        for _ in range(pets_config.BASE_FIGHT_BANK_CAPACITY - 2):
+            pets.record_mob_fight(entry, "1", block, loss, now=now)
+        self.assertEqual(pets.fights_left(entry, "1", now=now), 0)
+        with self.assertRaises(ValueError):
+            pets.record_mob_fight(entry, "1", block, loss, now=now)
+
+    def test_a_farming_pet_cannot_start_a_mob_fight(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        now = datetime(2026, 8, 9, 9, 0)
+        data = pets._load(entry)
+        data["pets"]["1"]["farm_run"] = {"ready_at": (now + timedelta(hours=1)).isoformat()}
+        pets._save(entry, data)
+
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "easy", rng=random.Random(1))
+        with self.assertRaises(ValueError):
+            pets.record_mob_fight(entry, "1", block, SimpleNamespace(winner="1"), now=now)
+        # The guard runs before the bank is touched.
+        self.assertEqual(pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY)
+
+    def test_a_win_pays_gold_and_xp_a_loss_pays_only_loss_xp_and_neither_touches_history(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        now = datetime(2026, 8, 9, 9, 0)
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "medium", rng=random.Random(1))
+
+        win = pets.record_mob_fight(
+            entry, "1", block, SimpleNamespace(winner="1", is_draw=False), now=now,
+        )
+        self.assertGreater(win["gold"], 0)
+        expected_win_xp = max(1, round(
+            pets_config.WIN_XP * pets_config.PVE_XP_SHARE * pets_mobs.TIER_REWARD["medium"]
+        ))
+        self.assertEqual(win["xp"], expected_win_xp)
+
+        loss = pets.record_mob_fight(
+            entry, "1", block, SimpleNamespace(winner=f"mob:{block['code']}", is_draw=False), now=now,
+        )
+        self.assertEqual(loss["gold"], 0)
+        self.assertEqual(loss["xp"], pets_config.LOSS_XP)
+
+        # A mob has no duel history to keep -- nothing was ever appended to data["fights"].
+        self.assertEqual(pets._load(entry)["fights"], [])
+
+    def test_mob_gold_matches_half_the_arena_purse_times_tier_and_the_mobs_own_purse(self):
+        """Every mob's gold multiplier is checked against the formula, not a table of
+        expected numbers, so this still passes if the roster or its prices change."""
+        entry = "chat"
+        self._tame(entry, "1")
+        now = datetime(2026, 8, 9, 9, 0)
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MAX):
+            for mob in pets_mobs.MOBS:
+                data = pets._load(entry)
+                # Refill the bank to exactly one fight before each mob, independent of
+                # cage/capacity bookkeeping -- this test is only about the payout formula.
+                data["pets"]["1"]["fight_bank"] = 1
+                data["pets"]["1"]["fight_bank_checkpoint"] = now.isoformat()
+                pets._save(entry, data)
+
+                block = pets.mob_block(entry, "1", mob.code, "medium", rng=random.Random(1))
+                outcome = pets.record_mob_fight(
+                    entry, "1", block, SimpleNamespace(winner="1", is_draw=False), now=now,
+                )
+                expected = max(1, round(
+                    pets_config.WIN_GOLD_MAX * pets_config.PVE_GOLD_SHARE
+                    * pets_mobs.TIER_REWARD["medium"] * mob.gold
+                ))
+                self.assertEqual(outcome["gold"], expected, mob.code)
+
+
+class RubyWalletTests(PetsTestCase):
+    def test_rubies_accumulate_never_go_negative_and_are_scoped_per_user_and_per_chat(self):
+        entry = "chat-a"
+        self.assertEqual(pets.ruby_balance(entry, "1"), 0)
+        self.assertEqual(pets.grant_rubies(entry, "1", 2), 2)
+        self.assertEqual(pets.grant_rubies(entry, "1", 3), 5)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 5)
+
+        # A non-positive grant changes nothing and never drives the balance negative.
+        self.assertEqual(pets.grant_rubies(entry, "1", -100), 5)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 5)
+
+        # A different user in the same chat has their own, untouched wallet.
+        self.assertEqual(pets.ruby_balance(entry, "2"), 0)
+
+        # The same user id in a different chat is a completely different wallet.
+        self.assertEqual(pets.ruby_balance("chat-b", "1"), 0)
+        pets.grant_rubies("chat-b", "1", 1)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 5)
+        self.assertEqual(pets.ruby_balance("chat-b", "1"), 1)
+
+    def test_a_mob_win_can_drop_rubies_and_a_loss_never_does(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        now = datetime(2026, 8, 9, 9, 0)
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "hard", rng=random.Random(1))
+
+        with patch("random.random", return_value=0.0):
+            win = pets.record_mob_fight(
+                entry, "1", block, SimpleNamespace(winner="1", is_draw=False), now=now,
+            )
+        self.assertGreaterEqual(win["rubies"], pets_config.PVE_RUBY_MIN)
+        self.assertLessEqual(win["rubies"], pets_config.PVE_RUBY_MAX)
+        self.assertEqual(pets.ruby_balance(entry, "1"), win["rubies"])
+
+        with patch("random.random", return_value=0.0):
+            loss = pets.record_mob_fight(
+                entry, "1", block,
+                SimpleNamespace(winner=f"mob:{block['code']}", is_draw=False), now=now,
+            )
+        self.assertEqual(loss["rubies"], 0)
+        # Unchanged by the loss, even though the same forced-low roll would have hit.
+        self.assertEqual(pets.ruby_balance(entry, "1"), win["rubies"])
+
+    def test_a_farm_shift_can_drop_a_ruby_seeded_on_the_run_id_exactly_once(self):
+        """Seeded on the run id (like the rest of the payout) rather than rolled fresh,
+        so a settlement that runs twice for the same finished shift cannot mint rubies
+        twice -- see settle_completed_farms's own comment on why gold uses the same
+        trick with economy.grant_once."""
+        entry, start = "farm-ruby", datetime(2026, 8, 9, 9, 0)
+        self._tame(entry, "1")
+        economy.grant(entry, "1", pets_config.FARM_UPGRADE_COSTS[0], "test")
+        self.assertTrue(pets.upgrade_farm(entry, "1", 0, now=start)[0])
+        self.assertTrue(pets.start_farm(entry, "1", 6, now=start)[0])
+
+        data = pets._load(entry)
+        # This exact id was found offline to draw below FARM_RUBY_CHANCE, so the shift
+        # is guaranteed (not merely likely) to pay a ruby.
+        data["pets"]["1"]["farm_run"]["run_id"] = "run11"
+        pets._save(entry, data)
+
+        finish = start + timedelta(hours=6)
+        receipts = pets.settle_completed_farms(entry, now=finish)
+        self.assertEqual(len(receipts), 1)
+        self.assertGreater(receipts[0]["rubies"], 0)
+        self.assertEqual(pets.ruby_balance(entry, "1"), receipts[0]["rubies"])
+
+        # The run is already cleared, so settling again is a no-op: nothing further mints.
+        again = pets.settle_completed_farms(entry, now=finish + timedelta(hours=1))
+        self.assertEqual(again, [])
+        self.assertEqual(pets.ruby_balance(entry, "1"), receipts[0]["rubies"])
+
+
+class MirrorSoulCombatTests(unittest.TestCase):
+    """pets_combat._mirror is pure, so it is tested the same way the rest of
+    pets_combat is tested (see test_pets_combat.py): no storage, just Fighters."""
+
+    def _wearer(self, key, name, **stat_kwargs):
+        return pets_combat.Fighter(
+            key=key, name=name, effects=({"code": "mirror_soul", "value": 20},), **stat_kwargs,
+        )
+
+    def test_mirror_pulls_a_stronger_wearer_down_to_the_opponents_own_numbers(self):
+        """Zero jitter isolates "come down to their numbers" from "then shake them",
+        which is checked separately below."""
+        weak = pets_combat.Fighter(
+            key="weak", name="Weak", strength=10, health=12, agility=8, luck=6, armor=3,
+        )
+        strong = self._wearer(
+            "strong", "Strong", strength=80, health=70, agility=60, luck=50, armor=40,
+        )
+        mirrored = pets_combat._mirror(strong, weak, _NoJitter())
+        for stat in ("strength", "health", "agility", "luck"):
+            self.assertEqual(getattr(mirrored, stat), getattr(weak, stat))
+        self.assertEqual(mirrored.armor, min(strong.armor, weak.armor))
+
+    def test_mirror_jitter_stays_inside_plus_minus_twenty_percent_of_the_opponent(self):
+        weak = pets_combat.Fighter(
+            key="weak", name="Weak", strength=10, health=10, agility=10, luck=10, armor=0,
+        )
+        strong = self._wearer(
+            "strong", "Strong", strength=80, health=80, agility=80, luck=80, armor=0,
+        )
+        lo, hi = max(1, round(10 * 0.8)), round(10 * 1.2)
+        for seed in range(50):
+            mirrored = pets_combat._mirror(strong, weak, random.Random(seed))
+            for stat in ("strength", "health", "agility", "luck"):
+                value = getattr(mirrored, stat)
+                self.assertGreaterEqual(value, lo)
+                self.assertLessEqual(value, hi)
+
+    def test_mirror_never_upgrades_a_wearer_who_is_already_the_weaker_side(self):
+        """It only ever comes down. A fighter below the opponent on every stat (and
+        armour) must be handed back completely unchanged -- if this ever became an
+        upgrade instead of a no-op, wearing the amulet by mistake would be free power."""
+        strong_opponent = pets_combat.Fighter(
+            key="opp", name="Opp", strength=80, health=80, agility=80, luck=80, armor=40,
+        )
+        weak_wearer = self._wearer(
+            "weak", "Weak", strength=10, health=10, agility=10, luck=10, armor=3,
+        )
+        unaffected = pets_combat._mirror(weak_wearer, strong_opponent, random.Random(1))
+        self.assertEqual(unaffected, weak_wearer)
+
+    def test_a_mirrored_fight_still_replays_identically_from_the_same_seed(self):
+        """The jitter is drawn from the fight's OWN rng inside simulate(), not a side
+        channel -- if it were not, a stored seed would stop reproducing the fight that
+        was actually shown to the players the moment either side wore the mirror."""
+        weak = pets_combat.Fighter(
+            key="weak", name="Weak", strength=8, health=8, agility=8, luck=8, armor=0,
+        )
+        strong = self._wearer(
+            "strong", "Strong", strength=70, health=70, agility=70, luck=70, armor=20,
+        )
+        first = pets_combat.simulate(strong, weak, seed=2026)
+        second = pets_combat.simulate(strong, weak, seed=2026)
+        self.assertEqual(first, second)
+        self.assertGreater(len(first.rounds), 0)
+
+
+class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
+    def test_auto_equip_fires_only_for_the_level_gap_and_ownership_then_restore_undoes_it(self):
+        entry = "chat"
+        self._tame(entry, "attacker", "Attacker")
+        self._tame(entry, "defender", "Defender")
+        data = pets._load(entry)
+        data["pets"]["attacker"]["level"] = 6
+        data["pets"]["defender"]["level"] = 1  # gap of 5: exactly MIRROR_LEVEL_GAP
+        # A different amulet already worn, to prove restore_after_mirror puts it back.
+        data["pets"]["attacker"]["inventory"] = ["bead"]
+        data["pets"]["attacker"]["equipped"]["amulet"] = "bead"
+        pets._save(entry, data)
+
+        # The gap qualifies, but nothing is owned yet -- nothing is swapped.
+        self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
+        self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
+
+        data = pets._load(entry)
+        data["pets"]["attacker"]["inventory"].append(pets.MIRROR_AMULET_CODE)
+        pets._save(entry, data)
+
+        self.assertEqual(
+            pets.auto_equip_mirror(entry, "attacker", "defender"), pets.MIRROR_AMULET_CODE,
+        )
+        self.assertEqual(
+            pets.get_pet(entry, "attacker")["equipped"]["amulet"], pets.MIRROR_AMULET_CODE,
+        )
+
+        self.assertTrue(pets.restore_after_mirror(entry, "attacker"))
+        self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
+
+        # One level short of the gap: owning the amulet is no longer enough.
+        data = pets._load(entry)
+        data["pets"]["defender"]["level"] = 2  # gap of 4
+        pets._save(entry, data)
+        self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
+        self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
+
+    def test_winning_with_the_mirror_equipped_is_not_docked_by_the_level_multiplier(self):
+        """«Награда за победу при этом не режется» -- the reward multiplier for a
+        lopsided win is clamped to 1.0 while wearing the mirror instead of being
+        replaced by whatever ARENA_LEVEL_REWARD_MULTIPLIERS would otherwise apply,
+        because the wearer already paid for the fair fight by giving up their stats."""
+        entry = "chat"
+        for uid in ("1", "2", "3", "4"):
+            self._tame(entry, uid, f"Pet{uid}")
+        data = pets._load(entry)
+        for winner_uid, loser_uid in (("1", "2"), ("3", "4")):
+            data["pets"][winner_uid]["level"] = 10
+            data["pets"][loser_uid]["level"] = 1
+        data["pets"]["3"]["inventory"].append(pets.MIRROR_AMULET_CODE)
+        data["pets"]["3"]["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
+        pets._save(entry, data)
+
+        multiplier = pets_config.arena_level_reward_multiplier(10, 1)
+        self.assertLess(multiplier, 1.0)  # confirms this matchup would normally be docked
+        pinned_roll = pets_config.WIN_GOLD_MAX
+        now = datetime(2026, 8, 9, 9, 0)
+
+        with patch("random.randint", return_value=pinned_roll):
+            without_mirror = pets.record_fight(
+                entry, "1", "2", SimpleNamespace(winner="1", loser="2", is_draw=False),
+                now.date(), now=now,
+            )
+            with_mirror = pets.record_fight(
+                entry, "3", "4", SimpleNamespace(winner="3", loser="4", is_draw=False),
+                now.date(), now=now,
+            )
+
+        self.assertEqual(without_mirror["gold"], round(pinned_roll * multiplier))
+        # Clamped to 1.0, not replaced by it -- the mirror removes the penalty, it does
+        # not also hand out the bonus a genuine upward win would earn.
+        self.assertEqual(with_mirror["gold"], pinned_roll)
+        self.assertGreater(with_mirror["gold"], without_mirror["gold"])
+
+
+if __name__ == "__main__":
+    unittest.main()
