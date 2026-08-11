@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 from html import escape
 
 import economy
+import casino
 import pets
 import pets_config as C
 import pets_updates
@@ -190,10 +191,8 @@ def main_view(
             {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
             {"text": "📬 Почта", "callback_data": callback_data(user_id, "mail")},
         ])
-        # Both placeholders for the same reason (see casino_view/quests_view): announced
-        # before they are built. Paired together rather than each getting the lone
-        # full-width row casino used to have alone -- two "soon" buttons side by side read
-        # as one coming-soon shelf, not as two half-finished features competing for space.
+        # Casino and quests are small optional activities, so they share one compact row
+        # instead of pushing the core pet controls below the fold.
         rows.append([
             {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
             {"text": "📜 Квесты", "callback_data": callback_data(user_id, "quests")},
@@ -307,18 +306,104 @@ def info_view(user_id) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 
-def casino_view(entry: str, user_id) -> tuple[str, dict]:
-    """A placeholder with a real button behind it, on purpose.
-
-    The button ships before the game does so the idea can be announced and reacted to
-    without a half-built gambling loop being live in a chat where coins are already tight.
-    Nothing here reads or writes the ledger.
-    """
+def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
+    """The coin-only casino lobby."""
+    coins = pets.balance_for(entry, user_id, xp)
     lines = [
         "🎰 <b>Казино</b>\n",
-        "Казик строится, заходите позже.",
+        f"🪙 Монеты: <b>{_money(coins)}</b>",
+        "Победа возвращает удвоенную ставку. Играем только на монеты.",
+        "Выбери игру: покер, напёрстки или больше / меньше.",
     ]
-    return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+    rows = [
+        [
+            {"text": "🃏 Покер", "callback_data": callback_data(user_id, "cgame", "poker")},
+            {"text": "🥥 Напёрстки", "callback_data": callback_data(user_id, "cgame", "shell")},
+        ],
+        [{"text": "↕️ Больше / меньше", "callback_data": callback_data(user_id, "cgame", "highlow")}],
+        _back_row(user_id),
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+_CASINO_GAME_NAMES = {"poker": "🃏 Покер", "shell": "🥥 Напёрстки", "highlow": "↕️ Больше / меньше"}
+
+
+def casino_bet_view(entry: str, user_id, xp: int, game: str) -> tuple[str, dict]:
+    if game not in casino.GAMES:
+        return casino_view(entry, user_id, xp)
+    coins = pets.balance_for(entry, user_id, xp)
+    descriptions = {
+        "poker": "Три карты тебе, три дилеру. Пара сильнее старших карт.",
+        "shell": "После ставки выбери один из трёх напёрстков.",
+        "highlow": "Открыта 7. Угадай: следующая карта выше или ниже; 7 проигрывает.",
+    }
+    rows = [[
+        {"text": f"🪙 {stake}", "callback_data": callback_data(user_id, "cbet", f"{game}:{stake}")}
+        for stake in casino.BET_AMOUNTS
+    ], [
+        {"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")},
+    ]]
+    return (
+        f"{_CASINO_GAME_NAMES[game]}\n\n{descriptions[game]}\n"
+        f"🪙 У тебя: <b>{_money(coins)}</b>\nВыбери ставку:",
+        {"inline_keyboard": rows},
+    )
+
+
+def casino_shell_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, dict]:
+    coins = pets.balance_for(entry, user_id, xp)
+    rows = [[
+        {"text": f"🥥 {cup}", "callback_data": callback_data(user_id, "cshell", f"{stake}:{cup}")}
+        for cup in (1, 2, 3)
+    ], [{"text": "◀️ Ставки", "callback_data": callback_data(user_id, "cgame", "shell")}]]
+    return (
+        f"🥥 <b>Напёрстки</b>\n\nСтавка: {_money(stake)} · монет: {_money(coins)}\n"
+        "Где шарик? Выбери напёрсток.", {"inline_keyboard": rows},
+    )
+
+
+def casino_highlow_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, dict]:
+    coins = pets.balance_for(entry, user_id, xp)
+    rows = [[
+        {"text": "⬇️ Меньше", "callback_data": callback_data(user_id, "chighlow", f"{stake}:low")},
+        {"text": "⬆️ Больше", "callback_data": callback_data(user_id, "chighlow", f"{stake}:high")},
+    ], [{"text": "◀️ Ставки", "callback_data": callback_data(user_id, "cgame", "highlow")}]]
+    return (
+        f"↕️ <b>Больше / меньше</b>\n\nСтавка: {_money(stake)} · монет: {_money(coins)}\n"
+        "Открыта карта: <b>7</b>. Что будет дальше?", {"inline_keyboard": rows},
+    )
+
+
+def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str, dict]:
+    if not result.get("ok"):
+        stake = int(result.get("stake", 0) or 0)
+        return (
+            f"🎰 <b>Казино</b>\n\nНе хватает монет на ставку {_money(stake)}. "
+            f"У тебя: {_money(int(result.get('balance', 0) or 0))}.",
+            {"inline_keyboard": [[{"text": "◀️ К играм", "callback_data": callback_data(user_id, "casino")}]]},
+        )
+    game = str(result.get("game") or "")
+    lines = [f"{_CASINO_GAME_NAMES.get(game, '🎰 Казино')}", ""]
+    if game == "poker":
+        lines.append("Твои: " + " · ".join(result.get("player_cards") or []))
+        lines.append("Дилер: " + " · ".join(result.get("dealer_cards") or []))
+    elif game == "shell":
+        lines.append(f"Ты выбрал напёрсток {result.get('choice')}; шарик был под {result.get('ball')}.")
+    elif game == "highlow":
+        choice = "больше" if result.get("choice") == "high" else "меньше"
+        lines.append(f"Ты выбрал «{choice}». Выпала карта: <b>{result.get('card')}</b>.")
+    if result.get("won"):
+        lines.append(f"\n🎉 Победа! Получено {_money(int(result['payout']))}.")
+    elif result.get("draw"):
+        lines.append(f"\n🤝 Ничья — ставка {_money(int(result['payout']))} возвращена.")
+    else:
+        lines.append(f"\n💨 Не повезло: ставка {_money(int(result['stake']))} проиграна.")
+    lines.append(f"🪙 Осталось: <b>{_money(int(result['balance']))}</b>")
+    return "\n".join(lines), {"inline_keyboard": [[
+        {"text": "🔁 Ещё раз", "callback_data": callback_data(user_id, "cgame", game)},
+        {"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")},
+    ]]}
 
 
 # Telegram keyboards get unusable past a handful of full-width rows, and the shelf is 35

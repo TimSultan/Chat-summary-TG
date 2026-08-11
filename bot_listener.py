@@ -69,6 +69,7 @@ import arena_core
 import arena_web
 import cabinet
 import button_builder
+import casino
 import economy
 import history
 import pets
@@ -6514,6 +6515,43 @@ async def handle_pets_callback(
             )
             return
 
+        if action == "cgame":
+            await _send_pets_view(
+                api, chat_id, pets_ui.casino_bet_view(entry, user_id, xp, argument),
+                message_id=message_id, log=log,
+            )
+            return
+
+        if action == "cbet":
+            game, _, raw_stake = str(argument or "").partition(":")
+            stake = casino.valid_stake(raw_stake)
+            if stake is None or game not in casino.GAMES:
+                await _send_pets_view(api, chat_id, pets_ui.casino_view(entry, user_id, xp), message_id=message_id, log=log)
+                return
+            if game == "poker":
+                result = casino.play_poker(entry, user_id, xp, stake)
+                rendered = pets_ui.casino_result_view(entry, user_id, xp, result)
+            elif game == "shell":
+                rendered = pets_ui.casino_shell_view(entry, user_id, xp, stake)
+            else:
+                rendered = pets_ui.casino_highlow_view(entry, user_id, xp, stake)
+            await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
+            return
+
+        if action in {"cshell", "chighlow"}:
+            raw_stake, _, choice = str(argument or "").partition(":")
+            stake = casino.valid_stake(raw_stake)
+            result = (
+                casino.play_shell(entry, user_id, xp, stake, choice)
+                if action == "cshell"
+                else casino.play_highlow(entry, user_id, xp, stake, choice)
+            )
+            await _send_pets_view(
+                api, chat_id, pets_ui.casino_result_view(entry, user_id, xp, result),
+                message_id=message_id, log=log,
+            )
+            return
+
         # --- plain redraws -------------------------------------------------------------
         if action == "updates":
             # Opening the log, rather than merely seeing the menu button, acknowledges
@@ -6545,7 +6583,7 @@ async def handle_pets_callback(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),
             "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
-            "casino": lambda: pets_ui.casino_view(entry, user_id),
+            "casino": lambda: pets_ui.casino_view(entry, user_id, xp),
             "quests": lambda: pets_ui.quests_view(
                 entry, user_id, "real" if argument == "real" else "paint",
             ),

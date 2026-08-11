@@ -247,6 +247,33 @@ def grant(entry: str, user_id, amount: int, reason: str) -> None:
     _save(entry, data)
 
 
+def settle_wager(
+    entry: str, user_id, xp: int, stake: int, won: bool, reason: str,
+    *, draw: bool = False,
+) -> tuple[bool, int]:
+    """Settle one coin-only wager in one ledger write.
+
+    A win returns twice the stake (the staked coins plus the same amount in winnings).
+    A draw returns the stake unchanged. Keeping debit and payout in the same save means a
+    restart can never take a bet without paying a completed win.
+    """
+    if stake <= 0:
+        return False, balance(entry, user_id, xp)
+    data = _load(entry)
+    current = _balance_from(data, user_id, xp)
+    if current < stake:
+        return False, current
+    record = _record(data, user_id)
+    record["spent"] = record.get("spent", 0) + int(stake)
+    _append_log(data, user_id, -int(stake), f"wager:{reason}")
+    payout = int(stake) * (2 if won else 1 if draw else 0)
+    if payout:
+        record["bonus"] = record.get("bonus", 0) + payout
+        _append_log(data, user_id, payout, f"wager_payout:{reason}")
+    _save(entry, data)
+    return True, _balance_from(data, user_id, xp)
+
+
 # --- purchase effects -------------------------------------------------------------
 #
 # Effects live on the same per-user record as the totals so one atomic write covers both
