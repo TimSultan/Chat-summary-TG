@@ -90,6 +90,13 @@ FARM_DURATION_HOURS = 6
 FARM_MIN_HOURS = 1
 FARM_MAX_HOURS = 8
 FARM_HOUR_CHOICES = tuple(range(FARM_MIN_HOURS, FARM_MAX_HOURS + 1))
+# What a «Билет на ферму» leaves on the clock. A minute rather than nothing at all, so a
+# redeemed shift still finishes through the ordinary settlement path -- the poller pays it
+# exactly the way it pays every other run, under the same single grant key -- and so the
+# pet is visibly recalled rather than teleported home mid-animation. A minute specifically
+# because that is the farm-returns loop's own interval (bot_listener's _farm_returns_loop):
+# anything shorter would not arrive any sooner, it would only promise to.
+FARM_TICKET_SECONDS = 60
 # Index = hours. 6 h is the balance anchor at 1.00 so today's numbers are unchanged there;
 # shorter shifts pay slightly less per hour (less to supervise, less risk of the pet being
 # unavailable), longer shifts pay slightly more (tying up the pet -- and the arena-bank

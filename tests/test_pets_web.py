@@ -785,6 +785,51 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh.status, 200)
         self.assertNotEqual(await fresh.read(), await first.read())
 
+    # ---- the farm ticket ----------------------------------------------------------------
+
+    async def test_a_farm_ticket_ends_the_shift_in_a_minute_without_touching_the_payout(self):
+        """The ticket buys the waiting, not the work: the eight-hour reward has to survive
+        being collected eight hours early, or the button is just a worse «Забрать сейчас»."""
+        self._tame(PLAYER)
+        self.assertTrue(pets.upgrade_farm(CHAT, PLAYER["id"], RICH_XP)[0])
+        self.assertTrue(pets.start_farm(CHAT, PLAYER["id"], 8)[0])
+        pets.grant_farm_ticket(CHAT, PLAYER["id"], "figurine:1")
+
+        before = (await (await self._get("/api/state", PLAYER)).json())["farm"]
+        self.assertEqual(before["tickets"], 1)
+        self.assertTrue(before["can_ticket"])
+        expected = before["reward"]
+
+        answer = await self._action(PLAYER, "farm_ticket")
+        self.assertTrue(answer["ok"], answer)
+        farm = answer["state"]["farm"]
+        self.assertTrue(farm["running"])
+        self.assertLessEqual(farm["seconds_left"], C.FARM_TICKET_SECONDS)
+        self.assertEqual(farm["planned_hours"], 8)
+        self.assertEqual(farm["tickets"], 0)
+        self.assertFalse(farm["can_ticket"])
+        self.assertEqual(farm["reward"], expected)
+
+        # Spending the only ticket means the button is gone, not broken.
+        again = await self._action(PLAYER, "farm_ticket")
+        self.assertFalse(again["ok"])
+
+    async def test_the_farm_screen_only_offers_a_ticket_that_would_do_something(self):
+        self._tame(PLAYER)
+        self.assertTrue(pets.upgrade_farm(CHAT, PLAYER["id"], RICH_XP)[0])
+
+        # A ticket in hand but no shift running: nothing to shorten.
+        pets.grant_farm_ticket(CHAT, PLAYER["id"], "figurine:1")
+        idle = (await (await self._get("/api/state", PLAYER)).json())["farm"]
+        self.assertEqual(idle["tickets"], 1)
+        self.assertFalse(idle["can_ticket"])
+        self.assertFalse((await self._action(PLAYER, "farm_ticket"))["ok"])
+
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('data-do="farmticket"', page)
+        self.assertIn('else if (d.do === "farmticket") { await act("farm_ticket"); }', page)
+        self.assertIn("farm.can_ticket", page)
+
     # ---- replaying a recorded fight -----------------------------------------------------
 
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):

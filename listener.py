@@ -30,6 +30,7 @@ from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 import history
 import economy
+import pets
 import stats
 import tree
 from config import SUMMARY_COMMAND, build_session, load_config
@@ -1230,7 +1231,15 @@ async def run_listener(
                 economy.grant(
                     entry, msg.sender_id, economy.FIGURINE_COIN_REWARD, "figurine_painted",
                 )
-                log(f"[listener] figurine painted by {sender_display_name(sender)} in '{entry}' (today: {count})")
+                # A farm ticket per paint, keyed on the message id: a reconnect can replay
+                # an update, and record_figurine_live above already refuses to count the
+                # same message twice for exactly that reason.
+                ticketed = pets.grant_farm_ticket(entry, msg.sender_id, f"figurine:{msg.id}")
+                log(
+                    f"[listener] figurine painted by {sender_display_name(sender)} in "
+                    f"'{entry}' (today: {count}"
+                    + (", +1 farm ticket)" if ticketed else ", ticket already granted)")
+                )
                 if bot_takeover:
                     if figurine_ack_queue is not None:
                         await figurine_ack_queue.put((entry, msg.id))

@@ -64,8 +64,13 @@ FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
 
 _NAME_MAX_LEN = 24
+# How many recent grant keys a ticket wallet remembers, purely to swallow a replayed
+# listener update (see grant_farm_ticket). Seconds matter here, not weeks.
+FARM_TICKET_GRANT_MEMORY = 50
 # The poller and a button press can settle the same finished run in one process.  The
 # run id also keys the economy grant, so a process restart cannot mint a second payout.
+# It also guards the ticket wallet and the shift a ticket shortens, both of which are
+# read-modify-writes against a run this same lock is settling.
 _farm_settlement_lock = threading.RLock()
 
 
@@ -79,7 +84,7 @@ def _pets_path(entry: str):
 def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
-        "gift_history": [], "economy_metrics": _new_economy_metrics(),
+        "gift_history": [], "farm_tickets": {}, "economy_metrics": _new_economy_metrics(),
     }
 
 
@@ -112,6 +117,9 @@ def _load(entry: str) -> dict:
     data.setdefault("fights", [])
     data.setdefault("duels", {})
     data.setdefault("gift_history", [])
+    # A store written before tickets existed simply has none; nothing to migrate.
+    if not isinstance(data.setdefault("farm_tickets", {}), dict):
+        data["farm_tickets"] = {}
     _economy_metrics(data)
     # Older saves used an append-only list.  Accept their duplicates while reading,
     # then expose a canonical unique inventory to every game operation.
@@ -980,7 +988,12 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
-        return {"available": False, "level": 0, "running": False, "ready": False}
+        # Tickets are still reported: they are earned by painting, so somebody can hold
+        # several before they ever own a pet to spend them on.
+        return {
+            "available": False, "level": 0, "running": False, "ready": False,
+            "tickets": _ticket_row(data, user_id)["count"], "can_ticket": False,
+        }
     level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
     run = record.get("farm_run") if isinstance(record.get("farm_run"), dict) else None
     ready = bool(run) and _farm_run_ready(run, moment)
@@ -1054,6 +1067,15 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         "ready": ready,
         "can_start": level > 0 and not run,
         "can_cancel": bool(run) and not ready,
+        "tickets": _ticket_row(data, user_id)["count"],
+        # The button is offered only when it would actually do something: a ticket in hand,
+        # a shift running, and more than a minute of it left to cut.
+        "can_ticket": (
+            bool(run) and not ready
+            and _ticket_row(data, user_id)["count"] > 0
+            and seconds_left > C.FARM_TICKET_SECONDS
+        ),
+        "ticket_seconds": C.FARM_TICKET_SECONDS,
         "started_at": run.get("started_at") if run else None,
         "ready_at": ready_at,
         "seconds_left": seconds_left,
@@ -1121,6 +1143,96 @@ def start_farm(
     }
     _save(entry, data)
     return True, f"Питомец отправлен на ферму на {hours} ч."
+
+
+def farm_tickets(entry, user_id) -> int:
+    return _ticket_row(_load(entry), user_id)["count"]
+
+
+def _ticket_row(data: dict, user_id) -> dict:
+    """This player's ticket wallet, repaired in place.
+
+    Kept at the top level of the store rather than on the pet record, because a ticket is
+    earned by painting a figurine -- something a member can do long before they buy a cage,
+    and the reward for it must not quietly evaporate because they had no pet yet.
+    """
+    wallet = data.setdefault("farm_tickets", {})
+    if not isinstance(wallet, dict):
+        wallet = data["farm_tickets"] = {}
+    row = wallet.setdefault(str(user_id), {})
+    if not isinstance(row, dict):
+        row = wallet[str(user_id)] = {}
+    row["count"] = _safe_nonnegative_int(row.get("count"))
+    granted = row.get("granted")
+    row["granted"] = [str(key) for key in granted][-FARM_TICKET_GRANT_MEMORY:] if isinstance(granted, list) else []
+    return row
+
+
+def grant_farm_ticket(entry, user_id, reason: str = "") -> bool:
+    """Hand one farm ticket to a member. True if this call is what added it.
+
+    `reason` is an idempotency key, and the caller is expected to supply the identity of
+    the event being rewarded (a message id, for a #япокрасил post). Listener deliveries
+    are normally exactly once, but a reconnect can replay an update -- stats.
+    record_figurine_live already refuses to count the same message twice for exactly this
+    reason, and a ticket is worth considerably more than a figurine in the day's tally.
+
+    Only the last few keys are remembered: a replay arrives seconds later, not weeks, and
+    an unbounded list of every paint anybody has ever posted is a store that only grows.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        row = _ticket_row(data, user_id)
+        key = str(reason or "")
+        if key and key in row["granted"]:
+            return False
+        row["count"] += 1
+        if key:
+            row["granted"] = (row["granted"] + [key])[-FARM_TICKET_GRANT_MEMORY:]
+        _save(entry, data)
+        return True
+
+
+def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
+    """Spend a ticket to cut the running shift down to one minute.
+
+    Only `ready_at` moves. `hours` -- the field the payout is computed from, and the field
+    cancel_farm overwrites with the hours actually worked -- is deliberately left alone, so
+    an eight-hour shift redeemed at minute three still pays for eight hours. That IS the
+    ticket: it buys the waiting, not the work. Nothing is granted here either; the ordinary
+    settlement path pays the run a minute later, through the same single grant key it
+    always would have.
+    """
+    moment = now or app_now()
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        run = record.get("farm_run")
+        if not isinstance(run, dict):
+            return False, "Питомец сейчас не работает на ферме."
+        if _farm_run_ready(run, moment):
+            return False, "Смена уже закончилась — награда вот-вот придёт."
+        row = _ticket_row(data, user_id)
+        if row["count"] <= 0:
+            return False, "Билетов нет. Их дают за новый покрас."
+        ready_at = moment + timedelta(seconds=C.FARM_TICKET_SECONDS)
+        try:
+            # Refuse rather than burn a ticket on a shift that was about to end anyway --
+            # this can only ever move the finish line closer.
+            if datetime.fromisoformat(str(run.get("ready_at"))) <= ready_at:
+                return False, "Смена и так закончится раньше — билет не нужен."
+        except (TypeError, ValueError):
+            pass
+        row["count"] -= 1
+        run["ready_at"] = ready_at.isoformat()
+        _save(entry, data)
+    hours = _farm_run_hours(run)
+    return True, (
+        f"Билет использован: смена на {hours} ч закончится через минуту. "
+        f"Награду заплатят как за полные {hours} ч."
+    )
 
 
 def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:

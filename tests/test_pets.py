@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs
 
+import app_time
 import economy
 import pets
 import pets_config
@@ -2062,6 +2063,148 @@ class MailTests(PetsTestCase):
             if "callback_data" in button
         ]
         self.assertIn("history", fight_actions)
+
+
+class FarmTicketTests(PetsTestCase):
+    """A ticket buys the WAITING, not the work: it moves the finish line and nothing else,
+    so the payout has to come out of settlement exactly as if the pet had stayed."""
+
+    def _farming(self, entry="chat", uid="1", hours=8, start=None):
+        # Naive, like every other farm test here: the store round-trips whatever it is
+        # given, and FarmTests' own fixtures set the precedent.
+        start = start or datetime(2026, 8, 9, 9, 0)
+        self._tame(entry, uid)
+        economy.grant(entry, uid, pets_config.FARM_UPGRADE_COSTS[0], "test")
+        self.assertTrue(pets.upgrade_farm(entry, uid, 0, now=start)[0])
+        ok, note = pets.start_farm(entry, uid, hours, now=start)
+        self.assertTrue(ok, note)
+        return start
+
+    def test_a_ticket_ends_an_eight_hour_shift_in_a_minute_and_still_pays_for_eight(self):
+        entry = "chat"
+        start = self._farming(entry, "1", hours=8)
+        expected = pets.farm_status(entry, "1", now=start)["reward"]
+        self.assertGreater(expected["gold"], 0)
+
+        self.assertTrue(pets.grant_farm_ticket(entry, "1", "figurine:1"))
+        moment = start + timedelta(minutes=3)
+        ok, note = pets.use_farm_ticket(entry, "1", now=moment)
+        self.assertTrue(ok, note)
+        self.assertIn("8", note)
+
+        # Still farming for the last minute -- and therefore still unable to pick a fight.
+        self.assertTrue(pets.is_farming(entry, "1", now=moment))
+        status = pets.farm_status(entry, "1", now=moment)
+        self.assertEqual(status["seconds_left"], pets_config.FARM_TICKET_SECONDS)
+        self.assertEqual(status["planned_hours"], 8)
+        self.assertEqual(status["tickets"], 0)
+
+        settled = pets.settle_completed_farms(
+            entry, now=moment + timedelta(seconds=pets_config.FARM_TICKET_SECONDS))
+        self.assertEqual(len(settled), 1)
+        receipt = settled[0]
+        self.assertEqual(receipt["hours"], 8)
+        # The whole point: the same money the untouched shift was going to pay.
+        self.assertEqual(receipt["gold"], expected["gold"])
+        self.assertEqual(receipt["xp"], expected["xp"])
+        self.assertEqual(receipt["item_code"], expected["item_code"])
+
+    def test_a_ticket_is_not_cancel_farm(self):
+        """Cancelling three minutes into an eight-hour shift pays nothing, because nothing
+        whole was worked. A ticket at the same moment pays the full eight hours. If these
+        two ever converge, the ticket has silently become worthless."""
+        entry = "chat"
+        start = self._farming(entry, "1", hours=8)
+        moment = start + timedelta(minutes=3)
+
+        self.assertTrue(pets.grant_farm_ticket(entry, "1", "a"))
+        self.assertTrue(pets.use_farm_ticket(entry, "1", now=moment)[0])
+        ticketed = pets.settle_completed_farms(
+            entry, now=moment + timedelta(seconds=pets_config.FARM_TICKET_SECONDS))[0]
+
+        second_start = self._farming("other", "1", hours=8)
+        cancel_moment = second_start + timedelta(minutes=3)
+        self.assertTrue(pets.cancel_farm("other", "1", now=cancel_moment)[0])
+        cancelled = pets.get_pet("other", "1")["farm_notifications"][-1]
+
+        self.assertEqual(ticketed["hours"], 8)
+        self.assertEqual(cancelled["hours"], 0)
+        self.assertGreater(ticketed["gold"], cancelled["gold"])
+
+    def test_a_ticket_is_refused_when_it_would_buy_nothing(self):
+        entry = "chat"
+        start = self._farming(entry, "1", hours=1)
+        self.assertTrue(pets.grant_farm_ticket(entry, "1", "a"))
+
+        # Inside the last minute there is nothing left to cut, so the ticket is kept.
+        late = start + timedelta(hours=1) - timedelta(seconds=30)
+        ok, note = pets.use_farm_ticket(entry, "1", now=late)
+        self.assertFalse(ok, note)
+        self.assertEqual(pets.farm_tickets(entry, "1"), 1)
+        self.assertFalse(pets.farm_status(entry, "1", now=late)["can_ticket"])
+
+        # And with no shift running at all there is nothing to shorten either.
+        pets.settle_completed_farms(entry, now=start + timedelta(hours=2))
+        ok, note = pets.use_farm_ticket(entry, "1", now=start + timedelta(hours=2))
+        self.assertFalse(ok, note)
+        self.assertEqual(pets.farm_tickets(entry, "1"), 1)
+
+    def test_a_ticket_without_one_in_hand_is_refused_and_spends_nothing(self):
+        entry = "chat"
+        start = self._farming(entry, "1", hours=6)
+        ok, note = pets.use_farm_ticket(entry, "1", now=start + timedelta(minutes=1))
+        self.assertFalse(ok)
+        self.assertIn("покрас", note)
+        self.assertEqual(
+            pets.farm_status(entry, "1", now=start + timedelta(minutes=1))["seconds_left"],
+            int(timedelta(hours=6, minutes=-1).total_seconds()),
+        )
+
+    def test_a_replayed_paint_post_does_not_mint_a_second_ticket(self):
+        """Listener deliveries are normally exactly once, but a reconnect can replay an
+        update -- which is why record_figurine_live refuses to count the same message
+        twice, and why the ticket for it is keyed on the same message id."""
+        entry = "chat"
+        self.assertTrue(pets.grant_farm_ticket(entry, "7", "figurine:100"))
+        self.assertFalse(pets.grant_farm_ticket(entry, "7", "figurine:100"))
+        self.assertEqual(pets.farm_tickets(entry, "7"), 1)
+
+        self.assertTrue(pets.grant_farm_ticket(entry, "7", "figurine:101"))
+        self.assertEqual(pets.farm_tickets(entry, "7"), 2)
+        # Someone with no pet still banks them -- painting is what earns a ticket, and a
+        # cage bought next week must not cost them the ones they already have.
+        self.assertIsNone(pets.get_pet(entry, "7"))
+        self.assertEqual(pets.farm_status(entry, "7")["tickets"], 2)
+
+    def test_the_farm_screen_offers_the_button_only_while_it_would_work(self):
+        entry = "chat"
+        # farm_view takes no clock of its own, so this one has to run against the real
+        # one -- the shift must genuinely still be in progress as the screen renders.
+        self._farming(entry, "1", hours=8, start=app_time.now())
+        _text, keyboard = pets_ui.farm_view(entry, "1", 0)
+        actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+            if "callback_data" in button
+        ]
+        self.assertNotIn("farmticket", actions)   # nothing in the wallet yet
+
+        self.assertTrue(pets.grant_farm_ticket(entry, "1", "a"))
+        text, keyboard = pets_ui.farm_view(entry, "1", 0)
+        actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+            if "callback_data" in button
+        ]
+        self.assertIn("farmticket", actions)
+        # And the screen says what the button will do -- specifically that, unlike
+        # «Забрать сейчас» right below it, this one keeps the whole payout.
+        self.assertIn("🎟", text)
+        self.assertIn("билет", text)
+        self.assertIn("как за все 8 ч", text)
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("🎟 Билет: закончить смену (1)", labels)
+
 
 
 class FightLookupTests(PetsTestCase):

@@ -565,6 +565,13 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 f"✨ {int(reward.get('xp', 0) or 0)} опыта."
             )
         lines.append("Забрать раньше срока можно — но заплатит смена только за целые отработанные часы.")
+        if status.get("can_ticket"):
+            # The distinction that matters, and the one a player will not assume: unlike
+            # «Забрать сейчас», a ticket costs nothing off the payout.
+            lines.append(
+                f"🎟 Есть билет ({int(status.get('tickets', 0) or 0)} шт.) — смена закончится "
+                f"через минуту, а заплатят как за все {planned} ч."
+            )
     elif status.get("ready"):
         lines.append("\n✅ Смена закончилась. Награда уже едет в личные сообщения.")
     else:
@@ -621,6 +628,13 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 hour_row = []
         if hour_row:
             rows.append(hour_row)
+    if status.get("can_ticket"):
+        # Above «Забрать сейчас», because it is the better version of the same wish and
+        # the two are one tap apart -- somebody impatient should meet the free one first.
+        rows.append([{
+            "text": f"🎟 Билет: закончить смену ({int(status.get('tickets', 0) or 0)})",
+            "callback_data": callback_data(user_id, "farmticket"),
+        }])
     if status.get("can_cancel"):
         rows.append([{
             "text": "❌ Забрать сейчас",

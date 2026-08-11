@@ -6168,6 +6168,12 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action == "farmticket":
+            ok, note = pets.use_farm_ticket(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
         if action == "farmcancel":
             ok, note = pets.cancel_farm(entry, user_id)
             await _pets_toast_and_redraw(

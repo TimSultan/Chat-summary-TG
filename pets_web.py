@@ -794,6 +794,10 @@ def _action_farm_cancel(entry, user_id, xp, payload):
     return pets.cancel_farm(entry, user_id)
 
 
+def _action_farm_ticket(entry, user_id, xp, payload):
+    return pets.use_farm_ticket(entry, user_id)
+
+
 def _action_farm_upgrade(entry, user_id, xp, payload):
     return pets.upgrade_farm(entry, user_id, xp)
 
@@ -832,6 +836,7 @@ _ACTIONS = {
     "rename": _action_rename,
     "farm_start": _action_farm_start,
     "farm_cancel": _action_farm_cancel,
+    "farm_ticket": _action_farm_ticket,
     "farm_upgrade": _action_farm_upgrade,
     "farm_feature": _action_farm_feature,
     "daily_bonus": _action_daily_bonus,
@@ -2131,6 +2136,17 @@ function renderFarm() {
         Math.min(100, (done / total) * 100) + '%"></i></div>' +
       (farm.reward ? '<div class="small muted" style="margin-top:8px">Ожидается: 💰' +
         money(farm.reward.gold) + " · ✨" + money(farm.reward.xp) + "</div>" : "") +
+      // Above «Забрать сейчас» and in the accent colour, because the two buttons answer
+      // the same impatience and only one of them costs you the payout.
+      (farm.can_ticket
+        ? '<button class="go" style="margin-top:10px" data-do="farmticket">🎟 Билет · закончить смену (' +
+          (farm.tickets || 0) + ")</button>" +
+          "<div class='tiny muted' style='margin-top:6px;text-align:center'>Заплатят как за все " +
+          (farm.planned_hours || 0) + " ч</div>"
+        : (farm.tickets
+          ? "<div class='tiny muted' style='margin-top:8px;text-align:center'>🎟 Билетов: " +
+            farm.tickets + "</div>"
+          : "")) +
       '<button class="go sec" style="margin-top:10px" data-do="farmcancel">❌ Забрать сейчас</button></div>';
   } else if (farm.ready) {
     shift = '<div class="panel"><h2>Смена готова</h2>' +
@@ -2845,6 +2861,7 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "daily") { await act("daily_bonus"); }
   else if (d.do === "notify") { await act("notifications"); }
   else if (d.do === "farmup") { await act("farm_upgrade"); }
+  else if (d.do === "farmticket") { await act("farm_ticket"); }
   else if (d.do === "farmcancel") { await act("farm_cancel"); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }
