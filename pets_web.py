@@ -310,9 +310,14 @@ async def handle_portrait(request: web.Request) -> web.Response:
             f"[pets_web] portrait {raw}: fetched {len(data)} bytes -> "
             f"{cached.stat().st_size} on disk in {time.monotonic() - started:.1f}s"
         )
-    # Immutable: the name is a hash of the file id, so this exact URL can never point at
-    # different pixels. A changed photo is a changed file_id and therefore a changed URL.
-    return web.FileResponse(cached, headers={"Cache-Control": "public, max-age=604800"})
+    # The DISK path is a hash of the file id, but the URL is not -- it is keyed on the
+    # owner, so /img/pet/42.jpg does point at different pixels once 42 changes their
+    # photo. It was served as immutable for a week on the strength of the disk name,
+    # which meant a new portrait stayed invisible to everybody who had already loaded the
+    # old one. Short freshness plus revalidation instead: FileResponse answers a
+    # conditional request with a 304, so the usual case still costs no image bytes, and a
+    # replaced photo (a new file_id, hence a new file with a new mtime) shows up at once.
+    return web.FileResponse(cached, headers={"Cache-Control": "public, max-age=300"})
 
 
 def _normalise_photo(data: bytes) -> bytes | None:

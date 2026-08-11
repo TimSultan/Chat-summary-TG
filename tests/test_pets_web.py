@@ -739,6 +739,32 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("data-shoptab=", page)
         self.assertIn('if (d.shoptab) { closeSheet(); TAB = "shop";', page)
 
+    async def test_a_replaced_photo_is_not_hidden_behind_a_weeklong_cache(self):
+        """/img/pet/<id>.jpg is keyed on the OWNER, not on the file id -- so the same URL
+        really does point at different pixels once somebody changes their photo. It used
+        to be served as immutable for a week on the strength of the disk cache's name,
+        which is the one way a working upload still looks like nothing happened."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = _jpeg_bytes()
+
+        first = await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg")
+        self.assertEqual(first.status, 200)
+        self.assertIn("max-age=300", first.headers["Cache-Control"])
+        # Cheap when nothing changed: a conditional request costs a 304, not the image.
+        again = await self.client.get(
+            f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg",
+            headers={"If-Modified-Since": first.headers["Last-Modified"]},
+        )
+        self.assertEqual(again.status, 304)
+
+        # A new photo is a new file_id, so it lands in a different cache file and is
+        # served immediately rather than after the old URL's lifetime expires.
+        self._photos["file_id_2"] = _jpeg_bytes(size=(80, 80), colour=(20, 200, 40))
+        self.assertTrue(pets.set_photo(CHAT, PLAYER["id"], "file_id_2")[0])
+        fresh = await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg")
+        self.assertEqual(fresh.status, 200)
+        self.assertNotEqual(await fresh.read(), await first.read())
+
     # ---- the mailbox --------------------------------------------------------------------
 
     async def test_mail_returns_the_readers_own_feed_with_server_side_times(self):
