@@ -6310,7 +6310,7 @@ async def handle_pets_callback(
             )
             await _send_pets_view(
                 api, chat_id,
-                (pets_ui.mob_result_text(reward, report), pets_ui.fight_report_keyboard(user_id)),
+                (pets_ui.mob_result_text(reward, report), pets_ui.mob_result_keyboard(user_id)),
                 message_id=message_id, log=log,
             )
             return

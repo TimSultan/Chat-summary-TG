@@ -68,6 +68,12 @@ class MobRollAndBlockTests(PetsTestCase):
         callback = pets_ui.callback_data("123", "mobfight", "goblin:hard")
         self.assertEqual(pets_ui.parse_callback(callback), ("123", "mobfight", "goblin:hard"))
 
+    def test_mob_result_offers_another_mob_not_a_player_search(self):
+        keyboard = pets_ui.mob_result_keyboard("123")
+        button = keyboard["inline_keyboard"][0][0]
+        self.assertEqual(button["text"], "👾 Найти моба")
+        self.assertEqual(pets_ui.parse_callback(button["callback_data"]), ("123", "mob", ""))
+
     def test_roll_mob_scales_to_the_callers_own_stats_and_returns_none_without_a_pet(self):
         entry = "chat"
         self.assertIsNone(pets.roll_mob(entry, "nobody"))

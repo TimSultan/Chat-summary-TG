@@ -1591,6 +1591,14 @@ def mob_result_text(reward: dict, report: str) -> str:
     return "\n".join(lines)
 
 
+def mob_result_keyboard(user_id) -> dict:
+    """The next fight after PVE must stay in PVE, not fall into the player search."""
+    return {"inline_keyboard": [
+        [{"text": "👾 Найти моба", "callback_data": callback_data(user_id, "mob")}],
+        _back_row(user_id),
+    ]}
+
+
 def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]:
     """The found opponent, with Напасть as a separate tap. Searching and attacking are two
     steps because a banked fight is spent by attacking, not by looking -- a player who
