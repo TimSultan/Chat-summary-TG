@@ -4,13 +4,15 @@ Two kinds, both from pets_quest_catalog.py, both proved the same way -- post a p
 the chat with the quest's own hashtag (`#quest-nmm`), and a moderator accepts or rejects
 it from the Mini App. Only an accepted submission pays.
 
-  PAINTING CHALLENGES are DEALT. One per player per day, "paint one small thing in this
-  technique", and the reroll below is how you trade the one you were given.
+  PAINTING CHALLENGES -- one small thing painted in one named technique.
 
-  КВЕСТЫ В РЕАЛЕ are TAKEN. Tidy the bench, walk six kilometres, buy a loupe. They sit in
-  a list the player picks from and can hold several of at once, which is deliberate: a
-  second dealt slot would stand visibly empty on every day nobody had one. Adding a real
-  quest is a row in the catalogue and nothing else.
+  КВЕСТЫ В РЕАЛЕ -- tidy the bench, walk six kilometres, buy a loupe.
+
+Both are DEALT, one at a time, at random, into two independent slots that work
+identically: sticky until finished, two escalating rerolls each, same submission and
+review path. A real quest was briefly a browsable shelf instead; dealing it is better
+because a list of 35 is a menu to shop for the cheapest item on, while a slot is a thing
+you were given. Adding a real quest is still a row in the catalogue and nothing else.
 
 THREE RULES THAT SHAPE EVERYTHING HERE
 
@@ -68,20 +70,28 @@ DIFFICULTIES = catalog.DIFFICULTIES
 # What an accepted quest pays, by difficulty 1-5.
 #
 # Calibrated against what already exists rather than invented: a won arena fight pays
-# 15-30 gold and 100 pet XP, a six-hour farm shift pays 14-33 gold, the daily bonus tops
-# out at 100, and posting a #япокрасил pays 500 all by itself. A quest is a real evening
-# (or week) at the desk AND a moderator's time, so it sits above all of those -- but the
-# paint itself is still what earns the 500, and this is on top of it.
+# 15-30 gold and 100 pet XP, a six-hour farm shift pays 14-33, the daily bonus tops out
+# at 100, and posting a #япокрасил pays 500 all by itself.
 #
-# The drop chance is the outlier on purpose: an arena win rolls 15% and a farm shift 3%,
-# because those happen many times a day. A quest happens once, so it has to be worth
-# opening -- by difficulty 5 a find is likelier than not.
+# The top of this table used to be 900, which was wrong twice over. It put one accepted
+# quest at nearly two #япокрасил posts -- and the paint post is meant to be the thing
+# that actually pays, with a quest as the bonus on top of it. And it was priced when a
+# player could only hold ONE quest; there are two live slots now (a painting challenge
+# and a Квест в реале), so the same numbers would have quietly doubled the daily take.
+#
+# 450 at the top instead: below a single paint post, and both slots cleared in one day
+# by a lucky player still lands under it. The curve is compressed as well as lowered, so
+# the escalating reroll stays worth taking without the top rung being the only one worth
+# painting.
+#
+# The drop chance came down with it for the same reason: two quests a day at 75% was a
+# faster item stream than the arena's own 15% per win.
 REWARDS_BY_DIFFICULTY = {
-    1: {"gold": 150, "xp": 60,  "tickets": 1, "drop_chance": 0.20},
-    2: {"gold": 250, "xp": 100, "tickets": 1, "drop_chance": 0.30},
-    3: {"gold": 400, "xp": 160, "tickets": 1, "drop_chance": 0.42},
-    4: {"gold": 600, "xp": 240, "tickets": 1, "drop_chance": 0.58},
-    5: {"gold": 900, "xp": 360, "tickets": 1, "drop_chance": 0.75},
+    1: {"gold": 80,  "xp": 40,  "tickets": 1, "drop_chance": 0.12},
+    2: {"gold": 130, "xp": 70,  "tickets": 1, "drop_chance": 0.18},
+    3: {"gold": 200, "xp": 110, "tickets": 1, "drop_chance": 0.26},
+    4: {"gold": 300, "xp": 160, "tickets": 1, "drop_chance": 0.36},
+    5: {"gold": 450, "xp": 240, "tickets": 1, "drop_chance": 0.50},
 }
 REWARD_FIELDS = ("gold", "xp", "tickets", "drop_chance")
 # Ceilings for the admin editor. Not paranoia about moderators -- a mistyped 5000 in a
@@ -121,7 +131,8 @@ def _empty() -> dict:
         "submissions": [],     # newest last; a rolling audit of every photo sent in
         "history": [],         # newest last; one row per finished quest
         "rewards": {},         # difficulty -> partial override of REWARDS_BY_DIFFICULTY
-        "taken": {},           # user_id -> real quests they have picked up
+        "real_assignments": {},  # user_id -> the one live Квест в реале
+        "done": {},            # user_id -> {quest code: when it was last finished}
         "disabled": [],        # quest codes a moderator has taken out of rotation
     }
 
@@ -142,9 +153,12 @@ def _load(entry: str) -> dict:
     base["assignments"] = {
         str(uid): row for uid, row in base["assignments"].items() if isinstance(row, dict)
     }
-    base["taken"] = {
-        str(uid): [row for row in rows if isinstance(row, dict)]
-        for uid, rows in base["taken"].items() if isinstance(rows, list)
+    base["real_assignments"] = {
+        str(uid): row for uid, row in base["real_assignments"].items() if isinstance(row, dict)
+    }
+    base["done"] = {
+        str(uid): {str(code): str(when) for code, when in rows.items()}
+        for uid, rows in base["done"].items() if isinstance(rows, dict)
     }
     base["submissions"] = [row for row in base["submissions"] if isinstance(row, dict)]
     base["history"] = [row for row in base["history"] if isinstance(row, dict)]
@@ -241,12 +255,13 @@ def set_quest_enabled(entry: str, code: str, enabled: bool) -> tuple[bool, str]:
     return True, ("Квест снова в ротации." if enabled else "Квест убран из ротации.")
 
 
-def available_quests(entry: str, data: dict | None = None) -> tuple:
-    """Painting challenges still in rotation. Real quests are never dealt, only taken."""
+def available_quests(entry: str, data: dict | None = None, kind: str = "paint") -> tuple:
+    """Quests of one kind still in a moderator's rotation."""
     data = data if data is not None else _load(entry)
     disabled = set(data.get("disabled", []))
-    pool = tuple(quest for quest in catalog.PAINT_QUESTS if quest.code not in disabled)
-    return pool or catalog.PAINT_QUESTS
+    everything = catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
+    pool = tuple(quest for quest in everything if quest.code not in disabled)
+    return pool or everything
 
 
 # --- assignment -----------------------------------------------------------------------
@@ -262,23 +277,39 @@ def _quest_payload(entry: str, quest, data: dict) -> dict:
         "hint": quest.hint,
         "tool": quest.tool,
         "difficulty": quest.difficulty,
+        "kind": quest.kind,
+        # A painting challenge is always proved by a photo of the painted thing; a real
+        # quest is proved by something else entirely, and the card has to say which.
+        "proof": quest.proof,
+        "badge": quest.badge,
+        "cooldown_days": quest.cooldown_days,
         "reward": rewards_for(entry, quest.difficulty, data),
     }
 
 
-def _pick(entry: str, user_id, data: dict, exclude: set[str], difficulty: int | None = None):
-    """A random painting challenge this player is not already looking at.
+def _pick(
+    entry: str, user_id, data: dict, exclude: set[str], difficulty: int | None = None,
+    kind: str = "paint", moment: datetime | None = None,
+):
+    """A random quest of one kind that this player can actually be given right now.
 
-    Weighted by nothing: every technique in rotation is equally likely, and difficulty is
-    what the reward scales on rather than what the odds do. Falls back to the full pool if
-    the exclusions would empty it -- a player who has rerolled everything still gets a
-    quest rather than an error.
+    Weighted by nothing: every quest in rotation is equally likely, and difficulty is
+    what the reward scales on rather than what the odds do.
 
     `difficulty` pins the rung, which is what makes a reroll cost something (see reroll).
-    If a moderator has disabled every quest at that level, it widens rather than failing:
-    a harder quest than asked for is still a quest, an exception is a broken button.
+    If nothing is left at that level it widens upward rather than failing: a harder quest
+    than asked for is still a quest, an exception is a broken button.
+
+    Returns None only when the whole eligible pool is empty, which a painting challenge
+    can never be but a real quest can -- every real quest carries a cooldown, and somebody
+    who has cleared the board has to be told so rather than handed a repeat.
     """
-    pool = [quest for quest in available_quests(entry, data) if quest.code not in exclude]
+    moment = moment or app_now()
+    pool = [quest for quest in available_quests(entry, data, kind) if quest.code not in exclude]
+    if kind == "real":
+        # A cooldown is what keeps a real quest from being farmed. Applied at the DEAL
+        # now rather than at a shelf, so the slot simply never offers one that is resting.
+        pool = [quest for quest in pool if _is_offerable(quest, data, user_id, moment)]
     if difficulty is not None:
         at_level = [quest for quest in pool if quest.difficulty == difficulty]
         if at_level:
@@ -287,42 +318,78 @@ def _pick(entry: str, user_id, data: dict, exclude: set[str], difficulty: int | 
         if harder:
             return random.choice(harder)
     if not pool:
-        pool = list(available_quests(entry, data))
+        # Widening past the exclusion is safe for painting challenges (there are 60 and
+        # none of them expire), but never past a cooldown -- see above.
+        wider = [
+            quest for quest in available_quests(entry, data, kind)
+            if kind != "real" or _is_offerable(quest, data, user_id, moment)
+        ]
+        if not wider:
+            return None
+        pool = wider
     return random.choice(pool)
 
 
-def _live_assignment(data: dict, user_id) -> dict | None:
-    row = data.get("assignments", {}).get(str(user_id))
+def _is_offerable(quest, data: dict, user_id, moment: datetime) -> bool:
+    """Whether a real quest's cooldown has lapsed for this player."""
+    until = _cooldown_until(quest, data, user_id, moment)
+    if until is None:
+        return True
+    if until == "never":
+        return False
+    return moment >= until
+
+
+# One slot per kind, and both run through the SAME code below. A real quest used to be
+# taken off a browsable shelf; it is dealt now, exactly like a painting challenge -- one
+# at a time, at random, sticky until finished. With 35 of them and cooldowns measured in
+# weeks the slot effectively always has something to offer, which is what makes dealing
+# them safe where a browsable list was the earlier answer.
+SLOTS = {"paint": "assignments", "real": "real_assignments"}
+
+
+def _live_assignment(data: dict, user_id, kind: str = "paint") -> dict | None:
+    row = data.get(SLOTS[kind], {}).get(str(user_id))
     if not isinstance(row, dict) or row.get("status") == "done":
         return None
     return row if catalog.find_quest(row.get("code")) else None
 
 
-def daily_quest(entry: str, user_id, now: datetime | None = None) -> dict:
-    """This player's live quest, assigning one if they have none.
+def quest_slot(entry: str, user_id, kind: str = "paint", now: datetime | None = None) -> dict:
+    """This player's live quest of one kind, assigning one if they have none.
 
     Deliberately NOT "today's quest": an unfinished quest is never replaced, so somebody
     who takes four days over a hard technique keeps it for four days. The day stamp is
     only a rate limit on being handed a NEW one -- finish today's and the next arrives
     tomorrow, not immediately, which is what stops a fast painter from clearing the
     board in an afternoon.
+
+    The two kinds are independent slots: finishing the painting challenge does not touch
+    the real-life one, and neither waits on the other.
     """
     moment = now or app_now()
     today = moment.date().isoformat()
     with _lock:
         data = _load(entry)
-        live = _live_assignment(data, user_id)
+        live = _live_assignment(data, user_id, kind)
         if live is None:
-            last_done = data.get("assignments", {}).get(str(user_id)) or {}
+            last_done = data.get(SLOTS[kind], {}).get(str(user_id)) or {}
             if last_done.get("status") == "done" and str(last_done.get("finished_day")) == today:
                 # Finished one already today. Show it, and say when the next is due.
                 return {
-                    "quest": None, "status": "resting", "next_day": "завтра",
+                    "quest": None, "status": "resting", "next_day": "завтра", "kind": kind,
                     "rerolls_left": 0, "submission": None,
                     "last": _quest_payload(entry, catalog.find_quest(last_done["code"]), data)
                     if catalog.find_quest(last_done.get("code")) else None,
                 }
-            quest = _pick(entry, user_id, data, exclude=set())
+            quest = _pick(entry, user_id, data, exclude=set(), kind=kind, moment=moment)
+            if quest is None:
+                # Only reachable for real quests, and only for somebody who has cleared
+                # every one that is off cooldown. Says so rather than dealing a repeat.
+                return {
+                    "quest": None, "status": "exhausted", "kind": kind,
+                    "rerolls_left": 0, "submission": None, "last": None,
+                }
             live = {
                 "code": quest.code,
                 "day": today,
@@ -331,12 +398,13 @@ def daily_quest(entry: str, user_id, now: datetime | None = None) -> dict:
                 "status": "open",
                 "submission_id": None,
             }
-            data.setdefault("assignments", {})[str(user_id)] = live
+            data.setdefault(SLOTS[kind], {})[str(user_id)] = live
             _save(entry, data)
         quest = catalog.find_quest(live["code"])
         submission = _find_submission(data, live.get("submission_id"))
         return {
             "quest": _quest_payload(entry, quest, data),
+            "kind": kind,
             # Two of the four reward legs need a creature to land in (see _pay). Said
             # here, on the card, rather than discovered at payout: somebody deciding
             # whether to spend an evening on this deserves to know beforehand.
@@ -348,8 +416,20 @@ def daily_quest(entry: str, user_id, now: datetime | None = None) -> dict:
         }
 
 
-def reroll(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]:
-    """Swap the daily challenge for a HARDER one, twice per quest.
+def daily_quest(entry: str, user_id, now: datetime | None = None) -> dict:
+    """The painting challenge slot."""
+    return quest_slot(entry, user_id, "paint", now)
+
+
+def real_quest(entry: str, user_id, now: datetime | None = None) -> dict:
+    """The Квест в реале slot."""
+    return quest_slot(entry, user_id, "real", now)
+
+
+def reroll(
+    entry: str, user_id, now: datetime | None = None, kind: str = "paint",
+) -> tuple[bool, str]:
+    """Swap the live quest of one kind for a HARDER one, twice per quest.
 
     A reroll costs something. Without that it is just a free "spin until I get an easy
     one", and the reward table -- which pays by difficulty -- would be handing out the
@@ -363,7 +443,7 @@ def reroll(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]
     moment = now or app_now()
     with _lock:
         data = _load(entry)
-        live = _live_assignment(data, user_id)
+        live = _live_assignment(data, user_id, kind)
         if live is None:
             return False, "Сейчас нет активного квеста."
         if live.get("status") == "review":
@@ -373,7 +453,10 @@ def reroll(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]
             return False, "Реролов больше нет."
         current = catalog.find_quest(live["code"])
         harder = min(max(1, int(getattr(current, "difficulty", 1) or 1)) + 1, max(DIFFICULTIES))
-        quest = _pick(entry, user_id, data, exclude={live["code"]}, difficulty=harder)
+        quest = _pick(entry, user_id, data, exclude={live["code"]},
+                      difficulty=harder, kind=kind, moment=moment)
+        if quest is None:
+            return False, "Больше нечего предложить — все квесты этого вида на отдыхе."
         live["code"] = quest.code
         live["rerolls_used"] = used + 1
         live["assigned_at"] = moment.isoformat()
@@ -419,25 +502,25 @@ def _moment_like(value, reference: datetime) -> datetime | None:
     return moment
 
 
-def _taken_rows(data: dict, user_id) -> list[dict]:
-    rows = data.setdefault("taken", {})
-    if not isinstance(rows, dict):
-        rows = data["taken"] = {}
-    mine = rows.setdefault(str(user_id), [])
-    if not isinstance(mine, list):
-        mine = rows[str(user_id)] = []
-    return [row for row in mine if isinstance(row, dict)]
+def _done_map(data: dict, user_id) -> dict:
+    """code -> when this player last finished it.
 
-
-def _live_taken(data: dict, user_id, code: str) -> dict | None:
-    for row in _taken_rows(data, user_id):
-        if row.get("code") == code and row.get("status") in ("open", "review"):
-            return row
-    return None
+    A compact per-user map rather than a scan of `history`: history is capped chat-wide
+    (HISTORY_LIMIT), and a once-ever quest whose completion had scrolled off the end of
+    it would quietly become available again. At most one row per quest per player, so it
+    stays small no matter how long somebody plays.
+    """
+    done = data.setdefault("done", {})
+    if not isinstance(done, dict):
+        done = data["done"] = {}
+    mine = done.setdefault(str(user_id), {})
+    if not isinstance(mine, dict):
+        mine = done[str(user_id)] = {}
+    return mine
 
 
 def _cooldown_until(quest, data: dict, user_id, reference: datetime) -> datetime | str | None:
-    """When this player may take `quest` again.
+    """When this player may be dealt `quest` again.
 
     None means now, "never" means it is a once-ever quest already done, and a datetime is
     the moment the cooldown lifts. A cooldown of 0 IS once-ever: buying a loupe cannot be
@@ -445,96 +528,16 @@ def _cooldown_until(quest, data: dict, user_id, reference: datetime) -> datetime
 
     Counted from THIS PLAYER'S own completion, which is also what spreads a fortnightly
     quest across the chat instead of handing it to everybody on the 1st and the 15th:
-    finish on the 3rd and it returns on the 17th, finish on the 9th and it returns on the
-    23rd. No separate staggering machinery, and -- more importantly -- one source of
-    truth, so the list and `take_quest` can never disagree about whether it is available.
+    finish on the 3rd and it comes back on the 17th, finish on the 9th and it comes back
+    on the 23rd. No separate staggering machinery, and only one source of truth, so the
+    deal and the reroll can never disagree about what is offerable.
     """
-    finished = [
-        row for row in _taken_rows(data, user_id)
-        if row.get("code") == quest.code and row.get("status") == "done"
-    ]
-    if not finished:
+    finished = _moment_like(_done_map(data, user_id).get(quest.code), reference)
+    if finished is None:
         return None
     if quest.cooldown_days <= 0:
         return "never"
-    stamps = [_moment_like(row.get("finished_at"), reference) for row in finished]
-    last = max((stamp for stamp in stamps if stamp is not None), default=None)
-    return last + timedelta(days=quest.cooldown_days) if last else None
-
-
-def real_quests(entry: str, user_id, now: datetime | None = None) -> list[dict]:
-    """The shelf: every real quest, with whether this player can take it right now."""
-    moment = now or app_now()
-    data = _load(entry)
-    disabled = set(data.get("disabled", []))
-    rows = []
-    for quest in catalog.REAL_QUESTS:
-        if quest.code in disabled:
-            continue
-        taken = _live_taken(data, user_id, quest.code)
-        until = _cooldown_until(quest, data, user_id, moment)
-        available, reason = True, ""
-        if taken is not None:
-            available, reason = False, ("на проверке" if taken.get("status") == "review" else "взят")
-        elif until == "never":
-            available, reason = False, "уже сдан"
-        elif isinstance(until, datetime) and moment < until:
-            available, reason = False, f"снова с {until.date().isoformat()}"
-        rows.append({
-            **_quest_payload(entry, quest, data),
-            "proof": quest.proof,
-            "badge": quest.badge,
-            "cooldown_days": quest.cooldown_days,
-            "available": available,
-            "reason": reason,
-            "status": (taken or {}).get("status", ""),
-        })
-    rows.sort(key=lambda row: (not row["available"], row["difficulty"]))
-    return rows
-
-
-def take_quest(entry: str, user_id, code: str, now: datetime | None = None) -> tuple[bool, str]:
-    """Put one real quest on this player's list. Painting challenges are not takeable."""
-    moment = now or app_now()
-    quest = catalog.find_quest(code)
-    if quest is None or quest.kind != "real":
-        return False, "Такого квеста в реале нет."
-    with _lock:
-        data = _load(entry)
-        if quest.code in set(data.get("disabled", [])):
-            return False, "Этот квест сейчас выключен."
-        if _live_taken(data, user_id, quest.code) is not None:
-            return False, "Этот квест уже взят."
-        until = _cooldown_until(quest, data, user_id, moment)
-        if until == "never":
-            return False, "Этот квест уже сдан — его проходят один раз."
-        if isinstance(until, datetime) and moment < until:
-            return False, f"Снова можно будет взять {until.date().isoformat()}."
-        data.setdefault("taken", {}).setdefault(str(user_id), []).append({
-            "code": quest.code,
-            "taken_at": moment.isoformat(),
-            "status": "open",
-            "submission_id": None,
-        })
-        _save(entry, data)
-    return True, f"Квест взят: «{quest.title}». Хештег — {catalog.hashtag(quest.code)}."
-
-
-def drop_quest(entry: str, user_id, code: str) -> tuple[bool, str]:
-    """Put a taken quest back on the shelf, as long as nothing is under review for it."""
-    with _lock:
-        data = _load(entry)
-        row = _live_taken(data, user_id, code)
-        if row is None:
-            return False, "Этот квест не взят."
-        if row.get("status") == "review":
-            return False, "Работа уже на проверке — дождись ответа."
-        data["taken"][str(user_id)] = [
-            other for other in _taken_rows(data, user_id) if other is not row
-        ]
-        _save(entry, data)
-    quest = catalog.find_quest(code)
-    return True, f"Квест отложен: «{quest.title if quest else code}»."
+    return finished + timedelta(days=quest.cooldown_days)
 
 
 def _find_submission(data: dict, submission_id) -> dict | None:
@@ -573,26 +576,19 @@ def submit(
         return False, "Такого квеста нет."
     with _lock:
         data = _load(entry)
-        # A real quest is proved against the row the player TOOK; a painting challenge
-        # against the one slot they were dealt. Either way the hashtag has to match
-        # something they actually hold -- otherwise the tag alone would be the whole game.
-        if quest.kind == "real":
-            live = _live_taken(data, user_id, quest.code)
-            if live is None:
-                return False, (
-                    f"Этот квест не взят. Открой «Квесты в реале» и возьми "
-                    f"«{quest.title}»."
-                )
-        else:
-            live = _live_assignment(data, user_id)
-            if live is None:
-                return False, "У тебя нет активного квеста — открой «Квесты» в /arena."
-            if live["code"] != quest.code:
-                active = catalog.find_quest(live["code"])
-                return False, (
-                    f"Сейчас у тебя другой челлендж: «{active.title}». "
-                    f"Его хештег — {catalog.hashtag(active.code)}."
-                )
+        # Both kinds are proved against the slot they were DEALT into. The hashtag has to
+        # match a quest the player actually holds -- otherwise the tag alone would be the
+        # whole game, with the assignment reduced to a suggestion.
+        live = _live_assignment(data, user_id, quest.kind)
+        if live is None:
+            return False, "У тебя нет активного квеста — открой «Квесты» в /arena."
+        if live["code"] != quest.code:
+            active = catalog.find_quest(live["code"])
+            label = "челлендж" if quest.kind == "paint" else "квест в реале"
+            return False, (
+                f"Сейчас у тебя другой {label}: «{active.title}». "
+                f"Его хештег — {catalog.hashtag(active.code)}."
+            )
         if live.get("status") == "review":
             return False, "Работа по этому квесту уже на проверке."
         row = {
@@ -707,10 +703,7 @@ def review(
         row["reviewed_at"] = moment.isoformat()
         row["note"] = str(note or "")[:300]
 
-        live = (
-            _live_taken(data, row["user_id"], quest.code) if quest.kind == "real"
-            else data.get("assignments", {}).get(str(row["user_id"]))
-        )
+        live = data.get(SLOTS.get(quest.kind, "assignments"), {}).get(str(row["user_id"]))
         if accept:
             reward = rewards_for(entry, quest.difficulty, data)
             receipt = {
@@ -724,6 +717,10 @@ def review(
                 live["status"] = "done"
                 live["finished_day"] = moment.date().isoformat()
                 live["finished_at"] = moment.isoformat()
+            # The durable completion stamp a cooldown is measured from. Written for BOTH
+            # kinds -- only real quests have cooldowns today, but the slot above is
+            # overwritten by the next deal, so this is the only lasting record of it.
+            _done_map(data, row["user_id"])[quest.code] = moment.isoformat()
             data.setdefault("history", []).append({
                 "user_id": row["user_id"], "author_name": row.get("author_name", ""),
                 "code": quest.code, "difficulty": quest.difficulty,

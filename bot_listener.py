@@ -6212,17 +6212,12 @@ async def handle_pets_callback(
                 message_id=message_id, log=log,
             )
             return
-        if action == "questtake":
-            ok, note = quests.take_quest(entry, user_id, argument)
+        if action == "questreroll":
+            kind = "real" if argument == "real" else "paint"
+            ok, note = quests.reroll(entry, user_id, kind=kind)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.real_quests_view(entry, user_id), log,
-            )
-            return
-        if action == "questreroll":
-            ok, note = quests.reroll(entry, user_id)
-            await _pets_toast_and_redraw(
-                api, chat_id, message_id, note, pets_ui.quests_view(entry, user_id), log
+                pets_ui.quests_view(entry, user_id, kind), log,
             )
             return
         if action == "farmticket":
@@ -6421,7 +6416,6 @@ async def handle_pets_callback(
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
             "history": lambda: pets_ui.history_view(entry, user_id),
             "mail": lambda: pets_ui.mail_view(entry, user_id),
-            "realquests": lambda: pets_ui.real_quests_view(entry, user_id),
             "updates": lambda: pets_ui.updates_view(
                 entry, user_id, int(argument) if argument.isdigit() else 0,
             ),
@@ -6434,7 +6428,9 @@ async def handle_pets_callback(
             ),
             "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
             "casino": lambda: pets_ui.casino_view(entry, user_id),
-            "quests": lambda: pets_ui.quests_view(entry, user_id),
+            "quests": lambda: pets_ui.quests_view(
+                entry, user_id, "real" if argument == "real" else "paint",
+            ),
             "dailybonus": lambda: pets_ui.daily_bonus_view(entry, user_id, xp),
             "bagitems": lambda: pets_ui.bag_items_view(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),

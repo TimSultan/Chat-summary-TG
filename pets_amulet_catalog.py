@@ -152,9 +152,9 @@ _DATA: Final = (
 # 8% roll. source="shop" is all it takes to sit on the counter permanently -- only weapons
 # rotate (see pets_config.daily_storefront_weapons and pets_ui._buyable_here).
 #
-# Priced at 450: above every other accessory on the shelf (10-170) because it is utility
-# rather than stats, and roughly one accepted difficulty-3 quest or one #япокрасил, so it
-# is a real decision that a week of ordinary play can afford.
+# Priced at 250: above every other accessory on the shelf (10-170) because it is utility
+# rather than stats, but well inside a week of ordinary play -- an item whose whole job is
+# to make lopsided fights fair is worth little if the people who need it cannot buy it.
 _SHOP_DATA: Final = (
     ("amulet_soul_mirror", "Зеркало души",
      "Показывает тебя ровно таким, каков соперник.", "rare",
@@ -163,7 +163,7 @@ _SHOP_DATA: Final = (
          "Перед боем опускает все твои статы до уровня соперника и разбрасывает их "
          "на ±20%. Награда за победу при этом не режется.",
          20,
-     ), 90, 0, 450),
+     ), 50, 0, 250),
 )
 
 

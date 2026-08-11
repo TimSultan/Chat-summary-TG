@@ -312,7 +312,8 @@ class PetsCommandTests(unittest.TestCase):
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
-        self.assertEqual(actions, {"main", "questreroll", "realquests"})
+        # The two slots link to each other, so the paint card offers the real one.
+        self.assertEqual(actions, {"main", "questreroll", "quests"})
 
     def test_rerolling_from_the_menu_swaps_the_quest_and_runs_out(self):
         first = quests.daily_quest(CHAT, PLAYER["id"])["quest"]["code"]
@@ -328,7 +329,7 @@ class PetsCommandTests(unittest.TestCase):
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
-        self.assertEqual(actions, {"main", "realquests"})
+        self.assertEqual(actions, {"main", "quests"})
         api = self._tap("questreroll")
         self.assertIn("Реролов больше нет", api.edits[0]["text"])
         self.assertGreater(len(seen), 1)

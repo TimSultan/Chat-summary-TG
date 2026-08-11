@@ -1346,34 +1346,15 @@ def _quest_board_payload(entry: str, me: str) -> dict:
     return _jsonable({
         **quests.daily_quest(entry, me),
         "rerolls_total": quests.REROLLS_PER_QUEST,
-        # The shelf, always sent whole: real quests are listed rather than dealt, so
-        # there is no second slot to leave standing empty.
-        "real": quests.real_quests(entry, me),
+        # The second slot. Dealt exactly like the painting challenge, and rendered by
+        # the same card -- the two differ in what they ask for, not in how they work.
+        "real": quests.real_quest(entry, me),
         "stats": quests.stats_for(entry, me),
         "history": quests.history(entry, me, limit=20),
     })
 
 
-async def handle_quest_take(request: web.Request) -> web.Response:
-    """Take a real quest off the shelf, or put one back."""
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        body = {}
-    user, _xp = await _player(request, body)
-    entry = request.app[_ENTRY_KEY]
-    me = str(user["id"])
-    code = str(body.get("code") or "")
-    drop = bool(body.get("drop"))
-    ok, message = await asyncio.to_thread(
-        quests.drop_quest if drop else quests.take_quest, entry, me, code,
-    )
-    request.app[_LOG_KEY](
-        f"[pets_web] quest {'drop' if drop else 'take'} {me} {code}: "
-        f"{'ok' if ok else 'refused'} -- {message}"
-    )
-    return _ok({"ok": ok, "message": message,
-                "board": await asyncio.to_thread(_quest_board_payload, entry, me)})
+
 
 
 async def handle_quest_reroll(request: web.Request) -> web.Response:
@@ -1384,9 +1365,13 @@ async def handle_quest_reroll(request: web.Request) -> web.Response:
     user, _xp = await _player(request, body)
     entry = request.app[_ENTRY_KEY]
     me = str(user["id"])
-    ok, message = quests.reroll(entry, me)
-    request.app[_LOG_KEY](f"[pets_web] quest reroll {me}: {'ok' if ok else 'refused'} -- {message}")
-    return _ok({"ok": ok, "message": message, "board": _jsonable(quests.daily_quest(entry, me))})
+    kind = "real" if str(body.get("kind") or "") == "real" else "paint"
+    ok, message = quests.reroll(entry, me, kind=kind)
+    request.app[_LOG_KEY](
+        f"[pets_web] quest reroll {me} ({kind}): {'ok' if ok else 'refused'} -- {message}"
+    )
+    return _ok({"ok": ok, "message": message,
+                "board": await asyncio.to_thread(_quest_board_payload, entry, me)})
 
 
 async def handle_quest_review_queue(request: web.Request) -> web.Response:
@@ -1587,7 +1572,6 @@ def attach(
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
         web.post(prefix + "/api/quests/reroll", handle_quest_reroll),
-        web.post(prefix + "/api/quests/take", handle_quest_take),
         # Moderator-only, all three (see _quest_admin).
         web.get(prefix + "/api/quests/review", handle_quest_review_queue),
         web.post(prefix + "/api/quests/review", handle_quest_review),
@@ -1880,11 +1864,6 @@ PAGE_HTML = """<!doctype html>
      reroll climbs a difficulty, so it is a choice and not a free respin. */
   .warn-note { margin-top: 7px; font-size: 11px; line-height: 1.4; color: var(--gold);
                text-align: center; }
-  /* One row on the real-quest shelf. Separated by a card rather than a rule, because
-     each one is a decision (take it or not), not an item in a list you scan past. */
-  .realq { background: var(--sunken); border-radius: 11px; padding: 10px; margin-bottom: 8px; }
-  .realq.off { opacity: .5; }
-  .realq .qtag { margin-top: 7px; }
   .qbadge { flex: none; font-size: 10px; font-weight: 700; color: var(--r-legendary);
             border: 1px solid var(--r-legendary); border-radius: 999px; padding: 2px 8px;
             white-space: nowrap; align-self: flex-start; }
@@ -2719,75 +2698,62 @@ async function questCall(path, payload) {
   }
 }
 
+// One card, both slots. They are dealt the same way and submitted the same way, so the
+// only thing that differs here is the heading and what the quest asks you to photograph.
+function questCard(board, kind) {
+  const paint = kind === "paint";
+  const heading = paint ? "🎯 Челлендж дня · покрас" : "🌍 Квест в реале";
+  const quest = board && board.quest;
+  if (!quest) {
+    const message = (board && board.status) === "exhausted"
+      ? "Все квесты в реале пройдены — новые откроются, когда отдохнут старые."
+      : "На сегодня всё — сдано. Новый придёт завтра.";
+    return '<div class="panel"><h2>' + heading + "</h2><div class='empty'>" +
+      message + "</div></div>";
+  }
+  const reviewing = board.status === "review";
+  const asks = paint
+    ? "<p class='small' style='margin:10px 0 4px'><b>Что красим:</b> " + esc(quest.subject) + "</p>"
+    : "<p class='small' style='margin:10px 0 4px'><b>Что делаем:</b> " + esc(quest.subject) + "</p>";
+  return '<div class="panel"><h2>' + heading + "</h2>" +
+    '<div class="qtitle">' + esc(quest.title) + "</div>" +
+    '<div class="row spread tiny muted" style="margin-top:2px"><span>' +
+      pips(quest.difficulty) + " " + esc(DIFF_NAMES[quest.difficulty] || "") + "</span>" +
+      (paint ? "<span>" + esc(TOOL_NAMES[quest.tool] || quest.tool) + "</span>"
+             : (quest.badge ? "<span class='qbadge'>🧽 " + esc(quest.badge) + "</span>" : "")) +
+    "</div>" +
+    asks +
+    "<p class='small muted' style='margin:0 0 8px'>" + esc(quest.technique) + "</p>" +
+    "<p class='tiny muted' style='margin:0 0 10px'>💡 " + esc(quest.hint) + "</p>" +
+    '<div class="qreward">' + rewardLine(quest.reward) + "</div>" +
+    (board.has_pet === false
+      ? "<div class='tiny muted' style='margin-top:6px;text-align:center'>" +
+        "Опыт и находку начислить некуда — сначала приручи существо. " +
+        "Монеты и билет придут в любом случае.</div>"
+      : "") +
+    (reviewing
+      ? "<div class='qtag review'>Работа на проверке у модератора</div>"
+      : '<div class="qtag">' +
+        (paint ? "Выложи фото" : "Нужно: " + esc(quest.proof) + ". Выложи") +
+        " в чат с хештегом <b>" + esc(quest.hashtag) + "</b></div>") +
+    '<div class="row" style="margin-top:10px">' +
+      '<button class="go sec" data-quest="' + kind + '"' +
+        (board.rerolls_left && !reviewing ? "" : " disabled") + ">🎲 Реролл · " +
+        (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
+    "</div>" +
+    (board.rerolls_left && !reviewing
+      ? "<div class='warn-note'>⚠️ Реролл даёт квест на ступень сложнее" +
+        (quest.difficulty >= 5 ? " — но выше пятой ступени уже некуда, придёт другой такой же."
+                               : " — и награда тоже вырастет.") + "</div>"
+      : "") +
+    "</div>";
+}
+
 function questBoard(data) {
   const board = data || {};
-  const quest = board.quest;
   const done = (board.stats || {}).done || 0;
-  let head = '<div class="panel"><h2>🎯 Челлендж дня · покрас</h2>';
-  if (!quest) {
-    head += "<div class='empty'>На сегодня всё — челлендж уже сдан.<br>" +
-      "Новый придёт завтра.</div></div>";
-  } else {
-    const reviewing = board.status === "review";
-    head +=
-      '<div class="qtitle">' + esc(quest.title) + "</div>" +
-      '<div class="row spread tiny muted" style="margin-top:2px"><span>' +
-        pips(quest.difficulty) + " " + esc(DIFF_NAMES[quest.difficulty] || "") + "</span>" +
-        "<span>" + esc(TOOL_NAMES[quest.tool] || quest.tool) + "</span></div>" +
-      "<p class='small' style='margin:10px 0 4px'><b>Что красим:</b> " + esc(quest.subject) + "</p>" +
-      "<p class='small muted' style='margin:0 0 8px'>" + esc(quest.technique) + "</p>" +
-      "<p class='tiny muted' style='margin:0 0 10px'>💡 " + esc(quest.hint) + "</p>" +
-      '<div class="qreward">' + rewardLine(quest.reward) + "</div>" +
-      (board.has_pet === false
-        ? "<div class='tiny muted' style='margin-top:6px;text-align:center'>" +
-          "Опыт и находку начислить некуда — сначала приручи существо. " +
-          "Монеты и билет придут в любом случае.</div>"
-        : "") +
-      (reviewing
-        ? "<div class='qtag review'>Работа на проверке у модератора</div>"
-        : '<div class="qtag">Выложи фото в чат с хештегом <b>' + esc(quest.hashtag) + "</b></div>") +
-      '<div class="row" style="margin-top:10px">' +
-        '<button class="go sec" data-quest="reroll"' +
-          (board.rerolls_left && !reviewing ? "" : " disabled") + ">🎲 Реролл · " +
-          (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
-      "</div>" +
-      (board.rerolls_left && !reviewing
-        ? "<div class='warn-note'>⚠️ Реролл даёт челлендж на ступень сложнее" +
-          (quest.difficulty >= 5 ? " — но выше пятой ступени уже некуда, придёт другой такой же."
-                                 : " — и награда тоже вырастет.") + "</div>"
-        : "") +
-      "</div>";
-  }
-  // The shelf. Always drawn whole, never as a slot -- a real quest is taken, not dealt,
-  // so there is nothing here to stand empty on a day when nobody holds one.
-  const shelf = board.real || [];
-  head += '<div class="panel"><h2>🌍 Квесты в реале · ' + shelf.length + "</h2>" +
-    "<div class='tiny muted' style='margin-bottom:9px'>Бери сколько хочешь — они не " +
-    "занимают место челленджа дня.</div>" +
-    shelf.map((quest) => {
-      const held = quest.status === "open" || quest.status === "review";
-      return '<div class="realq' + (quest.available || held ? "" : " off") + '">' +
-        '<div class="row spread"><span class="small"><b>' + esc(quest.title) + "</b><br>" +
-          "<span class='tiny muted'>" + pips(quest.difficulty) + " · " +
-          esc(quest.proof) + "</span></span>" +
-        (quest.badge ? "<span class='qbadge'>🧽 " + esc(quest.badge) + "</span>" : "") +
-        "</div>" +
-        "<div class='tiny' style='margin-top:5px'>" + rewardLine(quest.reward) + "</div>" +
-        (held
-          ? '<div class="qtag' + (quest.status === "review" ? " review" : "") + '">' +
-            (quest.status === "review"
-              ? "На проверке"
-              : "Взят — выложи " + esc(quest.proof) + " с хештегом <b>" +
-                esc(quest.hashtag) + "</b>") + "</div>" +
-            (quest.status === "review" ? "" :
-              '<button class="go sec" style="margin-top:7px" data-questdrop="' +
-              esc(quest.code) + '">Отложить</button>')
-          : (quest.available
-            ? '<button class="go sec" style="margin-top:7px" data-questtake="' +
-              esc(quest.code) + '">Взять</button>'
-            : "<div class='tiny muted' style='margin-top:7px'>" + esc(quest.reason) + "</div>")) +
-        "</div>";
-    }).join("") + "</div>";
+  const head = questCard(board, "paint") +
+    questCard(board.real || {}, "real");
 
   const rows = board.history || [];
   return head +
@@ -3494,8 +3460,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questtake],[data-questdrop],[data-accept],[data-reject],[data-queston]," +
-    "[data-mob]");
+    "[data-quest],[data-accept],[data-reject],[data-queston],[data-mob]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3513,12 +3478,7 @@ document.addEventListener("click", async (event) => {
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "fight") { haptic(); await fightMob(); return; }
-  if (d.quest === "reroll") { await questCall("/api/quests/reroll", {}); return; }
-  if (d.questtake) { await questCall("/api/quests/take", { code: d.questtake }); return; }
-  if (d.questdrop) {
-    await questCall("/api/quests/take", { code: d.questdrop, drop: true });
-    return;
-  }
+  if (d.quest) { await questCall("/api/quests/reroll", { kind: d.quest }); return; }
   if (d.accept || d.reject) {
     // A verdict pays real coins, so it is the one moderator action that asks twice.
     const id = d.accept || d.reject;
