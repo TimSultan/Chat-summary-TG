@@ -6169,6 +6169,49 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action == "mob":
+            block = pets.roll_mob(entry, user_id)
+            await _send_pets_view(
+                api, chat_id, pets_ui.mob_view(entry, user_id, block),
+                message_id=message_id, log=log,
+            )
+            return
+        if action == "mobfight":
+            code, _, tier = str(argument or "").partition(":")
+            block = pets.mob_block(entry, user_id, code, tier)
+            if block is None:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.notice_view(user_id, "Этот моб уже ушёл."),
+                    message_id=message_id, log=log,
+                )
+                return
+            mine = pets.get_pet(entry, user_id)
+            hero = _pets_fighter(entry, user_id, mine)
+            enemy = pets.mob_fighter(block)
+            result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
+            try:
+                reward = pets.record_mob_fight(entry, user_id, block, result)
+            except ValueError as e:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.notice_view(user_id, str(e)),
+                    message_id=message_id, log=log,
+                )
+                return
+            report = pets_ui.fight_report(
+                result, str(user_id),
+                {str(user_id): mine.get("name"), enemy.key: block["name"]}, None,
+            )
+            log(
+                f"[pets] mob {user_id} vs {block['code']} ({block['tier']}): "
+                f"{'win' if reward['won'] else 'loss'}, gold {reward['gold']}, "
+                f"rubies {reward['rubies']}, drop {reward.get('dropped_item')}"
+            )
+            await _send_pets_view(
+                api, chat_id,
+                (pets_ui.mob_result_text(reward, report), pets_ui.fight_report_keyboard(user_id)),
+                message_id=message_id, log=log,
+            )
+            return
         if action == "questtake":
             ok, note = quests.take_quest(entry, user_id, argument)
             await _pets_toast_and_redraw(
@@ -6861,6 +6904,9 @@ async def _pets_run_fight(
         await redraw_empty_fight_bank()
         return
 
+    # Зеркало души, if this is a long punch downward -- before the fighters are built,
+    # because it changes the stats they are built from (see pets.auto_equip_mirror).
+    mirrored = pets.auto_equip_mirror(entry, user_id, opponent_id)
     attacker_fighter = _pets_fighter(entry, user_id, mine)
     defender_fighter = _pets_fighter(entry, opponent_id, theirs)
     seed = secrets.randbits(63)
@@ -6884,8 +6930,12 @@ async def _pets_run_fight(
     except ValueError:
         # record_fight is the authority on spending the bank, and a stale final tap
         # stays entirely in the attacker's private UI.
+        if mirrored:
+            pets.restore_after_mirror(entry, user_id)
         await redraw_empty_fight_bank()
         return
+    if mirrored:
+        pets.restore_after_mirror(entry, user_id)
     report = pets_ui.fight_report(
         result, str(user_id),
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},

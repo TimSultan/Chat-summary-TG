@@ -1,4 +1,9 @@
-"""Contract tests for the independent 30-amulet drop catalogue."""
+"""Contract tests for the amulet catalogue: 30 findable, plus whatever is sold.
+
+The two populations have opposite invariants and are asserted separately on purpose. A
+dropped amulet is free and has to be rollable; a shop amulet is bought and must stay OUT
+of the loot table, or the one thing anybody can buy would also be eating loot rolls.
+"""
 
 from dataclasses import FrozenInstanceError
 
@@ -7,14 +12,36 @@ import pytest
 import pets_amulet_catalog as catalogue
 
 
+def _dropped():
+    return [item for item in catalogue.AMULET_SPECS
+            if item.code not in catalogue.SHOP_AMULET_CODES]
+
+
+def _bought():
+    return [item for item in catalogue.AMULET_SPECS
+            if item.code in catalogue.SHOP_AMULET_CODES]
+
+
 def test_exactly_thirty_unique_drop_only_amulets():
-    assert catalogue.AMULET_COUNT == 30
-    assert len(catalogue.AMULET_SPECS) == 30
-    assert len({item.code for item in catalogue.AMULET_SPECS}) == 30
-    assert len({item.name for item in catalogue.AMULET_SPECS}) == 30
-    assert all(item.slot == "amulet" and item.source == "drop" and item.price == 0
-               for item in catalogue.AMULET_SPECS)
-    assert all(item.drop_weight > 0 for item in catalogue.AMULET_SPECS)
+    dropped = _dropped()
+    assert len(dropped) == 30
+    assert catalogue.AMULET_COUNT == 30 + len(catalogue.SHOP_AMULET_CODES)
+    assert len({item.code for item in catalogue.AMULET_SPECS}) == catalogue.AMULET_COUNT
+    assert len({item.name for item in catalogue.AMULET_SPECS}) == catalogue.AMULET_COUNT
+    assert all(item.slot == "amulet" for item in catalogue.AMULET_SPECS)
+    assert all(item.source == "drop" and item.price == 0 for item in dropped)
+    assert all(item.drop_weight > 0 for item in dropped)
+
+
+def test_a_shop_amulet_is_priced_and_never_rolls_as_loot():
+    bought = _bought()
+    assert bought, "the catalogue is expected to sell at least one amulet"
+    assert all(item.source == "shop" for item in bought)
+    assert all(item.price > 0 for item in bought)
+    # Weight zero is what keeps it out of every drop table -- a purchasable item that can
+    # also drop devalues both the purchase and the roll.
+    assert all(item.drop_weight == 0 for item in bought)
+    assert all(item.resale_price > 0 for item in bought)
 
 
 def test_each_amulet_has_one_machine_readable_unique_effect():
@@ -25,11 +52,11 @@ def test_each_amulet_has_one_machine_readable_unique_effect():
         assert isinstance(effect["text"], str) and effect["text"]
         assert isinstance(effect["value"], int)
         codes.append(effect["code"])
-    assert len(set(codes)) == 30
+    assert len(set(codes)) == catalogue.AMULET_COUNT
 
 
 def test_raw_records_extend_existing_item_shape_only_with_effect():
-    assert len(catalogue.RAW_ITEMS) == 30
+    assert len(catalogue.RAW_ITEMS) == catalogue.AMULET_COUNT
     assert all(set(record) == catalogue.RAW_ITEM_FIELDS for record in catalogue.RAW_ITEMS)
     assert all(set(record["bonuses"]).issubset(catalogue.STAT_KEYS) for record in catalogue.RAW_ITEMS)
     assert all(record["effect"]["code"] in catalogue.EFFECT_HOOKS for record in catalogue.RAW_ITEMS)
@@ -46,5 +73,8 @@ def test_specs_are_frozen_and_legacy_item_adapter_stays_compatible():
 
 
 def test_rarities_are_spread_and_copy_is_short():
-    assert catalogue.RARITY_COUNTS == {"common": 12, "uncommon": 10, "rare": 6, "legendary": 2}
-    assert all(len(item.name) <= 50 and len(item.description) <= 65 for item in catalogue.AMULET_SPECS)
+    dropped_rarities = {rarity: sum(item.rarity == rarity for item in _dropped())
+                        for rarity in catalogue.RARITIES}
+    assert dropped_rarities == {"common": 12, "uncommon": 10, "rare": 6, "legendary": 2}
+    assert all(len(item.name) <= 50 and len(item.description) <= 65
+               for item in catalogue.AMULET_SPECS)

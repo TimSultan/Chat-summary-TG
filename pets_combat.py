@@ -29,7 +29,7 @@ can be no more than that many blows from either side.
 
 import random
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pets_config as C
 import pets_flavor
@@ -105,7 +105,7 @@ _EFFECT_DEFAULTS = {
     "poison": 3, "thorns": 7, "second_wind": 18, "last_stand": 1,
     "dodge_heal": 7, "crit_guard": 30, "retaliation": 3, "regen": 4,
     "focused": 20, "momentum": 2, "gambler": 18, "safeguard": 35,
-    "giant_slayer": 18, "collector": 25, "survivor": 30,
+    "giant_slayer": 18, "collector": 25, "survivor": 30, "mirror_soul": 20,
 }
 
 _EFFECT_TEXT = {
@@ -187,6 +187,39 @@ def restore(data) -> "Fighter | None":
         ),
         level=_stored_number(data.get("level"), 1),
     )
+
+
+def _mirror(fighter: "Fighter", opponent: "Fighter", rng) -> "Fighter":
+    """Зеркало души: come down to the opponent's numbers, then shake them.
+
+    The point is a fair fight against somebody far below you. Each of the four stats is
+    set to the OPPONENT's value and then jittered by up to ±value% -- so the wearer is
+    roughly mirrored but never exactly, and the fight is a real one rather than a coin
+    flip between two identical sheets.
+
+    It only ever comes DOWN. Wearing it against somebody stronger would otherwise be a
+    free upgrade, which is the opposite of what it is for: this is the item that lets a
+    big pet pick on a small one without the arena having to punish anybody for it (the
+    reward side of that bargain lives in pets.record_fight).
+
+    Armour is mirrored too but never jittered upward past the opponent's, because armour
+    is the one stat with a hard cap in derive() and a lucky roll there would quietly undo
+    the whole point.
+    """
+    effect = _effect(_effect_specs(fighter), "mirror_soul")
+    if effect is None:
+        return fighter
+    spread = max(0.0, _fraction(effect.get("value", 20)))
+    mirrored = {}
+    for stat in _STATS:
+        mine, theirs = getattr(fighter, stat), getattr(opponent, stat)
+        if mine <= theirs:
+            mirrored[stat] = mine
+            continue
+        jitter = 1.0 + rng.uniform(-spread, spread)
+        mirrored[stat] = max(1, round(theirs * jitter))
+    armour = min(fighter.armor, opponent.armor)
+    return replace(fighter, armor=armour, **mirrored)
 
 
 def _effect_specs(fighter: "Fighter") -> tuple[dict, ...]:
@@ -389,6 +422,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     if rng is not None and seed is not None:
         raise ValueError("pass either rng or seed, not both")
     rng = random.Random(seed) if seed is not None else (rng or random)
+    # Зеркало души rewrites its wearer BEFORE anything is derived, because it changes the
+    # four numbers everything else is computed from. Rolled off this rng like every other
+    # decision here, so a stored seed still replays the fight exactly (see snapshot()).
+    a, b = _mirror(a, b, rng), _mirror(b, a, rng)
     derived = {a.key: derive(a, b), b.key: derive(b, a)}
     fighters = {a.key: a, b.key: b}
     hp = {a.key: derived[a.key]["max_hp"], b.key: derived[b.key]["max_hp"]}

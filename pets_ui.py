@@ -1445,15 +1445,82 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"\n<b>{ARENA_NO_FIGHTS_NOTICE}</b>")
         lines.append("Следующий бой появится после указанного выше отсчёта.")
 
+    rubies = pets.ruby_balance(entry, user_id)
+    if rubies:
+        lines.append(f"\n💎 Руби: {_money(rubies)}")
+
     rows = []
     if left > 0 and not farming:
         rows.append([{
             "text": "🔍 Найти соперника",
             "callback_data": callback_data(user_id, "search"),
         }])
+        # PVE next to PVP rather than on its own screen: they spend the same bank, so
+        # the choice between them belongs where that bank is shown.
+        rows.append([{
+            "text": "👾 Найти моба",
+            "callback_data": callback_data(user_id, "mob"),
+        }])
     rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def mob_view(entry: str, user_id, block: dict | None) -> tuple[str, dict]:
+    """One rolled mob, ready to be fought or re-rolled.
+
+    The block is passed IN rather than rolled here: this module renders, it does not
+    decide, and a view that rolled its own mob would deal a different one every time the
+    screen was redrawn.
+    """
+    if not block:
+        return notice_view(user_id, "Мобов сейчас нет. Попробуй ещё раз.")
+    stats_line = " · ".join(
+        f"{C.STAT_EMOJI.get(key, '')}{block['stats'].get(key, 0)}" for key in C.STAT_KEYS
+    )
+    lines = [
+        f"👾 <b>{escape(block['name'])}</b>",
+        f"<i>{escape(block['flavour'])}</i>\n",
+        f"Сложность: <b>{escape(block['tier_name'])}</b> · сила ⚡ {_money(block['power'])}",
+        stats_line + (f" · 🛡{block['armor']}" if block.get("armor") else ""),
+        # The taunt brings its own quotation marks where it wants them -- wrapping it in
+        # another pair rendered «« ... »» on every mob that already quotes itself.
+        f"\n<i>{escape(block['taunt'])}</i>",
+        "\nЗа моба платят меньше, чем за игрока, но бить его можно всегда — "
+        "и только с мобов падают 💎 руби.",
+    ]
+    rows = [
+        [{"text": "⚔️ В бой", "callback_data": callback_data(user_id, "mobfight",
+                                                              f"{block['code']}:{block['tier']}")}],
+        [{"text": "🔍 Другой моб", "callback_data": callback_data(user_id, "mob")}],
+        [{"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")}],
+        _back_row(user_id),
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def mob_result_text(reward: dict, report: str) -> str:
+    """What the chat is told after a PVE fight, on top of the ordinary battle report."""
+    mob = reward.get("mob") or {}
+    lines = [
+        f"👾 <b>{escape(mob.get('name') or 'Моб')}</b> · {escape(mob.get('tier_name') or '')}\n",
+        report,
+    ]
+    bits = []
+    if reward.get("gold"):
+        bits.append(f"🪙 +{_money(int(reward['gold']))}")
+    if reward.get("xp"):
+        bits.append(f"✨ +{_money(int(reward['xp']))}")
+    if reward.get("rubies"):
+        bits.append(f"💎 +{int(reward['rubies'])}")
+    if bits:
+        lines.append("\n" + " · ".join(bits))
+    if reward.get("dropped_name"):
+        worn = " (надето)" if reward.get("auto_equipped") else ""
+        lines.append(f"🎁 Находка: «{escape(str(reward['dropped_name']))}»{worn}")
+    if reward.get("levels_gained"):
+        lines.append(f"⬆️ Новый уровень: {reward.get('level')}")
+    return "\n".join(lines)
 
 
 def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]:

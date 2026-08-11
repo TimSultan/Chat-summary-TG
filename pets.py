@@ -36,7 +36,9 @@ import threading
 from datetime import date, datetime, timedelta
 
 import economy
+import pets_combat
 import pets_config as C
+import pets_mobs as M
 import stats
 from app_time import now as app_now
 
@@ -62,6 +64,9 @@ FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 # is what stops a player who sells their only weapon from being handed another on the next
 # restart, forever.
 STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
+# Зеркало души. Named here rather than looked up by effect code because two call sites
+# need the ITEM (equip it, check it is owned) and only combat needs the effect.
+MIRROR_AMULET_CODE = "amulet_soul_mirror"
 
 _NAME_MAX_LEN = 24
 # How many recent grant keys a ticket wallet remembers, purely to swallow a replayed
@@ -84,7 +89,8 @@ def _pets_path(entry: str):
 def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
-        "gift_history": [], "farm_tickets": {}, "economy_metrics": _new_economy_metrics(),
+        "gift_history": [], "farm_tickets": {}, "rubies": {},
+        "economy_metrics": _new_economy_metrics(),
     }
 
 
@@ -96,6 +102,9 @@ def _new_economy_metrics() -> dict:
         "farm_runs": 0,
         "item_sale_gold": 0,
         "gifts": 0,
+        "rubies_minted": 0,
+        "pve_gold_minted": 0,
+        "pve_fights": 0,
         "arena_reward_gold": 0,
         "drops_by_rarity": {
             rarity: 0 for rarity in ("cursed", "common", "uncommon", "rare", "legendary")
@@ -120,6 +129,8 @@ def _load(entry: str) -> dict:
     # A store written before tickets existed simply has none; nothing to migrate.
     if not isinstance(data.setdefault("farm_tickets", {}), dict):
         data["farm_tickets"] = {}
+    if not isinstance(data.setdefault("rubies", {}), dict):
+        data["rubies"] = {}
     _economy_metrics(data)
     # Older saves used an append-only list.  Accept their duplicates while reading,
     # then expose a canonical unique inventory to every game operation.
@@ -1145,6 +1156,40 @@ def start_farm(
     return True, f"Питомец отправлен на ферму на {hours} ч."
 
 
+def _ruby_row(data: dict) -> dict:
+    wallet = data.setdefault("rubies", {})
+    if not isinstance(wallet, dict):
+        wallet = data["rubies"] = {}
+    return wallet
+
+
+def ruby_balance(entry, user_id) -> int:
+    """How many Руби this member holds.
+
+    A second currency, deliberately NOT in economy.py: coins are the chat's ledger, shared
+    with /stat and /shop and earned by talking, while rubies come only off mobs and the
+    occasional farm shift. Keeping them apart means nothing that spends coins can ever
+    accidentally spend these, and the day rubies get a sink they can be priced on their
+    own supply rather than against a ledger they never entered.
+    """
+    return max(0, int(_ruby_row(_load(entry)).get(str(user_id), 0) or 0))
+
+
+def grant_rubies(entry, user_id, amount: int) -> int:
+    """Add rubies and return the new balance. Nothing spends them yet, by design."""
+    amount = max(0, int(amount or 0))
+    if not amount:
+        return ruby_balance(entry, user_id)
+    with _farm_settlement_lock:
+        data = _load(entry)
+        wallet = _ruby_row(data)
+        total = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
+        wallet[str(user_id)] = total
+        _metric_add(data, "rubies_minted", amount)
+        _save(entry, data)
+    return total
+
+
 def farm_tickets(entry, user_id) -> int:
     return _ticket_row(_load(entry), user_id)["count"]
 
@@ -1440,15 +1485,26 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
                 _metric_add(data, "drops_by_rarity", rarity=item.rarity)
             else:
                 item_code = None
+            # An occasional ruby off a shift. Seeded on the run id like the rest of the
+            # payout, so a retried settlement pays the same one rather than rolling again
+            # -- the same reproducibility contract _farm_reward documents.
+            ruby_rng = random.Random(f"{run_id}:ruby")
+            ruby = (
+                ruby_rng.randint(C.FARM_RUBY_MIN, C.FARM_RUBY_MAX)
+                if ruby_rng.random() < C.FARM_RUBY_CHANCE else 0
+            )
             receipt = _farm_receipt(
                 user_id, record, run_id, hours, moment, levels_gained, reward, item_code, auto_equipped,
             )
+            receipt["rubies"] = ruby
             record.setdefault("farm_notifications", []).append(receipt)
             record["farm_notifications"] = record["farm_notifications"][-50:]
             record["farm_run"] = None
             _metric_add(data, "farm_gold_minted", gold)
             _metric_add(data, "farm_runs")
             _save(entry, data)
+            if ruby:
+                grant_rubies(entry, user_id, ruby)
             receipts.append(dict(receipt))
     return receipts
 
@@ -2252,6 +2308,56 @@ def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None
     )
 
 
+def auto_equip_mirror(entry, attacker_id, defender_id) -> str | None:
+    """Put Зеркало души on before punching a long way down. Returns the code if it went on.
+
+    Commissioned as automatic, and it has to be: the whole item exists so a strong pet can
+    fight a weak one fairly, and an amulet you must remember to swap in beforehand would
+    be worn by the people who least need reminding. Anybody who owns it and attacks
+    somebody MIRROR_LEVEL_GAP or more levels below gets it equipped for them.
+
+    Whatever was in the amulet slot is remembered on the record and put back by
+    `restore_after_mirror` once the fight is recorded -- an automatic swap that silently
+    kept the player's real amulet off would be a bug that only shows up as lost fights
+    later. Nothing happens at all for a player who does not own the mirror.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        attacker = _tamed_record(data, attacker_id)
+        defender = _tamed_record(data, defender_id)
+        if attacker is None or defender is None:
+            return None
+        gap = int(defender.get("level", 1) or 1) - int(attacker.get("level", 1) or 1)
+        if gap > -C.MIRROR_LEVEL_GAP:
+            return None
+        if MIRROR_AMULET_CODE not in attacker.get("inventory", []):
+            return None
+        equipped = attacker.setdefault("equipped", {})
+        if equipped.get("amulet") == MIRROR_AMULET_CODE:
+            return None
+        attacker["mirror_restore"] = equipped.get("amulet")
+        equipped["amulet"] = MIRROR_AMULET_CODE
+        _save(entry, data)
+    return MIRROR_AMULET_CODE
+
+
+def restore_after_mirror(entry, user_id) -> bool:
+    """Put back whatever the automatic mirror swap displaced. True if something moved."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None or "mirror_restore" not in record:
+            return False
+        previous = record.pop("mirror_restore")
+        equipped = record.setdefault("equipped", {})
+        if equipped.get("amulet") == MIRROR_AMULET_CODE:
+            # Only if it is still ours to put back -- a player who changed their own
+            # amulet mid-fight gets to keep that choice.
+            equipped["amulet"] = previous if previous in record.get("inventory", []) else None
+        _save(entry, data)
+    return True
+
+
 def find_opponent(
     entry, user_id, rng=None, exclude_ids=None, attackable_only: bool = False,
 ) -> str | None:
@@ -2395,6 +2501,13 @@ def record_fight(
     reward_multiplier = C.arena_level_reward_multiplier(
         winner.get("level", 1), loser.get("level", 1)
     )
+    # Зеркало души: "не уменьшает добычу за победу". The wearer has already given up
+    # their stats to make the fight fair, so the arena stops docking them for the level
+    # gap as well -- that double penalty is the exact reason nobody punches downward.
+    # Clamped at 1.0 rather than replaced by it: the mirror removes a penalty, it does
+    # not also hand out the bonus for punching UP.
+    if _equipped_effect(winner, "mirror_soul"):
+        reward_multiplier = max(1.0, reward_multiplier)
     gold = round(
         random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
         * (1 + bonus_pct / 100)
@@ -2565,6 +2678,153 @@ def record_fight(
         "opponent_level": defender.get("level", 1),
         "opponent_dropped_item": dropped_code if not attacker_won else None,
         "opponent_auto_equipped": auto_equipped if not attacker_won else False,
+    }
+
+
+# --- PVE ------------------------------------------------------------------------------
+
+
+def roll_mob(entry, user_id, rng=None) -> dict | None:
+    """Deal one mob at one tier, scaled against THIS player. None without a pet.
+
+    Both the mob and its tier are drawn at random, as commissioned -- there is no picking
+    a soft target off a list. The stat block is generated from the seeker's own effective
+    stats (see pets_mobs.TIER_SCALING), so a mob is a real fight at level 3 and still a
+    real fight at level 40 instead of being outgrown.
+
+    Nothing is stored. The returned block is handed straight to `fight_mob`, which rolls
+    its own fresh one -- a mob a player could re-roll and then bank would be a mob they
+    could shop for.
+    """
+    rng = rng or secrets.SystemRandom()
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return None
+    mob = rng.choice(list(M.MOBS))
+    tier = rng.choice(list(M.TIERS))
+    return _mob_block(entry, user_id, record, mob, tier, rng)
+
+
+def mob_block(entry, user_id, code: str, tier: str, rng=None) -> dict | None:
+    """Rebuild a named mob at a named tier, server-side.
+
+    The client is handed a mob and hands one back; this is what makes that safe. Only the
+    CODE and the TIER survive the round trip -- every stat is generated here from the
+    player's own numbers, so a hand-edited block is just a request for a different fight,
+    not a request for an easier one.
+    """
+    rng = rng or secrets.SystemRandom()
+    mob = M.find_mob(code)
+    record = _tamed_record(_load(entry), user_id)
+    if mob is None or record is None or tier not in M.TIERS:
+        return None
+    return _mob_block(entry, user_id, record, mob, tier, rng)
+
+
+def _mob_block(entry, user_id, record: dict, mob, tier: str, rng) -> dict:
+    scale, spread = M.TIER_SCALING[tier]
+    mine = effective_stats(entry, user_id)
+    stats_out = {}
+    for key in C.STAT_KEYS:
+        jitter = 1.0 + rng.uniform(-spread, spread)
+        stats_out[key] = max(1, round(mine.get(key, 1) * scale * jitter))
+    return {
+        "code": mob.code, "name": mob.name, "flavour": mob.flavour, "taunt": mob.taunt,
+        "tier": tier, "tier_name": M.TIER_NAMES[tier],
+        "stats": stats_out,
+        # Armour scales too but is never jittered upward -- derive() caps it, and a lucky
+        # roll there turns a "20% weaker" mob into an unkillable one.
+        "armor": max(0, round(mine.get("armor", 0) * scale)),
+        "level": int(record.get("level", 1) or 1),
+        "power": _power_from(stats_out, mine.get("armor", 0)),
+    }
+
+
+def _power_from(stats: dict, armor: int) -> int:
+    """A mob's power on the SAME scale the leaderboard shows, so the two are comparable."""
+    return C.POWER_RATING_BASE + sum(
+        {**stats, "armor": armor}.get(key, 0) * C.POWER_RATING_WEIGHTS[key]
+        for key in (*C.STAT_KEYS, "armor")
+    )
+
+
+def mob_fighter(block: dict):
+    """The mob as a pets_combat.Fighter. Key is the mob code, which is never a user id."""
+    stats = block.get("stats") or {}
+    return pets_combat.Fighter(
+        key=f"mob:{block.get('code')}",
+        name=block.get("name") or "Моб",
+        strength=stats.get("strength", 1), health=stats.get("health", 1),
+        agility=stats.get("agility", 1), luck=stats.get("luck", 1),
+        armor=block.get("armor", 0),
+        effects=(), level=int(block.get("level", 1) or 1),
+    )
+
+
+def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None = None) -> dict:
+    """Bank a PVE result: spend the fight, pay the purse, roll loot and rubies.
+
+    Uses the SAME fight bank as a duel, as commissioned, so PVE is an alternative to the
+    arena rather than a second income running beside it. There is no defender: nobody
+    loses coins, nobody gains XP on the other side, and nothing is written to the duel
+    log -- a mob has no history to keep and no name to snapshot.
+    """
+    moment = now or app_now()
+    mob = M.find_mob(block.get("code"))
+    if mob is None:
+        raise ValueError("Такого моба нет.")
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            raise ValueError("Сначала приручи существо.")
+        if _is_farming_record(record, moment):
+            raise ValueError("Питомец на ферме и не может участвовать в бою.")
+        capacity, *_ = _fight_bank_components(entry, user_id, record, moment)
+        available, _checkpoint, _changed = _settle_fight_bank(record, capacity, moment)
+        if available <= 0:
+            raise ValueError("В запасе нет боёв.")
+        _spend_arena_fight(record, capacity, moment)
+        record["fights"] = record.get("fights", 0) + 1
+
+        won = str(result.winner or "") == str(user_id)
+        tier = block.get("tier", "medium")
+        gold = xp = 0
+        if won:
+            record["wins"] = record.get("wins", 0) + 1
+            # Half an arena purse before the mob's own multiplier -- see pets_mobs.
+            base = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX) * C.PVE_GOLD_SHARE
+            gold = max(1, round(base * M.TIER_REWARD[tier] * mob.gold))
+            xp = max(1, round(C.WIN_XP * C.PVE_XP_SHARE * M.TIER_REWARD[tier]))
+        else:
+            xp = C.LOSS_XP
+        _, levels_gained = _apply_xp(record, xp)
+        _metric_add(data, "pve_fights")
+        if gold:
+            _metric_add(data, "pve_gold_minted", gold)
+        _save(entry, data)
+
+    if gold:
+        economy.grant(entry, user_id, gold, "pet_mob_win")
+    dropped = None
+    ruby = 0
+    if won:
+        dropped = grant_random_drop(entry, user_id, C.PVE_DROP_CHANCE * mob.loot)
+        if random.random() < min(1.0, M.TIER_RUBY_CHANCE[tier] * mob.ruby):
+            ruby = random.randint(C.PVE_RUBY_MIN, C.PVE_RUBY_MAX)
+            grant_rubies(entry, user_id, ruby)
+    return {
+        "won": won, "draw": bool(getattr(result, "is_draw", False)),
+        "gold": gold, "xp": xp, "levels_gained": levels_gained,
+        "level": get_pet(entry, user_id).get("level", 1) if get_pet(entry, user_id) else 1,
+        "rubies": ruby, "ruby_total": ruby_balance(entry, user_id),
+        "dropped_item": dropped.get("code") if dropped else None,
+        "dropped_name": dropped.get("name") if dropped else None,
+        "dropped_rarity": dropped.get("rarity") if dropped else None,
+        "auto_equipped": bool(dropped.get("auto_equipped")) if dropped else False,
+        "mob": {"code": mob.code, "name": mob.name, "tier": tier,
+                "tier_name": M.TIER_NAMES[tier]},
+        "at": moment.isoformat(),
     }
 
 

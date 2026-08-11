@@ -16,6 +16,12 @@ import pets_weapon_catalog
 import stats
 
 
+# Shop items priced on utility rather than on stat bonuses. Enumerated here on purpose:
+# the pricing test below waives the power formula only for these exact codes, so a future
+# hand-added three-figure accessory still has to justify itself against the formula.
+UTILITY_SHOP_CODES = frozenset({"amulet_soul_mirror"})
+
+
 class PetsTestCase(unittest.TestCase):
     """Base fixture: point stats._stats_dir (and therefore both economy's and pets'
     storage) at a throwaway directory, the same way tests/test_economy.py does."""
@@ -725,12 +731,19 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(pet["equipped"]["weapon"], "w003")
 
     def test_new_drop_catalogues_are_integrated_into_all_three_equipment_slots(self):
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "amulet"]), 32)
+        # 30 dropped amulets + 2 starter shop ones + whatever utility amulets are sold.
+        self.assertEqual(
+            len([item for item in pets_config.ITEMS if item.slot == "amulet"]),
+            32 + len(UTILITY_SHOP_CODES),
+        )
         self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 32)
         self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 32)
+        # The three DROP catalogues. Matched on source as well as prefix: the amulet
+        # catalogue also sells a utility item now, and it shares the prefix without
+        # belonging to the loot table this counts.
         new_drops = [
             item for item in pets_config.ITEMS
-            if item.code.startswith(("amulet_", "bt", "gl"))
+            if item.code.startswith(("amulet_", "bt", "gl")) and item.source == "drop"
         ]
         self.assertEqual(len(new_drops), 90)
         self.assertTrue(all(item.source == "drop" and item.drop_weight > 0 for item in new_drops))
@@ -1081,9 +1094,18 @@ class StorefrontAndCollectionTests(PetsTestCase):
         shop_items = [item for item in pets_config.ITEMS if item.source == "shop"]
         self.assertTrue(shop_items)
         # 6 accessories (bead/acorn/mittens/claws/slippers/springs) plus the weapon
-        # catalogue's 375 shop weapons (250 common + 120 uncommon + 5 rare).
-        self.assertEqual(len(shop_items), 381)
+        # catalogue's 375 shop weapons (250 common + 120 uncommon + 5 rare), plus the
+        # utility items below.
+        self.assertEqual(len(shop_items), 381 + len(UTILITY_SHOP_CODES))
         for item in shop_items:
+            if item.code in UTILITY_SHOP_CODES:
+                # Priced on what it DOES, not on stats it does not have -- the formula
+                # would put a bonus-less item at the common floor of 10, which is not a
+                # price for an amulet that rewrites a matchup. Still bounded, and still
+                # listed by code above, so this stays a decision rather than a loophole.
+                self.assertEqual(item.bonuses, {}, f"{item.code} is not a utility item")
+                self.assertLessEqual(item.price, 1_000, f"{item.code} is priced off-scale")
+                continue
             expected = pets_weapon_catalog.shop_price_for_bonuses(item.rarity, item.bonuses.items())
             self.assertEqual(
                 item.price, expected,

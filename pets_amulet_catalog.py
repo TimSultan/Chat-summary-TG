@@ -63,6 +63,7 @@ EFFECT_HOOKS: Final = {
     "giant_slayer": "on_attack: deal more damage to a higher-level opponent",
     "collector": "fight_end_win: increase the chance that any item drops",
     "survivor": "fight_end_loss: retain a fraction of loss-gold only",
+    "mirror_soul": "fight_start: match the opponent's stats, then jitter each by value%",
 }
 
 
@@ -143,6 +144,29 @@ _DATA: Final = (
 )
 
 
+# The one amulet that is BOUGHT rather than found, and the only entry here with a price.
+#
+# Зеркало души is a deliberate exception to "amulets are drop-only": it exists so a strong
+# pet can pick on a weak one without the arena punishing either side for it, and a thing
+# that fixes a matchmaking problem has to be reliably obtainable rather than waiting on an
+# 8% roll. source="shop" is all it takes to sit on the counter permanently -- only weapons
+# rotate (see pets_config.daily_storefront_weapons and pets_ui._buyable_here).
+#
+# Priced at 450: above every other accessory on the shelf (10-170) because it is utility
+# rather than stats, and roughly one accepted difficulty-3 quest or one #япокрасил, so it
+# is a real decision that a week of ordinary play can afford.
+_SHOP_DATA: Final = (
+    ("amulet_soul_mirror", "Зеркало души",
+     "Показывает тебя ровно таким, каков соперник.", "rare",
+     {}, _effect(
+         "mirror_soul",
+         "Перед боем опускает все твои статы до уровня соперника и разбрасывает их "
+         "на ±20%. Награда за победу при этом не режется.",
+         20,
+     ), 90, 0, 450),
+)
+
+
 AMULET_SPECS: Final[tuple[AmuletSpec, ...]] = tuple(
     AmuletSpec(
         code=code, name=name, description=description, rarity=rarity,
@@ -150,25 +174,45 @@ AMULET_SPECS: Final[tuple[AmuletSpec, ...]] = tuple(
         drop_weight=weight,
     )
     for code, name, description, rarity, bonuses, effect, resale, weight in _DATA
+) + tuple(
+    AmuletSpec(
+        code=code, name=name, description=description, rarity=rarity,
+        bonuses=tuple(bonuses.items()), effect=effect, resale_price=resale,
+        drop_weight=weight, source="shop", price=price,
+    )
+    for code, name, description, rarity, bonuses, effect, resale, weight, price in _SHOP_DATA
 )
+SHOP_AMULET_CODES: Final = frozenset(code for code, *_rest in _SHOP_DATA)
 RAW_ITEMS: Final[tuple[dict[str, object], ...]] = tuple(item.raw_item() for item in AMULET_SPECS)
 AMULET_COUNT: Final = len(AMULET_SPECS)
 RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in AMULET_SPECS) for rarity in RARITIES}
 
 
 def _validate_catalogue() -> None:
-    assert AMULET_COUNT == 30
+    # 30 dropped plus however many are sold. Split rather than a single total, so adding
+    # a shop amulet cannot quietly shrink the loot table it is meant to sit outside of.
+    assert AMULET_COUNT == 30 + len(SHOP_AMULET_CODES)
+    assert len(_DATA) == 30
     assert len({item.code for item in AMULET_SPECS}) == AMULET_COUNT
     assert len({item.name for item in AMULET_SPECS}) == AMULET_COUNT
     assert len({item.effect_dict()["code"] for item in AMULET_SPECS}) == AMULET_COUNT
-    assert all(item.slot == "amulet" and item.source == "drop" and item.price == 0 for item in AMULET_SPECS)
-    assert all(item.drop_weight > 0 and item.resale_price > 0 for item in AMULET_SPECS)
+    assert all(item.slot == "amulet" for item in AMULET_SPECS)
+    # Two populations with opposite invariants. A dropped amulet is free and must be
+    # rollable (drop_weight > 0); a shop amulet is bought and must NOT be in the drop
+    # table, or the thing you can always buy would also be taking up loot rolls.
+    dropped = [item for item in AMULET_SPECS if item.code not in SHOP_AMULET_CODES]
+    bought = [item for item in AMULET_SPECS if item.code in SHOP_AMULET_CODES]
+    assert all(item.source == "drop" and item.price == 0 for item in dropped)
+    assert all(item.drop_weight > 0 for item in dropped)
+    assert all(item.source == "shop" and item.price > 0 for item in bought)
+    assert all(item.drop_weight == 0 for item in bought)
+    assert all(item.resale_price > 0 for item in AMULET_SPECS)
     assert all(item.rarity in RARITIES for item in AMULET_SPECS)
     assert all(item.effect_dict()["code"] in EFFECT_HOOKS for item in AMULET_SPECS)
     assert all(isinstance(item.effect_dict()["value"], int) for item in AMULET_SPECS)
     assert all(key in STAT_KEYS and isinstance(value, int) for item in AMULET_SPECS for key, value in item.bonuses)
     assert all(set(record) == RAW_ITEM_FIELDS for record in RAW_ITEMS)
-    assert RARITY_COUNTS == {"common": 12, "uncommon": 10, "rare": 6, "legendary": 2}
+    assert RARITY_COUNTS == {"common": 12, "uncommon": 10, "rare": 7, "legendary": 2}
 
 
 _validate_catalogue()
@@ -176,5 +220,5 @@ _validate_catalogue()
 
 __all__ = [
     "RARITIES", "STAT_KEYS", "RAW_ITEM_FIELDS", "EFFECT_HOOKS", "AmuletSpec",
-    "AMULET_SPECS", "RAW_ITEMS", "AMULET_COUNT", "RARITY_COUNTS",
+    "AMULET_SPECS", "RAW_ITEMS", "AMULET_COUNT", "RARITY_COUNTS", "SHOP_AMULET_CODES",
 ]

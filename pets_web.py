@@ -53,6 +53,7 @@ import economy
 import pets
 import pets_combat
 import pets_config as C
+import pets_mobs
 import pets_updates
 import quests
 import stats
@@ -685,6 +686,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["arena"] = pets.fight_allowance_breakdown(entry, user_id)
     state["arena"]["farming"] = pets.is_farming(entry, user_id)
     state["arena"]["pity"] = pets.legendary_pity_progress(entry, user_id)
+    state["rubies"] = pets.ruby_balance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
     state["farm"]["passive"] = pets.passive_income_status(entry, user_id)
     return state
@@ -1002,6 +1004,10 @@ async def handle_attack(request: web.Request) -> web.Response:
             level=int(record.get("level", 1)),
         )
 
+    # Зеркало души goes on BEFORE the fighters are built, or it would not be among the
+    # effects they carry. See pets.auto_equip_mirror: only fires on a big level gap, only
+    # for somebody who owns it, and is put back straight after the fight is recorded.
+    mirrored = pets.auto_equip_mirror(entry, me, opponent_id)
     attacker, defender = fighter(me, mine), fighter(opponent_id, theirs)
     seed = secrets.randbits(63)
     result = pets_combat.simulate(attacker, defender, seed=seed)
@@ -1024,10 +1030,13 @@ async def handle_attack(request: web.Request) -> web.Response:
         # refresh rather than showing a fight that did not count.
         return _json_error(str(e), status=409, code="CANNOT_FIGHT")
 
+    if mirrored:
+        pets.restore_after_mirror(entry, me)
     dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
     prefix = request.app[_PREFIX_KEY]
     request.app[_LOG_KEY](
-        f"[pets_web] fight {me} vs {opponent_id}: "
+        f"[pets_web] fight {me} vs {opponent_id}"
+        + (" (зеркало души)" if mirrored else "") + ": "
         f"{'draw' if result.is_draw else ('win' if result.winner == me else 'loss')}, "
         f"{len(result.rounds)} rounds, gold {reward.get('gold') or -reward.get('loss_gold', 0)}, "
         f"xp {reward.get('xp')}, drop {reward.get('dropped_item')}"
@@ -1153,6 +1162,80 @@ async def handle_replay(request: web.Request) -> web.Response:
             "auto_equipped": bool(fight.get("auto_equipped")) if won else False,
         },
         "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
+    })
+
+
+async def handle_mob(request: web.Request) -> web.Response:
+    """Deal one mob, scaled against this player. Nothing is stored -- see pets.roll_mob."""
+    user, _xp = await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    block = await asyncio.to_thread(pets.roll_mob, entry, str(user["id"]))
+    if block is None:
+        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+    return _ok({"mob": _jsonable(block)})
+
+
+async def handle_mob_attack(request: web.Request) -> web.Response:
+    """Fight a mob. Same bank, same simulator, same playback as a duel.
+
+    The mob block comes back from the client, but nothing in it is trusted: `roll_mob`
+    is called again server-side to rebuild the stats. Otherwise the block would be an
+    open invitation to post a mob with one hit point and full rewards.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, xp = await _player(request, body)
+    entry = request.app[_ENTRY_KEY]
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    me = str(user["id"])
+    mine = pets.get_pet(entry, me)
+    if mine is None:
+        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+
+    mob = pets_mobs.find_mob(str(body.get("code") or ""))
+    tier = str(body.get("tier") or "")
+    if mob is None or tier not in pets_mobs.TIERS:
+        return _json_error("Соперник больше не доступен.", status=409, code="NO_MOB")
+    # Re-rolled here, from the tier the client asked for and nothing else it sent.
+    block = pets.mob_block(entry, me, mob.code, tier)
+    if block is None:
+        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+
+    effective = pets.effective_stats(entry, me)
+    hero = pets_combat.Fighter(
+        key=me, name=mine.get("name") or "Существо",
+        strength=effective["strength"], health=effective["health"],
+        agility=effective["agility"], luck=effective["luck"],
+        armor=effective.get("armor", 0),
+        effects=pets.equipped_combat_effects(entry, me),
+        level=int(mine.get("level", 1)),
+    )
+    enemy = pets.mob_fighter(block)
+    seed = secrets.randbits(63)
+    result = pets_combat.simulate(hero, enemy, seed=seed)
+    try:
+        reward = await asyncio.to_thread(pets.record_mob_fight, entry, me, block, result)
+    except ValueError as e:
+        return _json_error(str(e), status=409, code="CANNOT_FIGHT")
+
+    dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
+    prefix = request.app[_PREFIX_KEY]
+    request.app[_LOG_KEY](
+        f"[pets_web] mob {me} vs {mob.code} ({tier}): "
+        f"{'win' if reward['won'] else 'loss'}, {len(result.rounds)} rounds, "
+        f"gold {reward['gold']}, xp {reward['xp']}, rubies {reward['rubies']}, "
+        f"drop {reward.get('dropped_item')}"
+    )
+    return _ok({
+        "ok": True,
+        **_playback_payload(result, me, hero, enemy.key, enemy, block["name"]),
+        "mob": _jsonable(block),
+        "reward": _jsonable(reward),
+        "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
+        "state": _state_payload(entry, me, xp, prefix),
     })
 
 
@@ -1495,6 +1578,8 @@ def attach(
         web.post(prefix + "/api/action", handle_action),
         web.get(prefix + "/api/opponents", handle_opponents),
         web.post(prefix + "/api/attack", handle_attack),
+        web.get(prefix + "/api/mob", handle_mob),
+        web.post(prefix + "/api/mob", handle_mob_attack),
         web.get(prefix + "/api/shop", handle_shop),
         web.get(prefix + "/api/leaderboard", handle_leaderboard),
         web.get(prefix + "/api/history", handle_history),
@@ -1763,6 +1848,17 @@ PAGE_HTML = """<!doctype html>
   }
   .foe .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .foe.out { opacity: .45; }
+  /* The mob card. A single opponent rather than a row in a list, so it gets a card of
+     its own -- and the tier chip carries the whole decision: easy is a payday, hard is
+     a gamble, and the colour says which before the numbers are read. */
+  .mobcard .mobtaunt { margin-top: 8px; font-size: 13px; font-style: italic;
+                       color: var(--muted); border-left: 2px solid var(--line);
+                       padding-left: 9px; }
+  .tierchip { font-size: 11px; font-weight: 700; border-radius: 999px; padding: 2px 10px;
+              border: 1px solid currentColor; white-space: nowrap; }
+  .tierchip.win { color: var(--xp); }
+  .tierchip.gold { color: var(--gold); }
+  .tierchip.loss { color: var(--hp); }
   .pw { color: var(--gold); font-weight: 700; }
 
   /* ----------------------------------------------------------------------- quests
@@ -1947,6 +2043,7 @@ PAGE_HTML = """<!doctype html>
     <div class="purse">
       <span>💰 <b id="hudCoins">0</b></span>
       <span>⚔ <b id="hudFights">0</b><span class="muted" id="hudRecharge"></span></span>
+      <span id="hudRubyBox" hidden>💎 <b id="hudRuby">0</b></span>
     </div>
     <div class="bar"><i id="hudXp" style="width:0%"></i></div>
   </div>
@@ -2117,6 +2214,9 @@ function renderHud() {
     $("hudFace").innerHTML = pet ? shot(pet.portrait, pet.crop) : "🥚";
     if (pet) paintShots($("hudFace"));
   }
+  const rubies = (S && S.rubies) || 0;
+  $("hudRubyBox").hidden = !rubies;
+  $("hudRuby").textContent = money(rubies);
   const arena = (S && S.arena) || {};
   $("hudFights").textContent = (arena.available != null ? arena.available : 0) +
     "/" + (arena.capacity != null ? arena.capacity : 0);
@@ -2365,12 +2465,64 @@ async function renderArena() {
       clock(arena.seconds_until_next) + "</div>" : "") +
     "</div>" +
     (blocked ? '<div class="panel"><div class="small">' + esc(blocked) + "</div></div>" : "") +
+    // PVE above the roster: there is always a mob, and on a quiet day the player list is
+    // the empty half of this screen.
+    mobPanel(Boolean(blocked)) +
     '<div class="panel"><h2>Соперники · ' + FOES.opponents.length + "</h2>" +
       (FOES.opponents.length
         ? FOES.opponents.map((foe) => foeRow(foe, !blocked)).join("")
         : '<div class="empty">Больше ни у кого нет существа.</div>') +
     "</div>";
   paintShots(box);
+}
+
+// ------------------------------------------------------------------------------- PVE
+const TIER_TONE = { easy: "win", medium: "gold", hard: "loss" };
+let MOB = null;
+
+async function rollMob() {
+  try {
+    MOB = (await api("/api/mob")).mob;
+  } catch (e) { haptic("no"); toast(e.message); return; }
+  haptic();
+  render();
+}
+
+async function fightMob() {
+  if (!MOB) return;
+  let data;
+  try {
+    data = await api("/api/mob", { code: MOB.code, tier: MOB.tier });
+  } catch (e) { haptic("no"); toast(e.message); MOB = null; render(); return; }
+  S = data.state;
+  MOB = null;
+  FOES = null;
+  playDuel(data);
+}
+
+function mobPanel(blocked) {
+  if (!MOB) {
+    return '<div class="panel"><h2>👾 ПВЕ · мобы</h2>' +
+      "<div class='small muted' style='margin-bottom:9px'>Соперник из реального мира. " +
+      "Платят вдвое меньше, чем за игрока, зато всегда есть кого бить — и только с них " +
+      "падают <b>руби</b>.</div>" +
+      '<button class="go" data-mob="roll"' + (blocked ? " disabled" : "") +
+      ">🔍 Найти моба</button></div>";
+  }
+  return '<div class="panel mobcard"><h2>👾 ' + esc(MOB.name) + "</h2>" +
+    "<div class='row spread'><span class='tiny muted'>" + esc(MOB.flavour) + "</span>" +
+    '<span class="tierchip ' + (TIER_TONE[MOB.tier] || "") + '">' + esc(MOB.tier_name) +
+    "</span></div>" +
+    "<div class='mobtaunt'>" + esc(MOB.taunt) + "</div>" +
+    "<div class='row spread small' style='margin-top:9px'><span class='pw'>⚡ " +
+      money(MOB.power) + "</span><span class='tiny muted'>" +
+      ["strength", "health", "agility", "luck"].map((key) =>
+        (STAT_ICON[key] || key) + (MOB.stats[key] || 0)).join(" ") +
+      (MOB.armor ? " 🛡" + MOB.armor : "") + "</span></div>" +
+    '<div class="row" style="margin-top:10px;gap:8px">' +
+      '<button class="go" data-mob="fight"' + (blocked ? " disabled" : "") + ">⚔️ В бой</button>" +
+      '<button class="go sec" data-mob="roll" style="flex:0 0 42%">🔍 Другой</button>' +
+    "</div></div>";
 }
 
 function foeRow(foe, canFight) {
@@ -3342,7 +3494,8 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questtake],[data-questdrop],[data-accept],[data-reject],[data-queston]");
+    "[data-quest],[data-questtake],[data-questdrop],[data-accept],[data-reject],[data-queston]," +
+    "[data-mob]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3358,6 +3511,8 @@ document.addEventListener("click", async (event) => {
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
+  if (d.mob === "roll") { await rollMob(); return; }
+  if (d.mob === "fight") { haptic(); await fightMob(); return; }
   if (d.quest === "reroll") { await questCall("/api/quests/reroll", {}); return; }
   if (d.questtake) { await questCall("/api/quests/take", { code: d.questtake }); return; }
   if (d.questdrop) {

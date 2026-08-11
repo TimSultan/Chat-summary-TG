@@ -379,6 +379,35 @@ ARENA_LEVEL_REWARD_MULTIPLIERS = {
      2: 1.16,
      3: 1.25,
 }
+# How far below you an opponent has to be before Зеркало души is put on automatically.
+# Five: the arena's own reward multiplier already stops caring past three levels, so by
+# five the fight is both unrewarding and unfair, which is precisely the gap the mirror
+# exists to close.
+MIRROR_LEVEL_GAP = 5
+
+# ------------------------------------------------------------------------------- PVE
+# A duel moves coins between two players -- part of the winner's purse is paid by the
+# loser (LOSS_GOLD_SHARE), so the arena mints far less than it appears to. A mob pays out
+# of nothing at all, with nobody on the other side to lose anything, so the identical
+# purse would be a faucet running at twice the arena's real rate. Half, then, as asked:
+# "мобы давали примерно в два раза меньше денег".
+PVE_GOLD_SHARE = 0.5
+# XP is cut less hard than gold. Coins are the thing that inflates; pet levels are paced
+# by the fight bank either way, and a PVE-only player should not level at half speed.
+PVE_XP_SHARE = 0.7
+# Loot is rarer than the arena's 15%, before each mob's own multiplier -- a mob can be
+# fought at will within the bank, where a duel needs another player to exist.
+PVE_DROP_CHANCE = 0.09
+# Руби, the PVE currency. Nothing spends them yet by design; the numbers are small so
+# whatever they end up buying can be priced against a supply that grew slowly.
+PVE_RUBY_MIN = 1
+PVE_RUBY_MAX = 3
+# The farm's occasional ruby, "случайно пусть падает с фермы иногда": per SHIFT, not per
+# hour, and rare enough that the arena stays the place rubies actually come from.
+FARM_RUBY_CHANCE = 0.06
+FARM_RUBY_MIN = 1
+FARM_RUBY_MAX = 2
+
 HISTORY_LIMIT = 10          # "список последних 10 боев"
 # The mailbox merges three feeds (fights, farm shifts, gifts) into one, so it is capped
 # at what one Telegram message can carry comfortably rather than at HISTORY_LIMIT: it is
@@ -615,11 +644,17 @@ if _RAW_WEAPON_ITEMS:
 
 _catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)
 _catalogue_gear = tuple(_catalog_item(spec) for spec in _RAW_GEAR_ITEMS)
+# The loot table is what this guards: exactly 30 amulets have to be findable, and every
+# amulet has to be an amulet. Sold ones are counted separately -- adding something to the
+# shop counter must not be able to quietly take a slot out of the drop pool.
+_dropped_amulets = tuple(item for item in _catalogue_amulets if item.source == "drop")
 if _RAW_AMULET_ITEMS and (
-    len(_catalogue_amulets) != 30
-    or any(item.slot != "amulet" or item.source != "drop" for item in _catalogue_amulets)
+    len(_dropped_amulets) != 30
+    or any(item.slot != "amulet" for item in _catalogue_amulets)
+    or any(item.source not in ("drop", "shop") for item in _catalogue_amulets)
+    or any(item.price <= 0 for item in _catalogue_amulets if item.source == "shop")
 ):
-    raise ValueError("amulet catalogue must contain exactly 30 drop-only amulets")
+    raise ValueError("amulet catalogue must contain exactly 30 drop-only amulets, plus priced shop ones")
 if _RAW_GEAR_ITEMS and (
     len(_catalogue_gear) != 60
     or sum(item.slot == "boots" for item in _catalogue_gear) != 30
