@@ -25,6 +25,7 @@ import pets
 import pets_combat
 import pets_config
 import pets_mobs
+import pets_ui
 
 
 class PetsTestCase(unittest.TestCase):
@@ -58,6 +59,15 @@ class _NoJitter:
 
 
 class MobRollAndBlockTests(PetsTestCase):
+    def test_mob_fight_callback_keeps_both_code_and_tier(self):
+        """A compound callback argument must survive Telegram's outer separators.
+
+        Losing the tier made `mob_block` reject every normal «В бой» tap as if the mob
+        had disappeared, because it received only the code.
+        """
+        callback = pets_ui.callback_data("123", "mobfight", "goblin:hard")
+        self.assertEqual(pets_ui.parse_callback(callback), ("123", "mobfight", "goblin:hard"))
+
     def test_roll_mob_scales_to_the_callers_own_stats_and_returns_none_without_a_pet(self):
         entry = "chat"
         self.assertIsNone(pets.roll_mob(entry, "nobody"))

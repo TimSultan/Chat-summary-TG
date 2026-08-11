@@ -65,7 +65,11 @@ class QuestsTestCase(unittest.TestCase):
         self.assertTrue(ok, msg)
         live = quests.daily_quest(entry, user_id, now=now)
         submission_id = live["submission"]["id"]
-        ok, msg, receipt = quests.review(entry, submission_id, "mod1", accept, now=now)
+        ok, msg, receipt = quests.review(
+            entry, submission_id, "mod1", accept,
+            note="Попробуй сфотографировать работу при дневном свете." if not accept else "",
+            now=now,
+        )
         self.assertTrue(ok, msg)
         return quest, submission_id, receipt
 
@@ -554,6 +558,33 @@ class ReviewPaymentTests(QuestsTestCase):
         ok, msg = quests.submit(entry, "1", quest["code"], now=day + timedelta(minutes=6))
         self.assertTrue(ok, msg)
 
+    def test_rejection_requires_feedback_for_the_player(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        quest = quests.daily_quest(entry, "1", now=day)["quest"]
+        self.assertTrue(quests.submit(entry, "1", quest["code"], now=day)[0])
+        submission_id = quests.pending(entry)[0]["id"]
+
+        ok, message, _ = quests.review(entry, submission_id, "mod1", False, now=day)
+        self.assertFalse(ok)
+        self.assertIn("причин", message.lower())
+        self.assertEqual(quests.pending(entry)[0]["id"], submission_id)
+
+
+class QuestIdeaTests(QuestsTestCase):
+    def test_ideas_are_kept_in_a_moderator_inbox_newest_first(self):
+        self.assertTrue(quests.suggest_idea(
+            "chat", "1", "Добавить квест на необычную подставку", author_name="Вася"
+        )[0])
+        self.assertTrue(quests.suggest_idea(
+            "chat", "2", "Квест на покрас миниатюры", author_username="masha"
+        )[0])
+
+        rows = quests.ideas("chat")
+        self.assertEqual([row["user_id"] for row in rows], ["2", "1"])
+        self.assertEqual(rows[0]["author_username"], "masha")
+        self.assertFalse(quests.suggest_idea("chat", "3", "   ")[0])
+
 
 class RewardTableTests(QuestsTestCase):
     def test_set_reward_clamps_out_of_range_values_to_the_configured_limits(self):
@@ -746,14 +777,14 @@ class QuestModeratorTests(QuestsTestCase):
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
-        self.assertEqual(actions, {"main"})
+        self.assertEqual(actions, {"main", "questreview"})
 
         _text, keyboard = pets_ui.quest_mods_view(entry, "1", can_appoint=True)
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
-        self.assertEqual(actions, {"main", "questmodadd", "questmoddel"})
+        self.assertEqual(actions, {"main", "questreview", "questmodadd", "questmoddel"})
 
     def test_the_arena_menu_only_offers_the_screen_to_somebody_who_can_use_it(self):
         entry = "chat"
@@ -768,3 +799,15 @@ class QuestModeratorTests(QuestsTestCase):
                     if "callback_data" in button
                 }
                 self.assertEqual("questmods" in actions, allowed)
+
+    def test_the_chat_moderation_view_has_accept_and_reject_for_the_oldest_submission(self):
+        entry = "chat"
+        quest = quests.daily_quest(entry, "1")["quest"]
+        self.assertTrue(quests.submit(entry, "1", quest["code"], author_name="Вася")[0])
+        text, keyboard = pets_ui.quest_review_view(entry, "77")
+        self.assertIn(quest["title"], text)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(actions, {"main", "questaccept", "questreject"})

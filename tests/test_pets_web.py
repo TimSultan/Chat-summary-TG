@@ -145,6 +145,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # three reasons a portrait can come back as a placeholder, so it is behaviour under
         # test and not just noise (see the placeholder-reason tests below).
         self.logs: list[str] = []
+        self.quest_feedback: list[tuple] = []
+
+        async def quest_feedback(user_id, title, note):
+            self.quest_feedback.append((str(user_id), title, note))
 
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
@@ -154,6 +158,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 a, cfg, CHAT, is_member=is_member, is_admin=is_admin,
                 resolve_player=resolve_player,
                 fetch_photo=fetch_photo, save_photo=save_photo,
+                quest_feedback=quest_feedback,
                 log=self.logs.append,
             ),
         )
@@ -862,6 +867,34 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pets.farm_tickets(CHAT, PLAYER["id"]), paid["tickets"])
         self.assertEqual((await (await self._get("/api/quests/review", MODERATOR)).json())["rows"], [])
 
+    async def test_rejection_needs_a_reason_sends_it_to_the_player_and_ideas_reach_review(self):
+        self._tame(PLAYER)
+        code = (await (await self._get("/api/quests", PLAYER)).json())["quest"]["code"]
+        self.assertTrue(quests.submit(CHAT, PLAYER["id"], code, author_name="Player")[0])
+        row = (await (await self._get("/api/quests/review", MODERATOR)).json())["rows"][0]
+
+        missing = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/quests/review", json={
+            "init_data": _init_data(MODERATOR["id"]), "id": row["id"], "accept": False,
+        })).json()
+        self.assertFalse(missing["ok"])
+        self.assertEqual(len((await (await self._get("/api/quests/review", MODERATOR)).json())["rows"]), 1)
+
+        rejected = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/quests/review", json={
+            "init_data": _init_data(MODERATOR["id"]), "id": row["id"], "accept": False,
+            "note": "Нужна более чёткая фотография работы.",
+        })).json()
+        self.assertTrue(rejected["ok"], rejected)
+        self.assertEqual(self.quest_feedback, [
+            (str(PLAYER["id"]), row["title"], "Нужна более чёткая фотография работы.")
+        ])
+
+        idea = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/quests/ideas", json={
+            "init_data": _init_data(PLAYER["id"]), "text": "Добавить зимний квест.",
+        })).json()
+        self.assertTrue(idea["ok"], idea)
+        queue = await (await self._get("/api/quests/review", MODERATOR)).json()
+        self.assertEqual(queue["ideas"][0]["text"], "Добавить зимний квест.")
+
     async def test_a_moderator_can_retune_the_reward_table_within_limits(self):
         answer = await (await self.client.post(
             pets_web.ROUTE_PREFIX + "/api/quests/config",
@@ -888,9 +921,12 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("function questBoard(", page)
         self.assertIn("function reviewQueue(", page)
         self.assertIn("quests:🎯 Квесты", page)
-        self.assertIn('if (S && S.is_admin) menu.push("review:🛡 Проверка квестов");', page)
+        self.assertIn('id="questReviewTab"', page)
+        self.assertIn('data-questidea', page)
+        self.assertIn('data-reviewideas', page)
+        self.assertIn('Причина отклонения обязательна.', page)
         # A verdict spends coins, so it is confirmed rather than fired on one tap.
-        self.assertIn("confirmThen(accept ?", page)
+        self.assertIn("confirmThen(\"Принять работу и начислить награду?\"", page)
 
     # ---- the farm ticket ----------------------------------------------------------------
 

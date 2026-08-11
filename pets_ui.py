@@ -27,6 +27,7 @@ import pets
 import pets_config as C
 import pets_updates
 import quests
+import stats
 
 CALLBACK_PREFIX = "pet"
 # Telegram caps callback_data at 64 bytes. "pet:" + a 19-digit id + ":" + the longest
@@ -58,7 +59,11 @@ def parse_callback(data: str) -> tuple[str, str, str] | None:
     parts = (data or "").split(":")
     if len(parts) < 3 or parts[0] != CALLBACK_PREFIX:
         return None
-    return parts[1], parts[2], parts[3] if len(parts) > 3 else ""
+    # Some actions carry a compound argument (`mob-code:tier`, for example). Callback
+    # data itself is already separated into owner/action/argument by the first three
+    # fields, so the argument has to be joined back together rather than silently losing
+    # everything after its first colon.
+    return parts[1], parts[2], ":".join(parts[3:])
 
 
 def search_argument(current_opponent_id) -> str:
@@ -114,6 +119,7 @@ def _name(pet: dict) -> str:
 
 def main_view(
     entry: str, user_id, xp: int, webapp_url: str | None = None, quest_mod: bool = False,
+    quest_pending: int = 0,
 ) -> tuple[str, dict]:
     """The landing screen. Deliberately shows the whole state of the account in six lines
     -- cage, creature, level, coins, fights left -- because every other screen is one tap
@@ -215,8 +221,14 @@ def main_view(
         # Only drawn for somebody who can actually review. Whether that is true needs a
         # Telegram round trip, so the CALLER decides and passes it in -- this module stays
         # pure, and the routes behind the button re-check for themselves regardless.
+        pending_marker = "🔴 " if quest_pending else ""
+        if webapp_url:
+            rows.append([{
+                "text": f"{pending_marker}🛡 Проверка квестов",
+                "web_app": {"url": f"{webapp_url}?view=review"},
+            }])
         rows.append([{
-            "text": "🛡 Модераторы квестов",
+            "text": f"{pending_marker}🛡 Модераторы квестов",
             "callback_data": callback_data(user_id, "questmods"),
         }])
     rows.append([
@@ -407,6 +419,32 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def quest_review_view(entry: str, user_id) -> tuple[str, dict]:
+    """The oldest submitted quest, ready to decide without opening the Mini App."""
+    rows = quests.pending(entry)
+    lines = [f"🛡 <b>Проверка квестов · {len(rows)}</b>\n"]
+    if not rows:
+        lines.append("Все заявки разобраны.")
+        return "\n".join(lines), {"inline_keyboard": _back_row(user_id)}
+    row = rows[0]
+    author = row.get("author_name") or row.get("author_username") or row.get("user_id")
+    lines.extend([
+        f"<b>{escape(str(author))}</b>",
+        f"🎯 {escape(str(row.get('title') or row.get('code') or 'Квест'))}",
+        escape(str(row.get("subject") or "")),
+        "\nОткрой работу в чате и выбери решение.",
+    ])
+    keyboard = [[
+        {"text": "✅ Принять", "callback_data": callback_data(user_id, "questaccept", row["id"])},
+        {"text": "❌ Отклонить", "callback_data": callback_data(user_id, "questreject", row["id"])},
+    ]]
+    link = stats.figurine_message_link(None, row.get("chat_id"), row.get("message_id"))
+    if link:
+        keyboard.append([{"text": "📷 Открыть работу в чате", "url": link}])
+    keyboard.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": keyboard}
+
+
 def quest_mods_view(entry: str, user_id, can_appoint: bool) -> tuple[str, dict]:
     """Who may review quests here, and -- for a full admin -- how to change that.
 
@@ -420,7 +458,7 @@ def quest_mods_view(entry: str, user_id, can_appoint: bool) -> tuple[str, dict]:
     listed = quests.moderators(entry)
     lines = ["🛡 <b>Модераторы квестов</b>\n"]
     lines.append(
-        "Могут принимать и отклонять работы по квестам в мини-приложении. "
+        "Могут принимать и отклонять работы по квестам здесь и в мини-приложении. "
         "Больше ничего: ни значков, ни настроек чата."
     )
     if listed:
@@ -435,7 +473,11 @@ def quest_mods_view(entry: str, user_id, can_appoint: bool) -> tuple[str, dict]:
         "не нужно.</i>"
     )
 
-    rows = []
+    pending = quests.pending_count(entry)
+    rows = [[{
+        "text": ("🔴 " if pending else "") + f"🛡 Проверить заявки · {pending}",
+        "callback_data": callback_data(user_id, "questreview"),
+    }]]
     if can_appoint:
         rows.append([{
             "text": "➕ Добавить модератора",

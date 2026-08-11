@@ -5765,7 +5765,10 @@ async def handle_pets_command(
 
     await _send_pets_view(
         api, chat_id,
-        pets_ui.main_view(entry, user.user_id, xp, webapp_url=_pets_page_url(cfg)),
+        pets_ui.main_view(
+            entry, user.user_id, xp, webapp_url=_pets_page_url(cfg), quest_mod=is_quest_mod,
+            quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
+        ),
         reply_to_message_id=message["message_id"], log=log,
     )
 
@@ -6089,7 +6092,10 @@ async def handle_pets_callback(
     # AFTER answer_callback_query, never before: a blocking call ahead of it leaves the
     # button spinning until the client gives up.
     can_appoint_mods = False
-    if entry and action in ("main", "questmods", "questmodadd", "questmoddel"):
+    if entry and action in (
+        "main", "questmods", "questmodadd", "questmoddel",
+        "questreview", "questaccept", "questreject",
+    ):
         quest_admin_chat_id = await _resolve_chat_id(
             telethon_client, entry, known_chat_ids or {}, log=log,
         )
@@ -6222,6 +6228,48 @@ async def handle_pets_callback(
                 "Кого сделать модератором квестов? Ответь @username.",
                 message_id, owner_username=actor.get("username"),
             )
+            return
+        if action in ("questreview", "questaccept", "questreject"):
+            # The chat menu is a second, full moderation surface. Check the same gate as
+            # the web routes instead of trusting that the keyboard once belonged to a mod.
+            if not is_quest_mod:
+                await _send_pets_view(
+                    api, chat_id,
+                    pets_ui.notice_view(user_id, "Проверять квесты могут только модераторы."),
+                    message_id=message_id, log=log,
+                )
+                return
+            if action == "questreview":
+                await _send_pets_view(
+                    api, chat_id, pets_ui.quest_review_view(entry, user_id),
+                    message_id=message_id, log=log,
+                )
+                return
+            submission = next(
+                (row for row in quests.pending(entry) if row.get("id") == argument), None,
+            )
+            if submission is None:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.quest_review_view(entry, user_id),
+                    message_id=message_id, log=log,
+                )
+                return
+            if action == "questaccept":
+                _ok, note, _receipt = quests.review(
+                    entry, argument, user_id, True,
+                    reviewer_name=_display_name(actor),
+                )
+                await _pets_toast_and_redraw(
+                    api, chat_id, message_id, note,
+                    pets_ui.quest_review_view(entry, user_id), log,
+                )
+                return
+            flow = await _pets_start_flow(
+                api, pets_flows, chat_id, actor.get("id"), entry, "quest_reject_reason",
+                "Напиши причину отклонения. Она будет отправлена автору в личку бота.",
+                message_id, owner_username=actor.get("username"),
+            )
+            flow["submission_id"] = argument
             return
         if action == "mob":
             block = pets.roll_mob(entry, user_id)
@@ -6438,6 +6486,7 @@ async def handle_pets_callback(
                 if enabled else "Уведомления о результатах боёв выключены.",
                 pets_ui.main_view(
                     entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
+                    quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
                 ), log,
             )
             return
@@ -6465,6 +6514,7 @@ async def handle_pets_callback(
         views = {
             "main": lambda: pets_ui.main_view(
                 entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
+                quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
             ),
             "questmods": lambda: pets_ui.quest_mods_view(entry, user_id, can_appoint_mods),
             "info": lambda: pets_ui.info_view(user_id),
@@ -7379,6 +7429,58 @@ async def maybe_handle_pets_flow_message(
 
     awaiting = flow.get("awaiting")
     try:
+        if awaiting == "quest_reject_reason":
+            if not raw:
+                await api.send_message(
+                    chat_id, "Напиши причину отклонения или «отмена».", parse_mode=None,
+                )
+                return True
+            # A force-reply may outlive a demotion. Recheck at the only point that
+            # changes the submission, just like the web moderation endpoint does.
+            mod_chat_id = await _resolve_chat_id(
+                telethon_client, entry, known_chat_ids or {}, log=log,
+            )
+            can_review = bool(mod_chat_id) and await _can_manage_chat(
+                api, mod_chat_id, actor, entry,
+            )
+            can_review = can_review or quests.is_moderator(
+                entry, actor.get("id"), actor.get("username"),
+            )
+            if not can_review:
+                pets_flows.pop(flow_id, None)
+                await api.send_message(
+                    chat_id, "Проверять квесты могут только модераторы.", parse_mode=None,
+                )
+                return True
+            submission_id = str(flow.get("submission_id") or "")
+            row = next((item for item in quests.pending(entry) if item.get("id") == submission_id), None)
+            pets_flows.pop(flow_id, None)
+            if row is None:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.quest_review_view(entry, user.user_id), log=log,
+                )
+                return True
+            ok, note, _receipt = quests.review(
+                entry, submission_id, user.user_id, False,
+                reviewer_name=_display_name(actor), note=raw,
+            )
+            if ok:
+                try:
+                    await api.send_message(
+                        row["user_id"],
+                        "🎯 Вам прислали обратную связь по квесту "
+                        f"«{row.get('title') or row.get('code')}»:\n\n{raw}",
+                        parse_mode=None,
+                    )
+                except Exception:
+                    log(f"[pets] failed to send quest feedback:\n{traceback.format_exc()}")
+            await _send_pets_view(
+                api, chat_id,
+                pets_ui.quest_review_view(entry, user.user_id) if ok
+                else pets_ui.notice_view(user.user_id, note),
+                log=log,
+            )
+            return True
         if awaiting == "quest_mod_target":
             if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
                 await api.send_message(
@@ -8662,6 +8764,15 @@ async def run_bot_listener(
                     """
                     return await _pets_upload_photo(api, user_id, data, log=log)
 
+                async def _send_quest_feedback(user_id, title: str, note: str):
+                    """Deliver a rejection reason where the player will actually see it."""
+                    await api.send_message(
+                        user_id,
+                        "🎯 Вам прислали обратную связь по квесту "
+                        f"«{title}»:\n\n{note}",
+                        parse_mode=None,
+                    )
+
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
                     is_member=_is_vote_member,
@@ -8670,7 +8781,8 @@ async def run_bot_listener(
                     # which any trusted painter can do, while closing a vote is not.
                     is_admin=_is_quest_moderator,
                     resolve_player=_resolve_pet_player,
-                    fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo, log=log,
+                    fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
+                    quest_feedback=_send_quest_feedback, log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token

@@ -140,6 +140,7 @@ def _empty() -> dict:
         "done": {},            # user_id -> {quest code: when it was last finished}
         "moderators": {},      # user_id -> who may review, delegated by an admin
         "disabled": [],        # quest codes a moderator has taken out of rotation
+        "ideas": [],           # player-suggested quest ideas, newest last
     }
 
 
@@ -731,6 +732,47 @@ def pending(entry: str) -> list[dict]:
     return rows
 
 
+def pending_count(entry: str) -> int:
+    """How many works still need a moderator's verdict."""
+    return sum(1 for row in _load(entry).get("submissions", [])
+               if row.get("status") == "pending")
+
+
+def suggest_idea(
+    entry: str, user_id, text: str, *, author_name: str = "", author_username: str = "",
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Keep a player's quest idea for moderators to read later.
+
+    Ideas deliberately have no expiry and no public feed: they are an inbox for people
+    who curate the catalogue, not another chat the whole group has to keep up with.
+    """
+    idea = str(text or "").strip()
+    if not idea:
+        return False, "Напиши текст идеи."
+    if len(idea) > 1_000:
+        return False, "Идея слишком длинная — до 1000 символов."
+    moment = now or app_now()
+    with _lock:
+        data = _load(entry)
+        data.setdefault("ideas", []).append({
+            "id": f"{moment.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}",
+            "user_id": str(user_id),
+            "author_name": str(author_name or ""),
+            "author_username": str(author_username or "").lstrip("@"),
+            "text": idea,
+            "ts": moment.isoformat(),
+        })
+        _save(entry, data)
+    return True, "Идея сохранена. Спасибо!"
+
+
+def ideas(entry: str, limit: int = 500) -> list[dict]:
+    """All suggested ideas, newest first, for the quest moderation screen."""
+    rows = [dict(row) for row in reversed(_load(entry).get("ideas", []))]
+    return rows[:max(0, int(limit))]
+
+
 def submissions(entry: str, user_id=None, limit: int = 50) -> list[dict]:
     """The audit trail, newest first: every photo sent in and what became of it."""
     data = _load(entry)
@@ -787,6 +829,9 @@ def review(
     """
     moment = now or app_now()
     receipt: dict = {}
+    note = str(note or "").strip()
+    if not accept and not note:
+        return False, "Укажи причину отклонения.", receipt
     with _lock:
         data = _load(entry)
         row = _find_submission(data, submission_id)
@@ -802,7 +847,7 @@ def review(
         row["reviewed_by"] = str(reviewer_id)
         row["reviewed_by_name"] = str(reviewer_name or "")
         row["reviewed_at"] = moment.isoformat()
-        row["note"] = str(note or "")[:300]
+        row["note"] = note[:300]
 
         live = data.get(SLOTS.get(quest.kind, "assignments"), {}).get(str(row["user_id"]))
         if accept:

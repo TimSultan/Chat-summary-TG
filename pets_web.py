@@ -71,6 +71,7 @@ _IS_ADMIN_KEY = web.AppKey("pets_is_admin", Callable[[dict], Awaitable[bool]])
 _RESOLVE_KEY = web.AppKey("pets_resolve_player")
 _FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
 _SAVE_PHOTO_KEY = web.AppKey("pets_save_photo")
+_QUEST_FEEDBACK_KEY = web.AppKey("pets_quest_feedback")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
 
@@ -867,6 +868,9 @@ async def handle_state(request: web.Request) -> web.Response:
     # Whether the moderation entry is even drawn. A convenience for the menu, never a
     # permission: every route behind it asks the same gate again for itself.
     state["is_admin"] = await request.app[_IS_ADMIN_KEY](user)
+    # The queue is intentionally part of the ordinary state, so both moderation entries
+    # can light up from the same server-side fact rather than drifting apart.
+    state["pending_quests"] = quests.pending_count(entry) if state["is_admin"] else 0
     return _ok(state)
 
 
@@ -1375,6 +1379,23 @@ async def handle_quest_reroll(request: web.Request) -> web.Response:
                 "board": await asyncio.to_thread(_quest_board_payload, entry, me)})
 
 
+async def handle_quest_idea(request: web.Request) -> web.Response:
+    """Accept a free-text quest idea from any current chat member."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Играть могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    ok, message = await asyncio.to_thread(
+        quests.suggest_idea, request.app[_ENTRY_KEY], user["id"], body.get("text") or "",
+        author_name=user.get("first_name") or user.get("username") or "",
+        author_username=user.get("username") or "",
+    )
+    return _ok({"ok": ok, "message": message})
+
+
 async def handle_quest_review_queue(request: web.Request) -> web.Response:
     """Everything waiting on a moderator, plus the knobs they are allowed to turn."""
     user, _xp = await _quest_admin(request)
@@ -1401,6 +1422,7 @@ async def handle_quest_review_queue(request: web.Request) -> web.Response:
             for quest in quests.catalog.QUESTS
         ],
         "recent": _jsonable(quests.submissions(entry, limit=40)),
+        "ideas": _jsonable(quests.ideas(entry)),
     })
 
 
@@ -1413,6 +1435,11 @@ async def handle_quest_review(request: web.Request) -> web.Response:
     user, _xp = await _quest_admin(request, body)
     entry = request.app[_ENTRY_KEY]
     accept = bool(body.get("accept"))
+    # Keep the recipient before review changes the queue. The notification itself is
+    # deliberately best-effort: Telegram may forbid a DM until the player starts the bot,
+    # but that must never undo a moderator's verdict.
+    queued = next((row for row in quests.pending(entry)
+                   if str(row.get("id")) == str(body.get("id") or "")), None)
     ok, message, receipt = await asyncio.to_thread(
         quests.review, entry, str(body.get("id") or ""), str(user["id"]), accept,
         reviewer_name=user.get("first_name") or user.get("username") or "",
@@ -1424,6 +1451,16 @@ async def handle_quest_review(request: web.Request) -> web.Response:
         + (f", paid {receipt.get('gold')} gold / {receipt.get('xp')} xp"
            f" / {receipt.get('tickets')} ticket(s), drop {receipt.get('item')}" if receipt else "")
     )
+    if ok and not accept and queued is not None:
+        try:
+            await request.app[_QUEST_FEEDBACK_KEY](
+                queued["user_id"], queued.get("title") or queued.get("code"),
+                str(body.get("note") or "").strip(),
+            )
+        except Exception:
+            request.app[_LOG_KEY](
+                "[pets_web] failed to send quest rejection feedback:\n" + traceback.format_exc()
+            )
     return _ok({"ok": ok, "message": message, "receipt": _jsonable(receipt)})
 
 
@@ -1518,6 +1555,10 @@ async def _default_save_photo(user_id, data: bytes):
     return None
 
 
+async def _default_quest_feedback(user_id, title: str, note: str):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
@@ -1527,6 +1568,7 @@ def attach(
     resolve_player=None,
     fetch_photo=None,
     save_photo=None,
+    quest_feedback=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
@@ -1555,6 +1597,7 @@ def attach(
     app[_RESOLVE_KEY] = resolve_player or _default_resolve_player
     app[_FETCH_PHOTO_KEY] = fetch_photo or _default_fetch_photo
     app[_SAVE_PHOTO_KEY] = save_photo or _default_save_photo
+    app[_QUEST_FEEDBACK_KEY] = quest_feedback or _default_quest_feedback
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     app.add_routes([
@@ -1573,6 +1616,7 @@ def attach(
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
         web.post(prefix + "/api/quests/reroll", handle_quest_reroll),
+        web.post(prefix + "/api/quests/ideas", handle_quest_idea),
         # Moderator-only, all three (see _quest_admin).
         web.get(prefix + "/api/quests/review", handle_quest_review_queue),
         web.post(prefix + "/api/quests/review", handle_quest_review),
@@ -1682,6 +1726,7 @@ PAGE_HTML = """<!doctype html>
     background: var(--card); border-top: 1px solid var(--line);
     padding-bottom: env(safe-area-inset-bottom);
   }
+  .tabs.has-review { grid-template-columns: repeat(7, 1fr); }
   .tabs button {
     border: 0; background: none; padding: 7px 0 8px; color: var(--muted);
     display: flex; flex-direction: column; align-items: center; gap: 2px;
@@ -2045,6 +2090,7 @@ PAGE_HTML = """<!doctype html>
   <button data-tab="shop"><span class="ic">🛒</span>Лавка</button>
   <button data-tab="arena"><span class="ic">⚔️</span>Арена</button>
   <button data-tab="farm"><span class="ic">🌾</span>Ферма</button>
+  <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
   <button data-tab="more"><span class="ic">☰</span>Ещё</button>
 </nav>
 
@@ -2062,6 +2108,7 @@ let S = null;            // the server's state, verbatim -- never edited on the 
 let TAB = "hero";
 let SHOP = null, FOES = null, ROSTER = null;
 let ticker = null;
+const START_VIEW = new URLSearchParams(window.location.search).get("view");
 
 // --------------------------------------------------------------------------- transport
 async function api(path, body) {
@@ -2618,7 +2665,7 @@ async function renderMore() {
     // The review queue is the one entry that is not for everybody. Whether it appears at
     // all is the server's answer, never a guess from the client -- and every route behind
     // it re-checks, so a hand-typed moreView cannot open anything.
-    if (S && S.is_admin) menu.push("review:🛡 Проверка квестов");
+    if (S && S.is_admin) menu.push("review:" + (S.pending_quests ? "🔴 " : "") + "🛡 Проверка квестов");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -2702,6 +2749,9 @@ async function questCall(path, payload) {
     if (data.ok && data.receipt && data.receipt.item_name) {
       toast("Выпало: " + data.receipt.item_name);
     }
+    if (data.ok && path === "/api/quests/review" && S) {
+      S.pending_quests = Math.max(0, Number(S.pending_quests || 0) - 1);
+    }
     render();
     return data.ok;
   } catch (e) {
@@ -2770,6 +2820,7 @@ function questBoard(data) {
 
   const rows = board.history || [];
   return head +
+    '<button class="go sec" data-questidea>💡 Предложить идею</button>' +
     '<div class="panel"><h2>Сдано квестов · ' + done + "</h2>" + (rows.length
       ? rows.map((row) =>
           '<div class="row spread small" style="margin-bottom:7px"><span>' +
@@ -2780,6 +2831,7 @@ function questBoard(data) {
 }
 
 // -------------------------------------------------------------------- quest review
+let reviewIdeasOpen = false;
 function reviewQueue(data) {
   const rows = data.rows || [];
   let out = '<div class="panel"><h2>🛡 На проверке · ' + rows.length + "</h2>" + (rows.length
@@ -2800,6 +2852,18 @@ function reviewQueue(data) {
           "</div>" +
         "</div>").join("")
     : "<div class='empty'>Пусто. Все работы разобраны.</div>") + "</div>";
+
+  const ideas = data.ideas || [];
+  out += '<button class="go sec" data-reviewideas>💡 Идеи' +
+    (ideas.length ? " · " + ideas.length : "") + "</button>";
+  if (reviewIdeasOpen) {
+    out += '<div class="panel"><h2>💡 Идеи квестов · ' + ideas.length + "</h2>" + (ideas.length
+      ? ideas.map((idea) => '<div class="small" style="margin-bottom:12px"><b>' +
+          esc(idea.author_name || idea.author_username || idea.user_id || "Участник") + "</b>" +
+          (idea.author_username ? ' <span class="tiny muted">@' + esc(idea.author_username) + "</span>" : "") +
+          '<div style="white-space:pre-wrap;margin-top:3px">' + esc(idea.text) + "</div></div>").join("")
+      : '<div class="empty">Пока никто ничего не предложил.</div>') + "</div>";
+  }
 
   out += '<div class="panel"><h2>Награды по сложности</h2>' +
     "<div class='tiny muted' style='margin-bottom:8px'>Меняется сразу и только для этого чата.</div>" +
@@ -3438,7 +3502,15 @@ function render() {
   for (const name of ["hero", "bag", "shop", "arena", "farm", "more"]) {
     $("scr-" + name).hidden = name !== TAB;
   }
-  for (const button of $("tabs").children) button.classList.toggle("on", button.dataset.tab === TAB);
+  const reviewTab = $("questReviewTab");
+  reviewTab.hidden = !(S && S.is_admin);
+  $("tabs").classList.toggle("has-review", !reviewTab.hidden);
+  reviewTab.innerHTML = '<span class="ic">' + (S && S.pending_quests ? "🔴" : "🛡") +
+                        "</span>Проверка";
+  for (const button of $("tabs").children) {
+    button.classList.toggle("on", button.dataset.tab === TAB ||
+      (button.dataset.tab === "review" && TAB === "more" && moreView === "review"));
+  }
   if (TAB === "hero") renderHero();
   else if (TAB === "bag") renderBag();
   else if (TAB === "shop") renderShop();
@@ -3450,8 +3522,9 @@ function render() {
 $("tabs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-tab]");
   if (!button) return;
-  TAB = button.dataset.tab;
-  if (TAB === "more") moreView = "menu";
+  TAB = button.dataset.tab === "review" ? "more" : button.dataset.tab;
+  if (button.dataset.tab === "review") moreView = "review";
+  else if (TAB === "more") moreView = "menu";
   haptic();
   render();
 });
@@ -3473,7 +3546,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-accept],[data-reject],[data-queston],[data-mob]");
+    "[data-quest],[data-questidea],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3492,12 +3565,34 @@ document.addEventListener("click", async (event) => {
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "fight") { haptic(); await fightMob(); return; }
   if (d.quest) { await questCall("/api/quests/reroll", { kind: d.quest }); return; }
+  if (d.questidea !== undefined) {
+    sheet("<h3>💡 Предложить идею квеста</h3>" +
+      "<textarea id='questIdeaText' class='go sec' style='min-height:110px;text-align:left' " +
+      "maxlength='1000' placeholder='Опиши идею'></textarea><div class='acts'>" +
+      "<button class='go' id='saveQuestIdea'>Отправить</button></div>");
+    $("saveQuestIdea").onclick = async () => {
+      const text = $("questIdeaText").value.trim();
+      if (!text) { toast("Напиши текст идеи."); return; }
+      closeSheet();
+      await questCall("/api/quests/ideas", { text });
+    };
+    return;
+  }
+  if (d.reviewideas !== undefined) { reviewIdeasOpen = !reviewIdeasOpen; render(); return; }
   if (d.accept || d.reject) {
     // A verdict pays real coins, so it is the one moderator action that asks twice.
     const id = d.accept || d.reject;
     const accept = Boolean(d.accept);
-    confirmThen(accept ? "Принять работу и начислить награду?" : "Отклонить работу?",
-                () => questCall("/api/quests/review", { id, accept }));
+    if (!accept) {
+      const note = window.prompt("Напишите причину отклонения. Она придёт автору в личку бота.", "");
+      if (note === null) return;
+      if (!note.trim()) { toast("Причина отклонения обязательна."); return; }
+      confirmThen("Отклонить работу и отправить причину автору?",
+                  () => questCall("/api/quests/review", { id, accept, note: note.trim() }));
+    } else {
+      confirmThen("Принять работу и начислить награду?",
+                  () => questCall("/api/quests/review", { id, accept }));
+    }
     return;
   }
   if (d.queston) {
@@ -3599,7 +3694,14 @@ async function refresh() {
   }
 }
 
-refresh().then(() => { ticker = setInterval(tick, 1000); });
+refresh().then(() => {
+  if (START_VIEW === "review" && S && S.is_admin) {
+    TAB = "more";
+    moreView = "review";
+    render();
+  }
+  ticker = setInterval(tick, 1000);
+});
 </script>
 </body>
 </html>
