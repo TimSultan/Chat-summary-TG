@@ -674,8 +674,18 @@ def reputation_for(entry: str, user_id, user=None) -> int:
         stats.weekly_wins_for_user(entry, user_id),
         len(stats.custom_badges_for_user(entry, user_id)),
         record.get("received", 0),
-        stats.medal_levels(user) if user is not None else 0,
+        stats.medal_levels(user, casino_winnings_for_user(entry, user_id)) if user is not None else 0,
     )
+
+
+def casino_winnings_for_user(entry: str, user_id) -> int:
+    """All-time net casino profit, kept beside the wager records in the shared ledger."""
+    try:
+        record = _load(entry)["users"].get(str(user_id)) or {}
+        casino = _effects(record).get("casino") or {}
+        return max(0, int(casino.get("winnings", 0) or 0))
+    except (OSError, TypeError, ValueError):
+        return 0
 
 
 def stat_extras(entry: str, user_id, xp: int, user=None) -> dict:
@@ -689,6 +699,7 @@ def stat_extras(entry: str, user_id, xp: int, user=None) -> dict:
             "coins": balance(entry, user_id, xp),
             "reputation": reputation_for(entry, user_id, user),
             "custom_title": active_title(entry, user_id),
+            "casino_winnings": casino_winnings_for_user(entry, user_id),
         }
     except (OSError, ValueError):
         return {}

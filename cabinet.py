@@ -272,6 +272,7 @@ def badges_view(
     user: stats.UserStats,
     custom_badges: list,
     chat_custom_badge_total: int = 0,
+    casino_winnings: int = 0,
 ) -> tuple[str, dict]:
     """Hand-made badges first, then earned ones, then a completion counter.
 
@@ -282,7 +283,7 @@ def badges_view(
     """
     given = [badge for badge in (custom_badges or []) if getattr(badge, "custom", False)]
     other_awarded = [badge for badge in (custom_badges or []) if not getattr(badge, "custom", False)]
-    earned = stats.earned_badges(user) + other_awarded
+    earned = stats.earned_badges(user, casino_winnings=casino_winnings) + other_awarded
 
     lines = ["🏅 <b>Значки</b>"]
     if given:
@@ -298,7 +299,8 @@ def badges_view(
         lines.append("\nПока ни одного.")
 
     unlocked, total = stats.badge_collection_progress(
-        user, custom_badges=custom_badges, chat_custom_badge_total=chat_custom_badge_total
+        user, custom_badges=custom_badges, chat_custom_badge_total=chat_custom_badge_total,
+        casino_winnings=casino_winnings,
     )
     lines.append(f"\n📦 Открыто: {unlocked} из {total}")
     lines.append("<i>считая уровни чата и звания художника</i>")

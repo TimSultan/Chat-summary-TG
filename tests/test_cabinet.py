@@ -248,6 +248,7 @@ class BadgeSectionTests(unittest.TestCase):
             total,
             len(stats.PAINTING_BADGE_TIERS) + len(stats.MESSAGE_BADGE_TIERS)
             + len(stats.STREAK_BADGE_TIERS) + len(stats.NIGHT_BADGE_TIERS)
+            + len(stats.GAMBLER_BADGE_TIERS)
             + 4 + len(stats.CHAT_LEVEL_TIERS) + len(stats.XP_LEVELS),
         )
 

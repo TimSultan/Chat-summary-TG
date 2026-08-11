@@ -300,6 +300,15 @@ NIGHT_BADGE_TIERS = (
     (50, "night_shift_1", "🦉", "Ночная смена 1"),
 )
 
+# Casino winnings live in economy's ledger, so callers pass their accumulated net profit
+# into the generic badge renderers rather than making stats import economy.
+GAMBLER_BADGE_TIERS = (
+    (1_000, "gambler_4", "🎰", "Азартный IV"),
+    (500, "gambler_3", "🎰", "Азартный III"),
+    (250, "gambler_2", "🎰", "Азартный II"),
+    (100, "gambler_1", "🎰", "Азартный I"),
+)
+
 # Automatic badges use only counters already present in every production stats file.
 # Nothing here requires another Telegram fetch or a schema migration.
 AUTOMATIC_BADGES = (
@@ -471,7 +480,7 @@ def painter_rank(figurines_painted: int) -> tuple[Level, Level | None]:
     return current, next_level
 
 
-def medal_levels(user: "UserStats") -> int:
+def medal_levels(user: "UserStats", casino_winnings: int = 0) -> int:
     """How many earned-badge LEVELS this member holds -- the medal half of reputation.
 
     One point per medal, and one per tier inside a tiered family: somebody wearing
@@ -484,14 +493,15 @@ def medal_levels(user: "UserStats") -> int:
     scores REPUTATION_PER_BADGE_RECEIVED and a weekly win REPUTATION_PER_CONTEST_WIN, so
     a point on top would be the same medal counted twice.
 
-    Ceiling today is 17: painting 5, messages 2, streak 3, night shift 3, plus one each
-    for gallery, regular, #янепидор and contest participation.
+    Ceiling today is 21: painting 5, messages 2, streak 3, night shift 3, gambling 4,
+    plus one each for gallery, regular, #янепидор and contest participation.
     """
     tier_families = (
         (PAINTING_BADGE_TIERS, user.figurines_painted),
         (MESSAGE_BADGE_TIERS, user.messages),
         (STREAK_BADGE_TIERS, _longest_streak(user.active_day_dates)),
         (NIGHT_BADGE_TIERS, sum(user.hours.get(str(hour), 0) for hour in range(6))),
+        (GAMBLER_BADGE_TIERS, max(0, int(casino_winnings or 0))),
     )
     levels = sum(
         1
@@ -582,6 +592,7 @@ def badge_collection_progress(
     user: "UserStats",
     custom_badges: list[Badge] | None = None,
     chat_custom_badge_total: int = 0,
+    casino_winnings: int = 0,
 ) -> tuple[int, int]:
     """(unlocked, total) across everything collectable -- badges, chat-level tiers and
     painting ranks.
@@ -601,6 +612,7 @@ def badge_collection_progress(
         (MESSAGE_BADGE_TIERS, user.messages),
         (STREAK_BADGE_TIERS, _longest_streak(user.active_day_dates)),
         (NIGHT_BADGE_TIERS, sum(user.hours.get(str(hour), 0) for hour in range(6))),
+        (GAMBLER_BADGE_TIERS, max(0, int(casino_winnings or 0))),
     )
     unlocked = 0
     total = 0
@@ -632,7 +644,7 @@ def badge_collection_progress(
     return unlocked, total
 
 
-def earned_badges(user: "UserStats") -> list[Badge]:
+def earned_badges(user: "UserStats", casino_winnings: int = 0) -> list[Badge]:
     """Automatic badges earned from the existing all-time UserStats counters."""
     longest_streak = _longest_streak(user.active_day_dates)
     night_messages = sum(user.hours.get(str(hour), 0) for hour in range(6))
@@ -674,6 +686,11 @@ def earned_badges(user: "UserStats") -> list[Badge]:
                 night_messages,
                 NIGHT_BADGE_TIERS,
                 "написать {threshold} ночных сообщений",
+            ),
+            _highest_badge_tier(
+                max(0, int(casino_winnings or 0)),
+                GAMBLER_BADGE_TIERS,
+                "выиграть в казино {threshold} монет чистой прибыли",
             ),
         )
         if badge is not None
@@ -3000,6 +3017,7 @@ def format_stat(
     season_xp: int | None = None,
     bot_username: str | None = None,
     work_names: list | None = None,
+    casino_winnings: int = 0,
 ) -> str:
     """Build an HTML-formatted `/stat` message.
 
@@ -3075,7 +3093,7 @@ def format_stat(
     # a weekly-contest win is assigned by an administrator but is still earned, so it
     # stays below with the rest.
     unique = [badge for badge in (custom_badges or []) if badge.custom]
-    earned = earned_badges(user) + [
+    earned = earned_badges(user, casino_winnings=casino_winnings) + [
         badge for badge in (custom_badges or []) if not badge.custom
     ]
     if unique:

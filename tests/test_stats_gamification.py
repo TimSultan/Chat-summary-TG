@@ -746,7 +746,7 @@ class MedalReputationTests(unittest.TestCase):
         self.assertEqual(stats.medal_levels(stats.UserStats(user_id="1", figurines_painted=49)), 4)
 
     def test_every_family_and_flat_badge_adds_up_to_the_ceiling(self):
-        """17 = painting 5 + messages 2 + streak 3 + night 3 + four untiered ones."""
+        """21 = painting 5 + messages 2 + streak 3 + night 3 + gambling 4 + four flat."""
         user = stats.UserStats(
             user_id="1",
             figurines_painted=50,
@@ -760,7 +760,22 @@ class MedalReputationTests(unittest.TestCase):
             not_gay_hashtag_uses=1,
             weekly_contest_weeks={"2026-W30"},
         )
-        self.assertEqual(stats.medal_levels(user), 17)
+        self.assertEqual(stats.medal_levels(user, casino_winnings=1_000), 21)
+
+    def test_gambling_badge_levels_are_based_on_net_casino_profit(self):
+        user = stats.UserStats(user_id="1")
+        for winnings, badge_id, levels in (
+            (99, None, 0),
+            (100, "gambler_1", 1),
+            (250, "gambler_2", 2),
+            (500, "gambler_3", 3),
+            (1_000, "gambler_4", 4),
+        ):
+            with self.subTest(winnings=winnings):
+                earned = {badge.badge_id for badge in stats.earned_badges(user, winnings)}
+                gambler_badges = {badge_id for badge_id in earned if badge_id.startswith("gambler_")}
+                self.assertEqual(gambler_badges, {badge_id} if badge_id else set())
+                self.assertEqual(stats.medal_levels(user, winnings), levels)
 
     def test_the_count_matches_the_badges_stat_actually_shows(self):
         """medal_levels must never award a point for a medal the member cannot see: the

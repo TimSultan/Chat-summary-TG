@@ -2954,6 +2954,7 @@ async def _render_cabinet_section(
         return cabinet.badges_view(
             entry, user, badges(),
             chat_custom_badge_total=len(stats.list_custom_badges(entry)),
+            casino_winnings=economy.casino_winnings_for_user(entry, user.user_id),
         )
     if action == "title":
         return cabinet.title_view(entry, user, xp)
@@ -6529,12 +6530,15 @@ async def handle_pets_callback(
                 await _send_pets_view(api, chat_id, pets_ui.casino_view(entry, user_id, xp), message_id=message_id, log=log)
                 return
             if game == "poker":
-                result = casino.play_poker(entry, user_id, xp, stake)
-                rendered = pets_ui.casino_result_view(entry, user_id, xp, result)
+                result = casino.start_poker(entry, user_id, xp, stake)
+                rendered = pets_ui.casino_poker_view(entry, user_id, xp, result.get("active")) \
+                    if result.get("ok") else pets_ui.casino_result_view(entry, user_id, xp, result)
             elif game == "shell":
                 rendered = pets_ui.casino_shell_view(entry, user_id, xp, stake)
-            else:
+            elif game == "highlow":
                 rendered = pets_ui.casino_highlow_view(entry, user_id, xp, stake)
+            else:
+                rendered = pets_ui.casino_goat_pick_view(entry, user_id, xp, stake)
             await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
 
@@ -6550,6 +6554,31 @@ async def handle_pets_callback(
                 api, chat_id, pets_ui.casino_result_view(entry, user_id, xp, result),
                 message_id=message_id, log=log,
             )
+            return
+
+        if action == "cpoker":
+            result = casino.advance_poker(entry, user_id, xp)
+            rendered = pets_ui.casino_poker_view(entry, user_id, xp, result.get("active")) \
+                if result.get("active") else pets_ui.casino_result_view(entry, user_id, xp, result)
+            await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
+            return
+
+        if action == "cgoatpick":
+            raw_stake, _, choice = str(argument or "").partition(":")
+            result = casino.choose_goat_door(entry, user_id, xp, casino.valid_stake(raw_stake), choice)
+            rendered = pets_ui.casino_goat_view(entry, user_id, xp, result.get("active")) \
+                if result.get("ok") else pets_ui.casino_result_view(entry, user_id, xp, result)
+            await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
+            return
+
+        if action == "cgoat":
+            if not argument:
+                rendered = pets_ui.casino_goat_view(entry, user_id, xp)
+            else:
+                rendered = pets_ui.casino_result_view(
+                    entry, user_id, xp, casino.finish_goat(entry, user_id, xp, argument),
+                )
+            await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
 
         # --- plain redraws -------------------------------------------------------------
