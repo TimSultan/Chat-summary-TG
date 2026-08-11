@@ -899,8 +899,21 @@ async def handle_opponents(request: web.Request) -> web.Response:
     user, _xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
     me = str(user["id"])
-    mine = pets.power_rating(entry, me)
+    prefix = request.app[_PREFIX_KEY]
 
+    # In a thread, because this is the most expensive read in the game and it is pure
+    # blocking work: pets.py has no caching, so every one of get_pet / effective_stats /
+    # can_attack_in_arena / arena_attacks_against re-reads and re-parses the whole chat
+    # store (which carries a fight log up to 2000 rows), five times over per opponent. On
+    # the event loop that is a stall of the entire server -- and the moment it happens is
+    # exactly when the browser fires off one portrait download per row, so the stall lands
+    # on the requests least able to survive it.
+    return _ok(await asyncio.to_thread(_opponents_payload, entry, me, prefix))
+
+
+def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
+    mine = pets.power_rating(entry, me)
+    today = pets.today()
     opponents = []
     for row in pets.pet_leaderboard(entry):
         if str(row["user_id"]) == me:
@@ -908,7 +921,7 @@ async def handle_opponents(request: web.Request) -> web.Response:
         record = pets.get_pet(entry, row["user_id"]) or {}
         opponents.append({
             "user_id": str(row["user_id"]),
-            "portrait": _portrait_url(request.app[_PREFIX_KEY], row["user_id"]),
+            "portrait": _portrait_url(prefix, row["user_id"]),
             "crop": record.get("portrait_crop"),
             "name": row.get("name"),
             "owner_name": row.get("owner_name"),
@@ -919,11 +932,13 @@ async def handle_opponents(request: web.Request) -> web.Response:
             "wins": int(record.get("wins", 0)),
             "stats": pets.effective_stats(entry, row["user_id"]),
             "attackable": pets.can_attack_in_arena(entry, me, row["user_id"]),
-            "attacks_today": pets.arena_attacks_against(entry, me, row["user_id"], pets.today()),
+            "attacks_today": pets.arena_attacks_against(entry, me, row["user_id"], today),
             "gap": abs(int(row.get("power", 0)) - mine),
         })
+    # An even fight first: the roster is sorted by how near each opponent's power is to
+    # yours, with everyone you have already fought out today pushed to the bottom.
     opponents.sort(key=lambda o: (not o["attackable"], o["gap"]))
-    return _ok({"me_power": mine, "opponents": opponents})
+    return {"me_power": mine, "opponents": opponents}
 
 
 async def handle_attack(request: web.Request) -> web.Response:
