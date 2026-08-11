@@ -1345,7 +1345,14 @@ PAGE_HTML = """<!doctype html>
   /* A framed photo is positioned by its crop, not by object-fit -- the square can hang off
      the edge of the picture (that is how "fit the whole thing" is expressed), and
      object-position cannot say that. Same model as vote_web's applyFrame. */
-  .shot { position: relative; width: 100%; height: 100%; overflow: hidden; }
+  /* display:block is load-bearing, not tidiness. `shot()` emits a <span>, and width and
+     height do not apply to a non-replaced INLINE box -- so an un-blockified .shot is a
+     zero-sized containing block, and the absolutely positioned photo inside it resolves
+     width:100% to nothing. It looked like it worked because the first two callers put it
+     in a flex container (.hud .face, .doll .portrait), which blockifies its items for
+     free. The opponent roster and the ranking put it in a plain block instead -- so those
+     two, and only those two, rendered every portrait at zero pixels. */
+  .shot { display: block; position: relative; width: 100%; height: 100%; overflow: hidden; }
   .shot img { position: absolute; left: 0; top: 0; max-width: none; display: block; }
   .shot img.cover { width: 100%; height: 100%; object-fit: cover; }
   .slot {

@@ -636,6 +636,26 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 row["portrait"], f"{pets_web.ROUTE_PREFIX}/img/pet/{row['user_id']}.jpg"
             )
 
+    async def test_a_portrait_frame_is_blockified_so_it_can_have_a_size(self):
+        """The reason opponents' photos were invisible while the player's own was fine.
+
+        `shot()` emits a <span>, and width/height do not apply to a non-replaced INLINE
+        box -- so an un-blockified .shot is a zero-sized containing block and the
+        absolutely positioned <img> inside resolves width:100% to nothing. The two
+        callers that worked (.hud .face, .doll .portrait) are flex containers, which
+        blockify their items for free; the opponent roster and the ranking are plain
+        blocks, and they are exactly the two screens that showed no faces. Asserted
+        rather than left to a CSS reading, because nothing else in this file would fail
+        if the declaration were dropped again.
+        """
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        rule = next(line for line in page.splitlines() if line.strip().startswith(".shot {"))
+        self.assertIn("display: block", rule)
+        # The frames that hold one. If any of these stops being sized, the photo inside it
+        # has nothing to fill.
+        for frame in (".hud .face", ".foe .av", ".doll .portrait"):
+            self.assertIn(frame, page)
+
     # ---- the log ----------------------------------------------------------------------
 
     def _logged(self, needle):
