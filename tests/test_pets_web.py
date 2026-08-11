@@ -968,6 +968,62 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await refused.json())["error"], "RULES_CHANGED")
         self.assertTrue(self._logged("drifted"))
 
+    async def test_a_replay_is_narrated_with_the_names_the_fight_was_fought_under(self):
+        """The transcript is prose with the pets' names baked into every line. The client
+        highlights those names, and the header prints them -- so it needs the names AS OF
+        the fight, not today's. After a rename, reading them off the live pet would name a
+        creature that appears nowhere in the text being displayed."""
+        self._tame(PLAYER, name="Кабанчик")
+        self._tame(OPPONENT, name="Соперник")
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+
+        self.assertTrue(pets.rename(CHAT, PLAYER["id"], "Совсем другой")[0])
+        row = (await (await self._get("/api/history", PLAYER)).json())["rows"][0]
+        replayed = await (await self._get(f"/api/replay?id={row['id']}", PLAYER)).json()
+
+        self.assertEqual(replayed["you_name"], "Кабанчик")
+        self.assertEqual(replayed["opponent"]["name"], "Соперник")
+        # And it really is the name the rounds talk about.
+        self.assertTrue(any("Кабанчик" in r["text"] for r in replayed["rounds"]))
+
+    async def test_the_fight_log_colours_the_three_things_a_line_is_made_of(self):
+        """pets_flavor fills exactly {attacker}, {defender} and {amount} into every
+        template, so those three are what the log highlights -- and an amulet's amount is
+        not always damage, which is the distinction the tone map exists for."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function paintBlow(", page)
+        self.assertIn("function amountTone(", page)
+        for tone in (".duel .nm.mine", ".duel .nm.them",
+                     ".duel .amount.harm", ".duel .amount.heal", ".duel .amount.soak"):
+            self.assertIn(tone, page)
+        # Healing procs must be listed by the code pets_combat actually emits, or a
+        # vampiric drain gets painted as damage taken.
+        for code in ("vampiric", "second_wind", "dodge_heal", "regen"):
+            self.assertIn(code, page)
+        # Both the animated path and the skip button go through the same painter, so a
+        # skipped fight is not a differently formatted one.
+        self.assertEqual(page.count("function paintBlow("), 1)
+        self.assertIn('+ paintBlow(round, mineName, theirName) + "</div>"', page)
+        self.assertIn('+ paintBlow(r, mineName, theirName) + "</div>"', page)
+        # The two side colours are their own tokens: --xp/--hp already mean "your money
+        # went up/down" everywhere else, and the numbers keep saying that.
+        self.assertIn("--mine:", page)
+        self.assertIn("--foe:", page)
+
+    async def test_the_hud_portrait_is_not_rebuilt_on_every_tick(self):
+        """renderHud runs once a second while the fight bank recharges. Rewriting the
+        face's innerHTML there hands the browser a new <img> every second -- a fresh load,
+        a fresh decode, and a portrait that visibly flickers forever."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("let hudFaceKey = null;", page)
+        self.assertIn("if (faceKey !== hudFaceKey) {", page)
+        # The repaint has to be INSIDE the guard, so grab the guarded block and look.
+        guarded = page.split("if (faceKey !== hudFaceKey) {", 1)[1].split("}", 1)[0]
+        self.assertIn('$("hudFace").innerHTML', guarded)
+        self.assertEqual(page.count('$("hudFace").innerHTML'), 1)
+
     async def test_the_page_turns_a_logged_fight_into_a_button(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn("async function replay(id)", page)
@@ -1022,6 +1078,12 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('moreView = "mail"', page)
         self.assertIn("mail:📬 Почта", page)
         self.assertIn("function mailFeed(", page)
+        # A 20px emoji in a 42px square is not centred by a button's own text layout --
+        # it sits on a baseline inside default padding. Flex centring, padding zeroed.
+        rule = page.split(".hud .post {", 1)[1].split("}", 1)[0]
+        for declaration in ("display: flex", "align-items: center",
+                            "justify-content: center", "padding: 0"):
+            self.assertIn(declaration, rule)
         for tone in (".mail.win", ".mail.loss", ".mail.gold", ".mail.give"):
             self.assertIn(tone, page)
         # A find is tinted with the same rarity colour its item card is bordered with.

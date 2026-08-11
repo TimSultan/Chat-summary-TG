@@ -1042,6 +1042,12 @@ def _playback_payload(result, me: str, mine, opponent_id: str, theirs, opponent_
     """
     return {
         "you": me,
+        # The name as it was WHEN THE FIGHT HAPPENED, straight off the fighter the
+        # transcript was written from. The client used to read this off the live pet,
+        # which is the same string right up until somebody renames -- and then every
+        # round of every replay talks about a creature whose name is nowhere on screen,
+        # and none of the highlighting below can find it.
+        "you_name": getattr(mine, "name", "") or "",
         "opponent": {"user_id": opponent_id, "name": opponent_name},
         "winner": result.winner,
         "draw": result.is_draw,
@@ -1345,6 +1351,11 @@ PAGE_HTML = """<!doctype html>
     --gold: #e8b923;
     --hp: #e05260;
     --xp: #4caf72;
+    /* The two sides of a fight. Deliberately NOT --xp/--hp: those two mean "your money
+     * went up" and "your money went down" everywhere else in the game, and a fight log
+     * needs the numbers to keep saying that while the names say something different. */
+    --mine: var(--tg-theme-link-color, #62aef0);
+    --foe: #d98a5a;
     --r-cursed: #6b5b7b;
     --r-common: #8a9aa9;
     --r-uncommon: #4caf72;
@@ -1391,9 +1402,16 @@ PAGE_HTML = """<!doctype html>
   .hud .purse b { font-weight: 700; }
   /* The mailbox is the one screen you check rather than play, so it gets a fixed corner
      instead of a seventh tab -- six is already the width a phone can label. */
+  /* A button centres its label using its own text layout: default padding, a baseline,
+     and a line box. That is close enough for a word and visibly off for a single 20px
+     emoji in a 42px square. Flex centring with the padding zeroed puts the glyph in the
+     middle of the box instead of on a baseline inside it. align-self keeps the square
+     level with the portrait rather than stretched to the height of the name column. */
   .hud .post {
-    flex: none; width: 42px; height: 42px; border-radius: 12px; font-size: 20px;
-    border: 1px solid var(--line); background: var(--sunken); line-height: 1;
+    flex: none; align-self: center; width: 42px; height: 42px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 12px; font-size: 20px; line-height: 1;
+    border: 1px solid var(--line); background: var(--sunken);
   }
   .bar { height: 5px; border-radius: 3px; background: var(--sunken); overflow: hidden; margin-top: 5px; }
   .bar > i { display: block; height: 100%; background: var(--xp); border-radius: 3px; transition: width .35s; }
@@ -1643,6 +1661,19 @@ PAGE_HTML = """<!doctype html>
   .duel .blow.crit { border-left-color: var(--gold); }
   .duel .blow.dodge { border-left-color: var(--muted); opacity: .8; }
   .duel .blow.mine { border-left-color: var(--accent); }
+  .duel .blow.amulet { border-left-color: var(--r-legendary); }
+  /* The flavour text is prose with three things buried in it -- who acted, who was hit,
+     and how much. They are the only parts anybody actually reads at one line per half
+     second, so they are the only parts coloured: two sides, and a number whose colour
+     says which direction it moved HP. Everything else stays body text on purpose; a line
+     where six words are highlighted is a line where nothing is. */
+  .duel .nm { font-weight: 700; }
+  .duel .nm.mine { color: var(--mine); }
+  .duel .nm.them { color: var(--foe); }
+  .duel .amount { font-weight: 700; }
+  .duel .amount.harm { color: var(--hp); }
+  .duel .amount.heal { color: var(--xp); }
+  .duel .amount.soak { color: var(--muted); }
   .duel .verdict { text-align: center; font-size: 20px; font-weight: 700; margin: 6px 0; }
   /* A replay is pixel-for-pixel the live fight, which is the point -- and exactly why it
      has to say so somewhere, or a rerun of an old defeat reads as a fresh one. */
@@ -1837,13 +1868,24 @@ function shot(url, crop, extra) {
 }
 
 // ---------------------------------------------------------------------------- the HUD
+// What the HUD portrait currently shows. renderHud runs once a SECOND while the fight
+// bank is recharging (see tick), and rewriting innerHTML hands the browser a brand new
+// <img> every time -- which is a fresh load, a fresh decode and a visible flicker once a
+// second, forever. The picture only ever changes when the URL or the crop does, so that
+// pair is the repaint condition; everything else in the HUD is text and cheap to rewrite.
+let hudFaceKey = null;
+
 function renderHud() {
   const pet = S && S.pet;
   $("hudName").textContent = pet ? pet.name : "Без существа";
   $("hudLevel").textContent = pet ? pet.level : "—";
   $("hudCoins").textContent = money(S ? S.coins : 0);
-  $("hudFace").innerHTML = pet ? shot(pet.portrait, pet.crop) : "🥚";
-  if (pet) paintShots($("hudFace"));
+  const faceKey = pet ? (pet.portrait || "") + "|" + JSON.stringify(pet.crop || null) : "";
+  if (faceKey !== hudFaceKey) {
+    hudFaceKey = faceKey;
+    $("hudFace").innerHTML = pet ? shot(pet.portrait, pet.crop) : "🥚";
+    if (pet) paintShots($("hudFace"));
+  }
   const arena = (S && S.arena) || {};
   $("hudFights").textContent = (arena.available != null ? arena.available : 0) +
     "/" + (arena.capacity != null ? arena.capacity : 0);
@@ -2699,10 +2741,77 @@ async function replay(id) {
   playDuel(data);
 }
 
+// An amulet's amount is not always damage. These are the procs that give HP back, and
+// the ones that stop damage rather than deal it; anything else with a number is a hit.
+// Keyed on the effect code pets_combat puts in the event ("amulet_vampiric").
+const HEAL_PROCS = ["vampiric", "second_wind", "dodge_heal", "regen", "adrenaline"];
+const SOAK_PROCS = ["opening_shield", "safeguard", "crit_guard", "last_stand"];
+
+function amountTone(round) {
+  const event = String(round.event || "");
+  if (event.indexOf("amulet_") !== 0) return "harm";
+  const code = event.slice(7);
+  if (HEAL_PROCS.indexOf(code) >= 0) return "heal";
+  if (SOAK_PROCS.indexOf(code) >= 0) return "soak";
+  // gambler reports a signed percentage, not HP -- nothing about it is a quantity of
+  // health, so it gets no colour rather than a misleading one.
+  return code === "gambler" ? "" : "harm";
+}
+
+const isDigit = (ch) => ch >= "0" && ch <= "9";
+
+// The flavour text is a template with exactly three holes in it -- {attacker}, {defender}
+// and {amount} (see pets_flavor) -- so highlighting those three needs no prose parsing:
+// both names and the round's own damage figure are already known here.
+//
+// Scanned by hand rather than with a built regex, for two reasons. A pet name is player
+// input and would have to be regex-escaped, and this page is a Python string, so every
+// backslash in it has to survive being written twice -- one of those two mistakes is
+// silent and the other takes the whole log down. And matching a whole digit RUN against
+// the amount is exactly the "5 must not light up the 5 inside 15" rule, without needing
+// a word boundary or a lookbehind for it.
+//
+// Matching happens on the raw text and every piece is escaped exactly once on the way
+// out, so inserted markup is never rescanned and a pet called "span" changes nothing.
+function paintBlow(round, mineName, theirName) {
+  const rules = [];
+  if (mineName) rules.push({ text: mineName, cls: "nm mine" });
+  if (theirName && theirName !== mineName) rules.push({ text: theirName, cls: "nm them" });
+  rules.sort((a, b) => b.text.length - a.text.length);   // longest name wins a tie
+  const amount = Math.abs(Number(round.damage || 0));
+  const tone = amountTone(round);
+  const wanted = amount > 0 && tone ? String(amount) : null;
+
+  const text = String(round.text || "");
+  let out = "", plain = 0, at = 0;
+  const flush = (upto) => { out += esc(text.slice(plain, upto)); };
+  while (at < text.length) {
+    let hit = null, length = 0;
+    for (const rule of rules) {
+      if (rule.text && text.startsWith(rule.text, at)) { hit = rule.cls; length = rule.text.length; break; }
+    }
+    if (hit === null && wanted && isDigit(text[at]) && !(at && isDigit(text[at - 1]))) {
+      let end = at;
+      while (end < text.length && isDigit(text[end])) end += 1;
+      if (text.slice(at, end) === wanted) { hit = "amount " + tone; length = end - at; }
+    }
+    if (hit === null) { at += 1; continue; }
+    flush(at);
+    out += '<span class="' + hit + '">' + esc(text.substr(at, length)) + "</span>";
+    at += length;
+    plain = at;
+  }
+  flush(text.length);
+  return out;
+}
+
 function playDuel(data) {
   const me = data.you;
   const maxHp = data.max_hp || {};
-  const mineName = (S.pet && S.pet.name) || "Ты";
+  // The names the TRANSCRIPT was written with, not the pets' current ones -- a rename
+  // between the fight and the replay would otherwise leave every line naming a creature
+  // that appears nowhere on the screen.
+  const mineName = data.you_name || (S.pet && S.pet.name) || "Ты";
   const theirName = data.opponent.name || "Соперник";
   // Each bar against its OWN maximum. Falling back to the reader's own is what the whole
   // duel used to do, and it made a frailer opponent look untouched until they died.
@@ -2762,16 +2871,20 @@ function playDuel(data) {
     $("barTheirs").style.width = Math.min(100, (theirsHp / theirMax) * 100) + "%";
     $("hpMine").textContent = mineHp;
     $("hpTheirs").textContent = theirsHp;
-    const kind = round.event.indexOf("crit") >= 0 ? "crit"
-      : (round.event === "dodge" ? "dodge" : (mineTurn ? "mine" : ""));
+    const kind = String(round.event).indexOf("amulet_") === 0 ? "amulet"
+      : (round.event.indexOf("crit") >= 0 ? "crit"
+      : (round.event === "dodge" ? "dodge" : (mineTurn ? "mine" : "")));
     $("duelLog").insertAdjacentHTML("beforeend",
-      '<div class="blow ' + kind + '">' + esc(round.text) + "</div>");
+      '<div class="blow ' + kind + '">' + paintBlow(round, mineName, theirName) + "</div>");
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
     setTimeout(step, 520);
   };
   $("duelDone").onclick = () => {
+    // Skipping fast-forwards the animation, not the formatting: the lines it dumps are
+    // the same coloured lines step() would have written one at a time.
     while (index < data.rounds.length) { const r = data.rounds[index++];
-      $("duelLog").insertAdjacentHTML("beforeend", '<div class="blow">' + esc(r.text) + "</div>"); }
+      $("duelLog").insertAdjacentHTML("beforeend",
+        '<div class="blow">' + paintBlow(r, mineName, theirName) + "</div>"); }
     finish();
   };
   step();
