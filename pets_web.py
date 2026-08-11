@@ -687,6 +687,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["arena"]["farming"] = pets.is_farming(entry, user_id)
     state["arena"]["pity"] = pets.legendary_pity_progress(entry, user_id)
     state["rubies"] = pets.ruby_balance(entry, user_id)
+    state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
     state["farm"]["passive"] = pets.passive_income_status(entry, user_id)
     return state
@@ -1172,7 +1173,7 @@ async def handle_mob(request: web.Request) -> web.Response:
     block = await asyncio.to_thread(pets.roll_mob, entry, str(user["id"]))
     if block is None:
         return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
-    return _ok({"mob": _jsonable(block)})
+    return _ok({"mob": _jsonable(block), "pve": _jsonable(pets.pve_allowance(entry, str(user["id"])))})
 
 
 async def handle_mob_attack(request: web.Request) -> web.Response:
@@ -2479,16 +2480,28 @@ async function fightMob() {
   playDuel(data);
 }
 
-function mobPanel(blocked) {
+function mobPanel(farmBlocked) {
+  const pve = (S && S.pve) || {};
+  const left = pve.available != null ? pve.available : 0;
+  // PVE has its own counter, so it is blocked by its own emptiness -- not by the arena's.
+  const blocked = farmBlocked || left <= 0;
+  const counter = '<div class="row spread tiny" style="margin-bottom:9px">' +
+    "<span class='muted'>Атаки на мобов</span><span><b>" + left + "</b> / " +
+    (pve.capacity || 0) + (pve.seconds_until_reset
+      ? " <span class='muted'>· сброс через " + clock(pve.seconds_until_reset) + "</span>"
+      : "") + "</span></div>";
   if (!MOB) {
-    return '<div class="panel"><h2>👾 ПВЕ · мобы</h2>' +
+    return '<div class="panel"><h2>👾 ПВЕ · мобы</h2>' + counter +
       "<div class='small muted' style='margin-bottom:9px'>Соперник из реального мира. " +
-      "Платят вдвое меньше, чем за игрока, зато всегда есть кого бить — и только с них " +
-      "падают <b>руби</b>.</div>" +
-      '<button class="go" data-mob="roll"' + (blocked ? " disabled" : "") +
-      ">🔍 Найти моба</button></div>";
+      "Платят вдвое меньше, чем за игрока, зато бои для них свои — арену они не " +
+      "тратят, — и только с них падают <b>руби</b>.</div>" +
+      (left <= 0
+        ? "<div class='tiny muted' style='text-align:center'>Атаки кончились. " +
+          "Новые придут сразу у всех на сервере.</div>"
+        : '<button class="go" data-mob="roll"' + (blocked ? " disabled" : "") +
+          ">🔍 Найти моба</button>") + "</div>";
   }
-  return '<div class="panel mobcard"><h2>👾 ' + esc(MOB.name) + "</h2>" +
+  return '<div class="panel mobcard"><h2>👾 ' + esc(MOB.name) + "</h2>" + counter +
     "<div class='row spread'><span class='tiny muted'>" + esc(MOB.flavour) + "</span>" +
     '<span class="tierchip ' + (TIER_TONE[MOB.tier] || "") + '">' + esc(MOB.tier_name) +
     "</span></div>" +
@@ -3557,6 +3570,11 @@ function tick() {
     S.arena.seconds_until_next = Math.max(0, S.arena.seconds_until_next - 1);
     if (!S.arena.seconds_until_next) dirty = true;
     renderHud();
+  }
+  if (S.pve && S.pve.seconds_until_reset) {
+    S.pve.seconds_until_reset = Math.max(0, S.pve.seconds_until_reset - 1);
+    if (!S.pve.seconds_until_reset) dirty = true;
+    else if (TAB === "arena") renderArena();
   }
   if (S.farm && S.farm.seconds_left) {
     S.farm.seconds_left = Math.max(0, S.farm.seconds_left - 1);

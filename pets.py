@@ -2684,6 +2684,56 @@ def record_fight(
 # --- PVE ------------------------------------------------------------------------------
 
 
+def _pve_window(moment: datetime) -> int:
+    """Which fixed 8-hour block of the chat's clock `moment` falls in.
+
+    Derived from the wall clock rather than counted from each player's first fight, which
+    is what makes the reset simultaneous for everybody: the block boundaries are 00:00,
+    08:00 and 16:00 local for every member at once. Anchored on the local DATE so a
+    timezone with a non-zero UTC offset still breaks at midnight rather than at 03:00.
+    """
+    return (moment.date().toordinal() * 24 + moment.hour) // C.PVE_WINDOW_HOURS
+
+
+def _pve_window_end(moment: datetime) -> datetime:
+    """The moment this window closes and everybody's PVE attacks come back."""
+    block_start_hour = (moment.hour // C.PVE_WINDOW_HOURS) * C.PVE_WINDOW_HOURS
+    start = moment.replace(hour=block_start_hour, minute=0, second=0, microsecond=0)
+    return start + timedelta(hours=C.PVE_WINDOW_HOURS)
+
+
+def pve_allowance(entry, user_id, now: datetime | None = None) -> dict:
+    """PVE attacks left, and when the whole server gets them back.
+
+    Deliberately NOT the arena's fight bank. The arena trickles one fight back an hour per
+    player; this is a flat ten that everybody loses and regains together, so PVE is
+    something you sit down to rather than something you top up between messages.
+    """
+    moment = now or app_now()
+    record = _tamed_record(_load(entry), user_id)
+    used = 0
+    if record is not None and int(record.get("pve_window", -1) or -1) == _pve_window(moment):
+        used = max(0, int(record.get("pve_used", 0) or 0))
+    ends = _pve_window_end(moment)
+    return {
+        "available": max(0, C.PVE_ATTACKS_PER_WINDOW - used),
+        "capacity": C.PVE_ATTACKS_PER_WINDOW,
+        "used": used,
+        "resets_at": ends.isoformat(),
+        "seconds_until_reset": max(0, int((ends - moment).total_seconds())),
+        "window_hours": C.PVE_WINDOW_HOURS,
+    }
+
+
+def _spend_pve_fight(record: dict, moment: datetime) -> None:
+    """Consume one PVE attack, rolling the counter over into a new window if needed."""
+    window = _pve_window(moment)
+    if int(record.get("pve_window", -1) or -1) != window:
+        record["pve_window"] = window
+        record["pve_used"] = 0
+    record["pve_used"] = max(0, int(record.get("pve_used", 0) or 0)) + 1
+
+
 def roll_mob(entry, user_id, rng=None) -> dict | None:
     """Deal one mob at one tier, scaled against THIS player. None without a pet.
 
@@ -2780,11 +2830,19 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
             raise ValueError("Сначала приручи существо.")
         if _is_farming_record(record, moment):
             raise ValueError("Питомец на ферме и не может участвовать в бою.")
-        capacity, *_ = _fight_bank_components(entry, user_id, record, moment)
-        available, _checkpoint, _changed = _settle_fight_bank(record, capacity, moment)
-        if available <= 0:
-            raise ValueError("В запасе нет боёв.")
-        _spend_arena_fight(record, capacity, moment)
+        # PVE's OWN counter -- the arena bank is untouched by a mob fight and vice versa.
+        window = _pve_window(moment)
+        used = (
+            max(0, int(record.get("pve_used", 0) or 0))
+            if int(record.get("pve_window", -1) or -1) == window else 0
+        )
+        if used >= C.PVE_ATTACKS_PER_WINDOW:
+            ends = _pve_window_end(moment)
+            raise ValueError(
+                f"Атаки на мобов кончились. Новые придут в "
+                f"{ends.strftime('%H:%M')} — сразу у всех."
+            )
+        _spend_pve_fight(record, moment)
         record["fights"] = record.get("fights", 0) + 1
 
         won = str(result.winner or "") == str(user_id)

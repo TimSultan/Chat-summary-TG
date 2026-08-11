@@ -140,31 +140,70 @@ class MobRollAndBlockTests(PetsTestCase):
 
 
 class MobFightBankAndRewardTests(PetsTestCase):
-    def test_mob_fights_spend_the_same_bank_a_duel_uses_and_refuse_when_its_empty(self):
+    def test_mob_fights_spend_their_own_counter_and_never_the_arena_bank(self):
+        """PVE has an allowance of its own. If the two ever share again, an empty arena
+        bank silently takes the mobs with it -- and a night of PVE eats the duels the
+        arena's hourly recharge was pacing."""
         entry = "chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
         now = datetime(2026, 8, 9, 9, 0)
-        self.assertEqual(pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY)
-
-        duel = SimpleNamespace(winner="1", loser="2", is_draw=False)
-        pets.record_fight(entry, "1", "2", duel, now.date(), now=now)
+        arena_before = pets.fights_left(entry, "1", now=now)
         self.assertEqual(
-            pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY - 1,
+            pets.pve_allowance(entry, "1", now=now)["available"],
+            pets_config.PVE_ATTACKS_PER_WINDOW,
         )
 
         block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "medium", rng=random.Random(1))
         loss = SimpleNamespace(winner=f"mob:{block['code']}", is_draw=False)
-        pets.record_mob_fight(entry, "1", block, loss, now=now)
-        self.assertEqual(
-            pets.fights_left(entry, "1", now=now), pets_config.BASE_FIGHT_BANK_CAPACITY - 2,
-        )
-
-        for _ in range(pets_config.BASE_FIGHT_BANK_CAPACITY - 2):
+        for spent in range(1, pets_config.PVE_ATTACKS_PER_WINDOW + 1):
             pets.record_mob_fight(entry, "1", block, loss, now=now)
-        self.assertEqual(pets.fights_left(entry, "1", now=now), 0)
+            self.assertEqual(
+                pets.pve_allowance(entry, "1", now=now)["available"],
+                pets_config.PVE_ATTACKS_PER_WINDOW - spent,
+            )
+        # Ten mob fights later the arena bank has not moved at all.
+        self.assertEqual(pets.fights_left(entry, "1", now=now), arena_before)
+
         with self.assertRaises(ValueError):
             pets.record_mob_fight(entry, "1", block, loss, now=now)
+        # And a duel still works, because it was never the thing that ran out.
+        duel = SimpleNamespace(winner="1", loser="2", is_draw=False)
+        pets.record_fight(entry, "1", "2", duel, now.date(), now=now)
+        self.assertEqual(pets.fights_left(entry, "1", now=now), arena_before - 1)
+
+    def test_the_pve_window_resets_for_everybody_at_the_same_wall_clock_moment(self):
+        """"Таймер сбрасывается у всех на сервере одновременно" -- so the window is a
+        fixed block of the chat's own clock (00:00 / 08:00 / 16:00), not a countdown
+        started by each player's first fight."""
+        entry = "chat"
+        self._tame(entry, "1", "Early")
+        self._tame(entry, "2", "Late")
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "easy", rng=random.Random(1))
+        loss = SimpleNamespace(winner=f"mob:{block['code']}", is_draw=False)
+
+        # Two players start hours apart inside the same block.
+        pets.record_mob_fight(entry, "1", block, loss, now=datetime(2026, 8, 9, 8, 5))
+        pets.record_mob_fight(entry, "2", block, loss, now=datetime(2026, 8, 9, 15, 55))
+        for user_id in ("1", "2"):
+            spent = pets.pve_allowance(entry, user_id, now=datetime(2026, 8, 9, 15, 59))
+            self.assertEqual(spent["used"], 1)
+            self.assertEqual(spent["resets_at"][11:16], "16:00")
+
+        # ...and both come back full at the very same moment.
+        for user_id in ("1", "2"):
+            after = pets.pve_allowance(entry, user_id, now=datetime(2026, 8, 9, 16, 0))
+            self.assertEqual(after["available"], pets_config.PVE_ATTACKS_PER_WINDOW)
+            self.assertEqual(after["used"], 0)
+
+    def test_the_windows_are_eight_hours_and_start_at_midnight(self):
+        for hour, ends in ((0, "08:00"), (7, "08:00"), (8, "16:00"),
+                           (15, "16:00"), (16, "00:00"), (23, "00:00")):
+            with self.subTest(hour=hour):
+                moment = datetime(2026, 8, 11, hour, 30)
+                allowance = pets.pve_allowance("chat", "nobody", now=moment)
+                self.assertEqual(allowance["resets_at"][11:16], ends)
+                self.assertEqual(allowance["window_hours"], pets_config.PVE_WINDOW_HOURS)
 
     def test_a_farming_pet_cannot_start_a_mob_fight(self):
         entry = "chat"

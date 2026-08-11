@@ -1404,9 +1404,15 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"\n<b>{ARENA_NO_FIGHTS_NOTICE}</b>")
         lines.append("Следующий бой появится после указанного выше отсчёта.")
 
+    pve = pets.pve_allowance(entry, user_id)
+    lines.append(
+        f"\n👾 Атаки на мобов: {pve['available']} из {pve['capacity']}"
+        + (f" · сброс в {datetime.fromisoformat(pve['resets_at']).strftime('%H:%M')}"
+           if pve["seconds_until_reset"] else "")
+    )
     rubies = pets.ruby_balance(entry, user_id)
     if rubies:
-        lines.append(f"\n💎 Руби: {_money(rubies)}")
+        lines.append(f"💎 Руби: {_money(rubies)}")
 
     rows = []
     if left > 0 and not farming:
@@ -1414,10 +1420,11 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": "🔍 Найти соперника",
             "callback_data": callback_data(user_id, "search"),
         }])
-        # PVE next to PVP rather than on its own screen: they spend the same bank, so
-        # the choice between them belongs where that bank is shown.
+    # PVE next to PVP because the choice between them belongs in one place -- but on its
+    # OWN counter, so an empty arena bank does not hide the mobs and vice versa.
+    if pve["available"] > 0 and not farming:
         rows.append([{
-            "text": "👾 Найти моба",
+            "text": f"👾 Найти моба ({pve['available']})",
             "callback_data": callback_data(user_id, "mob"),
         }])
     rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
@@ -1434,6 +1441,7 @@ def mob_view(entry: str, user_id, block: dict | None) -> tuple[str, dict]:
     """
     if not block:
         return notice_view(user_id, "Мобов сейчас нет. Попробуй ещё раз.")
+    allowance = pets.pve_allowance(entry, user_id)
     stats_line = " · ".join(
         f"{C.STAT_EMOJI.get(key, '')}{block['stats'].get(key, 0)}" for key in C.STAT_KEYS
     )
@@ -1445,8 +1453,11 @@ def mob_view(entry: str, user_id, block: dict | None) -> tuple[str, dict]:
         # The taunt brings its own quotation marks where it wants them -- wrapping it in
         # another pair rendered «« ... »» on every mob that already quotes itself.
         f"\n<i>{escape(block['taunt'])}</i>",
-        "\nЗа моба платят меньше, чем за игрока, но бить его можно всегда — "
-        "и только с мобов падают 💎 руби.",
+        f"\n👾 Атаки на мобов: {allowance['available']} из {allowance['capacity']}"
+        + (f" · сброс в {datetime.fromisoformat(allowance['resets_at']).strftime('%H:%M')}"
+           " — сразу у всех" if allowance["seconds_until_reset"] else ""),
+        "\nЗа моба платят меньше, чем за игрока, но у мобов свой счётчик — арену они "
+        "не тратят. И только с них падают 💎 руби.",
     ]
     rows = [
         [{"text": "⚔️ В бой", "callback_data": callback_data(user_id, "mobfight",

@@ -392,6 +392,13 @@ MIRROR_LEVEL_GAP = 5
 # purse would be a faucet running at twice the arena's real rate. Half, then, as asked:
 # "мобы давали примерно в два раза меньше денег".
 PVE_GOLD_SHARE = 0.5
+# PVE has its OWN allowance, not a share of the arena bank. Ten attacks per window, and
+# the window is a fixed 8-hour block of the chat's own clock -- 00:00, 08:00, 16:00 --
+# so it refills for everybody on the server at the same moment rather than trickling back
+# per player the way the arena's hourly recharge does. That is the whole point of the
+# difference: the arena rewards checking in often, PVE is a batch you come back for.
+PVE_WINDOW_HOURS = 8
+PVE_ATTACKS_PER_WINDOW = 10
 # XP is cut less hard than gold. Coins are the thing that inflates; pet levels are paced
 # by the fight bank either way, and a PVE-only player should not level at half speed.
 PVE_XP_SHARE = 0.7
