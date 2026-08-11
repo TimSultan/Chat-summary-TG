@@ -27,8 +27,10 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import economy
 import pets
 import pets_config as C
+import quests
 import pets_web
 import vote_web
 from pets_ui import valuable_item  # the same "needs confirming" rarity rule pets_web uses
@@ -43,6 +45,8 @@ PLAYER = {"id": 42, "username": "player", "first_name": "Player"}
 OPPONENT = {"id": 43, "username": "opponent", "first_name": "Opponent"}
 THIRD = {"id": 44, "username": "third", "first_name": "Third"}
 NONMEMBER = {"id": 99, "username": "outsider", "first_name": "Outsider"}
+# A chat admin or /badgeadmin delegate -- the only person who may review a quest.
+MODERATOR = {"id": 55, "username": "mod", "first_name": "Mod"}
 UNTRACKED = {"id": 77, "username": "ghost", "first_name": "Ghost"}
 
 
@@ -103,8 +107,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
 
+        # vote_web's admin gate. pets_web gets its own below -- the same callable in
+        # production (_is_vote_admin), but named separately here so a test can prove the
+        # quest routes ask for themselves rather than trusting a menu flag.
         async def is_admin(user):
-            return False
+            return user.get("id") == MODERATOR["id"]
 
         async def is_member(user):
             return user.get("id") != NONMEMBER["id"]
@@ -144,7 +151,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         app = vote_web.create_app(
             cfg, CHAT, is_admin, log=lambda *_: None,
             attach=lambda a: pets_web.attach(
-                a, cfg, CHAT, is_member=is_member, resolve_player=resolve_player,
+                a, cfg, CHAT, is_member=is_member, is_admin=is_admin,
+                resolve_player=resolve_player,
                 fetch_photo=fetch_photo, save_photo=save_photo,
                 log=self.logs.append,
             ),
@@ -784,6 +792,102 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         fresh = await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg")
         self.assertEqual(fresh.status, 200)
         self.assertNotEqual(await fresh.read(), await first.read())
+
+    # ---- quests -------------------------------------------------------------------------
+
+    async def test_the_quest_board_carries_everything_needed_to_go_and_paint(self):
+        board = await (await self._get("/api/quests", PLAYER)).json()
+        quest = board["quest"]
+        for field in ("code", "hashtag", "title", "subject", "technique", "hint",
+                      "tool", "difficulty", "reward"):
+            self.assertIn(field, quest)
+        self.assertEqual(quest["hashtag"], "#quest-" + quest["code"])
+        self.assertEqual(board["rerolls_left"], quests.REROLLS_PER_QUEST)
+        # A quest board is not an admin surface, and the menu flag must never be the
+        # thing that decides -- but it still has to be honest about which menu to draw.
+        self.assertFalse(board["is_admin"])
+        self.assertTrue((await (await self._get("/api/quests", MODERATOR)).json())["is_admin"])
+
+    async def test_only_a_moderator_can_see_or_decide_a_quest_submission(self):
+        """The review queue holds other people's work and the accept button spends real
+        coins. Every one of these routes asks the gate for itself -- a client that simply
+        navigates to the tab, or forges the menu flag, still gets nothing."""
+        for method, path in (("get", "/api/quests/review"), ("post", "/api/quests/review"),
+                             ("post", "/api/quests/config")):
+            unsigned = await getattr(self.client, method)(pets_web.ROUTE_PREFIX + path, json={})
+            self.assertEqual(unsigned.status, 401, f"{method} {path} let an unsigned caller in")
+            refused = await getattr(self.client, method)(
+                pets_web.ROUTE_PREFIX + path,
+                json={"init_data": _init_data(PLAYER["id"])}, headers=self._auth(PLAYER),
+            )
+            self.assertEqual(refused.status, 403, f"{method} {path} let a player moderate")
+            self.assertEqual((await refused.json())["error"], "NOT_AN_ADMIN")
+
+    async def test_a_moderator_accepts_a_quest_and_the_reward_lands_exactly_once(self):
+        """Accept is a web button on a slow connection, so it will be double-tapped. The
+        second press must find the row already decided and move no money at all."""
+        self._tame(PLAYER)
+        board = await (await self._get("/api/quests", PLAYER)).json()
+        code = board["quest"]["code"]
+        self.assertTrue(quests.submit(
+            CHAT, PLAYER["id"], code, chat_id=-1001234567890, message_id=777,
+            author_name="Player")[0])
+
+        queue = await (await self._get("/api/quests/review", MODERATOR)).json()
+        self.assertEqual(len(queue["rows"]), 1)
+        row = queue["rows"][0]
+        self.assertEqual(row["code"], code)
+        # The photo is not re-hosted: the moderator is sent to the post itself.
+        self.assertEqual(row["link"], "https://t.me/c/1234567890/777")
+
+        before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+        answer = await (await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/quests/review",
+            json={"init_data": _init_data(MODERATOR["id"]), "id": row["id"], "accept": True},
+        )).json()
+        self.assertTrue(answer["ok"], answer)
+        paid = answer["receipt"]
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + paid["gold"])
+        self.assertEqual(pets.farm_tickets(CHAT, PLAYER["id"]), paid["tickets"])
+
+        again = await (await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/quests/review",
+            json={"init_data": _init_data(MODERATOR["id"]), "id": row["id"], "accept": True},
+        )).json()
+        self.assertFalse(again["ok"])
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + paid["gold"])
+        self.assertEqual(pets.farm_tickets(CHAT, PLAYER["id"]), paid["tickets"])
+        self.assertEqual((await (await self._get("/api/quests/review", MODERATOR)).json())["rows"], [])
+
+    async def test_a_moderator_can_retune_the_reward_table_within_limits(self):
+        answer = await (await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/quests/config",
+            json={"init_data": _init_data(MODERATOR["id"]),
+                  "difficulty": 3, "field": "gold", "value": 999_999},
+        )).json()
+        self.assertTrue(answer["ok"])
+        # Clamped, not accepted: a mistyped figure in a text box is a chat's economy gone,
+        # and coins already spent cannot be taken back.
+        capped = quests.REWARD_LIMITS["gold"][1]
+        self.assertEqual(quests.rewards_for(CHAT, 3)["gold"], capped)
+        row = next(r for r in answer["rewards"] if r["difficulty"] == 3)
+        self.assertEqual(row["gold"], capped)
+
+        refused = await (await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/quests/config",
+            json={"init_data": _init_data(MODERATOR["id"]),
+                  "difficulty": 3, "field": "everything", "value": 1},
+        )).json()
+        self.assertFalse(refused["ok"])
+
+    async def test_the_page_only_draws_the_review_tab_for_a_moderator(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function questBoard(", page)
+        self.assertIn("function reviewQueue(", page)
+        self.assertIn("quests:🎯 Квесты", page)
+        self.assertIn('if (S && S.is_admin) menu.push("review:🛡 Проверка квестов");', page)
+        # A verdict spends coins, so it is confirmed rather than fired on one tap.
+        self.assertIn("confirmThen(accept ?", page)
 
     # ---- the farm ticket ----------------------------------------------------------------
 

@@ -31,6 +31,7 @@ from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 import history
 import economy
 import pets
+import quests
 import stats
 import tree
 from config import SUMMARY_COMMAND, build_session, load_config
@@ -1245,6 +1246,31 @@ async def run_listener(
                         await figurine_ack_queue.put((entry, msg.id))
                 else:
                     await react_emoji(event.chat_id, msg.id, FIGURINE_ACK_EMOJI)
+
+        # A daily quest is submitted by posting the painted thing with the quest's own
+        # hashtag -- "#quest-nmm" (see quests.parse_hashtag and pets_quest_catalog).
+        # Checked on its own rather than inside the block above, because a quest photo is
+        # normally ALSO a #япокрасил post and both rewards are meant to land; but a
+        # submission without the figurine tag still counts, and one without a picture
+        # never does -- there is nothing for a moderator to look at.
+        if cfg.stats_enabled and (is_image_message(msg) or is_video_message(msg)):
+            quest_code = quests.parse_hashtag(text)
+            if quest_code is not None:
+                chat = await event.get_chat()
+                entry = matched_allowed_chat(chat)
+                if entry is not None:
+                    sender = await event.get_sender()
+                    ok, note = quests.submit(
+                        entry, msg.sender_id, quest_code,
+                        chat_id=event.chat_id, message_id=msg.id,
+                        author_name=sender_display_name(sender),
+                        author_username=getattr(sender, "username", None) or "",
+                    )
+                    log(
+                        f"[listener] quest '{quest_code}' from "
+                        f"{sender_display_name(sender)} in '{entry}': "
+                        + ("queued for review" if ok else f"refused -- {note}")
+                    )
 
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
         # confirmation before reposting whatever you replied to into your save channel

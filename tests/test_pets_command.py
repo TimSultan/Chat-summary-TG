@@ -25,6 +25,7 @@ import pets
 import pets_config as C
 import pets_image
 import pets_ui
+import quests
 import pets_updates
 import stats
 
@@ -291,15 +292,46 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("уже забран", api.edits[0]["text"])
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + 25)
 
-    def test_quests_screen_is_a_stateless_placeholder(self):
+    def test_the_quest_screen_hands_out_a_quest_and_tells_you_how_to_submit_it(self):
+        """It stopped being a placeholder. The screen has to carry the four things a
+        player leaves the app with: what the technique is, what small thing to paint, what
+        it pays, and -- last, because it is the only part they have to copy -- the hashtag
+        that turns a finished model into a submission."""
         text, keyboard = pets_ui.quests_view(CHAT, PLAYER["id"])
-        self.assertIn("Квесты скоро будут.", text)
-        # No button here changes anything -- the only way off this screen is back.
+        board = quests.daily_quest(CHAT, PLAYER["id"])
+        quest = board["quest"]
+
+        self.assertIn(quest["title"], text)
+        self.assertIn(quest["subject"], text)
+        self.assertIn(quest["hashtag"], text)
+        self.assertIn(str(quest["reward"]["gold"]), text)
+        # Opening the screen twice is not two quests: an assignment is sticky.
+        self.assertEqual(pets_ui.quests_view(CHAT, PLAYER["id"])[0], text)
+
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertEqual(actions, {"main", "questreroll"})
+
+    def test_rerolling_from_the_menu_swaps_the_quest_and_runs_out(self):
+        first = quests.daily_quest(CHAT, PLAYER["id"])["quest"]["code"]
+        seen = {first}
+        for _ in range(quests.REROLLS_PER_QUEST):
+            api = self._tap("questreroll")
+            self.assertIn("Новый квест", api.edits[0]["text"])
+            seen.add(quests.daily_quest(CHAT, PLAYER["id"])["quest"]["code"])
+
+        # Two rerolls used, so the button is gone and the action refuses.
+        _text, keyboard = pets_ui.quests_view(CHAT, PLAYER["id"])
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
         self.assertEqual(actions, {"main"})
+        api = self._tap("questreroll")
+        self.assertIn("Реролов больше нет", api.edits[0]["text"])
+        self.assertGreater(len(seen), 1)
 
     def test_fight_result_notifications_can_be_disabled_from_the_menu(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

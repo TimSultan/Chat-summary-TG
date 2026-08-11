@@ -77,6 +77,7 @@ import pets_config as C
 import pets_image
 import pets_ui
 import pets_updates
+import quests
 import pets_web
 import post_stats_web
 import preview
@@ -6168,6 +6169,12 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action == "questreroll":
+            ok, note = quests.reroll(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.quests_view(entry, user_id), log
+            )
+            return
         if action == "farmticket":
             ok, note = pets.use_farm_ticket(entry, user_id)
             await _pets_toast_and_redraw(
@@ -8478,7 +8485,11 @@ async def run_bot_listener(
 
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
-                    is_member=_is_vote_member, resolve_player=_resolve_pet_player,
+                    is_member=_is_vote_member,
+                    # Quest review only, and deliberately the SAME gate the voting page
+                    # moderates with: chat admins plus whoever /badgeadmin has delegated.
+                    is_admin=_is_vote_admin,
+                    resolve_player=_resolve_pet_player,
                     fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo, log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see

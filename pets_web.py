@@ -54,6 +54,8 @@ import pets
 import pets_combat
 import pets_config as C
 import pets_updates
+import quests
+import stats
 import voting
 from pets_ui import mail_day_label, valuable_item  # rules defined once, used by both UIs
 
@@ -62,6 +64,9 @@ ROUTE_PREFIX = "/pets"
 _CFG_KEY = web.AppKey("pets_cfg")
 _ENTRY_KEY = web.AppKey("pets_entry", str)
 _IS_MEMBER_KEY = web.AppKey("pets_is_member", Callable[[dict], Awaitable[bool]])
+# Quest moderation only. Everything else in this module is a player surface, so this is
+# the one gate that has to answer "may this person decide for somebody else".
+_IS_ADMIN_KEY = web.AppKey("pets_is_admin", Callable[[dict], Awaitable[bool]])
 _RESOLVE_KEY = web.AppKey("pets_resolve_player")
 _FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
 _SAVE_PHOTO_KEY = web.AppKey("pets_save_photo")
@@ -120,6 +125,10 @@ async def _authenticate(request: web.Request, body: dict | None = None) -> dict:
             text=json.dumps({"error": "UNAUTHORIZED", "message": str(e)}, ensure_ascii=False),
             content_type="application/json",
         )
+
+
+async def _default_is_admin(user: dict) -> bool:
+    return False
 
 
 async def _default_is_member(user: dict) -> bool:
@@ -851,7 +860,11 @@ _ACTIONS = {
 async def handle_state(request: web.Request) -> web.Response:
     user, xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
-    return _ok(_state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY]))
+    state = _state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY])
+    # Whether the moderation entry is even drawn. A convenience for the menu, never a
+    # permission: every route behind it asks the same gate again for itself.
+    state["is_admin"] = await request.app[_IS_ADMIN_KEY](user)
+    return _ok(state)
 
 
 async def handle_action(request: web.Request) -> web.Response:
@@ -1203,6 +1216,146 @@ async def handle_history(request: web.Request) -> web.Response:
     return _ok({"rows": rows})
 
 
+# --------------------------------------------------------------------------- quests
+
+
+async def _quest_admin(request: web.Request, body: dict | None = None):
+    """(user, xp) for a quest moderator, or an HTTPException. Fails closed.
+
+    Moderation is the same "chat admin or delegate" rule every other management surface
+    in this bot uses (_can_manage_chat, injected as is_admin) -- there is no separate
+    quest-reviewer list to keep in sync, and /badgeadmin already delegates it at runtime.
+    """
+    user, xp = await _player(request, body)
+    if not await request.app[_IS_ADMIN_KEY](user):
+        raise web.HTTPForbidden(
+            text=json.dumps({"error": "NOT_AN_ADMIN", "message": "Только для модераторов."}),
+            content_type="application/json",
+        )
+    return user, xp
+
+
+def _submission_link(row: dict) -> str | None:
+    """A t.me link to the post itself.
+
+    The photo is not re-hosted: it lives in the chat, the moderator is a member of that
+    chat, and one tap there gives them the full-size image, the whole album and a reply
+    box -- all of which a thumbnail rehosted here would take away. It also keeps a
+    Telethon media download out of a request that a moderator is waiting on.
+    """
+    return stats.figurine_message_link(None, row.get("chat_id"), row.get("message_id"))
+
+
+async def handle_quests(request: web.Request) -> web.Response:
+    """The player's own quest board: what they were given, and what it pays."""
+    user, _xp = await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    me = str(user["id"])
+    # Four store reads. Off the loop together rather than one of them at a time: this
+    # process also serves the ballot and answers the bot, and a blocking JSON read is a
+    # blocking JSON read whether or not it is the slowest one in the handler.
+    payload = await asyncio.to_thread(_quest_board_payload, entry, me)
+    payload["is_admin"] = await request.app[_IS_ADMIN_KEY](user)
+    return _ok(payload)
+
+
+def _quest_board_payload(entry: str, me: str) -> dict:
+    return _jsonable({
+        **quests.daily_quest(entry, me),
+        "rerolls_total": quests.REROLLS_PER_QUEST,
+        "stats": quests.stats_for(entry, me),
+        "history": quests.history(entry, me, limit=20),
+    })
+
+
+async def handle_quest_reroll(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    user, _xp = await _player(request, body)
+    entry = request.app[_ENTRY_KEY]
+    me = str(user["id"])
+    ok, message = quests.reroll(entry, me)
+    request.app[_LOG_KEY](f"[pets_web] quest reroll {me}: {'ok' if ok else 'refused'} -- {message}")
+    return _ok({"ok": ok, "message": message, "board": _jsonable(quests.daily_quest(entry, me))})
+
+
+async def handle_quest_review_queue(request: web.Request) -> web.Response:
+    """Everything waiting on a moderator, plus the knobs they are allowed to turn."""
+    user, _xp = await _quest_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    rows = []
+    for row in quests.pending(entry):
+        rows.append({
+            "id": row["id"], "user_id": row["user_id"],
+            "author": row.get("author_name") or row.get("author_username") or row["user_id"],
+            "username": row.get("author_username") or "",
+            "code": row["code"], "title": row["title"], "subject": row["subject"],
+            "difficulty": row["difficulty"], "reward": row["reward"],
+            "at": row.get("ts"), "link": _submission_link(row),
+            "portrait": _portrait_url(request.app[_PREFIX_KEY], row["user_id"]),
+        })
+    return _ok({
+        "rows": _jsonable(rows),
+        "rewards": quests.reward_table(entry),
+        "catalog": [
+            {"code": quest.code, "title": quest.title, "subject": quest.subject,
+             "difficulty": quest.difficulty, "tool": quest.tool,
+             "hashtag": quests.catalog.hashtag(quest.code),
+             "enabled": quest.code in {q.code for q in quests.available_quests(entry)}}
+            for quest in quests.catalog.QUESTS
+        ],
+        "recent": _jsonable(quests.submissions(entry, limit=40)),
+    })
+
+
+async def handle_quest_review(request: web.Request) -> web.Response:
+    """Accept or reject one submission. The only place a quest ever pays."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _quest_admin(request, body)
+    entry = request.app[_ENTRY_KEY]
+    accept = bool(body.get("accept"))
+    ok, message, receipt = await asyncio.to_thread(
+        quests.review, entry, str(body.get("id") or ""), str(user["id"]), accept,
+        reviewer_name=user.get("first_name") or user.get("username") or "",
+        note=str(body.get("note") or ""),
+    )
+    request.app[_LOG_KEY](
+        f"[pets_web] quest review by {user['id']}: {body.get('id')} -> "
+        f"{'accepted' if accept else 'rejected'} ({'ok' if ok else message})"
+        + (f", paid {receipt.get('gold')} gold / {receipt.get('xp')} xp"
+           f" / {receipt.get('tickets')} ticket(s), drop {receipt.get('item')}" if receipt else "")
+    )
+    return _ok({"ok": ok, "message": message, "receipt": _jsonable(receipt)})
+
+
+async def handle_quest_config(request: web.Request) -> web.Response:
+    """Edit the reward table, or take a quest out of rotation."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _quest_admin(request, body)
+    entry = request.app[_ENTRY_KEY]
+    if "code" in body:
+        ok, message = quests.set_quest_enabled(
+            entry, str(body.get("code") or ""), bool(body.get("enabled")),
+        )
+    else:
+        ok, message = quests.set_reward(
+            entry, body.get("difficulty"), str(body.get("field") or ""), body.get("value"),
+        )
+    request.app[_LOG_KEY](
+        f"[pets_web] quest config by {user['id']}: {body.get('code') or body.get('field')} -> "
+        f"{'ok' if ok else 'refused'} -- {message}"
+    )
+    return _ok({"ok": ok, "message": message, "rewards": quests.reward_table(entry)})
+
+
 async def handle_mail(request: web.Request) -> web.Response:
     """The mailbox: fights, farm shifts and gifts in one feed, newest first.
 
@@ -1215,7 +1368,7 @@ async def handle_mail(request: web.Request) -> web.Response:
     user, _xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
     rows = []
-    for event in pets.mail(entry, user["id"]):
+    for event in pets.mail(entry, user["id"], extra=quests.mail_events(entry, user["id"])):
         rows.append({**event, "day_label": mail_day_label(event.get("day") or "")})
     return _ok({"rows": _jsonable(rows)})
 
@@ -1276,6 +1429,7 @@ def attach(
     cfg,
     entry: str,
     is_member=None,
+    is_admin=None,
     resolve_player=None,
     fetch_photo=None,
     save_photo=None,
@@ -1301,6 +1455,9 @@ def attach(
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
+    # Fails closed: with no gate injected, nobody is a quest moderator and the review
+    # tab simply never appears -- rather than appearing for everyone.
+    app[_IS_ADMIN_KEY] = is_admin or _default_is_admin
     app[_RESOLVE_KEY] = resolve_player or _default_resolve_player
     app[_FETCH_PHOTO_KEY] = fetch_photo or _default_fetch_photo
     app[_SAVE_PHOTO_KEY] = save_photo or _default_save_photo
@@ -1318,6 +1475,12 @@ def attach(
         web.get(prefix + "/api/history", handle_history),
         web.get(prefix + "/api/mail", handle_mail),
         web.get(prefix + "/api/replay", handle_replay),
+        web.get(prefix + "/api/quests", handle_quests),
+        web.post(prefix + "/api/quests/reroll", handle_quest_reroll),
+        # Moderator-only, all three (see _quest_admin).
+        web.get(prefix + "/api/quests/review", handle_quest_review_queue),
+        web.post(prefix + "/api/quests/review", handle_quest_review),
+        web.post(prefix + "/api/quests/config", handle_quest_config),
         web.get(prefix + "/api/collection", handle_collection),
         web.get(prefix + "/api/updates", handle_updates),
         web.post(prefix + "/api/portrait", handle_portrait_upload),
@@ -1575,6 +1738,36 @@ PAGE_HTML = """<!doctype html>
   .foe .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .foe.out { opacity: .45; }
   .pw { color: var(--gold); font-weight: 700; }
+
+  /* ----------------------------------------------------------------------- quests
+     A quest card is read once and then acted on in the real world hours later, so it is
+     laid out as a brief rather than a list row: what the technique is, what to paint,
+     what it pays, and the hashtag that submits it -- in that order, largest first. */
+  .qtitle { font-size: 17px; font-weight: 700; }
+  .pips { letter-spacing: 1px; font-size: 11px; }
+  .pips.d1, .pips.d2 { color: var(--xp); }
+  .pips.d3 { color: var(--gold); }
+  .pips.d4, .pips.d5 { color: var(--hp); }
+  .qreward { background: var(--sunken); border-radius: 10px; padding: 8px 10px;
+             font-size: 12px; text-align: center; }
+  .qtag { margin-top: 9px; border: 1px dashed var(--accent); border-radius: 10px;
+          padding: 8px 10px; font-size: 12px; text-align: center; }
+  .qtag b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .qtag.review { border-style: solid; border-color: var(--gold); color: var(--gold); }
+
+  /* One pending submission. Three columns so the verdict buttons keep a fixed home no
+     matter how long a title or a painter's name turns out to be. */
+  .claim { display: grid; grid-template-columns: 46px 1fr; gap: 10px;
+           background: var(--sunken); border-radius: 12px; padding: 10px; margin-bottom: 9px; }
+  .claim .av { width: 46px; height: 46px; border-radius: 11px; overflow: hidden;
+               background: var(--card); }
+  .claim .cbody { min-width: 0; }
+  .claim .cbody a { color: var(--accent); }
+  .claim .cacts { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .rwrow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .rwrow label { display: flex; align-items: center; gap: 4px; }
+  .rwin { width: 64px; background: var(--sunken); color: var(--fg); font: inherit;
+          font-size: 13px; border: 1px solid var(--line); border-radius: 8px; padding: 5px 6px; }
 
   /* --------------------------------------------------------------------- the mailbox
      Colour-coded by what HAPPENED, not by which subsystem wrote the row: green won, red
@@ -2237,9 +2430,15 @@ let moreView = "menu";
 async function renderMore() {
   const box = $("scr-more");
   if (moreView === "menu") {
+    const menu = ["quests:🎯 Квесты", "mail:📬 Почта", "ranking:🏆 Рейтинг существ",
+                  "collection:📚 Коллекция оружия", "history:📜 История боёв",
+                  "updates:📰 Обновления"];
+    // The review queue is the one entry that is not for everybody. Whether it appears at
+    // all is the server's answer, never a guess from the client -- and every route behind
+    // it re-checks, so a hand-typed moreView cannot open anything.
+    if (S && S.is_admin) menu.push("review:🛡 Проверка квестов");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
-      ["mail:📬 Почта", "ranking:🏆 Рейтинг существ", "collection:📚 Коллекция оружия",
-       "history:📜 История боёв", "updates:📰 Обновления"].map((entry) => {
+      menu.map((entry) => {
         const [key, label] = entry.split(":");
         return '<button class="go sec" style="margin-bottom:8px" data-more="' + key + '">' +
                label + "</button>";
@@ -2271,6 +2470,10 @@ async function renderMore() {
       "</h2>" + (data.rows.length
         ? '<div class="items">' + data.rows.map((i) => itemCard(i)).join("") + "</div>"
         : '<div class="empty">Ещё ничего не найдено.</div>') + "</div>";
+  } else if (moreView === "quests") {
+    body = questBoard(await api("/api/quests"));
+  } else if (moreView === "review") {
+    body = reviewQueue(await api("/api/quests/review"));
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -2290,8 +2493,131 @@ async function renderMore() {
   paintShots(box);
 }
 
+// ---------------------------------------------------------------------------- quests
+const DIFF_NAMES = ["", "новичок", "просто", "средне", "сложно", "жёстко"];
+const TOOL_NAMES = { brush: "кисть", airbrush: "аэрограф", any: "кисть или аэрограф" };
+
+function pips(level) {
+  let out = "";
+  for (let i = 1; i <= 5; i += 1) out += i <= level ? "●" : "○";
+  return '<span class="pips d' + level + '">' + out + "</span>";
+}
+
+function rewardLine(reward) {
+  if (!reward) return "";
+  return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
+    "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
+    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%";
+}
+
+// Quest calls do not return the game state the way /api/action does -- nothing here
+// changes a pet -- so they redraw the screen they were pressed on instead of the world.
+async function questCall(path, payload) {
+  try {
+    const data = await api(path, payload || {});
+    haptic(data.ok ? "ok" : "no");
+    if (data.message) toast(data.message);
+    if (data.ok && data.receipt && data.receipt.item_name) {
+      toast("Выпало: " + data.receipt.item_name);
+    }
+    render();
+    return data.ok;
+  } catch (e) {
+    haptic("no");
+    toast(e.message);
+    return false;
+  }
+}
+
+function questBoard(data) {
+  const board = data || {};
+  const quest = board.quest;
+  const done = (board.stats || {}).done || 0;
+  let head = '<div class="panel"><h2>🎯 Квест дня</h2>';
+  if (!quest) {
+    head += "<div class='empty'>На сегодня всё — квест уже сдан.<br>" +
+      "Новый придёт завтра.</div></div>";
+  } else {
+    const reviewing = board.status === "review";
+    head +=
+      '<div class="qtitle">' + esc(quest.title) + "</div>" +
+      '<div class="row spread tiny muted" style="margin-top:2px"><span>' +
+        pips(quest.difficulty) + " " + esc(DIFF_NAMES[quest.difficulty] || "") + "</span>" +
+        "<span>" + esc(TOOL_NAMES[quest.tool] || quest.tool) + "</span></div>" +
+      "<p class='small' style='margin:10px 0 4px'><b>Что красим:</b> " + esc(quest.subject) + "</p>" +
+      "<p class='small muted' style='margin:0 0 8px'>" + esc(quest.technique) + "</p>" +
+      "<p class='tiny muted' style='margin:0 0 10px'>💡 " + esc(quest.hint) + "</p>" +
+      '<div class="qreward">' + rewardLine(quest.reward) + "</div>" +
+      (board.has_pet === false
+        ? "<div class='tiny muted' style='margin-top:6px;text-align:center'>" +
+          "Опыт и находку начислить некуда — сначала приручи существо. " +
+          "Монеты и билет придут в любом случае.</div>"
+        : "") +
+      (reviewing
+        ? "<div class='qtag review'>Работа на проверке у модератора</div>"
+        : '<div class="qtag">Выложи фото в чат с хештегом <b>' + esc(quest.hashtag) + "</b></div>") +
+      '<div class="row" style="margin-top:10px">' +
+        '<button class="go sec" data-quest="reroll"' +
+          (board.rerolls_left && !reviewing ? "" : " disabled") + ">🎲 Реролл · " +
+          (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
+      "</div></div>";
+  }
+  const rows = board.history || [];
+  return head +
+    '<div class="panel"><h2>Сдано квестов · ' + done + "</h2>" + (rows.length
+      ? rows.map((row) =>
+          '<div class="row spread small" style="margin-bottom:7px"><span>' +
+          pips(row.difficulty) + " " + esc(row.title) + "</span>" +
+          "<span class='tiny gain'>💰" + money(row.gold || 0) +
+          (row.item_name ? " · 🎁" : "") + "</span></div>").join("")
+      : "<div class='empty'>Пока ни одного.</div>") + "</div>";
+}
+
+// -------------------------------------------------------------------- quest review
+function reviewQueue(data) {
+  const rows = data.rows || [];
+  let out = '<div class="panel"><h2>🛡 На проверке · ' + rows.length + "</h2>" + (rows.length
+    ? rows.map((row) =>
+        '<div class="claim">' +
+          '<span class="av">' + shot(row.portrait, null) + "</span>" +
+          "<div class='cbody'><b>" + esc(row.author) + "</b>" +
+            (row.username ? " <span class='tiny muted'>@" + esc(row.username) + "</span>" : "") +
+            "<div class='small'>" + pips(row.difficulty) + " " + esc(row.title) + "</div>" +
+            "<div class='tiny muted'>" + esc(row.subject) + "</div>" +
+            "<div class='tiny' style='margin-top:4px'>" + rewardLine(row.reward) + "</div>" +
+            (row.link ? '<a class="tiny" target="_blank" rel="noreferrer" href="' +
+              esc(row.link) + '">Открыть пост в чате ↗</a>' : "") +
+          "</div>" +
+          '<div class="cacts">' +
+            '<button class="go" data-accept="' + esc(row.id) + '">Принять</button>' +
+            '<button class="go warn" data-reject="' + esc(row.id) + '">Отклонить</button>' +
+          "</div>" +
+        "</div>").join("")
+    : "<div class='empty'>Пусто. Все работы разобраны.</div>") + "</div>";
+
+  out += '<div class="panel"><h2>Награды по сложности</h2>' +
+    "<div class='tiny muted' style='margin-bottom:8px'>Меняется сразу и только для этого чата.</div>" +
+    (data.rewards || []).map((row) =>
+      '<div class="rwrow"><span class="small">' + pips(row.difficulty) + "</span>" +
+      ["gold", "xp", "tickets", "drop_chance"].map((field) =>
+        '<label class="tiny muted">' + ({ gold: "💰", xp: "✨", tickets: "🎟", drop_chance: "🎁" })[field] +
+        '<input class="rwin" type="number" step="' + (field === "drop_chance" ? "0.01" : "1") +
+        '" value="' + row[field] + '" data-reward="' + field + '" data-level="' + row.difficulty +
+        '"></label>').join("") + "</div>").join("") + "</div>";
+
+  out += '<div class="panel"><h2>Квесты в ротации</h2>' +
+    (data.catalog || []).map((quest) =>
+      '<div class="row spread small" style="margin-bottom:6px"><span>' + pips(quest.difficulty) +
+      " " + esc(quest.title) + "<br><span class='tiny muted'>" + esc(quest.hashtag) + "</span></span>" +
+      '<button class="chip' + (quest.enabled ? " on" : "") + '" data-queston="' + esc(quest.code) +
+      '" data-enabled="' + (quest.enabled ? "0" : "1") + '">' +
+      (quest.enabled ? "в ротации" : "выключен") + "</button></div>").join("") + "</div>";
+  return out;
+}
+
 // ------------------------------------------------------------------------------ mail
-const MAIL_ICONS = { attack: "⚔️", defense: "🛡", farm: "🌾", gift_in: "🎁", gift_out: "🎁" };
+const MAIL_ICONS = { attack: "⚔️", defense: "🛡", farm: "🌾", gift_in: "🎁", gift_out: "🎁",
+                     quest_ok: "🎯", quest_no: "🎯" };
 const MAIL_VERDICTS = { win: "Победа", loss: "Поражение", draw: "Ничья" };
 // The stripe colour, keyed on what the row means to the reader. A won defence is green
 // for the same reason a won attack is: the question is whether the day went well, not
@@ -2314,6 +2640,8 @@ function mailFeed(rows) {
 }
 
 function mailTone(row) {
+  if (row.kind === "quest_ok") return "win";
+  if (row.kind === "quest_no") return "loss";
   if (row.kind === "farm") return "gold";
   if (row.kind === "gift_in" || row.kind === "gift_out") return "give";
   return MAIL_TONES[row.outcome] || "";
@@ -2329,14 +2657,17 @@ function mailWho(row) {
 function mailRow(row) {
   const coins = Number(row.coins || 0);
   const meta = [];
-  if (row.kind !== "farm" && MAIL_VERDICTS[row.outcome]) {
+  if (row.kind !== "farm" && row.kind.indexOf("quest") !== 0 && MAIL_VERDICTS[row.outcome]) {
     meta.push("<span class='verdict'>" + MAIL_VERDICTS[row.outcome] + "</span>");
   }
   if (coins) {
     meta.push("<span class='" + (coins > 0 ? "gain" : "loss") + "'>" +
               (coins > 0 ? "+" : "−") + money(Math.abs(coins)) + " 💰</span>");
   }
-  if (row.kind === "farm" && row.xp) meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
+  if (row.xp && (row.kind === "farm" || row.kind === "quest_ok")) {
+    meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
+  }
+  if (row.kind === "quest_ok" && row.tickets) meta.push("<span class='gain'>+" + row.tickets + " 🎟</span>");
   if (row.item_name) {
     // Tinted by rarity, the same colour the item's own card is bordered with -- a
     // legendary find should be legible as one from across the feed.
@@ -2344,7 +2675,12 @@ function mailRow(row) {
               ')">' + esc(row.item_name) + (row.auto_equipped ? " · надето" : "") + "</span>");
   }
   let title;
-  if (row.kind === "farm") {
+  if (row.kind === "quest_ok") {
+    title = "Квест «<b>" + esc(row.pet_name || "") + "</b>» принят";
+  } else if (row.kind === "quest_no") {
+    title = "Квест «<b>" + esc(row.pet_name || "") + "</b>» отклонён" +
+      (row.note ? "<div class='tiny muted'>" + esc(row.note) + "</div>" : "");
+  } else if (row.kind === "farm") {
     title = "Ферма — смена " + Number(row.hours || 0) + " ч";
   } else if (row.kind === "gift_out") {
     title = "Подарок для " + mailWho(row);
@@ -2930,7 +3266,8 @@ $("hudMail").addEventListener("click", () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
-    "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]");
+    "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
+    "[data-quest],[data-accept],[data-reject],[data-queston]");
   if (!target) return;
   const d = target.dataset;
 
@@ -2946,6 +3283,19 @@ document.addEventListener("click", async (event) => {
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
+  if (d.quest === "reroll") { await questCall("/api/quests/reroll", {}); return; }
+  if (d.accept || d.reject) {
+    // A verdict pays real coins, so it is the one moderator action that asks twice.
+    const id = d.accept || d.reject;
+    const accept = Boolean(d.accept);
+    confirmThen(accept ? "Принять работу и начислить награду?" : "Отклонить работу?",
+                () => questCall("/api/quests/review", { id, accept }));
+    return;
+  }
+  if (d.queston) {
+    await questCall("/api/quests/config", { code: d.queston, enabled: d.enabled === "1" });
+    return;
+  }
   if (d.foe) { haptic(); fight(d.foe); return; }
   if (d.farmstart) { await act("farm_start", { hours: Number(d.farmstart) }); return; }
   if (d.feature) { await act("farm_feature", { feature: d.feature }); return; }
@@ -2988,6 +3338,18 @@ document.addEventListener("click", async (event) => {
       if (name) await act("rename", { name });
     };
   }
+});
+
+// The reward editor commits on blur/enter rather than on every keystroke -- one number
+// typed is several intermediate numbers, and each would be a saved edit to a live economy.
+document.addEventListener("change", async (event) => {
+  const input = event.target.closest("[data-reward]");
+  if (!input) return;
+  await questCall("/api/quests/config", {
+    difficulty: Number(input.dataset.level),
+    field: input.dataset.reward,
+    value: Number(input.value),
+  });
 });
 
 // The two countdowns tick locally between refreshes -- a timer that only moves when you

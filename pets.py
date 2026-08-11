@@ -2603,6 +2603,52 @@ def fight_id(fight: dict) -> str:
     return str((fight or {}).get("ts") or "").replace("+", "~")
 
 
+def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) -> dict | None:
+    """Roll one loot drop outside a fight, and give it if it lands.
+
+    For rewards that are not arena wins -- a completed quest today, whatever else later.
+    The POOL RULES are the arena's, not a second set: a weapon code is one physical object
+    and is unique chat-wide, an accessory is unique inside its owner's bag, and the roll is
+    rarity-weighted from the same catalogue. Duplicating those rules here rather than
+    sharing them is how a quest ends up minting a second copy of a legendary somebody
+    already owns, which `_load` would then silently collapse.
+
+    Seeded when a caller passes `seed`, so the same reward paid twice by a retried
+    settlement rolls the same item instead of two -- the same reproducibility trick
+    _farm_reward uses.
+    """
+    if chance <= 0:
+        return None
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            # No pet, nowhere to put an item. Gold and XP still land; this simply does not.
+            return None
+        rng = random.Random(seed) if seed else random
+        if rng.random() >= min(1.0, float(chance)):
+            return None
+        owned = _owned_weapon_codes(data) | set(record.get("inventory", []))
+        pool = [item for item in C.ITEMS if item.source == "drop" and item.code not in owned]
+        if not pool:
+            return None
+        weighted = [item for item in pool for _ in range(max(1, getattr(item, "drop_weight", 1)))]
+        dropped = rng.choice(weighted)
+        record.setdefault("inventory", []).append(dropped.code)
+        _discover(record, dropped.code)
+        equipped = record.setdefault("equipped", {})
+        current = C.find_item(equipped.get(dropped.slot))
+        auto_equipped = current is None or C.equipment_score(dropped) > C.equipment_score(current)
+        if auto_equipped:
+            equipped[dropped.slot] = dropped.code
+        _metric_add(data, "drops_by_rarity", rarity=dropped.rarity)
+        _save(entry, data)
+    return {
+        "code": dropped.code, "name": dropped.name, "rarity": dropped.rarity,
+        "slot": dropped.slot, "auto_equipped": auto_equipped,
+    }
+
+
 def find_fight(entry, user_id, wire_id) -> dict | None:
     """One recorded fight this player took part in, by the id `fight_id` gave out.
 
@@ -2652,7 +2698,7 @@ def _mail_pet(data: dict, user_id) -> tuple[str | None, str | None]:
     return record.get("name"), record.get("owner_name")
 
 
-def mail(entry, user_id, limit: int | None = None) -> list[dict]:
+def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = None) -> list[dict]:
     """One merged, newest-first feed of everything that happened to this player.
 
     Read-side only: no new store, nothing written, no migration. The three things worth
@@ -2670,6 +2716,11 @@ def mail(entry, user_id, limit: int | None = None) -> list[dict]:
     ``at`` as HH.MM and ``day`` as an ISO date, both already in the chat's timezone: the
     bot and the Mini App must not disagree about what time something happened, and the
     page has no idea which timezone the chat lives in.
+
+    `extra` is for events this module cannot read for itself -- quest verdicts, which live
+    in quests.py, and quests.py imports THIS module, so the dependency can only point one
+    way. The caller supplies them; the merging, the ordering and the cap all still happen
+    here, in the one place that knows what a mailbox is.
     """
     cap = C.MAIL_LIMIT if limit is None else max(0, int(limit))
     data = _load(entry)
@@ -2759,6 +2810,10 @@ def mail(entry, user_id, limit: int | None = None) -> list[dict]:
             **_mail_item(row.get("item_code")),
             "auto_equipped": False,
         })
+
+    for event in extra or []:
+        if isinstance(event, dict):
+            add(event.get("ts"), dict(event))
 
     events.sort(key=lambda pair: pair[0], reverse=True)
     return [event for _moment, event in events[:cap]]

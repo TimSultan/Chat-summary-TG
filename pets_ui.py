@@ -26,6 +26,7 @@ import economy
 import pets
 import pets_config as C
 import pets_updates
+import quests
 
 CALLBACK_PREFIX = "pet"
 # Telegram caps callback_data at 64 bytes. "pet:" + a 19-digit id + ":" + the longest
@@ -298,17 +299,69 @@ def casino_view(entry: str, user_id) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 
+QUEST_DIFFICULTY_NAMES = {1: "новичок", 2: "просто", 3: "средне", 4: "сложно", 5: "жёстко"}
+QUEST_TOOL_NAMES = {"brush": "кисть", "airbrush": "аэрограф", "any": "кисть или аэрограф"}
+
+
+def quest_pips(level: int) -> str:
+    level = min(max(0, int(level or 0)), 5)
+    return "●" * level + "○" * (5 - level)
+
+
 def quests_view(entry: str, user_id) -> tuple[str, dict]:
-    """casino_view's sibling: same reason (announce the button before the feature exists),
-    same shape (nothing read, nothing written). Kept as its own function rather than a
-    parameterised copy of casino_view so each placeholder's copy can diverge later without
-    the two screens having to stay in lockstep."""
-    lines = [
-        "📜 <b>Квесты</b>\n",
-        "Квесты скоро будут.",
-        "Мастер пока грунтует доску под список поручений.",
-    ]
-    return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+    """The quest of the day: one technique, one small thing to paint, one hashtag.
+
+    Everything a player needs in order to go and DO it, phrased so the hashtag is the last
+    thing they read -- it is the only part they have to copy, and it is what turns a
+    painted model into a submission a moderator can see.
+    """
+    board = quests.daily_quest(entry, user_id)
+    quest = board.get("quest")
+    lines = ["🎯 <b>Квест дня</b>\n"]
+    if not quest:
+        lines.append("На сегодня всё — квест уже сдан. Новый придёт завтра.")
+        return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+    reward = quest.get("reward") or {}
+    difficulty = int(quest.get("difficulty", 1) or 1)
+    lines.append(f"<b>{escape(quest['title'])}</b>")
+    lines.append(
+        f"{quest_pips(difficulty)} {QUEST_DIFFICULTY_NAMES.get(difficulty, '')}"
+        f" · {QUEST_TOOL_NAMES.get(quest.get('tool'), quest.get('tool', ''))}"
+    )
+    lines.append(f"\n<b>Что красим:</b> {escape(quest['subject'])}")
+    lines.append(escape(quest["technique"]))
+    lines.append(f"\n💡 {escape(quest['hint'])}")
+    lines.append(
+        f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · "
+        f"✨ {int(reward.get('xp', 0))} опыта · 🎟 {int(reward.get('tickets', 0))} билет"
+        f" · 🎁 шанс находки {round(float(reward.get('drop_chance', 0)) * 100)}%"
+    )
+    if not board.get("has_pet", True):
+        # Said here rather than discovered at payout: two of the four reward legs need a
+        # creature to land in (see quests._pay), and somebody deciding whether to spend an
+        # evening on this is owed that before they start, not after.
+        lines.append(
+            "\n⚠️ Опыт и находку начислить некуда — сначала приручи существо. "
+            "Монеты и билет придут в любом случае."
+        )
+    if board.get("status") == "review":
+        lines.append("\n⏳ Работа на проверке у модератора.")
+    else:
+        lines.append(
+            f"\nВыложи фото в чат с хештегом <code>{escape(quest['hashtag'])}</code> — "
+            "модератор посмотрит и начислит награду."
+        )
+
+    rows = []
+    rerolls = int(board.get("rerolls_left", 0) or 0)
+    if rerolls and board.get("status") != "review":
+        rows.append([{
+            "text": f"🎲 Реролл ({rerolls})",
+            "callback_data": callback_data(user_id, "questreroll"),
+        }])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def daily_bonus_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
@@ -1469,6 +1522,7 @@ MAIL_MAX_CHARS = 3800
 
 MAIL_ICONS = {
     "attack": "⚔️", "defense": "🛡", "farm": "🌾", "gift_in": "🎁", "gift_out": "🎁",
+    "quest_ok": "🎯", "quest_no": "🎯",
 }
 MAIL_OUTCOMES = {"win": "победа", "loss": "поражение", "draw": "ничья"}
 
@@ -1522,6 +1576,19 @@ def _mail_line(event: dict) -> str:
         if xp:
             body += f", +{_money(xp)} опыта"
         return f"{icon} {body}{_mail_find(event)}"
+    if kind in ("quest_ok", "quest_no"):
+        title = escape(event.get("pet_name") or "квест")
+        if kind == "quest_no":
+            note = escape(event.get("note") or "")
+            return f"{icon} Квест «{title}» отклонён" + (f": {note}" if note else "")
+        xp = int(event.get("xp", 0) or 0)
+        tickets = int(event.get("tickets", 0) or 0)
+        tail = money
+        if xp:
+            tail += f", +{_money(xp)} опыта"
+        if tickets:
+            tail += f", +{tickets} билет"
+        return f"{icon} Квест «{title}» принят{tail}"
     if kind in ("gift_in", "gift_out"):
         item = escape(event.get("item_name") or "предмет")
         verb = "Подарок для" if kind == "gift_out" else "Подарок от"
@@ -1542,7 +1609,9 @@ def mail_view(entry: str, user_id) -> tuple[str, dict]:
     subsystem produced the row. Fights, farm shifts and gifts therefore share one column
     instead of living in three separate menus.
     """
-    events = pets.mail(entry, user_id)
+    # Quest verdicts live in quests.py, which imports pets -- so they are collected here
+    # and handed to pets.mail, which still does the merging and the cap. See its docstring.
+    events = pets.mail(entry, user_id, extra=quests.mail_events(entry, user_id))
     lines = ["📬 <b>Почта</b>\n"]
     if not events:
         lines.append("Пока пусто. Здесь будут бои, смены на ферме и подарки.")
