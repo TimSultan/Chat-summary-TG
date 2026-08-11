@@ -600,6 +600,7 @@ ITEMS = (
 # non-weapon starters.
 try:
     from pets_weapon_catalog import (
+        MOB_HUNTER_WEAPON_CODE,
         PRE_REBALANCE_BUY_PRICES as PRE_REBALANCE_WEAPON_BUY_PRICES,
         RAW_ITEMS as _RAW_WEAPON_ITEMS,
         STARTER_WEAPON_MAX_PRICE,
@@ -608,6 +609,7 @@ except ImportError:
     _RAW_WEAPON_ITEMS = ()
     PRE_REBALANCE_WEAPON_BUY_PRICES = {}
     STARTER_WEAPON_MAX_PRICE = FARM_GOLD_PER_RUN[1]
+    MOB_HUNTER_WEAPON_CODE = ""
 
 try:
     from pets_amulet_catalog import RAW_ITEMS as _RAW_AMULET_ITEMS
@@ -808,22 +810,28 @@ def daily_storefront_weapons(
         today = _date.fromisoformat(today)
     pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
     excluded = excluded_codes or set()
+    # The anti-mob weapon is a permanent shop option.  It vanishes only after somebody
+    # in the chat has bought it, exactly like the rest of the shared stock.
+    hunter = next((item for item in pool if item.code == MOB_HUNTER_WEAPON_CODE), None)
+    rotating_pool = tuple(item for item in pool if item is not hunter)
     if len(pool) <= DAILY_STOREFRONT_SIZE:
         return tuple(item for item in pool if item.code not in excluded)
     digest = hashlib.sha256(str(entry).encode("utf-8")).digest()
-    initial_offset = int.from_bytes(digest[:8], "big") % len(pool)
-    offset = (initial_offset + today.toordinal() * DAILY_STOREFRONT_SIZE) % len(pool)
+    initial_offset = int.from_bytes(digest[:8], "big") % len(rotating_pool)
+    offset = (initial_offset + today.toordinal() * DAILY_STOREFRONT_SIZE) % len(rotating_pool)
     # Walk the whole deterministic rotation, rather than slicing first and filtering
     # afterwards. A weapon already owned somewhere in the chat disappears from the
     # shared shop permanently, and the next free code fills its place on the counter.
     stock = []
-    for index in range(len(pool)):
-        item = pool[(offset + index) % len(pool)]
+    for index in range(len(rotating_pool)):
+        item = rotating_pool[(offset + index) % len(rotating_pool)]
         if item.code in excluded:
             continue
         stock.append(item)
         if len(stock) >= DAILY_STOREFRONT_SIZE:
             break
+    if hunter is not None and hunter.code not in excluded:
+        stock = [hunter, *stock[:DAILY_STOREFRONT_SIZE - 1]]
     # The shop is the farm's first tangible reward.  A rotation may otherwise contain
     # only mid-tier gear, so replace its final slot with an unowned starter item.  The
     # choice is deterministic per chat/day and does not create a duplicate object.

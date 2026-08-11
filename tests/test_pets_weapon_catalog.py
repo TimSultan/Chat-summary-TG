@@ -197,7 +197,9 @@ def test_generated_names_are_plain_readable_noun_phrases():
     generated_names = [weapon.name for weapon in catalogue.WEAPON_SPECS[3:]]
     assert all(not name.startswith("«") and ":" not in name for name in generated_names)
     legendary_names = {name for name, _ in catalogue._LEGENDARY_COPY}
+    special_names = {"Копьё зверобоя"}
     assert all(
-        name in legendary_names or any(name.endswith(suffix) for suffix, _ in catalogue._THEMES)
+        name in legendary_names or name in special_names
+        or any(name.endswith(suffix) for suffix, _ in catalogue._THEMES)
         for name in generated_names
     )

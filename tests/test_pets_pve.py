@@ -59,6 +59,56 @@ class _NoJitter:
 
 
 class MobRollAndBlockTests(PetsTestCase):
+    def test_owned_mob_gear_auto_equips_for_one_fight_then_restores_loadout(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        record["inventory"] = ["w001", pets.MIRROR_AMULET_CODE, "w009", "amulet_mob_ward"]
+        record["equipped"]["weapon"] = "w001"
+        record["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
+        pets._save(entry, data)
+
+        self.assertEqual(
+            set(pets.auto_equip_mob_gear(entry, "1")), {"w009", "amulet_mob_ward"},
+        )
+        active = pets.get_pet(entry, "1")["equipped"]
+        self.assertEqual(active["weapon"], "w009")
+        self.assertEqual(active["amulet"], "amulet_mob_ward")
+
+        self.assertTrue(pets.restore_after_mob_gear(entry, "1"))
+        restored = pets.get_pet(entry, "1")["equipped"]
+        self.assertEqual(restored["weapon"], "w001")
+        self.assertEqual(restored["amulet"], pets.MIRROR_AMULET_CODE)
+        self.assertFalse(pets.restore_after_mob_gear(entry, "1"))
+
+    def test_store_keeps_the_two_mob_items_available_and_their_effects_are_targeted(self):
+        weapon = pets_config.find_item("w009")
+        amulet = pets_config.find_item("amulet_mob_ward")
+        self.assertEqual(weapon.name, "Копьё зверобоя")
+        self.assertEqual(weapon.effect["code"], "mob_hunter")
+        self.assertEqual(amulet.effect["code"], "mob_ward")
+        self.assertTrue(all(
+            weapon.code in {item.code for item in pets_config.daily_storefront_weapons("chat", day)}
+            for day in (pets.today(), pets.today() + timedelta(days=1))
+        ))
+
+        def fighter(key, effects=()):
+            return pets_combat.Fighter(
+                key=key, name=key, strength=40, health=40, agility=10, luck=10,
+                armor=0, effects=effects, level=10,
+            )
+
+        hunter = fighter("player", ({"code": "mob_hunter", "value": 15},))
+        vs_mob = pets_combat.simulate(hunter, fighter("mob:orc"), seed=42)
+        vs_pet = pets_combat.simulate(hunter, fighter("pet"), seed=42)
+        self.assertGreater(vs_mob.total_damage["player"], vs_pet.total_damage["player"])
+
+        ward = fighter("player", ({"code": "mob_ward", "value": 15},))
+        ward_vs_mob = pets_combat.simulate(ward, fighter("mob:orc"), seed=42)
+        ward_vs_pet = pets_combat.simulate(ward, fighter("pet"), seed=42)
+        self.assertLess(ward_vs_mob.total_damage["mob:orc"], ward_vs_pet.total_damage["pet"])
+
     def test_mob_fight_callback_keeps_both_code_and_tier(self):
         """A compound callback argument must survive Telegram's outer separators.
 
@@ -89,18 +139,22 @@ class MobRollAndBlockTests(PetsTestCase):
         self.assertIn(block["code"], {mob.code for mob in pets_mobs.MOBS})
         self.assertIn(block["tier"], pets_mobs.TIERS)
         scale, spread = pets_mobs.TIER_SCALING[block["tier"]]
-        for key in pets_config.STAT_KEYS:
-            lo = max(1, round(mine[key] * scale * (1 - spread)))
-            hi = round(mine[key] * scale * (1 + spread))
-            self.assertGreaterEqual(block["stats"][key], lo)
-            self.assertLessEqual(block["stats"][key], hi)
+        variable_power = pets._power_from(mine, mine["armor"]) - pets_config.POWER_RATING_BASE
+        target = variable_power * scale
+        # One jitter is applied to the complete profile, not independently to every
+        # stat. Integer stat points can move the shown rating by at most eight points.
+        shown = block["power"] - pets_config.POWER_RATING_BASE
+        self.assertGreaterEqual(shown, target * (1 - spread) - 8)
+        self.assertLessEqual(shown, target * (1 + spread) + 8)
         self.assertEqual(block["level"], pets.get_pet(entry, "1")["level"])
-        self.assertEqual(block["power"], pets._power_from(block["stats"], mine["armor"]))
+        self.assertEqual(block["power"], pets._power_from(block["stats"], block["armor"]))
 
-    def test_each_tier_scales_the_players_stats_exactly_as_documented(self):
-        """The core of the feature, so this pins the actual numbers rather than just a
-        direction: with the jitter pinned to zero, easy is 20% below the player, medium
-        10% below, hard 15% above -- straight out of pets_mobs.TIER_SCALING."""
+    def test_each_tier_scales_one_combat_profile_as_documented(self):
+        """With jitter pinned, a tier changes total variable combat power once.
+
+        The profile stays recognisable: strength, health, dodge, crit and armour cannot
+        independently spike into a much tougher fight than the tier says.
+        """
         entry = "chat"
         self._tame(entry, "1")
         data = pets._load(entry)
@@ -109,14 +163,17 @@ class MobRollAndBlockTests(PetsTestCase):
         mine = pets.effective_stats(entry, "1")
         mob = pets_mobs.MOBS[0]
 
-        expected_scale = {"easy": 0.80, "medium": 0.90, "hard": 1.15}
+        expected_scale = {"easy": 0.78, "medium": 0.90, "hard": 1.00}
+        variable_power = pets._power_from(mine, mine["armor"]) - pets_config.POWER_RATING_BASE
         for tier, scale in expected_scale.items():
             self.assertEqual(pets_mobs.TIER_SCALING[tier][0], scale)
             block = pets.mob_block(entry, "1", mob.code, tier, rng=_NoJitter())
+            profile_scale = round(variable_power * scale) / variable_power
             for key in pets_config.STAT_KEYS:
                 self.assertEqual(
-                    block["stats"][key], max(1, round(mine[key] * scale)), (tier, key),
+                    block["stats"][key], max(0, round(mine[key] * profile_scale)), (tier, key),
                 )
+            self.assertEqual(block["armor"], round(mine["armor"] * profile_scale))
 
     def test_mob_block_rebuilds_stats_from_code_and_tier_only(self):
         """A client is handed a block and hands the code+tier back; this is what makes
@@ -131,7 +188,9 @@ class MobRollAndBlockTests(PetsTestCase):
         pets._save(entry, data)
         mine = pets.effective_stats(entry, "1")
         mob = pets_mobs.MOBS[0]
-        scale = pets_mobs.TIER_SCALING["hard"][0]
+        scale, spread = pets_mobs.TIER_SCALING["hard"]
+        variable_power = pets._power_from(mine, mine["armor"]) - pets_config.POWER_RATING_BASE
+        profile_scale = round(variable_power * scale) / variable_power
 
         shown = pets.mob_block(entry, "1", mob.code, "hard", rng=_NoJitter())
         # A rogue client tries to hand back a weakened, higher-level forgery.
@@ -140,7 +199,7 @@ class MobRollAndBlockTests(PetsTestCase):
 
         rebuilt = pets.mob_block(entry, "1", shown["code"], shown["tier"], rng=_NoJitter())
         for key in pets_config.STAT_KEYS:
-            self.assertEqual(rebuilt["stats"][key], max(1, round(mine[key] * scale)))
+            self.assertEqual(rebuilt["stats"][key], max(0, round(mine[key] * profile_scale)))
             self.assertNotEqual(rebuilt["stats"][key], forged_stats[key])
         self.assertNotEqual(rebuilt["level"], forged_level)
         self.assertEqual(rebuilt["level"], pets.get_pet(entry, "1")["level"])
@@ -148,11 +207,9 @@ class MobRollAndBlockTests(PetsTestCase):
         # Two independent rebuilds of the same code+tier land in the identical band,
         # regardless of anything else (a fresh rng here) passed alongside them.
         again = pets.mob_block(entry, "1", mob.code, "hard", rng=random.Random(4))
-        for key in pets_config.STAT_KEYS:
-            lo = max(1, round(mine[key] * scale * 0.85))
-            hi = round(mine[key] * scale * 1.15)
-            self.assertLessEqual(lo, again["stats"][key])
-            self.assertLessEqual(again["stats"][key], hi)
+        shown_variable = again["power"] - pets_config.POWER_RATING_BASE
+        self.assertGreaterEqual(shown_variable, variable_power * scale * (1 - spread) - 8)
+        self.assertLessEqual(shown_variable, variable_power * scale * (1 + spread) + 8)
 
 
 class MobFightBankAndRewardTests(PetsTestCase):

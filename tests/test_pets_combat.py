@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pets_config as C
 import pets_combat as combat
 from pets_amulet_catalog import AMULET_SPECS
+from pets_weapon_catalog import WEAPON_SPECS
 from pets_combat import Fighter
 
 
@@ -354,15 +355,19 @@ class AmuletEffectTests(unittest.TestCase):
 
     def test_all_catalogue_effects_are_seeded_and_safe_to_replay(self):
         """A malformed metadata deployment must not make one arena click non-replayable."""
+        effect_specs = [
+            *AMULET_SPECS,
+            *(spec for spec in WEAPON_SPECS if spec.effect),
+        ]
         self.assertEqual(
-            {spec.effect_dict()["code"] for spec in AMULET_SPECS},
+            {spec.effect_dict()["code"] for spec in effect_specs},
             set(combat._EFFECT_DEFAULTS),
         )
         opponent = Fighter(
             key="b", name="Opponent", strength=40, health=40, agility=40, luck=40,
             armor=0, level=8,
         )
-        for spec in AMULET_SPECS:
+        for spec in effect_specs:
             with self.subTest(effect=spec.effect_dict()["code"]):
                 fighter = self._fighter_with(spec.effect_dict())
                 first = combat.simulate(fighter, opponent, seed=41)

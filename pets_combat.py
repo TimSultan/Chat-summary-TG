@@ -105,7 +105,8 @@ _EFFECT_DEFAULTS = {
     "poison": 3, "thorns": 7, "second_wind": 18, "last_stand": 1,
     "dodge_heal": 7, "crit_guard": 30, "retaliation": 3, "regen": 4,
     "focused": 20, "momentum": 2, "gambler": 18, "safeguard": 35,
-    "giant_slayer": 18, "collector": 25, "survivor": 30, "mirror_soul": 20,
+    "giant_slayer": 18, "mob_hunter": 15, "mob_ward": 15, "collector": 25,
+    "survivor": 30, "mirror_soul": 20,
 }
 
 _EFFECT_TEXT = {
@@ -470,6 +471,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     def hurt(source_key: str, target_key: str, damage: int, number: int) -> tuple[int, bool]:
         """Apply damage and one-shot defensive effects. Returns (impact, knockout)."""
         damage = max(0, int(damage))
+        if effectful and damage and str(source_key).startswith("mob:") \
+                and (value := _effect_value(effects[target_key], "mob_ward")) is not None:
+            damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
         if effectful and damage and "safeguard" not in used[target_key] \
                 and (value := _effect_value(effects[target_key], "safeguard")) is not None:
             used[target_key].add("safeguard")
@@ -624,6 +628,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 multiplier += min(combo_cap, _fraction(_effect_value(effects[attacker_key], "combo") or 0) * landed_hits[attacker_key])
             if _effect_value(effects[attacker_key], "giant_slayer") is not None and attacker.level < defender.level:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "giant_slayer") or 0))
+            if _effect_value(effects[attacker_key], "mob_hunter") is not None \
+                    and str(defender_key).startswith("mob:"):
+                multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "mob_hunter") or 0))
             if _effect_value(effects[attacker_key], "piercing") is not None:
                 # Restore a configurable part of armor's otherwise already-applied cut.
                 multiplier += derived[defender_key]["reduction"] * max(0, _fraction(_effect_value(effects[attacker_key], "piercing") or 0))

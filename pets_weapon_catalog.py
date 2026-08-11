@@ -43,6 +43,7 @@ SHOP_PRICE_POWER_WEIGHTS: Final = {
 # unowned starter weapon remains.  It deliberately equals the guaranteed gold from a
 # level-1 farm run; the passive +1/hour is a pleasant extra, never a requirement.
 STARTER_WEAPON_MAX_PRICE: Final = 14
+MOB_HUNTER_WEAPON_CODE: Final = "w009"
 SHOP_PRICE_RARITY_BASE: Final = {"common": 5, "uncommon": 18, "rare": 55}
 SHOP_PRICE_POWER_MULTIPLIER: Final = {"common": 0.30, "uncommon": 0.75, "rare": 1.20}
 
@@ -466,10 +467,19 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             else f"{object_description} {theme_description}"
         )
         name = f"{object_name} {suffix}"
+        code = f"w{index + 1:03d}"
+        effect = _effect_for(rarity, rarity_seen[rarity])
+        # A dependable PVE tool belongs on the counter, not in a once-in-a-hundred
+        # drop.  Keep its stable catalogue code so the 500-item contract and existing
+        # inventories remain intact.
+        if code == MOB_HUNTER_WEAPON_CODE:
+            name = "Копьё зверобоя"
+            description = "Для тех, кто идёт за рыком, а не за дуэлью."
+            effect = _effect("mob_hunter", "Против мобов: +15% урона.", 15)
         if rarity == "legendary":
             name, description = _LEGENDARY_COPY[rarity_seen[rarity] - 1]
         entries.append(WeaponSpec(
-            code=f"w{index + 1:03d}",
+            code=code,
             name=name,
             description=description,
             rarity=rarity,
@@ -478,7 +488,7 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             resale_price=resale_price,
             drop_weight=_drop_weight(rarity, source),
             bonuses=bonuses,
-            effect=_effect_for(rarity, rarity_seen[rarity]),
+            effect=effect,
         ))
     # There are 50 * 10 name combinations, of which the first three are replaced by
     # migration-safe legacy entries.  The early stop above keeps the public range w001..w500.
@@ -530,7 +540,10 @@ def _validate_catalogue() -> None:
     # silently shipped only three of the five rare passives, which no other check caught.
     for rarity, declared in (("rare", _RARE_EFFECTS), ("legendary", _LEGENDARY_EFFECTS)):
         used = {item.effect_dict()["code"] for item in with_effect if item.rarity == rarity}
-        assert used == {dict(effect)["code"] for effect in declared}
+        expected = {dict(effect)["code"] for effect in declared}
+        if rarity == "rare":
+            expected.add("mob_hunter")
+        assert used == expected
     starter_shop_items = [
         item for item in WEAPON_SPECS
         if item.source == "shop" and item.price <= STARTER_WEAPON_MAX_PRICE

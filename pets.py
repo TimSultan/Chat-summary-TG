@@ -67,6 +67,9 @@ STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
 # Зеркало души. Named here rather than looked up by effect code because two call sites
 # need the ITEM (equip it, check it is owned) and only combat needs the effect.
 MIRROR_AMULET_CODE = "amulet_soul_mirror"
+# PVE counterparts to the mirror: when owned, they are temporarily worn for a mob fight
+# and the player's normal loadout is restored immediately afterwards.
+MOB_GEAR_CODES = {"weapon": "w009", "amulet": "amulet_mob_ward"}
 
 _NAME_MAX_LEN = 24
 # How many recent grant keys a ticket wallet remembers, purely to swallow a replayed
@@ -2358,6 +2361,56 @@ def restore_after_mirror(entry, user_id) -> bool:
     return True
 
 
+def auto_equip_mob_gear(entry, user_id) -> tuple[str, ...]:
+    """Temporarily wear every owned anti-mob item before a PVE fight.
+
+    This deliberately mirrors :func:`auto_equip_mirror`: PVE utility should work for a
+    player who bought the item, without making them remember an inventory swap, but it
+    must not silently replace their normal arena setup after the result is shown.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return ()
+        equipped = record.setdefault("equipped", {})
+        restore = {}
+        equipped_codes = []
+        for slot, code in MOB_GEAR_CODES.items():
+            if code not in record.get("inventory", []) or equipped.get(slot) == code:
+                continue
+            restore[slot] = equipped.get(slot)
+            equipped[slot] = code
+            equipped_codes.append(code)
+        if not restore:
+            return ()
+        record["mob_gear_restore"] = restore
+        _save(entry, data)
+    return tuple(equipped_codes)
+
+
+def restore_after_mob_gear(entry, user_id) -> bool:
+    """Restore the exact weapon/amulet displaced by :func:`auto_equip_mob_gear`."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None or "mob_gear_restore" not in record:
+            return False
+        restore = record.pop("mob_gear_restore")
+        equipped = record.setdefault("equipped", {})
+        restored = False
+        if isinstance(restore, dict):
+            for slot, previous in restore.items():
+                code = MOB_GEAR_CODES.get(slot)
+                # Do not overwrite a deliberate change made while the result was being
+                # sent; the auto swap restores only the item it itself still wears.
+                if code and equipped.get(slot) == code:
+                    equipped[slot] = previous if previous in record.get("inventory", []) else None
+                    restored = True
+        _save(entry, data)
+    return restored
+
+
 def find_opponent(
     entry, user_id, rng=None, exclude_ids=None, attackable_only: bool = False,
 ) -> str | None:
@@ -2774,19 +2827,26 @@ def mob_block(entry, user_id, code: str, tier: str, rng=None) -> dict | None:
 def _mob_block(entry, user_id, record: dict, mob, tier: str, rng) -> dict:
     scale, spread = M.TIER_SCALING[tier]
     mine = effective_stats(entry, user_id)
+    # Scale the *whole combat profile* once.  The old implementation gave every stat
+    # its own high/low roll, so a hard mob could luck into a full set of peaks at once.
+    # Power has a fixed base, therefore only its variable part is scaled; otherwise the
+    # base would make low-level mobs look much tougher than their tier promises.
+    profile_jitter = 1.0 + rng.uniform(-spread, spread)
+    mine_power = _power_from(mine, mine.get("armor", 0))
+    variable_power = max(1, mine_power - C.POWER_RATING_BASE)
+    target_variable_power = max(0, round(variable_power * scale * profile_jitter))
+    profile_scale = target_variable_power / variable_power
     stats_out = {}
     for key in C.STAT_KEYS:
-        jitter = 1.0 + rng.uniform(-spread, spread)
-        stats_out[key] = max(1, round(mine.get(key, 1) * scale * jitter))
+        stats_out[key] = max(0, round(mine.get(key, 0) * profile_scale))
+    armor = max(0, round(mine.get("armor", 0) * profile_scale))
     return {
         "code": mob.code, "name": mob.name, "flavour": mob.flavour, "taunt": mob.taunt,
         "tier": tier, "tier_name": M.TIER_NAMES[tier],
         "stats": stats_out,
-        # Armour scales too but is never jittered upward -- derive() caps it, and a lucky
-        # roll there turns a "20% weaker" mob into an unkillable one.
-        "armor": max(0, round(mine.get("armor", 0) * scale)),
+        "armor": armor,
         "level": int(record.get("level", 1) or 1),
-        "power": _power_from(stats_out, mine.get("armor", 0)),
+        "power": _power_from(stats_out, armor),
     }
 
 

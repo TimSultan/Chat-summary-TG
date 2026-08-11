@@ -61,6 +61,8 @@ EFFECT_HOOKS: Final = {
     "gambler": "fight_start: deterministic seeded risk/reward roll",
     "safeguard": "fight_start: reduce the first incoming hit",
     "giant_slayer": "on_attack: deal more damage to a higher-level opponent",
+    "mob_hunter": "on_attack: deal more damage to a mob",
+    "mob_ward": "after_damage_taken: reduce damage received from a mob",
     "collector": "fight_end_win: increase the chance that any item drops",
     "survivor": "fight_end_loss: retain a fraction of loss-gold only",
     "mirror_soul": "fight_start: match the opponent's stats, then jitter each by value%",
@@ -164,6 +166,13 @@ _SHOP_DATA: Final = (
          "на ±20%. Награда за победу при этом не режется.",
          20,
      ), 50, 0, 250),
+    ("amulet_mob_ward", "Оберег охотника",
+     "Не любит рычание и предпочитает, чтобы оно било мимо.", "rare",
+     {}, _effect(
+         "mob_ward",
+         "От мобов: на 15% меньше получаемого урона.",
+         15,
+     ), 44, 0, 220),
 )
 
 
@@ -212,7 +221,7 @@ def _validate_catalogue() -> None:
     assert all(isinstance(item.effect_dict()["value"], int) for item in AMULET_SPECS)
     assert all(key in STAT_KEYS and isinstance(value, int) for item in AMULET_SPECS for key, value in item.bonuses)
     assert all(set(record) == RAW_ITEM_FIELDS for record in RAW_ITEMS)
-    assert RARITY_COUNTS == {"common": 12, "uncommon": 10, "rare": 7, "legendary": 2}
+    assert RARITY_COUNTS == {"common": 12, "uncommon": 10, "rare": 8, "legendary": 2}
 
 
 _validate_catalogue()

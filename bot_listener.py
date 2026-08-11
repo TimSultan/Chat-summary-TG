@@ -6287,6 +6287,11 @@ async def handle_pets_callback(
                     message_id=message_id, log=log,
                 )
                 return
+            mob_gear = pets.auto_equip_mob_gear(entry, user_id)
+            if mob_gear:
+                # Gear stats are part of a player's current combat profile, so rebuild
+                # the server-side block after the temporary PVE loadout is in place.
+                block = pets.mob_block(entry, user_id, code, tier)
             mine = pets.get_pet(entry, user_id)
             hero = _pets_fighter(entry, user_id, mine)
             enemy = pets.mob_fighter(block)
@@ -6294,11 +6299,15 @@ async def handle_pets_callback(
             try:
                 reward = pets.record_mob_fight(entry, user_id, block, result)
             except ValueError as e:
+                if mob_gear:
+                    pets.restore_after_mob_gear(entry, user_id)
                 await _send_pets_view(
                     api, chat_id, pets_ui.notice_view(user_id, str(e)),
                     message_id=message_id, log=log,
                 )
                 return
+            if mob_gear:
+                pets.restore_after_mob_gear(entry, user_id)
             report = pets_ui.fight_report(
                 result, str(user_id),
                 {str(user_id): mine.get("name"), enemy.key: block["name"]}, None,

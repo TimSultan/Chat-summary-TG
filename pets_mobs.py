@@ -37,12 +37,14 @@ from typing import Final
 TIERS: Final = ("easy", "medium", "hard")
 TIER_NAMES: Final = {"easy": "лёгкий", "medium": "средний", "hard": "сильный"}
 
-# tier -> (stat multiplier against the player, ± jitter). Read straight from the brief:
-# easy is 20% weaker ±20%, medium 10% weaker ±10%, hard 15% stronger ±15%.
+# tier -> (target total combat-power ratio, ± one profile jitter).  A mob is built as
+# one coherent version of the player's build, rather than independently multiplying
+# every stat.  That avoids the old case where a hard mob rolled high strength, health,
+# dodge and crit at once and became much stronger than its displayed tier.
 TIER_SCALING: Final = {
-    "easy": (0.80, 0.20),
-    "medium": (0.90, 0.10),
-    "hard": (1.15, 0.15),
+    "easy": (0.78, 0.04),
+    "medium": (0.90, 0.04),
+    "hard": (1.00, 0.04),
 }
 # What each tier pays, as a multiplier on the halved arena purse. A hard mob is worth
 # picking precisely because it is likely to beat you.

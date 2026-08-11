@@ -19,7 +19,7 @@ import stats
 # Shop items priced on utility rather than on stat bonuses. Enumerated here on purpose:
 # the pricing test below waives the power formula only for these exact codes, so a future
 # hand-added three-figure accessory still has to justify itself against the formula.
-UTILITY_SHOP_CODES = frozenset({"amulet_soul_mirror"})
+UTILITY_SHOP_CODES = frozenset({"amulet_soul_mirror", "amulet_mob_ward"})
 
 
 class PetsTestCase(unittest.TestCase):
