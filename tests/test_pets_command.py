@@ -211,6 +211,35 @@ class PetsCommandTests(unittest.TestCase):
             ))
         return api
 
+    def test_every_menu_action_renders_instead_of_erroring(self):
+        """A guard for the whole callback table, not one button.
+
+        «Назад» is on nearly every screen and routes to "main", so a name that exists in
+        one handler but not the other takes the entire menu down at once -- which is how
+        it shipped: a plain redraw raised NameError, the blanket except turned it into
+        "Что-то сломалось", and no test tapped a redraw through the CALLBACK path to
+        notice. Walking the table costs nothing and covers every future addition to it.
+        """
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file", "Player")
+
+        redraws = [
+            "main", "info", "cage", "farm", "train", "bag", "fight", "history", "mail",
+            "updates", "leaderboard", "pet", "casino", "quests", "dailybonus", "store",
+            "collection", "questmods",
+        ]
+        for action in redraws:
+            with self.subTest(action=action):
+                api = self._tap(action)
+                self.assertTrue(
+                    api.edits or api.sent,
+                    f"'{action}' produced no message at all",
+                )
+                rendered = "".join(
+                    str(call.get("text", "")) for call in (api.edits + api.sent)
+                )
+                self.assertNotIn("Что-то сломалось", rendered, f"'{action}' errored")
+
     def _empty_fight_bank(self, user_id):
         """Put one pet at an empty, freshly checkpointed hourly fight bank."""
         capacity = pets.fight_allowance_breakdown(CHAT, user_id, pets.today())["capacity"]

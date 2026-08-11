@@ -6081,6 +6081,19 @@ async def handle_pets_callback(
         callback_id, pets_ui.ARENA_NO_FIGHTS_NOTICE if no_arena_fights else None,
     )
 
+    # Both need a Telegram round trip, so they are resolved once per tap and threaded
+    # into the pure views below. AFTER answer_callback_query, never before -- a blocking
+    # call ahead of it leaves the button spinning until the client gives up.
+    quest_admin_chat_id = await _resolve_chat_id(
+        telethon_client, entry, known_chat_ids or {}, log=log,
+    ) if entry else None
+    can_appoint_mods = bool(quest_admin_chat_id) and await _can_manage_chat(
+        api, quest_admin_chat_id, actor, entry,
+    )
+    is_quest_mod = can_appoint_mods or quests.is_moderator(
+        entry, actor.get("id"), actor.get("username"),
+    )
+
     user, xp = await _pets_context(telethon_client, entry, tz, actor, log=log)
     if user is None:
         await _send_pets_view(
