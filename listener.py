@@ -1248,7 +1248,7 @@ async def run_listener(
                     await react_emoji(event.chat_id, msg.id, FIGURINE_ACK_EMOJI)
 
         # A daily quest is submitted by posting the painted thing with the quest's own
-        # hashtag -- "#quest-nmm" (see quests.parse_hashtag and pets_quest_catalog).
+        # hashtag -- "#quest_nmm" (see quests.parse_hashtag and pets_quest_catalog).
         # Checked on its own rather than inside the block above, because a quest photo is
         # normally ALSO a #япокрасил post and both rewards are meant to land; but a
         # submission without the figurine tag still counts, and one without a picture

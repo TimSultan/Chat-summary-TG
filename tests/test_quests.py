@@ -161,20 +161,77 @@ class SubmissionTests(QuestsTestCase):
 class ParseHashtagTests(unittest.TestCase):
     def test_finds_the_code_inside_a_longer_caption(self):
         self.assertEqual(
-            quests.parse_hashtag("вот моя работа #quest-nmm, сделано за вечер"), "nmm"
+            quests.parse_hashtag("вот моя работа #quest_nmm, сделано за вечер"), "nmm"
         )
 
     def test_is_case_insensitive(self):
-        self.assertEqual(quests.parse_hashtag("готово! #QUEST-NMM"), "nmm")
+        self.assertEqual(quests.parse_hashtag("готово! #QUEST_NMM"), "nmm")
+
+    def test_every_catalogue_tag_is_one_telegram_hashtag(self):
+        """Telegram ends a hashtag at the first character that is not a letter, a digit
+        or an underscore. A hyphenated code therefore posted as the tag `#quest` followed
+        by loose text -- unclickable, and not grouped with anything in search. This is the
+        reason the codes use underscores, so it is the thing worth pinning."""
+        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+        for quest in catalog.QUESTS:
+            with self.subTest(code=quest.code):
+                tag = catalog.hashtag(quest.code)
+                self.assertTrue(tag.startswith("#"))
+                self.assertTrue(set(tag[1:]) <= allowed, tag)
+                self.assertEqual(quests.parse_hashtag(f"готово {tag}"), quest.code)
+
+    def test_a_hyphenated_tag_written_before_the_change_still_counts(self):
+        """Captions posted under the old spelling -- or copied from an old message -- are
+        still submissions. Folding them costs one replace and orphans nobody."""
+        self.assertEqual(quests.parse_hashtag("старый пост #quest-anime-eyes"), "anime_eyes")
+        self.assertEqual(quests.parse_hashtag("#quest-nmm"), "nmm")
+        self.assertIs(catalog.find_quest("anime-eyes"), catalog.find_quest("anime_eyes"))
 
     def test_returns_none_for_an_unknown_code(self):
-        self.assertIsNone(quests.parse_hashtag("#quest-not-a-real-code"))
+        self.assertIsNone(quests.parse_hashtag("#quest_not_a_real_code"))
+
+    def test_a_store_written_before_the_rename_keeps_working(self):
+        """Codes are canonicalised on READ rather than migrated on disk. Without it, a
+        live assignment would be dealt away from under somebody, every cooldown would
+        reset, and a once-ever quest like the loupe would quietly pay out twice."""
+        import json
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("stats._stats_dir", return_value=Path(folder)):
+                day = datetime(2026, 8, 11, 9, 0)
+                quests._path("chat").write_text(json.dumps({
+                    "version": 1,
+                    "assignments": {"1": {
+                        "code": "anime-eyes", "day": "2026-08-11",
+                        "assigned_at": day.isoformat(), "rerolls_used": 0,
+                        "status": "open", "submission_id": None,
+                    }},
+                    "real_assignments": {}, "submissions": [], "history": [], "rewards": {},
+                    "done": {"1": {"magnifier": day.isoformat(), "run-6km": day.isoformat()}},
+                    "disabled": ["nmm-gold"],
+                }), encoding="utf-8")
+
+                board = quests.daily_quest("chat", "1", now=day)
+                self.assertEqual(board["quest"]["code"], "anime_eyes")
+                self.assertEqual(board["quest"]["hashtag"], "#quest_anime_eyes")
+
+                data = quests._load("chat")
+                self.assertEqual(set(data["done"]["1"]), {"magnifier", "run_6km"})
+                self.assertEqual(data["disabled"], ["nmm_gold"])
+                # The cooldowns those stamps stand for are still being served.
+                once = catalog.find_quest("magnifier")
+                self.assertFalse(quests._is_offerable(
+                    once, data, "1", day + timedelta(days=999)))
+                repeatable = catalog.find_quest("run_6km")
+                self.assertFalse(quests._is_offerable(repeatable, data, "1", day))
+                self.assertTrue(quests._is_offerable(
+                    repeatable, data, "1", day + timedelta(days=repeatable.cooldown_days + 1)))
 
     def test_does_not_read_a_versioned_tag_as_its_base_code(self):
-        """The character class that lets a code survive being hand-typed ([a-z0-9-]) also
-        swallows a trailing "-v2" into the same match, so a caption tagged for a different,
-        unknown variant must not silently credit the base quest."""
-        self.assertIsNone(quests.parse_hashtag("работа по технике #quest-nmm-v2"))
+        """The character class that lets a code survive being hand-typed also swallows a
+        trailing "_v2" into the same match, so a caption tagged for a different, unknown
+        variant must not silently credit the base quest."""
+        self.assertIsNone(quests.parse_hashtag("работа по технике #quest_nmm_v2"))
 
 
 class EscalatingRerollTests(QuestsTestCase):

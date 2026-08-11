@@ -1,7 +1,7 @@
 """Quests: assignment, submission, review and history.
 
 Two kinds, both from pets_quest_catalog.py, both proved the same way -- post a photo in
-the chat with the quest's own hashtag (`#quest-nmm`), and a moderator accepts or rejects
+the chat with the quest's own hashtag (`#quest_nmm`), and a moderator accepts or rejects
 it from the Mini App. Only an accepted submission pays.
 
   PAINTING CHALLENGES -- one small thing painted in one named technique.
@@ -103,15 +103,20 @@ REWARD_LIMITS = {
 HISTORY_LIMIT = 400
 SUBMISSION_LIMIT = 400
 
-# `#quest-nmm`, anywhere in a caption, case-insensitively. The trailing boundary keeps
-# "#quest-nmm-v2" from being read as "#quest-nmm".
-_HASHTAG_RE = re.compile(r"#quest-([a-z0-9-]+)", re.IGNORECASE)
+# `#quest_nmm` anywhere in a caption, case-insensitively.
+#
+# BOTH separators are accepted after "quest" and inside the code. The tags are written
+# with underscores now, because Telegram ends a hashtag at the first character outside
+# letters/digits/underscore -- `#quest-nmm` posted as the tag `#quest` plus loose text,
+# which neither highlighted nor grouped in search. Hyphens stay readable here so a
+# caption written before that change, or copied from an old message, still counts.
+_HASHTAG_RE = re.compile(r"#quest[_-]([a-z0-9_-]+)", re.IGNORECASE)
 
 
 def parse_hashtag(text: str) -> str | None:
     """The quest code in a caption, or None. Unknown codes are not codes."""
     for match in _HASHTAG_RE.finditer(str(text or "")):
-        code = match.group(1).lower().rstrip("-")
+        code = catalog.normalise_code(match.group(1).rstrip("-_"))
         if catalog.find_quest(code) is not None:
             return code
     return None
@@ -156,13 +161,21 @@ def _load(entry: str) -> dict:
     base["real_assignments"] = {
         str(uid): row for uid, row in base["real_assignments"].items() if isinstance(row, dict)
     }
+    # Codes are canonicalised on READ rather than migrated on disk -- the same thing
+    # pets._load does for legacy item codes. Quest codes used hyphens until Telegram's
+    # hashtag parser turned out to end a tag at one (see catalog.normalise_code), and a
+    # stored `done` key that no longer matched its quest would silently reopen a
+    # once-ever quest and lose every cooldown.
     base["done"] = {
-        str(uid): {str(code): str(when) for code, when in rows.items()}
+        str(uid): {catalog.normalise_code(code): str(when) for code, when in rows.items()}
         for uid, rows in base["done"].items() if isinstance(rows, dict)
     }
+    for row in list(base["assignments"].values()) + list(base["real_assignments"].values()):
+        if row.get("code"):
+            row["code"] = catalog.normalise_code(row["code"])
     base["submissions"] = [row for row in base["submissions"] if isinstance(row, dict)]
     base["history"] = [row for row in base["history"] if isinstance(row, dict)]
-    base["disabled"] = [str(code) for code in base["disabled"]]
+    base["disabled"] = [catalog.normalise_code(code) for code in base["disabled"]]
     return base
 
 
@@ -567,7 +580,7 @@ def submit(
     """Record a photo posted with a quest hashtag, for a moderator to look at.
 
     Refuses a hashtag that is not the player's OWN live quest. Otherwise the hashtag would
-    be the whole game: post `#quest-nmm` under anything and collect, with the daily
+    be the whole game: post `#quest_nmm` under anything and collect, with the daily
     assignment reduced to a suggestion.
     """
     moment = now or app_now()

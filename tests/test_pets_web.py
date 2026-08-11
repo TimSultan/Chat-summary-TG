@@ -801,7 +801,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         for field in ("code", "hashtag", "title", "subject", "technique", "hint",
                       "tool", "difficulty", "reward"):
             self.assertIn(field, quest)
-        self.assertEqual(quest["hashtag"], "#quest-" + quest["code"])
+        # Underscores, not hyphens: Telegram ends a hashtag at the first character
+        # outside letters/digits/underscore, so "#quest-nmm" was never one tag.
+        self.assertEqual(quest["hashtag"], "#quest_" + quest["code"])
+        self.assertNotIn("-", quest["code"])
         self.assertEqual(board["rerolls_left"], quests.REROLLS_PER_QUEST)
         # A quest board is not an admin surface, and the menu flag must never be the
         # thing that decides -- but it still has to be honest about which menu to draw.
