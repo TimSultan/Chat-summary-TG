@@ -134,6 +134,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             self.save_calls.append((user_id, data))
             return self.next_saved_file_id
 
+        # Captured rather than discarded: the log is the only thing that distinguishes the
+        # three reasons a portrait can come back as a placeholder, so it is behaviour under
+        # test and not just noise (see the placeholder-reason tests below).
+        self.logs: list[str] = []
+
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
         app = vote_web.create_app(
@@ -141,7 +146,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             attach=lambda a: pets_web.attach(
                 a, cfg, CHAT, is_member=is_member, resolve_player=resolve_player,
                 fetch_photo=fetch_photo, save_photo=save_photo,
-                log=lambda *_: None,
+                log=self.logs.append,
             ),
         )
         self.server = TestServer(app)
@@ -629,6 +634,118 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 row["portrait"], f"{pets_web.ROUTE_PREFIX}/img/pet/{row['user_id']}.jpg"
             )
+
+    # ---- the log ----------------------------------------------------------------------
+
+    def _logged(self, needle):
+        return [line for line in self.logs if needle in line]
+
+    async def test_the_three_reasons_for_a_placeholder_are_told_apart_in_the_log(self):
+        """A pet nobody photographed, a lookup that found no pet at all, and a download
+        that failed all render the SAME grey tile. On screen they are indistinguishable, so
+        the log is the only thing that can tell a working game from a broken one -- which
+        is the whole reason the reason is written down."""
+        self._tame(PLAYER)                       # has a photo (file_id "file_id")
+        self._photos["file_id"] = None           # ...that Telegram declines to hand over
+        pets.buy_cage(CHAT, OPPONENT["id"], RICH_XP)
+        pets.tame(CHAT, OPPONENT["id"], RICH_XP, "Голый", None, "Opponent")
+
+        await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{OPPONENT['id']}.jpg")
+        await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/123456.jpg")
+        await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg")
+
+        self.assertTrue(self._logged("no photo_file_id"))
+        self.assertTrue(self._logged("no pet under entry"))
+        self.assertTrue(self._logged("download returned nothing"))
+
+    async def test_a_cached_portrait_is_not_logged_again(self):
+        """One line per image VIEW would bury everything else in the log -- a single arena
+        screen is a dozen portraits. Only the fetch is worth a line; a cache hit is not."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = _jpeg_bytes()
+
+        for _ in range(3):
+            await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg")
+
+        self.assertEqual(len(self._logged("fetched")), 1, self.logs)
+
+    async def test_a_download_that_raises_is_logged_and_still_answers(self):
+        """A broken picture must not become a broken page: the roster still has to render,
+        so the exception is recorded and the placeholder is served."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = RuntimeError("Telegram said no")
+
+        response = await self.client.get(f"{pets_web.ROUTE_PREFIX}/img/pet/{PLAYER['id']}.jpg")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "image/svg+xml")
+        self.assertTrue(self._logged("fetch raised"))
+        self.assertTrue(any("Telegram said no" in line for line in self.logs))
+
+    async def test_every_action_is_logged_with_who_did_it_and_whether_it_took(self):
+        """When a player reports that something went wrong, this is the record of what they
+        actually did -- the alternative is asking them to remember. A REFUSED action is
+        logged too: "nothing happened" is exactly the case worth being able to look up."""
+        self._tame(PLAYER)
+
+        await self._action(PLAYER, "upgrade_stat", stat="strength", times=1)
+        await self._action(PLAYER, "equip", code="w001")   # not owned -- refused
+
+        self.assertTrue(self._logged(f"{PLAYER['id']} upgrade_stat strength -> ok"))
+        self.assertTrue(self._logged(f"{PLAYER['id']} equip w001 -> refused"))
+
+    async def test_a_fight_is_logged_with_its_outcome(self):
+        """A fight moves coins, XP and sometimes an item. It is the most consequential
+        thing the page does, so it leaves a line saying what it decided."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+
+        line = self._logged(f"fight {PLAYER['id']} vs {OPPONENT['id']}")
+        self.assertEqual(len(line), 1, self.logs)
+        self.assertRegex(line[0], r"(win|loss|draw)")
+        self.assertIn("rounds", line[0])
+
+    async def test_the_upload_logs_both_byte_counts(self):
+        """The re-encode is the part most likely to be wrong later -- a change that stopped
+        shrinking photos would be invisible without the two numbers side by side."""
+        self._tame(PLAYER)
+
+        await self._upload_portrait(PLAYER, _large_jpeg_bytes())
+
+        self.assertTrue(self._logged("portrait upload from"))
+        self.assertRegex(self._logged("portrait upload from")[0], r"\d+ -> \d+ bytes")
+
+    # ---- the slot picker (page wiring) --------------------------------------------------
+
+    async def test_tapping_a_slot_offers_what_else_fits_it(self):
+        """A hand on an equipment slot is asking "what can go here?", not "what is here?".
+        The paperdoll therefore opens the slot, not the single item in it -- and every
+        alternative is one tap from being worn, with its stat delta against what is."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function openSlot(", page)
+        self.assertIn("if (d.slot !== undefined && d.slot && !d.act) { openSlot(d.slot); return; }", page)
+        self.assertIn("data-equipnow=", page)
+        self.assertIn('if (d.equipnow) { closeSheet(); await act("equip", { code: d.equipnow }); return; }', page)
+
+    async def test_a_slot_with_no_alternatives_points_at_the_shop(self):
+        """An empty answer is still an answer, but a dead end is not: the one thing to do
+        about a slot you own nothing for is to go and buy something for it."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("data-shoptab=", page)
+        self.assertIn('if (d.shoptab) { closeSheet(); TAB = "shop";', page)
+
+    async def test_the_slot_placeholders_use_the_games_own_emoji(self):
+        """⚔ ◈ ▲ are typographic lookalikes and render as flat text next to 🧤, which reads
+        as three broken icons beside one working one. The game already has a slot emoji per
+        slot; the art placeholder uses those."""
+        self.assertEqual(pets_web.SLOT_GLYPHS, dict(C.SLOT_EMOJI))
+        for slot, emoji in C.SLOT_EMOJI.items():
+            with self.subTest(slot=slot):
+                self.assertIn(emoji, pets_web.placeholder_svg("w001", "common", slot))
 
 
 if __name__ == "__main__":

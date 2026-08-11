@@ -1095,8 +1095,17 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self._two_pets(entry)
         offered = next(item for item in pets_config.daily_storefront_weapons(entry, pets.today())
                        if item.rarity not in {"rare", "legendary"})
+        # The window is not fixed for the day: buying a weapon takes it out of the pool for
+        # the whole chat, and the storefront BACKFILLS the empty slot. So "outside today's
+        # window" has to be judged against the window as it will be AFTER the first
+        # purchase, not before it -- otherwise the test picks whatever happens to be next
+        # in line and then calls a legitimate sale a bug. That is date-dependent, and it
+        # duly failed on 2026-08-11, when the backfill happened to land on w009.
+        on_sale = {item.code for item in pets_config.daily_storefront_weapons(entry, pets.today())}
+        on_sale |= {item.code for item in pets_config.daily_storefront_weapons(
+            entry, pets.today(), excluded_codes={offered.code})}
         outside = next(item for item in pets_config.items_for_slot("weapon", "shop")
-                       if item.code not in {offered.code for offered in pets_config.daily_storefront_weapons(entry, pets.today())})
+                       if item.code not in on_sale)
         economy.grant(entry, "1", offered.price + outside.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, offered.code)[0])
         ok, note = pets.buy_item(entry, "1", 0, outside.code)
