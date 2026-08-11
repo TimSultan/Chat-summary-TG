@@ -351,7 +351,7 @@ def casino_bet_view(entry: str, user_id, xp: int, game: str) -> tuple[str, dict]
         return casino_view(entry, user_id, xp)
     coins = pets.balance_for(entry, user_id, xp)
     descriptions = {
-        "poker": "Техасский холдем: 3 → 4 → 5 общих карт. Соперник всегда коллирует.",
+        "poker": "Техасский холдем: 3 → 4 → 5 общих карт. На каждом этапе можно повысить ставку.",
         "shell": "После ставки выбери один из трёх напёрстков.",
         "highlow": "Открыта 7. Угадай: следующая карта выше или ниже; 7 проигрывает.",
         "goat": "Выбери дверь; одну пустую откроют, затем решишь — оставить или поменять.",
@@ -393,7 +393,9 @@ def casino_highlow_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, 
     )
 
 
-def casino_poker_view(entry: str, user_id, xp: int, state: dict | None = None) -> tuple[str, dict]:
+def casino_poker_view(
+    entry: str, user_id, xp: int, state: dict | None = None, notice: str = ""
+) -> tuple[str, dict]:
     state = state or casino.active_game(entry, user_id)
     if not state or state.get("kind") != "poker":
         return casino_view(entry, user_id, xp)
@@ -401,14 +403,19 @@ def casino_poker_view(entry: str, user_id, xp: int, state: dict | None = None) -
     stage = hand["stage"]
     text = (
         f"🃏 <b>Покер · этап {stage} из 5</b>\n\n"
-        f"Твои карты: <b>{' · '.join(hand['player_cards'])}</b>\n"
+        f"Общая ставка: <b>{_money(hand['stake'] * 2)}</b>\n"
         f"Стол: <b>{' · '.join(hand['board_cards'])}</b>\n"
-        f"Ставка: {_money(hand['stake'])}\n\n"
-        "Соперник коллирует. Открыть следующую карту?"
+        f"Твои карты: <b>{' · '.join(hand['player_cards'])}</b>\n\n"
     )
-    return text, {"inline_keyboard": [[
-        {"text": "🃏 Колл · открыть карту", "callback_data": callback_data(user_id, "cpoker")},
-    ]]}
+    if notice:
+        text += notice
+    return text + "Открыть следующую карту?", {"inline_keyboard": [
+        [{"text": "🃏 Колл", "callback_data": callback_data(user_id, "cpoker")}],
+        [
+            {"text": f"+{amount}", "callback_data": callback_data(user_id, "cpoker", f"raise:{amount}")}
+            for amount in casino.BET_AMOUNTS
+        ],
+    ]}
 
 
 def casino_goat_pick_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, dict]:

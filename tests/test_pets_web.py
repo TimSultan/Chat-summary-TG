@@ -1177,11 +1177,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--mine:", page)
         self.assertIn("--foe:", page)
 
-    async def test_the_hud_portrait_is_not_rebuilt_on_every_tick(self):
-        """renderHud runs once a second while the fight bank recharges. Rewriting the
-        face's innerHTML there hands the browser a new <img> every second -- a fresh load,
-        a fresh decode, and a portrait that visibly flickers forever."""
+    async def test_arena_timers_update_once_a_minute_without_rebuilding_hud_portrait(self):
+        """Minute-resolution timers avoid recreating the opponent roster and avatars every
+        second, while the HUD still keeps its face node behind its change guard."""
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("const TIMER_TICK_SECONDS = 60;", page)
+        self.assertIn("setInterval(tick, TIMER_TICK_MS);", page)
+        self.assertNotIn("setInterval(tick, 1000)", page)
         self.assertIn("let hudFaceKey = null;", page)
         self.assertIn("if (faceKey !== hudFaceKey) {", page)
         # The repaint has to be INSIDE the guard, so grab the guarded block and look.

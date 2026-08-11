@@ -43,12 +43,30 @@ class CasinoTests(unittest.TestCase):
         self.assertEqual(casino.poker_snapshot(started["active"])["stage"], 3)
         self.assertEqual(economy.balance("chat", "1", 0), 5)
 
-        turn = casino.advance_poker("chat", "1", 0)
+        turn = casino.advance_poker("chat", "1", 0, raise_by=5)
         self.assertEqual(casino.poker_snapshot(turn["active"])["stage"], 4)
+        self.assertEqual(turn["active"]["stake"], 10)
+        self.assertEqual(economy.balance("chat", "1", 0), 0)
         result = casino.advance_poker("chat", "1", 0)
         self.assertTrue(result["won"])
-        self.assertEqual(result["payout"], 10)
-        self.assertEqual(economy.balance("chat", "1", 0), 15)
+        self.assertEqual(result["payout"], 20)
+        self.assertEqual(economy.balance("chat", "1", 0), 20)
+
+    def test_poker_view_puts_the_pot_first_and_offers_call_or_raise(self):
+        started = casino.start_poker("chat", "1", 0, 5, rng=_FixedRng())
+        text, keyboard = pets_ui.casino_poker_view("chat", "1", 0, started["active"])
+        self.assertLess(text.index("Общая ставка"), text.index("Стол"))
+        self.assertLess(text.index("Стол"), text.index("Твои карты"))
+        self.assertNotIn("Соперник коллирует", text)
+        callbacks = [
+            pets_ui.parse_callback(button["callback_data"])
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn(("1", "cpoker", ""), callbacks)
+        self.assertEqual(
+            {argument for _, action, argument in callbacks if action == "cpoker" and argument},
+            {f"raise:{amount}" for amount in casino.BET_AMOUNTS},
+        )
 
     def test_shells_and_higher_lower_settle_the_chosen_outcome(self):
         lost = casino.play_shell("chat", "1", 0, 5, 1, rng=_FixedRng(number=2))

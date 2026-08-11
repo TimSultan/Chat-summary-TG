@@ -66,10 +66,13 @@ def _start(entry, user_id, xp: int, stake: int, state: dict) -> dict:
     return {"ok": True, "active": dict(state), "balance": balance - stake, "stake": stake}
 
 
-def _finish_active(entry, user_id, xp: int, state: dict, won: bool, details: dict, *, draw: bool = False) -> dict:
+def _finish_active(
+    entry, user_id, xp: int, state: dict, won: bool, details: dict, *, draw: bool = False,
+    data: dict | None = None, record: dict | None = None,
+) -> dict:
     """Pay a wager already debited by `_start`, and clear its saved state atomically."""
-    data = economy._load(entry)
-    record = economy._record(data, user_id)
+    data = data if data is not None else economy._load(entry)
+    record = record if record is not None else economy._record(data, user_id)
     active = _active_state(record)
     if active != state:
         return {"ok": False, "error": "stale", "balance": economy._balance_from(data, user_id, xp), "stake": 0}
@@ -172,13 +175,33 @@ def _best_score(cards) -> tuple[int, ...]:
     return max(_five_score(hand) for hand in combinations(cards, 5))
 
 
-def advance_poker(entry, user_id, xp: int) -> dict:
-    """Reveal the turn, then river and showdown. The opponent always calls."""
+def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
+    """Call or raise, then reveal the turn or settle the river atomically."""
     data = economy._load(entry)
     record = economy._record(data, user_id)
     state = _active_state(record)
     if not state or state.get("kind") != "poker":
         return {"ok": False, "error": "stale", "balance": economy._balance_from(data, user_id, xp), "stake": 0}
+    if raise_by in (None, "", 0, "0"):
+        raise_by = 0
+    else:
+        raise_by = valid_stake(raise_by)
+        if raise_by is None:
+            return {
+                "ok": False, "error": "invalid", "active": state,
+                "balance": economy._balance_from(data, user_id, xp), "stake": 0,
+            }
+    if raise_by:
+        balance = economy._balance_from(data, user_id, xp)
+        if balance < raise_by:
+            return {
+                "ok": False, "error": "funds", "active": state,
+                "balance": balance, "stake": raise_by,
+            }
+        record["spent"] = record.get("spent", 0) + raise_by
+        economy._append_log(data, user_id, -raise_by, "wager_raise:casino:poker")
+        state["stake"] = int(state["stake"]) + raise_by
+        economy._effects(record).setdefault("casino", {})["active"] = state
     stage = int(state.get("stage", 3))
     if stage < 4:
         state["stage"] = 4
@@ -192,7 +215,7 @@ def advance_poker(entry, user_id, xp: int) -> dict:
         "player_cards": [_card(card) for card in state["player"]],
         "dealer_cards": [_card(card) for card in state["dealer"]],
         "board_cards": [_card(card) for card in state["board"]],
-    }, draw=player_score == dealer_score)
+    }, draw=player_score == dealer_score, data=data, record=record)
 
 
 def play_shell(entry, user_id, xp: int, stake, choice, rng=None) -> dict:

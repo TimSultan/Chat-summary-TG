@@ -931,39 +931,46 @@ async def handle_opponents(request: web.Request) -> web.Response:
     me = str(user["id"])
     prefix = request.app[_PREFIX_KEY]
 
-    # In a thread, because this is the most expensive read in the game and it is pure
-    # blocking work: pets.py has no caching, so every one of get_pet / effective_stats /
-    # can_attack_in_arena / arena_attacks_against re-reads and re-parses the whole chat
-    # store (which carries a fight log up to 2000 rows), five times over per opponent. On
-    # the event loop that is a stall of the entire server -- and the moment it happens is
-    # exactly when the browser fires off one portrait download per row, so the stall lands
-    # on the requests least able to survive it.
+    # This remains blocking work, but _opponents_payload reads the chat store once and
+    # derives every row from that one snapshot. It must stay off the event loop because a
+    # large fight log is still real disk/JSON work, just no longer multiplied per opponent.
     return _ok(await asyncio.to_thread(_opponents_payload, entry, me, prefix))
 
 
 def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
-    mine = pets.power_rating(entry, me)
+    data = pets._load(entry)
+    mine_record = pets._tamed_record(data, me)
+    mine = pets._power_rating_for(mine_record) if mine_record else 0
     today = pets.today()
-    opponents = []
-    for row in pets.pet_leaderboard(entry):
-        if str(row["user_id"]) == me:
+    today_key = today.isoformat()
+    attacks_today = {}
+    for fight in data.get("fights", []):
+        if fight.get("date") != today_key or str(fight.get("attacker_id")) != me:
             continue
-        record = pets.get_pet(entry, row["user_id"]) or {}
+        defender_id = str(fight.get("defender_id"))
+        attacks_today[defender_id] = attacks_today.get(defender_id, 0) + 1
+    attacker_can_fight = bool(mine_record) and not pets._is_farming_record(mine_record)
+    opponents = []
+    for opponent_id, record in data.get("pets", {}).items():
+        if opponent_id == me or not isinstance(record, dict) or not record.get("name"):
+            continue
+        power = pets._power_rating_for(record)
+        used = attacks_today.get(str(opponent_id), 0)
         opponents.append({
-            "user_id": str(row["user_id"]),
-            "portrait": _portrait_url(prefix, row["user_id"]),
+            "user_id": str(opponent_id),
+            "portrait": _portrait_url(prefix, opponent_id),
             "crop": record.get("portrait_crop"),
-            "name": row.get("name"),
-            "owner_name": row.get("owner_name"),
-            "owner_username": row.get("owner_username"),
-            "power": row.get("power", 0),
+            "name": record.get("name"),
+            "owner_name": record.get("owner_name") or "кто-то",
+            "owner_username": record.get("owner_username"),
+            "power": power,
             "level": int(record.get("level", 1)),
             "fights": int(record.get("fights", 0)),
             "wins": int(record.get("wins", 0)),
-            "stats": pets.effective_stats(entry, row["user_id"]),
-            "attackable": pets.can_attack_in_arena(entry, me, row["user_id"]),
-            "attacks_today": pets.arena_attacks_against(entry, me, row["user_id"], today),
-            "gap": abs(int(row.get("power", 0)) - mine),
+            "stats": pets._effective_stats_for(record),
+            "attackable": attacker_can_fight and used < C.ARENA_SAME_OPPONENT_DAILY_LIMIT,
+            "attacks_today": used,
+            "gap": abs(power - mine),
         })
     # An even fight first: the roster is sorted by how near each opponent's power is to
     # yours, with everyone you have already fought out today pushed to the bottom.
@@ -2160,10 +2167,9 @@ async function act(action, payload) {
 // ------------------------------------------------------------------------------ helpers
 const money = (n) => (n || 0).toLocaleString("ru-RU");
 function clock(seconds) {
-  seconds = Math.max(0, Math.floor(seconds || 0));
-  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
-  const pad = (v) => (v < 10 ? "0" + v : "" + v);
-  return h ? h + ":" + pad(m) + ":" + pad(s) : pad(m) + ":" + pad(s);
+  const minutes = Math.ceil(Math.max(0, Number(seconds) || 0) / 60);
+  const h = Math.floor(minutes / 60), m = minutes % 60;
+  return h ? h + " ч " + m + " мин" : m + " мин";
 }
 const STAT_ICON = { strength: "⚔️", health: "❤️", agility: "💨", luck: "🍀", armor: "🛡" };
 const STAT_NAME = { strength: "Сила", health: "Здоровье", agility: "Ловкость",
@@ -3684,24 +3690,25 @@ document.addEventListener("change", async (event) => {
   });
 });
 
-// The two countdowns tick locally between refreshes -- a timer that only moves when you
-// pull to refresh does not read as a timer. The numbers are still the server's; this only
-// counts down the gap, and a reload puts them right.
+// Timers update in whole minutes. Repainting an arena every second recreates every
+// opponent portrait, which is needless network/decode work and makes the faces flicker.
+const TIMER_TICK_SECONDS = 60;
+const TIMER_TICK_MS = TIMER_TICK_SECONDS * 1000;
 function tick() {
   if (!S) return;
   let dirty = false;
   if (S.arena && S.arena.seconds_until_next) {
-    S.arena.seconds_until_next = Math.max(0, S.arena.seconds_until_next - 1);
+    S.arena.seconds_until_next = Math.max(0, S.arena.seconds_until_next - TIMER_TICK_SECONDS);
     if (!S.arena.seconds_until_next) dirty = true;
     renderHud();
   }
   if (S.pve && S.pve.seconds_until_reset) {
-    S.pve.seconds_until_reset = Math.max(0, S.pve.seconds_until_reset - 1);
+    S.pve.seconds_until_reset = Math.max(0, S.pve.seconds_until_reset - TIMER_TICK_SECONDS);
     if (!S.pve.seconds_until_reset) dirty = true;
     else if (TAB === "arena") renderArena();
   }
   if (S.farm && S.farm.seconds_left) {
-    S.farm.seconds_left = Math.max(0, S.farm.seconds_left - 1);
+    S.farm.seconds_left = Math.max(0, S.farm.seconds_left - TIMER_TICK_SECONDS);
     if (!S.farm.seconds_left) dirty = true;
     else if (TAB === "farm") renderFarm();
   }
@@ -3729,7 +3736,7 @@ refresh().then(() => {
     moreView = "review";
     render();
   }
-  ticker = setInterval(tick, 1000);
+  ticker = setInterval(tick, TIMER_TICK_MS);
 });
 </script>
 </body>

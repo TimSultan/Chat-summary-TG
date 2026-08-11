@@ -6557,9 +6557,17 @@ async def handle_pets_callback(
             return
 
         if action == "cpoker":
-            result = casino.advance_poker(entry, user_id, xp)
-            rendered = pets_ui.casino_poker_view(entry, user_id, xp, result.get("active")) \
-                if result.get("active") else pets_ui.casino_result_view(entry, user_id, xp, result)
+            raw_raise = str(argument or "")
+            raise_by = raw_raise.partition(":")[2] if raw_raise.startswith("raise:") else raw_raise
+            result = casino.advance_poker(entry, user_id, xp, raise_by)
+            if result.get("active"):
+                notice = (
+                    f"⚠️ Не хватает {int(result.get('stake', 0) or 0)} монет на рейз.\n\n"
+                    if result.get("error") == "funds" else ""
+                )
+                rendered = pets_ui.casino_poker_view(entry, user_id, xp, result["active"], notice)
+            else:
+                rendered = pets_ui.casino_result_view(entry, user_id, xp, result)
             await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
 
