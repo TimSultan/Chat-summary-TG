@@ -326,7 +326,7 @@ class AmuletEffectTests(unittest.TestCase):
         bare = _fighter("a", 40, name="A")
         opponent = _fighter("b", 40, name="B")
         expected = combat.simulate(bare, opponent, seed=918)
-        for code in ("collector", "survivor"):
+        for code in ("collector", "trophy_compass", "coin_rake", "survivor"):
             with self.subTest(effect=code):
                 equipped = Fighter(
                     key="a", name="A", strength=40, health=40, agility=40, luck=40,
@@ -373,6 +373,57 @@ class AmuletEffectTests(unittest.TestCase):
                 first = combat.simulate(fighter, opponent, seed=41)
                 self.assertEqual(first, combat.simulate(fighter, opponent, seed=41))
                 self.assertGreater(len(first.rounds), 0)
+
+    def test_new_weapon_modifiers_proc_inside_the_attack_cap(self):
+        opponent = Fighter(
+            key="b", name="Opponent", strength=40, health=40, agility=40, luck=40,
+            armor=40, level=3,
+        )
+        effects = (
+            {"code": "armor_shred", "value": 6, "cap": 24},
+            {"code": "wound", "value": 1, "cap": 6},
+            {"code": "burn", "value": 4, "turns": 2},
+            {"code": "venom_blade", "value": 18, "poison": 2},
+            {"code": "bleed", "value": 2, "cap": 3},
+            {"code": "shield_breaker", "value": 100},
+            {"code": "heavy_combo", "value": 20, "every": 3},
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 20)), \
+                patch.object(combat, "_signature", return_value=None):
+            for effect in effects:
+                with self.subTest(effect=effect["code"]):
+                    result = combat.simulate(self._fighter_with(effect), opponent, seed=73)
+                    self.assertTrue(any(
+                        round_.event == f"amulet_{effect['code']}"
+                        for round_ in result.rounds
+                    ))
+                    ordinary = [
+                        round_ for round_ in result.rounds
+                        if not round_.event.startswith("amulet_")
+                    ]
+                    for fighter_key in ("a", "b"):
+                        self.assertLessEqual(
+                            sum(round_.attacker == fighter_key for round_ in ordinary),
+                            C.MAX_ATTACKS_PER_FIGHTER,
+                        )
+
+    def test_wound_reduction_is_capped_and_replays_exactly(self):
+        effect = {"code": "wound", "value": 1, "cap": 6}
+        opponent = Fighter(
+            key="b", name="Opponent", strength=40, health=40, agility=40, luck=40,
+            armor=0, level=3,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 1)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(self._fighter_with(effect), opponent, seed=74)
+            replay = combat.simulate(self._fighter_with(effect), opponent, seed=74)
+        self.assertEqual(result, replay)
+        removed = sum(
+            round_.damage for round_ in result.rounds
+            if round_.event == "amulet_wound"
+        )
+        starting_hp = combat.derive(opponent, self._fighter_with(effect))["max_hp"]
+        self.assertLessEqual(removed, round(starting_hp * 0.06) + 1)
 
     def test_start_stats_and_visible_procs_use_catalogue_percentages(self):
         opponent = _fighter("b", 40, name="B")

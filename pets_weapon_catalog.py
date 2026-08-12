@@ -271,16 +271,67 @@ _LEGENDARY_EFFECTS: Final = (
     _effect("vampiric", "Лечит 10% нанесённого урона.", 10),
 )
 
-# Exactly half of the rare weapons get a passive, tuned the same way to 53-55% -- a
-# visible edge that stays clearly under the legendary band.  One-shot heals (second_wind,
-# last_stand) are deliberately absent: they measured 63-72% and cannot be tuned down,
-# which would make a rare drop hit harder than a legendary one.
+# Exactly half of the rare weapons get a passive. Repeating a modifier is deliberate:
+# it lets a player find the same play style at two strengths without making all 500
+# weapons carry rules text. A weapon still has one named modifier; the equipped amulet
+# supplies the second axis, and compound ideas such as venom stay one coherent effect.
 _RARE_EFFECTS: Final = (
+    _effect("mob_hunter", "Против мобов: +15% урона.", 15),
+    _effect("precision", "Шанс промаха снижен на 25%.", 25),
+    _effect("burn", "Попадание поджигает: 4 урона два хода.", 4, turns=2),
+    _effect("venom_blade", "Попадание наносит 2 яда и даёт следующей атаке врага 18% промаха.", 18, poison=2),
+    _effect("armor_shred", "Каждое попадание ослабляет броню на 6%, максимум на 24%.", 6, cap=24),
+    _effect("wound", "Каждое попадание режет максимум HP на 1%, всего до 6%.", 1, cap=6),
+    _effect("coin_rake", "За победу: +1 монета за попадание, максимум +5.", 1, cap=5),
+    _effect("bleed", "Попадания складывают кровотечение по 2 урона, до 3 зарядов.", 2, cap=3),
+    _effect("shield_breaker", "Первое попадание ломает щит и игнорирует 100% брони.", 100),
+    _effect("heavy_combo", "Каждое третье попадание наносит на 20% больше урона.", 20, every=3),
+    _effect("precision", "Шанс промаха снижен на 12%.", 12),
+    _effect("burn", "Попадание поджигает: 2 урона два хода.", 2, turns=2),
+    _effect("venom_blade", "Попадание наносит 2 яда и даёт следующей атаке врага 12% промаха.", 12, poison=2),
+    _effect("armor_shred", "Каждое попадание ослабляет броню на 4%, максимум на 20%.", 4, cap=20),
+    _effect("wound", "Каждое второе попадание режет максимум HP на 1%, всего до 4%.", 1, cap=4, every=2),
+    _effect("coin_rake", "За победу: +1 монета за попадание, максимум +3.", 1, cap=3),
+    _effect("bleed", "Попадания складывают кровотечение по 1 урону, до 4 зарядов.", 1, cap=4),
+    _effect("shield_breaker", "Первое попадание ломает щит и игнорирует 70% брони.", 70),
+    _effect("heavy_combo", "Каждое третье попадание наносит на 12% больше урона.", 12, every=3),
     _effect("focused", "После промаха: +18% урона следующей атаке.", 18),
     _effect("momentum", "Каждый раунд: +3% урона, максимум +18%.", 3, cap=18),
     _effect("combo", "Попадания: до +16% урона серией.", 5, cap=16),
-    _effect("regen", "В конце раунда лечит 6 HP.", 6),
+    _effect("regen", "Перед атакой лечит 6 HP.", 6),
     _effect("retaliation", "После удара: +6 урона следующей атаке.", 6),
+    _effect("executioner", "Против врага ниже 30% HP: +16% урона.", 16, threshold=30),
+)
+
+# The 25 effect-bearing rare slots get memorable identities that explain their modifier
+# before the player even opens the details sheet. Index zero is w009, the permanent PVE
+# shop tool; the remaining names follow _RARE_EFFECTS one-for-one.
+_RARE_SPECIAL_COPY: Final = (
+    ("Копьё зверобоя", "Для тех, кто идёт за рыком, а не за дуэлью."),
+    ("Рапира без промаха", "Тонкая, быстрая и неприятно точная."),
+    ("Горящий клинок", "Остывает только после победы."),
+    ("Отравленный клинок", "Даже царапина портит весь следующий ход."),
+    ("Ржавый колун", "С каждым ударом оставляет меньше брони."),
+    ("Коса короткой жизни", "Отрезает не только здоровье, но и его предел."),
+    ("Клинок сборщика", "Монеты сами выпадают из карманов арены."),
+    ("Зазубренный тесак", "Каждая новая царапина спорит с предыдущей."),
+    ("Молот щитолома", "Первый удар не признаёт слова «защита»."),
+    ("Трёхтактная кувалда", "Самое страшное происходит на счёт три."),
+    ("Дуэльный стилет", "Не такой точный, как рапира, зато компактный."),
+    ("Паяльная сабля", "Пламя послабее, но держится цепко."),
+    ("Аптечный кортик", "Содержимое ампулы явно было не лекарством."),
+    ("Напильник бронегрыза", "Медленно, уверенно, без лишнего звона."),
+    ("Пила увядания", "Оставляет здоровью всё меньше места."),
+    ("Карманный вымогатель", "Скромный заработок за нескромную победу."),
+    ("Игла кровопускателя", "Небольшая рана, зато их бывает много."),
+    ("Таран щитолома", "Броню уважает, но только частично."),
+    ("Кувалда третьего удара", "Долго считает до трёх, зато не ошибается."),
+    ("Клавиатура реванша", "После промаха вводит аргумент заново."),
+    ("Заводная алебарда", "Чем дольше бой, тем сильнее заводится."),
+    ("Чемодан комбо", "Каждое попадание добавляет новый довод."),
+    ("Ремонтный ёршик", "Чинит хозяина прямо между ударами."),
+    ("Тостер возмездия", "Возвращает полученное горячим."),
+    ("Бутылка последнего шанса", "Особенно опасна, когда враг уже пошатнулся."),
 )
 
 
@@ -469,12 +520,13 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
         name = f"{object_name} {suffix}"
         code = f"w{index + 1:03d}"
         effect = _effect_for(rarity, rarity_seen[rarity])
+        if rarity == "rare" and effect:
+            name, description = _RARE_SPECIAL_COPY[rarity_seen[rarity] // 2]
         # A dependable PVE tool belongs on the counter, not in a once-in-a-hundred
         # drop.  Keep its stable catalogue code so the 500-item contract and existing
         # inventories remain intact.
         if code == MOB_HUNTER_WEAPON_CODE:
-            name = "Копьё зверобоя"
-            description = "Для тех, кто идёт за рыком, а не за дуэлью."
+            name, description = _RARE_SPECIAL_COPY[0]
             effect = _effect("mob_hunter", "Против мобов: +15% урона.", 15)
         if rarity == "legendary":
             name, description = _LEGENDARY_COPY[rarity_seen[rarity] - 1]
@@ -541,8 +593,6 @@ def _validate_catalogue() -> None:
     for rarity, declared in (("rare", _RARE_EFFECTS), ("legendary", _LEGENDARY_EFFECTS)):
         used = {item.effect_dict()["code"] for item in with_effect if item.rarity == rarity}
         expected = {dict(effect)["code"] for effect in declared}
-        if rarity == "rare":
-            expected.add("mob_hunter")
         assert used == expected
     starter_shop_items = [
         item for item in WEAPON_SPECS

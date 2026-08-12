@@ -172,6 +172,26 @@ def test_weapon_passives_reach_the_item_record_combat_reads():
     assert mop.effect["threshold"] == 45
 
 
+def test_rare_modifiers_are_varied_and_repeated_at_distinct_strengths():
+    modified = [
+        weapon for weapon in catalogue.WEAPON_SPECS
+        if weapon.rarity == "rare" and weapon.effect
+    ]
+    by_code = {}
+    for weapon in modified:
+        effect = weapon.effect_dict()
+        by_code.setdefault(effect["code"], []).append(effect)
+
+    assert len(modified) == 25
+    assert len(by_code) == 16
+    for code in (
+        "precision", "burn", "venom_blade", "armor_shred", "wound",
+        "coin_rake", "bleed", "shield_breaker", "heavy_combo",
+    ):
+        assert len(by_code[code]) == 2
+        assert by_code[code][0] != by_code[code][1]
+
+
 def test_names_are_clear_and_descriptions_are_short():
     names = [weapon.name for weapon in catalogue.WEAPON_SPECS]
     descriptions = [weapon.description for weapon in catalogue.WEAPON_SPECS]
@@ -197,7 +217,7 @@ def test_generated_names_are_plain_readable_noun_phrases():
     generated_names = [weapon.name for weapon in catalogue.WEAPON_SPECS[3:]]
     assert all(not name.startswith("«") and ":" not in name for name in generated_names)
     legendary_names = {name for name, _ in catalogue._LEGENDARY_COPY}
-    special_names = {"Копьё зверобоя"}
+    special_names = {name for name, _ in catalogue._RARE_SPECIAL_COPY}
     assert all(
         name in legendary_names or name in special_names
         or any(name.endswith(suffix) for suffix, _ in catalogue._THEMES)

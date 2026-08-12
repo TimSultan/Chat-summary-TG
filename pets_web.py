@@ -3364,11 +3364,12 @@ async function replay(id) {
   playDuel(data);
 }
 
-// An amulet's amount is not always damage. These are the procs that give HP back, and
+// An item's effect amount is not always damage. These are the procs that give HP back, and
 // the ones that stop damage rather than deal it; anything else with a number is a hit.
-// Keyed on the effect code pets_combat puts in the event ("amulet_vampiric").
+// Keyed on the legacy-compatible effect prefix pets_combat uses ("amulet_vampiric").
 const HEAL_PROCS = ["vampiric", "bite", "blood_pact", "second_wind", "medkit", "dodge_heal", "regen", "adrenaline"];
 const SOAK_PROCS = ["opening_shield", "armor_burst", "safeguard", "crit_guard", "countercrit", "death_shield", "last_stand"];
+const UTILITY_PROCS = ["gambler", "candle", "armor_shred"];
 
 function amountTone(round) {
   const event = String(round.event || "");
@@ -3376,9 +3377,8 @@ function amountTone(round) {
   const code = event.slice(7);
   if (HEAL_PROCS.indexOf(code) >= 0) return "heal";
   if (SOAK_PROCS.indexOf(code) >= 0) return "soak";
-  // gambler reports a signed percentage, not HP -- nothing about it is a quantity of
-  // health, so it gets no colour rather than a misleading one.
-  return code === "gambler" ? "" : "harm";
+  // Percentages and state changes are not HP, so they get no damage colour.
+  return UTILITY_PROCS.indexOf(code) >= 0 ? "" : "harm";
 }
 
 const isDigit = (ch) => ch >= "0" && ch <= "9";

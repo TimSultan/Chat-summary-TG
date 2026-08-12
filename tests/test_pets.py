@@ -1282,6 +1282,19 @@ class StorefrontAndCollectionTests(PetsTestCase):
                     emoji = pets_config.ARMOR_EMOJI if key == "armor" else pets_config.STAT_EMOJI[key]
                     self.assertIn(f"{emoji} {value:+d}", text)
 
+    def test_weapon_shop_lists_the_modifier_before_buying(self):
+        self._two_pets("weapon-effect-shelf")
+        weapon = next(
+            item for item in pets_config.items_for_slot("weapon", "shop")
+            if getattr(item, "effect", {}).get("code") == "precision"
+        )
+        with patch.object(pets, "daily_storefront_weapons", return_value=(weapon,)):
+            text, _ = pets_ui.store_view("weapon-effect-shelf", "1", 0)
+        self.assertIn(weapon.effect["text"], text)
+        for key, value in weapon.bonuses.items():
+            emoji = pets_config.ARMOR_EMOJI if key == "armor" else pets_config.STAT_EMOJI[key]
+            self.assertIn(f"{emoji} {value:+d}", text)
+
     def test_collection_lists_only_chat_discoveries_and_their_current_owners(self):
         entry = "shop-chat"
         self._two_pets(entry)
@@ -1548,6 +1561,35 @@ class RecordFightTests(PetsTestCase):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
         self.assertEqual(outcome["dropped_item"], drop_item.code)
+
+    def test_coin_rake_adds_only_capped_landed_hit_gold(self):
+        entry = "coin-rake-chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        rake = next(
+            item for item in pets_config.ITEMS
+            if getattr(item, "effect", {}).get("code") == "coin_rake"
+            and int(item.effect.get("cap", 0)) == 5
+        )
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"] = [rake.code]
+        data["pets"]["1"]["equipped"]["weapon"] = rake.code
+        pets._save(entry, data)
+        rounds = [
+            SimpleNamespace(attacker="1", number=index, event="hit", damage=10)
+            for index in range(1, 9)
+        ]
+        rounds.extend((
+            SimpleNamespace(attacker="1", number=8, event="amulet_burn", damage=99),
+            SimpleNamespace(attacker="1", number=9, event="dodge", damage=0),
+        ))
+        result = SimpleNamespace(winner="1", loser="2", rounds=rounds)
+
+        with patch("random.randint", return_value=10), patch("random.random", return_value=1.0):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(outcome["gold"], 15)
+        self.assertEqual(economy.balance(entry, "1", 0), 15)
 
     def test_survivor_amulet_preserves_thirty_percent_of_the_attackers_loss_penalty(self):
         """Survivor only ever discounts a penalty, and only the ATTACKER pays one now (a

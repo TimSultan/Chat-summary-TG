@@ -82,6 +82,14 @@ EFFECT_HOOKS: Final = {
     "acid": "after_first_miss: next hit cannot be dodged and pierces armour",
     "spring": "after_two_hits_taken: double the next attack",
     "candle": "fight_start: gain a large random damage bonus or penalty",
+    "armor_shred": "after_hit: progressively reduce enemy armour effectiveness",
+    "wound": "after_hit: progressively reduce enemy maximum health for this fight",
+    "burn": "after_hit: ignite the enemy for damage on their next turns",
+    "venom_blade": "after_hit: poison the enemy and add a miss chance to their next attack",
+    "coin_rake": "fight_end_win: add a capped coin bonus based on landed hits",
+    "bleed": "after_hit: stack bleeding damage on the enemy",
+    "shield_breaker": "on_first_hit: ignore armour and break active shields",
+    "heavy_combo": "on_nth_hit: greatly increase that hit's damage",
 }
 
 

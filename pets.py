@@ -2566,6 +2566,25 @@ def record_fight(
         * (1 + bonus_pct / 100)
         * reward_multiplier
     )
+    # The coin-rake fantasy is "coins fly out on every hit", but directly charging an
+    # offline defender would break the arena's no-loss guarantee and invite farming one
+    # victim. The arena therefore adds the capped amount to the winner's purse. Only
+    # ordinary landed attacks count; effect log rows and dodges do not.
+    coin_rake = _equipped_effect(winner, "coin_rake")
+    if coin_rake:
+        landed = sum(
+            1 for blow in getattr(result, "rounds", ())
+            if str(getattr(blow, "attacker", "")) == winner_uid
+            and int(getattr(blow, "number", 0) or 0) > 0
+            and int(getattr(blow, "damage", 0) or 0) > 0
+            and not str(getattr(blow, "event", "")).startswith("amulet_")
+        )
+        try:
+            per_hit = max(0, int(coin_rake.get("value", 1) or 0))
+            cap = max(0, int(coin_rake.get("cap", 5) or 0))
+        except (TypeError, ValueError):
+            per_hit, cap = 0, 0
+        gold += min(cap, landed * per_hit)
     economy.grant(entry, winner_uid, gold, "pet_fight_win")
     _metric_add(data, "arena_reward_gold", gold)
 
