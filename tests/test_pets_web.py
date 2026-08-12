@@ -367,6 +367,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         page = await self.client.get(pets_web.ROUTE_PREFIX + "/", headers=self._auth(THIRD))
         html = await page.text()
         self.assertIn("moneyaudit:🕵️ Денежный аудит", html)
+        self.assertIn("data-auditfilter", html)
+        self.assertIn("Имя, @username, существо или ID", html)
+        self.assertIn("refreshAuditUserFilter()", html)
         self.assertIn("data-audituser", html)
         self.assertIn("audit-graph", html)
 

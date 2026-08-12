@@ -3278,10 +3278,50 @@ function featureName(key) { return FEATURE_NAMES[key] || key; }
 let moreView = "menu";
 let auditUser = "";
 let auditHours = 24;
+let auditFilter = "";
+let auditData = null;
 
 function signedMoney(value) {
   const number = Number(value || 0);
   return (number > 0 ? "+" : number < 0 ? "−" : "") + money(Math.abs(number));
+}
+
+function auditUserLabel(user) {
+  return (user.username ? "@" + user.username + " · " : "") + user.name +
+    (user.pet_name ? " · " + user.pet_name : "") + " · ID " + user.user_id;
+}
+
+function filteredAuditUsers() {
+  const users = (auditData && auditData.users) || [];
+  const needle = auditFilter.trim().toLowerCase();
+  if (!needle) return users;
+  return users.filter((user) => [
+    user.name, user.username, user.username ? "@" + user.username : "",
+    user.pet_name, user.user_id,
+  ].filter(Boolean).join(" ").toLowerCase().includes(needle));
+}
+
+function auditUserOptions(users, selected) {
+  const selectedVisible = users.some((user) => String(user.user_id) === String(selected));
+  const placeholder = selectedVisible ? "" : '<option value="" selected disabled>' +
+    (users.length ? "Выбери найденного игрока" : "Никого не найдено") + "</option>";
+  return placeholder + users.map((user) =>
+    '<option value="' + esc(user.user_id) + '"' +
+      (String(user.user_id) === String(selected) ? ' selected' : '') + '>' +
+      esc(auditUserLabel(user)) + '</option>'
+  ).join("");
+}
+
+function refreshAuditUserFilter() {
+  const select = document.querySelector("[data-audituser]");
+  if (!select) return;
+  const users = filteredAuditUsers();
+  select.innerHTML = auditUserOptions(users, auditData && auditData.selected);
+  select.disabled = !users.length;
+  const count = document.querySelector("[data-auditcount]");
+  if (count) count.textContent = auditFilter.trim()
+    ? "Найдено: " + users.length
+    : "Всего игроков: " + (((auditData && auditData.users) || []).length);
 }
 
 function economyAudit(data) {
@@ -3290,6 +3330,7 @@ function economyAudit(data) {
     '<div class="empty">В денежном журнале пока нет пользователей.</div></div>';
   auditUser = data.selected || auditUser;
   auditHours = report.hours || auditHours;
+  auditData = data;
   const maximum = Math.max(1, ...(report.hourly || []).map((row) => Number(row.earned || 0)));
   const activeSources = (report.sources || []).filter((row) => row.earned || row.spent);
   const graph = (report.hourly || []).map((hour, index) => {
@@ -3331,19 +3372,21 @@ function economyAudit(data) {
     (row.delta >= 0 ? 'audit-positive' : 'audit-negative') + '">' + signedMoney(row.delta) +
     '</b></div>'
   ).join("") || '<div class="empty">За период операций нет.</div>';
-  const userOptions = (data.users || []).map((user) => {
-    const label = (user.username ? "@" + user.username + " · " : "") + user.name +
-      (user.pet_name ? " · " + user.pet_name : "") + " · ID " + user.user_id;
-    return '<option value="' + esc(user.user_id) + '"' +
-      (String(user.user_id) === String(data.selected) ? ' selected' : '') + '>' + esc(label) + '</option>';
-  }).join("");
+  const matchingUsers = filteredAuditUsers();
+  const userOptions = auditUserOptions(matchingUsers, data.selected);
   const windows = (data.windows || [24, 72, 168]).map((hours) =>
     '<button class="chip' + (Number(hours) === Number(report.hours) ? ' on' : '') +
     '" data-audithours="' + hours + '">' + (hours === 24 ? '24 часа' : hours === 72 ? '3 дня' : '7 дней') +
     '</button>'
   ).join("");
   return '<div class="panel"><h2>🕵️ Денежный аудит</h2>' +
-    '<select class="audit-select" data-audituser>' + userOptions + '</select>' +
+    '<input class="audit-select" style="margin-bottom:7px" type="search" autocomplete="off" ' +
+      'placeholder="Имя, @username, существо или ID" value="' + esc(auditFilter) + '" data-auditfilter>' +
+    '<select class="audit-select" data-audituser' + (matchingUsers.length ? '' : ' disabled') +
+      '>' + userOptions + '</select>' +
+    '<div class="tiny muted" style="margin-top:5px" data-auditcount>' +
+      (auditFilter.trim() ? 'Найдено: ' + matchingUsers.length : 'Всего игроков: ' + (data.users || []).length) +
+      '</div>' +
     '<div class="chiprow" style="margin-top:9px">' + windows + '</div>' +
     '<div class="audit-summary" style="margin-top:10px">' +
       tile('Начислено', '+' + money(report.earned)) + tile('Списано', '−' + money(report.spent)) +
@@ -4515,6 +4558,15 @@ document.addEventListener("click", async (event) => {
       if (name) await act("rename", { name });
     };
   }
+});
+
+// User filtering is entirely local: typing must feel instant and must not turn every
+// character into an admin API request.
+document.addEventListener("input", (event) => {
+  const input = event.target.closest("[data-auditfilter]");
+  if (!input) return;
+  auditFilter = input.value;
+  refreshAuditUserFilter();
 });
 
 // The reward editor commits on blur/enter rather than on every keystroke -- one number
