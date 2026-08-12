@@ -245,6 +245,37 @@ class MobFightBankAndRewardTests(PetsTestCase):
         pets.record_fight(entry, "1", "2", duel, now.date(), now=now)
         self.assertEqual(pets.fights_left(entry, "1", now=now), arena_before - 1)
 
+    def test_an_empty_arena_bank_still_allows_mob_fights(self):
+        """The other direction of the same separation, and the one the Mini App got wrong.
+
+        Out of duels is not out of mobs. The arena panel greyed the PVE buttons out
+        whenever the duel bank hit zero, describing a rule the server has never had --
+        so this pins the server's actual answer from an exhausted arena.
+        """
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        now = datetime(2026, 8, 9, 9, 0)
+
+        duel = SimpleNamespace(winner="1", loser="2", is_draw=False)
+        for _ in range(pets.fights_left(entry, "1", now=now)):
+            pets.record_fight(entry, "1", "2", duel, now.date(), now=now)
+        self.assertEqual(pets.fights_left(entry, "1", now=now), 0)
+
+        # The mob allowance never noticed, and a mob fight goes through on an empty bank.
+        self.assertEqual(
+            pets.pve_allowance(entry, "1", now=now)["available"],
+            pets_config.PVE_ATTACKS_PER_WINDOW,
+        )
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "medium", rng=random.Random(1))
+        loss = SimpleNamespace(winner=f"mob:{block['code']}", is_draw=False)
+        pets.record_mob_fight(entry, "1", block, loss, now=now)
+        self.assertEqual(
+            pets.pve_allowance(entry, "1", now=now)["available"],
+            pets_config.PVE_ATTACKS_PER_WINDOW - 1,
+        )
+        self.assertEqual(pets.fights_left(entry, "1", now=now), 0)
+
     def test_the_pve_window_resets_for_everybody_at_the_same_wall_clock_moment(self):
         """"Таймер сбрасывается у всех на сервере одновременно" -- so the window is a
         fixed block of the chat's own clock (00:00 / 08:00 / 16:00), not a countdown

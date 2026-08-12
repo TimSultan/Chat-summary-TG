@@ -1462,7 +1462,11 @@ async def handle_mob(request: web.Request) -> web.Response:
 
 
 async def handle_mob_attack(request: web.Request) -> web.Response:
-    """Fight a mob. Same bank, same simulator, same playback as a duel.
+    """Fight a mob. Same simulator and same playback as a duel, but its OWN bank.
+
+    Nothing here reads the arena allowance: a mob fight spends `pve_used` and leaves the
+    duel bank alone (pets.record_mob_fight). A player out of arena fights can still farm
+    mobs, and any screen that greys these buttons out because the arena is empty is wrong.
 
     The mob block comes back from the client, but nothing in it is trusted: `roll_mob`
     is called again server-side to rebuild the stats. Otherwise the block would be an
@@ -3027,9 +3031,13 @@ async function renderArena() {
   if (!FOES) { box.innerHTML = '<div class="empty">Ищу соперников…</div>';
                FOES = await api("/api/opponents"); }
 
-  const blocked = arena.farming
-    ? "Существо на ферме — оттуда не дерутся."
-    : (arena.available > 0 ? null : "Бои кончились. Восстановление: " +
+  // Two reasons a fight can be refused, and they stop different things. The farm stops
+  // every kind: the creature is not here. An empty arena bank stops arena fights ONLY --
+  // PVE keeps its own counter and spends nothing from this one (pets.record_mob_fight),
+  // which is why mobPanel is handed the farm alone and never this combined flag.
+  const farming = arena.farming ? "Существо на ферме — оттуда не дерутся." : null;
+  const blocked = farming
+    || (arena.available > 0 ? null : "Бои с игроками кончились. Восстановление: " +
         clock(arena.seconds_until_next) + ".");
 
   box.innerHTML =
@@ -3049,7 +3057,7 @@ async function renderArena() {
       '<button class="go" data-testbattle="open">Открыть боевую песочницу</button></div>' +
     // PVE above the roster: there is always a mob, and on a quiet day the player list is
     // the empty half of this screen.
-    mobPanel(Boolean(blocked)) +
+    mobPanel(Boolean(farming)) +
     '<div class="panel"><h2>Соперники · ' + FOES.opponents.length + "</h2>" +
       (FOES.opponents.length
         ? FOES.opponents.map((foe) => foeRow(foe, !blocked)).join("")
