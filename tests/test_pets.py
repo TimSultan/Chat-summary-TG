@@ -1010,6 +1010,48 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertNotIn(pets_ui.callback_data("1", "sell", item.code), callbacks)
 
 
+class ForgeTests(PetsTestCase):
+    def test_reforge_consumes_three_weakest_free_items_and_grants_next_rarity(self):
+        self._tame("forge", "1")
+        common = [
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.rarity == "common"
+        ][:4]
+        data = pets._load("forge")
+        data["pets"]["1"]["inventory"] = [item.code for item in common]
+        data["pets"]["1"]["locked_items"] = [common[-1].code]
+        pets._save("forge", data)
+
+        status = pets.forge_status("forge", "1")["recipes"][0]
+        self.assertTrue(status["can_forge"])
+        self.assertNotIn(common[-1].code, status["ingredients"])
+        ok, message, result_code = pets.reforge_items("forge", "1", "common", random.Random(7))
+
+        self.assertTrue(ok, message)
+        result = pets_config.find_item(result_code)
+        self.assertEqual(result.rarity, "rare")
+        self.assertEqual(result.source, "drop")
+        inventory = pets.get_pet("forge", "1")["inventory"]
+        self.assertIn(common[-1].code, inventory)
+        self.assertIn(result.code, inventory)
+        self.assertEqual(len(inventory), 2)
+
+    def test_reforge_never_consumes_equipped_or_locked_items(self):
+        self._tame("forge-safe", "1")
+        common = [item for item in pets_config.ITEMS if item.rarity == "common"][:4]
+        data = pets._load("forge-safe")
+        record = data["pets"]["1"]
+        record["inventory"] = [item.code for item in common]
+        record["equipped"][common[0].slot] = common[0].code
+        record["locked_items"] = [common[1].code]
+        pets._save("forge-safe", data)
+
+        ok, _message, result_code = pets.reforge_items("forge-safe", "1", "common")
+        self.assertFalse(ok)
+        self.assertIsNone(result_code)
+        self.assertEqual(pets.get_pet("forge-safe", "1")["inventory"], [item.code for item in common])
+
+
 class StorefrontAndCollectionTests(PetsTestCase):
     def _two_pets(self, entry="shop-chat"):
         self._tame(entry, "1", "One")
@@ -1018,18 +1060,21 @@ class StorefrontAndCollectionTests(PetsTestCase):
         data["pets"]["1"]["level"] = pets_config.GIFT_MIN_PET_LEVEL
         pets._save(entry, data)
 
-    def test_daily_storefront_is_stable_sized_and_changes_tomorrow(self):
-        day = date(2026, 8, 8)
-        first = pets_config.daily_storefront_weapons("shop-chat", day)
-        again = pets_config.daily_storefront_weapons("shop-chat", day)
-        tomorrow = pets_config.daily_storefront_weapons("shop-chat", day + timedelta(days=1))
+    def test_daily_storefront_is_stable_sized_and_changes_each_twelve_hours(self):
+        moment = datetime(2026, 8, 8, 3)
+        first = pets_config.daily_storefront_weapons("shop-chat", moment)
+        again = pets_config.daily_storefront_weapons("shop-chat", moment.replace(hour=11))
+        afternoon = pets_config.daily_storefront_weapons("shop-chat", moment.replace(hour=12))
         self.assertEqual(first, again)
-        self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 10)
+        self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 7)
         self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
         self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
-        self.assertNotEqual([item.code for item in first], [item.code for item in tomorrow])
+        self.assertNotEqual([item.code for item in first], [item.code for item in afternoon])
         self.assertTrue(all(item.source == "shop" and item.slot == "weapon" for item in first))
         self.assertTrue(all(item.rarity != "cursed" for item in first))
+        rotating = [item for item in first if item.code != pets_config.MOB_HUNTER_WEAPON_CODE]
+        self.assertEqual(sum(item.rarity == "common" for item in rotating), 3)
+        self.assertEqual(sum(item.rarity == "rare" for item in rotating), 3)
 
     def test_every_daily_storefront_has_a_weapon_from_one_basic_farm_run(self):
         """The shop's onboarding promise cannot depend on a lucky daily rotation."""
@@ -1074,12 +1119,10 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertEqual(len({item.code for item in weapons}), 500)
         self.assertEqual(len({item.name for item in weapons}), 500)
         shop = [item for item in weapons if item.source == "shop"]
-        prices = {
-            rarity: [item.price for item in shop if item.rarity == rarity]
-            for rarity in ("common", "uncommon", "rare")
-        }
-        self.assertEqual((min(prices["common"]), max(prices["common"])), (10, 20))
-        self.assertEqual((min(prices["uncommon"]), max(prices["uncommon"])), (55, 75))
+        prices = {rarity: [item.price for item in shop if item.rarity == rarity]
+                  for rarity in ("common", "rare")}
+        self.assertEqual((min(prices["common"]), max(prices["common"])), (10, 75))
+        self.assertFalse(any(item.rarity == "uncommon" for item in weapons))
         self.assertEqual((min(prices["rare"]), max(prices["rare"])), (160, 195))
         self.assertTrue(all(item.resale_price <= item.price // 5 for item in shop))
         self.assertTrue(all(
@@ -1107,12 +1150,11 @@ class StorefrontAndCollectionTests(PetsTestCase):
                 # stats, so the pure-stat weapon formula would underprice them.
                 self.assertLessEqual(item.price, 1_000, f"{item.code} is priced off-scale")
                 continue
-            expected = pets_weapon_catalog.shop_price_for_bonuses(item.rarity, item.bonuses.items())
-            self.assertEqual(
-                item.price, expected,
-                f"{item.code} costs {item.price}, expected {expected} for a "
-                f"{item.rarity} item with bonuses {item.bonuses}",
-            )
+            expected = {
+                pets_weapon_catalog.shop_price_for_bonuses(rarity, item.bonuses.items())
+                for rarity in ({"common", "uncommon"} if item.rarity == "common" else {item.rarity})
+            }
+            self.assertIn(item.price, expected)
             self.assertLessEqual(item.price, 195, f"{item.code} is priced off-scale")
 
     def test_core_purchase_refuses_weapon_outside_daily_window(self):
@@ -1860,6 +1902,20 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         data["pets"][str(user_id)]["xp"] = 0
         pets._save(entry, data)
 
+    def test_sixth_empty_arena_win_forces_an_ordinary_item_drop(self):
+        self._two_pets()
+        data = pets._load("chat")
+        data["pets"]["1"]["item_pity_wins"] = pets_config.ITEM_PITY_ELIGIBLE_WINS - 1
+        pets._save("chat", data)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=1.0):
+            outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 1))
+
+        self.assertIsNotNone(outcome["dropped_item"])
+        self.assertEqual(pets.get_pet("chat", "1").get("item_pity_wins"), 0)
+
     def test_pity_forces_an_unowned_legendary_at_the_documented_ceiling(self):
         self._two_pets()
         threshold = pets_config.LEGENDARY_PITY_ELIGIBLE_WINS
@@ -2432,7 +2488,7 @@ class FarmTests(PetsTestCase):
 
         with patch("pets.app_now", return_value=finish):
             starter = next(
-                item for item in pets.daily_storefront_weapons(entry, finish.date())
+                item for item in pets.daily_storefront_weapons(entry, finish)
                 if item.price <= receipt["gold"]
             )
             ok, message = pets.buy_item(entry, "1", 0, starter.code)
@@ -2590,11 +2646,11 @@ class FarmTests(PetsTestCase):
         self.assertLess(xp[0], xp[-1])
         self.assertLess(drop[0], drop[-1])
 
-    def test_drop_chance_table_rises_with_hours_and_keeps_the_six_hour_anchor(self):
+    def test_drop_chance_table_rises_with_hours_and_reaches_half_at_eight(self):
         chances = [pets_config.FARM_DROP_CHANCE_BY_HOURS[hours] for hours in pets_config.FARM_HOUR_CHOICES]
         self.assertEqual(chances, sorted(chances))
         self.assertLess(chances[0], chances[-1])
-        self.assertEqual(pets_config.FARM_DROP_CHANCE_BY_HOURS[6], 0.03)
+        self.assertEqual(pets_config.FARM_DROP_CHANCE_BY_HOURS[8], 0.50)
 
     def test_legendary_is_impossible_under_seven_hours_and_reachable_at_eight(self):
         """FARM_LOOT_RARITY_WEIGHTS omits "legendary" below 7 hours entirely, so this is a

@@ -41,10 +41,10 @@ SLOT_PAGE_SIZE = 8
 INVENTORY_PAGE_SIZE = 6
 COLLECTION_PAGE_SIZE = 8
 ARENA_NO_FIGHTS_NOTICE = "🚫 В запасе нет боёв."
-RARITY_FILTERS = ("all", "cursed", "common", "uncommon", "rare", "legendary")
+RARITY_FILTERS = ("all", "cursed", "common", "rare", "legendary")
 RARITY_FILTER_NAMES = {
     "all": "Все", "cursed": "Проклятые", "common": "Обычные",
-    "uncommon": "Необычные", "rare": "Редкие", "legendary": "Легендарные",
+    "rare": "Редкие", "legendary": "Легендарные",
 }
 
 
@@ -1141,9 +1141,12 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "bagitems", slot_argument(slot)),
         }])
     rows.append([{
-        "text": "🛒 Магазин дня", "callback_data": callback_data(user_id, "store"),
+        "text": "🛒 Магазин", "callback_data": callback_data(user_id, "store"),
     }, {
         "text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection"),
+    }])
+    rows.append([{
+        "text": "⚒️ Кузница", "callback_data": callback_data(user_id, "forge"),
     }])
     if owned:
         lines.append(
@@ -1151,6 +1154,53 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         )
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    labels = {"common": "обычных", "rare": "редких", "legendary": "легендарный"}
+    status = pets.forge_status(entry, user_id)
+    lines = [
+        "⚒️ <b>Кузница</b>",
+        "Три свободных предмета одной редкости превращаются в один случайный предмет следующей.",
+        "<i>Надетые и защищённые вещи кузница не трогает. Сначала уходят самые слабые.</i>",
+    ]
+    rows = []
+    for recipe in status.get("recipes", []):
+        rarity = recipe["rarity"]
+        result_rarity = recipe["result_rarity"]
+        ingredients = [C.find_item(code) for code in recipe.get("ingredients", [])]
+        lines.append(
+            f"\n<b>3 {labels[rarity]} → {labels[result_rarity]}</b> "
+            f"({recipe['available']} доступно)"
+        )
+        if ingredients:
+            lines.append("Будут использованы: " + ", ".join(
+                f"«{escape(item.name)}»" for item in ingredients if item is not None
+            ))
+        else:
+            lines.append("Подходящих вещей пока нет.")
+        rows.append([{
+            "text": f"⚒️ 3 {labels[rarity]} → {labels[result_rarity]}",
+            "callback_data": callback_data(
+                user_id, "reforge" if recipe.get("can_forge") else "noop", rarity,
+            ),
+        }])
+    rows.append([{
+        "text": "🛠️ Ковка оружия — скоро",
+        "callback_data": callback_data(user_id, "weaponforge"),
+    }])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def weapon_forge_view(user_id) -> tuple[str, dict]:
+    return (
+        "🛠️ <b>Ковка оружия</b>\n\nЗдесь позже можно будет создавать оружие по рецептам. Функция пока готовится.",
+        {"inline_keyboard": [[{"text": "◀️ В кузницу", "callback_data": callback_data(user_id, "forge")}]]},
+    )
 
 
 def slot_argument(slot: str, page: int = 0) -> str:
@@ -1237,7 +1287,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
     owned = set(pet.get("inventory", []))
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
-    daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry, pets.today())}
+    daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry)}
 
     # Owned gear must stay reachable even when its catalogue code lives on page 63, so it
     # keeps the first two sort tiers. But an amulet/gloves/boots catalogue is otherwise
@@ -1452,7 +1502,7 @@ def parse_confirmation_argument(argument: str) -> tuple[str, str]:
 def _rarity_buttons(
     user_id, action: str, selected: str, *, paged: bool = False, include_cursed: bool = True,
 ) -> list:
-    short = {"all": "Все", "cursed": "☠️", "common": "⚪", "uncommon": "🟢", "rare": "🔵", "legendary": "🟡"}
+    short = {"all": "Все", "cursed": "☠️", "common": "⚪", "rare": "🔵", "legendary": "🟡"}
     buttons = []
     for rarity in RARITY_FILTERS:
         if rarity == "cursed" and not include_cursed:
@@ -1464,7 +1514,7 @@ def _rarity_buttons(
 
 
 def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, dict]:
-    """The 10-item daily weapon window plus direct routes to accessory shelves."""
+    """The 12-hour weapon window plus direct routes to accessory shelves."""
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
@@ -1472,15 +1522,15 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     if rarity == "cursed":
         rarity = "all"
     owned = set(pet.get("inventory", []))
-    stock = pets.daily_storefront_weapons(entry, pets.today())
+    stock = pets.daily_storefront_weapons(entry)
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
     lines = [
-        "🛒 <b>Витрина дня</b>",
-        f"Сегодня в продаже {C.DAILY_STOREFRONT_SIZE} оружий. Завтра ассортимент сменится.",
+        "🛒 <b>Витрина</b>",
+        "Каждые 12 часов появляются 3 обычных и 3 редких оружия. Фиксированные вещи остаются.",
     ]
     lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
     if not visible:
-        lines.append("Сегодня оружия этой редкости не завезли.")
+        lines.append("Сейчас оружия этой редкости нет.")
     rows = _rarity_buttons(user_id, "store", rarity, include_cursed=False)
     purchase_buttons = []
     for number, item in enumerate(visible, 1):

@@ -35,7 +35,7 @@ raises everybody equally. See PETS_BALANCE.md.
 """
 
 import hashlib
-from datetime import date as _date
+from datetime import date as _date, datetime as _datetime
 
 # --------------------------------------------------------------------------- currency
 # The pet game spends the SAME coins /stat and /shop already show. That is deliberate:
@@ -120,26 +120,24 @@ FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # STARTER_WEAPON_MAX_PRICE below stays a meaningful, stated-once number.
 FARM_GOLD_PER_RUN = (0, 14, 16, 18, 20, 22, 24, 26, 28, 30, 33)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
-# Index = hours; also six-hour-anchored at today's 0.03. A one-hour shift is barely worth
-# supervising for loot, so its chance is a token 0.5%; an eight-hour shift roughly doubles
-# the old rate, because 7-8 h are also the only lengths that can roll a legendary weapon
-# (see FARM_LOOT_RARITY_WEIGHTS below) -- the higher roll count is what actually gets
-# players there.
-FARM_DROP_CHANCE_BY_HOURS = (0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.06)
+# Index = hours. Long shifts are now the farm's deliberate loot route: eight hours reaches
+# 50%, while short shifts remain useful chiefly for coins and XP. Only 7-8 h can roll a
+# legendary weapon (see FARM_LOOT_RARITY_WEIGHTS below).
+FARM_DROP_CHANCE_BY_HOURS = (0.0, 0.01, 0.02, 0.04, 0.07, 0.12, 0.20, 0.32, 0.50)
 # Rarity is now picked FIRST (from this hours-indexed table), and only then is an item of
 # that rarity drawn from the eligible pool. Legendary is deliberately absent below 7 h --
 # a farm shift is unattended and reservation-free, so the only lever keeping a legendary
 # WEAPON rare is gating which shifts can roll for one at all, same spirit as arena's
 # 500-win pity being a ceiling rather than the normal path.
 FARM_LOOT_RARITY_WEIGHTS = {
-    1: {"common": 80, "uncommon": 20},
-    2: {"common": 74, "uncommon": 26},
-    3: {"common": 66, "uncommon": 31, "rare": 3},
-    4: {"common": 60, "uncommon": 34, "rare": 6},
-    5: {"common": 54, "uncommon": 36, "rare": 10},
-    6: {"common": 46, "uncommon": 39, "rare": 15},
-    7: {"common": 38, "uncommon": 40, "rare": 21, "legendary": 1},
-    8: {"common": 28, "uncommon": 42, "rare": 27, "legendary": 4},
+    1: {"common": 100},
+    2: {"common": 100},
+    3: {"common": 97, "rare": 3},
+    4: {"common": 94, "rare": 6},
+    5: {"common": 90, "rare": 10},
+    6: {"common": 85, "rare": 15},
+    7: {"common": 78, "rare": 21, "legendary": 1},
+    8: {"common": 69, "rare": 27, "legendary": 4},
 }
 # Farm levels also generate passive gold. The top stays at the former 5 coins/hour so
 # merging the two buildings improves clarity without doubling the passive faucet.
@@ -402,9 +400,9 @@ PVE_ATTACKS_PER_WINDOW = 10
 # XP is cut less hard than gold. Coins are the thing that inflates; pet levels are paced
 # by the fight bank either way, and a PVE-only player should not level at half speed.
 PVE_XP_SHARE = 0.7
-# Loot is rarer than the arena's 15%, before each mob's own multiplier -- a mob can be
+# Loot is rarer than the arena's 20%, before each mob's own multiplier -- a mob can be
 # fought at will within the bank, where a duel needs another player to exist.
-PVE_DROP_CHANCE = 0.09
+PVE_DROP_CHANCE = 0.12
 # Руби, the PVE currency. Nothing spends them yet by design; the numbers are small so
 # whatever they end up buying can be priced against a supply that grew slowly.
 PVE_RUBY_MIN = 1
@@ -534,7 +532,10 @@ class Item:
         self.source = source
         self.bonuses = dict(bonuses)
         self.description = description
-        self.rarity = rarity
+        # The old uncommon tier was merged into common.  Normalize while constructing
+        # runtime items so old catalogue rows and persisted codes keep their stats and
+        # prices without exposing a second green rarity anywhere in the game.
+        self.rarity = "common" if rarity == "uncommon" else rarity
         self.resale_price = resale_price
         self.drop_weight = drop_weight
         self.effect = dict(effect or {})
@@ -739,10 +740,10 @@ def resale_value(item: Item) -> int:
 
 # How often a win drops an item at all, and from which pool.  Only the winner rolls,
 # so at the old 8% a player on the base five-fight bank saw an item about once every
-# five days -- long enough that most fights felt like they paid nothing.  15% puts a
-# casual player at roughly one item every three days while leaving the *conditional*
-# rarity split (which item, once a drop happens) completely untouched.
-DROP_CHANCE = 0.15
+# five days -- long enough that most fights felt like they paid nothing. 20% plus the
+# six-win ceiling makes empty streaks short while leaving the conditional rarity split
+# (which item, once a drop happens) untouched.
+DROP_CHANCE = 0.20
 
 # Luck is now the "find things" stat as well as the crit stat: it multiplies the chance of
 # an item dropping, in the arena and on the farm alike.
@@ -756,8 +757,8 @@ DROP_CHANCE = 0.15
 #
 #     luck    1     10     20     40     60     80
 #     bonus  +2%   +13%   +23%   +36%   +44%   +49%
-#     arena  15.2% 17.0%  18.4%  20.3%  21.5%  22.4%   (from a 15% base)
-#     farm 8h 6.1%  6.8%   7.4%   8.1%   8.6%   9.0%   (from a 6% base)
+#     arena  20.3% 22.7%  24.6%  27.1%  28.6%  29.8%   (from a 20% base)
+#     farm 8h 50.8% 56.7% 61.4% 67.8% 71.4% 74.6%   (from a 50% base)
 #
 # Deliberately a multiplier on the base rather than a flat addition: a one-hour farm shift
 # is meant to be a poor way to hunt for loot, and a flat bonus would make luck turn it into
@@ -779,6 +780,9 @@ def luck_drop_multiplier(luck: int) -> float:
 # reach.  300 wins is deliberately conservative: luck still matters, but an active
 # player cannot miss every legendary forever.
 LEGENDARY_PITY_ELIGIBLE_WINS = 300
+# Even ordinary loot cannot hide behind an unlucky streak forever.  This counter is
+# independent of the legendary-weapon ceiling above and resets on every item found.
+ITEM_PITY_ELIGIBLE_WINS = 6
 
 # Gifts are social rather than a fast alt-account funnel.  The giver needs a creature
 # with a little arena history, and each giver can move only one item per day.  The
@@ -788,50 +792,51 @@ GIFT_COOLDOWN_SECONDS = 24 * 60 * 60
 GIFT_AUDIT_LIMIT = 500
 
 # The shop deliberately has a small, changing window instead of asking players to
-# scroll through hundreds of purchasable weapons. The offset is chat-specific, while moving
-# it by one full window per calendar day guarantees that tomorrow cannot be the same
-# window as today (as long as there are more than 10 shop weapons).
-DAILY_STOREFRONT_SIZE = 10
+# scroll through hundreds of purchasable weapons. Every twelve-hour window selects three
+# ordinary and three rare weapons per chat; permanent utility stock is added separately.
+STOREFRONT_ROTATION_HOURS = 12
+STOREFRONT_PER_RARITY = 3
+STOREFRONT_RARITIES = ("common", "rare")
+DAILY_STOREFRONT_SIZE = STOREFRONT_PER_RARITY * len(STOREFRONT_RARITIES) + 1
 
 
 def daily_storefront_weapons(
     entry: str,
-    day: _date | None = None,
+    day: _date | _datetime | str | None = None,
     excluded_codes: set[str] | frozenset[str] | None = None,
 ) -> tuple[Item, ...]:
-    """The stable daily set of purchasable weapons for one chat.
+    """The stable twelve-hour set of purchasable weapons for one chat.
 
     This is intentionally a pure function: a restart, a second button tap, or two
     players opening the shop must all see the same stock.  `day` makes balance tests
     and previews deterministic without changing the server clock.
     """
-    today = day or _date.today()
-    if isinstance(today, str):
-        today = _date.fromisoformat(today)
+    moment = day or _datetime.now()
+    if isinstance(moment, str):
+        try:
+            moment = _datetime.fromisoformat(moment)
+        except ValueError:
+            moment = _date.fromisoformat(moment)
+    if isinstance(moment, _date) and not isinstance(moment, _datetime):
+        moment = _datetime.combine(moment, _datetime.min.time())
+    window = moment.date().toordinal() * 2 + moment.hour // STOREFRONT_ROTATION_HOURS
     pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
     excluded = excluded_codes or set()
     # The anti-mob weapon is a permanent shop option.  It vanishes only after somebody
     # in the chat has bought it, exactly like the rest of the shared stock.
     hunter = next((item for item in pool if item.code == MOB_HUNTER_WEAPON_CODE), None)
-    rotating_pool = tuple(item for item in pool if item is not hunter)
-    if len(pool) <= DAILY_STOREFRONT_SIZE:
-        return tuple(item for item in pool if item.code not in excluded)
-    digest = hashlib.sha256(str(entry).encode("utf-8")).digest()
-    initial_offset = int.from_bytes(digest[:8], "big") % len(rotating_pool)
-    offset = (initial_offset + today.toordinal() * DAILY_STOREFRONT_SIZE) % len(rotating_pool)
-    # Walk the whole deterministic rotation, rather than slicing first and filtering
-    # afterwards. A weapon already owned somewhere in the chat disappears from the
-    # shared shop permanently, and the next free code fills its place on the counter.
+    rotating_pool = tuple(
+        item for item in pool if item is not hunter and item.code not in excluded
+    )
     stock = []
-    for index in range(len(rotating_pool)):
-        item = rotating_pool[(offset + index) % len(rotating_pool)]
-        if item.code in excluded:
-            continue
-        stock.append(item)
-        if len(stock) >= DAILY_STOREFRONT_SIZE:
-            break
+    for rarity in STOREFRONT_RARITIES:
+        candidates = [item for item in rotating_pool if item.rarity == rarity]
+        candidates.sort(key=lambda item: hashlib.sha256(
+            f"{entry}:{window}:{rarity}:{item.code}".encode("utf-8")
+        ).digest())
+        stock.extend(candidates[:STOREFRONT_PER_RARITY])
     if hunter is not None and hunter.code not in excluded:
-        stock = [hunter, *stock[:DAILY_STOREFRONT_SIZE - 1]]
+        stock = [hunter, *stock]
     # The shop is the farm's first tangible reward.  A rotation may otherwise contain
     # only mid-tier gear, so replace its final slot with an unowned starter item.  The
     # choice is deterministic per chat/day and does not create a duplicate object.
@@ -843,8 +848,11 @@ def daily_storefront_weapons(
             and item.price <= STARTER_WEAPON_MAX_PRICE
         ]
         if starters:
-            starter_offset = (initial_offset + today.toordinal()) % len(starters)
-            stock[-1] = starters[starter_offset]
+            starter = min(starters, key=lambda item: hashlib.sha256(
+                f"{entry}:{window}:starter:{item.code}".encode("utf-8")
+            ).digest())
+            common_indexes = [i for i, item in enumerate(stock) if item.rarity == "common"]
+            stock[common_indexes[-1] if common_indexes else -1] = starter
     return tuple(stock)
 
 

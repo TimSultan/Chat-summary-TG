@@ -6515,6 +6515,13 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.daily_bonus_view(entry, user_id, xp), log
             )
             return
+        if action == "reforge":
+            ok, note, _result_code = pets.reforge_items(entry, user_id, argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.forge_view(entry, user_id, xp), log,
+            )
+            return
 
         if action == "cgame":
             await _send_pets_view(
@@ -6606,6 +6613,8 @@ async def handle_pets_callback(
             "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
+            "forge": lambda: pets_ui.forge_view(entry, user_id, xp),
+            "weaponforge": lambda: pets_ui.weapon_forge_view(user_id),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
             "history": lambda: pets_ui.history_view(entry, user_id),
             "mail": lambda: pets_ui.mail_view(entry, user_id),

@@ -349,14 +349,14 @@ def _weapon_owner_ids(data: dict, code: str) -> list[str]:
     ]
 
 
-def _daily_storefront_weapons(data: dict, entry: str, day: date | None = None):
+def _daily_storefront_weapons(data: dict, entry: str, day: date | datetime | str | None = None):
     return C.daily_storefront_weapons(
-        entry, day or today(), excluded_codes=_owned_weapon_codes(data),
+        entry, day or app_now(), excluded_codes=_owned_weapon_codes(data),
     )
 
 
-def daily_storefront_weapons(entry: str, day: date | None = None):
-    """The shared daily stock, excluding every weapon already owned in this chat."""
+def daily_storefront_weapons(entry: str, day: date | datetime | str | None = None):
+    """The shared 12-hour stock, excluding every weapon already owned in this chat."""
     return _daily_storefront_weapons(_load(entry), entry, day)
 
 
@@ -847,7 +847,7 @@ def _farm_multipliers(features: dict, hours: int, luck: int = 0) -> tuple[float,
 
 # Rarity is checked from richest to plainest so a fallback always lands on something more
 # common, never something rarer than what was actually rolled.
-_FARM_RARITY_FALLBACK_ORDER = ("legendary", "rare", "uncommon", "common")
+_FARM_RARITY_FALLBACK_ORDER = ("legendary", "rare", "common")
 
 
 def _farm_item_for(
@@ -1039,7 +1039,7 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
             "effect": (
                 "+25% монет" if key == "well" else
                 "+25% опыта" if key == "sprinkler" else
-                "шанс вещи 3% → 8%" if key == "beds" else
+                "+5 п.п. к шансу вещи" if key == "beds" else
                 "+20% монет и опыта"
             ),
         }
@@ -1936,9 +1936,9 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         if owners:
             return False, f"«{item.name}» уже принадлежит другому игроку."
     if item.slot == "weapon" and item.code not in {
-        offered.code for offered in _daily_storefront_weapons(data, entry, today())
+        offered.code for offered in _daily_storefront_weapons(data, entry, app_now())
     }:
-        return False, "Этого оружия сегодня нет на витрине. Загляни завтра."
+        return False, "Этого оружия сейчас нет на витрине. Она меняется каждые 12 часов."
     if item.code in record["inventory"]:
         return False, f"«{item.name}» у тебя уже есть."
     ok, balance = economy.spend(entry, user_id, xp, item.price, f"buy:pet_item:{item.code}")
@@ -1983,6 +1983,77 @@ def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
         note = f"Предмет защищён: «{item.name}»."
     _save(entry, data)
     return True, note, value
+
+
+FORGE_NEXT_RARITY = {"common": "rare", "rare": "legendary"}
+
+
+def _forge_ingredients(record: dict, rarity: str) -> list:
+    equipped = set((record.get("equipped") or {}).values())
+    locked = set(record.get("locked_items") or [])
+    items = [
+        item for item in (C.find_item(code) for code in record.get("inventory", []))
+        if item is not None and item.rarity == rarity
+        and item.code not in equipped and item.code not in locked
+    ]
+    # Consume the least valuable candidates first.  The preview shows these exact three,
+    # so a strong favourite never disappears merely because it shares a rarity.
+    return sorted(items, key=lambda item: (
+        C.equipment_score(item), C.resale_value(item), item.code,
+    ))
+
+
+def forge_status(entry: str, user_id) -> dict:
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return {"recipes": []}
+    recipes = []
+    for rarity, result_rarity in FORGE_NEXT_RARITY.items():
+        ingredients = _forge_ingredients(record, rarity)
+        recipes.append({
+            "rarity": rarity,
+            "result_rarity": result_rarity,
+            "available": len(ingredients),
+            "ingredients": [item.code for item in ingredients[:3]],
+            "can_forge": len(ingredients) >= 3,
+        })
+    return {"recipes": recipes}
+
+
+def reforge_items(entry: str, user_id, rarity: str, rng=None) -> tuple[bool, str, str | None]:
+    """Turn three unlocked, unequipped items into one random drop of the next rarity."""
+    rarity = "common" if rarity == "uncommon" else str(rarity or "")
+    result_rarity = FORGE_NEXT_RARITY.get(rarity)
+    if result_rarity is None:
+        return False, "Эту редкость перековать нельзя.", None
+    chooser = rng or random
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо.", None
+        ingredients = _forge_ingredients(record, rarity)
+        if len(ingredients) < 3:
+            return False, "Нужно три свободных предмета этой редкости. Надетые и защищённые не считаются.", None
+        consumed = ingredients[:3]
+        owned = set(record.get("inventory", [])) | _owned_weapon_codes(data)
+        pool = [
+            item for item in C.ITEMS
+            if item.source == "drop" and item.rarity == result_rarity
+            and item.code not in owned
+        ]
+        if not pool:
+            return False, "Подходящие новые предметы этой редкости закончились.", None
+        result = chooser.choice(pool)
+        inventory = record.setdefault("inventory", [])
+        for item in consumed:
+            inventory.remove(item.code)
+        inventory.append(result.code)
+        _discover(record, result.code)
+        _metric_add(data, "forges")
+        _save(entry, data)
+    names = ", ".join(f"«{item.name}»" for item in consumed)
+    return True, f"Перековано: {names}. Получено: «{result.name}»!", result.code
 
 
 def begin_item_confirmation(entry, user_id, action: str, code: str) -> tuple[bool, str, str]:
@@ -2650,9 +2721,11 @@ def record_fight(
         item for item in drop_pool if item.slot == "weapon" and item.rarity == "legendary"
     ]
     pity_before = max(0, int(winner.get("legendary_pity_wins", 0) or 0))
+    item_pity_before = max(0, int(winner.get("item_pity_wins", 0) or 0))
     force_legendary = bool(legendary_pool) and (
         pity_before + 1 >= C.LEGENDARY_PITY_ELIGIBLE_WINS
     )
+    force_item = bool(drop_pool) and item_pity_before + 1 >= C.ITEM_PITY_ELIGIBLE_WINS
     dropped = None
     auto_equipped = False
     collector_bonus = _effect_fraction(_equipped_effect(winner, "collector"))
@@ -2666,7 +2739,7 @@ def record_fight(
     drop_chance = min(1.0, C.DROP_CHANCE * (1 + collector_bonus + compass_bonus) * luck_bonus)
     if force_legendary:
         dropped = random.choice(legendary_pool)
-    elif drop_pool and random.random() < drop_chance:
+    elif drop_pool and (force_item or random.random() < drop_chance):
         # Keep the selection inspectable/testable with random.choice while still
         # honoring rarity weights. The catalogue's small integer weights keep this
         # expanded pool tiny (and only build it on an actual drop).
@@ -2690,8 +2763,10 @@ def record_fight(
         winner["legendary_pity_wins"] = 0
     else:
         winner["legendary_pity_wins"] = (
-            0 if dropped is not None and dropped.rarity == "legendary" else pity_before + 1
+            0 if dropped is not None and dropped.slot == "weapon"
+            and dropped.rarity == "legendary" else pity_before + 1
         )
+    winner["item_pity_wins"] = 0 if dropped is not None or not drop_pool else item_pity_before + 1
 
     winner_xp = max(1, round(C.WIN_XP * reward_multiplier))
     _, winner_levels_gained = _apply_xp(winner, winner_xp)

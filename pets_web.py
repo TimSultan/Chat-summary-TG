@@ -87,7 +87,7 @@ ART_SIZE = 210
 # Rarity is the game's loudest signal -- it decides a card's border, its glow and its
 # placeholder. Kept here rather than read from RARITY_LABELS so the page has real colours
 # and not emoji, and ordered worst-to-best so sorting can use the index.
-RARITY_ORDER = ("cursed", "common", "uncommon", "rare", "legendary")
+RARITY_ORDER = ("cursed", "common", "rare", "legendary")
 RARITY_COLOURS = {
     "cursed": "#6b5b7b",
     "common": "#8a9aa9",
@@ -691,6 +691,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
     state["farm"]["passive"] = pets.passive_income_status(entry, user_id)
+    state["forge"] = pets.forge_status(entry, user_id)
     return state
 
 
@@ -705,7 +706,10 @@ def _shop_payload(entry: str, user_id, prefix: str) -> dict:
         for slot in C.SLOT_KEYS if slot != "weapon"
         for item in C.items_for_slot(slot, source="shop")
     ]
-    return {"weapons": weapons, "accessories": accessories, "rotates_daily": True}
+    return {
+        "weapons": weapons, "accessories": accessories,
+        "rotates_daily": False, "rotation_hours": C.STOREFRONT_ROTATION_HOURS,
+    }
 
 
 # ------------------------------------------------------------------------------ actions
@@ -738,6 +742,13 @@ def _action_lock(entry, user_id, xp, payload):
 
 def _action_buy(entry, user_id, xp, payload):
     return pets.buy_item(entry, user_id, xp, str(payload.get("code") or ""))
+
+
+def _action_reforge(entry, user_id, xp, payload):
+    ok, message, _code = pets.reforge_items(
+        entry, user_id, str(payload.get("rarity") or ""),
+    )
+    return ok, message
 
 
 def _action_sell(entry, user_id, xp, payload):
@@ -842,6 +853,7 @@ _ACTIONS = {
     "unequip": _action_unequip,
     "lock": _action_lock,
     "buy": _action_buy,
+    "reforge": _action_reforge,
     "sell": _action_sell,
     "gift": _action_gift,
     "buy_cage": _action_buy_cage,
@@ -2407,7 +2419,27 @@ function renderBag() {
     '<div class="panel"><h2>В сумке · ' + items.length + "</h2>" +
       (items.length ? '<div class="items">' + items.map((i) => itemCard(i)).join("") + "</div>"
                     : '<div class="empty">Пусто. Загляни в лавку или выиграй в арене.</div>') +
-    "</div>";
+    "</div>" + forgePanel();
+}
+
+function forgePanel() {
+  const names = { common: "обычных", rare: "редких", legendary: "легендарный" };
+  const recipes = (S.forge && S.forge.recipes) || [];
+  return '<div class="panel"><h2>⚒️ Кузница</h2>' +
+    '<div class="small muted" style="margin-bottom:10px">Три свободных предмета одной редкости ' +
+      'превращаются в случайный предмет следующей. Надетые и защищённые вещи не расходуются.</div>' +
+    recipes.map((recipe) => {
+      const ingredients = recipe.ingredients.map((code) => S.bag.find((item) => item.code === code))
+        .filter(Boolean);
+      return '<div class="panel" style="margin:8px 0;padding:10px">' +
+        '<div class="small"><b>3 ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
+        '</b> · доступно ' + recipe.available + '</div>' +
+        (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
+          ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
+        '<button class="go sec" data-reforge="' + recipe.rarity + '"' +
+          (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
+    }).join('') +
+    '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
 }
 
 // `skipAll` for the shop, where "everything" is not a shelf you can stand at -- the daily
@@ -2422,7 +2454,7 @@ function slotChips(active, key, skipAll) {
 
 function rarityChips(active, key) {
   const rarities = [["all", "Любая"], ["legendary", "🟣"], ["rare", "🔵"],
-                    ["uncommon", "🟢"], ["common", "⚪"], ["cursed", "☠️"]];
+                    ["common", "⚪"], ["cursed", "☠️"]];
   return rarities.map(([value, label]) =>
     '<button class="chip' + (active === value ? " on" : "") + '" data-' + key + '="' + value + '">' +
     label + "</button>").join("");
@@ -2470,7 +2502,7 @@ async function renderShop() {
   box.innerHTML =
     '<div class="chiprow">' + slotChips(shopSlot, "shopslot", true) + "</div>" +
     '<div class="panel"><h2>' +
-      (shopSlot === "weapon" ? "Витрина дня · меняется каждый день" : "Всегда в продаже") +
+      (shopSlot === "weapon" ? "Витрина · меняется каждые 12 часов" : "Всегда в продаже") +
     "</h2>" +
     (items.length ? '<div class="items">' + items.map(shopCard).join("") + "</div>"
                   : '<div class="empty">Сегодня тут пусто.</div>') +
@@ -3563,7 +3595,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob]");
+    "[data-quest],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3577,6 +3609,7 @@ document.addEventListener("click", async (event) => {
   if (d.bagrarity) { bagRarity = d.bagrarity; render(); return; }
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
+  if (d.reforge) { await act("reforge", { rarity: d.reforge }); return; }
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
