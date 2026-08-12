@@ -8,19 +8,15 @@ it from the Mini App. Only an accepted submission pays.
 
   КВЕСТЫ В РЕАЛЕ -- tidy the bench, walk six kilometres, buy a loupe.
 
-Both are DEALT, one at a time, at random, into two independent slots that work
-identically: sticky until finished, two escalating rerolls each, same submission and
-review path. A real quest was briefly a browsable shelf instead; dealing it is better
-because a list of 35 is a menu to shop for the cheapest item on, while a slot is a thing
-you were given. Adding a real quest is still a row in the catalogue and nothing else.
+Painting challenges are dealt as three cards; the real-life board always has one. Every
+board lasts 24 hours. If every card is completed early, the next set arrives eight hours
+after the final acceptance (or at the original deadline, whichever comes first). Each
+card has its own two escalating rerolls and follows the same submission and review path.
 
 THREE RULES THAT SHAPE EVERYTHING HERE
 
-  A quest is not replaced until it is FINISHED. "One per day" is a rate limit, not an
-  expiry: an unfinished quest carries over indefinitely, because a technique worth a day
-  of painting cannot be a thing that silently vanishes at midnight while you are still
-  working on it. `daily_quest` therefore only ever hands out a new one when there is no
-  live assignment at all.
+  A BOARD is stable for its full 24-hour window. Its cards change together at the visible
+  deadline, so Telegram and the Mini App always describe the same set.
 
   A REJECTION does not end the quest either -- it clears the submission and lets the
   player try again on the same technique. Rejecting is feedback, not a punishment, and
@@ -176,6 +172,9 @@ def _load(entry: str) -> dict:
     for row in list(base["assignments"].values()) + list(base["real_assignments"].values()):
         if row.get("code"):
             row["code"] = catalog.normalise_code(row["code"])
+        for card in row.get("quests", []) if isinstance(row.get("quests"), list) else []:
+            if isinstance(card, dict) and card.get("code"):
+                card["code"] = catalog.normalise_code(card["code"])
     base["submissions"] = [row for row in base["submissions"] if isinstance(row, dict)]
     base["history"] = [row for row in base["history"] if isinstance(row, dict)]
     base["moderators"] = {
@@ -499,94 +498,180 @@ def _is_offerable(quest, data: dict, user_id, moment: datetime) -> bool:
     return moment >= until
 
 
-# One slot per kind, and both run through the SAME code below. A real quest used to be
-# taken off a browsable shelf; it is dealt now, exactly like a painting challenge -- one
-# at a time, at random, sticky until finished. With 35 of them and cooldowns measured in
-# weeks the slot effectively always has something to offer, which is what makes dealing
-# them safe where a browsable list was the earlier answer.
+# Independent storage for the three-card painting board and one-card real-life board.
 SLOTS = {"paint": "assignments", "real": "real_assignments"}
+QUESTS_PER_BOARD = {"paint": 3, "real": 1}
+BOARD_LIFETIME = timedelta(hours=24)
+EMPTY_BOARD_REFRESH = timedelta(hours=8)
 
 
-def _live_assignment(data: dict, user_id, kind: str = "paint") -> dict | None:
-    row = data.get(SLOTS[kind], {}).get(str(user_id))
-    if not isinstance(row, dict) or row.get("status") == "done":
-        return None
-    return row if catalog.find_quest(row.get("code")) else None
+def _assignment_row(quest, moment: datetime) -> dict:
+    return {
+        "code": quest.code, "day": moment.date().isoformat(),
+        "assigned_at": moment.isoformat(), "rerolls_used": 0,
+        "status": "open", "submission_id": None,
+    }
 
 
-def quest_slot(entry: str, user_id, kind: str = "paint", now: datetime | None = None) -> dict:
-    """This player's live quest of one kind, assigning one if they have none.
+def _board_rows(board: dict) -> list[dict]:
+    rows = board.get("quests") if isinstance(board, dict) else None
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
-    Deliberately NOT "today's quest": an unfinished quest is never replaced, so somebody
-    who takes four days over a hard technique keeps it for four days. The day stamp is
-    only a rate limit on being handed a NEW one -- finish today's and the next arrives
-    tomorrow, not immediately, which is what stops a fast painter from clearing the
-    board in an afternoon.
 
-    The two kinds are independent slots: finishing the painting challenge does not touch
-    the real-life one, and neither waits on the other.
-    """
+def _board_refresh_at(board: dict, moment: datetime) -> datetime:
+    issued = _moment_like(board.get("issued_at"), moment) or moment
+    expires = _moment_like(board.get("expires_at"), moment) or (issued + BOARD_LIFETIME)
+    rows = _board_rows(board)
+    if not rows or all(row.get("status") == "done" for row in rows):
+        empty = _moment_like(board.get("empty_since"), moment) or moment
+        return min(expires, empty + EMPTY_BOARD_REFRESH)
+    return expires
+
+
+def _make_board(
+    entry: str, user_id, data: dict, kind: str, moment: datetime,
+    avoid: set[str] | None = None,
+) -> dict:
+    rows = []
+    excluded = set(avoid or ())
+    for _ in range(QUESTS_PER_BOARD[kind]):
+        quest = _pick(entry, user_id, data, excluded, kind=kind, moment=moment)
+        if quest is None or quest.code in excluded:
+            break
+        rows.append(_assignment_row(quest, moment))
+        excluded.add(quest.code)
+    board = {
+        "bundle_version": 1, "kind": kind, "issued_at": moment.isoformat(),
+        "expires_at": (moment + BOARD_LIFETIME).isoformat(), "quests": rows,
+        "empty_since": moment.isoformat() if not rows else None,
+    }
+    data.setdefault(SLOTS[kind], {})[str(user_id)] = board
+    return board
+
+
+def _ensure_board(entry: str, user_id, data: dict, kind: str, moment: datetime) -> tuple[dict, bool]:
+    stored = data.setdefault(SLOTS[kind], {}).get(str(user_id))
+    changed = False
+    if isinstance(stored, dict) and stored.get("code"):
+        # Preserve the old live quest as card one, then deal the missing cards.
+        issued = _moment_like(stored.get("assigned_at"), moment) or moment
+        stored = {
+            "bundle_version": 1, "kind": kind, "issued_at": issued.isoformat(),
+            "expires_at": (issued + BOARD_LIFETIME).isoformat(),
+            "quests": [stored], "empty_since": None,
+        }
+        data[SLOTS[kind]][str(user_id)] = stored
+        excluded = {stored["quests"][0].get("code")}
+        while len(stored["quests"]) < QUESTS_PER_BOARD[kind]:
+            quest = _pick(entry, user_id, data, excluded, kind=kind, moment=moment)
+            if quest is None or quest.code in excluded:
+                break
+            stored["quests"].append(_assignment_row(quest, moment))
+            excluded.add(quest.code)
+        changed = True
+    if not isinstance(stored, dict) or "quests" not in stored:
+        return _make_board(entry, user_id, data, kind, moment), True
+    cleaned = [row for row in _board_rows(stored) if catalog.find_quest(row.get("code"))]
+    if len(cleaned) != len(_board_rows(stored)):
+        stored["quests"] = cleaned
+        changed = True
+    if moment >= _board_refresh_at(stored, moment):
+        return _make_board(
+            entry, user_id, data, kind, moment,
+            avoid={row.get("code") for row in _board_rows(stored)},
+        ), True
+    return stored, changed
+
+
+def _live_assignment(
+    data: dict, user_id, kind: str = "paint", *, code: str | None = None,
+    submission_id: str | None = None,
+) -> dict | None:
+    stored = data.get(SLOTS[kind], {}).get(str(user_id))
+    rows = _board_rows(stored)
+    if not rows and isinstance(stored, dict) and stored.get("code"):
+        rows = [stored]
+    wanted = catalog.normalise_code(code) if code is not None else None
+    for row in rows:
+        if wanted is not None and row.get("code") != wanted:
+            continue
+        if submission_id is not None and str(row.get("submission_id")) != str(submission_id):
+            continue
+        if row.get("status") != "done" and catalog.find_quest(row.get("code")):
+            return row
+    return None
+
+
+def quest_board(entry: str, user_id, kind: str = "paint", now: datetime | None = None) -> dict:
+    """A 24-hour selection: three painting cards or one real-life card."""
     moment = now or app_now()
-    today = moment.date().isoformat()
     with _lock:
         data = _load(entry)
-        live = _live_assignment(data, user_id, kind)
-        if live is None:
-            last_done = data.get(SLOTS[kind], {}).get(str(user_id)) or {}
-            if last_done.get("status") == "done" and str(last_done.get("finished_day")) == today:
-                # Finished one already today. Show it, and say when the next is due.
-                return {
-                    "quest": None, "status": "resting", "next_day": "завтра", "kind": kind,
-                    "rerolls_left": 0, "submission": None,
-                    "last": _quest_payload(entry, catalog.find_quest(last_done["code"]), data)
-                    if catalog.find_quest(last_done.get("code")) else None,
-                }
-            quest = _pick(entry, user_id, data, exclude=set(), kind=kind, moment=moment)
-            if quest is None:
-                # Only reachable for real quests, and only for somebody who has cleared
-                # every one that is off cooldown. Says so rather than dealing a repeat.
-                return {
-                    "quest": None, "status": "exhausted", "kind": kind,
-                    "rerolls_left": 0, "submission": None, "last": None,
-                }
-            live = {
-                "code": quest.code,
-                "day": today,
-                "assigned_at": moment.isoformat(),
-                "rerolls_used": 0,
-                "status": "open",
-                "submission_id": None,
-            }
-            data.setdefault(SLOTS[kind], {})[str(user_id)] = live
+        board, changed = _ensure_board(entry, user_id, data, kind, moment)
+        if changed:
             _save(entry, data)
-        quest = catalog.find_quest(live["code"])
-        submission = _find_submission(data, live.get("submission_id"))
+        cards = []
+        for live in _board_rows(board):
+            quest = catalog.find_quest(live.get("code"))
+            if quest is None:
+                continue
+            submission = _find_submission(data, live.get("submission_id"))
+            cards.append({
+                **_quest_payload(entry, quest, data),
+                "status": live.get("status", "open"),
+                "rerolls_left": max(
+                    0, REROLLS_PER_QUEST - int(live.get("rerolls_used", 0) or 0)
+                ),
+                "submission": _public_submission(submission) if submission else None,
+            })
+        open_cards = [card for card in cards if card["status"] == "open"]
+        reviewing = [card for card in cards if card["status"] == "review"]
+        refresh_at = _board_refresh_at(board, moment)
+        status = "open" if open_cards else (
+            "review" if reviewing else ("resting" if cards else "exhausted")
+        )
+        # A just-submitted card remains the compatibility headline while it is under
+        # review; the new UIs use the full `quests` list and are not constrained by it.
+        primary = (reviewing or open_cards or cards or [None])[0]
         return {
-            "quest": _quest_payload(entry, quest, data),
-            "kind": kind,
-            # Two of the four reward legs need a creature to land in (see _pay). Said
-            # here, on the card, rather than discovered at payout: somebody deciding
-            # whether to spend an evening on this deserves to know beforehand.
+            "quest": primary,  # compatibility for integrations that show one headline
+            "quests": cards, "kind": kind,
             "has_pet": pets.get_pet(entry, user_id) is not None,
-            "status": live.get("status", "open"),
-            "day": live.get("day"),
-            "rerolls_left": max(0, REROLLS_PER_QUEST - int(live.get("rerolls_used", 0) or 0)),
-            "submission": _public_submission(submission) if submission else None,
+            "status": status,
+            "rerolls_left": primary.get("rerolls_left", 0) if primary else 0,
+            "submission": primary.get("submission") if primary else None,
+            "available_count": len(open_cards), "attention": bool(open_cards),
+            "refresh_at": refresh_at.isoformat(),
+            "seconds_until_refresh": max(0, int((refresh_at - moment).total_seconds())),
         }
 
 
 def daily_quest(entry: str, user_id, now: datetime | None = None) -> dict:
-    """The painting challenge slot."""
-    return quest_slot(entry, user_id, "paint", now)
+    """The three-card painting board."""
+    return quest_board(entry, user_id, "paint", now)
 
 
 def real_quest(entry: str, user_id, now: datetime | None = None) -> dict:
-    """The Квест в реале slot."""
-    return quest_slot(entry, user_id, "real", now)
+    """The one-card real-life board."""
+    return quest_board(entry, user_id, "real", now)
+
+
+# Public compatibility name retained for callers that used the old one-slot API.
+quest_slot = quest_board
+
+
+def has_available_quests(entry: str, user_id, now: datetime | None = None) -> bool:
+    """Whether either board currently has a quest the player can act on."""
+    moment = now or app_now()
+    return bool(
+        daily_quest(entry, user_id, moment).get("attention")
+        or real_quest(entry, user_id, moment).get("attention")
+    )
 
 
 def reroll(
     entry: str, user_id, now: datetime | None = None, kind: str = "paint",
+    code: str | None = None,
 ) -> tuple[bool, str]:
     """Swap the live quest of one kind for a HARDER one, twice per quest.
 
@@ -602,7 +687,11 @@ def reroll(
     moment = now or app_now()
     with _lock:
         data = _load(entry)
-        live = _live_assignment(data, user_id, kind)
+        board, _changed = _ensure_board(entry, user_id, data, kind, moment)
+        live = (
+            _live_assignment(data, user_id, kind, code=code)
+            if code else _live_assignment(data, user_id, kind)
+        )
         if live is None:
             return False, "Сейчас нет активного квеста."
         if live.get("status") == "review":
@@ -612,7 +701,9 @@ def reroll(
             return False, "Реролов больше нет."
         current = catalog.find_quest(live["code"])
         harder = min(max(1, int(getattr(current, "difficulty", 1) or 1)) + 1, max(DIFFICULTIES))
-        quest = _pick(entry, user_id, data, exclude={live["code"]},
+        quest = _pick(
+            entry, user_id, data,
+            exclude={row.get("code") for row in _board_rows(board)},
                       difficulty=harder, kind=kind, moment=moment)
         if quest is None:
             return False, "Больше нечего предложить — все квесты этого вида на отдыхе."
@@ -738,8 +829,15 @@ def submit(
         # Both kinds are proved against the slot they were DEALT into. The hashtag has to
         # match a quest the player actually holds -- otherwise the tag alone would be the
         # whole game, with the assignment reduced to a suggestion.
-        live = _live_assignment(data, user_id, quest.kind)
+        _board, _changed = _ensure_board(entry, user_id, data, quest.kind, moment)
+        live = _live_assignment(data, user_id, quest.kind, code=quest.code)
         if live is None:
+            current = [
+                catalog.hashtag(row.get("code")) for row in _board_rows(_board)
+                if row.get("status") == "open" and catalog.find_quest(row.get("code"))
+            ]
+            if current:
+                return False, "Сейчас доступны другие квесты: " + ", ".join(current) + "."
             return False, "У тебя нет активного квеста — открой «Квесты» в /arena."
         if live["code"] != quest.code:
             active = catalog.find_quest(live["code"])
@@ -911,7 +1009,9 @@ def review(
         row["reviewed_at"] = moment.isoformat()
         row["note"] = note[:300]
 
-        live = data.get(SLOTS.get(quest.kind, "assignments"), {}).get(str(row["user_id"]))
+        live = _live_assignment(
+            data, row["user_id"], quest.kind, submission_id=str(row["id"]),
+        )
         if accept:
             reward = rewards_for(entry, quest.difficulty, data)
             receipt = {
@@ -925,6 +1025,11 @@ def review(
                 live["status"] = "done"
                 live["finished_day"] = moment.date().isoformat()
                 live["finished_at"] = moment.isoformat()
+                board = data.get(SLOTS[quest.kind], {}).get(str(row["user_id"]))
+                if _board_rows(board) and all(
+                    item.get("status") == "done" for item in _board_rows(board)
+                ):
+                    board["empty_since"] = moment.isoformat()
             # The durable completion stamp a cooldown is measured from. Written for BOTH
             # kinds -- only real quests have cooldowns today, but the slot above is
             # overwritten by the next deal, so this is the only lasting record of it.

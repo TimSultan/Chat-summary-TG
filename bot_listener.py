@@ -6361,11 +6361,15 @@ async def handle_pets_callback(
             )
             return
         if action == "questreroll":
-            kind = "real" if argument == "real" else "paint"
-            ok, note = quests.reroll(entry, user_id, kind=kind)
+            raw_kind, separator, code = str(argument or "").partition(":")
+            kind = "real" if raw_kind == "real" else "paint"
+            ok, note = quests.reroll(
+                entry, user_id, kind=kind, code=code if separator else None,
+            )
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.quests_view(entry, user_id, kind), log,
+                pets_ui.quest_detail_view(entry, user_id, kind, code)
+                if separator else pets_ui.quests_view(entry, user_id, kind), log,
             )
             return
         if action == "farmticket":
@@ -6661,6 +6665,9 @@ async def handle_pets_callback(
             "casino": lambda: pets_ui.casino_view(entry, user_id, xp),
             "quests": lambda: pets_ui.quests_view(
                 entry, user_id, "real" if argument == "real" else "paint",
+            ),
+            "questdetail": lambda: pets_ui.quest_detail_view(
+                entry, user_id, *(str(argument or "paint:").split(":", 1)),
             ),
             "dailybonus": lambda: pets_ui.daily_bonus_view(entry, user_id, xp),
             "bagitems": lambda: pets_ui.bag_items_view(

@@ -668,6 +668,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
         },
         "farm_receipts": mine,
         "unread_updates": pets_updates.has_unread(entry, user_id),
+        "quest_attention": quests.has_available_quests(entry, user_id),
     }
 
     if not record:
@@ -1389,7 +1390,9 @@ async def handle_quest_reroll(request: web.Request) -> web.Response:
     entry = request.app[_ENTRY_KEY]
     me = str(user["id"])
     kind = "real" if str(body.get("kind") or "") == "real" else "paint"
-    ok, message = quests.reroll(entry, me, kind=kind)
+    ok, message = quests.reroll(
+        entry, me, kind=kind, code=str(body.get("code") or "") or None,
+    )
     request.app[_LOG_KEY](
         f"[pets_web] quest reroll {me} ({kind}): {'ok' if ok else 'refused'} -- {message}"
     )
@@ -2709,9 +2712,9 @@ let moreView = "menu";
 async function renderMore() {
   const box = $("scr-more");
   if (moreView === "menu") {
-    const menu = ["quests:🎯 Квесты", "mail:📬 Почта", "ranking:🏆 Рейтинг существ",
+    const menu = ["quests:" + (S && S.quest_attention ? "❗ " : "") + "🎯 Квесты", "mail:📬 Почта", "ranking:🏆 Рейтинг существ",
                   "collection:📚 Коллекция оружия", "history:📜 История боёв",
-                  "updates:📰 Обновления"];
+                  "updates:" + (S && S.unread_updates ? "❗ " : "") + "📰 Обновления"];
     // The review queue is the one entry that is not for everybody. Whether it appears at
     // all is the server's answer, never a guess from the client -- and every route behind
     // it re-checks, so a hand-typed moreView cannot open anything.
@@ -2763,6 +2766,7 @@ async function renderMore() {
       : '<div class="empty">Боёв ещё не было.</div>') + "</div>";
   } else if (moreView === "updates") {
     const data = await api("/api/updates");
+    if (S) S.unread_updates = false;
     body = (data.rows || []).map((row) =>
       '<div class="panel"><h2>' + esc(row.title || "Обновление") + "</h2>" +
       '<div class="small" style="white-space:pre-wrap">' + esc(row.text || "") +
@@ -2811,9 +2815,9 @@ async function questCall(path, payload) {
   }
 }
 
-// One card, both slots. They are dealt the same way and submitted the same way, so the
+// Legacy single-card renderer retained for old embedded clients.
 // only thing that differs here is the heading and what the quest asks you to photograph.
-function questCard(board, kind) {
+function legacyQuestCard(board, kind) {
   const paint = kind === "paint";
   const heading = paint ? "🎯 Челлендж дня · покрас" : "🌍 Квест в реале";
   const quest = board && board.quest;
@@ -2863,7 +2867,7 @@ function questCard(board, kind) {
     "</div>";
 }
 
-function questBoard(data) {
+function legacyQuestBoard(data) {
   const board = data || {};
   const done = (board.stats || {}).done || 0;
   const head = questCard(board, "paint") +
@@ -2879,6 +2883,93 @@ function questBoard(data) {
           "<span class='tiny gain'>💰" + money(row.gold || 0) +
           (row.item_name ? " · 🎁" : "") + "</span></div>").join("")
       : "<div class='empty'>Пока ни одного.</div>") + "</div>";
+}
+
+let ACTIVE_QUEST_BOARD = null;
+
+function questStatus(card) {
+  if (card.status === "review") return ["⏳", "на проверке"];
+  if (card.status === "done") return ["✅", "выполнен"];
+  return ["❗", "доступен"];
+}
+
+function questCompactCard(card, kind, index) {
+  const status = questStatus(card);
+  return '<button class="panel" data-questopen="' + kind + ':' + esc(card.code) + '" ' +
+    'style="width:100%;text-align:left;border:1px solid var(--line);margin-bottom:9px">' +
+    '<div class="row spread"><b>' + index + '. ' + status[0] + ' ' + esc(card.title) + '</b>' +
+    '<span class="tiny muted">' + status[1] + '</span></div>' +
+    '<div class="tiny muted" style="margin-top:5px">' + pips(card.difficulty) + ' · ' +
+    esc(card.subject) + '</div><div class="tiny gain" style="margin-top:6px">' +
+    rewardLine(card.reward) + '</div></button>';
+}
+
+function questCard(board, kind) {
+  const paint = kind === "paint";
+  const heading = paint ? "🎯 Квесты на покрас · 3 карточки" : "🌍 Квест в реале";
+  const cards = (board && board.quests) || [];
+  return '<div class="panel"><h2>' + heading + '</h2>' +
+    '<div class="tiny muted" style="margin-bottom:9px">⏳ Новая подборка через ' +
+    '<b class="quest-timer" data-seconds="' + Number(board.seconds_until_refresh || 0) + '">' +
+    clock(board.seconds_until_refresh || 0) + '</b>. Успей отправить фото до обновления. ' +
+    'Если выполнить всё раньше, новые задания придут через 8 часов.</div>' +
+    (cards.length ? cards.map((card, index) => questCompactCard(card, kind, index + 1)).join("")
+                  : '<div class="empty">Доступных заданий пока нет. Проверим снова через 8 часов.</div>') +
+    '</div>';
+}
+
+function questBoard(data) {
+  ACTIVE_QUEST_BOARD = data || {};
+  if (S) {
+    S.quest_attention = Boolean(
+      ((ACTIVE_QUEST_BOARD.quests || []).some((row) => row.status === "open")) ||
+      (((ACTIVE_QUEST_BOARD.real || {}).quests || []).some((row) => row.status === "open"))
+    );
+  }
+  const done = (ACTIVE_QUEST_BOARD.stats || {}).done || 0;
+  const rows = ACTIVE_QUEST_BOARD.history || [];
+  return questCard(ACTIVE_QUEST_BOARD, "paint") +
+    questCard(ACTIVE_QUEST_BOARD.real || {}, "real") +
+    '<button class="go sec" data-questidea>💡 Предложить идею</button>' +
+    '<div class="panel"><h2>Сдано квестов · ' + done + '</h2>' + (rows.length
+      ? rows.map((row) => '<div class="row spread small" style="margin-bottom:7px"><span>' +
+          pips(row.difficulty) + ' ' + esc(row.title) + '</span><span class="tiny gain">🪙' +
+          money(row.gold || 0) + (row.item_name ? ' · 🎁' : '') + '</span></div>').join("")
+      : '<div class="empty">Пока ни одного.</div>') + '</div>';
+}
+
+function openQuestDetail(kind, code) {
+  const board = kind === "real" ? (ACTIVE_QUEST_BOARD.real || {}) : ACTIVE_QUEST_BOARD;
+  const card = ((board && board.quests) || []).find((row) => row.code === code);
+  if (!card) { toast("Подборка уже обновилась."); return; }
+  const status = questStatus(card);
+  const steps = [
+    "Возьми новую, ещё не показанную работу и подготовь нужную деталь.",
+    kind === "paint" ? "Нанеси технику небольшими контролируемыми этапами."
+                     : "Выполни действие полностью, не только для фотографии.",
+    "Сверь результат с подсказкой и поправь самые заметные места.",
+    "Сделай чёткое фото: " + (card.proof || "готового результата") + ".",
+    "Выложи фото в чат с хештегом " + card.hashtag + ".",
+  ];
+  sheet('<h3>' + status[0] + ' ' + esc(card.title) + '</h3>' +
+    '<div class="tiny muted">' + pips(card.difficulty) + ' · ' +
+      esc(DIFF_NAMES[card.difficulty] || '') + '</div>' +
+    '<p class="small"><b>' + (kind === "paint" ? "Что красим: " : "Что делаем: ") +
+      '</b>' + esc(card.subject) + '</p>' +
+    '<p class="small"><b>Техника:</b> ' + esc(card.technique) + '</p>' +
+    '<p class="small muted">💡 <b>Подсказка:</b> ' + esc(card.hint) + '</p>' +
+    '<div class="panel"><h2>Как выполнить</h2>' + steps.map((step, index) =>
+      '<div class="small" style="margin-bottom:7px"><b>' + (index + 1) + '.</b> ' +
+      esc(step) + '</div>').join("") + '</div>' +
+    '<div class="qreward">' + rewardLine(card.reward) + '</div>' +
+    '<div class="qtag ' + (card.status === "review" ? "review" : "") + '">' +
+      (card.status === "done" ? "Квест принят и завершён." :
+       card.status === "review" ? "Работа на проверке у модератора." :
+       "Старые работы не подходят — нужно покрасить что-то новое.") + '</div>' +
+    (card.status === "open" && card.rerolls_left
+      ? '<div class="warn-note">Реролл даст квест на ступень сложнее, и награда тоже вырастет.</div>' +
+        '<div class="acts"><button class="go sec" data-questreroll="' + kind + ':' + esc(code) +
+        '">🎲 Реролл · осталось ' + card.rerolls_left + '</button></div>' : ''));
 }
 
 // -------------------------------------------------------------------- quest review
@@ -3604,7 +3695,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]");
+    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]");
   if (!target) return;
   const d = target.dataset;
 
@@ -3623,6 +3714,17 @@ document.addEventListener("click", async (event) => {
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "fight") { haptic(); await fightMob(); return; }
+  if (d.questopen) {
+    const [kind, code] = d.questopen.split(":", 2);
+    openQuestDetail(kind, code);
+    return;
+  }
+  if (d.questreroll) {
+    const [kind, code] = d.questreroll.split(":", 2);
+    closeSheet();
+    await questCall("/api/quests/reroll", { kind, code });
+    return;
+  }
   if (d.quest) { await questCall("/api/quests/reroll", { kind: d.quest }); return; }
   if (d.questidea !== undefined) {
     sheet("<h3>💡 Предложить идею квеста</h3>" +
@@ -3743,6 +3845,12 @@ const TIMER_TICK_MS = TIMER_TICK_SECONDS * 1000;
 function tick() {
   if (!S) return;
   let dirty = false;
+  document.querySelectorAll(".quest-timer[data-seconds]").forEach((node) => {
+    const left = Math.max(0, Number(node.dataset.seconds || 0) - TIMER_TICK_SECONDS);
+    node.dataset.seconds = String(left);
+    node.textContent = clock(left);
+    if (!left && TAB === "more" && moreView === "quests") dirty = true;
+  });
   if (S.arena && S.arena.seconds_until_next) {
     S.arena.seconds_until_next = Math.max(0, S.arena.seconds_until_next - TIMER_TICK_SECONDS);
     if (!S.arena.seconds_until_next) dirty = true;

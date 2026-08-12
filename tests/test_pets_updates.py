@@ -44,11 +44,11 @@ class PetUpdatesTests(unittest.TestCase):
         )
         self.assertLessEqual(len(arrow["callback_data"].encode("utf-8")), pets_ui.MAX_CALLBACK_BYTES)
 
-    def test_menu_button_loses_red_dot_once_log_is_opened(self):
+    def test_menu_button_loses_exclamation_once_log_is_opened(self):
         entry = "chat"
         user_id = 42
         before = pets_ui.main_view(entry, user_id, 0)[1]
-        self.assertIn("🔴 Обновления", [
+        self.assertIn("❗ 📰 Обновления", [
             button["text"] for row in before["inline_keyboard"] for button in row
         ])
 
@@ -144,4 +144,3 @@ class ChatAuthoredUpdateTests(unittest.TestCase):
         stored["custom"].append({"title": "Без id", "text": "потеряет якорь"})
         path.write_text(json.dumps(stored), encoding="utf-8")
         self.assertEqual([row.title for row in pets_updates.custom(entry)], ["После миграции"])
-

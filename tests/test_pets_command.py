@@ -319,7 +319,10 @@ class PetsCommandTests(unittest.TestCase):
         }
         self.assertIn("dailybonus", actions)
         self.assertNotIn("casino", actions)
-        self.assertNotIn("quests", actions)
+        self.assertIn("quests", actions)
+        self.assertIn("❗ 📜 Квесты", [
+            button["text"] for row in keyboard["inline_keyboard"] for button in row
+        ])
 
     def test_daily_bonus_claims_once_a_day_and_refuses_a_second_tap(self):
         before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
@@ -341,27 +344,29 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + 25)
 
     def test_the_quest_screen_hands_out_a_quest_and_tells_you_how_to_submit_it(self):
-        """It stopped being a placeholder. The screen has to carry the four things a
-        player leaves the app with: what the technique is, what small thing to paint, what
-        it pays, and -- last, because it is the only part they have to copy -- the hashtag
-        that turns a finished model into a submission."""
+        """The overview is three readable cards; a tap opens the full brief."""
         text, keyboard = pets_ui.quests_view(CHAT, PLAYER["id"])
         board = quests.daily_quest(CHAT, PLAYER["id"])
-        quest = board["quest"]
-
-        self.assertIn(quest["title"], text)
-        self.assertIn(quest["subject"], text)
-        self.assertIn(quest["hashtag"], text)
-        self.assertIn(str(quest["reward"]["gold"]), text)
-        # Opening the screen twice is not two quests: an assignment is sticky.
+        self.assertEqual(len(board["quests"]), 3)
+        for quest in board["quests"]:
+            self.assertIn(quest["title"], text)
+            self.assertIn(quest["subject"], text)
         self.assertEqual(pets_ui.quests_view(CHAT, PLAYER["id"])[0], text)
 
-        actions = {
-            pets_ui.parse_callback(button["callback_data"])[1]
+        details = [
+            pets_ui.parse_callback(button["callback_data"])
             for row in keyboard["inline_keyboard"] for button in row
-        }
-        # The two slots link to each other, so the paint card offers the real one.
-        self.assertEqual(actions, {"main", "questreroll", "quests"})
+            if pets_ui.parse_callback(button["callback_data"])[1] == "questdetail"
+        ]
+        self.assertEqual(len(details), 3)
+        code = board["quests"][0]["code"]
+        detail_text, detail_keyboard = pets_ui.quest_detail_view(CHAT, PLAYER["id"], "paint", code)
+        quest = board["quests"][0]
+        self.assertIn(quest["hashtag"], detail_text)
+        self.assertIn(str(quest["reward"]["gold"]), detail_text)
+        self.assertIn("Как выполнить", detail_text)
+        self.assertIn("Старые работы не подходят", detail_text)
+        self.assertIn("questreroll", str(detail_keyboard))
 
     def test_rerolling_from_the_menu_swaps_the_quest_and_runs_out(self):
         first = quests.daily_quest(CHAT, PLAYER["id"])["quest"]["code"]
@@ -377,7 +382,7 @@ class PetsCommandTests(unittest.TestCase):
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
         }
-        self.assertEqual(actions, {"main", "quests"})
+        self.assertEqual(actions, {"main", "quests", "questdetail"})
         api = self._tap("questreroll")
         self.assertIn("Реролов больше нет", api.edits[0]["text"])
         self.assertGreater(len(seen), 1)

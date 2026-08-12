@@ -807,6 +807,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_quest_board_carries_everything_needed_to_go_and_paint(self):
         board = await (await self._get("/api/quests", PLAYER)).json()
+        self.assertEqual(len(board["quests"]), 3)
+        self.assertEqual(len({card["code"] for card in board["quests"]}), 3)
+        self.assertEqual(len(board["real"]["quests"]), 1)
+        self.assertGreater(board["seconds_until_refresh"], 0)
+        self.assertLessEqual(board["seconds_until_refresh"], 24 * 60 * 60)
         quest = board["quest"]
         for field in ("code", "hashtag", "title", "subject", "technique", "hint",
                       "tool", "difficulty", "reward"):
@@ -952,7 +957,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn("function questBoard(", page)
         self.assertIn("function reviewQueue(", page)
-        self.assertIn("quests:🎯 Квесты", page)
+        self.assertIn('S.quest_attention ? "❗ "', page)
+        self.assertIn('"🎯 Квесты"', page)
+        self.assertIn("data-questopen", page)
+        self.assertIn("class=\"quest-timer\"", page)
         self.assertIn('id="questReviewTab"', page)
         self.assertIn('data-questidea', page)
         self.assertIn('data-reviewideas', page)

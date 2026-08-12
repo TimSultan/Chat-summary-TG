@@ -75,39 +75,55 @@ class QuestsTestCase(unittest.TestCase):
 
 
 class AssignmentTests(QuestsTestCase):
-    def test_an_unfinished_quest_is_never_replaced_by_a_new_day(self):
-        """One technique can take days to actually paint. Rule one of quests.py's module
-        docstring is that the day stamp only rate-limits handing out a NEW quest and never
-        expires one that is still open -- if this broke, whoever is a few days into a hard
-        NMM quest would find it swapped out from under them for something unrelated."""
+    def test_paint_board_has_three_unique_cards_for_twenty_four_hours(self):
         entry = "chat"
         first = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
-        code = first["quest"]["code"]
+        codes = {card["code"] for card in first["quests"]}
+        self.assertEqual(len(codes), 3)
+        self.assertEqual(first["available_count"], 3)
 
         again_same_day = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 20, 0))
-        self.assertEqual(again_same_day["quest"]["code"], code)
+        self.assertEqual({card["code"] for card in again_same_day["quests"]}, codes)
 
-        four_days_later = quests.daily_quest(entry, "1", now=datetime(2026, 8, 13, 9, 0))
-        self.assertEqual(four_days_later["quest"]["code"], code)
-        self.assertEqual(four_days_later["status"], "open")
+        next_board = quests.daily_quest(entry, "1", now=datetime(2026, 8, 10, 9, 0))
+        next_codes = {card["code"] for card in next_board["quests"]}
+        self.assertEqual(len(next_codes), 3)
+        self.assertTrue(codes.isdisjoint(next_codes))
 
-    def test_finishing_a_quest_rests_the_player_until_the_next_day(self):
-        """Rule two: a fast painter who clears their quest at breakfast cannot just pull a
-        second one that afternoon. `status` has to read "resting", not silently hand out a
-        fresh code, or the one-a-day cadence the reward table is priced around breaks."""
+    def test_finishing_one_card_leaves_the_other_two_available(self):
         entry = "chat"
         self._tame(entry, "1")
         day = datetime(2026, 8, 9, 9, 0)
         quest, _submission_id, _receipt = self._finish_quest(entry, "1", day)
 
-        resting = quests.daily_quest(entry, "1", now=day + timedelta(hours=6))
-        self.assertEqual(resting["status"], "resting")
-        self.assertIsNone(resting["quest"])
-        self.assertEqual(resting["last"]["code"], quest["code"])
+        board = quests.daily_quest(entry, "1", now=day + timedelta(hours=6))
+        self.assertEqual(board["status"], "open")
+        self.assertEqual(board["available_count"], 2)
+        completed = next(card for card in board["quests"] if card["code"] == quest["code"])
+        self.assertEqual(completed["status"], "done")
 
-        next_day = quests.daily_quest(entry, "1", now=day + timedelta(days=1))
-        self.assertEqual(next_day["status"], "open")
-        self.assertIsNotNone(next_day["quest"])
+    def test_empty_paint_board_refreshes_after_eight_hours(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        started = datetime(2026, 8, 9, 9, 0)
+        old_codes = {card["code"] for card in quests.daily_quest(entry, "1", now=started)["quests"]}
+
+        for minute in range(3):
+            self._finish_quest(entry, "1", started + timedelta(minutes=minute))
+
+        resting = quests.daily_quest(entry, "1", now=started + timedelta(hours=7, minutes=59))
+        self.assertEqual(resting["status"], "resting")
+        self.assertEqual(resting["available_count"], 0)
+
+        refreshed = quests.daily_quest(entry, "1", now=started + timedelta(hours=8, minutes=2))
+        new_codes = {card["code"] for card in refreshed["quests"]}
+        self.assertEqual(refreshed["available_count"], 3)
+        self.assertTrue(old_codes.isdisjoint(new_codes))
+
+    def test_real_board_always_has_one_card(self):
+        board = quests.real_quest("chat", "1", now=datetime(2026, 8, 9, 9, 0))
+        self.assertEqual(len(board["quests"]), 1)
+        self.assertEqual(board["available_count"], 1)
 
 
 class RerollTests(QuestsTestCase):
@@ -295,7 +311,7 @@ class EscalatingRerollTests(QuestsTestCase):
         hardest = catalog.quests_by_difficulty(max(catalog.DIFFICULTIES))[0]
         quests.daily_quest(entry, "1", now=day)
         data = quests._load(entry)
-        data["assignments"]["1"]["code"] = hardest.code
+        data["assignments"]["1"]["quests"][0]["code"] = hardest.code
         quests._save(entry, data)
 
         ok, message = quests.reroll(entry, "1", now=day)
@@ -305,9 +321,7 @@ class EscalatingRerollTests(QuestsTestCase):
         self.assertEqual(swapped["difficulty"], max(catalog.DIFFICULTIES))
 
     def test_a_reroll_never_deals_a_real_quest(self):
-        """Квесты в реале are taken from a shelf, never dealt -- a reroll that handed
-        somebody "buy a loupe" instead of a painting technique would be a category error
-        and would also skip the taking rules entirely."""
+        """The two independently dealt boards must never mix their catalogues."""
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
         real_codes = {quest.code for quest in catalog.REAL_QUESTS}
@@ -318,9 +332,7 @@ class EscalatingRerollTests(QuestsTestCase):
 
 
 class RealQuestTests(QuestsTestCase):
-    """Квесты в реале are DEALT now, exactly like painting challenges: one at a time, at
-    random, into a slot of their own. They were briefly a browsable shelf; a list of 35 is
-    a menu to shop the cheapest item off, and the reward table pays by difficulty."""
+    """The real-life board is independently dealt and always contains one card."""
 
     def test_the_real_slot_deals_one_real_quest_and_never_a_painting_one(self):
         entry = "chat"
@@ -348,24 +360,29 @@ class RealQuestTests(QuestsTestCase):
         self.assertEqual(quests.daily_quest(entry, "1", now=day)["quest"]["code"], paint)
         self.assertEqual(quests.real_quest(entry, "1", now=day)["status"], "resting")
 
-    def test_a_real_quest_is_sticky_and_rerolls_on_its_own_allowance(self):
+    def test_a_real_quest_lasts_twenty_four_hours_and_has_its_own_rerolls(self):
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
         first = quests.real_quest(entry, "1", now=day)
         self.assertEqual(first["rerolls_left"], quests.REROLLS_PER_QUEST)
         self.assertEqual(
-            quests.real_quest(entry, "1", now=day + timedelta(days=3))["quest"]["code"],
+            quests.real_quest(entry, "1", now=day + timedelta(hours=12))["quest"]["code"],
+            first["quest"]["code"],
+        )
+        self.assertNotEqual(
+            quests.real_quest(entry, "1", now=day + timedelta(days=1))["quest"]["code"],
             first["quest"]["code"],
         )
         # Rerolling the real slot leaves the painting slot's allowance alone.
-        quests.daily_quest(entry, "1", now=day)
-        self.assertTrue(quests.reroll(entry, "1", now=day, kind="real")[0])
+        next_day = day + timedelta(days=1)
+        quests.daily_quest(entry, "1", now=next_day)
+        self.assertTrue(quests.reroll(entry, "1", now=next_day, kind="real")[0])
         self.assertEqual(
-            quests.real_quest(entry, "1", now=day)["rerolls_left"],
+            quests.real_quest(entry, "1", now=next_day)["rerolls_left"],
             quests.REROLLS_PER_QUEST - 1,
         )
         self.assertEqual(
-            quests.daily_quest(entry, "1", now=day)["rerolls_left"],
+            quests.daily_quest(entry, "1", now=next_day)["rerolls_left"],
             quests.REROLLS_PER_QUEST,
         )
 

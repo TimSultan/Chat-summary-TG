@@ -195,7 +195,10 @@ def main_view(
         # instead of pushing the core pet controls below the fold.
         rows.append([
             {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
-            {"text": "📜 Квесты", "callback_data": callback_data(user_id, "quests")},
+            {
+                "text": ("❗ " if quests.has_available_quests(entry, user_id) else "") + "📜 Квесты",
+                "callback_data": callback_data(user_id, "quests"),
+            },
         ])
         notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
         rows.append([
@@ -204,7 +207,7 @@ def main_view(
                 "callback_data": callback_data(user_id, "fightnotify"),
             },
             {
-                "text": "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления",
+                "text": "❗ 📰 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления",
                 "callback_data": callback_data(user_id, "updates"),
             },
         ])
@@ -214,8 +217,12 @@ def main_view(
             "callback_data": callback_data(user_id, "tame"),
         }])
     if not pet:
-        updates_button = "🔴 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
-        rows.append([{"text": updates_button, "callback_data": callback_data(user_id, "updates")}])
+        updates_button = "❗ 📰 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
+        quest_button = ("❗ " if quests.has_available_quests(entry, user_id) else "") + "📜 Квесты"
+        rows.append([
+            {"text": quest_button, "callback_data": callback_data(user_id, "quests")},
+            {"text": updates_button, "callback_data": callback_data(user_id, "updates")},
+        ])
     if quest_mod:
         # Only drawn for somebody who can actually review. Whether that is true needs a
         # Telegram round trip, so the CALLER decides and passes it in -- this module stays
@@ -481,7 +488,7 @@ def quest_pips(level: int) -> str:
     return "●" * level + "○" * (5 - level)
 
 
-def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
+def _legacy_quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     """One quest slot: what it is, what it pays, and the hashtag that submits it.
 
     Both kinds render through here because both are dealt the same way -- the only
@@ -564,6 +571,97 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         }])
     rows.append([other_button])
     rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _quest_timer(seconds: int) -> str:
+    minutes = max(0, (int(seconds or 0) + 59) // 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes} мин" if hours else f"{minutes} мин"
+
+
+def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
+    """Compact quest shelf: three readable cards and three matching buttons."""
+    kind = "real" if kind == "real" else "paint"
+    board = quests.real_quest(entry, user_id) if kind == "real" else quests.daily_quest(entry, user_id)
+    cards = board.get("quests") or []
+    paint = kind == "paint"
+    title = "🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>"
+    lines = [title, f"\n⏳ Новая подборка через <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>."]
+    lines.append(
+        "Успей отправить фото до обновления. Выполни всё раньше — новая подборка придёт через 8 часов."
+    )
+    buttons = []
+    for index, card in enumerate(cards, 1):
+        status = card.get("status", "open")
+        marker = "❗" if status == "open" else ("⏳" if status == "review" else "✅")
+        subject = " ".join(str(card.get("subject") or "").split())
+        if len(subject) > 105:
+            subject = subject[:104].rstrip() + "…"
+        lines.extend([
+            f"\n<b>{index}. {marker} {escape(card.get('title') or 'Квест')}</b>",
+            f"{quest_pips(card.get('difficulty', 1))} · {escape(subject)}",
+        ])
+        buttons.append([{
+            "text": f"{index}. {marker} {str(card.get('title') or 'Квест')[:45]}",
+            "callback_data": callback_data(user_id, "questdetail", f"{kind}:{card.get('code')}"),
+        }])
+    if not cards:
+        lines.append("\nПока доступных заданий нет. Проверим снова через 8 часов.")
+    other = "real" if paint else "paint"
+    buttons.append([{
+        "text": "🌍 Квест в реале" if paint else "🎯 Три квеста на покрас",
+        "callback_data": callback_data(user_id, "quests", other),
+    }])
+    buttons.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, dict]:
+    """Full brief and a practical step-by-step tutorial for one selected card."""
+    kind = "real" if kind == "real" else "paint"
+    board = quests.real_quest(entry, user_id) if kind == "real" else quests.daily_quest(entry, user_id)
+    card = next((row for row in board.get("quests", []) if row.get("code") == code), None)
+    if card is None:
+        return quests_view(entry, user_id, kind)
+    paint = kind == "paint"
+    reward = card.get("reward") or {}
+    difficulty = int(card.get("difficulty", 1) or 1)
+    status = card.get("status", "open")
+    lines = [
+        f"{'🎯' if paint else '🌍'} <b>{escape(card.get('title') or 'Квест')}</b>",
+        f"{quest_pips(difficulty)} {QUEST_DIFFICULTY_NAMES.get(difficulty, '')}",
+        f"\n<b>{'Что красим' if paint else 'Что делаем'}:</b> {escape(card.get('subject') or '')}",
+        f"\n<b>Техника:</b> {escape(card.get('technique') or '')}",
+        f"\n💡 <b>Подсказка:</b> {escape(card.get('hint') or '')}",
+        "\n<b>Как выполнить:</b>",
+        "1. Возьми новую, ещё не показанную работу и подготовь нужную деталь.",
+        f"2. {'Нанеси технику из описания небольшими контролируемыми этапами.' if paint else 'Выполни действие полностью, не только для фотографии.'}",
+        "3. Сверь результат с подсказкой и поправь самые заметные места.",
+        f"4. Сделай чёткое фото: {escape(card.get('proof') or 'готового результата')}.",
+        f"5. Выложи фото в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
+        f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
+        f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
+        f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>",
+    ]
+    if status == "review":
+        lines.append("\n⏳ Работа уже на проверке у модератора.")
+    elif status == "done":
+        lines.append("\n✅ Квест принят и завершён.")
+    else:
+        lines.append("\n⚠️ Старые работы не подходят — нужно покрасить что-то новое.")
+    rows = []
+    rerolls = int(card.get("rerolls_left", 0) or 0)
+    if status == "open" and rerolls:
+        lines.append("Реролл даст квест на ступень сложнее, и награда тоже вырастет.")
+        rows.append([{
+            "text": f"🎲 Реролл · осталось {rerolls}",
+            "callback_data": callback_data(user_id, "questreroll", f"{kind}:{code}"),
+        }])
+    rows.append([{
+        "text": "◀️ К карточкам",
+        "callback_data": callback_data(user_id, "quests", kind),
+    }])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
