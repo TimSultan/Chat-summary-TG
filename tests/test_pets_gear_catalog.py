@@ -7,20 +7,20 @@ import pytest
 import pets_gear_catalog as catalogue
 
 
-def test_catalogue_contains_exactly_thirty_items_for_each_new_slot():
-    assert len(catalogue.BOOT_SPECS) == 30
-    assert len(catalogue.GLOVE_SPECS) == 30
-    assert catalogue.GEAR_COUNT == 60
+def test_catalogue_contains_exactly_thirty_two_items_for_each_new_slot():
+    assert len(catalogue.BOOT_SPECS) == 32
+    assert len(catalogue.GLOVE_SPECS) == 32
+    assert catalogue.GEAR_COUNT == 64
     assert {item.slot for item in catalogue.BOOT_SPECS} == {"boots"}
     assert {item.slot for item in catalogue.GLOVE_SPECS} == {"gloves"}
 
 
 def test_codes_and_names_are_unique_and_codes_are_stable_ascii():
-    assert len({item.code for item in catalogue.GEAR_SPECS}) == 60
-    assert len({item.name for item in catalogue.GEAR_SPECS}) == 60
+    assert len({item.code for item in catalogue.GEAR_SPECS}) == 64
+    assert len({item.name for item in catalogue.GEAR_SPECS}) == 64
     assert all(item.code.isascii() and item.code.isalnum() for item in catalogue.GEAR_SPECS)
     assert catalogue.BOOT_SPECS[0].code == "bt01"
-    assert catalogue.GLOVE_SPECS[-1].code == "gl30"
+    assert catalogue.GLOVE_SPECS[-1].code == "gl32"
 
 
 def test_every_item_is_an_economical_drop_with_standard_stat_bonuses_only():
@@ -32,29 +32,37 @@ def test_every_item_is_an_economical_drop_with_standard_stat_bonuses_only():
         assert item.bonuses
         assert all(key in catalogue.STAT_KEYS and isinstance(value, int)
                    for key, value in item.bonuses)
-        assert all(-2 <= value <= 7 for _, value in item.bonuses)
+        limit = 10 if item.rarity == "legendary" else 7
+        floor = -5 if item.rarity == "legendary" else -2
+        assert all(floor <= value <= limit for _, value in item.bonuses)
 
 
 def test_rarity_mix_is_balanced_and_legendary_items_are_very_uncommon():
     assert catalogue.RARITY_COUNTS == {
-        "common": 32, "uncommon": 18, "rare": 8, "legendary": 2,
+        "common": 32, "uncommon": 18, "rare": 8, "legendary": 6,
     }
     for slot_items in (catalogue.BOOT_SPECS, catalogue.GLOVE_SPECS):
         assert [item.rarity for item in slot_items].count("common") == 16
         assert [item.rarity for item in slot_items].count("uncommon") == 9
         assert [item.rarity for item in slot_items].count("rare") == 4
-        assert [item.rarity for item in slot_items].count("legendary") == 1
+        assert [item.rarity for item in slot_items].count("legendary") == 3
         legendary_weight = sum(item.drop_weight for item in slot_items if item.rarity == "legendary")
         total_weight = sum(item.drop_weight for item in slot_items)
-        assert legendary_weight / total_weight == pytest.approx(1 / 255)
+        assert legendary_weight / total_weight == pytest.approx(3 / 257)
+
+
+def test_every_legendary_gear_item_has_its_own_effect():
+    legendary = [item for item in catalogue.GEAR_SPECS if item.rarity == "legendary"]
+    assert len(legendary) == 6
+    assert {item.effect_dict()["code"] for item in legendary} == catalogue.EFFECT_CODES
 
 
 def test_raw_items_match_the_existing_trade_record_schema_and_are_fresh_records():
     required = {
         "code", "name", "slot", "price", "source", "bonuses", "description",
-        "rarity", "resale_price", "drop_weight",
+        "rarity", "resale_price", "drop_weight", "effect",
     }
-    assert len(catalogue.RAW_ITEMS) == 60
+    assert len(catalogue.RAW_ITEMS) == 64
     assert all(set(record) == required for record in catalogue.RAW_ITEMS)
     first = catalogue.GEAR_SPECS[0]
     record = first.raw_item()

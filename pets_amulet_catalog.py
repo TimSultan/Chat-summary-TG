@@ -90,6 +90,12 @@ EFFECT_HOOKS: Final = {
     "bleed": "after_hit: stack bleeding damage on the enemy",
     "shield_breaker": "on_first_hit: ignore armour and break active shields",
     "heavy_combo": "on_nth_hit: greatly increase that hit's damage",
+    "phantom_step": "on_first_attack_taken: force the ordinary attack to miss",
+    "afterimage": "after_first_dodge: empower the next own attack",
+    "rewind": "on_lethal_once: cancel the hit and restore a share of maximum health",
+    "echo_strike": "after_first_hit: repeat a share of the damage dealt",
+    "crushing_grip": "after_first_hit: permanently weaken enemy damage for this fight",
+    "perfect_parry": "after_damage_taken_once: absorb damage and add it to the next attack",
 }
 
 

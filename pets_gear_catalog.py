@@ -10,10 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from pets_amulet_catalog import EFFECT_HOOKS
+
 
 RARITIES: Final = ("common", "uncommon", "rare", "legendary")
 STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
 SLOTS: Final = ("boots", "gloves")
+EFFECT_CODES: Final = frozenset({
+    "phantom_step", "afterimage", "rewind", "echo_strike", "crushing_grip", "perfect_parry",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +33,7 @@ class GearSpec:
     resale_price: int
     drop_weight: int
     bonuses: tuple[tuple[str, int], ...]
+    effect: tuple[tuple[str, str | int | bool], ...] = ()
     source: str = "drop"
     buy_price: int = 0
 
@@ -38,6 +44,9 @@ class GearSpec:
 
     def bonus_dict(self) -> dict[str, int]:
         return dict(self.bonuses)
+
+    def effect_dict(self) -> dict[str, str | int | bool]:
+        return dict(self.effect)
 
     def item_arguments(self) -> tuple[str, str, str, int, str, dict[str, int], str]:
         return (
@@ -58,6 +67,7 @@ class GearSpec:
             "rarity": self.rarity,
             "resale_price": self.resale_price,
             "drop_weight": self.drop_weight,
+            "effect": self.effect_dict(),
         }
 
 
@@ -75,12 +85,17 @@ _TIER: Final = {
 def _spec(
     code: str, name: str, description: str, slot: str, rarity: str,
     bonuses: tuple[tuple[str, int], ...],
+    effect: tuple[tuple[str, str | int | bool], ...] = (),
 ) -> GearSpec:
     resale_price, drop_weight = _TIER[rarity]
     return GearSpec(
         code=code, name=name, description=description, slot=slot, rarity=rarity,
-        resale_price=resale_price, drop_weight=drop_weight, bonuses=bonuses,
+        resale_price=resale_price, drop_weight=drop_weight, bonuses=bonuses, effect=effect,
     )
+
+
+def _effect(code: str, text: str, value: int) -> tuple[tuple[str, str | int | bool], ...]:
+    return tuple({"code": code, "text": text, "value": value}.items())
 
 
 BOOT_SPECS: Final[tuple[GearSpec, ...]] = (
@@ -113,7 +128,9 @@ BOOT_SPECS: Final[tuple[GearSpec, ...]] = (
     _spec("bt27", "Ботинки из чата дома", "Собраны всем подъездом и очень убедительны.", "boots", "rare", (("armor", 7), ("strength", 2), ("agility", -1))),
     _spec("bt28", "Кроссовки с красной кнопкой", "Нажимать нельзя. Поэтому нажали.", "boots", "rare", (("agility", 5), ("luck", 3), ("armor", -1))),
     _spec("bt29", "Сапоги главного по лужам", "Любая лужа становится личным кабинетом.", "boots", "rare", (("health", 6), ("armor", 4))),
-    _spec("bt30", "Чешки абсолютного ухода", "Позволяют красиво исчезнуть после фразы «я всё понял».", "boots", "legendary", (("agility", 6), ("luck", 4), ("armor", -2))),
+    _spec("bt30", "Берцы полуночного призрака", "Легендарная форма берцев ночного перекуса.", "boots", "legendary", (("agility", 9), ("health", 5), ("luck", -3)), _effect("phantom_step", "Первая обычная атака врага гарантированно промахивается.", 1)),
+    _spec("bt31", "Кроссовки исчезающей кнопки", "Красная кнопка теперь срабатывает между шагами.", "boots", "legendary", (("agility", 9), ("luck", 5), ("armor", -3)), _effect("afterimage", "После первого уворота следующая атака сильнее на 45%.", 45)),
+    _spec("bt32", "Сапоги повелителя луж", "Лужи научились отматывать неудачный шаг назад.", "boots", "legendary", (("health", 10), ("armor", 6), ("agility", -4)), _effect("rewind", "Раз за бой смертельный удар отменяется и возвращает 25% максимального HP.", 25)),
 )
 
 
@@ -147,7 +164,9 @@ GLOVE_SPECS: Final[tuple[GearSpec, ...]] = (
     _spec("gl27", "Перчатки с режимом «турбо»", "Режим включается ровно на самом видном месте.", "gloves", "rare", (("agility", 4), ("strength", 4), ("armor", -1))),
     _spec("gl28", "Варежки несгибаемого кассира", "Пересчитывают сдачу и противников дважды.", "gloves", "rare", (("armor", 7), ("luck", 2), ("agility", -1))),
     _spec("gl29", "Перчатки с запахом победы", "Никто не знает запаха, но все отступают.", "gloves", "rare", (("strength", 4), ("health", 5), ("luck", 1))),
-    _spec("gl30", "Варежки финального босса", "Мягкие снаружи, аргументы — внутри.", "gloves", "legendary", (("strength", 6), ("armor", 6), ("agility", -2))),
+    _spec("gl30", "Рукавицы повелителя банок", "Открывают крышки, двери и второй удар подряд.", "gloves", "legendary", (("strength", 9), ("armor", 6), ("agility", -3)), _effect("echo_strike", "Первое попадание повторяется эхом на 50% нанесённого урона.", 50)),
+    _spec("gl31", "Перчатки абсолютного турбо", "Режим больше не выключается после предупреждения.", "gloves", "legendary", (("strength", 9), ("agility", 6), ("armor", -4)), _effect("crushing_grip", "Первое попадание навсегда снижает урон врага на 10% в этом бою.", 10)),
+    _spec("gl32", "Варежки последнего кассира", "Сдачу не дают, удары возвращают полностью.", "gloves", "legendary", (("armor", 10), ("luck", 5), ("agility", -4)), _effect("perfect_parry", "Первый полученный удар слабее на 35%; поглощённый урон добавляется к следующей атаке.", 35)),
 )
 
 
@@ -160,9 +179,9 @@ RARITY_COUNTS: Final = {
 
 
 def _validate_catalogue() -> None:
-    assert len(BOOT_SPECS) == 30
-    assert len(GLOVE_SPECS) == 30
-    assert GEAR_COUNT == 60
+    assert len(BOOT_SPECS) == 32
+    assert len(GLOVE_SPECS) == 32
+    assert GEAR_COUNT == 64
     assert len({item.code for item in GEAR_SPECS}) == GEAR_COUNT
     assert len({item.name for item in GEAR_SPECS}) == GEAR_COUNT
     assert all(item.code.isascii() and item.code.isalnum() for item in GEAR_SPECS)
@@ -171,13 +190,18 @@ def _validate_catalogue() -> None:
                for item in GEAR_SPECS)
     assert all(item.bonuses and all(key in STAT_KEYS and isinstance(value, int)
                                    for key, value in item.bonuses) for item in GEAR_SPECS)
-    assert RARITY_COUNTS == {"common": 32, "uncommon": 18, "rare": 8, "legendary": 2}
+    legendary = [item for item in GEAR_SPECS if item.rarity == "legendary"]
+    assert len(legendary) == 6 and all(item.effect for item in legendary)
+    assert {item.effect_dict()["code"] for item in legendary} == EFFECT_CODES
+    assert EFFECT_CODES <= set(EFFECT_HOOKS)
+    assert not any(item.effect for item in GEAR_SPECS if item.rarity != "legendary")
+    assert RARITY_COUNTS == {"common": 32, "uncommon": 18, "rare": 8, "legendary": 6}
 
 
 _validate_catalogue()
 
 
 __all__ = [
-    "RARITIES", "STAT_KEYS", "SLOTS", "GearSpec", "BOOT_SPECS", "GLOVE_SPECS",
+    "RARITIES", "STAT_KEYS", "SLOTS", "EFFECT_CODES", "GearSpec", "BOOT_SPECS", "GLOVE_SPECS",
     "GEAR_SPECS", "RAW_ITEMS", "GEAR_COUNT", "RARITY_COUNTS",
 ]

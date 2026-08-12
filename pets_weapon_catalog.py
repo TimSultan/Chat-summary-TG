@@ -302,14 +302,11 @@ def _effect(code: str, text: str, value: int, **params: int | bool) -> tuple[tup
 _LEGENDARY_EFFECTS: Final = (
     # Швабра на изоленте -- the angry mop swings harder the worse it is going.
     _effect("berserker", "Ниже 45% HP: +28% урона.", 28, threshold=45),
-    # Пульт от реальности -- the off button cancels the enemy's best moment.
-    _effect("crit_guard", "Первый крит врага слабее на 40%.", 40),
-    # Табурет Судного дня -- four legs that answer back.
-    _effect("thorns", "Возвращает 12% полученного урона.", 12),
-    # Красная кнопка -- nobody knows what it does, so it goes off immediately.
-    _effect("opening_blast", "В начале наносит 12% текущего HP врага.", 12),
-    # Дедовский кипятильник -- heats the water, the air, and the holder.
-    _effect("vampiric", "Лечит 10% нанесённого урона.", 10),
+    # Legendary forms deliberately continue rare weapon archetypes at a higher ceiling.
+    _effect("precision", "Шанс промаха снижен на 45%.", 45),
+    _effect("burn", "Попадание поджигает: 7 урона три хода.", 7, turns=3),
+    _effect("wound", "Каждое попадание режет максимум HP на 2%, всего до 10%.", 2, cap=10),
+    _effect("armor_shred", "Каждое попадание ослабляет броню на 10%, максимум на 50%.", 10, cap=50),
 )
 
 # Exactly half of the rare weapons get a passive. Repeating a modifier is deliberate:
@@ -447,10 +444,10 @@ _LEGACY_WEAPONS: Final = (
 # Four generated legendary slots get actual punch-line names instead of inheriting a
 # catalogue suffix.  w003 above is the fifth legendary and remains migration-compatible.
 _LEGENDARY_COPY: Final = (
-    ("Пульт от реальности", "Кнопка выключения всё-таки нашлась."),
-    ("Табурет Судного дня", "Четыре ножки. Ни одной надежды."),
-    ("Красная кнопка", "Никто не знает, что она делает."),
-    ("Дедовский кипятильник", "Греет воду, воздух и обстановку."),
+    ("Рапира идеальной линии", "Промах для неё считается технической неисправностью."),
+    ("Клинок вечного жара", "Пламя переживает и бой, и победителя."),
+    ("Коса пустого здоровья", "Каждый взмах оставляет всё меньше места для жизни."),
+    ("Молот нулевой брони", "После него защита остаётся только воспоминанием."),
 )
 
 

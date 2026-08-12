@@ -1986,6 +1986,7 @@ def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
 
 
 FORGE_NEXT_RARITY = {"common": "rare", "rare": "legendary"}
+FORGE_REQUIREMENTS = {"common": 3, "rare": 7}
 
 
 def _forge_ingredients(record: dict, rarity: str) -> list:
@@ -2010,12 +2011,14 @@ def forge_status(entry: str, user_id) -> dict:
     recipes = []
     for rarity, result_rarity in FORGE_NEXT_RARITY.items():
         ingredients = _forge_ingredients(record, rarity)
+        required = FORGE_REQUIREMENTS[rarity]
         recipes.append({
             "rarity": rarity,
             "result_rarity": result_rarity,
             "available": len(ingredients),
-            "ingredients": [item.code for item in ingredients[:3]],
-            "can_forge": len(ingredients) >= 3,
+            "required": required,
+            "ingredients": [item.code for item in ingredients[:required]],
+            "can_forge": len(ingredients) >= required,
         })
     return {"recipes": recipes}
 
@@ -2033,9 +2036,10 @@ def reforge_items(entry: str, user_id, rarity: str, rng=None) -> tuple[bool, str
         if record is None:
             return False, "Сначала приручи существо.", None
         ingredients = _forge_ingredients(record, rarity)
-        if len(ingredients) < 3:
-            return False, "Нужно три свободных предмета этой редкости. Надетые и защищённые не считаются.", None
-        consumed = ingredients[:3]
+        required = FORGE_REQUIREMENTS[rarity]
+        if len(ingredients) < required:
+            return False, f"Нужно {required} свободных предметов этой редкости. Надетые и защищённые не считаются.", None
+        consumed = ingredients[:required]
         owned = set(record.get("inventory", [])) | _owned_weapon_codes(data)
         pool = [
             item for item in C.ITEMS

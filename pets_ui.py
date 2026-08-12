@@ -1164,16 +1164,17 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     status = pets.forge_status(entry, user_id)
     lines = [
         "⚒️ <b>Кузница</b>",
-        "Три свободных предмета одной редкости превращаются в один случайный предмет следующей.",
+        "3 обычных предмета превращаются в редкий, а 7 редких — в легендарный.",
         "<i>Надетые и защищённые вещи кузница не трогает. Сначала уходят самые слабые.</i>",
     ]
     rows = []
     for recipe in status.get("recipes", []):
         rarity = recipe["rarity"]
         result_rarity = recipe["result_rarity"]
+        required = recipe["required"]
         ingredients = [C.find_item(code) for code in recipe.get("ingredients", [])]
         lines.append(
-            f"\n<b>3 {labels[rarity]} → {labels[result_rarity]}</b> "
+            f"\n<b>{required} {labels[rarity]} → {labels[result_rarity]}</b> "
             f"({recipe['available']} доступно)"
         )
         if ingredients:
@@ -1183,7 +1184,7 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         else:
             lines.append("Подходящих вещей пока нет.")
         rows.append([{
-            "text": f"⚒️ 3 {labels[rarity]} → {labels[result_rarity]}",
+            "text": f"⚒️ {required} {labels[rarity]} → {labels[result_rarity]}",
             "callback_data": callback_data(
                 user_id, "reforge" if recipe.get("can_forge") else "noop", rarity,
             ),

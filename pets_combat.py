@@ -113,6 +113,8 @@ _EFFECT_DEFAULTS = {
     "death_shield": 20, "acid": 25, "spring": 100, "candle": 40,
     "armor_shred": 6, "wound": 1, "burn": 3, "venom_blade": 18,
     "coin_rake": 1, "bleed": 2, "shield_breaker": 100, "heavy_combo": 50,
+    "phantom_step": 1, "afterimage": 45, "rewind": 25,
+    "echo_strike": 50, "crushing_grip": 10, "perfect_parry": 35,
 }
 
 _EFFECT_TEXT = {
@@ -154,6 +156,12 @@ _EFFECT_TEXT = {
     "safeguard": "смягчает первый удар на {amount} урона.",
     "gambler": "проверяет авось: {amount:+d}% к урону.",
     "adrenaline": "разгоняется от критического удара: +{amount} HP.",
+    "phantom_step": "исчезает из-под первого удара.",
+    "afterimage": "оставляет послеслед: следующая атака сильнее.",
+    "rewind": "отменяет смертельный шаг и возвращает {amount} HP.",
+    "echo_strike": "повторяет попадание эхом: {amount} урона.",
+    "crushing_grip": "сжимает хватку: урон соперника ниже на {amount}%.",
+    "perfect_parry": "парирует удар и запасает {amount} урона для ответа.",
 }
 
 
@@ -489,6 +497,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     venom_miss = {a.key: 0.0, b.key: 0.0}
     pending_venom: dict[str, tuple[str, int] | None] = {a.key: None, b.key: None}
     bleeding: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
+    afterimage_bonus = {a.key: 0.0, b.key: 0.0}
+    damage_weakened = {a.key: 0.0, b.key: 0.0}
 
     initiative = .5
     if effectful:
@@ -516,6 +526,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         if effectful and damage and str(source_key).startswith("mob:") \
                 and (value := _effect_value(effects[target_key], "mob_ward")) is not None:
             damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
+        if effectful and damage and "perfect_parry" not in used[target_key] \
+                and (value := _effect_value(effects[target_key], "perfect_parry")) is not None:
+            used[target_key].add("perfect_parry")
+            before_parry = damage
+            damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
+            absorbed = max(0, before_parry - damage)
+            retaliation_bonus[target_key] += absorbed
+            effect_round(number, target_key, source_key, "perfect_parry", absorbed)
         if effectful and damage and "safeguard" not in used[target_key] \
                 and (value := _effect_value(effects[target_key], "safeguard")) is not None:
             used[target_key].add("safeguard")
@@ -537,12 +555,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             effect_round(number, target_key, source_key, "opening_shield", round(absorbed))
         damage = max(0, damage)
         rescue = next(
-            (code for code in ("death_shield", "last_stand")
+            (code for code in ("rewind", "death_shield", "last_stand")
              if code not in used[target_key] and _effect_value(effects[target_key], code) is not None),
             None,
         )
         if effectful and damage >= hp[target_key] and rescue:
             used[target_key].add(rescue)
+            if rescue == "rewind":
+                restored = max(1, round(max_hp[target_key] * max(0, _fraction(
+                    _effect_value(effects[target_key], "rewind") or 0
+                ))))
+                hp[target_key] = restored
+                effect_round(number, target_key, source_key, rescue, restored)
+                return 0, False
             impact = max(0, round(hp[target_key]) - 1)
             hp[target_key] = 1.0
             if rescue == "death_shield":
@@ -711,8 +736,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             defender_numbers["reduction"] *= max(0.0, 1 - ignored)
         forced_venom_miss = venom_miss[attacker_key] > 0 and rng.random() < venom_miss[attacker_key]
         venom_miss[attacker_key] = 0.0
+        phantom_dodge = effectful and "phantom_step" not in used[defender_key] \
+            and _effect_value(effects[defender_key], "phantom_step") is not None
+        if phantom_dodge:
+            used[defender_key].add("phantom_step")
+            effect_round(round_number, defender_key, attacker_key, "phantom_step")
         event, damage = (
-            ("dodge", 0) if forced_venom_miss
+            ("dodge", 0) if forced_venom_miss or phantom_dodge
             else _resolve_blow(derived[attacker_key], defender_numbers, rng)
         )
         if signature and signature[0] == "health":
@@ -732,6 +762,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             # absolute and makes the combat log's primary hit number truthful.
             attack_no = attacks_made[attacker_key]
             multiplier = 1.0
+            multiplier *= max(.10, 1 - damage_weakened[attacker_key])
+            if afterimage_bonus[attacker_key]:
+                multiplier += afterimage_bonus[attacker_key]
+                afterimage_bonus[attacker_key] = 0.0
+                effect_round(round_number, attacker_key, defender_key, "afterimage")
             if _effect_value(effects[attacker_key], "battle_cry") is not None and attack_no == 0:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "battle_cry") or 0))
             if _effect_value(effects[attacker_key], "late_strike") is not None \
@@ -829,6 +864,26 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         # Post-hit effects occur after the ordinary attack line so the sequence reads
         # naturally in Telegram.  They can knock out the attacker too.
         if effectful and damage:
+            if (value := _effect_value(effects[attacker_key], "echo_strike")) is not None \
+                    and "echo_strike" not in used[attacker_key] and not knocked_out:
+                used[attacker_key].add("echo_strike")
+                echo_damage = max(1, round(impact * max(0, _fraction(value))))
+                echo_impact, echo_ko = hurt(
+                    attacker_key, defender_key, echo_damage, round_number,
+                )
+                total_damage[attacker_key] += echo_impact
+                effect_round(round_number, attacker_key, defender_key, "echo_strike", echo_impact)
+                if echo_ko:
+                    return attacker_key
+            if (value := _effect_value(effects[attacker_key], "crushing_grip")) is not None \
+                    and "crushing_grip" not in used[attacker_key] and not knocked_out:
+                used[attacker_key].add("crushing_grip")
+                damage_weakened[defender_key] = max(
+                    damage_weakened[defender_key], max(0, _fraction(value)),
+                )
+                effect_round(
+                    round_number, attacker_key, defender_key, "crushing_grip", round(value),
+                )
             if (value := _effect_value(effects[attacker_key], "vampiric")) is not None:
                 before = hp[attacker_key]
                 hp[attacker_key] = min(max_hp[attacker_key], hp[attacker_key] + impact * max(0, _fraction(value)))
@@ -992,14 +1047,26 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             if _effect_value(effects[attacker_key], "acid") is not None and "acid" not in used[attacker_key]:
                 used[attacker_key].add("acid")
                 acid_ready[attacker_key] = True
+            if "afterimage" not in used[defender_key] \
+                    and (value := _effect_value(effects[defender_key], "afterimage")) is not None:
+                used[defender_key].add("afterimage")
+                afterimage_bonus[defender_key] = max(0, _fraction(value))
         elif effectful and event == "dodge" and _effect_value(effects[attacker_key], "focused") is not None:
             landed_hits[attacker_key] = 0
             focused_ready[attacker_key] = True
+            if "afterimage" not in used[defender_key] \
+                    and (value := _effect_value(effects[defender_key], "afterimage")) is not None:
+                used[defender_key].add("afterimage")
+                afterimage_bonus[defender_key] = max(0, _fraction(value))
         elif effectful and event == "dodge":
             landed_hits[attacker_key] = 0
             if _effect_value(effects[attacker_key], "acid") is not None and "acid" not in used[attacker_key]:
                 used[attacker_key].add("acid")
                 acid_ready[attacker_key] = True
+            if "afterimage" not in used[defender_key] \
+                    and (value := _effect_value(effects[defender_key], "afterimage")) is not None:
+                used[defender_key].add("afterimage")
+                afterimage_bonus[defender_key] = max(0, _fraction(value))
         return attacker_key if knocked_out else None
 
     stopped_early = False

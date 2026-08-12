@@ -740,8 +740,8 @@ class EquipmentTradingTests(PetsTestCase):
             len([item for item in pets_config.ITEMS if item.slot == "amulet"]),
             42 + len(UTILITY_SHOP_CODES),
         )
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 32)
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 32)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 34)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 34)
         # The three DROP catalogues. Matched on source as well as prefix: the amulet
         # catalogue also sells a utility item now, and it shares the prefix without
         # belonging to the loot table this counts.
@@ -749,9 +749,18 @@ class EquipmentTradingTests(PetsTestCase):
             item for item in pets_config.ITEMS
             if item.code.startswith(("amulet_", "bt", "gl")) and item.source == "drop"
         ]
-        self.assertEqual(len(new_drops), 100)
+        self.assertEqual(len(new_drops), 104)
         self.assertTrue(all(item.source == "drop" and item.drop_weight > 0 for item in new_drops))
-        self.assertEqual(len([item for item in new_drops if item.effect]), 40)
+        self.assertEqual(len([item for item in new_drops if item.effect]), 46)
+
+    def test_every_equipment_slot_has_at_least_three_effectful_legendaries(self):
+        for slot in pets_config.SLOT_KEYS:
+            legendary = [
+                item for item in pets_config.ITEMS
+                if item.slot == slot and item.rarity == "legendary"
+            ]
+            self.assertGreaterEqual(len(legendary), 3, slot)
+            self.assertTrue(all(item.effect for item in legendary), slot)
 
     def test_equipped_amulet_passive_reaches_combat_and_is_visible_in_the_bag(self):
         self._two_pets()
@@ -1035,6 +1044,27 @@ class ForgeTests(PetsTestCase):
         self.assertIn(common[-1].code, inventory)
         self.assertIn(result.code, inventory)
         self.assertEqual(len(inventory), 2)
+
+    def test_legendary_reforge_requires_and_consumes_seven_rares(self):
+        self._tame("forge-legend", "1")
+        rares = [
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.rarity == "rare"
+        ][:7]
+        data = pets._load("forge-legend")
+        data["pets"]["1"]["inventory"] = [item.code for item in rares]
+        pets._save("forge-legend", data)
+
+        recipe = pets.forge_status("forge-legend", "1")["recipes"][1]
+        self.assertEqual(recipe["required"], 7)
+        self.assertTrue(recipe["can_forge"])
+        ok, message, result_code = pets.reforge_items(
+            "forge-legend", "1", "rare", random.Random(11),
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(pets_config.find_item(result_code).rarity, "legendary")
+        self.assertEqual(pets.get_pet("forge-legend", "1")["inventory"], [result_code])
 
     def test_reforge_never_consumes_equipped_or_locked_items(self):
         self._tame("forge-safe", "1")

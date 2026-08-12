@@ -2426,13 +2426,13 @@ function forgePanel() {
   const names = { common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
-    '<div class="small muted" style="margin-bottom:10px">Три свободных предмета одной редкости ' +
-      'превращаются в случайный предмет следующей. Надетые и защищённые вещи не расходуются.</div>' +
+    '<div class="small muted" style="margin-bottom:10px">3 обычных превращаются в редкий, ' +
+      'а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
     recipes.map((recipe) => {
       const ingredients = recipe.ingredients.map((code) => S.bag.find((item) => item.code === code))
         .filter(Boolean);
       return '<div class="panel" style="margin:8px 0;padding:10px">' +
-        '<div class="small"><b>3 ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
+        '<div class="small"><b>' + recipe.required + ' ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
         '</b> · доступно ' + recipe.available + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
@@ -3399,8 +3399,8 @@ async function replay(id) {
 // An item's effect amount is not always damage. These are the procs that give HP back, and
 // the ones that stop damage rather than deal it; anything else with a number is a hit.
 // Keyed on the legacy-compatible effect prefix pets_combat uses ("amulet_vampiric").
-const HEAL_PROCS = ["vampiric", "bite", "blood_pact", "second_wind", "medkit", "dodge_heal", "regen", "adrenaline"];
-const SOAK_PROCS = ["opening_shield", "armor_burst", "safeguard", "crit_guard", "countercrit", "death_shield", "last_stand"];
+const HEAL_PROCS = ["vampiric", "bite", "blood_pact", "second_wind", "medkit", "dodge_heal", "regen", "adrenaline", "rewind"];
+const SOAK_PROCS = ["opening_shield", "armor_burst", "safeguard", "crit_guard", "countercrit", "death_shield", "last_stand", "perfect_parry"];
 const UTILITY_PROCS = ["gambler", "candle", "armor_shred"];
 
 function amountTone(round) {

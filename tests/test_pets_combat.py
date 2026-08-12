@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pets_config as C
 import pets_combat as combat
 from pets_amulet_catalog import AMULET_SPECS
+from pets_gear_catalog import GEAR_SPECS
 from pets_weapon_catalog import WEAPON_SPECS
 from pets_combat import Fighter
 
@@ -358,6 +359,7 @@ class AmuletEffectTests(unittest.TestCase):
         effect_specs = [
             *AMULET_SPECS,
             *(spec for spec in WEAPON_SPECS if spec.effect),
+            *(spec for spec in GEAR_SPECS if spec.effect),
         ]
         self.assertEqual(
             {spec.effect_dict()["code"] for spec in effect_specs},
@@ -373,6 +375,27 @@ class AmuletEffectTests(unittest.TestCase):
                 first = combat.simulate(fighter, opponent, seed=41)
                 self.assertEqual(first, combat.simulate(fighter, opponent, seed=41))
                 self.assertGreater(len(first.rounds), 0)
+
+    def test_every_legendary_boot_and_glove_effect_actually_procs(self):
+        opponent = Fighter(
+            key="b", name="Opponent", strength=55, health=45, agility=35, luck=35,
+            armor=10, level=8,
+        )
+        legendary_gear = [
+            spec for spec in GEAR_SPECS if spec.rarity == "legendary"
+        ]
+        self.assertEqual(len(legendary_gear), 6)
+        for spec in legendary_gear:
+            code = spec.effect_dict()["code"]
+            with self.subTest(effect=code):
+                fighter = self._fighter_with(spec.effect_dict())
+                seen = any(
+                    any(row.event == f"amulet_{code}" for row in combat.simulate(
+                        fighter, opponent, seed=seed,
+                    ).rounds)
+                    for seed in range(120)
+                )
+                self.assertTrue(seen, f"{code} never proc'd")
 
     def test_new_weapon_modifiers_proc_inside_the_attack_cap(self):
         opponent = Fighter(

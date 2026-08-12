@@ -666,12 +666,12 @@ if _RAW_AMULET_ITEMS and (
 ):
     raise ValueError("amulet catalogue must contain exactly 40 drop-only amulets, plus priced shop ones")
 if _RAW_GEAR_ITEMS and (
-    len(_catalogue_gear) != 60
-    or sum(item.slot == "boots" for item in _catalogue_gear) != 30
-    or sum(item.slot == "gloves" for item in _catalogue_gear) != 30
+    len(_catalogue_gear) != 64
+    or sum(item.slot == "boots" for item in _catalogue_gear) != 32
+    or sum(item.slot == "gloves" for item in _catalogue_gear) != 32
     or any(item.source != "drop" for item in _catalogue_gear)
 ):
-    raise ValueError("gear catalogue must contain 30 drop-only boots and 30 gloves")
+    raise ValueError("gear catalogue must contain 32 drop-only boots and 32 gloves")
 _new_catalogue_items = _catalogue_amulets + _catalogue_gear
 if _new_catalogue_items:
     existing_codes = {item.code for item in ITEMS}
