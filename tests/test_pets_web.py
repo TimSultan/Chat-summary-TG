@@ -160,6 +160,17 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         async def quest_completion(row):
             self.quest_completions.append(dict(row))
 
+        # Recorded rather than sent: the birthday DM is the one part of a greeting that
+        # can fail in production (a bot cannot write to somebody who never opened it), so
+        # a test needs to see both that it was attempted and that failing it is survivable.
+        self.birthday_greetings: list[tuple] = []
+        self.birthday_notify_raises: Exception | None = None
+
+        async def birthday_notify(celebrant, greeter_name, gold, xp):
+            if self.birthday_notify_raises:
+                raise self.birthday_notify_raises
+            self.birthday_greetings.append((str(celebrant), greeter_name, gold, xp))
+
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
         app = vote_web.create_app(
@@ -171,6 +182,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 fetch_photo=fetch_photo, save_photo=save_photo,
                 quest_feedback=quest_feedback,
                 quest_completion=quest_completion,
+                birthday_notify=birthday_notify,
                 log=self.logs.append,
             ),
         )
@@ -1492,6 +1504,124 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         for slot, emoji in C.SLOT_EMOJI.items():
             with self.subTest(slot=slot):
                 self.assertIn(emoji, pets_web.placeholder_svg("w001", "common", slot))
+
+    # ---- birthdays ----------------------------------------------------------------------
+
+    async def _birthday(self, user, **payload):
+        response = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/birthday",
+            json={"init_data": _init_data(user["id"]), **payload},
+        )
+        return response
+
+    async def test_only_a_chat_admin_can_open_or_set_the_birthday(self):
+        """The same narrow gate the money audit uses. Both routes ask for themselves --
+        the menu entry the client draws is a convenience, never the permission."""
+        self._tame(PLAYER)
+        for user in (PLAYER, MODERATOR):
+            with self.subTest(user=user["username"]):
+                read = await self._get("/api/birthday", user)
+                self.assertEqual(read.status, 403, await read.text())
+                write = await self._birthday(user, user_id=PLAYER["id"])
+                self.assertEqual(write.status, 403, await write.text())
+
+        # THIRD is the economy admin in this fixture.
+        read = await self._get("/api/birthday", THIRD)
+        self.assertEqual(read.status, 200, await read.text())
+        body = await read.json()
+        self.assertIsNone(body["birthday"])
+        self.assertIn(str(PLAYER["id"]), [row["user_id"] for row in body["candidates"]])
+
+    async def test_a_greeting_pays_both_sides_dms_the_celebrant_and_only_lands_once(self):
+        self._tame(PLAYER)
+        self._tame(THIRD, name="Именинник")
+        self.assertEqual((await self._birthday(THIRD, user_id=THIRD["id"])).status, 200)
+
+        before_greeter = economy.balance(CHAT, str(PLAYER["id"]), RICH_XP)
+        before_celebrant = economy.balance(CHAT, str(THIRD["id"]), RICH_XP)
+        response = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/congratulate",
+            json={"init_data": _init_data(PLAYER["id"])},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        receipt = (await response.json())["receipt"]
+
+        self.assertFalse(receipt["already"])
+        self.assertEqual(
+            economy.balance(CHAT, str(PLAYER["id"]), RICH_XP) - before_greeter, receipt["gold"],
+        )
+        self.assertEqual(
+            economy.balance(CHAT, str(THIRD["id"]), RICH_XP) - before_celebrant,
+            receipt["celebrant_gold"],
+        )
+        self.assertEqual(len(self.birthday_greetings), 1)
+        celebrant, greeter_name, gold, _xp = self.birthday_greetings[0]
+        self.assertEqual(celebrant, str(THIRD["id"]))
+        self.assertEqual(greeter_name, PLAYER["first_name"])
+        self.assertEqual(gold, receipt["celebrant_gold"])
+
+        # A second press pays nothing more and sends no second message.
+        repeat = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/congratulate",
+            json={"init_data": _init_data(PLAYER["id"])},
+        )
+        self.assertTrue((await repeat.json())["receipt"]["already"])
+        self.assertEqual(len(self.birthday_greetings), 1)
+
+    async def test_a_closed_dm_does_not_fail_a_greeting_that_is_already_paid(self):
+        """A bot cannot write to somebody who never opened its chat. The money is banked
+        before the message is attempted, so losing it must not hand the greeter an error
+        and an unspendable retry."""
+        self._tame(PLAYER)
+        self._tame(THIRD, name="Именинник")
+        self.assertEqual((await self._birthday(THIRD, user_id=THIRD["id"])).status, 200)
+        self.birthday_notify_raises = RuntimeError("Forbidden: bot can't initiate conversation")
+
+        before = economy.balance(CHAT, str(THIRD["id"]), RICH_XP)
+        response = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/congratulate",
+            json={"init_data": _init_data(PLAYER["id"])},
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        receipt = (await response.json())["receipt"]
+        self.assertFalse(receipt["already"])
+        self.assertEqual(
+            economy.balance(CHAT, str(THIRD["id"]), RICH_XP) - before, receipt["celebrant_gold"],
+        )
+        self.assertTrue(any("birthday DM" in line for line in self.logs), self.logs)
+
+    async def test_the_celebrant_is_pinned_first_in_the_roster_and_is_not_attackable(self):
+        self._tame(PLAYER)
+        self._tame(MODERATOR, name="Обычный")
+        self._tame(THIRD, name="Именинник")
+        self.assertEqual((await self._birthday(THIRD, user_id=THIRD["id"])).status, 200)
+
+        body = await (await self._get("/api/opponents", PLAYER)).json()
+        self.assertEqual(body["opponents"][0]["user_id"], str(THIRD["id"]))
+        self.assertTrue(body["opponents"][0]["birthday"])
+        # Their card offers a greeting, so it must not also offer a fight.
+        self.assertFalse(body["opponents"][0]["attackable"])
+        self.assertEqual(body["birthday"]["user_id"], str(THIRD["id"]))
+        self.assertFalse(body["birthday"]["is_me"])
+        self.assertFalse(body["birthday"]["greeted"])
+
+        celebrant_view = await (await self._get("/api/opponents", THIRD)).json()
+        self.assertTrue(celebrant_view["birthday"]["is_me"])
+
+    async def test_clearing_takes_the_celebration_out_of_the_roster(self):
+        self._tame(PLAYER)
+        self._tame(THIRD, name="Именинник")
+        self.assertEqual((await self._birthday(THIRD, user_id=THIRD["id"])).status, 200)
+        self.assertEqual((await self._birthday(THIRD, clear=True)).status, 200)
+
+        body = await (await self._get("/api/opponents", PLAYER)).json()
+        self.assertIsNone(body["birthday"])
+        self.assertFalse(any(row.get("birthday") for row in body["opponents"]))
+        refused = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/congratulate",
+            json={"init_data": _init_data(PLAYER["id"])},
+        )
+        self.assertEqual(refused.status, 409, await refused.text())
 
 
 if __name__ == "__main__":

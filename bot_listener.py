@@ -6582,6 +6582,30 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.skills_view(entry, user_id), log
             )
             return
+        if action == "bday":
+            try:
+                receipt = pets.congratulate(entry, user_id)
+                note = ("Ты уже поздравил сегодня." if receipt.get("already")
+                        else f"Поздравление отправлено. +{receipt['gold']} золота"
+                             + (f", +{receipt['xp']} опыта" if receipt.get("xp") else ""))
+            except ValueError as e:
+                receipt, note = None, str(e)
+            # Paid and stored already; a closed DM must not turn this into a failure.
+            if receipt and not receipt.get("already"):
+                try:
+                    await api.send_message(
+                        receipt["celebrant"],
+                        f"🎂 Вас поздравил {receipt.get('greeter_name') or 'кто-то'} на арене."
+                        f"\n\n+{receipt['celebrant_gold']} золота"
+                        + (f", +{receipt['celebrant_xp']} опыта" if receipt.get("celebrant_xp") else ""),
+                        parse_mode=None,
+                    )
+                except ChatSummaryError as e:
+                    log(f"[pets] birthday DM to {receipt['celebrant']} failed: {e}")
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.fight_view(entry, user_id, xp), log
+            )
+            return
         if action == "skillclear":
             ok, note = pets.clear_skill_slot(entry, user_id, argument)
             await _pets_toast_and_redraw(
@@ -8968,6 +8992,22 @@ async def run_bot_listener(
                 async def _send_web_quest_completion(row: dict):
                     await _send_quest_completion(api, row, log)
 
+                async def _send_birthday_greeting(celebrant, greeter_name: str,
+                                                  gold: int, xp: int):
+                    """Tell the celebrant somebody just wished them a happy birthday.
+
+                    Their own DM, because it is addressed to them personally and the group
+                    would get one of these per well-wisher. A bot cannot write to somebody
+                    who has never opened its chat, so this may simply fail -- the greeting
+                    is already paid and stored by then, and pets_web logs and moves on.
+                    """
+                    reward = f"\n\n+{gold} золота" + (f", +{xp} опыта" if xp else "")
+                    await api.send_message(
+                        celebrant,
+                        f"🎂 Вас поздравил {greeter_name} на арене." + reward,
+                        parse_mode=None,
+                    )
+
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
                     is_member=_is_vote_member,
@@ -8979,7 +9019,8 @@ async def run_bot_listener(
                     resolve_player=_resolve_pet_player,
                     fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
                     quest_feedback=_send_quest_feedback,
-                    quest_completion=_send_web_quest_completion, log=log,
+                    quest_completion=_send_web_quest_completion,
+                    birthday_notify=_send_birthday_greeting, log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token

@@ -3283,6 +3283,171 @@ def _pve_window_end(moment: datetime) -> datetime:
     return start + timedelta(hours=C.PVE_WINDOW_HOURS)
 
 
+# ---------------------------------------------------------------------------- birthdays
+# One person a day sits at the top of the arena with a Поздравить button instead of an
+# attack one. Stored with the DATE it is for, never as a bare switch: an admin sets it and
+# forgets it, and a dated row retires itself at midnight instead of paying a stale
+# celebrant for a fortnight.
+BIRTHDAY_KEY = "birthday"
+
+
+def _birthday_row(data: dict) -> dict:
+    row = data.setdefault(BIRTHDAY_KEY, {})
+    if not isinstance(row, dict):
+        row = data[BIRTHDAY_KEY] = {}
+    if not isinstance(row.get("greeted"), dict):
+        row["greeted"] = {}
+    return row
+
+
+def _birthday_active(row: dict, day: date | None = None) -> bool:
+    return bool(str(row.get("user_id") or "")) \
+        and str(row.get("date") or "") == (day or today()).isoformat()
+
+
+def birthday(entry, day: date | None = None, viewer=None) -> dict | None:
+    """Today's celebrant, or None. Reading never mutates the store.
+
+    `viewer` adds the two facts every screen needs and neither should work out for
+    itself: whether the person looking IS the celebrant, and whether they have already
+    sent their greeting. Both clients render from these rather than re-deriving them.
+    """
+    data = _load(entry)
+    row = _birthday_row(data)
+    if not _birthday_active(row, day):
+        return None
+    celebrant = str(row["user_id"])
+    record = _tamed_record(data, celebrant)
+    greeted = row.get("greeted") or {}
+    return {
+        "user_id": celebrant,
+        "date": row.get("date"),
+        "greeted_count": len(greeted),
+        "greeted_by": sorted(str(key) for key in greeted),
+        "owner_name": (record or {}).get("owner_name") or row.get("owner_name") or "именинник",
+        "owner_username": (record or {}).get("owner_username") or row.get("owner_username"),
+        "pet_name": (record or {}).get("name"),
+        "has_pet": record is not None,
+        "is_me": viewer is not None and str(viewer) == celebrant,
+        "greeted": viewer is not None and str(viewer) in greeted,
+    }
+
+
+def set_birthday(entry, user_id, *, day: date | None = None, set_by=None,
+                 owner_name: str | None = None, owner_username: str | None = None) -> dict:
+    """Put somebody at the top of the arena for one day.
+
+    Re-setting the SAME person on the same day keeps the greeting log, so an admin who
+    fixes a typo in the name does not reopen the day for everyone who already paid their
+    respects. Naming anybody else -- or another date -- starts a fresh log, because it is
+    a different celebration.
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        raise ValueError("Не выбран именинник.")
+    day = day or today()
+    data = _load(entry)
+    row = _birthday_row(data)
+    same = str(row.get("user_id") or "") == user_id and str(row.get("date") or "") == day.isoformat()
+    record = _tamed_record(data, user_id)
+    data[BIRTHDAY_KEY] = {
+        "user_id": user_id,
+        "date": day.isoformat(),
+        "set_by": str(set_by or ""),
+        "set_at": app_now().isoformat(),
+        "owner_name": owner_name or (record or {}).get("owner_name") or "именинник",
+        "owner_username": owner_username or (record or {}).get("owner_username"),
+        "greeted": dict(row.get("greeted") or {}) if same else {},
+    }
+    _save(entry, data)
+    return birthday(entry, day) or {}
+
+
+def clear_birthday(entry) -> bool:
+    """Take the celebration down early. Returns whether there was one to take down."""
+    data = _load(entry)
+    row = _birthday_row(data)
+    if not str(row.get("user_id") or ""):
+        return False
+    data[BIRTHDAY_KEY] = {"greeted": {}}
+    _save(entry, data)
+    return True
+
+
+def congratulate(entry, user_id, day: date | None = None) -> dict:
+    """Congratulate today's celebrant. Pays both of them a win's worth, once per person.
+
+    Idempotent on the greeter: a second tap returns the first receipt instead of paying
+    again, so a double-click or a retried request cannot mint a second purse. The reward
+    is a win's gold and xp for BOTH sides, exactly as commissioned -- the greeter is paid
+    for showing up and the celebrant is paid per well-wisher.
+
+    Costs no arena fight. A birthday is not a duel, and making it compete with the fight
+    bank would mean choosing between congratulating somebody and playing.
+    """
+    user_id = str(user_id)
+    day = day or today()
+    with _farm_settlement_lock:
+        data = _load(entry)
+        row = _birthday_row(data)
+        if not _birthday_active(row, day):
+            raise ValueError("Сегодня никто не празднует.")
+        celebrant = str(row["user_id"])
+        if celebrant == user_id:
+            raise ValueError("Себя поздравлять не нужно — это все остальные к тебе.")
+        prior = (row.get("greeted") or {}).get(user_id)
+        if isinstance(prior, dict):
+            return {**prior, "already": True}
+
+        greeter_record = _tamed_record(data, user_id)
+        celebrant_record = _tamed_record(data, celebrant)
+        # Each side rolls its own purse, the same way two arena wins would.
+        gold = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        celebrant_gold = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        economy.grant(entry, user_id, gold, "pet_birthday_greeting")
+        economy.grant(entry, celebrant, celebrant_gold, "pet_birthday_greeted")
+        _metric_add(data, "arena_reward_gold", gold + celebrant_gold)
+        # Gold lands on the person; xp lands on the creature, so somebody who has not
+        # tamed one yet still gets paid rather than being turned away at the button.
+        xp = C.WIN_XP if greeter_record is not None else 0
+        celebrant_xp = C.WIN_XP if celebrant_record is not None else 0
+        if greeter_record is not None:
+            _apply_xp(greeter_record, xp)
+        if celebrant_record is not None:
+            _apply_xp(celebrant_record, celebrant_xp)
+
+        receipt = {
+            "already": False,
+            "celebrant": celebrant,
+            "celebrant_name": row.get("owner_name") or "именинник",
+            "greeter": user_id,
+            "greeter_name": (greeter_record or {}).get("owner_name") or "кто-то",
+            "gold": gold, "xp": xp,
+            "celebrant_gold": celebrant_gold, "celebrant_xp": celebrant_xp,
+            "ts": app_now().isoformat(),
+        }
+        row["greeted"][user_id] = receipt
+        _remember_birthday_notification(data, celebrant, receipt)
+        _save(entry, data)
+        return receipt
+
+
+def _remember_birthday_notification(data: dict, celebrant: str, receipt: dict) -> None:
+    """The celebrant's copy, kept in the store so a closed DM cannot lose the news."""
+    rows = data.setdefault("birthday_notifications", [])
+    if not isinstance(rows, list):
+        rows = data["birthday_notifications"] = []
+    rows.append({
+        "user_id": str(celebrant),
+        "greeter": receipt.get("greeter"),
+        "greeter_name": receipt.get("greeter_name"),
+        "gold": receipt.get("celebrant_gold"),
+        "xp": receipt.get("celebrant_xp"),
+        "ts": receipt.get("ts"),
+    })
+    data["birthday_notifications"] = rows[-400:]
+
+
 def pve_allowance(entry, user_id, now: datetime | None = None) -> dict:
     """PVE attacks left, and when the whole server gets them back.
 

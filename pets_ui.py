@@ -2033,7 +2033,26 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if rubies:
         lines.append(f"💎 Руби: {_money(rubies)}")
 
+    # Above the search, and above the fight bank: it costs no fight, it lasts one day,
+    # and somebody who opens the arena with an empty bank should still see it.
+    party = pets.birthday(entry, viewer=user_id)
+    if party and not party["is_me"]:
+        lines.append(f"\n🎂 <b>Сегодня день рождения!</b> {escape(party['owner_name'])}")
+        if party["greeted"]:
+            lines.append("<i>Ты уже поздравил.</i>")
+        else:
+            lines.append("<i>Поздравь — награду получите оба, и это не потратит бой.</i>")
+    elif party:
+        lines.append(
+            f"\n🎂 <b>С днём рождения!</b> Тебя поздравили: {party['greeted_count']}"
+        )
+
     rows = []
+    if party and not party["is_me"] and not party["greeted"]:
+        rows.append([{
+            "text": f"🎉 Поздравить · {str(party['owner_name'])[:24]}",
+            "callback_data": callback_data(user_id, "bday"),
+        }])
     if left > 0 and not farming:
         rows.append([{
             "text": "🔍 Найти соперника",

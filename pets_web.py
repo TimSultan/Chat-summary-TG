@@ -73,6 +73,9 @@ _IS_ADMIN_KEY = web.AppKey("pets_is_admin", Callable[[dict], Awaitable[bool]])
 _IS_ECONOMY_ADMIN_KEY = web.AppKey(
     "pets_is_economy_admin", Callable[[dict], Awaitable[bool]],
 )
+_BIRTHDAY_NOTIFY_KEY = web.AppKey(
+    "pets_birthday_notify", Callable[[str, str, int, int], Awaitable[None]],
+)
 _RESOLVE_KEY = web.AppKey("pets_resolve_player")
 _FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
 _SAVE_PHOTO_KEY = web.AppKey("pets_save_photo")
@@ -1247,7 +1250,21 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
     # An even fight first: the roster is sorted by how near each opponent's power is to
     # yours, with everyone you have already fought out today pushed to the bottom.
     opponents.sort(key=lambda o: (not o["attackable"], o["gap"]))
-    return {"me_power": mine, "opponents": opponents}
+
+    # The celebrant goes to the very top and stops being a target for the day: the card
+    # in their place offers a greeting, not an attack. Marked on the row rather than
+    # pulled out of the list so a client that has not been updated still shows the
+    # person, merely without the party.
+    celebration = pets.birthday(entry, viewer=me)
+    if celebration:
+        celebrant = celebration["user_id"]
+        for index, row in enumerate(opponents):
+            if row["user_id"] == celebrant:
+                row["birthday"] = True
+                row["attackable"] = False
+                opponents.insert(0, opponents.pop(index))
+                break
+    return {"me_power": mine, "opponents": opponents, "birthday": celebration}
 
 
 async def handle_attack(request: web.Request) -> web.Response:
@@ -1610,8 +1627,108 @@ async def _quest_admin(request: web.Request, body: dict | None = None):
     return user, xp
 
 
-async def _economy_admin(request: web.Request):
-    user, xp = await _player(request)
+async def handle_congratulate(request: web.Request) -> web.Response:
+    """Wish today's celebrant a happy birthday. Pays both, once per well-wisher.
+
+    A route of its own rather than an entry in _ACTIONS because it has to await the DM
+    to the celebrant, and _ACTIONS is a table of synchronous store edits. The payment is
+    committed BEFORE the message is attempted: a celebrant whose DM is closed must still
+    be paid, and `pets.congratulate` has already stored its own copy of the news.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
+    user, _xp = await _player(request, body)
+    entry = request.app[_ENTRY_KEY]
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Поздравлять могут только участники чата.", status=403, code="NOT_A_MEMBER")
+
+    me = str(user["id"])
+    try:
+        receipt = await asyncio.to_thread(pets.congratulate, entry, me)
+    except ValueError as e:
+        return _json_error(str(e), status=409, code="CANNOT_CONGRATULATE")
+
+    if not receipt.get("already"):
+        # Failure here is logged and swallowed: the money is already banked, and a bot
+        # cannot write to somebody who has never opened its DM. Losing the notification
+        # must not turn a successful greeting into an error the greeter has to retry.
+        try:
+            await request.app[_BIRTHDAY_NOTIFY_KEY](
+                receipt["celebrant"], receipt.get("greeter_name") or "кто-то",
+                int(receipt.get("celebrant_gold") or 0), int(receipt.get("celebrant_xp") or 0),
+            )
+        except Exception as e:  # noqa: BLE001 -- see above
+            request.app[_LOG_KEY](f"[pets_web] birthday DM to {receipt['celebrant']} failed: {e}")
+
+    request.app[_LOG_KEY](
+        f"[pets_web] {me} congratulated {receipt.get('celebrant')}"
+        f"{' (repeat)' if receipt.get('already') else ''}"
+    )
+    return _ok({
+        "receipt": _jsonable(receipt),
+        "state": await asyncio.to_thread(_state_payload, entry, user["id"], _xp,
+                                         request.app[_PREFIX_KEY]),
+    })
+
+
+async def handle_birthday_admin(request: web.Request) -> web.Response:
+    """Who is celebrating, and everybody who could be. Chat admins only."""
+    await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    return _ok(await asyncio.to_thread(_birthday_admin_payload, entry))
+
+
+def _birthday_admin_payload(entry: str) -> dict:
+    data = pets._load(entry)
+    candidates = [
+        {
+            "user_id": str(user_id),
+            "owner_name": record.get("owner_name") or "кто-то",
+            "owner_username": record.get("owner_username"),
+            "pet_name": record.get("name"),
+        }
+        for user_id, record in (data.get("pets") or {}).items()
+        if isinstance(record, dict) and record.get("name")
+    ]
+    candidates.sort(key=lambda row: str(row["owner_name"]).lower())
+    return {"birthday": pets.birthday(entry), "candidates": candidates, "today": pets.today().isoformat()}
+
+
+async def handle_birthday_set(request: web.Request) -> web.Response:
+    """Set or clear the celebration. Chat admins only."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _economy_admin(request, body)
+    entry = request.app[_ENTRY_KEY]
+
+    if body.get("clear"):
+        cleared = await asyncio.to_thread(pets.clear_birthday, entry)
+        request.app[_LOG_KEY](f"[pets_web] {user['id']} cleared the birthday ({cleared})")
+        return _ok({
+            "message": "Праздник снят." if cleared else "Никто и не праздновал.",
+            **await asyncio.to_thread(_birthday_admin_payload, entry),
+        })
+
+    try:
+        await asyncio.to_thread(
+            pets.set_birthday, entry, str(body.get("user_id") or ""), set_by=user["id"],
+        )
+    except ValueError as e:
+        return _json_error(str(e), status=400, code="BAD_BIRTHDAY")
+    request.app[_LOG_KEY](f"[pets_web] {user['id']} set the birthday to {body.get('user_id')}")
+    payload = await asyncio.to_thread(_birthday_admin_payload, entry)
+    return _ok({"message": "Праздник назначен на сегодня.", **payload})
+
+
+async def _economy_admin(request: web.Request, body: dict | None = None):
+    # `body` for the POST callers: a GET carries initData in the header, but a mutation
+    # sends it in the JSON like every other action, and reading only the header would
+    # turn an authorised admin into an anonymous caller.
+    user, xp = await _player(request, body)
     if not await request.app[_IS_ECONOMY_ADMIN_KEY](user):
         raise web.HTTPForbidden(
             text=json.dumps({
@@ -1925,6 +2042,10 @@ async def _default_quest_completion(row: dict):
     return None
 
 
+async def _default_birthday_notify(celebrant, greeter_name: str, gold: int, xp: int):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
@@ -1937,6 +2058,7 @@ def attach(
     save_photo=None,
     quest_feedback=None,
     quest_completion=None,
+    birthday_notify=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
@@ -1970,6 +2092,9 @@ def attach(
     app[_SAVE_PHOTO_KEY] = save_photo or _default_save_photo
     app[_QUEST_FEEDBACK_KEY] = quest_feedback or _default_quest_feedback
     app[_QUEST_COMPLETION_KEY] = quest_completion or _default_quest_completion
+    # Declines silently when absent: without a bot to send it, a greeting still pays and
+    # still lands in the celebrant's stored notifications.
+    app[_BIRTHDAY_NOTIFY_KEY] = birthday_notify or _default_birthday_notify
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
@@ -1982,6 +2107,10 @@ def attach(
         web.post(prefix + "/api/action", handle_action),
         web.get(prefix + "/api/opponents", handle_opponents),
         web.post(prefix + "/api/attack", handle_attack),
+        web.post(prefix + "/api/congratulate", handle_congratulate),
+        # Chat admins only, both of them (see _economy_admin).
+        web.get(prefix + "/api/birthday", handle_birthday_admin),
+        web.post(prefix + "/api/birthday", handle_birthday_set),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
         web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
         web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
@@ -2204,6 +2333,10 @@ PAGE_HTML = """<!doctype html>
   .live-skill b, .live-skill small { display: block; }
   .live-skill small { margin-top: 4px; color: var(--muted); font-weight: 400; }
   .live-skill.ultimate { border-color: var(--r-legendary); }
+  /* The one card on the arena that is not a fight. Gold border rather than the accent,
+     so it reads as an occasion and not as another button to press. */
+  .panel.birthday { border: 1px solid var(--gold); }
+  .panel.birthday h2 { color: var(--gold); }
   /* An open slot, drawn like one: dashed, quiet, and obviously something you can fill,
      rather than a card that looks broken because its contents failed to load. */
   .live-skill.empty { border-style: dashed; color: var(--muted); background: none; }
@@ -3055,6 +3188,9 @@ async function renderArena() {
       '<div class="small muted" style="margin-bottom:9px">Четыре свитка, щиты, защита и ручные ходы. ' +
       'Результаты, награды и счётчики не записываются.</div>' +
       '<button class="go" data-testbattle="open">Открыть боевую песочницу</button></div>' +
+    // Above everything, including PVE: it is one day, and the point of it is that
+    // nobody has to go looking.
+    birthdayPanel() +
     // PVE above the roster: there is always a mob, and on a quiet day the player list is
     // the empty half of this screen.
     mobPanel(Boolean(farming)) +
@@ -3237,6 +3373,99 @@ async function fightMob() {
   MOB = null;
   FOES = null;
   playDuel(data);
+}
+
+function birthdayAdmin(data) {
+  const party = data.birthday;
+  const rows = data.candidates || [];
+  const current = party
+    ? '<div class="panel"><h2>🎂 Сегодня празднует</h2>' +
+      "<div class='row spread'><span><b>" + esc(party.owner_name) + "</b>" +
+      (party.pet_name ? " <span class='tiny muted'>· " + esc(party.pet_name) + "</span>" : "") +
+      "</span><span class='small'>поздравили: " + Number(party.greeted_count || 0) +
+      "</span></div>" +
+      '<button class="go sec" style="margin-top:10px" data-birthdayclear="1">Снять праздник</button>' +
+      "</div>"
+    : '<div class="panel"><h2>🎂 День рождения</h2>' +
+      "<div class='small muted'>Сегодня никто не празднует. Выбери именинника — он встанет " +
+      "первым на арене у всех, вместо кнопки атаки будет «Поздравить», и награду получат " +
+      "оба: и поздравивший, и именинник.</div></div>";
+  // Set for TODAY only, deliberately: the row carries its date and retires itself at
+  // midnight, so a forgotten celebration cannot keep paying out all week.
+  return current +
+    '<div class="panel"><h2>Кого поздравляем</h2>' +
+    '<input class="inp" data-birthdayfilter placeholder="Поиск по имени">' +
+    "<div class='tiny muted' style='margin:8px 0'>Назначается на сегодня (" +
+      esc(data.today || "") + "). Завтра снимется само.</div>" +
+    (rows.length
+      ? rows.map((row) =>
+          // The searchable text rides on the row so filtering can hide and show rows in
+          // place, the way the audit filter does -- re-rendering the list on every
+          // keystroke would take the focus out of the box being typed into.
+          '<div class="row spread" style="margin-bottom:8px" data-bdayrow="' +
+          esc(((row.owner_name || "") + " " + (row.owner_username || "")).toLowerCase()) +
+          '"><span class="small">' + esc(row.owner_name) +
+          (row.owner_username ? " <span class='tiny muted'>@" + esc(row.owner_username) + "</span>" : "") +
+          "</span>" +
+          '<button class="chip" data-birthdayset="' + esc(row.user_id) + '"' +
+          (party && party.user_id === row.user_id ? " disabled" : "") + ">" +
+          (party && party.user_id === row.user_id ? "выбран" : "выбрать") + "</button></div>").join("")
+      : '<div class="empty">Пока ни у кого нет существа.</div>') +
+    "</div>";
+}
+
+async function setBirthday(userId) {
+  try {
+    const data = await api("/api/birthday", userId ? { user_id: userId } : { clear: true });
+    toast(data.message || "Готово");
+    haptic("ok");
+    FOES = null;                       // the arena card has to be rebuilt for everyone
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+}
+
+function birthdayPanel() {
+  const party = FOES && FOES.birthday;
+  if (!party) return "";
+  const who = esc(party.owner_name || "именинник");
+  const count = Number(party.greeted_count || 0);
+  const tally = count
+    ? "<div class='tiny muted' style='margin-top:8px;text-align:center'>Уже поздравили: " +
+      count + "</div>"
+    : "";
+  // Three different people read this card: the one with the birthday, the one who has
+  // already congratulated them, and everybody else. Only the last of those gets a button.
+  let action;
+  if (party.is_me) {
+    action = "<div class='small' style='text-align:center'>Сегодня твой день. " +
+      "Тебя поздравляют на арене — каждому поздравившему и тебе идёт награда.</div>";
+  } else if (party.greeted) {
+    action = "<div class='small' style='text-align:center'>✅ Ты уже поздравил" +
+      "</div>";
+  } else {
+    action = '<button class="go" data-congratulate="1">🎉 Поздравить</button>' +
+      "<div class='tiny muted' style='margin-top:7px;text-align:center'>" +
+      "Бой это не тратит. Награду получите оба.</div>";
+  }
+  return '<div class="panel birthday"><h2>🎂 День рождения · ' + who + "</h2>" +
+    (party.pet_name
+      ? "<div class='tiny muted' style='margin-bottom:9px'>Существо: " +
+        esc(party.pet_name) + "</div>"
+      : "") +
+    action + tally + "</div>";
+}
+
+async function congratulate() {
+  try {
+    const data = await api("/api/congratulate", {});
+    S = data.state;
+    FOES = null;                       // the card has to come back as "уже поздравил"
+    haptic("ok");
+    toast(data.receipt && data.receipt.already
+      ? "Ты уже поздравил сегодня."
+      : "Поздравление отправлено. +" + Number((data.receipt || {}).gold || 0) + " золота");
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
 }
 
 function mobPanel(farmBlocked) {
@@ -3515,6 +3744,7 @@ async function renderMore() {
     // it re-checks, so a hand-typed moreView cannot open anything.
     if (S && S.is_admin) menu.push("review:" + (S.pending_quests ? "🔴 " : "") + "🛡 Проверка квестов");
     if (S && S.is_economy_admin) menu.push("moneyaudit:🕵️ Денежный аудит");
+    if (S && S.is_economy_admin) menu.push("birthday:🎂 День рождения");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -3556,6 +3786,8 @@ async function renderMore() {
     const query = "?hours=" + encodeURIComponent(auditHours) +
       (auditUser ? "&user_id=" + encodeURIComponent(auditUser) : "");
     body = economyAudit(await api("/api/economy/audit" + query));
+  } else if (moreView === "birthday") {
+    body = birthdayAdmin(await api("/api/birthday"));
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -4510,9 +4742,14 @@ document.addEventListener("click", async (event) => {
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
-    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]");
+    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
+    "[data-congratulate],[data-birthdayset],[data-birthdayclear]");
   if (!target) return;
   const d = target.dataset;
+
+  if (d.congratulate) { await congratulate(); return; }
+  if (d.birthdayset !== undefined) { await setBirthday(d.birthdayset); return; }
+  if (d.birthdayclear !== undefined) { await setBirthday(null); return; }
 
   if (d.testbattle === "open") { await openTestBattle(); return; }
   if (d.testbattle === "close") {
@@ -4667,6 +4904,14 @@ document.addEventListener("click", async (event) => {
 // User filtering is entirely local: typing must feel instant and must not turn every
 // character into an admin API request.
 document.addEventListener("input", (event) => {
+  const birthday = event.target.closest("[data-birthdayfilter]");
+  if (birthday) {
+    const term = birthday.value.trim().toLowerCase();
+    document.querySelectorAll("[data-bdayrow]").forEach((row) => {
+      row.hidden = Boolean(term) && !row.dataset.bdayrow.includes(term);
+    });
+    return;
+  }
   const input = event.target.closest("[data-auditfilter]");
   if (!input) return;
   auditFilter = input.value;
