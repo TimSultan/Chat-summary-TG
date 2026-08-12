@@ -16,6 +16,8 @@ class ScrollCatalogTests(unittest.TestCase):
         self.assertEqual(len(catalog.ULTIMATE_SCROLLS), 10)
         self.assertEqual(len(catalog.SHIELDS), 10)
         self.assertTrue(all(row["auto_weight"] == 1 for row in catalog.SCROLLS))
+        self.assertEqual({row["element"] for row in catalog.SCROLLS}, set(catalog.ELEMENTS))
+        self.assertTrue(all(row["element"] in catalog.ELEMENTS for row in catalog.SCROLLS))
         self.assertTrue(any(row["dodgeable"] is False for row in catalog.SCROLLS))
         self.assertTrue(any("NMM" in row["name"] for row in catalog.SCROLLS))
         self.assertTrue(any("Звездопад" in row["name"] for row in catalog.SCROLLS))

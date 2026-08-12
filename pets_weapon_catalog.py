@@ -28,7 +28,7 @@ SOURCES: Final = ("shop", "drop")
 STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
 
 # Shop prices follow the same relative combat weights as the arena power rating.  The
-# Three ordinary items can be forged into one rare item, so the ordinary price floor must
+# Five ordinary items can be forged into one rare item, so the ordinary price floor must
 # protect that recipe from becoming a cheaper substitute for the rare shelf. Rounding to
 # five keeps prices readable and prevents arbitrary catalogue IDs from separating items
 # with the same combat power.
@@ -39,7 +39,7 @@ SHOP_PRICE_POWER_WEIGHTS: Final = {
     "luck": 2,
     "armor": 3,
 }
-# The weakest shop weapon anchors the ordinary tier. Three of these cost 180 coins, just
+# The weakest shop weapon anchors the ordinary tier. Five of these cost 300 coins, well
 # above the 160-195 direct rare-weapon band; forging therefore buys variety, not arbitrage.
 STARTER_WEAPON_MAX_PRICE: Final = 60
 MOB_HUNTER_WEAPON_CODE: Final = "w009"

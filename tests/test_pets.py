@@ -1038,18 +1038,20 @@ class EquipmentTradingTests(PetsTestCase):
 
 
 class ForgeTests(PetsTestCase):
-    def test_reforge_consumes_three_weakest_free_items_and_grants_next_rarity(self):
+    def test_reforge_consumes_five_weakest_free_items_and_grants_next_rarity(self):
         self._tame("forge", "1")
         common = [
             item for item in pets_config.ITEMS
             if item.source == "drop" and item.rarity == "common"
-        ][:4]
+        ][:6]
         data = pets._load("forge")
         data["pets"]["1"]["inventory"] = [item.code for item in common]
         data["pets"]["1"]["locked_items"] = [common[-1].code]
         pets._save("forge", data)
 
         status = pets.forge_status("forge", "1")["recipes"][0]
+        self.assertEqual(status["required"], 5)
+        self.assertEqual(len(status["ingredients"]), 5)
         self.assertTrue(status["can_forge"])
         self.assertNotIn(common[-1].code, status["ingredients"])
         ok, message, result_code = pets.reforge_items("forge", "1", "common", random.Random(7))
@@ -1062,6 +1064,25 @@ class ForgeTests(PetsTestCase):
         self.assertIn(common[-1].code, inventory)
         self.assertIn(result.code, inventory)
         self.assertEqual(len(inventory), 2)
+
+    def test_common_reforge_requires_five_free_items(self):
+        self._tame("forge-requires-five", "1")
+        common = [
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.rarity == "common"
+        ][:4]
+        data = pets._load("forge-requires-five")
+        data["pets"]["1"]["inventory"] = [item.code for item in common]
+        pets._save("forge-requires-five", data)
+
+        recipe = pets.forge_status("forge-requires-five", "1")["recipes"][0]
+        self.assertEqual(recipe["required"], 5)
+        self.assertFalse(recipe["can_forge"])
+        ok, _message, result_code = pets.reforge_items(
+            "forge-requires-five", "1", "common", random.Random(7),
+        )
+        self.assertFalse(ok)
+        self.assertIsNone(result_code)
 
     def test_legendary_reforge_requires_and_consumes_seven_rares(self):
         self._tame("forge-legend", "1")

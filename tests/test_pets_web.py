@@ -268,8 +268,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({slot["slot"] for slot in full["equipment"]}, set(C.SLOT_KEYS))
         self.assertTrue(all(slot["item"] is None for slot in full["equipment"]))
         self.assertEqual(len(full["skills"]["slots"]), 4)
-        self.assertEqual(len(full["skills"]["regular"]), 30)
-        self.assertEqual(len(full["skills"]["ultimate"]), 10)
+        self.assertEqual(len(full["skills"]["regular"]), 3)
+        self.assertEqual(len(full["skills"]["ultimate"]), 1)
         self.assertTrue(full["skills"]["slots"][3]["ultimate"])
         self.assertFalse(full["is_economy_admin"])
         self.assertIn("bag", full)
@@ -379,6 +379,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self._tame(PLAYER)
         regular = SCROLLS.REGULAR_SCROLLS[-1]["code"]
         ultimate = SCROLLS.ULTIMATE_SCROLLS[-1]["code"]
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["owned_scrolls"].extend([regular, ultimate])
+        pets._save(CHAT, data)
 
         wrong = await self._action(PLAYER, "set_skill", slot=1, code=ultimate)
         self.assertFalse(wrong["ok"])
@@ -394,6 +397,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         html = await page.text()
         self.assertIn("data-liveskill", html)
         self.assertIn("data-liveskillset", html)
+        self.assertIn("SCROLL_ELEMENTS", html)
+        self.assertNotIn("можно увернуться", html)
         self.assertIn('["shield", "🛡 Щиты"]', html)
 
     async def test_equipping_and_unequipping_move_an_item_between_bag_and_slot(self):
@@ -529,6 +534,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(body["shields"]), 10)
         self.assertTrue(all(row["auto_weight"] == 1 for row in body["regular_scrolls"]))
         self.assertTrue(all(row["effects"] for row in body["regular_scrolls"]))
+        self.assertEqual(
+            {row["element"] for row in body["regular_scrolls"] + body["ultimate_scrolls"]},
+            set(SCROLLS.ELEMENTS),
+        )
         self.assertEqual(
             {row["user_id"] for row in body["opponents"]},
             {"dummy", str(OPPONENT["id"])},
@@ -1061,6 +1070,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.quest_completions[0]["message_id"], 777)
         self.assertEqual(self.quest_completions[0]["photo_file_id"], "quest-photo")
         self.assertEqual(self.quest_completions[0]["hashtag"], "#quest_" + code)
+        self.assertEqual(self.quest_completions[0]["paid"], paid)
 
         again = await (await self.client.post(
             pets_web.ROUTE_PREFIX + "/api/quests/review",

@@ -634,6 +634,22 @@ class QuestCatalogueEditTests(QuestsTestCase):
 
 
 class RewardTableTests(QuestsTestCase):
+    def test_only_hard_quest_cards_advertise_the_fixed_scroll_chance(self):
+        data = quests._load("chat")
+        easy = next(row for row in catalog.QUESTS if row.difficulty == 3)
+        hard = next(row for row in catalog.QUESTS if row.difficulty == 4)
+        brutal = next(row for row in catalog.QUESTS if row.difficulty == 5)
+
+        self.assertNotIn("scroll_chance", quests._quest_payload("chat", easy, data)["reward"])
+        self.assertEqual(
+            quests._quest_payload("chat", hard, data)["reward"]["scroll_chance"],
+            pets.HARD_QUEST_SCROLL_CHANCES[4],
+        )
+        self.assertEqual(
+            quests._quest_payload("chat", brutal, data)["reward"]["scroll_chance"],
+            pets.HARD_QUEST_SCROLL_CHANCES[5],
+        )
+
     def test_set_reward_clamps_out_of_range_values_to_the_configured_limits(self):
         """A moderator's fat-fingered 50000 must not become the chat's new gold reward --
         REWARD_LIMITS exists precisely because there is no undo for coins already spent."""

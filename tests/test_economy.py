@@ -93,6 +93,16 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(report["earned"], 10)
         self.assertEqual(economy.audit_user_ids("chat"), {"1", "2"})
 
+    def test_idempotent_figurine_grants_stay_in_the_activity_audit_bucket(self):
+        moment = datetime(2026, 8, 12, 18, 5, tzinfo=timezone.utc)
+        with patch("economy.app_now", return_value=moment):
+            self.assertTrue(economy.grant_once("chat", "1", 500, "figurine:777"))
+            self.assertFalse(economy.grant_once("chat", "1", 500, "figurine:777"))
+
+        report = economy.audit_report("chat", "1", 24, now=moment)
+        activity = next(row for row in report["sources"] if row["code"] == "activity")
+        self.assertEqual((activity["earned"], activity["net"]), (500, 500))
+
     def test_catalogue_is_the_title_alone(self):
         self.assertEqual([item.code for item in economy.SHOP_ITEMS], ["title"])
         self.assertIsNone(economy.find_item("roast"))

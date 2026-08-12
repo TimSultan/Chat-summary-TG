@@ -302,6 +302,23 @@ def rewards_for(entry: str, difficulty: int, data: dict | None = None) -> dict:
     return reward
 
 
+def _reward_payload(entry: str, difficulty: int, data: dict | None = None) -> dict:
+    """Player-facing quest rewards, including the fixed rare-scroll roll.
+
+    Gold, XP, tickets and item chance remain moderator-editable. Scroll acquisition is
+    deliberately a separate global balance table, so a quest moderator cannot
+    accidentally turn a rare permanent ability into a guaranteed routine payout.
+    """
+    reward = rewards_for(entry, difficulty, data)
+    scroll_chance = pets.HARD_QUEST_SCROLL_CHANCES.get(int(difficulty or 0))
+    if scroll_chance is not None:
+        reward.update({
+            "scroll_chance": scroll_chance,
+            "scroll_pity": pets.HARD_QUEST_SCROLL_PITY,
+        })
+    return reward
+
+
 def reward_table(entry: str) -> list[dict]:
     """Every difficulty's current payout, for the admin editor and the quest card."""
     data = _load(entry)
@@ -441,7 +458,7 @@ def _quest_payload(entry: str, quest, data: dict) -> dict:
         "proof": quest.proof,
         "badge": quest.badge,
         "cooldown_days": quest.cooldown_days,
-        "reward": rewards_for(entry, quest.difficulty, data),
+        "reward": _reward_payload(entry, quest.difficulty, data),
     }
 
 
@@ -888,7 +905,7 @@ def pending(entry: str) -> list[dict]:
         row["hint"] = text.get("hint", "")
         row["proof"] = text.get("proof", "")
         row["hashtag"] = catalog.hashtag(row.get("code"))
-        row["reward"] = rewards_for(entry, row.get("difficulty", 1), data)
+        row["reward"] = _reward_payload(entry, row.get("difficulty", 1), data)
     return rows
 
 
@@ -1055,6 +1072,15 @@ def review(
     # cannot pay twice -- it can only fail to pay, which the receipt makes visible.
     paid = _pay(entry, receipt, submission_id)
     receipt.update(paid)
+    # The review row is the durable source for mailbox events.  Payment deliberately
+    # happens outside the quest lock, so record the realised drop/scroll receipt in a
+    # short second transaction rather than claiming a random reward that never landed.
+    with _lock:
+        data = _load(entry)
+        row = _find_submission(data, submission_id)
+        if row is not None and row.get("status") == "accepted":
+            row["paid"] = {**dict(row.get("paid") or {}), **paid}
+            _save(entry, data)
     if receipt.get("badge"):
         receipt["badge_given"] = _award_badge(
             entry, receipt["user_id"], receipt["badge"], receipt.get("author_name", ""),
@@ -1063,7 +1089,7 @@ def review(
     if paid["xp"]:
         message += f", {paid['xp']} опыта"
     if not paid["has_pet"]:
-        message += " (опыт и находка не начислены — у игрока нет существа)"
+        message += " (опыт и предмет снаряжения не начислены — у игрока нет существа)"
     return True, message + ".", receipt
 
 
@@ -1130,12 +1156,22 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
         entry, user_id, float(receipt.get("drop_chance", 0.0) or 0.0),
         seed=f"quest:{submission_id}",
     ) if has_pet else None
+    # Scrolls are their own rare, permanent reward stream.  Only accepted difficulty-4
+    # and difficulty-5 quests enter it; the submission id makes the roll deterministic
+    # and idempotent even if a worker ever retries this reward receipt.
+    scroll = pets.grant_scroll_for_hard_quest(
+        entry, user_id, submission_id, receipt.get("difficulty", 0),
+    )
     return {
         "gold": gold, "xp": xp, "tickets": tickets, "has_pet": has_pet,
         "item": dropped.get("code") if dropped else None,
         "item_name": dropped.get("name") if dropped else None,
         "item_rarity": dropped.get("rarity") if dropped else None,
         "auto_equipped": bool(dropped.get("auto_equipped")) if dropped else False,
+        "scroll": scroll.get("code") if scroll and scroll.get("granted") else None,
+        "scroll_name": scroll.get("name") if scroll and scroll.get("granted") else None,
+        "scroll_icon": scroll.get("icon") if scroll and scroll.get("granted") else None,
+        "scroll_ultimate": bool(scroll.get("ultimate")) if scroll and scroll.get("granted") else False,
     }
 
 
@@ -1168,7 +1204,11 @@ def mail_events(entry: str, user_id, limit: int = 30) -> list[dict]:
             "pet_name": quest.title if quest else row.get("code"),
             "owner_name": row.get("reviewed_by_name") or "",
             "note": row.get("note") or "",
-            "item": None, "item_name": None, "item_rarity": None, "auto_equipped": False,
+            "item": paid.get("item"), "item_name": paid.get("item_name"),
+            "item_rarity": paid.get("item_rarity"), "auto_equipped": bool(paid.get("auto_equipped")),
+            "scroll": paid.get("scroll"), "scroll_name": paid.get("scroll_name"),
+            "scroll_icon": paid.get("scroll_icon"), "scroll_ultimate": bool(paid.get("scroll_ultimate")),
+            "scroll_source": f"quest:{row.get('id')}" if paid.get("scroll") else None,
         })
         if len(rows) >= max(0, int(limit)):
             break

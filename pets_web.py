@@ -649,13 +649,24 @@ def _skills_payload(record: dict) -> dict:
         row = pets_scroll_catalog.public_scroll(pets_scroll_catalog.scroll(code))
         row["slot"] = index
         selected.append(row)
+    owned = set(pets._owned_scroll_codes_for(record))
     return {
         "slots": selected,
+        "owned_count": len(owned),
+        "catalogue_count": len(pets_scroll_catalog.SCROLLS),
+        "rewards": {
+            "paint_chance": pets.PAINT_SCROLL_CHANCE,
+            "paint_pity": pets.PAINT_SCROLL_PITY,
+            "hard_quest_chances": dict(pets.HARD_QUEST_SCROLL_CHANCES),
+            "hard_quest_pity": pets.HARD_QUEST_SCROLL_PITY,
+        },
         "regular": [
             pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.REGULAR_SCROLLS
+            if row["code"] in owned
         ],
         "ultimate": [
             pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.ULTIMATE_SCROLLS
+            if row["code"] in owned
         ],
     }
 
@@ -1784,6 +1795,7 @@ async def handle_quest_review(request: web.Request) -> web.Response:
     if ok and queued is not None:
         try:
             if accept:
+                queued["paid"] = dict(receipt)
                 await request.app[_QUEST_COMPLETION_KEY](queued)
             else:
                 await request.app[_QUEST_FEEDBACK_KEY](
@@ -2819,16 +2831,29 @@ function renderBag() {
 }
 
 function shortSkillName(name) { return String(name || "").replace(/^.*?: /, ""); }
+const SCROLL_ELEMENTS = {
+  fire: "🔥 Огненный", frost: "❄️ Морозный", water: "💧 Водный",
+  earth: "🪨 Земля", plants: "🌿 Растения", air: "💨 Воздушный",
+};
+function scrollElement(spell) { return SCROLL_ELEMENTS[spell && spell.element] || ""; }
 
 function liveSkillsPanel() {
   const rows = (S.skills && S.skills.slots) || [];
+  const rewards = (S.skills && S.skills.rewards) || {};
+  const hard = rewards.hard_quest_chances || {};
   return '<div class="panel"><div class="row spread"><h2 style="margin:0">📜 Свитки</h2>' +
     '<span class="tiny muted">в бою выбираются автоматически</span></div>' +
     '<div class="live-skills" style="margin-top:9px">' + rows.map((spell) =>
       '<button class="go sec live-skill' + (spell.ultimate ? " ultimate" : "") +
       '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' + esc(spell.icon) + " " +
-      esc(shortSkillName(spell.name)) + '</b><small>' + esc(spell.short) + '</small></button>'
-    ).join("") + '</div></div>';
+      esc(shortSkillName(spell.name)) + '</b><small>' + esc(scrollElement(spell)) + " · " +
+      esc(spell.short) + '</small></button>'
+    ).join("") + '</div><div class="tiny muted" style="margin-top:10px">Открыто ' +
+      Number(S.skills.owned_count || 0) + ' из ' + Number(S.skills.catalogue_count || 0) +
+      '. Новый #япокрасил: ' + Math.round(Number(rewards.paint_chance || 0) * 1000) / 10 +
+      '% (не позже ' + Number(rewards.paint_pity || 0) + '-го). Сложные квесты 4/5: ' +
+      Math.round(Number(hard[4] || 0) * 100) + '%/' + Math.round(Number(hard[5] || 0) * 100) +
+      '% (не позже ' + Number(rewards.hard_quest_pity || 0) + '-го).</div></div>';
 }
 
 function openLiveSkillPicker(slot) {
@@ -2839,7 +2864,7 @@ function openLiveSkillPicker(slot) {
     '</h3><p class="tiny muted">В автобою каждый доступный свиток имеет одинаковый шанс применения.</p>' +
     pool.map((spell) => '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) +
       '</b><div class="small">' + esc(spell.short) + '</div><div class="tiny muted">' +
-      (spell.dodgeable ? 'можно увернуться' : 'нельзя увернуться') +
+      esc(scrollElement(spell)) + (spell.dodgeable === false ? ' · нельзя увернуться' : '') +
       (spell.ultimate ? ' · один раз' : ' · CD ' + spell.cooldown) + '</div>' +
       '<button class="go sec" style="margin-top:8px" data-liveskillset="' + number + ':' +
       esc(spell.code) + '"' + (current && current.code === spell.code ? ' disabled' : '') + '>' +
@@ -2850,7 +2875,7 @@ function forgePanel() {
   const names = { common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
-    '<div class="small muted" style="margin-bottom:10px">3 обычных превращаются в редкий, ' +
+    '<div class="small muted" style="margin-bottom:10px">5 обычных превращаются в редкий, ' +
       'а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
     recipes.map((recipe) => {
       const ingredients = recipe.ingredients.map((code) => S.bag.find((item) => item.code === code))
@@ -2977,8 +3002,9 @@ async function renderArena() {
 function testOptions(rows, selected) {
   return (rows || []).map((row) => '<option value="' + esc(row.code) + '"' +
     (row.code === selected ? " selected" : "") + '>' + esc(row.icon || "📜") + " " +
-    esc(row.name) + (row.cooldown != null ? " · CD " + row.cooldown : "") +
-    (row.dodgeable === false ? " · точно" : "") + "</option>").join("");
+    esc(row.name) + " · " + esc(scrollElement(row)) +
+    (row.cooldown != null ? " · CD " + row.cooldown : "") +
+    (row.dodgeable === false ? " · нельзя увернуться" : "") + "</option>").join("");
 }
 
 function testSelect(id, label, rows, selected) {
@@ -3040,9 +3066,10 @@ function renderTestBattle(box) {
     : "Ход " + TEST_BATTLE.turn;
   const slotButtons = (mine.slots || []).map((slot) => {
     const action = "skill_" + slot.slot;
-    const note = slot.ultimate ? (mine.ultimate_used ? "использован" : "один раз")
-      : (slot.remaining_cooldown ? "готов через " + slot.remaining_cooldown :
-         (slot.dodgeable === false ? "нельзя увернуться" : "можно увернуться"));
+    const note = [scrollElement(slot), slot.ultimate
+      ? (mine.ultimate_used ? "использован" : "один раз")
+      : (slot.remaining_cooldown ? "готов через " + slot.remaining_cooldown : "готов"),
+      slot.dodgeable === false ? "нельзя увернуться" : ""].filter(Boolean).join(" · ");
     return '<button class="go sec test-action' + (slot.ultimate ? " ultimate" : "") +
       '" data-testaction="' + action + '"' + (legal.has(action) ? "" : " disabled") + '>' +
       esc(slot.icon) + " " + esc(slot.name.replace(/^.*?: /, "")) + '<small>' + esc(note) +
@@ -3116,7 +3143,8 @@ function showTestCatalog() {
     'отдыхает. Свойства берутся из редактируемой серверной таблицы.</p>' + spells.map((spell) =>
       '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) + '</b><div class="small">' +
       esc(spell.short) + '</div><div class="tiny muted">' + (spell.ultimate ? "УЛЬТИМЕЙТ · один раз" :
-      "CD " + spell.cooldown) + " · " + (spell.dodgeable ? "можно увернуться" : "неизбежный") +
+      "CD " + spell.cooldown) + " · " + esc(scrollElement(spell)) +
+      (spell.dodgeable === false ? " · нельзя увернуться" : "") +
       "</div></div>").join("") + '<h3>🛡 Щиты</h3>' + (TEST_SETUP.shields || []).map((shield) =>
       '<div class="panel"><b>' + esc(shield.icon) + " " + esc(shield.name) + '</b><div class="small">' +
       esc(shield.short) + "</div></div>").join(""));
@@ -3495,9 +3523,13 @@ function pips(level) {
 
 function rewardLine(reward) {
   if (!reward) return "";
+  const scroll = reward.scroll_chance
+    ? " · <span class='gain'>📜 " + Math.round(reward.scroll_chance * 100) +
+      "% (не позже " + Number(reward.scroll_pity || 0) + "-го)</span>"
+    : "";
   return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
     "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
-    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%";
+    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + scroll;
 }
 
 // Quest calls do not return the game state the way /api/action does -- nothing here
@@ -3552,8 +3584,8 @@ function legacyQuestCard(board, kind) {
     '<div class="qreward">' + rewardLine(quest.reward) + "</div>" +
     (board.has_pet === false
       ? "<div class='tiny muted' style='margin-top:6px;text-align:center'>" +
-        "Опыт и находку начислить некуда — сначала приручи существо. " +
-        "Монеты и билет придут в любом случае.</div>"
+        "Опыт и предмет снаряжения начислить некуда — сначала приручи существо. " +
+        "Монеты, билет и найденный свиток сохранятся в любом случае.</div>"
       : "") +
     (reviewing
       ? "<div class='qtag review'>Работа на проверке у модератора</div>"
@@ -3743,7 +3775,7 @@ function reviewQueue(data) {
 
 // ------------------------------------------------------------------------------ mail
 const MAIL_ICONS = { attack: "⚔️", defense: "🛡", farm: "🌾", gift_in: "🎁", gift_out: "🎁",
-                     quest_ok: "🎯", quest_no: "🎯" };
+                     quest_ok: "🎯", quest_no: "🎯", scroll: "📜" };
 const MAIL_VERDICTS = { win: "Победа", loss: "Поражение", draw: "Ничья" };
 // The stripe colour, keyed on what the row means to the reader. A won defence is green
 // for the same reason a won attack is: the question is whether the day went well, not
@@ -3768,6 +3800,7 @@ function mailFeed(rows) {
 function mailTone(row) {
   if (row.kind === "quest_ok") return "win";
   if (row.kind === "quest_no") return "loss";
+  if (row.kind === "scroll") return "win";
   if (row.kind === "farm") return "gold";
   if (row.kind === "gift_in" || row.kind === "gift_out") return "give";
   return MAIL_TONES[row.outcome] || "";
@@ -3794,6 +3827,9 @@ function mailRow(row) {
     meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
   }
   if (row.kind === "quest_ok" && row.tickets) meta.push("<span class='gain'>+" + row.tickets + " 🎟</span>");
+  if (row.scroll_name && row.kind !== "scroll") {
+    meta.push("<span class='find'>📜 " + esc(row.scroll_name) + "</span>");
+  }
   if (row.item_name) {
     // Tinted by rarity, the same colour the item's own card is bordered with -- a
     // legendary find should be legible as one from across the feed.
@@ -3806,6 +3842,9 @@ function mailRow(row) {
   } else if (row.kind === "quest_no") {
     title = "Квест «<b>" + esc(row.pet_name || "") + "</b>» отклонён" +
       (row.note ? "<div class='tiny muted'>" + esc(row.note) + "</div>" : "");
+  } else if (row.kind === "scroll") {
+    title = "Открыт " + (row.scroll_ultimate ? "ультимейт" : "свиток") + ": «<b>" +
+      esc(row.scroll_name || "свиток") + "</b>»";
   } else if (row.kind === "farm") {
     title = "Ферма — смена " + Number(row.hours || 0) + " ч";
   } else if (row.kind === "gift_out") {

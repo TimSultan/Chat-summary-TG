@@ -1229,17 +1229,27 @@ async def run_listener(
                     getattr(sender, "username", None), sender_display_name(sender),
                     message_id=msg.id, log=log,
                 )
-                economy.grant(
-                    entry, msg.sender_id, economy.FIGURINE_COIN_REWARD, "figurine_painted",
+                # The update may be replayed after a reconnect.  This one message is one
+                # painting reward, so coins use the same durable event key as the ticket.
+                economy.grant_once(
+                    entry, msg.sender_id, economy.FIGURINE_COIN_REWARD, f"figurine:{msg.id}",
                 )
                 # A farm ticket per paint, keyed on the message id: a reconnect can replay
                 # an update, and record_figurine_live above already refuses to count the
                 # same message twice for exactly that reason.
                 ticketed = pets.grant_farm_ticket(entry, msg.sender_id, f"figurine:{msg.id}")
+                # Ticket success is the existing replay gate: only a genuinely new
+                # painted post receives a rare scroll attempt.
+                scroll_reward = (
+                    pets.grant_scroll_for_painting(entry, msg.sender_id, msg.id)
+                    if ticketed else {"granted": False, "reason": "ticket_already_granted"}
+                )
                 log(
                     f"[listener] figurine painted by {sender_display_name(sender)} in "
                     f"'{entry}' (today: {count}"
-                    + (", +1 farm ticket)" if ticketed else ", ticket already granted)")
+                    + (", +1 farm ticket" if ticketed else ", ticket already granted")
+                    + (f", scroll {scroll_reward.get('code')}" if scroll_reward.get("granted") else "")
+                    + ")"
                 )
                 if bot_takeover:
                     if figurine_ack_queue is not None:

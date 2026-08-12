@@ -124,6 +124,9 @@ class LiveLoadoutStorageTests(unittest.TestCase):
     def test_slots_reject_wrong_types_and_persist_a_valid_selection(self):
         regular = scrolls.REGULAR_SCROLLS[-1]["code"]
         ultimate = scrolls.ULTIMATE_SCROLLS[-1]["code"]
+        data = pets._load("chat")
+        data["pets"]["1"]["owned_scrolls"].extend([regular, ultimate])
+        pets._save("chat", data)
         self.assertFalse(pets.set_skill_slot("chat", "1", 1, ultimate)[0])
         self.assertFalse(pets.set_skill_slot("chat", "1", 4, regular)[0])
         self.assertTrue(pets.set_skill_slot("chat", "1", 2, regular)[0])
@@ -142,6 +145,56 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertEqual(snapshot["code"], shield.code)
         self.assertEqual(snapshot["name"], shield.name)
         self.assertEqual(snapshot["defend_effects"], shield.effect["defend_effects"])
+
+    def test_scroll_rewards_are_idempotent_and_survive_until_a_painter_tames(self):
+        # Painting belongs to a person, not their current pet ownership: a rare unlock
+        # cannot disappear merely because it arrived before the cage purchase.
+        first = pets.grant_scroll_reward(
+            "chat", "2", source="paint:501", kind="paint", chance=1.0, pity_after=20,
+        )
+        self.assertTrue(first["granted"])
+        replay = pets.grant_scroll_reward(
+            "chat", "2", source="paint:501", kind="paint", chance=0.0, pity_after=20,
+        )
+        self.assertEqual(replay, first)
+
+        economy.grant("chat", "2", C.CAGE_PRICE + C.TAME_PRICE, "test")
+        self.assertTrue(pets.buy_cage("chat", "2", 0)[0])
+        self.assertTrue(pets.tame("chat", "2", 0, "Painter", "photo", "Owner")[0])
+        self.assertIn(first["code"], pets.owned_scrolls("chat", "2"))
+
+    def test_unowned_scrolls_cannot_be_equipped(self):
+        unknown = next(code for code in (row["code"] for row in scrolls.REGULAR_SCROLLS)
+                       if code not in pets.owned_scrolls("chat", "1"))
+        ok, message = pets.set_skill_slot("chat", "1", 1, unknown)
+        self.assertFalse(ok)
+        self.assertIn("ещё не открыт", message)
+
+    def test_scroll_pity_forces_a_unique_unlock_and_resets(self):
+        first = pets.grant_scroll_reward(
+            "chat", "2", source="paint:1", kind="paint", chance=0.0, pity_after=3,
+        )
+        second = pets.grant_scroll_reward(
+            "chat", "2", source="paint:2", kind="paint", chance=0.0, pity_after=3,
+        )
+        third = pets.grant_scroll_reward(
+            "chat", "2", source="paint:3", kind="paint", chance=0.0, pity_after=3,
+        )
+        self.assertFalse(first["granted"])
+        self.assertFalse(second["granted"])
+        self.assertTrue(third["granted"])
+        self.assertTrue(third["forced"])
+
+        fourth = pets.grant_scroll_reward(
+            "chat", "2", source="paint:4", kind="paint", chance=0.0, pity_after=3,
+        )
+        self.assertFalse(fourth["granted"])
+        self.assertEqual(fourth["pity"], 1)
+        fifth = pets.grant_scroll_reward(
+            "chat", "2", source="paint:5", kind="paint", chance=1.0, pity_after=3,
+        )
+        self.assertTrue(fifth["granted"])
+        self.assertNotEqual(fifth["code"], third["code"])
 
 
 if __name__ == "__main__":

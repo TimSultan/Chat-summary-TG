@@ -43,7 +43,7 @@ import pets_scroll_catalog as SCROLLS
 import stats
 from app_time import now as app_now
 
-PETS_STORE_VERSION = 4
+PETS_STORE_VERSION = 5
 # Rolling fight log, capped independently of C.HISTORY_LIMIT (that constant bounds what
 # ONE player is shown per /history call, not how many chat-wide entries are kept on disk)
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
@@ -76,6 +76,15 @@ _NAME_MAX_LEN = 24
 # How many recent grant keys a ticket wallet remembers, purely to swallow a replayed
 # listener update (see grant_farm_ticket). Seconds matter here, not weeks.
 FARM_TICKET_GRANT_MEMORY = 50
+# Scrolls are earned abilities.  A few basic ones are deliberately available from the
+# moment a creature is tamed; everything else is a rare permanent unlock rather than a
+# consumable item or a shop purchase.
+SCROLL_REWARD_MEMORY = 1_000
+PAINT_SCROLL_CHANCE = 0.025
+PAINT_SCROLL_PITY = 20
+HARD_QUEST_SCROLL_CHANCES = {4: 0.12, 5: 0.20}
+HARD_QUEST_SCROLL_PITY = 6
+ULTIMATE_SCROLL_SHARE = 0.12
 # The poller and a button press can settle the same finished run in one process.  The
 # run id also keys the economy grant, so a process restart cannot mint a second payout.
 # It also guards the ticket wallet and the shift a ticket shortens, both of which are
@@ -94,6 +103,7 @@ def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "rubies": {},
+        "scroll_wallets": {}, "scroll_notifications": [],
         "storefront_sales": {},
         "economy_metrics": _new_economy_metrics(),
     }
@@ -136,6 +146,11 @@ def _load(entry: str) -> dict:
         data["farm_tickets"] = {}
     if not isinstance(data.setdefault("rubies", {}), dict):
         data["rubies"] = {}
+    if not isinstance(data.setdefault("scroll_wallets", {}), dict):
+        data["scroll_wallets"] = {}
+    notices = data.setdefault("scroll_notifications", [])
+    data["scroll_notifications"] = [row for row in notices if isinstance(row, dict)][-400:] \
+        if isinstance(notices, list) else []
     sales = data.setdefault("storefront_sales", {})
     if not isinstance(sales, dict):
         data["storefront_sales"] = {}
@@ -152,6 +167,7 @@ def _load(entry: str) -> dict:
             if window is not None and isinstance(codes, list) else {}
         )
     _economy_metrics(data)
+    legal_scrolls = {row["code"] for row in SCROLLS.SCROLLS}
     # Older saves used an append-only list.  Accept their duplicates while reading,
     # then expose a canonical unique inventory to every game operation.
     for record in data["pets"].values():
@@ -233,6 +249,40 @@ def _load(entry: str) -> dict:
             record["skill_slots"] = list(SCROLLS.validate_loadout(record.get("skill_slots")))
         except ValueError:
             record["skill_slots"] = list(SCROLLS.DEFAULT_LOADOUT)
+        # Scroll availability used to be global.  Preserve every scroll a historic
+        # creature had equipped, as well as the starter set, so this migration never
+        # silently takes a live ability away.  New creatures only receive the starter
+        # set; later scrolls are permanent rare unlocks.
+        owned_scrolls = record.get("owned_scrolls")
+        if not isinstance(owned_scrolls, list):
+            owned_scrolls = []
+        record["owned_scrolls"] = list(dict.fromkeys(
+            code for code in [*SCROLLS.DEFAULT_LOADOUT, *record["skill_slots"], *owned_scrolls]
+            if isinstance(code, str) and code in legal_scrolls
+        ))
+    # A player may paint and earn a scroll before taming a creature.  This top-level
+    # wallet is deliberately shaped like farm tickets: it survives that gap, then gets
+    # merged into the pet's owned list the first time the creature is read.
+    for user_id, wallet in list(data["scroll_wallets"].items()):
+        if not isinstance(wallet, dict):
+            wallet = data["scroll_wallets"][user_id] = {}
+        unlocked = wallet.get("unlocked")
+        if not isinstance(unlocked, list):
+            unlocked = []
+        wallet["unlocked"] = list(dict.fromkeys(
+            code for code in unlocked if isinstance(code, str) and code in legal_scrolls
+        ))
+        wallet["reward_log"] = wallet.get("reward_log") if isinstance(wallet.get("reward_log"), dict) else {}
+        wallet_pity = wallet.get("pity") if isinstance(wallet.get("pity"), dict) else {}
+        wallet["pity"] = {
+            "paint": _safe_nonnegative_int(wallet_pity.get("paint")),
+            "hard_quest": _safe_nonnegative_int(wallet_pity.get("hard_quest")),
+        }
+        record = data["pets"].get(str(user_id))
+        if isinstance(record, dict):
+            record["owned_scrolls"] = list(dict.fromkeys([
+                *record.get("owned_scrolls", []), *wallet["unlocked"],
+            ]))
     return data
 
 
@@ -351,6 +401,7 @@ def _new_record() -> dict:
         "farm_notifications": [],
         "fight_result_notifications": True,
         "skill_slots": list(SCROLLS.DEFAULT_LOADOUT),
+        "owned_scrolls": list(SCROLLS.DEFAULT_LOADOUT),
     }
 
 
@@ -1856,13 +1907,201 @@ def _skill_loadout_for(record: dict | None) -> tuple[str, str, str, str]:
         return SCROLLS.DEFAULT_LOADOUT
 
 
+def _owned_scroll_codes_for(record: dict | None) -> tuple[str, ...]:
+    """Canonical permanent scroll collection for one creature.
+
+    The starter loadout is always present even in a hand-edited or partially migrated
+    record.  Equipped codes are included as a final backwards-compatibility safeguard:
+    an old valid loadout can never become unusable merely because a save was read during
+    the ownership migration.
+    """
+    legal = {row["code"] for row in SCROLLS.SCROLLS}
+    values = (record or {}).get("owned_scrolls")
+    if not isinstance(values, list):
+        values = []
+    values = [*SCROLLS.DEFAULT_LOADOUT, *_skill_loadout_for(record), *values]
+    return tuple(dict.fromkeys(code for code in values if isinstance(code, str) and code in legal))
+
+
+def owned_scrolls(entry: str, user_id, *, ultimate: bool | None = None) -> tuple[str, ...]:
+    """Permanent abilities this creature may equip, ordered by discovery.
+
+    ``ultimate`` narrows the collection for a particular slot without exposing a second
+    mutable inventory model to Telegram and the Mini App.
+    """
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    values = tuple(dict.fromkeys([
+        *_owned_scroll_codes_for(record), *_scroll_wallet(data, user_id)["unlocked"],
+    ]))
+    if ultimate is None:
+        return values
+    return tuple(code for code in values if bool(SCROLLS.scroll(code).get("ultimate")) == bool(ultimate))
+
+
+def _scroll_wallet(data: dict, user_id) -> dict:
+    """A durable per-user reward wallet, also valid before the first pet is tamed."""
+    wallets = data.setdefault("scroll_wallets", {})
+    if not isinstance(wallets, dict):
+        wallets = data["scroll_wallets"] = {}
+    row = wallets.setdefault(str(user_id), {})
+    if not isinstance(row, dict):
+        row = wallets[str(user_id)] = {}
+    legal = {spell["code"] for spell in SCROLLS.SCROLLS}
+    unlocked = row.get("unlocked")
+    if not isinstance(unlocked, list):
+        unlocked = []
+    row["unlocked"] = list(dict.fromkeys(
+        code for code in unlocked if isinstance(code, str) and code in legal
+    ))
+    _scroll_reward_row(row)
+    return row
+
+
+def _scroll_reward_row(row: dict) -> tuple[dict, dict]:
+    """Repair a reward wallet's bounded replay log and pity counters."""
+    log = row.setdefault("reward_log", {})
+    if not isinstance(log, dict):
+        log = row["reward_log"] = {}
+    pity = row.setdefault("pity", {})
+    if not isinstance(pity, dict):
+        pity = row["pity"] = {}
+    for kind in ("paint", "hard_quest"):
+        pity[kind] = _safe_nonnegative_int(pity.get(kind))
+    return log, pity
+
+
+def _remember_scroll_reward(log: dict, source: str, receipt: dict) -> None:
+    """Remember both misses and wins: a replay must not get a fresh dice roll."""
+    log[source] = dict(receipt)
+    if len(log) > SCROLL_REWARD_MEMORY:
+        # Dict insertion order is durable in current Python.  Keeping the newest keys is
+        # enough for transport retries; quest acceptance itself has a separate permanent
+        # submission-state guard, and a figurine replay is already swallowed by tickets.
+        for stale in list(log)[:len(log) - SCROLL_REWARD_MEMORY]:
+            log.pop(stale, None)
+
+
+def _remember_scroll_notification(data: dict, user_id, receipt: dict) -> None:
+    """A rare unlock must be visible even when it came from a group paint post."""
+    if not receipt.get("granted"):
+        return
+    rows = data.setdefault("scroll_notifications", [])
+    if not isinstance(rows, list):
+        rows = data["scroll_notifications"] = []
+    source = str(receipt.get("source") or "")
+    if any(str(row.get("source") or "") == source and str(row.get("user_id")) == str(user_id)
+           for row in rows):
+        return
+    rows.append({
+        "user_id": str(user_id), "source": source, "ts": app_now().isoformat(),
+        "code": receipt.get("code"), "name": receipt.get("name"), "icon": receipt.get("icon"),
+        "ultimate": bool(receipt.get("ultimate")), "kind": receipt.get("kind"),
+    })
+    data["scroll_notifications"] = rows[-400:]
+
+
+def grant_scroll_reward(
+    entry: str, user_id, *, source: str, kind: str, chance: float, pity_after: int,
+    seed: str | None = None,
+) -> dict:
+    """Try to unlock one previously unknown scroll, exactly once for an earned event.
+
+    The caller supplies a stable source identity (a figurine's message id or a quest
+    submission id).  We persist a miss too, so retries cannot farm randomness.  A pity
+    counter only advances on eligible, unique events and resets solely after an actual
+    unlock.  Ultimates are selected from the same permanent collection but only have a
+    12% share while ordinary scrolls remain, making them meaningfully rarer without a
+    second loot table to tune.
+    """
+    source = str(source or "").strip()
+    if kind not in ("paint", "hard_quest") or not source:
+        return {"granted": False, "reason": "invalid_source"}
+    chance = max(0.0, min(1.0, float(chance or 0.0)))
+    pity_after = max(1, int(pity_after or 1))
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        wallet = _scroll_wallet(data, user_id)
+        log, pity = _scroll_reward_row(wallet)
+        prior = log.get(source)
+        if isinstance(prior, dict):
+            return dict(prior)
+
+        owned = set(_owned_scroll_codes_for(record)) | set(wallet["unlocked"])
+        regular = [row for row in SCROLLS.REGULAR_SCROLLS if row["code"] not in owned]
+        ultimates = [row for row in SCROLLS.ULTIMATE_SCROLLS if row["code"] not in owned]
+        if not regular and not ultimates:
+            receipt = {"granted": False, "reason": "catalogue_complete", "source": source, "kind": kind}
+            _remember_scroll_reward(log, source, receipt)
+            _save(entry, data)
+            return receipt
+
+        entropy = f"{entry}|{user_id}|{kind}|{source}|{seed or source}"
+        rng = random.Random(hashlib.sha256(entropy.encode("utf-8")).hexdigest())
+        forced = pity[kind] + 1 >= pity_after
+        won = forced or rng.random() < chance
+        if not won:
+            pity[kind] += 1
+            receipt = {
+                "granted": False, "reason": "miss", "source": source, "kind": kind,
+                "pity": pity[kind], "pity_after": pity_after,
+            }
+            _remember_scroll_reward(log, source, receipt)
+            _save(entry, data)
+            return receipt
+
+        # No ordinary candidates means an ultimate is the only possible useful drop;
+        # otherwise its low fixed share makes ultimate unlocks genuinely special.
+        pool = ultimates if not regular or (ultimates and rng.random() < ULTIMATE_SCROLL_SHARE) else regular
+        spell = pool[rng.randrange(len(pool))]
+        wallet["unlocked"].append(spell["code"])
+        if record is not None:
+            record["owned_scrolls"] = list(dict.fromkeys([
+                *_owned_scroll_codes_for(record), *wallet["unlocked"],
+            ]))
+        pity[kind] = 0
+        receipt = {
+            "granted": True, "source": source, "kind": kind, "code": spell["code"],
+            "name": spell["name"], "icon": spell["icon"], "ultimate": bool(spell["ultimate"]),
+            "forced": forced,
+        }
+        _remember_scroll_reward(log, source, receipt)
+        _remember_scroll_notification(data, user_id, receipt)
+        _save(entry, data)
+        return receipt
+
+
+def grant_scroll_for_painting(entry: str, user_id, message_id) -> dict:
+    """One rare scroll attempt for a genuinely new #япокрасил ticket event."""
+    return grant_scroll_reward(
+        entry, user_id, source=f"paint:{message_id}", kind="paint", chance=PAINT_SCROLL_CHANCE,
+        pity_after=PAINT_SCROLL_PITY, seed=f"paint:{message_id}",
+    )
+
+
+def grant_scroll_for_hard_quest(entry: str, user_id, submission_id, difficulty) -> dict:
+    """Reward accepted difficulty-4/5 quests; easier cards never enter this loot roll."""
+    try:
+        difficulty = int(difficulty)
+    except (TypeError, ValueError):
+        difficulty = 0
+    chance = HARD_QUEST_SCROLL_CHANCES.get(difficulty)
+    if chance is None:
+        return {"granted": False, "reason": "not_hard", "kind": "hard_quest"}
+    return grant_scroll_reward(
+        entry, user_id, source=f"quest:{submission_id}", kind="hard_quest", chance=chance,
+        pity_after=HARD_QUEST_SCROLL_PITY, seed=f"quest:{submission_id}",
+    )
+
+
 def skill_loadout(entry, user_id) -> tuple[str, str, str, str]:
     """The pet's three regular scrolls and one once-per-fight ultimate."""
     return _skill_loadout_for(_tamed_record(_load(entry), user_id))
 
 
 def set_skill_slot(entry, user_id, slot: int, code: str) -> tuple[bool, str]:
-    """Equip one globally known scroll; scrolls are abilities and are never consumed."""
+    """Equip one permanently unlocked scroll; abilities are never consumed."""
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -1876,6 +2115,8 @@ def set_skill_slot(entry, user_id, slot: int, code: str) -> tuple[bool, str]:
         return False, "Неизвестный слот или свиток."
     if bool(spell.get("ultimate")) != (index == 3):
         return False, "В четвёртом слоте должен быть ультимейт, в первых трёх — обычные свитки."
+    if code not in _owned_scroll_codes_for(record):
+        return False, "Этот свиток ещё не открыт. Его можно найти за покрас или сложный квест."
     loadout = list(_skill_loadout_for(record))
     if code in loadout and loadout[index] != code:
         return False, "Один свиток нельзя поставить сразу в два слота."
@@ -2092,7 +2333,7 @@ def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
 
 
 FORGE_NEXT_RARITY = {"common": "rare", "rare": "legendary"}
-FORGE_REQUIREMENTS = {"common": 3, "rare": 7}
+FORGE_REQUIREMENTS = {"common": 5, "rare": 7}
 
 
 def _forge_ingredients(record: dict, rarity: str) -> list:
@@ -2103,7 +2344,7 @@ def _forge_ingredients(record: dict, rarity: str) -> list:
         if item is not None and item.rarity == rarity
         and item.code not in equipped and item.code not in locked
     ]
-    # Consume the least valuable candidates first.  The preview shows these exact three,
+    # Consume the least valuable candidates first.  The preview shows these exact items,
     # so a strong favourite never disappears merely because it shares a rarity.
     return sorted(items, key=lambda item: (
         C.equipment_score(item), C.resale_value(item), item.code,
@@ -2130,7 +2371,7 @@ def forge_status(entry: str, user_id) -> dict:
 
 
 def reforge_items(entry: str, user_id, rarity: str, rng=None) -> tuple[bool, str, str | None]:
-    """Turn three unlocked, unequipped items into one random drop of the next rarity."""
+    """Turn unlocked, unequipped ingredients into one random next-rarity drop."""
     rarity = "common" if rarity == "uncommon" else str(rarity or "")
     result_rarity = FORGE_NEXT_RARITY.get(rarity)
     if result_rarity is None:
@@ -3392,6 +3633,26 @@ def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = No
             "owner_name": owner_name,
             **_mail_item(row.get("item_code")),
             "auto_equipped": False,
+        })
+
+    # A quest verdict already carries its scroll on the same mailbox line. Keep the
+    # standalone notification as a crash-safe fallback in storage, but do not show the
+    # same unlock twice when the quest receipt was persisted normally.
+    covered_scroll_sources = {
+        str(event.get("scroll_source")) for event in (extra or [])
+        if isinstance(event, dict) and event.get("scroll_name") and event.get("scroll_source")
+    }
+    for notice in data.get("scroll_notifications", []):
+        if not isinstance(notice, dict) or str(notice.get("user_id")) != uid:
+            continue
+        if str(notice.get("source") or "") in covered_scroll_sources:
+            continue
+        add(notice.get("ts"), {
+            "kind": "scroll", "outcome": "win", "coins": 0,
+            "scroll": notice.get("code"), "scroll_name": notice.get("name"),
+            "scroll_icon": notice.get("icon"), "scroll_ultimate": bool(notice.get("ultimate")),
+            "scroll_source": notice.get("kind"), "pet_name": None, "owner_name": None,
+            "item": None, "item_name": None, "item_rarity": None, "auto_equipped": False,
         })
 
     for event in extra or []:

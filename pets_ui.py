@@ -555,13 +555,18 @@ def _legacy_quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, 
         f"✨ {int(reward.get('xp', 0))} опыта · 🎟 {int(reward.get('tickets', 0))} билет"
         f" · 🎁 шанс находки {round(float(reward.get('drop_chance', 0)) * 100)}%"
     )
+    if reward.get("scroll_chance"):
+        lines.append(
+            f"📜 Новый свиток: {round(float(reward['scroll_chance']) * 100)}%, "
+            f"гарантирован не позже {int(reward.get('scroll_pity', 0))}-го сложного квеста."
+        )
     if not board.get("has_pet", True):
         # Said here rather than discovered at payout: two of the four reward legs need a
         # creature to land in (see quests._pay), and somebody deciding whether to spend an
         # evening on this is owed that before they start, not after.
         lines.append(
-            "\n⚠️ Опыт и находку начислить некуда — сначала приручи существо. "
-            "Монеты и билет придут в любом случае."
+            "\n⚠️ Опыт и предмет снаряжения начислить некуда — сначала приручи существо. "
+            "Монеты, билет и найденный свиток сохранятся в любом случае."
         )
     if board.get("status") == "review":
         lines.append("\n⏳ Работа на проверке у модератора.")
@@ -649,6 +654,11 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
     reward = card.get("reward") or {}
     difficulty = int(card.get("difficulty", 1) or 1)
     status = card.get("status", "open")
+    scroll_reward = (
+        f"\n📜 Новый свиток: {round(float(reward['scroll_chance']) * 100)}%, "
+        f"гарантирован не позже {int(reward.get('scroll_pity', 0))}-го сложного квеста."
+        if reward.get("scroll_chance") else ""
+    )
     lines = [
         f"{'🎯' if paint else '🌍'} <b>{escape(card.get('title') or 'Квест')}</b>",
         f"{quest_pips(difficulty)} {QUEST_DIFFICULTY_NAMES.get(difficulty, '')}",
@@ -663,6 +673,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"5. Выложи фото в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
         f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
+        scroll_reward,
         f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>",
     ]
     if status == "review":
@@ -1252,7 +1263,7 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     status = pets.forge_status(entry, user_id)
     lines = [
         "⚒️ <b>Кузница</b>",
-        "3 обычных предмета превращаются в редкий, а 7 редких — в легендарный.",
+        "5 обычных предметов превращаются в редкий, а 7 редких — в легендарный.",
         "<i>Надетые и защищённые вещи кузница не трогает. Сначала уходят самые слабые.</i>",
     ]
     rows = []
@@ -1290,10 +1301,14 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
+    unlocked = pets.owned_scrolls(entry, user_id)
     lines = [
         "📜 <b>Боевые свитки</b>",
         "В обычных боях существо само выбирает между атакой, защитой и доступными свитками.",
         "<i>У каждого доступного свитка одинаковый шанс. Четвёртый слот — ультимейт один раз за бой.</i>",
+        f"<i>Открыто свитков: {len(unlocked)} из {len(SCROLLS.SCROLLS)}. Новые попадаются за покрас и сложные квесты.</i>",
+        "<i>Новый #япокрасил: шанс 2,5%, свиток не позже 20-го покраса. "
+        "Принятый квест сложности 4/5: шанс 12%/20%, свиток не позже 6-го сложного квеста.</i>",
     ]
     rows = []
     for index, code in enumerate(pets.skill_loadout(entry, user_id), start=1):
@@ -1304,7 +1319,8 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
             f"<b>{index}. {escape(spell['icon'])} {escape(title)}</b>"
             + (" · УЛЬТИМЕЙТ" if spell["ultimate"] else f" · CD {spell['cooldown']}"),
             escape(spell["short"]),
-            "Можно увернуться." if spell["dodgeable"] else "Нельзя увернуться.",
+            SCROLLS.element_label(spell["element"])
+            + (" · Нельзя увернуться." if not spell["dodgeable"] else ""),
         ])
         rows.append([{
             "text": f"Изменить слот {index} · {spell['icon']} {title}",
@@ -1320,7 +1336,9 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
     if not pet:
         return no_pet_view(user_id)
     slot = max(1, min(4, int(slot)))
-    pool = SCROLLS.ULTIMATE_SCROLLS if slot == 4 else SCROLLS.REGULAR_SCROLLS
+    unlocked = set(pets.owned_scrolls(entry, user_id, ultimate=(slot == 4)))
+    catalogue = SCROLLS.ULTIMATE_SCROLLS if slot == 4 else SCROLLS.REGULAR_SCROLLS
+    pool = [spell for spell in catalogue if spell["code"] in unlocked]
     page_size = 6
     total_pages = max(1, (len(pool) + page_size - 1) // page_size)
     page = min(max(0, int(page)), total_pages - 1)
@@ -1329,7 +1347,7 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
     lines = [
         f"📜 <b>Слот {slot}</b> · {page + 1}/{total_pages}",
         "Ультимейт используется не больше одного раза за бой." if slot == 4
-        else "Выбери обычный магический свиток или свиток умения.",
+        else "Выбери открытый магический свиток или свиток умения.",
     ]
     rows = []
     for spell in visible:
@@ -1338,7 +1356,8 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
             "",
             f"<b>{escape(spell['icon'])} {escape(spell['name'])}</b>" + (" ✅" if chosen else ""),
             escape(spell["short"]),
-            ("Можно увернуться" if spell["dodgeable"] else "Нельзя увернуться")
+            SCROLLS.element_label(spell["element"])
+            + (" · Нельзя увернуться" if not spell["dodgeable"] else "")
             + (" · один раз" if spell["ultimate"] else f" · CD {spell['cooldown']}"),
         ])
         if not chosen:
@@ -2141,7 +2160,7 @@ MAIL_MAX_CHARS = 3800
 
 MAIL_ICONS = {
     "attack": "⚔️", "defense": "🛡", "farm": "🌾", "gift_in": "🎁", "gift_out": "🎁",
-    "quest_ok": "🎯", "quest_no": "🎯",
+    "quest_ok": "🎯", "quest_no": "🎯", "scroll": "📜",
 }
 MAIL_OUTCOMES = {"win": "победа", "loss": "поражение", "draw": "ничья"}
 
@@ -2207,7 +2226,13 @@ def _mail_line(event: dict) -> str:
             tail += f", +{_money(xp)} опыта"
         if tickets:
             tail += f", +{tickets} билет"
+        if event.get("scroll_name"):
+            tail += " · 📜 «" + escape(event["scroll_name"]) + "»"
         return f"{icon} Квест «{title}» принят{tail}"
+    if kind == "scroll":
+        name = escape(event.get("scroll_name") or "свиток")
+        rarity = "ультимейт" if event.get("scroll_ultimate") else "свиток"
+        return f"{icon} Открыт {rarity}: «{name}»"
     if kind in ("gift_in", "gift_out"):
         item = escape(event.get("item_name") or "предмет")
         verb = "Подарок для" if kind == "gift_out" else "Подарок от"

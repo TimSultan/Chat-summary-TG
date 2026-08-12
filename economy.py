@@ -724,7 +724,7 @@ def _audit_source(reason: str) -> str:
     if value == "daily_bonus":
         return "daily"
     if value.startswith("grant:daily_chatter:") or value.startswith("daily_chatter") \
-            or value.startswith("figurine"):
+            or value.startswith("grant:figurine:") or value.startswith("figurine"):
         return "activity"
     if value.startswith("sell:pet_item:"):
         return "sales"

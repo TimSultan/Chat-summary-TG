@@ -219,6 +219,7 @@ class PetsCommandTests(unittest.TestCase):
             "title": "Покрась героя", "subject": "Покрась новую миниатюру.",
             "technique": "Добавь аккуратные высветления.", "hint": "Не спеши.",
             "proof": "Покажи готовую работу.", "hashtag": "#quest_hero",
+            "paid": {"scroll_name": "Магический свиток: Багровая комета"},
         }
         _run(bot_listener._send_quest_completion(api, row, log=lambda *_: None))
 
@@ -229,6 +230,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("Покрась новую миниатюру", sent["caption"])
         self.assertIn("#quest_hero", sent["caption"])
         self.assertIn("Отличная работа", sent["caption"])
+        self.assertIn("Багровая комета", sent["caption"])
         self.assertLessEqual(len(sent["caption"]), 1024)
 
     def test_every_menu_action_renders_instead_of_erroring(self):
@@ -800,6 +802,8 @@ class PetsCommandTests(unittest.TestCase):
 
         opened = self._tap("skills")
         self.assertIn("Боевые свитки", opened.edits[-1]["text"])
+        self.assertIn("Воздушный", opened.edits[-1]["text"])
+        self.assertNotIn("Можно увернуться", opened.edits[-1]["text"])
         self.assertEqual(len(pets.skill_loadout(CHAT, PLAYER["id"])), 4)
         picker = self._tap("skillpick", "2,4")
         self.assertIn("Слот 2", picker.edits[-1]["text"])
@@ -809,6 +813,9 @@ class PetsCommandTests(unittest.TestCase):
         ))
 
         code = SCROLLS.REGULAR_SCROLLS[-1]["code"]
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["owned_scrolls"].append(code)
+        pets._save(CHAT, data)
         changed = self._tap("setskill", f"2:{code}")
         self.assertEqual(pets.skill_loadout(CHAT, PLAYER["id"])[1], code)
         self.assertIn("Боевые свитки", changed.edits[-1]["text"])

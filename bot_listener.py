@@ -5702,7 +5702,11 @@ def _quest_completion_caption(row: dict) -> str:
     body = "\n".join(part for part in details if part)
     hashtag = str(row.get("hashtag") or "").strip()
     heading = f"🎉 Отличная работа! Квест «{title}» выполнен и принят."
-    ending = f"\n\n{hashtag}\nТак держать! 💪" if hashtag else "\n\nТак держать! 💪"
+    paid = row.get("paid") if isinstance(row.get("paid"), dict) else row
+    scroll_name = str(paid.get("scroll_name") or "").strip()
+    scroll_line = f"\n📜 Открыт свиток: {scroll_name}" if scroll_name else ""
+    ending = (f"\n\n{hashtag}{scroll_line}\nТак держать! 💪"
+              if hashtag else f"{scroll_line}\n\nТак держать! 💪")
     # Telegram counts astral emoji as two UTF-16 units. Staying below the documented
     # 1024-character cap leaves enough headroom for those surrogate pairs.
     available = max(0, 1000 - len(heading) - len(ending) - 2)
@@ -6305,11 +6309,12 @@ async def handle_pets_callback(
                 )
                 return
             if action == "questaccept":
-                accepted, note, _receipt = quests.review(
+                accepted, note, receipt = quests.review(
                     entry, argument, user_id, True,
                     reviewer_name=_display_name(actor),
                 )
                 if accepted:
+                    submission["paid"] = dict(receipt)
                     await _send_quest_completion(api, submission, log)
                 await _pets_toast_and_redraw(
                     api, chat_id, message_id, note,
