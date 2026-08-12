@@ -12,7 +12,7 @@ are stable ASCII identifiers (``w001`` through ``w500``), not display names.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final
 
 
@@ -377,9 +377,9 @@ def _effect_for(rarity: str, rarity_rank: int) -> tuple[tuple[str, str | int | b
     """The passive for one generated weapon, or ``()`` when it stays flat-stat only.
 
     Legendaries are keyed by rank so the passive matches the hand-written punch-line
-    name.  Rares alternate by rank -- every odd one earns a passive, which makes "half of
-    rare" exact (25 of 50) without hand-listing codes -- and step through the five rare
-    passives in turn so all five actually appear in the catalogue.
+    name. Rares alternate by rank -- every odd one initially earns a passive (25 of 50)
+    without hand-listing codes. Five strong lines are promoted after generation, leaving
+    twenty effect-bearing rares and ten legendary weapons in the final catalogue.
     """
     if rarity == "legendary":
         return _LEGENDARY_EFFECTS[rarity_rank % len(_LEGENDARY_EFFECTS)]
@@ -450,6 +450,37 @@ _LEGENDARY_COPY: Final = (
     ("Молот нулевой брони", "После него защита остаётся только воспоминанием."),
 )
 
+# Five established rare drops are "ascended" in place instead of adding new codes.
+# Existing inventories therefore keep the same objects while their familiar archetypes
+# gain legendary stats and stronger versions of the same modifier.
+_ASCENDED_LEGENDARIES: Final = {
+    "w070": (
+        "Клык короля ядов", "Даже промахнувшийся враг уверен, что это из-за яда.",
+        (("strength", 31), ("agility", 4), ("luck", 3), ("armor", -4)),
+        _effect("venom_blade", "Попадание наносит 4 яда и даёт следующей атаке врага 25% промаха.", 25, poison=4),
+    ),
+    "w129": (
+        "Казначейский клинок", "Считает чужие монеты быстрее, чем наносит удары.",
+        (("strength", 28), ("agility", 7), ("luck", 5), ("armor", -5)),
+        _effect("coin_rake", "За победу: +2 монеты за попадание, максимум +10.", 2, cap=10),
+    ),
+    "w147": (
+        "Пила алого следа", "После неё бой ещё долго не может остановиться.",
+        (("strength", 31), ("agility", 3), ("luck", 3), ("armor", -4)),
+        _effect("bleed", "Попадания складывают кровотечение по 4 урона, до 4 зарядов.", 4, cap=4),
+    ),
+    "w167": (
+        "Таран последнего щита", "Первым ударом отменяет само понятие защиты.",
+        (("strength", 32), ("armor", 8), ("agility", -5)),
+        _effect("shield_breaker", "Первое попадание ломает щит, игнорирует броню и ослабляет её ещё на 20%.", 100, shred=20),
+    ),
+    "w189": (
+        "Маятник тяжёлого ритма", "Считает только до двух — третьего удара обычно не нужно.",
+        (("strength", 32), ("health", 10), ("agility", -5)),
+        _effect("heavy_combo", "Каждое второе попадание наносит на 30% больше урона.", 30, every=2),
+    ),
+}
+
 
 def _source_for(rarity: str, rarity_rank: int) -> str:
     # Cursed junk belongs to arena drops, never a shop shelf. The shop offers normal
@@ -512,9 +543,9 @@ def _pre_rebalance_buy_price(code: str, rarity: str, source: str) -> int:
 def _drop_weight(rarity: str, source: str) -> int:
     """Relative arena-drop chance; zero means this weapon is not in the drop pool.
 
-    Forty-five rare weapons at weight 10, 75 cursed weapons at weight 1 and five
-    legendary weapons at weight 1 make legendary drops 5 / 530 (about 0.94%) of weapon
-    drops. Cursed junk stays noticeable without overwhelming useful rewards.
+    Forty rare weapons at weight 10, 75 cursed weapons at weight 1 and ten legendary
+    weapons at weight 1 make legendary drops 10 / 485 (about 2.06%) of weapon drops.
+    Cursed junk stays noticeable without overwhelming useful rewards.
     """
     if source != "drop":
         return 0
@@ -577,6 +608,17 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             bonuses=bonuses,
             effect=effect,
         ))
+    # Promote selected rare codes only after the stable 500-code catalogue is assembled.
+    # Their source stays drop-only; changing rarity and weight is enough for every drop,
+    # forge, pity and UI path to see the upgraded item.
+    entries = [
+        replace(
+            item,
+            name=ascended[0], description=ascended[1], rarity="legendary",
+            bonuses=ascended[2], effect=ascended[3], resale_price=220, drop_weight=1,
+        ) if (ascended := _ASCENDED_LEGENDARIES.get(item.code)) else item
+        for item in entries
+    ]
     # The word banks offer far more than 500 pairs. The early stop keeps the public range
     # w001..w500 and, crucially, all existing inventory codes stable.
     return tuple(entries)
@@ -611,12 +653,13 @@ def _validate_catalogue() -> None:
                                    for key, value in item.bonuses) for item in WEAPON_SPECS)
     assert all(item.drop_weight == 0 for item in WEAPON_SPECS if item.source == "shop")
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
-    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 50, "legendary": 5}
-    # Every legendary and exactly half the rares carry a passive; nothing below rare does.
+    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 45, "legendary": 10}
+    # Every legendary carries a passive; the promoted five come from effect-bearing rare
+    # lines, leaving twenty modified rares and twenty-five plain ones.
     with_effect = [item for item in WEAPON_SPECS if item.effect]
     assert all(item.rarity in {"rare", "legendary"} for item in with_effect)
     assert all(item.effect for item in WEAPON_SPECS if item.rarity == "legendary")
-    assert sum(1 for item in WEAPON_SPECS if item.rarity == "rare" and item.effect) == 25
+    assert sum(1 for item in WEAPON_SPECS if item.rarity == "rare" and item.effect) == 20
     # Guarded: EFFECT_HOOKS is empty when this data module is imported on its own, and
     # the fallback must stay a fallback rather than becoming an import-time failure.
     assert not EFFECT_HOOKS or all(
@@ -629,7 +672,9 @@ def _validate_catalogue() -> None:
     for rarity, declared in (("rare", _RARE_EFFECTS), ("legendary", _LEGENDARY_EFFECTS)):
         used = {item.effect_dict()["code"] for item in with_effect if item.rarity == rarity}
         expected = {dict(effect)["code"] for effect in declared}
-        assert used == expected
+        if rarity == "legendary":
+            expected |= {dict(data[3])["code"] for data in _ASCENDED_LEGENDARIES.values()}
+        assert used == expected if rarity == "legendary" else used <= expected
     starter_shop_items = [
         item for item in WEAPON_SPECS
         if item.source == "shop" and item.price <= STARTER_WEAPON_MAX_PRICE

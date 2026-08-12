@@ -1641,7 +1641,7 @@ class RecordFightTests(PetsTestCase):
         rake = next(
             item for item in pets_config.ITEMS
             if getattr(item, "effect", {}).get("code") == "coin_rake"
-            and int(item.effect.get("cap", 0)) == 5
+            and item.rarity == "legendary"
         )
         data = pets._load(entry)
         data["pets"]["1"]["inventory"] = [rake.code]
@@ -1660,8 +1660,8 @@ class RecordFightTests(PetsTestCase):
         with patch("random.randint", return_value=10), patch("random.random", return_value=1.0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        self.assertEqual(outcome["gold"], 15)
-        self.assertEqual(economy.balance(entry, "1", 0), 15)
+        self.assertEqual(outcome["gold"], 20)
+        self.assertEqual(economy.balance(entry, "1", 0), 20)
 
     def test_survivor_amulet_preserves_thirty_percent_of_the_attackers_loss_penalty(self):
         """Survivor only ever discounts a penalty, and only the ATTACKER pays one now (a
@@ -1853,7 +1853,10 @@ class RecordFightTests(PetsTestCase):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
-        first, second = [item for item in pets_config.ITEMS if item.source == "drop"][:2]
+        first, second = [
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.slot == "weapon" and item.rarity != "legendary"
+        ][:2]
         data = pets._load(entry)
         data["pets"]["2"]["inventory"] = [first.code]
         pets._save(entry, data)
@@ -1870,6 +1873,29 @@ class RecordFightTests(PetsTestCase):
         self.assertNotIn(first.code, winner_inventory)
         self.assertEqual(winner_inventory.count(second.code), 1)
         self.assertEqual(pets.get_pet(entry, "2")["inventory"].count(first.code), 1)
+
+    def test_drop_pool_allows_one_legendary_design_for_two_players(self):
+        entry = "shared-legendary"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        legendary = next(
+            item for item in pets_config.ITEMS
+            if item.source == "drop" and item.slot == "weapon"
+            and item.rarity == "legendary" and item.code != pets.REMOVED_MOP_CODE
+        )
+        data = pets._load(entry)
+        data["pets"]["2"]["inventory"] = [legendary.code]
+        pets._save(entry, data)
+        result = SimpleNamespace(winner="1", loser="2")
+
+        with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
+             patch("random.random", return_value=0.0), \
+             patch("random.choice", return_value=legendary):
+            outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
+
+        self.assertEqual(outcome["dropped_item"], legendary.code)
+        self.assertIn(legendary.code, pets.get_pet(entry, "1")["inventory"])
+        self.assertIn(legendary.code, pets.get_pet(entry, "2")["inventory"])
 
     def test_history_snapshots_names_and_owners_and_zeroes_gold_on_the_losers_row(self):
         entry = "chat"
@@ -1982,11 +2008,11 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         self.assertFalse(progress["eligible"])
         self.assertEqual(progress["wins_without_legend"], 0)
 
-    def test_legendaries_owned_across_the_chat_exhaust_the_shared_pity_pool(self):
+    def test_legendaries_owned_by_others_do_not_exhaust_a_players_pity_pool(self):
         self._two_pets()
         legends = [
             item for item in pets_config.ITEMS
-            if item.source == "drop" and item.rarity == "legendary"
+            if item.source == "drop" and item.slot == "weapon" and item.rarity == "legendary"
         ]
         data = pets._load("chat")
         data["pets"]["1"]["inventory"] = [item.code for item in legends[::2]]
@@ -1996,8 +2022,8 @@ class PityGiftAndTelemetryTests(PetsTestCase):
 
         progress = pets.legendary_pity_progress("chat", "1")
 
-        self.assertFalse(progress["eligible"])
-        self.assertEqual(progress["wins_without_legend"], 0)
+        self.assertTrue(progress["eligible"])
+        self.assertEqual(progress["wins_without_legend"], 123)
 
     def test_gift_requires_level_records_audit_and_enforces_daily_cooldown(self):
         self._two_pets()
@@ -2705,16 +2731,12 @@ class FarmTests(PetsTestCase):
         )
         self.assertTrue(legendary_seen, "no legendary rolled across 500 seeds at 8 hours")
 
-    def test_farm_loot_can_include_a_weapon_never_owned_by_anyone_in_the_chat(self):
-        """The old restriction ("never a chat-unique weapon") is gone now that loot rolls
-        at settlement; the chat-wide ownership rule it was protecting is not."""
+    def test_farm_legendary_can_repeat_across_players_but_not_inside_one_bag(self):
         entry = "farm-weapon-loot"
         self._tame(entry, "1")
         self._tame(entry, "2")
         data = pets._load(entry)
-        # Give "2" every legendary drop-only weapon (there are only 5) so any legendary
-        # roll for "1" is forced to fall back -- while the 45 drop-only rares stay free,
-        # so a weapon can still be found, just never one of these codes.
+        # Another player's legendary set must not exhaust the finite design catalogue.
         owned_elsewhere = [
             item.code for item in pets_config.ITEMS
             if item.source == "drop" and item.slot == "weapon" and item.rarity == "legendary"
@@ -2723,13 +2745,17 @@ class FarmTests(PetsTestCase):
         pets._save(entry, data)
         data = pets._load(entry)
         record = data["pets"]["1"]
-        found_any_weapon = False
+        repeated_legendary = None
         for seed in range(400):
             found = pets._farm_item_for(data, record, random.Random(seed), 8, 1.0)
-            if found is not None and found.slot == "weapon":
-                found_any_weapon = True
-                self.assertNotIn(found.code, owned_elsewhere)
-        self.assertTrue(found_any_weapon, "no weapon ever rolled across 400 seeds at 8 hours")
+            if found is not None and found.slot == "weapon" and found.code in owned_elsewhere:
+                repeated_legendary = found
+                break
+        self.assertIsNotNone(repeated_legendary)
+        record["inventory"] = [repeated_legendary.code]
+        for seed in range(400):
+            found = pets._farm_item_for(data, record, random.Random(seed), 8, 1.0)
+            self.assertTrue(found is None or found.code != repeated_legendary.code)
 
     # -------------------------------------------------------------------- cancelling early
 

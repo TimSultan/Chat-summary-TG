@@ -499,6 +499,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     bleeding: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
     afterimage_bonus = {a.key: 0.0, b.key: 0.0}
     damage_weakened = {a.key: 0.0, b.key: 0.0}
+    stun_procs = {a.key: 0, b.key: 0}
 
     initiative = .5
     if effectful:
@@ -840,6 +841,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             used[attacker_key].add("shield_breaker")
             shields[defender_key] = 0.0
             effect_round(round_number, attacker_key, defender_key, "shield_breaker")
+            # Legendary shield-breakers keep part of the breach open for the rest of
+            # the fight. Rare versions omit ``shred`` and retain their old behaviour.
+            shred = max(0.0, _fraction(_param(
+                effects[attacker_key], "shield_breaker", "shred", 0,
+            )))
+            armor_shredded[defender_key] = max(armor_shredded[defender_key], shred)
 
         if effectful:
             impact, knocked_out = hurt(attacker_key, defender_key, damage, round_number)
@@ -975,8 +982,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 if healed:
                     effect_round(round_number, attacker_key, defender_key, "blood_pact", healed)
             if (value := _effect_value(effects[attacker_key], "stun")) is not None \
-                    and event == "crit" and "stun" not in used[attacker_key] and not knocked_out:
-                used[attacker_key].add("stun")
+                    and event == "crit" and not knocked_out \
+                    and stun_procs[attacker_key] < max(1, round(_param(
+                        effects[attacker_key], "stun", "cap", 1,
+                    ))):
+                stun_procs[attacker_key] += 1
                 stunned[defender_key] = True
                 effect_round(round_number, attacker_key, defender_key, "stun")
             if (value := _effect_value(effects[attacker_key], "chill")) is not None \

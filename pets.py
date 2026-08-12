@@ -329,14 +329,19 @@ def _tamed_record(data: dict, user_id) -> dict | None:
 
 
 def _owned_weapon_codes(data: dict) -> set[str]:
-    """All weapon objects currently owned anywhere in one chat."""
+    """Weapon codes that remain one-of-a-kind across the whole chat.
+
+    Legendary designs may belong to different players: otherwise a finite catalogue
+    would permanently cap the number of legendary owners. A player's own inventory is
+    still excluded separately by every grant path, so nobody gets a duplicate copy.
+    """
     owned = set()
     for record in data.get("pets", {}).values():
         if not isinstance(record, dict):
             continue
         for code in record.get("inventory", []):
             item = C.find_item(code)
-            if item is not None and item.slot == "weapon":
+            if item is not None and item.slot == "weapon" and item.rarity != "legendary":
                 owned.add(item.code)
     return owned
 
@@ -858,11 +863,9 @@ def _farm_item_for(
 
     Loot is now rolled at settlement time rather than pre-reserved at start_farm, so the
     original reason weapons were excluded from farm drops -- avoiding a race with the
-    chat-wide one-copy weapon catalogue -- no longer applies. The uniqueness rule itself
-    still applies without exception: a weapon already owned by ANYONE in the chat, or
-    already claimed earlier in the SAME settlement batch (`claimed_weapon_codes`, since
-    settle_completed_farms can pay out several pets' runs in one pass before any of them
-    is saved), can never be handed out here.
+    chat-wide one-copy weapon catalogue -- no longer applies. Ordinary weapons still use
+    that rule. Legendary designs may be owned by different players, while the winner's
+    own inventory and same-batch claims still prevent duplicate copies for one player.
     """
     if rng.random() >= chance:
         return None
@@ -881,6 +884,7 @@ def _farm_item_for(
             if item.source == "drop" and item.rarity == rarity and item.code not in owned
             and (
                 item.slot != "weapon"
+                or item.rarity == "legendary"
                 or (item.code not in claimed_weapon_codes and not _weapon_owner_ids(data, item.code))
             )
         ]
@@ -1447,7 +1451,7 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             else:
                 reward = _farm_reward(initial, record, run, frozenset(claimed_weapons))
             found = C.find_item(reward.get("item_code")) if reward.get("item_code") else None
-            if found is not None and found.slot == "weapon":
+            if found is not None and found.slot == "weapon" and found.rarity != "legendary":
                 claimed_weapons.add(found.code)
             due.append((str(user_id), dict(run), reward))
         if repaired:
@@ -1470,7 +1474,8 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             _, levels_gained = _apply_xp(record, max(0, int(reward.get("xp", 0) or 0)))
             item_code = reward.get("item_code")
             item = C.find_item(item_code) if item_code else None
-            if item is not None and item.slot == "weapon" and _weapon_owner_ids(data, item.code):
+            if item is not None and item.slot == "weapon" and item.rarity != "legendary" \
+                    and _weapon_owner_ids(data, item.code):
                 # Somebody else claimed this exact weapon between the roll above and this
                 # reload (a purchase, an arena drop, another chat's settlement tick). Drop
                 # the find rather than mint a second copy; gold/xp are unaffected.
@@ -1546,7 +1551,7 @@ def mark_farm_notified(entry, user_id, run_id, now: datetime | None = None) -> b
 
 
 def enforce_unique_weapons(entries) -> dict:
-    """One-time cleanup that turns catalogue codes into chat-wide unique objects.
+    """One-time cleanup that makes non-legendary weapon codes chat-wide unique.
 
     ``w003`` is deliberately removed from every old owner and pays the requested fixed
     100 coins. For other historic duplicates, one copy remains (an equipped copy wins
@@ -1593,6 +1598,10 @@ def enforce_unique_weapons(entries) -> dict:
                 code not in (pair[1].get("equipped") or {}).values(), pair[0],
             ))
             item = C.find_item(code)
+            # Legendary weapons are designs, not one physical chat-wide object. Keep
+            # historic copies instead of deleting legitimate trophies on migration.
+            if item is not None and item.rarity == "legendary":
+                continue
             refund = (
                 C.PRE_REBALANCE_WEAPON_BUY_PRICES.get(code, item.price)
                 if item.source == "shop"
@@ -2530,8 +2539,8 @@ def find_opponent(
 def legendary_pity_progress(entry: str, user_id) -> dict:
     """Progress toward the next guaranteed legendary drop for this pet.
 
-    Only wins while an unowned drop-only legendary still exists are eligible.  Once all
-    five are held, the counter is reset rather than promising an impossible duplicate.
+    Only wins while this player still has an unowned drop-only legendary design are
+    eligible. Other players owning the same design no longer exhaust the guarantee.
     """
     data = _load(entry)
     record = _tamed_record(data, user_id)
@@ -2541,7 +2550,7 @@ def legendary_pity_progress(entry: str, user_id) -> dict:
             "eligible": False, "wins_without_legend": 0,
             "remaining_wins": threshold, "threshold": threshold,
         }
-    owned = _owned_weapon_codes(data)
+    owned = set(record.get("inventory", []))
     eligible = any(
         item.slot == "weapon" and item.source == "drop"
         and item.rarity == "legendary" and item.code not in owned
@@ -2705,20 +2714,20 @@ def record_fight(
             economy.grant(entry, loser_uid, consolation, "pet_fight_defender_consolation")
 
     dropped_code = None
-    # An item code represents one unique object. A full duplicate-proof pool also
-    # means a lucky winner can still receive a different drop. The pity counter is
-    # deliberately tied to wins, not merely to successful 8% drop rolls: the normal
-    # rate is about 0.088% for a legendary, so a 500-win ceiling removes a frustrating
-    # extreme tail while leaving almost every drop to the ordinary weighted table.
-    # Weapons are unique chat-wide; accessories are unique inside the winner's own bag.
-    # Excluding both sets prevents a successful 8% roll from reporting a duplicate that
+    # A player's bag never receives the same code twice. Ordinary weapons are additionally
+    # unique chat-wide; legendary designs may drop to multiple players, so the size of
+    # the player base does not cap how many people can earn one. The pity counter is
+    # deliberately tied to wins, not merely to successful 8% drop rolls: a 500-win
+    # ceiling removes a frustrating extreme tail while leaving almost every drop to the
+    # ordinary weighted table.
+    # Excluding both sets prevents a successful drop roll from reporting a duplicate that
     # `_load` would silently collapse on the next read.
     owned_codes = _owned_weapon_codes(data) | set(winner.get("inventory", []))
     drop_pool = [
         item for item in C.ITEMS
         if item.source == "drop" and item.code not in owned_codes
     ]
-    # The 500-win pity contract is specifically for the five legendary weapons. New
+    # The 500-win pity contract is specifically for legendary weapons. New
     # legendary amulets/boots/gloves remain exciting normal rolls, not substitutes for
     # the promised weapon.
     legendary_pool = [
@@ -3085,11 +3094,10 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) ->
     """Roll one loot drop outside a fight, and give it if it lands.
 
     For rewards that are not arena wins -- a completed quest today, whatever else later.
-    The POOL RULES are the arena's, not a second set: a weapon code is one physical object
-    and is unique chat-wide, an accessory is unique inside its owner's bag, and the roll is
-    rarity-weighted from the same catalogue. Duplicating those rules here rather than
-    sharing them is how a quest ends up minting a second copy of a legendary somebody
-    already owns, which `_load` would then silently collapse.
+    The pool rules are the arena's, not a second set: ordinary weapons remain chat-wide
+    unique; legendary weapon designs and accessories may belong to different players;
+    every code is unique inside its owner's bag. The roll is rarity-weighted from the
+    same catalogue.
 
     Seeded when a caller passes `seed`, so the same reward paid twice by a retried
     settlement rolls the same item instead of two -- the same reproducibility trick

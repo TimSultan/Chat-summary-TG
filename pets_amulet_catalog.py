@@ -173,16 +173,16 @@ _DATA: Final = (
     ("amulet_tall_ruler", "Линейка против больших", "Меряет противника по росту.", "rare", {"strength": 4}, _effect("giant_slayer", "Против более высокого уровня: +18% урона.", 18), 48, 5),
     ("amulet_trophy_magnet", "Магнит для трофеев", "Липнет к редким вещам.", "legendary", {"luck": 6}, _effect("collector", "Шанс выпадения любого предмета: +25%.", 25), 96, 1),
     ("amulet_last_receipt", "Последний чек", "Доказывает, что ты выжил.", "legendary", {"health": 6, "armor": 3}, _effect("survivor", "При поражении сохраняет 30% штрафа.", 30), 96, 1),
-    ("amulet_hornet_sting", "Жало шершня", "Внутри всё ещё кто-то жужжит.", "rare", {"luck": 4, "health": -5}, _effect("stun", "Первый крит оглушает врага на один ход.", 1), 48, 5),
+    ("amulet_hornet_sting", "Жало королевы шершней", "Гудит так, будто уже выбрало следующую жертву.", "legendary", {"luck": 8, "health": -7}, _effect("stun", "Первые два крита оглушают врага на один ход.", 1, cap=2), 96, 1),
     ("amulet_thorn_cocoon", "Шипастый кокон", "Выглядит мирно ровно до первого удара.", "legendary", {"health": 10, "strength": -6}, _effect("cocoon", "Первый ход пропускает и отражает весь следующий полученный урон.", 100), 96, 1),
-    ("amulet_glass_eye", "Стеклянный глаз", "Красиво блестит. Защищает плохо.", "rare", {"luck": 8, "armor": -7}, _effect("glass_crit", "Первый крит наносит на 60% больше урона.", 60), 48, 5),
+    ("amulet_glass_eye", "Всевидящий стеклянный глаз", "Видит идеальный удар и совсем не видит опасность.", "legendary", {"luck": 12, "armor": -10}, _effect("glass_crit", "Первый крит наносит на 75% больше урона.", 75), 96, 1),
     ("amulet_blood_pact", "Кровавый договор", "Подписан чем-то липким.", "legendary", {"strength": 9, "health": -10}, _effect("blood_pact", "Каждый третий успешный удар лечит на 35% нанесённого урона.", 35), 96, 1),
-    ("amulet_frost_fang", "Ледяной зуб", "После укуса хочется надеть шарф.", "rare", {"agility": 5, "strength": -3}, _effect("chill", "Первое попадание ослабляет следующий удар врага на 40%.", 40), 48, 5),
-    ("amulet_tesla_coil", "Катушка Теслы", "Трогать языком не советуем.", "rare", {"strength": 5, "armor": -4}, _effect("tesla", "Третье попадание выпускает разряд на 15% максимального HP врага.", 15), 48, 5),
+    ("amulet_frost_fang", "Клык вечной мерзлоты", "Рядом с ним даже злость покрывается инеем.", "legendary", {"agility": 9, "strength": -5}, _effect("chill", "Первое попадание ослабляет следующий удар врага на 60%.", 60), 96, 1),
+    ("amulet_tesla_coil", "Сердце шаровой молнии", "Трещит от нетерпения уже на втором ударе.", "legendary", {"strength": 9, "armor": -6}, _effect("tesla", "Третье попадание выпускает разряд на 15% максимального HP врага.", 15), 96, 1),
     ("amulet_not_today", "Медаль «Не сегодня»", "Один раз можно поспорить с судьбой.", "legendary", {"armor": 8, "luck": -6}, _effect("death_shield", "Смертельный удар оставляет 1 HP и даёт щит на 20% HP.", 20), 96, 1),
     ("amulet_broken_flask", "Битая колба", "Промахнулся — стало только опаснее.", "uncommon", {"strength": 5, "health": -4}, _effect("acid", "После первого промаха следующий удар нельзя увернуть и он пробивает 25% брони.", 25), 24, 12),
     ("amulet_angry_spring", "Пружина злости", "Два удара — и её уже не удержать.", "uncommon", {"health": 4, "armor": -3}, _effect("spring", "После двух полученных ударов следующий удар наносит двойной урон.", 100), 24, 12),
-    ("amulet_black_candle", "Чёрная свеча", "Горит ярко, но не обещает в чью сторону.", "rare", {"luck": 6, "health": -5}, _effect("candle", "В начале боя: +40% или -20% к урону до конца боя.", 40, downside=20), 48, 5),
+    ("amulet_black_candle", "Свеча чёрного солнца", "Светит только тому, кому сегодня повезло.", "legendary", {"luck": 10, "health": -8}, _effect("candle", "В начале боя: +55% или -20% к урону до конца боя.", 55, downside=20), 96, 1),
 )
 
 
@@ -285,7 +285,7 @@ def _validate_catalogue() -> None:
     assert all(isinstance(item.effect_dict()["value"], int) for item in AMULET_SPECS)
     assert all(key in STAT_KEYS and isinstance(value, int) for item in AMULET_SPECS for key, value in item.bonuses)
     assert all(set(record) == RAW_ITEM_FIELDS for record in RAW_ITEMS)
-    assert RARITY_COUNTS == {"common": 12, "uncommon": 15, "rare": 16, "legendary": 5}
+    assert RARITY_COUNTS == {"common": 12, "uncommon": 15, "rare": 11, "legendary": 10}
 
 
 _validate_catalogue()

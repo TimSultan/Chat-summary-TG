@@ -75,6 +75,6 @@ def test_specs_are_frozen_and_legacy_item_adapter_stays_compatible():
 def test_rarities_are_spread_and_copy_is_short():
     dropped_rarities = {rarity: sum(item.rarity == rarity for item in _dropped())
                         for rarity in catalogue.RARITIES}
-    assert dropped_rarities == {"common": 12, "uncommon": 12, "rare": 11, "legendary": 5}
+    assert dropped_rarities == {"common": 12, "uncommon": 12, "rare": 6, "legendary": 10}
     assert all(len(item.name) <= 50 and len(item.description) <= 65
                for item in catalogue.AMULET_SPECS)

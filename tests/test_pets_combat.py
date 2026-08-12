@@ -430,6 +430,47 @@ class AmuletEffectTests(unittest.TestCase):
                             C.MAX_ATTACKS_PER_FIGHTER,
                         )
 
+    def test_legendary_sting_can_stun_twice_but_never_more(self):
+        attacker = Fighter(
+            key="a", name="Stinger", strength=5, health=200, agility=10, luck=10,
+            armor=0, effects=({"code": "stun", "value": 1, "cap": 2},), level=1,
+        )
+        defender = Fighter(
+            key="b", name="Tank", strength=5, health=200, agility=10, luck=10,
+            armor=0, effects=(), level=1,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("crit", 5)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(attacker, defender, seed=75)
+        stun_rows = [
+            row for row in result.rounds
+            if row.event == "amulet_stun" and row.attacker == attacker.key
+        ]
+        # Each proc writes one application row and one row when the skipped turn is
+        # consumed: two procs therefore produce exactly four visible stun rows.
+        self.assertEqual(len(stun_rows), 4)
+
+    def test_legendary_shield_breaker_keeps_the_breach_open(self):
+        defender = Fighter(
+            key="b", name="Armored", strength=10, health=200, agility=10, luck=10,
+            armor=200, effects=(), level=1,
+        )
+
+        def attacker(effect):
+            return Fighter(
+                key="a", name="Breaker", strength=20, health=100, agility=20, luck=20,
+                armor=0, effects=(effect,), level=1,
+            )
+
+        rare = combat.simulate(
+            attacker({"code": "shield_breaker", "value": 100}), defender, seed=0,
+        )
+        legendary = combat.simulate(
+            attacker({"code": "shield_breaker", "value": 100, "shred": 20}),
+            defender, seed=0,
+        )
+        self.assertGreater(legendary.total_damage["a"], rare.total_damage["a"])
+
     def test_wound_reduction_is_capped_and_replays_exactly(self):
         effect = {"code": "wound", "value": 1, "cap": 6}
         opponent = Fighter(

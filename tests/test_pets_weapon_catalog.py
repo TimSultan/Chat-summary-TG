@@ -49,26 +49,24 @@ def test_first_three_ids_preserve_legacy_identity_and_descriptions():
     ]
 
 
-def test_rarity_distribution_has_bad_average_good_and_few_legendary_items():
+def test_rarity_distribution_has_bad_average_good_and_more_legendary_items():
     assert catalogue.RARITY_COUNTS == {
-        "cursed": 75, "common": 250, "uncommon": 120, "rare": 50, "legendary": 5,
+        "cursed": 75, "common": 250, "uncommon": 120, "rare": 45, "legendary": 10,
     }
     cursed = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "cursed"]
     rares = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "rare"]
     legendary = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "legendary"]
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in cursed)
     assert all(max(value for _, value in weapon.bonuses) >= 20 for weapon in rares)
-    assert len(legendary) == 5
+    assert len(legendary) == 10
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in legendary)
 
     # w003 is a deliberate, requested exception to the two rules below: at +21 strength it
     # is the antique of the tier, weaker on paper than the best rare (+24) and out-scored
-    # by 13 of the 50 rares. It keeps its legendary passive and its 220-coin salvage. The
-    # rules still bind the four generated legendaries, which are the ones a player is
-    # actually chasing -- widening the exception past this single hand-written entry is
-    # what would make the rarest drop in the game a coin flip.
+    # by several rares. It keeps its legendary passive and its 220-coin salvage. The
+    # rules still bind every other legendary, including the five ascended rare designs.
     generated = [weapon for weapon in legendary if weapon.code != "w003"]
-    assert len(generated) == 4
+    assert len(generated) == 9
     assert all(dict(weapon.bonuses)["strength"] >= 28 for weapon in generated)
     assert min(dict(weapon.bonuses)["strength"] for weapon in generated) > max(
         dict(weapon.bonuses)["strength"] for weapon in rares
@@ -123,7 +121,7 @@ def test_shop_prices_match_fight_income_and_actual_combat_power():
     assert catalogue.PRE_REBALANCE_BUY_PRICES["w002"] == 900
 
 
-def test_raw_items_expose_trade_schema_and_legendary_drop_weight_is_about_one_percent():
+def test_raw_items_expose_trade_schema_and_expanded_legendary_drop_weight():
     required = {
         "code", "name", "slot", "price", "source", "bonuses", "description", "rarity",
         "resale_price", "drop_weight", "effect",
@@ -133,12 +131,12 @@ def test_raw_items_expose_trade_schema_and_legendary_drop_weight_is_about_one_pe
     drop_records = [record for record in catalogue.RAW_ITEMS if record["source"] == "drop"]
     legendary_weight = sum(record["drop_weight"] for record in drop_records if record["rarity"] == "legendary")
     total_weight = sum(record["drop_weight"] for record in drop_records)
-    assert legendary_weight / total_weight == pytest.approx(5 / 530)
+    assert legendary_weight / total_weight == pytest.approx(10 / 485)
     cursed = [record for record in catalogue.RAW_ITEMS if record["rarity"] == "cursed"]
     assert cursed and all(record["source"] == "drop" for record in cursed)
 
 
-def test_every_legendary_and_half_of_rare_carry_a_passive_effect():
+def test_every_legendary_and_twenty_remaining_rares_carry_a_passive_effect():
     import pets_amulet_catalog
 
     by_rarity = {rarity: [] for rarity in catalogue.RARITIES}
@@ -147,7 +145,7 @@ def test_every_legendary_and_half_of_rare_carry_a_passive_effect():
 
     assert all(weapon.effect for weapon in by_rarity["legendary"])
     rare_with_effect = [weapon for weapon in by_rarity["rare"] if weapon.effect]
-    assert len(rare_with_effect) == len(by_rarity["rare"]) // 2 == 25
+    assert len(rare_with_effect) == 20
     # Nothing below rare gets one, so a passive stays a mark of a real find.
     assert not any(
         weapon.effect
@@ -182,14 +180,19 @@ def test_rare_modifiers_are_varied_and_repeated_at_distinct_strengths():
         effect = weapon.effect_dict()
         by_code.setdefault(effect["code"], []).append(effect)
 
-    assert len(modified) == 25
+    assert len(modified) == 20
     assert len(by_code) == 16
-    for code in (
-        "precision", "burn", "venom_blade", "armor_shred", "wound",
-        "coin_rake", "bleed", "shield_breaker", "heavy_combo",
-    ):
+    for code in ("precision", "burn", "armor_shred", "wound"):
         assert len(by_code[code]) == 2
         assert by_code[code][0] != by_code[code][1]
+    # The stronger form of these five lines moved into the legendary tier.
+    for code in ("venom_blade", "coin_rake", "bleed", "shield_breaker", "heavy_combo"):
+        assert len(by_code[code]) == 1
+        legendary = next(
+            weapon.effect_dict() for weapon in catalogue.WEAPON_SPECS
+            if weapon.rarity == "legendary" and weapon.effect_dict()["code"] == code
+        )
+        assert legendary != by_code[code][0]
 
 
 def test_names_are_clear_and_descriptions_are_short():
@@ -229,6 +232,7 @@ def test_generated_names_are_plain_readable_noun_phrases():
     generated_names = [weapon.name for weapon in catalogue.WEAPON_SPECS[3:]]
     assert all(not name.startswith("«") and ":" not in name for name in generated_names)
     legendary_names = {name for name, _ in catalogue._LEGENDARY_COPY}
+    legendary_names |= {data[0] for data in catalogue._ASCENDED_LEGENDARIES.values()}
     special_names = {name for name, _ in catalogue._RARE_SPECIAL_COPY}
     assert all(
         name in legendary_names or name in special_names
