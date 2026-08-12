@@ -452,13 +452,17 @@ PAGE_HTML = """<!doctype html>
 <title>Арена</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
+  /* Pinned dark rather than themed from the client, for --thumb-bg's reason applied to
+     the whole page: the thumbnails have that navy baked into them, so a client in light
+     mode gives us dark tiles on white cards and hint-grey text that nobody can read. */
   :root {
-    --bg: var(--tg-theme-bg-color, #17212b);
-    --fg: var(--tg-theme-text-color, #f5f5f5);
-    --muted: var(--tg-theme-hint-color, #8a9aa9);
-    --card: var(--tg-theme-secondary-bg-color, #232e3c);
-    --accent: var(--tg-theme-button-color, #3390ec);
-    --accent-fg: var(--tg-theme-button-text-color, #fff);
+    color-scheme: dark;
+    --bg: #17212b;
+    --fg: #f5f5f5;
+    --muted: #8a9aa9;
+    --card: #232e3c;
+    --accent: #3390ec;
+    --accent-fg: #fff;
     --thumb-bg: #1a2532;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -669,8 +673,19 @@ PAGE_HTML = """<!doctype html>
 
 <script>
 const PREFIX = "__PREFIX__";
+/* The header and the overscroll strip belong to the client, not to our CSS, so on a
+   light-themed phone they stay white around our dark page unless asked. Each setter
+   landed in a different Bot API version; a client too old to answer keeps its own. */
+function paintChrome(tg) {
+  const ask = (method, colour, since) => {
+    try { if (tg.isVersionAtLeast(since)) tg[method](colour); } catch (e) {}
+  };
+  ask("setBackgroundColor", "#17212b", "6.1");
+  ask("setHeaderColor", "#17212b", "6.9");
+  ask("setBottomBarColor", "#232e3c", "7.10");
+}
 const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) { tg.ready(); tg.expand(); paintChrome(tg); }
 const initData = (tg && tg.initData) || "";
 
 let state = null;

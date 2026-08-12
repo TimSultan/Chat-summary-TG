@@ -2006,15 +2006,21 @@ PAGE_HTML = """<!doctype html>
 <title>Арена</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-  /* Telegram hands the page its own palette; every colour falls back to a dark default so
-     the game still looks like itself in a client that sends nothing. */
+  /* Dark on every client, on purpose -- Telegram's themeParams are read and ignored.
+     Only six of the colours below could ever have come from the client; the rest of the
+     game is drawn for a dark ground and cannot follow it: the gold, the rarity colours,
+     the fight-log sides, and the item art, whose tiles have #1a2532 painted into the SVG
+     the same way vote_image bakes a letterbox into a photo. Half a palette following an
+     Android client into light mode is what put grey hint text on white cards next to
+     navy item tiles and made the cabinet unreadable. */
   :root {
-    --bg: var(--tg-theme-bg-color, #17212b);
-    --fg: var(--tg-theme-text-color, #f5f5f5);
-    --muted: var(--tg-theme-hint-color, #8a9aa9);
-    --card: var(--tg-theme-secondary-bg-color, #232e3c);
-    --accent: var(--tg-theme-button-color, #3390ec);
-    --accent-fg: var(--tg-theme-button-text-color, #fff);
+    color-scheme: dark;
+    --bg: #17212b;
+    --fg: #f5f5f5;
+    --muted: #8a9aa9;
+    --card: #232e3c;
+    --accent: #3390ec;
+    --accent-fg: #fff;
     --line: rgba(128,128,128,.22);
     --sunken: rgba(0,0,0,.22);
     --gold: #e8b923;
@@ -2023,7 +2029,7 @@ PAGE_HTML = """<!doctype html>
     /* The two sides of a fight. Deliberately NOT --xp/--hp: those two mean "your money
      * went up" and "your money went down" everywhere else in the game, and a fight log
      * needs the numbers to keep saying that while the names say something different. */
-    --mine: var(--tg-theme-link-color, #62aef0);
+    --mine: #62aef0;
     --foe: #d98a5a;
     --r-cursed: #6b5b7b;
     --r-common: #8a9aa9;
@@ -2519,8 +2525,21 @@ PAGE_HTML = """<!doctype html>
 
 <script>
 const PREFIX = "__PREFIX__";
+/* CSS reaches the page but not the frame around it: the header carrying the bot's name,
+   and the strip a rubber-band scroll pulls into view. Those are the client's, and on a
+   phone set to a light theme they stay white around our dark page unless asked. Each
+   setter arrived in a different Bot API version, so each is asked for separately -- a
+   client too old to answer keeps its own chrome, which is no worse than today. */
+function paintChrome(tg) {
+  const ask = (method, colour, since) => {
+    try { if (tg.isVersionAtLeast(since)) tg[method](colour); } catch (e) {}
+  };
+  ask("setBackgroundColor", "#17212b", "6.1");
+  ask("setHeaderColor", "#17212b", "6.9");
+  ask("setBottomBarColor", "#232e3c", "7.10");
+}
 const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) { tg.ready(); tg.expand(); paintChrome(tg); }
 const initData = (tg && tg.initData) || "";
 
 const $ = (id) => document.getElementById(id);

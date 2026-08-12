@@ -675,13 +675,17 @@ PAGE_HTML = """<!doctype html>
 <title>Голосование</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
+  /* Pinned dark rather than themed from the client: the photos on this page are shown
+     against the same navy the finished picture is letterboxed with, and a client in
+     light mode puts them on white cards under hint-grey text nobody can read. */
   :root {
-    --bg: var(--tg-theme-bg-color, #17212b);
-    --fg: var(--tg-theme-text-color, #f5f5f5);
-    --muted: var(--tg-theme-hint-color, #8a9aa9);
-    --card: var(--tg-theme-secondary-bg-color, #232e3c);
-    --accent: var(--tg-theme-button-color, #3390ec);
-    --accent-fg: var(--tg-theme-button-text-color, #fff);
+    color-scheme: dark;
+    --bg: #17212b;
+    --fg: #f5f5f5;
+    --muted: #8a9aa9;
+    --card: #232e3c;
+    --accent: #3390ec;
+    --accent-fg: #fff;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   /* Same trap the cropping page fell into: [hidden] is a UA rule, and .winner's own
@@ -903,8 +907,19 @@ PAGE_HTML = """<!doctype html>
 
 <script>
 const PREFIX = "__PREFIX__";
+/* The header and the overscroll strip belong to the client, not to our CSS, so on a
+   light-themed phone they stay white around our dark page unless asked. Each setter
+   landed in a different Bot API version; a client too old to answer keeps its own. */
+function paintChrome(tg) {
+  const ask = (method, colour, since) => {
+    try { if (tg.isVersionAtLeast(since)) tg[method](colour); } catch (e) {}
+  };
+  ask("setBackgroundColor", "#17212b", "6.1");
+  ask("setHeaderColor", "#17212b", "6.9");
+  ask("setBottomBarColor", "#232e3c", "7.10");
+}
 const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) { tg.ready(); tg.expand(); paintChrome(tg); }
 const initData = (tg && tg.initData) || "";
 
 let poll = null;
@@ -1792,16 +1807,19 @@ BOARD_HTML = """<!doctype html>
 <title>Кадрирование итогов</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
+  /* Hardcoded rather than themed, the whole palette for --thumb-bg's reason: the picture
+     that comes out has this colour baked into it, so the preview must show it even to
+     somebody running a light Telegram theme -- and a preview framed in white while the
+     photo inside it is letterboxed navy is not a preview of anything. */
   :root {
-    --bg: var(--tg-theme-bg-color, #17212b);
-    --fg: var(--tg-theme-text-color, #f5f5f5);
-    --muted: var(--tg-theme-hint-color, #8a9aa9);
-    --card: var(--tg-theme-secondary-bg-color, #232e3c);
-    --accent: var(--tg-theme-button-color, #3390ec);
-    --accent-fg: var(--tg-theme-button-text-color, #fff);
-    /* The letterbox colour vote_image.py paints behind a fitted photo. Hardcoded rather
-       than themed on purpose: the picture that comes out has this colour baked into it,
-       so the preview must show it even to somebody running a light Telegram theme. */
+    color-scheme: dark;
+    --bg: #17212b;
+    --fg: #f5f5f5;
+    --muted: #8a9aa9;
+    --card: #232e3c;
+    --accent: #3390ec;
+    --accent-fg: #fff;
+    /* The letterbox colour vote_image.py paints behind a fitted photo. */
     --thumb-bg: #1a2532;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -1958,8 +1976,19 @@ BOARD_HTML = """<!doctype html>
 
 <script>
 const PREFIX = "__PREFIX__";
+/* The header and the overscroll strip belong to the client, not to our CSS, so on a
+   light-themed phone they stay white around our dark page unless asked. Each setter
+   landed in a different Bot API version; a client too old to answer keeps its own. */
+function paintChrome(tg) {
+  const ask = (method, colour, since) => {
+    try { if (tg.isVersionAtLeast(since)) tg[method](colour); } catch (e) {}
+  };
+  ask("setBackgroundColor", "#17212b", "6.1");
+  ask("setHeaderColor", "#17212b", "6.9");
+  ask("setBottomBarColor", "#232e3c", "7.10");
+}
 const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) { tg.ready(); tg.expand(); paintChrome(tg); }
 const initData = (tg && tg.initData) || "";
 
 let works = [];       // the ranked board: {id, author, username, votes, photo}
