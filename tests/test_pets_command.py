@@ -314,6 +314,21 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(labels[1][1], "🎰 Казино")
         self.assertEqual(labels[2], ["🛒 Магазин", "🎒 Снаряжение"])
 
+    def test_financial_admin_gets_a_direct_private_button_to_the_audit_graph(self):
+        _, keyboard = pets_ui.main_view(
+            CHAT, PLAYER["id"], RICH_XP,
+            webapp_url="https://example.com/pets", finance_admin=True,
+        )
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        audit = next(button for button in buttons if button["text"] == "🕵️ Денежный аудит")
+        self.assertEqual(audit["web_app"]["url"], "https://example.com/pets?view=economy")
+        self.assertFalse(any(
+            button.get("text") == "🕵️ Денежный аудит"
+            for row in pets_ui.main_view(
+                CHAT, PLAYER["id"], RICH_XP, webapp_url="https://example.com/pets",
+            )[1]["inline_keyboard"] for button in row
+        ))
+
     def test_daily_bonus_button_is_offered_without_a_pet(self):
         # The one row on this menu that must survive every `if pet:` gate: chat activity,
         # not the arena, is most members' only income.

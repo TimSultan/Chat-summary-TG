@@ -983,6 +983,12 @@ optional body on the rest. Those entries are stored per chat, always sort after 
 ones, and are escaped rather than rendered as HTML, so typed markup cannot break the send.
 Publishing one restores the red dot for everybody. The command is deliberately absent from
 the registered Telegram command menu, like the other admin-only commands.
+Chat administrators also get a private `Денежный аудит` Mini App button. It selects any
+tracked user and graphs the last 24 hours, 3 days or 7 days hour-by-hour, stacked by quest,
+casino, PvP, PvE, farm, sales, bonuses and other ledger sources. Gross credits, debits and
+net change are separate (especially for casino stakes), with the raw reasons below the
+graph. The rolling audit depth is 50,000 operations. Coins derived directly from chat XP
+are labelled separately because the legacy XP balance has no per-transaction timestamps.
 Administrators can use `/testfight` from the group or the bot DM to pit their pet against
 a random existing opponent in the main chat. It runs the normal combat and result-image
 pipeline but deliberately records no fight, XP, gold, drop, loss debit or banked-fight use;

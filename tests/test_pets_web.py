@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,6 +115,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         async def is_admin(user):
             return user.get("id") == MODERATOR["id"]
 
+        async def is_economy_admin(user):
+            # Financial records use a separate, narrower gate from quest review.
+            return user.get("id") == THIRD["id"]
+
         async def is_member(user):
             return user.get("id") != NONMEMBER["id"]
 
@@ -161,6 +166,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             cfg, CHAT, is_admin, log=lambda *_: None,
             attach=lambda a: pets_web.attach(
                 a, cfg, CHAT, is_member=is_member, is_admin=is_admin,
+                is_economy_admin=is_economy_admin,
                 resolve_player=resolve_player,
                 fetch_photo=fetch_photo, save_photo=save_photo,
                 quest_feedback=quest_feedback,
@@ -223,6 +229,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             ("get", "/api/state"), ("get", "/api/opponents"), ("get", "/api/shop"),
             ("get", "/api/leaderboard"), ("get", "/api/history"), ("get", "/api/collection"),
             ("get", "/api/updates"), ("get", "/api/mail"),
+            ("get", "/api/economy/audit"),
             ("get", "/api/test-battle"),
             ("post", "/api/action"), ("post", "/api/attack"),
             ("post", "/api/test-battle/start"), ("post", "/api/test-battle/action"),
@@ -264,6 +271,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(full["skills"]["regular"]), 30)
         self.assertEqual(len(full["skills"]["ultimate"]), 10)
         self.assertTrue(full["skills"]["slots"][3]["ultimate"])
+        self.assertFalse(full["is_economy_admin"])
         self.assertIn("bag", full)
         self.assertIn("arena", full)
         self.assertIn("farm", full)
@@ -319,6 +327,48 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         state = await self._get("/api/state", NONMEMBER)
         self.assertEqual(state.status, 200)
+
+    # ---- money audit -----------------------------------------------------------------
+
+    async def test_money_audit_is_hidden_from_players_and_rechecked_by_its_own_gate(self):
+        player_state = await (await self._get("/api/state", PLAYER)).json()
+        quest_mod_state = await (await self._get("/api/state", MODERATOR)).json()
+        admin_state = await (await self._get("/api/state", THIRD)).json()
+        self.assertFalse(player_state["is_economy_admin"])
+        self.assertFalse(quest_mod_state["is_economy_admin"])
+        self.assertTrue(admin_state["is_economy_admin"])
+
+        denied = await self._get("/api/economy/audit", PLAYER)
+        self.assertEqual(denied.status, 403)
+        self.assertEqual((await denied.json())["error"], "NOT_AN_ECONOMY_ADMIN")
+
+    async def test_money_audit_returns_user_picker_hour_graph_and_source_net(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        with patch("economy.app_now", return_value=moment):
+            economy.grant(CHAT, PLAYER["id"], 40, "grant:quest:submission-1")
+            economy.grant(CHAT, PLAYER["id"], -10, "wager:casino:poker")
+            economy.grant(CHAT, PLAYER["id"], 20, "wager_payout:casino:poker")
+            response = await self._get(
+                f"/api/economy/audit?user_id={PLAYER['id']}&hours=24", THIRD,
+            )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body["selected"], str(PLAYER["id"]))
+        self.assertEqual(body["windows"], [24, 72, 168])
+        self.assertTrue(any(row["user_id"] == str(PLAYER["id"]) for row in body["users"]))
+        self.assertEqual(len(body["report"]["hourly"]), 24)
+        poker = next(row for row in body["report"]["sources"] if row["code"] == "casino_poker")
+        self.assertEqual((poker["earned"], poker["spent"], poker["net"]), (20, 10, 10))
+        quest = next(row for row in body["report"]["sources"] if row["code"] == "quests")
+        self.assertEqual(quest["earned"], 40)
+        self.assertTrue(body["report"]["xp_not_hourly"])
+
+    async def test_page_contains_admin_money_button_graph_and_user_selector(self):
+        page = await self.client.get(pets_web.ROUTE_PREFIX + "/", headers=self._auth(THIRD))
+        html = await page.text()
+        self.assertIn("moneyaudit:🕵️ Денежный аудит", html)
+        self.assertIn("data-audituser", html)
+        self.assertIn("audit-graph", html)
 
     # ---- equipment --------------------------------------------------------------------
 

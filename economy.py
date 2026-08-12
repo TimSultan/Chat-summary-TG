@@ -34,8 +34,11 @@ from app_time import now as app_now
 
 ECONOMY_STORE_VERSION = 1
 # Rolling audit trail only -- per-user totals above it are what balances are computed
-# from, so trimming this can never change anybody's balance.
-LOG_LIMIT = 1_000
+# from, so trimming this can never change anybody's balance. The financial-admin graph
+# needs enough depth to compare several busy weeks across the whole chat; 1,000 rows was
+# routinely exhausted by casino stakes long before abuse could be reviewed.
+LOG_LIMIT = 50_000
+AUDIT_WINDOW_HOURS = (24, 72, 168)
 FIGURINE_COIN_REWARD = 500
 
 # Member-to-member transfers were removed. `received` is still read by balance() and
@@ -676,6 +679,185 @@ def reputation_for(entry: str, user_id, user=None) -> int:
         record.get("received", 0),
         stats.medal_levels(user, casino_winnings_for_user(entry, user_id)) if user is not None else 0,
     )
+
+
+_AUDIT_SOURCES = {
+    "quests": ("Квесты", "#9b6fe8"),
+    "casino_poker": ("Покер", "#e0a126"),
+    "casino_shell": ("Напёрстки", "#d97a35"),
+    "casino_highlow": ("Больше / меньше", "#c95c61"),
+    "pvp": ("Бои с игроками", "#4f8fe8"),
+    "mobs": ("Бои с мобами", "#e05252"),
+    "farm": ("Ферма", "#4ca66a"),
+    "daily": ("Ежедневный бонус", "#55b9ad"),
+    "activity": ("Активность и призы", "#5dba73"),
+    "sales": ("Продажа вещей", "#78a843"),
+    "refunds": ("Возвраты", "#7fa9c9"),
+    "purchases": ("Покупки и прокачка", "#78838f"),
+    "grants": ("Выдачи и миграции", "#b884c9"),
+    "other": ("Другое", "#8f98a3"),
+}
+
+
+def _audit_source(reason: str) -> str:
+    """Stable player-facing bucket for one raw ledger reason.
+
+    Both sides of a casino game intentionally share a source. The report can therefore
+    show gross payouts, wagers and NET poker income together instead of calling a 100
+    coin returned stake a 100 coin profit.
+    """
+    value = str(reason or "").lower()
+    if value.startswith("grant:quest:"):
+        return "quests"
+    if "casino:poker" in value:
+        return "casino_poker"
+    if "casino:shell" in value:
+        return "casino_shell"
+    if "casino:highlow" in value:
+        return "casino_highlow"
+    if value.startswith("pet_fight_"):
+        return "pvp"
+    if value == "pet_mob_win":
+        return "mobs"
+    if value.startswith("grant:pet:farm:") or value == "pet:farm_passive_income":
+        return "farm"
+    if value == "daily_bonus":
+        return "daily"
+    if value.startswith("grant:daily_chatter:") or value.startswith("daily_chatter") \
+            or value.startswith("figurine"):
+        return "activity"
+    if value.startswith("sell:pet_item:"):
+        return "sales"
+    if value.startswith("refund:") or value.startswith("wager_refund:"):
+        return "refunds"
+    if value.startswith("buy:") or value.startswith("wager:") \
+            or value.startswith("wager_raise:"):
+        return "purchases" if "casino:" not in value else "other"
+    if value.startswith("grant:"):
+        return "grants"
+    return "other"
+
+
+def _audit_timestamp(value, tz) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
+
+
+def audit_user_ids(entry: str) -> set[str]:
+    """Every account represented by totals or by a still-retained transaction."""
+    data = _load(entry)
+    return {
+        *map(str, data.get("users", {})),
+        *(str(row.get("user_id")) for row in data.get("log", []) if row.get("user_id") is not None),
+    }
+
+
+def audit_report(
+    entry: str, user_id, hours: int = 24, *, now: datetime | None = None,
+) -> dict:
+    """Hourly, source-split ledger activity for one user, oldest hour first.
+
+    This is diagnostic data, never a balance source. It deliberately reports gross
+    credits, debits and their net separately. Chat XP coins are derived from stats and
+    do not create ledger rows; callers must display ``xp_not_hourly`` rather than
+    pretending those coins were earned at an invented time.
+    """
+    hours = int(hours or 24)
+    if hours not in AUDIT_WINDOW_HOURS:
+        hours = 24
+    moment = now or app_now()
+    tz = moment.tzinfo or app_now().tzinfo
+    moment = moment.replace(tzinfo=tz) if moment.tzinfo is None else moment.astimezone(tz)
+    end_hour = moment.replace(minute=0, second=0, microsecond=0)
+    start_hour = end_hour - timedelta(hours=hours - 1)
+    key = str(user_id)
+    data = _load(entry)
+    all_log = data.get("log", [])
+
+    buckets = {}
+    for offset in range(hours):
+        bucket = start_hour + timedelta(hours=offset)
+        buckets[bucket.isoformat()] = {
+            "at": bucket.isoformat(), "label": bucket.strftime("%d.%m %H:00"),
+            "earned": 0, "spent": 0, "net": 0, "sources": {}, "transactions": 0,
+        }
+    transactions = []
+    for raw in all_log:
+        if str(raw.get("user_id")) != key:
+            continue
+        timestamp = _audit_timestamp(raw.get("ts"), tz)
+        if timestamp is None or timestamp < start_hour or timestamp >= end_hour + timedelta(hours=1):
+            continue
+        delta = int(raw.get("delta", 0) or 0)
+        source = _audit_source(raw.get("reason", ""))
+        source_name, colour = _AUDIT_SOURCES[source]
+        bucket_key = timestamp.replace(minute=0, second=0, microsecond=0).isoformat()
+        bucket = buckets.get(bucket_key)
+        if bucket is None:
+            continue
+        part = bucket["sources"].setdefault(source, {
+            "code": source, "name": source_name, "color": colour,
+            "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+        })
+        if delta >= 0:
+            bucket["earned"] += delta
+            part["earned"] += delta
+        else:
+            bucket["spent"] += -delta
+            part["spent"] += -delta
+        bucket["net"] += delta
+        bucket["transactions"] += 1
+        part["net"] += delta
+        part["transactions"] += 1
+        transactions.append({
+            "at": timestamp.isoformat(), "time": timestamp.strftime("%d.%m %H:%M"),
+            "delta": delta, "reason": str(raw.get("reason") or ""),
+            "ref": str(raw.get("ref") or ""), "source": source,
+            "source_name": source_name, "color": colour,
+        })
+
+    hourly = list(buckets.values())
+    for bucket in hourly:
+        bucket["sources"] = sorted(
+            bucket["sources"].values(), key=lambda row: (-row["earned"], row["name"]),
+        )
+    source_totals = {}
+    for bucket in hourly:
+        for part in bucket["sources"]:
+            total = source_totals.setdefault(part["code"], {
+                "code": part["code"], "name": part["name"], "color": part["color"],
+                "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+            })
+            for field in ("earned", "spent", "net", "transactions"):
+                total[field] += part[field]
+    record = data.get("users", {}).get(key) or {}
+    parsed_all = [
+        stamp for stamp in (_audit_timestamp(row.get("ts"), tz) for row in all_log)
+        if stamp is not None
+    ]
+    return {
+        "user_id": key, "hours": hours,
+        "from": start_hour.isoformat(), "to": moment.isoformat(),
+        "hourly": hourly,
+        "sources": sorted(source_totals.values(), key=lambda row: (-row["earned"], row["name"])),
+        "transactions": sorted(transactions, key=lambda row: row["at"], reverse=True)[:200],
+        "earned": sum(row["earned"] for row in hourly),
+        "spent": sum(row["spent"] for row in hourly),
+        "net": sum(row["net"] for row in hourly),
+        "ledger_totals": {
+            "bonus": int(record.get("bonus", 0) or 0),
+            "spent": int(record.get("spent", 0) or 0),
+            "received_legacy": int(record.get("received", 0) or 0),
+        },
+        "coverage_start": min(parsed_all).isoformat() if parsed_all else None,
+        "log_at_capacity": len(all_log) >= LOG_LIMIT,
+        "xp_not_hourly": True,
+    }
 
 
 def casino_winnings_for_user(entry: str, user_id) -> int:

@@ -59,6 +59,40 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(economy.balance("chat", "1", xp), 0)
         self.assertEqual(economy.balance("chat", "1", xp - stats.XP_PER_COIN * 20), 0)
 
+    def test_admin_audit_splits_each_hour_by_source_and_keeps_casino_net_honest(self):
+        times = iter([
+            datetime(2026, 8, 12, 18, 5, tzinfo=timezone.utc),
+            datetime(2026, 8, 12, 18, 10, tzinfo=timezone.utc),
+            datetime(2026, 8, 12, 18, 12, tzinfo=timezone.utc),
+            datetime(2026, 8, 12, 19, 1, tzinfo=timezone.utc),
+        ])
+        with patch("economy.app_now", side_effect=lambda: next(times)):
+            economy.grant("chat", "1", 40, "grant:quest:submission-1")
+            economy.grant("chat", "1", -10, "wager:casino:poker")
+            economy.grant("chat", "1", 20, "wager_payout:casino:poker")
+            economy.grant("chat", "1", 15, "pet_fight_win")
+
+        report = economy.audit_report(
+            "chat", "1", 24, now=datetime(2026, 8, 12, 19, 30, tzinfo=timezone.utc),
+        )
+        active = [row for row in report["hourly"] if row["transactions"]]
+        self.assertEqual([row["label"] for row in active], ["12.08 18:00", "12.08 19:00"])
+        self.assertEqual((report["earned"], report["spent"], report["net"]), (75, 10, 65))
+        poker = next(row for row in report["sources"] if row["code"] == "casino_poker")
+        self.assertEqual((poker["earned"], poker["spent"], poker["net"]), (20, 10, 10))
+        self.assertEqual(report["transactions"][0]["source"], "pvp")
+        self.assertTrue(report["xp_not_hourly"])
+
+    def test_admin_audit_ignores_other_users_and_rejects_unbounded_windows(self):
+        moment = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+        with patch("economy.app_now", return_value=moment):
+            economy.grant("chat", "1", 10, "daily_bonus")
+            economy.grant("chat", "2", 999, "pet_fight_win")
+        report = economy.audit_report("chat", "1", 999_999, now=moment)
+        self.assertEqual(report["hours"], 24)
+        self.assertEqual(report["earned"], 10)
+        self.assertEqual(economy.audit_user_ids("chat"), {"1", "2"})
+
     def test_catalogue_is_the_title_alone(self):
         self.assertEqual([item.code for item in economy.SHOP_ITEMS], ["title"])
         self.assertIsNone(economy.find_item("roast"))

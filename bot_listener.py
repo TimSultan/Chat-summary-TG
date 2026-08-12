@@ -5782,6 +5782,9 @@ async def handle_pets_command(
     can_appoint_mods = bool(quest_admin_chat_id) and await _can_manage_chat(
         api, quest_admin_chat_id, actor, entry,
     )
+    is_finance_admin = bool(quest_admin_chat_id) and await _is_chat_admin_or_privileged(
+        api, quest_admin_chat_id, actor,
+    )
     is_quest_mod = can_appoint_mods or quests.is_moderator(
         entry, actor.get("id"), actor.get("username"),
     )
@@ -5803,6 +5806,7 @@ async def handle_pets_command(
         pets_ui.main_view(
             entry, user.user_id, xp, webapp_url=_pets_page_url(cfg), quest_mod=is_quest_mod,
             quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
+            finance_admin=is_finance_admin,
         ),
         reply_to_message_id=message["message_id"], log=log,
     )
@@ -6129,8 +6133,9 @@ async def handle_pets_callback(
     # AFTER answer_callback_query, never before: a blocking call ahead of it leaves the
     # button spinning until the client gives up.
     can_appoint_mods = False
+    is_finance_admin = False
     if entry and action in (
-        "main", "questmods", "questmodadd", "questmoddel",
+        "main", "fightnotify", "questmods", "questmodadd", "questmoddel",
         "questreview", "questaccept", "questreject",
     ):
         quest_admin_chat_id = await _resolve_chat_id(
@@ -6139,6 +6144,10 @@ async def handle_pets_callback(
         can_appoint_mods = bool(quest_admin_chat_id) and await _can_manage_chat(
             api, quest_admin_chat_id, actor, entry,
         )
+        if action in {"main", "fightnotify"} and quest_admin_chat_id:
+            is_finance_admin = await _is_chat_admin_or_privileged(
+                api, quest_admin_chat_id, actor,
+            )
     is_quest_mod = can_appoint_mods or quests.is_moderator(
         entry, actor.get("id"), actor.get("username"),
     )
@@ -6543,6 +6552,7 @@ async def handle_pets_callback(
                 pets_ui.main_view(
                     entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
                     quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
+                    finance_admin=is_finance_admin,
                 ), log,
             )
             return
@@ -6652,6 +6662,7 @@ async def handle_pets_callback(
             "main": lambda: pets_ui.main_view(
                 entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
                 quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
+                finance_admin=is_finance_admin,
             ),
             "questmods": lambda: pets_ui.quest_mods_view(entry, user_id, can_appoint_mods),
             "info": lambda: pets_ui.info_view(user_id),
@@ -8807,6 +8818,17 @@ async def run_bot_listener(
                 return True
             return await _is_vote_admin(user)
 
+        async def _is_economy_admin(user: dict) -> bool:
+            """Financial history: real chat admins and hardcoded owners, not delegates."""
+            if not home_chat_ref:
+                return False
+            admin_chat_id = await _resolve_chat_id(
+                telethon_client, home_chat_ref, known_chat_ids, log=log,
+            )
+            if admin_chat_id is None:
+                return False
+            return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
+
         async def _is_vote_member(user: dict) -> bool:
             """The "голосовать могут только подписчики" gate: only members of the home
             chat may cast a ballot. Fails closed -- an unresolvable home chat blocks
@@ -8931,6 +8953,7 @@ async def run_bot_listener(
                     # deliberately so: reviewing a painting is "does this look like NMM",
                     # which any trusted painter can do, while closing a vote is not.
                     is_admin=_is_quest_moderator,
+                    is_economy_admin=_is_economy_admin,
                     resolve_player=_resolve_pet_player,
                     fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
                     quest_feedback=_send_quest_feedback,

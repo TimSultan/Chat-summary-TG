@@ -67,9 +67,12 @@ ROUTE_PREFIX = "/pets"
 _CFG_KEY = web.AppKey("pets_cfg")
 _ENTRY_KEY = web.AppKey("pets_entry", str)
 _IS_MEMBER_KEY = web.AppKey("pets_is_member", Callable[[dict], Awaitable[bool]])
-# Quest moderation only. Everything else in this module is a player surface, so this is
-# the one gate that has to answer "may this person decide for somebody else".
+# Quest moderation and financial audit deliberately use separate gates: reviewing a
+# painting can be delegated, while reading everybody's coin ledger cannot.
 _IS_ADMIN_KEY = web.AppKey("pets_is_admin", Callable[[dict], Awaitable[bool]])
+_IS_ECONOMY_ADMIN_KEY = web.AppKey(
+    "pets_is_economy_admin", Callable[[dict], Awaitable[bool]],
+)
 _RESOLVE_KEY = web.AppKey("pets_resolve_player")
 _FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
 _SAVE_PHOTO_KEY = web.AppKey("pets_save_photo")
@@ -915,7 +918,14 @@ async def handle_state(request: web.Request) -> web.Response:
     state = _state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY])
     # Whether the moderation entry is even drawn. A convenience for the menu, never a
     # permission: every route behind it asks the same gate again for itself.
-    state["is_admin"] = await request.app[_IS_ADMIN_KEY](user)
+    is_admin, is_economy_admin = await asyncio.gather(
+        request.app[_IS_ADMIN_KEY](user),
+        request.app[_IS_ECONOMY_ADMIN_KEY](user),
+    )
+    state["is_admin"] = is_admin
+    # Financial history is more sensitive than quest review and uses its own, narrower
+    # production gate. The flag only draws a button; the endpoint re-checks it.
+    state["is_economy_admin"] = is_economy_admin
     # The queue is intentionally part of the ordinary state, so both moderation entries
     # can light up from the same server-side fact rather than drifting apart.
     state["pending_quests"] = quests.pending_count(entry) if state["is_admin"] else 0
@@ -1576,6 +1586,76 @@ async def _quest_admin(request: web.Request, body: dict | None = None):
     return user, xp
 
 
+async def _economy_admin(request: web.Request):
+    user, xp = await _player(request)
+    if not await request.app[_IS_ECONOMY_ADMIN_KEY](user):
+        raise web.HTTPForbidden(
+            text=json.dumps({
+                "error": "NOT_AN_ECONOMY_ADMIN",
+                "message": "Денежный аудит доступен только администраторам чата.",
+            }, ensure_ascii=False),
+            content_type="application/json",
+        )
+    return user, xp
+
+
+def _economy_audit_users(entry: str) -> tuple[list[dict], dict[str, stats.UserStats]]:
+    """Union of tracked chat users, pet owners and ledger-only accounts."""
+    tracked = stats.aggregate_all_time(entry)
+    pet_rows = {str(row["user_id"]): row for row in pets.pet_leaderboard(entry)}
+    ids = set(tracked) | set(pet_rows) | economy.audit_user_ids(entry)
+    rows = []
+    for user_id in ids:
+        stat = tracked.get(user_id)
+        pet = pet_rows.get(user_id) or {}
+        display_name = (
+            (stat.display_name if stat else None)
+            or pet.get("owner_name") or f"ID {user_id}"
+        )
+        username = (stat.username if stat else None) or pet.get("owner_username")
+        rows.append({
+            "user_id": user_id,
+            "name": display_name,
+            "username": username,
+            "pet_name": pet.get("name"),
+        })
+    rows.sort(key=lambda row: (str(row["name"]).casefold(), row["user_id"]))
+    return rows, tracked
+
+
+async def handle_economy_audit(request: web.Request) -> web.Response:
+    """Admin-only hourly source graph over the real coin audit trail."""
+    caller, _xp = await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    users, tracked = _economy_audit_users(entry)
+    requested = str(request.query.get("user_id") or "")
+    known = {row["user_id"] for row in users}
+    selected = requested if requested in known else (
+        str(caller["id"]) if str(caller["id"]) in known else (users[0]["user_id"] if users else "")
+    )
+    try:
+        window = int(request.query.get("hours", 24))
+    except (TypeError, ValueError):
+        window = 24
+    report = economy.audit_report(entry, selected, window) if selected else None
+    selected_stats = tracked.get(selected)
+    if report is not None:
+        baseline = stats._load_words_per_point(entry) or stats.DEFAULT_WORDS_PER_POINT
+        report["xp_coins_archived"] = (
+            stats.coins_for_xp(selected_stats.xp(baseline)) if selected_stats else None
+        )
+        report["xp_coins_note"] = (
+            "Монеты из активности чата считаются из XP и не создают почасовых операций. "
+            "Показана оценка по сохранённым дням; сегодняшний незакрытый день может в неё не входить."
+        )
+    return _ok({
+        "users": users,
+        "selected": selected,
+        "windows": list(economy.AUDIT_WINDOW_HOURS),
+        "report": report,
+    })
+
+
 def _submission_link(row: dict) -> str | None:
     """A t.me link to the post itself.
 
@@ -1826,6 +1906,7 @@ def attach(
     entry: str,
     is_member=None,
     is_admin=None,
+    is_economy_admin=None,
     resolve_player=None,
     fetch_photo=None,
     save_photo=None,
@@ -1856,6 +1937,9 @@ def attach(
     # Fails closed: with no gate injected, nobody is a quest moderator and the review
     # tab simply never appears -- rather than appearing for everyone.
     app[_IS_ADMIN_KEY] = is_admin or _default_is_admin
+    # Deliberately separate from quest moderators. Production injects the narrower
+    # chat-admin gate; omitted means nobody can read financial history.
+    app[_IS_ECONOMY_ADMIN_KEY] = is_economy_admin or _default_is_admin
     app[_RESOLVE_KEY] = resolve_player or _default_resolve_player
     app[_FETCH_PHOTO_KEY] = fetch_photo or _default_fetch_photo
     app[_SAVE_PHOTO_KEY] = save_photo or _default_save_photo
@@ -1881,6 +1965,7 @@ def attach(
         web.get(prefix + "/api/shop", handle_shop),
         web.get(prefix + "/api/leaderboard", handle_leaderboard),
         web.get(prefix + "/api/history", handle_history),
+        web.get(prefix + "/api/economy/audit", handle_economy_audit),
         web.get(prefix + "/api/mail", handle_mail),
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
@@ -2088,6 +2173,29 @@ PAGE_HTML = """<!doctype html>
   .live-skill b, .live-skill small { display: block; }
   .live-skill small { margin-top: 4px; color: var(--muted); font-weight: 400; }
   .live-skill.ultimate { border-color: var(--r-legendary); }
+
+  /* Financial audit: a horizontal hour strip keeps a 24h/7d timeline readable on a
+     phone. Each bar is stacked by income source; expenses stay in the exact table below
+     so a returned casino stake can never masquerade as profit. */
+  .audit-graph { display:flex; align-items:flex-end; gap:4px; min-height:170px;
+                 overflow-x:auto; padding:12px 2px 5px; }
+  .audit-hour { flex:1 0 20px; min-width:20px; height:145px; display:flex;
+                flex-direction:column; justify-content:flex-end; align-items:stretch; }
+  .audit-stack { height:112px; display:flex; flex-direction:column-reverse;
+                 justify-content:flex-start; border-bottom:1px solid var(--line); }
+  .audit-segment { width:100%; min-height:2px; }
+  .audit-label { font-size:8px; color:var(--muted); text-align:center; margin-top:5px;
+                 writing-mode:vertical-rl; transform:rotate(180deg); height:25px; }
+  .audit-legend { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  .audit-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:4px; }
+  .audit-table { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;
+                 gap:7px 9px; align-items:center; }
+  .audit-table .head { color:var(--muted); font-size:10px; }
+  .audit-positive { color:var(--xp); }
+  .audit-negative { color:var(--hp); }
+  .audit-select { width:100%; border:1px solid var(--line); border-radius:12px;
+                  background:var(--card); color:var(--text); padding:11px; font:inherit; }
+  .audit-summary { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; }
 
   /* --------------------------------------------------------------- stats + combat */
   .grid4 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -3168,6 +3276,97 @@ function featureName(key) { return FEATURE_NAMES[key] || key; }
 
 // ------------------------------------------------------------------------ more screen
 let moreView = "menu";
+let auditUser = "";
+let auditHours = 24;
+
+function signedMoney(value) {
+  const number = Number(value || 0);
+  return (number > 0 ? "+" : number < 0 ? "−" : "") + money(Math.abs(number));
+}
+
+function economyAudit(data) {
+  const report = data.report;
+  if (!report) return '<div class="panel"><h2>🕵️ Денежный аудит</h2>' +
+    '<div class="empty">В денежном журнале пока нет пользователей.</div></div>';
+  auditUser = data.selected || auditUser;
+  auditHours = report.hours || auditHours;
+  const maximum = Math.max(1, ...(report.hourly || []).map((row) => Number(row.earned || 0)));
+  const activeSources = (report.sources || []).filter((row) => row.earned || row.spent);
+  const graph = (report.hourly || []).map((hour, index) => {
+    const totalHeight = Math.round(112 * Number(hour.earned || 0) / maximum);
+    const pieces = (hour.sources || []).filter((part) => part.earned > 0).map((part) => {
+      const height = hour.earned ? Math.max(2, totalHeight * part.earned / hour.earned) : 0;
+      return '<span class="audit-segment" style="height:' + height + 'px;background:' +
+        esc(part.color) + '" title="' + esc(part.name) + ': +' + money(part.earned) + '"></span>';
+    }).join("");
+    const label = report.hours <= 24 || index % (report.hours <= 72 ? 3 : 12) === 0
+      ? String(hour.label || "").slice(6) : "";
+    return '<div class="audit-hour" title="' + esc(hour.label) + ': +' + money(hour.earned) +
+      ' / −' + money(hour.spent) + '"><div class="audit-stack">' + pieces +
+      '</div><span class="audit-label">' + esc(label) + '</span></div>';
+  }).join("");
+  const sourceRows = activeSources.map((row) =>
+    '<span class="small"><span class="audit-dot" style="background:' + esc(row.color) +
+    '"></span>' + esc(row.name) + '</span><b class="small audit-positive">+' + money(row.earned) +
+    '</b><b class="small audit-negative">−' + money(row.spent) + '</b><b class="small">' +
+    signedMoney(row.net) + '</b>'
+  ).join("") || '<span class="small muted">Операций в этом окне нет.</span>';
+  const hourDetails = (report.hourly || []).filter((hour) => hour.transactions).map((hour) =>
+    '<div style="padding:9px 0;border-bottom:1px solid var(--line)">' +
+      '<div class="row spread"><b>' + esc(hour.label) + '</b><span class="small">' +
+        '<span class="audit-positive">+' + money(hour.earned) + '</span> · ' +
+        '<span class="audit-negative">−' + money(hour.spent) + '</span> · <b>' +
+        signedMoney(hour.net) + '</b></span></div>' +
+      (hour.sources || []).map((part) =>
+        '<div class="row spread tiny" style="margin-top:5px"><span><span class="audit-dot" ' +
+        'style="background:' + esc(part.color) + '"></span>' + esc(part.name) + '</span><span>' +
+        '<span class="audit-positive">+' + money(part.earned) + '</span> / ' +
+        '<span class="audit-negative">−' + money(part.spent) + '</span> · ' +
+        signedMoney(part.net) + '</span></div>').join("") + '</div>'
+  ).join("") || '<div class="empty">В выбранном окне операций нет.</div>';
+  const transactionRows = (report.transactions || []).slice(0, 100).map((row) =>
+    '<div class="row spread small" style="gap:8px;margin-bottom:6px"><span><span class="muted">' +
+    esc(row.time) + '</span><br>' + esc(row.source_name) +
+    '<br><span class="tiny muted">' + esc(row.reason) + '</span></span><b class="' +
+    (row.delta >= 0 ? 'audit-positive' : 'audit-negative') + '">' + signedMoney(row.delta) +
+    '</b></div>'
+  ).join("") || '<div class="empty">За период операций нет.</div>';
+  const userOptions = (data.users || []).map((user) => {
+    const label = (user.username ? "@" + user.username + " · " : "") + user.name +
+      (user.pet_name ? " · " + user.pet_name : "") + " · ID " + user.user_id;
+    return '<option value="' + esc(user.user_id) + '"' +
+      (String(user.user_id) === String(data.selected) ? ' selected' : '') + '>' + esc(label) + '</option>';
+  }).join("");
+  const windows = (data.windows || [24, 72, 168]).map((hours) =>
+    '<button class="chip' + (Number(hours) === Number(report.hours) ? ' on' : '') +
+    '" data-audithours="' + hours + '">' + (hours === 24 ? '24 часа' : hours === 72 ? '3 дня' : '7 дней') +
+    '</button>'
+  ).join("");
+  return '<div class="panel"><h2>🕵️ Денежный аудит</h2>' +
+    '<select class="audit-select" data-audituser>' + userOptions + '</select>' +
+    '<div class="chiprow" style="margin-top:9px">' + windows + '</div>' +
+    '<div class="audit-summary" style="margin-top:10px">' +
+      tile('Начислено', '+' + money(report.earned)) + tile('Списано', '−' + money(report.spent)) +
+      tile('Чистыми', signedMoney(report.net)) + '</div></div>' +
+    '<div class="panel"><h2>Начисления по часам</h2><div class="audit-graph">' + graph + '</div>' +
+      '<div class="audit-legend">' + activeSources.filter((row) => row.earned).map((row) =>
+        '<span class="tiny"><span class="audit-dot" style="background:' + esc(row.color) + '"></span>' +
+        esc(row.name) + '</span>').join("") + '</div></div>' +
+    '<details class="panel" open><summary><b>Почасовая расшифровка</b></summary>' +
+      '<div style="margin-top:7px">' + hourDetails + '</div></details>' +
+    '<div class="panel"><h2>Откуда деньги</h2><div class="audit-table">' +
+      '<span class="head">Источник</span><span class="head">Пришло</span>' +
+      '<span class="head">Ушло</span><span class="head">Чистыми</span>' + sourceRows + '</div></div>' +
+    '<div class="panel"><h2>XP-баланс вне графика</h2><div class="small">' +
+      (report.xp_coins_archived == null ? 'Нет сохранённой оценки.' :
+       'Около <b>' + money(report.xp_coins_archived) + '</b> монет заработано активностью за всё время.') +
+      '</div><div class="tiny muted" style="margin-top:6px">' + esc(report.xp_coins_note || '') +
+      '</div></div>' +
+    '<details class="panel"><summary><b>Последние операции · ' +
+      (report.transactions || []).length + '</b></summary><div style="margin-top:10px">' +
+      transactionRows + '</div></details>' +
+    (report.log_at_capacity ? '<div class="warn-note">Журнал достиг лимита; самые старые операции уже удалены.</div>' : '');
+}
 
 async function renderMore() {
   const box = $("scr-more");
@@ -3179,6 +3378,7 @@ async function renderMore() {
     // all is the server's answer, never a guess from the client -- and every route behind
     // it re-checks, so a hand-typed moreView cannot open anything.
     if (S && S.is_admin) menu.push("review:" + (S.pending_quests ? "🔴 " : "") + "🛡 Проверка квестов");
+    if (S && S.is_economy_admin) menu.push("moneyaudit:🕵️ Денежный аудит");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -3216,6 +3416,10 @@ async function renderMore() {
     body = questBoard(await api("/api/quests"));
   } else if (moreView === "review") {
     body = reviewQueue(await api("/api/quests/review"));
+  } else if (moreView === "moneyaudit") {
+    const query = "?hours=" + encodeURIComponent(auditHours) +
+      (auditUser ? "&user_id=" + encodeURIComponent(auditUser) : "");
+    body = economyAudit(await api("/api/economy/audit" + query));
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -4159,7 +4363,7 @@ document.addEventListener("click", async (event) => {
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
-    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset]");
+    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]");
   if (!target) return;
   const d = target.dataset;
 
@@ -4178,6 +4382,11 @@ document.addEventListener("click", async (event) => {
     const code = d.liveskillset.slice(split + 1);
     closeSheet();
     await act("set_skill", { slot, code });
+    return;
+  }
+  if (d.audithours) {
+    auditHours = Number(d.audithours) || 24;
+    render();
     return;
   }
 
@@ -4311,6 +4520,12 @@ document.addEventListener("click", async (event) => {
 // The reward editor commits on blur/enter rather than on every keystroke -- one number
 // typed is several intermediate numbers, and each would be a saved edit to a live economy.
 document.addEventListener("change", async (event) => {
+  const audit = event.target.closest("[data-audituser]");
+  if (audit) {
+    auditUser = audit.value;
+    render();
+    return;
+  }
   const input = event.target.closest("[data-reward]");
   if (!input) return;
   await questCall("/api/quests/config", {
@@ -4370,6 +4585,11 @@ refresh().then(() => {
   if (START_VIEW === "review" && S && S.is_admin) {
     TAB = "more";
     moreView = "review";
+    render();
+  }
+  if (START_VIEW === "economy" && S && S.is_economy_admin) {
+    TAB = "more";
+    moreView = "moneyaudit";
     render();
   }
   ticker = setInterval(tick, TIMER_TICK_MS);

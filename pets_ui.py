@@ -121,7 +121,7 @@ def _name(pet: dict) -> str:
 
 def main_view(
     entry: str, user_id, xp: int, webapp_url: str | None = None, quest_mod: bool = False,
-    quest_pending: int = 0,
+    quest_pending: int = 0, finance_admin: bool = False,
 ) -> tuple[str, dict]:
     """The landing screen. Deliberately shows the whole state of the account in six lines
     -- cage, creature, level, coins, fights left -- because every other screen is one tap
@@ -228,6 +228,14 @@ def main_view(
         rows.append([{
             "text": f"{pending_marker}🛡 Модераторы квестов",
             "callback_data": callback_data(user_id, "questmods"),
+        }])
+    if finance_admin and webapp_url:
+        # A graph belongs in the Mini App, but its entry should also be reachable from
+        # the Telegram menu admins already use. The web route independently re-checks
+        # the financial-admin gate before returning a single transaction.
+        rows.append([{
+            "text": "🕵️ Денежный аудит",
+            "web_app": {"url": f"{webapp_url}?view=economy"},
         }])
     rows.append([
         {"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")},
