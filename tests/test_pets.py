@@ -236,18 +236,36 @@ class CageAndTamingTests(PetsTestCase):
 
 
 class StatUpgradeTests(PetsTestCase):
-    def test_upgrade_stat_at_max_level_refuses(self):
+    def test_upgrade_stat_has_no_level_ceiling(self):
         entry = "chat"
         self._tame(entry, "1")
         data = pets._load(entry)
-        data["pets"]["1"]["stats"]["strength"] = pets_config.STAT_MAX_LEVEL
+        data["pets"]["1"]["stats"]["strength"] = 80
         pets._save(entry, data)
         economy.grant(entry, "1", 100_000, "test")
 
         ok, msg, spent = pets.upgrade_stat(entry, "1", 0, "strength", times=1)
-        self.assertFalse(ok)
-        self.assertEqual(spent, 0)
-        self.assertEqual(pets.stat_level(entry, "1", "strength"), pets_config.STAT_MAX_LEVEL)
+        self.assertTrue(ok, msg)
+        self.assertEqual(spent, pets_config.stat_upgrade_cost(80))
+        self.assertEqual(pets.stat_level(entry, "1", "strength"), 81)
+
+    def test_endurance_is_saved_but_does_not_change_power_yet(self):
+        entry = "endurance"
+        self._tame(entry, "1")
+        legacy = pets._load(entry)
+        legacy["pets"]["1"]["stats"].pop("endurance")
+        pets._save(entry, legacy)
+        self.assertEqual(
+            pets.get_pet(entry, "1")["stats"]["endurance"], pets_config.STAT_MIN_LEVEL,
+        )
+        before = pets.power_rating(entry, "1")
+        economy.grant(entry, "1", 100, "test")
+        ok, message, _spent = pets.upgrade_stat(entry, "1", 0, "endurance", times=10)
+        self.assertTrue(ok, message)
+        self.assertEqual(pets.stat_level(entry, "1", "endurance"), 11)
+        self.assertEqual(pets.power_rating(entry, "1"), before)
+        self.assertIn("Выносливость", pets_ui.train_view(entry, "1", 0)[0])
+        self.assertIn("эффект появится позже", pets_ui.train_view(entry, "1", 0)[0])
 
     def test_upgrade_stat_times_charges_the_sum_of_steps_not_a_flat_multiple(self):
         entry = "chat"
@@ -1521,7 +1539,7 @@ class RecordFightTests(PetsTestCase):
         self._tame(entry, "2", "Defender")
         result = SimpleNamespace(winner="1", loser="2")
         base = pets_config.DROP_CHANCE
-        lucky = base * pets_config.luck_drop_multiplier(pets_config.STAT_MAX_LEVEL)
+        lucky = base * pets_config.luck_drop_multiplier(80)
         self.assertGreater(lucky, base)
 
         # A roll that lands between the two thresholds drops for a lucky pet and not for
@@ -1533,7 +1551,7 @@ class RecordFightTests(PetsTestCase):
         self.assertIsNone(outcome.get("dropped_item"))
 
         data = pets._load(entry)
-        data["pets"]["1"]["stats"]["luck"] = pets_config.STAT_MAX_LEVEL
+        data["pets"]["1"]["stats"]["luck"] = 80
         pets._save(entry, data)
         with patch("random.random", return_value=between), \
              patch("random.randint", return_value=pets_config.WIN_GOLD_MAX):
@@ -2476,7 +2494,7 @@ class FarmTests(PetsTestCase):
 
         data = pets._load(entry)
         run_luck = data["pets"]["1"]["farm_run"]["luck"]
-        data["pets"]["1"]["stats"]["luck"] = pets_config.STAT_MAX_LEVEL
+        data["pets"]["1"]["stats"]["luck"] = 80
         pets._save(entry, data)
         self.assertEqual(run_luck, pets_config.STAT_MIN_LEVEL)
 

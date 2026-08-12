@@ -156,6 +156,12 @@ def _load(entry: str) -> dict:
     for record in data["pets"].values():
         if not isinstance(record, dict):
             continue
+        purchased_stats = record.get("stats")
+        if not isinstance(purchased_stats, dict):
+            purchased_stats = {}
+            record["stats"] = purchased_stats
+        for key in C.STAT_KEYS:
+            purchased_stats.setdefault(key, C.STAT_MIN_LEVEL)
         inventory = record.get("inventory")
         if not isinstance(inventory, list):
             inventory = []
@@ -1790,8 +1796,6 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
 
     name = C.STAT_NAMES[stat]
     level = record["stats"].get(stat, C.STAT_MIN_LEVEL)
-    if level >= C.STAT_MAX_LEVEL:
-        return False, f"{name} уже прокачан(а) до максимума ({C.STAT_MAX_LEVEL}).", 0
 
     # Costs climb with level (see pets_config.stat_upgrade_cost), so N levels is NOT
     # N * cost -- walk the individual steps and stop the moment the running total would
@@ -1801,7 +1805,7 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
     bought = 0
     total_cost = 0
     reached_level = level
-    while bought < times and reached_level < C.STAT_MAX_LEVEL:
+    while bought < times:
         step_cost = C.stat_upgrade_cost(reached_level)
         if total_cost + step_cost > current_balance:
             break
@@ -1824,11 +1828,6 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
 
     if bought == times:
         message = f"{name} прокачан(а) до {reached_level} уровня. Потрачено {total_cost} монет."
-    elif reached_level >= C.STAT_MAX_LEVEL:
-        message = (
-            f"{name} прокачан(а) до максимума ({reached_level}). "
-            f"Куплено {bought} из {times} уровней, потрачено {total_cost} монет."
-        )
     else:
         message = (
             f"Хватило золота только на {bought} из {times} уровней {name} "

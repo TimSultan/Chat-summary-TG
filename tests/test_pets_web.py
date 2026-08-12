@@ -146,9 +146,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # test and not just noise (see the placeholder-reason tests below).
         self.logs: list[str] = []
         self.quest_feedback: list[tuple] = []
+        self.quest_completions: list[dict] = []
 
         async def quest_feedback(user_id, title, note):
             self.quest_feedback.append((str(user_id), title, note))
+
+        async def quest_completion(row):
+            self.quest_completions.append(dict(row))
 
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
@@ -159,6 +163,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 resolve_player=resolve_player,
                 fetch_photo=fetch_photo, save_photo=save_photo,
                 quest_feedback=quest_feedback,
+                quest_completion=quest_completion,
                 log=self.logs.append,
             ),
         )
@@ -839,7 +844,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         code = board["quest"]["code"]
         self.assertTrue(quests.submit(
             CHAT, PLAYER["id"], code, chat_id=-1001234567890, message_id=777,
-            author_name="Player")[0])
+            photo_file_id="quest-photo", author_name="Player")[0])
 
         queue = await (await self._get("/api/quests/review", MODERATOR)).json()
         self.assertEqual(len(queue["rows"]), 1)
@@ -857,6 +862,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         paid = answer["receipt"]
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + paid["gold"])
         self.assertEqual(pets.farm_tickets(CHAT, PLAYER["id"]), paid["tickets"])
+        self.assertEqual(len(self.quest_completions), 1)
+        self.assertEqual(self.quest_completions[0]["user_id"], str(PLAYER["id"]))
+        self.assertEqual(self.quest_completions[0]["message_id"], 777)
+        self.assertEqual(self.quest_completions[0]["photo_file_id"], "quest-photo")
+        self.assertEqual(self.quest_completions[0]["hashtag"], "#quest_" + code)
 
         again = await (await self.client.post(
             pets_web.ROUTE_PREFIX + "/api/quests/review",
@@ -865,6 +875,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(again["ok"])
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + paid["gold"])
         self.assertEqual(pets.farm_tickets(CHAT, PLAYER["id"]), paid["tickets"])
+        self.assertEqual(len(self.quest_completions), 1)
         self.assertEqual((await (await self._get("/api/quests/review", MODERATOR)).json())["rows"], [])
 
     async def test_rejection_needs_a_reason_sends_it_to_the_player_and_ideas_reach_review(self):

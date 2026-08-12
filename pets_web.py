@@ -72,6 +72,7 @@ _RESOLVE_KEY = web.AppKey("pets_resolve_player")
 _FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
 _SAVE_PHOTO_KEY = web.AppKey("pets_save_photo")
 _QUEST_FEEDBACK_KEY = web.AppKey("pets_quest_feedback")
+_QUEST_COMPLETION_KEY = web.AppKey("pets_quest_completion")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
 
@@ -540,11 +541,9 @@ def _stat_payload(entry: str, user_id, record: dict) -> list[dict]:
             "effective": level,
             "bonus": level - base,
             "max": C.STAT_MAX_LEVEL,
-            "cost_1": C.stat_upgrade_cost(base) if base < C.STAT_MAX_LEVEL else None,
-            "cost_10": (
-                C.total_stat_cost(min(base + 10, C.STAT_MAX_LEVEL), base)
-                if base < C.STAT_MAX_LEVEL else None
-            ),
+            "cost_1": C.stat_upgrade_cost(base),
+            "cost_10": C.total_stat_cost(base + 10, base),
+            "pending_effect": key == "endurance",
         })
     rows.append({
         "key": "armor",
@@ -1465,15 +1464,18 @@ async def handle_quest_review(request: web.Request) -> web.Response:
         + (f", paid {receipt.get('gold')} gold / {receipt.get('xp')} xp"
            f" / {receipt.get('tickets')} ticket(s), drop {receipt.get('item')}" if receipt else "")
     )
-    if ok and not accept and queued is not None:
+    if ok and queued is not None:
         try:
-            await request.app[_QUEST_FEEDBACK_KEY](
-                queued["user_id"], queued.get("title") or queued.get("code"),
-                str(body.get("note") or "").strip(),
-            )
+            if accept:
+                await request.app[_QUEST_COMPLETION_KEY](queued)
+            else:
+                await request.app[_QUEST_FEEDBACK_KEY](
+                    queued["user_id"], queued.get("title") or queued.get("code"),
+                    str(body.get("note") or "").strip(),
+                )
         except Exception:
             request.app[_LOG_KEY](
-                "[pets_web] failed to send quest rejection feedback:\n" + traceback.format_exc()
+                "[pets_web] failed to send quest verdict DM:\n" + traceback.format_exc()
             )
     return _ok({"ok": ok, "message": message, "receipt": _jsonable(receipt)})
 
@@ -1577,6 +1579,10 @@ async def _default_quest_feedback(user_id, title: str, note: str):
     return None
 
 
+async def _default_quest_completion(row: dict):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
@@ -1587,6 +1593,7 @@ def attach(
     fetch_photo=None,
     save_photo=None,
     quest_feedback=None,
+    quest_completion=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
@@ -1616,6 +1623,7 @@ def attach(
     app[_FETCH_PHOTO_KEY] = fetch_photo or _default_fetch_photo
     app[_SAVE_PHOTO_KEY] = save_photo or _default_save_photo
     app[_QUEST_FEEDBACK_KEY] = quest_feedback or _default_quest_feedback
+    app[_QUEST_COMPLETION_KEY] = quest_completion or _default_quest_completion
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     app.add_routes([
@@ -2183,13 +2191,13 @@ function clock(seconds) {
   const h = Math.floor(minutes / 60), m = minutes % 60;
   return h ? h + " ч " + m + " мин" : m + " мин";
 }
-const STAT_ICON = { strength: "⚔️", health: "❤️", agility: "💨", luck: "🍀", armor: "🛡" };
+const STAT_ICON = { strength: "⚔️", health: "❤️", agility: "💨", luck: "🍀", endurance: "🫁", armor: "🛡" };
 const STAT_NAME = { strength: "Сила", health: "Здоровье", agility: "Ловкость",
-                    luck: "Удача", armor: "Броня" };
+                    luck: "Удача", endurance: "Выносливость", armor: "Броня" };
 
 function bonusText(bonuses) {
   const parts = [];
-  for (const key of ["strength", "health", "agility", "luck", "armor"]) {
+  for (const key of ["strength", "health", "agility", "luck", "endurance", "armor"]) {
     const value = bonuses[key];
     if (!value) continue;
     parts.push((STAT_ICON[key] || key) + (value > 0 ? "+" : "") + value);
@@ -2343,9 +2351,10 @@ function statRow(stat) {
             (affordable(stat.cost_1) ? "" : " disabled") + ">+1 · " + money(stat.cost_1) + "</button>" +
           '<button class="plus" data-up="' + stat.key + '" data-times="10"' +
             (affordable(stat.cost_10) ? "" : " disabled") + ">+10 · " + money(stat.cost_10) + "</button>");
+  const pending = stat.pending_effect ? ' <span class="tiny muted">эффект позже</span>' : "";
   return '<div class="statrow"><div class="lbl">' +
     (STAT_ICON[stat.key] || "") + " <b>" + esc(stat.name) + "</b> " +
-    '<span class="muted small">' + stat.purchased + "</span> → <b>" + stat.effective + "</b>" + bonus +
+    '<span class="muted small">' + stat.purchased + "</span> → <b>" + stat.effective + "</b>" + bonus + pending +
     "</div>" + buttons + "</div>";
 }
 
@@ -3051,7 +3060,7 @@ function openItem(code) {
 
   const wornHere = (S.equipment.find((s) => s.slot === item.slot) || {}).item;
   const deltas = [];
-  for (const key of ["strength", "health", "agility", "luck", "armor"]) {
+  for (const key of ["strength", "health", "agility", "luck", "endurance", "armor"]) {
     const change = (item.bonuses[key] || 0) - ((wornHere && wornHere.bonuses[key]) || 0);
     if (change) deltas.push('<span class="' + (change > 0 ? "gain" : "loss") + '">' +
       (STAT_ICON[key] || key) + " " + (change > 0 ? "+" : "") + change + "</span>");
@@ -3105,7 +3114,7 @@ function openSlot(slotKey) {
   const delta = (item) => {
     // Against what is worn right now, because that is the actual trade being considered.
     const parts = [];
-    for (const key of ["strength", "health", "agility", "luck", "armor"]) {
+    for (const key of ["strength", "health", "agility", "luck", "endurance", "armor"]) {
       const change = (item.bonuses[key] || 0) - ((worn && worn.bonuses[key]) || 0);
       if (change) parts.push('<span class="' + (change > 0 ? "gain" : "loss") + '">' +
         (STAT_ICON[key] || key) + (change > 0 ? "+" : "") + change + "</span>");

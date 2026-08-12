@@ -789,6 +789,7 @@ def pending(entry: str) -> list[dict]:
         row["technique"] = text.get("technique", "")
         row["hint"] = text.get("hint", "")
         row["proof"] = text.get("proof", "")
+        row["hashtag"] = catalog.hashtag(row.get("code"))
         row["reward"] = rewards_for(entry, row.get("difficulty", 1), data)
     return rows
 

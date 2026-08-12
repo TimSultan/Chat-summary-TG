@@ -211,6 +211,25 @@ class PetsCommandTests(unittest.TestCase):
             ))
         return api
 
+    def test_accepted_quest_is_returned_to_the_player_with_photo_text_tag_and_praise(self):
+        api = FakeApi()
+        row = {
+            "user_id": str(PLAYER["id"]), "photo_file_id": "submitted-photo",
+            "title": "Покрась героя", "subject": "Покрась новую миниатюру.",
+            "technique": "Добавь аккуратные высветления.", "hint": "Не спеши.",
+            "proof": "Покажи готовую работу.", "hashtag": "#quest_hero",
+        }
+        _run(bot_listener._send_quest_completion(api, row, log=lambda *_: None))
+
+        self.assertEqual(len(api.photos), 1)
+        sent = api.photos[0]
+        self.assertEqual(sent["chat_id"], str(PLAYER["id"]))
+        self.assertEqual(sent["photo"], "submitted-photo")
+        self.assertIn("Покрась новую миниатюру", sent["caption"])
+        self.assertIn("#quest_hero", sent["caption"])
+        self.assertIn("Отличная работа", sent["caption"])
+        self.assertLessEqual(len(sent["caption"]), 1024)
+
     def test_every_menu_action_renders_instead_of_erroring(self):
         """A guard for the whole callback table, not one button.
 

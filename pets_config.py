@@ -175,8 +175,8 @@ def farm_xp_for(level: int, hours: int, xp_multiplier: float = 1.0) -> int:
 
 # ---------------------------------------------------------------------- stat upgrades
 # cost(L -> L+1) = round(STAT_COST_BASE * L ** STAT_COST_EXPONENT), so the first point
-# costs exactly 1 gold ("каждый поинт стоит 1 голды") and the 79th costs 189. The
-# exponent is the single knob: 1.0 is linear and cheap, 1.5 makes level 80 a fantasy.
+# costs exactly 1 gold ("каждый поинт стоит 1 голды"). There is no level ceiling; the
+# exponent is the single knob that makes each next point progressively more expensive.
 #
 #     exponent   1 stat -> 40   1 stat -> 80   3 stats -> 80
 #     1.0                 780          3,160           9,480
@@ -185,22 +185,24 @@ def farm_xp_for(level: int, hours: int, xp_multiplier: float = 1.0) -> int:
 #     1.5               4,005         22,557          67,671
 
 STAT_MIN_LEVEL = 1
-STAT_MAX_LEVEL = 80
+STAT_MAX_LEVEL = None
 STAT_COST_BASE = 1.0
 STAT_COST_EXPONENT = 1.2
 
-STAT_KEYS = ("strength", "health", "agility", "luck")
+STAT_KEYS = ("strength", "health", "agility", "luck", "endurance")
 STAT_NAMES = {
     "strength": "Сила",
     "health": "Здоровье",
     "agility": "Ловкость",
     "luck": "Удача",
+    "endurance": "Выносливость",
 }
 STAT_EMOJI = {
     "strength": "⚔️",
     "health": "❤️",
     "agility": "💨",
     "luck": "🍀",
+    "endurance": "🫁",
 }
 # Armor is NOT purchasable -- it exists only on equipment, which is what makes the
 # inventory worth having rather than a second stat screen.
@@ -210,7 +212,7 @@ ARMOR_EMOJI = "🛡"
 
 def stat_upgrade_cost(level: int) -> int:
     """Gold to go from `level` to `level + 1`. Never free, never fractional."""
-    if level < STAT_MIN_LEVEL or level >= STAT_MAX_LEVEL:
+    if level < STAT_MIN_LEVEL:
         return 0
     return max(1, round(STAT_COST_BASE * level ** STAT_COST_EXPONENT))
 
@@ -326,6 +328,9 @@ POWER_RATING_WEIGHTS = {
     "health": 4,
     "agility": 2,
     "luck": 2,
+    # Reserved for its future mechanic. Buying it must not distort matchmaking before
+    # it changes an actual combat value.
+    "endurance": 0,
     "armor": 3,
 }
 OPPONENT_POWER_WINDOW = 125

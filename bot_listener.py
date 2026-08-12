@@ -5694,6 +5694,39 @@ async def _send_pets_view(
         log(f"[pets] failed to send a view:\n{traceback.format_exc()}")
 
 
+def _quest_completion_caption(row: dict) -> str:
+    """Build a player-facing receipt that fits Telegram's photo-caption limit."""
+    title = str(row.get("title") or row.get("code") or "Квест")
+    details = [str(row.get(key) or "").strip()
+               for key in ("subject", "technique", "hint", "proof")]
+    body = "\n".join(part for part in details if part)
+    hashtag = str(row.get("hashtag") or "").strip()
+    heading = f"🎉 Отличная работа! Квест «{title}» выполнен и принят."
+    ending = f"\n\n{hashtag}\nТак держать! 💪" if hashtag else "\n\nТак держать! 💪"
+    # Telegram counts astral emoji as two UTF-16 units. Staying below the documented
+    # 1024-character cap leaves enough headroom for those surrogate pairs.
+    available = max(0, 1000 - len(heading) - len(ending) - 2)
+    if len(body) > available:
+        body = body[:max(0, available - 1)].rstrip() + "…"
+    return heading + (f"\n\n{body}" if body else "") + ending
+
+
+async def _send_quest_completion(api, row: dict, log=print) -> None:
+    """Return an accepted work and its assignment to the author in the bot DM."""
+    try:
+        caption = _quest_completion_caption(row)
+        if row.get("photo_file_id"):
+            await api.send_photo(
+                row["user_id"], row["photo_file_id"], caption=caption, parse_mode=None,
+            )
+        else:
+            await api.send_message(row["user_id"], caption, parse_mode=None)
+    except Exception:
+        # A player may not have opened the bot's DM. The verdict and reward are already
+        # durable, so a blocked notification must never undo acceptance.
+        log(f"[pets] failed to send completed quest:\n{traceback.format_exc()}")
+
+
 async def handle_pets_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -6257,10 +6290,12 @@ async def handle_pets_callback(
                 )
                 return
             if action == "questaccept":
-                _ok, note, _receipt = quests.review(
+                accepted, note, _receipt = quests.review(
                     entry, argument, user_id, True,
                     reviewer_name=_display_name(actor),
                 )
+                if accepted:
+                    await _send_quest_completion(api, submission, log)
                 await _pets_toast_and_redraw(
                     api, chat_id, message_id, note,
                     pets_ui.quest_review_view(entry, user_id), log,
@@ -8860,6 +8895,9 @@ async def run_bot_listener(
                         parse_mode=None,
                     )
 
+                async def _send_web_quest_completion(row: dict):
+                    await _send_quest_completion(api, row, log)
+
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
                     is_member=_is_vote_member,
@@ -8869,7 +8907,8 @@ async def run_bot_listener(
                     is_admin=_is_quest_moderator,
                     resolve_player=_resolve_pet_player,
                     fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
-                    quest_feedback=_send_quest_feedback, log=log,
+                    quest_feedback=_send_quest_feedback,
+                    quest_completion=_send_web_quest_completion, log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token

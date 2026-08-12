@@ -291,7 +291,8 @@ def info_view(user_id) -> tuple[str, dict]:
     lines.append(
         "Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. "
         "Удача повышает шанс крита и шанс найти вещь — в бою и на ферме "
-        f"(до +{round(C.LUCK_DROP_BONUS_MAX * 100)}% на максимуме)."
+        f"(до +{round(C.LUCK_DROP_BONUS_MAX * 100)}%). "
+        "Выносливость уже можно прокачивать, её особый эффект появится позже."
     )
     lines.append("\n<b>Особые преимущества</b>")
     lines.append(
@@ -1024,10 +1025,11 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # The effective value differs from the purchased level by the pet's own level and
         # its gear, so both are printed: one is what was paid for, the other is what
         # actually fights.
-        lines.append(
-            f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]}: {level}"
-            f" <i>(в бою {effective.get(key, level)})</i>"
+        detail = (
+            "эффект появится позже" if key == "endurance"
+            else f"в бою {effective.get(key, level)}"
         )
+        lines.append(f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]}: {level} <i>({detail})</i>")
     lines.append(f"{C.ARMOR_EMOJI} {C.ARMOR_NAME}: {effective.get('armor', 0)} <i>(из снаряжения)</i>")
     # Luck is the one stat whose payoff is invisible in a fight log, so its current find
     # bonus is spelled out where the points are actually bought.
@@ -1037,30 +1039,23 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         " — и в бою, и на ферме."
     )
     lines.append(f"\n🪙 Монеты: {_money(coins)}")
-    lines.append(f"\n<i>Уровни: {C.STAT_MIN_LEVEL}–{C.STAT_MAX_LEVEL}. Чем выше, тем дороже следующий пункт.</i>")
+    lines.append("\n<i>Максимального уровня нет. Чем выше, тем дороже следующий пункт.</i>")
 
     rows = []
     for key in C.STAT_KEYS:
         level = levels.get(key, C.STAT_MIN_LEVEL)
-        if level >= C.STAT_MAX_LEVEL:
-            rows.append([{
-                "text": f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]} — максимум",
-                "callback_data": callback_data(user_id, "noop"),
-            }])
-            continue
         one = C.stat_upgrade_cost(level)
-        ten = C.total_stat_cost(min(level + 10, C.STAT_MAX_LEVEL), level)
+        ten = C.total_stat_cost(level + 10, level)
         row = [{
             "text": f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]} +1 — {_money(one)}",
             "callback_data": callback_data(user_id, "up", key),
         }]
         # The +10 button is not a discount, just fewer taps: it charges the sum of the ten
         # individual steps, and buys as many as the wallet reaches.
-        if level + 1 < C.STAT_MAX_LEVEL:
-            row.append({
-                "text": f"+10 — {_money(ten)}",
-                "callback_data": callback_data(user_id, "up10", key),
-            })
+        row.append({
+            "text": f"+10 — {_money(ten)}",
+            "callback_data": callback_data(user_id, "up10", key),
+        })
         rows.append(row)
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
