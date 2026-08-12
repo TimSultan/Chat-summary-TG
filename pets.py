@@ -93,6 +93,7 @@ def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "rubies": {},
+        "storefront_sales": {},
         "economy_metrics": _new_economy_metrics(),
     }
 
@@ -134,6 +135,21 @@ def _load(entry: str) -> dict:
         data["farm_tickets"] = {}
     if not isinstance(data.setdefault("rubies", {}), dict):
         data["rubies"] = {}
+    sales = data.setdefault("storefront_sales", {})
+    if not isinstance(sales, dict):
+        data["storefront_sales"] = {}
+    else:
+        try:
+            window = int(sales.get("window"))
+        except (TypeError, ValueError):
+            window = None
+        codes = sales.get("codes")
+        data["storefront_sales"] = (
+            {"window": window, "codes": list(dict.fromkeys(
+                code for code in codes if isinstance(code, str)
+            ))}
+            if window is not None and isinstance(codes, list) else {}
+        )
     _economy_metrics(data)
     # Older saves used an append-only list.  Accept their duplicates while reading,
     # then expose a canonical unique inventory to every game operation.
@@ -355,8 +371,12 @@ def _weapon_owner_ids(data: dict, code: str) -> list[str]:
 
 
 def _daily_storefront_weapons(data: dict, entry: str, day: date | datetime | str | None = None):
+    moment = day or app_now()
+    sales = data.get("storefront_sales") or {}
+    sold_codes = set(sales.get("codes") or []) \
+        if sales.get("window") == C.storefront_window(moment) else set()
     return C.daily_storefront_weapons(
-        entry, day or app_now(), excluded_codes=_owned_weapon_codes(data),
+        entry, moment, excluded_codes=_owned_weapon_codes(data) | sold_codes,
     )
 
 
@@ -1930,6 +1950,7 @@ def pet_leaderboard(entry: str) -> list[dict]:
 
 def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
     data = _load(entry)
+    moment = app_now()
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
@@ -1945,7 +1966,7 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         if owners:
             return False, f"«{item.name}» уже принадлежит другому игроку."
     if item.slot == "weapon" and item.code not in {
-        offered.code for offered in _daily_storefront_weapons(data, entry, app_now())
+        offered.code for offered in _daily_storefront_weapons(data, entry, moment)
     }:
         return False, "Этого оружия сейчас нет на витрине. Она меняется каждые 12 часов."
     if item.code in record["inventory"]:
@@ -1955,6 +1976,15 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         return False, f"Нужно {item.price} монет, у тебя {balance}."
     record["inventory"].append(item.code)
     _discover(record, item.code)
+    if item.slot == "weapon":
+        window = C.storefront_window(moment)
+        sales = data.get("storefront_sales") or {}
+        if sales.get("window") != window:
+            sales = {"window": window, "codes": []}
+            data["storefront_sales"] = sales
+        sold = sales.setdefault("codes", [])
+        if item.code not in sold:
+            sold.append(item.code)
     _save(entry, data)
     return True, f"Куплено: «{item.name}» за {item.price} монет."
 

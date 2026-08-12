@@ -38,9 +38,9 @@ def test_first_three_ids_preserve_legacy_identity_and_descriptions():
     """
     assert [(weapon.code, weapon.name, weapon.source, weapon.price, dict(weapon.bonuses), weapon.description)
             for weapon in catalogue.WEAPON_SPECS[:3]] == [
-        ("w001", "Мамин тапок", "shop", 10, {"strength": 6},
+        ("w001", "Мамин тапок", "shop", 60, {"strength": 6},
          "Летит точнее, чем кажется."),
-        ("w002", "Мамина сковородка", "shop", 65,
+        ("w002", "Мамина сковородка", "shop", 100,
          {"strength": 14, "luck": 4},
          "После неё спор окончен."),
         ("w003", "Старый компрессор", "drop", 0,
@@ -98,8 +98,8 @@ def test_sources_prices_and_bonuses_are_sensible_for_the_current_combat_scale():
 
 def test_shop_prices_match_fight_income_and_actual_combat_power():
     expected_bands = {
-        "common": (10, 20),
-        "uncommon": (55, 75),
+        "common": (60, 75),
+        "uncommon": (85, 105),
         "rare": (160, 195),
     }
     for rarity, (minimum, maximum) in expected_bands.items():

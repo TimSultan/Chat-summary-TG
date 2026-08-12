@@ -83,9 +83,8 @@ LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 FARM_MAX_LEVEL = 10
 # FARM_DURATION_HOURS is kept as the balance ANCHOR, not a default a player is steered
 # toward: FARM_GOLD_PER_RUN/FARM_XP_PER_RUN/FARM_DROP_CHANCE_BY_HOURS are all stated "per
-# six hours", the STARTER_WEAPON_MAX_PRICE invariant below is checked against exactly this
-# number, and any farm_run persisted before this feature shipped never recorded an explicit
-# hours field -- it was always exactly six, so that is what a missing field still means.
+# six hours", and any farm_run persisted before this feature shipped never recorded an
+# explicit hours field -- it was always exactly six, so that is what a missing field means.
 FARM_DURATION_HOURS = 6
 FARM_MIN_HOURS = 1
 FARM_MAX_HOURS = 8
@@ -116,8 +115,7 @@ FARM_UPGRADE_COSTS = (10, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
 # farm they paid for, they just end up having paid today's price for it.
 FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # Six-hour REFERENCE payouts -- see farm_gold_for/farm_xp_for for how an actual `hours`
-# length is derived from them. Kept as the anchor rather than rescaled per-hour so
-# STARTER_WEAPON_MAX_PRICE below stays a meaningful, stated-once number.
+# length is derived from them. Kept as the anchor rather than rescaled per-hour.
 FARM_GOLD_PER_RUN = (0, 14, 16, 18, 20, 22, 24, 26, 28, 30, 33)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
 # Index = hours. Long shifts are now the farm's deliberate loot route: eight hours reaches
@@ -546,7 +544,7 @@ class Item:
 # below), stick/fork/bone are entirely REPLACED by w001/w002/w003 (their weapon-slot
 # entries get filtered out of ITEMS), LEGACY_ITEM_CODES redirects find_item() there, and
 # the prices below matter only for the degraded no-catalogue-module fallback. They are
-# kept numerically identical to w001/w002's real catalogue prices (10/65) so that
+# kept numerically identical to w001/w002's real catalogue prices (60/100) so that
 # fallback path can never regress to the pre-rebalance 250/900 economy.
 #
 # The six accessories (bead/acorn/mittens/claws/slippers/springs) are NOT replaced by
@@ -564,23 +562,23 @@ class Item:
 ITEMS = (
     # power 24 (str 6*4) -- the common floor. Identical shape to w001 ("+6 strength,
     # nothing else"), so the price matches w001's real catalogue price exactly.
-    Item("stick", "Кисть-щетина №8", "weapon", 10, "shop", {"strength": 6},
+    Item("stick", "Кисть-щетина №8", "weapon", 60, "shop", {"strength": 6},
         "Жёсткая, уверенная, для смелых мазков."),
     # power 64 (str 14*4 + luck 4*2) -- uncommon band. Identical shape to w002, same price.
-    Item("fork", "Аэрограф Harder & Steenbeck", "weapon", 65, "shop", {"strength": 14, "luck": 4},
+    Item("fork", "Аэрограф Harder & Steenbeck", "weapon", 100, "shop", {"strength": 14, "luck": 4},
         "Ровный факел краски и немного магии в триггере."),
     Item("bone", "Компрессор старого мастера", "weapon", 0, "drop", {"strength": 20, "agility": -3},
         "Тяжёлый, гудит и выдаёт идеальное давление."),
     # power 16 (luck 8*2) -- below even the weakest generated common weapon (24), so it
-    # sits at shop_price_for_bonuses' common floor: 10.
-    Item("bead", "Флакон Nuln Oil", "amulet", 10, "shop", {"luck": 8},
+    # sits at shop_price_for_bonuses' common floor: 60.
+    Item("bead", "Флакон Nuln Oil", "amulet", 60, "shop", {"luck": 8},
         "Одна капля на модель, другая непременно на стол."),
     # power 52 (luck 16*2 + health 5*4) lands inside the uncommon weapon band (52-74) --
     # was the second-worst offender at 1,100, over fifty times its actual combat weight.
-    Item("acorn", "Набор Scale75 Artist", "amulet", 55, "shop", {"luck": 16, "health": 5},
+    Item("acorn", "Набор Scale75 Artist", "amulet", 85, "shop", {"luck": 16, "health": 5},
         "Пигмент настолько плотный, что вдохновляет на подвиги.", rarity="uncommon"),
     # power 60 (armor 20*3) -- squarely uncommon, same tier and price as springs below.
-    Item("mittens", "Нитриловые перчатки", "gloves", 65, "shop", {"armor": 20},
+    Item("mittens", "Нитриловые перчатки", "gloves", 95, "shop", {"armor": 20},
         "Защищают лапы от краски, грунта и внезапных проливов.", rarity="uncommon"),
     # power 95 (agility 10*2 + armor 25*3) lands inside the rare weapon band (86-116) --
     # the worst offender at the old 1,000; now priced like the shop's other aspirational
@@ -588,10 +586,10 @@ ITEMS = (
     Item("claws", "Перчатки сухой кисти", "gloves", 170, "shop", {"agility": 10, "armor": 25},
         "Пыльные, ловкие и привычные к самым острым граням.", rarity="rare"),
     # power 14 (agility 7*2) -- below the common floor, same as bead.
-    Item("slippers", "Тапки из малярного скотча", "boots", 10, "shop", {"agility": 7},
+    Item("slippers", "Тапки из малярного скотча", "boots", 60, "shop", {"agility": 7},
         "Лёгкие и липкие: ни одна база не убежит."),
     # power 60 (agility 15*2 + armor 10*3) -- uncommon, same tier and price as mittens.
-    Item("springs", "Ботинки с банками Vallejo", "boots", 65, "shop", {"agility": 15, "armor": 10},
+    Item("springs", "Ботинки с банками Vallejo", "boots", 95, "shop", {"agility": 15, "armor": 10},
         "Шуршат шариками внутри и ускоряют путь к столу.", rarity="uncommon"),
 )
 
@@ -643,13 +641,6 @@ if _RAW_WEAPON_ITEMS:
     _codes = [item.code for item in _catalogue_weapons]
     if len(set(_codes)) != len(_codes):
         raise ValueError("weapon catalogue contains duplicate item codes")
-    # Checked against the six-hour REFERENCE payout, not against whatever the shortest
-    # 1 h shift would pay (FARM_DURATION_BONUS makes that deliberately less). The promise
-    # this protects is narrower than it used to read: a level-1 farm's six-hour shift can
-    # always afford the daily starter weapon, even before any passive gold is collected --
-    # a 1-4 h shift may need to be repeated, or topped up with passive income, first.
-    if STARTER_WEAPON_MAX_PRICE > FARM_GOLD_PER_RUN[1]:
-        raise ValueError("a reference six-hour level-1 farm shift must afford the daily starter weapon")
     ITEMS = _catalogue_weapons + tuple(item for item in ITEMS if item.slot != "weapon")
 
 _catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)
@@ -800,6 +791,19 @@ STOREFRONT_RARITIES = ("common", "rare")
 DAILY_STOREFRONT_SIZE = STOREFRONT_PER_RARITY * len(STOREFRONT_RARITIES) + 1
 
 
+def storefront_window(day: _date | _datetime | str | None = None) -> int:
+    """Stable identifier for the twelve-hour shop window containing ``day``."""
+    moment = day or _datetime.now()
+    if isinstance(moment, str):
+        try:
+            moment = _datetime.fromisoformat(moment)
+        except ValueError:
+            moment = _date.fromisoformat(moment)
+    if isinstance(moment, _date) and not isinstance(moment, _datetime):
+        moment = _datetime.combine(moment, _datetime.min.time())
+    return moment.date().toordinal() * 2 + moment.hour // STOREFRONT_ROTATION_HOURS
+
+
 def daily_storefront_weapons(
     entry: str,
     day: _date | _datetime | str | None = None,
@@ -811,23 +815,15 @@ def daily_storefront_weapons(
     players opening the shop must all see the same stock.  `day` makes balance tests
     and previews deterministic without changing the server clock.
     """
-    moment = day or _datetime.now()
-    if isinstance(moment, str):
-        try:
-            moment = _datetime.fromisoformat(moment)
-        except ValueError:
-            moment = _date.fromisoformat(moment)
-    if isinstance(moment, _date) and not isinstance(moment, _datetime):
-        moment = _datetime.combine(moment, _datetime.min.time())
-    window = moment.date().toordinal() * 2 + moment.hour // STOREFRONT_ROTATION_HOURS
+    window = storefront_window(day)
     pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
     excluded = excluded_codes or set()
     # The anti-mob weapon is a permanent shop option.  It vanishes only after somebody
     # in the chat has bought it, exactly like the rest of the shared stock.
     hunter = next((item for item in pool if item.code == MOB_HUNTER_WEAPON_CODE), None)
-    rotating_pool = tuple(
-        item for item in pool if item is not hunter and item.code not in excluded
-    )
+    # Choose the window from the full catalogue first. Sold/owned items are filtered only
+    # at the end, so an empty shelf stays empty instead of silently drawing replacements.
+    rotating_pool = tuple(item for item in pool if item is not hunter)
     stock = []
     for rarity in STOREFRONT_RARITIES:
         candidates = [item for item in rotating_pool if item.rarity == rarity]
@@ -835,16 +831,14 @@ def daily_storefront_weapons(
             f"{entry}:{window}:{rarity}:{item.code}".encode("utf-8")
         ).digest())
         stock.extend(candidates[:STOREFRONT_PER_RARITY])
-    if hunter is not None and hunter.code not in excluded:
+    if hunter is not None:
         stock = [hunter, *stock]
-    # The shop is the farm's first tangible reward.  A rotation may otherwise contain
-    # only mid-tier gear, so replace its final slot with an unowned starter item.  The
-    # choice is deterministic per chat/day and does not create a duplicate object.
+    # Keep one weakest-tier weapon in the initially selected window. Exclusions are still
+    # applied afterwards, so buying it leaves a real hole instead of injecting another.
     if stock and not any(item.price <= STARTER_WEAPON_MAX_PRICE for item in stock):
         starters = [
             item for item in pool
-            if item.code not in excluded
-            and item.code not in {offered.code for offered in stock}
+            if item.code not in {offered.code for offered in stock}
             and item.price <= STARTER_WEAPON_MAX_PRICE
         ]
         if starters:
@@ -853,7 +847,7 @@ def daily_storefront_weapons(
             ).digest())
             common_indexes = [i for i, item in enumerate(stock) if item.rarity == "common"]
             stock[common_indexes[-1] if common_indexes else -1] = starter
-    return tuple(stock)
+    return tuple(item for item in stock if item.code not in excluded)
 
 
 def find_item(code: str):

@@ -28,10 +28,10 @@ SOURCES: Final = ("shop", "drop")
 STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
 
 # Shop prices follow the same relative combat weights as the arena power rating.  The
-# entry tier is intentionally cheap enough for a first level-1 farm harvest (14 coins):
-# a player gets a useful choice immediately, while uncommon and rare gear stay goals.
-# Rounding to five keeps larger prices readable and prevents arbitrary catalogue IDs
-# from making two equally strong weapons cost hundreds of coins apart.
+# Three ordinary items can be forged into one rare item, so the ordinary price floor must
+# protect that recipe from becoming a cheaper substitute for the rare shelf. Rounding to
+# five keeps prices readable and prevents arbitrary catalogue IDs from separating items
+# with the same combat power.
 SHOP_PRICE_POWER_WEIGHTS: Final = {
     "strength": 4,
     "health": 4,
@@ -39,13 +39,12 @@ SHOP_PRICE_POWER_WEIGHTS: Final = {
     "luck": 2,
     "armor": 3,
 }
-# A daily shelf must always contain at least one item at or below this cost whenever an
-# unowned starter weapon remains.  It deliberately equals the guaranteed gold from a
-# level-1 farm run; the passive +1/hour is a pleasant extra, never a requirement.
-STARTER_WEAPON_MAX_PRICE: Final = 14
+# The weakest shop weapon anchors the ordinary tier. Three of these cost 180 coins, just
+# above the 160-195 direct rare-weapon band; forging therefore buys variety, not arbitrage.
+STARTER_WEAPON_MAX_PRICE: Final = 60
 MOB_HUNTER_WEAPON_CODE: Final = "w009"
-SHOP_PRICE_RARITY_BASE: Final = {"common": 5, "uncommon": 18, "rare": 55}
-SHOP_PRICE_POWER_MULTIPLIER: Final = {"common": 0.30, "uncommon": 0.75, "rare": 1.20}
+SHOP_PRICE_RARITY_BASE: Final = {"common": 45, "uncommon": 40, "rare": 55}
+SHOP_PRICE_POWER_MULTIPLIER: Final = {"common": 0.60, "uncommon": 0.90, "rare": 1.20}
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,9 +429,9 @@ _LEGACY_WEAPONS: Final = (
     # These IDs are the target of the stick/fork/bone migration aliases. Their identity
     # and stats remain lossless; prices use the current arena-income scale.
     ("w001", "Мамин тапок", "Летит точнее, чем кажется.",
-     "common", "shop", 10, 2, 0, (("strength", 6),)),
+     "common", "shop", 60, 12, 0, (("strength", 6),)),
     ("w002", "Мамина сковородка", "После неё спор окончен.",
-     "uncommon", "shop", 65, 13, 0, (("strength", 14), ("luck", 4))),
+     "uncommon", "shop", 100, 20, 0, (("strength", 14), ("luck", 4))),
     # Renamed back to the compressor it was before the 500-weapon catalogue overwrote it
     # with a mop; the description is the original one, recovered from f52cb1e. Its stats
     # are deliberately below the other four legendaries -- this is the one legendary that
@@ -503,12 +502,11 @@ def shop_price_for_bonuses(rarity: str, bonuses) -> int:
         SHOP_PRICE_POWER_WEIGHTS[key] * int(value) for key, value in bonuses
     ))
     raw = base + power * SHOP_PRICE_POWER_MULTIPLIER[rarity]
-    # The first common weapon is the onboarding purchase: pure +6 strength costs ten.
-    # Other commons remain only slightly dearer (10/15/20), while the two higher shop
-    # tiers retain a visible scarcity premium.
+    # Ordinary items share one visible rarity at runtime, but the old uncommon rows keep
+    # their stronger stat curve and therefore a higher price inside that tier.
     rounded = int((raw + 2.5) // 5) * 5
     if rarity == "common":
-        return max(10, min(20, rounded))
+        return max(60, min(75, rounded))
     return max(5, rounded)
 
 
@@ -519,8 +517,7 @@ def _prices(rarity: str, source: str, bonuses) -> tuple[int, int]:
         return 0, 220 if rarity == "legendary" else 110 if rarity == "rare" else 10
     buy = shop_price_for_bonuses(rarity, bonuses)
     # 20% (rounded down) makes selling a convenience and inventory sink, never an
-    # arbitrage route.  The old 5-coin floor became too generous once starter weapons
-    # cost ten, so cheap gear can now be sold for its actual low fraction.
+    # arbitrage route.
     return buy, max(1, buy * 20 // 100)
 
 

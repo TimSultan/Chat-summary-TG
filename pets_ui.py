@@ -1552,7 +1552,7 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
             })
     if purchase_buttons:
         lines.append("Нажми номер оружия, чтобы купить.")
-        # The full 10-item window occupies exactly three compact rows (4 + 4 + 2).
+        # The full seven-item window occupies at most three compact rows.
         # Filtered/partly-owned windows keep the same maximum of three rows.
         buttons_per_row = (len(purchase_buttons) + 2) // 3
         rows.extend(
