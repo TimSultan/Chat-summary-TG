@@ -6217,13 +6217,17 @@ async def handle_pets_callback(
         if action == "buycage":
             ok, note = pets.buy_cage(entry, user_id, xp)
             await _pets_toast_and_redraw(
-                api, chat_id, message_id, note, pets_ui.cage_view(entry, user_id, xp), log
+                api, chat_id, message_id, note,
+                pets_ui.pet_view(entry, user_id, xp) if argument == "pet"
+                else pets_ui.cage_view(entry, user_id, xp), log,
             )
             return
         if action == "upcage":
             ok, note = pets.upgrade_cage(entry, user_id, xp)
             await _pets_toast_and_redraw(
-                api, chat_id, message_id, note, pets_ui.cage_view(entry, user_id, xp), log
+                api, chat_id, message_id, note,
+                pets_ui.pet_view(entry, user_id, xp) if argument == "pet"
+                else pets_ui.cage_view(entry, user_id, xp), log,
             )
             return
         if action == "farmstart":
@@ -6657,7 +6661,7 @@ async def handle_pets_callback(
             "leaderboard": lambda: pets_ui.leaderboard_view(
                 entry, user_id, int(argument) if argument.isdigit() else 0,
             ),
-            "pet": lambda: pets_ui.pet_view(entry, user_id),
+            "pet": lambda: pets_ui.pet_view(entry, user_id, xp),
             "slot": lambda: pets_ui.slot_view(
                 entry, user_id, xp, *pets_ui.parse_slot_argument(argument),
             ),

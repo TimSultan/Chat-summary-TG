@@ -991,7 +991,7 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertIn("Снаряжение", text)
         self.assertIn(pets_ui.callback_data("1", "bagitems", "weapon,0"), callbacks)
         self.assertIn(pets_ui.callback_data("1", "store"), callbacks)
-        self.assertIn(pets_ui.callback_data("1", "collection"), callbacks)
+        self.assertNotIn(pets_ui.callback_data("1", "collection"), callbacks)
         self.assertNotIn(pets_ui.callback_data("1", "slot", "weapon"), callbacks)
 
         _, store_keyboard = pets_ui.store_view("chat", "1", 0)
@@ -2144,7 +2144,7 @@ class MailTests(PetsTestCase):
                 entry, attacker, defender, result, when.date(), now=when,
             )
 
-    def test_mail_merges_fights_farm_and_gifts_newest_first_with_local_times(self):
+    def test_mail_merges_fights_farm_and_gifts_with_newest_at_bottom(self):
         entry = "chat"
         self._tame(entry, "1", "Мой")
         self._tame(entry, "2", "Чужой")
@@ -2165,12 +2165,12 @@ class MailTests(PetsTestCase):
 
         rows = pets.mail(entry, "1")
         self.assertEqual([row["kind"] for row in rows],
-                         ["gift_in", "farm", "defense", "attack"])
+                         ["attack", "defense", "farm", "gift_in"])
         self.assertEqual([row["at"] for row in rows],
-                         ["13.40", "12.15", "11.30", "10.05"])
+                         ["10.05", "11.30", "12.15", "13.40"])
         self.assertTrue(all(row["day"] == "2026-08-09" for row in rows))
 
-        gift, farm, defense, attack = rows
+        attack, defense, farm, gift = rows
         self.assertEqual(gift["item_name"], pets_config.find_item("w002").name)
         self.assertEqual(gift["pet_name"], "Чужой")
         self.assertEqual(farm["hours"], 6)
@@ -2184,7 +2184,7 @@ class MailTests(PetsTestCase):
         # The other player's mailbox is the same events from the other side.
         theirs = pets.mail(entry, "2")
         self.assertEqual([row["kind"] for row in theirs],
-                         ["gift_out", "attack", "defense"])
+                         ["defense", "attack", "gift_out"])
         self.assertEqual(theirs[1]["outcome"], "win")
 
     def test_coins_are_signed_from_the_readers_own_side(self):
@@ -2203,7 +2203,7 @@ class MailTests(PetsTestCase):
         # 2 attacks and loses: 1 defended, lost, and is PAID a consolation rather than
         # charged -- so their line has to read positive.
         self._fight(entry, "2", "1", "2", datetime(2026, 8, 9, 11, 0))
-        defended = pets.mail(entry, "1")[0]
+        defended = pets.mail(entry, "1")[-1]
         self.assertEqual(defended["kind"], "defense")
         self.assertEqual(defended["outcome"], "loss")
         self.assertGreater(defended["coins"], 0)
@@ -2246,9 +2246,9 @@ class MailTests(PetsTestCase):
         rows = pets.mail(entry, "1")
         self.assertEqual(len(rows), pets_config.MAIL_LIMIT)
         times = [row["ts"] for row in rows]
-        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertEqual(times, sorted(times))
         # Capped means the NEWEST kept, not the first thirty written.
-        self.assertEqual(rows[0]["at"], (start + timedelta(hours=pets_config.MAIL_LIMIT + 4)).strftime("%H.%M"))
+        self.assertEqual(rows[-1]["at"], (start + timedelta(hours=pets_config.MAIL_LIMIT + 4)).strftime("%H.%M"))
 
     def test_mail_view_groups_by_day_and_escapes_names(self):
         entry = "chat"

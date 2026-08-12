@@ -158,47 +158,41 @@ def main_view(
     if webapp_url:
         # First, and alone on its row: it is the whole game rather than one more screen.
         rows.append([{"text": "🎮 Открыть игру", "web_app": {"url": webapp_url}}])
+    quest_button = ("❗ " if quests.has_available_quests(entry, user_id) else "") + "📜 Квесты"
+    updates_button = (
+        "❗ 📰 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
+    )
+
+    # Play first, account utilities second. These four rows remain in the same order for
+    # newcomers and established players, so muscle memory survives taming a creature.
     rows.append([
-        {"text": "🏠 Клетка", "callback_data": callback_data(user_id, "cage")},
-        {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
+        {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
+        {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")},
     ])
-    # Chat activity is most members' income, full stop -- the majority never buy a cage.
-    # Every other row below this point is gated on `pet` in one way or another, so the
-    # daily bonus gets its own row up here, outside all of that, to stay reachable by
-    # someone who has never tamed anything.
-    rows.append([{
-        "text": "🎁 Ежедневный бонус",
-        "callback_data": callback_data(user_id, "dailybonus"),
-    }])
+    rows.append([
+        {"text": quest_button, "callback_data": callback_data(user_id, "quests")},
+        {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
+    ])
+    rows.append([
+        {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
+        {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
+    ])
+
+    # A claimed bonus is no longer a dead menu entry for the rest of the day.
+    if economy.daily_bonus_status(entry, user_id).get("can_claim"):
+        rows.append([{
+            "text": "🎁 Забрать ежедневный бонус",
+            "callback_data": callback_data(user_id, "dailybonus"),
+        }])
+
     if pet:
         rows.append([
-            {"text": "🐾 Существо", "callback_data": callback_data(user_id, "pet")},
+            {"text": "🖼 Существо", "callback_data": callback_data(user_id, "pet")},
             {"text": "💪 Прокачка", "callback_data": callback_data(user_id, "train")},
         ])
         rows.append([
-            {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")},
-            {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
-        ])
-        rows.append([
-            {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
-            {"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")},
-        ])
-        # Почта stands where «История боёв» used to: it contains those same fights and
-        # adds farm shifts and gifts, so keeping both here would be two buttons onto one
-        # feed. The pure fight log is unchanged and still one tap away -- inside ⚔️ Арена,
-        # which is where somebody asking "how did my last fights go" already is.
-        rows.append([
-            {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
             {"text": "📬 Почта", "callback_data": callback_data(user_id, "mail")},
-        ])
-        # Casino and quests are small optional activities, so they share one compact row
-        # instead of pushing the core pet controls below the fold.
-        rows.append([
-            {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
-            {
-                "text": ("❗ " if quests.has_available_quests(entry, user_id) else "") + "📜 Квесты",
-                "callback_data": callback_data(user_id, "quests"),
-            },
+            {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
         ])
         notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
         rows.append([
@@ -207,20 +201,17 @@ def main_view(
                 "callback_data": callback_data(user_id, "fightnotify"),
             },
             {
-                "text": "❗ 📰 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления",
+                "text": updates_button,
                 "callback_data": callback_data(user_id, "updates"),
             },
         ])
-    elif cage:
-        rows.append([{
-            "text": f"🐣 Приручить свою фигурку — {_money(C.TAME_PRICE)}",
-            "callback_data": callback_data(user_id, "tame"),
-        }])
-    if not pet:
-        updates_button = "❗ 📰 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
-        quest_button = ("❗ " if quests.has_available_quests(entry, user_id) else "") + "📜 Квесты"
+    else:
         rows.append([
-            {"text": quest_button, "callback_data": callback_data(user_id, "quests")},
+            {"text": "🖼 Существо", "callback_data": callback_data(user_id, "pet")},
+            {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
+        ])
+        rows.append([
+            {"text": "📬 Почта", "callback_data": callback_data(user_id, "mail")},
             {"text": updates_button, "callback_data": callback_data(user_id, "updates")},
         ])
     if quest_mod:
@@ -280,37 +271,23 @@ def leaderboard_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
 
 
 def info_view(user_id) -> tuple[str, dict]:
-    """A compact rules reference available before and after getting a pet."""
-    lines = ["ℹ️ <b>Как играть</b>\n"]
-    lines.append("Все настройки арены можно найти, написав /arena в личке бота.")
-    lines.append(
-        f"1. Купи клетку за {_coins(C.CAGE_PRICE)}, затем приручи своего покраса за {_coins(C.TAME_PRICE)}."
-    )
-    lines.append("2. Прокачивай Силу, Здоровье, Ловкость и Удачу; экипировка добавляет статы и Броню.")
-    lines.append("3. Сражайся через /arena: соперник выбирается случайно. В запас приходит +1 бой каждый час; его максимум увеличивают клетка, ферма и свежие #япокрасил.")
-    lines.append(
-        f"4. Победа приносит {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и опыт. "
-        f"Поражение забирает только {round(C.LOSS_GOLD_SHARE * 100)}% награды, без долгов."
-    )
-    lines.append("5. Ненужную снятую экипировку можно продать или подарить владельцу другого существа.")
-    lines.append("6. Каждый второй уровень фермы добавляет место в запасе боёв; все уровни улучшают смены и пассивную добычу монет.")
-    lines.append("\n<b>Статы</b>")
-    lines.append(
-        "Сила увеличивает урон. Здоровье повышает HP. Ловкость даёт уклонение. "
-        "Удача повышает шанс крита и шанс найти вещь — в бою и на ферме "
-        f"(до +{round(C.LUCK_DROP_BONUS_MAX * 100)}%). "
-        "Выносливость уже можно прокачивать, её особый эффект появится позже."
-    )
-    lines.append("\n<b>Особые преимущества</b>")
-    lines.append(
-        "Если один стат в 2 раза выше, чем у соперника, он иногда срабатывает как фирменный приём; "
-        "в 3 раза — сильнее. За бой срабатывает только один такой приём на существо."
-    )
-    lines.append(
-        "Сила наносит мощный стартовый удар, Здоровье гасит первый удар, Ловкость уклоняется или отвечает, "
-        "Броня блокирует удар, а Удача даёт сильный, но не смертельный стартовый эффект."
-    )
-    lines.append("\n<b>Дуэли</b>: напиши /duel @user в общем чате или в личке бота. Одного и того же соперника можно вызвать раз в день.")
+    """The few ideas a newcomer needs; individual screens teach their own details."""
+    lines = [
+        "ℹ️ <b>Как играть</b>\n",
+        "Открой /arena в личке бота — здесь живёт вся игра.",
+        "\n<b>1. Создай своё существо</b>",
+        "Купи клетку и приручи фигурку. "
+        "<b>На картинке существа должен быть именно твой собственный покрас</b> — "
+        "загрузи фотографию своей раскрашенной миниатюры.",
+        "\n<b>2. Развивай его</b>",
+        "Прокачивай характеристики, находи оружие и экипировку, собирай подходящий комплект.",
+        "\n<b>3. Играй</b>",
+        "Сражайся с игроками и мобами, выполняй квесты, отправляй существо на ферму "
+        "и рискуй монетами в казино.",
+        "\n<b>4. Получай награды</b>",
+        "Монеты, опыт и вещи приходят за активность в чате, победы, квесты и ферму. "
+        "Каждый экран сам подскажет, что можно сделать дальше.",
+    ]
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
 
 
@@ -1051,6 +1028,7 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"{label}: {feature_level}/{feature_max}{effect_text}")
 
     lines.append(f"\n🪙 У тебя: {_money(coins)}")
+    lines.append(f"🎟 Билетов: {int(status.get('tickets', 0) or 0)}")
     rows = []
     if status.get("can_start"):
         # Four per row -- two rows of four -- so all eight choices fit without a single
@@ -1206,8 +1184,6 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         }])
     rows.append([{
         "text": "🛒 Магазин", "callback_data": callback_data(user_id, "store"),
-    }, {
-        "text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection"),
     }])
     rows.append([{
         "text": "⚒️ Кузница", "callback_data": callback_data(user_id, "forge"),
@@ -1639,7 +1615,6 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
             "callback_data": callback_data(user_id, "shopslot", "boots"),
         }],
         [{"text": "🎒 Моё снаряжение", "callback_data": callback_data(user_id, "bag")}],
-        [{"text": "📚 Коллекция", "callback_data": callback_data(user_id, "collection")}],
         _back_row(user_id),
     ])
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -2119,7 +2094,7 @@ def _mail_line(event: dict) -> str:
 
 
 def mail_view(entry: str, user_id) -> tuple[str, dict]:
-    """Everything that happened to this player, one screen, newest first.
+    """Everything that happened to this player, oldest at top and newest at bottom.
 
     Grouped by day with the time in front of every line, because the question the mailbox
     answers is "what did I miss" -- and that is a question about when, not about which
@@ -2129,22 +2104,30 @@ def mail_view(entry: str, user_id) -> tuple[str, dict]:
     # Quest verdicts live in quests.py, which imports pets -- so they are collected here
     # and handed to pets.mail, which still does the merging and the cap. See its docstring.
     events = pets.mail(entry, user_id, extra=quests.mail_events(entry, user_id))
-    lines = ["📬 <b>Почта</b>\n"]
-    if not events:
-        lines.append("Пока пусто. Здесь будут бои, смены на ферме и подарки.")
-    current_day = None
-    for event in events:
-        day = event.get("day") or ""
-        if day != current_day:
-            # The title already leaves one blank line behind it; only later headings
-            # need to open their own gap.
-            gap = "" if current_day is None else "\n"
-            current_day = day
-            lines.append(f"{gap}<b>{mail_day_label(day)}</b>")
-        lines.append(f"<code>{escape(event.get('at') or '--.--')}</code> {_mail_line(event)}")
-    text = "\n".join(lines)
-    if len(text) > MAIL_MAX_CHARS:
-        text = text[:MAIL_MAX_CHARS].rsplit("\n", 1)[0] + "\n\n<i>…показаны не все события.</i>"
+
+    def render(visible: list[dict], trimmed: bool = False) -> str:
+        lines = ["📬 <b>Почта</b>\n"]
+        if trimmed:
+            lines.append("<i>…старые события скрыты.</i>\n")
+        if not visible:
+            lines.append("Пока пусто. Здесь будут бои, смены на ферме и подарки.")
+        current_day = None
+        for event in visible:
+            day = event.get("day") or ""
+            if day != current_day:
+                gap = "" if current_day is None else "\n"
+                current_day = day
+                lines.append(f"{gap}<b>{mail_day_label(day)}</b>")
+            lines.append(f"<code>{escape(event.get('at') or '--.--')}</code> {_mail_line(event)}")
+        return "\n".join(lines)
+
+    # Keep the bottom of the feed when Telegram's message limit is reached: that is where
+    # the newest events live now. Removing complete rows also avoids cutting an HTML tag.
+    visible = list(events)
+    text = render(visible)
+    while len(text) > MAIL_MAX_CHARS and len(visible) > 1:
+        visible.pop(0)
+        text = render(visible, trimmed=True)
     rows = [
         [{"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
          {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")}],
@@ -2196,19 +2179,47 @@ def pet_card(entry: str, user_id, pet: dict) -> str:
 # --------------------------------------------------------------------- shared bits
 
 
-def pet_view(entry: str, user_id) -> tuple[str, dict]:
+def pet_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
     """The owner's own view of their creature: the same card /pet prints, plus the two
     buttons only the owner has any business pressing."""
     pet = pets.get_pet(entry, user_id)
     if not pet:
-        return no_pet_view(user_id)
+        cage = pets.cage_level(entry, user_id)
+        coins = pets.balance_for(entry, user_id, xp)
+        if not cage:
+            text = (
+                "🖼 <b>Твоё существо</b>\n\nСначала купи клетку. После этого бот попросит "
+                "фото твоей собственной раскрашенной миниатюры — она станет картинкой существа."
+                f"\n\n🪙 У тебя: {_money(coins)}"
+            )
+            action = {
+                "text": f"🏠 Купить клетку — {_money(C.CAGE_PRICE)}",
+                "callback_data": callback_data(user_id, "buycage", "pet"),
+            }
+        else:
+            text = (
+                "🖼 <b>Твоё существо</b>\n\nКлетка готова. Теперь пришли фотографию "
+                "именно своей раскрашенной миниатюры и дай ей имя."
+                f"\n\n🪙 У тебя: {_money(coins)}"
+            )
+            action = {
+                "text": f"🐣 Приручить свой покрас — {_money(C.TAME_PRICE)}",
+                "callback_data": callback_data(user_id, "tame"),
+            }
+        return text, {"inline_keyboard": [[action], _back_row(user_id)]}
     rows = [
         [
             {"text": "✏️ Переименовать", "callback_data": callback_data(user_id, "rename")},
-            {"text": "🖼 Сменить фото", "callback_data": callback_data(user_id, "photo")},
+            {"text": "🖼 Картинка существа", "callback_data": callback_data(user_id, "photo")},
         ],
-        _back_row(user_id),
     ]
+    cage = pets.cage_level(entry, user_id)
+    if cage < C.CAGE_MAX_LEVEL:
+        rows.append([{
+            "text": f"⬆️ Улучшить клетку — {_money(C.CAGE_UPGRADE_COSTS[cage])}",
+            "callback_data": callback_data(user_id, "upcage", "pet"),
+        }])
+    rows.append(_back_row(user_id))
     return pet_card(entry, user_id, pet), {"inline_keyboard": rows}
 
 

@@ -281,7 +281,8 @@ class PetsCommandTests(unittest.TestCase):
             pets_ui.parse_callback(b["callback_data"])[1]
             for b in _buttons(api.sent[0]) if "callback_data" in b
         }
-        self.assertIn("cage", actions)
+        self.assertNotIn("cage", actions)
+        self.assertIn("pet", actions)
         self.assertIn("info", actions)
 
     def test_tamed_pet_menu_uses_two_button_rows_including_fight_notifications(self):
@@ -290,12 +291,7 @@ class PetsCommandTests(unittest.TestCase):
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
-        # Paired rows throughout, with one deliberate exception: the daily bonus is
-        # reachable without a pet (see the no-pet test below) and so cannot share a row
-        # with anything pet-gated, and gets a full-width row of its own instead. Casino
-        # and Квесты -- two coming-soon placeholders announced the same way -- now pair
-        # with each other rather than casino standing alone. Pinning the exception by
-        # name keeps a THIRD lone button from appearing by accident.
+        # The claimable daily bonus is the only full-width callback row.
         lone = [
             pets_ui.parse_callback(row[0]["callback_data"])[1]
             for row in keyboard["inline_keyboard"] if len(row) != 2
@@ -308,6 +304,14 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("fightnotify", actions)
         self.assertIn("casino", actions)
         self.assertIn("quests", actions)
+        self.assertNotIn("cage", actions)
+        self.assertNotIn("collection", actions)
+
+        labels = [[button["text"] for button in row] for row in keyboard["inline_keyboard"]]
+        self.assertEqual(labels[0], ["⚔️ Арена", "🌾 Ферма"])
+        self.assertIn("📜 Квесты", labels[1][0])
+        self.assertEqual(labels[1][1], "🎰 Казино")
+        self.assertEqual(labels[2], ["🛒 Магазин", "🎒 Снаряжение"])
 
     def test_daily_bonus_button_is_offered_without_a_pet(self):
         # The one row on this menu that must survive every `if pet:` gate: chat activity,
@@ -318,7 +322,7 @@ class PetsCommandTests(unittest.TestCase):
             for row in keyboard["inline_keyboard"] for button in row
         }
         self.assertIn("dailybonus", actions)
-        self.assertNotIn("casino", actions)
+        self.assertIn("casino", actions)
         self.assertIn("quests", actions)
         self.assertIn("❗ 📜 Квесты", [
             button["text"] for row in keyboard["inline_keyboard"] for button in row
@@ -338,6 +342,13 @@ class PetsCommandTests(unittest.TestCase):
             for row in api.edits[0]["reply_markup"]["inline_keyboard"] for b in row
         }
         self.assertNotIn("dailybonusclaim", claim_actions)
+
+        main_actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)[1]["inline_keyboard"]
+            for button in row if button.get("callback_data")
+        }
+        self.assertNotIn("dailybonus", main_actions)
 
         api = self._tap("dailybonusclaim")
         self.assertIn("уже забран", api.edits[0]["text"])
@@ -409,10 +420,22 @@ class PetsCommandTests(unittest.TestCase):
         api = self._tap("info")
         self.assertIn("Как играть", api.edits[0]["text"])
         self.assertIn("/arena в личке бота", api.edits[0]["text"])
-        self.assertIn("своего покраса", api.edits[0]["text"])
-        self.assertIn("/duel @user", api.edits[0]["text"])
-        self.assertIn("Особые преимущества", api.edits[0]["text"])
-        self.assertIn("30%", api.edits[0]["text"])
+        self.assertIn("твой собственный покрас", api.edits[0]["text"])
+        self.assertIn("Сражайся с игроками и мобами", api.edits[0]["text"])
+        self.assertNotIn("Особые преимущества", api.edits[0]["text"])
+
+    def test_creature_screen_owns_the_picture_and_cage_controls(self):
+        economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.TAME_PRICE + 9999, "test")
+        before_text, before_keyboard = pets_ui.pet_view(CHAT, PLAYER["id"], RICH_XP)
+        self.assertIn("собственной раскрашенной миниатюры", before_text)
+        self.assertIn("buycage", str(before_keyboard))
+
+        self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)[0])
+        self.assertTrue(pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")[0])
+        _text, keyboard = pets_ui.pet_view(CHAT, PLAYER["id"], RICH_XP)
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("🖼 Картинка существа", labels)
+        self.assertTrue(any(label.startswith("⬆️ Улучшить клетку") for label in labels))
 
     def test_arena_screen_shows_empty_bank_capacity_and_hourly_countdown(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
@@ -435,8 +458,10 @@ class PetsCommandTests(unittest.TestCase):
         economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.FARM_UPGRADE_COSTS[0], "test")
         self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
         self.assertTrue(pets.tame(CHAT, PLAYER["id"], RICH_XP, "Фермер", "file", "Player")[0])
+        self.assertTrue(pets.grant_farm_ticket(CHAT, PLAYER["id"], "test-ticket"))
 
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
+        self.assertIn("🎟 Билетов: 1", rendered[0])
         initial_actions = {
             pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})
         }

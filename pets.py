@@ -3214,7 +3214,7 @@ def _mail_pet(data: dict, user_id) -> tuple[str | None, str | None]:
 
 
 def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = None) -> list[dict]:
-    """One merged, newest-first feed of everything that happened to this player.
+    """One merged feed with the newest kept and displayed at the bottom.
 
     Read-side only: no new store, nothing written, no migration. The three things worth
     telling somebody about are already persisted by the code that performs them -- fights
@@ -3330,8 +3330,9 @@ def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = No
         if isinstance(event, dict):
             add(event.get("ts"), dict(event))
 
-    events.sort(key=lambda pair: pair[0], reverse=True)
-    return [event for _moment, event in events[:cap]]
+    events.sort(key=lambda pair: pair[0])
+    kept = events[-cap:] if cap else []
+    return [event for _moment, event in kept]
 
 
 def award_xp(entry, user_id, amount) -> tuple[int, int]:

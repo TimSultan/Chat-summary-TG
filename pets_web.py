@@ -1511,7 +1511,7 @@ async def handle_quest_config(request: web.Request) -> web.Response:
 
 
 async def handle_mail(request: web.Request) -> web.Response:
-    """The mailbox: fights, farm shifts and gifts in one feed, newest first.
+    """The mailbox: fights, farm shifts and gifts, with new events at the bottom.
 
     Forwarded verbatim from pets.mail -- including the HH.MM it already formatted, and
     the day heading. The page must not re-derive either from the ISO timestamp: the
@@ -2637,6 +2637,7 @@ function renderFarm() {
   if (!farm.level) {
     box.innerHTML = '<div class="panel"><h2>Ферма</h2>' +
       "<p class='small'>Ферма приносит монеты и опыт, пока ты занят чем-то ещё.</p>" +
+      "<p class='small muted'>🎟 Билетов: " + (farm.tickets || 0) + "</p>" +
       '<button class="go" data-do="farmup"' + (affordable(farm.next_level_cost) ? "" : " disabled") +
       ">🏡 Построить · " + money(farm.next_level_cost) + "</button></div>";
     return;
@@ -2684,6 +2685,7 @@ function renderFarm() {
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
         money(passive.stored || 0) + " из " + money(passive.cap || 0) + "</div>" +
+      '<div class="small muted" style="margin-top:4px">🎟 Билетов: ' + (farm.tickets || 0) + "</div>" +
       (farm.next_level_cost != null
         ? '<button class="go sec" style="margin-top:10px" data-do="farmup"' +
           (affordable(farm.next_level_cost) ? "" : " disabled") +
