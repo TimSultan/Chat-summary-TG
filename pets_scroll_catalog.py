@@ -1,9 +1,9 @@
-"""Editable scroll and shield tables for the browser combat prototype.
+"""Editable scroll and shield tables shared by live and test combat.
 
-Nothing here is an inventory item and nothing enters the live arena.  Designers can tune
-the dictionaries below without touching the turn engine: every numeric combat property
-lives in this module, while ``pets_test_combat.py`` only implements the small vocabulary
-listed in ``EFFECT_OPS``.
+Scrolls are permanent abilities rather than inventory items; shields are converted into
+ordinary live items by ``pets_shield_catalog``. Designers can tune the dictionaries
+below without touching either turn engine: every numeric combat property lives here,
+while the engines only implement the small vocabulary listed in ``EFFECT_OPS``.
 """
 
 from __future__ import annotations

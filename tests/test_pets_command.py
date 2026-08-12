@@ -24,6 +24,7 @@ import economy
 import pets
 import pets_config as C
 import pets_image
+import pets_scroll_catalog as SCROLLS
 import pets_ui
 import quests
 import pets_updates
@@ -778,6 +779,39 @@ class PetsCommandTests(unittest.TestCase):
             api.edits[-1]["text"],
         )
 
+    def test_scroll_screen_and_picker_work_through_telegram_callbacks(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Бублик", "file_a", "Player")
+
+        opened = self._tap("skills")
+        self.assertIn("Боевые свитки", opened.edits[-1]["text"])
+        self.assertEqual(len(pets.skill_loadout(CHAT, PLAYER["id"])), 4)
+        picker = self._tap("skillpick", "2,4")
+        self.assertIn("Слот 2", picker.edits[-1]["text"])
+        self.assertTrue(all(
+            len(button["callback_data"].encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES
+            for button in _buttons(picker.edits[-1]) if button.get("callback_data")
+        ))
+
+        code = SCROLLS.REGULAR_SCROLLS[-1]["code"]
+        changed = self._tap("setskill", f"2:{code}")
+        self.assertEqual(pets.skill_loadout(CHAT, PLAYER["id"])[1], code)
+        self.assertIn("Боевые свитки", changed.edits[-1]["text"])
+
+    def test_shields_have_a_real_shop_shelf_with_stats_effects_and_buy_buttons(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Бублик", "file_a", "Player")
+
+        api = self._tap("shopslot", "shield")
+        shelf = api.edits[-1]
+        self.assertIn("Щит", shelf["text"])
+        self.assertIn("При защите", shelf["text"])
+        self.assertIn("🛡", shelf["text"])
+        self.assertTrue(any(
+            pets_ui.parse_callback(button["callback_data"])[1] == "buy"
+            for button in _buttons(shelf) if button.get("callback_data")
+        ))
+
     def test_opening_updates_marks_the_latest_entry_read_and_redraws_the_log(self):
         self.assertTrue(pets_updates.has_unread(CHAT, PLAYER["id"]))
 
@@ -938,22 +972,26 @@ class PetsCommandTests(unittest.TestCase):
                 f"action {action!r} drew nothing at all",
             )
 
-    def test_result_image_item_receipt_contains_weapon_stats_and_amulet_effect(self):
+    def test_result_image_item_receipt_contains_weapon_amulet_and_shield_effects(self):
         pet = {
             "equipped": {
                 "weapon": "w001",
                 "amulet": "amulet_left_sock",
+                "shield": "shield_paper_buckler",
             },
         }
 
         weapon = bot_listener._pets_image_item(pet, "weapon")
         amulet = bot_listener._pets_image_item(pet, "amulet")
+        shield = bot_listener._pets_image_item(pet, "shield")
 
         self.assertEqual(weapon["name"], C.find_item("w001").name)
         self.assertEqual(weapon["rarity"], C.find_item("w001").rarity)
         self.assertEqual(weapon["bonuses"], dict(C.find_item("w001").bonuses))
         self.assertTrue(amulet["effect"])
         self.assertEqual(amulet["bonuses"], dict(C.find_item("amulet_left_sock").bonuses))
+        self.assertIn("При защите", shield["effect"])
+        self.assertEqual(shield["bonuses"], dict(C.find_item("shield_paper_buckler").bonuses))
         self.assertIsNone(bot_listener._pets_image_item(pet, "boots"))
 
     def test_fight_posts_one_composite_result_image(self):

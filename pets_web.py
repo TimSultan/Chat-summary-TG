@@ -579,6 +579,8 @@ def _combat_payload(entry: str, user_id, record: dict) -> dict:
         strength=effective["strength"], health=effective["health"],
         agility=effective["agility"], luck=effective["luck"],
         armor=effective.get("armor", 0), level=int(record.get("level", 1)),
+        skills=pets._skill_loadout_for(record),
+        shield=pets._combat_shield_for(record),
     )
     derived = pets_combat.derive(mirror, mirror)
     return {
@@ -620,7 +622,9 @@ def _pet_payload(entry: str, user_id, record: dict, prefix: str) -> dict:
 
 
 def _equipment_payload(record: dict, prefix: str) -> list[dict]:
-    """The four slots, always all four -- an empty slot is a thing to fill, so it is drawn
+    """All equipment slots, including the live Defend shield, always represented.
+
+    An empty slot is a thing to fill, so it is drawn
     rather than omitted (which is what makes a paperdoll a paperdoll)."""
     slots = []
     for slot in C.SLOT_KEYS:
@@ -633,6 +637,24 @@ def _equipment_payload(record: dict, prefix: str) -> list[dict]:
             "item": _item_payload(item, prefix, record) if item else None,
         })
     return slots
+
+
+def _skills_payload(record: dict) -> dict:
+    loadout = pets._skill_loadout_for(record)
+    selected = []
+    for index, code in enumerate(loadout, start=1):
+        row = pets_scroll_catalog.public_scroll(pets_scroll_catalog.scroll(code))
+        row["slot"] = index
+        selected.append(row)
+    return {
+        "slots": selected,
+        "regular": [
+            pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.REGULAR_SCROLLS
+        ],
+        "ultimate": [
+            pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.ULTIMATE_SCROLLS
+        ],
+    }
 
 
 def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
@@ -685,6 +707,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["stats"] = _stat_payload(entry, user_id, record)
     state["combat"] = _combat_payload(entry, user_id, record)
     state["equipment"] = _equipment_payload(record, prefix)
+    state["skills"] = _skills_payload(record)
     state["bag"] = [
         _item_payload(item, prefix, record)
         for item in (C.find_item(code) for code in record.get("inventory", []))
@@ -739,6 +762,12 @@ def _action_equip(entry, user_id, xp, payload):
 
 def _action_unequip(entry, user_id, xp, payload):
     return pets.unequip(entry, user_id, str(payload.get("slot") or ""))
+
+
+def _action_set_skill(entry, user_id, xp, payload):
+    return pets.set_skill_slot(
+        entry, user_id, payload.get("slot"), str(payload.get("code") or ""),
+    )
 
 
 def _action_lock(entry, user_id, xp, payload):
@@ -857,6 +886,7 @@ _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
     "equip": _action_equip,
     "unequip": _action_unequip,
+    "set_skill": _action_set_skill,
     "lock": _action_lock,
     "buy": _action_buy,
     "reforge": _action_reforge,
@@ -1226,6 +1256,8 @@ async def handle_attack(request: web.Request) -> web.Response:
             armor=effective.get("armor", 0),
             effects=pets.equipped_combat_effects(entry, key),
             level=int(record.get("level", 1)),
+            skills=pets.skill_loadout(entry, key),
+            shield=pets.combat_shield(entry, key),
         )
 
     # Зеркало души goes on BEFORE the fighters are built, or it would not be among the
@@ -1436,6 +1468,8 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
         armor=effective.get("armor", 0),
         effects=pets.equipped_combat_effects(entry, me),
         level=int(mine.get("level", 1)),
+        skills=pets.skill_loadout(entry, me),
+        shield=pets.combat_shield(entry, me),
     )
     enemy = pets.mob_fighter(block)
     seed = secrets.randbits(63)
@@ -2003,8 +2037,8 @@ PAGE_HTML = """<!doctype html>
   .chiprow::-webkit-scrollbar { display: none; }
 
   /* ------------------------------------------------------------- the paperdoll
-     Four slots around the portrait, in the arrangement they are worn: weapon and amulet at
-     the hands, gloves and boots below. A list of four rows would say the same thing and
+     Five slots around the portrait, in the arrangement they are worn. A plain list would
+     say the same thing and
      teach nothing -- the point of a doll is that an empty slot is a shaped hole. */
   .doll { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 10px; align-items: center; }
   .doll .portrait {
@@ -2047,6 +2081,13 @@ PAGE_HTML = """<!doctype html>
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .slot.filled { border-style: solid; }
+  .pet-equipment-summary { grid-column: 1 / -1; text-align: center; }
+
+  .live-skills { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .live-skill { text-align: left; min-height: 76px; padding: 9px; }
+  .live-skill b, .live-skill small { display: block; }
+  .live-skill small { margin-top: 4px; color: var(--muted); font-weight: 400; }
+  .live-skill.ultimate { border-color: var(--r-legendary); }
 
   /* --------------------------------------------------------------- stats + combat */
   .grid4 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -2274,6 +2315,8 @@ PAGE_HTML = """<!doctype html>
   .duel .blow.dodge { border-left-color: var(--muted); opacity: .8; }
   .duel .blow.mine { border-left-color: var(--accent); }
   .duel .blow.amulet { border-left-color: var(--r-legendary); }
+  .duel .blow.skill { border-left-color: var(--r-rare); }
+  .duel .blow.defend { border-left-color: #4c82b8; }
   /* The flavour text is prose with three things buried in it -- who acted, who was hit,
      and how much. They are the only parts anybody actually reads at one line per half
      second, so they are the only parts coloured: two sides, and a number whose colour
@@ -2541,16 +2584,17 @@ function renderHero() {
           shot(pet.portrait, pet.crop) +
           '<span class="edit">✏️</span>' +
           '<span class="pw">⚡ ' + money(combat.power) + "</span></button>" +
-        "<div>" + slot(worn.amulet) + "</div>" +
+        "<div>" + slot(worn.shield) + "</div>" +
         "<div>" + slot(worn.gloves) + "</div>" +
-        '<div class="tiny muted" style="text-align:center">' +
+        "<div>" + slot(worn.amulet) + "</div>" +
+        "<div>" + slot(worn.boots) + "</div>" +
+        '<div class="tiny muted pet-equipment-summary">' +
           esc(pet.name) + " · ур. " + pet.level + "<br>" +
           pet.xp + " / " + pet.xp_needed + " опыта<br>" +
           "боёв " + pet.fights + " · побед " + pet.wins +
         "</div>" +
-        "<div>" + slot(worn.boots) + "</div>" +
       "</div>" +
-    "</div>" +
+    "</div>" + liveSkillsPanel() +
 
     '<div class="panel"><h2>В бою</h2><div class="grid4">' +
       tile("❤️ Здоровье", combat.max_hp) +
@@ -2666,6 +2710,34 @@ function renderBag() {
     "</div>" + forgePanel();
 }
 
+function shortSkillName(name) { return String(name || "").replace(/^.*?: /, ""); }
+
+function liveSkillsPanel() {
+  const rows = (S.skills && S.skills.slots) || [];
+  return '<div class="panel"><div class="row spread"><h2 style="margin:0">📜 Свитки</h2>' +
+    '<span class="tiny muted">в бою выбираются автоматически</span></div>' +
+    '<div class="live-skills" style="margin-top:9px">' + rows.map((spell) =>
+      '<button class="go sec live-skill' + (spell.ultimate ? " ultimate" : "") +
+      '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' + esc(spell.icon) + " " +
+      esc(shortSkillName(spell.name)) + '</b><small>' + esc(spell.short) + '</small></button>'
+    ).join("") + '</div></div>';
+}
+
+function openLiveSkillPicker(slot) {
+  const number = Number(slot);
+  const pool = number === 4 ? S.skills.ultimate : S.skills.regular;
+  const current = S.skills.slots[number - 1];
+  sheet('<h3>' + (number === 4 ? '✨ Ультимейт · один раз за бой' : '📜 Свиток · слот ' + number) +
+    '</h3><p class="tiny muted">В автобою каждый доступный свиток имеет одинаковый шанс применения.</p>' +
+    pool.map((spell) => '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) +
+      '</b><div class="small">' + esc(spell.short) + '</div><div class="tiny muted">' +
+      (spell.dodgeable ? 'можно увернуться' : 'нельзя увернуться') +
+      (spell.ultimate ? ' · один раз' : ' · CD ' + spell.cooldown) + '</div>' +
+      '<button class="go sec" style="margin-top:8px" data-liveskillset="' + number + ':' +
+      esc(spell.code) + '"' + (current && current.code === spell.code ? ' disabled' : '') + '>' +
+      (current && current.code === spell.code ? 'Выбрано' : 'Поставить в слот') + '</button></div>').join(''));
+}
+
 function forgePanel() {
   const names = { common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
@@ -2690,7 +2762,7 @@ function forgePanel() {
 // weapon rotation and the permanent accessories are priced and stocked differently.
 function slotChips(active, key, skipAll) {
   const slots = [["all", "Всё"], ["weapon", "🗡 Оружие"], ["amulet", "📿 Амулеты"],
-                 ["gloves", "🧤 Перчатки"], ["boots", "👢 Сапоги"]];
+                 ["gloves", "🧤 Перчатки"], ["boots", "👢 Сапоги"], ["shield", "🛡 Щиты"]];
   return slots.filter(([value]) => !(skipAll && value === "all")).map(([value, label]) =>
     '<button class="chip' + (active === value ? " on" : "") + '" data-' + key + '="' + value + '">' +
     label + "</button>").join("");
@@ -4014,9 +4086,12 @@ function playDuel(data) {
     $("barTheirs").style.width = Math.min(100, (theirsHp / theirMax) * 100) + "%";
     $("hpMine").textContent = mineHp;
     $("hpTheirs").textContent = theirsHp;
-    const kind = String(round.event).indexOf("amulet_") === 0 ? "amulet"
-      : (round.event.indexOf("crit") >= 0 ? "crit"
-      : (round.event === "dodge" ? "dodge" : (mineTurn ? "mine" : "")));
+    const eventName = String(round.event || "");
+    const kind = eventName.indexOf("amulet_") === 0 ? "amulet"
+      : (eventName === "dodge" || eventName === "skill_dodge" ? "dodge"
+      : (eventName === "defend" ? "defend"
+      : (eventName.indexOf("skill_") === 0 ? "skill"
+      : (eventName.indexOf("crit") >= 0 ? "crit" : (mineTurn ? "mine" : "")))));
     $("duelLog").insertAdjacentHTML("beforeend",
       '<div class="blow ' + kind + '">' + paintBlow(round, mineName, theirName) + "</div>");
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
@@ -4084,7 +4159,7 @@ document.addEventListener("click", async (event) => {
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
-    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog]");
+    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset]");
   if (!target) return;
   const d = target.dataset;
 
@@ -4096,6 +4171,15 @@ document.addEventListener("click", async (event) => {
   if (d.testmode) { await startTestBattle(d.testmode); return; }
   if (d.testaction) { await testBattleAction(d.testaction); return; }
   if (d.testcatalog !== undefined) { showTestCatalog(); return; }
+  if (d.liveskill) { openLiveSkillPicker(d.liveskill); return; }
+  if (d.liveskillset) {
+    const split = d.liveskillset.indexOf(":");
+    const slot = Number(d.liveskillset.slice(0, split));
+    const code = d.liveskillset.slice(split + 1);
+    closeSheet();
+    await act("set_skill", { slot, code });
+    return;
+  }
 
   // Equipping straight from the slot sheet: one tap, no detour through the item's own
   // card. Choosing between two swords is the whole point of that screen.

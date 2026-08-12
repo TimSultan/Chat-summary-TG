@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import economy
 import pets
 import pets_config as C
+import pets_scroll_catalog as SCROLLS
 import quests
 import pets_web
 import vote_web
@@ -243,7 +244,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_state_shows_no_pet_before_a_cage_and_the_full_paperdoll_after_taming(self):
         """GET /api/state is the one shape every screen renders from. A player with
         nothing yet still needs a price to look at; a tamed player needs every panel --
-        stats, gear (all four slots, empty ones included), bag, arena, farm -- in that
+        stats, gear (all five slots, empty ones included), bag, arena, farm -- in that
         same single call, because the whole point of the design is that no screen has to
         ask twice."""
         bare = await (await self._get("/api/state", PLAYER)).json()
@@ -256,9 +257,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(full["pet"])
         self.assertTrue(full["has_cage"])
         self.assertIn("stats", full)
-        self.assertEqual(len(full["equipment"]), 4)
+        self.assertEqual(len(full["equipment"]), 5)
         self.assertEqual({slot["slot"] for slot in full["equipment"]}, set(C.SLOT_KEYS))
         self.assertTrue(all(slot["item"] is None for slot in full["equipment"]))
+        self.assertEqual(len(full["skills"]["slots"]), 4)
+        self.assertEqual(len(full["skills"]["regular"]), 30)
+        self.assertEqual(len(full["skills"]["ultimate"]), 10)
+        self.assertTrue(full["skills"]["slots"][3]["ultimate"])
         self.assertIn("bag", full)
         self.assertIn("arena", full)
         self.assertIn("farm", full)
@@ -316,6 +321,27 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.status, 200)
 
     # ---- equipment --------------------------------------------------------------------
+
+    async def test_live_scroll_loadout_can_be_changed_without_inventory_items(self):
+        self._tame(PLAYER)
+        regular = SCROLLS.REGULAR_SCROLLS[-1]["code"]
+        ultimate = SCROLLS.ULTIMATE_SCROLLS[-1]["code"]
+
+        wrong = await self._action(PLAYER, "set_skill", slot=1, code=ultimate)
+        self.assertFalse(wrong["ok"])
+        changed = await self._action(PLAYER, "set_skill", slot=2, code=regular)
+        self.assertTrue(changed["ok"], changed["message"])
+        changed = await self._action(PLAYER, "set_skill", slot=4, code=ultimate)
+        self.assertTrue(changed["ok"], changed["message"])
+        self.assertEqual(changed["state"]["skills"]["slots"][1]["code"], regular)
+        self.assertEqual(changed["state"]["skills"]["slots"][3]["code"], ultimate)
+
+    async def test_page_contains_live_scroll_picker_and_the_shield_paperdoll_slot(self):
+        page = await self.client.get(pets_web.ROUTE_PREFIX + "/", headers=self._auth(PLAYER))
+        html = await page.text()
+        self.assertIn("data-liveskill", html)
+        self.assertIn("data-liveskillset", html)
+        self.assertIn('["shield", "🛡 Щиты"]', html)
 
     async def test_equipping_and_unequipping_move_an_item_between_bag_and_slot(self):
         """The paperdoll and the bag are two views of the same inventory, not two separate

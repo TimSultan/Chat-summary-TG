@@ -6024,6 +6024,8 @@ def _pets_fighter(entry: str, user_id, pet: dict):
         armor=effective.get("armor", 0),
         effects=pets.equipped_combat_effects(entry, user_id),
         level=pet.get("level", 1),
+        skills=pets.skill_loadout(entry, user_id),
+        shield=pets.combat_shield(entry, user_id),
     )
 
 
@@ -6558,6 +6560,13 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.daily_bonus_view(entry, user_id, xp), log
             )
             return
+        if action == "setskill":
+            raw_slot, _, code = str(argument or "").partition(":")
+            ok, note = pets.set_skill_slot(entry, user_id, raw_slot, code)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.skills_view(entry, user_id), log
+            )
+            return
         if action == "reforge":
             ok, note, _result_code = pets.reforge_items(entry, user_id, argument)
             await _pets_toast_and_redraw(
@@ -6650,6 +6659,10 @@ async def handle_pets_callback(
             "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
+            "skills": lambda: pets_ui.skills_view(entry, user_id),
+            "skillpick": lambda: pets_ui.skill_picker_view(
+                entry, user_id, *pets_ui.parse_slot_argument(argument),
+            ),
             "forge": lambda: pets_ui.forge_view(entry, user_id, xp),
             "weaponforge": lambda: pets_ui.weapon_forge_view(user_id),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
@@ -7360,6 +7373,7 @@ async def _pets_render_result_image(
             "owner_avatar": avatar_a,
             "weapon": _pets_image_item(attacker, "weapon"),
             "amulet": _pets_image_item(attacker, "amulet"),
+            "shield": _pets_image_item(attacker, "shield"),
             **((fight_hp or {}).get(str(attacker_id), {})),
         }, {
             "id": str(defender_id),
@@ -7371,6 +7385,7 @@ async def _pets_render_result_image(
             "owner_avatar": avatar_b,
             "weapon": _pets_image_item(defender, "weapon"),
             "amulet": _pets_image_item(defender, "amulet"),
+            "shield": _pets_image_item(defender, "shield"),
             **((fight_hp or {}).get(str(defender_id), {})),
         })
     except Exception:

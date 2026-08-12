@@ -240,6 +240,10 @@ def total_stat_cost(target_level: int, from_level: int = STAT_MIN_LEVEL) -> int:
 
 BASE_HP = 500               # "все начинают с 500"
 HP_PER_POINT = 19
+# Live scroll battles give Strength a small durability contribution too. It only applies
+# to fighters carrying a four-scroll loadout, so historic replay snapshots keep their
+# exact old HP while every migrated/current pet gets the longer format.
+HP_PER_STRENGTH_WITH_SKILLS = 5
 BASE_DAMAGE = 49.5
 DAMAGE_PER_POINT = 2.42
 # Every blow is nudged by +-15% so two identical pets do not play out identically.
@@ -287,6 +291,10 @@ ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 # Each pet gets at most this many attacks. If neither side is knocked out by then, the
 # living pet that dealt more total damage wins; see pets_combat.simulate.
 MAX_ATTACKS_PER_FIGHTER = 10
+# Scrolls and Defend spend actions without always dealing damage. Their fights get a
+# larger deterministic budget, otherwise healing/guard builds would hit the old cap long
+# before either side had a chance to use its loadout.
+MAX_SKILL_ACTIONS_PER_FIGHTER = 24
 
 # ------------------------------------------------------------------ stat lead bonus
 # Every lead matters: a stat that is 10% higher contributes 10% more, rising linearly to
@@ -501,18 +509,20 @@ def pet_xp_for_next_level(level: int) -> int:
 # "drop" items cannot be bought at any price and only fall out of arena wins. Anything
 # with a price of 0 and source "drop" is a trophy.
 
-SLOT_KEYS = ("weapon", "amulet", "gloves", "boots")
+SLOT_KEYS = ("weapon", "amulet", "gloves", "boots", "shield")
 SLOT_NAMES = {
     "weapon": "Оружие",
     "amulet": "Амулет",
     "gloves": "Перчатки",
     "boots": "Сапоги",
+    "shield": "Щит",
 }
 SLOT_EMOJI = {
     "weapon": "🗡",
     "amulet": "📿",
     "gloves": "🧤",
     "boots": "👢",
+    "shield": "🛡",
 }
 
 
@@ -625,6 +635,11 @@ try:
 except ImportError:
     _RAW_GEAR_ITEMS = ()
 
+try:
+    from pets_shield_catalog import RAW_ITEMS as _RAW_SHIELD_ITEMS
+except ImportError:
+    _RAW_SHIELD_ITEMS = ()
+
 
 def _catalog_item(spec):
     if isinstance(spec, Item):
@@ -650,6 +665,7 @@ if _RAW_WEAPON_ITEMS:
 
 _catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)
 _catalogue_gear = tuple(_catalog_item(spec) for spec in _RAW_GEAR_ITEMS)
+_catalogue_shields = tuple(_catalog_item(spec) for spec in _RAW_SHIELD_ITEMS)
 # The loot table is what this guards: exactly 40 amulets have to be findable, and every
 # amulet has to be an amulet. Sold ones are counted separately -- adding something to the
 # shop counter must not be able to quietly take a slot out of the drop pool.
@@ -668,7 +684,13 @@ if _RAW_GEAR_ITEMS and (
     or any(item.source != "drop" for item in _catalogue_gear)
 ):
     raise ValueError("gear catalogue must contain 32 drop-only boots and 32 gloves")
-_new_catalogue_items = _catalogue_amulets + _catalogue_gear
+if _RAW_SHIELD_ITEMS and (
+    len(_catalogue_shields) != 10
+    or any(item.slot != "shield" for item in _catalogue_shields)
+    or sum(item.source == "shop" for item in _catalogue_shields) != 3
+):
+    raise ValueError("shield catalogue must contain 10 shields, exactly three sold in shops")
+_new_catalogue_items = _catalogue_amulets + _catalogue_gear + _catalogue_shields
 if _new_catalogue_items:
     existing_codes = {item.code for item in ITEMS}
     new_codes = [item.code for item in _new_catalogue_items]

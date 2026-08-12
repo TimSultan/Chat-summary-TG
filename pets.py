@@ -39,6 +39,7 @@ import economy
 import pets_combat
 import pets_config as C
 import pets_mobs as M
+import pets_scroll_catalog as SCROLLS
 import stats
 from app_time import now as app_now
 
@@ -225,6 +226,13 @@ def _load(entry: str) -> dict:
         record["fight_result_notifications"] = bool(
             record.get("fight_result_notifications", True)
         )
+        # Scrolls are abilities, not inventory objects. Every historic pet receives a
+        # legal starter loadout on read; malformed hand-edited saves fall back atomically
+        # instead of entering combat with a half-valid fourth (ultimate) slot.
+        try:
+            record["skill_slots"] = list(SCROLLS.validate_loadout(record.get("skill_slots")))
+        except ValueError:
+            record["skill_slots"] = list(SCROLLS.DEFAULT_LOADOUT)
     return data
 
 
@@ -342,6 +350,7 @@ def _new_record() -> dict:
         "farm_run": None,
         "farm_notifications": [],
         "fight_result_notifications": True,
+        "skill_slots": list(SCROLLS.DEFAULT_LOADOUT),
     }
 
 
@@ -1838,6 +1847,65 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
 
 def effective_stats(entry, user_id) -> dict:
     return _effective_stats_for(_tamed_record(_load(entry), user_id) or {})
+
+
+def _skill_loadout_for(record: dict | None) -> tuple[str, str, str, str]:
+    try:
+        return SCROLLS.validate_loadout((record or {}).get("skill_slots"))
+    except ValueError:
+        return SCROLLS.DEFAULT_LOADOUT
+
+
+def skill_loadout(entry, user_id) -> tuple[str, str, str, str]:
+    """The pet's three regular scrolls and one once-per-fight ultimate."""
+    return _skill_loadout_for(_tamed_record(_load(entry), user_id))
+
+
+def set_skill_slot(entry, user_id, slot: int, code: str) -> tuple[bool, str]:
+    """Equip one globally known scroll; scrolls are abilities and are never consumed."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    try:
+        index = int(slot) - 1
+    except (TypeError, ValueError):
+        index = -1
+    spell = SCROLLS.scroll(code)
+    if index not in range(4) or spell is None:
+        return False, "Неизвестный слот или свиток."
+    if bool(spell.get("ultimate")) != (index == 3):
+        return False, "В четвёртом слоте должен быть ультимейт, в первых трёх — обычные свитки."
+    loadout = list(_skill_loadout_for(record))
+    if code in loadout and loadout[index] != code:
+        return False, "Один свиток нельзя поставить сразу в два слота."
+    loadout[index] = code
+    try:
+        record["skill_slots"] = list(SCROLLS.validate_loadout(loadout))
+    except ValueError as error:
+        return False, str(error)
+    _save(entry, data)
+    return True, f"Слот {slot}: «{spell['name']}»."
+
+
+def _combat_shield_for(record: dict | None) -> dict | None:
+    code = ((record or {}).get("equipped") or {}).get("shield")
+    item = C.find_item(code) if code else None
+    if item is None or item.slot != "shield":
+        return None
+    effect = dict(getattr(item, "effect", {}) or {})
+    return {
+        "code": item.code, "name": item.name,
+        "guard": effect.get("guard", .40),
+        "defend_effects": tuple(
+            dict(row) for row in effect.get("defend_effects", ()) if isinstance(row, dict)
+        ),
+    }
+
+
+def combat_shield(entry, user_id) -> dict | None:
+    """Snapshot of the worn shield's Defend hook for deterministic combat/replay."""
+    return _combat_shield_for(_tamed_record(_load(entry), user_id))
 
 
 def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:

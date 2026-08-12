@@ -26,6 +26,7 @@ import economy
 import casino
 import pets
 import pets_config as C
+import pets_scroll_catalog as SCROLLS
 import pets_updates
 import quests
 import stats
@@ -1183,6 +1184,10 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "bagitems", slot_argument(slot)),
         }])
     rows.append([{
+        "text": "📜 Боевые свитки · 4 слота",
+        "callback_data": callback_data(user_id, "skills"),
+    }])
+    rows.append([{
         "text": "🛒 Магазин", "callback_data": callback_data(user_id, "store"),
     }])
     rows.append([{
@@ -1237,6 +1242,82 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def skills_view(entry: str, user_id) -> tuple[str, dict]:
+    """The live loadout: three ordinary scrolls and one once-per-fight ultimate."""
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    lines = [
+        "📜 <b>Боевые свитки</b>",
+        "В обычных боях существо само выбирает между атакой, защитой и доступными свитками.",
+        "<i>У каждого доступного свитка одинаковый шанс. Четвёртый слот — ультимейт один раз за бой.</i>",
+    ]
+    rows = []
+    for index, code in enumerate(pets.skill_loadout(entry, user_id), start=1):
+        spell = SCROLLS.scroll(code)
+        title = str(spell["name"]).split(": ", 1)[-1]
+        lines.extend([
+            "",
+            f"<b>{index}. {escape(spell['icon'])} {escape(title)}</b>"
+            + (" · УЛЬТИМЕЙТ" if spell["ultimate"] else f" · CD {spell['cooldown']}"),
+            escape(spell["short"]),
+            "Можно увернуться." if spell["dodgeable"] else "Нельзя увернуться.",
+        ])
+        rows.append([{
+            "text": f"Изменить слот {index} · {spell['icon']} {title}",
+            "callback_data": callback_data(user_id, "skillpick", f"{index},0"),
+        }])
+    rows.append([{"text": "🎒 К снаряжению", "callback_data": callback_data(user_id, "bag")}])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[str, dict]:
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    slot = max(1, min(4, int(slot)))
+    pool = SCROLLS.ULTIMATE_SCROLLS if slot == 4 else SCROLLS.REGULAR_SCROLLS
+    page_size = 6
+    total_pages = max(1, (len(pool) + page_size - 1) // page_size)
+    page = min(max(0, int(page)), total_pages - 1)
+    visible = pool[page * page_size:(page + 1) * page_size]
+    current = pets.skill_loadout(entry, user_id)[slot - 1]
+    lines = [
+        f"📜 <b>Слот {slot}</b> · {page + 1}/{total_pages}",
+        "Ультимейт используется не больше одного раза за бой." if slot == 4
+        else "Выбери обычный магический свиток или свиток умения.",
+    ]
+    rows = []
+    for spell in visible:
+        chosen = spell["code"] == current
+        lines.extend([
+            "",
+            f"<b>{escape(spell['icon'])} {escape(spell['name'])}</b>" + (" ✅" if chosen else ""),
+            escape(spell["short"]),
+            ("Можно увернуться" if spell["dodgeable"] else "Нельзя увернуться")
+            + (" · один раз" if spell["ultimate"] else f" · CD {spell['cooldown']}"),
+        ])
+        if not chosen:
+            rows.append([{
+                "text": f"{spell['icon']} Выбрать · {str(spell['name']).split(': ', 1)[-1]}",
+                "callback_data": callback_data(user_id, "setskill", f"{slot}:{spell['code']}"),
+            }])
+    navigation = []
+    if page:
+        navigation.append({
+            "text": "◀️", "callback_data": callback_data(user_id, "skillpick", f"{slot},{page - 1}"),
+        })
+    if page + 1 < total_pages:
+        navigation.append({
+            "text": "▶️", "callback_data": callback_data(user_id, "skillpick", f"{slot},{page + 1}"),
+        })
+    if navigation:
+        rows.append(navigation)
+    rows.append([{"text": "◀️ К свиткам", "callback_data": callback_data(user_id, "skills")}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
 def weapon_forge_view(user_id) -> tuple[str, dict]:
     return (
         "🛠️ <b>Ковка оружия</b>\n\nЗдесь позже можно будет создавать оружие по рецептам. Функция пока готовится.",
@@ -1272,7 +1353,7 @@ def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
     the two buyable accessories landed on page one depended on how much the player already
     owned, so an active player still opened the shop onto a wall of "только из боёв" with
     no button anywhere. Weapons never had that problem because they have their own
-    storefront (``store_view``). This is the same thing for the other three slots: a short,
+    storefront (``store_view``). This is the same thing for the other four slots: a short,
     unpaginated shelf, so "buy an amulet" is always exactly two taps.
     """
     pet = pets.get_pet(entry, user_id)
@@ -1613,6 +1694,9 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
         [{
             "text": f"{C.SLOT_EMOJI['boots']} {C.SLOT_NAMES['boots']}",
             "callback_data": callback_data(user_id, "shopslot", "boots"),
+        }, {
+            "text": f"{C.SLOT_EMOJI['shield']} {C.SLOT_NAMES['shield']}",
+            "callback_data": callback_data(user_id, "shopslot", "shield"),
         }],
         [{"text": "🎒 Моё снаряжение", "callback_data": callback_data(user_id, "bag")}],
         _back_row(user_id),
@@ -1908,7 +1992,7 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
     """Short caption for the composite result image; the image carries the full receipt."""
     lines = [f"<b>{escape(result.closing)}</b>"]
     if result.stopped_early:
-        lines.append("<i>Решение по урону после 10 атак.</i>")
+        lines.append("<i>Решение по урону после лимита ходов.</i>")
 
     won = result.winner == mine_key
     if result.is_draw:

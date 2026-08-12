@@ -88,6 +88,8 @@ class FightImageTests(unittest.TestCase):
             "weapon": {"name": "Сковородка", "rarity": "rare", "bonuses": {"strength": 6}},
             "amulet": {"name": "Чайный пакетик", "rarity": "uncommon", "bonuses": {"health": 3},
                        "effect": "В бою +14 здоровья."},
+            "shield": {"name": "Картонный баклер", "rarity": "common", "bonuses": {"armor": 10},
+                       "effect": "При защите создаёт барьер."},
         }
         defender = {
             "id": "b", "pet_name": "Бета", "owner_name": "Bob",
@@ -200,6 +202,18 @@ class BattleLogImageTests(unittest.TestCase):
         )
         self.assertFalse(entries[0]["passive"])
         self.assertEqual(entries[0]["health"], 300)
+
+    def test_defend_and_non_damaging_scrolls_show_the_casters_health(self):
+        entries = pets_image._log_entries(
+            self._result([
+                self._round("a", event="defend", damage=0),
+                self._round("a", event="skill_scroll_healing_rain", damage=-50),
+                self._round("a", event="skill_scroll_arcane_spark", damage=90),
+            ]),
+            self.ATTACKER, self.DEFENDER,
+        )
+        self.assertEqual([row["passive"] for row in entries], [True, True, False])
+        self.assertEqual([row["health"] for row in entries], [400, 400, 300])
 
 
 if __name__ == "__main__":

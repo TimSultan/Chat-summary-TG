@@ -1202,10 +1202,10 @@ class StorefrontAndCollectionTests(PetsTestCase):
         reintroduce a three-figure accessory."""
         shop_items = [item for item in pets_config.ITEMS if item.source == "shop"]
         self.assertTrue(shop_items)
-        # 6 accessories (bead/acorn/mittens/claws/slippers/springs) plus the weapon
-        # catalogue's 375 shop weapons (250 common + 120 uncommon + 5 rare), plus the
-        # utility items below.
-        self.assertEqual(len(shop_items), 381 + len(UTILITY_SHOP_CODES))
+        # 6 accessories (bead/acorn/mittens/claws/slippers/springs), 3 shields and the
+        # weapon catalogue's 375 shop weapons (250 common + 120 uncommon + 5 rare),
+        # plus the utility items below.
+        self.assertEqual(len(shop_items), 384 + len(UTILITY_SHOP_CODES))
         for item in shop_items:
             if item.code in UTILITY_SHOP_CODES:
                 # Utility amulets are priced for their combat effect as well as their

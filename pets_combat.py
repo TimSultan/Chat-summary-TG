@@ -33,6 +33,7 @@ from dataclasses import dataclass, replace
 
 import pets_config as C
 import pets_flavor
+import pets_scroll_catalog as SCROLLS
 
 _STATS = ("strength", "health", "agility", "luck")
 _SIGNATURE_STATS = _STATS + ("armor",)
@@ -52,6 +53,11 @@ class Fighter:
     # Each entry may be ``"vampiric"`` or ``{"code": "vampiric", "value": .12}``.
     effects: tuple = ()
     level: int = 1       # pet level snapshot; used by Giant Slayer
+    # Active combat loadout. Empty means a historic/classic fighter and preserves the
+    # old simulator byte-for-byte; current pets carry 3 regular scrolls + one ultimate.
+    skills: tuple = ()
+    # Snapshot of the equipped live shield's Defend hook (or None for base Defend).
+    shield: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +168,7 @@ _EFFECT_TEXT = {
     "echo_strike": "повторяет попадание эхом: {amount} урона.",
     "crushing_grip": "сжимает хватку: урон соперника ниже на {amount}%.",
     "perfect_parry": "парирует удар и запасает {amount} урона для ответа.",
+    "guard": "держит защиту: поглощено {amount} урона.",
 }
 
 
@@ -189,6 +196,8 @@ def snapshot(fighter: "Fighter") -> dict:
             for effect in (fighter.effects or ())
         ],
         "level": fighter.level,
+        "skills": list(fighter.skills or ()),
+        "shield": dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None,
     }
 
 
@@ -209,6 +218,13 @@ def restore(data) -> "Fighter | None":
     key = str(data.get("key") or "")
     if not key:
         return None
+    raw_skills = data.get("skills") or ()
+    try:
+        skills = SCROLLS.validate_loadout(raw_skills) if raw_skills else ()
+    except ValueError:
+        return None
+    raw_shield = data.get("shield")
+    shield = dict(raw_shield) if isinstance(raw_shield, Mapping) else None
     return Fighter(
         key=key,
         name=str(data.get("name") or "Существо"),
@@ -223,6 +239,8 @@ def restore(data) -> "Fighter | None":
             if isinstance(effect, (Mapping, str))
         ),
         level=_stored_number(data.get("level"), 1),
+        skills=skills,
+        shield=shield,
     )
 
 
@@ -379,6 +397,8 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         return 1.0 + stat_bonus[stat]
 
     max_hp = C.BASE_HP + fighter.health * C.HP_PER_POINT * factor("health")
+    if fighter.skills:
+        max_hp += fighter.strength * C.HP_PER_STRENGTH_WITH_SKILLS * factor("strength")
     damage = C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT * factor("strength")
     dodge = _saturate(C.DODGE_MAX, C.DODGE_K, fighter.agility * factor("agility"))
     crit = C.CRIT_BASE + _saturate(C.CRIT_MAX, C.CRIT_K, fighter.luck * factor("luck"))
@@ -469,6 +489,18 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     hp = dict(max_hp)
     total_damage = {a.key: 0, b.key: 0}
     effects = {a.key: derived[a.key]["effects"], b.key: derived[b.key]["effects"]}
+    skill_loadouts = {}
+    for fighter in (a, b):
+        try:
+            skill_loadouts[fighter.key] = (
+                SCROLLS.validate_loadout(fighter.skills) if fighter.skills else ()
+            )
+        except ValueError:
+            skill_loadouts[fighter.key] = ()
+    equipped_shields = {
+        fighter.key: dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None
+        for fighter in (a, b)
+    }
     # Collector, Trophy Compass, Coin Rake and Survivor settle in pets.record_fight.
     # Merely equipping one of them must
     # not switch combat to the passive pipeline or alter an otherwise identical replay.
@@ -476,7 +508,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     effectful = any(
         effect["code"] not in non_combat_codes
         for fighter_effects in effects.values() for effect in fighter_effects
-    )
+    ) or any(skill_loadouts.values()) or any(equipped_shields.values())
     shields = {a.key: 0.0, b.key: 0.0}
     used = {a.key: set() for a in (a, b)}
     landed_hits = {a.key: 0 for a in (a, b)}
@@ -500,6 +532,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     afterimage_bonus = {a.key: 0.0, b.key: 0.0}
     damage_weakened = {a.key: 0.0, b.key: 0.0}
     stun_procs = {a.key: 0, b.key: 0}
+    guards = {a.key: 0.0, b.key: 0.0}
+    skill_cooldowns = {a.key: {} for a in (a, b)}
+    ultimate_used = {a.key: False for a in (a, b)}
+    skill_statuses = {a.key: {} for a in (a, b)}
 
     initiative = .5
     if effectful:
@@ -521,9 +557,18 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             text=f"✨ {fighters[owner_key].name} {template.format(amount=amount)}",
         ))
 
-    def hurt(source_key: str, target_key: str, damage: int, number: int) -> tuple[int, bool]:
+    def hurt(
+        source_key: str, target_key: str, damage: int, number: int,
+        pierce_guard: float = 0.0,
+    ) -> tuple[int, bool]:
         """Apply damage and one-shot defensive effects. Returns (impact, knockout)."""
         damage = max(0, int(damage))
+        if damage and guards[target_key] > 0:
+            before_guard = damage
+            blocked_share = guards[target_key] * max(0.0, 1.0 - min(1.0, pierce_guard))
+            damage = round(damage * max(0.0, 1.0 - blocked_share))
+            guards[target_key] = 0.0
+            effect_round(number, target_key, source_key, "guard", before_guard - damage)
         if effectful and damage and str(source_key).startswith("mob:") \
                 and (value := _effect_value(effects[target_key], "mob_ward")) is not None:
             damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
@@ -582,6 +627,241 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         before = hp[target_key]
         hp[target_key] = max(0.0, hp[target_key] - damage)
         return round(before - hp[target_key]), hp[target_key] <= 0
+
+    def skill_value(key: str, name: str) -> float:
+        value = skill_statuses[key].get(name)
+        return float(value[0]) if isinstance(value, list) and value else 0.0
+
+    def put_skill_status(key: str, name: str, value: float, turns: int) -> None:
+        old = skill_statuses[key].get(name)
+        current_value = float(old[0]) if isinstance(old, list) and old else 0.0
+        current_turns = int(old[1]) if isinstance(old, list) and len(old) > 1 else 0
+        skill_statuses[key][name] = [max(current_value, float(value)), max(current_turns, turns)]
+
+    def tick_skill_state(key: str, used_code: str | None = None) -> None:
+        for name in ("blind", "weaken", "vulnerable", "damage_boost", "regen"):
+            row = skill_statuses[key].get(name)
+            if not isinstance(row, list):
+                continue
+            row[1] -= 1
+            if row[1] <= 0:
+                skill_statuses[key].pop(name, None)
+        for code in list(skill_cooldowns[key]):
+            skill_cooldowns[key][code] -= 1
+            if skill_cooldowns[key][code] <= 0:
+                skill_cooldowns[key].pop(code, None)
+        if used_code:
+            cooldown = int(SCROLLS.scroll(used_code).get("cooldown", 0))
+            if cooldown:
+                skill_cooldowns[key][used_code] = cooldown
+
+    def harmful_status_allowed(target_key: str) -> bool:
+        if not skill_statuses[target_key].pop("negative_ward", False):
+            return True
+        rounds.append(Round(
+            number=0, attacker=target_key, event="skill_ward", damage=0,
+            attacker_hp=round(hp[target_key]), defender_hp=round(hp[_other_key(target_key)]),
+            text=f"🎗 {fighters[target_key].name} блокирует негативный эффект.",
+        ))
+        return False
+
+    def _other_key(key: str) -> str:
+        return b.key if key == a.key else a.key
+
+    def reflect_skill_damage(source_key: str, target_key: str, impact: int, number: int) -> str | None:
+        reflected = float(skill_statuses[target_key].pop("reflect_next", 0) or 0)
+        if not reflected or not impact:
+            return None
+        back = max(1, round(impact * reflected))
+        back_impact, back_ko = hurt(target_key, source_key, back, number)
+        total_damage[target_key] += back_impact
+        rounds.append(Round(
+            number=number, attacker=target_key, event="skill_reflect", damage=back_impact,
+            attacker_hp=round(hp[target_key]), defender_hp=round(hp[source_key]),
+            text=f"🌹 {fighters[target_key].name} отражает {back_impact} урона.",
+        ))
+        return target_key if back_ko else None
+
+    def spell_damage(
+        source_key: str, target_key: str, effect: Mapping, number: int,
+    ) -> tuple[int, str | None]:
+        raw = derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 1.0)))
+        raw *= 1 + rng.uniform(-C.DAMAGE_VARIANCE, C.DAMAGE_VARIANCE)
+        if rng.random() < derived[source_key]["crit"]:
+            raw *= C.CRIT_MULTIPLIER
+        raw *= max(.10, 1.0 - skill_value(source_key, "weaken"))
+        raw *= 1.0 + skill_value(source_key, "damage_boost")
+        raw *= 1.0 + skill_value(target_key, "vulnerable")
+        armor = derived[target_key]["reduction"] * max(
+            0.0, 1.0 - min(1.0, float(effect.get("pierce_armor", 0) or 0)),
+        )
+        raw *= 1.0 - armor
+        impact, knocked_out = hurt(
+            source_key, target_key, max(1, round(raw)), number,
+            pierce_guard=max(0.0, float(effect.get("pierce_guard", 0) or 0)),
+        )
+        total_damage[source_key] += impact
+        reflected_winner = (
+            None if knocked_out else reflect_skill_damage(source_key, target_key, impact, number)
+        )
+        return impact, reflected_winner or (source_key if knocked_out else None)
+
+    def apply_scroll_effect(
+        source_key: str, target_key: str, effect: Mapping, number: int,
+    ) -> tuple[int, str | None]:
+        op = str(effect.get("op") or "")
+        if op == "damage":
+            return spell_damage(source_key, target_key, effect, number)
+        if op in {"burn", "weaken", "blind", "vulnerable", "stun"} \
+                and not harmful_status_allowed(target_key):
+            return 0, None
+        if op == "heal":
+            hp[source_key] = min(
+                max_hp[source_key],
+                hp[source_key] + max_hp[source_key] * max(0.0, float(effect.get("percent", 0))),
+            )
+        elif op == "shield":
+            shields[source_key] = min(
+                max_hp[source_key], shields[source_key] + max(
+                    1, round(max_hp[source_key] * max(0.0, float(effect.get("percent", 0))))
+                ),
+            )
+        elif op == "burn":
+            burning[target_key] = (
+                source_key,
+                max(1, int(effect.get("turns", 1))),
+                max(1, round(derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 0))))),
+            )
+        elif op in {"weaken", "blind", "vulnerable"}:
+            put_skill_status(
+                target_key, op, max(0.0, float(effect.get("value", 0))),
+                max(1, int(effect.get("turns", 1))),
+            )
+        elif op == "stun":
+            stunned[target_key] = True
+        elif op == "dodge_next":
+            skill_statuses[source_key]["dodge_next"] = True
+        elif op == "reflect_next":
+            skill_statuses[source_key]["reflect_next"] = max(
+                float(skill_statuses[source_key].get("reflect_next", 0) or 0),
+                max(0.0, float(effect.get("value", 0))),
+            )
+        elif op == "cleanse":
+            burning[source_key] = None
+            stunned[source_key] = False
+            for name in ("burn", "blind", "weaken", "vulnerable"):
+                skill_statuses[source_key].pop(name, None)
+        elif op == "break_shield":
+            shields[target_key] = 0.0
+        elif op == "regen":
+            # +1 because the status is created during this action, which is ticked below.
+            put_skill_status(
+                source_key, "regen",
+                max_hp[source_key] * max(0.0, float(effect.get("percent", 0))),
+                max(1, int(effect.get("turns", 1))) + 1,
+            )
+        elif op == "damage_boost":
+            put_skill_status(
+                source_key, "damage_boost", max(0.0, float(effect.get("value", 0))),
+                max(1, int(effect.get("turns", 1))) + 1,
+            )
+        elif op == "negative_ward":
+            skill_statuses[source_key]["negative_ward"] = True
+        elif op == "self_damage":
+            self_harm = max(1, round(
+                max_hp[source_key] * max(0.0, float(effect.get("percent", 0)))
+            ))
+            before = hp[source_key]
+            hp[source_key] = max(0.0, hp[source_key] - self_harm)
+            if hp[source_key] <= 0:
+                return 0, target_key
+            total_damage[target_key] += round(before - hp[source_key])
+        return 0, None
+
+    def active_actions(key: str) -> list[str]:
+        loadout = skill_loadouts[key]
+        if not loadout:
+            return ["attack"]
+        actions = ["attack", "defend"]
+        for index, code in enumerate(loadout):
+            spell = SCROLLS.scroll(code)
+            if skill_cooldowns[key].get(code):
+                continue
+            if spell["ultimate"] and ultimate_used[key]:
+                continue
+            actions.append(f"skill_{index + 1}")
+        return actions
+
+    def start_active_turn(key: str, other_key: str, number: int) -> None:
+        regen = skill_statuses[key].get("regen")
+        if isinstance(regen, list) and regen[0] > 0 and hp[key] > 0:
+            before = hp[key]
+            hp[key] = min(max_hp[key], hp[key] + regen[0])
+            healed = round(hp[key] - before)
+            if healed:
+                rounds.append(Round(
+                    number=number, attacker=key, event="skill_regen", damage=-healed,
+                    attacker_hp=round(hp[key]), defender_hp=round(hp[other_key]),
+                    text=f"💧 {fighters[key].name} восстанавливает {healed} HP.",
+                ))
+
+    def take_active_action(
+        source_key: str, target_key: str, action: str, number: int,
+    ) -> str | None:
+        if action == "defend":
+            shield = equipped_shields[source_key] or {}
+            guards[source_key] = max(.10, min(.80, float(shield.get("guard", .40) or .40)))
+            for effect in shield.get("defend_effects", ()):
+                _impact, winner = apply_scroll_effect(source_key, target_key, effect, number)
+                if winner:
+                    return winner
+            rounds.append(Round(
+                number=number, attacker=source_key, event="defend", damage=0,
+                attacker_hp=round(hp[source_key]), defender_hp=round(hp[target_key]),
+                text=(f"🛡 {fighters[source_key].name} защищается"
+                      + (f" щитом «{shield.get('name')}»." if shield.get("name") else ".")),
+            ))
+            tick_skill_state(source_key)
+            return None
+
+        index = int(action.removeprefix("skill_")) - 1
+        code = skill_loadouts[source_key][index]
+        spell = SCROLLS.scroll(code)
+        if spell["ultimate"]:
+            ultimate_used[source_key] = True
+        harmful = any(effect.get("op") in {
+            "damage", "burn", "weaken", "blind", "vulnerable", "stun", "break_shield",
+        } for effect in spell["effects"])
+        dodged = False
+        if harmful and spell["dodgeable"]:
+            if skill_statuses[target_key].pop("dodge_next", False):
+                dodged = True
+            else:
+                miss_chance = min(
+                    .85,
+                    derived[target_key]["dodge"] * derived[source_key]["accuracy"]
+                    + skill_value(source_key, "blind"),
+                )
+                dodged = rng.random() < miss_chance
+        impact = 0
+        winner = None
+        if not dodged:
+            for effect in spell["effects"]:
+                dealt, winner = apply_scroll_effect(source_key, target_key, effect, number)
+                impact += dealt
+                if winner:
+                    break
+        rounds.append(Round(
+            number=number, attacker=source_key,
+            event="skill_dodge" if dodged else f"skill_{code}", damage=impact,
+            attacker_hp=round(hp[source_key]), defender_hp=round(hp[target_key]),
+            text=(f"💨 {fighters[target_key].name} ускользает от «{spell['name']}»." if dodged
+                  else f"{spell['icon']} {fighters[source_key].name}: "
+                       f"{str(spell['short']).rstrip('.')}"
+                       + (f" — {impact} урона." if impact else ".")),
+        ))
+        tick_skill_state(source_key, code)
+        return winner
 
     if effectful:
         for owner_key, other_key in ((a.key, b.key), (b.key, a.key)):
@@ -655,9 +935,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     def strike(attacker_key: str, defender_key: str, round_number: int) -> str | None:
         """One blow, appended as a Round. Returns the key of a fighter knocked out."""
         attacker, defender = fighters[attacker_key], fighters[defender_key]
+        personal_limit = (
+            C.MAX_SKILL_ACTIONS_PER_FIGHTER
+            if skill_loadouts[attacker_key] else C.MAX_ATTACKS_PER_FIGHTER
+        )
+        if attacks_made[attacker_key] >= personal_limit:
+            return None
+        if skill_loadouts[attacker_key]:
+            start_active_turn(attacker_key, defender_key, round_number)
         if effectful and stunned[attacker_key]:
             stunned[attacker_key] = False
             effect_round(round_number, defender_key, attacker_key, "stun")
+            if skill_loadouts[attacker_key]:
+                tick_skill_state(attacker_key)
             return None
         if effectful and _effect_value(effects[attacker_key], "cocoon") is not None \
                 and "cocoon" not in used[attacker_key]:
@@ -665,6 +955,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             cocooned[attacker_key] = True
             attacks_made[attacker_key] += 1
             effect_round(round_number, attacker_key, defender_key, "cocoon")
+            if skill_loadouts[attacker_key]:
+                tick_skill_state(attacker_key)
             return None
         if effectful and (burn := burning[attacker_key]) is not None:
             source_key, turns, burn_damage = burn
@@ -705,6 +997,15 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             healed = round(hp[attacker_key] - before)
             if healed:
                 effect_round(round_number, attacker_key, defender_key, "regen", healed)
+        if skill_loadouts[attacker_key]:
+            choices = active_actions(attacker_key)
+            # Every available scroll has the same one-ticket chance. A plain attack has
+            # four tickets so active combat does not turn into an endless wall of heals
+            # and shields; Defend keeps one ticket like any single ability.
+            action = rng.choice(["attack"] * 4 + [row for row in choices if row != "attack"])
+            if action != "attack":
+                attacks_made[attacker_key] += 1
+                return take_active_action(attacker_key, defender_key, action, round_number)
         signature = signatures.pop(defender_key, None)
         if signature and signature[0] == "agility":
             if signature[1] == 3:
@@ -737,13 +1038,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             defender_numbers["reduction"] *= max(0.0, 1 - ignored)
         forced_venom_miss = venom_miss[attacker_key] > 0 and rng.random() < venom_miss[attacker_key]
         venom_miss[attacker_key] = 0.0
+        forced_skill_miss = False
+        if skill_loadouts[attacker_key]:
+            if skill_statuses[defender_key].pop("dodge_next", False):
+                forced_skill_miss = True
+            elif skill_value(attacker_key, "blind") > 0:
+                forced_skill_miss = rng.random() < min(.80, skill_value(attacker_key, "blind"))
         phantom_dodge = effectful and "phantom_step" not in used[defender_key] \
             and _effect_value(effects[defender_key], "phantom_step") is not None
         if phantom_dodge:
             used[defender_key].add("phantom_step")
             effect_round(round_number, defender_key, attacker_key, "phantom_step")
         event, damage = (
-            ("dodge", 0) if forced_venom_miss or phantom_dodge
+            ("dodge", 0) if forced_venom_miss or forced_skill_miss or phantom_dodge
             else _resolve_blow(derived[attacker_key], defender_numbers, rng)
         )
         if signature and signature[0] == "health":
@@ -764,6 +1071,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             attack_no = attacks_made[attacker_key]
             multiplier = 1.0
             multiplier *= max(.10, 1 - damage_weakened[attacker_key])
+            multiplier *= max(.10, 1 - skill_value(attacker_key, "weaken"))
+            multiplier *= 1 + skill_value(attacker_key, "damage_boost")
+            multiplier *= 1 + skill_value(defender_key, "vulnerable")
             if afterimage_bonus[attacker_key]:
                 multiplier += afterimage_bonus[attacker_key]
                 afterimage_bonus[attacker_key] = 0.0
@@ -867,6 +1177,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         attacks_made[attacker_key] += 1
         if damage:
             landed_hits[attacker_key] += 1
+        if skill_loadouts[attacker_key] and impact and not knocked_out:
+            reflected_winner = reflect_skill_damage(
+                attacker_key, defender_key, impact, round_number,
+            )
+            if reflected_winner:
+                return reflected_winner
 
         # Post-hit effects occur after the ordinary attack line so the sequence reads
         # naturally in Telegram.  They can knock out the attacker too.
@@ -1077,13 +1393,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                     and (value := _effect_value(effects[defender_key], "afterimage")) is not None:
                 used[defender_key].add("afterimage")
                 afterimage_bonus[defender_key] = max(0, _fraction(value))
+        if skill_loadouts[attacker_key]:
+            tick_skill_state(attacker_key)
         return attacker_key if knocked_out else None
 
     stopped_early = False
     winner_key = loser_key = None
     is_draw = False
 
-    for round_number in range(1, C.MAX_ATTACKS_PER_FIGHTER + 1):
+    action_limit = (
+        C.MAX_SKILL_ACTIONS_PER_FIGHTER
+        if any(skill_loadouts.values()) else C.MAX_ATTACKS_PER_FIGHTER
+    )
+    for round_number in range(1, action_limit + 1):
         leader_key = order[(round_number - 1) % 2]
         follower_key = order[round_number % 2]
 

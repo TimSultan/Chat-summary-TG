@@ -184,14 +184,16 @@ def _equipment_bonus_text(item: dict | None) -> str:
     return "   ".join(parts) or "—"
 
 
-def _draw_item_title(draw, left: int, y: int, label: str, item: dict | None) -> None:
+def _draw_item_title(
+    draw, left: int, y: int, label: str, item: dict | None, max_width: int | None = None,
+) -> None:
     rarity = str((item or {}).get("rarity") or "common")
     symbol, color = RARITY_SYMBOLS.get(rarity, RARITY_SYMBOLS["common"])
     symbol_font = _font(16, bold=True)
     draw.text((left, y - 1), symbol, font=symbol_font, fill=color)
     name = (item or {}).get("name") or "не надето"
     font = _font(15, bold=True)
-    text = _fit_text(draw, f"{label}  {name}", font, PET_IMAGE_SIZE[0] - 25)
+    text = _fit_text(draw, f"{label}  {name}", font, (max_width or PET_IMAGE_SIZE[0]) - 25)
     draw.text((left + 23, y), text, font=font, fill="#273137")
 
 
@@ -200,6 +202,7 @@ def _draw_equipment(draw, x: int, fighter: dict) -> None:
     right = left + PET_IMAGE_SIZE[0]
     weapon = fighter.get("weapon")
     amulet = fighter.get("amulet")
+    shield = fighter.get("shield")
 
     _draw_item_title(draw, left, WEAPON_NAME_TOP, "ОРУЖИЕ", weapon)
     weapon_stats = _fit_text(
@@ -212,10 +215,18 @@ def _draw_equipment(draw, x: int, fighter: dict) -> None:
         draw.text((left, WEAPON_EFFECT_TOP), effect_line, font=_font(13), fill="#53606a")
     draw.line((left, WEAPON_DIVIDER_TOP, right, WEAPON_DIVIDER_TOP), fill="#c4cbc8", width=1)
 
-    _draw_item_title(draw, left, AMULET_NAME_TOP, "ТАЛИСМАН", amulet)
+    # Amulet and shield share one compact row. The round log carries the complete prose;
+    # the receipt only needs to make both equipped effects visible at a glance.
+    column = PET_IMAGE_SIZE[0] // 2
+    shield_left = left + column
+    _draw_item_title(draw, left, AMULET_NAME_TOP, "ТАЛИСМАН", amulet, column - 6)
+    _draw_item_title(draw, shield_left, AMULET_NAME_TOP, "ЩИТ", shield, column)
     effect = (amulet or {}).get("effect") or "без эффекта"
-    effect_text = _fit_text(draw, f"♦ {effect}", _font(13), PET_IMAGE_SIZE[0])
+    effect_text = _fit_text(draw, f"♦ {effect}", _font(13), column - 8)
     draw.text((left, AMULET_EFFECT_TOP), effect_text, font=_font(13), fill="#53606a")
+    shield_effect = (shield or {}).get("effect") or "без эффекта"
+    shield_text = _fit_text(draw, f"♦ {shield_effect}", _font(13), column)
+    draw.text((shield_left, AMULET_EFFECT_TOP), shield_text, font=_font(13), fill="#53606a")
     draw.line((left, EQUIPMENT_DIVIDER_TOP, right, EQUIPMENT_DIVIDER_TOP), fill="#9ca8a4", width=2)
 
 
@@ -350,7 +361,11 @@ def render_fight_result(path, result, attacker: dict, defender: dict) -> Path:
     _center(draw, 850, "НАНЕСЕНО УРОНА", _font(18, bold=True), "#5c666c")
     draw.text((518, 875), str(left_damage), font=_font(43, bold=True), fill="#147a59")
     draw.text((684, 875), str(right_damage), font=_font(43, bold=True), fill="#b83e58")
-    _center(draw, 933, "НОКАУТ" if not result.stopped_early and not result.is_draw else "10 АТАК", _font(18, bold=True), "#5c666c")
+    _center(
+        draw, 933,
+        "НОКАУТ" if not result.stopped_early and not result.is_draw else "ПО ЛИМИТУ",
+        _font(18, bold=True), "#5c666c",
+    )
 
     if winner:
         winner_name = attacker.get("pet_name") if winner == attacker.get("id") else defender.get("pet_name")
@@ -432,9 +447,13 @@ def _log_entries(result, attacker: dict, defender: dict) -> list[dict]:
         key = str(round_.attacker)
         is_attacker = key == attacker_key
         owner = attacker if is_attacker else defender
-        # An amulet or weapon proc belongs to whoever triggered it, so its remaining
-        # health is the interesting number; a blow's is the target's.
-        passive = str(round_.event or "").startswith("amulet_")
+        # A passive/self-only skill belongs to whoever triggered it, so its remaining
+        # health is the interesting number; an attack or damaging spell shows the target.
+        event = str(round_.event or "")
+        passive = (
+            event.startswith("amulet_") or event == "defend"
+            or (event.startswith("skill_") and event != "skill_dodge" and round_.damage <= 0)
+        )
         entries.append({
             "color": LOG_ATTACKER_COLOR if is_attacker else LOG_DEFENDER_COLOR,
             "tint": LOG_ATTACKER_TINT if is_attacker else LOG_DEFENDER_TINT,

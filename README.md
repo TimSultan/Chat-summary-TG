@@ -1003,10 +1003,10 @@ has none, so the six-hour REFERENCE level-1 farm shift (14 coins) always buys on
 own; a shorter shift pays less and may need a repeat trip or the hourly passive income to
 top it up first. Higher rarities remain long-term goals, while resale stays at a low 20%
 (rounded down, including below five coins for the starter tier).
-The two purchasable accessories in each of the other three slots (amulet, gloves, boots)
-price the same way -- previously hand-picked numbers up to 1,100 coins that predated
-`shop_price_for_bonuses` and never followed the weapon rebalance; they now cost 10-170
-coins depending on the same power-and-rarity formula (see PETS_BALANCE.md 6.0.3).
+The purchasable accessories in the four non-weapon slots (amulet, gloves, boots and the
+new shield slot) price the same way -- previously hand-picked numbers up to 1,100 coins
+that predated `shop_price_for_bonuses` and never followed the weapon rebalance. Three
+shields are permanent shop stock; another seven are arena/farm drops.
 Rarity weights make a legendary about 0.94% of weapon drops; if an unowned legendary has
 not appeared for 500 eligible wins, the next win guarantees one. Aggregate-only economy
 telemetry tracks passive minting, sales, gifts, arena gold and drops.
@@ -1018,6 +1018,16 @@ opening, attack, defence, healing and comeback hooks. Two legendary utility effe
 at settlement: Collector raises the item-drop chance from 8% to 10%, while Survivor
 keeps 30% of the normal loss penalty. All 90 additions are drop-only. They share the
 existing 8% item roll without replacing the five-weapon legendary pity pool.
+
+Every current pet also carries a live four-scroll loadout: three regular magic/skill
+scrolls and a fourth ultimate that can resolve at most once per fight. The loadout is
+chosen from the editable 30+10 table in `pets_scroll_catalog.py` and can be changed in
+both Telegram and the Mini App. Live arena and mob fights automatically choose between
+normal attacks, Defend and off-cooldown scrolls. Defend reduces the next incoming hit;
+an equipped shield can add its own barrier, reflection, heal, cleanse or other hook.
+Skill-enabled pets receive a small Strength-based HP addition and a larger action cap;
+fighters restored from old snapshots remain on the original HP and ten-attack rules so
+stored replays stay deterministic.
 
 At startup, the one-time `unique_weapons_202608` migration removes «Швабра на изоленте»
 (`w003`) from every old inventory and grants each former owner 100 coins. Other historic
