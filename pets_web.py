@@ -646,8 +646,17 @@ def _skills_payload(record: dict) -> dict:
     loadout = pets._skill_loadout_for(record)
     selected = []
     for index, code in enumerate(loadout, start=1):
-        row = pets_scroll_catalog.public_scroll(pets_scroll_catalog.scroll(code))
+        spell = pets_scroll_catalog.scroll(code) if code else None
+        if spell is None:
+            # An empty slot still ships, so the panel can draw four slots and show which
+            # of them are open rather than silently rendering a shorter list.
+            selected.append({"slot": index, "code": None, "empty": True,
+                             "ultimate": index == 4, "name": "", "icon": "",
+                             "short": "", "element": "", "effects_text": []})
+            continue
+        row = pets_scroll_catalog.public_scroll(spell)
         row["slot"] = index
+        row["empty"] = False
         selected.append(row)
     owned = set(pets._owned_scroll_codes_for(record))
     return {
@@ -1054,7 +1063,7 @@ def _test_battle_setup_payload(entry: str, me: str, prefix: str) -> dict:
             "guard_percent": round(pets_test_combat.BASE_GUARD * 100),
         },
         "defaults": {
-            "skills": list(pets_scroll_catalog.DEFAULT_LOADOUT),
+            "skills": list(pets_scroll_catalog.SAMPLE_LOADOUT),
             "shield": pets_scroll_catalog.DEFAULT_SHIELD,
         },
         "regular_scrolls": [
@@ -1130,13 +1139,13 @@ async def handle_test_battle_start(request: web.Request) -> web.Response:
     )
     try:
         loadout = pets_scroll_catalog.validate_loadout(
-            body.get("skills") or pets_scroll_catalog.DEFAULT_LOADOUT
+            body.get("skills") or pets_scroll_catalog.SAMPLE_LOADOUT
         )
         shield_code = str(body.get("shield") or pets_scroll_catalog.DEFAULT_SHIELD)
         if pets_scroll_catalog.shield(shield_code) is None:
             raise ValueError("Неизвестный щит.")
         battle = pets_test_combat.start_battle(
-            player, enemy, loadout, pets_scroll_catalog.DEFAULT_LOADOUT,
+            player, enemy, loadout, pets_scroll_catalog.SAMPLE_LOADOUT,
             shield_code, pets_scroll_catalog.DEFAULT_SHIELD,
         )
     except ValueError as error:
@@ -2191,6 +2200,10 @@ PAGE_HTML = """<!doctype html>
   .live-skill b, .live-skill small { display: block; }
   .live-skill small { margin-top: 4px; color: var(--muted); font-weight: 400; }
   .live-skill.ultimate { border-color: var(--r-legendary); }
+  /* An open slot, drawn like one: dashed, quiet, and obviously something you can fill,
+     rather than a card that looks broken because its contents failed to load. */
+  .live-skill.empty { border-style: dashed; color: var(--muted); background: none; }
+  .live-skill.empty b { font-weight: 600; }
   /* What the scroll actually does, in numbers. Brighter than the flavour line under it
      on purpose: comparing two scrolls means comparing these, and the description above
      them is atmosphere. */
@@ -2877,12 +2890,16 @@ function liveSkillsPanel() {
   return '<div class="panel"><div class="row spread"><h2 style="margin:0">📜 Свитки</h2>' +
     '<span class="tiny muted">в бою выбираются автоматически</span></div>' +
     '<div class="live-skills" style="margin-top:9px">' + rows.map((spell) =>
-      '<button class="go sec live-skill' + (spell.ultimate ? " ultimate" : "") +
-      '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' + esc(spell.icon) + " " +
-      esc(shortSkillName(spell.name)) + '</b>' + scrollEffects(spell) +
-      '<small>' + esc(scrollElement(spell)) +
-      (spell.dodgeable === false ? ' · нельзя увернуться' : '') + " · " +
-      esc(spell.short) + '</small></button>'
+      spell.empty
+        ? '<button class="go sec live-skill empty" data-liveskill="' + spell.slot +
+          '"><b>' + spell.slot + ' · Пусто</b><small>' +
+          (spell.ultimate ? 'слот под ультимейт' : 'слот свободен') + '</small></button>'
+        : '<button class="go sec live-skill' + (spell.ultimate ? " ultimate" : "") +
+          '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' + esc(spell.icon) + " " +
+          esc(shortSkillName(spell.name)) + '</b>' + scrollEffects(spell) +
+          '<small>' + esc(scrollElement(spell)) +
+          (spell.dodgeable === false ? ' · нельзя увернуться' : '') + " · " +
+          esc(spell.short) + '</small></button>'
     ).join("") + '</div><div class="tiny muted" style="margin-top:10px">Открыто ' +
       Number(S.skills.owned_count || 0) + ' из ' + Number(S.skills.catalogue_count || 0) +
       '. Новый #япокрасил: ' + Math.round(Number(rewards.paint_chance || 0) * 1000) / 10 +
@@ -2895,8 +2912,15 @@ function openLiveSkillPicker(slot) {
   const number = Number(slot);
   const pool = number === 4 ? S.skills.ultimate : S.skills.regular;
   const current = S.skills.slots[number - 1];
+  const filled = current && !current.empty;
   sheet('<h3>' + (number === 4 ? '✨ Ультимейт · один раз за бой' : '📜 Свиток · слот ' + number) +
-    '</h3><p class="tiny muted">Каждый выбранный свиток используется один раз за бой. В автобою доступные свитки имеют одинаковый шанс применения.</p>' +
+    '</h3><p class="tiny muted">Слот можно оставить пустым. Каждый выбранный свиток используется один раз за бой; в автобою доступные свитки имеют одинаковый шанс применения.</p>' +
+    (filled
+      ? '<button class="go sec" data-liveskillset="' + number + ':">✖️ Освободить слот</button>'
+      : '') +
+    (pool.length
+      ? ''
+      : '<div class="empty">Открытых свитков для этого слота пока нет. Они выпадают за #япокрасил и за принятые сложные квесты.</div>') +
     pool.map((spell) => '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) +
       '</b><div class="small">' + esc(spell.short) + '</div>' + scrollEffects(spell) +
       '<div class="tiny muted">' +

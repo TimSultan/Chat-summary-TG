@@ -53,10 +53,11 @@ FIGHT_LOG_LIMIT = 2_000
 # See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
 UNIQUE_WEAPONS_MIGRATION_FLAG = "unique_weapons_202608"
-# Store-level marker: this chat's scroll collections have already been taken back to the
-# starter four, so everybody re-earns the other 36 through drops. A dated name because a
-# later wipe wants a new flag rather than a cleared one -- see reset_scroll_collections.
-SCROLL_RESET_FLAG = "scroll_reset_202608"
+# Store-level marker: this chat's scroll collections have already been emptied, so
+# everybody earns all forty through drops. A new dated name rather than a cleared old
+# one, deliberately: the first wipe left a starter set behind, and a chat that already
+# ran it still has those four to lose -- see reset_scroll_collections.
+SCROLL_RESET_FLAG = "scroll_wipe_all_202608"
 HAMSTERATOR_RETIREMENT_REASON = "pet_hamsterator_retirement_202608"
 # w003 was the mop when that migration stripped it from every owner; it has since been
 # renamed back to Старый компрессор. The code and the payout reason below are historical
@@ -246,22 +247,21 @@ def _load(entry: str) -> dict:
         record["fight_result_notifications"] = bool(
             record.get("fight_result_notifications", True)
         )
-        # Scrolls are abilities, not inventory objects. Every historic pet receives a
-        # legal starter loadout on read; malformed hand-edited saves fall back atomically
-        # instead of entering combat with a half-valid fourth (ultimate) slot.
+        # Scrolls are abilities, not inventory objects, and the four slots holding them
+        # may each be empty. A malformed hand-edited loadout falls back to four empty
+        # slots atomically, rather than entering combat half-valid.
         try:
             record["skill_slots"] = list(SCROLLS.validate_loadout(record.get("skill_slots")))
         except ValueError:
-            record["skill_slots"] = list(SCROLLS.DEFAULT_LOADOUT)
-        # Scroll availability used to be global.  Preserve every scroll a historic
-        # creature had equipped, as well as the starter set, so this migration never
-        # silently takes a live ability away.  New creatures only receive the starter
-        # set; later scrolls are permanent rare unlocks.
+            record["skill_slots"] = list(SCROLLS.EMPTY_LOADOUT)
+        # Equipped codes are folded into the owned list as a repair for saves written
+        # before ownership was tracked per creature. Nothing else is added: there is no
+        # starter set, so a creature owns exactly what it has earned.
         owned_scrolls = record.get("owned_scrolls")
         if not isinstance(owned_scrolls, list):
             owned_scrolls = []
         record["owned_scrolls"] = list(dict.fromkeys(
-            code for code in [*SCROLLS.DEFAULT_LOADOUT, *record["skill_slots"], *owned_scrolls]
+            code for code in [*SCROLLS.equipped_codes(record["skill_slots"]), *owned_scrolls]
             if isinstance(code, str) and code in legal_scrolls
         ))
     # A player may paint and earn a scroll before taming a creature.  This top-level
@@ -404,8 +404,8 @@ def _new_record() -> dict:
         "farm_run": None,
         "farm_notifications": [],
         "fight_result_notifications": True,
-        "skill_slots": list(SCROLLS.DEFAULT_LOADOUT),
-        "owned_scrolls": list(SCROLLS.DEFAULT_LOADOUT),
+        "skill_slots": list(SCROLLS.EMPTY_LOADOUT),
+        "owned_scrolls": [],
     }
 
 
@@ -1711,23 +1711,21 @@ def enforce_unique_weapons(entries) -> dict:
 
 
 def reset_scroll_collections(entries) -> dict:
-    """Take every unlocked scroll back to the starter four, once per chat.
+    """Empty every scroll collection and every slot, once per chat.
 
-    The starter loadout is the floor rather than zero because a creature must enter a
-    fight with four legal slots (``SCROLLS.validate_loadout``); "no scrolls at all" is not
-    a state the combat engine can represent. Everything above that floor goes, and the
-    catalogue's other 36 have to be earned again through paint and hard-quest drops.
+    A clean zero, not a floor: the four slots may each be empty, so "owns nothing" is a
+    state a creature can actually be in, and all forty scrolls are earned through paint
+    and hard-quest drops from here.
 
     Ownership lives in three places that all have to be cleared together, because each
     one is merged back into the others on the next read: the creature's ``owned_scrolls``,
-    the equipped ``skill_slots`` (unioned into the owned list by ``_owned_scroll_codes_for``,
+    the equipped ``skill_slots`` (folded into the owned list by ``_owned_scroll_codes_for``,
     so leaving them would hand back precisely the scrolls a player was using), and the
     per-user wallet that survives an untamed gap. ``reward_log`` is deliberately kept --
     it is the receipt ledger that stops an old paint or quest being replayed for a second
     roll, and clearing it would reopen every past event to farming.
     """
     report = {"players": 0, "scrolls": 0}
-    starter = set(SCROLLS.DEFAULT_LOADOUT)
     for entry in entries:
         data = _load(entry)
         if data.get(SCROLL_RESET_FLAG):
@@ -1747,13 +1745,12 @@ def reset_scroll_collections(entries) -> dict:
                 held.update(
                     code for code in wallet.get("unlocked") or [] if isinstance(code, str)
                 )
-            lost = held - starter
-            if lost:
+            if held:
                 report["players"] += 1
-                report["scrolls"] += len(lost)
+                report["scrolls"] += len(held)
             if isinstance(record, dict):
-                record["owned_scrolls"] = list(SCROLLS.DEFAULT_LOADOUT)
-                record["skill_slots"] = list(SCROLLS.DEFAULT_LOADOUT)
+                record["owned_scrolls"] = []
+                record["skill_slots"] = list(SCROLLS.EMPTY_LOADOUT)
             if isinstance(wallet, dict):
                 wallet["unlocked"] = []
                 # The collection starts over, so the counters pacing it start over too --
@@ -1961,26 +1958,25 @@ def effective_stats(entry, user_id) -> dict:
     return _effective_stats_for(_tamed_record(_load(entry), user_id) or {})
 
 
-def _skill_loadout_for(record: dict | None) -> tuple[str, str, str, str]:
+def _skill_loadout_for(record: dict | None) -> tuple:
     try:
         return SCROLLS.validate_loadout((record or {}).get("skill_slots"))
     except ValueError:
-        return SCROLLS.DEFAULT_LOADOUT
+        return SCROLLS.EMPTY_LOADOUT
 
 
 def _owned_scroll_codes_for(record: dict | None) -> tuple[str, ...]:
     """Canonical permanent scroll collection for one creature.
 
-    The starter loadout is always present even in a hand-edited or partially migrated
-    record.  Equipped codes are included as a final backwards-compatibility safeguard:
-    an old valid loadout can never become unusable merely because a save was read during
-    the ownership migration.
+    Starts empty and grows only through drops. Equipped codes are folded in as a
+    backwards-compatibility safeguard: an old valid loadout can never become unusable
+    merely because a save was read during the ownership migration.
     """
     legal = {row["code"] for row in SCROLLS.SCROLLS}
     values = (record or {}).get("owned_scrolls")
     if not isinstance(values, list):
         values = []
-    values = [*SCROLLS.DEFAULT_LOADOUT, *_skill_loadout_for(record), *values]
+    values = [*SCROLLS.equipped_codes(_skill_loadout_for(record)), *values]
     return tuple(dict.fromkeys(code for code in values if isinstance(code, str) and code in legal))
 
 
@@ -2156,13 +2152,26 @@ def grant_scroll_for_hard_quest(entry: str, user_id, submission_id, difficulty) 
     )
 
 
-def skill_loadout(entry, user_id) -> tuple[str, str, str, str]:
-    """The pet's three regular scrolls and one once-per-fight ultimate."""
+def skill_loadout(entry, user_id) -> tuple:
+    """The pet's four scroll slots, in order. An empty slot reads as None."""
     return _skill_loadout_for(_tamed_record(_load(entry), user_id))
 
 
-def set_skill_slot(entry, user_id, slot: int, code: str) -> tuple[bool, str]:
-    """Equip one permanently unlocked scroll; abilities are never consumed."""
+def clear_skill_slot(entry, user_id, slot: int) -> tuple[bool, str]:
+    """Take the scroll out of one slot and leave it empty.
+
+    Emptying is an ordinary move rather than an undo: a creature is not required to
+    field four scrolls, so a slot with nothing in it is a position a player can choose.
+    """
+    return set_skill_slot(entry, user_id, slot, None)
+
+
+def set_skill_slot(entry, user_id, slot: int, code: str | None) -> tuple[bool, str]:
+    """Equip one permanently unlocked scroll, or empty the slot with a falsy code.
+
+    Abilities are never consumed: equipping moves a scroll the creature already owns
+    into a slot, and clearing puts it back in the collection untouched.
+    """
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -2171,14 +2180,25 @@ def set_skill_slot(entry, user_id, slot: int, code: str) -> tuple[bool, str]:
         index = int(slot) - 1
     except (TypeError, ValueError):
         index = -1
+    if index not in range(4):
+        return False, "Неизвестный слот."
+    loadout = list(_skill_loadout_for(record))
+
+    if not code:
+        if loadout[index] is None:
+            return False, f"Слот {slot} и так пустой."
+        loadout[index] = None
+        record["skill_slots"] = list(SCROLLS.validate_loadout(loadout))
+        _save(entry, data)
+        return True, f"Слот {slot} свободен."
+
     spell = SCROLLS.scroll(code)
-    if index not in range(4) or spell is None:
-        return False, "Неизвестный слот или свиток."
+    if spell is None:
+        return False, "Неизвестный свиток."
     if bool(spell.get("ultimate")) != (index == 3):
         return False, "В четвёртом слоте должен быть ультимейт, в первых трёх — обычные свитки."
     if code not in _owned_scroll_codes_for(record):
         return False, "Этот свиток ещё не открыт. Его можно найти за покрас или сложный квест."
-    loadout = list(_skill_loadout_for(record))
     if code in loadout and loadout[index] != code:
         return False, "Один свиток нельзя поставить сразу в два слота."
     loadout[index] = code

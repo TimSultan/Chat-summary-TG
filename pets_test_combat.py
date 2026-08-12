@@ -86,11 +86,11 @@ def start_battle(
     }
     state["fighters"] = {
         "player": _fighter(
-            "player", copy.deepcopy(player), player_loadout or catalog.DEFAULT_LOADOUT,
+            "player", copy.deepcopy(player), player_loadout or catalog.SAMPLE_LOADOUT,
             player_shield or catalog.DEFAULT_SHIELD,
         ),
         "enemy": _fighter(
-            "enemy", copy.deepcopy(enemy), enemy_loadout or catalog.DEFAULT_LOADOUT,
+            "enemy", copy.deepcopy(enemy), enemy_loadout or catalog.SAMPLE_LOADOUT,
             enemy_shield or catalog.DEFAULT_SHIELD,
         ),
     }

@@ -224,8 +224,8 @@ def total_stat_cost(target_level: int, from_level: int = STAT_MIN_LEVEL) -> int:
 
 # --------------------------------------------------------------------------- combat
 # Tuned so an even fight naturally runs for ~20 blows -- about ten from each side -- at
-# EVERY level. `MAX_ATTACKS_PER_FIGHTER` makes ten attacks each a hard ceiling; a fight
-# that reaches it is awarded by total damage rather than continuing past the limit.
+# EVERY level. `MAX_SKILL_ACTIONS_PER_FIGHTER` is the ceiling rather than the target: a
+# fight that reaches it is awarded by total damage rather than continuing past the limit.
 #
 #   HP     = BASE_HP + health * HP_PER_POINT             (500 + 19/pt -> 2,020 at 80)
 #   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT  (49.5 + 2.42/pt -> 243 at 80)
@@ -288,12 +288,17 @@ LUCK_OPENING_DAMAGE_SHARE = 0.40
 ARMOR_MAX = 0.60            # hard ceiling on damage reduction, so armor can never zero a hit
 ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 
-# Each pet gets at most this many attacks. If neither side is knocked out by then, the
-# living pet that dealt more total damage wins; see pets_combat.simulate.
-MAX_ATTACKS_PER_FIGHTER = 10
-# Scrolls and Defend spend actions without always dealing damage. Their fights get a
-# larger deterministic budget, otherwise healing/guard builds would hit the old cap long
-# before either side had a chance to use its loadout.
+# Each pet gets at most this many actions -- attacks, Defends and scrolls alike. If
+# neither side is knocked out by then, the living pet that dealt more total damage wins;
+# see pets_combat.simulate.
+#
+# One budget for every fighter, whether it carries scrolls or not. It used to be 10 for a
+# scroll-less fighter and 24 for one with a loadout, which quietly made an empty slot cost
+# 14 actions on top of the missing scroll -- worth more than any scroll's own effect, and
+# the reason PVE mobs (which never carry scrolls) fought at well under half a player's
+# turns. Scrolls and Defend spend actions without always dealing damage, so the budget
+# stays at the larger number: at 10, a healing or guard build would run out of fight
+# before it had used its loadout.
 MAX_SKILL_ACTIONS_PER_FIGHTER = 24
 
 # ------------------------------------------------------------------ stat lead bonus

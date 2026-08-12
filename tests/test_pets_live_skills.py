@@ -12,20 +12,19 @@ import pets_config as C
 import pets_scroll_catalog as scrolls
 
 
-def _fighter(key: str, *, loadout=scrolls.DEFAULT_LOADOUT, shield=None):
+def _fighter(key: str, *, loadout=scrolls.SAMPLE_LOADOUT, shield=None):
     return combat.Fighter(
         key=key, name=key.upper(), strength=20, health=20, agility=20, luck=20,
         armor=5, skills=loadout, shield=shield,
     )
 
 
-def _loadout_containing(code: str) -> tuple[str, str, str, str]:
+def _loadout_containing(code: str) -> tuple:
+    """One scroll in its own slot and nothing else, now that slots may be empty."""
     spell = scrolls.scroll(code)
     if spell["ultimate"]:
-        return (*scrolls.DEFAULT_LOADOUT[:3], code)
-    ordinary = [code]
-    ordinary.extend(row for row in scrolls.DEFAULT_LOADOUT[:3] if row != code)
-    return (*ordinary[:3], scrolls.DEFAULT_LOADOUT[3])
+        return (None, None, None, code)
+    return (code, None, None, None)
 
 
 class LiveCombatTableTests(unittest.TestCase):
@@ -112,7 +111,7 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertTrue(pets.buy_cage("chat", "1", 0)[0])
         self.assertTrue(pets.tame("chat", "1", 0, "Hero", "photo", "Owner")[0])
 
-    def test_old_pet_migrates_to_four_skills_and_an_empty_shield_slot(self):
+    def test_old_pet_migrates_to_four_empty_slots_and_an_empty_shield_slot(self):
         data = pets._load("chat")
         record = data["pets"]["1"]
         record.pop("skill_slots")
@@ -120,9 +119,21 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         pets._save("chat", data)
 
         migrated = pets.get_pet("chat", "1")
-        self.assertEqual(tuple(migrated["skill_slots"]), scrolls.DEFAULT_LOADOUT)
+        # Four slots appear, and all of them are open: the migration grants no scrolls.
+        self.assertEqual(tuple(migrated["skill_slots"]), scrolls.EMPTY_LOADOUT)
         self.assertIn("shield", migrated["equipped"])
         self.assertIsNone(migrated["equipped"]["shield"])
+
+    def test_a_scroll_left_in_an_old_loadout_is_kept_as_owned(self):
+        """Reading a save must never be the thing that loses somebody a scroll."""
+        code = scrolls.REGULAR_SCROLLS[-1]["code"]
+        data = pets._load("chat")
+        data["pets"]["1"]["skill_slots"] = [code, None, None, None]
+        data["pets"]["1"]["owned_scrolls"] = []
+        pets._save("chat", data)
+
+        self.assertEqual(pets.skill_loadout("chat", "1"), (code, None, None, None))
+        self.assertIn(code, pets.owned_scrolls("chat", "1"))
 
     def test_slots_reject_wrong_types_and_persist_a_valid_selection(self):
         regular = scrolls.REGULAR_SCROLLS[-1]["code"]
@@ -199,14 +210,14 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertTrue(fifth["granted"])
         self.assertNotEqual(fifth["code"], third["code"])
 
-    def test_scroll_reset_strips_every_unlock_back_to_the_starter_four_once(self):
+    def test_scroll_wipe_empties_every_collection_and_slot_once(self):
         regular = scrolls.REGULAR_SCROLLS[-1]["code"]
         ultimate = scrolls.ULTIMATE_SCROLLS[-1]["code"]
         data = pets._load("chat")
         data["pets"]["1"]["owned_scrolls"].extend([regular, ultimate])
         pets._save("chat", data)
-        # Equipped as well as owned: the loadout is unioned back into the collection on
-        # read, so a reset that spared it would quietly hand these two straight back.
+        # Equipped as well as owned: the loadout is folded back into the collection on
+        # read, so a wipe that spared it would quietly hand these two straight back.
         self.assertTrue(pets.set_skill_slot("chat", "1", 2, regular)[0])
         self.assertTrue(pets.set_skill_slot("chat", "1", 4, ultimate)[0])
         # A painter with a wallet but no creature is part of the same wipe.
@@ -219,9 +230,9 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertEqual(report["players"], 2)
         self.assertEqual(report["scrolls"], 3)
 
-        self.assertEqual(pets.owned_scrolls("chat", "1"), scrolls.DEFAULT_LOADOUT)
-        self.assertEqual(pets.skill_loadout("chat", "1"), scrolls.DEFAULT_LOADOUT)
-        self.assertEqual(pets.owned_scrolls("chat", "2"), scrolls.DEFAULT_LOADOUT)
+        self.assertEqual(pets.owned_scrolls("chat", "1"), ())
+        self.assertEqual(pets.skill_loadout("chat", "1"), scrolls.EMPTY_LOADOUT)
+        self.assertEqual(pets.owned_scrolls("chat", "2"), ())
         self.assertEqual(pets._load("chat")["scroll_notifications"], [])
 
         # Flag-gated like every other one-off migration: a restart must not wipe a
@@ -240,7 +251,7 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertTrue(first["granted"])
 
         pets.reset_scroll_collections(["chat"])
-        self.assertEqual(pets.owned_scrolls("chat", "1"), scrolls.DEFAULT_LOADOUT)
+        self.assertEqual(pets.owned_scrolls("chat", "1"), ())
 
         # The same paint replayed after the wipe returns its stored receipt rather than
         # rolling again, so a wiped collection cannot be rebuilt from old sources.
@@ -248,7 +259,7 @@ class LiveLoadoutStorageTests(unittest.TestCase):
             "chat", "1", source="paint:42", kind="paint", chance=1.0, pity_after=20,
         )
         self.assertEqual(replay, first)
-        self.assertEqual(pets.owned_scrolls("chat", "1"), scrolls.DEFAULT_LOADOUT)
+        self.assertEqual(pets.owned_scrolls("chat", "1"), ())
 
 
 class ScrollWordingTests(unittest.TestCase):

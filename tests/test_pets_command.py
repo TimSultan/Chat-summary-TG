@@ -801,13 +801,14 @@ class PetsCommandTests(unittest.TestCase):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Бублик", "file_a", "Player")
 
+        # A newly tamed creature owns nothing, so all four slots open empty.
         opened = self._tap("skills")
         self.assertIn("Боевые свитки", opened.edits[-1]["text"])
-        self.assertIn("Воздушный", opened.edits[-1]["text"])
-        self.assertNotIn("Можно увернуться", opened.edits[-1]["text"])
-        self.assertEqual(len(pets.skill_loadout(CHAT, PLAYER["id"])), 4)
+        self.assertIn("Пусто", opened.edits[-1]["text"])
+        self.assertEqual(pets.skill_loadout(CHAT, PLAYER["id"]), SCROLLS.EMPTY_LOADOUT)
         picker = self._tap("skillpick", "2,4")
         self.assertIn("Слот 2", picker.edits[-1]["text"])
+        self.assertIn("Открытых свитков для этого слота пока нет", picker.edits[-1]["text"])
         self.assertTrue(all(
             len(button["callback_data"].encode("utf-8")) <= pets_ui.MAX_CALLBACK_BYTES
             for button in _buttons(picker.edits[-1]) if button.get("callback_data")
@@ -820,6 +821,14 @@ class PetsCommandTests(unittest.TestCase):
         changed = self._tap("setskill", f"2:{code}")
         self.assertEqual(pets.skill_loadout(CHAT, PLAYER["id"])[1], code)
         self.assertIn("Боевые свитки", changed.edits[-1]["text"])
+        self.assertIn("Воздушный", changed.edits[-1]["text"])
+
+        # And taking it back out again leaves the slot open, through the same screen.
+        cleared = self._tap("skillclear", "2")
+        self.assertIsNone(pets.skill_loadout(CHAT, PLAYER["id"])[1])
+        self.assertIn("Пусто", cleared.edits[-1]["text"])
+        # Clearing never destroys the scroll -- it goes back to being equippable.
+        self.assertIn(code, pets.owned_scrolls(CHAT, PLAYER["id"]))
 
     def test_realistic_poker_can_start_and_fold_through_telegram_callbacks(self):
         stakes = self._tap("cgame", "poker_ai")

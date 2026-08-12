@@ -23,12 +23,27 @@ class ScrollCatalogTests(unittest.TestCase):
         self.assertTrue(any("Звездопад" in row["name"] for row in catalog.SCROLLS))
 
     def test_loadout_reserves_fourth_slot_for_an_ultimate(self):
-        self.assertEqual(catalog.validate_loadout(catalog.DEFAULT_LOADOUT), catalog.DEFAULT_LOADOUT)
+        self.assertEqual(catalog.validate_loadout(catalog.SAMPLE_LOADOUT), catalog.SAMPLE_LOADOUT)
         with self.assertRaisesRegex(ValueError, "четвёртый"):
             catalog.validate_loadout((
-                catalog.DEFAULT_LOADOUT[3], *catalog.DEFAULT_LOADOUT[1:3],
-                catalog.DEFAULT_LOADOUT[0],
+                catalog.SAMPLE_LOADOUT[3], *catalog.SAMPLE_LOADOUT[1:3],
+                catalog.SAMPLE_LOADOUT[0],
             ))
+
+    def test_slots_may_be_empty_individually_and_all_at_once(self):
+        """A creature fields what it has found; the rest of the slots simply stay open."""
+        self.assertEqual(catalog.validate_loadout(catalog.EMPTY_LOADOUT), catalog.EMPTY_LOADOUT)
+        # Short, missing and blank entries all normalise to the same four-slot shape.
+        self.assertEqual(catalog.validate_loadout(("", None, "", None)), catalog.EMPTY_LOADOUT)
+        one = catalog.SAMPLE_LOADOUT[0]
+        self.assertEqual(catalog.validate_loadout((one, None, None, None)),
+                         (one, None, None, None))
+        self.assertEqual(catalog.equipped_codes((one, None, None, None)), (one,))
+        # What an empty slot must not become is an excuse to break the other rules.
+        with self.assertRaisesRegex(ValueError, "четыре слота"):
+            catalog.validate_loadout((one, None))
+        with self.assertRaisesRegex(ValueError, "два слота"):
+            catalog.validate_loadout((one, one, None, None))
 
 
 class TestBattleEngineTests(unittest.TestCase):
@@ -132,12 +147,12 @@ class TestBattleEngineTests(unittest.TestCase):
                     code for code in (item["code"] for item in catalog.REGULAR_SCROLLS)
                     if code not in regular
                 )
-            state = self._battle(player_loadout=(*regular[:3], catalog.DEFAULT_LOADOUT[3]))
+            state = self._battle(player_loadout=(*regular[:3], catalog.SAMPLE_LOADOUT[3]))
             resolved = combat.take_turn(state, "player", "skill_1")
             self.assertGreaterEqual(resolved["turn"], 2, row["code"])
 
         for row in catalog.ULTIMATE_SCROLLS:
-            state = self._battle(player_loadout=(*catalog.DEFAULT_LOADOUT[:3], row["code"]))
+            state = self._battle(player_loadout=(*catalog.SAMPLE_LOADOUT[:3], row["code"]))
             resolved = combat.take_turn(state, "player", "skill_4")
             self.assertTrue(resolved["fighters"]["player"]["ultimate_used"], row["code"])
 

@@ -1375,7 +1375,21 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
     ]
     rows = []
     for index, code in enumerate(pets.skill_loadout(entry, user_id), start=1):
-        spell = SCROLLS.scroll(code)
+        spell = SCROLLS.scroll(code) if code else None
+        if spell is None:
+            # An empty slot is a normal state, not a fault: a creature fields as many
+            # scrolls as it has found, and the fourth slot stays open until an ultimate
+            # turns up at all.
+            lines.extend([
+                "",
+                f"<b>{index}. Пусто</b>" + (" · ультимейт" if index == 4 else ""),
+                "<i>Слот свободен.</i>",
+            ])
+            rows.append([{
+                "text": f"Поставить в слот {index}",
+                "callback_data": callback_data(user_id, "skillpick", f"{index},0"),
+            }])
+            continue
         title = str(spell["name"]).split(": ", 1)[-1]
         # Scrolls have no cooldown and never had one -- every entry is uses: 1. The header
         # used to print spell['cooldown'], a key the catalogue does not define, and the
@@ -1391,10 +1405,16 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
             SCROLLS.element_label(spell["element"])
             + (" · Нельзя увернуться." if not spell["dodgeable"] else "")
         )
-        rows.append([{
-            "text": f"Изменить слот {index} · {spell['icon']} {title}",
-            "callback_data": callback_data(user_id, "skillpick", f"{index},0"),
-        }])
+        rows.append([
+            {
+                "text": f"Слот {index} · {spell['icon']} {title}",
+                "callback_data": callback_data(user_id, "skillpick", f"{index},0"),
+            },
+            {
+                "text": "✖️",
+                "callback_data": callback_data(user_id, "skillclear", str(index)),
+            },
+        ])
     rows.append([{"text": "🎒 К снаряжению", "callback_data": callback_data(user_id, "bag")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -1419,6 +1439,19 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
         else "Выбери открытый магический свиток или свиток умения.",
     ]
     rows = []
+    if not pool:
+        # The ordinary state for a new creature rather than an error, so it says what to
+        # go and do instead of apologising for an empty list.
+        lines.extend([
+            "",
+            "<i>Открытых свитков для этого слота пока нет.</i>",
+            "Свитки выпадают за #япокрасил и за принятые сложные квесты.",
+        ])
+    if current:
+        rows.append([{
+            "text": "✖️ Освободить слот",
+            "callback_data": callback_data(user_id, "skillclear", str(slot)),
+        }])
     for spell in visible:
         chosen = spell["code"] == current
         lines.extend([

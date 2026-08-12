@@ -23,8 +23,8 @@ rather than a confusing double-message, and "low_damage" only ever replaces a pl
 A "round" is a full exchange, not a single blow: the round's leader swings, and -- unless
 that already ends the fight -- the other side swings straight back within the same round
 number. Leadership alternates round to round from the rng-picked first mover, so nobody
-is stuck permanently swinging second. `MAX_ATTACKS_PER_FIGHTER` is a hard cap, so there
-can be no more than that many blows from either side.
+is stuck permanently swinging second. `MAX_SKILL_ACTIONS_PER_FIGHTER` is a hard cap on
+each fighter's actions, so there can be no more than that many blows from either side.
 """
 
 import random
@@ -774,7 +774,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             return ["attack"]
         actions = ["attack", "defend"]
         for index, code in enumerate(loadout):
-            if code in used_scrolls[key]:
+            # An empty slot offers nothing to choose. It still costs the creature
+            # nothing else: Defend and the full action budget come with having slots,
+            # not with having filled them.
+            if not code or code in used_scrolls[key]:
                 continue
             actions.append(f"skill_{index + 1}")
         return actions
@@ -814,6 +817,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         index = int(action.removeprefix("skill_")) - 1
         code = skill_loadouts[source_key][index]
         spell = SCROLLS.scroll(code)
+        if spell is None:
+            # active_actions never offers an empty slot, so this cannot be reached today.
+            # It stays because the alternative failure is a crashed fight: a hole in a
+            # loadout must never be the thing that takes a live battle down.
+            tick_skill_state(source_key)
+            return None
         used_scrolls[source_key].add(code)
         harmful = any(effect.get("op") in {
             "damage", "burn", "weaken", "blind", "vulnerable", "stun", "break_shield",
@@ -921,10 +930,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     def strike(attacker_key: str, defender_key: str, round_number: int) -> str | None:
         """One blow, appended as a Round. Returns the key of a fighter knocked out."""
         attacker, defender = fighters[attacker_key], fighters[defender_key]
-        personal_limit = (
-            C.MAX_SKILL_ACTIONS_PER_FIGHTER
-            if skill_loadouts[attacker_key] else C.MAX_ATTACKS_PER_FIGHTER
-        )
+        # One budget for everybody, whether or not they carry a scroll. Tying it to the
+        # loadout made an empty slot cost 14 actions on top of the missing scroll --
+        # against an opponent who had one, that gap alone decided the fight far more
+        # often than any scroll effect did (see pets_scroll_sim.py).
+        personal_limit = C.MAX_SKILL_ACTIONS_PER_FIGHTER
         if attacks_made[attacker_key] >= personal_limit:
             return None
         if skill_loadouts[attacker_key]:
@@ -1387,11 +1397,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     winner_key = loser_key = None
     is_draw = False
 
-    action_limit = (
-        C.MAX_SKILL_ACTIONS_PER_FIGHTER
-        if any(skill_loadouts.values()) else C.MAX_ATTACKS_PER_FIGHTER
-    )
-    for round_number in range(1, action_limit + 1):
+    for round_number in range(1, C.MAX_SKILL_ACTIONS_PER_FIGHTER + 1):
         leader_key = order[(round_number - 1) % 2]
         follower_key = order[round_number % 2]
 

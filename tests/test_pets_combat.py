@@ -200,7 +200,7 @@ class SimulateTests(unittest.TestCase):
         self.assertEqual(result.loser, "attacker")
         self.assertEqual(result.rounds[0].event, "signature_agility_counter")
 
-    def test_fights_allow_no_more_than_ten_attacks_per_fighter(self):
+    def test_fights_allow_no_more_than_the_action_cap_per_fighter(self):
         # A round is a full exchange (leader strikes, follower counters back in the same
         # round unless already dead). The cap applies to each pet, not merely to total
         # blows, so a future change cannot let the opening attacker get an extra strike.
@@ -208,9 +208,9 @@ class SimulateTests(unittest.TestCase):
         for seed in range(200):
             result = combat.simulate(a, b, rng=random.Random(seed))
             attacks = {key: sum(rnd.attacker == key for rnd in result.rounds) for key in (a.key, b.key)}
-            self.assertLessEqual(result.rounds[-1].number, C.MAX_ATTACKS_PER_FIGHTER)
-            self.assertLessEqual(attacks[a.key], C.MAX_ATTACKS_PER_FIGHTER)
-            self.assertLessEqual(attacks[b.key], C.MAX_ATTACKS_PER_FIGHTER)
+            self.assertLessEqual(result.rounds[-1].number, C.MAX_SKILL_ACTIONS_PER_FIGHTER)
+            self.assertLessEqual(attacks[a.key], C.MAX_SKILL_ACTIONS_PER_FIGHTER)
+            self.assertLessEqual(attacks[b.key], C.MAX_SKILL_ACTIONS_PER_FIGHTER)
             self.assertGreater(len(result.rounds), 0)
 
     def test_hp_is_never_negative_in_any_round(self):
@@ -233,18 +233,21 @@ class SimulateTests(unittest.TestCase):
                 self.assertIn(result.loser, (a.key, b.key))
                 self.assertNotEqual(result.winner, result.loser)
 
-    def test_even_fights_knock_out_about_eighty_five_percent_of_the_time(self):
-        rates = {}
+    def test_even_fights_are_decided_by_a_knockout(self):
+        """The damage tiebreak is a backstop, not an outcome the design leans on.
+
+        This used to sit near 85%: a fighter without scrolls got 10 actions, and an even
+        fight often ran out of them. Every fighter now gets the same 24 that a pet
+        carrying scrolls always had, and at that budget the tiebreak was already almost
+        never reached -- so this is bare fights joining live ones, not a new behaviour.
+        """
         for level in (1, 40, 80):
             a, b = _fighter("a", level, name="A"), _fighter("b", level, name="B")
             rate = sum(
                 not combat.simulate(a, b, seed=seed).stopped_early
                 for seed in range(1_000)
             ) / 1_000
-            rates[level] = rate
-            self.assertGreaterEqual(rate, 0.80, f"level {level}: knockout rate {rate}")
-            self.assertLessEqual(rate, 0.92, f"level {level}: knockout rate {rate}")
-        self.assertAlmostEqual(statistics.mean(rates.values()), 0.85, delta=0.04)
+            self.assertGreaterEqual(rate, 0.95, f"level {level}: knockout rate {rate}")
 
     def test_a_vastly_stronger_fighter_wins_at_least_90_percent_of_the_time(self):
         strong = Fighter(key="strong", name="Strong", strength=80, health=80,
@@ -270,8 +273,13 @@ class SimulateTests(unittest.TestCase):
             result = combat.simulate(a, b, rng=random.Random(1))
 
         self.assertTrue(result.stopped_early)
-        self.assertEqual(len(result.rounds), 2 * C.MAX_ATTACKS_PER_FIGHTER)
-        self.assertEqual(result.total_damage, {"a": 200, "b": 100})
+        self.assertEqual(len(result.rounds), 2 * C.MAX_SKILL_ACTIONS_PER_FIGHTER)
+        # Derived rather than written out, so retuning the budget cannot leave this
+        # test asserting a fight length the engine no longer runs.
+        self.assertEqual(result.total_damage, {
+            "a": 20 * C.MAX_SKILL_ACTIONS_PER_FIGHTER,
+            "b": 10 * C.MAX_SKILL_ACTIONS_PER_FIGHTER,
+        })
         self.assertEqual(result.winner, "a")
 
     def test_a_knockout_wins_even_when_the_loser_dealt_more_damage(self):
@@ -301,7 +309,10 @@ class SimulateTests(unittest.TestCase):
         self.assertTrue(result.is_draw)
         self.assertIsNone(result.winner)
         self.assertIsNone(result.loser)
-        self.assertEqual(result.total_damage, {"a": 200, "b": 200})
+        self.assertEqual(result.total_damage, {
+            "a": 20 * C.MAX_SKILL_ACTIONS_PER_FIGHTER,
+            "b": 20 * C.MAX_SKILL_ACTIONS_PER_FIGHTER,
+        })
 
 
 class AmuletEffectTests(unittest.TestCase):
@@ -427,7 +438,7 @@ class AmuletEffectTests(unittest.TestCase):
                     for fighter_key in ("a", "b"):
                         self.assertLessEqual(
                             sum(round_.attacker == fighter_key for round_ in ordinary),
-                            C.MAX_ATTACKS_PER_FIGHTER,
+                            C.MAX_SKILL_ACTIONS_PER_FIGHTER,
                         )
 
     def test_legendary_sting_can_stun_twice_but_never_more(self):

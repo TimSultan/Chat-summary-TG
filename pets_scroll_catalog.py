@@ -244,7 +244,13 @@ SHIELDS = (
 SCROLLS = REGULAR_SCROLLS + ULTIMATE_SCROLLS
 SCROLL_BY_CODE = {row["code"]: row for row in SCROLLS}
 SHIELD_BY_CODE = {row["code"]: row for row in SHIELDS}
-DEFAULT_LOADOUT = (
+# Four slots, all empty. A creature owns its slots the way it owns its equipment slots:
+# they exist from the moment it is tamed, and an empty one simply has nothing in it.
+# There is deliberately no starter set -- every one of the forty scrolls is earned.
+EMPTY_LOADOUT = (None, None, None, None)
+# Only for the designer sandbox in pets_test_combat, which needs something equipped to
+# demonstrate a turn. Never granted to a player and never written to a save.
+SAMPLE_LOADOUT = (
     "scroll_arcane_spark", "scroll_healing_rain", "scroll_nmm_glint",
     "ultimate_starfall",
 )
@@ -259,16 +265,40 @@ def shield(code: str) -> dict | None:
     return SHIELD_BY_CODE.get(str(code or ""))
 
 
-def validate_loadout(codes) -> tuple[str, str, str, str]:
-    values = tuple(str(code or "") for code in (codes or ()))
-    if len(values) != 4 or len(set(values)) != 4:
-        raise ValueError("Выбери четыре разных свитка.")
-    found = [scroll(code) for code in values]
-    if any(row is None for row in found):
-        raise ValueError("В наборе есть неизвестный свиток.")
-    if any(row["ultimate"] for row in found[:3]) or not found[3]["ultimate"]:
-        raise ValueError("Первые три слота — обычные свитки, четвёртый — ультимейт.")
-    return values
+def validate_loadout(codes) -> tuple:
+    """Four slots, each holding a scroll or nothing. Returns codes with None for empty.
+
+    Always four entries, never fewer: the slots are the creature's, not the scrolls'.
+    An empty slot is a legal resting state rather than an error, so a player who owns
+    two scrolls equips two and leaves the rest open -- exactly how an empty weapon or
+    amulet slot behaves. What stays enforced is what a filled slot may hold: ordinary
+    scrolls in the first three, an ultimate in the fourth, and never the same scroll
+    twice, since a scroll is a once-per-fight power and a second copy would be dead.
+    """
+    values = tuple(codes or ())
+    if len(values) != 4:
+        raise ValueError("У существа четыре слота под свитки.")
+    slots = []
+    for index, raw in enumerate(values):
+        code = str(raw or "")
+        if not code:
+            slots.append(None)
+            continue
+        row = scroll(code)
+        if row is None:
+            raise ValueError("В наборе есть неизвестный свиток.")
+        if bool(row["ultimate"]) != (index == 3):
+            raise ValueError("Первые три слота — обычные свитки, четвёртый — ультимейт.")
+        slots.append(code)
+    filled = [code for code in slots if code]
+    if len(set(filled)) != len(filled):
+        raise ValueError("Один свиток нельзя поставить сразу в два слота.")
+    return tuple(slots)
+
+
+def equipped_codes(loadout) -> tuple[str, ...]:
+    """Just the scrolls actually in the slots, in slot order. Empty slots drop out."""
+    return tuple(code for code in (loadout or ()) if code)
 
 
 # Blind is the one number a player would read as a lie: the turn engine caps a forced
@@ -387,7 +417,11 @@ def _validate() -> None:
     shield_codes = [row["code"] for row in SHIELDS]
     if len(shield_codes) != 10 or len(set(shield_codes)) != len(shield_codes):
         raise ValueError("shield catalogue must contain 10 unique entries")
-    validate_loadout(DEFAULT_LOADOUT)
+    validate_loadout(SAMPLE_LOADOUT)
+    # Four empty slots is the state every creature is tamed into, so it has to survive
+    # the same validator every equip goes through, unchanged.
+    if validate_loadout(EMPTY_LOADOUT) != EMPTY_LOADOUT:
+        raise ValueError("an empty loadout must validate to four empty slots")
 
 
 _validate()

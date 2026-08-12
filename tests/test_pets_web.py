@@ -267,9 +267,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(full["equipment"]), 5)
         self.assertEqual({slot["slot"] for slot in full["equipment"]}, set(C.SLOT_KEYS))
         self.assertTrue(all(slot["item"] is None for slot in full["equipment"]))
+        # Four slots from the moment it is tamed, all of them empty and none of them
+        # offering anything to equip yet -- a creature earns every scroll it fields.
         self.assertEqual(len(full["skills"]["slots"]), 4)
-        self.assertEqual(len(full["skills"]["regular"]), 3)
-        self.assertEqual(len(full["skills"]["ultimate"]), 1)
+        self.assertTrue(all(slot["empty"] for slot in full["skills"]["slots"]))
+        self.assertEqual(full["skills"]["owned_count"], 0)
+        self.assertEqual(full["skills"]["regular"], [])
+        self.assertEqual(full["skills"]["ultimate"], [])
         self.assertTrue(full["skills"]["slots"][3]["ultimate"])
         self.assertFalse(full["is_economy_admin"])
         self.assertIn("bag", full)

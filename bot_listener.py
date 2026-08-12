@@ -6582,6 +6582,12 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.skills_view(entry, user_id), log
             )
             return
+        if action == "skillclear":
+            ok, note = pets.clear_skill_slot(entry, user_id, argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.skills_view(entry, user_id), log
+            )
+            return
         if action == "reforge":
             ok, note, _result_code = pets.reforge_items(entry, user_id, argument)
             await _pets_toast_and_redraw(
