@@ -1377,14 +1377,20 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
     for index, code in enumerate(pets.skill_loadout(entry, user_id), start=1):
         spell = SCROLLS.scroll(code)
         title = str(spell["name"]).split(": ", 1)[-1]
+        # Scrolls have no cooldown and never had one -- every entry is uses: 1. The header
+        # used to print spell['cooldown'], a key the catalogue does not define, and the
+        # KeyError took the whole screen down to the generic error card.
         lines.extend([
             "",
             f"<b>{index}. {escape(spell['icon'])} {escape(title)}</b>"
-            + (" · УЛЬТИМЕЙТ" if spell["ultimate"] else f" · CD {spell['cooldown']}"),
+            + (" · УЛЬТИМЕЙТ" if spell["ultimate"] else "") + " · один раз за бой",
             escape(spell["short"]),
-            SCROLLS.element_label(spell["element"])
-            + (" · Нельзя увернуться." if not spell["dodgeable"] else ""),
         ])
+        lines.extend(f"▸ {escape(line)}" for line in SCROLLS.effect_lines(spell))
+        lines.append(
+            SCROLLS.element_label(spell["element"])
+            + (" · Нельзя увернуться." if not spell["dodgeable"] else "")
+        )
         rows.append([{
             "text": f"Изменить слот {index} · {spell['icon']} {title}",
             "callback_data": callback_data(user_id, "skillpick", f"{index},0"),
@@ -1419,10 +1425,13 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
             "",
             f"<b>{escape(spell['icon'])} {escape(spell['name'])}</b>" + (" ✅" if chosen else ""),
             escape(spell["short"]),
+        ])
+        lines.extend(f"▸ {escape(line)}" for line in SCROLLS.effect_lines(spell))
+        lines.append(
             SCROLLS.element_label(spell["element"])
             + (" · Нельзя увернуться" if not spell["dodgeable"] else "")
-            + (" · один раз" if spell["ultimate"] else f" · CD {spell['cooldown']}"),
-        ])
+            + " · один раз за бой"
+        )
         if not chosen:
             rows.append([{
                 "text": f"{spell['icon']} Выбрать · {str(spell['name']).split(': ', 1)[-1]}",

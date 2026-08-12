@@ -2191,6 +2191,12 @@ PAGE_HTML = """<!doctype html>
   .live-skill b, .live-skill small { display: block; }
   .live-skill small { margin-top: 4px; color: var(--muted); font-weight: 400; }
   .live-skill.ultimate { border-color: var(--r-legendary); }
+  /* What the scroll actually does, in numbers. Brighter than the flavour line under it
+     on purpose: comparing two scrolls means comparing these, and the description above
+     them is atmosphere. */
+  .fx { margin-top: 5px; display: grid; gap: 2px; font-size: 11px; color: var(--fg); }
+  .fx > span { display: block; }
+  .fx > span::before { content: "▸ "; color: var(--accent); }
 
   /* Financial audit: a horizontal hour strip keeps a 24h/7d timeline readable on a
      phone. Each bar is stacked by income source; expenses stay in the exact table below
@@ -2856,6 +2862,14 @@ const SCROLL_ELEMENTS = {
 };
 function scrollElement(spell) { return SCROLL_ELEMENTS[spell && spell.element] || ""; }
 
+/* The damage and effect numbers, worded server-side by pets_scroll_catalog.effect_text so
+   this page and the Telegram screen can never describe the same scroll differently. */
+function scrollEffects(spell) {
+  const lines = (spell && spell.effects_text) || [];
+  if (!lines.length) return "";
+  return '<div class="fx">' + lines.map((line) => '<span>' + esc(line) + '</span>').join("") + '</div>';
+}
+
 function liveSkillsPanel() {
   const rows = (S.skills && S.skills.slots) || [];
   const rewards = (S.skills && S.skills.rewards) || {};
@@ -2865,7 +2879,9 @@ function liveSkillsPanel() {
     '<div class="live-skills" style="margin-top:9px">' + rows.map((spell) =>
       '<button class="go sec live-skill' + (spell.ultimate ? " ultimate" : "") +
       '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' + esc(spell.icon) + " " +
-      esc(shortSkillName(spell.name)) + '</b><small>' + esc(scrollElement(spell)) + " · " +
+      esc(shortSkillName(spell.name)) + '</b>' + scrollEffects(spell) +
+      '<small>' + esc(scrollElement(spell)) +
+      (spell.dodgeable === false ? ' · нельзя увернуться' : '') + " · " +
       esc(spell.short) + '</small></button>'
     ).join("") + '</div><div class="tiny muted" style="margin-top:10px">Открыто ' +
       Number(S.skills.owned_count || 0) + ' из ' + Number(S.skills.catalogue_count || 0) +
@@ -2882,7 +2898,8 @@ function openLiveSkillPicker(slot) {
   sheet('<h3>' + (number === 4 ? '✨ Ультимейт · один раз за бой' : '📜 Свиток · слот ' + number) +
     '</h3><p class="tiny muted">Каждый выбранный свиток используется один раз за бой. В автобою доступные свитки имеют одинаковый шанс применения.</p>' +
     pool.map((spell) => '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) +
-      '</b><div class="small">' + esc(spell.short) + '</div><div class="tiny muted">' +
+      '</b><div class="small">' + esc(spell.short) + '</div>' + scrollEffects(spell) +
+      '<div class="tiny muted">' +
       esc(scrollElement(spell)) + (spell.dodgeable === false ? ' · нельзя увернуться' : '') +
       ' · один раз за бой</div>' +
       '<button class="go sec" style="margin-top:8px" data-liveskillset="' + number + ':' +
@@ -3158,11 +3175,12 @@ function showTestCatalog() {
   sheet('<h3>📚 Свитки и щиты</h3><p class="tiny muted">Каждый выбранный свиток применяется один раз за бой. ' +
     'Свойства берутся из редактируемой серверной таблицы.</p>' + spells.map((spell) =>
       '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) + '</b><div class="small">' +
-      esc(spell.short) + '</div><div class="tiny muted">один раз за бой · ' + esc(scrollElement(spell)) +
+      esc(spell.short) + '</div>' + scrollEffects(spell) +
+      '<div class="tiny muted">один раз за бой · ' + esc(scrollElement(spell)) +
       (spell.dodgeable === false ? " · нельзя увернуться" : "") +
       "</div></div>").join("") + '<h3>🛡 Щиты</h3>' + (TEST_SETUP.shields || []).map((shield) =>
       '<div class="panel"><b>' + esc(shield.icon) + " " + esc(shield.name) + '</b><div class="small">' +
-      esc(shield.short) + "</div></div>").join(""));
+      esc(shield.short) + "</div>" + scrollEffects(shield) + "</div>").join(""));
 }
 
 // ------------------------------------------------------------------------------- PVE

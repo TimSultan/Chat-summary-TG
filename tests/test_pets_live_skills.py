@@ -199,6 +199,94 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertTrue(fifth["granted"])
         self.assertNotEqual(fifth["code"], third["code"])
 
+    def test_scroll_reset_strips_every_unlock_back_to_the_starter_four_once(self):
+        regular = scrolls.REGULAR_SCROLLS[-1]["code"]
+        ultimate = scrolls.ULTIMATE_SCROLLS[-1]["code"]
+        data = pets._load("chat")
+        data["pets"]["1"]["owned_scrolls"].extend([regular, ultimate])
+        pets._save("chat", data)
+        # Equipped as well as owned: the loadout is unioned back into the collection on
+        # read, so a reset that spared it would quietly hand these two straight back.
+        self.assertTrue(pets.set_skill_slot("chat", "1", 2, regular)[0])
+        self.assertTrue(pets.set_skill_slot("chat", "1", 4, ultimate)[0])
+        # A painter with a wallet but no creature is part of the same wipe.
+        earned = pets.grant_scroll_reward(
+            "chat", "2", source="paint:9", kind="paint", chance=1.0, pity_after=20,
+        )
+        self.assertTrue(earned["granted"])
+
+        report = pets.reset_scroll_collections(["chat"])
+        self.assertEqual(report["players"], 2)
+        self.assertEqual(report["scrolls"], 3)
+
+        self.assertEqual(pets.owned_scrolls("chat", "1"), scrolls.DEFAULT_LOADOUT)
+        self.assertEqual(pets.skill_loadout("chat", "1"), scrolls.DEFAULT_LOADOUT)
+        self.assertEqual(pets.owned_scrolls("chat", "2"), scrolls.DEFAULT_LOADOUT)
+        self.assertEqual(pets._load("chat")["scroll_notifications"], [])
+
+        # Flag-gated like every other one-off migration: a restart must not wipe a
+        # collection somebody has legitimately rebuilt since.
+        regained = pets.grant_scroll_reward(
+            "chat", "1", source="paint:77", kind="paint", chance=1.0, pity_after=20,
+        )
+        self.assertTrue(regained["granted"])
+        self.assertEqual(pets.reset_scroll_collections(["chat"]), {"players": 0, "scrolls": 0})
+        self.assertIn(regained["code"], pets.owned_scrolls("chat", "1"))
+
+    def test_scroll_reset_keeps_the_receipt_ledger_so_old_events_cannot_be_refarmed(self):
+        first = pets.grant_scroll_reward(
+            "chat", "1", source="paint:42", kind="paint", chance=1.0, pity_after=20,
+        )
+        self.assertTrue(first["granted"])
+
+        pets.reset_scroll_collections(["chat"])
+        self.assertEqual(pets.owned_scrolls("chat", "1"), scrolls.DEFAULT_LOADOUT)
+
+        # The same paint replayed after the wipe returns its stored receipt rather than
+        # rolling again, so a wiped collection cannot be rebuilt from old sources.
+        replay = pets.grant_scroll_reward(
+            "chat", "1", source="paint:42", kind="paint", chance=1.0, pity_after=20,
+        )
+        self.assertEqual(replay, first)
+        self.assertEqual(pets.owned_scrolls("chat", "1"), scrolls.DEFAULT_LOADOUT)
+
+
+class ScrollWordingTests(unittest.TestCase):
+    """Every catalogue number has to reach the player as words, in both clients."""
+
+    def test_every_scroll_and_shield_describes_all_of_its_effects(self):
+        for row in scrolls.SCROLLS:
+            lines = scrolls.effect_lines(row)
+            self.assertEqual(len(lines), len(row["effects"]), row["code"])
+            self.assertTrue(all(line.strip() for line in lines), row["code"])
+        for row in scrolls.SHIELDS:
+            self.assertEqual(
+                len(scrolls.effect_lines(row)), len(row.get("defend_effects", ())), row["code"],
+            )
+
+    def test_effect_wording_carries_the_tuned_numbers(self):
+        self.assertEqual(
+            scrolls.effect_text({"op": "damage", "amount": 1.45}),
+            "Урон 145% от обычного удара",
+        )
+        self.assertEqual(
+            scrolls.effect_text({"op": "damage", "amount": 1.25, "pierce_guard": .65, "pierce_armor": .50}),
+            "Урон 125% от обычного удара, игнорирует 50% брони, пробивает 65% блока",
+        )
+        self.assertEqual(
+            scrolls.effect_text({"op": "burn", "amount": .45, "turns": 2}),
+            "Поджигает: 45% удара за ход, 2 хода",
+        )
+        # Clamped to what the engine will actually do with a large catalogue value.
+        self.assertEqual(
+            scrolls.effect_text({"op": "blind", "value": .95, "turns": 1}),
+            "Враг промахивается с шансом 80%, 1 ход",
+        )
+
+    def test_the_public_payload_carries_the_wording_to_the_mini_app(self):
+        row = scrolls.public_scroll(scrolls.scroll("scroll_arcane_spark"))
+        self.assertEqual(row["effects_text"], ["Урон 145% от обычного удара"])
+
 
 if __name__ == "__main__":
     unittest.main()

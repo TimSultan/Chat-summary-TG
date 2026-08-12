@@ -271,12 +271,94 @@ def validate_loadout(codes) -> tuple[str, str, str, str]:
     return values
 
 
+# Blind is the one number a player would read as a lie: the turn engine caps a forced
+# miss at 80% however large the catalogue value grows (pets_combat, forced_skill_miss).
+BLIND_CAP = .80
+
+
+def _percent(value) -> str:
+    return f"{round(float(value or 0) * 100)}%"
+
+
+def _turns(effect) -> str:
+    """`2 хода`. Scroll durations are 1-3, so the third Russian plural form never shows."""
+    turns = max(1, int(effect.get("turns", 1) or 1))
+    if turns == 1:
+        return "1 ход"
+    return f"{turns} хода" if turns < 5 else f"{turns} ходов"
+
+
+def effect_text(effect: dict) -> str:
+    """One player-facing sentence for one combat effect, numbers included.
+
+    The single place the effect tables are put into words: Telegram's scroll screen and
+    the Mini App both render this, so a tuned number cannot start meaning two different
+    things in two clients. Wording follows what the engine actually does with the field
+    -- `amount` multiplies a normal hit, `percent` is a share of max health, `value` is a
+    status strength -- because a player comparing two scrolls is really comparing these.
+    """
+    op = str(effect.get("op") or "")
+    if op == "damage":
+        parts = [f"Урон {_percent(effect.get('amount', 1.0))} от обычного удара"]
+        if float(effect.get("pierce_armor") or 0) > 0:
+            parts.append(f"игнорирует {_percent(effect['pierce_armor'])} брони")
+        if float(effect.get("pierce_guard") or 0) > 0:
+            parts.append(f"пробивает {_percent(effect['pierce_guard'])} блока")
+        return ", ".join(parts)
+    if op == "heal":
+        return f"Восстанавливает {_percent(effect.get('percent'))} здоровья"
+    if op == "shield":
+        return f"Щит на {_percent(effect.get('percent'))} здоровья"
+    if op == "burn":
+        return f"Поджигает: {_percent(effect.get('amount'))} удара за ход, {_turns(effect)}"
+    if op == "weaken":
+        return f"Враг бьёт слабее на {_percent(effect.get('value'))}, {_turns(effect)}"
+    if op == "blind":
+        chance = min(BLIND_CAP, float(effect.get("value") or 0))
+        return f"Враг промахивается с шансом {_percent(chance)}, {_turns(effect)}"
+    if op == "vulnerable":
+        return f"Враг получает на {_percent(effect.get('value'))} больше урона, {_turns(effect)}"
+    if op == "stun":
+        return "Враг пропускает ход"
+    if op == "dodge_next":
+        return "Уклоняется от следующего удара"
+    if op == "reflect_next":
+        return f"Отражает {_percent(effect.get('value'))} следующего удара"
+    if op == "cleanse":
+        return "Снимает с себя все негативные эффекты"
+    if op == "break_shield":
+        return "Разбивает щит врага"
+    if op == "regen":
+        return f"Восстанавливает {_percent(effect.get('percent'))} здоровья за ход, {_turns(effect)}"
+    if op == "damage_boost":
+        return f"Свой урон выше на {_percent(effect.get('value'))}, {_turns(effect)}"
+    if op == "negative_ward":
+        return "Поглощает следующий негативный эффект"
+    if op == "self_damage":
+        return f"Забирает {_percent(effect.get('percent'))} своего здоровья"
+    return ""
+
+
+def effect_lines(row: dict) -> tuple[str, ...]:
+    """Every effect of one scroll or shield, in the order the engine applies them."""
+    lines = [effect_text(effect) for effect in row.get("effects") or row.get("defend_effects") or ()]
+    return tuple(line for line in lines if line)
+
+
 def public_scroll(row: dict) -> dict:
-    return {**row, "effects": [dict(effect) for effect in row["effects"]]}
+    return {
+        **row,
+        "effects": [dict(effect) for effect in row["effects"]],
+        "effects_text": list(effect_lines(row)),
+    }
 
 
 def public_shield(row: dict) -> dict:
-    return {**row, "defend_effects": [dict(effect) for effect in row.get("defend_effects", ())]}
+    return {
+        **row,
+        "defend_effects": [dict(effect) for effect in row.get("defend_effects", ())],
+        "effects_text": list(effect_lines(row)),
+    }
 
 
 def _validate() -> None:
@@ -294,6 +376,10 @@ def _validate() -> None:
         for effect in row["effects"]:
             if effect.get("op") not in EFFECT_OPS:
                 raise ValueError(f"unknown scroll operation: {effect.get('op')}")
+            # Both clients print effect_text and nothing else, so an op that grows a new
+            # spelling here must not reach players as a silently blank line.
+            if not effect_text(effect):
+                raise ValueError(f"scroll effect has no wording: {row['code']} {effect.get('op')}")
         if not row["dodgeable"] and any(effect.get("op") == "stun" for effect in row["effects"]):
             raise ValueError(f"undodgeable stun is not allowed: {row['code']}")
     if {row["element"] for row in SCROLLS} != set(ELEMENTS):

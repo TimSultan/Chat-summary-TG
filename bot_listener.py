@@ -8604,6 +8604,12 @@ async def run_bot_listener(
         weapon_migration = pets.enforce_unique_weapons(cfg.listener_allowed_chats)
         if weapon_migration["removed_mops"] or weapon_migration["deduplicated"]:
             log(f"[pets] unique weapon migration: {weapon_migration}")
+        scroll_reset = pets.reset_scroll_collections(cfg.listener_allowed_chats)
+        if scroll_reset["players"]:
+            log(
+                f"[pets] scroll reset: took {scroll_reset['scrolls']} unlocked scrolls back "
+                f"from {scroll_reset['players']} players; everybody re-earns them as drops"
+            )
         refunded_farms = pets.refund_farm_builds(cfg.listener_allowed_chats)
         if refunded_farms:
             log(f"[pets] refunded {refunded_farms} farm builds at {C.FARM_BUILD_REFUND} coins")

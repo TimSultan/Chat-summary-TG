@@ -53,6 +53,10 @@ FIGHT_LOG_LIMIT = 2_000
 # See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
 UNIQUE_WEAPONS_MIGRATION_FLAG = "unique_weapons_202608"
+# Store-level marker: this chat's scroll collections have already been taken back to the
+# starter four, so everybody re-earns the other 36 through drops. A dated name because a
+# later wipe wants a new flag rather than a cleared one -- see reset_scroll_collections.
+SCROLL_RESET_FLAG = "scroll_reset_202608"
 HAMSTERATOR_RETIREMENT_REASON = "pet_hamsterator_retirement_202608"
 # w003 was the mop when that migration stripped it from every owner; it has since been
 # renamed back to Старый компрессор. The code and the payout reason below are historical
@@ -1702,6 +1706,63 @@ def enforce_unique_weapons(entries) -> dict:
                 report["deduplicated"] += 1
 
         data[UNIQUE_WEAPONS_MIGRATION_FLAG] = True
+        _save(entry, data)
+    return report
+
+
+def reset_scroll_collections(entries) -> dict:
+    """Take every unlocked scroll back to the starter four, once per chat.
+
+    The starter loadout is the floor rather than zero because a creature must enter a
+    fight with four legal slots (``SCROLLS.validate_loadout``); "no scrolls at all" is not
+    a state the combat engine can represent. Everything above that floor goes, and the
+    catalogue's other 36 have to be earned again through paint and hard-quest drops.
+
+    Ownership lives in three places that all have to be cleared together, because each
+    one is merged back into the others on the next read: the creature's ``owned_scrolls``,
+    the equipped ``skill_slots`` (unioned into the owned list by ``_owned_scroll_codes_for``,
+    so leaving them would hand back precisely the scrolls a player was using), and the
+    per-user wallet that survives an untamed gap. ``reward_log`` is deliberately kept --
+    it is the receipt ledger that stops an old paint or quest being replayed for a second
+    roll, and clearing it would reopen every past event to farming.
+    """
+    report = {"players": 0, "scrolls": 0}
+    starter = set(SCROLLS.DEFAULT_LOADOUT)
+    for entry in entries:
+        data = _load(entry)
+        if data.get(SCROLL_RESET_FLAG):
+            continue
+        pets_by_user = data.get("pets", {})
+        wallets = data.get("scroll_wallets", {})
+        for user_id in dict.fromkeys([*pets_by_user, *wallets]):
+            record = pets_by_user.get(user_id)
+            wallet = wallets.get(user_id)
+            held = set()
+            if isinstance(record, dict):
+                for key in ("owned_scrolls", "skill_slots"):
+                    held.update(
+                        code for code in record.get(key) or [] if isinstance(code, str)
+                    )
+            if isinstance(wallet, dict):
+                held.update(
+                    code for code in wallet.get("unlocked") or [] if isinstance(code, str)
+                )
+            lost = held - starter
+            if lost:
+                report["players"] += 1
+                report["scrolls"] += len(lost)
+            if isinstance(record, dict):
+                record["owned_scrolls"] = list(SCROLLS.DEFAULT_LOADOUT)
+                record["skill_slots"] = list(SCROLLS.DEFAULT_LOADOUT)
+            if isinstance(wallet, dict):
+                wallet["unlocked"] = []
+                # The collection starts over, so the counters pacing it start over too --
+                # nobody carries 19 unlucky paints into a catalogue they no longer own.
+                wallet["pity"] = {"paint": 0, "hard_quest": 0}
+        # The mailbox replays these forever; left alone it would go on congratulating
+        # players on scrolls the same migration just took away.
+        data["scroll_notifications"] = []
+        data[SCROLL_RESET_FLAG] = True
         _save(entry, data)
     return report
 
