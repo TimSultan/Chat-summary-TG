@@ -6691,6 +6691,7 @@ async def handle_pets_callback(
             ),
             "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
             "casino": lambda: pets_ui.casino_view(entry, user_id, xp),
+            "ccombos": lambda: pets_ui.casino_combinations_view(user_id),
             "quests": lambda: pets_ui.quests_view(
                 entry, user_id, "real" if argument == "real" else "paint",
             ),

@@ -351,9 +351,12 @@ def casino_bet_view(entry: str, user_id, xp: int, game: str) -> tuple[str, dict]
     rows = [[
         {"text": f"🪙 {stake}", "callback_data": callback_data(user_id, "cbet", f"{game}:{stake}")}
         for stake in stakes
-    ], [
-        {"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")},
     ]]
+    if game == "poker":
+        rows.append([{
+            "text": "📚 Комбинации", "callback_data": callback_data(user_id, "ccombos"),
+        }])
+    rows.append([{"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")}])
     return (
         f"{_CASINO_GAME_NAMES[game]}\n\n{descriptions[game]}\n"
         f"🪙 У тебя: <b>{_money(coins)}</b>\nВыбери ставку:",
@@ -416,6 +419,24 @@ def casino_poker_view(
     ]}
 
 
+def casino_combinations_view(user_id) -> tuple[str, dict]:
+    """Poker cheat sheet, strongest hand first, using the evaluator's own table."""
+    lines = [
+        "📚 <b>Комбинации в покере</b>",
+        "От сильнейшей к слабейшей:\n",
+    ]
+    for number, row in enumerate(casino.POKER_COMBINATIONS, 1):
+        lines.append(f"<b>{number}. {row['name']}</b> — {row['description']}")
+    lines.extend([
+        "",
+        "Если комбинации одинаковые, сначала сравниваются карты самой комбинации, "
+        "затем кикеры. Если совпали все пять карт — ничья.",
+    ])
+    return "\n".join(lines), {"inline_keyboard": [[{
+        "text": "◀️ К покеру", "callback_data": callback_data(user_id, "cgame", "poker"),
+    }]]}
+
+
 def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str, dict]:
     if not result.get("ok"):
         stake = int(result.get("stake", 0) or 0)
@@ -435,9 +456,19 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
     game = str(result.get("game") or "")
     lines = [f"{_CASINO_GAME_NAMES.get(game, '🎰 Казино')}", ""]
     if game == "poker":
-        lines.append("Твои: " + " · ".join(result.get("player_cards") or []))
-        lines.append("Стол: " + " · ".join(result.get("board_cards") or []))
-        lines.append("Дилер: " + " · ".join(result.get("dealer_cards") or []))
+        player_combination = (result.get("player_combination") or {}).get("name") or "Не определена"
+        dealer_combination = (result.get("dealer_combination") or {}).get("name") or "Не определена"
+        lines.extend([
+            "Карты на столе:",
+            f"<b>{' · '.join(result.get('board_cards') or [])}</b>\n",
+            "Твои карты:",
+            f"<b>{' · '.join(result.get('player_cards') or [])}</b>",
+            f"Твоя комбинация: <b>{player_combination}</b>\n",
+            "Карты дилера:",
+            f"<b>{' · '.join(result.get('dealer_cards') or [])}</b>",
+            f"Комбинация дилера: <b>{dealer_combination}</b>\n",
+            f"<b>{result.get('comparison') or ''}</b>",
+        ])
     elif game == "shell":
         cups = ["🥥", "🥥", "🥥"]
         cups[int(result.get("ball", 0)) - 1] = "🟢"
@@ -449,16 +480,20 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
             f"Ты выбрал «{choice}». Выпало: <b>{casino.highlow_card_text(result.get('card'))}</b>."
         )
     if result.get("won"):
-        lines.append(f"\n🎉 Победа! Получено {_money(int(result['payout']))}.")
+        victory = "Получено" if game == "poker" else "Победа! Получено"
+        lines.append(f"\n🎉 {victory} {_money(int(result['payout']))}.")
     elif result.get("draw"):
         lines.append(f"\n🤝 Ничья — ставка {_money(int(result['payout']))} возвращена.")
     else:
         lines.append(f"\n💨 Не повезло: ставка {_money(int(result['stake']))} проиграна.")
     lines.append(f"🪙 Осталось: <b>{_money(int(result['balance']))}</b>")
-    return "\n".join(lines), {"inline_keyboard": [[
-        {"text": "🔁 Ещё раз", "callback_data": callback_data(user_id, "cgame", game)},
-        {"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")},
-    ]]}
+    rows = [[{"text": "🔁 Ещё раз", "callback_data": callback_data(user_id, "cgame", game)}]]
+    if game == "poker":
+        rows[0].append({
+            "text": "📚 Комбинации", "callback_data": callback_data(user_id, "ccombos"),
+        })
+    rows.append([{"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")}])
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 # Telegram keyboards get unusable past a handful of full-width rows, and the shelf is 35

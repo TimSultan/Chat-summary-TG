@@ -17,6 +17,59 @@ _SUITS: Final = ("♠", "♥", "♦", "♣")
 _DECK: Final = tuple((rank, suit) for rank in _RANKS for suit in _SUITS)
 _CARD_NAMES: Final = {11: "В", 12: "Д", 13: "К", 14: "Т"}
 
+# Strongest first.  This single table drives both the result explanation and the
+# in-game help page, so their terminology cannot drift apart.
+POKER_COMBINATIONS: Final = (
+    {
+        "code": "royal_flush", "name": "Роял-флеш", "genitive": "роял-флеша",
+        "description": "10, В, Д, К и Т одной масти.",
+    },
+    {
+        "code": "straight_flush", "name": "Стрит-флеш", "genitive": "стрит-флеша",
+        "description": "Пять карт подряд одной масти.",
+    },
+    {
+        "code": "four_kind", "name": "Каре", "genitive": "каре",
+        "description": "Четыре карты одного достоинства.",
+    },
+    {
+        "code": "full_house", "name": "Фул-хаус", "genitive": "фул-хауса",
+        "description": "Три одинаковые карты и пара.",
+    },
+    {
+        "code": "flush", "name": "Флеш", "genitive": "флеша",
+        "description": "Пять карт одной масти в любом порядке.",
+    },
+    {
+        "code": "straight", "name": "Стрит", "genitive": "стрита",
+        "description": "Пять карт подряд любых мастей.",
+    },
+    {
+        "code": "three_kind", "name": "Сет", "genitive": "сета",
+        "description": "Три карты одного достоинства.",
+    },
+    {
+        "code": "two_pair", "name": "Две пары", "genitive": "двух пар",
+        "description": "Две разные пары карт.",
+    },
+    {
+        "code": "pair", "name": "Пара", "genitive": "пары",
+        "description": "Две карты одного достоинства.",
+    },
+    {
+        "code": "high_card", "name": "Старшая карта", "genitive": "старшей карты",
+        "description": "Комбинации нет — сравниваются самые старшие карты.",
+    },
+)
+
+_POKER_COMBINATION_BY_CODE: Final = {
+    row["code"]: row for row in POKER_COMBINATIONS
+}
+_POKER_SCORE_CODES: Final = {
+    8: "straight_flush", 7: "four_kind", 6: "full_house", 5: "flush",
+    4: "straight", 3: "three_kind", 2: "two_pair", 1: "pair", 0: "high_card",
+}
+
 
 def valid_stake(value, game: str | None = None) -> int | None:
     try:
@@ -208,6 +261,51 @@ def _best_score(cards) -> tuple[int, ...]:
     return max(_five_score(hand) for hand in combinations(cards, 5))
 
 
+def poker_combination(score: tuple[int, ...]) -> dict:
+    """Player-facing metadata for a private evaluator score."""
+    code = (
+        "royal_flush"
+        if int(score[0]) == 8 and len(score) > 1 and int(score[1]) == 14
+        else _POKER_SCORE_CODES[int(score[0])]
+    )
+    row = _POKER_COMBINATION_BY_CODE[code]
+    return {"code": code, "name": row["name"], "description": row["description"]}
+
+
+def _poker_comparison(player_score: tuple[int, ...], dealer_score: tuple[int, ...]) -> str:
+    """Explain not only who won, but which comparison decided the showdown."""
+    player_row = _POKER_COMBINATION_BY_CODE[poker_combination(player_score)["code"]]
+    dealer_row = _POKER_COMBINATION_BY_CODE[poker_combination(dealer_score)["code"]]
+    if player_score == dealer_score:
+        return (
+            f"Ничья: у обоих {player_row['name'].lower()} и одинаковые решающие карты."
+        )
+    player_won = player_score > dealer_score
+    if player_row["code"] != dealer_row["code"]:
+        if player_won:
+            return f"Ты победил: {player_row['name']} сильнее {dealer_row['genitive']}."
+        return f"Ты проиграл: {player_row['name']} слабее {dealer_row['genitive']}."
+
+    # Same kind of hand: Python's tuple comparison uses the first differing rank, which
+    # is exactly poker's pair/set/kicker ordering. Show those two decisive ranks rather
+    # than an opaque "dealer won".
+    differing = next(
+        index for index, (mine, theirs) in enumerate(zip(player_score, dealer_score))
+        if mine != theirs
+    )
+    mine = _CARD_NAMES.get(int(player_score[differing]), str(player_score[differing]))
+    theirs = _CARD_NAMES.get(int(dealer_score[differing]), str(dealer_score[differing]))
+    if player_won:
+        return (
+            f"Ты победил: у обоих {player_row['name'].lower()}, но твоя решающая карта "
+            f"старше — {mine} против {theirs}."
+        )
+    return (
+        f"Ты проиграл: у обоих {player_row['name'].lower()}, но решающая карта дилера "
+        f"старше — {theirs} против {mine}."
+    )
+
+
 def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
     """Call or raise, then reveal the turn or settle the river atomically."""
     data = economy._load(entry)
@@ -252,6 +350,9 @@ def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
         "player_cards": [_card(card) for card in state["player"]],
         "dealer_cards": [_card(card) for card in state["dealer"]],
         "board_cards": [_card(card) for card in state["board"]],
+        "player_combination": poker_combination(player_score),
+        "dealer_combination": poker_combination(dealer_score),
+        "comparison": _poker_comparison(player_score, dealer_score),
     }, draw=player_score == dealer_score, data=data, record=record)
 
 
@@ -298,6 +399,6 @@ def play_highlow(entry, user_id, xp: int, stake, choice, open_card=7, rng=None) 
 
 
 __all__ = [
-    "BET_AMOUNTS", "POKER_BET_AMOUNTS", "GAMES", "valid_stake", "active_game", "start_poker", "poker_snapshot",
+    "BET_AMOUNTS", "POKER_BET_AMOUNTS", "POKER_COMBINATIONS", "GAMES", "valid_stake", "active_game", "start_poker", "poker_snapshot", "poker_combination",
     "advance_poker", "play_shell", "play_highlow", "draw_highlow_open_card", "highlow_card_text",
 ]

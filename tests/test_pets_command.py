@@ -245,7 +245,7 @@ class PetsCommandTests(unittest.TestCase):
 
         redraws = [
             "main", "info", "cage", "farm", "train", "bag", "fight", "history", "mail",
-            "updates", "leaderboard", "pet", "casino", "quests", "dailybonus", "store",
+            "updates", "leaderboard", "pet", "casino", "ccombos", "quests", "dailybonus", "store",
             "collection", "questmods",
         ]
         for action in redraws:

@@ -64,7 +64,66 @@ class CasinoTests(unittest.TestCase):
         result = casino.advance_poker("chat", "1", 0, raise_by=25)
         self.assertTrue(result["won"])
         self.assertEqual(result["payout"], 150)
+        self.assertEqual(result["player_combination"]["name"], "Пара")
+        self.assertEqual(result["dealer_combination"]["name"], "Старшая карта")
+        self.assertEqual(result["comparison"], "Ты победил: Пара сильнее старшей карты.")
         self.assertEqual(economy.balance("chat", "1", 0), 375)
+
+        text, keyboard = pets_ui.casino_result_view("chat", "1", 0, result)
+        self.assertLess(text.index("Карты на столе"), text.index("Твои карты"))
+        self.assertLess(text.index("Твои карты"), text.index("Твоя комбинация"))
+        self.assertLess(text.index("Твоя комбинация"), text.index("Карты дилера"))
+        self.assertLess(text.index("Карты дилера"), text.index("Комбинация дилера"))
+        self.assertIn("Ты победил: Пара сильнее старшей карты.", text)
+        self.assertIn(
+            "ccombos",
+            [
+                pets_ui.parse_callback(button["callback_data"])[1]
+                for row in keyboard["inline_keyboard"] for button in row
+            ],
+        )
+
+    def test_poker_explains_full_house_over_pair_and_same_hand_kicker(self):
+        full_house_cards = [
+            (14, "♠"), (14, "♥"), (13, "♠"), (12, "♥"),
+            (14, "♦"), (2, "♣"), (2, "♦"), (7, "♠"), (9, "♣"),
+        ]
+        casino.start_poker("chat", "1", 0, 10, rng=_FixedRng(cards=full_house_cards))
+        casino.advance_poker("chat", "1", 0)
+        casino.advance_poker("chat", "1", 0)
+        result = casino.advance_poker("chat", "1", 0)
+        self.assertEqual(result["player_combination"]["name"], "Фул-хаус")
+        self.assertEqual(result["dealer_combination"]["name"], "Пара")
+        self.assertEqual(result["comparison"], "Ты победил: Фул-хаус сильнее пары.")
+
+        kicker_cards = [
+            (14, "♠"), (12, "♥"), (14, "♥"), (11, "♣"),
+            (13, "♣"), (9, "♦"), (7, "♠"), (5, "♣"), (2, "♦"),
+        ]
+        casino.start_poker("chat", "1", 0, 10, rng=_FixedRng(cards=kicker_cards))
+        casino.advance_poker("chat", "1", 0)
+        casino.advance_poker("chat", "1", 0)
+        result = casino.advance_poker("chat", "1", 0)
+        self.assertEqual(result["player_combination"]["name"], "Старшая карта")
+        self.assertEqual(result["dealer_combination"]["name"], "Старшая карта")
+        self.assertIn("твоя решающая карта старше — Д против В", result["comparison"])
+
+    def test_poker_combination_help_is_complete_and_sorted_strongest_first(self):
+        self.assertEqual(
+            [row["name"] for row in casino.POKER_COMBINATIONS],
+            [
+                "Роял-флеш", "Стрит-флеш", "Каре", "Фул-хаус", "Флеш",
+                "Стрит", "Сет", "Две пары", "Пара", "Старшая карта",
+            ],
+        )
+        text, keyboard = pets_ui.casino_combinations_view("1")
+        self.assertLess(text.index("Роял-флеш"), text.index("Стрит-флеш"))
+        self.assertLess(text.index("Фул-хаус"), text.index("Пара"))
+        self.assertIn("кикеры", text)
+        self.assertEqual(
+            pets_ui.parse_callback(keyboard["inline_keyboard"][0][0]["callback_data"]),
+            ("1", "cgame", "poker"),
+        )
 
     def test_poker_view_puts_the_pot_first_and_offers_call_or_raise(self):
         started = casino.start_poker("chat", "1", 0, 25, rng=_FixedRng())
