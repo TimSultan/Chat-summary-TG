@@ -19,7 +19,11 @@ import stats
 # Shop items priced on utility rather than on stat bonuses. Enumerated here on purpose:
 # the pricing test below waives the power formula only for these exact codes, so a future
 # hand-added three-figure accessory still has to justify itself against the formula.
-UTILITY_SHOP_CODES = frozenset({"amulet_soul_mirror", "amulet_mob_ward"})
+UTILITY_SHOP_CODES = frozenset({
+    "amulet_leech_fang", "amulet_armor_capsule", "amulet_initiative_pendulum",
+    "amulet_first_aid_heart", "amulet_crit_catcher", "amulet_trophy_compass",
+    "amulet_soul_mirror", "amulet_mob_ward",
+})
 
 
 class PetsTestCase(unittest.TestCase):
@@ -731,10 +735,10 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(pet["equipped"]["weapon"], "w003")
 
     def test_new_drop_catalogues_are_integrated_into_all_three_equipment_slots(self):
-        # 30 dropped amulets + 2 starter shop ones + whatever utility amulets are sold.
+        # 40 dropped amulets + 2 starter shop ones + the utility shelf.
         self.assertEqual(
             len([item for item in pets_config.ITEMS if item.slot == "amulet"]),
-            32 + len(UTILITY_SHOP_CODES),
+            42 + len(UTILITY_SHOP_CODES),
         )
         self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 32)
         self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 32)
@@ -745,9 +749,9 @@ class EquipmentTradingTests(PetsTestCase):
             item for item in pets_config.ITEMS
             if item.code.startswith(("amulet_", "bt", "gl")) and item.source == "drop"
         ]
-        self.assertEqual(len(new_drops), 90)
+        self.assertEqual(len(new_drops), 100)
         self.assertTrue(all(item.source == "drop" and item.drop_weight > 0 for item in new_drops))
-        self.assertEqual(len([item for item in new_drops if item.effect]), 30)
+        self.assertEqual(len([item for item in new_drops if item.effect]), 40)
 
     def test_equipped_amulet_passive_reaches_combat_and_is_visible_in_the_bag(self):
         self._two_pets()
@@ -1099,11 +1103,8 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertEqual(len(shop_items), 381 + len(UTILITY_SHOP_CODES))
         for item in shop_items:
             if item.code in UTILITY_SHOP_CODES:
-                # Priced on what it DOES, not on stats it does not have -- the formula
-                # would put a bonus-less item at the common floor of 10, which is not a
-                # price for an amulet that rewrites a matchup. Still bounded, and still
-                # listed by code above, so this stays a decision rather than a loophole.
-                self.assertEqual(item.bonuses, {}, f"{item.code} is not a utility item")
+                # Utility amulets are priced for their combat effect as well as their
+                # stats, so the pure-stat weapon formula would underprice them.
                 self.assertLessEqual(item.price, 1_000, f"{item.code} is priced off-scale")
                 continue
             expected = pets_weapon_catalog.shop_price_for_bonuses(item.rarity, item.bonuses.items())
@@ -1267,6 +1268,19 @@ class StorefrontAndCollectionTests(PetsTestCase):
             self.assertNotIn(label, block)
         lines = block.splitlines()
         self.assertTrue(any(line.startswith("🪙 ") for line in lines[1:]))
+
+    def test_amulet_shop_lists_each_stat_and_effect_before_buying(self):
+        self._two_pets("amulet-shelf")
+        text, _ = pets_ui.shop_slot_view("amulet-shelf", "1", 0, "amulet")
+        stock = pets_config.items_for_slot("amulet", "shop")
+        self.assertGreaterEqual(len(stock), 8)
+        for item in stock:
+            with self.subTest(item=item.code):
+                if item.effect:
+                    self.assertIn(item.effect["text"], text)
+                for key, value in item.bonuses.items():
+                    emoji = pets_config.ARMOR_EMOJI if key == "armor" else pets_config.STAT_EMOJI[key]
+                    self.assertIn(f"{emoji} {value:+d}", text)
 
     def test_collection_lists_only_chat_discoveries_and_their_current_owners(self):
         entry = "shop-chat"

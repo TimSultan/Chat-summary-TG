@@ -107,6 +107,10 @@ _EFFECT_DEFAULTS = {
     "focused": 20, "momentum": 2, "gambler": 18, "safeguard": 35,
     "giant_slayer": 18, "mob_hunter": 15, "mob_ward": 15, "collector": 25,
     "survivor": 30, "mirror_soul": 20,
+    "bite": 50, "armor_burst": 75, "late_strike": 35, "medkit": 20,
+    "countercrit": 20, "trophy_compass": 35, "stun": 1, "cocoon": 100,
+    "glass_crit": 60, "blood_pact": 35, "chill": 40, "tesla": 15,
+    "death_shield": 20, "acid": 25, "spring": 100, "candle": 40,
 }
 
 _EFFECT_TEXT = {
@@ -123,6 +127,21 @@ _EFFECT_TEXT = {
     "retaliation": "отвечает контрударом: {amount} урона.",
     "regen": "восстанавливает {amount} HP перед ударом.",
     "crit_guard": "гасит один критический удар.",
+    "bite": "кусает ещё раз: {amount} урона и немного здоровья обратно.",
+    "armor_burst": "раскрывает бронекапсулу и гасит {amount} урона.",
+    "late_strike": "раскачивает маятник и бьёт сильнее.",
+    "medkit": "раскрывает аптечку: +{amount} HP.",
+    "countercrit": "ловит крит и готовит ответный удар.",
+    "stun": "оглушает соперника на один ход.",
+    "cocoon": "прячется в кокон и готовит шипы.",
+    "glass_crit": "наводит стеклянный глаз: крит усилен.",
+    "blood_pact": "забирает из третьего удара {amount} HP.",
+    "chill": "морозит соперника: следующий удар слабее.",
+    "tesla": "выпускает разряд: {amount} урона.",
+    "death_shield": "цепляется за медаль и поднимает аварийный щит.",
+    "acid": "обливает оружие кислотой: следующий удар не увернуть.",
+    "spring": "сжимает пружину: следующий удар двойной.",
+    "candle": "зажигает чёрную свечу: {amount:+d}% к урону.",
     "safeguard": "смягчает первый удар на {amount} урона.",
     "gambler": "проверяет авось: {amount:+d}% к урону.",
     "adrenaline": "разгоняется от критического удара: +{amount} HP.",
@@ -432,9 +451,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     hp = {a.key: derived[a.key]["max_hp"], b.key: derived[b.key]["max_hp"]}
     total_damage = {a.key: 0, b.key: 0}
     effects = {a.key: derived[a.key]["effects"], b.key: derived[b.key]["effects"]}
-    # Collector and Survivor settle in pets.record_fight. Merely equipping either must
+    # Collector, Trophy Compass and Survivor settle in pets.record_fight. Merely equipping
+    # either must
     # not switch combat to the passive pipeline or alter an otherwise identical replay.
-    non_combat_codes = {"collector", "survivor"}
+    non_combat_codes = {"collector", "trophy_compass", "survivor"}
     effectful = any(
         effect["code"] not in non_combat_codes
         for fighter_effects in effects.values() for effect in fighter_effects
@@ -447,6 +467,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     retaliation_bonus = {a.key: 0.0 for a in (a, b)}
     gambler_bonus = {a.key: 0.0 for a in (a, b)}
     pending_poison: dict[str, tuple[str, int] | None] = {a.key: None, b.key: None}
+    stunned = {a.key: False, b.key: False}
+    cocooned = {a.key: False, b.key: False}
+    armor_burst_ready = {a.key: False, b.key: False}
+    chilled = {a.key: False, b.key: False}
+    acid_ready = {a.key: False, b.key: False}
+    spring_hits_taken = {a.key: 0, b.key: 0}
+    spring_ready = {a.key: False, b.key: False}
 
     initiative = .5
     if effectful:
@@ -480,6 +507,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             before_safeguard = damage
             damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
             effect_round(number, target_key, source_key, "safeguard", before_safeguard - damage)
+        if effectful and damage and armor_burst_ready[target_key]:
+            armor_burst_ready[target_key] = False
+            before_burst = damage
+            value = _effect_value(effects[target_key], "armor_burst") or 0
+            damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
+            effect_round(number, target_key, source_key, "armor_burst", before_burst - damage)
         if effectful and shields[target_key] > 0 and damage:
             absorbed = min(shields[target_key], damage)
             shields[target_key] -= absorbed
@@ -488,12 +521,22 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             # player why its HP did not move by that amount.
             effect_round(number, target_key, source_key, "opening_shield", round(absorbed))
         damage = max(0, damage)
-        if effectful and damage >= hp[target_key] and "last_stand" not in used[target_key] \
-                and _effect_value(effects[target_key], "last_stand") is not None:
-            used[target_key].add("last_stand")
+        rescue = next(
+            (code for code in ("death_shield", "last_stand")
+             if code not in used[target_key] and _effect_value(effects[target_key], code) is not None),
+            None,
+        )
+        if effectful and damage >= hp[target_key] and rescue:
+            used[target_key].add(rescue)
             impact = max(0, round(hp[target_key]) - 1)
             hp[target_key] = 1.0
-            effect_round(number, target_key, source_key, "last_stand")
+            if rescue == "death_shield":
+                shields[target_key] += max(
+                    1, round(derived[target_key]["max_hp"] * max(0, _fraction(
+                        _effect_value(effects[target_key], "death_shield") or 0
+                    )))
+                )
+            effect_round(number, target_key, source_key, rescue)
             return impact, False
         before = hp[target_key]
         hp[target_key] = max(0.0, hp[target_key] - damage)
@@ -511,6 +554,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 downside = _param(effects[owner_key], "gambler", "downside", abs(value) / 2)
                 gambler_bonus[owner_key] = _fraction(value if rng.random() < .5 else -downside)
                 effect_round(0, owner_key, other_key, "gambler", round(gambler_bonus[owner_key] * 100))
+            if (value := _effect_value(effects[owner_key], "candle")) is not None:
+                downside = _param(effects[owner_key], "candle", "downside", abs(value) / 2)
+                candle = _fraction(value if rng.random() < .5 else -downside)
+                gambler_bonus[owner_key] += candle
+                effect_round(0, owner_key, other_key, "candle", round(candle * 100))
     signatures = {}
     for key in (a.key, b.key):
         signature = derived[key]["signature"]
@@ -566,6 +614,17 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     def strike(attacker_key: str, defender_key: str, round_number: int) -> str | None:
         """One blow, appended as a Round. Returns the key of a fighter knocked out."""
         attacker, defender = fighters[attacker_key], fighters[defender_key]
+        if effectful and stunned[attacker_key]:
+            stunned[attacker_key] = False
+            effect_round(round_number, defender_key, attacker_key, "stun")
+            return None
+        if effectful and _effect_value(effects[attacker_key], "cocoon") is not None \
+                and "cocoon" not in used[attacker_key]:
+            used[attacker_key].add("cocoon")
+            cocooned[attacker_key] = True
+            attacks_made[attacker_key] += 1
+            effect_round(round_number, attacker_key, defender_key, "cocoon")
+            return None
         if effectful and (poison := pending_poison[attacker_key]) is not None:
             source_key, poison_damage = poison
             pending_poison[attacker_key] = None
@@ -593,7 +652,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 text=pets_flavor.line("signature_agility", attacker.name, defender.name, rng=rng),
             ))
             return None
-        event, damage = _resolve_blow(derived[attacker_key], derived[defender_key], rng)
+        defender_numbers = derived[defender_key]
+        acid_attack = effectful and acid_ready[attacker_key]
+        if acid_attack:
+            defender_numbers = dict(defender_numbers)
+            defender_numbers["dodge"] = 0.0
+            acid_ready[attacker_key] = False
+            effect_round(round_number, attacker_key, defender_key, "acid")
+        event, damage = _resolve_blow(derived[attacker_key], defender_numbers, rng)
         if signature and signature[0] == "health":
             damage = 0 if signature[1] == 3 else round(damage * 0.5)
             event = "signature_health"
@@ -613,6 +679,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             multiplier = 1.0
             if _effect_value(effects[attacker_key], "battle_cry") is not None and attack_no == 0:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "battle_cry") or 0))
+            if _effect_value(effects[attacker_key], "late_strike") is not None \
+                    and attack_no == 0 and attacker_key == order[round_number % 2]:
+                multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "late_strike") or 0))
+                effect_round(round_number, attacker_key, defender_key, "late_strike")
             if _effect_value(effects[attacker_key], "berserker") is not None and hp[attacker_key] <= derived[attacker_key]["max_hp"] * _param(effects[attacker_key], "berserker", "threshold", 35) / 100:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "berserker") or 0))
             if _effect_value(effects[attacker_key], "executioner") is not None and hp[defender_key] <= derived[defender_key]["max_hp"] * _param(effects[attacker_key], "executioner", "threshold", 30) / 100:
@@ -634,6 +704,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             if _effect_value(effects[attacker_key], "piercing") is not None:
                 # Restore a configurable part of armor's otherwise already-applied cut.
                 multiplier += derived[defender_key]["reduction"] * max(0, _fraction(_effect_value(effects[attacker_key], "piercing") or 0))
+            if acid_attack:
+                multiplier += derived[defender_key]["reduction"] * max(0, _fraction(
+                    _effect_value(effects[attacker_key], "acid") or 0
+                ))
+            if spring_ready[attacker_key]:
+                spring_ready[attacker_key] = False
+                multiplier *= 2
+                effect_round(round_number, attacker_key, defender_key, "spring")
             multiplier += gambler_bonus[attacker_key]
             flat_retaliation = retaliation_bonus[attacker_key]
             retaliation_bonus[attacker_key] = 0.0
@@ -644,6 +722,23 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                     _effect_value(effects[defender_key], "crit_guard") or 0
                 ))
                 effect_round(round_number, defender_key, attacker_key, "crit_guard")
+            if event == "crit" and "glass_crit" not in used[attacker_key] \
+                    and (value := _effect_value(effects[attacker_key], "glass_crit")) is not None:
+                used[attacker_key].add("glass_crit")
+                multiplier += max(0, _fraction(value))
+                effect_round(round_number, attacker_key, defender_key, "glass_crit")
+            if event == "crit" and "countercrit" not in used[defender_key] \
+                    and (value := _effect_value(effects[defender_key], "countercrit")) is not None:
+                used[defender_key].add("countercrit")
+                multiplier /= max(1, C.CRIT_MULTIPLIER)
+                retaliation_bonus[defender_key] += max(1, round(damage * max(0, _fraction(value))))
+                effect_round(round_number, defender_key, attacker_key, "countercrit")
+            if chilled[attacker_key]:
+                chilled[attacker_key] = False
+                multiplier *= max(.10, 1 - max(0, _fraction(_effect_value(
+                    effects[defender_key], "chill"
+                ) or 0)))
+                effect_round(round_number, defender_key, attacker_key, "chill")
             damage = max(1, round(damage * multiplier + flat_retaliation))
 
         if effectful:
@@ -678,6 +773,47 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             if (value := _effect_value(effects[attacker_key], "poison")) is not None and not knocked_out:
                 poison = max(1, round(max(0, value)))
                 pending_poison[defender_key] = (attacker_key, poison)
+            if (value := _effect_value(effects[attacker_key], "bite")) is not None \
+                    and "bite" not in used[attacker_key] and not knocked_out:
+                used[attacker_key].add("bite")
+                bite_damage = max(1, round(impact * .65))
+                bite_impact, bite_ko = hurt(attacker_key, defender_key, bite_damage, round_number)
+                total_damage[attacker_key] += bite_impact
+                before = hp[attacker_key]
+                hp[attacker_key] = min(
+                    derived[attacker_key]["max_hp"], hp[attacker_key] + bite_impact * max(0, _fraction(value))
+                )
+                effect_round(round_number, attacker_key, defender_key, "bite", bite_impact)
+                if bite_ko:
+                    return attacker_key
+            if (value := _effect_value(effects[attacker_key], "blood_pact")) is not None \
+                    and landed_hits[attacker_key] % 3 == 0:
+                before = hp[attacker_key]
+                hp[attacker_key] = min(
+                    derived[attacker_key]["max_hp"], hp[attacker_key] + impact * max(0, _fraction(value))
+                )
+                healed = round(hp[attacker_key] - before)
+                if healed:
+                    effect_round(round_number, attacker_key, defender_key, "blood_pact", healed)
+            if (value := _effect_value(effects[attacker_key], "stun")) is not None \
+                    and event == "crit" and "stun" not in used[attacker_key] and not knocked_out:
+                used[attacker_key].add("stun")
+                stunned[defender_key] = True
+                effect_round(round_number, attacker_key, defender_key, "stun")
+            if (value := _effect_value(effects[attacker_key], "chill")) is not None \
+                    and "chill" not in used[attacker_key] and not knocked_out:
+                used[attacker_key].add("chill")
+                chilled[defender_key] = True
+                effect_round(round_number, attacker_key, defender_key, "chill")
+            if (value := _effect_value(effects[attacker_key], "tesla")) is not None \
+                    and landed_hits[attacker_key] >= 3 and "tesla" not in used[attacker_key] and not knocked_out:
+                used[attacker_key].add("tesla")
+                shock = max(1, round(derived[defender_key]["max_hp"] * max(0, _fraction(value))))
+                shock_impact, shock_ko = hurt(attacker_key, defender_key, shock, round_number)
+                total_damage[attacker_key] += shock_impact
+                effect_round(round_number, attacker_key, defender_key, "tesla", shock_impact)
+                if shock_ko:
+                    return attacker_key
             if not knocked_out and (value := _effect_value(effects[defender_key], "second_wind")) is not None \
                     and "second_wind" not in used[defender_key] \
                     and hp[defender_key] <= derived[defender_key]["max_hp"] * _param(effects[defender_key], "second_wind", "threshold", 30) / 100:
@@ -685,7 +821,31 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 before = hp[defender_key]
                 hp[defender_key] = min(derived[defender_key]["max_hp"], hp[defender_key] + derived[defender_key]["max_hp"] * max(0, _fraction(value)))
                 effect_round(round_number, defender_key, attacker_key, "second_wind", round(hp[defender_key] - before))
+            if not knocked_out and (value := _effect_value(effects[defender_key], "medkit")) is not None \
+                    and "medkit" not in used[defender_key] \
+                    and hp[defender_key] <= derived[defender_key]["max_hp"] * _param(effects[defender_key], "medkit", "threshold", 35) / 100:
+                used[defender_key].add("medkit")
+                before = hp[defender_key]
+                hp[defender_key] = min(derived[defender_key]["max_hp"], hp[defender_key] + derived[defender_key]["max_hp"] * max(0, _fraction(value)))
+                effect_round(round_number, defender_key, attacker_key, "medkit", round(hp[defender_key] - before))
             if not knocked_out:
+                if _effect_value(effects[defender_key], "armor_burst") is not None \
+                        and "armor_burst" not in used[defender_key]:
+                    used[defender_key].add("armor_burst")
+                    armor_burst_ready[defender_key] = True
+                if _effect_value(effects[defender_key], "spring") is not None \
+                        and "spring" not in used[defender_key]:
+                    spring_hits_taken[defender_key] += 1
+                    if spring_hits_taken[defender_key] >= 2:
+                        used[defender_key].add("spring")
+                        spring_ready[defender_key] = True
+                if cocooned[defender_key]:
+                    cocooned[defender_key] = False
+                    recoil_impact, recoil_ko = hurt(defender_key, attacker_key, impact, round_number)
+                    total_damage[defender_key] += recoil_impact
+                    effect_round(round_number, defender_key, attacker_key, "cocoon", recoil_impact)
+                    if recoil_ko:
+                        return defender_key
                 if (value := _effect_value(effects[defender_key], "thorns")) is not None:
                     recoil = max(1, round(impact * max(0, _fraction(value))))
                     recoil_impact, recoil_ko = hurt(defender_key, attacker_key, recoil, round_number)
@@ -705,11 +865,17 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             healed = round(hp[defender_key] - before)
             if healed:
                 effect_round(round_number, defender_key, attacker_key, "dodge_heal", healed)
+            if _effect_value(effects[attacker_key], "acid") is not None and "acid" not in used[attacker_key]:
+                used[attacker_key].add("acid")
+                acid_ready[attacker_key] = True
         elif effectful and event == "dodge" and _effect_value(effects[attacker_key], "focused") is not None:
             landed_hits[attacker_key] = 0
             focused_ready[attacker_key] = True
         elif effectful and event == "dodge":
             landed_hits[attacker_key] = 0
+            if _effect_value(effects[attacker_key], "acid") is not None and "acid" not in used[attacker_key]:
+                used[attacker_key].add("acid")
+                acid_ready[attacker_key] = True
         return attacker_key if knocked_out else None
 
     stopped_early = False

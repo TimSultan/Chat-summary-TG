@@ -653,17 +653,17 @@ if _RAW_WEAPON_ITEMS:
 
 _catalogue_amulets = tuple(_catalog_item(spec) for spec in _RAW_AMULET_ITEMS)
 _catalogue_gear = tuple(_catalog_item(spec) for spec in _RAW_GEAR_ITEMS)
-# The loot table is what this guards: exactly 30 amulets have to be findable, and every
+# The loot table is what this guards: exactly 40 amulets have to be findable, and every
 # amulet has to be an amulet. Sold ones are counted separately -- adding something to the
 # shop counter must not be able to quietly take a slot out of the drop pool.
 _dropped_amulets = tuple(item for item in _catalogue_amulets if item.source == "drop")
 if _RAW_AMULET_ITEMS and (
-    len(_dropped_amulets) != 30
+    len(_dropped_amulets) != 40
     or any(item.slot != "amulet" for item in _catalogue_amulets)
     or any(item.source not in ("drop", "shop") for item in _catalogue_amulets)
     or any(item.price <= 0 for item in _catalogue_amulets if item.source == "shop")
 ):
-    raise ValueError("amulet catalogue must contain exactly 30 drop-only amulets, plus priced shop ones")
+    raise ValueError("amulet catalogue must contain exactly 40 drop-only amulets, plus priced shop ones")
 if _RAW_GEAR_ITEMS and (
     len(_catalogue_gear) != 60
     or sum(item.slot == "boots" for item in _catalogue_gear) != 30

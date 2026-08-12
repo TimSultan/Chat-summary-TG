@@ -1625,7 +1625,8 @@ def _bonus_icon_text(item) -> str:
         emoji = C.ARMOR_EMOJI if key == "armor" else C.STAT_EMOJI.get(key, "•")
         parts.append(f"{emoji} {value:+d}")
     if isinstance(getattr(item, "effect", None), dict) and item.effect.get("code"):
-        parts.append("🧿")
+        effect_text = str(item.effect.get("text") or "").strip()
+        parts.append(f"🧿 {escape(effect_text)}" if effect_text else "🧿")
     return "  ".join(parts) or "—"
 
 

@@ -66,6 +66,22 @@ EFFECT_HOOKS: Final = {
     "collector": "fight_end_win: increase the chance that any item drops",
     "survivor": "fight_end_loss: retain a fraction of loss-gold only",
     "mirror_soul": "fight_start: match the opponent's stats, then jitter each by value%",
+    "bite": "after_first_hit: bite once, then heal for a share of bite damage",
+    "armor_burst": "after_damage_taken_once: heavily reduce the next incoming hit",
+    "late_strike": "on_first_attack_second: increase the opening counterattack",
+    "medkit": "on_low_health_once: restore a share of maximum health",
+    "countercrit": "on_critical_taken_once: cancel it and prepare a counterattack",
+    "trophy_compass": "fight_end_win: increase drops after defeating a higher-level foe",
+    "stun": "after_first_critical: the opponent skips one attack",
+    "cocoon": "on_first_attack: skip it and reflect the next received hit",
+    "glass_crit": "on_first_critical: greatly increase critical damage",
+    "blood_pact": "after_every_third_hit: heal for a share of damage dealt",
+    "chill": "after_first_hit: weaken the opponent's next attack",
+    "tesla": "after_third_hit: shock the opponent for a share of maximum health",
+    "death_shield": "on_lethal_once: survive at one health and gain a shield",
+    "acid": "after_first_miss: next hit cannot be dodged and pierces armour",
+    "spring": "after_two_hits_taken: double the next attack",
+    "candle": "fight_start: gain a large random damage bonus or penalty",
 }
 
 
@@ -143,6 +159,16 @@ _DATA: Final = (
     ("amulet_tall_ruler", "Линейка против больших", "Меряет противника по росту.", "rare", {"strength": 4}, _effect("giant_slayer", "Против более высокого уровня: +18% урона.", 18), 48, 5),
     ("amulet_trophy_magnet", "Магнит для трофеев", "Липнет к редким вещам.", "legendary", {"luck": 6}, _effect("collector", "Шанс выпадения любого предмета: +25%.", 25), 96, 1),
     ("amulet_last_receipt", "Последний чек", "Доказывает, что ты выжил.", "legendary", {"health": 6, "armor": 3}, _effect("survivor", "При поражении сохраняет 30% штрафа.", 30), 96, 1),
+    ("amulet_hornet_sting", "Жало шершня", "Внутри всё ещё кто-то жужжит.", "rare", {"luck": 4, "health": -5}, _effect("stun", "Первый крит оглушает врага на один ход.", 1), 48, 5),
+    ("amulet_thorn_cocoon", "Шипастый кокон", "Выглядит мирно ровно до первого удара.", "legendary", {"health": 10, "strength": -6}, _effect("cocoon", "Первый ход пропускает и отражает весь следующий полученный урон.", 100), 96, 1),
+    ("amulet_glass_eye", "Стеклянный глаз", "Красиво блестит. Защищает плохо.", "rare", {"luck": 8, "armor": -7}, _effect("glass_crit", "Первый крит наносит на 60% больше урона.", 60), 48, 5),
+    ("amulet_blood_pact", "Кровавый договор", "Подписан чем-то липким.", "legendary", {"strength": 9, "health": -10}, _effect("blood_pact", "Каждый третий успешный удар лечит на 35% нанесённого урона.", 35), 96, 1),
+    ("amulet_frost_fang", "Ледяной зуб", "После укуса хочется надеть шарф.", "rare", {"agility": 5, "strength": -3}, _effect("chill", "Первое попадание ослабляет следующий удар врага на 40%.", 40), 48, 5),
+    ("amulet_tesla_coil", "Катушка Теслы", "Трогать языком не советуем.", "rare", {"strength": 5, "armor": -4}, _effect("tesla", "Третье попадание выпускает разряд на 15% максимального HP врага.", 15), 48, 5),
+    ("amulet_not_today", "Медаль «Не сегодня»", "Один раз можно поспорить с судьбой.", "legendary", {"armor": 8, "luck": -6}, _effect("death_shield", "Смертельный удар оставляет 1 HP и даёт щит на 20% HP.", 20), 96, 1),
+    ("amulet_broken_flask", "Битая колба", "Промахнулся — стало только опаснее.", "uncommon", {"strength": 5, "health": -4}, _effect("acid", "После первого промаха следующий удар нельзя увернуть и он пробивает 25% брони.", 25), 24, 12),
+    ("amulet_angry_spring", "Пружина злости", "Два удара — и её уже не удержать.", "uncommon", {"health": 4, "armor": -3}, _effect("spring", "После двух полученных ударов следующий удар наносит двойной урон.", 100), 24, 12),
+    ("amulet_black_candle", "Чёрная свеча", "Горит ярко, но не обещает в чью сторону.", "rare", {"luck": 6, "health": -5}, _effect("candle", "В начале боя: +40% или -20% к урону до конца боя.", 40, downside=20), 48, 5),
 )
 
 
@@ -158,6 +184,30 @@ _DATA: Final = (
 # rather than stats, but well inside a week of ordinary play -- an item whose whole job is
 # to make lopsided fights fair is worth little if the people who need it cannot buy it.
 _SHOP_DATA: Final = (
+    ("amulet_leech_fang", "Клык пиявки", "Улыбается, когда становится больно.", "rare",
+     {"strength": 5, "agility": -4}, _effect(
+         "bite", "Первое попадание дополнительно кусает врага и лечит на 50% урона укуса.", 50,
+     ), 32, 0, 140),
+    ("amulet_armor_capsule", "Бронекапсула", "Разбивается строго в самый нужный момент.", "uncommon",
+     {"armor": 7, "luck": -3}, _effect(
+         "armor_burst", "После первого полученного удара следующий слабее на 75%.", 75,
+     ), 26, 0, 110),
+    ("amulet_initiative_pendulum", "Маятник инициативы", "Любит, когда начинают не с него.", "uncommon",
+     {"agility": 5, "health": -2}, _effect(
+         "late_strike", "Первый удар вторым в раунде сильнее на 35%.", 35,
+     ), 24, 0, 90),
+    ("amulet_first_aid_heart", "Сердце аптечки", "Тихо шуршит бинтами.", "uncommon",
+     {"health": 8, "strength": -2}, _effect(
+         "medkit", "На 35% HP один раз восстанавливает 20% максимального здоровья.", 20, threshold=35,
+     ), 26, 0, 130),
+    ("amulet_crit_catcher", "Ловец критов", "Особенно любит ловить обидные.", "rare",
+     {"armor": 4, "agility": -3}, _effect(
+         "countercrit", "Первый крит врага отменяет и усиливает следующий ответный удар на 20%.", 20,
+     ), 34, 0, 150),
+    ("amulet_trophy_compass", "Компас трофеев", "Всегда указывает на того, кто сильнее.", "rare",
+     {"luck": 4, "armor": -2}, _effect(
+         "trophy_compass", "Победа над соперником выше уровнем: +35% к шансу дропа.", 35,
+     ), 36, 0, 170),
     ("amulet_soul_mirror", "Зеркало души",
      "Показывает тебя ровно таким, каков соперник.", "rare",
      {}, _effect(
@@ -198,10 +248,10 @@ RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in AMULET_SPE
 
 
 def _validate_catalogue() -> None:
-    # 30 dropped plus however many are sold. Split rather than a single total, so adding
+    # 40 dropped plus however many are sold. Split rather than a single total, so adding
     # a shop amulet cannot quietly shrink the loot table it is meant to sit outside of.
-    assert AMULET_COUNT == 30 + len(SHOP_AMULET_CODES)
-    assert len(_DATA) == 30
+    assert AMULET_COUNT == 40 + len(SHOP_AMULET_CODES)
+    assert len(_DATA) == 40
     assert len({item.code for item in AMULET_SPECS}) == AMULET_COUNT
     assert len({item.name for item in AMULET_SPECS}) == AMULET_COUNT
     assert len({item.effect_dict()["code"] for item in AMULET_SPECS}) == AMULET_COUNT
@@ -221,7 +271,7 @@ def _validate_catalogue() -> None:
     assert all(isinstance(item.effect_dict()["value"], int) for item in AMULET_SPECS)
     assert all(key in STAT_KEYS and isinstance(value, int) for item in AMULET_SPECS for key, value in item.bonuses)
     assert all(set(record) == RAW_ITEM_FIELDS for record in RAW_ITEMS)
-    assert RARITY_COUNTS == {"common": 12, "uncommon": 10, "rare": 8, "legendary": 2}
+    assert RARITY_COUNTS == {"common": 12, "uncommon": 15, "rare": 16, "legendary": 5}
 
 
 _validate_catalogue()

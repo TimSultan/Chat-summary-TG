@@ -1191,6 +1191,12 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('$("hudFace").innerHTML', guarded)
         self.assertEqual(page.count('$("hudFace").innerHTML'), 1)
 
+    async def test_shop_cards_show_an_items_effect_without_opening_the_detail_sheet(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function shopCard(item)", page)
+        self.assertIn("item.effect && item.effect.text", page)
+        self.assertIn("✨ ' + esc(item.effect.text)", page)
+
     async def test_the_page_turns_a_logged_fight_into_a_button(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn("async function replay(id)", page)

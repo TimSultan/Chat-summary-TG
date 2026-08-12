@@ -2450,7 +2450,11 @@ function shopCard(item) {
     '" data-item="' + esc(item.code) + '">' +
     itemArt(item, owned ? '<span class="flag">есть</span>' : "") +
     '<span class="nm">' + esc(item.name) + "</span>" +
-    '<span class="meta">' + bonusText(item.bonuses) + " · 💰" + money(item.price) + "</span></button>";
+    '<span class="meta">' + bonusText(item.bonuses) + " · 💰" + money(item.price) + "</span>" +
+    (item.effect && item.effect.text
+      ? '<span class="tiny muted">✨ ' + esc(item.effect.text) + "</span>"
+      : "") +
+    "</button>";
 }
 
 // ------------------------------------------------------------------------ shop screen
@@ -3363,8 +3367,8 @@ async function replay(id) {
 // An amulet's amount is not always damage. These are the procs that give HP back, and
 // the ones that stop damage rather than deal it; anything else with a number is a hit.
 // Keyed on the effect code pets_combat puts in the event ("amulet_vampiric").
-const HEAL_PROCS = ["vampiric", "second_wind", "dodge_heal", "regen", "adrenaline"];
-const SOAK_PROCS = ["opening_shield", "safeguard", "crit_guard", "last_stand"];
+const HEAL_PROCS = ["vampiric", "bite", "blood_pact", "second_wind", "medkit", "dodge_heal", "regen", "adrenaline"];
+const SOAK_PROCS = ["opening_shield", "armor_burst", "safeguard", "crit_guard", "countercrit", "death_shield", "last_stand"];
 
 function amountTone(round) {
   const event = String(round.event || "");

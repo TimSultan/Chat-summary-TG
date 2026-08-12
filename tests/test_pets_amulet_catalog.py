@@ -1,4 +1,4 @@
-"""Contract tests for the amulet catalogue: 30 findable, plus whatever is sold.
+"""Contract tests for the amulet catalogue: 40 findable, plus whatever is sold.
 
 The two populations have opposite invariants and are asserted separately on purpose. A
 dropped amulet is free and has to be rollable; a shop amulet is bought and must stay OUT
@@ -22,10 +22,10 @@ def _bought():
             if item.code in catalogue.SHOP_AMULET_CODES]
 
 
-def test_exactly_thirty_unique_drop_only_amulets():
+def test_exactly_forty_unique_drop_only_amulets():
     dropped = _dropped()
-    assert len(dropped) == 30
-    assert catalogue.AMULET_COUNT == 30 + len(catalogue.SHOP_AMULET_CODES)
+    assert len(dropped) == 40
+    assert catalogue.AMULET_COUNT == 40 + len(catalogue.SHOP_AMULET_CODES)
     assert len({item.code for item in catalogue.AMULET_SPECS}) == catalogue.AMULET_COUNT
     assert len({item.name for item in catalogue.AMULET_SPECS}) == catalogue.AMULET_COUNT
     assert all(item.slot == "amulet" for item in catalogue.AMULET_SPECS)
@@ -75,6 +75,6 @@ def test_specs_are_frozen_and_legacy_item_adapter_stays_compatible():
 def test_rarities_are_spread_and_copy_is_short():
     dropped_rarities = {rarity: sum(item.rarity == rarity for item in _dropped())
                         for rarity in catalogue.RARITIES}
-    assert dropped_rarities == {"common": 12, "uncommon": 10, "rare": 6, "legendary": 2}
+    assert dropped_rarities == {"common": 12, "uncommon": 12, "rare": 11, "legendary": 5}
     assert all(len(item.name) <= 50 and len(item.description) <= 65
                for item in catalogue.AMULET_SPECS)

@@ -2637,12 +2637,14 @@ def record_fight(
     dropped = None
     auto_equipped = False
     collector_bonus = _effect_fraction(_equipped_effect(winner, "collector"))
+    compass_bonus = _effect_fraction(_equipped_effect(winner, "trophy_compass")) \
+        if int(winner.get("level", 1) or 1) < int(loser.get("level", 1) or 1) else 0.0
     # Only the winner rolls, so it is the winner's luck that pays -- the same pet whose
     # luck already bought the crits that probably won the fight.
     luck_bonus = C.luck_drop_multiplier(
         (winner.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL)
     )
-    drop_chance = min(1.0, C.DROP_CHANCE * (1 + collector_bonus) * luck_bonus)
+    drop_chance = min(1.0, C.DROP_CHANCE * (1 + collector_bonus + compass_bonus) * luck_bonus)
     if force_legendary:
         dropped = random.choice(legendary_pool)
     elif drop_pool and random.random() < drop_chance:
