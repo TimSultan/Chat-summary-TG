@@ -28,6 +28,17 @@ class _FixedRng:
         return items[0]
 
 
+class _SequenceRng:
+    def __init__(self, *numbers):
+        self.numbers = iter(numbers)
+
+    def randint(self, low, high):
+        value = next(self.numbers)
+        if value < low or value > high:
+            raise AssertionError(f"{value} is outside {low}..{high}")
+        return value
+
+
 class CasinoTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -109,6 +120,36 @@ class CasinoTests(unittest.TestCase):
         text, _ = pets_ui.casino_result_view("chat", "1", 0, shell_win)
         self.assertIn("🟢", text)
         self.assertNotIn("шарик был под", text)
+
+    def test_higher_lower_shows_a_varied_open_card_and_compares_the_next_one(self):
+        text, keyboard = pets_ui.casino_highlow_view("chat", "1", 0, 10, open_card=10)
+        self.assertIn("<b>10</b>", text)
+        callbacks = {
+            pets_ui.parse_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+            if ":chighlow:" in button["callback_data"]
+        }
+        self.assertEqual(callbacks, {"10:10:low", "10:10:high"})
+
+        result = casino.play_highlow(
+            "chat", "1", 0, 10, "high", 10, rng=_SequenceRng(9, 12),
+        )
+        self.assertTrue(result["won"])
+        self.assertEqual(result["open_card"], 10)
+        self.assertEqual(result["card"], 12)
+        result_text, _ = pets_ui.casino_result_view("chat", "1", 0, result)
+        self.assertIn("<b>10</b>", result_text)
+        self.assertIn(f"<b>{casino.highlow_card_text(12)}</b>", result_text)
+
+    def test_higher_lower_keeps_equal_odds_on_low_and_high_open_cards(self):
+        low = casino.play_highlow(
+            "chat", "1", 0, 10, "low", 4, rng=_SequenceRng(1, 2),
+        )
+        self.assertTrue(low["won"])
+        high = casino.play_highlow(
+            "chat", "1", 0, 10, "high", 12, rng=_SequenceRng(11, 14),
+        )
+        self.assertTrue(high["won"])
 
     def test_retired_goat_game_is_refunded_and_cleared(self):
         data = economy._load("chat")

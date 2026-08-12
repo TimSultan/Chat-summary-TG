@@ -6550,13 +6550,16 @@ async def handle_pets_callback(
             return
 
         if action in {"cshell", "chighlow"}:
-            raw_stake, _, choice = str(argument or "").partition(":")
+            raw_stake, _, game_argument = str(argument or "").partition(":")
             stake = casino.valid_stake(raw_stake)
-            result = (
-                casino.play_shell(entry, user_id, xp, stake, choice)
-                if action == "cshell"
-                else casino.play_highlow(entry, user_id, xp, stake, choice)
-            )
+            if action == "cshell":
+                result = casino.play_shell(entry, user_id, xp, stake, game_argument)
+            else:
+                raw_open_card, separator, choice = game_argument.partition(":")
+                # Buttons from older messages contain only the choice and keep the old 7.
+                open_card = raw_open_card if separator else 7
+                choice = choice if separator else raw_open_card
+                result = casino.play_highlow(entry, user_id, xp, stake, choice, open_card)
             await _send_pets_view(
                 api, chat_id, pets_ui.casino_result_view(entry, user_id, xp, result),
                 message_id=message_id, log=log,

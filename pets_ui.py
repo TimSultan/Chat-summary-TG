@@ -351,7 +351,7 @@ def casino_bet_view(entry: str, user_id, xp: int, game: str) -> tuple[str, dict]
     descriptions = {
         "poker": "Техасский холдем: 3 → 4 → 5 общих карт. Рейз всегда равен входной ставке.",
         "shell": "После ставки выбери один из трёх напёрстков.",
-        "highlow": "Открыта 7. Угадай: следующая карта выше или ниже; 7 проигрывает.",
+        "highlow": "Угадай: следующая карта будет выше или ниже открытой. Равная карта проигрывает.",
     }
     stakes = casino.POKER_BET_AMOUNTS if game == "poker" else casino.BET_AMOUNTS
     rows = [[
@@ -379,15 +379,20 @@ def casino_shell_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, di
     )
 
 
-def casino_highlow_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, dict]:
+def casino_highlow_view(
+    entry: str, user_id, xp: int, stake: int, open_card: int | None = None
+) -> tuple[str, dict]:
     coins = pets.balance_for(entry, user_id, xp)
+    if open_card is None:
+        open_card = casino.draw_highlow_open_card()
     rows = [[
-        {"text": "⬇️ Меньше", "callback_data": callback_data(user_id, "chighlow", f"{stake}:low")},
-        {"text": "⬆️ Больше", "callback_data": callback_data(user_id, "chighlow", f"{stake}:high")},
+        {"text": "⬇️ Меньше", "callback_data": callback_data(user_id, "chighlow", f"{stake}:{open_card}:low")},
+        {"text": "⬆️ Больше", "callback_data": callback_data(user_id, "chighlow", f"{stake}:{open_card}:high")},
     ], [{"text": "◀️ Ставки", "callback_data": callback_data(user_id, "cgame", "highlow")}]]
     return (
         f"↕️ <b>Больше / меньше</b>\n\nСтавка: {_money(stake)} · монет: {_money(coins)}\n"
-        "Открыта карта: <b>7</b>. Что будет дальше?", {"inline_keyboard": rows},
+        f"Открыта карта: <b>{casino.highlow_card_text(open_card)}</b>. Что будет дальше?",
+        {"inline_keyboard": rows},
     )
 
 
@@ -445,7 +450,10 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
         lines.append(" ".join(cups))
     elif game == "highlow":
         choice = "больше" if result.get("choice") == "high" else "меньше"
-        lines.append(f"Ты выбрал «{choice}». Выпала карта: <b>{result.get('card')}</b>.")
+        lines.append(
+            f"Было: <b>{casino.highlow_card_text(result.get('open_card'))}</b>. "
+            f"Ты выбрал «{choice}». Выпало: <b>{casino.highlow_card_text(result.get('card'))}</b>."
+        )
     if result.get("won"):
         lines.append(f"\n🎉 Победа! Получено {_money(int(result['payout']))}.")
     elif result.get("draw"):

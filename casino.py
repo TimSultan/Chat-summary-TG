@@ -31,6 +31,21 @@ def _card(card: tuple[int, str] | list) -> str:
     return f"{_CARD_NAMES.get(int(card[0]), str(card[0]))}{card[1]}"
 
 
+def highlow_card_text(rank) -> str:
+    """Render a rank without a suit for the higher/lower table."""
+    try:
+        value = int(rank)
+    except (TypeError, ValueError):
+        value = 7
+    return str(_CARD_NAMES.get(value, value))
+
+
+def draw_highlow_open_card(rng=None) -> int:
+    """Deal a varied opening rank while leaving room on both sides of it."""
+    rng = rng or random.SystemRandom()
+    return rng.randint(3, 13)
+
+
 def _active_state(record: dict) -> dict | None:
     state = economy._effects(record).get("casino", {}).get("active")
     return dict(state) if isinstance(state, dict) else None
@@ -256,21 +271,33 @@ def play_shell(entry, user_id, xp: int, stake, choice, rng=None) -> dict:
     }, multiplier=3)
 
 
-def play_highlow(entry, user_id, xp: int, stake, choice, rng=None) -> dict:
-    """The visible card is seven; a matching next card loses, so each choice wins 5/11."""
+def play_highlow(entry, user_id, xp: int, stake, choice, open_card=7, rng=None) -> dict:
+    """Deal around the shown rank with equal 5/11 odds for either direction."""
     stake = valid_stake(stake)
     choice = str(choice or "").lower()
-    if stake is None or choice not in {"high", "low"}:
+    try:
+        open_card = int(open_card)
+    except (TypeError, ValueError):
+        open_card = 0
+    if stake is None or choice not in {"high", "low"} or open_card not in range(3, 14):
         return {"ok": False, "error": "invalid", "balance": economy.balance(entry, user_id, xp), "stake": stake or 0}
     rng = rng or random.SystemRandom()
-    card = rng.randint(2, 12)
-    won = card > 7 if choice == "high" else card < 7
+    # Five lower outcomes, one tie and five higher outcomes keep both choices fair,
+    # including when the visible rank is close to an edge.
+    outcome = rng.randint(1, 11)
+    if outcome <= 5:
+        card = rng.randint(2, open_card - 1)
+    elif outcome == 6:
+        card = open_card
+    else:
+        card = rng.randint(open_card + 1, 14)
+    won = card > open_card if choice == "high" else card < open_card
     return _settle(entry, user_id, xp, stake, won, {
-        "game": "highlow", "choice": choice, "card": card,
+        "game": "highlow", "choice": choice, "open_card": open_card, "card": card,
     })
 
 
 __all__ = [
     "BET_AMOUNTS", "POKER_BET_AMOUNTS", "GAMES", "valid_stake", "active_game", "start_poker", "poker_snapshot",
-    "advance_poker", "play_shell", "play_highlow",
+    "advance_poker", "play_shell", "play_highlow", "draw_highlow_open_card", "highlow_card_text",
 ]
