@@ -86,13 +86,22 @@ class TestBattleEngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "недоступно"):
             combat.take_turn(state, "player", "skill_4")
 
-    def test_cooldown_requires_other_actions(self):
+    def test_regular_scroll_is_removed_from_legal_actions_after_one_use(self):
         state = combat.take_turn(self._battle(), "player", "skill_1")
-        state = combat.take_turn(state, "enemy", "attack")
+        self.assertTrue(state["fighters"]["player"]["used_scrolls"])
         self.assertNotIn("skill_1", combat.legal_actions(state, "player"))
-        state = combat.take_turn(state, "player", "attack")
         state = combat.take_turn(state, "enemy", "attack")
-        self.assertIn("skill_1", combat.legal_actions(state, "player"))
+        with self.assertRaisesRegex(ValueError, "недоступно"):
+            combat.take_turn(state, "player", "skill_1")
+
+    def test_healing_rain_has_a_real_turn_value(self):
+        state = self._battle()
+        player = state["fighters"]["player"]
+        player["hp"] -= round(player["max_hp"] * .50)
+        result = combat.take_turn(state, "player", "skill_2")
+        healed = result["fighters"]["player"]["hp"] - player["hp"]
+        self.assertGreaterEqual(healed, round(player["max_hp"] * .24))
+        self.assertGreaterEqual(result["fighters"]["player"]["barrier"], round(player["max_hp"] * .10))
 
     def test_auto_mode_uses_legal_uniform_candidates_and_always_finishes(self):
         state = self._battle()

@@ -2880,11 +2880,11 @@ function openLiveSkillPicker(slot) {
   const pool = number === 4 ? S.skills.ultimate : S.skills.regular;
   const current = S.skills.slots[number - 1];
   sheet('<h3>' + (number === 4 ? '✨ Ультимейт · один раз за бой' : '📜 Свиток · слот ' + number) +
-    '</h3><p class="tiny muted">В автобою каждый доступный свиток имеет одинаковый шанс применения.</p>' +
+    '</h3><p class="tiny muted">Каждый выбранный свиток используется один раз за бой. В автобою доступные свитки имеют одинаковый шанс применения.</p>' +
     pool.map((spell) => '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) +
       '</b><div class="small">' + esc(spell.short) + '</div><div class="tiny muted">' +
       esc(scrollElement(spell)) + (spell.dodgeable === false ? ' · нельзя увернуться' : '') +
-      (spell.ultimate ? ' · один раз' : ' · CD ' + spell.cooldown) + '</div>' +
+      ' · один раз за бой</div>' +
       '<button class="go sec" style="margin-top:8px" data-liveskillset="' + number + ':' +
       esc(spell.code) + '"' + (current && current.code === spell.code ? ' disabled' : '') + '>' +
       (current && current.code === spell.code ? 'Выбрано' : 'Поставить в слот') + '</button></div>').join(''));
@@ -3021,8 +3021,7 @@ async function renderArena() {
 function testOptions(rows, selected) {
   return (rows || []).map((row) => '<option value="' + esc(row.code) + '"' +
     (row.code === selected ? " selected" : "") + '>' + esc(row.icon || "📜") + " " +
-    esc(row.name) + " · " + esc(scrollElement(row)) +
-    (row.cooldown != null ? " · CD " + row.cooldown : "") +
+    esc(row.name) + " · " + esc(scrollElement(row)) + " · один раз за бой" +
     (row.dodgeable === false ? " · нельзя увернуться" : "") + "</option>").join("");
 }
 
@@ -3085,9 +3084,7 @@ function renderTestBattle(box) {
     : "Ход " + TEST_BATTLE.turn;
   const slotButtons = (mine.slots || []).map((slot) => {
     const action = "skill_" + slot.slot;
-    const note = [scrollElement(slot), slot.ultimate
-      ? (mine.ultimate_used ? "использован" : "один раз")
-      : (slot.remaining_cooldown ? "готов через " + slot.remaining_cooldown : "готов"),
+    const note = [scrollElement(slot), slot.available ? "готов" : "использован",
       slot.dodgeable === false ? "нельзя увернуться" : ""].filter(Boolean).join(" · ");
     return '<button class="go sec test-action' + (slot.ultimate ? " ultimate" : "") +
       '" data-testaction="' + action + '"' + (legal.has(action) ? "" : " disabled") + '>' +
@@ -3158,11 +3155,10 @@ async function testBattleAction(action) {
 
 function showTestCatalog() {
   const spells = [...(TEST_SETUP.regular_scrolls || []), ...(TEST_SETUP.ultimate_scrolls || [])];
-  sheet('<h3>📚 Свитки и щиты</h3><p class="tiny muted">CD — сколько своих действий свиток ' +
-    'отдыхает. Свойства берутся из редактируемой серверной таблицы.</p>' + spells.map((spell) =>
+  sheet('<h3>📚 Свитки и щиты</h3><p class="tiny muted">Каждый выбранный свиток применяется один раз за бой. ' +
+    'Свойства берутся из редактируемой серверной таблицы.</p>' + spells.map((spell) =>
       '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) + '</b><div class="small">' +
-      esc(spell.short) + '</div><div class="tiny muted">' + (spell.ultimate ? "УЛЬТИМЕЙТ · один раз" :
-      "CD " + spell.cooldown) + " · " + esc(scrollElement(spell)) +
+      esc(spell.short) + '</div><div class="tiny muted">один раз за бой · ' + esc(scrollElement(spell)) +
       (spell.dodgeable === false ? " · нельзя увернуться" : "") +
       "</div></div>").join("") + '<h3>🛡 Щиты</h3>' + (TEST_SETUP.shields || []).map((shield) =>
       '<div class="panel"><b>' + esc(shield.icon) + " " + esc(shield.name) + '</b><div class="small">' +

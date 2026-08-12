@@ -533,8 +533,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     damage_weakened = {a.key: 0.0, b.key: 0.0}
     stun_procs = {a.key: 0, b.key: 0}
     guards = {a.key: 0.0, b.key: 0.0}
-    skill_cooldowns = {a.key: {} for a in (a, b)}
-    ultimate_used = {a.key: False for a in (a, b)}
+    used_scrolls = {a.key: set() for a in (a, b)}
     skill_statuses = {a.key: {} for a in (a, b)}
 
     initiative = .5
@@ -638,7 +637,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         current_turns = int(old[1]) if isinstance(old, list) and len(old) > 1 else 0
         skill_statuses[key][name] = [max(current_value, float(value)), max(current_turns, turns)]
 
-    def tick_skill_state(key: str, used_code: str | None = None) -> None:
+    def tick_skill_state(key: str) -> None:
         for name in ("blind", "weaken", "vulnerable", "damage_boost", "regen"):
             row = skill_statuses[key].get(name)
             if not isinstance(row, list):
@@ -646,15 +645,6 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             row[1] -= 1
             if row[1] <= 0:
                 skill_statuses[key].pop(name, None)
-        for code in list(skill_cooldowns[key]):
-            skill_cooldowns[key][code] -= 1
-            if skill_cooldowns[key][code] <= 0:
-                skill_cooldowns[key].pop(code, None)
-        if used_code:
-            cooldown = int(SCROLLS.scroll(used_code).get("cooldown", 0))
-            if cooldown:
-                skill_cooldowns[key][used_code] = cooldown
-
     def harmful_status_allowed(target_key: str) -> bool:
         if not skill_statuses[target_key].pop("negative_ward", False):
             return True
@@ -784,10 +774,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             return ["attack"]
         actions = ["attack", "defend"]
         for index, code in enumerate(loadout):
-            spell = SCROLLS.scroll(code)
-            if skill_cooldowns[key].get(code):
-                continue
-            if spell["ultimate"] and ultimate_used[key]:
+            if code in used_scrolls[key]:
                 continue
             actions.append(f"skill_{index + 1}")
         return actions
@@ -827,8 +814,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         index = int(action.removeprefix("skill_")) - 1
         code = skill_loadouts[source_key][index]
         spell = SCROLLS.scroll(code)
-        if spell["ultimate"]:
-            ultimate_used[source_key] = True
+        used_scrolls[source_key].add(code)
         harmful = any(effect.get("op") in {
             "damage", "burn", "weaken", "blind", "vulnerable", "stun", "break_shield",
         } for effect in spell["effects"])
@@ -860,7 +846,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                        f"{str(spell['short']).rstrip('.')}"
                        + (f" — {impact} урона." if impact else ".")),
         ))
-        tick_skill_state(source_key, code)
+        tick_skill_state(source_key)
         return winner
 
     if effectful:

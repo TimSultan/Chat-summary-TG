@@ -68,7 +68,7 @@ def _fighter(key: str, snapshot: dict, loadout, shield_code: str) -> dict:
         "crit": min(.32, .04 + .28 * luck / (luck + 80.0)),
         "armor_reduction": min(.55, .55 * armor / (armor + 120.0)) if armor else 0.0,
         "skills": list(codes), "shield": shield_code,
-        "cooldowns": {}, "ultimate_used": False, "barrier": 0,
+        "used_scrolls": [], "ultimate_used": False, "barrier": 0,
         "guard": 0.0, "statuses": {}, "damage_done": 0,
     }
 
@@ -296,7 +296,7 @@ def _start_of_turn(state: dict, fighter: dict) -> bool:
     return True
 
 
-def _tick_actor_statuses(fighter: dict, used_code: str | None = None) -> None:
+def _tick_actor_statuses(fighter: dict) -> None:
     for name in ("blind", "weaken", "damage_boost"):
         turns_key = name + "_turns"
         turns = _integer(fighter["statuses"].get(turns_key))
@@ -304,16 +304,6 @@ def _tick_actor_statuses(fighter: dict, used_code: str | None = None) -> None:
             fighter["statuses"][turns_key] = turns - 1
             if turns <= 1:
                 fighter["statuses"].pop(name, None)
-    for code in list(fighter["cooldowns"]):
-        fighter["cooldowns"][code] = max(0, _integer(fighter["cooldowns"][code]) - 1)
-        if fighter["cooldowns"][code] <= 0:
-            fighter["cooldowns"].pop(code, None)
-    if used_code:
-        cooldown = _integer(catalog.scroll(used_code).get("cooldown"))
-        if cooldown:
-            fighter["cooldowns"][used_code] = cooldown
-
-
 def legal_actions(state: dict, actor: str | None = None) -> list[str]:
     if state.get("finished"):
         return []
@@ -324,7 +314,7 @@ def legal_actions(state: dict, actor: str | None = None) -> list[str]:
     actions = ["attack", "defend"]
     for index, code in enumerate(fighter["skills"]):
         spell = catalog.scroll(code)
-        if not spell or fighter["cooldowns"].get(code):
+        if not spell or code in fighter.get("used_scrolls", []):
             continue
         if spell["ultimate"] and fighter["ultimate_used"]:
             continue
@@ -373,7 +363,6 @@ def _take_turn(state: dict, actor_key: str, action: str) -> None:
         _finish_or_advance(state)
         return
 
-    used_code = None
     if action == "attack":
         if _misses(state, actor, target, True):
             _add_log(state, "dodge", f"{target['name']} уклоняется от атаки {actor['name']}.", actor_key)
@@ -391,6 +380,7 @@ def _take_turn(state: dict, actor_key: str, action: str) -> None:
             raise ValueError("Неизвестный слот свитка.")
         used_code = actor["skills"][index]
         spell = catalog.scroll(used_code)
+        actor.setdefault("used_scrolls", []).append(used_code)
         if spell["ultimate"]:
             actor["ultimate_used"] = True
         if _misses(state, actor, target, bool(spell["dodgeable"])):
@@ -400,7 +390,7 @@ def _take_turn(state: dict, actor_key: str, action: str) -> None:
             for effect in spell["effects"]:
                 _apply_effect(state, actor, target, effect, spell["name"])
 
-    _tick_actor_statuses(actor, used_code)
+    _tick_actor_statuses(actor)
     _finish_or_advance(state)
 
 
@@ -439,10 +429,7 @@ def public_state(state: dict) -> dict:
         for index, code in enumerate(fighter.pop("skills", []), start=1):
             spell = catalog.public_scroll(catalog.scroll(code))
             spell["slot"] = index
-            spell["remaining_cooldown"] = fighter.get("cooldowns", {}).get(code, 0)
-            spell["available"] = not spell["remaining_cooldown"] and not (
-                spell["ultimate"] and fighter.get("ultimate_used")
-            )
+            spell["available"] = code not in fighter.get("used_scrolls", [])
             fighter["slots"].append(spell)
         fighter["shield"] = catalog.public_shield(catalog.shield(fighter["shield"]))
     payload["legal_actions"] = legal_actions(state)

@@ -77,11 +77,14 @@ class LiveCombatTableTests(unittest.TestCase):
                     observed = result
                     break
             self.assertIsNotNone(observed, spell["code"])
-            if spell["ultimate"]:
-                self.assertLessEqual(
-                    sum(row.event == f"skill_{spell['code']}" for row in observed.rounds), 1,
-                    spell["code"],
-                )
+            self.assertLessEqual(
+                sum(
+                    row.event == f"skill_{spell['code']}" and row.attacker == fighter.key
+                    for row in observed.rounds
+                ),
+                1,
+                spell["code"],
+            )
 
     def test_defend_uses_the_equipped_shields_data_driven_hook(self):
         mirror = scrolls.shield("shield_mirror")
