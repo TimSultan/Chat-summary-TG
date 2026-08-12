@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app_time
 import bot_listener
+import casino
 import economy
 import pets
 import pets_config as C
@@ -247,7 +248,7 @@ class PetsCommandTests(unittest.TestCase):
 
         redraws = [
             "main", "info", "cage", "farm", "train", "bag", "fight", "history", "mail",
-            "updates", "leaderboard", "pet", "casino", "ccombos", "quests", "dailybonus", "store",
+            "updates", "leaderboard", "pet", "casino", "ccombos", "cpokerstyles", "quests", "dailybonus", "store",
             "collection", "questmods",
         ]
         for action in redraws:
@@ -819,6 +820,18 @@ class PetsCommandTests(unittest.TestCase):
         changed = self._tap("setskill", f"2:{code}")
         self.assertEqual(pets.skill_loadout(CHAT, PLAYER["id"])[1], code)
         self.assertIn("Боевые свитки", changed.edits[-1]["text"])
+
+    def test_realistic_poker_can_start_and_fold_through_telegram_callbacks(self):
+        stakes = self._tap("cgame", "poker_ai")
+        self.assertIn("тайно выбирает стиль", stakes.edits[-1]["text"])
+
+        started = self._tap("cbet", "poker_ai:25")
+        self.assertIn("Соперник изучает стол", started.edits[-1]["text"])
+        self.assertEqual(casino.active_game(CHAT, PLAYER["id"])["mode"], "opponent")
+
+        folded = self._tap("cpoker", "fold")
+        self.assertIn("Ты сбросил карты", folded.edits[-1]["text"])
+        self.assertIsNone(casino.active_game(CHAT, PLAYER["id"]))
 
     def test_shields_have_a_real_shop_shelf_with_stats_effects_and_buy_buttons(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

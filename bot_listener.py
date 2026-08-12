@@ -6603,8 +6603,11 @@ async def handle_pets_callback(
             if stake is None or game not in casino.GAMES:
                 await _send_pets_view(api, chat_id, pets_ui.casino_view(entry, user_id, xp), message_id=message_id, log=log)
                 return
-            if game == "poker":
-                result = casino.start_poker(entry, user_id, xp, stake)
+            if game in {"poker", "poker_ai"}:
+                result = casino.start_poker(
+                    entry, user_id, xp, stake,
+                    mode="opponent" if game == "poker_ai" else "classic",
+                )
                 rendered = pets_ui.casino_poker_view(entry, user_id, xp, result.get("active")) \
                     if result.get("ok") else pets_ui.casino_result_view(entry, user_id, xp, result)
             elif game == "shell":
@@ -6639,7 +6642,7 @@ async def handle_pets_callback(
             result = casino.advance_poker(entry, user_id, xp, raise_by)
             if result.get("active"):
                 notice = (
-                    f"⚠️ Не хватает {int(result.get('stake', 0) or 0)} монет на рейз.\n\n"
+                    f"⚠️ Не хватает {int(result.get('stake', 0) or 0)} монет для этого действия.\n\n"
                     if result.get("error") == "funds" else ""
                 )
                 rendered = pets_ui.casino_poker_view(entry, user_id, xp, result["active"], notice)
@@ -6696,7 +6699,8 @@ async def handle_pets_callback(
             ),
             "shopslot": lambda: pets_ui.shop_slot_view(entry, user_id, xp, argument),
             "casino": lambda: pets_ui.casino_view(entry, user_id, xp),
-            "ccombos": lambda: pets_ui.casino_combinations_view(user_id),
+            "ccombos": lambda: pets_ui.casino_combinations_view(user_id, argument),
+            "cpokerstyles": lambda: pets_ui.casino_poker_styles_view(user_id),
             "quests": lambda: pets_ui.quests_view(
                 entry, user_id, "real" if argument == "real" else "paint",
             ),

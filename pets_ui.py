@@ -318,14 +318,17 @@ def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
         "🎰 <b>Казино</b>\n",
         f"🪙 Монеты: <b>{_money(coins)}</b>",
         "Победа возвращает удвоенную ставку; в напёрстках — x3. Играем только на монеты.",
-        "Выбери игру: покер, напёрстки или больше / меньше.",
+        "Выбери игру: два режима покера, напёрстки или больше / меньше.",
     ]
     rows = [
         [
-            {"text": "🃏 Покер", "callback_data": callback_data(user_id, "cgame", "poker")},
-            {"text": "🥥 Напёрстки", "callback_data": callback_data(user_id, "cgame", "shell")},
+            {"text": "🃏 Покер · классика", "callback_data": callback_data(user_id, "cgame", "poker")},
         ],
         [
+            {"text": "🧠 Покер · живой соперник", "callback_data": callback_data(user_id, "cgame", "poker_ai")},
+        ],
+        [
+            {"text": "🥥 Напёрстки", "callback_data": callback_data(user_id, "cgame", "shell")},
             {"text": "↕️ Больше / меньше", "callback_data": callback_data(user_id, "cgame", "highlow")},
         ],
         _back_row(user_id),
@@ -334,7 +337,8 @@ def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
 
 
 _CASINO_GAME_NAMES = {
-    "poker": "🃏 Покер", "shell": "🥥 Напёрстки", "highlow": "↕️ Больше / меньше",
+    "poker": "🃏 Покер · классика", "poker_ai": "🧠 Покер · живой соперник",
+    "shell": "🥥 Напёрстки", "highlow": "↕️ Больше / меньше",
 }
 
 
@@ -343,18 +347,26 @@ def casino_bet_view(entry: str, user_id, xp: int, game: str) -> tuple[str, dict]
         return casino_view(entry, user_id, xp)
     coins = pets.balance_for(entry, user_id, xp)
     descriptions = {
-        "poker": "Техасский холдем: 3 → 4 → 5 общих карт. Рейз всегда равен входной ставке.",
+        "poker": "Техасский холдем: дилер всегда поддерживает ставку. Рейз равен входной ставке.",
+        "poker_ai": (
+            "Соперник на каждую раздачу тайно выбирает стиль, оценивает только свои карты и стол, "
+            "может чекнуть, коллировать, повышать или сбросить."
+        ),
         "shell": "После ставки выбери один из трёх напёрстков.",
         "highlow": "Угадай: следующая карта будет выше или ниже открытой. Равная карта проигрывает.",
     }
-    stakes = casino.POKER_BET_AMOUNTS if game == "poker" else casino.BET_AMOUNTS
+    stakes = casino.POKER_BET_AMOUNTS if game in {"poker", "poker_ai"} else casino.BET_AMOUNTS
     rows = [[
         {"text": f"🪙 {stake}", "callback_data": callback_data(user_id, "cbet", f"{game}:{stake}")}
         for stake in stakes
     ]]
-    if game == "poker":
+    if game in {"poker", "poker_ai"}:
         rows.append([{
-            "text": "📚 Комбинации", "callback_data": callback_data(user_id, "ccombos"),
+            "text": "📚 Комбинации", "callback_data": callback_data(user_id, "ccombos", game),
+        }])
+    if game == "poker_ai":
+        rows.append([{
+            "text": "🎭 Стили соперника", "callback_data": callback_data(user_id, "cpokerstyles"),
         }])
     rows.append([{"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")}])
     return (
@@ -401,25 +413,38 @@ def casino_poker_view(
         return casino_view(entry, user_id, xp)
     hand = casino.poker_snapshot(state)
     stage = hand["stage"]
+    opponent = hand["mode"] == "opponent"
     text = (
-        f"🃏 <b>Покер · на столе {stage} карт</b>\n\n"
-        f"Общая ставка: <b>{_money(hand['stake'] * 2)}</b>\n"
+        f"{'🧠' if opponent else '🃏'} <b>Покер · на столе {stage} карт</b>\n\n"
+        f"Общая ставка: <b>{_money(hand['pot'])}</b>\n"
         f"Стол: <b>{' · '.join(hand['board_cards'])}</b>\n"
         f"Твои карты: <b>{' · '.join(hand['player_cards'])}</b>\n\n"
     )
+    if opponent and hand.get("last_action"):
+        text += f"<i>{escape(hand['last_action'])}</i>\n\n"
     if notice:
         text += notice
-    prompt = "Вскрыть карты?" if stage == 5 else "Открыть следующую карту?"
+    if hand["to_call"]:
+        prompt = f"Соперник повысил. Поддержать ещё {hand['to_call']}?"
+        primary = f"🃏 Колл +{hand['to_call']}"
+    else:
+        prompt = "Вскрыть карты?" if stage == 5 else "Открыть следующую карту?"
+        primary = "🃏 Колл" if not opponent else "✋ Чек"
+    raise_cost = hand["base_stake"] + hand["to_call"]
+    raise_label = f"Рейз +{hand['base_stake']}"
+    if hand["to_call"]:
+        raise_label += f" · внести {raise_cost}"
     return text + prompt, {"inline_keyboard": [
-        [{"text": "🃏 Колл", "callback_data": callback_data(user_id, "cpoker")}],
+        [{"text": primary, "callback_data": callback_data(user_id, "cpoker")}],
         [{
-            "text": f"Рейз +{hand['base_stake']}",
+            "text": raise_label,
             "callback_data": callback_data(user_id, "cpoker", f"raise:{hand['base_stake']}"),
         }],
+        [{"text": "🏳 Сбросить карты", "callback_data": callback_data(user_id, "cpoker", "fold")}],
     ]}
 
 
-def casino_combinations_view(user_id) -> tuple[str, dict]:
+def casino_combinations_view(user_id, game: str = "poker") -> tuple[str, dict]:
     """Poker cheat sheet, strongest hand first, using the evaluator's own table."""
     lines = [
         "📚 <b>Комбинации в покере</b>",
@@ -432,8 +457,27 @@ def casino_combinations_view(user_id) -> tuple[str, dict]:
         "Если комбинации одинаковые, сначала сравниваются карты самой комбинации, "
         "затем кикеры. Если совпали все пять карт — ничья.",
     ])
+    game = "poker_ai" if game == "poker_ai" else "poker"
     return "\n".join(lines), {"inline_keyboard": [[{
-        "text": "◀️ К покеру", "callback_data": callback_data(user_id, "cgame", "poker"),
+        "text": "◀️ К покеру", "callback_data": callback_data(user_id, "cgame", game),
+    }]]}
+
+
+def casino_poker_styles_view(user_id) -> tuple[str, dict]:
+    """Explain the four conventional opponent archetypes without revealing this hand."""
+    lines = [
+        "🎭 <b>Стили соперника</b>",
+        "На каждую раздачу стиль выбирается заново и остаётся тайной до её конца.\n",
+    ]
+    for row in casino.POKER_STYLES:
+        lines.append(f"<b>{escape(row['name'])}</b> — {escape(row['short'])}")
+    lines.extend([
+        "",
+        "Тайтовый игрок чаще выбрасывает слабые руки, лузовый играет шире. "
+        "Агрессивный чаще повышает и блефует, пассивный предпочитает чек и колл.",
+    ])
+    return "\n".join(lines), {"inline_keyboard": [[{
+        "text": "◀️ К ставкам", "callback_data": callback_data(user_id, "cgame", "poker_ai"),
     }]]}
 
 
@@ -454,21 +498,37 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
             {"inline_keyboard": [[{"text": "◀️ К играм", "callback_data": callback_data(user_id, "casino")}]]},
         )
     game = str(result.get("game") or "")
-    lines = [f"{_CASINO_GAME_NAMES.get(game, '🎰 Казино')}", ""]
+    poker_mode = str(result.get("mode") or "classic")
+    game_title = "poker_ai" if game == "poker" and poker_mode == "opponent" else game
+    lines = [f"{_CASINO_GAME_NAMES.get(game_title, '🎰 Казино')}", ""]
     if game == "poker":
-        player_combination = (result.get("player_combination") or {}).get("name") or "Не определена"
-        dealer_combination = (result.get("dealer_combination") or {}).get("name") or "Не определена"
-        lines.extend([
-            "Карты на столе:",
-            f"<b>{' · '.join(result.get('board_cards') or [])}</b>\n",
-            "Твои карты:",
-            f"<b>{' · '.join(result.get('player_cards') or [])}</b>",
-            f"Твоя комбинация: <b>{player_combination}</b>\n",
-            "Карты дилера:",
-            f"<b>{' · '.join(result.get('dealer_cards') or [])}</b>",
-            f"Комбинация дилера: <b>{dealer_combination}</b>\n",
-            f"<b>{result.get('comparison') or ''}</b>",
-        ])
+        style = result.get("opponent_style") or {}
+        if style:
+            lines.append(f"Стиль соперника: <b>{escape(style.get('name') or '')}</b>")
+            lines.append(f"<i>{escape(style.get('short') or '')}</i>\n")
+        if result.get("folded_by"):
+            lines.extend([
+                "Карты на столе:",
+                f"<b>{' · '.join(result.get('board_cards') or [])}</b>\n",
+                "Твои карты:",
+                f"<b>{' · '.join(result.get('player_cards') or [])}</b>\n",
+                f"<b>{result.get('comparison') or ''}</b>",
+            ])
+        else:
+            player_combination = (result.get("player_combination") or {}).get("name") or "Не определена"
+            dealer_combination = (result.get("dealer_combination") or {}).get("name") or "Не определена"
+            opponent_word = "соперника" if poker_mode == "opponent" else "дилера"
+            lines.extend([
+                "Карты на столе:",
+                f"<b>{' · '.join(result.get('board_cards') or [])}</b>\n",
+                "Твои карты:",
+                f"<b>{' · '.join(result.get('player_cards') or [])}</b>",
+                f"Твоя комбинация: <b>{player_combination}</b>\n",
+                f"Карты {opponent_word}:",
+                f"<b>{' · '.join(result.get('dealer_cards') or [])}</b>",
+                f"Комбинация {opponent_word}: <b>{dealer_combination}</b>\n",
+                f"<b>{result.get('comparison') or ''}</b>",
+            ])
     elif game == "shell":
         cups = ["🥥", "🥥", "🥥"]
         cups[int(result.get("ball", 0)) - 1] = "🟢"
@@ -484,13 +544,16 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
         lines.append(f"\n🎉 {victory} {_money(int(result['payout']))}.")
     elif result.get("draw"):
         lines.append(f"\n🤝 Ничья — ставка {_money(int(result['payout']))} возвращена.")
+    elif result.get("folded_by") == "player":
+        lines.append(f"\n🏳 Сброшено: {_money(int(result['stake']))} осталось в банке.")
     else:
         lines.append(f"\n💨 Не повезло: ставка {_money(int(result['stake']))} проиграна.")
     lines.append(f"🪙 Осталось: <b>{_money(int(result['balance']))}</b>")
-    rows = [[{"text": "🔁 Ещё раз", "callback_data": callback_data(user_id, "cgame", game)}]]
+    again_game = "poker_ai" if game == "poker" and poker_mode == "opponent" else game
+    rows = [[{"text": "🔁 Ещё раз", "callback_data": callback_data(user_id, "cgame", again_game)}]]
     if game == "poker":
         rows[0].append({
-            "text": "📚 Комбинации", "callback_data": callback_data(user_id, "ccombos"),
+            "text": "📚 Комбинации", "callback_data": callback_data(user_id, "ccombos", again_game),
         })
     rows.append([{"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")}])
     return "\n".join(lines), {"inline_keyboard": rows}

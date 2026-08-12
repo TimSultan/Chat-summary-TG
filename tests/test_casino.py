@@ -1,5 +1,6 @@
 """Casino outcomes stay server-side and use only the shared coin ledger."""
 
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -138,7 +139,7 @@ class CasinoTests(unittest.TestCase):
         self.assertIn(("1", "cpoker", ""), callbacks)
         self.assertEqual(
             {argument for _, action, argument in callbacks if action == "cpoker" and argument},
-            {"raise:25"},
+            {"raise:25", "fold"},
         )
 
     def test_poker_raise_must_equal_the_opening_stake(self):
@@ -149,6 +150,131 @@ class CasinoTests(unittest.TestCase):
         self.assertEqual(rejected["error"], "invalid")
         self.assertEqual(rejected["active"], started["active"])
         self.assertEqual(economy.balance("chat", "1", 0), before)
+
+    def test_realistic_poker_chooses_one_of_four_hidden_styles(self):
+        started = casino.start_poker(
+            "chat", "1", 0, 25, rng=_FixedRng(), mode="opponent",
+        )
+        self.assertTrue(started["ok"])
+        self.assertEqual(
+            {row["code"] for row in casino.POKER_STYLES},
+            {"tight_aggressive", "loose_aggressive", "tight_passive", "loose_passive"},
+        )
+        self.assertIn(started["active"]["opponent_style"], {
+            row["code"] for row in casino.POKER_STYLES
+        })
+        snapshot = casino.poker_snapshot(started["active"])
+        self.assertEqual(snapshot["mode"], "opponent")
+        self.assertEqual(snapshot["pot"], 50)
+        self.assertNotIn("opponent_style", snapshot)
+
+        text, keyboard = pets_ui.casino_bet_view("chat", "1", 0, "poker_ai")
+        self.assertIn("тайно выбирает стиль", text)
+        callbacks = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn("cpokerstyles", callbacks)
+        styles_text, _ = pets_ui.casino_poker_styles_view("1")
+        self.assertTrue(all(row["name"] in styles_text for row in casino.POKER_STYLES))
+
+    def test_realistic_opponent_can_fold_to_a_raise_and_pays_the_current_pot(self):
+        casino.start_poker("chat", "1", 0, 25, rng=_FixedRng(), mode="opponent")
+        with patch("casino._opponent_decision", return_value="fold"):
+            result = casino.advance_poker("chat", "1", 0, raise_by=25)
+
+        self.assertTrue(result["won"])
+        self.assertEqual(result["folded_by"], "dealer")
+        self.assertEqual(result["payout"], 75)
+        self.assertEqual(result["dealer_cards"], [])
+        self.assertEqual(economy.balance("chat", "1", 0), 325)
+        self.assertIsNone(casino.active_game("chat", "1"))
+        text, keyboard = pets_ui.casino_result_view("chat", "1", 0, result)
+        self.assertIn("Стиль соперника", text)
+        self.assertIn("Соперник сбросил карты", text)
+        self.assertNotIn("Карты соперника:", text)
+        self.assertEqual(
+            pets_ui.parse_callback(keyboard["inline_keyboard"][0][0]["callback_data"])[2],
+            "poker_ai",
+        )
+
+    def test_realistic_opponent_can_raise_after_a_check_then_be_called_or_folded_to(self):
+        casino.start_poker("chat", "1", 0, 25, rng=_FixedRng(), mode="opponent")
+        with patch("casino._opponent_decision", return_value="raise"):
+            raised = casino.advance_poker("chat", "1", 0)
+        snapshot = casino.poker_snapshot(raised["active"])
+        self.assertEqual(snapshot["stage"], 3)
+        self.assertEqual(snapshot["to_call"], 25)
+        self.assertEqual(snapshot["pot"], 75)
+        self.assertEqual(economy.balance("chat", "1", 0), 275)
+
+        text, keyboard = pets_ui.casino_poker_view("chat", "1", 0, raised["active"])
+        self.assertIn("Колл +25", text + str(keyboard))
+        self.assertIn("Сбросить карты", str(keyboard))
+
+        called = casino.advance_poker("chat", "1", 0)
+        called_snapshot = casino.poker_snapshot(called["active"])
+        self.assertEqual(called_snapshot["stage"], 4)
+        self.assertEqual(called_snapshot["to_call"], 0)
+        self.assertEqual(called_snapshot["pot"], 100)
+        self.assertEqual(economy.balance("chat", "1", 0), 250)
+
+        folded = casino.advance_poker("chat", "1", 0, "fold")
+        self.assertEqual(folded["folded_by"], "player")
+        self.assertFalse(folded["won"])
+        self.assertEqual(economy.balance("chat", "1", 0), 250)
+
+    def test_unaffordable_opponent_raise_stays_pending_until_the_player_folds(self):
+        casino.start_poker("chat", "1", 0, 100, rng=_FixedRng(), mode="opponent")
+        with patch("casino._opponent_decision", return_value="raise"):
+            raised = casino.advance_poker("chat", "1", 0)
+        self.assertEqual(casino.poker_snapshot(raised["active"])["to_call"], 100)
+        self.assertTrue(economy.spend("chat", "1", 0, 150, "test:drain")[0])
+
+        refused = casino.advance_poker("chat", "1", 0)
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["error"], "funds")
+        self.assertEqual(refused["stake"], 100)
+        self.assertEqual(casino.poker_snapshot(refused["active"])["to_call"], 100)
+        self.assertEqual(economy.balance("chat", "1", 0), 50)
+
+        folded = casino.advance_poker("chat", "1", 0, "fold")
+        self.assertEqual(folded["folded_by"], "player")
+        self.assertIsNone(casino.active_game("chat", "1"))
+
+    def test_classic_poker_also_allows_the_player_to_fold(self):
+        casino.start_poker("chat", "1", 0, 25, rng=_FixedRng())
+        result = casino.advance_poker("chat", "1", 0, "fold")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["folded_by"], "player")
+        self.assertEqual(result["payout"], 0)
+        self.assertEqual(economy.balance("chat", "1", 0), 275)
+
+    def test_opponent_decision_never_reads_the_players_hidden_cards(self):
+        state = casino.start_poker(
+            "chat", "1", 0, 25, rng=_FixedRng(), mode="opponent",
+        )["active"]
+        changed = copy.deepcopy(state)
+        changed["player"] = [[2, "♥"], [3, "♥"]]
+        self.assertEqual(
+            casino._opponent_decision(state, faced_raise=True),
+            casino._opponent_decision(changed, faced_raise=True),
+        )
+
+    def test_aggressive_styles_have_more_raise_pressure_than_passive_twins(self):
+        styles = {row["code"]: row for row in casino.POKER_STYLES}
+        self.assertLess(
+            styles["loose_aggressive"]["raise_above"],
+            styles["loose_passive"]["raise_above"],
+        )
+        self.assertGreater(
+            styles["loose_aggressive"]["bluff_chance"],
+            styles["loose_passive"]["bluff_chance"],
+        )
+        self.assertGreater(
+            styles["tight_passive"]["fold_below"],
+            styles["loose_passive"]["fold_below"],
+        )
 
     def test_available_stakes_are_ten_twenty_five_fifty_and_one_hundred(self):
         self.assertEqual(casino.POKER_BET_AMOUNTS, (10, 25, 50, 100))
@@ -237,6 +363,10 @@ class CasinoTests(unittest.TestCase):
         self.assertIn("покер", text.lower())
         self.assertIn("наперстки", text.lower().replace("ё", "е"))
         self.assertIn("больше / меньше", text.lower())
+        self.assertIn(
+            "живой соперник",
+            " ".join(button["text"] for row in keyboard["inline_keyboard"] for button in row).lower(),
+        )
         self.assertNotIn("коза", text.lower())
         self.assertNotIn("🐐", " ".join(button["text"] for row in keyboard["inline_keyboard"] for button in row))
         actions = [
@@ -244,6 +374,11 @@ class CasinoTests(unittest.TestCase):
             for row in keyboard["inline_keyboard"] for button in row
         ]
         self.assertIn("cgame", actions)
+        arguments = [
+            pets_ui.parse_callback(button["callback_data"])[2]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertIn("poker_ai", arguments)
 
 
 if __name__ == "__main__":

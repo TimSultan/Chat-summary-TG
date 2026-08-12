@@ -11,7 +11,8 @@ import economy
 
 BET_AMOUNTS: Final = (1, 5, 10, 25)
 POKER_BET_AMOUNTS: Final = (10, 25, 50, 100)
-GAMES: Final = ("poker", "shell", "highlow")
+POKER_MODES: Final = ("classic", "opponent")
+GAMES: Final = ("poker", "poker_ai", "shell", "highlow")
 _RANKS: Final = tuple(range(2, 15))
 _SUITS: Final = ("♠", "♥", "♦", "♣")
 _DECK: Final = tuple((rank, suit) for rank in _RANKS for suit in _SUITS)
@@ -70,13 +71,46 @@ _POKER_SCORE_CODES: Final = {
     4: "straight", 3: "three_kind", 2: "two_pair", 1: "pair", 0: "high_card",
 }
 
+# The conventional two-axis poker model: tight/loose controls which hands continue,
+# aggressive/passive controls how often that continuing range raises.  Numeric knobs are
+# intentionally kept in this one editable table.  ``fold_below`` and ``raise_above`` are
+# estimated showdown-equity thresholds; the other values keep a style from becoming a
+# perfectly readable robot.
+POKER_STYLES: Final = (
+    {
+        "code": "tight_aggressive", "name": "Тайтово-агрессивный",
+        "short": "Играет мало рук, но сильные разыгрывает напористо.",
+        "fold_below": .43, "raise_above": .64, "bluff_chance": .08,
+        "value_raise_chance": .78, "reraise_chance": .55,
+    },
+    {
+        "code": "loose_aggressive", "name": "Лузово-агрессивный",
+        "short": "Заходит широко, часто давит рейзами и иногда блефует.",
+        "fold_below": .24, "raise_above": .50, "bluff_chance": .20,
+        "value_raise_chance": .88, "reraise_chance": .72,
+    },
+    {
+        "code": "tight_passive", "name": "Тайтово-пассивный",
+        "short": "Слабые руки выбрасывает, со средними осторожно коллирует.",
+        "fold_below": .50, "raise_above": .78, "bluff_chance": .01,
+        "value_raise_chance": .34, "reraise_chance": .12,
+    },
+    {
+        "code": "loose_passive", "name": "Лузово-пассивный",
+        "short": "Часто остаётся в раздаче и любит колл больше рейза.",
+        "fold_below": .18, "raise_above": .82, "bluff_chance": .02,
+        "value_raise_chance": .24, "reraise_chance": .08,
+    },
+)
+_POKER_STYLE_BY_CODE: Final = {row["code"]: row for row in POKER_STYLES}
+
 
 def valid_stake(value, game: str | None = None) -> int | None:
     try:
         stake = int(value)
     except (TypeError, ValueError):
         return None
-    allowed = POKER_BET_AMOUNTS if game == "poker" else BET_AMOUNTS
+    allowed = POKER_BET_AMOUNTS if game in {"poker", "poker_ai"} else BET_AMOUNTS
     return stake if stake in allowed else None
 
 
@@ -153,7 +187,7 @@ def _start(entry, user_id, xp: int, stake: int, state: dict) -> dict:
 
 def _finish_active(
     entry, user_id, xp: int, state: dict, won: bool, details: dict, *, draw: bool = False,
-    data: dict | None = None, record: dict | None = None,
+    data: dict | None = None, record: dict | None = None, payout_override: int | None = None,
 ) -> dict:
     """Pay a wager already debited by `_start`, and clear its saved state atomically."""
     data = data if data is not None else economy._load(entry)
@@ -162,7 +196,10 @@ def _finish_active(
     if active != state:
         return {"ok": False, "error": "stale", "balance": economy._balance_from(data, user_id, xp), "stake": 0}
     stake = int(state["stake"])
-    payout = stake * (2 if won else 1 if draw else 0)
+    payout = (
+        max(0, int(payout_override)) if payout_override is not None
+        else stake * (2 if won else 1 if draw else 0)
+    )
     if payout:
         record["bonus"] = record.get("bonus", 0) + payout
         economy._append_log(data, user_id, payout, f"wager_payout:casino:{state['kind']}")
@@ -199,19 +236,29 @@ def _settle(entry, user_id, xp: int, stake: int, won: bool, details: dict, *, mu
     }
 
 
-def start_poker(entry, user_id, xp: int, stake, rng=None) -> dict:
-    """Open a five-card Texas Hold'em hand at the flop (three community cards)."""
+def start_poker(entry, user_id, xp: int, stake, rng=None, *, mode: str = "classic") -> dict:
+    """Open Hold'em at the flop in classic or behavioural-opponent mode."""
     stake = valid_stake(stake, "poker")
     if stake is None:
         return {"ok": False, "error": "invalid", "balance": economy.balance(entry, user_id, xp), "stake": 0}
+    mode = mode if mode in POKER_MODES else "classic"
     rng = rng or random.SystemRandom()
     cards = list(rng.sample(_DECK, 9))
     state = {
         "kind": "poker", "stake": stake, "base_stake": stake, "stage": 3,
+        "mode": mode, "dealer_stake": stake, "to_call": 0,
         "player": [list(card) for card in cards[:2]],
         "dealer": [list(card) for card in cards[2:4]],
         "board": [list(card) for card in cards[4:]],
     }
+    if mode == "opponent":
+        style = rng.choice(POKER_STYLES)
+        state.update({
+            "opponent_style": style["code"],
+            "opponent_seed": rng.randint(0, 2_147_483_647),
+            "opponent_decisions": 0,
+            "last_action": "Соперник изучает стол.",
+        })
     return _start(entry, user_id, xp, stake, state)
 
 
@@ -221,7 +268,12 @@ def poker_snapshot(state: dict) -> dict:
     return {
         "stage": stage,
         "stake": int(state.get("stake", 0)),
+        "dealer_stake": int(state.get("dealer_stake", state.get("stake", 0))),
+        "pot": int(state.get("stake", 0)) + int(state.get("dealer_stake", state.get("stake", 0))),
         "base_stake": int(state.get("base_stake", state.get("stake", 0))),
+        "mode": state.get("mode") if state.get("mode") in POKER_MODES else "classic",
+        "to_call": max(0, int(state.get("to_call", 0) or 0)),
+        "last_action": str(state.get("last_action") or ""),
         "player_cards": [_card(card) for card in state.get("player", [])],
         "board_cards": [_card(card) for card in (state.get("board") or [])[:stage]],
     }
@@ -306,13 +358,224 @@ def _poker_comparison(player_score: tuple[int, ...], dealer_score: tuple[int, ..
     )
 
 
+def poker_style(code: str) -> dict | None:
+    """Public text for a behavioural opponent style; numeric tuning stays private."""
+    row = _POKER_STYLE_BY_CODE.get(str(code or ""))
+    return {key: row[key] for key in ("code", "name", "short")} if row else None
+
+
+def _set_active(record: dict, state: dict) -> None:
+    economy._effects(record).setdefault("casino", {})["active"] = state
+
+
+def _poker_result_details(state: dict) -> dict:
+    player_score = _best_score(state["player"] + state["board"])
+    dealer_score = _best_score(state["dealer"] + state["board"])
+    comparison = _poker_comparison(player_score, dealer_score)
+    if state.get("mode") == "opponent":
+        comparison = comparison.replace("дилера", "соперника")
+    return {
+        "mode": state.get("mode", "classic"),
+        "opponent_style": poker_style(state.get("opponent_style")),
+        "player_cards": [_card(card) for card in state["player"]],
+        "dealer_cards": [_card(card) for card in state["dealer"]],
+        "board_cards": [_card(card) for card in state["board"]],
+        "player_combination": poker_combination(player_score),
+        "dealer_combination": poker_combination(dealer_score),
+        "comparison": comparison,
+    }
+
+
+def _showdown_poker(entry, user_id, xp: int, state: dict, data: dict, record: dict) -> dict:
+    player_score = _best_score(state["player"] + state["board"])
+    dealer_score = _best_score(state["dealer"] + state["board"])
+    _set_active(record, state)
+    return _finish_active(
+        entry, user_id, xp, state, player_score > dealer_score,
+        _poker_result_details(state), draw=player_score == dealer_score,
+        data=data, record=record,
+        payout_override=(
+            int(state["stake"]) + int(state.get("dealer_stake", state["stake"]))
+            if player_score > dealer_score else int(state["stake"]) if player_score == dealer_score else 0
+        ),
+    )
+
+
+def _fold_poker(
+    entry, user_id, xp: int, state: dict, data: dict, record: dict, folded_by: str,
+) -> dict:
+    """Settle without exposing the opponent's folded cards."""
+    dealer_folded = folded_by == "dealer"
+    stage = min(5, max(3, int(state.get("stage", 3))))
+    _set_active(record, state)
+    return _finish_active(
+        entry, user_id, xp, state, dealer_folded,
+        {
+            "mode": state.get("mode", "classic"),
+            "folded_by": folded_by,
+            "opponent_style": poker_style(state.get("opponent_style")),
+            "player_cards": [_card(card) for card in state.get("player", [])],
+            "dealer_cards": [],
+            "board_cards": [_card(card) for card in (state.get("board") or [])[:stage]],
+            "comparison": (
+                "Соперник сбросил карты — банк твой."
+                if dealer_folded else "Ты сбросил карты и уступил банк."
+            ),
+        },
+        data=data, record=record,
+        payout_override=(
+            int(state["stake"]) + int(state.get("dealer_stake", state["stake"]))
+            if dealer_folded else 0
+        ),
+    )
+
+
+def _opponent_rng(state: dict) -> random.Random:
+    decision = max(0, int(state.get("opponent_decisions", 0) or 0))
+    state["opponent_decisions"] = decision + 1
+    return random.Random(
+        f"poker-opponent:{state.get('opponent_seed', 0)}:{state.get('stage', 3)}:{decision}"
+    )
+
+
+def _opponent_equity(state: dict, rng: random.Random, trials: int = 72) -> float:
+    """Estimate strength using only cards the opponent is allowed to know.
+
+    The actual player's hole cards and unrevealed board are deliberately NOT excluded
+    from the sampling pool: from the opponent's point of view they are unknown cards.
+    This is the guard that keeps a server-side bot from quietly becoming a cheater.
+    """
+    stage = min(5, max(3, int(state.get("stage", 3))))
+    dealer = [tuple(card) for card in state.get("dealer", [])]
+    visible = [tuple(card) for card in (state.get("board") or [])[:stage]]
+    known = set(dealer + visible)
+    unseen = [card for card in _DECK if card not in known]
+    board_needed = 5 - len(visible)
+    wins = 0.0
+    trials = min(160, max(24, int(trials or 72)))
+    for _ in range(trials):
+        drawn = rng.sample(unseen, 2 + board_needed)
+        opponent_hole = drawn[:2]
+        board = visible + drawn[2:]
+        mine = _best_score(dealer + board)
+        theirs = _best_score(opponent_hole + board)
+        wins += 1.0 if mine > theirs else .5 if mine == theirs else 0.0
+    return wins / trials
+
+
+def _opponent_decision(state: dict, *, faced_raise: bool, can_reraise: bool = True) -> str:
+    """Return fold/call/check/raise from the selected style and estimated equity."""
+    style = _POKER_STYLE_BY_CODE.get(str(state.get("opponent_style") or "")) \
+        or _POKER_STYLE_BY_CODE["tight_aggressive"]
+    rng = _opponent_rng(state)
+    equity = _opponent_equity(state, rng)
+    perceived = max(0.0, min(1.0, equity + rng.uniform(-.045, .045)))
+    if faced_raise and perceived < float(style["fold_below"]):
+        return "fold"
+    if can_reraise:
+        value_raise = (
+            perceived >= float(style["raise_above"])
+            and rng.random() < float(style["value_raise_chance"])
+        )
+        bluff_raise = perceived < .50 and rng.random() < float(style["bluff_chance"])
+        if value_raise or bluff_raise:
+            if not faced_raise or rng.random() < float(style["reraise_chance"]):
+                return "raise"
+    return "call" if faced_raise else "check"
+
+
+def _poker_charge(data: dict, record: dict, user_id, xp: int, state: dict, amount: int) -> dict | None:
+    amount = max(0, int(amount or 0))
+    balance = economy._balance_from(data, user_id, xp)
+    if balance < amount:
+        return {
+            "ok": False, "error": "funds", "active": state,
+            "balance": balance, "stake": amount,
+        }
+    if amount:
+        record["spent"] = record.get("spent", 0) + amount
+        economy._append_log(data, user_id, -amount, "wager_raise:casino:poker")
+        state["stake"] = int(state["stake"]) + amount
+    return None
+
+
+def _next_poker_street(entry, user_id, xp: int, state: dict, data: dict, record: dict) -> dict:
+    stage = int(state.get("stage", 3))
+    state["to_call"] = 0
+    if stage < 5:
+        state["stage"] = stage + 1
+        _set_active(record, state)
+        economy._save(entry, data)
+        return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
+    return _showdown_poker(entry, user_id, xp, state, data, record)
+
+
+def _advance_classic_poker(
+    entry, user_id, xp: int, state: dict, data: dict, record: dict, raise_by: int,
+) -> dict:
+    if raise_by:
+        refused = _poker_charge(data, record, user_id, xp, state, raise_by)
+        if refused:
+            return refused
+        state["dealer_stake"] = int(state.get("dealer_stake", state["stake"] - raise_by)) + raise_by
+    return _next_poker_street(entry, user_id, xp, state, data, record)
+
+
+def _advance_opponent_poker(
+    entry, user_id, xp: int, state: dict, data: dict, record: dict, raise_by: int,
+) -> dict:
+    base = int(state.get("base_stake", state.get("stake", 0)) or 0)
+    to_call = max(0, int(state.get("to_call", 0) or 0))
+    if raise_by:
+        # A re-raise first calls the outstanding bet, then adds exactly the original
+        # buy-in.  One bot re-raise per street caps the exchange and prevents loops.
+        refused = _poker_charge(data, record, user_id, xp, state, to_call + base)
+        if refused:
+            return refused
+        state["to_call"] = 0
+        decision = _opponent_decision(state, faced_raise=True, can_reraise=not bool(to_call))
+        if decision == "fold":
+            state["last_action"] = "Соперник сбросил карты после твоего рейза."
+            return _fold_poker(entry, user_id, xp, state, data, record, "dealer")
+        if decision == "raise" and not to_call:
+            state["dealer_stake"] = int(state.get("dealer_stake", 0)) + base * 2
+            state["to_call"] = base
+            state["last_action"] = f"Соперник переставил ещё на {base}."
+            _set_active(record, state)
+            economy._save(entry, data)
+            return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
+        state["dealer_stake"] = int(state.get("dealer_stake", 0)) + base
+        state["last_action"] = "Соперник поддержал твой рейз."
+        return _next_poker_street(entry, user_id, xp, state, data, record)
+
+    if to_call:
+        refused = _poker_charge(data, record, user_id, xp, state, to_call)
+        if refused:
+            return refused
+        state["last_action"] = "Ты поддержал рейз соперника."
+        return _next_poker_street(entry, user_id, xp, state, data, record)
+
+    decision = _opponent_decision(state, faced_raise=False)
+    if decision == "raise":
+        state["dealer_stake"] = int(state.get("dealer_stake", state["stake"])) + base
+        state["to_call"] = base
+        state["last_action"] = f"После твоего чека соперник поднял на {base}."
+        _set_active(record, state)
+        economy._save(entry, data)
+        return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
+    state["last_action"] = "Соперник тоже сделал чек."
+    return _next_poker_street(entry, user_id, xp, state, data, record)
+
+
 def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
-    """Call or raise, then reveal the turn or settle the river atomically."""
+    """Fold, check/call or raise, then let the selected opponent answer."""
     data = economy._load(entry)
     record = economy._record(data, user_id)
     state = _active_state(record)
     if not state or state.get("kind") != "poker":
         return {"ok": False, "error": "stale", "balance": economy._balance_from(data, user_id, xp), "stake": 0}
+    if str(raise_by or "").strip().lower() == "fold":
+        return _fold_poker(entry, user_id, xp, state, data, record, "player")
     base_stake = int(state.get("base_stake", state.get("stake", 0)) or 0)
     if raise_by in (None, "", 0, "0"):
         raise_by = 0
@@ -326,34 +589,10 @@ def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
                 "ok": False, "error": "invalid", "active": state,
                 "balance": economy._balance_from(data, user_id, xp), "stake": 0,
             }
-    if raise_by:
-        balance = economy._balance_from(data, user_id, xp)
-        if balance < raise_by:
-            return {
-                "ok": False, "error": "funds", "active": state,
-                "balance": balance, "stake": raise_by,
-            }
-        record["spent"] = record.get("spent", 0) + raise_by
-        economy._append_log(data, user_id, -raise_by, "wager_raise:casino:poker")
-        state["stake"] = int(state["stake"]) + raise_by
-        economy._effects(record).setdefault("casino", {})["active"] = state
-    stage = int(state.get("stage", 3))
-    if stage < 5:
-        state["stage"] = stage + 1
-        economy._effects(record).setdefault("casino", {})["active"] = state
-        economy._save(entry, data)
-        return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
-    player = state["player"] + state["board"]
-    dealer = state["dealer"] + state["board"]
-    player_score, dealer_score = _best_score(player), _best_score(dealer)
-    return _finish_active(entry, user_id, xp, state, player_score > dealer_score, {
-        "player_cards": [_card(card) for card in state["player"]],
-        "dealer_cards": [_card(card) for card in state["dealer"]],
-        "board_cards": [_card(card) for card in state["board"]],
-        "player_combination": poker_combination(player_score),
-        "dealer_combination": poker_combination(dealer_score),
-        "comparison": _poker_comparison(player_score, dealer_score),
-    }, draw=player_score == dealer_score, data=data, record=record)
+    mode = state.get("mode") if state.get("mode") in POKER_MODES else "classic"
+    if mode == "opponent":
+        return _advance_opponent_poker(entry, user_id, xp, state, data, record, raise_by)
+    return _advance_classic_poker(entry, user_id, xp, state, data, record, raise_by)
 
 
 def play_shell(entry, user_id, xp: int, stake, choice, rng=None) -> dict:
@@ -399,6 +638,8 @@ def play_highlow(entry, user_id, xp: int, stake, choice, open_card=7, rng=None) 
 
 
 __all__ = [
-    "BET_AMOUNTS", "POKER_BET_AMOUNTS", "POKER_COMBINATIONS", "GAMES", "valid_stake", "active_game", "start_poker", "poker_snapshot", "poker_combination",
+    "BET_AMOUNTS", "POKER_BET_AMOUNTS", "POKER_COMBINATIONS", "POKER_STYLES",
+    "POKER_MODES", "GAMES", "valid_stake", "active_game", "start_poker",
+    "poker_snapshot", "poker_combination", "poker_style",
     "advance_poker", "play_shell", "play_highlow", "draw_highlow_open_card", "highlow_card_text",
 ]
