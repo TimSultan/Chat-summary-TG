@@ -201,10 +201,22 @@ def test_names_are_clear_and_descriptions_are_short():
     assert all(len(description) <= 65 for description in descriptions)
     assert any(name.startswith("Тапок ") for name in names)
     assert any(name.startswith("Сковородка ") for name in names)
-    assert any("с авито" in name.lower() for name in names)
-    assert any("из гаража" in name.lower() for name in names)
+    assert any("для важных переговоров" in name.lower() for name in names)
+    assert any("после странной доставки" in name.lower() for name in names)
     assert not any(any(bad in name.lower() for bad in ("дедлайн", "созвон", "проверки")) for name in names)
-    assert len(set(descriptions)) >= 100
+    assert not any(any(tired in name.lower() for tired in (
+        "без чека", "от соседа", "с авито", "из гаража",
+    )) for name in names)
+    assert len(set(descriptions)) == len(descriptions)
+
+
+def test_no_generic_name_story_is_repeated_more_than_ten_times():
+    counts = {
+        suffix: sum(weapon.name.endswith(suffix) for weapon in catalogue.WEAPON_SPECS)
+        for suffix, _description in catalogue._THEMES
+    }
+    assert len(catalogue._THEMES) == 50
+    assert max(counts.values()) <= 10
 
 
 def test_generated_rarities_are_interleaved_instead_of_front_loaded():

@@ -119,7 +119,8 @@ class WeaponSpec:
         }
 
 
-# 50 familiar objects x 10 concrete origins = 500 unique names.  These deliberately
+# 50 familiar objects rotate through 50 concrete stories; the catalogue takes 500
+# well-spread pairs from that larger space. These deliberately
 # sound like nicknames people would actually give a stupid improvised weapon: no
 # corporate jargon, random abstractions or fantasy-name soup.  The second tuple value is
 # a short physical joke about the object; stats carry the detailed information.
@@ -177,16 +178,56 @@ _OBJECTS: Final = (
 )
 
 _THEMES: Final = (
-    ("с Авито", "Продавец удалил аккаунт."),
-    ("из гаража", "Пахнет бензином."),
-    ("на синей изоленте", "Значит, надёжно."),
-    ("без чека", "Возврат не примут."),
-    ("из общаги", "Комендант уже ищет."),
-    ("от соседа", "Он просил вернуть."),
-    ("с балкона", "Долетело не сразу."),
-    ("за триста рублей", "Торг был уместен."),
-    ("в аренду", "Плата за каждый промах."),
-    ("из 2007-го", "Пережило три ремонта."),
+    ("из коробки с проводами", "Лежало на самом дне."),
+    ("после дачного сезона", "Видало слишком многое."),
+    ("с красной наклейкой", "Предупреждение стёрлось."),
+    ("для важных переговоров", "Убеждает без слов."),
+    ("из запасов завхоза", "Учёта уже нет."),
+    ("после трёх ремонтов", "Четвёртый не планируется."),
+    ("с аварийной полки", "Берут в крайнем случае."),
+    ("из потерянной посылки", "Адресат не объявился."),
+    ("со склада реквизита", "Роль оказалась боевой."),
+    ("с боевым скотчем", "Держится из принципа."),
+    ("после переезда", "Коробку так и не нашли."),
+    ("из набора для пикника", "Отдых быстро закончился."),
+    ("из мастерской в подвале", "Мастер просил молчать."),
+    ("с барахолки у вокзала", "Цена вызвала вопросы."),
+    ("из кабинета труда", "Урок всё ещё идёт."),
+    ("из закрытого ларька", "Ключ подошёл случайно."),
+    ("с верхней антресоли", "Пыль усиливает эффект."),
+    ("из дедушкиного сарая", "Инструкция потерялась."),
+    ("после офисного ремонта", "Списать не успели."),
+    ("с последней гарантией", "Сервис уже закрылся."),
+    ("из коробки на выброс", "Передумали вовремя."),
+    ("с пометкой срочно", "Причину не уточнили."),
+    ("после неудачной сборки", "Лишних деталей не осталось."),
+    ("из забытой кладовки", "Дверь заклинило снова."),
+    ("с учебной тревоги", "Тревога стала настоящей."),
+    ("из набора новосёла", "Праздник пошёл не туда."),
+    ("после ночной смены", "Усталость только злит."),
+    ("с полки у кассы", "Импульсивная покупка."),
+    ("из багажника такси", "Владелец не перезвонил."),
+    ("с распродажи реквизита", "Сцена была последней."),
+    ("из комнаты охраны", "Камеры отвернулись."),
+    ("после генеральной уборки", "Выбросить не решились."),
+    ("из коробки с ёлкой", "Праздник отменяется."),
+    ("с пожарного стенда", "Тревожный, но полезный."),
+    ("из очереди на ремонт", "Очередь не дождалась."),
+    ("после семейного совета", "Решение было громким."),
+    ("с выставочного стенда", "Трогать было нельзя."),
+    ("из подсобки кафе", "Смена закончилась дракой."),
+    ("после курса самообороны", "Методичку поняло буквально."),
+    ("с забытого верстака", "Хозяин ушёл за ключом."),
+    ("из коробки возвратов", "Причина возврата ясна."),
+    ("с технического этажа", "Лифт туда не ходит."),
+    ("после детского утренника", "Костюмер до сих пор ищет."),
+    ("из набора выживальщика", "Пункт инструкции вырван."),
+    ("с полки у лифта", "Никто не признался."),
+    ("после шумного ремонта", "Тишина наконец наступила."),
+    ("из службы находок", "Забирать никто не пришёл."),
+    ("с закрытой распродажи", "Открывать было ошибкой."),
+    ("после странной доставки", "Курьер убежал первым."),
+    ("из реквизита квеструма", "Выход оказался запасным."),
 )
 
 
@@ -494,9 +535,8 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             effect=_LEGENDARY_EFFECTS[0] if rarity == "legendary" else (),
         ))
     rarity_seen = {rarity: 0 for rarity in RARITIES}
-    # Adjacent codes intentionally rotate both object and concrete origin. Daily storefronts
-    # use contiguous code windows, so a grouped Cartesian product would show sixteen
-    # near-identical "...с Авито" names at once even though the full catalogue varied.
+    # Adjacent codes intentionally rotate both object and concrete story. The 50-story
+    # bank means no memorable suffix appears fifty times across the catalogue anymore.
     combinations = tuple(
         (*_OBJECTS[index % len(_OBJECTS)],
          *_THEMES[(index // len(_OBJECTS) + index % len(_OBJECTS)) % len(_THEMES)])
@@ -512,11 +552,9 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
         source = _source_for(rarity, rarity_seen[rarity])
         bonuses = _bonus_tuple(index, rarity)
         buy_price, resale_price = _prices(rarity, source, bonuses)
-        description = (
-            f"{object_description} Есть подвох."
-            if rarity == "cursed"
-            else f"{object_description} {theme_description}"
-        )
+        # The rarity badge and negative stats already make a cursed item clear. Keeping
+        # its actual story here avoids dozens of identical "Есть подвох" descriptions.
+        description = f"{object_description} {theme_description}"
         name = f"{object_name} {suffix}"
         code = f"w{index + 1:03d}"
         effect = _effect_for(rarity, rarity_seen[rarity])
@@ -542,8 +580,8 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             bonuses=bonuses,
             effect=effect,
         ))
-    # There are 50 * 10 name combinations, of which the first three are replaced by
-    # migration-safe legacy entries.  The early stop above keeps the public range w001..w500.
+    # The word banks offer far more than 500 pairs. The early stop keeps the public range
+    # w001..w500 and, crucially, all existing inventory codes stable.
     return tuple(entries)
 
 
@@ -565,6 +603,7 @@ def _validate_catalogue() -> None:
     assert WEAPON_COUNT == 500
     assert len({item.code for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.name for item in WEAPON_SPECS}) == WEAPON_COUNT
+    assert len({item.description for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert all(item.code.isascii() and item.code.isalnum() for item in WEAPON_SPECS)
     assert all(item.slot == "weapon" and item.rarity in RARITIES for item in WEAPON_SPECS)
     assert all(item.source in SOURCES for item in WEAPON_SPECS)
