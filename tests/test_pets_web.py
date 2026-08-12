@@ -222,7 +222,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             ("get", "/api/state"), ("get", "/api/opponents"), ("get", "/api/shop"),
             ("get", "/api/leaderboard"), ("get", "/api/history"), ("get", "/api/collection"),
             ("get", "/api/updates"), ("get", "/api/mail"),
+            ("get", "/api/test-battle"),
             ("post", "/api/action"), ("post", "/api/attack"),
+            ("post", "/api/test-battle/start"), ("post", "/api/test-battle/action"),
         ):
             response = await getattr(self.client, method)(pets_web.ROUTE_PREFIX + path, json={})
             self.assertEqual(response.status, 401, f"{method} {path} let an unsigned caller in")
@@ -430,6 +432,114 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         ids = {row["user_id"] for row in body["opponents"]}
         self.assertNotIn(str(PLAYER["id"]), ids)
         self.assertEqual(ids, {str(OPPONENT["id"]), str(THIRD["id"])})
+
+    # ---- isolated turn-based prototype ----------------------------------------------
+
+    async def test_turn_based_setup_exposes_four_slots_and_the_editable_catalogues(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        response = await self._get("/api/test-battle", PLAYER)
+        self.assertEqual(response.status, 200, await response.text())
+        body = await response.json()
+
+        self.assertTrue(body["test_only"])
+        self.assertEqual(len(body["defaults"]["skills"]), 4)
+        self.assertEqual(len(body["regular_scrolls"]), 30)
+        self.assertEqual(len(body["ultimate_scrolls"]), 10)
+        self.assertEqual(len(body["shields"]), 10)
+        self.assertTrue(all(row["auto_weight"] == 1 for row in body["regular_scrolls"]))
+        self.assertTrue(all(row["effects"] for row in body["regular_scrolls"]))
+        self.assertEqual(
+            {row["user_id"] for row in body["opponents"]},
+            {"dummy", str(OPPONENT["id"])},
+        )
+
+    async def test_manual_turns_and_auto_finish_do_not_touch_the_live_game(self):
+        self._tame(PLAYER)
+        before = json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True)
+
+        start = await self.client.post(pets_web.ROUTE_PREFIX + "/api/test-battle/start", json={
+            "init_data": _init_data(PLAYER["id"]), "mode": "manual", "opponent_id": "dummy",
+        })
+        self.assertEqual(start.status, 200, await start.text())
+        opened = await start.json()
+        self.assertTrue(opened["ok"])
+        self.assertTrue(opened["session"])
+        self.assertTrue(opened["battle"]["test_only"])
+        self.assertEqual(len(opened["battle"]["fighters"]["player"]["slots"]), 4)
+
+        defended = await self.client.post(pets_web.ROUTE_PREFIX + "/api/test-battle/action", json={
+            "init_data": _init_data(PLAYER["id"]), "session": opened["session"],
+            "action": "defend",
+        })
+        self.assertEqual(defended.status, 200, await defended.text())
+        defended_body = await defended.json()
+        self.assertEqual(defended_body["battle"]["actor"], "player")
+        self.assertTrue(any(row["kind"] == "defend" for row in defended_body["battle"]["log"]))
+
+        finished = await self.client.post(pets_web.ROUTE_PREFIX + "/api/test-battle/action", json={
+            "init_data": _init_data(PLAYER["id"]), "session": opened["session"],
+            "action": "auto",
+        })
+        self.assertEqual(finished.status, 200, await finished.text())
+        self.assertTrue((await finished.json())["battle"]["finished"])
+        self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True), before)
+
+    async def test_automatic_and_multiplayer_placeholder_create_no_live_results(self):
+        self._tame(PLAYER)
+        before = json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True)
+
+        automatic = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/test-battle/start", json={
+                "init_data": _init_data(PLAYER["id"]), "mode": "auto",
+                "opponent_id": "dummy",
+            },
+        )
+        self.assertEqual(automatic.status, 200, await automatic.text())
+        auto_body = await automatic.json()
+        self.assertIsNone(auto_body["session"])
+        self.assertTrue(auto_body["battle"]["finished"])
+
+        multiplayer = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/test-battle/start", json={
+                "init_data": _init_data(PLAYER["id"]), "mode": "multiplayer",
+            },
+        )
+        self.assertEqual(multiplayer.status, 200, await multiplayer.text())
+        multi_body = await multiplayer.json()
+        self.assertEqual(multi_body["status"], "coming_soon")
+        self.assertNotIn("session", multi_body)
+        self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True), before)
+
+    async def test_a_test_session_is_private_and_rejects_unknown_actions(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        start = await self.client.post(pets_web.ROUTE_PREFIX + "/api/test-battle/start", json={
+            "init_data": _init_data(PLAYER["id"]), "mode": "manual", "opponent_id": "dummy",
+        })
+        token = (await start.json())["session"]
+
+        stolen = await self.client.post(pets_web.ROUTE_PREFIX + "/api/test-battle/action", json={
+            "init_data": _init_data(OPPONENT["id"]), "session": token, "action": "attack",
+        })
+        self.assertEqual(stolen.status, 403)
+        self.assertEqual((await stolen.json())["error"], "WRONG_TEST_OWNER")
+
+        invalid = await self.client.post(pets_web.ROUTE_PREFIX + "/api/test-battle/action", json={
+            "init_data": _init_data(PLAYER["id"]), "session": token, "action": "delete_everything",
+        })
+        self.assertEqual(invalid.status, 409)
+        self.assertEqual((await invalid.json())["error"], "BAD_TEST_ACTION")
+
+    async def test_turn_based_page_warns_that_it_is_a_test_and_wires_all_moves(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('data-testbattle="open"', page)
+        self.assertIn('data-testaction="attack"', page)
+        self.assertIn('data-testaction="defend"', page)
+        self.assertIn('data-testmode="multiplayer"', page)
+        self.assertIn("testSkill4", page)
+        self.assertIn("Результаты, награды и счётчики не записываются", page)
 
     # ---- portrait: the image route ---------------------------------------------------
 

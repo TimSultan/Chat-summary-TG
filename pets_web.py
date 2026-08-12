@@ -54,6 +54,8 @@ import pets
 import pets_combat
 import pets_config as C
 import pets_mobs
+import pets_scroll_catalog
+import pets_test_combat
 import pets_updates
 import quests
 import stats
@@ -75,6 +77,10 @@ _QUEST_FEEDBACK_KEY = web.AppKey("pets_quest_feedback")
 _QUEST_COMPLETION_KEY = web.AppKey("pets_quest_completion")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
+_TEST_BATTLE_SESSIONS_KEY = web.AppKey("pets_test_battle_sessions", dict)
+
+TEST_BATTLE_SESSION_TTL = 30 * 60
+TEST_BATTLE_SESSION_LIMIT = 1000
 
 # Item codes are ASCII and short by construction (w001, amulet_red_button, bt01). Anything
 # else never reaches the filesystem -- same two-step guard vote_web.handle_media uses.
@@ -949,6 +955,200 @@ async def handle_opponents(request: web.Request) -> web.Response:
     return _ok(await asyncio.to_thread(_opponents_payload, entry, me, prefix))
 
 
+# ---------------------------------------------------------------- test turn-based battle
+
+def _test_fighter_snapshot(record: dict, key: str, prefix: str) -> dict:
+    return {
+        "name": record.get("name") or "Существо",
+        "portrait": _portrait_url(prefix, key) if key != "dummy" else None,
+        "crop": record.get("portrait_crop"),
+        "stats": pets._effective_stats_for(record),
+    }
+
+
+def _test_dummy_snapshot(mine: dict) -> dict:
+    stats = dict(pets._effective_stats_for(mine))
+    return {
+        "name": "Тренировочный голем", "portrait": None, "crop": None,
+        "stats": stats,
+    }
+
+
+def _test_battle_setup_payload(entry: str, me: str, prefix: str) -> dict:
+    """Read-only setup data. No live arena limits or counters participate."""
+    data = pets._load(entry)
+    mine = pets._tamed_record(data, me)
+    opponents = []
+    if mine is not None:
+        opponents.append({
+            "user_id": "dummy", "name": "Тренировочный голем", "owner_name": "Песочница",
+            "portrait": None, "crop": None, "stats": pets._effective_stats_for(mine),
+        })
+        for opponent_id, record in data.get("pets", {}).items():
+            if str(opponent_id) == str(me) or not isinstance(record, dict) or not record.get("name"):
+                continue
+            opponents.append({
+                "user_id": str(opponent_id), "name": record.get("name"),
+                "owner_name": record.get("owner_name") or "кто-то",
+                "portrait": _portrait_url(prefix, opponent_id), "crop": record.get("portrait_crop"),
+                "stats": pets._effective_stats_for(record),
+            })
+    return {
+        "test_only": True,
+        "rules": {
+            "base_hp": pets_test_combat.TEST_BASE_HP,
+            "hp_per_health": pets_test_combat.TEST_HP_PER_HEALTH,
+            "hp_per_strength": pets_test_combat.TEST_HP_PER_STRENGTH,
+            "turn_limit": pets_test_combat.TEST_TURN_LIMIT,
+            "guard_percent": round(pets_test_combat.BASE_GUARD * 100),
+        },
+        "defaults": {
+            "skills": list(pets_scroll_catalog.DEFAULT_LOADOUT),
+            "shield": pets_scroll_catalog.DEFAULT_SHIELD,
+        },
+        "regular_scrolls": [
+            pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.REGULAR_SCROLLS
+        ],
+        "ultimate_scrolls": [
+            pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.ULTIMATE_SCROLLS
+        ],
+        "shields": [pets_scroll_catalog.public_shield(row) for row in pets_scroll_catalog.SHIELDS],
+        "opponents": opponents,
+    }
+
+
+def _prune_test_battles(app: web.Application) -> None:
+    sessions = app[_TEST_BATTLE_SESSIONS_KEY]
+    now = time.monotonic()
+    expired = [token for token, row in sessions.items()
+               if now - float(row.get("last_used", 0)) > TEST_BATTLE_SESSION_TTL]
+    for token in expired:
+        sessions.pop(token, None)
+    if len(sessions) > TEST_BATTLE_SESSION_LIMIT:
+        oldest = sorted(sessions, key=lambda token: sessions[token].get("last_used", 0))
+        for token in oldest[:len(sessions) - TEST_BATTLE_SESSION_LIMIT]:
+            sessions.pop(token, None)
+
+
+async def handle_test_battle_setup(request: web.Request) -> web.Response:
+    user, _xp = await _player(request)
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Тестировать бой могут только участники чата.", status=403,
+                           code="NOT_A_MEMBER")
+    entry = request.app[_ENTRY_KEY]
+    me = str(user["id"])
+    if pets.get_pet(entry, me) is None:
+        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+    return _ok(await asyncio.to_thread(
+        _test_battle_setup_payload, entry, me, request.app[_PREFIX_KEY],
+    ))
+
+
+async def handle_test_battle_start(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Тестировать бой могут только участники чата.", status=403,
+                           code="NOT_A_MEMBER")
+    mode = str(body.get("mode") or "manual")
+    if mode == "multiplayer":
+        return _ok({
+            "ok": False, "test_only": True, "mode": "multiplayer", "status": "coming_soon",
+            "message": "Парный режим появится позже — сейчас это только место для будущего матчмейкинга.",
+        })
+    if mode not in ("manual", "auto"):
+        return _json_error("Неизвестный режим.", code="BAD_MODE")
+
+    entry = request.app[_ENTRY_KEY]
+    me = str(user["id"])
+    data = await asyncio.to_thread(pets._load, entry)
+    mine = pets._tamed_record(data, me)
+    if mine is None:
+        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+    opponent_id = str(body.get("opponent_id") or "dummy")
+    theirs = None if opponent_id == "dummy" else pets._tamed_record(data, opponent_id)
+    if opponent_id != "dummy" and theirs is None:
+        return _json_error("Соперник больше не доступен.", status=409, code="NO_OPPONENT")
+    prefix = request.app[_PREFIX_KEY]
+    player = _test_fighter_snapshot(mine, me, prefix)
+    enemy = _test_dummy_snapshot(mine) if theirs is None else _test_fighter_snapshot(
+        theirs, opponent_id, prefix,
+    )
+    try:
+        loadout = pets_scroll_catalog.validate_loadout(
+            body.get("skills") or pets_scroll_catalog.DEFAULT_LOADOUT
+        )
+        shield_code = str(body.get("shield") or pets_scroll_catalog.DEFAULT_SHIELD)
+        if pets_scroll_catalog.shield(shield_code) is None:
+            raise ValueError("Неизвестный щит.")
+        battle = pets_test_combat.start_battle(
+            player, enemy, loadout, pets_scroll_catalog.DEFAULT_LOADOUT,
+            shield_code, pets_scroll_catalog.DEFAULT_SHIELD,
+        )
+    except ValueError as error:
+        return _json_error(str(error), code="BAD_LOADOUT")
+
+    if mode == "auto":
+        battle = pets_test_combat.run_auto(battle)
+        return _ok({
+            "ok": True, "mode": mode, "session": None,
+            "message": "Автобой завершён. Награды и счётчики не менялись.",
+            "battle": pets_test_combat.public_state(battle),
+        })
+
+    _prune_test_battles(request.app)
+    token = secrets.token_urlsafe(18)
+    request.app[_TEST_BATTLE_SESSIONS_KEY][token] = {
+        "owner": me, "entry": entry, "mode": mode,
+        "last_used": time.monotonic(), "battle": battle,
+    }
+    return _ok({
+        "ok": True, "mode": mode, "session": token,
+        "message": "Тестовый бой начался. Результат нигде не запишется.",
+        "battle": pets_test_combat.public_state(battle),
+    })
+
+
+async def handle_test_battle_action(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return _json_error("Тестировать бой могут только участники чата.", status=403,
+                           code="NOT_A_MEMBER")
+    _prune_test_battles(request.app)
+    token = str(body.get("session") or "")
+    session = request.app[_TEST_BATTLE_SESSIONS_KEY].get(token)
+    if session is None:
+        return _json_error("Тестовый бой закончился или устарел.", status=404,
+                           code="NO_TEST_SESSION")
+    if session.get("owner") != str(user["id"]) or session.get("entry") != request.app[_ENTRY_KEY]:
+        return _json_error("Это чужой тестовый бой.", status=403, code="WRONG_TEST_OWNER")
+    try:
+        action = str(body.get("action") or "")
+        if action == "auto":
+            battle = pets_test_combat.run_auto(session["battle"])
+            session["mode"] = "auto"
+        else:
+            battle = pets_test_combat.take_turn(session["battle"], "player", action)
+            while not battle.get("finished") and battle.get("actor") == "enemy":
+                battle = pets_test_combat.auto_turn(battle)
+    except ValueError as error:
+        return _json_error(str(error), status=409, code="BAD_TEST_ACTION")
+    session["battle"] = battle
+    session["last_used"] = time.monotonic()
+    return _ok({
+        "ok": True, "mode": session.get("mode", "manual"), "session": token,
+        "message": "Тест завершён — ничего не записано." if battle.get("finished") else "",
+        "battle": pets_test_combat.public_state(battle),
+    })
+
+
 def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
     data = pets._load(entry)
     mine_record = pets._tamed_record(data, me)
@@ -1629,6 +1829,9 @@ def attach(
     app[_QUEST_COMPLETION_KEY] = quest_completion or _default_quest_completion
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
+    # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
+    # the real pet store. Opaque tokens and ownership checks isolate simultaneous users.
+    app[_TEST_BATTLE_SESSIONS_KEY] = {}
     app.add_routes([
         web.get(prefix, handle_page),
         web.get(prefix + "/", handle_page),
@@ -1636,6 +1839,9 @@ def attach(
         web.post(prefix + "/api/action", handle_action),
         web.get(prefix + "/api/opponents", handle_opponents),
         web.post(prefix + "/api/attack", handle_attack),
+        web.get(prefix + "/api/test-battle", handle_test_battle_setup),
+        web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
+        web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
         web.get(prefix + "/api/mob", handle_mob),
         web.post(prefix + "/api/mob", handle_mob_attack),
         web.get(prefix + "/api/shop", handle_shop),
@@ -2026,6 +2232,31 @@ PAGE_HTML = """<!doctype html>
     animation: rise .16s ease-out;
   }
 
+  /* ---------------------------------------------------- turn-based combat prototype */
+  .test-banner { border: 1px solid var(--r-legendary); background: rgba(176,107,224,.10);
+                 border-radius: 12px; padding: 10px; font-size: 12px; }
+  .test-select { width: 100%; background: var(--sunken); color: var(--fg); border: 1px solid var(--line);
+                 border-radius: 10px; padding: 10px; font: inherit; margin-top: 4px; }
+  .test-loadout { display: grid; grid-template-columns: 1fr; gap: 9px; }
+  .test-fighters { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+  .test-fighter { background: var(--sunken); border-radius: 12px; padding: 10px; min-width: 0; }
+  .test-fighter .av { width: 54px; height: 54px; border-radius: 12px; overflow: hidden;
+                      background: var(--card); font-size: 28px; display: flex;
+                      align-items: center; justify-content: center; margin-bottom: 7px; }
+  .test-fighter .hpbar { height: 9px; border-radius: 6px; background: var(--card); overflow: hidden; }
+  .test-fighter .hpbar > i { display: block; height: 100%; background: var(--hp);
+                             transition: width .28s; }
+  .test-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .test-action { min-height: 58px; padding: 8px; line-height: 1.2; }
+  .test-action small { display: block; font-size: 10px; opacity: .75; margin-top: 4px; }
+  .test-action.ultimate { border-color: var(--r-legendary); color: var(--r-legendary); }
+  .test-log { max-height: 270px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .test-event { background: var(--sunken); border-radius: 9px; padding: 7px 9px; font-size: 12px;
+                border-left: 3px solid var(--line); }
+  .test-event.damage, .test-event.burn { border-left-color: var(--hp); }
+  .test-event.heal, .test-event.shield { border-left-color: var(--xp); }
+  .test-event.spell { border-left-color: var(--r-legendary); }
+
   /* ---------------------------------------------------------------- the fight view
      A fight is a sequence, so it is played as one: two HP bars and the blows arriving in
      order. The chat interface can only post the verdict; this is the part that was missing
@@ -2136,6 +2367,7 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
 let S = null;            // the server's state, verbatim -- never edited on the client
 let TAB = "hero";
 let SHOP = null, FOES = null, ROSTER = null;
+let TEST_SETUP = null, TEST_BATTLE = null, TEST_SESSION = null, TEST_MODE = null, TEST_BUSY = false;
 let ticker = null;
 const START_VIEW = new URLSearchParams(window.location.search).get("view");
 
@@ -2525,6 +2757,7 @@ async function renderShop() {
 async function renderArena() {
   const box = $("scr-arena");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
+  if (TEST_SETUP || TEST_BATTLE) { renderTestBattle(box); return; }
   const arena = S.arena;
   if (!FOES) { box.innerHTML = '<div class="empty">Ищу соперников…</div>';
                FOES = await api("/api/opponents"); }
@@ -2545,6 +2778,10 @@ async function renderArena() {
       clock(arena.seconds_until_next) + "</div>" : "") +
     "</div>" +
     (blocked ? '<div class="panel"><div class="small">' + esc(blocked) + "</div></div>" : "") +
+    '<div class="panel"><h2>🧪 Пошаговый бой · тест</h2>' +
+      '<div class="small muted" style="margin-bottom:9px">Четыре свитка, щиты, защита и ручные ходы. ' +
+      'Результаты, награды и счётчики не записываются.</div>' +
+      '<button class="go" data-testbattle="open">Открыть боевую песочницу</button></div>' +
     // PVE above the roster: there is always a mob, and on a quiet day the player list is
     // the empty half of this screen.
     mobPanel(Boolean(blocked)) +
@@ -2554,6 +2791,155 @@ async function renderArena() {
         : '<div class="empty">Больше ни у кого нет существа.</div>') +
     "</div>";
   paintShots(box);
+}
+
+// --------------------------------------------------------- turn-based test battle
+function testOptions(rows, selected) {
+  return (rows || []).map((row) => '<option value="' + esc(row.code) + '"' +
+    (row.code === selected ? " selected" : "") + '>' + esc(row.icon || "📜") + " " +
+    esc(row.name) + (row.cooldown != null ? " · CD " + row.cooldown : "") +
+    (row.dodgeable === false ? " · точно" : "") + "</option>").join("");
+}
+
+function testSelect(id, label, rows, selected) {
+  return '<label class="small"><b>' + label + '</b><select class="test-select" id="' + id + '">' +
+    testOptions(rows, selected) + "</select></label>";
+}
+
+function testPortrait(fighter) {
+  return fighter.portrait ? shot(fighter.portrait, fighter.crop) : "🗿";
+}
+
+function testHp(fighter) {
+  const pct = Math.max(0, Math.min(100, 100 * fighter.hp / Math.max(1, fighter.max_hp)));
+  return '<div class="small"><b>' + esc(fighter.name) + '</b></div>' +
+    '<div class="tiny muted">HP ' + fighter.hp + " / " + fighter.max_hp +
+      (fighter.barrier ? " · барьер " + fighter.barrier : "") + "</div>" +
+    '<div class="hpbar" style="height:9px;margin-top:6px"><i style="width:' + pct + '%"></i></div>';
+}
+
+function testBattleLog(rows) {
+  return (rows || []).slice(-18).map((row) =>
+    '<div class="test-event ' + esc(row.kind || "") + '">' + esc(row.text || "") + "</div>"
+  ).join("");
+}
+
+function renderTestBattle(box) {
+  if (!TEST_BATTLE) {
+    if (!TEST_SETUP) { box.innerHTML = '<div class="empty">Загружаю песочницу…</div>'; return; }
+    const defaults = TEST_SETUP.defaults || {};
+    const foes = TEST_SETUP.opponents || [];
+    box.innerHTML =
+      '<div class="test-banner"><b>🧪 Это отдельный тест.</b><br>Он читает характеристики питомцев, ' +
+        'но не тратит бои, не выдаёт награды и ничего не пишет в историю.</div>' +
+      '<div class="panel"><h2>Соперник</h2><select class="test-select" id="testOpponent">' +
+        foes.map((foe) => '<option value="' + esc(foe.user_id) + '">' + esc(foe.name) +
+          " · " + esc(foe.owner_name || "") + "</option>").join("") + '</select></div>' +
+      '<div class="panel"><h2>Четыре слота свитков</h2><div class="test-loadout">' +
+        testSelect("testSkill1", "1 · свиток", TEST_SETUP.regular_scrolls, defaults.skills[0]) +
+        testSelect("testSkill2", "2 · свиток", TEST_SETUP.regular_scrolls, defaults.skills[1]) +
+        testSelect("testSkill3", "3 · свиток", TEST_SETUP.regular_scrolls, defaults.skills[2]) +
+        testSelect("testSkill4", "4 · УЛЬТИМЕЙТ · один раз", TEST_SETUP.ultimate_scrolls, defaults.skills[3]) +
+        testSelect("testShield", "🛡 Щит · эффект срабатывает при защите", TEST_SETUP.shields,
+                   defaults.shield) + '</div>' +
+        '<button class="go sec" style="margin-top:10px" data-testcatalog>📚 Читать весь каталог</button></div>' +
+      '<div class="panel"><h2>Режим</h2><div class="test-actions">' +
+        '<button class="go" data-testmode="manual">🎮 Играть самому</button>' +
+        '<button class="go sec" data-testmode="auto">🎲 Автоматический</button>' +
+        '<button class="go sec" data-testmode="multiplayer" style="grid-column:1/-1">' +
+          '👥 Два игрока · скоро</button></div></div>' +
+      '<button class="go sec" data-testbattle="close">◀️ Вернуться на арену</button>';
+    return;
+  }
+
+  const mine = TEST_BATTLE.fighters.player;
+  const foe = TEST_BATTLE.fighters.enemy;
+  const legal = new Set(TEST_BATTLE.legal_actions || []);
+  const result = TEST_BATTLE.finished
+    ? (TEST_BATTLE.draw ? "Ничья" : TEST_BATTLE.winner === "player" ? "Победа" : "Поражение")
+    : "Ход " + TEST_BATTLE.turn;
+  const slotButtons = (mine.slots || []).map((slot) => {
+    const action = "skill_" + slot.slot;
+    const note = slot.ultimate ? (mine.ultimate_used ? "использован" : "один раз")
+      : (slot.remaining_cooldown ? "готов через " + slot.remaining_cooldown :
+         (slot.dodgeable === false ? "нельзя увернуться" : "можно увернуться"));
+    return '<button class="go sec test-action' + (slot.ultimate ? " ultimate" : "") +
+      '" data-testaction="' + action + '"' + (legal.has(action) ? "" : " disabled") + '>' +
+      esc(slot.icon) + " " + esc(slot.name.replace(/^.*?: /, "")) + '<small>' + esc(note) +
+      "</small></button>";
+  }).join("");
+  box.innerHTML =
+    '<div class="test-banner"><b>🧪 Тестовый бой · ' + result +
+      '</b><br>Монеты, опыт, победы и запас боёв не изменяются.</div>' +
+    '<div class="test-fighters"><div class="test-fighter"><div class="av">' + testPortrait(mine) +
+      '</div>' + testHp(mine) + '</div><div class="test-fighter"><div class="av">' +
+      testPortrait(foe) + '</div>' + testHp(foe) + "</div></div>" +
+    (TEST_BATTLE.finished ? "" : '<div class="panel"><h2>Твой ход</h2><div class="test-actions">' +
+      '<button class="go test-action" data-testaction="attack">⚔️ Атаковать<small>обычный удар</small></button>' +
+      '<button class="go sec test-action" data-testaction="defend">🛡 Защититься<small>' +
+        esc(mine.shield.name) + "</small></button>" + slotButtons + "</div>" +
+      '<button class="go sec" style="margin-top:10px" data-testaction="auto">' +
+        '🎲 Продолжить автоматически</button></div>') +
+    '<div class="panel"><h2>Ход боя</h2><div class="test-log" id="testLog">' +
+      testBattleLog(TEST_BATTLE.log) + "</div></div>" +
+    '<div class="test-actions"><button class="go sec" data-testbattle="restart">⚙️ Новый набор</button>' +
+      '<button class="go sec" data-testbattle="close">◀️ На арену</button></div>';
+  paintShots(box);
+  const log = $("testLog"); if (log) log.scrollTop = log.scrollHeight;
+}
+
+async function openTestBattle() {
+  if (TEST_BUSY) return;
+  TEST_BUSY = true;
+  TEST_BATTLE = null; TEST_SESSION = null; TEST_MODE = null;
+  try { TEST_SETUP = await api("/api/test-battle"); }
+  catch (e) { haptic("no"); toast(e.message); return; }
+  finally { TEST_BUSY = false; }
+  render();
+}
+
+async function startTestBattle(mode) {
+  if (TEST_BUSY) return;
+  const skills = [1, 2, 3, 4].map((index) => $("testSkill" + index).value);
+  if (new Set(skills.slice(0, 3)).size !== 3) {
+    haptic("no"); toast("В первые три слота нужны разные свитки."); return;
+  }
+  TEST_BUSY = true;
+  try {
+    const data = await api("/api/test-battle/start", {
+      mode, opponent_id: $("testOpponent").value, shield: $("testShield").value, skills,
+    });
+    if (data.status === "coming_soon") { toast(data.message); return; }
+    TEST_BATTLE = data.battle; TEST_SESSION = data.session; TEST_MODE = data.mode;
+    haptic(TEST_BATTLE.finished && TEST_BATTLE.winner === "player" ? "ok" : undefined);
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+  finally { TEST_BUSY = false; }
+}
+
+async function testBattleAction(action) {
+  if (!TEST_SESSION || TEST_BUSY) return;
+  TEST_BUSY = true;
+  try {
+    const data = await api("/api/test-battle/action", { session: TEST_SESSION, action });
+    TEST_BATTLE = data.battle; TEST_MODE = data.mode;
+    if (data.message) toast(data.message);
+    haptic(TEST_BATTLE.finished ? (TEST_BATTLE.winner === "player" ? "ok" : "no") : undefined);
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+  finally { TEST_BUSY = false; }
+}
+
+function showTestCatalog() {
+  const spells = [...(TEST_SETUP.regular_scrolls || []), ...(TEST_SETUP.ultimate_scrolls || [])];
+  sheet('<h3>📚 Свитки и щиты</h3><p class="tiny muted">CD — сколько своих действий свиток ' +
+    'отдыхает. Свойства берутся из редактируемой серверной таблицы.</p>' + spells.map((spell) =>
+      '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) + '</b><div class="small">' +
+      esc(spell.short) + '</div><div class="tiny muted">' + (spell.ultimate ? "УЛЬТИМЕЙТ · один раз" :
+      "CD " + spell.cooldown) + " · " + (spell.dodgeable ? "можно увернуться" : "неизбежный") +
+      "</div></div>").join("") + '<h3>🛡 Щиты</h3>' + (TEST_SETUP.shields || []).map((shield) =>
+      '<div class="panel"><b>' + esc(shield.icon) + " " + esc(shield.name) + '</b><div class="small">' +
+      esc(shield.short) + "</div></div>").join(""));
 }
 
 // ------------------------------------------------------------------------------- PVE
@@ -3697,9 +4083,19 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]");
+    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
+    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog]");
   if (!target) return;
   const d = target.dataset;
+
+  if (d.testbattle === "open") { await openTestBattle(); return; }
+  if (d.testbattle === "close") {
+    TEST_SETUP = null; TEST_BATTLE = null; TEST_SESSION = null; TEST_MODE = null; render(); return;
+  }
+  if (d.testbattle === "restart") { TEST_BATTLE = null; TEST_SESSION = null; render(); return; }
+  if (d.testmode) { await startTestBattle(d.testmode); return; }
+  if (d.testaction) { await testBattleAction(d.testaction); return; }
+  if (d.testcatalog !== undefined) { showTestCatalog(); return; }
 
   // Equipping straight from the slot sheet: one tap, no detour through the item's own
   // card. Choosing between two swords is the whole point of that screen.
