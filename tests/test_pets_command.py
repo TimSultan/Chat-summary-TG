@@ -750,8 +750,9 @@ class PetsCommandTests(unittest.TestCase):
         data = pets._load(CHAT)
         data["pets"][str(PLAYER["id"])]["level"] = C.GIFT_MIN_PET_LEVEL
         pets._save(CHAT, data)
-        # Store purchases are only valid for today's rotating 16-weapon window.
-        item = next(item for item in C.daily_storefront_weapons(CHAT, pets.today())
+        # Use the live game wrapper so selection and purchase share the same app-clock
+        # window; the pure catalogue helper intentionally uses the process clock.
+        item = next(item for item in pets.daily_storefront_weapons(CHAT)
                     if item.rarity not in {"rare", "legendary"})
         economy.grant(CHAT, PLAYER["id"], item.price, "test")
         self.assertTrue(pets.buy_item(CHAT, PLAYER["id"], RICH_XP, item.code)[0])

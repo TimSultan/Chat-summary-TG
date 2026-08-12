@@ -306,7 +306,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
         pets._save(entry, data)
 
         item = next(
-            weapon for weapon in pets_config.daily_storefront_weapons(entry, pets.today())
+            weapon for weapon in pets.daily_storefront_weapons(entry)
             if "strength" in weapon.bonuses
         )
         economy.grant(entry, "1", item.price, "test")
@@ -352,7 +352,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
     def test_equipping_a_second_weapon_replaces_the_first(self):
         entry = "chat"
         self._tame(entry, "1")
-        stick, fork = pets_config.daily_storefront_weapons(entry, pets.today())[:2]
+        stick, fork = pets.daily_storefront_weapons(entry)[:2]
         economy.grant(entry, "1", stick.price + fork.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, stick.code)[0])
         self.assertTrue(pets.buy_item(entry, "1", 0, fork.code)[0])
@@ -820,7 +820,7 @@ class EquipmentTradingTests(PetsTestCase):
     def test_sell_refuses_equipped_and_pays_explicit_resale(self):
         self._two_pets()
         item = next(
-            weapon for weapon in pets_config.daily_storefront_weapons("chat", pets.today())
+            weapon for weapon in pets.daily_storefront_weapons("chat")
             if weapon.rarity not in {"rare", "legendary"}
         )
         economy.grant("chat", "1", item.price, "test")
@@ -836,7 +836,7 @@ class EquipmentTradingTests(PetsTestCase):
     def test_gift_is_unique_atomic_and_refuses_equipped_or_receiver_duplicate(self):
         self._two_pets()
         item = next(
-            weapon for weapon in pets_config.daily_storefront_weapons("chat", pets.today())
+            weapon for weapon in pets.daily_storefront_weapons("chat")
             if weapon.rarity not in {"rare", "legendary"}
         )
         economy.grant("chat", "1", item.price, "test")
@@ -1204,10 +1204,10 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_core_purchase_refuses_weapon_outside_daily_window(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        offered = next(item for item in pets_config.daily_storefront_weapons(entry, pets.today())
+        offered = next(item for item in pets.daily_storefront_weapons(entry)
                        if item.rarity not in {"rare", "legendary"})
         # The window is fixed: buying one offer removes it without drawing a replacement.
-        on_sale = {item.code for item in pets_config.daily_storefront_weapons(entry, pets.today())}
+        on_sale = {item.code for item in pets.daily_storefront_weapons(entry)}
         outside = next(item for item in pets_config.items_for_slot("weapon", "shop")
                        if item.code not in on_sale)
         economy.grant(entry, "1", offered.price + outside.price, "test")
@@ -1220,14 +1220,14 @@ class StorefrontAndCollectionTests(PetsTestCase):
         entry = "shop-chat"
         self._two_pets(entry)
         item = next(
-            weapon for weapon in pets.daily_storefront_weapons(entry, pets.today())
+            weapon for weapon in pets.daily_storefront_weapons(entry)
             if weapon.rarity not in {"rare", "legendary"}
         )
         economy.grant(entry, "1", item.price, "test")
         economy.grant(entry, "2", item.price, "test")
 
         self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
-        remaining_stock = pets.daily_storefront_weapons(entry, pets.today())
+        remaining_stock = pets.daily_storefront_weapons(entry)
         self.assertEqual(len(remaining_stock), pets_config.DAILY_STOREFRONT_SIZE - 1)
         self.assertNotIn(item.code, {weapon.code for weapon in remaining_stock})
         ok, note = pets.buy_item(entry, "2", 0, item.code)
@@ -1259,7 +1259,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_discovery_survives_sale_and_gift_and_old_inventory_migrates(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        first, second = [item for item in pets_config.daily_storefront_weapons(entry, pets.today())
+        first, second = [item for item in pets.daily_storefront_weapons(entry)
                          if item.rarity not in {"rare", "legendary"}][:2]
         economy.grant(entry, "1", first.price + second.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, first.code)[0])
@@ -1276,7 +1276,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_lock_blocks_sale_and_gift(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        item = next(item for item in pets_config.daily_storefront_weapons(entry, pets.today())
+        item = next(item for item in pets.daily_storefront_weapons(entry)
                     if item.rarity not in {"rare", "legendary"})
         economy.grant(entry, "1", item.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
@@ -1325,7 +1325,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self._two_pets(entry)
         text, _ = pets_ui.store_view(entry, "1", 0)
         visible_names = [
-            item.name for item in pets_config.daily_storefront_weapons(entry, pets.today())
+            item.name for item in pets.daily_storefront_weapons(entry)
         ]
         for current, following in zip(visible_names, visible_names[1:]):
             separator = text.index("\n\n", text.index(current))
@@ -1334,7 +1334,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_store_numbers_every_item_and_groups_purchase_numbers_in_three_rows(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        stock = pets_config.daily_storefront_weapons(entry, pets.today())
+        stock = pets.daily_storefront_weapons(entry)
         text, keyboard = pets_ui.store_view(entry, "1", 0)
 
         for number, item in enumerate(stock, 1):
@@ -1353,7 +1353,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_store_uses_stat_and_coin_icons_with_price_on_its_own_line(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        item = pets_config.daily_storefront_weapons(entry, pets.today())[0]
+        item = pets.daily_storefront_weapons(entry)[0]
         text, _ = pets_ui.store_view(entry, "1", 0)
         item_start = text.index(item.name)
         item_end = text.find("\n\n", item_start)
@@ -1398,7 +1398,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_collection_lists_only_chat_discoveries_and_their_current_owners(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        first, second = pets_config.daily_storefront_weapons(entry, pets.today())[:2]
+        first, second = pets.daily_storefront_weapons(entry)[:2]
         hidden = next(
             item for item in pets_config.items_for_slot("weapon")
             if item.code not in {first.code, second.code}

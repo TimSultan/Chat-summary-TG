@@ -6532,7 +6532,7 @@ async def handle_pets_callback(
 
         if action == "cbet":
             game, _, raw_stake = str(argument or "").partition(":")
-            stake = casino.valid_stake(raw_stake)
+            stake = casino.valid_stake(raw_stake, game)
             if stake is None or game not in casino.GAMES:
                 await _send_pets_view(api, chat_id, pets_ui.casino_view(entry, user_id, xp), message_id=message_id, log=log)
                 return
@@ -6545,7 +6545,7 @@ async def handle_pets_callback(
             elif game == "highlow":
                 rendered = pets_ui.casino_highlow_view(entry, user_id, xp, stake)
             else:
-                rendered = pets_ui.casino_goat_pick_view(entry, user_id, xp, stake)
+                rendered = pets_ui.casino_view(entry, user_id, xp)
             await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
 
@@ -6578,22 +6578,13 @@ async def handle_pets_callback(
             await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
 
-        if action == "cgoatpick":
-            raw_stake, _, choice = str(argument or "").partition(":")
-            result = casino.choose_goat_door(entry, user_id, xp, casino.valid_stake(raw_stake), choice)
-            rendered = pets_ui.casino_goat_view(entry, user_id, xp, result.get("active")) \
-                if result.get("ok") else pets_ui.casino_result_view(entry, user_id, xp, result)
-            await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
-            return
-
-        if action == "cgoat":
-            if not argument:
-                rendered = pets_ui.casino_goat_view(entry, user_id, xp)
-            else:
-                rendered = pets_ui.casino_result_view(
-                    entry, user_id, xp, casino.finish_goat(entry, user_id, xp, argument),
-                )
-            await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
+        if action in {"cgoatpick", "cgoat"}:
+            # Old Telegram messages can outlive the removed game. Opening either retired
+            # button redraws the current lobby; active_game refunds a persisted wager.
+            await _send_pets_view(
+                api, chat_id, pets_ui.casino_view(entry, user_id, xp),
+                message_id=message_id, log=log,
+            )
             return
 
         # --- plain redraws -------------------------------------------------------------

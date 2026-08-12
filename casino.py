@@ -10,19 +10,21 @@ import economy
 
 
 BET_AMOUNTS: Final = (1, 5, 10, 25)
-GAMES: Final = ("poker", "shell", "highlow", "goat")
+POKER_BET_AMOUNTS: Final = (10, 25, 50, 100)
+GAMES: Final = ("poker", "shell", "highlow")
 _RANKS: Final = tuple(range(2, 15))
 _SUITS: Final = ("♠", "♥", "♦", "♣")
 _DECK: Final = tuple((rank, suit) for rank in _RANKS for suit in _SUITS)
 _CARD_NAMES: Final = {11: "В", 12: "Д", 13: "К", 14: "Т"}
 
 
-def valid_stake(value) -> int | None:
+def valid_stake(value, game: str | None = None) -> int | None:
     try:
         stake = int(value)
     except (TypeError, ValueError):
         return None
-    return stake if stake in BET_AMOUNTS else None
+    allowed = POKER_BET_AMOUNTS if game == "poker" else BET_AMOUNTS
+    return stake if stake in allowed else None
 
 
 def _card(card: tuple[int, str] | list) -> str:
@@ -43,10 +45,25 @@ def _record_winnings(record: dict, stake: int, payout: int) -> None:
 
 
 def active_game(entry, user_id) -> dict | None:
-    """Read a resumable poker/goat game without changing coins or its stage."""
+    """Read a resumable poker game and refund a retired-game wager if one remains."""
     data = economy._load(entry)
     record = data.get("users", {}).get(str(user_id)) or {}
-    return _active_state(record)
+    active = _active_state(record)
+    if not active or active.get("kind") == "poker":
+        return active
+    # «Коза» was removed while games could be persisted between button taps. Returning
+    # the debited stake is the only safe migration: otherwise opening the new casino
+    # would either strand the player forever or silently eat an old wager.
+    try:
+        stake = max(0, int(active.get("stake", 0) or 0))
+    except (TypeError, ValueError):
+        stake = 0
+    if stake:
+        record["bonus"] = record.get("bonus", 0) + stake
+        economy._append_log(data, user_id, stake, f"wager_refund:casino:{active.get('kind', 'retired')}")
+    economy._effects(record).setdefault("casino", {}).pop("active", None)
+    economy._save(entry, data)
+    return None
 
 
 def _start(entry, user_id, xp: int, stake: int, state: dict) -> dict:
@@ -116,13 +133,13 @@ def _settle(entry, user_id, xp: int, stake: int, won: bool, details: dict, *, mu
 
 def start_poker(entry, user_id, xp: int, stake, rng=None) -> dict:
     """Open a five-card Texas Hold'em hand at the flop (three community cards)."""
-    stake = valid_stake(stake)
+    stake = valid_stake(stake, "poker")
     if stake is None:
         return {"ok": False, "error": "invalid", "balance": economy.balance(entry, user_id, xp), "stake": 0}
     rng = rng or random.SystemRandom()
     cards = list(rng.sample(_DECK, 9))
     state = {
-        "kind": "poker", "stake": stake, "stage": 3,
+        "kind": "poker", "stake": stake, "base_stake": stake, "stage": 3,
         "player": [list(card) for card in cards[:2]],
         "dealer": [list(card) for card in cards[2:4]],
         "board": [list(card) for card in cards[4:]],
@@ -136,6 +153,7 @@ def poker_snapshot(state: dict) -> dict:
     return {
         "stage": stage,
         "stake": int(state.get("stake", 0)),
+        "base_stake": int(state.get("base_stake", state.get("stake", 0))),
         "player_cards": [_card(card) for card in state.get("player", [])],
         "board_cards": [_card(card) for card in (state.get("board") or [])[:stage]],
     }
@@ -182,11 +200,15 @@ def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
     state = _active_state(record)
     if not state or state.get("kind") != "poker":
         return {"ok": False, "error": "stale", "balance": economy._balance_from(data, user_id, xp), "stake": 0}
+    base_stake = int(state.get("base_stake", state.get("stake", 0)) or 0)
     if raise_by in (None, "", 0, "0"):
         raise_by = 0
     else:
-        raise_by = valid_stake(raise_by)
-        if raise_by is None:
+        try:
+            raise_by = int(raise_by)
+        except (TypeError, ValueError):
+            raise_by = -1
+        if raise_by != base_stake:
             return {
                 "ok": False, "error": "invalid", "active": state,
                 "balance": economy._balance_from(data, user_id, xp), "stake": 0,
@@ -203,8 +225,8 @@ def advance_poker(entry, user_id, xp: int, raise_by=0) -> dict:
         state["stake"] = int(state["stake"]) + raise_by
         economy._effects(record).setdefault("casino", {})["active"] = state
     stage = int(state.get("stage", 3))
-    if stage < 4:
-        state["stage"] = 4
+    if stage < 5:
+        state["stage"] = stage + 1
         economy._effects(record).setdefault("casino", {})["active"] = state
         economy._save(entry, data)
         return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
@@ -248,40 +270,7 @@ def play_highlow(entry, user_id, xp: int, stake, choice, rng=None) -> dict:
     })
 
 
-def choose_goat_door(entry, user_id, xp: int, stake, choice, rng=None) -> dict:
-    """Pick one door, then save the prize and an opened goat door for the final choice."""
-    stake = valid_stake(stake)
-    try:
-        choice = int(choice)
-    except (TypeError, ValueError):
-        choice = 0
-    if stake is None or choice not in (1, 2, 3):
-        return {"ok": False, "error": "invalid", "balance": economy.balance(entry, user_id, xp), "stake": stake or 0}
-    rng = rng or random.SystemRandom()
-    prize = rng.randint(1, 3)
-    opened = rng.choice([door for door in (1, 2, 3) if door not in {choice, prize}])
-    state = {"kind": "goat", "stake": stake, "choice": choice, "prize": prize, "opened": opened}
-    return _start(entry, user_id, xp, stake, state)
-
-
-def finish_goat(entry, user_id, xp: int, decision: str) -> dict:
-    """Settle the Monty Hall choice: keep the first door or switch to the last closed one."""
-    data = economy._load(entry)
-    record = economy._record(data, user_id)
-    state = _active_state(record)
-    if not state or state.get("kind") != "goat":
-        return {"ok": False, "error": "stale", "balance": economy._balance_from(data, user_id, xp), "stake": 0}
-    decision = str(decision or "").lower()
-    if decision not in {"keep", "switch"}:
-        return {"ok": False, "error": "invalid", "balance": economy._balance_from(data, user_id, xp), "stake": int(state["stake"])}
-    first, opened = int(state["choice"]), int(state["opened"])
-    final = first if decision == "keep" else next(door for door in (1, 2, 3) if door not in {first, opened})
-    return _finish_active(entry, user_id, xp, state, final == int(state["prize"]), {
-        "choice": first, "opened": opened, "prize": int(state["prize"]), "final": final, "decision": decision,
-    })
-
-
 __all__ = [
-    "BET_AMOUNTS", "GAMES", "valid_stake", "active_game", "start_poker", "poker_snapshot",
-    "advance_poker", "play_shell", "play_highlow", "choose_goat_door", "finish_goat",
+    "BET_AMOUNTS", "POKER_BET_AMOUNTS", "GAMES", "valid_stake", "active_game", "start_poker", "poker_snapshot",
+    "advance_poker", "play_shell", "play_highlow",
 ]

@@ -312,13 +312,12 @@ def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
     active = casino.active_game(entry, user_id)
     if active:
         game = str(active.get("kind") or "")
-        action = "cpoker" if game == "poker" else "cgoat"
         return (
             f"🎰 <b>Казино</b>\n\n🪙 Монеты: <b>{_money(coins)}</b>\n"
             "У тебя есть незавершённая игра — продолжи её.",
             {"inline_keyboard": [[
                 {"text": f"▶️ Продолжить {_CASINO_GAME_NAMES.get(game, 'игру')}",
-                 "callback_data": callback_data(user_id, action)},
+                 "callback_data": callback_data(user_id, "cpoker")},
             ], _back_row(user_id)]},
         )
     lines = [
@@ -334,7 +333,6 @@ def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
         ],
         [
             {"text": "↕️ Больше / меньше", "callback_data": callback_data(user_id, "cgame", "highlow")},
-            {"text": "🐐 Коза", "callback_data": callback_data(user_id, "cgame", "goat")},
         ],
         _back_row(user_id),
     ]
@@ -342,7 +340,7 @@ def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
 
 
 _CASINO_GAME_NAMES = {
-    "poker": "🃏 Покер", "shell": "🥥 Напёрстки", "highlow": "↕️ Больше / меньше", "goat": "🐐 Коза",
+    "poker": "🃏 Покер", "shell": "🥥 Напёрстки", "highlow": "↕️ Больше / меньше",
 }
 
 
@@ -351,14 +349,14 @@ def casino_bet_view(entry: str, user_id, xp: int, game: str) -> tuple[str, dict]
         return casino_view(entry, user_id, xp)
     coins = pets.balance_for(entry, user_id, xp)
     descriptions = {
-        "poker": "Техасский холдем: 3 → 4 → 5 общих карт. На каждом этапе можно повысить ставку.",
+        "poker": "Техасский холдем: 3 → 4 → 5 общих карт. Рейз всегда равен входной ставке.",
         "shell": "После ставки выбери один из трёх напёрстков.",
         "highlow": "Открыта 7. Угадай: следующая карта выше или ниже; 7 проигрывает.",
-        "goat": "Выбери дверь; одну пустую откроют, затем решишь — оставить или поменять.",
     }
+    stakes = casino.POKER_BET_AMOUNTS if game == "poker" else casino.BET_AMOUNTS
     rows = [[
         {"text": f"🪙 {stake}", "callback_data": callback_data(user_id, "cbet", f"{game}:{stake}")}
-        for stake in casino.BET_AMOUNTS
+        for stake in stakes
     ], [
         {"text": "◀️ Игры", "callback_data": callback_data(user_id, "casino")},
     ]]
@@ -402,50 +400,21 @@ def casino_poker_view(
     hand = casino.poker_snapshot(state)
     stage = hand["stage"]
     text = (
-        f"🃏 <b>Покер · этап {stage} из 5</b>\n\n"
+        f"🃏 <b>Покер · на столе {stage} карт</b>\n\n"
         f"Общая ставка: <b>{_money(hand['stake'] * 2)}</b>\n"
         f"Стол: <b>{' · '.join(hand['board_cards'])}</b>\n"
         f"Твои карты: <b>{' · '.join(hand['player_cards'])}</b>\n\n"
     )
     if notice:
         text += notice
-    return text + "Открыть следующую карту?", {"inline_keyboard": [
+    prompt = "Вскрыть карты?" if stage == 5 else "Открыть следующую карту?"
+    return text + prompt, {"inline_keyboard": [
         [{"text": "🃏 Колл", "callback_data": callback_data(user_id, "cpoker")}],
-        [
-            {"text": f"+{amount}", "callback_data": callback_data(user_id, "cpoker", f"raise:{amount}")}
-            for amount in casino.BET_AMOUNTS
-        ],
+        [{
+            "text": f"Рейз +{hand['base_stake']}",
+            "callback_data": callback_data(user_id, "cpoker", f"raise:{hand['base_stake']}"),
+        }],
     ]}
-
-
-def casino_goat_pick_view(entry: str, user_id, xp: int, stake: int) -> tuple[str, dict]:
-    coins = pets.balance_for(entry, user_id, xp)
-    rows = [[
-        {"text": f"🚪 {door}", "callback_data": callback_data(user_id, "cgoatpick", f"{stake}:{door}")}
-        for door in (1, 2, 3)
-    ], [{"text": "◀️ Ставки", "callback_data": callback_data(user_id, "cgame", "goat")}]]
-    return (
-        f"🐐 <b>Коза</b>\n\nСтавка: {_money(stake)} · монет: {_money(coins)}\n"
-        "За одной дверью приз. Выбери первую дверь.", {"inline_keyboard": rows},
-    )
-
-
-def casino_goat_view(entry: str, user_id, xp: int, state: dict | None = None) -> tuple[str, dict]:
-    state = state or casino.active_game(entry, user_id)
-    if not state or state.get("kind") != "goat":
-        return casino_view(entry, user_id, xp)
-    chosen, opened = int(state["choice"]), int(state["opened"])
-    other = next(door for door in (1, 2, 3) if door not in {chosen, opened})
-    doors = ["🐐" if door == opened else "🚪" for door in (1, 2, 3)]
-    return (
-        f"🐐 <b>Коза</b>\n\n{' '.join(doors)}\n"
-        f"Ты выбрал дверь {chosen}; ведущий открыл пустую дверь с козой.\n"
-        "Оставить выбор или перейти к другой закрытой двери?",
-        {"inline_keyboard": [[
-            {"text": f"Оставить {chosen}", "callback_data": callback_data(user_id, "cgoat", "keep")},
-            {"text": f"Поменять на {other}", "callback_data": callback_data(user_id, "cgoat", "switch")},
-        ]]},
-    )
 
 
 def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str, dict]:
@@ -453,12 +422,10 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
         stake = int(result.get("stake", 0) or 0)
         if result.get("error") == "active":
             active = result.get("active") or {}
-            game = str(active.get("kind") or "")
-            action = "cpoker" if game == "poker" else "cgoat"
             return (
                 "🎰 <b>Казино</b>\n\nСначала закончи начатую игру.",
                 {"inline_keyboard": [[
-                    {"text": "▶️ Продолжить", "callback_data": callback_data(user_id, action)},
+                    {"text": "▶️ Продолжить", "callback_data": callback_data(user_id, "cpoker")},
                 ]]},
             )
         return (
@@ -479,10 +446,6 @@ def casino_result_view(entry: str, user_id, xp: int, result: dict) -> tuple[str,
     elif game == "highlow":
         choice = "больше" if result.get("choice") == "high" else "меньше"
         lines.append(f"Ты выбрал «{choice}». Выпала карта: <b>{result.get('card')}</b>.")
-    elif game == "goat":
-        doors = ["🐐" if door == int(result.get("opened", 0)) else "🚪" for door in (1, 2, 3)]
-        doors[int(result.get("prize", 0)) - 1] = "🎁"
-        lines.append(" ".join(doors))
     if result.get("won"):
         lines.append(f"\n🎉 Победа! Получено {_money(int(result['payout']))}.")
     elif result.get("draw"):
