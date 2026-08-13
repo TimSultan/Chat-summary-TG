@@ -2285,11 +2285,20 @@ def _effective_stats_for(record: dict) -> dict:
             elif stat_key in bonuses:
                 bonuses[stat_key] += amount
 
+    # A granted debuff scales the finished numbers rather than any one of their parts, so
+    # it cannot be dodged by re-equipping and applies identically to a bare pet and a
+    # fully geared one. This is the ONLY place it is applied: everything downstream --
+    # the fight, the power rating, both pet cards, the leaderboard -- reads its stats
+    # through here, so none of them needs to know that debuffs exist.
+    scale = debuff_scale(record)
     result = {
-        key: max(1, stat_levels.get(key, C.STAT_MIN_LEVEL) + pet_level * C.PET_LEVEL_STAT_BONUS + bonuses[key])
+        key: max(1, round(
+            (stat_levels.get(key, C.STAT_MIN_LEVEL)
+             + pet_level * C.PET_LEVEL_STAT_BONUS + bonuses[key]) * scale
+        ))
         for key in C.STAT_KEYS
     }
-    result["armor"] = max(0, armor)
+    result["armor"] = max(0, round(armor * scale))
     return result
 
 
@@ -2327,6 +2336,9 @@ def pet_leaderboard(entry: str) -> list[dict]:
             "owner_name": record.get("owner_name") or "кто-то",
             "owner_username": record.get("owner_username"),
             "power": _power_rating_for(record),
+            # The power beside it is already the reduced one, so the ranking would
+            # otherwise be quietly misreporting a marked creature as simply weaker.
+            "debuff": debuff_for(record),
         }
         for user_id, record in data["pets"].items()
         if record.get("name")
@@ -3281,6 +3293,134 @@ def _pve_window_end(moment: datetime) -> datetime:
     block_start_hour = (moment.hour // C.PVE_WINDOW_HOURS) * C.PVE_WINDOW_HOURS
     start = moment.replace(hour=block_start_hour, minute=0, second=0, microsecond=0)
     return start + timedelta(hours=C.PVE_WINDOW_HOURS)
+
+
+# ------------------------------------------------------------------------------ debuffs
+# A mark an admin hands out by name (see C.DEBUFFS). It lives on the CREATURE'S record
+# rather than in a chat-level row, which is what lets `_effective_stats_for` apply it
+# without any caller passing the store around -- and therefore what makes it show up in
+# the fight, the power rating and every card at once.
+#
+# Whether it is still in force is DERIVED, never stored: the row keeps the picture the
+# creature wore when the mark was given, and the mark is simply not active once the
+# picture is a different one. Nothing has to notice the change, so no upload path can
+# forget to lift it and no cron has to run. The row stays behind afterwards as a record
+# of what happened; only `_debuff_active` decides whether it bites.
+DEBUFF_KEY = "debuff"
+
+
+def _debuff_row(record: dict | None) -> dict:
+    row = (record or {}).get(DEBUFF_KEY)
+    return row if isinstance(row, dict) else {}
+
+
+def _debuff_active(record: dict | None) -> bool:
+    row = _debuff_row(record)
+    spec = C.debuff_spec(row.get("code"))
+    if spec is None:
+        return False
+    if spec.get("clears_on") == "photo":
+        # `None` on both sides is a creature that had no picture and still has none --
+        # squarely the case the mark is about, so that counts as unchanged.
+        return row.get("photo_file_id") == (record or {}).get("photo_file_id")
+    return True
+
+
+def debuff_scale(record: dict | None) -> float:
+    """The multiplier this creature's stats are under. 1.0 for almost everybody."""
+    if not _debuff_active(record):
+        return 1.0
+    spec = C.debuff_spec(_debuff_row(record).get("code")) or {}
+    try:
+        scale = float(spec.get("scale", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return max(C.DEBUFF_STAT_SCALE_FLOOR, min(1.0, scale))
+
+
+def debuff_for(record: dict | None) -> dict | None:
+    """One creature's active mark as display data, or None. Never touches the store.
+
+    Returns the catalogue copy alongside the row, because every screen that shows the
+    mark has to show what it is and how to get rid of it -- a bare "🎭 Самозванец" with a
+    stat penalty behind it and no explanation is indistinguishable from a bug.
+    """
+    if not _debuff_active(record):
+        return None
+    row = _debuff_row(record)
+    spec = C.debuff_spec(row.get("code")) or {}
+    return {
+        "code": row.get("code"),
+        "emoji": spec.get("emoji", "•"),
+        "title": spec.get("title", ""),
+        "line": spec.get("line", ""),
+        "description": spec.get("description", ""),
+        "hint": spec.get("hint", ""),
+        "percent": round((1 - debuff_scale(record)) * 100),
+        "set_at": row.get("set_at"),
+        "set_by": row.get("set_by"),
+    }
+
+
+def debuff(entry, user_id) -> dict | None:
+    """The active mark on one player's creature, or None."""
+    return debuff_for(_tamed_record(_load(entry), str(user_id)))
+
+
+def set_debuff(entry, user_id, code, *, set_by=None) -> dict:
+    """Hand a mark to one player. Re-granting the same code re-arms it on today's picture.
+
+    Re-arming is deliberate: an admin who gives the same mark twice means "this picture is
+    still not good enough", and without re-snapshotting, the second grant would land
+    already-expired against the picture the first one recorded.
+    """
+    user_id = str(user_id or "").strip()
+    spec = C.debuff_spec(code)
+    if not user_id:
+        raise ValueError("Не выбран игрок.")
+    if spec is None:
+        raise ValueError("Такого эффекта нет.")
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        raise ValueError("У этого игрока нет существа.")
+    record[DEBUFF_KEY] = {
+        "code": str(code),
+        "photo_file_id": record.get("photo_file_id"),
+        "set_by": str(set_by or ""),
+        "set_at": app_now().isoformat(),
+    }
+    _save(entry, data)
+    return debuff_for(record) or {}
+
+
+def clear_debuff(entry, user_id) -> bool:
+    """Take a mark off by hand. Returns whether there was one on the creature."""
+    data = _load(entry)
+    record = _tamed_record(data, str(user_id))
+    if record is None or not _debuff_row(record):
+        return False
+    record.pop(DEBUFF_KEY, None)
+    _save(entry, data)
+    return True
+
+
+def debuff_holders(entry) -> list[dict]:
+    """Everyone currently carrying an active mark, for the admin screen."""
+    data = _load(entry)
+    rows = []
+    for user_id, record in (data.get("pets") or {}).items():
+        mark = debuff_for(record) if isinstance(record, dict) else None
+        if mark is None:
+            continue
+        rows.append({
+            "user_id": str(user_id),
+            "owner_name": record.get("owner_name") or "кто-то",
+            "owner_username": record.get("owner_username"),
+            "pet_name": record.get("name"),
+            **mark,
+        })
+    return sorted(rows, key=lambda row: str(row["owner_name"]).lower())
 
 
 # ---------------------------------------------------------------------------- birthdays

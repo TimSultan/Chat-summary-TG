@@ -730,6 +730,10 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
         return state
 
     state["pet"] = _pet_payload(entry, user_id, record, prefix)
+    # Top level rather than inside `pet`, because several screens draw it and none of them
+    # is "the pet screen": it belongs to the creature but it explains the stats, the power
+    # rating and the arena all at once.
+    state["debuff"] = pets.debuff_for(record)
     state["stats"] = _stat_payload(entry, user_id, record)
     state["combat"] = _combat_payload(entry, user_id, record)
     state["equipment"] = _equipment_payload(record, prefix)
@@ -1243,6 +1247,11 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
             "fights": int(record.get("fights", 0)),
             "wins": int(record.get("wins", 0)),
             "stats": pets._effective_stats_for(record),
+            # Carried per row so the roster can mark somebody quietly in place. The power
+            # beside it is already the reduced one -- `_effective_stats_for` applied the
+            # scale -- so the badge explains a number the player can otherwise only wonder
+            # about.
+            "debuff": pets.debuff_for(record),
             "attackable": attacker_can_fight and used < C.ARENA_SAME_OPPONENT_DAILY_LIMIT,
             "attacks_today": used,
             "gap": abs(power - mine),
@@ -1264,7 +1273,13 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
                 row["attackable"] = False
                 opponents.insert(0, opponents.pop(index))
                 break
-    return {"me_power": mine, "opponents": opponents, "birthday": celebration}
+    # `my_debuff` rides along with the roster rather than being read off the state, so
+    # the arena can show the player their own mark on the screen where it costs them
+    # something, next to the power rating it has already reduced.
+    return {
+        "me_power": mine, "opponents": opponents, "birthday": celebration,
+        "my_debuff": pets.debuff_for(mine_record),
+    }
 
 
 async def handle_attack(request: web.Request) -> web.Response:
@@ -1563,7 +1578,7 @@ async def handle_leaderboard(request: web.Request) -> web.Response:
         "rows": [
             {"rank": index, "user_id": str(row["user_id"]), "name": row.get("name"),
              "owner_name": row.get("owner_name"), "owner_username": row.get("owner_username"),
-             "power": row.get("power", 0),
+             "power": row.get("power", 0), "debuff": row.get("debuff"),
              "portrait": _portrait_url(request.app[_PREFIX_KEY], row["user_id"])}
             for index, row in enumerate(rows, start=1)
         ],
@@ -1600,6 +1615,9 @@ async def handle_loadout(request: web.Request) -> web.Response:
         "wins": int(record.get("wins", 0)),
         "power": pets._power_rating_for(record),
         "stats": effective,
+        # The stats above are already scaled down by any mark, so the panel has to say
+        # why -- otherwise it silently misreports somebody's creature as weaker.
+        "debuff": pets.debuff_for(record),
         "slots": slots,
         # The scrolls are half of what a build is, so a panel that showed only the five
         # equipment slots would be describing half a creature.
@@ -1769,6 +1787,73 @@ async def handle_birthday_set(request: web.Request) -> web.Response:
     request.app[_LOG_KEY](f"[pets_web] {user['id']} set the birthday to {body.get('user_id')}")
     payload = await asyncio.to_thread(_birthday_admin_payload, entry)
     return _ok({"message": "Праздник назначен на сегодня.", **payload})
+
+
+async def handle_debuff_admin(request: web.Request) -> web.Response:
+    """Who is marked, what marks exist, and everybody who could be given one."""
+    await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    return _ok(await asyncio.to_thread(_debuff_admin_payload, entry))
+
+
+def _debuff_admin_payload(entry: str) -> dict:
+    data = pets._load(entry)
+    candidates = [
+        {
+            "user_id": str(user_id),
+            "owner_name": record.get("owner_name") or "кто-то",
+            "owner_username": record.get("owner_username"),
+            "pet_name": record.get("name"),
+            "has_photo": bool(record.get("photo_file_id")),
+        }
+        for user_id, record in (data.get("pets") or {}).items()
+        if isinstance(record, dict) and record.get("name")
+    ]
+    candidates.sort(key=lambda row: str(row["owner_name"]).lower())
+    # The catalogue travels to the client so the admin picks a mark by its real copy --
+    # the same title, joke and get-out line the player will read -- rather than by a code.
+    return {
+        "debuffs": [
+            {"code": code, **{key: spec[key] for key in
+                              ("emoji", "title", "line", "description", "hint")}}
+            for code, spec in C.DEBUFFS.items()
+        ],
+        "holders": pets.debuff_holders(entry),
+        "candidates": candidates,
+    }
+
+
+async def handle_debuff_set(request: web.Request) -> web.Response:
+    """Give or take away one player's mark. Chat admins only."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _economy_admin(request, body)
+    entry = request.app[_ENTRY_KEY]
+    target = str(body.get("user_id") or "")
+
+    if body.get("clear"):
+        cleared = await asyncio.to_thread(pets.clear_debuff, entry, target)
+        request.app[_LOG_KEY](f"[pets_web] {user['id']} cleared the debuff on {target} ({cleared})")
+        return _ok({
+            "message": "Эффект снят." if cleared else "На этом игроке ничего не было.",
+            **await asyncio.to_thread(_debuff_admin_payload, entry),
+        })
+
+    try:
+        mark = await asyncio.to_thread(
+            pets.set_debuff, entry, target, str(body.get("code") or ""), set_by=user["id"],
+        )
+    except ValueError as e:
+        return _json_error(str(e), status=400, code="BAD_DEBUFF")
+    request.app[_LOG_KEY](
+        f"[pets_web] {user['id']} gave {body.get('code')} to {target}"
+    )
+    return _ok({
+        "message": f"{mark.get('emoji', '')} {mark.get('title', 'Эффект')} выдан.".strip(),
+        **await asyncio.to_thread(_debuff_admin_payload, entry),
+    })
 
 
 async def _economy_admin(request: web.Request, body: dict | None = None):
@@ -2158,6 +2243,8 @@ def attach(
         # Chat admins only, both of them (see _economy_admin).
         web.get(prefix + "/api/birthday", handle_birthday_admin),
         web.post(prefix + "/api/birthday", handle_birthday_set),
+        web.get(prefix + "/api/debuff", handle_debuff_admin),
+        web.post(prefix + "/api/debuff", handle_debuff_set),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
         web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
         web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
@@ -2385,6 +2472,20 @@ PAGE_HTML = """<!doctype html>
      so it reads as an occasion and not as another button to press. */
   .panel.birthday { border: 1px solid var(--gold); }
   .panel.birthday h2 { color: var(--gold); }
+  /* A granted mark. Deliberately the quietest thing on any screen it lands on: no accent
+     colour, no border on the inline form, and the same muted grey the secondary lines
+     already use. It has to be findable, not loud -- see debuffTag/debuffNote. */
+  .dbf {
+    display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .01em;
+    padding: 1px 6px; border-radius: 999px; white-space: nowrap; vertical-align: middle;
+    color: var(--muted); background: rgba(128, 128, 128, .16);
+  }
+  .dbfnote {
+    margin-top: 9px; padding: 8px 10px; border-radius: 10px;
+    background: rgba(128, 128, 128, .12); border: 1px solid rgba(128, 128, 128, .22);
+  }
+  .dbfhead { font-size: 13px; margin-bottom: 3px; }
+  .dbfcost { color: var(--muted); font-size: 12px; font-weight: 600; }
   /* An open slot, drawn like one: dashed, quiet, and obviously something you can fill,
      rather than a card that looks broken because its contents failed to load. */
   .live-skill.empty { border-style: dashed; color: var(--muted); background: none; }
@@ -2965,6 +3066,9 @@ function renderHero() {
 
     '<div class="panel"><h2>Характеристики</h2>' +
       S.stats.map(statRow).join("") +
+      // Under the stats it is subtracting from. Tapping the portrait right above is how
+      // the picture gets changed, so the way out is one screen away from the explanation.
+      debuffNote(S.debuff) +
     "</div>" +
 
     cagePanel() + dailyPanel() +
@@ -2978,7 +3082,13 @@ function tile(label, value) {
 }
 
 function statRow(stat) {
-  const bonus = stat.bonus ? ' <span class="gain">+' + stat.bonus + "</span>" : "";
+  // Signed both ways: the gap between purchased and effective used to be gear alone and
+  // therefore always positive, but a granted debuff scales the effective number down, and
+  // a hardcoded "+" turned that into "+-1".
+  const bonus = stat.bonus
+    ? ' <span class="' + (stat.bonus > 0 ? "gain" : "loss") + '">' +
+      (stat.bonus > 0 ? "+" : "−") + Math.abs(stat.bonus) + "</span>"
+    : "";
   const maxed = stat.max != null && stat.purchased >= stat.max;
   const buttons = stat.gear_only
     ? '<span class="tiny muted">только с вещей</span>'
@@ -3245,6 +3355,9 @@ async function renderArena() {
     "</div>" +
     (arena.seconds_until_next ? '<div class="tiny muted" style="margin-top:6px">Следующий бой через ' +
       clock(arena.seconds_until_next) + "</div>" : "") +
+    // Directly under the power rating it has already reduced. That is the whole of why
+    // it is here and not on some notifications screen: this is the number it changed.
+    debuffNote(FOES.my_debuff) +
     "</div>" +
     (blocked ? '<div class="panel"><div class="small">' + esc(blocked) + "</div></div>" : "") +
     '<div class="panel"><h2>🧪 Пошаговый бой · тест</h2>' +
@@ -3487,6 +3600,72 @@ async function setBirthday(userId) {
   } catch (e) { haptic("no"); toast(e.message); }
 }
 
+// Which mark the next tap on «выдать» hands out. Only ever one is defined today, so this
+// starts on it and the picker only earns its keep once there are two.
+let debuffPick = "";
+
+function debuffAdmin(data) {
+  const marks = data.debuffs || [];
+  const holders = data.holders || [];
+  const rows = data.candidates || [];
+  if (!marks.some((m) => m.code === debuffPick)) debuffPick = (marks[0] || {}).code || "";
+  const chosen = marks.find((m) => m.code === debuffPick) || {};
+
+  // The admin reads exactly the copy the player will read, straight off the catalogue --
+  // picking a punishment by its machine code is how the wrong one gets handed out.
+  const picker = '<div class="panel"><h2>🎭 Эффекты игрокам</h2>' +
+    marks.map((mark) =>
+      '<button class="go sec" style="margin-bottom:8px;text-align:left"' +
+      (mark.code === debuffPick ? " disabled" : "") +
+      ' data-debuffpick="' + esc(mark.code) + '">' +
+      esc(mark.emoji) + " " + esc(mark.title) + " · " + esc(mark.line) + "</button>").join("") +
+    debuffNote(chosen) +
+    "</div>";
+
+  const current = '<div class="panel"><h2>Сейчас висит · ' + holders.length + "</h2>" +
+    (holders.length
+      ? holders.map((row) =>
+          "<div class='row spread' style='margin-bottom:8px'><span class='small'>" +
+          esc(row.owner_name) + " " + debuffTag(row) +
+          (row.pet_name ? "<br><span class='tiny muted'>" + esc(row.pet_name) + "</span>" : "") +
+          "</span><button class='chip' data-debuffclear='" + esc(row.user_id) +
+          "'>снять</button></div>").join("") +
+        "<div class='tiny muted' style='margin-top:6px'>Снимется и само, как только игрок " +
+        "поменяет картинку существа.</div>"
+      : "<div class='small muted'>Пока ни на ком.</div>") +
+    "</div>";
+
+  return picker + current +
+    '<div class="panel"><h2>Кому выдать</h2>' +
+    '<input class="inp" data-debufffilter placeholder="Поиск по имени">' +
+    "<div class='tiny muted' style='margin:8px 0'>Выдаётся " + esc(chosen.title || "эффект") +
+      ". Запоминается картинка, которая стоит сейчас — сменит её, и эффект спадёт.</div>" +
+    (rows.length
+      ? rows.map((row) =>
+          // Same in-place filtering the birthday list uses: re-rendering on every
+          // keystroke would take the focus out of the box being typed into.
+          '<div class="row spread" style="margin-bottom:8px" data-dbfrow="' +
+          esc(((row.owner_name || "") + " " + (row.owner_username || "")).toLowerCase()) +
+          '"><span class="small">' + esc(row.owner_name) +
+          (row.owner_username ? " <span class='tiny muted'>@" + esc(row.owner_username) + "</span>" : "") +
+          (row.has_photo ? "" : " <span class='tiny muted'>· без картинки</span>") +
+          "</span>" +
+          '<button class="chip" data-debuffset="' + esc(row.user_id) + '">выдать</button></div>').join("")
+      : '<div class="empty">Пока ни у кого нет существа.</div>') +
+    "</div>";
+}
+
+async function setDebuff(userId, clear) {
+  try {
+    const data = await api("/api/debuff",
+      clear ? { user_id: userId, clear: true } : { user_id: userId, code: debuffPick });
+    toast(data.message || "Готово");
+    haptic("ok");
+    FOES = null;                       // power ratings on the roster have just moved
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+}
+
 const PEEKED = {};                 // user_id -> loadout, so reopening never refetches
 
 function statLine(stats) {
@@ -3522,6 +3701,10 @@ function peekPanel(data) {
       "</span><span class='pw'>⚡ " + money(data.power) + "</span></div>" +
     "<div class='tiny muted' style='margin-bottom:9px'>" + esc(statLine(data.stats || {})) +
       " · боёв " + Number(data.fights || 0) + ", побед " + Number(data.wins || 0) + "</div>" +
+    // Between the stats and the gear, because the stats printed above are the reduced
+    // ones and anybody comparing them against the same build on somebody else deserves
+    // to know why they do not add up.
+    debuffNote(data.debuff) +
     (data.slots || []).map(peekItem).join("") +
     (scrolls.length
       ? "<div class='tiny muted' style='margin-top:9px'>📜 Свитки</div>" +
@@ -3627,13 +3810,35 @@ function mobPanel(farmBlocked) {
     "</div></div>";
 }
 
+// A granted mark, drawn the same way wherever it appears. Three shapes for three amounts
+// of room, but the rule is the same in all of them: the mark never appears without the
+// line that says what it costs and the line that says how to be rid of it. Muted, small
+// and below the name -- the brief was "на видном месте, но не кричит в лицо", and a mark
+// somebody else can see is embarrassing enough without a red banner helping.
+function debuffTag(mark) {
+  if (!mark) return "";
+  return "<span class='dbf' title='" + esc(mark.description || "") + "'>" +
+    esc(mark.emoji || "") + " " + esc(mark.title || "") + "</span>";
+}
+
+function debuffNote(mark, extra) {
+  if (!mark) return "";
+  return "<div class='dbfnote" + (extra ? " " + extra : "") + "'>" +
+    "<div class='dbfhead'>" + esc(mark.emoji || "") + " <b>" + esc(mark.title || "") + "</b>" +
+      (mark.line ? " <span class='dbfcost'>" + esc(mark.line) + "</span>" : "") + "</div>" +
+    (mark.description ? "<div class='tiny muted'>" + esc(mark.description) + "</div>" : "") +
+    (mark.hint ? "<div class='tiny muted' style='margin-top:4px'>" + esc(mark.hint) + "</div>" : "") +
+    "</div>";
+}
+
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
   return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
     (usable ? "" : " disabled") + '>' +
     '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
     "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
-      "</span><br><span class='tiny muted'>" + esc(foe.owner_name || "") +
+      "</span> " + debuffTag(foe.debuff) +
+      "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
       " · побед " + foe.wins + " из " + foe.fights +
       (foe.attackable ? "" : " · сегодня уже хватит") + "</span></span>" +
     "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";
@@ -3867,6 +4072,7 @@ async function renderMore() {
     if (S && S.is_admin) menu.push("review:" + (S.pending_quests ? "🔴 " : "") + "🛡 Проверка квестов");
     if (S && S.is_economy_admin) menu.push("moneyaudit:🕵️ Денежный аудит");
     if (S && S.is_economy_admin) menu.push("birthday:🎂 День рождения");
+    if (S && S.is_economy_admin) menu.push("debuff:🎭 Эффекты игрокам");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -3893,6 +4099,7 @@ async function renderMore() {
           '<span class="av">' + shot(row.portrait, null) + "</span>" +
           "<span class='small'><b>" + row.rank + ".</b> " + esc(row.name || "—") +
           (row.user_id === data.me ? " <span class='tiny muted'>(ты)</span>" : "") +
+          " " + debuffTag(row.debuff) +
           "<br><span class='tiny muted'>" + esc(row.owner_name || "") + "</span></span>" +
           "<span class='pw'>⚡ " + money(row.power) + "</span></button>" +
           '<div class="peek" data-peekbody="' + esc(row.user_id) + '" hidden></div>').join("")
@@ -3913,6 +4120,8 @@ async function renderMore() {
     body = economyAudit(await api("/api/economy/audit" + query));
   } else if (moreView === "birthday") {
     body = birthdayAdmin(await api("/api/birthday"));
+  } else if (moreView === "debuff") {
+    body = debuffAdmin(await api("/api/debuff"));
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -4868,7 +5077,8 @@ document.addEventListener("click", async (event) => {
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
-    "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]");
+    "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
+    "[data-debuffpick],[data-debuffset],[data-debuffclear]");
   if (!target) return;
   const d = target.dataset;
 
@@ -4876,6 +5086,11 @@ document.addEventListener("click", async (event) => {
   if (d.congratulate) { await congratulate(); return; }
   if (d.birthdayset !== undefined) { await setBirthday(d.birthdayset); return; }
   if (d.birthdayclear !== undefined) { await setBirthday(null); return; }
+  // Picking a mark is local state, so it re-renders without touching the server; the
+  // other two are the mutation.
+  if (d.debuffpick !== undefined) { debuffPick = d.debuffpick; render(); return; }
+  if (d.debuffset !== undefined) { await setDebuff(d.debuffset, false); return; }
+  if (d.debuffclear !== undefined) { await setDebuff(d.debuffclear, true); return; }
 
   if (d.testbattle === "open") { await openTestBattle(); return; }
   if (d.testbattle === "close") {
@@ -5035,6 +5250,14 @@ document.addEventListener("input", (event) => {
     const term = birthday.value.trim().toLowerCase();
     document.querySelectorAll("[data-bdayrow]").forEach((row) => {
       row.hidden = Boolean(term) && !row.dataset.bdayrow.includes(term);
+    });
+    return;
+  }
+  const marked = event.target.closest("[data-debufffilter]");
+  if (marked) {
+    const term = marked.value.trim().toLowerCase();
+    document.querySelectorAll("[data-dbfrow]").forEach((row) => {
+      row.hidden = Boolean(term) && !row.dataset.dbfrow.includes(term);
     });
     return;
   }

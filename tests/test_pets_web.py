@@ -1546,6 +1546,92 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         blank = await self._get("/api/loadout", PLAYER)
         self.assertEqual(blank.status, 400, await blank.text())
 
+    # ---- granted debuffs ------------------------------------------------------------------
+
+    async def _debuff(self, user, **payload):
+        return await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/debuff",
+            json={"init_data": _init_data(user["id"]), **payload},
+        )
+
+    async def test_only_a_chat_admin_can_open_or_hand_out_a_debuff(self):
+        """Same narrow gate as the birthday and the money audit. Both routes ask for
+        themselves -- the menu entry the client draws is a convenience, not a permission."""
+        self._tame(PLAYER)
+        for user in (PLAYER, MODERATOR):
+            with self.subTest(user=user["username"]):
+                read = await self._get("/api/debuff", user)
+                self.assertEqual(read.status, 403, await read.text())
+                write = await self._debuff(user, user_id=PLAYER["id"], code="impostor")
+                self.assertEqual(write.status, 403, await write.text())
+
+        read = await self._get("/api/debuff", THIRD)   # the economy admin in this fixture
+        self.assertEqual(read.status, 200, await read.text())
+        body = await read.json()
+        self.assertEqual(body["holders"], [])
+        self.assertIn("impostor", [row["code"] for row in body["debuffs"]])
+        self.assertIn(str(PLAYER["id"]), [row["user_id"] for row in body["candidates"]])
+
+    async def test_the_catalogue_the_admin_picks_from_carries_the_players_own_copy(self):
+        """The admin chooses by reading the same title, joke and get-out line the player
+        will read. Picking a punishment by machine code is how the wrong one goes out."""
+        read = await self._get("/api/debuff", THIRD)
+        mark = next(row for row in (await read.json())["debuffs"] if row["code"] == "impostor")
+        for field in ("emoji", "title", "line", "description", "hint"):
+            with self.subTest(field=field):
+                self.assertEqual(mark[field], C.DEBUFFS["impostor"][field])
+
+    async def test_a_granted_debuff_reaches_the_arena_the_state_and_the_peek_panel(self):
+        """The three places a player actually meets it, and each has to carry the
+        explanation with it -- a stat penalty with no words attached reads as a bug."""
+        self._tame(PLAYER)
+        self._tame(THIRD, name="Наблюдатель")
+        granted = await self._debuff(THIRD, user_id=PLAYER["id"], code="impostor")
+        self.assertEqual(granted.status, 200, await granted.text())
+
+        state = await (await self._get("/api/state", PLAYER)).json()
+        self.assertEqual(state["debuff"]["title"], C.DEBUFFS["impostor"]["title"])
+        self.assertEqual(state["debuff"]["hint"], C.DEBUFFS["impostor"]["hint"])
+
+        # The marked player's own arena, and the same mark on somebody else's roster row.
+        mine = await (await self._get("/api/opponents", PLAYER)).json()
+        self.assertEqual(mine["my_debuff"]["code"], "impostor")
+        theirs = await (await self._get("/api/opponents", THIRD)).json()
+        row = next(r for r in theirs["opponents"] if r["user_id"] == str(PLAYER["id"]))
+        self.assertEqual(row["debuff"]["description"], C.DEBUFFS["impostor"]["description"])
+
+        peek = await (await self._get(
+            "/api/loadout?user_id=" + str(PLAYER["id"]), THIRD)).json()
+        self.assertEqual(peek["debuff"]["code"], "impostor")
+
+        # Nobody else picked one up.
+        self.assertIsNone(theirs["my_debuff"])
+        self.assertIsNone((await (await self._get("/api/state", THIRD)).json())["debuff"])
+
+    async def test_a_debuff_can_be_taken_off_by_hand_and_by_changing_the_picture(self):
+        self._tame(PLAYER)
+        self.assertEqual((await self._debuff(THIRD, user_id=PLAYER["id"], code="impostor")).status, 200)
+        cleared = await self._debuff(THIRD, user_id=PLAYER["id"], clear=True)
+        self.assertEqual(cleared.status, 200, await cleared.text())
+        self.assertEqual((await cleared.json())["holders"], [])
+
+        # And again, this time letting the player lift it themselves by uploading a new
+        # portrait through the page -- the route the feature is actually about.
+        self.assertEqual((await self._debuff(THIRD, user_id=PLAYER["id"], code="impostor")).status, 200)
+        self.assertIsNotNone(pets.debuff(CHAT, str(PLAYER["id"])))
+        uploaded = await self._upload_portrait(PLAYER, _jpeg_bytes())
+        self.assertEqual(uploaded.status, 200, await uploaded.text())
+        self.assertIsNone(pets.debuff(CHAT, str(PLAYER["id"])))
+
+    async def test_an_unknown_code_or_a_petless_player_is_refused(self):
+        self._tame(PLAYER)
+        bad_code = await self._debuff(THIRD, user_id=PLAYER["id"], code="no_such_mark")
+        self.assertEqual(bad_code.status, 400, await bad_code.text())
+        self.assertEqual((await bad_code.json())["error"], "BAD_DEBUFF")
+
+        no_pet = await self._debuff(THIRD, user_id=MODERATOR["id"], code="impostor")
+        self.assertEqual(no_pet.status, 400, await no_pet.text())
+
     # ---- birthdays ----------------------------------------------------------------------
 
     async def _birthday(self, user, **payload):

@@ -2033,6 +2033,14 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if rubies:
         lines.append(f"💎 Руби: {_money(rubies)}")
 
+    # The other of the two arenas that has to show this. Below the counters and above the
+    # birthday card: it is a standing condition on the creature about to fight, not news.
+    mark = pets.debuff_for(pet)
+    if mark:
+        lines.append(f"\n{mark['emoji']} <b>{escape(mark['title'])}</b> — {escape(mark['line'])}")
+        lines.append(f"<i>{escape(mark['description'])}</i>")
+        lines.append(f"<i>{escape(mark['hint'])}</i>")
+
     # Above the search, and above the fight bank: it costs no fight, it lasts one day,
     # and somebody who opens the arena with an empty bank should still see it.
     party = pets.birthday(entry, viewer=user_id)
@@ -2159,6 +2167,15 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
     for key in C.STAT_KEYS:
         lines.append(f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]}: {their_stats.get(key, 1)}")
     lines.append(f"{C.ARMOR_EMOJI} {C.ARMOR_NAME}: {their_stats.get('armor', 0)}")
+    # Their stats above are already the reduced ones, so this is not gossip -- it is why
+    # the opponent you are sizing up reads weaker than their level suggests.
+    their_mark = pets.debuff_for(theirs)
+    if their_mark:
+        lines.append(
+            f"\n{their_mark['emoji']} <b>{escape(their_mark['title'])}</b>"
+            f" — {escape(their_mark['line'])}"
+        )
+        lines.append(f"<i>{escape(their_mark['description'])}</i>")
 
     rows = [
         [{
@@ -2435,9 +2452,20 @@ def pet_card(entry: str, user_id, pet: dict) -> str:
     for key in C.STAT_KEYS:
         purchased = levels.get(key, C.STAT_MIN_LEVEL)
         total = effective.get(key, purchased)
-        extra = f" <i>(+{total - purchased})</i>" if total != purchased else ""
+        # Signed, because the gap is no longer always a bonus: a granted debuff scales the
+        # effective number down, and the old hardcoded "+" printed "(+-1)".
+        extra = f" <i>({total - purchased:+d})</i>" if total != purchased else ""
         lines.append(f"{C.STAT_EMOJI[key]} {C.STAT_NAMES[key]}: {total}{extra}")
     lines.append(f"{C.ARMOR_EMOJI} {C.ARMOR_NAME}: {effective.get('armor', 0)}")
+    # Directly under the stats it is subtracting from, with its joke and its way out.
+    # The numbers above are already the reduced ones, so leaving the mark unexplained
+    # here would make the card look like it was doing arithmetic wrong.
+    mark = pets.debuff_for(pet)
+    if mark:
+        lines.append("")
+        lines.append(f"{mark['emoji']} <b>{escape(mark['title'])}</b> — {escape(mark['line'])}")
+        lines.append(f"<i>{escape(mark['description'])}</i>")
+        lines.append(f"<i>{escape(mark['hint'])}</i>")
 
     equipped = pet.get("equipped") or {}
     worn = [C.find_item(code) for code in equipped.values() if code]

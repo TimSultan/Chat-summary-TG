@@ -505,6 +505,48 @@ def pet_xp_for_next_level(level: int) -> int:
     return max(1, round(PET_XP_BASE * level ** PET_XP_EXPONENT))
 
 
+# -------------------------------------------------------------------- granted debuffs
+# Marks an admin hands out by name from the Mini App. Nothing in the game awards one and
+# no amount of playing removes one -- the only way out is the condition the debuff names.
+#
+# `scale` multiplies EVERY effective stat, armour included, in exactly one place
+# (pets._effective_stats_for), so it reaches combat, the power rating and therefore
+# matchmaking, both pet cards and both arenas without any of them knowing it exists.
+#
+# `clears_on` is the whole point of the design rather than a convenience. "photo" means
+# the mark is compared against the picture the creature wore when it was handed out, so
+# changing that picture lifts it -- not on a timer, not by an admin remembering, and not
+# through a hook that some other code path could bypass. A punishment nobody can lift is
+# a ban with extra steps; this one is a nudge with a door in it.
+#
+# Every field here is player-facing copy. `description` is the joke and `hint` is the way
+# out, and both travel with the debuff everywhere it is shown -- a −5% that appears on a
+# card with no explanation reads as a bug in the game.
+DEBUFF_STAT_SCALE_FLOOR = 0.50   # a mark may sting; it may not delete somebody's creature
+
+DEBUFFS = {
+    "impostor": {
+        "emoji": "🎭",
+        "title": "Самозванец",
+        "line": "−5% ко всем статам",
+        "description": "Что-то на этой аватарке подозрительно мало твоей краски…",
+        "hint": "Спадёт само, как только сменишь картинку существа.",
+        "scale": 0.95,
+        "clears_on": "photo",
+    },
+}
+
+
+def debuff_spec(code) -> dict | None:
+    """One debuff's data, or None for an unknown code.
+
+    Unknown codes are survivable on purpose: a save written by a newer build must not be
+    able to crash a fight, and a mark whose definition has gone simply stops applying.
+    """
+    spec = DEBUFFS.get(str(code or ""))
+    return dict(spec) if spec else None
+
+
 # ------------------------------------------------------------------------ inventory
 # Four slots, as asked. The catalogue is deliberately thin -- "доступные список добавим
 # позже с ценами" -- but the shape is fixed, so adding an item later is one more Item()
