@@ -441,21 +441,34 @@ def _weapon_owner_ids(data: dict, code: str) -> list[str]:
     ]
 
 
-def _daily_storefront_weapons(
-    data: dict, entry: str, user_id, day: date | datetime | str | None = None,
+def _daily_storefront_items(
+    data: dict, entry: str, user_id, slot: str, day: date | datetime | str | None = None,
 ):
     moment = day or app_now()
     record = _tamed_record(data, user_id) or {}
-    return C.daily_storefront_weapons(
-        entry, moment, excluded_codes=set(record.get("inventory", [])), user_id=user_id,
+    return C.daily_storefront_items(
+        entry, slot, moment, excluded_codes=set(record.get("inventory", [])), user_id=user_id,
     )
+
+
+def _daily_storefront_weapons(
+    data: dict, entry: str, user_id, day: date | datetime | str | None = None,
+):
+    return _daily_storefront_items(data, entry, user_id, "weapon", day)
+
+
+def daily_storefront_items(
+    entry: str, slot: str, day: date | datetime | str | None = None, *, user_id=None,
+):
+    """One player's five ordinary and one rare offers for this slot and 12-hour window."""
+    return _daily_storefront_items(_load(entry), entry, user_id, slot, day)
 
 
 def daily_storefront_weapons(
     entry: str, day: date | datetime | str | None = None, *, user_id=None,
 ):
     """One player's five ordinary and one rare weapon offers for this 12-hour window."""
-    return _daily_storefront_weapons(_load(entry), entry, user_id, day)
+    return daily_storefront_items(entry, "weapon", day, user_id=user_id)
 
 
 def _name_taken(data: dict, name: str, exclude_uid: str | None = None) -> bool:
@@ -2361,24 +2374,19 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
     item = C.find_item(code)
     if item is None:
         return False, "Такого предмета не существует."
-    if item.source != "shop":
-        return False, f"«{item.name}» нельзя купить -- он выпадает только из боёв."
-    if item.slot == "weapon":
-        if item.code in record["inventory"]:
-            return False, f"«{item.name}» у тебя уже есть."
-    if item.slot == "weapon" and item.code not in {
-        offered.code for offered in _daily_storefront_weapons(data, entry, user_id, moment)
-    }:
-        return False, "Этого оружия сейчас нет на витрине. Она меняется каждые 12 часов."
+    offers = _daily_storefront_items(data, entry, user_id, item.slot, moment)
+    offered = next((offer for offer in offers if offer.code == item.code), None)
+    if offered is None:
+        return False, "Этого предмета сейчас нет на витрине. Она меняется каждые 12 часов."
     if item.code in record["inventory"]:
         return False, f"«{item.name}» у тебя уже есть."
-    ok, balance = economy.spend(entry, user_id, xp, item.price, f"buy:pet_item:{item.code}")
+    ok, balance = economy.spend(entry, user_id, xp, offered.price, f"buy:pet_item:{item.code}")
     if not ok:
-        return False, f"Нужно {item.price} монет, у тебя {balance}."
+        return False, f"Нужно {offered.price} монет, у тебя {balance}."
     record["inventory"].append(item.code)
     _discover(record, item.code)
     _save(entry, data)
-    return True, f"Куплено: «{item.name}» за {item.price} монет."
+    return True, f"Куплено: «{item.name}» за {offered.price} монет."
 
 
 def _discover(record: dict, code: str) -> None:

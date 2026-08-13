@@ -29,22 +29,22 @@ _ITEM_RULES = {
         "bonuses": {"armor": 18, "luck": 6},
     },
     "shield_thorn": {
-        "price": 0, "source": "drop", "rarity": "rare",
+        "price": 0, "source": "drop", "rarity": "common",
         "resale_price": 48, "drop_weight": 4,
         "bonuses": {"armor": 25, "health": -3},
     },
     "shield_frost": {
-        "price": 0, "source": "drop", "rarity": "rare",
+        "price": 0, "source": "drop", "rarity": "common",
         "resale_price": 48, "drop_weight": 4,
         "bonuses": {"armor": 22, "strength": 4},
     },
     "shield_palette": {
-        "price": 0, "source": "drop", "rarity": "rare",
+        "price": 0, "source": "drop", "rarity": "common",
         "resale_price": 48, "drop_weight": 4,
         "bonuses": {"armor": 14, "luck": 8},
     },
     "shield_lantern": {
-        "price": 0, "source": "drop", "rarity": "rare",
+        "price": 0, "source": "drop", "rarity": "common",
         "resale_price": 48, "drop_weight": 4,
         "bonuses": {"armor": 15, "health": 8},
     },

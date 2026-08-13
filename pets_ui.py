@@ -1501,19 +1501,18 @@ def parse_slot_argument(argument: str) -> tuple[str, int]:
     return slot, int(raw_page) if raw_page.isdecimal() else 0
 
 
-def _buyable_here(item, daily_weapon_codes) -> bool:
+def _buyable_here(item, storefront_codes) -> bool:
     """Whether tapping "Купить" on this item would work right now.
 
     Shared by the sort key below and the button-rendering loop so the two can never
-    disagree: a weapon is only really for sale while it sits in today's ten-item
-    window (see ``daily_storefront_weapons``); every other shop item is always for
-    sale, since amulets/gloves/boots have no rotating storefront.
+    disagree: every slot is only buyable while it sits in the player's current
+    twelve-hour storefront.
     """
-    return item.source == "shop" and (item.slot != "weapon" or item.code in daily_weapon_codes)
+    return item.code in storefront_codes
 
 
 def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
-    """The shop's shelf for one non-weapon slot: what is on sale, and nothing else.
+    """The shop's personal 12-hour shelf for one non-weapon slot.
 
     ``slot_view`` is the full catalogue for a slot -- hundreds of entries, most of them
     drop-only trophies -- and reaching it from the 🛒 shop was the whole problem: whether
@@ -1529,12 +1528,13 @@ def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
     if slot not in C.SLOT_KEYS or slot == "weapon":
         return store_view(entry, user_id, xp)
     owned = set(pet.get("inventory", []))
-    stock = sorted(C.items_for_slot(slot, "shop"), key=lambda item: (item.price, item.code))
+    stock = pets.daily_storefront_items(entry, slot, user_id=user_id)
 
-    lines = [f"🛒 <b>{escape(C.SLOT_NAMES[slot])}</b> {C.SLOT_EMOJI[slot]}\n"]
+    lines = [
+        f"🛒 <b>{escape(C.SLOT_NAMES[slot])}</b> {C.SLOT_EMOJI[slot]}",
+        "Твоя витрина: 5 обычных и 1 редкий предмет, обновляется каждые 12 часов.\n",
+    ]
     rows = []
-    if not stock:
-        lines.append("Этот слот целиком выпадает из боёв — купить его нельзя.")
     for number, item in enumerate(stock, 1):
         label = C.RARITY_LABELS.get(getattr(item, "rarity", "common"), "⚪ Обычное")
         lines.append(f"<b>{number}. {escape(item.name)}</b> · {label}")
@@ -1548,8 +1548,6 @@ def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
                 "text": f"Купить {item.name} — {_money(item.price)}",
                 "callback_data": callback_data(user_id, "buy", item.code),
             }])
-    if stock and all(item.code in owned for item in stock):
-        lines.append("Здесь всё уже куплено. Остальное в этом слоте выпадает только из боёв.")
     lines.append(f"🪙 Монеты: {_money(pets.balance_for(entry, user_id, xp))}")
 
     rows.append([{
@@ -1576,7 +1574,9 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
     owned = set(pet.get("inventory", []))
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
-    daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry, user_id=user_id)}
+    storefront = pets.daily_storefront_items(entry, slot, user_id=user_id)
+    storefront_prices = {item.code: item.price for item in storefront}
+    storefront_codes = set(storefront_prices)
 
     # Owned gear must stay reachable even when its catalogue code lives on page 63, so it
     # keeps the first two sort tiers. But an amulet/gloves/boots catalogue is otherwise
@@ -1591,7 +1591,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
         key=lambda item: (
             item.code != worn,
             item.code not in owned,
-            not _buyable_here(item, daily_weapon_codes),
+            not _buyable_here(item, storefront_codes),
             item.code,
         ),
     )
@@ -1599,7 +1599,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
     page = min(max(0, page), total_pages - 1)
     visible = all_items[page * SLOT_PAGE_SIZE:(page + 1) * SLOT_PAGE_SIZE]
     lines = [f"{C.SLOT_EMOJI[slot]} <b>{escape(C.SLOT_NAMES[slot])}</b> · {page + 1}/{total_pages}\n"]
-    if not any(item.code not in owned and _buyable_here(item, daily_weapon_codes) for item in all_items):
+    if not any(item.code not in owned and _buyable_here(item, storefront_codes) for item in all_items):
         # Everything purchasable is either already owned or (for weapons) off today's
         # window -- say so once, up top, instead of letting a page full of "только из
         # боёв" entries imply the shop sells nothing here at all.
@@ -1613,10 +1613,10 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
         lock_mark = " 🔒" if item.code in locked else ""
         if item.code in owned:
             state = "в сумке"
+        elif item.code in storefront_codes:
+            state = _coins(storefront_prices[item.code])
         elif item.source == "drop":
             state = "только из боёв"
-        elif item.slot == "weapon" and item.code not in daily_weapon_codes:
-            state = "не на витрине сегодня"
         else:
             state = _coins(item.price)
         lines.append(f"<b>{escape(item.name)}</b>{mark}{lock_mark} — {_bonus_text(item)} · {state}")
@@ -1647,9 +1647,9 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
                 "text": f"💰 Продать · {_money(C.resale_value(item))}",
                 "callback_data": callback_data(user_id, "sell", item.code),
             }])
-        elif _buyable_here(item, daily_weapon_codes):
+        elif _buyable_here(item, storefront_codes):
             rows.append([{
-                "text": f"Купить {item.name} — {_money(item.price)}",
+                "text": f"Купить {item.name} — {_money(storefront_prices[item.code])}",
                 "callback_data": callback_data(user_id, "buy", item.code),
             }])
     lines.append(f"🪙 Монеты: {_money(coins)}")
@@ -1803,7 +1803,7 @@ def _rarity_buttons(
 
 
 def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, dict]:
-    """The 12-hour weapon window plus direct routes to accessory shelves."""
+    """The 12-hour weapon shelf plus direct routes to other rotating equipment shelves."""
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
@@ -1815,7 +1815,7 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
     lines = [
         "🛒 <b>Витрина</b>",
-        "Каждые 12 часов появляются 5 обычных и 1 редкое оружие только для тебя.",
+        "Каждые 12 часов появляются 5 обычных и 1 редкий предмет для каждого слота.",
     ]
     lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
     if not visible:

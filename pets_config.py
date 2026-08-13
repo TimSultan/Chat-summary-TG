@@ -856,9 +856,9 @@ GIFT_MIN_PET_LEVEL = 3
 GIFT_COOLDOWN_SECONDS = 24 * 60 * 60
 GIFT_AUDIT_LIMIT = 500
 
-# The shop deliberately has a small, personal changing window instead of asking players
-# to scroll through hundreds of purchasable weapons. Every twelve-hour window selects
-# five ordinary and one rare weapon for each player.
+# The shop deliberately has small, personal changing windows instead of asking players
+# to scroll through hundreds of items. Every twelve-hour window selects five ordinary
+# and one rare item for each equipment slot.
 STOREFRONT_ROTATION_HOURS = 12
 STOREFRONT_NORMAL_COUNT = 5
 STOREFRONT_RARE_COUNT = 1
@@ -879,21 +879,53 @@ def storefront_window(day: _date | _datetime | str | None = None) -> int:
     return moment.date().toordinal() * 2 + moment.hour // STOREFRONT_ROTATION_HOURS
 
 
-def daily_storefront_weapons(
+def storefront_price(item: Item) -> int:
+    """The sale price for a rotating offer without changing its drop provenance."""
+    if item.price > 0:
+        return int(item.price)
+    power = sum(
+        {"strength": 4, "health": 4, "agility": 2, "luck": 2, "armor": 3}.get(key, 0)
+        * int(value)
+        for key, value in item.bonuses.items()
+    )
+    base = 55 if item.rarity == "rare" else 45
+    multiplier = 1.20 if item.rarity == "rare" else .60
+    return max(60, min(195, int((base + power * multiplier + 2.5) // 5) * 5))
+
+
+def _storefront_offer(item: Item) -> Item:
+    """Make a purchasable view of a catalog item without modifying the catalog itself."""
+    return Item(
+        item.code, item.name, item.slot, storefront_price(item), "shop", item.bonuses,
+        item.description, item.rarity, item.resale_price, item.drop_weight, item.effect,
+    )
+
+
+def daily_storefront_items(
     entry: str,
+    slot: str,
     day: _date | _datetime | str | None = None,
     excluded_codes: set[str] | frozenset[str] | None = None,
     *,
     user_id: str | int | None = None,
 ) -> tuple[Item, ...]:
-    """The stable twelve-hour set of purchasable weapons for one player.
+    """The stable twelve-hour set of purchasable items for one player and slot.
 
     This is intentionally a pure function: a restart or second button tap keeps a
     player's stock stable, while another player gets a different selection. `day`
     makes balance tests and previews deterministic without changing the server clock.
     """
     window = storefront_window(day)
-    pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
+    if slot not in SLOT_KEYS:
+        return ()
+    pool = tuple(sorted(
+        (
+            item for item in items_for_slot(slot)
+            if item.rarity in STOREFRONT_RARITIES
+            and (slot != "weapon" or item.source == "shop")
+        ),
+        key=lambda item: item.code,
+    ))
     excluded = excluded_codes or set()
     player = str(user_id or "preview")
     stock = []
@@ -918,7 +950,18 @@ def daily_storefront_weapons(
             ).digest())
             common_indexes = [i for i, item in enumerate(stock) if item.rarity == "common"]
             stock[common_indexes[-1] if common_indexes else -1] = starter
-    return tuple(stock)
+    return tuple(_storefront_offer(item) for item in stock)
+
+
+def daily_storefront_weapons(
+    entry: str,
+    day: _date | _datetime | str | None = None,
+    excluded_codes: set[str] | frozenset[str] | None = None,
+    *,
+    user_id: str | int | None = None,
+) -> tuple[Item, ...]:
+    """Compatibility wrapper for the weapon shelf."""
+    return daily_storefront_items(entry, "weapon", day, excluded_codes, user_id=user_id)
 
 
 def find_item(code: str):

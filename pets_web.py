@@ -759,20 +759,18 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
 
 
 def _shop_payload(entry: str, user_id, prefix: str) -> dict:
-    """One shop, not two. The chat interface splits the daily weapon rotation from the
-    permanent accessory shelf across separate screens reached by different buttons; they
-    are the same act of spending coins and belong on one page, tabbed by slot."""
+    """The personal 12-hour storefront for every equipment slot."""
     record = pets.get_pet(entry, user_id) or {}
     weapons = [_item_payload(item, prefix, record)
            for item in pets.daily_storefront_weapons(entry, user_id=user_id)]
     accessories = [
         _item_payload(item, prefix, record)
         for slot in C.SLOT_KEYS if slot != "weapon"
-        for item in C.items_for_slot(slot, source="shop")
+        for item in pets.daily_storefront_items(entry, slot, user_id=user_id)
     ]
     return {
         "weapons": weapons, "accessories": accessories,
-        "rotates_daily": False, "rotation_hours": C.STOREFRONT_ROTATION_HOURS,
+      "rotates_daily": True, "rotation_hours": C.STOREFRONT_ROTATION_HOURS,
     }
 
 
@@ -3828,8 +3826,7 @@ function forgePanel() {
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
 }
 
-// `skipAll` for the shop, where "everything" is not a shelf you can stand at -- the daily
-// weapon rotation and the permanent accessories are priced and stocked differently.
+// `skipAll` for the shop, where every equipment slot has its own personal rotation.
 function slotChips(active, key, skipAll) {
   const slots = [["all", "Всё"], ["weapon", "🗡 Оружие"], ["amulet", "📿 Амулеты"],
                  ["gloves", "🧤 Перчатки"], ["boots", "👢 Сапоги"], ["shield", "🛡 Щиты"]];
@@ -3888,7 +3885,7 @@ async function renderShop() {
   box.innerHTML =
     '<div class="chiprow">' + slotChips(shopSlot, "shopslot", true) + "</div>" +
     '<div class="panel"><h2>' +
-      (shopSlot === "weapon" ? "Витрина · меняется каждые 12 часов" : "Всегда в продаже") +
+      "Витрина · меняется каждые 12 часов" +
     "</h2>" +
     (items.length ? '<div class="items">' + items.map(shopCard).join("") + "</div>"
                   : '<div class="empty">Сегодня тут пусто.</div>') +

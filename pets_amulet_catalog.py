@@ -191,8 +191,8 @@ _DATA: Final = (
 # Зеркало души is a deliberate exception to "amulets are drop-only": it exists so a strong
 # pet can pick on a weak one without the arena punishing either side for it, and a thing
 # that fixes a matchmaking problem has to be reliably obtainable rather than waiting on an
-# 8% roll. source="shop" is all it takes to sit on the counter permanently -- only weapons
-# rotate (see pets_config.daily_storefront_weapons and pets_ui._buyable_here).
+# 8% roll. It remains a normal catalog item and can appear in the personal rotating shelf
+# like every other equipment item (see pets_config.daily_storefront_items and pets_ui._buyable_here).
 #
 # Priced at 250: above every other accessory on the shelf (10-170) because it is utility
 # rather than stats, but well inside a week of ordinary play -- an item whose whole job is

@@ -905,8 +905,7 @@ class EquipmentTradingTests(PetsTestCase):
         sold nothing but weapons. Purchasable stock must now win its own sort tier and
         land on page one regardless of how its code compares to the drop-only pool."""
         self._two_pets()
-        for slot in ("amulet", "gloves", "boots"):
-            self.assertTrue(pets_config.items_for_slot(slot, "shop"), slot)
+        for slot in ("amulet", "gloves", "boots", "shield"):
             text, keyboard = pets_ui.slot_view("chat", "1", 0, slot, 0)
             buy_callbacks = [
                 button["callback_data"]
@@ -927,7 +926,7 @@ class EquipmentTradingTests(PetsTestCase):
         """
         self._two_pets()
         data = pets._load("chat")
-        for slot in ("amulet", "gloves", "boots"):
+        for slot in ("amulet", "gloves", "boots", "shield"):
             drops = [item.code for item in pets_config.items_for_slot(slot, "drop")][:12]
             self.assertTrue(drops, slot)
             data["pets"]["1"]["inventory"].extend(drops)
@@ -940,15 +939,15 @@ class EquipmentTradingTests(PetsTestCase):
                 pets_ui.parse_callback(button["callback_data"])[1]
             for row in storefront["inline_keyboard"] for button in row
         }
-        for slot in ("amulet", "gloves", "boots"):
+        for slot in ("amulet", "gloves", "boots", "shield"):
             self.assertEqual(routes.get(slot), "shopslot", f"{slot} tab must open the shelf")
             text, keyboard = pets_ui.shop_slot_view("chat", "1", 0, slot)
             buys = [
                 button for row in keyboard["inline_keyboard"] for button in row
                 if pets_ui.parse_callback(button["callback_data"])[1] == "buy"
             ]
-            # Every purchasable item in the slot, with no paging to reach any of them.
-            self.assertEqual(len(buys), len(pets_config.items_for_slot(slot, "shop")))
+            # Every personal offer is visible, with no paging to reach any of them.
+            self.assertEqual(len(buys), pets_config.DAILY_STOREFRONT_SIZE)
             self.assertNotIn("только из боёв", text)
             # The full catalogue stays reachable, it is just not what the shop opens onto.
             self.assertIn("slot", [
@@ -956,18 +955,17 @@ class EquipmentTradingTests(PetsTestCase):
                 for row in keyboard["inline_keyboard"] for button in row
             ])
 
-    def test_an_accessory_shelf_says_so_once_everything_on_it_is_bought(self):
+    def test_buying_an_accessory_replaces_only_the_buyers_offer(self):
         self._two_pets()
-        for item in pets_config.items_for_slot("boots", "shop"):
-            economy.grant("chat", "1", item.price, "test")
-            self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
-
-        text, keyboard = pets_ui.shop_slot_view("chat", "1", 0, "boots")
-        self.assertIn("уже куплено", text)
-        self.assertFalse([
-            button for row in keyboard["inline_keyboard"] for button in row
-            if pets_ui.parse_callback(button["callback_data"])[1] == "buy"
-        ])
+        before = pets.daily_storefront_items("chat", "boots", user_id="1")
+        bought = before[0]
+        economy.grant("chat", "1", bought.price, "test")
+        self.assertTrue(pets.buy_item("chat", "1", 0, bought.code)[0])
+        after = pets.daily_storefront_items("chat", "boots", user_id="1")
+        other = pets.daily_storefront_items("chat", "boots", user_id="2")
+        self.assertEqual(len(after), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertNotIn(bought.code, {item.code for item in after})
+        self.assertEqual(len(other), pets_config.DAILY_STOREFRONT_SIZE)
 
     def test_buy_accessory_lands_in_inventory_for_every_non_weapon_slot(self):
         """pets.buy_item's own logic already worked for accessories before this fix --
@@ -975,8 +973,8 @@ class EquipmentTradingTests(PetsTestCase):
         end-to-end anyway, so a future change to buy_item's weapon-only branches (the
         daily-window and single-owner checks) cannot silently break accessories again."""
         self._two_pets()
-        for slot in ("amulet", "gloves", "boots"):
-            item = next(iter(pets_config.items_for_slot(slot, "shop")))
+        for slot in ("amulet", "gloves", "boots", "shield"):
+            item = pets.daily_storefront_items("chat", slot, user_id="1")[0]
             economy.grant("chat", "1", item.price, "test")
             ok, note = pets.buy_item("chat", "1", 0, item.code)
             self.assertTrue(ok, note)
@@ -1131,24 +1129,27 @@ class StorefrontAndCollectionTests(PetsTestCase):
 
     def test_daily_storefront_is_stable_sized_and_changes_each_twelve_hours(self):
         moment = datetime(2026, 8, 8, 3)
-        first = pets_config.daily_storefront_weapons("shop-chat", moment, user_id="1")
-        again = pets_config.daily_storefront_weapons(
-            "shop-chat", moment.replace(hour=11), user_id="1",
-        )
-        afternoon = pets_config.daily_storefront_weapons(
-            "shop-chat", moment.replace(hour=12), user_id="1",
-        )
-        other_player = pets_config.daily_storefront_weapons("shop-chat", moment, user_id="2")
-        self.assertEqual(first, again)
-        self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 6)
-        self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
-        self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
-        self.assertNotEqual([item.code for item in first], [item.code for item in afternoon])
-        self.assertNotEqual([item.code for item in first], [item.code for item in other_player])
-        self.assertTrue(all(item.source == "shop" and item.slot == "weapon" for item in first))
-        self.assertTrue(all(item.rarity != "cursed" for item in first))
-        self.assertEqual(sum(item.rarity == "common" for item in first), 5)
-        self.assertEqual(sum(item.rarity == "rare" for item in first), 1)
+        for slot in pets_config.SLOT_KEYS:
+            with self.subTest(slot=slot):
+                first = pets_config.daily_storefront_items("shop-chat", slot, moment, user_id="1")
+                again = pets_config.daily_storefront_items(
+                    "shop-chat", slot, moment.replace(hour=11), user_id="1",
+                )
+                afternoon = pets_config.daily_storefront_items(
+                    "shop-chat", slot, moment.replace(hour=12), user_id="1",
+                )
+                other_player = pets_config.daily_storefront_items(
+                    "shop-chat", slot, moment, user_id="2",
+                )
+                self.assertEqual(first, again)
+                self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 6)
+                self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
+                self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
+                self.assertNotEqual([item.code for item in first], [item.code for item in afternoon])
+                self.assertNotEqual([item.code for item in first], [item.code for item in other_player])
+                self.assertTrue(all(item.source == "shop" and item.slot == slot for item in first))
+                self.assertEqual(sum(item.rarity == "common" for item in first), 5)
+                self.assertEqual(sum(item.rarity == "rare" for item in first), 1)
 
     def test_every_daily_storefront_has_a_weapon_at_the_ordinary_price_floor(self):
         # The rotation advances in twelve-hour windows; a full year guards against a
@@ -1405,8 +1406,8 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_amulet_shop_lists_each_stat_and_effect_before_buying(self):
         self._two_pets("amulet-shelf")
         text, _ = pets_ui.shop_slot_view("amulet-shelf", "1", 0, "amulet")
-        stock = pets_config.items_for_slot("amulet", "shop")
-        self.assertGreaterEqual(len(stock), 8)
+        stock = pets.daily_storefront_items("amulet-shelf", "amulet", user_id="1")
+        self.assertEqual(len(stock), pets_config.DAILY_STOREFRONT_SIZE)
         for item in stock:
             with self.subTest(item=item.code):
                 if item.effect:
