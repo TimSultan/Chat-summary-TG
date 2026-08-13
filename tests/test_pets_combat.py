@@ -579,5 +579,91 @@ class AmuletEffectTests(unittest.TestCase):
             )
 
 
+class EffectKnobTests(unittest.TestCase):
+    """Every number a passive prints has to change the fight it is printed on.
+
+    This is one test rather than a dozen because it guards a *class* of bug, and that
+    class shipped repeatedly: `spring` hardcoded a double, `cocoon` reflected exactly the
+    blow it ate, `chill` and `phantom_step` were one-shot flags, and `first_strike` only
+    moved an initiative roll that alternates back the next round anyway. In every case
+    the catalogue said one thing, the engine did another, and nothing failed -- the rare
+    and the legendary version of the same item measured identically. A passive whose knob
+    does nothing is worse than a missing passive, because the player pays for it.
+    """
+
+    OPPONENT = Fighter(
+        key="b", name="B", strength=20, health=20, agility=20, luck=20, armor=5, level=10,
+    )
+    # (code, weak, strong) -- roughly the ends the catalogue ships between, widened where
+    # the two shipped tiers are close enough that the gap between them is real but small.
+    KNOBS = (
+        ("spring", {"value": 100}, {"value": 200}),
+        ("cocoon", {"value": 100}, {"value": 250}),
+        ("chill", {"value": 100, "hits": 1}, {"value": 100, "hits": 2}),
+        ("phantom_step", {"value": 1, "hits": 1}, {"value": 1, "hits": 2}),
+        ("first_strike", {"value": 25}, {"value": 100}),
+        ("armor_shred", {"value": 4, "cap": 16}, {"value": 10, "cap": 36}),
+        ("shield_breaker", {"value": 70, "power": 10}, {"value": 100, "power": 150}),
+        ("piercing", {"value": 6}, {"value": 24}),
+        ("acid", {"value": 25}, {"value": 80}),
+        ("precision", {"value": 45}, {"value": 90}),
+        ("gambler", {"value": 60, "downside": 10, "chance": 10},
+                    {"value": 60, "downside": 10, "chance": 90}),
+        ("candle", {"value": 90, "downside": 20, "chance": 10},
+                   {"value": 90, "downside": 20, "chance": 90}),
+    )
+
+    def _score(self, effect):
+        hero = Fighter(
+            key="a", name="A", strength=20, health=20, agility=20, luck=20, armor=5,
+            level=10, effects=(effect,),
+        )
+        wins = 0.0
+        for seed in range(600):
+            result = combat.simulate(hero, self.OPPONENT, seed=seed)
+            wins += 1.0 if result.winner == "a" else (.5 if result.is_draw else 0.0)
+        return wins / 600 * 100
+
+    def test_every_tunable_passive_is_stronger_at_its_higher_setting(self):
+        for code, weak, strong in self.KNOBS:
+            with self.subTest(effect=code):
+                low = self._score({"code": code, **weak})
+                high = self._score({"code": code, **strong})
+                # Three points on 600 seeded fights is well clear of noise and far below
+                # any of the real gaps; the assertion is "the knob is connected", not a
+                # pin on today's tuning.
+                self.assertGreater(
+                    high, low + 3,
+                    f"{code}: {weak} scored {low:.1f}%, {strong} scored {high:.1f}% -- "
+                    "the catalogue value is not reaching the fight",
+                )
+
+    def test_the_default_settings_still_reproduce_the_old_one_shot_behaviour(self):
+        """The three knobs added here default to the value the engine used to hardcode,
+        so an item that never declares them fights exactly as it did before."""
+        for code, params in (
+            ("spring", {"value": 100}),
+            ("cocoon", {"value": 100}),
+            ("chill", {"value": 60}),
+            ("phantom_step", {"value": 1}),
+        ):
+            with self.subTest(effect=code):
+                bare = {"code": code, **params}
+                explicit = {"code": code, **params, "hits": 1}
+                hero_a = Fighter(
+                    key="a", name="A", strength=20, health=20, agility=20, luck=20,
+                    armor=5, level=10, effects=(bare,),
+                )
+                hero_b = Fighter(
+                    key="a", name="A", strength=20, health=20, agility=20, luck=20,
+                    armor=5, level=10, effects=(explicit,),
+                )
+                for seed in (11, 404, 9001):
+                    self.assertEqual(
+                        combat.simulate(hero_a, self.OPPONENT, seed=seed).rounds,
+                        combat.simulate(hero_b, self.OPPONENT, seed=seed).rounds,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

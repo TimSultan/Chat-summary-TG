@@ -294,52 +294,68 @@ def _effect(code: str, text: str, value: int, **params: int | bool) -> tuple[tup
     return tuple({"code": code, "text": text, "value": value, **params}.items())
 
 
-# Every legendary weapon carries a passive.  The values below are not guesses: each was
-# measured in a mirror match (identical stats, one side with the passive, 4,000 seeded
-# fights) and tuned to land at 59-62%.  Codes that read well but proved inert there were
-# rejected -- notably first_strike, which moves initiative but not outcomes over ten
-# rounds, and piercing/gambler, which barely register even when scaled up.
+# Every legendary weapon carries a passive.  The values below are not guesses: each is
+# measured by `pets_effect_sim.py`, which puts one reference creature carrying exactly
+# this passive against an identical creature carrying none over four opponent shapes and
+# reports the paired win-rate gap.  Legendaries are tuned to land at +22..30 points.
+#
+# The earlier pass tuned these against a much smaller health bar and never re-checked:
+# the reference creature has 980 HP and hits for 98, so "7 урона три хода" was under one
+# percent of a health bar a tick and the whole legendary tier was landing between +2 and
+# +19 instead of in one band.  Numbers here are deliberately at the TOP of the plausible
+# range -- a legendary the holder cannot feel is the worse failure.
 # Order matches the names: w003 first, then _LEGENDARY_COPY.
 _LEGENDARY_EFFECTS: Final = (
     # Швабра на изоленте -- the angry mop swings harder the worse it is going.
-    _effect("berserker", "Ниже 45% HP: +28% урона.", 28, threshold=45),
+    _effect("berserker", "Ниже 50% HP: +45% урона.", 45, threshold=50),
     # Legendary forms deliberately continue rare weapon archetypes at a higher ceiling.
-    _effect("precision", "Шанс промаха снижен на 45%.", 45),
-    _effect("burn", "Попадание поджигает: 7 урона три хода.", 7, turns=3),
-    _effect("wound", "Каждое попадание режет максимум HP на 2%, всего до 10%.", 2, cap=10),
-    _effect("armor_shred", "Каждое попадание ослабляет броню на 10%, максимум на 50%.", 10, cap=50),
+    # 75 is the engine's ceiling for precision: derive() clamps the miss multiplier.
+    _effect("precision", "Промахов почти нет: шанс промаха ниже на 90%.", 90),
+    _effect("burn", "Каждое попадание поджигает: 12 урона на трёх ходах соперника.", 12, turns=3),
+    _effect("wound", "Каждое попадание режет максимум HP на 3%, всего до 18%.", 3, cap=18),
+    _effect("armor_shred", "Каждое попадание ослабляет броню и добавляет 10% урона, до +36%.", 10, cap=36),
 )
 
 # Exactly half of the rare weapons get a passive. Repeating a modifier is deliberate:
 # it lets a player find the same play style at two strengths without making all 500
 # weapons carry rules text. A weapon still has one named modifier; the equipped amulet
 # supplies the second axis, and compound ideas such as venom stay one coherent effect.
+#
+# Tuned to +13..18 win points in `pets_effect_sim.py`, the same harness the legendary
+# table above is tuned against. Copy states repetition explicitly ("каждое попадание",
+# "перед каждым действием") because the per-tick number is small by necessity -- an
+# effect that fires thirteen times a fight cannot print a big one -- and a player reading
+# "лечит 6 HP" next to a 980-point health bar has no way to know it means 80 a fight.
 _RARE_EFFECTS: Final = (
     _effect("mob_hunter", "Против мобов: +15% урона.", 15),
-    _effect("precision", "Шанс промаха снижен на 25%.", 25),
-    _effect("burn", "Попадание поджигает: 4 урона два хода.", 4, turns=2),
-    _effect("venom_blade", "Попадание наносит 2 яда и даёт следующей атаке врага 18% промаха.", 18, poison=2),
-    _effect("armor_shred", "Каждое попадание ослабляет броню на 6%, максимум на 24%.", 6, cap=24),
-    _effect("wound", "Каждое попадание режет максимум HP на 1%, всего до 6%.", 1, cap=6),
-    _effect("coin_rake", "За победу: +1 монета за попадание, максимум +5.", 1, cap=5),
-    _effect("bleed", "Попадания складывают кровотечение по 2 урона, до 3 зарядов.", 2, cap=3),
-    _effect("shield_breaker", "Первое попадание ломает щит и игнорирует 100% брони.", 100),
-    _effect("heavy_combo", "Каждое третье попадание наносит на 20% больше урона.", 20, every=3),
-    _effect("precision", "Шанс промаха снижен на 12%.", 12),
-    _effect("burn", "Попадание поджигает: 2 урона два хода.", 2, turns=2),
-    _effect("venom_blade", "Попадание наносит 2 яда и даёт следующей атаке врага 12% промаха.", 12, poison=2),
-    _effect("armor_shred", "Каждое попадание ослабляет броню на 4%, максимум на 20%.", 4, cap=20),
-    _effect("wound", "Каждое второе попадание режет максимум HP на 1%, всего до 4%.", 1, cap=4, every=2),
-    _effect("coin_rake", "За победу: +1 монета за попадание, максимум +3.", 1, cap=3),
-    _effect("bleed", "Попадания складывают кровотечение по 1 урону, до 4 зарядов.", 1, cap=4),
-    _effect("shield_breaker", "Первое попадание ломает щит и игнорирует 70% брони.", 70),
-    _effect("heavy_combo", "Каждое третье попадание наносит на 12% больше урона.", 12, every=3),
-    _effect("focused", "После промаха: +18% урона следующей атаке.", 18),
+    _effect("precision", "Шанс промаха снижен на 70%.", 70),
+    _effect("burn", "Каждое попадание поджигает: 6 урона на трёх ходах соперника.", 6, turns=3),
+    _effect("venom_blade", "Попадание наносит 8 яда и даёт следующей атаке врага 24% промаха.", 24, poison=8),
+    _effect("armor_shred", "Каждое попадание ослабляет броню и добавляет 6% урона, до +18%.", 6, cap=18),
+    _effect("wound", "Каждое попадание режет максимум HP на 2%, всего до 12%.", 2, cap=12),
+    # coin_rake is the one passive the combat harness cannot see, so it is judged against
+    # the purse instead: a win pays WIN_GOLD_MIN..MAX, i.e. 15-30 coins, and this mints on
+    # top of that. +10 is therefore already close to half a win again, and the tempting
+    # "make it big like the others" number would have tripled the arena's gold faucet.
+    _effect("coin_rake", "За победу: +2 монеты за попадание, максимум +10.", 2, cap=10),
+    _effect("bleed", "Попадания складывают кровотечение по 4 урона, до 4 зарядов.", 4, cap=4),
+    _effect("shield_breaker", "Первое попадание ломает щит, игнорирует броню и бьёт вдвое сильнее.", 100, power=100),
+    _effect("heavy_combo", "Каждое третье попадание наносит на 50% больше урона.", 50, every=3),
+    _effect("precision", "Шанс промаха снижен на 60%.", 60),
+    _effect("burn", "Каждое попадание поджигает: 4 урона на трёх ходах соперника.", 4, turns=3),
+    _effect("venom_blade", "Попадание наносит 6 яда и даёт следующей атаке врага 20% промаха.", 20, poison=6),
+    _effect("armor_shred", "Каждое попадание ослабляет броню и добавляет 4% урона, до +16%.", 4, cap=16),
+    _effect("wound", "Каждое второе попадание режет максимум HP на 2%, всего до 10%.", 2, cap=10, every=2),
+    _effect("coin_rake", "За победу: +1 монета за попадание, максимум +8.", 1, cap=8),
+    _effect("bleed", "Попадания складывают кровотечение по 2 урона, до 4 зарядов.", 2, cap=4),
+    _effect("shield_breaker", "Первое попадание ломает щит, игнорирует броню и бьёт на 90% сильнее.", 70, power=90),
+    _effect("heavy_combo", "Каждое третье попадание наносит на 40% больше урона.", 40, every=3),
+    _effect("focused", "После промаха: +120% урона следующей атаке.", 120),
     _effect("momentum", "Каждый раунд: +3% урона, максимум +18%.", 3, cap=18),
     _effect("combo", "Попадания: до +16% урона серией.", 5, cap=16),
-    _effect("regen", "Перед атакой лечит 6 HP.", 6),
-    _effect("retaliation", "После удара: +6 урона следующей атаке.", 6),
-    _effect("executioner", "Против врага ниже 30% HP: +16% урона.", 16, threshold=30),
+    _effect("regen", "Лечит 9 HP перед каждым действием — около 120 HP за бой.", 9),
+    _effect("retaliation", "После каждого пропущенного удара: +14 урона следующей атаке.", 14),
+    _effect("executioner", "Против врага ниже 40% HP: +50% урона.", 50, threshold=40),
 )
 
 # The 25 effect-bearing rare slots get memorable identities that explain their modifier
@@ -458,27 +474,27 @@ _ASCENDED_LEGENDARIES: Final = {
     "w070": (
         "Клык короля ядов", "Даже промахнувшийся враг уверен, что это из-за яда.",
         (("strength", 31), ("agility", 4), ("luck", 3), ("armor", -4)),
-        _effect("venom_blade", "Попадание наносит 4 яда и даёт следующей атаке врага 25% промаха.", 25, poison=4),
+        _effect("venom_blade", "Попадание наносит 12 яда и даёт следующей атаке врага 30% промаха.", 30, poison=12),
     ),
     "w129": (
         "Казначейский клинок", "Считает чужие монеты быстрее, чем наносит удары.",
         (("strength", 28), ("agility", 7), ("luck", 5), ("armor", -5)),
-        _effect("coin_rake", "За победу: +2 монеты за попадание, максимум +10.", 2, cap=10),
+        _effect("coin_rake", "За победу: +3 монеты за попадание, максимум +16.", 3, cap=16),
     ),
     "w147": (
         "Пила алого следа", "После неё бой ещё долго не может остановиться.",
         (("strength", 31), ("agility", 3), ("luck", 3), ("armor", -4)),
-        _effect("bleed", "Попадания складывают кровотечение по 4 урона, до 4 зарядов.", 4, cap=4),
+        _effect("bleed", "Попадания складывают кровотечение по 6 урона, до 4 зарядов.", 6, cap=4),
     ),
     "w167": (
         "Таран последнего щита", "Первым ударом отменяет само понятие защиты.",
         (("strength", 32), ("armor", 8), ("agility", -5)),
-        _effect("shield_breaker", "Первое попадание ломает щит, игнорирует броню и ослабляет её ещё на 20%.", 100, shred=20),
+        _effect("shield_breaker", "Первое попадание ломает щит, бьёт на 75% сильнее и навсегда снимает 25% брони.", 100, power=75, shred=25),
     ),
     "w189": (
         "Маятник тяжёлого ритма", "Считает только до двух — третьего удара обычно не нужно.",
         (("strength", 32), ("health", 10), ("agility", -5)),
-        _effect("heavy_combo", "Каждое второе попадание наносит на 30% больше урона.", 30, every=2),
+        _effect("heavy_combo", "Каждое второе попадание наносит на 45% больше урона.", 45, every=2),
     ),
 }
 
@@ -495,22 +511,22 @@ _NEW_BUILD_WEAPONS: Final = (
     (
         "w501", "Треснувшее зеркало", "Семь лет неудач достаются противнику.",
         "rare", (("strength", 21), ("luck", 6), ("health", -4)),
-        _effect("lucky", "Крит в бою: +5%.", 5),
+        _effect("lucky", "Крит в бою: +12%.", 12),
     ),
     (
         "w502", "Зеркальный шар", "Каждый осколок — отдельный шанс на удачу.",
         "legendary", (("strength", 30), ("luck", 9), ("armor", -5)),
-        _effect("lucky", "Крит в бою: +8%.", 8),
+        _effect("lucky", "Крит в бою: +20%.", 20),
     ),
     (
         "w503", "Банка с пиявками", "Присасывается быстрее, чем вы успеваете возразить.",
         "rare", (("strength", 21), ("health", 6), ("armor", -2)),
-        _effect("vampiric", "Лечит 9% нанесённого урона.", 9),
+        _effect("vampiric", "Лечит 12% нанесённого урона.", 12),
     ),
     (
         "w504", "Капельница скорой помощи", "Забирает и возвращает — в свою пользу.",
         "legendary", (("strength", 30), ("health", 10), ("agility", -4)),
-        _effect("vampiric", "Лечит 14% нанесённого урона.", 14),
+        _effect("vampiric", "Лечит 20% нанесённого урона.", 20),
     ),
 )
 

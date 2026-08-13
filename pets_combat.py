@@ -428,8 +428,12 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     if (value := _effect_value(effects, "plating")) is not None:
         reduction = min(.70, max(0.0, reduction + _fraction(value)))
     if (value := _effect_value(effects, "precision")) is not None:
-        # Existing accuracy is a *miss multiplier*, hence lower is better.
-        accuracy = max(.25, accuracy * (1 - max(-.50, _fraction(value))))
+        # Existing accuracy is a *miss multiplier*, hence lower is better. The floor used
+        # to be .25, which quietly capped the whole code at "misses cut to a quarter" --
+        # a legendary written as 75% could not be worth more than a rare written as 60%,
+        # and neither reached the band its tier is tuned to. .10 leaves the promise of a
+        # near-perfect weapon reachable while still never removing dodging entirely.
+        accuracy = max(.10, accuracy * (1 - max(-.50, _fraction(value))))
 
     return {
         "max_hp": max_hp,
@@ -520,7 +524,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     stunned = {a.key: False, b.key: False}
     cocooned = {a.key: False, b.key: False}
     armor_burst_ready = {a.key: False, b.key: False}
-    chilled = {a.key: False, b.key: False}
+    # Counters rather than flags: chill and phantom_step both fired exactly once whatever
+    # the catalogue said, which capped two legendaries at about half the tier they are
+    # priced at. A `hits` of 1 reproduces the old behaviour exactly.
+    chilled = {a.key: 0, b.key: 0}
+    phantom_dodges = {a.key: 0, b.key: 0}
     acid_ready = {a.key: False, b.key: False}
     spring_hits_taken = {a.key: 0, b.key: 0}
     spring_ready = {a.key: False, b.key: False}
@@ -874,15 +882,22 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 effect_round(0, owner_key, other_key, "opening_shield", amount)
             if _effect_value(effects[owner_key], "battle_cry") is not None:
                 effect_round(0, owner_key, other_key, "battle_cry")
-            if (value := _effect_value(effects[owner_key], "gambler")) is not None:
-                downside = _param(effects[owner_key], "gambler", "downside", abs(value) / 2)
-                gambler_bonus[owner_key] = _fraction(value if rng.random() < .5 else -downside)
-                effect_round(0, owner_key, other_key, "gambler", round(gambler_bonus[owner_key] * 100))
-            if (value := _effect_value(effects[owner_key], "candle")) is not None:
-                downside = _param(effects[owner_key], "candle", "downside", abs(value) / 2)
-                candle = _fraction(value if rng.random() < .5 else -downside)
-                gambler_bonus[owner_key] += candle
-                effect_round(0, owner_key, other_key, "candle", round(candle * 100))
+            # Both gambles take an explicit `chance` of landing the good half. It used to
+            # be a hardcoded coin flip, which made these two items worth nothing however
+            # big the numbers grew: win rate responds to a damage multiplier steeply but
+            # saturates, so an even bet between "+60% and nearly certain to win" and
+            # "-30% and nearly certain to lose" averages back to the coin flip it started
+            # as. Measured: gambler at 60/-30 scored BELOW carrying no amulet at all.
+            # A gamble is only worth wearing when the downside stays small or the odds
+            # are tilted, so the catalogue now says which of the two it is buying.
+            for code in ("gambler", "candle"):
+                if (value := _effect_value(effects[owner_key], code)) is None:
+                    continue
+                downside = _param(effects[owner_key], code, "downside", abs(value) / 2)
+                chance = max(0.0, min(1.0, _param(effects[owner_key], code, "chance", 50) / 100))
+                roll = _fraction(value if rng.random() < chance else -downside)
+                gambler_bonus[owner_key] += roll
+                effect_round(0, owner_key, other_key, code, round(roll * 100))
     signatures = {}
     for key in (a.key, b.key):
         signature = derived[key]["signature"]
@@ -1048,10 +1063,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 forced_skill_miss = True
             elif skill_value(attacker_key, "blind") > 0:
                 forced_skill_miss = rng.random() < min(.80, skill_value(attacker_key, "blind"))
-        phantom_dodge = effectful and "phantom_step" not in used[defender_key] \
-            and _effect_value(effects[defender_key], "phantom_step") is not None
+        phantom_dodge = effectful \
+            and _effect_value(effects[defender_key], "phantom_step") is not None \
+            and phantom_dodges[defender_key] < max(1, round(_param(
+                effects[defender_key], "phantom_step", "hits", 1,
+            )))
         if phantom_dodge:
-            used[defender_key].add("phantom_step")
+            phantom_dodges[defender_key] += 1
             effect_round(round_number, defender_key, attacker_key, "phantom_step")
         event, damage = (
             ("dodge", 0) if forced_venom_miss or forced_skill_miss or phantom_dodge
@@ -1084,6 +1102,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 effect_round(round_number, attacker_key, defender_key, "afterimage")
             if _effect_value(effects[attacker_key], "battle_cry") is not None and attack_no == 0:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "battle_cry") or 0))
+            # Initiative on its own is worth nothing measurable -- leadership alternates
+            # every round anyway, so all three first_strike items scored dead level with
+            # carrying no passive at all. The head start now buys something: the opening
+            # burst, over `hits` attacks, which is what "перехватывает инициативу" means
+            # to anybody reading it. The initiative roll above is unchanged.
+            if (value := _effect_value(effects[attacker_key], "first_strike")) is not None \
+                    and attack_no < max(1, round(_param(effects[attacker_key], "first_strike", "hits", 3))):
+                multiplier += max(0, _fraction(value))
             if _effect_value(effects[attacker_key], "late_strike") is not None \
                     and attack_no == 0 and attacker_key == order[round_number % 2]:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "late_strike") or 0))
@@ -1111,16 +1137,38 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             if _effect_value(effects[attacker_key], "mob_hunter") is not None \
                     and str(defender_key).startswith("mob:"):
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "mob_hunter") or 0))
-            if _effect_value(effects[attacker_key], "piercing") is not None:
-                # Restore a configurable part of armor's otherwise already-applied cut.
-                multiplier += derived[defender_key]["reduction"] * max(0, _fraction(_effect_value(effects[attacker_key], "piercing") or 0))
+            # Armour is a much smaller number than the copy on these three items implies:
+            # `reduction` is 3% at armour 5 and about 11% on a dedicated tank, so taking
+            # away even ALL of it was worth under three win points in the mirror-match
+            # harness (pets_effect_sim.py). They were percentages of a percentage. Each
+            # now also lands as ordinary damage in its own right, which is what "броня
+            # больше не держит" is supposed to feel like and what makes the number printed
+            # on the item mean something to the player reading it.
+            if armor_shredded[defender_key]:
+                multiplier += armor_shredded[defender_key]
+            if shield_breaker_attack:
+                multiplier += max(0, _fraction(_param(
+                    effects[attacker_key], "shield_breaker", "power",
+                    _effect_value(effects[attacker_key], "shield_breaker") or 0,
+                )))
+            if (value := _effect_value(effects[attacker_key], "piercing")) is not None:
+                # Restore a configurable part of armor's otherwise already-applied cut,
+                # then charge the same share again as raw damage.
+                pierce = max(0, _fraction(value))
+                multiplier += derived[defender_key]["reduction"] * pierce + pierce
             if acid_attack:
-                multiplier += derived[defender_key]["reduction"] * max(0, _fraction(
-                    _effect_value(effects[attacker_key], "acid") or 0
-                ))
+                # Same armour arithmetic as piercing above, so the same second clause:
+                # the splash is what makes the undodgeable hit worth waiting for.
+                splash = max(0, _fraction(_effect_value(effects[attacker_key], "acid") or 0))
+                multiplier += derived[defender_key]["reduction"] * splash + splash
             if spring_ready[attacker_key]:
                 spring_ready[attacker_key] = False
-                multiplier *= 2
+                # The value used to be ignored -- a hardcoded double meant the rare and
+                # the legendary spring were the same item with different copy, and all
+                # three measured identically. 100 keeps the original doubling exactly.
+                multiplier *= 1 + max(0, _fraction(
+                    _effect_value(effects[attacker_key], "spring") or 100
+                ))
                 effect_round(round_number, attacker_key, defender_key, "spring")
             multiplier += gambler_bonus[attacker_key]
             flat_retaliation = retaliation_bonus[attacker_key]
@@ -1144,7 +1192,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 retaliation_bonus[defender_key] += max(1, round(damage * max(0, _fraction(value))))
                 effect_round(round_number, defender_key, attacker_key, "countercrit")
             if chilled[attacker_key]:
-                chilled[attacker_key] = False
+                chilled[attacker_key] -= 1
                 multiplier *= max(.10, 1 - max(0, _fraction(_effect_value(
                     effects[defender_key], "chill"
                 ) or 0)))
@@ -1312,7 +1360,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             if (value := _effect_value(effects[attacker_key], "chill")) is not None \
                     and "chill" not in used[attacker_key] and not knocked_out:
                 used[attacker_key].add("chill")
-                chilled[defender_key] = True
+                chilled[defender_key] = max(1, round(_param(
+                    effects[attacker_key], "chill", "hits", 1,
+                )))
                 effect_round(round_number, attacker_key, defender_key, "chill")
             if (value := _effect_value(effects[attacker_key], "tesla")) is not None \
                     and landed_hits[attacker_key] >= 3 and "tesla" not in used[attacker_key] and not knocked_out:
@@ -1350,7 +1400,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                         spring_ready[defender_key] = True
                 if cocooned[defender_key]:
                     cocooned[defender_key] = False
-                    recoil_impact, recoil_ko = hurt(defender_key, attacker_key, impact, round_number)
+                    # The value was ignored here too: the cocoon always returned exactly
+                    # the blow it ate, so raising the number on the item changed nothing.
+                    # 100 reproduces the old behaviour, and the item pays for the turn it
+                    # skipped only if it can send back more than it took.
+                    recoil = max(1, round(impact * max(0, _fraction(
+                        _effect_value(effects[defender_key], "cocoon") or 100
+                    ))))
+                    recoil_impact, recoil_ko = hurt(defender_key, attacker_key, recoil, round_number)
                     total_damage[defender_key] += recoil_impact
                     effect_round(round_number, defender_key, attacker_key, "cocoon", recoil_impact)
                     if recoil_ko:

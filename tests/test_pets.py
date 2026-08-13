@@ -1727,8 +1727,12 @@ class RecordFightTests(PetsTestCase):
         with patch("random.randint", return_value=10), patch("random.random", return_value=1.0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        self.assertEqual(outcome["gold"], 20)
-        self.assertEqual(economy.balance(entry, "1", 0), 20)
+        # Eight ordinary landed hits; the burn row and the dodge must not be counted.
+        # Read the cap off the catalogue rather than pinning a total, so a balance pass
+        # cannot make this test fail for the one reason it is not testing.
+        expected = 10 + min(int(rake.effect["cap"]), 8 * int(rake.effect["value"]))
+        self.assertEqual(outcome["gold"], expected)
+        self.assertEqual(economy.balance(entry, "1", 0), expected)
 
     def test_survivor_amulet_preserves_thirty_percent_of_the_attackers_loss_penalty(self):
         """Survivor only ever discounts a penalty, and only the ATTACKER pays one now (a

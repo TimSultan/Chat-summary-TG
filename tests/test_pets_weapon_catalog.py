@@ -168,7 +168,9 @@ def test_weapon_passives_reach_the_item_record_combat_reads():
     mop = pets_config.find_item("w003")
     assert mop.rarity == "legendary"
     assert mop.effect["code"] == "berserker"
-    assert mop.effect["threshold"] == 45
+    # The point is that the optional per-effect params survive the trip into the item
+    # record combat reads, not what the balance pass currently tunes them to.
+    assert mop.effect["threshold"] == dict(catalogue._LEGENDARY_EFFECTS[0])["threshold"]
 
 
 def test_rare_modifiers_are_varied_and_repeated_at_distinct_strengths():
