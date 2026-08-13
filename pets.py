@@ -40,6 +40,7 @@ import pets_combat
 import pets_config as C
 import pets_mobs as M
 import pets_scroll_catalog as SCROLLS
+import pets_sprite as SPRITE
 import stats
 from app_time import now as app_now
 
@@ -3293,6 +3294,41 @@ def _pve_window_end(moment: datetime) -> datetime:
     block_start_hour = (moment.hour // C.PVE_WINDOW_HOURS) * C.PVE_WINDOW_HOURS
     start = moment.replace(hour=block_start_hour, minute=0, second=0, microsecond=0)
     return start + timedelta(hours=C.PVE_WINDOW_HOURS)
+
+
+# ------------------------------------------------------------------------------- sprites
+# Which kind of thing the creature's photograph actually shows -- a dog, a robot, a ghost.
+# The battle screen animates the photo, and the idle it plays has to match the subject or
+# the whole effect reads as a picture wobbling rather than a creature standing there.
+#
+# Derived once per PHOTOGRAPH, never per fight: it costs a vision call, and the answer
+# cannot change while the picture does not. The row records which photo it came from, so
+# a new picture reads as a cache miss rather than as a stale answer about the old one
+# (see pets_sprite.cached_archetype). Storage here, the decision itself in pets_sprite.
+
+
+def sprite_archetype(entry, user_id) -> str | None:
+    """The remembered archetype for this creature's CURRENT photo, or None if unknown."""
+    return SPRITE.cached_archetype(_tamed_record(_load(entry), str(user_id)))
+
+
+def remember_sprite(entry, user_id, archetype_code: str) -> str:
+    """Store an archetype against the picture it was derived from.
+
+    Re-reads the record inside the lock rather than trusting the caller's snapshot: the
+    classification happens off the event loop and takes seconds, and the player may well
+    have changed their picture in the meantime. Writing the new code against a photo it
+    was not derived from would cache a wrong answer that nothing would ever invalidate.
+    """
+    data = _load(entry)
+    record = _tamed_record(data, str(user_id))
+    if record is None:
+        return SPRITE.DEFAULT_ARCHETYPE
+    record[SPRITE.SPRITE_KEY] = SPRITE.sprite_row(
+        archetype_code, record.get("photo_file_id"), app_now().isoformat(),
+    )
+    _save(entry, data)
+    return str(record[SPRITE.SPRITE_KEY]["archetype"])
 
 
 # ------------------------------------------------------------------------------ debuffs

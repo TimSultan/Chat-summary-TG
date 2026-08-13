@@ -58,6 +58,14 @@ def _fighter(key: str, snapshot: dict, loadout, shield_code: str) -> dict:
         "key": key,
         "name": str(snapshot.get("name") or ("Герой" if key == "player" else "Соперник")),
         "portrait": snapshot.get("portrait"), "crop": snapshot.get("crop"),
+        # Which sort of thing the photograph shows, so the browser can pick an idle
+        # animation that matches it. Carried on the fighter rather than looked up by
+        # the client, for the same reason the portrait is: this module is handed a
+        # read-only snapshot and must not start reading the pet store.
+        "kind": str(snapshot.get("kind") or "creature"),
+        # Who the picture belongs to, purely so the browser can ask the server what the
+        # photograph shows. Never used by the simulation itself.
+        "owner_id": (str(snapshot["owner_id"]) if snapshot.get("owner_id") else None),
         "stats": {
             "strength": strength, "health": health, "agility": agility,
             "luck": luck, "armor": armor,

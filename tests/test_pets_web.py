@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -32,6 +33,7 @@ import economy
 import pets
 import pets_config as C
 import pets_scroll_catalog as SCROLLS
+import pets_sprite
 import quests
 import pets_web
 import vote_web
@@ -107,7 +109,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         for patcher in self._patchers:
             patcher.start()
 
-        cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
+        # The sprite route needs a key to be present at all before it will spend a
+        # vision call; `pets_sprite.classify` itself is patched in the tests that
+        # exercise it, so nothing here ever reaches the network.
+        cfg = SimpleNamespace(
+            telegram_bot_token=BOT_TOKEN,
+            openai_api_key="test-key", openai_model="test-model",
+        )
 
         # vote_web's admin gate. pets_web gets its own below -- the same callable in
         # production (_is_vote_admin), but named separately here so a test can prove the
@@ -639,11 +647,18 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_turn_based_page_warns_that_it_is_a_test_and_wires_all_moves(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn('data-testbattle="open"', page)
-        self.assertIn('data-testaction="attack"', page)
-        self.assertIn('data-testaction="defend"', page)
         self.assertIn('data-testmode="multiplayer"', page)
         self.assertIn("testSkill4", page)
         self.assertIn("Результаты, награды и счётчики не записываются", page)
+        # The buttons are built through one `cell()` helper now that they have to fit two
+        # rows on a phone, so the rendered `data-testaction="attack"` no longer appears
+        # literally in the source. What still has to be true is that every move the engine
+        # accepts has a call site, and that the click dispatcher listens for them.
+        self.assertIn("[data-testaction]", page)
+        for action in ('cell("attack"', 'cell("defend"', 'cell("auto"',
+                       'data-testaction="skill_'):
+            with self.subTest(action=action):
+                self.assertIn(action, page)
 
     # ---- portrait: the image route ---------------------------------------------------
 
@@ -1545,6 +1560,112 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status, 404, await missing.text())
         blank = await self._get("/api/loadout", PLAYER)
         self.assertEqual(blank.status, 400, await blank.text())
+
+    # ---- sprite archetypes ----------------------------------------------------------------
+    async def test_every_archetype_has_an_idle_animation_on_the_page(self):
+        """The archetype list is a contract across three languages, and nothing else joins
+        them up: `pets_sprite` decides the code, the page's JS accepts it, and the CSS is
+        what actually animates it. Add a thirteenth kind in Python alone and that creature
+        stands frozen for the whole fight -- no error anywhere, just a photo that never
+        moves. This is the only thing that would catch it."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        for code in pets_sprite.ARCHETYPES:
+            with self.subTest(archetype=code):
+                self.assertIn(f'"{code}"', page)                    # in the JS whitelist
+                self.assertIn(f'@keyframes sprite-idle-{code}', page)
+                self.assertIn(f'.sprite[data-kind="{code}"]', page)
+        # And the other direction: a keyframe set the vocabulary no longer contains is
+        # dead weight that will confuse the next person to read it.
+        drawn = set(re.findall(r"@keyframes sprite-idle-([a-z]+)", page))
+        self.assertEqual(drawn, set(pets_sprite.ARCHETYPES))
+
+    async def test_the_battle_stage_keeps_its_controls_to_two_rows(self):
+        """Eight cells in a four-column grid is what makes the fight fit a phone: the
+        stage, then attack, defend, four scrolls, auto and exit. A ninth action would
+        silently wrap onto a third row and push the log off the screen."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("grid-template-columns: repeat(4, 1fr)", page)
+        self.assertIn('class="test-stage"', page)
+        # The sprite element carries everything the animation needs: which idle to run,
+        # which way its attacks travel, and who to re-ask about once classified.
+        for attribute in ('data-kind="', 'data-side="', 'data-owner="', "--dir:"):
+            with self.subTest(attribute=attribute):
+                self.assertIn(attribute, page)
+
+
+    async def test_the_sprite_route_classifies_a_photo_once_and_remembers_it(self):
+        """One vision call per PHOTOGRAPH, not per battle, and not per re-render.
+
+        The battle screen asks on open and re-renders after every action, so a route that
+        re-classified would spend a paid model call several times a turn. What makes the
+        cache safe is that the answer cannot change while the picture does not."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = _jpeg_bytes()
+
+        with patch("pets_sprite.classify", return_value="quadruped") as classify:
+            first = await self._get(
+                f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
+            self.assertEqual(first.status, 200, await first.text())
+            self.assertEqual(await first.json(), {
+                "user_id": str(PLAYER["id"]), "kind": "quadruped", "known": True,
+            })
+            second = await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
+            self.assertEqual((await second.json())["kind"], "quadruped")
+        self.assertEqual(classify.call_count, 1)
+
+        # And a new photograph is a new subject, so it asks again rather than answering
+        # about the picture that is no longer there.
+        pets.set_photo(CHAT, str(PLAYER["id"]), "a-different-file")
+        self._photos["a-different-file"] = _jpeg_bytes()
+        with patch("pets_sprite.classify", return_value="machine") as classify:
+            again = await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
+            self.assertEqual((await again.json())["kind"], "machine")
+        self.assertEqual(classify.call_count, 1)
+
+    async def test_a_failed_classification_is_answered_but_never_cached(self):
+        """Caching the fallback would record "we could not reach the model" as if it were
+        "this is an unrecognisable creature", and nothing would ever ask again."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = _jpeg_bytes()
+        with patch("pets_sprite.classify", return_value="creature") as classify:
+            for _ in range(2):
+                response = await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
+                body = await response.json()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(body["kind"], "creature")
+                self.assertFalse(body["known"])
+        self.assertEqual(classify.call_count, 2)
+
+    async def test_the_sprite_route_answers_usably_for_a_player_with_no_pet_or_no_photo(self):
+        """The battle screen has no way to draw "error". Every path returns a code it can
+        animate, so a missing picture degrades to the neutral idle instead of a blank."""
+        missing = await self._get("/api/sprite?user_id=999999", PLAYER)
+        self.assertEqual(missing.status, 200)
+        self.assertEqual((await missing.json())["kind"], "creature")
+
+        self._tame(PLAYER)                      # tamed, but no bytes behind the file_id
+        with patch("pets_sprite.classify") as classify:
+            no_photo = await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
+        self.assertEqual((await no_photo.json())["kind"], "creature")
+        classify.assert_not_called()
+
+    async def test_a_battle_starts_with_the_archetype_already_known(self):
+        """The fighter payload carries whatever has been worked out, so a creature that
+        has been classified before animates correctly from the first frame."""
+        self._tame(PLAYER)
+        pets.remember_sprite(CHAT, str(PLAYER["id"]), "spirit")
+        started = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/test-battle/start",
+            json={"init_data": _init_data(PLAYER["id"]), "mode": "manual",
+                  "opponent_id": "dummy"},
+        )
+        self.assertEqual(started.status, 200, await started.text())
+        fighters = (await started.json())["battle"]["fighters"]
+        self.assertEqual(fighters["player"]["kind"], "spirit")
+        self.assertEqual(fighters["player"]["owner_id"], str(PLAYER["id"]))
+        # The training golem has no photograph and reads as the lump it is.
+        self.assertEqual(fighters["enemy"]["kind"], "blob")
+        self.assertIsNone(fighters["enemy"]["owner_id"])
 
     # ---- granted debuffs ------------------------------------------------------------------
 

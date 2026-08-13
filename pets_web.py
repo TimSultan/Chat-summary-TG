@@ -55,6 +55,7 @@ import pets_combat
 import pets_config as C
 import pets_mobs
 import pets_scroll_catalog
+import pets_sprite
 import pets_test_combat
 import pets_updates
 import quests
@@ -1030,6 +1031,10 @@ def _test_fighter_snapshot(record: dict, key: str, prefix: str) -> dict:
         "portrait": _portrait_url(prefix, key) if key != "dummy" else None,
         "crop": record.get("portrait_crop"),
         "stats": pets._effective_stats_for(record),
+        # Whatever has already been worked out about this photograph. Never classified
+        # here: the battle has to start now, and /api/sprite upgrades it a moment later.
+        "kind": pets_sprite.cached_archetype(record) or pets_sprite.DEFAULT_ARCHETYPE,
+        "owner_id": None if key == "dummy" else str(key),
     }
 
 
@@ -1038,6 +1043,8 @@ def _test_dummy_snapshot(mine: dict) -> dict:
     return {
         "name": "Тренировочный голем", "portrait": None, "crop": None,
         "stats": stats,
+        # The golem is a lump with no photograph, and reads as one.
+        "kind": "blob",
     }
 
 
@@ -1059,6 +1066,7 @@ def _test_battle_setup_payload(entry: str, me: str, prefix: str) -> dict:
                 "owner_name": record.get("owner_name") or "кто-то",
                 "portrait": _portrait_url(prefix, opponent_id), "crop": record.get("portrait_crop"),
                 "stats": pets._effective_stats_for(record),
+                "kind": pets_sprite.cached_archetype(record) or pets_sprite.DEFAULT_ARCHETYPE,
             })
     return {
         "test_only": True,
@@ -1789,6 +1797,77 @@ async def handle_birthday_set(request: web.Request) -> web.Response:
     return _ok({"message": "Праздник назначен на сегодня.", **payload})
 
 
+async def _portrait_bytes(request: web.Request, record: dict) -> bytes | None:
+    """The creature's photo as bytes, off the same disk cache the portrait route fills.
+
+    Reuses that cache rather than downloading again: by the time anybody opens a battle
+    the picture has almost always been rendered at least once, so this usually costs one
+    file read. The download path is kept as a fallback for the case where it has not.
+    """
+    file_id = record.get("photo_file_id")
+    if not file_id:
+        return None
+    cached = portrait_cache_path(file_id)
+    if cached.is_file():
+        try:
+            return await asyncio.to_thread(cached.read_bytes)
+        except OSError:
+            return None
+    try:
+        data = await request.app[_FETCH_PHOTO_KEY](file_id)
+    except Exception:
+        request.app[_LOG_KEY](f"[pets_web] sprite fetch raised:\n{traceback.format_exc()}")
+        return None
+    if data:
+        try:
+            await asyncio.to_thread(_write_portrait, cached, data)
+        except Exception:
+            pass                      # the classification does not need it on disk
+    return data
+
+
+async def handle_sprite(request: web.Request) -> web.Response:
+    """Which kind of creature one player's photograph shows, for the battle animation.
+
+    Answers from the store when the picture has already been looked at, and only then
+    spends a vision call -- the answer cannot change while the photograph does not.
+
+    Deliberately its own route rather than part of the battle payload: classification is
+    a network round trip to a model and takes seconds, and a battle screen that waited for
+    it would feel broken. The screen opens immediately with the neutral idle and upgrades
+    itself when this lands, which is why every failure path here returns a usable code
+    with HTTP 200 instead of an error.
+    """
+    await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    who = str(request.query.get("user_id") or "").strip()
+    record = pets.get_pet(entry, who) if who else None
+    if record is None:
+        return _ok({"user_id": who, "kind": pets_sprite.DEFAULT_ARCHETYPE, "known": False})
+
+    cached = pets_sprite.cached_archetype(record)
+    if cached:
+        return _ok({"user_id": who, "kind": cached, "known": True})
+
+    cfg = request.app[_CFG_KEY]
+    api_key = getattr(cfg, "openai_api_key", "")
+    image = await _portrait_bytes(request, record) if api_key else None
+    if not image:
+        return _ok({"user_id": who, "kind": pets_sprite.DEFAULT_ARCHETYPE, "known": False})
+
+    kind = await asyncio.to_thread(
+        pets_sprite.classify, image,
+        api_key=api_key, model=getattr(cfg, "openai_model", "") or "gpt-4o-mini",
+    )
+    # Only a real answer is worth remembering. Storing the fallback would cache "we could
+    # not reach the model" as if it were "this is an unrecognisable creature", and nothing
+    # would ever ask again.
+    if kind != pets_sprite.DEFAULT_ARCHETYPE:
+        await asyncio.to_thread(pets.remember_sprite, entry, who, kind)
+        request.app[_LOG_KEY](f"[pets_web] sprite {who}: {kind}")
+    return _ok({"user_id": who, "kind": kind, "known": kind != pets_sprite.DEFAULT_ARCHETYPE})
+
+
 async def handle_debuff_admin(request: web.Request) -> web.Response:
     """Who is marked, what marks exist, and everybody who could be given one."""
     await _economy_admin(request)
@@ -2243,6 +2322,7 @@ def attach(
         # Chat admins only, both of them (see _economy_admin).
         web.get(prefix + "/api/birthday", handle_birthday_admin),
         web.post(prefix + "/api/birthday", handle_birthday_set),
+        web.get(prefix + "/api/sprite", handle_sprite),
         web.get(prefix + "/api/debuff", handle_debuff_admin),
         web.post(prefix + "/api/debuff", handle_debuff_set),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
@@ -2725,18 +2805,385 @@ PAGE_HTML = """<!doctype html>
   .test-select { width: 100%; background: var(--sunken); color: var(--fg); border: 1px solid var(--line);
                  border-radius: 10px; padding: 10px; font: inherit; margin-top: 4px; }
   .test-loadout { display: grid; grid-template-columns: 1fr; gap: 9px; }
-  .test-fighters { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
-  .test-fighter { background: var(--sunken); border-radius: 12px; padding: 10px; min-width: 0; }
-  .test-fighter .av { width: 54px; height: 54px; border-radius: 12px; overflow: hidden;
-                      background: var(--card); font-size: 28px; display: flex;
-                      align-items: center; justify-content: center; margin-bottom: 7px; }
-  .test-fighter .hpbar { height: 9px; border-radius: 6px; background: var(--card); overflow: hidden; }
-  .test-fighter .hpbar > i { display: block; height: 100%; background: var(--hp);
-                             transition: width .28s; }
-  .test-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .test-action { min-height: 58px; padding: 8px; line-height: 1.2; }
-  .test-action small { display: block; font-size: 10px; opacity: .75; margin-top: 4px; }
+  /* The stage. A fixed aspect ratio rather than a fixed height, so the two creatures keep
+     their relative size on every phone instead of being squashed on a short screen. The
+     health bars sit ON it rather than under it: the whole point of the redesign is that
+     the fight is one thing you look at, with the controls beneath, and a screen that
+     stacked banner + two cards + six tall buttons did not fit a phone at all. */
+  .test-stage {
+    position: relative; aspect-ratio: 16 / 10; max-height: 46vh; border-radius: 14px;
+    overflow: hidden; background: var(--sunken); border: 1px solid var(--line);
+    touch-action: manipulation;
+  }
+  /* A floor to stand on. Without something reading as ground, a bobbing cut-out photo
+     looks like it is falling rather than idling. */
+  .test-stage::after {
+    content: ""; position: absolute; left: 6%; right: 6%; bottom: 11%; height: 12px;
+    border-radius: 50%; background: radial-gradient(ellipse at center,
+      rgba(0,0,0,.30) 0%, rgba(0,0,0,.12) 45%, transparent 72%);
+  }
+  .test-spot { position: absolute; bottom: 12%; width: 42%; height: 68%; }
+  .test-spot[data-side="player"] { left: 4%; }
+  .test-spot[data-side="enemy"] { right: 4%; }
+  .test-hud { position: absolute; top: 0; left: 0; right: 0; display: grid;
+              grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; }
+  .test-hud > div { min-width: 0; }
+  .test-hud .who { font-size: 11px; font-weight: 700; white-space: nowrap;
+                   overflow: hidden; text-overflow: ellipsis; }
+  .test-hud .num { font-size: 10px; color: var(--muted); }
+  .test-hud [data-side="enemy"] { text-align: right; }
+  .test-hud .hpbar { height: 7px; border-radius: 5px; background: rgba(0,0,0,.35);
+                     overflow: hidden; margin-top: 3px; }
+  .test-hud .hpbar > i { display: block; height: 100%; background: var(--hp);
+                         transition: width .28s; }
+  .test-hud .hpbar.barrier > i { background: var(--xp); }
+  .test-turn { position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+               font-size: 10px; font-weight: 700; color: var(--muted);
+               background: rgba(0,0,0,.30); border-radius: 999px; padding: 2px 9px; }
+  /* Four across, so the six fight actions plus auto and exit are two rows on a phone --
+     the brief was "all in one or two rows". Compact and icon-led: the scroll's full name
+     and rules text live in the catalogue sheet, not on a button somebody taps in a hurry. */
+  .test-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .test-action {
+    /* Fixed height rather than auto: a two-line scroll name ("Огненный вал") next to a
+       one-line one ("Атака") gives the grid two rows of different heights, which reads as
+       a layout bug. Two lines is the ceiling, and the name is clipped rather than allowed
+       to make a third. */
+    min-height: 68px; padding: 6px 3px; line-height: 1.15; font-size: 11px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; text-align: center; overflow: hidden;
+  }
+  .test-action .ic { font-size: 19px; line-height: 1; }
+  .test-action small { display: block; font-size: 9px; opacity: .7; overflow: hidden;
+                       text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
   .test-action.ultimate { border-color: var(--r-legendary); color: var(--r-legendary); }
+  .test-action.spent { opacity: .38; }
+  /* Roomier once there is room -- a tablet or a desktop browser has no reason to keep
+     phone-sized targets. */
+  @media (min-width: 520px) {
+    .test-action { min-height: 74px; font-size: 12px; }
+    .test-action .ic { font-size: 22px; }
+  }
+  /* ---------------------------------------------------------------------- battle sprites
+     A "sprite" here is not a sprite sheet -- it is one photograph of a painted miniature,
+     animated entirely with CSS transforms on a single <img>. The idle loop lives on the
+     <img> (or the .sprite-fallback glyph) so it keeps running underneath combat moves; the
+     combat moves themselves (lunge/hurt/ko) live on the .sprite wrapper, because they need
+     to travel the whole picture across the battlefield, not just wobble the artwork in
+     place. Nesting the two means they compose for free: a quadruped can still be mid-bounce
+     while its wrapper lunges forward.
+  */
+
+  .sprite {
+    position: relative;
+    display: block;
+    width: 100%;
+    height: 100%;
+    /* The photo stands on an implied ground line at its own bottom edge. Pivoting there
+       (instead of the default 50% 50%) is what makes breathing/bouncing/tipping-over read
+       as the creature moving while its feet stay planted, rather than the whole picture
+       swelling or spinning around its own center. */
+    transform-origin: 50% 100%;
+    will-change: transform;
+  }
+
+  .sprite img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    transform-origin: 50% 100%;
+    will-change: transform;
+  }
+
+  /* Shown instead of an <img> when the fighter has no portrait yet. Sized and centered like
+     the glyph placeholder already used elsewhere in this page (see .test-fighter .av), so a
+     fighter without a photo still fits the same box other fighters render into. */
+  .sprite .sprite-fallback {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    font-size: 2.4em;
+    line-height: 1;
+    transform-origin: 50% 100%;
+    will-change: transform;
+  }
+
+  /* ------------------------------------------------------------------------- idle loops
+     Every archetype gets its own duration and easing on purpose: these sit side by side on
+     the same screen (player vs. enemy) and need to be tellable apart at a glance, the same
+     way you can tell a dog from a fish from a robot from across a room without looking hard.
+     Amplitudes are kept small (a few percent of the sprite's own box) because this plays on
+     a loop for minutes at a time -- anything bigger reads as distracting rather than alive.
+  */
+
+  /* humanoid: two breaths per cycle (chest rises via scaleY, pivoting from the feet) plus
+     one full weight-shift left-then-right over the same span. Slow and even, like someone
+     standing at ease. Too fast here and it reads as nervous fidgeting instead of idle rest. */
+  @keyframes sprite-idle-humanoid {
+    0%   { transform: translateX(0) translateY(0) scaleY(1); }
+    25%  { transform: translateX(1.2%) translateY(-1.4%) scaleY(1.018); }
+    50%  { transform: translateX(0) translateY(0) scaleY(1); }
+    75%  { transform: translateX(-1.2%) translateY(-1.4%) scaleY(1.018); }
+    100% { transform: translateX(0) translateY(0) scaleY(1); }
+  }
+  .sprite[data-kind="humanoid"] img,
+  .sprite[data-kind="humanoid"] .sprite-fallback {
+    animation: sprite-idle-humanoid 4.8s ease-in-out infinite;
+  }
+
+  /* quadruped: a vertical head-bob with a slight rotational sway, noticeably quicker than
+     the humanoid breath -- a four-legged animal's resting shift of weight is a livelier,
+     choppier motion than a biped's. Too slow and it stops reading as an animal at all. */
+  @keyframes sprite-idle-quadruped {
+    0%   { transform: translateY(0) rotate(0deg); }
+    50%  { transform: translateY(-3.2%) rotate(-1deg); }
+    100% { transform: translateY(0) rotate(0deg); }
+  }
+  .sprite[data-kind="quadruped"] img,
+  .sprite[data-kind="quadruped"] .sprite-fallback {
+    animation: sprite-idle-quadruped 1.8s cubic-bezier(.42, 0, .58, 1) infinite;
+  }
+
+  /* bird: quick vertical bob paired with a horizontal squash pulse that reads as folded
+     wings resettling against the body. The overshoot in the easing curve (values above 1)
+     gives a light springy snap rather than a smooth glide -- a bird's small movements are
+     sharp, not fluid, and a plain ease-in-out here would look aquatic instead. */
+  @keyframes sprite-idle-bird {
+    0%   { transform: translateY(0) scaleX(1); }
+    38%  { transform: translateY(-4.5%) scaleX(1.045); }
+    55%  { transform: translateY(.5%) scaleX(.97); }
+    100% { transform: translateY(0) scaleX(1); }
+  }
+  .sprite[data-kind="bird"] img,
+  .sprite[data-kind="bird"] .sprite-fallback {
+    animation: sprite-idle-bird 1.05s cubic-bezier(.33, 1.4, .6, 1) infinite;
+  }
+
+  /* insect: small, fast, deliberately IRREGULAR steps. The stops below are not evenly
+     spaced and the timing is linear (no easing curve smoothing the travel between them) --
+     that combination is what produces a jitter instead of a wobble. Evenly-spaced stops
+     with ease-in-out would just look like a tiny, oddly slow version of the bird idle. */
+  @keyframes sprite-idle-insect {
+    0%   { transform: translate(0, 0); }
+    9%   { transform: translate(.8%, -.6%); }
+    18%  { transform: translate(-.5%, .9%); }
+    30%  { transform: translate(.9%, .4%); }
+    44%  { transform: translate(-.9%, -.7%); }
+    58%  { transform: translate(.4%, .8%); }
+    71%  { transform: translate(-.6%, -.4%); }
+    85%  { transform: translate(.7%, -.9%); }
+    100% { transform: translate(0, 0); }
+  }
+  .sprite[data-kind="insect"] img,
+  .sprite[data-kind="insect"] .sprite-fallback {
+    animation: sprite-idle-insect .62s linear infinite;
+  }
+
+  /* aquatic: a vertical float and a roll (rotate), deliberately a quarter-cycle OUT OF
+     PHASE with each other -- when the float crosses its resting height the roll is at an
+     extreme, and vice versa, so the two never bottom out into a neutral pose at the same
+     instant. That is what "never fully still" means here in practice: an in-phase version
+     of this (both peaking together) has a visible dead moment at 0%/50%/100%. */
+  @keyframes sprite-idle-aquatic {
+    0%   { transform: translateY(0) rotate(1deg); }
+    25%  { transform: translateY(-4%) rotate(0deg); }
+    50%  { transform: translateY(0) rotate(-1deg); }
+    75%  { transform: translateY(4%) rotate(0deg); }
+    100% { transform: translateY(0) rotate(1deg); }
+  }
+  .sprite[data-kind="aquatic"] img,
+  .sprite[data-kind="aquatic"] .sprite-fallback {
+    animation: sprite-idle-aquatic 3.6s ease-in-out infinite;
+  }
+
+  /* reptile: a big, slow breath (larger scaleY than humanoid) that PAUSES at the top for a
+     tenth of the cycle before releasing, plus a small head tilt that arrives with that
+     pause. The hold is the important part -- without it this is just a slower version of
+     the humanoid breath; with it, it reads as an animal that is in no hurry at all. */
+  @keyframes sprite-idle-reptile {
+    0%   { transform: scaleY(1) translateY(0) rotate(0deg); }
+    45%  { transform: scaleY(1.035) translateY(-1.3%) rotate(-1.2deg); }
+    55%  { transform: scaleY(1.035) translateY(-1.3%) rotate(-1.2deg); }
+    100% { transform: scaleY(1) translateY(0) rotate(0deg); }
+  }
+  .sprite[data-kind="reptile"] img,
+  .sprite[data-kind="reptile"] .sprite-fallback {
+    animation: sprite-idle-reptile 5.6s cubic-bezier(.45, 0, .55, 1) infinite;
+  }
+
+  /* blob: classic squash-and-stretch. scaleX and scaleY move in opposite directions and
+     roughly cancel out (1.09 x .90 and .93 x 1.09 both land near 1.0), so the shape changes
+     without visibly changing size -- that near-cancellation is "volume roughly preserved". */
+  @keyframes sprite-idle-blob {
+    0%   { transform: scale(1, 1) translateY(0); }
+    30%  { transform: scale(1.09, .90) translateY(1.5%); }
+    65%  { transform: scale(.93, 1.09) translateY(-2.2%); }
+    100% { transform: scale(1, 1) translateY(0); }
+  }
+  .sprite[data-kind="blob"] img,
+  .sprite[data-kind="blob"] .sprite-fallback {
+    animation: sprite-idle-blob 1.5s ease-in-out infinite;
+  }
+
+  /* machine: rigid, discrete motion. steps(1, jump-end) turns every segment between two
+     keyframes into a HOLD of the earlier value followed by an instant snap to the next --
+     no easing curve can produce that, only a stepped timing function can. The pose reads as
+     a servo ticking into position rather than settling there. Most of the 5.2s loop is a
+     dead hold (the machine is simply idling); the pair of stops at 88%/92% is a brief,
+     sharp misalignment nudge -- a "glitch" -- that only occupies about a tenth of the loop,
+     which is what keeps it reading as rare rather than as a constant twitch. */
+  @keyframes sprite-idle-machine {
+    0%   { transform: translate(0, 0); }
+    22%  { transform: translate(0, -2%); }
+    47%  { transform: translate(0, 0); }
+    86%  { transform: translate(0, 0); }
+    88%  { transform: translate(1.6%, -1%); }
+    92%  { transform: translate(-.8%, .4%); }
+    96%  { transform: translate(0, 0); }
+    100% { transform: translate(0, 0); }
+  }
+  .sprite[data-kind="machine"] img,
+  .sprite[data-kind="machine"] .sprite-fallback {
+    animation: sprite-idle-machine 5.2s steps(1, jump-end) infinite;
+  }
+
+  /* vehicle: a tight, high-frequency buzz -- sub-1% amplitude, linear timing (an eased
+     vibration looks like gentle rocking, not an idling engine), and a period fast enough
+     (under 200ms) to blur into a hum rather than read as discrete little hops. */
+  @keyframes sprite-idle-vehicle {
+    0%   { transform: translate(0, 0); }
+    25%  { transform: translate(.35%, -.25%); }
+    50%  { transform: translate(-.3%, .3%); }
+    75%  { transform: translate(.25%, .2%); }
+    100% { transform: translate(0, 0); }
+  }
+  .sprite[data-kind="vehicle"] img,
+  .sprite[data-kind="vehicle"] .sprite-fallback {
+    animation: sprite-idle-vehicle .16s linear infinite;
+  }
+
+  /* plant: very slow rotation from the base, like a stalk bending in wind. The keyframe
+     stops (32%/68%) are deliberately NOT symmetric around 50% -- an evenly-spaced sway
+     reads as a metronome, an unevenly-spaced one reads as actual gusts arriving at their
+     own pace. This is the slowest idle of the twelve; anything quicker stops looking lazy. */
+  @keyframes sprite-idle-plant {
+    0%   { transform: rotate(0deg) translateX(0); }
+    32%  { transform: rotate(2.6deg) translateX(.8%); }
+    68%  { transform: rotate(-2.1deg) translateX(-.6%); }
+    100% { transform: rotate(0deg) translateX(0); }
+  }
+  .sprite[data-kind="plant"] img,
+  .sprite[data-kind="plant"] .sprite-fallback {
+    animation: sprite-idle-plant 6.4s ease-in-out infinite;
+  }
+
+  /* spirit: rises and fades together rather than just sliding up and down -- the opacity
+     dip at the peak (down to .78, never fully transparent) plus a faint scale-up is what
+     sells "weightless" instead of "a solid object on a slow elevator". */
+  @keyframes sprite-idle-spirit {
+    0%   { transform: translateY(0) scale(1); opacity: 1; }
+    50%  { transform: translateY(-5%) scale(1.015); opacity: .78; }
+    100% { transform: translateY(0) scale(1); opacity: 1; }
+  }
+  .sprite[data-kind="spirit"] img,
+  .sprite[data-kind="spirit"] .sprite-fallback {
+    animation: sprite-idle-spirit 3.4s ease-in-out infinite;
+  }
+
+  /* creature: the fallback for "we don't know what this is". Deliberately the plainest
+     animation here -- a single breathing cycle, no sway, no tilt, nothing that commits to a
+     body plan the photo might not have. It should look calm and alive, never wrong. */
+  @keyframes sprite-idle-creature {
+    0%   { transform: translateY(0) scaleY(1); }
+    50%  { transform: translateY(-1.1%) scaleY(1.014); }
+    100% { transform: translateY(0) scaleY(1); }
+  }
+  .sprite[data-kind="creature"] img,
+  .sprite[data-kind="creature"] .sprite-fallback {
+    animation: sprite-idle-creature 4s ease-in-out infinite;
+  }
+
+  /* -------------------------------------------------------------------------- combat moves
+     These animate the .sprite WRAPPER, not the img -- the idle keyframes above keep running
+     on the img underneath, so a lunge or a hit lands on top of whatever the idle is doing
+     instead of interrupting it.
+
+     --dir carries which way this fighter's own attacks travel: 1 for the player (posted on
+     the left, attacks rightward toward the enemy) and -1 for the enemy (posted on the
+     right, attacks leftward toward the player). One keyframe set drives both because every
+     distance in it is written as var(--dir) times a fixed length; sprite.js is responsible
+     for setting --dir when it builds the markup. The var(--dir, 1) fallback just means a
+     sprite that somehow renders without the inline custom property lunges toward the right
+     instead of not moving at all. */
+
+  @keyframes sprite-lunge {
+    0%   { transform: translateX(0) scale(1); }
+    38%  { transform: translateX(calc(var(--dir, 1) * 22px)) scale(1.045); }
+    100% { transform: translateX(0) scale(1); }
+  }
+  /* 420ms total, but the keyframe stop that marks "fully lunged" sits at 38% of it (about
+     160ms) -- reaching the strike quickly and then taking the remaining ~260ms to settle
+     back is what makes an impact feel thrown rather than just slid back and forth. */
+  .sprite.lunge {
+    animation: sprite-lunge 420ms cubic-bezier(.2, .8, .3, 1) 1;
+  }
+
+  /* Recoils AWAY from the attacker -- the opposite sign of this fighter's own --dir, since
+     getting hit pushes you back from where you throw your own attacks -- while a brightness
+     spike and a brief drop-shadow tinted with the existing damage colour (--hp) read as an
+     impact flash. Kept short (300ms) and small (9px, half the lunge distance) on purpose:
+     this fires every time a hit lands, so anything bigger would turn into a constant strobe
+     over a multi-turn fight instead of a single readable "ow". */
+  @keyframes sprite-hurt {
+    0%   { transform: translateX(0); filter: brightness(1) saturate(1) drop-shadow(0 0 0 transparent); }
+    30%  { transform: translateX(calc(var(--dir, 1) * -9px)); filter: brightness(1.55) saturate(.5) drop-shadow(0 0 5px var(--hp)); }
+    100% { transform: translateX(0); filter: brightness(1) saturate(1) drop-shadow(0 0 0 transparent); }
+  }
+  .sprite.hurt {
+    animation: sprite-hurt 300ms ease-out 1;
+  }
+
+  /* A settled end state, not a loop -- entered once via transition and then left alone.
+     Tips the sprite backward (away from its own attack direction, same convention as the
+     hurt recoil) and desaturates/dims it so a knocked-out fighter reads as out of the fight
+     at a glance next to one that is merely idling. The !important on the idle animations is
+     deliberate: idle rules and this one share the same selector specificity
+     (.sprite[data-kind] vs .sprite.ko), so without it, source order alone would decide the
+     winner and a KO'd fighter could keep visibly breathing underneath its own dimmed, tipped
+     pose depending on where this rule happens to sit in the file. */
+  .sprite.ko {
+    transform: rotate(calc(var(--dir, 1) * -14deg)) translateY(1.5%);
+    filter: grayscale(.65) brightness(.55);
+    transition: transform .4s ease-out, filter .4s ease-out;
+  }
+  .sprite.ko img,
+  .sprite.ko .sprite-fallback {
+    animation: none !important;
+  }
+
+  /* Idle motion is constant and ambient -- exactly the category prefers-reduced-motion
+     exists to suppress. Combat moves are brief, meaningful, and rare enough to keep, but
+     still get compressed toward "instant" out of respect for the same preference: a snap to
+     the new pose rather than a 420ms slide still tells the player a hit happened. */
+  @media (prefers-reduced-motion: reduce) {
+    .sprite img,
+    .sprite .sprite-fallback {
+      animation: none !important;
+    }
+    .sprite.lunge {
+      animation-duration: 70ms !important;
+    }
+    .sprite.hurt {
+      animation-duration: 120ms !important;
+    }
+    .sprite.ko {
+      transition-duration: 120ms !important;
+    }
+  }
+
   .test-log { max-height: 270px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
   .test-event { background: var(--sunken); border-radius: 9px; padding: 7px 9px; font-size: 12px;
                 border-left: 3px solid var(--line); }
@@ -3391,16 +3838,176 @@ function testSelect(id, label, rows, selected) {
     testOptions(rows, selected) + "</select></label>";
 }
 
-function testPortrait(fighter) {
-  return fighter.portrait ? shot(fighter.portrait, fighter.crop) : "🗿";
+// One corner of the stage overlay. Name, numbers and bar, mirrored for the enemy so the
+// two read outward from the middle rather than both crowding the left edge.
+function testHudSide(fighter, side) {
+  const pct = Math.max(0, Math.min(100, 100 * fighter.hp / Math.max(1, fighter.max_hp)));
+  return '<div data-side="' + side + '">' +
+    '<div class="who">' + esc(fighter.name || "—") + "</div>" +
+    '<div class="num">' + fighter.hp + " / " + fighter.max_hp +
+      (fighter.barrier ? " · 🛡" + fighter.barrier : "") + "</div>" +
+    '<div class="hpbar"><i style="width:' + pct + '%"></i></div></div>';
 }
 
-function testHp(fighter) {
-  const pct = Math.max(0, Math.min(100, 100 * fighter.hp / Math.max(1, fighter.max_hp)));
-  return '<div class="small"><b>' + esc(fighter.name) + '</b></div>' +
-    '<div class="tiny muted">HP ' + fighter.hp + " / " + fighter.max_hp +
-      (fighter.barrier ? " · барьер " + fighter.barrier : "") + "</div>" +
-    '<div class="hpbar" style="height:9px;margin-top:6px"><i style="width:' + pct + '%"></i></div>';
+// --------------------------------------------------------------------- battle sprites
+// Turns a fighter's flat portrait photo into an animated element via sprite.css: a
+// .sprite wrapper carrying the archetype (data-kind, picked by sprite.css to choose an
+// idle loop) and which way this fighter's attacks travel (--dir, see sprite.css for why).
+// Everything here assumes the page's existing esc() and shot() helpers are already
+// defined (esc: HTML-escaper: shot(url, crop, extra): renders a cropped image into a
+// ".shot" box) and does not redefine either.
+
+// The archetype contract. Kept as a Set (not read off the CSS) because the two have to
+// agree on the same fixed list either way, and checking against a literal list here is
+// what lets a bad or missing value be caught and swapped for "creature" BEFORE it ever
+// reaches the DOM -- an unrecognized data-kind has no matching keyframes in sprite.css,
+// which would leave that fighter's photo frozen for the whole fight instead of merely
+// defaulting to the plain idle.
+const SPRITE_KINDS = new Set([
+  "humanoid", "quadruped", "bird", "insect", "aquatic", "reptile",
+  "blob", "machine", "vehicle", "plant", "spirit", "creature",
+]);
+
+// side is "player" or "enemy"; anything else quietly becomes "player" rather than
+// producing a sprite that no selector or querySelector call can ever find again.
+function spriteMarkup(fighter, side) {
+  try {
+    const f = fighter || {};
+    const kind = SPRITE_KINDS.has(f.kind) ? f.kind : "creature";
+    const sideKey = side === "enemy" ? "enemy" : "player";
+    const dir = sideKey === "enemy" ? -1 : 1;
+    const body = f.portrait
+      ? shot(f.portrait, f.crop || null)
+      : '<span class="sprite-fallback">🗿</span>';   // a fighter with no photograph yet
+    // data-owner is how the late-arriving classification finds this element again: the
+    // archetype is worked out by /api/sprite seconds after the battle has already opened,
+    // and applySpriteKind swaps data-kind on whatever is on screen by then.
+    const owner = f.owner_id ? ' data-owner="' + esc(String(f.owner_id)) + '"' : "";
+    return '<span class="sprite" data-kind="' + kind + '" data-side="' + sideKey +
+      '"' + owner + ' style="--dir:' + dir + '">' + body + "</span>";
+  } catch (e) {
+    // A blank slot beats an exception that blanks the rest of the battle screen.
+    return "";
+  }
+}
+
+// Re-triggers a one-shot CSS animation class on a sprite. Reading offsetWidth between the
+// remove and the re-add forces the browser to flush style before the class comes back --
+// skip that and the browser coalesces the remove+add into a no-op, so calling this twice
+// in a row (two quick hits) would only animate once.
+function playSpriteAction(side, action) {
+  try {
+    if (action !== "lunge" && action !== "hurt" && action !== "ko") return;
+    const sideKey = side === "enemy" ? "enemy" : side === "player" ? "player" : null;
+    if (!sideKey) return;
+    const el = document.querySelector('.sprite[data-side="' + sideKey + '"]');
+    if (!el) return;
+    el.classList.remove(action);
+    void el.offsetWidth; // force reflow, see comment above
+    el.classList.add(action);
+    if (action === "ko") return; // ko is a settled pose, left on rather than cleaned up
+    const clear = () => el.classList.remove(action);
+    el.addEventListener("animationend", clear, { once: true });
+    // animationend can fail to fire (backgrounded tab, reduced-motion swapping the
+    // duration mid-flight) -- a leftover class would leave the sprite permanently offset
+    // or tinted, so give it a timeout well past even the un-reduced lunge duration.
+    setTimeout(clear, 900);
+  } catch (e) {
+    // Never let a display-only animation trip up the battle screen it decorates.
+  }
+}
+
+// Kinds of log row that land as a hit worth flinching for. Mirrors the harmful-effect set
+// in pets_test_combat.py loosely (not imported -- the client only needs a yes/no read of
+// "did this look like a strike", not the real game rule), so a self-inflicted cost (a
+// fighter paying their own HP for a spell) can occasionally misread as a hit landing on
+// the opponent. That is an acceptable approximation: the log row only carries who ACTED,
+// never who was targeted, so there is no field here that could disambiguate it further.
+const SPRITE_HARMFUL_KINDS = {
+  damage: 1, burn: 1, weaken: 1, blind: 1, vulnerable: 1, stun: 1, break: 1, reflect: 1,
+};
+
+// events is one turn's worth of battle log rows ({ kind, actor, ... }). Sequences the
+// animation as: whoever acted this turn lunges immediately, and if something harmful
+// actually landed (and nobody dodged it), the other side flinches about 180ms later --
+// long enough that the lunge visibly arrives first, short enough that the two still read
+// as one exchange rather than two unrelated events.
+function playSpriteExchange(events) {
+  try {
+    const rows = Array.isArray(events) ? events : [];
+    let attacker = null;
+    for (const row of rows) {
+      const actor = row && row.actor;
+      if (actor === "player" || actor === "enemy") { attacker = actor; break; }
+    }
+    if (!attacker) return;
+    const target = attacker === "player" ? "enemy" : "player";
+    const dodged = rows.some((row) => row && row.kind === "dodge");
+    const landed = !dodged && rows.some((row) =>
+      row && row.actor === attacker && SPRITE_HARMFUL_KINDS[row.kind]);
+    playSpriteAction(attacker, "lunge");
+    if (landed) setTimeout(() => playSpriteAction(target, "hurt"), 180);
+  } catch (e) {
+    // Same rule as playSpriteAction: this is sequencing sugar, never a hard dependency.
+  }
+}
+
+// The last turn number whose blows have already been played. The battle screen re-renders
+// its whole markup after every action, so without this the sprites would replay the entire
+// fight from the top on every tap.
+let SPRITE_PLAYED_TURN = -1;
+
+// One turn's worth of movement. The engine's log is the source of truth: each row carries
+// `turn`, `actor` ("player"/"enemy") and `kind`, so the attacker is simply whoever owns the
+// blow, and the target is the other one. Anything that is not a blow (a heal, a barrier,
+// the start line) moves nobody -- the brief was that attacking is the only motion.
+function animateTurn(log, finished, winner) {
+  const rows = Array.isArray(log) ? log : [];
+  const turn = rows.length ? Number(rows[rows.length - 1].turn || 0) : 0;
+  if (turn === SPRITE_PLAYED_TURN) return;
+  SPRITE_PLAYED_TURN = turn;
+  // playSpriteExchange knows how to read one turn's rows -- which of them is a real strike
+  // and whether it was dodged. All this has to do is hand it the right turn.
+  playSpriteExchange(rows.filter((row) => Number(row.turn || 0) === turn));
+  if (finished && winner) {
+    setTimeout(() => playSpriteAction(winner === "player" ? "enemy" : "player", "ko"), 420);
+  }
+}
+
+// Which archetypes the page has already asked about, so opening a battle does not fire the
+// same classification request on every re-render. A battle re-renders after every action.
+const SPRITE_KIND = {};
+let SPRITE_ASKED = {};
+
+function applySpriteKind(userId, kind) {
+  SPRITE_KIND[userId] = kind;
+  // Written into the battle state as well as onto the live element. The screen rebuilds
+  // its markup from that state after every action, so touching only the DOM would show
+  // the right idle until the next tap and then silently fall back to the neutral one.
+  if (TEST_BATTLE && TEST_BATTLE.fighters) {
+    for (const fighter of Object.values(TEST_BATTLE.fighters)) {
+      if (fighter && String(fighter.owner_id) === String(userId)) fighter.kind = kind;
+    }
+  }
+  document.querySelectorAll('.sprite[data-owner="' + CSS.escape(String(userId)) + '"]')
+    .forEach((node) => { node.dataset.kind = kind; });
+}
+
+// The battle opens on the neutral idle and upgrades itself a moment later. Classification
+// is a round trip to a vision model and takes seconds; making the screen wait for it would
+// trade a real animation for a blank stage, and the fallback idle is perfectly watchable.
+async function requestSpriteKinds() {
+  if (!TEST_BATTLE) return;
+  const wanted = [TEST_BATTLE.fighters.player, TEST_BATTLE.fighters.enemy]
+    .map((f) => f && f.owner_id)
+    .filter((id) => id && !SPRITE_ASKED[id]);
+  for (const id of wanted) {
+    SPRITE_ASKED[id] = true;
+    try {
+      const data = await api("/api/sprite?user_id=" + encodeURIComponent(id));
+      if (data && data.kind) applySpriteKind(id, data.kind);
+    } catch (e) { /* the neutral idle stays; a sprite is not worth a visible error */ }
+  }
 }
 
 function testBattleLog(rows) {
@@ -3443,33 +4050,55 @@ function renderTestBattle(box) {
   const result = TEST_BATTLE.finished
     ? (TEST_BATTLE.draw ? "Ничья" : TEST_BATTLE.winner === "player" ? "Победа" : "Поражение")
     : "Ход " + TEST_BATTLE.turn;
+  // One cell per action, four across, so everything fits two rows on a phone. The label
+  // is the shortest thing that still identifies the scroll; its full rules text is one tap
+  // away in the catalogue, which is where somebody reads rather than plays.
+  const cell = (action, icon, label, note, extra) =>
+    '<button class="go ' + (extra || "sec") + ' test-action" data-testaction="' + action + '"' +
+    (legal.has(action) ? "" : " disabled") + '><span class="ic">' + esc(icon) + "</span>" +
+    esc(label) + (note ? "<small>" + esc(note) + "</small>" : "") + "</button>";
   const slotButtons = (mine.slots || []).map((slot) => {
-    const action = "skill_" + slot.slot;
-    const note = [scrollElement(slot), slot.available ? "готов" : "использован",
-      slot.dodgeable === false ? "нельзя увернуться" : ""].filter(Boolean).join(" · ");
+    const short = String(slot.name || "").replace(/^.*?: /, "");
     return '<button class="go sec test-action' + (slot.ultimate ? " ultimate" : "") +
-      '" data-testaction="' + action + '"' + (legal.has(action) ? "" : " disabled") + '>' +
-      esc(slot.icon) + " " + esc(slot.name.replace(/^.*?: /, "")) + '<small>' + esc(note) +
+      (slot.available ? "" : " spent") +
+      '" data-testaction="skill_' + slot.slot + '"' +
+      (legal.has("skill_" + slot.slot) ? "" : " disabled") + '><span class="ic">' +
+      esc(slot.icon) + "</span>" + esc(short.slice(0, 16)) +
+      "<small>" + esc(slot.available ? scrollElement(slot) : "использован") +
       "</small></button>";
   }).join("");
+
   box.innerHTML =
-    '<div class="test-banner"><b>🧪 Тестовый бой · ' + result +
-      '</b><br>Монеты, опыт, победы и запас боёв не изменяются.</div>' +
-    '<div class="test-fighters"><div class="test-fighter"><div class="av">' + testPortrait(mine) +
-      '</div>' + testHp(mine) + '</div><div class="test-fighter"><div class="av">' +
-      testPortrait(foe) + '</div>' + testHp(foe) + "</div></div>" +
-    (TEST_BATTLE.finished ? "" : '<div class="panel"><h2>Твой ход</h2><div class="test-actions">' +
-      '<button class="go test-action" data-testaction="attack">⚔️ Атаковать<small>обычный удар</small></button>' +
-      '<button class="go sec test-action" data-testaction="defend">🛡 Защититься<small>' +
-        esc(mine.shield.name) + "</small></button>" + slotButtons + "</div>" +
-      '<button class="go sec" style="margin-top:10px" data-testaction="auto">' +
-        '🎲 Продолжить автоматически</button></div>') +
-    '<div class="panel"><h2>Ход боя</h2><div class="test-log" id="testLog">' +
-      testBattleLog(TEST_BATTLE.log) + "</div></div>" +
-    '<div class="test-actions"><button class="go sec" data-testbattle="restart">⚙️ Новый набор</button>' +
-      '<button class="go sec" data-testbattle="close">◀️ На арену</button></div>';
+    '<div class="test-banner"><b>🧪 Тестовый бой</b> · ничего не тратится и никуда не пишется.</div>' +
+    // The stage carries the health bars and the turn counter itself, so the fight stays
+    // one object on screen and the controls sit directly under the thumb.
+    '<div class="test-stage" id="testStage">' +
+      '<div class="test-hud">' + testHudSide(mine, "player") + testHudSide(foe, "enemy") + "</div>" +
+      '<div class="test-turn">' + esc(result) + "</div>" +
+      '<div class="test-spot" data-side="player">' + spriteMarkup(mine, "player") + "</div>" +
+      '<div class="test-spot" data-side="enemy">' + spriteMarkup(foe, "enemy") + "</div>" +
+    "</div>" +
+    (TEST_BATTLE.finished
+      ? '<div class="test-actions" style="margin-top:9px">' +
+        '<button class="go test-action" data-testbattle="restart" style="grid-column:span 2">' +
+          '<span class="ic">⚙️</span>Новый бой</button>' +
+        '<button class="go sec test-action" data-testbattle="close" style="grid-column:span 2">' +
+          '<span class="ic">◀️</span>На арену</button></div>'
+      : '<div class="test-actions" style="margin-top:9px">' +
+        cell("attack", "⚔️", "Атака", "удар", "") +
+        cell("defend", "🛡", "Защита", String(mine.shield.name || "").slice(0, 14)) +
+        slotButtons +
+        cell("auto", "🎲", "Авто", "до конца") +
+        '<button class="go sec test-action" data-testbattle="close">' +
+          '<span class="ic">◀️</span>Выход</button></div>') +
+    '<div class="panel" style="margin-top:9px"><h2>Ход боя</h2><div class="test-log" id="testLog">' +
+      testBattleLog(TEST_BATTLE.log) + "</div></div>";
   paintShots(box);
   const log = $("testLog"); if (log) log.scrollTop = log.scrollHeight;
+  // Played after the markup lands, so the elements the animation looks for exist. The
+  // turn that just resolved is whatever is new at the end of the log.
+  animateTurn(TEST_BATTLE.log, TEST_BATTLE.finished, TEST_BATTLE.winner);
+  requestSpriteKinds();
 }
 
 async function openTestBattle() {
@@ -3495,6 +4124,7 @@ async function startTestBattle(mode) {
     });
     if (data.status === "coming_soon") { toast(data.message); return; }
     TEST_BATTLE = data.battle; TEST_SESSION = data.session; TEST_MODE = data.mode;
+    SPRITE_PLAYED_TURN = -1;           // a new fight replays from its own first blow
     haptic(TEST_BATTLE.finished && TEST_BATTLE.winner === "player" ? "ok" : undefined);
     render();
   } catch (e) { haptic("no"); toast(e.message); }
