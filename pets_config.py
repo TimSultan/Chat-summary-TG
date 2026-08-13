@@ -188,6 +188,7 @@ STAT_MIN_LEVEL = 1
 STAT_MAX_LEVEL = None
 STAT_COST_BASE = 1.0
 STAT_COST_EXPONENT = 1.2
+STAT_RESPEC_RUBY_COST = 15
 
 STAT_KEYS = ("strength", "health", "agility", "luck", "endurance")
 STAT_NAMES = {

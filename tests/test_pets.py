@@ -231,6 +231,44 @@ class CageAndTamingTests(PetsTestCase):
 
 
 class StatUpgradeTests(PetsTestCase):
+    def test_respec_costs_rubies_then_spends_points_before_gold(self):
+        entry = "respec"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        record["stats"]["strength"] = 6
+        record["stats"]["health"] = 4
+        pets._save(entry, data)
+        pets.grant_rubies(entry, "1", pets_config.STAT_RESPEC_RUBY_COST)
+
+        ok, message, points = pets.respec_stats(entry, "1")
+
+        self.assertTrue(ok, message)
+        self.assertEqual(points, 8)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 0)
+        pet = pets.get_pet(entry, "1")
+        self.assertTrue(all(level == pets_config.STAT_MIN_LEVEL for level in pet["stats"].values()))
+        self.assertEqual(pets.available_stat_points(pet), 8)
+        text, keyboard = pets_ui.train_view(entry, "1", 0)
+        self.assertIn("Свободные очки: <b>8</b>", text)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn(pets_ui.callback_data("1", "respec"), callbacks)
+
+        ok, message, spent = pets.upgrade_stat(entry, "1", 0, "strength", times=5)
+        self.assertTrue(ok, message)
+        self.assertEqual(spent, 0)
+        self.assertEqual(pets.stat_level(entry, "1", "strength"), 6)
+        self.assertEqual(pets.available_stat_points(pets.get_pet(entry, "1")), 3)
+
+        gold_cost = pets_config.stat_upgrade_cost(4)
+        economy.grant(entry, "1", gold_cost, "test")
+        ok, message, spent = pets.upgrade_stat(entry, "1", 0, "agility", times=4)
+        self.assertTrue(ok, message)
+        self.assertEqual(spent, gold_cost)
+        self.assertEqual(pets.stat_level(entry, "1", "agility"), 5)
+        self.assertEqual(pets.available_stat_points(pets.get_pet(entry, "1")), 0)
+        self.assertEqual(economy.balance(entry, "1", 0), 0)
+
     def test_upgrade_stat_has_no_level_ceiling(self):
         entry = "chat"
         self._tame(entry, "1")

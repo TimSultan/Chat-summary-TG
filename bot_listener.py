@@ -6424,6 +6424,12 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.train_view(entry, user_id, xp), log
             )
             return
+        if action == "respec":
+            ok, note, _ = pets.respec_stats(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.train_view(entry, user_id, xp), log
+            )
+            return
         if action == "buy":
             ok, note = pets.buy_item(entry, user_id, xp, argument)
             slot = pets_ui.slot_of(argument)

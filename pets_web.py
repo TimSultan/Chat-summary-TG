@@ -536,7 +536,7 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
     }
 
 
-def _stat_payload(entry: str, user_id, record: dict) -> list[dict]:
+def _stat_payload(entry: str, user_id, record: dict, stat_points: int = 0) -> list[dict]:
     """A stat row: what it cost, what it is now, and what the gear adds on top.
 
     Purchased and effective are kept apart because they are spent differently -- coins
@@ -545,6 +545,7 @@ def _stat_payload(entry: str, user_id, record: dict) -> list[dict]:
     """
     effective = pets.effective_stats(entry, user_id)
     purchased = record.get("stats", {})
+    stat_points = max(0, int(stat_points or 0))
     rows = []
     for key in C.STAT_KEYS:
         base = int(purchased.get(key, 1))
@@ -557,8 +558,8 @@ def _stat_payload(entry: str, user_id, record: dict) -> list[dict]:
             "effective": level,
             "bonus": level - base,
             "max": C.STAT_MAX_LEVEL,
-            "cost_1": C.stat_upgrade_cost(base),
-            "cost_10": C.total_stat_cost(base + 10, base),
+            "cost_1": 0 if stat_points else C.stat_upgrade_cost(base),
+            "cost_10": C.total_stat_cost(base + 10, base + min(stat_points, 10)),
             "pending_effect": key == "endurance",
         })
     rows.append({
@@ -738,7 +739,9 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     # is "the pet screen": it belongs to the creature but it explains the stats, the power
     # rating and the arena all at once.
     state["debuff"] = pets.debuff_for(record)
-    state["stats"] = _stat_payload(entry, user_id, record)
+    state["stat_points"] = pets.available_stat_points(record)
+    state["stat_respec_ruby_cost"] = C.STAT_RESPEC_RUBY_COST
+    state["stats"] = _stat_payload(entry, user_id, record, state["stat_points"])
     state["combat"] = _combat_payload(entry, user_id, record)
     state["equipment"] = _equipment_payload(record, prefix)
     state["skills"] = _skills_payload(record)
@@ -786,6 +789,11 @@ def _action_upgrade_stat(entry, user_id, xp, payload):
         return False, "Неизвестная характеристика."
     times = 10 if int(payload.get("times") or 1) > 1 else 1
     ok, message, _spent = pets.upgrade_stat(entry, user_id, xp, stat, times=times)
+    return ok, message
+
+
+def _action_respec_stats(entry, user_id, xp, payload):
+    ok, message, _points = pets.respec_stats(entry, user_id)
     return ok, message
 
 
@@ -917,6 +925,7 @@ def _action_notifications(entry, user_id, xp, payload):
 
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
+  "respec_stats": _action_respec_stats,
     "equip": _action_equip,
     "unequip": _action_unequip,
     "set_skill": _action_set_skill,
@@ -3631,6 +3640,7 @@ function renderHero() {
 
     '<div class="panel"><h2>Характеристики</h2>' +
       S.stats.map(statRow).join("") +
+      statRespec() +
       // Under the stats it is subtracting from. Tapping the portrait right above is how
       // the picture gets changed, so the way out is one screen away from the explanation.
       debuffNote(S.debuff) +
@@ -3660,14 +3670,28 @@ function statRow(stat) {
     : (maxed
         ? '<span class="tiny muted">максимум</span>'
         : '<button class="plus" data-up="' + stat.key + '" data-times="1"' +
-            (affordable(stat.cost_1) ? "" : " disabled") + ">+1 · " + money(stat.cost_1) + "</button>" +
+            (affordable(stat.cost_1) ? "" : " disabled") + ">+1 · " +
+            (stat.cost_1 ? money(stat.cost_1) : "бесплатно") + "</button>" +
           '<button class="plus" data-up="' + stat.key + '" data-times="10"' +
-            (affordable(stat.cost_10) ? "" : " disabled") + ">+10 · " + money(stat.cost_10) + "</button>");
+            (affordable(stat.cost_10) ? "" : " disabled") + ">+10 · " +
+            (stat.cost_10 ? money(stat.cost_10) : "бесплатно") + "</button>");
   const pending = stat.pending_effect ? ' <span class="tiny muted">эффект позже</span>' : "";
   return '<div class="statrow"><div class="lbl">' +
     (STAT_ICON[stat.key] || "") + " <b>" + esc(stat.name) + "</b> " +
     '<span class="muted small">' + stat.purchased + "</span> → <b>" + stat.effective + "</b>" + bonus + pending +
     "</div>" + buttons + "</div>";
+}
+
+function statRespec() {
+  if (!S.pet) return "";
+  const invested = (S.stats || []).some((stat) => !stat.gear_only && stat.purchased > 1);
+  const points = Number(S.stat_points || 0);
+  const cost = Number(S.stat_respec_ruby_cost || 15);
+  const disabled = !invested || Number(S.rubies || 0) < cost;
+  return '<div class="stat-respec">' +
+    (points ? '<span class="tiny">🎯 Свободные очки: <b>' + points + '</b></span>' : "") +
+    '<button class="go sec" data-do="respec"' + (disabled ? " disabled" : "") +
+    '>🔄 Перераспределить статы · ' + cost + ' 💎</button></div>';
 }
 
 function cagePanel() {
@@ -6019,6 +6043,10 @@ document.addEventListener("click", async (event) => {
   }
 
   if (d.do === "buycage") { await act("buy_cage"); }
+  else if (d.do === "respec") {
+    confirmThen("Сбросить купленные статы за 15 💎? Золото не вернётся, но появятся свободные очки.",
+                () => act("respec_stats"));
+  }
   else if (d.do === "upcage") { await act("upgrade_cage"); }
   else if (d.do === "daily") { await act("daily_bonus"); }
   else if (d.do === "notify") { await act("notifications"); }

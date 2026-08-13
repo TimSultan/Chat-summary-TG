@@ -1233,6 +1233,9 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         " — и в бою, и на ферме."
     )
     lines.append(f"\n🪙 Монеты: {_money(coins)}")
+    points = pets.available_stat_points(pet)
+    if points:
+        lines.append(f"🎯 Свободные очки: <b>{points}</b> <i>(сначала тратятся они)</i>")
     lines.append("\n<i>Максимального уровня нет. Чем выше, тем дороже следующий пункт.</i>")
 
     rows = []
@@ -1251,6 +1254,10 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "up10", key),
         })
         rows.append(row)
+    rows.append([{
+        "text": f"🔄 Сбросить статы — {C.STAT_RESPEC_RUBY_COST} 💎",
+        "callback_data": callback_data(user_id, "respec"),
+    }])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 

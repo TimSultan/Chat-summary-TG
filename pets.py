@@ -44,7 +44,7 @@ import pets_sprite as SPRITE
 import stats
 from app_time import now as app_now
 
-PETS_STORE_VERSION = 5
+PETS_STORE_VERSION = 6
 # Rolling fight log, capped independently of C.HISTORY_LIMIT (that constant bounds what
 # ONE player is shown per /history call, not how many chat-wide entries are kept on disk)
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
@@ -179,6 +179,10 @@ def _load(entry: str) -> dict:
             record["stats"] = purchased_stats
         for key in C.STAT_KEYS:
             purchased_stats.setdefault(key, C.STAT_MIN_LEVEL)
+        try:
+            record["stat_points"] = max(0, int(record.get("stat_points", 0) or 0))
+        except (TypeError, ValueError):
+            record["stat_points"] = 0
         inventory = record.get("inventory")
         if not isinstance(inventory, list):
             inventory = []
@@ -379,6 +383,7 @@ def _new_record() -> dict:
         "cage_price_paid": C.CAGE_PRICE,
         "cage_level": 1,
         "stats": {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS},
+        "stat_points": 0,
         "equipped": {slot: None for slot in C.SLOT_KEYS},
         "inventory": [],
         "discovered": [],
@@ -1766,6 +1771,38 @@ def stat_level(entry, user_id, stat) -> int:
     return record.get("stats", {}).get(stat, C.STAT_MIN_LEVEL)
 
 
+def available_stat_points(record: dict | None) -> int:
+    """Unspent respec points attached to one pet record."""
+    try:
+        return max(0, int((record or {}).get("stat_points", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def respec_stats(entry, user_id) -> tuple[bool, str, int]:
+    """Reset purchased stats and turn their invested levels into free stat points."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо.", 0
+        refundable = sum(
+            max(0, int(record["stats"].get(key, C.STAT_MIN_LEVEL)) - C.STAT_MIN_LEVEL)
+            for key in C.STAT_KEYS
+        )
+        if refundable <= 0:
+            return False, "Сбрасывать пока нечего.", 0
+        wallet = _ruby_row(data)
+        rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+        if rubies < C.STAT_RESPEC_RUBY_COST:
+            return False, f"Нужно {C.STAT_RESPEC_RUBY_COST} 💎, у тебя {rubies}.", 0
+        wallet[str(user_id)] = rubies - C.STAT_RESPEC_RUBY_COST
+        record["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
+        record["stat_points"] = available_stat_points(record) + refundable
+        _save(entry, data)
+    return True, f"Статы сброшены. Свободных очков: {record['stat_points']}.", refundable
+
+
 def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
     if stat not in C.STAT_KEYS:
         return False, "Неизвестная характеристика.", 0
@@ -1788,11 +1825,16 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
     bought = 0
     total_cost = 0
     reached_level = level
+    free_points = available_stat_points(record)
+    used_points = 0
     while bought < times:
-        step_cost = C.stat_upgrade_cost(reached_level)
-        if total_cost + step_cost > current_balance:
-            break
-        total_cost += step_cost
+        if used_points < free_points:
+            used_points += 1
+        else:
+            step_cost = C.stat_upgrade_cost(reached_level)
+            if total_cost + step_cost > current_balance:
+                break
+            total_cost += step_cost
         reached_level += 1
         bought += 1
 
@@ -1800,21 +1842,25 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
         needed = C.stat_upgrade_cost(level)
         return False, f"Нужно {needed} монет на следующий уровень {name}, у тебя {current_balance}.", 0
 
-    ok, _ = economy.spend(entry, user_id, xp, total_cost, f"buy:pet_stat:{stat}", ref=str(reached_level))
+    ok = total_cost == 0 or economy.spend(
+        entry, user_id, xp, total_cost, f"buy:pet_stat:{stat}", ref=str(reached_level),
+    )[0]
     if not ok:
         # The balance moved between the check above and the debit (e.g. a second command
         # landed in between) -- refuse cleanly on stale numbers rather than overspend.
         return False, "Баланс изменился, попробуй ещё раз.", 0
 
     record["stats"][stat] = reached_level
+    record["stat_points"] = free_points - used_points
     _save(entry, data)
 
+    point_note = f" Использовано очков: {used_points}." if used_points else ""
     if bought == times:
-        message = f"{name} прокачан(а) до {reached_level} уровня. Потрачено {total_cost} монет."
+        message = f"{name} прокачан(а) до {reached_level} уровня. Потрачено {total_cost} монет.{point_note}"
     else:
         message = (
             f"Хватило золота только на {bought} из {times} уровней {name} "
-            f"(до {reached_level}), потрачено {total_cost} монет."
+            f"(до {reached_level}), потрачено {total_cost} монет.{point_note}"
         )
     return True, message, total_cost
 
