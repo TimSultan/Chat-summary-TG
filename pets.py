@@ -44,7 +44,8 @@ import pets_sprite as SPRITE
 import stats
 from app_time import now as app_now
 
-PETS_STORE_VERSION = 6
+import pets_dungeon as D
+PETS_STORE_VERSION = 7
 # Rolling fight log, capped independently of C.HISTORY_LIMIT (that constant bounds what
 # ONE player is shown per /history call, not how many chat-wide entries are kept on disk)
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
@@ -246,6 +247,11 @@ def _load(entry: str) -> dict:
         record["fight_result_notifications"] = bool(
             record.get("fight_result_notifications", True)
         )
+        dungeon = record.get("dungeon_run")
+        record["dungeon_run"] = dungeon if isinstance(dungeon, dict) else None
+        record["dungeon_deepest"] = max(
+            1, _safe_nonnegative_int(record.get("dungeon_deepest"), 1),
+        )
         # Scrolls are abilities, not inventory objects, and the four slots holding them
         # may each be empty. A malformed hand-edited loadout falls back to four empty
         # slots atomically, rather than entering combat half-valid.
@@ -406,6 +412,8 @@ def _new_record() -> dict:
         "fight_result_notifications": True,
         "skill_slots": list(SCROLLS.EMPTY_LOADOUT),
         "owned_scrolls": [],
+        "dungeon_run": None,
+        "dungeon_deepest": 1,
     }
 
 
@@ -1934,7 +1942,7 @@ def _scroll_reward_row(row: dict) -> tuple[dict, dict]:
     pity = row.setdefault("pity", {})
     if not isinstance(pity, dict):
         pity = row["pity"] = {}
-    for kind in ("paint", "hard_quest"):
+    for kind in ("paint", "hard_quest", "dungeon"):
         pity[kind] = _safe_nonnegative_int(pity.get(kind))
     return log, pity
 
@@ -1983,7 +1991,7 @@ def grant_scroll_reward(
     second loot table to tune.
     """
     source = str(source or "").strip()
-    if kind not in ("paint", "hard_quest") or not source:
+    if kind not in ("paint", "hard_quest", "dungeon") or not source:
         return {"granted": False, "reason": "invalid_source"}
     chance = max(0.0, min(1.0, float(chance or 0.0)))
     pity_after = max(1, int(pity_after or 1))
@@ -2158,6 +2166,210 @@ def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
         if isinstance(effect, dict) and effect.get("code"):
             effects.append(dict(effect))
     return tuple(effects)
+
+
+def _dungeon_active(record: dict | None) -> bool:
+    return bool(isinstance(record, dict) and record.get("dungeon_run"))
+
+
+def dungeon_status(entry: str, user_id) -> dict:
+    """Public state reconstructed from the server-owned dungeon run."""
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return {"active": False, "min_power": D.MIN_POWER}
+    run = record.get("dungeon_run")
+    state = {
+        "active": bool(run), "min_power": D.MIN_POWER,
+        "power": _power_rating_for(record), "deepest": int(record.get("dungeon_deepest", 1)),
+        "escalator_cost": D.ESCALATOR_RUBY_COST,
+    }
+    if not isinstance(run, dict):
+        return state
+    floor = max(1, int(run.get("floor", 1) or 1))
+    max_hp = max(1, int(run.get("max_hp", 1) or 1))
+    cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
+    encounters = []
+    for row in D.encounters_for_floor(floor):
+        copy = dict(row)
+        copy["cleared"] = copy["index"] in cleared
+        encounters.append(copy)
+    state.update({
+        "floor": floor, "theme": D.floor_name(floor), "hp": max(0, int(run.get("hp", max_hp))),
+        "max_hp": max_hp, "cleared": sorted(cleared), "encounters": encounters,
+        "can_rest": len(cleared) == len(encounters),
+        "heal_cost": D.shop_heal_cost(floor), "boss_lives": int(run.get("boss_lives", 0) or 0),
+    })
+    return state
+
+
+def _dungeon_fighter(record: dict, key: str) -> pets_combat.Fighter:
+    effective = _effective_stats_for(record)
+    effects = []
+    for code in (record.get("equipped") or {}).values():
+        item = C.find_item(code) if code else None
+        effect = getattr(item, "effect", None) if item else None
+        if isinstance(effect, dict) and effect.get("code"):
+            effects.append(dict(effect))
+    return pets_combat.Fighter(
+        key=str(key), name=record.get("name") or "Существо",
+        strength=effective["strength"], health=effective["health"],
+        agility=effective["agility"], luck=effective["luck"], armor=effective.get("armor", 0),
+        effects=tuple(effects), level=int(record.get("level", 1)),
+        skills=_skill_loadout_for(record), shield=_combat_shield_for(record),
+    )
+
+
+def _dungeon_has_healing(record: dict) -> bool:
+    healing_effects = {"vampiric", "second_wind", "dodge_heal", "regen", "medkit", "bite", "blood_pact"}
+    for code in _skill_loadout_for(record):
+        scroll = SCROLLS.scroll(code) if code else None
+        if scroll and any(row.get("op") in {"heal", "regen"} for row in scroll.get("effects", ())):
+            return True
+    return any(
+        (getattr(C.find_item(code), "effect", {}) or {}).get("code") in healing_effects
+        for code in (record.get("equipped") or {}).values() if code
+    )
+
+
+def _dungeon_has_element(record: dict, element: str) -> bool:
+    return any((SCROLLS.scroll(code) or {}).get("element") == element
+               for code in _skill_loadout_for(record) if code)
+
+
+def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool, str]:
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        if _is_farming_record(record, app_now()):
+            return False, "Питомец на ферме."
+        if _dungeon_active(record):
+            return False, "Ты уже в подземелье."
+        if _power_rating_for(record) < D.MIN_POWER:
+            return False, f"Для подземелья нужно {D.MIN_POWER} силы."
+        floor = 1
+        if escalator:
+            floor = max(1, int(record.get("dungeon_deepest", 1)))
+            if floor <= 1:
+                return False, "Эскалатор откроется, когда доберёшься глубже."
+            wallet = _ruby_row(data)
+            rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+            if rubies < D.ESCALATOR_RUBY_COST:
+                return False, f"Нужно {D.ESCALATOR_RUBY_COST} рубинов."
+            wallet[str(user_id)] = rubies - D.ESCALATOR_RUBY_COST
+        hero = _dungeon_fighter(record, str(user_id))
+        max_hp = round(pets_combat.derive(hero, hero)["max_hp"])
+        record["dungeon_run"] = {"floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": []}
+        _save(entry, data)
+    return True, f"{'Эскалатор доставил' if escalator else 'Ты вошёл'} на этаж {floor}."
+
+
+def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | None]:
+    """Fight a fixed encounter, recording persistent damage before rewards leave the store."""
+    reward = None
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        floor = max(1, int(run.get("floor", 1) or 1))
+        row = D.encounter(floor, index)
+        cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
+        if row["index"] in cleared:
+            return False, "Этот противник уже побеждён.", None
+        if row["gimmick"] == "fire_only" and not _dungeon_has_element(record, "fire"):
+            return False, "Ледяного дракона ранит только огненный свиток.", None
+        if row["gimmick"] == "spells_only" and not any(_skill_loadout_for(record)):
+            return False, "Призрака можно ранить только свитками.", None
+        if row["gimmick"] == "healing_pass" and _dungeon_has_healing(record):
+            cleared.add(row["index"])
+            run["cleared"] = sorted(cleared)
+            reward, result = dict(row["reward"]), None
+            message = "Лечение успокоило плачущее дерево. Ты проходишь дальше."
+        else:
+            hero = _dungeon_fighter(record, str(user_id))
+            enemy = pets_combat.Fighter(
+                key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
+                level=row["level"],
+                effects=(({"code": "thorns", "value": 50},) if row["gimmick"] == "healing_pass" else ()),
+                **row["stats"],
+            )
+            result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
+            player_hp = 0
+            for turn in reversed(result.rounds):
+                if turn.attacker == str(user_id):
+                    player_hp = turn.attacker_hp
+                    break
+                if turn.defender_hp >= 0:
+                    player_hp = turn.defender_hp
+                    break
+            run["hp"] = min(max(0, int(run.get("hp", 0))), max(0, int(player_hp)))
+            if result.winner != str(user_id):
+                record["dungeon_run"] = None
+                _save(entry, data)
+                return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result}
+            if row["gimmick"] == "reincarnate" and not int(run.get("boss_lives", 0) or 0):
+                run["boss_lives"] = 1
+                _save(entry, data)
+                return True, f"{row['name']} возрождается. Добей его ещё раз.", {"encounter": row, "result": result, "reincarnated": True}
+            cleared.add(row["index"])
+            run["cleared"] = sorted(cleared)
+            reward, message = dict(row["reward"]), f"Побеждён: {row['name']}."
+        _apply_xp(record, int(reward["xp"]))
+        _save(entry, data)
+
+    economy.grant(entry, user_id, int(reward["gold"]), "pet_dungeon_win")
+    dropped = grant_random_drop(entry, user_id, float(reward["item_chance"]), seed=f"dungeon:{floor}:{index}")
+    scroll = None
+    if reward["scroll_chance"]:
+        scroll = grant_scroll_reward(entry, user_id, source=f"dungeon:{floor}:{index}", kind="dungeon", chance=float(reward["scroll_chance"]), pity_after=8)
+    return True, message, {"encounter": row, "result": result, "reward": reward, "dropped": dropped, "scroll": scroll}
+
+
+def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    run = record.get("dungeon_run") if record else None
+    if not isinstance(run, dict):
+        return False, "Сначала войди в подземелье."
+    floor = int(run.get("floor", 1) or 1)
+    if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
+        return False, "Сначала очисти этаж."
+    cost = D.shop_heal_cost(floor)
+    paid, _balance = economy.spend(entry, user_id, xp, cost, "pet_dungeon_heal")
+    if not paid:
+        return False, f"На лечение нужно {cost} монет."
+    run["hp"] = int(run.get("max_hp", 1))
+    _save(entry, data)
+    return True, "Лавка подземелья полностью восстановила здоровье."
+
+
+def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    run = record.get("dungeon_run") if record else None
+    if not isinstance(run, dict):
+        return False, "Сначала войди в подземелье."
+    floor = int(run.get("floor", 1) or 1)
+    if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
+        return False, "Сначала очисти этаж."
+    run["floor"], run["cleared"] = floor + 1, []
+    run.pop("boss_lives", None)
+    record["dungeon_deepest"] = max(int(record.get("dungeon_deepest", 1)), floor + 1)
+    _save(entry, data)
+    return True, f"Ты спускаешься на этаж {floor + 1}."
+
+
+def quit_dungeon(entry: str, user_id) -> tuple[bool, str]:
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None or not _dungeon_active(record):
+        return False, "Ты не в подземелье."
+    record["dungeon_run"] = None
+    _save(entry, data)
+    return True, "Ты покинул подземелье."
 
 
 def _equipped_effect(record: dict, effect_code: str) -> dict | None:
@@ -2518,6 +2730,8 @@ def equip(entry, user_id, code) -> tuple[bool, str]:
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
+    if _dungeon_active(record):
+        return False, "Снаряжение можно менять только между этажами подземелья."
     item = C.find_item(code)
     if item is None:
         return False, "Такого предмета не существует."
@@ -2537,6 +2751,8 @@ def unequip(entry, user_id, slot) -> tuple[bool, str]:
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
+    if _dungeon_active(record):
+        return False, "Снаряжение можно менять только между этажами подземелья."
     equipped = record.setdefault("equipped", {})
     current = equipped.get(slot)
     if not current:

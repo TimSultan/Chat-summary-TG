@@ -754,6 +754,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["arena"]["farming"] = pets.is_farming(entry, user_id)
     state["arena"]["pity"] = pets.legendary_pity_progress(entry, user_id)
     state["rubies"] = pets.ruby_balance(entry, user_id)
+    state["dungeon"] = pets.dungeon_status(entry, user_id)
     state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
     state["farm"]["passive"] = pets.passive_income_status(entry, user_id)
@@ -923,6 +924,31 @@ def _action_notifications(entry, user_id, xp, payload):
     return True, "Отчёты о боях включены." if enabled else "Отчёты о боях выключены."
 
 
+def _action_dungeon_enter(entry, user_id, xp, payload):
+    return pets.enter_dungeon(entry, user_id)
+
+
+def _action_dungeon_escalator(entry, user_id, xp, payload):
+    return pets.enter_dungeon(entry, user_id, escalator=True)
+
+
+def _action_dungeon_fight(entry, user_id, xp, payload):
+    ok, message, _result = pets.dungeon_fight(entry, user_id, int(payload.get("index") or 0))
+    return ok, message
+
+
+def _action_dungeon_rest(entry, user_id, xp, payload):
+    return pets.dungeon_rest(entry, user_id, xp)
+
+
+def _action_dungeon_descend(entry, user_id, xp, payload):
+    return pets.dungeon_descend(entry, user_id)
+
+
+def _action_dungeon_quit(entry, user_id, xp, payload):
+    return pets.quit_dungeon(entry, user_id)
+
+
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
   "respec_stats": _action_respec_stats,
@@ -945,6 +971,12 @@ _ACTIONS = {
     "daily_bonus": _action_daily_bonus,
     "notifications": _action_notifications,
     "portrait_crop": _action_portrait_crop,
+    "dungeon_enter": _action_dungeon_enter,
+    "dungeon_escalator": _action_dungeon_escalator,
+    "dungeon_fight": _action_dungeon_fight,
+    "dungeon_rest": _action_dungeon_rest,
+    "dungeon_descend": _action_dungeon_descend,
+    "dungeon_quit": _action_dungeon_quit,
 }
 
 
@@ -2578,6 +2610,20 @@ PAGE_HTML = """<!doctype html>
   .go.sec { background: transparent; border: 1px solid var(--line); color: var(--fg); }
   .go.warn { background: var(--hp); color: #fff; }
   .go:disabled { opacity: .4; }
+  .dungeon { overflow: hidden; padding: 0; border-color: rgba(232,185,35,.45); }
+  .dungeon-head { min-height: 142px; position: relative; padding: 15px; display: flex; align-items: flex-end; background: repeating-linear-gradient(135deg, #1d3c3e 0 18px, #162a34 18px 36px); }
+  .dungeon-head.boss { background: repeating-linear-gradient(135deg, #502331 0 18px, #201e31 18px 36px); }
+  .dungeon-title { font-family: Georgia, serif; font-size: 24px; font-weight: 700; color: #ffe8a3; text-shadow: 0 2px 0 #121820; }
+  .dungeon-title small { display: block; margin-top: 3px; font: 12px/1.3 "Segoe UI", sans-serif; color: #d4e7df; }
+  .dungeon-stat { position: absolute; top: 12px; right: 13px; text-align: right; font-size: 12px; color: #fff2c0; }
+  .dungeon-body { padding: 12px; }
+  .dungeon-enemies { display: grid; gap: 8px; }
+  .dungeon-enemy { text-align: left; display: grid; grid-template-columns: 48px 1fr auto; align-items: center; gap: 9px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; background: rgba(0,0,0,.16); padding: 7px; color: var(--fg); }
+  .dungeon-enemy.done { opacity: .48; filter: saturate(.25); }
+  .dungeon-art { width: 48px; height: 48px; border-radius: 7px; overflow: hidden; background: #10171c; }
+  .dungeon-art svg { width: 100%; height: 100%; display: block; }
+  .dungeon-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 11px; }
+  .dungeon-actions .go { padding: 9px 8px; font-size: 13px; }
   .chip {
     border: 1px solid var(--line); background: transparent; border-radius: 999px;
     padding: 6px 12px; font-size: 13px; white-space: nowrap;
@@ -3627,7 +3673,7 @@ function renderHero() {
           "боёв " + pet.fights + " · побед " + pet.wins +
         "</div>" +
       "</div>" +
-    "</div>" + liveSkillsPanel() +
+    "</div>" + liveSkillsPanel() + dungeonPanel() +
 
     '<div class="panel"><h2>В бою</h2><div class="grid4">' +
       tile("❤️ Здоровье", combat.max_hp) +
@@ -3722,6 +3768,24 @@ function dailyPanel() {
       (daily.can_claim ? "" : " disabled") + ">" +
       (daily.can_claim ? "🎁 Забрать " + money(daily.amount) : "Сегодня уже забрано") +
     "</button></div>";
+}
+
+function dungeonArt(enemy) {
+  const fill = enemy.boss ? "#e05a5a" : "#76b87b";
+  const eye = enemy.boss ? "#ffe99a" : "#d8f4d3";
+  return '<span class="dungeon-art"><svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" fill="' + (enemy.boss ? '#301d2c' : '#17312c') + '"/><path d="M5 55L19 35 29 42 40 20 59 55Z" fill="#0e1b24"/><path d="M17 52c0-17 7-29 16-29s16 12 16 29" fill="' + fill + '"/><circle cx="27" cy="34" r="3" fill="' + eye + '"/><circle cx="39" cy="34" r="3" fill="' + eye + '"/>' + (enemy.boss ? '<path d="M24 24l-7-12 13 8 4-14 4 14 13-8-7 12" fill="#f0c85a"/>' : '') + '</svg></span>';
+}
+
+function dungeonPanel() {
+  const dungeon = S.dungeon || {};
+  if (!S.pet) return "";
+  if (!dungeon.active) {
+    const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Три врага на этаж. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>⚔️ Войти</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · 5 💎</button>' : '') + '</div></div>';
+  }
+  const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
+  const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="dungeon-actions"><button class="go sec" data-dungeon="rest">🛒 Лечение · ' + dungeon.heal_cost + '</button><button class="go" data-dungeon="descend">⬇️ Спуститься</button></div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
 }
 
 function renderOnboarding() {
@@ -5900,9 +5964,14 @@ document.addEventListener("click", async (event) => {
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
-    "[data-debuffpick],[data-debuffset],[data-debuffclear]");
+    "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]");
   if (!target) return;
   const d = target.dataset;
+  if (d.dungeon) {
+    const actions = { enter: "dungeon_enter", escalator: "dungeon_escalator", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit" };
+    await act(actions[d.dungeon], d.dungeon === "fight" ? { index: Number(d.index) } : {});
+    return;
+  }
 
   if (d.peek) { await togglePeek(d.peek); return; }
   if (d.congratulate) { await congratulate(); return; }

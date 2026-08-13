@@ -195,6 +195,9 @@ def main_view(
             {"text": "📬 Почта", "callback_data": callback_data(user_id, "mail")},
             {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
         ])
+        rows.append([{
+            "text": "🕳 Подземелье", "callback_data": callback_data(user_id, "dungeon"),
+        }])
         notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
         rows.append([
             {
@@ -298,6 +301,31 @@ def info_view(user_id) -> tuple[str, dict]:
         "Каждый экран сам подскажет, что можно сделать дальше.",
     ]
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+
+def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    state = pets.dungeon_status(entry, user_id)
+    if not state.get("active"):
+        power = int(state.get("power", 0))
+        needed = int(state.get("min_power", 1000))
+        lines = ["🕳 <b>Подземелье</b>", "", f"⚡ Сила: <b>{_money(power)}</b> / {_money(needed)}",
+                 "Три врага на этаж, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
+        rows = [[{"text": "⚔️ Войти", "callback_data": callback_data(user_id, "dungeonenter")}]]
+        if int(state.get("deepest", 1)) > 1:
+            rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · 5 💎", "callback_data": callback_data(user_id, "dungeonescalator")}])
+        rows.append(_back_row(user_id))
+        return "\n".join(lines), {"inline_keyboard": rows}
+    lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", ""]
+    rows = []
+    for enemy in state.get("encounters", []):
+        marker = "✅" if enemy.get("cleared") else ("👑" if enemy.get("boss") else "⚔️")
+        lines.append(f"{marker} {escape(str(enemy['name']))}" + (f" — {escape(str(enemy['hint']))}" if enemy.get("hint") else ""))
+        if not enemy.get("cleared"):
+            rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
+    if state.get("can_rest"):
+        rows.append([{"text": f"🛒 Лечение · {state['heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest")}, {"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
+    rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:

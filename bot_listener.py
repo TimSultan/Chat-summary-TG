@@ -6328,6 +6328,31 @@ async def handle_pets_callback(
             )
             flow["submission_id"] = argument
             return
+        if action == "dungeon":
+            await _send_pets_view(api, chat_id, pets_ui.dungeon_view(entry, user_id, xp),
+                                  message_id=message_id, log=log)
+            return
+        if action in ("dungeonenter", "dungeonescalator", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
+            if action == "dungeonenter":
+                ok, note = pets.enter_dungeon(entry, user_id)
+            elif action == "dungeonescalator":
+                ok, note = pets.enter_dungeon(entry, user_id, escalator=True)
+            elif action == "dungeonrest":
+                ok, note = pets.dungeon_rest(entry, user_id, xp)
+            elif action == "dungeondescend":
+                ok, note = pets.dungeon_descend(entry, user_id)
+            elif action == "dungeonquit":
+                ok, note = pets.quit_dungeon(entry, user_id)
+            else:
+                try:
+                    index = int(argument)
+                except (TypeError, ValueError):
+                    index = 0
+                ok, note, _result = pets.dungeon_fight(entry, user_id, index)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.dungeon_view(entry, user_id, xp), log,
+            )
+            return
         if action == "mob":
             block = pets.roll_mob(entry, user_id)
             await _send_pets_view(
