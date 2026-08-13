@@ -28,17 +28,19 @@ def _loadout_containing(code: str) -> tuple:
 
 
 class LiveCombatTableTests(unittest.TestCase):
-    def test_catalogue_has_three_regular_slots_one_ultimate_and_ten_live_shields(self):
+    def test_catalogue_has_three_regular_slots_one_ultimate_and_the_live_shields(self):
         self.assertEqual(len(scrolls.REGULAR_SCROLLS), 30)
         self.assertEqual(len(scrolls.ULTIMATE_SCROLLS), 10)
-        self.assertEqual(len(scrolls.SHIELDS), 10)
-        self.assertEqual(len(C.items_for_slot("shield")), 10)
+        self.assertEqual(len(scrolls.SHIELDS), 14)
+        self.assertEqual(len(C.items_for_slot("shield")), 14)
 
         shop = C.items_for_slot("shield", "shop")
         drops = [item for item in C.items_for_slot("shield") if item.source == "drop"]
+        # The shop stays at three however many shields the loot table grows: a shield you
+        # can always buy must not take a roll away from one you have to find.
         self.assertEqual(len(shop), 3)
-        self.assertEqual(len(drops), 7)
-        self.assertEqual(sum(item.rarity == "legendary" for item in drops), 3)
+        self.assertEqual(len(drops), 11)
+        self.assertEqual(sum(item.rarity == "legendary" for item in drops), 5)
         self.assertTrue(all(item.price > 0 and item.drop_weight == 0 for item in shop))
         self.assertTrue(all(item.resale_price > 0 and item.drop_weight > 0 for item in drops))
         self.assertTrue(all(item.effect and item.effect.get("defend_effects") is not None

@@ -238,6 +238,18 @@ SHIELDS = (
     {"code": "shield_rune", "name": "Рунный щит", "icon": "🔷",
      "short": "При защите создаёт барьер 12% HP.",
      "defend_effects": ({"op": "shield", "percent": .12},)},
+    {"code": "shield_clothespin", "name": "Бельевая прищепка", "icon": "🗜️",
+     "short": "При защите усиливает свой следующий удар на 25%.",
+     "defend_effects": ({"op": "damage_boost", "value": .25, "turns": 1},)},
+    {"code": "shield_forge_clamp", "name": "Кузнечный зажим", "icon": "⚙️",
+     "short": "При защите усиливает свои следующие два удара на 35%.",
+     "defend_effects": ({"op": "damage_boost", "value": .35, "turns": 2},)},
+    {"code": "shield_solvent_jar", "name": "Баночка растворителя", "icon": "🧪",
+     "short": "При защите поджигает врага: 35% урона за ход, 2 хода.",
+     "defend_effects": ({"op": "burn", "amount": .35, "turns": 2},)},
+    {"code": "shield_solvent_drum", "name": "Бочка растворителя", "icon": "🛢️",
+     "short": "При защите поджигает врага: 45% урона за ход, 3 хода.",
+     "defend_effects": ({"op": "burn", "amount": .45, "turns": 3},)},
 )
 
 
@@ -415,8 +427,8 @@ def _validate() -> None:
     if {row["element"] for row in SCROLLS} != set(ELEMENTS):
         raise ValueError("every scroll element must be represented")
     shield_codes = [row["code"] for row in SHIELDS]
-    if len(shield_codes) != 10 or len(set(shield_codes)) != len(shield_codes):
-        raise ValueError("shield catalogue must contain 10 unique entries")
+    if len(shield_codes) != 14 or len(set(shield_codes)) != len(shield_codes):
+        raise ValueError("shield catalogue must contain 14 unique entries")
     validate_loadout(SAMPLE_LOADOUT)
     # Four empty slots is the state every creature is tamed into, so it has to survive
     # the same validator every equip goes through, unchanged.

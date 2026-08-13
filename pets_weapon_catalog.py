@@ -1,13 +1,15 @@
 """The clear, comic, fixed weapon catalogue for the pet arena.
 
 This module owns *data*, rather than game logic.  ``WEAPON_SPECS`` is an immutable
-tuple of exactly 500 :class:`WeaponSpec` values.  It is safe for ``pets_config`` to
+tuple of exactly 504 :class:`WeaponSpec` values.  It is safe for ``pets_config`` to
 turn a spec into its mutable ``Item`` object with ``spec.item_arguments()``; the raw
 catalogue itself cannot be changed accidentally during a fight.
 
 The catalogue is generated from curated word banks at import time so that it remains
 reviewable and deterministic without maintaining a 500-line hand-written list.  Codes
-are stable ASCII identifiers (``w001`` through ``w500``), not display names.
+are stable ASCII identifiers (``w001`` through ``w500``), not display names.  Four more
+hand-written drop-only weapons, ``w501``..``w504``, close out a couple of equipment
+builds that had no weapon carrying their signature effect (see ``_NEW_BUILD_WEAPONS``).
 """
 
 from __future__ import annotations
@@ -480,6 +482,38 @@ _ASCENDED_LEGENDARIES: Final = {
     ),
 }
 
+# Two equipment builds -- crit/glass-cannon and healing/lifesteal -- fill five slots
+# with five different effect codes each, but had no *weapon* carrying their signature
+# effect (pets_combat._effect_specs keeps only the strongest instance of a duplicated
+# code, so two items sharing one code would waste a slot). These four hand-written
+# drop-only weapons close that gap. They sit outside the generated w001..w500 range
+# rather than reusing a generated slot, so no existing code, drop table or inventory
+# shifts. Rare values land on the amulet-table default for the code (see
+# pets_combat._EFFECT_DEFAULTS); legendary values are roughly 1.4-1.8x that default --
+# the same restrained ratio the rest of the catalogue's rare/legendary pairs use.
+_NEW_BUILD_WEAPONS: Final = (
+    (
+        "w501", "Треснувшее зеркало", "Семь лет неудач достаются противнику.",
+        "rare", (("strength", 21), ("luck", 6), ("health", -4)),
+        _effect("lucky", "Крит в бою: +5%.", 5),
+    ),
+    (
+        "w502", "Зеркальный шар", "Каждый осколок — отдельный шанс на удачу.",
+        "legendary", (("strength", 30), ("luck", 9), ("armor", -5)),
+        _effect("lucky", "Крит в бою: +8%.", 8),
+    ),
+    (
+        "w503", "Банка с пиявками", "Присасывается быстрее, чем вы успеваете возразить.",
+        "rare", (("strength", 21), ("health", 6), ("armor", -2)),
+        _effect("vampiric", "Лечит 9% нанесённого урона.", 9),
+    ),
+    (
+        "w504", "Капельница скорой помощи", "Забирает и возвращает — в свою пользу.",
+        "legendary", (("strength", 30), ("health", 10), ("agility", -4)),
+        _effect("vampiric", "Лечит 14% нанесённого урона.", 14),
+    ),
+)
+
 
 def _source_for(rarity: str, rarity_rank: int) -> str:
     # Cursed junk belongs to arena drops, never a shop shelf. The shop offers normal
@@ -618,13 +652,27 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
     ]
     # The word banks offer far more than 500 pairs. The early stop keeps the public range
     # w001..w500 and, crucially, all existing inventory codes stable.
+    for code, name, description, rarity, bonuses, effect in _NEW_BUILD_WEAPONS:
+        buy_price, resale_price = _prices(rarity, "drop", bonuses)
+        entries.append(WeaponSpec(
+            code=code,
+            name=name,
+            description=description,
+            rarity=rarity,
+            source="drop",
+            buy_price=buy_price,
+            resale_price=resale_price,
+            drop_weight=_drop_weight(rarity, "drop"),
+            bonuses=bonuses,
+            effect=effect,
+        ))
     return tuple(entries)
 
 
 WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = _build_catalogue()
-# Compatibility records for item/trade code.  Use only these 500 records when wiring
+# Compatibility records for item/trade code.  Use only these 504 records when wiring
 # the equipment system: existing ``stick``, ``fork`` and ``bone`` are replacements,
-# not additions, if the total weapon count must remain exactly 500.
+# not additions, if the total weapon count must remain exactly 504.
 RAW_ITEMS: Final[tuple[dict[str, object], ...]] = tuple(item.raw_item() for item in WEAPON_SPECS)
 WEAPON_COUNT: Final = len(WEAPON_SPECS)
 RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in WEAPON_SPECS) for rarity in RARITIES}
@@ -636,7 +684,7 @@ PRE_REBALANCE_BUY_PRICES: Final = {
 
 def _validate_catalogue() -> None:
     """Fail immediately if a future catalogue edit violates its public contract."""
-    assert WEAPON_COUNT == 500
+    assert WEAPON_COUNT == 504
     assert len({item.code for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.name for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.description for item in WEAPON_SPECS}) == WEAPON_COUNT
@@ -650,13 +698,16 @@ def _validate_catalogue() -> None:
                                    for key, value in item.bonuses) for item in WEAPON_SPECS)
     assert all(item.drop_weight == 0 for item in WEAPON_SPECS if item.source == "shop")
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
-    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 45, "legendary": 10}
+    # The generated 500 carry 75/250/120/45/10; _NEW_BUILD_WEAPONS then adds two more
+    # rare drops and two more legendary drops on top (w501..w504).
+    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 47, "legendary": 12}
     # Every legendary carries a passive; the promoted five come from effect-bearing rare
-    # lines, leaving twenty modified rares and twenty-five plain ones.
+    # lines, leaving twenty modified rares and twenty-five plain ones out of the generated
+    # 500 -- plus the two effect-bearing rares and two legendaries in _NEW_BUILD_WEAPONS.
     with_effect = [item for item in WEAPON_SPECS if item.effect]
     assert all(item.rarity in {"rare", "legendary"} for item in with_effect)
     assert all(item.effect for item in WEAPON_SPECS if item.rarity == "legendary")
-    assert sum(1 for item in WEAPON_SPECS if item.rarity == "rare" and item.effect) == 20
+    assert sum(1 for item in WEAPON_SPECS if item.rarity == "rare" and item.effect) == 22
     # Guarded: EFFECT_HOOKS is empty when this data module is imported on its own, and
     # the fallback must stay a fallback rather than becoming an import-time failure.
     assert not EFFECT_HOOKS or all(
@@ -669,6 +720,7 @@ def _validate_catalogue() -> None:
     for rarity, declared in (("rare", _RARE_EFFECTS), ("legendary", _LEGENDARY_EFFECTS)):
         used = {item.effect_dict()["code"] for item in with_effect if item.rarity == rarity}
         expected = {dict(effect)["code"] for effect in declared}
+        expected |= {dict(effect)["code"] for _, _, _, r, _, effect in _NEW_BUILD_WEAPONS if r == rarity}
         if rarity == "legendary":
             expected |= {dict(data[3])["code"] for data in _ASCENDED_LEGENDARIES.values()}
         assert used == expected if rarity == "legendary" else used <= expected

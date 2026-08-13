@@ -7,13 +7,14 @@ import pytest
 import pets_weapon_catalog as catalogue
 
 
-def test_catalogue_has_exactly_500_unique_stable_weapons():
-    assert catalogue.WEAPON_COUNT == 500
-    assert len(catalogue.WEAPON_SPECS) == 500
-    assert len({weapon.code for weapon in catalogue.WEAPON_SPECS}) == 500
-    assert len({weapon.name for weapon in catalogue.WEAPON_SPECS}) == 500
+def test_catalogue_has_exactly_504_unique_stable_weapons():
+    assert catalogue.WEAPON_COUNT == 504
+    assert len(catalogue.WEAPON_SPECS) == 504
+    assert len({weapon.code for weapon in catalogue.WEAPON_SPECS}) == 504
+    assert len({weapon.name for weapon in catalogue.WEAPON_SPECS}) == 504
     assert catalogue.WEAPON_SPECS[0].code == "w001"
-    assert catalogue.WEAPON_SPECS[-1].code == "w500"
+    # w501-w504 are the hand-written build weapons, appended after the generated run.
+    assert catalogue.WEAPON_SPECS[-1].code == "w504"
     assert all(weapon.code.isascii() and weapon.code.isalnum() for weapon in catalogue.WEAPON_SPECS)
 
 
@@ -51,14 +52,14 @@ def test_first_three_ids_preserve_legacy_identity_and_descriptions():
 
 def test_rarity_distribution_has_bad_average_good_and_more_legendary_items():
     assert catalogue.RARITY_COUNTS == {
-        "cursed": 75, "common": 250, "uncommon": 120, "rare": 45, "legendary": 10,
+        "cursed": 75, "common": 250, "uncommon": 120, "rare": 47, "legendary": 12,
     }
     cursed = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "cursed"]
     rares = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "rare"]
     legendary = [weapon for weapon in catalogue.WEAPON_SPECS if weapon.rarity == "legendary"]
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in cursed)
     assert all(max(value for _, value in weapon.bonuses) >= 20 for weapon in rares)
-    assert len(legendary) == 10
+    assert len(legendary) == 12
     assert all(any(value < 0 for _, value in weapon.bonuses) for weapon in legendary)
 
     # w003 is a deliberate, requested exception to the two rules below: at +21 strength it
@@ -66,7 +67,7 @@ def test_rarity_distribution_has_bad_average_good_and_more_legendary_items():
     # by several rares. It keeps its legendary passive and its 220-coin salvage. The
     # rules still bind every other legendary, including the five ascended rare designs.
     generated = [weapon for weapon in legendary if weapon.code != "w003"]
-    assert len(generated) == 9
+    assert len(generated) == 11
     assert all(dict(weapon.bonuses)["strength"] >= 28 for weapon in generated)
     assert min(dict(weapon.bonuses)["strength"] for weapon in generated) > max(
         dict(weapon.bonuses)["strength"] for weapon in rares
@@ -126,12 +127,12 @@ def test_raw_items_expose_trade_schema_and_expanded_legendary_drop_weight():
         "code", "name", "slot", "price", "source", "bonuses", "description", "rarity",
         "resale_price", "drop_weight", "effect",
     }
-    assert len(catalogue.RAW_ITEMS) == 500
+    assert len(catalogue.RAW_ITEMS) == 504
     assert all(required == set(record) for record in catalogue.RAW_ITEMS)
     drop_records = [record for record in catalogue.RAW_ITEMS if record["source"] == "drop"]
     legendary_weight = sum(record["drop_weight"] for record in drop_records if record["rarity"] == "legendary")
     total_weight = sum(record["drop_weight"] for record in drop_records)
-    assert legendary_weight / total_weight == pytest.approx(10 / 485)
+    assert legendary_weight / total_weight == pytest.approx(12 / 507)
     cursed = [record for record in catalogue.RAW_ITEMS if record["rarity"] == "cursed"]
     assert cursed and all(record["source"] == "drop" for record in cursed)
 
@@ -145,7 +146,7 @@ def test_every_legendary_and_twenty_remaining_rares_carry_a_passive_effect():
 
     assert all(weapon.effect for weapon in by_rarity["legendary"])
     rare_with_effect = [weapon for weapon in by_rarity["rare"] if weapon.effect]
-    assert len(rare_with_effect) == 20
+    assert len(rare_with_effect) == 22
     # Nothing below rare gets one, so a passive stays a mark of a real find.
     assert not any(
         weapon.effect
@@ -180,8 +181,8 @@ def test_rare_modifiers_are_varied_and_repeated_at_distinct_strengths():
         effect = weapon.effect_dict()
         by_code.setdefault(effect["code"], []).append(effect)
 
-    assert len(modified) == 20
-    assert len(by_code) == 16
+    assert len(modified) == 22
+    assert len(by_code) == 18
     for code in ("precision", "burn", "armor_shred", "wound"):
         assert len(by_code[code]) == 2
         assert by_code[code][0] != by_code[code][1]
@@ -229,7 +230,14 @@ def test_generated_rarities_are_interleaved_instead_of_front_loaded():
 
 
 def test_generated_names_are_plain_readable_noun_phrases():
-    generated_names = [weapon.name for weapon in catalogue.WEAPON_SPECS[3:]]
+    # The build weapons are hand-written, like the first three, so the theme-suffix rule
+    # that governs the generated run does not apply to them -- they get their own check
+    # below rather than being quietly exempted from all of them.
+    hand_written = {row[0] for row in catalogue._NEW_BUILD_WEAPONS}
+    generated_names = [
+        weapon.name for weapon in catalogue.WEAPON_SPECS[3:]
+        if weapon.code not in hand_written
+    ]
     assert all(not name.startswith("«") and ":" not in name for name in generated_names)
     legendary_names = {name for name, _ in catalogue._LEGENDARY_COPY}
     legendary_names |= {data[0] for data in catalogue._ASCENDED_LEGENDARIES.values()}
@@ -239,3 +247,22 @@ def test_generated_names_are_plain_readable_noun_phrases():
         or any(name.endswith(suffix) for suffix, _ in catalogue._THEMES)
         for name in generated_names
     )
+
+
+def test_hand_written_build_weapons_read_like_the_rest_of_the_catalogue():
+    hand_written = {row[0] for row in catalogue._NEW_BUILD_WEAPONS}
+    weapons = [w for w in catalogue.WEAPON_SPECS if w.code in hand_written]
+    assert len(weapons) == 4
+    for weapon in weapons:
+        assert not weapon.name.startswith("«") and ":" not in weapon.name
+        assert weapon.source == "drop" and weapon.buy_price == 0
+        assert weapon.effect, weapon.code
+    # Two builds, each a rare and the same effect again at legendary strength.
+    pairs = {}
+    for weapon in weapons:
+        pairs.setdefault(weapon.effect_dict()["code"], []).append(weapon)
+    assert set(pairs) == {"lucky", "vampiric"}
+    for code, pair in pairs.items():
+        rare, legendary = sorted(pair, key=lambda w: w.rarity == "legendary")
+        assert rare.rarity == "rare" and legendary.rarity == "legendary"
+        assert legendary.effect_dict()["value"] > rare.effect_dict()["value"], code

@@ -758,8 +758,8 @@ class EquipmentTradingTests(PetsTestCase):
             len([item for item in pets_config.ITEMS if item.slot == "amulet"]),
             42 + len(UTILITY_SHOP_CODES),
         )
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 34)
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 34)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 42)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 42)
         # The three DROP catalogues. Matched on source as well as prefix: the amulet
         # catalogue also sells a utility item now, and it shares the prefix without
         # belonging to the loot table this counts.
@@ -767,9 +767,9 @@ class EquipmentTradingTests(PetsTestCase):
             item for item in pets_config.ITEMS
             if item.code.startswith(("amulet_", "bt", "gl")) and item.source == "drop"
         ]
-        self.assertEqual(len(new_drops), 104)
+        self.assertEqual(len(new_drops), 120)
         self.assertTrue(all(item.source == "drop" and item.drop_weight > 0 for item in new_drops))
-        self.assertEqual(len([item for item in new_drops if item.effect]), 46)
+        self.assertEqual(len([item for item in new_drops if item.effect]), 62)
 
     def test_every_equipment_slot_has_at_least_three_effectful_legendaries(self):
         for slot in pets_config.SLOT_KEYS:
@@ -1176,11 +1176,11 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertEqual(len(stock), len(full) - 1)
         self.assertNotIn(offered.code, {item.code for item in stock})
 
-    def test_weapon_price_bands_keep_500_unique_weapons_and_rare_goals(self):
+    def test_weapon_price_bands_keep_504_unique_weapons_and_rare_goals(self):
         weapons = pets_config.items_for_slot("weapon")
-        self.assertEqual(len(weapons), 500)
-        self.assertEqual(len({item.code for item in weapons}), 500)
-        self.assertEqual(len({item.name for item in weapons}), 500)
+        self.assertEqual(len(weapons), 504)
+        self.assertEqual(len({item.code for item in weapons}), 504)
+        self.assertEqual(len({item.name for item in weapons}), 504)
         shop = [item for item in weapons if item.source == "shop"]
         prices = {rarity: [item.price for item in shop if item.rarity == rarity]
                   for rarity in ("common", "rare")}

@@ -387,19 +387,40 @@ class AmuletEffectTests(unittest.TestCase):
                 self.assertEqual(first, combat.simulate(fighter, opponent, seed=41))
                 self.assertGreater(len(first.rounds), 0)
 
-    def test_every_legendary_boot_and_glove_effect_actually_procs(self):
+    def test_every_effectful_boot_and_glove_actually_procs(self):
+        """Both tiers now, not just legendary: the build items put effects on the rare
+        rung too, and a rare that never fires is a slot the player filled for nothing."""
         opponent = Fighter(
             key="b", name="Opponent", strength=55, health=45, agility=35, luck=35,
             armor=10, level=8,
         )
-        legendary_gear = [
-            spec for spec in GEAR_SPECS if spec.rarity == "legendary"
-        ]
-        self.assertEqual(len(legendary_gear), 6)
-        for spec in legendary_gear:
+        effectful_gear = [spec for spec in GEAR_SPECS if spec.effect]
+        self.assertEqual(len(effectful_gear), 22)
+        self.assertEqual({spec.rarity for spec in effectful_gear}, {"rare", "legendary"})
+        # Two of them change the fight without ever writing a line in it: precision moves
+        # the miss multiplier at derive time and first_strike only tilts the initiative
+        # roll. Looking for a log row would call both of them broken, so each is checked
+        # against the number it actually moves.
+        silent = {"precision", "first_strike"}
+        bare = self._fighter_with({"code": "regen", "value": 0})
+        for spec in effectful_gear:
             code = spec.effect_dict()["code"]
             with self.subTest(effect=code):
                 fighter = self._fighter_with(spec.effect_dict())
+                if code == "precision":
+                    self.assertLess(
+                        combat.derive(fighter, opponent)["accuracy"],
+                        combat.derive(bare, opponent)["accuracy"],
+                    )
+                    continue
+                if code == "first_strike":
+                    def leads(who):
+                        return sum(
+                            combat.simulate(who, opponent, seed=seed).rounds[0].attacker == "a"
+                            for seed in range(300)
+                        )
+                    self.assertGreater(leads(fighter), leads(bare))
+                    continue
                 seen = any(
                     any(row.event == f"amulet_{code}" for row in combat.simulate(
                         fighter, opponent, seed=seed,
@@ -407,6 +428,7 @@ class AmuletEffectTests(unittest.TestCase):
                     for seed in range(120)
                 )
                 self.assertTrue(seen, f"{code} never proc'd")
+        self.assertTrue(silent <= {spec.effect_dict()["code"] for spec in effectful_gear})
 
     def test_new_weapon_modifiers_proc_inside_the_attack_cap(self):
         opponent = Fighter(

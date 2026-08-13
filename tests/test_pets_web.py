@@ -547,7 +547,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(body["defaults"]["skills"]), 4)
         self.assertEqual(len(body["regular_scrolls"]), 30)
         self.assertEqual(len(body["ultimate_scrolls"]), 10)
-        self.assertEqual(len(body["shields"]), 10)
+        self.assertEqual(len(body["shields"]), 14)
         self.assertTrue(all(row["auto_weight"] == 1 for row in body["regular_scrolls"]))
         self.assertTrue(all(row["effects"] for row in body["regular_scrolls"]))
         self.assertEqual(

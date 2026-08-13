@@ -18,6 +18,7 @@ STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
 SLOTS: Final = ("boots", "gloves")
 EFFECT_CODES: Final = frozenset({
     "phantom_step", "afterimage", "rewind", "echo_strike", "crushing_grip", "perfect_parry",
+    "precision", "first_strike", "spring", "dodge_heal", "regen", "venom_blade", "bleed",
 })
 
 
@@ -71,9 +72,9 @@ class GearSpec:
         }
 
 
-# A common item is deliberately modest.  The single legendary per slot is a fun
-# trophy, not a replacement for a good weapon.  Weights make a legendary one item in
-# 255 drops from either of these slot pools (about 0.39%).
+# A common item is deliberately modest.  Legendary items are fun trophies, not a
+# replacement for a good weapon.  Weights make a legendary one item in roughly 255
+# drops from either of these slot pools (about 0.39% per specific legendary).
 _TIER: Final = {
     "common": (8, 12),
     "uncommon": (15, 6),
@@ -131,6 +132,14 @@ BOOT_SPECS: Final[tuple[GearSpec, ...]] = (
     _spec("bt30", "Берцы полуночного призрака", "Легендарная форма берцев ночного перекуса.", "boots", "legendary", (("agility", 9), ("health", 5), ("luck", -3)), _effect("phantom_step", "Первая обычная атака врага гарантированно промахивается.", 1)),
     _spec("bt31", "Кроссовки исчезающей кнопки", "Красная кнопка теперь срабатывает между шагами.", "boots", "legendary", (("agility", 9), ("luck", 5), ("armor", -3)), _effect("afterimage", "После первого уворота следующая атака сильнее на 45%.", 45)),
     _spec("bt32", "Сапоги повелителя луж", "Лужи научились отматывать неудачный шаг назад.", "boots", "legendary", (("health", 10), ("armor", 6), ("agility", -4)), _effect("rewind", "Раз за бой смертельный удар отменяется и возвращает 25% максимального HP.", 25)),
+    _spec("bt33", "Кроссовки нарушителя старта", "Стартуют на полшага раньше свистка.", "boots", "rare", (("agility", 5), ("luck", 3), ("health", -1)), _effect("first_strike", "Шанс сходить первым выше на 16%.", 16)),
+    _spec("bt34", "Кроссовки короля фальстартов", "Судьи сдались, свисток теперь просто разминка.", "boots", "legendary", (("agility", 9), ("luck", 6), ("health", -3)), _effect("first_strike", "Шанс сходить первым выше на 28%.", 28)),
+    _spec("bt35", "Ботинки на скрытой пружине", "Два удара — разбег. Третий — уже высказывание.", "boots", "rare", (("armor", 6), ("health", 3), ("agility", -1)), _effect("spring", "После двух полученных ударов следующий удар — двойной.", 90)),
+    _spec("bt36", "Берцы на боевой пружине", "Два удара — терпение. Третий — разрыв контракта.", "boots", "legendary", (("armor", 10), ("health", 5), ("agility", -3)), _effect("spring", "После двух полученных ударов следующий удар — двойной и злопамятный.", 160)),
+    _spec("bt37", "Сапоги с автогрелкой", "Каждый раунд греют ровно на один бинт вперёд.", "boots", "rare", (("health", 6), ("armor", 3)), _effect("regen", "В конце раунда лечит 3 HP.", 3)),
+    _spec("bt38", "Сапоги с грелкой на максимум", "Раунд заканчивается — грелка выкладывается по полной.", "boots", "legendary", (("health", 10), ("armor", 5)), _effect("regen", "В конце раунда лечит 6 HP.", 6)),
+    _spec("bt39", "Ботинки с кнопкой в носке", "Каждый удар оставляет маленькое, но обидное напоминание.", "boots", "rare", (("strength", 4), ("luck", 3), ("armor", -1)), _effect("bleed", "Каждое попадание добавляет кровотечение: 2 урона за раунд, стакается.", 2)),
+    _spec("bt40", "Берцы с гвоздями в подошве", "Напоминания копятся, и уже совсем не маленькие.", "boots", "legendary", (("strength", 8), ("luck", 6), ("armor", -3)), _effect("bleed", "Каждое попадание добавляет кровотечение: 3 урона за раунд, стакается сильнее.", 3)),
 )
 
 
@@ -167,6 +176,14 @@ GLOVE_SPECS: Final[tuple[GearSpec, ...]] = (
     _spec("gl30", "Рукавицы повелителя банок", "Открывают крышки, двери и второй удар подряд.", "gloves", "legendary", (("strength", 9), ("armor", 6), ("agility", -3)), _effect("echo_strike", "Первое попадание повторяется эхом на 50% нанесённого урона.", 50)),
     _spec("gl31", "Перчатки абсолютного турбо", "Режим больше не выключается после предупреждения.", "gloves", "legendary", (("strength", 9), ("agility", 6), ("armor", -4)), _effect("crushing_grip", "Первое попадание навсегда снижает урон врага на 10% в этом бою.", 10)),
     _spec("gl32", "Варежки последнего кассира", "Сдачу не дают, удары возвращают полностью.", "gloves", "legendary", (("armor", 10), ("luck", 5), ("agility", -4)), _effect("perfect_parry", "Первый полученный удар слабее на 35%; поглощённый урон добавляется к следующей атаке.", 35)),
+    _spec("gl33", "Перчатки дартс-чемпиона", "Три вечера подряд без единого мимо.", "gloves", "rare", (("strength", 4), ("luck", 4), ("armor", -1)), _effect("precision", "Уворот врага ниже на 7%.", 7)),
+    _spec("gl34", "Перчатки короля дартс-турнира", "Мимо давно не пролетало ничего, включая слухи.", "gloves", "legendary", (("strength", 8), ("luck", 7), ("armor", -3)), _effect("precision", "Уворот врага ниже на 12%.", 12)),
+    _spec("gl35", "Перчатки дворового вратаря", "Ловит всё, что летит, и сразу назначает пенальти в ответ.", "gloves", "rare", (("armor", 5), ("strength", 3), ("agility", -1)), _effect("perfect_parry", "Первый полученный удар слабее на 32%; поглощённый урон добавляется к следующей атаке.", 32)),
+    _spec("gl36", "Перчатки вратаря сборной двора", "Пенальти теперь назначает даже без повода.", "gloves", "legendary", (("armor", 9), ("strength", 5), ("agility", -3)), _effect("perfect_parry", "Первый полученный удар слабее на 55%; поглощённый урон добавляется к следующей атаке.", 55)),
+    _spec("gl37", "Рукавицы уклониста-медика", "Уворачивается по инструкции, лечит по привычке.", "gloves", "rare", (("health", 5), ("agility", 3), ("luck", 1)), _effect("dodge_heal", "После уворота лечит 6 HP.", 6)),
+    _spec("gl38", "Рукавицы старшего уклониста-медика", "Уворачивается по призванию, лечит с запасом.", "gloves", "legendary", (("health", 9), ("agility", 5), ("luck", 2)), _effect("dodge_heal", "После уворота лечит 11 HP.", 11)),
+    _spec("gl39", "Перчатки с молотым перцем", "Прикосновение жжётся, соперник щурится ещё пару ходов.", "gloves", "rare", (("strength", 4), ("luck", 4), ("health", -1)), _effect("venom_blade", "После попадания соперник получает яд и на 16% чаще промахивается следующим ударом.", 16)),
+    _spec("gl40", "Перчатки с контрабандным перцем чили", "Слёзы соперника теперь не высыхают два раунда подряд.", "gloves", "legendary", (("strength", 8), ("luck", 7), ("health", -3)), _effect("venom_blade", "После попадания соперник получает яд и на 28% чаще промахивается следующим ударом.", 28)),
 )
 
 
@@ -179,9 +196,9 @@ RARITY_COUNTS: Final = {
 
 
 def _validate_catalogue() -> None:
-    assert len(BOOT_SPECS) == 32
-    assert len(GLOVE_SPECS) == 32
-    assert GEAR_COUNT == 64
+    assert len(BOOT_SPECS) == 40
+    assert len(GLOVE_SPECS) == 40
+    assert GEAR_COUNT == 80
     assert len({item.code for item in GEAR_SPECS}) == GEAR_COUNT
     assert len({item.name for item in GEAR_SPECS}) == GEAR_COUNT
     assert all(item.code.isascii() and item.code.isalnum() for item in GEAR_SPECS)
@@ -191,11 +208,11 @@ def _validate_catalogue() -> None:
     assert all(item.bonuses and all(key in STAT_KEYS and isinstance(value, int)
                                    for key, value in item.bonuses) for item in GEAR_SPECS)
     legendary = [item for item in GEAR_SPECS if item.rarity == "legendary"]
-    assert len(legendary) == 6 and all(item.effect for item in legendary)
-    assert {item.effect_dict()["code"] for item in legendary} == EFFECT_CODES
+    assert len(legendary) == 14 and all(item.effect for item in legendary)
+    assert all(item.effect_dict()["code"] in EFFECT_HOOKS for item in legendary)
     assert EFFECT_CODES <= set(EFFECT_HOOKS)
-    assert not any(item.effect for item in GEAR_SPECS if item.rarity != "legendary")
-    assert RARITY_COUNTS == {"common": 32, "uncommon": 18, "rare": 8, "legendary": 6}
+    assert not any(item.effect for item in GEAR_SPECS if item.rarity in ("common", "uncommon"))
+    assert RARITY_COUNTS == {"common": 32, "uncommon": 18, "rare": 16, "legendary": 14}
 
 
 _validate_catalogue()

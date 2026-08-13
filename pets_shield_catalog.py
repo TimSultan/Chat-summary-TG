@@ -58,6 +58,26 @@ _ITEM_RULES = {
         "resale_price": 96, "drop_weight": 1,
         "bonuses": {"armor": 34, "health": 10, "agility": -5},
     },
+    "shield_clothespin": {
+        "price": 0, "source": "drop", "rarity": "rare",
+        "resale_price": 48, "drop_weight": 4,
+        "bonuses": {"armor": 10, "strength": 7, "luck": 7},
+    },
+    "shield_forge_clamp": {
+        "price": 0, "source": "drop", "rarity": "legendary",
+        "resale_price": 96, "drop_weight": 1,
+        "bonuses": {"armor": 16, "strength": 10, "luck": 10},
+    },
+    "shield_solvent_jar": {
+        "price": 0, "source": "drop", "rarity": "rare",
+        "resale_price": 48, "drop_weight": 4,
+        "bonuses": {"armor": 20, "strength": 6},
+    },
+    "shield_solvent_drum": {
+        "price": 0, "source": "drop", "rarity": "legendary",
+        "resale_price": 96, "drop_weight": 1,
+        "bonuses": {"armor": 28, "strength": 12},
+    },
 }
 
 
@@ -81,8 +101,8 @@ RAW_ITEMS = tuple(
 
 def _validate() -> None:
     codes = [row["code"] for row in RAW_ITEMS]
-    if len(codes) != 10 or len(set(codes)) != 10:
-        raise ValueError("shield catalogue must contain 10 unique items")
+    if len(codes) != 14 or len(set(codes)) != 14:
+        raise ValueError("shield catalogue must contain 14 unique items")
     if set(codes) != set(_ITEM_RULES):
         raise ValueError("every shield needs live item rules")
     if sum(row["source"] == "shop" for row in RAW_ITEMS) != 3:

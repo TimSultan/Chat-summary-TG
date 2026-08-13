@@ -661,8 +661,8 @@ def _catalog_item(spec):
 
 if _RAW_WEAPON_ITEMS:
     _catalogue_weapons = tuple(_catalog_item(spec) for spec in _RAW_WEAPON_ITEMS)
-    if len(_catalogue_weapons) != 500 or any(item.slot != "weapon" for item in _catalogue_weapons):
-        raise ValueError("weapon catalogue must contain exactly 500 weapon entries")
+    if len(_catalogue_weapons) != 504 or any(item.slot != "weapon" for item in _catalogue_weapons):
+        raise ValueError("weapon catalogue must contain exactly 504 weapon entries")
     _codes = [item.code for item in _catalogue_weapons]
     if len(set(_codes)) != len(_codes):
         raise ValueError("weapon catalogue contains duplicate item codes")
@@ -683,18 +683,18 @@ if _RAW_AMULET_ITEMS and (
 ):
     raise ValueError("amulet catalogue must contain exactly 40 drop-only amulets, plus priced shop ones")
 if _RAW_GEAR_ITEMS and (
-    len(_catalogue_gear) != 64
-    or sum(item.slot == "boots" for item in _catalogue_gear) != 32
-    or sum(item.slot == "gloves" for item in _catalogue_gear) != 32
+    len(_catalogue_gear) != 80
+    or sum(item.slot == "boots" for item in _catalogue_gear) != 40
+    or sum(item.slot == "gloves" for item in _catalogue_gear) != 40
     or any(item.source != "drop" for item in _catalogue_gear)
 ):
-    raise ValueError("gear catalogue must contain 32 drop-only boots and 32 gloves")
+    raise ValueError("gear catalogue must contain 40 drop-only boots and 40 gloves")
 if _RAW_SHIELD_ITEMS and (
-    len(_catalogue_shields) != 10
+    len(_catalogue_shields) != 14
     or any(item.slot != "shield" for item in _catalogue_shields)
     or sum(item.source == "shop" for item in _catalogue_shields) != 3
 ):
-    raise ValueError("shield catalogue must contain 10 shields, exactly three sold in shops")
+    raise ValueError("shield catalogue must contain 14 shields, exactly three sold in shops")
 _new_catalogue_items = _catalogue_amulets + _catalogue_gear + _catalogue_shields
 if _new_catalogue_items:
     existing_codes = {item.code for item in ITEMS}

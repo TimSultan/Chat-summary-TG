@@ -7,20 +7,20 @@ import pytest
 import pets_gear_catalog as catalogue
 
 
-def test_catalogue_contains_exactly_thirty_two_items_for_each_new_slot():
-    assert len(catalogue.BOOT_SPECS) == 32
-    assert len(catalogue.GLOVE_SPECS) == 32
-    assert catalogue.GEAR_COUNT == 64
+def test_catalogue_contains_exactly_forty_items_for_each_new_slot():
+    assert len(catalogue.BOOT_SPECS) == 40
+    assert len(catalogue.GLOVE_SPECS) == 40
+    assert catalogue.GEAR_COUNT == 80
     assert {item.slot for item in catalogue.BOOT_SPECS} == {"boots"}
     assert {item.slot for item in catalogue.GLOVE_SPECS} == {"gloves"}
 
 
 def test_codes_and_names_are_unique_and_codes_are_stable_ascii():
-    assert len({item.code for item in catalogue.GEAR_SPECS}) == 64
-    assert len({item.name for item in catalogue.GEAR_SPECS}) == 64
+    assert len({item.code for item in catalogue.GEAR_SPECS}) == 80
+    assert len({item.name for item in catalogue.GEAR_SPECS}) == 80
     assert all(item.code.isascii() and item.code.isalnum() for item in catalogue.GEAR_SPECS)
     assert catalogue.BOOT_SPECS[0].code == "bt01"
-    assert catalogue.GLOVE_SPECS[-1].code == "gl32"
+    assert catalogue.GLOVE_SPECS[-1].code == "gl40"
 
 
 def test_every_item_is_an_economical_drop_with_standard_stat_bonuses_only():
@@ -39,22 +39,30 @@ def test_every_item_is_an_economical_drop_with_standard_stat_bonuses_only():
 
 def test_rarity_mix_is_balanced_and_legendary_items_are_very_uncommon():
     assert catalogue.RARITY_COUNTS == {
-        "common": 32, "uncommon": 18, "rare": 8, "legendary": 6,
+        "common": 32, "uncommon": 18, "rare": 16, "legendary": 14,
     }
     for slot_items in (catalogue.BOOT_SPECS, catalogue.GLOVE_SPECS):
         assert [item.rarity for item in slot_items].count("common") == 16
         assert [item.rarity for item in slot_items].count("uncommon") == 9
-        assert [item.rarity for item in slot_items].count("rare") == 4
-        assert [item.rarity for item in slot_items].count("legendary") == 3
+        assert [item.rarity for item in slot_items].count("rare") == 8
+        assert [item.rarity for item in slot_items].count("legendary") == 7
+        # Still about one legendary in forty drops from this pool. The build items
+        # doubled the rare and legendary shelves, so the ratio moved -- what has to
+        # hold is that a legendary stays a trophy rather than an expectation.
         legendary_weight = sum(item.drop_weight for item in slot_items if item.rarity == "legendary")
         total_weight = sum(item.drop_weight for item in slot_items)
-        assert legendary_weight / total_weight == pytest.approx(3 / 257)
+        assert legendary_weight / total_weight == pytest.approx(7 / 269)
 
 
-def test_every_legendary_gear_item_has_its_own_effect():
+def test_every_rare_and_legendary_build_item_carries_a_declared_effect():
+    """Effects used to be legendary-only. Builds need a rare rung too, so the rule is
+    now about which tiers may carry one -- not that only the top tier does."""
     legendary = [item for item in catalogue.GEAR_SPECS if item.rarity == "legendary"]
-    assert len(legendary) == 6
-    assert {item.effect_dict()["code"] for item in legendary} == catalogue.EFFECT_CODES
+    assert len(legendary) == 14
+    assert all(item.effect for item in legendary)
+    effectful = [item for item in catalogue.GEAR_SPECS if item.effect]
+    assert {item.rarity for item in effectful} == {"rare", "legendary"}
+    assert {item.effect_dict()["code"] for item in effectful} == catalogue.EFFECT_CODES
 
 
 def test_raw_items_match_the_existing_trade_record_schema_and_are_fresh_records():
@@ -62,7 +70,7 @@ def test_raw_items_match_the_existing_trade_record_schema_and_are_fresh_records(
         "code", "name", "slot", "price", "source", "bonuses", "description",
         "rarity", "resale_price", "drop_weight", "effect",
     }
-    assert len(catalogue.RAW_ITEMS) == 64
+    assert len(catalogue.RAW_ITEMS) == 80
     assert all(set(record) == required for record in catalogue.RAW_ITEMS)
     first = catalogue.GEAR_SPECS[0]
     record = first.raw_item()
