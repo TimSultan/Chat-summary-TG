@@ -43,7 +43,9 @@ class DeriveTests(unittest.TestCase):
 
         self.assertEqual(derived["deficits"], ("luck", "agility"))
         self.assertAlmostEqual(derived["accuracy"], 1.30)
-        self.assertEqual(derived["initiative_penalty"], C.STAT_DEFICIT_INITIATIVE_PENALTY)
+        self.assertEqual(
+            derived["incoming_damage_multiplier"], C.STAT_DEFICIT_AGILITY_DAMAGE_MULTIPLIER,
+        )
 
     def test_strength_and_health_deficits_reduce_dodge_and_maximum_hp(self):
         frail = Fighter(key="frail", name="Хрупкий", strength=5, health=5, agility=20, luck=20, armor=0)
@@ -70,6 +72,26 @@ class DeriveTests(unittest.TestCase):
         notices = [round_ for round_ in result.rounds if round_.event.startswith("deficit_")]
         self.assertEqual({round_.event for round_ in notices}, {"deficit_luck", "deficit_agility"})
         self.assertTrue(all(round_.number == 0 and round_.damage == 0 for round_ in notices))
+
+    def test_agility_deficit_increases_damage_in_a_classic_fight(self):
+        attacker = _fighter("attacker", 20)
+        weak = Fighter(key="weak", name="Медленный", strength=20, health=200, agility=10, luck=20, armor=0)
+        balanced = Fighter(key="balanced", name="Ровный", strength=20, health=200, agility=20, luck=20, armor=0)
+
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
+                patch.object(C, "MAX_SKILL_ACTIONS_PER_FIGHTER", 1), \
+                patch.object(C, "SIGNATURE_TRIGGER_CHANCES", {
+                    "strength": {2: 0.0, 3: 0.0},
+                    "health": {2: 0.0, 3: 0.0},
+                    "agility": {2: 0.0, 3: 0.0},
+                    "luck": {2: 0.0, 3: 0.0},
+                    "armor": {2: 0.0, 3: 0.0},
+                }):
+            vulnerable = combat.simulate(attacker, weak, seed=4)
+            baseline = combat.simulate(attacker, balanced, seed=4)
+
+        self.assertEqual(vulnerable.total_damage["attacker"], 12)
+        self.assertEqual(baseline.total_damage["attacker"], 10)
 
     def test_symmetric_fighters_get_no_dominance_bonus(self):
         a, b = _fighter("a", 40), _fighter("b", 40)

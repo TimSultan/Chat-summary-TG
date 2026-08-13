@@ -40,7 +40,7 @@ _SIGNATURE_STATS = _STATS + ("armor",)
 _DEFICIT_TEXT = {
     "strength": "🧱 {name} не держит корпус: слабая сила режет уклонение.",
     "health": "🩹 {name} выходит без запаса прочности: максимум HP ниже.",
-    "agility": "🐌 {name} залипает на старте: соперник чаще перехватывает инициативу.",
+    "agility": "🐌 {name} не успевает уйти с линии удара: входящий урон выше.",
     "luck": "🧲 {name} роняет подкову: атаки легче прочитать и обойти.",
 }
 
@@ -472,7 +472,9 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         "dominance": {stat: bool(bonus) for stat, bonus in stat_bonus.items()},
         "stat_bonus": stat_bonus,
         "deficits": deficits,
-        "initiative_penalty": C.STAT_DEFICIT_INITIATIVE_PENALTY if "agility" in deficits else 0.0,
+        "incoming_damage_multiplier": (
+            C.STAT_DEFICIT_AGILITY_DAMAGE_MULTIPLIER if "agility" in deficits else 1.0
+        ),
         "effects": effects,
     }
 
@@ -571,7 +573,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     used_scrolls = {a.key: set() for a in (a, b)}
     skill_statuses = {a.key: {} for a in (a, b)}
 
-    initiative = .5 - derived[a.key]["initiative_penalty"] + derived[b.key]["initiative_penalty"]
+    initiative = .5
     if effectful:
         if (value := _effect_value(effects[a.key], "first_strike")) is not None:
             initiative += _fraction(value)
@@ -605,6 +607,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     ) -> tuple[int, bool]:
         """Apply damage and one-shot defensive effects. Returns (impact, knockout)."""
         damage = max(0, int(damage))
+        damage = round(damage * derived[target_key]["incoming_damage_multiplier"])
         if damage and guards[target_key] > 0:
             before_guard = damage
             blocked_share = guards[target_key] * max(0.0, 1.0 - min(1.0, pierce_guard))
@@ -955,7 +958,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 )
 
     def signature_round(attacker_key: str, defender_key: str, event: str, damage: int) -> bool:
-        if effectful:
+        if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
             impact, knocked_out = hurt(attacker_key, defender_key, damage, 0)
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
@@ -1245,7 +1248,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
             )))
             armor_shredded[defender_key] = max(armor_shredded[defender_key], shred)
 
-        if effectful:
+        if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
             impact, knocked_out = hurt(attacker_key, defender_key, damage, round_number)
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
