@@ -54,8 +54,10 @@ import pets
 import pets_combat
 import pets_config as C
 import pets_mobs
+import pets_gemini
 import pets_scroll_catalog
 import pets_sprite
+import pets_sprite_store
 import pets_test_combat
 import pets_updates
 import quests
@@ -85,6 +87,7 @@ _QUEST_COMPLETION_KEY = web.AppKey("pets_quest_completion")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
 _TEST_BATTLE_SESSIONS_KEY = web.AppKey("pets_test_battle_sessions", dict)
+_SPRITE_JOBS_KEY = web.AppKey("pets_sprite_jobs", set)
 
 TEST_BATTLE_SESSION_TTL = 30 * 60
 TEST_BATTLE_SESSION_LIMIT = 1000
@@ -1827,45 +1830,119 @@ async def _portrait_bytes(request: web.Request, record: dict) -> bytes | None:
 
 
 async def handle_sprite(request: web.Request) -> web.Response:
-    """Which kind of creature one player's photograph shows, for the battle animation.
+    """Everything the battle screen needs to animate one player's creature.
 
-    Answers from the store when the picture has already been looked at, and only then
-    spends a vision call -- the answer cannot change while the photograph does not.
+    Answers with three things: which of the twelve archetypes the photograph shows, the
+    URLs of any generated frames that are ready, and whether generation is still running.
 
-    Deliberately its own route rather than part of the battle payload: classification is
-    a network round trip to a model and takes seconds, and a battle screen that waited for
-    it would feel broken. The screen opens immediately with the neutral idle and upgrades
-    itself when this lands, which is why every failure path here returns a usable code
-    with HTTP 200 instead of an error.
+    It never waits for a model. Working out what a picture shows is one round trip and
+    generating frames is four, so a battle screen that blocked on either would feel
+    broken. The screen opens on whatever exists -- at worst the raw photograph with the
+    neutral idle, which is exactly what it did before this feature -- and improves itself
+    on a later look. That is why every failure path here is a usable answer with HTTP 200
+    rather than an error the client would have to render.
     """
     await _player(request)
     entry = request.app[_ENTRY_KEY]
+    prefix = request.app[_PREFIX_KEY]
+    cfg = request.app[_CFG_KEY]
     who = str(request.query.get("user_id") or "").strip()
     record = pets.get_pet(entry, who) if who else None
     if record is None:
-        return _ok({"user_id": who, "kind": pets_sprite.DEFAULT_ARCHETYPE, "known": False})
+        return _ok({"user_id": who, "kind": pets_sprite.DEFAULT_ARCHETYPE,
+                    "frames": [], "status": "none"})
 
-    cached = pets_sprite.cached_archetype(record)
-    if cached:
-        return _ok({"user_id": who, "kind": cached, "known": True})
+    file_id = str(record.get("photo_file_id") or "")
+    manifest = await asyncio.to_thread(pets_sprite_store.read_manifest, file_id) if file_id else {}
+    if manifest.get("frames"):
+        # Frames on disk are the finished article; nothing else needs asking.
+        return _ok({
+            "user_id": who,
+            "kind": str(manifest.get("archetype") or pets_sprite.DEFAULT_ARCHETYPE),
+            "frames": [
+                {"name": name, "url": f"{prefix}/img/sprite/{who}/{name}.png"}
+                for name in manifest["frames"]
+            ],
+            "status": "ready",
+        })
 
-    cfg = request.app[_CFG_KEY]
-    api_key = getattr(cfg, "openai_api_key", "")
-    image = await _portrait_bytes(request, record) if api_key else None
-    if not image:
-        return _ok({"user_id": who, "kind": pets_sprite.DEFAULT_ARCHETYPE, "known": False})
+    kind = pets_sprite.cached_archetype(record) or pets_sprite.DEFAULT_ARCHETYPE
+    gemini_key = getattr(cfg, "gemini_api_key", "") or ""
+    status = "none"
 
-    kind = await asyncio.to_thread(
-        pets_sprite.classify, image,
-        api_key=api_key, model=getattr(cfg, "openai_model", "") or "gpt-4o-mini",
-    )
-    # Only a real answer is worth remembering. Storing the fallback would cache "we could
-    # not reach the model" as if it were "this is an unrecognisable creature", and nothing
-    # would ever ask again.
-    if kind != pets_sprite.DEFAULT_ARCHETYPE:
-        await asyncio.to_thread(pets.remember_sprite, entry, who, kind)
-        request.app[_LOG_KEY](f"[pets_web] sprite {who}: {kind}")
-    return _ok({"user_id": who, "kind": kind, "known": kind != pets_sprite.DEFAULT_ARCHETYPE})
+    if file_id and gemini_key and pets_sprite_store.claim(file_id):
+        # Fire and forget, one job per photograph per process. The task holds a reference
+        # on the app so a garbage collector cannot cancel it halfway through, which is the
+        # documented way to lose a bare asyncio.create_task.
+        async def build():
+            image = await _portrait_bytes(request, record)
+            if not image:
+                return
+            await asyncio.to_thread(
+                pets_sprite_store.generate, image, file_id,
+                api_key=gemini_key,
+                vision_model=getattr(cfg, "gemini_vision_model", "gemini-2.5-flash"),
+                image_model=getattr(cfg, "gemini_image_model", "gemini-2.5-flash-image"),
+                log=request.app[_LOG_KEY],
+            )
+
+        task = asyncio.create_task(_guarded(build(), request.app[_LOG_KEY], f"sprite {who}"))
+        request.app[_SPRITE_JOBS_KEY].add(task)
+        task.add_done_callback(request.app[_SPRITE_JOBS_KEY].discard)
+        status = "pending"
+    elif file_id and gemini_key:
+        status = "pending"                # somebody else's job is already on it
+
+    # No Gemini configured: fall back to the archetype alone, which still picks a matching
+    # CSS idle for the raw photograph. Classified with OpenAI, which every deployment has.
+    if kind == pets_sprite.DEFAULT_ARCHETYPE and not gemini_key:
+        openai_key = getattr(cfg, "openai_api_key", "")
+        image = await _portrait_bytes(request, record) if openai_key else None
+        if image:
+            kind = await asyncio.to_thread(
+                pets_sprite.classify, image,
+                api_key=openai_key, model=getattr(cfg, "openai_model", "") or "gpt-4o-mini",
+            )
+            if kind != pets_sprite.DEFAULT_ARCHETYPE:
+                await asyncio.to_thread(pets.remember_sprite, entry, who, kind)
+
+    return _ok({"user_id": who, "kind": kind, "frames": [], "status": status})
+
+
+async def _guarded(coroutine, log, label: str) -> None:
+    """Run a background job and log what it did instead of letting it vanish.
+
+    A bare create_task that raises reports nothing until the loop shuts down, and this one
+    is a paid model call: silence is the difference between a feature that is off and one
+    that is broken.
+    """
+    try:
+        await coroutine
+    except Exception:
+        log(f"[pets_web] {label} background job failed:")
+        log(traceback.format_exc())
+
+
+async def handle_sprite_frame(request: web.Request) -> web.Response:
+    """One generated frame, by owner id. Unauthenticated for the same reason the portrait
+    route is: an <img> cannot carry the initData header, and this is derived from a photo
+    that was posted to the chat anyway.
+
+    Served immutable and long-lived, which the portrait route could not do: that URL is
+    keyed on the OWNER, so it has to stay fresh across a photo change, whereas a frame's
+    content is fixed by the photograph it came from and a new photograph produces a new
+    set at a new time. A stale frame is still corrected by the manifest, not by the cache.
+    """
+    raw = request.match_info["user_id"]
+    frame = request.match_info["frame"]
+    if not _SAFE_CODE.match(raw or "") or frame not in pets_gemini.FRAMES:
+        raise web.HTTPNotFound()
+    record = pets.get_pet(request.app[_ENTRY_KEY], raw) or {}
+    file_id = str(record.get("photo_file_id") or "")
+    path = pets_sprite_store.frame_path(file_id, frame) if file_id else None
+    if path is None or not path.is_file():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=604800"})
 
 
 async def handle_debuff_admin(request: web.Request) -> web.Response:
@@ -2311,6 +2388,10 @@ def attach(
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
     # the real pet store. Opaque tokens and ownership checks isolate simultaneous users.
     app[_TEST_BATTLE_SESSIONS_KEY] = {}
+    # Strong references to in-flight sprite jobs. The event loop only holds a task
+    # weakly, so without this the garbage collector is free to cancel a generation
+    # halfway through and nothing would ever say why.
+    app[_SPRITE_JOBS_KEY] = set()
     app.add_routes([
         web.get(prefix, handle_page),
         web.get(prefix + "/", handle_page),
@@ -2323,6 +2404,7 @@ def attach(
         web.get(prefix + "/api/birthday", handle_birthday_admin),
         web.post(prefix + "/api/birthday", handle_birthday_set),
         web.get(prefix + "/api/sprite", handle_sprite),
+        web.get(prefix + "/img/sprite/{user_id}/{frame}.png", handle_sprite_frame),
         web.get(prefix + "/api/debuff", handle_debuff_admin),
         web.post(prefix + "/api/debuff", handle_debuff_set),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
@@ -2909,6 +2991,43 @@ PAGE_HTML = """<!doctype html>
     line-height: 1;
     transform-origin: 50% 100%;
     will-change: transform;
+  }
+
+  /* ------------------------------------------------------------------- generated frames
+     When Gemini has drawn the creature, the wrapper holds three stacked cut-outs instead
+     of one photograph. The two idle frames cross-fade into each other on a loop, which is
+     what "breathing" means once the drawing itself changes rather than the transform; the
+     attack pose is hidden until the wrapper is mid-lunge.
+
+     The per-archetype transform underneath keeps running regardless, so a flipbooked dog
+     still bobs like a dog. The frames carry the breath and the transform carries the
+     bounce, and neither has to know about the other. */
+  .sprite .frame {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+    object-position: 50% 100%; opacity: 0;
+  }
+  .sprite .frame[data-frame="idle_a"], .sprite .frame[data-frame="idle_b"] {
+    animation: sprite-breathe 2.2s ease-in-out infinite;
+  }
+  /* The two idle frames run the same keyframes half a cycle apart (the delay is set
+     inline per frame), so one is always fading up while the other fades down and the
+     creature is never briefly invisible. */
+  @keyframes sprite-breathe {
+    0%, 44% { opacity: 1; }
+    56%, 100% { opacity: 0; }
+  }
+  /* Mid-lunge the drawing itself changes to the attack pose. Held for the whole travel
+     rather than flashed, so the moment of impact is a pose and not a flicker. */
+  .sprite.lunge .frame[data-frame="idle_a"],
+  .sprite.lunge .frame[data-frame="idle_b"] { animation: none; opacity: 0; }
+  .sprite.lunge .frame[data-frame="attack"] { opacity: 1; }
+  /* A creature whose attack frame never generated: the idle frames must not be blanked by
+     the rule above, or it would vanish every time it swung. */
+  .sprite[data-framed="1"]:not(:has(.frame[data-frame="attack"])).lunge
+    .frame[data-frame="idle_a"] { animation: none; opacity: 1; }
+  @media (prefers-reduced-motion: reduce) {
+    .sprite .frame[data-frame="idle_a"] { animation: none; opacity: 1; }
+    .sprite .frame[data-frame="idle_b"] { animation: none; opacity: 0; }
   }
 
   /* ------------------------------------------------------------------------- idle loops
@@ -3996,6 +4115,42 @@ function applySpriteKind(userId, kind) {
 // The battle opens on the neutral idle and upgrades itself a moment later. Classification
 // is a round trip to a vision model and takes seconds; making the screen wait for it would
 // trade a real animation for a blank stage, and the fallback idle is perfectly watchable.
+// Generated frames, once they exist: user_id -> [{name, url}]. A creature with frames
+// flipbooks them; a creature without keeps breathing as a whole photograph under CSS.
+// Both are real sprites as far as the rest of the screen is concerned.
+const SPRITE_FRAMES = {};
+
+function applySpriteFrames(userId, frames) {
+  if (!frames || !frames.length) return;
+  SPRITE_FRAMES[userId] = frames;
+  if (TEST_BATTLE && TEST_BATTLE.fighters) {
+    for (const fighter of Object.values(TEST_BATTLE.fighters)) {
+      if (fighter && String(fighter.owner_id) === String(userId)) fighter.frames = frames;
+    }
+  }
+  // Repainted in place rather than by re-rendering the screen: a render mid-fight would
+  // restart the idle of BOTH creatures and replay the turn animation.
+  document.querySelectorAll('.sprite[data-owner="' + CSS.escape(String(userId)) + '"]')
+    .forEach(paintSpriteFrames);
+}
+
+// Swaps the single photograph for the generated frames, stacked and cross-faded by CSS.
+// The archetype idle stays on the wrapper underneath, so a flipbooked creature still
+// bobs like the animal it is -- the frames carry the breath, the transform carries the
+// bounce, and neither has to know about the other.
+function paintSpriteFrames(node) {
+  const frames = SPRITE_FRAMES[node.dataset.owner];
+  if (!frames || node.dataset.framed === "1") return;
+  node.dataset.framed = "1";
+  node.innerHTML = frames.map((frame, index) =>
+    '<img class="frame" data-frame="' + esc(frame.name) + '" src="' + esc(frame.url) +
+    '" alt="" style="animation-delay:' + (index * -1.1) + 's">').join("");
+}
+
+// Asks about both fighters once per page load, then keeps asking while a generation is
+// still running. Four model calls take tens of seconds, so the battle opens on whatever
+// exists and improves itself underneath the player -- polling is the only honest way to
+// notice, since nothing pushes to this page.
 async function requestSpriteKinds() {
   if (!TEST_BATTLE) return;
   const wanted = [TEST_BATTLE.fighters.player, TEST_BATTLE.fighters.enemy]
@@ -4003,10 +4158,23 @@ async function requestSpriteKinds() {
     .filter((id) => id && !SPRITE_ASKED[id]);
   for (const id of wanted) {
     SPRITE_ASKED[id] = true;
-    try {
-      const data = await api("/api/sprite?user_id=" + encodeURIComponent(id));
-      if (data && data.kind) applySpriteKind(id, data.kind);
-    } catch (e) { /* the neutral idle stays; a sprite is not worth a visible error */ }
+    pollSprite(id, 0);
+  }
+}
+
+async function pollSprite(userId, attempt) {
+  let data;
+  try {
+    data = await api("/api/sprite?user_id=" + encodeURIComponent(userId));
+  } catch (e) {
+    return;                    // the photograph keeps breathing; not worth a visible error
+  }
+  if (data.kind) applySpriteKind(userId, data.kind);
+  if (data.frames && data.frames.length) { applySpriteFrames(userId, data.frames); return; }
+  // Give up after about two minutes. A generation that has not finished by then has
+  // almost certainly failed, and a page left polling forever is a slow leak.
+  if (data.status === "pending" && attempt < 12) {
+    setTimeout(() => pollSprite(userId, attempt + 1), 10000);
   }
 }
 
@@ -4097,6 +4265,7 @@ function renderTestBattle(box) {
   const log = $("testLog"); if (log) log.scrollTop = log.scrollHeight;
   // Played after the markup lands, so the elements the animation looks for exist. The
   // turn that just resolved is whatever is new at the end of the log.
+  document.querySelectorAll(".sprite").forEach(paintSpriteFrames);
   animateTurn(TEST_BATTLE.log, TEST_BATTLE.finished, TEST_BATTLE.winner);
   requestSpriteKinds();
 }

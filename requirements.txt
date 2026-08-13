@@ -6,3 +6,4 @@ tzlocal>=5.2
 tzdata>=2024.1
 aiohttp>=3.9
 pillow>=10.1
+google-genai>=1.0

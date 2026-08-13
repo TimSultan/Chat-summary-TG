@@ -41,6 +41,9 @@ class Config:
     openai_api_key: str
     openai_model: str
     openai_routing_model: str
+    gemini_api_key: str
+    gemini_vision_model: str
+    gemini_image_model: str
     listener_allowed_chats: list[str]
     summary_queue_delay_seconds: int
     webapp_public_url: str | None
@@ -217,6 +220,12 @@ def load_config() -> Config:
         # need little reasoning and have a tiny input, so they default to the cheapest
         # tier instead of paying for the same model used for full-transcript generation.
         openai_routing_model=os.getenv("OPENAI_ROUTING_MODEL", "gpt-5.4-nano"),
+        # Optional, unlike the OpenAI key above: without it the arena simply keeps
+        # animating the raw photograph instead of a generated sprite, which is what it
+        # did before this existed. Nothing else in the bot uses Gemini.
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "") or "",
+        gemini_vision_model=os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash"),
+        gemini_image_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image"),
         listener_allowed_chats=[c.strip() for c in allowed_chats_raw.split(",") if c.strip()],
         summary_queue_delay_seconds=summary_queue_delay_seconds,
         webapp_public_url=webapp_public_url,

@@ -10,6 +10,7 @@ coexists with the rest of the server without colliding.
 
 import hashlib
 import hmac
+import asyncio
 import json
 import os
 import re
@@ -34,6 +35,7 @@ import pets
 import pets_config as C
 import pets_scroll_catalog as SCROLLS
 import pets_sprite
+import pets_sprite_store
 import quests
 import pets_web
 import vote_web
@@ -194,6 +196,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 log=self.logs.append,
             ),
         )
+        # Kept on the case so a test can flip a setting (the Gemini key) or await the
+        # background sprite jobs the app holds references to.
+        self.app = app
+        self.app_cfg = cfg
         self.server = TestServer(app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -1562,6 +1568,53 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blank.status, 400, await blank.text())
 
     # ---- sprite archetypes ----------------------------------------------------------------
+    async def test_a_configured_gemini_generates_frames_in_the_background_and_serves_them(self):
+        """The route must never wait for the model. Four generations take tens of seconds,
+        so the first look starts the job and answers "pending" with whatever it already
+        has; the frames appear on a later look and are then served as ordinary images."""
+        self._tame(PLAYER)
+        self._photos["file_id"] = _jpeg_bytes()
+        png = bytes.fromhex("89504e470d0a1a0a") + b"drawn"
+        drawn = {"idle_a": png, "idle_b": png, "attack": png}
+        reading = {"archetype": "reptile", "subject": "a lizard"}
+        self.app_cfg.gemini_api_key = "gemini-key"
+        self.addCleanup(setattr, self.app_cfg, "gemini_api_key", "")
+        self.addCleanup(pets_sprite_store.forget, "file_id")
+
+        with (
+            patch("pets_gemini.available", return_value=True),
+            patch("pets_gemini.analyse", return_value=reading),
+            patch("pets_gemini.generate_frames", return_value=drawn),
+        ):
+            first = await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
+            self.assertEqual(first.status, 200, await first.text())
+            self.assertEqual((await first.json())["status"], "pending")
+            # The job is a background task the app holds a reference to; let it finish.
+            await asyncio.gather(*list(self.app[pets_web._SPRITE_JOBS_KEY]))
+
+        ready = await (await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)).json()
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(ready["kind"], "reptile")
+        self.assertEqual([f["name"] for f in ready["frames"]], ["idle_a", "idle_b", "attack"])
+
+        # And the frame URLs it handed out actually serve the bytes.
+        image = await self.client.get(ready["frames"][0]["url"])
+        self.assertEqual(image.status, 200)
+        self.assertEqual(await image.read(), png)
+
+
+    async def test_an_unknown_frame_or_a_creature_without_one_is_a_plain_404(self):
+        """The route takes a name straight out of the URL, so it has to be checked against
+        the known frames rather than joined onto a path -- otherwise it is a way to ask the
+        server for arbitrary files."""
+        self._tame(PLAYER)
+        for path in (f"/img/sprite/{PLAYER['id']}/idle_a.png",
+                     f"/img/sprite/{PLAYER['id']}/..%2F..%2Fsecrets.png",
+                     f"/img/sprite/{PLAYER['id']}/nonsense.png"):
+            with self.subTest(path=path):
+                response = await self.client.get(pets_web.ROUTE_PREFIX + path)
+                self.assertEqual(response.status, 404)
+
     async def test_every_archetype_has_an_idle_animation_on_the_page(self):
         """The archetype list is a contract across three languages, and nothing else joins
         them up: `pets_sprite` decides the code, the page's JS accepts it, and the CSS is
@@ -1607,7 +1660,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
             self.assertEqual(first.status, 200, await first.text())
             self.assertEqual(await first.json(), {
-                "user_id": str(PLAYER["id"]), "kind": "quadruped", "known": True,
+                "user_id": str(PLAYER["id"]), "kind": "quadruped",
+                "frames": [], "status": "none",
             })
             second = await self._get(f"/api/sprite?user_id={PLAYER['id']}", PLAYER)
             self.assertEqual((await second.json())["kind"], "quadruped")
@@ -1633,7 +1687,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 body = await response.json()
                 self.assertEqual(response.status, 200)
                 self.assertEqual(body["kind"], "creature")
-                self.assertFalse(body["known"])
+                self.assertEqual(body["frames"], [])
         self.assertEqual(classify.call_count, 2)
 
     async def test_the_sprite_route_answers_usably_for_a_player_with_no_pet_or_no_photo(self):
