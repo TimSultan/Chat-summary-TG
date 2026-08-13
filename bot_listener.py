@@ -8631,9 +8631,6 @@ async def run_bot_listener(
                 f"[pets] retired hamsterators: refunded {retired_hamsterators['gold']} gold "
                 f"to {retired_hamsterators['players']} players"
             )
-        weapon_migration = pets.enforce_unique_weapons(cfg.listener_allowed_chats)
-        if weapon_migration["removed_mops"] or weapon_migration["deduplicated"]:
-            log(f"[pets] unique weapon migration: {weapon_migration}")
         scroll_reset = pets.reset_scroll_collections(cfg.listener_allowed_chats)
         if scroll_reset["players"]:
             log(
@@ -8643,8 +8640,6 @@ async def run_bot_listener(
         refunded_farms = pets.refund_farm_builds(cfg.listener_allowed_chats)
         if refunded_farms:
             log(f"[pets] refunded {refunded_farms} farm builds at {C.FARM_BUILD_REFUND} coins")
-        # After enforce_unique_weapons, so a chat still holding duplicates cannot have one
-        # of them counted as "already has a weapon" and skip somebody who is about to lose it.
         starter_weapons = pets.grant_starter_weapons(cfg.listener_allowed_chats)
         if starter_weapons:
             log(f"[pets] gave {starter_weapons} players a free common weapon")

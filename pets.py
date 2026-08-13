@@ -53,18 +53,12 @@ FIGHT_LOG_LIMIT = 2_000
 # Store-level marker: this chat's one-off cage-upgrade refund has already been paid out.
 # See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
-UNIQUE_WEAPONS_MIGRATION_FLAG = "unique_weapons_202608"
 # Store-level marker: this chat's scroll collections have already been emptied, so
 # everybody earns all forty through drops. A new dated name rather than a cleared old
 # one, deliberately: the first wipe left a starter set behind, and a chat that already
 # ran it still has those four to lose -- see reset_scroll_collections.
 SCROLL_RESET_FLAG = "scroll_wipe_all_202608"
 HAMSTERATOR_RETIREMENT_REASON = "pet_hamsterator_retirement_202608"
-# w003 was the mop when that migration stripped it from every owner; it has since been
-# renamed back to Старый компрессор. The code and the payout reason below are historical
-# identifiers -- changing either would re-run a migration that has already been paid.
-REMOVED_MOP_CODE = "w003"
-REMOVED_MOP_COMPENSATION = 100
 # Same two-lock shape as the cage refund above, for the farm's 75 -> 10 build price.
 FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 # One free common weapon for anybody who never got one. Also two-locked: the per-chat flag
@@ -413,32 +407,6 @@ def _new_record() -> dict:
 def _tamed_record(data: dict, user_id) -> dict | None:
     record = data["pets"].get(str(user_id))
     return record if record and record.get("name") else None
-
-
-def _owned_weapon_codes(data: dict) -> set[str]:
-    """Weapon codes that remain one-of-a-kind across the whole chat.
-
-    Legendary designs may belong to different players: otherwise a finite catalogue
-    would permanently cap the number of legendary owners. A player's own inventory is
-    still excluded separately by every grant path, so nobody gets a duplicate copy.
-    """
-    owned = set()
-    for record in data.get("pets", {}).values():
-        if not isinstance(record, dict):
-            continue
-        for code in record.get("inventory", []):
-            item = C.find_item(code)
-            if item is not None and item.slot == "weapon" and item.rarity != "legendary":
-                owned.add(item.code)
-    return owned
-
-
-def _weapon_owner_ids(data: dict, code: str) -> list[str]:
-    return [
-        str(user_id)
-        for user_id, record in data.get("pets", {}).items()
-        if isinstance(record, dict) and code in record.get("inventory", [])
-    ]
 
 
 def _daily_storefront_items(
@@ -822,11 +790,9 @@ def refund_farm_builds(entries) -> int:
 def grant_starter_weapons(entries) -> int:
     """Hand one free common weapon to every pet that owns no weapon at all.
 
-    Weapons are chat-unique objects, so this cannot just pick any common: it has to skip
-    everything already claimed in this chat, including what an earlier pet in this very
-    loop was just given (nothing is saved until the end). The choice is seeded per
-    chat+player so an interrupted run re-picks the same weapon rather than wandering
-    through the catalogue on each retry.
+    The choice is seeded per chat+player so an interrupted run re-picks the same weapon
+    rather than wandering through the catalogue on each retry. Weapon designs are shared
+    between players; only a player's own bag must remain duplicate-free.
 
     Locked per chat rather than per user: "owns no weapon" is a condition a player can
     re-enter by selling or gifting, and without the flag every restart would refill them.
@@ -836,11 +802,6 @@ def grant_starter_weapons(entries) -> int:
         data = _load(entry)
         if data.get(STARTER_WEAPON_GIFT_FLAG):
             continue
-        taken = {
-            code for record in data.get("pets", {}).values()
-            if isinstance(record, dict)
-            for code in record.get("inventory", [])
-        }
         pool = sorted(
             (item for item in C.ITEMS if item.slot == "weapon" and item.rarity == "common"),
             key=lambda item: item.code,
@@ -854,14 +815,8 @@ def grant_starter_weapons(entries) -> int:
                 for code in owned
             ):
                 continue
-            available = [item for item in pool if item.code not in taken]
-            if not available:
-                # 250 commons against one chat's players makes this unreachable in
-                # practice; exhausting it is not a reason to hand out a duplicate.
-                break
-            gift = random.Random(f"{entry}:{user_id}:starter-weapon").choice(available)
+            gift = random.Random(f"{entry}:{user_id}:starter-weapon").choice(pool)
             owned.append(gift.code)
-            taken.add(gift.code)
             _discover(record, gift.code)
             # Their weapon slot is empty by definition, so there is nothing to compare
             # against and nothing to displace.
@@ -897,20 +852,6 @@ def retire_hamsterators(entries) -> dict:
         if changed:
             _save(entry, data)
     return {"players": players, "gold": refunded_gold}
-
-
-def _remove_weapon_from_record(record: dict, code: str) -> None:
-    record["inventory"] = [owned for owned in record.get("inventory", []) if owned != code]
-    for slot, equipped_code in (record.get("equipped") or {}).items():
-        if equipped_code == code:
-            record["equipped"][slot] = None
-    record["locked_items"] = [
-        locked for locked in record.get("locked_items", []) if locked != code
-    ]
-    pending = record.get("pending_item_actions") or {}
-    record["pending_item_actions"] = {
-        key: token for key, token in pending.items() if not key.endswith(f":{code}")
-    }
 
 
 # --- farm --------------------------------------------------------------------------
@@ -963,15 +904,11 @@ _FARM_RARITY_FALLBACK_ORDER = ("legendary", "rare", "common")
 
 def _farm_item_for(
     data: dict, record: dict, rng: random.Random, hours: int, chance: float,
-    claimed_weapon_codes: frozenset[str] = frozenset(),
 ):
     """Roll a farm find: rarity first (hours-scaled), then an eligible item of that rarity.
 
-    Loot is now rolled at settlement time rather than pre-reserved at start_farm, so the
-    original reason weapons were excluded from farm drops -- avoiding a race with the
-    chat-wide one-copy weapon catalogue -- no longer applies. Ordinary weapons still use
-    that rule. Legendary designs may be owned by different players, while the winner's
-    own inventory and same-batch claims still prevent duplicate copies for one player.
+    Loot is rolled at settlement time. Every item design may belong to more than one
+    player, while a winner's own inventory still prevents duplicate copies.
     """
     if rng.random() >= chance:
         return None
@@ -988,11 +925,6 @@ def _farm_item_for(
         pool = [
             item for item in C.ITEMS
             if item.source == "drop" and item.rarity == rarity and item.code not in owned
-            and (
-                item.slot != "weapon"
-                or item.rarity == "legendary"
-                or (item.code not in claimed_weapon_codes and not _weapon_owner_ids(data, item.code))
-            )
         ]
         if not pool:
             continue
@@ -1019,7 +951,7 @@ def _farm_run_hours(run: dict) -> int:
     return max(0, min(C.FARM_MAX_HOURS, hours))
 
 
-def _farm_reward(data: dict, record: dict, run: dict, claimed_weapon_codes: frozenset[str] = frozenset()) -> dict:
+def _farm_reward(data: dict, record: dict, run: dict) -> dict:
     """Roll gold/xp/a find for one completed (or cancelled) shift.
 
     `level` and `features` are read from the RUN, not the live record: start_farm snapshots
@@ -1044,7 +976,7 @@ def _farm_reward(data: dict, record: dict, run: dict, claimed_weapon_codes: froz
     luck = max(0, int(run.get("luck", 0) or 0))
     gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours, luck)
     rng = random.Random(f"{run_id}:{hours}")
-    found = _farm_item_for(data, record, rng, hours, drop_chance, claimed_weapon_codes)
+    found = _farm_item_for(data, record, rng, hours, drop_chance)
     return {
         "gold": C.farm_gold_for(level, hours, gold_multiplier),
         "xp": C.farm_xp_for(level, hours, xp_multiplier),
@@ -1531,10 +1463,6 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
         initial = _load(entry)
         due = []
         repaired = False
-        # Weapons chosen for an EARLIER due run in this same pass, before any of them is
-        # saved -- without this, two pets settling in the same tick could both roll the
-        # same still-technically-unowned weapon. See _farm_item_for's docstring.
-        claimed_weapons: set[str] = set()
         for user_id, record in initial.get("pets", {}).items():
             if not isinstance(record, dict) or not record.get("name"):
                 continue
@@ -1555,10 +1483,8 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
                     ),
                 }
             else:
-                reward = _farm_reward(initial, record, run, frozenset(claimed_weapons))
+                reward = _farm_reward(initial, record, run)
             found = C.find_item(reward.get("item_code")) if reward.get("item_code") else None
-            if found is not None and found.slot == "weapon" and found.rarity != "legendary":
-                claimed_weapons.add(found.code)
             due.append((str(user_id), dict(run), reward))
         if repaired:
             # Persist the deterministic recovery before `grant_once`; a crash after it
@@ -1580,13 +1506,6 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             _, levels_gained = _apply_xp(record, max(0, int(reward.get("xp", 0) or 0)))
             item_code = reward.get("item_code")
             item = C.find_item(item_code) if item_code else None
-            if item is not None and item.slot == "weapon" and item.rarity != "legendary" \
-                    and _weapon_owner_ids(data, item.code):
-                # Somebody else claimed this exact weapon between the roll above and this
-                # reload (a purchase, an arena drop, another chat's settlement tick). Drop
-                # the find rather than mint a second copy; gold/xp are unaffected.
-                item = None
-                item_code = None
             auto_equipped = False
             if item is not None and item.code not in record.setdefault("inventory", []):
                 record["inventory"].append(item.code)
@@ -1654,76 +1573,6 @@ def mark_farm_notified(entry, user_id, run_id, now: datetime | None = None) -> b
             _save(entry, data)
             return True
     return False
-
-
-def enforce_unique_weapons(entries) -> dict:
-    """One-time cleanup that makes non-legendary weapon codes chat-wide unique.
-
-    ``w003`` is deliberately removed from every old owner and pays the requested fixed
-    100 coins. For other historic duplicates, one copy remains (an equipped copy wins
-    the deterministic tie-break); removed shop copies receive their purchase price and
-    removed drops receive their normal resale value. Every grant is independently
-    idempotent, so a crash before the pets save cannot pay anyone twice on restart.
-    """
-    report = {
-        "removed_mops": 0,
-        "mop_grants": 0,
-        "deduplicated": 0,
-        "duplicate_refunds": 0,
-        "duplicate_refund_gold": 0,
-    }
-    for entry in entries:
-        data = _load(entry)
-        if data.get(UNIQUE_WEAPONS_MIGRATION_FLAG):
-            continue
-
-        for user_id, record in data.get("pets", {}).items():
-            if not isinstance(record, dict) or REMOVED_MOP_CODE not in record.get("inventory", []):
-                continue
-            if economy.grant_once(
-                entry, user_id, REMOVED_MOP_COMPENSATION, "pet_w003_removal_202608",
-            ):
-                report["mop_grants"] += 1
-            _remove_weapon_from_record(record, REMOVED_MOP_CODE)
-            report["removed_mops"] += 1
-
-        claims: dict[str, list[tuple[str, dict]]] = {}
-        for user_id, record in data.get("pets", {}).items():
-            if not isinstance(record, dict):
-                continue
-            for code in record.get("inventory", []):
-                item = C.find_item(code)
-                if item is not None and item.slot == "weapon":
-                    claims.setdefault(item.code, []).append((str(user_id), record))
-
-        for code, owners in claims.items():
-            if len(owners) <= 1:
-                continue
-            # Prefer somebody actively using the object, then use a stable id tie-break.
-            owners.sort(key=lambda pair: (
-                code not in (pair[1].get("equipped") or {}).values(), pair[0],
-            ))
-            item = C.find_item(code)
-            # Legendary weapons are designs, not one physical chat-wide object. Keep
-            # historic copies instead of deleting legitimate trophies on migration.
-            if item is not None and item.rarity == "legendary":
-                continue
-            refund = (
-                C.PRE_REBALANCE_WEAPON_BUY_PRICES.get(code, item.price)
-                if item.source == "shop"
-                else C.resale_value(item)
-            )
-            for user_id, record in owners[1:]:
-                reason = f"pet_weapon_duplicate_202608:{code}"
-                if refund > 0 and economy.grant_once(entry, user_id, refund, reason):
-                    report["duplicate_refunds"] += 1
-                    report["duplicate_refund_gold"] += refund
-                _remove_weapon_from_record(record, code)
-                report["deduplicated"] += 1
-
-        data[UNIQUE_WEAPONS_MIGRATION_FLAG] = True
-        _save(entry, data)
-    return report
 
 
 def reset_scroll_collections(entries) -> dict:
@@ -2479,7 +2328,7 @@ def reforge_items(entry: str, user_id, rarity: str, rng=None) -> tuple[bool, str
         if len(ingredients) < required:
             return False, f"Нужно {required} свободных предметов этой редкости. Надетые и защищённые не считаются.", None
         consumed = ingredients[:required]
-        owned = set(record.get("inventory", [])) | _owned_weapon_codes(data)
+        owned = set(record.get("inventory", []))
         pool = [
             item for item in C.ITEMS
             if item.source == "drop" and item.rarity == result_rarity
@@ -3144,15 +2993,9 @@ def record_fight(
             economy.grant(entry, loser_uid, consolation, "pet_fight_defender_consolation")
 
     dropped_code = None
-    # A player's bag never receives the same code twice. Ordinary weapons are additionally
-    # unique chat-wide; legendary designs may drop to multiple players, so the size of
-    # the player base does not cap how many people can earn one. The pity counter is
-    # deliberately tied to wins, not merely to successful 8% drop rolls: a 500-win
-    # ceiling removes a frustrating extreme tail while leaving almost every drop to the
-    # ordinary weighted table.
-    # Excluding both sets prevents a successful drop roll from reporting a duplicate that
-    # `_load` would silently collapse on the next read.
-    owned_codes = _owned_weapon_codes(data) | set(winner.get("inventory", []))
+    # A player's bag never receives the same code twice, but item designs are shared
+    # between players. The pity counter is tied to wins, not merely successful rolls.
+    owned_codes = set(winner.get("inventory", []))
     drop_pool = [
         item for item in C.ITEMS
         if item.source == "drop" and item.code not in owned_codes
@@ -3852,10 +3695,9 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) ->
     """Roll one loot drop outside a fight, and give it if it lands.
 
     For rewards that are not arena wins -- a completed quest today, whatever else later.
-    The pool rules are the arena's, not a second set: ordinary weapons remain chat-wide
-    unique; legendary weapon designs and accessories may belong to different players;
-    every code is unique inside its owner's bag. The roll is rarity-weighted from the
-    same catalogue.
+    The pool rules are the arena's, not a second set: every code is unique inside its
+    owner's bag, while item designs may belong to multiple players. The roll is
+    rarity-weighted from the same catalogue.
 
     Seeded when a caller passes `seed`, so the same reward paid twice by a retried
     settlement rolls the same item instead of two -- the same reproducibility trick
@@ -3872,7 +3714,7 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) ->
         rng = random.Random(seed) if seed else random
         if rng.random() >= min(1.0, float(chance)):
             return None
-        owned = _owned_weapon_codes(data) | set(record.get("inventory", []))
+        owned = set(record.get("inventory", []))
         pool = [item for item in C.ITEMS if item.source == "drop" and item.code not in owned]
         if not pool:
             return None

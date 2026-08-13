@@ -147,7 +147,7 @@ class CageAndTamingTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "1", 0), 0)
         self.assertGreater(pets_config.FARM_BUILD_REFUND, pets_config.FARM_UPGRADE_COSTS[0])
 
-    def test_weaponless_pets_each_get_a_different_free_common_weapon(self):
+    def test_weaponless_pets_each_get_a_free_common_weapon(self):
         entry = "chat"
         for uid in ("1", "2", "3"):
             self._tame(entry, uid)
@@ -160,7 +160,6 @@ class CageAndTamingTests(PetsTestCase):
 
         self.assertEqual(pets.grant_starter_weapons([entry]), 2)
 
-        gifts = []
         for uid in ("1", "2"):
             pet = pets.get_pet(entry, uid)
             weapons = [
@@ -172,11 +171,7 @@ class CageAndTamingTests(PetsTestCase):
             # Nothing was in the slot, so the gift is worn rather than left in the bag.
             self.assertEqual(pet["equipped"]["weapon"], weapons[0].code)
             self.assertIn(weapons[0].code, pet["discovered"])
-            gifts.append(weapons[0].code)
 
-        # Weapons are chat-unique objects: two players cannot be handed the same one.
-        self.assertEqual(len(set(gifts)), 2)
-        self.assertNotIn(armed.code, gifts)
         self.assertEqual(pets.get_pet(entry, "3")["inventory"], [armed.code])
 
     def test_selling_the_gift_later_does_not_earn_a_second_one(self):
@@ -797,44 +792,6 @@ class EquipmentTradingTests(PetsTestCase):
         text, _ = pets_ui.bag_items_view("chat", "1", 0, "amulet")
         self.assertIn(amulet.effect["text"], text)
 
-    def test_unique_weapon_migration_removes_every_mop_and_deduplicates_once(self):
-        self._two_pets()
-        mop = pets_config.find_item("w003")
-        duplicate = pets_config.find_item("w001")
-        data = pets._load("chat")
-        for user_id in ("1", "2"):
-            data["pets"][user_id]["inventory"] = [mop.code, duplicate.code]
-            data["pets"][user_id]["discovered"] = [mop.code, duplicate.code]
-        data["pets"]["1"]["equipped"]["weapon"] = mop.code
-        data["pets"]["1"]["locked_items"] = [mop.code]
-        data["pets"]["1"]["pending_item_actions"] = {f"gift:{mop.code}": "token"}
-        # The equipped duplicate is the copy the deterministic migration preserves.
-        data["pets"]["2"]["equipped"]["weapon"] = duplicate.code
-        pets._save("chat", data)
-
-        report = pets.enforce_unique_weapons(["chat"])
-
-        self.assertEqual(report["removed_mops"], 2)
-        self.assertEqual(report["mop_grants"], 2)
-        self.assertEqual(report["deduplicated"], 1)
-        old_duplicate_price = pets_config.PRE_REBALANCE_WEAPON_BUY_PRICES[duplicate.code]
-        self.assertEqual(economy.balance("chat", "1", 0), 100 + old_duplicate_price)
-        self.assertEqual(economy.balance("chat", "2", 0), 100)
-        first = pets.get_pet("chat", "1")
-        second = pets.get_pet("chat", "2")
-        self.assertNotIn(mop.code, first["inventory"])
-        self.assertNotIn(mop.code, second["inventory"])
-        self.assertIsNone(first["equipped"]["weapon"])
-        self.assertNotIn(mop.code, first["locked_items"])
-        self.assertNotIn(f"gift:{mop.code}", first["pending_item_actions"])
-        self.assertNotIn(duplicate.code, first["inventory"])
-        self.assertIn(duplicate.code, second["inventory"])
-        self.assertIn(mop.code, first["discovered"])
-
-        self.assertEqual(pets.enforce_unique_weapons(["chat"])["removed_mops"], 0)
-        self.assertEqual(economy.balance("chat", "1", 0), 100 + old_duplicate_price)
-        self.assertEqual(economy.balance("chat", "2", 0), 100)
-
     def test_sell_refuses_equipped_and_pays_explicit_resale(self):
         self._two_pets()
         item = next(
@@ -873,6 +830,17 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertNotIn(item.code, pets.get_pet("chat", "1")["inventory"])
         self.assertIn(item.code, pets.get_pet("chat", "2")["inventory"])
         self.assertFalse(pets.gift_item("chat", "2", "2", item.code)[0])
+
+    def test_same_weapon_drop_can_belong_to_two_players(self):
+        self._two_pets()
+
+        first = pets.grant_random_drop("chat", "1", 1.0, seed="shared-weapon")
+        second = pets.grant_random_drop("chat", "2", 1.0, seed="shared-weapon")
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first["code"], second["code"])
+        self.assertIn(first["code"], pets.get_pet("chat", "1")["inventory"])
+        self.assertIn(second["code"], pets.get_pet("chat", "2")["inventory"])
 
     def test_weapon_catalogue_is_paginated_with_compact_callbacks(self):
         self._two_pets()
