@@ -15,3 +15,4 @@ session_string_output.txt
 # The reference implementation the arena was ported from -- read alongside the code, not
 # shipped with it. arena_core.py and the README cite it by path.
 import/
+sprite_preview/
