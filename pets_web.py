@@ -1570,6 +1570,53 @@ async def handle_leaderboard(request: web.Request) -> web.Response:
     })
 
 
+async def handle_loadout(request: web.Request) -> web.Response:
+    """What one creature is wearing right now, for the leaderboard's peek panel.
+
+    Read-only and about somebody else, so the ownership flags `_item_payload` normally
+    derives from the viewer are derived from the OWNER instead: on this panel "equipped"
+    means "they are wearing it", which is the only question the panel answers. Nothing
+    here is buyable or sellable, so no viewer-relative flag would mean anything.
+    """
+    await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    prefix = request.app[_PREFIX_KEY]
+    who = str(request.query.get("user_id") or "").strip()
+    if not who:
+        return _json_error("Не указан игрок.", status=400, code="NO_USER")
+
+    record = pets.get_pet(entry, who)
+    if record is None:
+        return _json_error("У этого игрока нет существа.", status=404, code="NO_PET")
+
+    slots = await asyncio.to_thread(_equipment_payload, record, prefix)
+    effective = await asyncio.to_thread(pets.effective_stats, entry, who)
+    return _ok({
+        "user_id": who,
+        "name": record.get("name"),
+        "owner_name": record.get("owner_name"),
+        "level": int(record.get("level", 1)),
+        "fights": int(record.get("fights", 0)),
+        "wins": int(record.get("wins", 0)),
+        "power": pets._power_rating_for(record),
+        "stats": effective,
+        "slots": slots,
+        # The scrolls are half of what a build is, so a panel that showed only the five
+        # equipment slots would be describing half a creature.
+        "skills": [
+            {"slot": index, "code": code,
+             **({"empty": True} if not code else {
+                 "empty": False,
+                 "name": str(pets_scroll_catalog.scroll(code)["name"]).split(": ", 1)[-1],
+                 "icon": pets_scroll_catalog.scroll(code)["icon"],
+                 "effects_text": list(pets_scroll_catalog.effect_lines(
+                     pets_scroll_catalog.scroll(code))),
+             })}
+            for index, code in enumerate(pets._skill_loadout_for(record), start=1)
+        ],
+    })
+
+
 async def handle_history(request: web.Request) -> web.Response:
     """Recent fights, already phrased from the reader's side.
 
@@ -2118,6 +2165,7 @@ def attach(
         web.post(prefix + "/api/mob", handle_mob_attack),
         web.get(prefix + "/api/shop", handle_shop),
         web.get(prefix + "/api/leaderboard", handle_leaderboard),
+        web.get(prefix + "/api/loadout", handle_loadout),
         web.get(prefix + "/api/history", handle_history),
         web.get(prefix + "/api/economy/audit", handle_economy_audit),
         web.get(prefix + "/api/mail", handle_mail),
@@ -2430,6 +2478,21 @@ PAGE_HTML = """<!doctype html>
          background: var(--sunken); border-radius: 12px; padding: 10px; border: 0; width: 100%;
          text-align: left; }
   .foe + .foe { margin-top: 8px; }
+  /* The leaderboard peek: one row per equipment slot, opened under the name that was
+     tapped. Indented and tinted so it reads as belonging to the row above rather than
+     as the next entry in the table. */
+  .peek { margin: 8px 0 12px 12px; padding-left: 10px; border-left: 2px solid var(--line); }
+  .peek + .foe { margin-top: 8px; }
+  .peekrow { background: var(--sunken); border-radius: 10px; padding: 8px 10px; margin-bottom: 6px; }
+  .peekrow.empty-slot { display: flex; justify-content: space-between; align-items: center;
+                        background: none; border: 1px dashed var(--line); color: var(--muted); }
+  .peekrow .stats { margin-top: 3px; }
+  .peekrow .fxline { margin-top: 3px; color: var(--accent); }
+  .peekrow .desc { margin-top: 4px; font-style: italic; }
+  .peekrow.r-rare { box-shadow: inset 3px 0 0 var(--r-rare); }
+  .peekrow.r-legendary { box-shadow: inset 3px 0 0 var(--r-legendary); }
+  .peekrow.r-uncommon { box-shadow: inset 3px 0 0 var(--r-uncommon); }
+  .peekrow.r-cursed { box-shadow: inset 3px 0 0 var(--r-cursed); }
   .foe .av {
     width: 46px; height: 46px; border-radius: 11px; background: var(--card);
     overflow: hidden; flex: none; position: relative;
@@ -3424,6 +3487,65 @@ async function setBirthday(userId) {
   } catch (e) { haptic("no"); toast(e.message); }
 }
 
+const PEEKED = {};                 // user_id -> loadout, so reopening never refetches
+
+function statLine(stats) {
+  return ["strength", "health", "agility", "luck", "armor"]
+    .filter((key) => Number(stats[key] || 0))
+    .map((key) => (STAT_ICON[key] || key) + " " + Number(stats[key] || 0))
+    .join("  ");
+}
+
+function peekItem(slot) {
+  const item = slot.item;
+  if (!item) {
+    return '<div class="peekrow empty-slot"><b>' + esc(slot.emoji) + " " + esc(slot.name) +
+           "</b><span class='tiny muted'>пусто</span></div>";
+  }
+  const bonuses = Object.entries(item.bonuses || {})
+    .map(([key, value]) => (STAT_ICON[key] || key) + " " + (value > 0 ? "+" : "") + value)
+    .join("  ");
+  const effect = (item.effect || {}).text;
+  return '<div class="peekrow r-' + esc(item.rarity) + '">' +
+    "<div class='row spread'><b>" + esc(slot.emoji) + " " + esc(item.name) + "</b>" +
+    "<span class='tiny muted'>" + esc(item.rarity_name || "") + "</span></div>" +
+    (bonuses ? "<div class='small stats'>" + esc(bonuses) + "</div>" : "") +
+    (effect ? "<div class='small fxline'>" + esc(effect) + "</div>" : "") +
+    (item.description ? "<div class='tiny muted desc'>" + esc(item.description) + "</div>" : "") +
+    "</div>";
+}
+
+function peekPanel(data) {
+  const scrolls = (data.skills || []).filter((row) => !row.empty);
+  return "<div class='row spread' style='margin-bottom:8px'>" +
+      "<span class='small'><b>" + esc(data.name || "—") + "</b> · ур. " + Number(data.level || 1) +
+      "</span><span class='pw'>⚡ " + money(data.power) + "</span></div>" +
+    "<div class='tiny muted' style='margin-bottom:9px'>" + esc(statLine(data.stats || {})) +
+      " · боёв " + Number(data.fights || 0) + ", побед " + Number(data.wins || 0) + "</div>" +
+    (data.slots || []).map(peekItem).join("") +
+    (scrolls.length
+      ? "<div class='tiny muted' style='margin-top:9px'>📜 Свитки</div>" +
+        scrolls.map((row) => "<div class='peekrow'><b>" + esc(row.icon) + " " +
+          esc(row.name) + "</b>" + (row.effects_text || []).map((line) =>
+            "<div class='small fxline'>" + esc(line) + "</div>").join("") + "</div>").join("")
+      : "<div class='tiny muted' style='margin-top:9px'>Свитков пока нет.</div>");
+}
+
+async function togglePeek(userId) {
+  const box = document.querySelector('[data-peekbody="' + CSS.escape(userId) + '"]');
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; return; }
+  box.hidden = false;
+  if (PEEKED[userId]) { box.innerHTML = peekPanel(PEEKED[userId]); return; }
+  box.innerHTML = "<div class='tiny muted'>Загружаю…</div>";
+  try {
+    PEEKED[userId] = await api("/api/loadout?user_id=" + encodeURIComponent(userId));
+    box.innerHTML = peekPanel(PEEKED[userId]);
+  } catch (e) {
+    box.innerHTML = "<div class='tiny muted'>" + esc(e.message) + "</div>";
+  }
+}
+
 function birthdayPanel() {
   const party = FOES && FOES.birthday;
   if (!party) return "";
@@ -3763,14 +3885,17 @@ async function renderMore() {
   let body = "";
   if (moreView === "ranking") {
     const data = await api("/api/leaderboard");
-    body = '<div class="panel"><h2>Рейтинг</h2>' + (data.rows.length
+    body = '<div class="panel"><h2>Рейтинг</h2>' +
+      "<div class='tiny muted' style='margin-bottom:9px'>Нажми на имя — покажет, " +
+      "что существо носит прямо сейчас.</div>" + (data.rows.length
       ? data.rows.map((row) =>
-          '<div class="foe" style="cursor:default">' +
+          '<button class="foe" data-peek="' + esc(row.user_id) + '">' +
           '<span class="av">' + shot(row.portrait, null) + "</span>" +
           "<span class='small'><b>" + row.rank + ".</b> " + esc(row.name || "—") +
           (row.user_id === data.me ? " <span class='tiny muted'>(ты)</span>" : "") +
           "<br><span class='tiny muted'>" + esc(row.owner_name || "") + "</span></span>" +
-          "<span class='pw'>⚡ " + money(row.power) + "</span></div>").join("")
+          "<span class='pw'>⚡ " + money(row.power) + "</span></button>" +
+          '<div class="peek" data-peekbody="' + esc(row.user_id) + '" hidden></div>').join("")
       : '<div class="empty">Пока пусто.</div>') + "</div>";
   } else if (moreView === "collection") {
     const data = await api("/api/collection");
@@ -4743,10 +4868,11 @@ document.addEventListener("click", async (event) => {
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
-    "[data-congratulate],[data-birthdayset],[data-birthdayclear]");
+    "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]");
   if (!target) return;
   const d = target.dataset;
 
+  if (d.peek) { await togglePeek(d.peek); return; }
   if (d.congratulate) { await congratulate(); return; }
   if (d.birthdayset !== undefined) { await setBirthday(d.birthdayset); return; }
   if (d.birthdayclear !== undefined) { await setBirthday(null); return; }

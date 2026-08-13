@@ -772,7 +772,15 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         loadout = skill_loadouts[key]
         if not loadout:
             return ["attack"]
-        actions = ["attack", "defend"]
+        actions = ["attack"]
+        # Defend only when there is no guard already standing. A guard is a one-shot
+        # block: it is set to a flat value here and zeroed by the hit it absorbs, so
+        # raising it a second time writes the same number and buys nothing. That is not
+        # a rare case -- leadership alternates round to round, so each fighter acts twice
+        # in a row every other round (a, b, b, a, a, b), and a pair of Defends inside
+        # that back-to-back turn threw the first one away.
+        if guards[key] <= 0:
+            actions.append("defend")
         for index, code in enumerate(loadout):
             # An empty slot offers nothing to choose. It still costs the creature
             # nothing else: Defend and the full action budget come with having slots,

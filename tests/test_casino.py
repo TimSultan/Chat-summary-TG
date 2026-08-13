@@ -178,6 +178,43 @@ class CasinoTests(unittest.TestCase):
         styles_text, _ = pets_ui.casino_poker_styles_view("1")
         self.assertTrue(all(row["name"] in styles_text for row in casino.POKER_STYLES))
 
+    def test_the_opponent_never_bets_more_than_the_player_can_still_cover(self):
+        """A raise nobody can call is not a poker decision, it is the table taking the
+        hand: _poker_charge refuses a call above the balance, so the only button left was
+        Fold. The bot now caps its raise at what is in front of the player, which turns
+        that spot back into a real choice -- call for everything, or fold."""
+        # 25 in the pot leaves 5 behind: less than the 25 the bot used to bet.
+        economy.spend("chat", "1", 0, 270, "make the player poor")
+        self.assertEqual(economy.balance("chat", "1", 0), 30)
+        casino.start_poker("chat", "1", 0, 25, rng=_FixedRng(), mode="opponent")
+        self.assertEqual(economy.balance("chat", "1", 0), 5)
+
+        with patch("casino._opponent_decision", return_value="raise"):
+            result = casino.advance_poker("chat", "1", 0, 0)
+
+        self.assertTrue(result["ok"], result)
+        to_call = int(result["active"]["to_call"])
+        self.assertEqual(to_call, 5, "the bot must bet the player's whole remaining stack")
+
+        # And that call actually goes through rather than being refused for funds.
+        called = casino.advance_poker("chat", "1", 0, 0)
+        self.assertTrue(called["ok"], called)
+        self.assertNotEqual(called.get("error"), "funds")
+        self.assertEqual(economy.balance("chat", "1", 0), 0)
+
+    def test_a_broke_player_is_never_raised_at_all(self):
+        """With nothing left there is no all-in to offer, so the bot checks instead of
+        betting zero and demanding a call for it."""
+        economy.spend("chat", "1", 0, 275, "make the player broke")
+        casino.start_poker("chat", "1", 0, 25, rng=_FixedRng(), mode="opponent")
+        self.assertEqual(economy.balance("chat", "1", 0), 0)
+
+        with patch("casino._opponent_decision", return_value="raise"):
+            result = casino.advance_poker("chat", "1", 0, 0)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(int((result.get("active") or {}).get("to_call", 0)), 0)
+
     def test_realistic_opponent_can_fold_to_a_raise_and_pays_the_current_pot(self):
         casino.start_poker("chat", "1", 0, 25, rng=_FixedRng(), mode="opponent")
         with patch("casino._opponent_decision", return_value="fold"):

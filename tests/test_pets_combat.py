@@ -233,6 +233,40 @@ class SimulateTests(unittest.TestCase):
                 self.assertIn(result.loser, (a.key, b.key))
                 self.assertNotEqual(result.winner, result.loser)
 
+    def test_a_fighter_never_defends_twice_while_its_guard_is_still_up(self):
+        """Leadership alternates round to round, so each fighter acts twice in a row every
+        other round (a, b, b, a, a, b). A guard is a one-shot block set to a flat value,
+        so a second Defend inside that back-to-back turn rewrote the same number and threw
+        the first action away. It happened in roughly one fight in three."""
+        import pets_scroll_catalog as scrolls
+
+        def fighter(key, shield=None):
+            return Fighter(
+                key=key, name=key, strength=30, health=30, agility=25, luck=20,
+                armor=8, level=8, skills=scrolls.SAMPLE_LOADOUT, shield=shield,
+            )
+
+        acting = {"defend", "hit", "crit", "blocked", "low_damage", "dodge", "amulet_guard"}
+        # Once bare and once with a shield that heals on Defend -- the case where a
+        # second Defend still did something, and so the tempting one to leave alone.
+        for shield in (None, scrolls.shield("shield_lantern")):
+            a, b = fighter("a", shield), fighter("b", shield)
+            defends = 0
+            for seed in range(400):
+                previous_actor = previous_event = None
+                for row in combat.simulate(a, b, seed=seed).rounds:
+                    if not (row.event in acting or row.event.startswith("skill_")):
+                        continue
+                    if row.event == "defend":
+                        defends += 1
+                        self.assertFalse(
+                            row.attacker == previous_actor and previous_event == "defend",
+                            f"{row.attacker} defended twice in a row on seed {seed}",
+                        )
+                    previous_actor, previous_event = row.attacker, row.event
+            # The rule must not have simply stopped anybody from ever defending.
+            self.assertGreater(defends, 200)
+
     def test_even_fights_are_decided_by_a_knockout(self):
         """The damage tiebreak is a backstop, not an outcome the design leans on.
 

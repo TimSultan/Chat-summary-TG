@@ -1505,6 +1505,47 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(slot=slot):
                 self.assertIn(emoji, pets_web.placeholder_svg("w001", "common", slot))
 
+    # ---- leaderboard peek ---------------------------------------------------------------
+
+    async def test_the_leaderboard_peek_shows_what_another_pet_is_wearing(self):
+        """Tapping a name on the ranking opens this. It is about somebody else, so the
+        equipped flag has to describe the OWNER -- a panel that answered "do you have
+        this equipped" while showing their gear would be answering the wrong question."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        item = next(i for i in C.items_for_slot("weapon") if i.source == "shop")
+        data = pets._load(CHAT)
+        data["pets"][str(OPPONENT["id"])]["inventory"].append(item.code)
+        pets._save(CHAT, data)
+        self.assertTrue(pets.equip(CHAT, str(OPPONENT["id"]), item.code)[0])
+
+        response = await self._get(
+            f"/api/loadout?user_id={OPPONENT['id']}", PLAYER,
+        )
+        self.assertEqual(response.status, 200, await response.text())
+        body = await response.json()
+
+        self.assertEqual(body["user_id"], str(OPPONENT["id"]))
+        self.assertEqual(body["name"], "Соперник")
+        self.assertEqual({row["slot"] for row in body["slots"]}, set(C.SLOT_KEYS))
+        weapon = next(row for row in body["slots"] if row["slot"] == "weapon")
+        self.assertEqual(weapon["item"]["code"], item.code)
+        # Flagged from the owner's record, not the viewer's -- PLAYER owns none of this.
+        self.assertTrue(weapon["item"]["equipped"])
+        self.assertTrue(weapon["item"]["description"])
+        self.assertIn("bonuses", weapon["item"])
+        # Empty slots are still drawn, so the panel shows what is missing too.
+        self.assertTrue(any(row["item"] is None for row in body["slots"]))
+        self.assertEqual(len(body["skills"]), 4)
+        self.assertTrue(all(row["empty"] for row in body["skills"]))
+
+    async def test_the_peek_refuses_an_unknown_or_petless_player(self):
+        self._tame(PLAYER)
+        missing = await self._get("/api/loadout?user_id=123456", PLAYER)
+        self.assertEqual(missing.status, 404, await missing.text())
+        blank = await self._get("/api/loadout", PLAYER)
+        self.assertEqual(blank.status, 400, await blank.text())
+
     # ---- birthdays ----------------------------------------------------------------------
 
     async def _birthday(self, user, **payload):

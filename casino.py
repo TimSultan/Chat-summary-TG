@@ -499,6 +499,17 @@ def _poker_charge(data: dict, record: dict, user_id, xp: int, state: dict, amoun
     return None
 
 
+def _affordable_raise(data: dict, user_id, xp: int, base: int) -> int:
+    """How much the bot may raise: never more than the player can actually put in.
+
+    A raise nobody can cover is not a poker decision, it is the table taking the hand --
+    `_poker_charge` refuses a call above the balance, so the only button left is Fold.
+    Capping the bot at what is in front of the player turns that same spot back into a
+    real choice: call for everything and be all in, or fold.
+    """
+    return max(0, min(int(base or 0), economy._balance_from(data, user_id, xp)))
+
+
 def _next_poker_street(entry, user_id, xp: int, state: dict, data: dict, record: dict) -> dict:
     stage = int(state.get("stage", 3))
     state["to_call"] = 0
@@ -537,10 +548,12 @@ def _advance_opponent_poker(
         if decision == "fold":
             state["last_action"] = "Соперник сбросил карты после твоего рейза."
             return _fold_poker(entry, user_id, xp, state, data, record, "dealer")
-        if decision == "raise" and not to_call:
-            state["dealer_stake"] = int(state.get("dealer_stake", 0)) + base * 2
-            state["to_call"] = base
-            state["last_action"] = f"Соперник переставил ещё на {base}."
+        bump = _affordable_raise(data, user_id, xp, base) if decision == "raise" else 0
+        if bump and not to_call:
+            # Calls the player's raise, then re-raises by as much as they can still cover.
+            state["dealer_stake"] = int(state.get("dealer_stake", 0)) + base + bump
+            state["to_call"] = bump
+            state["last_action"] = f"Соперник переставил ещё на {bump}."
             _set_active(record, state)
             economy._save(entry, data)
             return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
@@ -556,10 +569,11 @@ def _advance_opponent_poker(
         return _next_poker_street(entry, user_id, xp, state, data, record)
 
     decision = _opponent_decision(state, faced_raise=False)
-    if decision == "raise":
-        state["dealer_stake"] = int(state.get("dealer_stake", state["stake"])) + base
-        state["to_call"] = base
-        state["last_action"] = f"После твоего чека соперник поднял на {base}."
+    bump = _affordable_raise(data, user_id, xp, base) if decision == "raise" else 0
+    if bump:
+        state["dealer_stake"] = int(state.get("dealer_stake", state["stake"])) + bump
+        state["to_call"] = bump
+        state["last_action"] = f"После твоего чека соперник поднял на {bump}."
         _set_active(record, state)
         economy._save(entry, data)
         return {"ok": True, "active": dict(state), "balance": economy._balance_from(data, user_id, xp)}
