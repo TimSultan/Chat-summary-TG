@@ -37,6 +37,12 @@ import pets_scroll_catalog as SCROLLS
 
 _STATS = ("strength", "health", "agility", "luck")
 _SIGNATURE_STATS = _STATS + ("armor",)
+_DEFICIT_TEXT = {
+    "strength": "🧱 {name} не держит корпус: слабая сила режет уклонение.",
+    "health": "🩹 {name} выходит без запаса прочности: максимум HP ниже.",
+    "agility": "🐌 {name} залипает на старте: соперник чаще перехватывает инициативу.",
+    "luck": "🧲 {name} роняет подкову: атаки легче прочитать и обойти.",
+}
 
 
 @dataclass(frozen=True)
@@ -379,6 +385,17 @@ def _signature(fighter: "Fighter", opponent: "Fighter") -> tuple[str, int] | Non
     return stat, tier
 
 
+def _stat_deficits(fighter: "Fighter", opponent: "Fighter") -> tuple[str, ...]:
+    """The two largest opponent-relative stat gaps that expose build weaknesses."""
+    gaps = []
+    for stat in _STATS:
+        mine = max(1, getattr(fighter, stat))
+        theirs = max(1, getattr(opponent, stat))
+        if mine / theirs <= C.STAT_DEFICIT_RATIO:
+            gaps.append((mine / theirs, stat))
+    return tuple(stat for _, stat in sorted(gaps)[:C.STAT_DEFICIT_MAX])
+
+
 def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     """The fight-start numbers for one side.
 
@@ -392,6 +409,7 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         stat: _stat_lead_bonus(getattr(fighter, stat), getattr(opponent, stat))
         for stat in _STATS
     }
+    deficits = _stat_deficits(fighter, opponent)
 
     def factor(stat: str) -> float:
         return 1.0 + stat_bonus[stat]
@@ -435,6 +453,13 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         # near-perfect weapon reachable while still never removing dodging entirely.
         accuracy = max(.10, accuracy * (1 - max(-.50, _fraction(value))))
 
+    if "health" in deficits:
+        max_hp *= C.STAT_DEFICIT_HEALTH_MULTIPLIER
+    if "strength" in deficits:
+        dodge *= C.STAT_DEFICIT_DODGE_MULTIPLIER
+    if "luck" in deficits:
+        accuracy *= C.STAT_DEFICIT_ACCURACY_MULTIPLIER
+
     return {
         "max_hp": max_hp,
         "damage": damage,
@@ -446,6 +471,8 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         "reduction": reduction,
         "dominance": {stat: bool(bonus) for stat, bonus in stat_bonus.items()},
         "stat_bonus": stat_bonus,
+        "deficits": deficits,
+        "initiative_penalty": C.STAT_DEFICIT_INITIATIVE_PENALTY if "agility" in deficits else 0.0,
         "effects": effects,
     }
 
@@ -544,7 +571,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     used_scrolls = {a.key: set() for a in (a, b)}
     skill_statuses = {a.key: {} for a in (a, b)}
 
-    initiative = .5
+    initiative = .5 - derived[a.key]["initiative_penalty"] + derived[b.key]["initiative_penalty"]
     if effectful:
         if (value := _effect_value(effects[a.key], "first_strike")) is not None:
             initiative += _fraction(value)
@@ -554,6 +581,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     opening = pets_flavor.line("opening", fighters[order[0]].name, fighters[order[1]].name, rng=rng)
 
     rounds = []
+
+    for owner_key, other_key in ((a.key, b.key), (b.key, a.key)):
+        for stat in derived[owner_key]["deficits"]:
+            rounds.append(Round(
+                number=0, attacker=owner_key, event=f"deficit_{stat}", damage=0,
+                attacker_hp=round(hp[owner_key]), defender_hp=round(hp[other_key]),
+                text=_DEFICIT_TEXT[stat].format(name=fighters[owner_key].name),
+            ))
 
     def effect_round(number: int, owner_key: str, other_key: str, code: str, amount: int = 0):
         """Put an equipped-item proc in the normal transcript, without flavour RNG."""

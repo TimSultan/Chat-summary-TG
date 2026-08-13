@@ -33,6 +33,44 @@ def _fighter(key, level, armor=0, name=None):
 
 
 class DeriveTests(unittest.TestCase):
+    def test_two_x_stat_gaps_expose_only_the_two_largest_build_weaknesses(self):
+        specialist = Fighter(
+            key="specialist", name="Спец", strength=20, health=20, agility=5, luck=4, armor=0,
+        )
+        balanced = _fighter("balanced", 20)
+
+        derived = combat.derive(specialist, balanced)
+
+        self.assertEqual(derived["deficits"], ("luck", "agility"))
+        self.assertAlmostEqual(derived["accuracy"], 1.30)
+        self.assertEqual(derived["initiative_penalty"], C.STAT_DEFICIT_INITIATIVE_PENALTY)
+
+    def test_strength_and_health_deficits_reduce_dodge_and_maximum_hp(self):
+        frail = Fighter(key="frail", name="Хрупкий", strength=5, health=5, agility=20, luck=20, armor=0)
+        balanced = _fighter("balanced", 20)
+
+        derived = combat.derive(frail, balanced)
+
+        self.assertEqual(derived["deficits"], ("health", "strength"))
+        baseline_dodge = combat._saturate(C.DODGE_MAX, C.DODGE_K, frail.agility)
+        self.assertAlmostEqual(
+            derived["dodge"], baseline_dodge * C.STAT_DEFICIT_DODGE_MULTIPLIER,
+        )
+        self.assertAlmostEqual(
+            derived["max_hp"],
+            (C.BASE_HP + frail.health * C.HP_PER_POINT) * C.STAT_DEFICIT_HEALTH_MULTIPLIER,
+        )
+
+    def test_deficits_are_announced_at_fight_start(self):
+        specialist = Fighter(key="specialist", name="Спец", strength=20, health=20, agility=5, luck=4, armor=0)
+        balanced = _fighter("balanced", 20)
+
+        result = combat.simulate(specialist, balanced, seed=12)
+
+        notices = [round_ for round_ in result.rounds if round_.event.startswith("deficit_")]
+        self.assertEqual({round_.event for round_ in notices}, {"deficit_luck", "deficit_agility"})
+        self.assertTrue(all(round_.number == 0 and round_.damage == 0 for round_ in notices))
+
     def test_symmetric_fighters_get_no_dominance_bonus(self):
         a, b = _fighter("a", 40), _fighter("b", 40)
         derived = combat.derive(a, b)

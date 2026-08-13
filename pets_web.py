@@ -3690,6 +3690,7 @@ function statRespec() {
   const disabled = !invested || Number(S.rubies || 0) < cost;
   return '<div class="stat-respec">' +
     (points ? '<span class="tiny">🎯 Свободные очки: <b>' + points + '</b></span>' : "") +
+    '<p class="tiny muted">Стат ниже половины от соперника открывает слабость в бою.</p>' +
     '<button class="go sec" data-do="respec"' + (disabled ? " disabled" : "") +
     '>🔄 Перераспределить статы · ' + cost + ' 💎</button></div>';
 }

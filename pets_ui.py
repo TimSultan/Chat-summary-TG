@@ -1236,6 +1236,10 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     points = pets.available_stat_points(pet)
     if points:
         lines.append(f"🎯 Свободные очки: <b>{points}</b> <i>(сначала тратятся они)</i>")
+    lines.append(
+        "\n<i>Если стат меньше половины стата соперника, проявится слабость: "
+        "сила режет уклонение, здоровье — HP, ловкость — старт, удача — меткость.</i>"
+    )
     lines.append("\n<i>Максимального уровня нет. Чем выше, тем дороже следующий пункт.</i>")
 
     rows = []

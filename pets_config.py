@@ -311,6 +311,16 @@ MAX_SKILL_ACTIONS_PER_FIGHTER = 24
 DOMINANCE_RATIO = 1.30      # ratio where the gradual bonus reaches its ceiling
 DOMINANCE_BONUS = 0.30      # maximum bonus to one stat's contribution
 
+# A specialised build is valid, but leaving a stat at less than half the opponent's
+# effective value exposes a concrete weakness. Only the two largest gaps bite in one
+# fight: being generally outmatched is already hard enough without stacking all four.
+STAT_DEFICIT_RATIO = 0.50
+STAT_DEFICIT_MAX = 2
+STAT_DEFICIT_DODGE_MULTIPLIER = 0.65
+STAT_DEFICIT_ACCURACY_MULTIPLIER = 1.30
+STAT_DEFICIT_INITIATIVE_PENALTY = 0.15
+STAT_DEFICIT_HEALTH_MULTIPLIER = 0.90
+
 # ------------------------------------------------------------------------ the arena
 #
 # Arena fights live in a per-pet bank, not a daily counter. A complete elapsed hour
