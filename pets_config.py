@@ -856,13 +856,14 @@ GIFT_MIN_PET_LEVEL = 3
 GIFT_COOLDOWN_SECONDS = 24 * 60 * 60
 GIFT_AUDIT_LIMIT = 500
 
-# The shop deliberately has a small, changing window instead of asking players to
-# scroll through hundreds of purchasable weapons. Every twelve-hour window selects three
-# ordinary and three rare weapons per chat; permanent utility stock is added separately.
+# The shop deliberately has a small, personal changing window instead of asking players
+# to scroll through hundreds of purchasable weapons. Every twelve-hour window selects
+# five ordinary and one rare weapon for each player.
 STOREFRONT_ROTATION_HOURS = 12
-STOREFRONT_PER_RARITY = 3
+STOREFRONT_NORMAL_COUNT = 5
+STOREFRONT_RARE_COUNT = 1
 STOREFRONT_RARITIES = ("common", "rare")
-DAILY_STOREFRONT_SIZE = STOREFRONT_PER_RARITY * len(STOREFRONT_RARITIES) + 1
+DAILY_STOREFRONT_SIZE = STOREFRONT_NORMAL_COUNT + STOREFRONT_RARE_COUNT
 
 
 def storefront_window(day: _date | _datetime | str | None = None) -> int:
@@ -882,46 +883,42 @@ def daily_storefront_weapons(
     entry: str,
     day: _date | _datetime | str | None = None,
     excluded_codes: set[str] | frozenset[str] | None = None,
+    *,
+    user_id: str | int | None = None,
 ) -> tuple[Item, ...]:
-    """The stable twelve-hour set of purchasable weapons for one chat.
+    """The stable twelve-hour set of purchasable weapons for one player.
 
-    This is intentionally a pure function: a restart, a second button tap, or two
-    players opening the shop must all see the same stock.  `day` makes balance tests
-    and previews deterministic without changing the server clock.
+    This is intentionally a pure function: a restart or second button tap keeps a
+    player's stock stable, while another player gets a different selection. `day`
+    makes balance tests and previews deterministic without changing the server clock.
     """
     window = storefront_window(day)
     pool = tuple(sorted(items_for_slot("weapon", "shop"), key=lambda item: item.code))
     excluded = excluded_codes or set()
-    # The anti-mob weapon is a permanent shop option.  It vanishes only after somebody
-    # in the chat has bought it, exactly like the rest of the shared stock.
-    hunter = next((item for item in pool if item.code == MOB_HUNTER_WEAPON_CODE), None)
-    # Choose the window from the full catalogue first. Sold/owned items are filtered only
-    # at the end, so an empty shelf stays empty instead of silently drawing replacements.
-    rotating_pool = tuple(item for item in pool if item is not hunter)
+    player = str(user_id or "preview")
     stock = []
+    counts = {"common": STOREFRONT_NORMAL_COUNT, "rare": STOREFRONT_RARE_COUNT}
     for rarity in STOREFRONT_RARITIES:
-        candidates = [item for item in rotating_pool if item.rarity == rarity]
+        candidates = [item for item in pool if item.rarity == rarity and item.code not in excluded]
         candidates.sort(key=lambda item: hashlib.sha256(
-            f"{entry}:{window}:{rarity}:{item.code}".encode("utf-8")
+            f"{entry}:{player}:{window}:{rarity}:{item.code}".encode("utf-8")
         ).digest())
-        stock.extend(candidates[:STOREFRONT_PER_RARITY])
-    if hunter is not None:
-        stock = [hunter, *stock]
-    # Keep one weakest-tier weapon in the initially selected window. Exclusions are still
-    # applied afterwards, so buying it leaves a real hole instead of injecting another.
+        stock.extend(candidates[:counts[rarity]])
+    # Every personal shelf contains an affordable first purchase when one is available.
     if stock and not any(item.price <= STARTER_WEAPON_MAX_PRICE for item in stock):
         starters = [
             item for item in pool
             if item.code not in {offered.code for offered in stock}
+            and item.code not in excluded
             and item.price <= STARTER_WEAPON_MAX_PRICE
         ]
         if starters:
             starter = min(starters, key=lambda item: hashlib.sha256(
-                f"{entry}:{window}:starter:{item.code}".encode("utf-8")
+                f"{entry}:{player}:{window}:starter:{item.code}".encode("utf-8")
             ).digest())
             common_indexes = [i for i, item in enumerate(stock) if item.rarity == "common"]
             stock[common_indexes[-1] if common_indexes else -1] = starter
-    return tuple(item for item in stock if item.code not in excluded)
+    return tuple(stock)
 
 
 def find_item(code: str):

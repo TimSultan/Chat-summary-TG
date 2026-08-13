@@ -441,19 +441,21 @@ def _weapon_owner_ids(data: dict, code: str) -> list[str]:
     ]
 
 
-def _daily_storefront_weapons(data: dict, entry: str, day: date | datetime | str | None = None):
+def _daily_storefront_weapons(
+    data: dict, entry: str, user_id, day: date | datetime | str | None = None,
+):
     moment = day or app_now()
-    sales = data.get("storefront_sales") or {}
-    sold_codes = set(sales.get("codes") or []) \
-        if sales.get("window") == C.storefront_window(moment) else set()
+    record = _tamed_record(data, user_id) or {}
     return C.daily_storefront_weapons(
-        entry, moment, excluded_codes=_owned_weapon_codes(data) | sold_codes,
+        entry, moment, excluded_codes=set(record.get("inventory", [])), user_id=user_id,
     )
 
 
-def daily_storefront_weapons(entry: str, day: date | datetime | str | None = None):
-    """The shared 12-hour stock, excluding every weapon already owned in this chat."""
-    return _daily_storefront_weapons(_load(entry), entry, day)
+def daily_storefront_weapons(
+    entry: str, day: date | datetime | str | None = None, *, user_id=None,
+):
+    """One player's five ordinary and one rare weapon offers for this 12-hour window."""
+    return _daily_storefront_weapons(_load(entry), entry, user_id, day)
 
 
 def _name_taken(data: dict, name: str, exclude_uid: str | None = None) -> bool:
@@ -2362,13 +2364,10 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
     if item.source != "shop":
         return False, f"«{item.name}» нельзя купить -- он выпадает только из боёв."
     if item.slot == "weapon":
-        owners = _weapon_owner_ids(data, item.code)
-        if str(user_id) in owners:
+        if item.code in record["inventory"]:
             return False, f"«{item.name}» у тебя уже есть."
-        if owners:
-            return False, f"«{item.name}» уже принадлежит другому игроку."
     if item.slot == "weapon" and item.code not in {
-        offered.code for offered in _daily_storefront_weapons(data, entry, moment)
+        offered.code for offered in _daily_storefront_weapons(data, entry, user_id, moment)
     }:
         return False, "Этого оружия сейчас нет на витрине. Она меняется каждые 12 часов."
     if item.code in record["inventory"]:
@@ -2378,15 +2377,6 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         return False, f"Нужно {item.price} монет, у тебя {balance}."
     record["inventory"].append(item.code)
     _discover(record, item.code)
-    if item.slot == "weapon":
-        window = C.storefront_window(moment)
-        sales = data.get("storefront_sales") or {}
-        if sales.get("window") != window:
-            sales = {"window": window, "codes": []}
-            data["storefront_sales"] = sales
-        sold = sales.setdefault("codes", [])
-        if item.code not in sold:
-            sold.append(item.code)
     _save(entry, data)
     return True, f"Куплено: «{item.name}» за {item.price} монет."
 

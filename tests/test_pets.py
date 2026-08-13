@@ -324,7 +324,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
         pets._save(entry, data)
 
         item = next(
-            weapon for weapon in pets.daily_storefront_weapons(entry)
+            weapon for weapon in pets.daily_storefront_weapons(entry, user_id="1")
             if "strength" in weapon.bonuses
         )
         economy.grant(entry, "1", item.price, "test")
@@ -370,7 +370,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
     def test_equipping_a_second_weapon_replaces_the_first(self):
         entry = "chat"
         self._tame(entry, "1")
-        stick, fork = pets.daily_storefront_weapons(entry)[:2]
+        stick, fork = pets.daily_storefront_weapons(entry, user_id="1")[:2]
         economy.grant(entry, "1", stick.price + fork.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, stick.code)[0])
         self.assertTrue(pets.buy_item(entry, "1", 0, fork.code)[0])
@@ -838,7 +838,7 @@ class EquipmentTradingTests(PetsTestCase):
     def test_sell_refuses_equipped_and_pays_explicit_resale(self):
         self._two_pets()
         item = next(
-            weapon for weapon in pets.daily_storefront_weapons("chat")
+            weapon for weapon in pets.daily_storefront_weapons("chat", user_id="1")
             if weapon.rarity not in {"rare", "legendary"}
         )
         economy.grant("chat", "1", item.price, "test")
@@ -854,7 +854,7 @@ class EquipmentTradingTests(PetsTestCase):
     def test_gift_is_unique_atomic_and_refuses_equipped_or_receiver_duplicate(self):
         self._two_pets()
         item = next(
-            weapon for weapon in pets.daily_storefront_weapons("chat")
+            weapon for weapon in pets.daily_storefront_weapons("chat", user_id="1")
             if weapon.rarity not in {"rare", "legendary"}
         )
         economy.grant("chat", "1", item.price, "test")
@@ -1131,19 +1131,24 @@ class StorefrontAndCollectionTests(PetsTestCase):
 
     def test_daily_storefront_is_stable_sized_and_changes_each_twelve_hours(self):
         moment = datetime(2026, 8, 8, 3)
-        first = pets_config.daily_storefront_weapons("shop-chat", moment)
-        again = pets_config.daily_storefront_weapons("shop-chat", moment.replace(hour=11))
-        afternoon = pets_config.daily_storefront_weapons("shop-chat", moment.replace(hour=12))
+        first = pets_config.daily_storefront_weapons("shop-chat", moment, user_id="1")
+        again = pets_config.daily_storefront_weapons(
+            "shop-chat", moment.replace(hour=11), user_id="1",
+        )
+        afternoon = pets_config.daily_storefront_weapons(
+            "shop-chat", moment.replace(hour=12), user_id="1",
+        )
+        other_player = pets_config.daily_storefront_weapons("shop-chat", moment, user_id="2")
         self.assertEqual(first, again)
-        self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 7)
+        self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 6)
         self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
         self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
         self.assertNotEqual([item.code for item in first], [item.code for item in afternoon])
+        self.assertNotEqual([item.code for item in first], [item.code for item in other_player])
         self.assertTrue(all(item.source == "shop" and item.slot == "weapon" for item in first))
         self.assertTrue(all(item.rarity != "cursed" for item in first))
-        rotating = [item for item in first if item.code != pets_config.MOB_HUNTER_WEAPON_CODE]
-        self.assertEqual(sum(item.rarity == "common" for item in rotating), 3)
-        self.assertEqual(sum(item.rarity == "rare" for item in rotating), 3)
+        self.assertEqual(sum(item.rarity == "common" for item in first), 5)
+        self.assertEqual(sum(item.rarity == "rare" for item in first), 1)
 
     def test_every_daily_storefront_has_a_weapon_at_the_ordinary_price_floor(self):
         # The rotation advances in twelve-hour windows; a full year guards against a
@@ -1166,15 +1171,15 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertTrue(starters)
         self.assertTrue(all(item.resale_price <= item.price // 5 for item in starters))
 
-    def test_storefront_does_not_backfill_an_excluded_ordinary_slot(self):
-        full = pets_config.daily_storefront_weapons("shop-chat", date(2026, 8, 8))
-        offered = next(item for item in full if item.rarity == "common")
+    def test_storefront_backfills_personal_items_after_a_purchase(self):
+        full = pets_config.daily_storefront_weapons("shop-chat", date(2026, 8, 8), user_id="1")
+        owned = next(item for item in full if item.rarity == "common")
         stock = pets_config.daily_storefront_weapons(
             "shop-chat", date(2026, 8, 8),
-            excluded_codes={offered.code},
+            excluded_codes={owned.code}, user_id="1",
         )
-        self.assertEqual(len(stock), len(full) - 1)
-        self.assertNotIn(offered.code, {item.code for item in stock})
+        self.assertEqual(len(stock), len(full))
+        self.assertNotIn(owned.code, {item.code for item in stock})
 
     def test_weapon_price_bands_keep_504_unique_weapons_and_rare_goals(self):
         weapons = pets_config.items_for_slot("weapon")
@@ -1243,10 +1248,9 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_core_purchase_refuses_weapon_outside_daily_window(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        offered = next(item for item in pets.daily_storefront_weapons(entry)
+        offered = next(item for item in pets.daily_storefront_weapons(entry, user_id="1")
                        if item.rarity not in {"rare", "legendary"})
-        # The window is fixed: buying one offer removes it without drawing a replacement.
-        on_sale = {item.code for item in pets.daily_storefront_weapons(entry)}
+        on_sale = {item.code for item in pets.daily_storefront_weapons(entry, user_id="1")}
         outside = next(item for item in pets_config.items_for_slot("weapon", "shop")
                        if item.code not in on_sale)
         economy.grant(entry, "1", offered.price + outside.price, "test")
@@ -1255,50 +1259,40 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertFalse(ok)
         self.assertIn("витрин", note)
 
-    def test_shop_weapon_can_have_only_one_owner_in_the_chat(self):
+    def test_shop_purchase_does_not_remove_another_players_personal_store(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        item = next(
-            weapon for weapon in pets.daily_storefront_weapons(entry)
-            if weapon.rarity not in {"rare", "legendary"}
-        )
+        item = next(weapon for weapon in pets.daily_storefront_weapons(entry, user_id="1")
+                    if weapon.rarity == "common")
         economy.grant(entry, "1", item.price, "test")
-        economy.grant(entry, "2", item.price, "test")
-
         self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
-        remaining_stock = pets.daily_storefront_weapons(entry)
-        self.assertEqual(len(remaining_stock), pets_config.DAILY_STOREFRONT_SIZE - 1)
-        self.assertNotIn(item.code, {weapon.code for weapon in remaining_stock})
-        ok, note = pets.buy_item(entry, "2", 0, item.code)
-        self.assertFalse(ok)
-        self.assertIn("принадлежит другому игроку", note)
-        self.assertEqual(economy.balance(entry, "2", 0), item.price)
+        first_player_stock = pets.daily_storefront_weapons(entry, user_id="1")
+        second_player_stock = pets.daily_storefront_weapons(entry, user_id="2")
+        self.assertEqual(len(first_player_stock), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertNotIn(item.code, {weapon.code for weapon in first_player_stock})
+        self.assertEqual(len(second_player_stock), pets_config.DAILY_STOREFRONT_SIZE)
 
-    def test_buying_every_offer_leaves_shop_empty_until_next_rotation(self):
+    def test_buying_every_offer_refills_the_personal_store(self):
         entry = "empty-shop"
         self._two_pets(entry)
         moment = datetime(2026, 8, 8, 3)
         with patch("pets.app_now", return_value=moment):
-            stock = pets.daily_storefront_weapons(entry, moment)
+            stock = pets.daily_storefront_weapons(entry, moment, user_id="1")
             economy.grant(entry, "1", sum(item.price for item in stock), "test")
-            for expected_left, item in zip(range(len(stock) - 1, -1, -1), stock):
+            for item in stock:
                 self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
-                self.assertEqual(len(pets.daily_storefront_weapons(entry, moment)), expected_left)
+                self.assertEqual(
+                    len(pets.daily_storefront_weapons(entry, moment, user_id="1")),
+                    pets_config.DAILY_STOREFRONT_SIZE,
+                )
 
-        # Even if the buyer no longer owns the objects, sold slots stay empty in this
-        # window; the next twelve-hour rotation starts with a fresh seven offers.
-        data = pets._load(entry)
-        data["pets"]["1"]["inventory"] = []
-        data["pets"]["1"]["equipped"] = {slot: None for slot in pets_config.SLOT_KEYS}
-        pets._save(entry, data)
-        self.assertEqual(pets.daily_storefront_weapons(entry, moment), ())
-        refreshed = pets.daily_storefront_weapons(entry, moment.replace(hour=12))
+        refreshed = pets.daily_storefront_weapons(entry, moment.replace(hour=12), user_id="1")
         self.assertEqual(len(refreshed), pets_config.DAILY_STOREFRONT_SIZE)
 
     def test_discovery_survives_sale_and_gift_and_old_inventory_migrates(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        first, second = [item for item in pets.daily_storefront_weapons(entry)
+        first, second = [item for item in pets.daily_storefront_weapons(entry, user_id="1")
                          if item.rarity not in {"rare", "legendary"}][:2]
         economy.grant(entry, "1", first.price + second.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, first.code)[0])
@@ -1315,7 +1309,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_lock_blocks_sale_and_gift(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        item = next(item for item in pets.daily_storefront_weapons(entry)
+        item = next(item for item in pets.daily_storefront_weapons(entry, user_id="1")
                     if item.rarity not in {"rare", "legendary"})
         economy.grant(entry, "1", item.price, "test")
         self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
@@ -1364,7 +1358,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self._two_pets(entry)
         text, _ = pets_ui.store_view(entry, "1", 0)
         visible_names = [
-            item.name for item in pets.daily_storefront_weapons(entry)
+            item.name for item in pets.daily_storefront_weapons(entry, user_id="1")
         ]
         for current, following in zip(visible_names, visible_names[1:]):
             separator = text.index("\n\n", text.index(current))
@@ -1373,7 +1367,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_store_numbers_every_item_and_groups_purchase_numbers_in_three_rows(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        stock = pets.daily_storefront_weapons(entry)
+        stock = pets.daily_storefront_weapons(entry, user_id="1")
         text, keyboard = pets_ui.store_view(entry, "1", 0)
 
         for number, item in enumerate(stock, 1):
@@ -1392,7 +1386,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_store_uses_stat_and_coin_icons_with_price_on_its_own_line(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        item = pets.daily_storefront_weapons(entry)[0]
+        item = pets.daily_storefront_weapons(entry, user_id="1")[0]
         text, _ = pets_ui.store_view(entry, "1", 0)
         item_start = text.index(item.name)
         item_end = text.find("\n\n", item_start)
@@ -1437,7 +1431,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
     def test_collection_lists_only_chat_discoveries_and_their_current_owners(self):
         entry = "shop-chat"
         self._two_pets(entry)
-        first, second = pets.daily_storefront_weapons(entry)[:2]
+        first, second = pets.daily_storefront_weapons(entry, user_id="1")[:2]
         hidden = next(
             item for item in pets_config.items_for_slot("weapon")
             if item.code not in {first.code, second.code}
@@ -2613,7 +2607,10 @@ class FarmTests(PetsTestCase):
         self.assertEqual(receipt["gold"], pets_config.FARM_GOLD_PER_RUN[1])
 
         with patch("pets.app_now", return_value=finish):
-            starter = min(pets.daily_storefront_weapons(entry, finish), key=lambda item: item.price)
+            starter = min(
+                pets.daily_storefront_weapons(entry, finish, user_id="1"),
+                key=lambda item: item.price,
+            )
             ok, message = pets.buy_item(entry, "1", 0, starter.code)
         self.assertFalse(ok)
         self.assertIn(str(starter.price), message)

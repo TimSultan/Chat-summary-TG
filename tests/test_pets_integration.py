@@ -115,7 +115,7 @@ class PetsIntegrationTests(unittest.TestCase):
         # Gear: buying, equipping, and the stat actually landing on the creature.
         bare = pets.effective_stats(ENTRY, ALICE)
         weapon = next(
-            item for item in C.daily_storefront_weapons(ENTRY, pets.today())
+            item for item in C.daily_storefront_weapons(ENTRY, pets.today(), user_id=ALICE)
             if "strength" in item.bonuses
         )
         ok, note = pets.buy_item(ENTRY, ALICE, RICH_XP, weapon.code)

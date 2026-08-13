@@ -763,7 +763,8 @@ def _shop_payload(entry: str, user_id, prefix: str) -> dict:
     permanent accessory shelf across separate screens reached by different buttons; they
     are the same act of spending coins and belong on one page, tabbed by slot."""
     record = pets.get_pet(entry, user_id) or {}
-    weapons = [_item_payload(item, prefix, record) for item in pets.daily_storefront_weapons(entry)]
+    weapons = [_item_payload(item, prefix, record)
+           for item in pets.daily_storefront_weapons(entry, user_id=user_id)]
     accessories = [
         _item_payload(item, prefix, record)
         for slot in C.SLOT_KEYS if slot != "weapon"

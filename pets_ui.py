@@ -1576,7 +1576,7 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
     owned = set(pet.get("inventory", []))
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
-    daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry)}
+    daily_weapon_codes = {item.code for item in pets.daily_storefront_weapons(entry, user_id=user_id)}
 
     # Owned gear must stay reachable even when its catalogue code lives on page 63, so it
     # keeps the first two sort tiers. But an amulet/gloves/boots catalogue is otherwise
@@ -1811,11 +1811,11 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     if rarity == "cursed":
         rarity = "all"
     owned = set(pet.get("inventory", []))
-    stock = pets.daily_storefront_weapons(entry)
+    stock = pets.daily_storefront_weapons(entry, user_id=user_id)
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
     lines = [
         "🛒 <b>Витрина</b>",
-        "Каждые 12 часов появляются 3 обычных и 3 редких оружия. Фиксированные вещи остаются.",
+        "Каждые 12 часов появляются 5 обычных и 1 редкое оружие только для тебя.",
     ]
     lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
     if not visible:

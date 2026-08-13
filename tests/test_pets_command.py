@@ -879,7 +879,7 @@ class PetsCommandTests(unittest.TestCase):
         pets._save(CHAT, data)
         # Use the live game wrapper so selection and purchase share the same app-clock
         # window; the pure catalogue helper intentionally uses the process clock.
-        item = next(item for item in pets.daily_storefront_weapons(CHAT)
+        item = next(item for item in pets.daily_storefront_weapons(CHAT, user_id=PLAYER["id"])
                     if item.rarity not in {"rare", "legendary"})
         economy.grant(CHAT, PLAYER["id"], item.price, "test")
         self.assertTrue(pets.buy_item(CHAT, PLAYER["id"], RICH_XP, item.code)[0])
