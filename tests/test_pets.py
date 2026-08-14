@@ -869,6 +869,47 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertIn(item.code, pets.get_pet("chat", "2")["inventory"])
         self.assertFalse(pets.gift_item("chat", "2", "2", item.code)[0])
 
+    def test_gifted_weapon_keeps_its_rune_owner_tag_and_counters(self):
+        self._two_pets()
+        item = next(
+            weapon for weapon in pets.daily_storefront_weapons("chat", user_id="1")
+            if weapon.rarity not in {"rare", "legendary"}
+        )
+        economy.grant("chat", "1", item.price, "test")
+        self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
+        data = pets._load("chat")
+        data["pets"]["1"].setdefault("weapon_enchantments", {})[item.code] = "fire"
+        data["pets"]["1"]["weapon_records"][item.code].update({
+            "pet_wins": 7, "mob_wins": 5, "boss_wins": 2,
+        })
+        pets._save("chat", data)
+
+        self.assertTrue(pets.gift_item("chat", "1", "2", item.code)[0])
+
+        details = pets.weapon_details("chat", "2", item.code)
+        receiver = pets.get_pet("chat", "2")
+        self.assertEqual(details, {
+            "first_owner": "One", "pet_wins": 7, "mob_wins": 5, "boss_wins": 2,
+        })
+        self.assertEqual(receiver["weapon_enchantments"][item.code], "fire")
+        self.assertNotIn(item.code, pets.get_pet("chat", "1").get("weapon_enchantments", {}))
+
+    def test_pet_victory_increments_the_equipped_weapons_counter(self):
+        self._two_pets()
+        item = next(
+            weapon for weapon in pets.daily_storefront_weapons("chat", user_id="1")
+            if weapon.rarity not in {"rare", "legendary"}
+        )
+        economy.grant("chat", "1", item.price, "test")
+        self.assertTrue(pets.buy_item("chat", "1", 0, item.code)[0])
+        self.assertTrue(pets.equip("chat", "1", item.code)[0])
+
+        pets.record_fight(
+            "chat", "1", "2", SimpleNamespace(winner="1", loser="2", is_draw=False), date(2026, 8, 1),
+        )
+
+        self.assertEqual(pets.weapon_details("chat", "1", item.code)["pet_wins"], 1)
+
     def test_same_weapon_drop_can_belong_to_two_players(self):
         self._two_pets()
 

@@ -517,6 +517,7 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
     """
     equipped_codes = set((record or {}).get("equipped", {}).values())
     owned = item.code in set((record or {}).get("inventory", []))
+    weapon = (record or {}).get("weapon_records", {}).get(item.code, {}) if item.slot == "weapon" else {}
     return {
         "code": item.code,
         "name": item.name,
@@ -537,6 +538,12 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
         "locked": item.code in set((record or {}).get("locked_items", [])),
         "enchantment": ((record or {}).get("weapon_enchantments") or {}).get(item.code)
           if item.slot == "weapon" else None,
+        "weapon_details": {
+            "first_owner": str(weapon.get("first_owner") or (record or {}).get("name") or ""),
+            "pet_wins": max(0, int(weapon.get("pet_wins", 0) or 0)),
+            "mob_wins": max(0, int(weapon.get("mob_wins", 0) or 0)),
+            "boss_wins": max(0, int(weapon.get("boss_wins", 0) or 0)),
+        } if item.slot == "weapon" and owned else None,
     }
 
 
@@ -4039,6 +4046,13 @@ function itemArt(item, marks) {
 }
 
 function itemCard(item, flag) {
+  const weapon = item.weapon_details;
+  const weaponStats = weapon
+    ? '<span class="tiny muted">🏷 Первый Владелец - ' + esc(weapon.first_owner || '') +
+      '<br>⚔️ Петы ' + Number(weapon.pet_wins || 0) + ' · 👹 Мобы ' +
+      Number(weapon.mob_wins || 0) + ' · 👑 Боссы ' + Number(weapon.boss_wins || 0) +
+      '</span>'
+    : '';
   const marks = (item.equipped ? '<span class="flag">надето</span>'
                                : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
                 (item.locked ? '<span class="lockmark">🔒</span>' : "") +
@@ -4047,7 +4061,7 @@ function itemCard(item, flag) {
   return '<button class="item r-' + item.rarity + '" data-item="' + esc(item.code) + '">' +
     itemArt(item, marks) +
     '<span class="nm">' + esc(item.name) + "</span>" +
-    '<span class="meta">' + bonusText(item.bonuses) + "</span></button>";
+    '<span class="meta">' + bonusText(item.bonuses) + "</span>" + weaponStats + "</button>";
 }
 
 function shopCard(item) {

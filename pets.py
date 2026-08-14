@@ -1317,6 +1317,50 @@ def rune_status(entry: str, user_id) -> dict:
     }
 
 
+def _weapon_record(record: dict, code: str) -> dict:
+    """Return one weapon's durable provenance and combat counters."""
+    item = C.find_item(code)
+    if item is None or item.slot != "weapon":
+        return {}
+    records = record.setdefault("weapon_records", {})
+    row = records.get(item.code)
+    if not isinstance(row, dict):
+        row = {
+            "first_owner": str(record.get("name") or "Безымянный питомец"),
+            "pet_wins": 0, "mob_wins": 0, "boss_wins": 0,
+        }
+        records[item.code] = row
+    row["first_owner"] = str(row.get("first_owner") or record.get("name") or "Безымянный питомец")
+    for key in ("pet_wins", "mob_wins", "boss_wins"):
+        row[key] = max(0, int(row.get(key, 0) or 0))
+    return row
+
+
+def weapon_details(entry: str, user_id, code: str) -> dict:
+    """Public, non-mutating view of a weapon's immutable tag and counters."""
+    record = _tamed_record(_load(entry), user_id)
+    item = C.find_item(code)
+    if record is None or item is None or item.slot != "weapon" or code not in record.get("inventory", []):
+        return {}
+    row = (record.get("weapon_records") or {}).get(item.code)
+    row = row if isinstance(row, dict) else {}
+    return {
+        "first_owner": str(row.get("first_owner") or record.get("name") or "Безымянный питомец"),
+        "pet_wins": max(0, int(row.get("pet_wins", 0) or 0)),
+        "mob_wins": max(0, int(row.get("mob_wins", 0) or 0)),
+        "boss_wins": max(0, int(row.get("boss_wins", 0) or 0)),
+    }
+
+
+def _record_weapon_win(record: dict, kind: str) -> None:
+    code = (record.get("equipped") or {}).get("weapon")
+    if kind not in {"pet_wins", "mob_wins", "boss_wins"} or not code:
+        return
+    row = _weapon_record(record, code)
+    if row:
+        row[kind] += 1
+
+
 def grant_runes(entry: str, user_id, element: str, amount: int, source: str) -> dict:
     if element not in RUNE_ELEMENTS or int(amount or 0) <= 0:
         return {"granted": 0}
@@ -2612,6 +2656,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
             reward, message = D.roll_reward(floor, bool(row.get("boss"))), f"Побеждён: {row['name']}."
+            _record_weapon_win(record, "boss_wins" if row.get("boss") else "mob_wins")
         _apply_xp(record, int(reward["xp"]))
         _save(entry, data)
 
@@ -2804,6 +2849,8 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
         return False, f"Нужно {offered.price} монет, у тебя {balance}."
     record["inventory"].append(item.code)
     _discover(record, item.code)
+    if item.slot == "weapon":
+        _weapon_record(record, item.code)
     _save(entry, data)
     return True, f"Куплено: «{item.name}» за {offered.price} монет."
 
@@ -2965,6 +3012,9 @@ def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tu
         return False, "Редкий предмет нужно подтвердить отдельной кнопкой.", 0
     value = C.resale_value(item)
     record["inventory"].remove(item.code)
+    if item.slot == "weapon":
+        record.setdefault("weapon_enchantments", {}).pop(item.code, None)
+        record.setdefault("weapon_records", {}).pop(item.code, None)
     _metric_add(data, "item_sale_gold", value)
     _save(entry, data)
     economy.grant(entry, user_id, value, f"sell:pet_item:{item.code}")
@@ -3020,11 +3070,20 @@ def gift_item(
         return False, "Редкий предмет нужно подтвердить отдельной кнопкой."
     if item.code in receiver.get("inventory", []):
         return False, "У получателя уже есть такой предмет."
+    weapon_record = dict(_weapon_record(giver, item.code)) if item.slot == "weapon" else None
+    enchantment = (
+        giver.setdefault("weapon_enchantments", {}).pop(item.code, None)
+        if item.slot == "weapon" else None
+    )
     giver["inventory"].remove(item.code)
     if item.code in giver.get("locked_items", []):
         giver["locked_items"].remove(item.code)
     receiver.setdefault("inventory", []).append(item.code)
     _discover(receiver, item.code)
+    if weapon_record is not None:
+        receiver.setdefault("weapon_records", {})[item.code] = weapon_record
+        if enchantment in RUNE_ELEMENTS:
+            receiver.setdefault("weapon_enchantments", {})[item.code] = enchantment
     giver["gift_last_at"] = moment.isoformat()
     audit = data.setdefault("gift_history", [])
     audit.append({
@@ -3492,6 +3551,7 @@ def record_fight(
     winner = data["pets"][winner_uid]
     loser = data["pets"][loser_uid]
     winner["wins"] = winner.get("wins", 0) + 1
+    _record_weapon_win(winner, "pet_wins")
 
     winner_cage_level = winner.get("cage_level", 1)
     bonus_pct = C.CAGE_GOLD_BONUS_PCT[winner_cage_level - 1]
@@ -4209,6 +4269,7 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
         gold = xp = 0
         if won:
             record["wins"] = record.get("wins", 0) + 1
+            _record_weapon_win(record, "mob_wins")
             # Half an arena purse before the mob's own multiplier -- see pets_mobs.
             base = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX) * C.PVE_GOLD_SHARE
             gold = max(1, round(base * M.TIER_REWARD[tier] * mob.gold))
@@ -4326,6 +4387,8 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) ->
         dropped = rng.choice(weighted)
         record.setdefault("inventory", []).append(dropped.code)
         _discover(record, dropped.code)
+        if dropped.slot == "weapon":
+            _weapon_record(record, dropped.code)
         equipped = record.setdefault("equipped", {})
         current = C.find_item(equipped.get(dropped.slot))
         auto_equipped = current is None or C.equipment_score(dropped) > C.equipment_score(current)

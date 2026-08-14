@@ -1780,6 +1780,14 @@ def slot_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tuple[s
         lines.append(f"<b>{escape(item.name)}</b>{mark}{lock_mark} — {_bonus_text(item)} · {state}")
         rarity = C.RARITY_LABELS.get(getattr(item, "rarity", "common"), "⚪ Обычное")
         lines[-1] = f"<b>{escape(item.name)}</b>{mark}{lock_mark} · {rarity} · {_bonus_text(item)} · {state}"
+        if item.slot == "weapon" and item.code in owned:
+            details = pets.weapon_details(entry, user_id, item.code)
+            lines.append(
+                f"🏷 Первый Владелец - {escape(details.get('first_owner') or '')}\n"
+                f"⚔️ Победил петов: {details.get('pet_wins', 0)} · "
+                f"👹 Победил мобов: {details.get('mob_wins', 0)} · "
+                f"👑 Победил боссов: {details.get('boss_wins', 0)}"
+            )
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
         lines.append("")
@@ -1863,6 +1871,13 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
         lines.append(f"\n{number}. <b>{escape(item.name)}</b>{mark}{lock_mark}")
         lines.append(f"{label} · {_bonus_text(item)}")
+        if item.slot == "weapon":
+            details = pets.weapon_details(entry, user_id, item.code)
+            lines.append(
+                f"🏷 Первый Владелец - {escape(details.get('first_owner') or '')}\n"
+                f"⚔️ Петы: {details.get('pet_wins', 0)} · 👹 Мобы: {details.get('mob_wins', 0)} · "
+                f"👑 Боссы: {details.get('boss_wins', 0)}"
+            )
         if item.description:
             lines.append(f"<i>{escape(item.description)}</i>")
 
