@@ -85,6 +85,25 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertIsNone(pets.get_pet(self.entry, self.user_id)["dungeon_run"])
 
+    def test_malformed_dungeon_run_is_repaired_before_a_fight(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": "broken", "hp": None, "cleared": "broken",
+        }
+        pets._save(self.entry, data)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+
+        self.assertEqual(run, {
+            "floor": 1, "hp": 1, "max_hp": 1, "cleared": [], "boss_lives": 0,
+        })
+
+    def test_existing_pet_owners_receive_three_dungeon_tickets_once(self):
+        self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 1)
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
+        self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

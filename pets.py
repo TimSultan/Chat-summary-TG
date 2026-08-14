@@ -66,6 +66,7 @@ FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 # is what stops a player who sells their only weapon from being handed another on the next
 # restart, forever.
 STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
+DUNGEON_TICKET_GIFT_FLAG = "dungeon_ticket_gift_20260814"
 # Зеркало души. Named here rather than looked up by effect code because two call sites
 # need the ITEM (equip it, check it is owned) and only combat needs the effect.
 MIRROR_AMULET_CODE = "amulet_soul_mirror"
@@ -98,6 +99,42 @@ _farm_settlement_lock = threading.RLock()
 
 def _pets_path(entry: str):
     return stats._stats_dir() / f"{stats._cache_key(entry)}_pets.json"
+
+
+def _normalise_dungeon_run(run) -> dict | None:
+    """Repair old or partial dungeon state before any screen or fight consumes it."""
+    if not isinstance(run, dict):
+        return None
+    try:
+        floor = max(1, int(run.get("floor", 1) or 1))
+    except (TypeError, ValueError):
+        floor = 1
+    try:
+        max_hp = max(1, int(run.get("max_hp", run.get("hp", 1)) or 1))
+    except (TypeError, ValueError):
+        max_hp = 1
+    try:
+        hp = int(run.get("hp", max_hp))
+        hp = min(max_hp, hp) if hp > 0 else max_hp
+    except (TypeError, ValueError):
+        hp = max_hp
+    cleared = run.get("cleared")
+    if not isinstance(cleared, (list, tuple, set)):
+        cleared = []
+    allowed = {row["index"] for row in D.encounters_for_floor(floor)}
+    repaired = set()
+    for value in cleared:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if index in allowed:
+            repaired.add(index)
+    try:
+        boss_lives = max(0, min(1, int(run.get("boss_lives", 0) or 0)))
+    except (TypeError, ValueError):
+        boss_lives = 0
+    return {"floor": floor, "hp": hp, "max_hp": max_hp, "cleared": sorted(repaired), "boss_lives": boss_lives}
 
 
 def _empty() -> dict:
@@ -249,8 +286,7 @@ def _load(entry: str) -> dict:
         record["fight_result_notifications"] = bool(
             record.get("fight_result_notifications", True)
         )
-        dungeon = record.get("dungeon_run")
-        record["dungeon_run"] = dungeon if isinstance(dungeon, dict) else None
+        record["dungeon_run"] = _normalise_dungeon_run(record.get("dungeon_run"))
         record["dungeon_deepest"] = max(
             1, _safe_nonnegative_int(record.get("dungeon_deepest"), 1),
         )
@@ -1382,6 +1418,26 @@ def grant_dungeon_ticket(entry, user_id) -> int:
         wallet[str(user_id)] = total
         _save(entry, data)
     return total
+
+
+def grant_dungeon_ticket_gift(entries, amount: int = 3) -> int:
+    """Give the launch gift once to every existing owner able to enter the dungeon."""
+    granted = 0
+    amount = max(0, int(amount or 0))
+    for entry in entries:
+        with _farm_settlement_lock:
+            data = _load(entry)
+            if data.get(DUNGEON_TICKET_GIFT_FLAG):
+                continue
+            wallet = data.setdefault("dungeon_tickets", {})
+            for user_id, record in data.get("pets", {}).items():
+                if not isinstance(record, dict) or not record.get("name"):
+                    continue
+                wallet[str(user_id)] = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
+                granted += 1
+            data[DUNGEON_TICKET_GIFT_FLAG] = True
+            _save(entry, data)
+    return granted
 
 
 def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:

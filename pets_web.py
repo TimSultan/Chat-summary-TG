@@ -955,8 +955,11 @@ def _action_dungeon_escalator(entry, user_id, xp, payload):
 
 
 def _action_dungeon_fight(entry, user_id, xp, payload):
-  ok, message, result = pets.dungeon_fight(entry, user_id, int(payload.get("index") or 0))
-  return ok, message, result
+  try:
+      index = int(payload.get("index") or 0)
+  except (TypeError, ValueError):
+      return False, "Выбери противника ещё раз.", None
+  return pets.dungeon_fight(entry, user_id, index)
 
 
 def _action_dungeon_rest(entry, user_id, xp, payload):

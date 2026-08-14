@@ -8723,6 +8723,9 @@ async def run_bot_listener(
         starter_weapons = pets.grant_starter_weapons(cfg.listener_allowed_chats)
         if starter_weapons:
             log(f"[pets] gave {starter_weapons} players a free common weapon")
+        dungeon_tickets = pets.grant_dungeon_ticket_gift(cfg.listener_allowed_chats)
+        if dungeon_tickets:
+            log(f"[pets] gave {dungeon_tickets} players 3 dungeon tickets")
         log(
             f"[bot_listener] logged in as @{bot_username or me.get('id')}. Long-polling for messages "
             f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "
