@@ -13,6 +13,11 @@ MIN_POWER: Final = 1_000
 ESCALATOR_RUBY_COST: Final = 5
 SHOP_FULL_HEAL_BASE_COST: Final = 60
 SCROLL_LOOT_START_FLOOR: Final = 10
+DUNGEON_OPEN: Final = False
+DUNGEON_CLOSED_NOTICE: Final = (
+    "К подземелью подъехала экспедиция для расследования. "
+    "Его оцепили и никого не пускают."
+)
 
 THEMES: Final = (
     ("Тролльи катакомбы", ("Костолом", "Мостовой громила", "Шаман гнили")),

@@ -32,6 +32,14 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(boss[0]["boss"])
         self.assertEqual(boss[0]["gimmick"], "reincarnate")
 
+    def test_dungeon_is_closed_for_investigation(self):
+        ok, message = pets.enter_dungeon(self.entry, self.user_id)
+        self.assertFalse(ok)
+        self.assertEqual(message, dungeon.DUNGEON_CLOSED_NOTICE)
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertFalse(state["available"])
+        self.assertEqual(state["closed_notice"], dungeon.DUNGEON_CLOSED_NOTICE)
+
     def test_entry_is_gated_then_persists_the_run(self):
         ok, _ = pets.enter_dungeon(self.entry, self.user_id)
         self.assertFalse(ok)

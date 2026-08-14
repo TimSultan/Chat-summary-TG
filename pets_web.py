@@ -3779,6 +3779,9 @@ function dungeonArt(enemy) {
 function dungeonPanel() {
   const dungeon = S.dungeon || {};
   if (!S.pet) return "";
+  if (!dungeon.available) {
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье закрыто<small>Экспедиция ведёт расследование</small></div></div><div class="dungeon-body"><p class="small muted" style="margin:0">' + esc(dungeon.closed_notice || 'Подземелье временно закрыто.') + '</p>' + (dungeon.active ? '<button class="go warn" style="margin-top:10px" data-dungeon="quit">Вернуться</button>' : '') + '</div></div>';
+  }
   if (!dungeon.active) {
     const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
     return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Три врага на этаж. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>⚔️ Войти</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · 5 💎</button>' : '') + '</div></div>';

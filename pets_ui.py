@@ -305,6 +305,16 @@ def info_view(user_id) -> tuple[str, dict]:
 
 def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     state = pets.dungeon_status(entry, user_id)
+    if not state.get("available"):
+        rows = []
+        if state.get("active"):
+            rows.append([{"text": "🚪 Вернуться", "callback_data": callback_data(user_id, "dungeonquit")}])
+        rows.append(_back_row(user_id))
+        return (
+            "🕳 <b>Подземелье закрыто</b>\n\n"
+            f"{escape(str(state.get('closed_notice') or 'Подземелье временно закрыто.'))}",
+            {"inline_keyboard": rows},
+        )
     if not state.get("active"):
         power = int(state.get("power", 0))
         needed = int(state.get("min_power", 1000))

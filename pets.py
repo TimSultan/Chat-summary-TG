@@ -2176,10 +2176,14 @@ def dungeon_status(entry: str, user_id) -> dict:
     """Public state reconstructed from the server-owned dungeon run."""
     record = _tamed_record(_load(entry), user_id)
     if record is None:
-        return {"active": False, "min_power": D.MIN_POWER}
+        return {
+            "active": False, "available": D.DUNGEON_OPEN,
+            "closed_notice": D.DUNGEON_CLOSED_NOTICE, "min_power": D.MIN_POWER,
+        }
     run = record.get("dungeon_run")
     state = {
-        "active": bool(run), "min_power": D.MIN_POWER,
+        "active": bool(run), "available": D.DUNGEON_OPEN,
+        "closed_notice": D.DUNGEON_CLOSED_NOTICE, "min_power": D.MIN_POWER,
         "power": _power_rating_for(record), "deepest": int(record.get("dungeon_deepest", 1)),
         "escalator_cost": D.ESCALATOR_RUBY_COST,
     }
@@ -2237,6 +2241,8 @@ def _dungeon_has_element(record: dict, element: str) -> bool:
 
 
 def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool, str]:
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
@@ -2267,6 +2273,8 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
 
 def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | None]:
     """Fight a fixed encounter, recording persistent damage before rewards leave the store."""
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE, None
     reward = None
     with _farm_settlement_lock:
         data = _load(entry)
@@ -2329,6 +2337,8 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
 
 
 def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE
     data = _load(entry)
     record = _tamed_record(data, user_id)
     run = record.get("dungeon_run") if record else None
@@ -2347,6 +2357,8 @@ def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:
 
 
 def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE
     data = _load(entry)
     record = _tamed_record(data, user_id)
     run = record.get("dungeon_run") if record else None
