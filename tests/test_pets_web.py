@@ -311,7 +311,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_defends_hero_rendering_when_equipment_is_empty(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX + "/")).text()
         self.assertIn('for (const s of (S.equipment || []))', page)
-        self.assertIn('emptySlot("weapon")', page)
+        self.assertIn('const equippedSlot = (slotName)', page)
+        self.assertIn('equippedSlot("weapon")', page)
         self.assertIn("Снаряжения пока нет.", page)
 
     async def test_a_mutating_action_returns_state_that_already_reflects_it(self):

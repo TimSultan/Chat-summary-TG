@@ -3760,25 +3760,25 @@ function renderHero() {
   };
   const worn = {};
   for (const s of (S.equipment || [])) worn[s.slot] = s;
-  const emptySlot = (slotName) => ({
-    slot: slotName, name: ({ weapon: "Оружие", shield: "Щит", gloves: "Перчатки", amulet: "Амулет", boots: "Сапоги" })[slotName] || slotName,
-    emoji: ({ weapon: "🗡", shield: "🛡", gloves: "🧤", amulet: "📿", boots: "👢" })[slotName] || "", item: null,
-  });
+  const equippedSlot = (slotName) => {
+    const equipped = worn[slotName];
+    return equipped && equipped.item ? "<div>" + slot(equipped) + "</div>" : "";
+  };
 
   box.innerHTML =
     '<div class="panel">' +
       '<div class="doll">' +
-        "<div>" + slot(worn.weapon || emptySlot("weapon")) + "</div>" +
+        equippedSlot("weapon") +
         // Tapping the portrait is how you change and frame the photo. It is the one thing
         // on this screen that is a picture, so it is where a hand goes looking.
         '<button class="portrait" data-do="portrait">' +
           shot(pet.portrait, pet.crop) +
           '<span class="edit">✏️</span>' +
           '<span class="pw">⚡ ' + money(combat.power) + "</span></button>" +
-        "<div>" + slot(worn.shield || emptySlot("shield")) + "</div>" +
-        "<div>" + slot(worn.gloves || emptySlot("gloves")) + "</div>" +
-        "<div>" + slot(worn.amulet || emptySlot("amulet")) + "</div>" +
-        "<div>" + slot(worn.boots || emptySlot("boots")) + "</div>" +
+        equippedSlot("shield") +
+        equippedSlot("gloves") +
+        equippedSlot("amulet") +
+        equippedSlot("boots") +
         '<div class="tiny muted pet-equipment-summary">' +
           esc(pet.name) + " · ур. " + pet.level + "<br>" +
           pet.xp + " / " + pet.xp_needed + " опыта<br>" +
