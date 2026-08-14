@@ -838,6 +838,22 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attack_types=attack_types,
         )
         total_damage[source_key] += impact
+        # A damage scroll can carry a share of its *actual* landed damage back to its
+        # caster.  This is intentionally based on ``impact`` after armour, guards and
+        # defensive procs, rather than its advertised raw multiplier: Predator Bite
+        # promises to heal from what it dealt, and a fully blocked bite dealt nothing.
+        lifesteal = max(0.0, min(1.0, float(effect.get("lifesteal", 0) or 0)))
+        if impact and lifesteal:
+            before = hp[source_key]
+            hp[source_key] = min(max_hp[source_key], hp[source_key] + impact * lifesteal)
+            healed = round(hp[source_key] - before)
+            if healed:
+                rounds.append(Round(
+                    number=number, attacker=source_key, event="skill_lifesteal", damage=-healed,
+                    attacker_hp=round(hp[source_key]), defender_hp=round(hp[target_key]),
+                    text=f"💚 {fighters[source_key].name} восстанавливает {healed} HP от удара.",
+                    attack_types=normalize_attack_types(attack_types),
+                ))
         reflected_winner = None if knocked_out or reflection_winner else reflect_skill_damage(
             source_key, target_key, impact, number,
         )
@@ -919,16 +935,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
 
     def active_actions(key: str) -> list[str]:
         loadout = skill_loadouts[key]
-        if not loadout:
-            return ["attack"]
         actions = ["attack"]
+        # Defend is deliberately unavailable on the fighter's first real action.  A
+        # shield is a response after combat has started, not an opening barrier; allowing
+        # it at action zero made shield hooks visibly fire on the first line of live logs.
+        # ``attacks_made`` counts attacks, scrolls, Defend and Cocoon alike, so being
+        # stunned before acting does not accidentally unlock a shield early.
         # Defend only when there is no guard already standing. A guard is a one-shot
         # block: it is set to a flat value here and zeroed by the hit it absorbs, so
         # raising it a second time writes the same number and buys nothing. That is not
         # a rare case -- leadership alternates round to round, so each fighter acts twice
         # in a row every other round (a, b, b, a, a, b), and a pair of Defends inside
         # that back-to-back turn threw the first one away.
-        if guards[key] <= 0:
+        if attacks_made[key] >= 1 and guards[key] <= 0:
             actions.append("defend")
         for index, code in enumerate(loadout):
             # An empty slot offers nothing to choose. It still costs the creature
@@ -1116,13 +1135,17 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         personal_limit = C.MAX_SKILL_ACTIONS_PER_FIGHTER
         if attacks_made[attacker_key] >= personal_limit:
             return None
-        if skill_loadouts[attacker_key]:
-            start_active_turn(attacker_key, defender_key, round_number)
+        # Statuses can come from shields as well as scrolls.  Their lifecycle must not
+        # depend on whether the affected fighter happens to have a filled skill loadout.
+        start_active_turn(attacker_key, defender_key, round_number)
         if effectful and stunned[attacker_key]:
             stunned[attacker_key] = False
-            effect_round(round_number, defender_key, attacker_key, "stun")
-            if skill_loadouts[attacker_key]:
-                tick_skill_state(attacker_key)
+            rounds.append(Round(
+                number=round_number, attacker=attacker_key, event="stun_skip", damage=0,
+                attacker_hp=round(hp[attacker_key]), defender_hp=round(hp[defender_key]),
+                text=f"💫 {fighters[attacker_key].name} оглушён и пропускает ход.",
+            ))
+            tick_skill_state(attacker_key)
             return None
         if effectful and _effect_value(effects[attacker_key], "cocoon") is not None \
                 and "cocoon" not in used[attacker_key]:
@@ -1130,8 +1153,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             cocooned[attacker_key] = True
             attacks_made[attacker_key] += 1
             effect_round(round_number, attacker_key, defender_key, "cocoon")
-            if skill_loadouts[attacker_key]:
-                tick_skill_state(attacker_key)
+            tick_skill_state(attacker_key)
             return None
         if effectful and (burn := burning[attacker_key]) is not None:
             source_key, turns, burn_damage, burn_attack_types = burn
@@ -1182,7 +1204,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             healed = round(hp[attacker_key] - before)
             if healed:
                 effect_round(round_number, attacker_key, defender_key, "regen", healed)
-        if skill_loadouts[attacker_key]:
+        if skill_loadouts[attacker_key] or equipped_shields[attacker_key]:
             choices = active_actions(attacker_key)
             # Every available scroll has the same one-ticket chance. A plain attack has
             # four tickets so active combat does not turn into an endless wall of heals
@@ -1224,11 +1246,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         forced_venom_miss = venom_miss[attacker_key] > 0 and rng.random() < venom_miss[attacker_key]
         venom_miss[attacker_key] = 0.0
         forced_skill_miss = False
-        if skill_loadouts[attacker_key]:
-            if skill_statuses[defender_key].pop("dodge_next", False):
-                forced_skill_miss = True
-            elif skill_value(attacker_key, "blind") > 0:
-                forced_skill_miss = rng.random() < min(.80, skill_value(attacker_key, "blind"))
+        if skill_statuses[defender_key].pop("dodge_next", False):
+            forced_skill_miss = True
+        elif skill_value(attacker_key, "blind") > 0:
+            forced_skill_miss = rng.random() < min(.80, skill_value(attacker_key, "blind"))
         phantom_dodge = effectful \
             and _effect_value(effects[defender_key], "phantom_step") is not None \
             and phantom_dodges[defender_key] < max(1, round(_param(
@@ -1406,7 +1427,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             return reflection_winner
         if damage:
             landed_hits[attacker_key] += 1
-        if skill_loadouts[attacker_key] and impact and not knocked_out:
+        if impact and not knocked_out:
             reflected_winner = reflect_skill_damage(
                 attacker_key, defender_key, impact, round_number,
             )
@@ -1637,8 +1658,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     and (value := _effect_value(effects[defender_key], "afterimage")) is not None:
                 used[defender_key].add("afterimage")
                 afterimage_bonus[defender_key] = max(0, _fraction(value))
-        if skill_loadouts[attacker_key]:
-            tick_skill_state(attacker_key)
+        tick_skill_state(attacker_key)
         return attacker_key if knocked_out else None
 
     stopped_early = False

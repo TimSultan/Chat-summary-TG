@@ -328,6 +328,125 @@ class SimulateTests(unittest.TestCase):
             # The rule must not have simply stopped anybody from ever defending.
             self.assertGreater(defends, 200)
 
+    def test_an_equipped_shield_cannot_defend_before_the_second_personal_action(self):
+        """Shield hooks used to be eligible immediately, so a seeded fight could open
+        with healing, reflection or a barrier before its wearer had done anything."""
+        import pets_scroll_catalog as scrolls
+
+        class DefendWhenPossible:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "defend" if "defend" in values else values[0]
+
+        shielded = Fighter(
+            key="shielded", name="Shielded", strength=10, health=200,
+            agility=10, luck=1, armor=0, shield=scrolls.shield("shield_lantern"),
+        )
+        target = Fighter(
+            key="target", name="Target", strength=1, health=200,
+            agility=1, luck=1, armor=0,
+        )
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 1)):
+            result = combat.simulate(
+                shielded, target, rng=DefendWhenPossible(), max_actions=2,
+            )
+
+        own_actions = [
+            row for row in result.rounds
+            if row.attacker == shielded.key and row.event in {
+                "hit", "crit", "blocked", "low_damage", "dodge", "defend",
+            }
+        ]
+        self.assertGreaterEqual(len(own_actions), 2)
+        self.assertNotEqual(own_actions[0].event, "defend")
+        self.assertEqual(own_actions[1].event, "defend")
+        self.assertFalse(any(
+            row.event == "defend" and row.number == own_actions[0].number
+            for row in result.rounds
+        ))
+
+    def test_shield_reflection_affects_an_opponent_without_scrolls(self):
+        """Dungeon enemies have no scroll loadout. Shield statuses still have to affect
+        them; the old loadout gate made bosses ignore Mirror and several other shields."""
+        import pets_scroll_catalog as scrolls
+
+        class DefendWhenPossible:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "defend" if "defend" in values else values[0]
+
+        shielded = Fighter(
+            key="hero", name="Hero", strength=10, health=200, agility=10, luck=1,
+            armor=0, shield=scrolls.shield("shield_mirror"),
+        )
+        boss = Fighter(
+            key="dungeon:boss_10", name="Boss", strength=10, health=200,
+            agility=10, luck=1, armor=0,
+        )
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 20)):
+            result = combat.simulate(
+                shielded, boss, rng=DefendWhenPossible(), max_actions=3,
+            )
+
+        reflected = next(row for row in result.rounds if row.event == "skill_reflect")
+        self.assertEqual(reflected.attacker, shielded.key)
+        self.assertGreater(reflected.damage, 0)
+
+    def test_stun_skips_a_dungeon_boss_before_items_or_actions_can_trigger(self):
+        """A boss uses the same status rules as a pet. In particular, stun resolves
+        before Cocoon, regeneration, Defend, scrolls or its ordinary attack."""
+
+        class StunFirst:
+            calls = 0
+
+            def random(self):
+                self.calls += 1
+                # Hero wins initiative; later rolls keep the stun scroll from dodging.
+                return 0.0 if self.calls == 1 else 0.99
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "skill_1" if "skill_1" in values else values[0]
+
+        hero = Fighter(
+            key="hero", name="Hero", strength=20, health=200, agility=20, luck=1,
+            armor=0, skills=("scroll_gravity_thread", None, None, None),
+        )
+        boss = Fighter(
+            key="dungeon:boss_5", name="Boss", strength=20, health=200,
+            agility=20, luck=1, armor=0,
+            effects=({"code": "cocoon", "value": 250}, {"code": "regen", "value": 20}),
+        )
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 10)):
+            result = combat.simulate(hero, boss, rng=StunFirst(), max_actions=1)
+
+        self.assertIn("skill_scroll_gravity_thread", [row.event for row in result.rounds])
+        skipped = next(row for row in result.rounds if row.event == "stun_skip")
+        self.assertEqual(skipped.attacker, boss.key)
+        self.assertIn("пропускает ход", skipped.text)
+        self.assertFalse(any(
+            row.attacker == boss.key and row.event in {
+                "hit", "crit", "blocked", "low_damage", "dodge", "defend",
+                "amulet_cocoon", "amulet_regen",
+            }
+            for row in result.rounds
+        ))
+
     def test_even_fights_are_decided_by_a_knockout(self):
         """The damage tiebreak is a backstop, not an outcome the design leans on.
 
@@ -573,13 +692,16 @@ class AmuletEffectTests(unittest.TestCase):
         with patch.object(combat, "_resolve_blow", return_value=("crit", 5)), \
                 patch.object(combat, "_signature", return_value=None):
             result = combat.simulate(attacker, defender, seed=75)
-        stun_rows = [
+        applications = [
             row for row in result.rounds
             if row.event == "amulet_stun" and row.attacker == attacker.key
         ]
-        # Each proc writes one application row and one row when the skipped turn is
-        # consumed: two procs therefore produce exactly four visible stun rows.
-        self.assertEqual(len(stun_rows), 4)
+        skipped = [
+            row for row in result.rounds
+            if row.event == "stun_skip" and row.attacker == defender.key
+        ]
+        self.assertEqual(len(applications), 2)
+        self.assertEqual(len(skipped), 2)
 
     def test_legendary_shield_breaker_keeps_the_breach_open(self):
         defender = Fighter(
@@ -730,6 +852,33 @@ class EffectKnobTests(unittest.TestCase):
 
 
 class AttackTypeTests(unittest.TestCase):
+    def test_predator_bite_heals_from_the_damage_it_lands(self):
+        class SkillRng:
+            def random(self):
+                return .99
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "skill_1" if "skill_1" in values else values[0]
+
+        biter = Fighter(
+            key="biter", name="Biter", strength=20, health=200, agility=20, luck=1,
+            armor=0, skills=("scroll_predator_bite", None, None, None), starting_hp=1_000,
+        )
+        target = Fighter(
+            key="target", name="Target", strength=1, health=500, agility=1, luck=1,
+            armor=0, starting_hp=10_000,
+        )
+        with patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(biter, target, rng=SkillRng(), max_actions=1)
+
+        bite = next(row for row in result.rounds if row.event == "skill_scroll_predator_bite")
+        healed = next(row for row in result.rounds if row.event == "skill_lifesteal")
+        self.assertEqual(healed.damage, -round(bite.damage * .70))
+        self.assertGreater(healed.attacker_hp, 1_000)
+
     def test_elemental_damage_is_also_magic(self):
         self.assertEqual(
             combat.normalize_attack_types((combat.ELEMENTAL,)),

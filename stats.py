@@ -224,6 +224,7 @@ WEEKLY_CONTEST_STORE_VERSION = 1
 CABINET_START_PAYLOAD = "cabinet"
 WORK_NAME_STORE_VERSION = 1
 BADGE_MANAGER_STORE_VERSION = 1
+XP_GRANT_STORE_VERSION = 1
 # Long enough for "Космодесантник Ультрамаринов", short enough that thirty of them still
 # fit in one Telegram message alongside their links.
 WORK_NAME_MAX_CHARS = 32
@@ -792,6 +793,54 @@ def _weekly_contest_path(entry: str) -> Path:
 
 def _level_state_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_level_state.json"
+
+
+def _xp_grants_path(entry: str) -> Path:
+    return _stats_dir() / f"{_cache_key(entry)}_xp_grants.json"
+
+
+def _load_xp_grants(entry: str) -> dict:
+    try:
+        data = json.loads(_xp_grants_path(entry).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"version": XP_GRANT_STORE_VERSION, "users": {}}
+    if not isinstance(data, dict) or data.get("version") != XP_GRANT_STORE_VERSION:
+        return {"version": XP_GRANT_STORE_VERSION, "users": {}}
+    users = data.get("users")
+    return {"version": XP_GRANT_STORE_VERSION, "users": users if isinstance(users, dict) else {}}
+
+
+def grant_xp_once(
+    entry: str, user_id, amount: int, key: str, *,
+    username: str | None = None, display_name: str | None = None,
+) -> bool:
+    """Persist one idempotent XP adjustment that participates in normal coin derivation."""
+    amount = int(amount)
+    key = str(key or "").strip()
+    if amount <= 0 or not key:
+        return False
+    data = _load_xp_grants(entry)
+    users = data["users"]
+    user = users.get(str(user_id))
+    if not isinstance(user, dict):
+        user = {"grants": {}}
+        users[str(user_id)] = user
+    grants = user.setdefault("grants", {})
+    if not isinstance(grants, dict):
+        grants = {}
+        user["grants"] = grants
+    if key in grants:
+        return False
+    grants[key] = {"amount": amount, "granted_at": app_now().date().isoformat()}
+    if username:
+        user["username"] = str(username).lstrip("@")
+    if display_name:
+        user["display_name"] = str(display_name)
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _xp_grants_path(entry).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return True
 
 
 def _deleted_figurines_path(entry: str) -> Path:
@@ -2283,6 +2332,10 @@ class UserStats:
     season_replies: int = 0
     season_active_days: int = 0
     season_figurines: int = 0
+    # Explicit administrative adjustments live outside message/day caches. They are
+    # still XP, so coins and levels consume them through the same methods as earned XP.
+    bonus_xp: int = 0
+    season_bonus_xp: int = 0
 
     def xp(self, words_per_point: float) -> int:
         """`words_per_point` -- see the function of that name -- is this chat's frozen
@@ -2301,6 +2354,7 @@ class UserStats:
             + self.replies * XP_PER_REPLY
             + self.active_days * XP_PER_ACTIVE_DAY
             + self.figurines_painted * XP_PER_FIGURINE
+            + self.bonus_xp
         )
 
     def season_xp(self, words_per_point: float) -> int:
@@ -2319,6 +2373,7 @@ class UserStats:
             + self.season_replies * XP_PER_REPLY
             + self.season_active_days * XP_PER_ACTIVE_DAY
             + self.season_figurines * XP_PER_FIGURINE
+            + self.season_bonus_xp
         )
 
     def _has_season_data(self) -> bool:
@@ -2329,6 +2384,7 @@ class UserStats:
             or self.season_replies
             or self.season_active_days
             or self.season_figurines
+            or self.season_bonus_xp
         )
 
     def score(self, words_per_point: float) -> int:
@@ -2518,6 +2574,38 @@ def aggregate(entry: str, start_day: date, end_day: date) -> dict[str, UserStats
     return combined
 
 
+def _apply_xp_grants(
+    entry: str, combined: dict[str, UserStats], season_start: date | None = None,
+) -> None:
+    """Merge persistent adjustments into all-time/season totals, never daily rankings."""
+    for user_id, row in _load_xp_grants(entry)["users"].items():
+        if not isinstance(row, dict):
+            continue
+        user = combined.setdefault(str(user_id), UserStats(user_id=str(user_id)))
+        if row.get("username") and not user.username:
+            user.username = str(row["username"])
+        if row.get("display_name") and user.display_name == "Unknown":
+            user.display_name = str(row["display_name"])
+        grants = row.get("grants")
+        if not isinstance(grants, dict):
+            continue
+        for grant in grants.values():
+            if not isinstance(grant, dict):
+                continue
+            try:
+                amount = max(0, int(grant.get("amount", 0)))
+            except (TypeError, ValueError):
+                continue
+            user.bonus_xp += amount
+            if season_start is not None:
+                try:
+                    granted_on = date.fromisoformat(str(grant.get("granted_at")))
+                except ValueError:
+                    granted_on = None
+                if granted_on is not None and granted_on >= season_start:
+                    user.season_bonus_xp += amount
+
+
 def aggregate_all_time(entry: str, season_start: date | None = None) -> dict[str, UserStats]:
     """Like aggregate, but over every day ever recorded for this chat (globs STATS_DIR
     rather than walking a bounded date range) -- used by /stat, which reports a person's
@@ -2537,6 +2625,7 @@ def aggregate_all_time(entry: str, season_start: date | None = None) -> dict[str
         except (json.JSONDecodeError, OSError):
             continue
         _merge_day(combined, payload, season_start=season_start)
+    _apply_xp_grants(entry, combined, season_start=season_start)
     _apply_deleted_figurines(entry, combined)
     return combined
 

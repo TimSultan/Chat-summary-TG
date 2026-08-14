@@ -324,8 +324,9 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                  "Состав этажей меняется, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
         rows = [[{"text": (f"⚔️ Войти · билет ({tickets})" if tickets else f"⚔️ Войти · {state.get('entry_cost', 15)} 💎"), "callback_data": callback_data(user_id, "dungeonenter")}]]
         if int(state.get("deepest", 1)) > 1:
-            cost = int(state.get("entry_cost", 15)) + int(state.get("escalator_cost", 5))
-            rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · {cost} 💎", "callback_data": callback_data(user_id, "dungeonescalator")}])
+            cost = (0 if tickets else int(state.get("entry_cost", 15))) + int(state.get("escalator_cost", 5))
+            payment = f"билет + {cost} 💎" if tickets else f"{cost} 💎"
+            rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · {payment}", "callback_data": callback_data(user_id, "dungeonescalator")}])
         rows.append(_back_row(user_id))
         return "\n".join(lines), {"inline_keyboard": rows}
     lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", escape(str(state.get('description') or '')), ""]
@@ -862,6 +863,36 @@ def quest_review_view(entry: str, user_id) -> tuple[str, dict]:
     if link:
         keyboard.append([{"text": "📷 Открыть работу в чате", "url": link}])
     keyboard.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": keyboard}
+
+
+def quest_submission_notification_view(
+    moderator_id, submission: dict, webapp_url: str | None = None,
+) -> tuple[str, dict]:
+    """A moderator's private alert for one newly submitted quest.
+
+    The review queue itself remains the source of truth: these controls only open its
+    two existing review surfaces.  Keeping the moderator id in the Telegram callback
+    preserves the same forwarded-message protection as the rest of the pet menu.
+    """
+    title = str(submission.get("title") or submission.get("code") or "Квест")
+    author = str(submission.get("author_name") or submission.get("author_username") or "Игрок")
+    lines = [
+        "🎯 Новая заявка на проверку квеста.",
+        f"<b>{escape(title)}</b>",
+        f"Автор: {escape(author)}",
+    ]
+    keyboard = []
+    if webapp_url:
+        separator = "&" if "?" in webapp_url else "?"
+        keyboard.append([{
+            "text": "🖥 Проверить в вебе",
+            "web_app": {"url": f"{webapp_url}{separator}view=review"},
+        }])
+    keyboard.append([{
+        "text": "📲 Проверить в Telegram",
+        "callback_data": callback_data(moderator_id, "questreview"),
+    }])
     return "\n".join(lines), {"inline_keyboard": keyboard}
 
 

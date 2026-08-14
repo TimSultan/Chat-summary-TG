@@ -952,6 +952,7 @@ async def run_listener(
     tz,
     log=print,
     figurine_ack_queue: "asyncio.Queue | None" = None,
+    quest_submission_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
     file_block_queue: "asyncio.Queue | None" = None,
@@ -973,6 +974,10 @@ async def run_listener(
     stats.format_procrastinators) -- unprompted, ambient content, so same
     bot-account-only rule as every other post: passed through to run_stats_rollover, and
     simply never sent (no personal-account fallback) if there's no bot account.
+
+    `quest_submission_queue`, if given, receives each newly accepted quest submission
+    as ``(entry, submission)``. The bot listener owns moderator DMs and review buttons,
+    while this Telethon session is the only process that observes the submitted media.
 
     `dismiss_queue`, if given, is where (chat_id, message_id) goes from
     _maybe_dismiss_on_thumbs_up (see on_reaction) when the thumbs-up dismiss shortcut
@@ -1281,6 +1286,19 @@ async def run_listener(
                         f"{sender_display_name(sender)} in '{entry}': "
                         + ("queued for review" if ok else f"refused -- {note}")
                     )
+                    if ok and quest_submission_queue is not None:
+                        submission = next(
+                            (row for row in reversed(quests.pending(entry))
+                             if str(row.get("message_id")) == str(msg.id)),
+                            None,
+                        )
+                        if submission is not None:
+                            await quest_submission_queue.put((entry, submission))
+                        else:
+                            log(
+                                f"[listener] could not locate newly queued quest "
+                                f"submission for message {msg.id} in '{entry}'"
+                            )
 
         # "сохрани" (config.py SAVE_TRIGGER_KEYWORD), sent by you as a reply, asks for
         # confirmation before reposting whatever you replied to into your save channel
@@ -1536,6 +1554,10 @@ async def main():
         # bot_listener.py, so the *reaction* onto that message still comes from the bot
         # account, same bot-account-only rule as every other reply.
         figurine_ack_queue: asyncio.Queue = asyncio.Queue()
+        # Quest submissions are observed by this session with the actual media post,
+        # then handed to the bot account so each delegated moderator gets private
+        # review controls.
+        quest_submission_queue: asyncio.Queue = asyncio.Queue()
         # stats_digest_queue carries (allowed_chats entry, text) every other day for the
         # "Топ покрастинаторов" call-out (see run_stats_rollover/
         # stats.format_procrastinators) -- ambient, unprompted content, same
@@ -1557,12 +1579,14 @@ async def main():
         await asyncio.gather(
             run_listener(
                 client, cfg, tz,
-                figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
+                figurine_ack_queue=figurine_ack_queue, quest_submission_queue=quest_submission_queue,
+                stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
             ),
             bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
-                figurine_ack_queue=figurine_ack_queue, stats_digest_queue=stats_digest_queue,
+                figurine_ack_queue=figurine_ack_queue, quest_submission_queue=quest_submission_queue,
+                stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
             ),
         )

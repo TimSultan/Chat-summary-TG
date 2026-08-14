@@ -234,6 +234,28 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("Багровая комета", sent["caption"])
         self.assertLessEqual(len(sent["caption"]), 1024)
 
+    def test_each_delegated_quest_moderator_gets_web_and_telegram_review_controls(self):
+        quests.add_moderator(CHAT, "77", "mod_one", "Mod One", PLAYER["id"], "Player")
+        quests.add_moderator(CHAT, "88", "mod_two", "Mod Two", PLAYER["id"], "Player")
+        api = FakeApi()
+
+        _run(bot_listener._send_quest_submission_notifications(
+            api, CHAT,
+            {"id": "submission-1", "title": "Paint a hero", "author_name": "Player"},
+            "https://example.com/pets", log=lambda *_: None,
+        ))
+
+        self.assertEqual({sent["chat_id"] for sent in api.sent}, {"77", "88"})
+        for sent in api.sent:
+            moderator_id = sent["chat_id"]
+            self.assertIn("Paint a hero", sent["text"])
+            buttons = _buttons(sent)
+            self.assertEqual(buttons[0]["web_app"]["url"], "https://example.com/pets?view=review")
+            self.assertEqual(
+                pets_ui.parse_callback(buttons[1]["callback_data"]),
+                (moderator_id, "questreview", ""),
+            )
+
     def test_every_menu_action_renders_instead_of_erroring(self):
         """A guard for the whole callback table, not one button.
 

@@ -661,7 +661,7 @@ def _apply_xp(record: dict, amount: int) -> tuple[int, int]:
     old_level = record.get("level", 1)
     record["xp"] = record.get("xp", 0) + amount
     level = old_level
-    while level < C.PET_MAX_LEVEL:
+    while C.PET_MAX_LEVEL is None or level < C.PET_MAX_LEVEL:
         needed = C.pet_xp_for_next_level(level)
         if needed <= 0 or record["xp"] < needed:
             break
@@ -2472,16 +2472,9 @@ def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
             effects.append(dict(effect))
     weapon = (record.get("equipped") or {}).get("weapon")
     element = (record.get("weapon_enchantments") or {}).get(weapon)
-    enchant_effects = {
-        "fire": {"code": "burn", "value": 5, "turns": 2},
-        "frost": {"code": "chill", "value": 25},
-        "water": {"code": "regen", "value": 5},
-        "earth": {"code": "plating", "value": 3},
-        "air": {"code": "precision", "value": 15},
-        "plants": {"code": "vampiric", "value": 5},
-    }
-    if element in enchant_effects:
-        effects.append(enchant_effects[element])
+    enchant_effect = C.rune_enchantment_effect(element, _effective_stats_for(record))
+    if enchant_effect:
+        effects.append(enchant_effect)
     return tuple(effects)
 
 
@@ -2543,18 +2536,9 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
             effects.append(dict(effect))
     weapon = (record.get("equipped") or {}).get("weapon")
     element = (record.get("weapon_enchantments") or {}).get(weapon)
-    if element == "fire":
-        effects.append({"code": "burn", "value": 5, "turns": 2})
-    elif element == "frost":
-        effects.append({"code": "chill", "value": 25})
-    elif element == "water":
-        effects.append({"code": "regen", "value": 5})
-    elif element == "earth":
-        effects.append({"code": "plating", "value": 3})
-    elif element == "air":
-        effects.append({"code": "precision", "value": 15})
-    elif element == "plants":
-        effects.append({"code": "vampiric", "value": 5})
+    enchant_effect = C.rune_enchantment_effect(element, effective)
+    if enchant_effect:
+        effects.append(enchant_effect)
     return pets_combat.Fighter(
         key=str(key), name=record.get("name") or "Существо",
         strength=effective["strength"], health=effective["health"],
@@ -2620,21 +2604,24 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
         ticket_count = max(0, int(tickets.get(str(user_id), 0) or 0))
         wallet = _ruby_row(data)
         rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
-        if ticket_count:
-            tickets[str(user_id)] = ticket_count - 1
-        elif rubies < D.ENTRY_RUBY_COST:
-            return False, f"Вход стоит {D.ENTRY_RUBY_COST} рубинов."
-        else:
-            wallet[str(user_id)] = rubies - D.ENTRY_RUBY_COST
         floor = 1
         if escalator:
             floor = max(1, int(record.get("dungeon_deepest", 1)))
             if floor <= 1:
                 return False, "Эскалатор откроется, когда доберёшься глубже."
-            rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
-            if rubies < D.ESCALATOR_RUBY_COST:
-                return False, f"Нужно {D.ESCALATOR_RUBY_COST} рубинов."
-            wallet[str(user_id)] = rubies - D.ESCALATOR_RUBY_COST
+        # A ticket replaces the admission fee only.  Validate every separate cost before
+        # consuming it, so a failed escalator attempt cannot silently burn a ticket.
+        ruby_cost = (0 if ticket_count else D.ENTRY_RUBY_COST) + (
+            D.ESCALATOR_RUBY_COST if escalator else 0
+        )
+        if rubies < ruby_cost:
+            if not ticket_count and not escalator:
+                return False, f"Вход стоит {D.ENTRY_RUBY_COST} рубинов."
+            return False, f"Нужно {ruby_cost} рубинов."
+        if ticket_count:
+            tickets[str(user_id)] = ticket_count - 1
+        if ruby_cost:
+            wallet[str(user_id)] = rubies - ruby_cost
         hero = _dungeon_fighter(record, str(user_id))
         max_hp = round(pets_combat.derive(hero, hero)["max_hp"])
         record["dungeon_run"] = {"floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": []}

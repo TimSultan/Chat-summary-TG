@@ -513,19 +513,65 @@ def arena_level_reward_multiplier(winner_level: int, loser_level: int) -> float:
 # curve reads directly in wins: level 10 at ~25 wins, level 20 at ~93, level 30 at ~196,
 # level 50 at ~499. The exponent is below 1 on purpose -- the +1-to-everything per level
 # is already the strongest thing in the game, so the curve only has to be long, not
-# vertical.
+# vertical.  There is deliberately no pet-level ceiling: XP remains valuable after 50.
 
-PET_MAX_LEVEL = 50
+PET_MAX_LEVEL = None
 PET_XP_BASE = 80.0
 PET_XP_EXPONENT = 0.8
 PET_LEVEL_STAT_BONUS = 1    # +1 to every stat per pet level
 
 
 def pet_xp_for_next_level(level: int) -> int:
-    """XP needed to go from `level` to `level + 1`. 0 once PET_MAX_LEVEL is reached."""
-    if level < 1 or level >= PET_MAX_LEVEL:
+    """XP needed to go from ``level`` to ``level + 1`` (the ladder is unbounded)."""
+    if level < 1:
         return 0
     return max(1, round(PET_XP_BASE * level ** PET_XP_EXPONENT))
+
+
+# A rune is a paid, permanent weapon enhancement, so its benefit must remain visible as
+# pets' combat stats grow.  Flat 3--5 point effects disappeared into a 10--24 action
+# fight once a pet had progressed beyond its starter stats.  Values are derived from the
+# same base HP/damage equations as combat; percentage effects retain safe hard ceilings.
+RUNE_REGEN_MAX_HP_SHARE = .015
+RUNE_FIRE_DAMAGE_SHARE = .30
+RUNE_CHILL_BASE = 18
+RUNE_CHILL_AGILITY_DIVISOR = 8
+RUNE_CHILL_MAX = 35
+RUNE_PLATING_BASE = 5
+RUNE_PLATING_MAX = 16
+RUNE_PRECISION_BASE = 12
+RUNE_PRECISION_AGILITY_DIVISOR = 7
+RUNE_PRECISION_MAX = 30
+RUNE_VAMPIRIC_BASE = 5
+RUNE_VAMPIRIC_STRENGTH_DIVISOR = 20
+RUNE_VAMPIRIC_MAX = 15
+
+
+def rune_enchantment_effect(element: str, stats: dict) -> dict | None:
+    """Build a combat-effect snapshot for one elemental weapon rune.
+
+    ``stats`` must be the owner's effective stats, so equipment and pet levels are
+    included without the combat engine needing access to persisted player records.
+    """
+    strength = max(1, int(stats.get("strength", 1) or 1))
+    health = max(1, int(stats.get("health", 1) or 1))
+    agility = max(1, int(stats.get("agility", 1) or 1))
+    armor = max(0, int(stats.get("armor", 0) or 0))
+    max_hp = BASE_HP + health * HP_PER_POINT
+    damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT
+    if element == "fire":
+        return {"code": "burn", "value": max(15, round(damage * RUNE_FIRE_DAMAGE_SHARE)), "turns": 2}
+    if element == "frost":
+        return {"code": "chill", "value": min(RUNE_CHILL_MAX, RUNE_CHILL_BASE + agility // RUNE_CHILL_AGILITY_DIVISOR)}
+    if element == "water":
+        return {"code": "regen", "value": max(8, round(max_hp * RUNE_REGEN_MAX_HP_SHARE))}
+    if element == "earth":
+        return {"code": "plating", "value": min(RUNE_PLATING_MAX, RUNE_PLATING_BASE + armor // 8 + health // 80)}
+    if element == "air":
+        return {"code": "precision", "value": min(RUNE_PRECISION_MAX, RUNE_PRECISION_BASE + agility // RUNE_PRECISION_AGILITY_DIVISOR)}
+    if element == "plants":
+        return {"code": "vampiric", "value": min(RUNE_VAMPIRIC_MAX, RUNE_VAMPIRIC_BASE + strength // RUNE_VAMPIRIC_STRENGTH_DIVISOR)}
+    return None
 
 
 # -------------------------------------------------------------------- granted debuffs

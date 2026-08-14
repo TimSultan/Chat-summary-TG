@@ -146,6 +146,69 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(len(state["encounters"]), 2)
         self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
 
+    def test_dungeon_ticket_replaces_the_ruby_entry_fee_and_is_consumed(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+
+        ok, message = pets.enter_dungeon(self.entry, self.user_id)
+
+        self.assertTrue(ok, message)
+        self.assertIn("билету", message)
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 0)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 0)
+
+    def test_failed_escalator_does_not_consume_the_entry_ticket(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
+        }
+        data["pets"][self.user_id]["dungeon_deepest"] = 2
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+
+        _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        escalator = next(
+            button for row in keyboard["inline_keyboard"] for button in row
+            if "Эскалатор" in button["text"]
+        )
+        self.assertIn(f"билет + {dungeon.ESCALATOR_RUBY_COST} 💎", escalator["text"])
+
+        ok, message = pets.enter_dungeon(self.entry, self.user_id, escalator=True)
+
+        self.assertFalse(ok)
+        self.assertIn(str(dungeon.ESCALATOR_RUBY_COST), message)
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 1)
+
+    def test_first_two_floor_budgets_pay_for_a_full_rest_even_on_low_rolls(self):
+        floor_one = dungeon.reward_for(1, False, enemy_count=2)["gold"]
+        floor_two = dungeon.reward_for(2, False, enemy_count=10)["gold"]
+        low_roll_gold = 2 * round(floor_one * .8) + 10 * round(floor_two * .8)
+
+        self.assertGreaterEqual(low_roll_gold, dungeon.SHOP_FULL_HEAL_COST)
+
+    def test_rune_effects_scale_with_the_equipped_pet_stats_in_dungeon_and_arena(self):
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["equipped"]["weapon"] = "w001"
+        record.setdefault("weapon_enchantments", {})["w001"] = "water"
+        record["stats"] = {
+            "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+
+        arena_effect = next(effect for effect in pets.equipped_combat_effects(self.entry, self.user_id)
+                            if effect["code"] == "regen")
+        dungeon_effect = next(effect for effect in pets._dungeon_fighter(
+            pets.get_pet(self.entry, self.user_id), self.user_id
+        ).effects if effect["code"] == "regen")
+
+        self.assertGreaterEqual(arena_effect["value"], 60)
+        self.assertEqual(dungeon_effect, arena_effect)
+
     def test_quit_clears_a_malformed_dungeon_run(self):
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {

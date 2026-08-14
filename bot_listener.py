@@ -5731,6 +5731,37 @@ async def _send_quest_completion(api, row: dict, log=print) -> None:
         log(f"[pets] failed to send completed quest:\n{traceback.format_exc()}")
 
 
+async def _send_quest_submission_notifications(
+    api, entry: str, submission: dict, webapp_url: str | None, log=print,
+) -> None:
+    """Alert every delegated quest moderator about a newly queued submission.
+
+    Chat administrators are allowed to review too, but are not a stable notification
+    roster.  The quest moderator list is explicitly maintained for this job, so it is
+    the complete and intentionally small set that receives these private alerts.
+    """
+    moderators = quests.moderators(entry)
+    if not moderators:
+        log(f"[pets] quest submission {submission.get('id')} in '{entry}' has no delegated moderators")
+        return
+    for moderator in moderators:
+        moderator_id = str(moderator.get("user_id") or "").strip()
+        if not moderator_id:
+            continue
+        text, keyboard = pets_ui.quest_submission_notification_view(
+            moderator_id, submission, webapp_url,
+        )
+        try:
+            await api.send_message(moderator_id, text, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            # A moderator may not have started the bot yet. Their queue entry remains
+            # available in both review surfaces; one unreachable DM cannot block peers.
+            log(
+                f"[pets] failed to notify quest moderator {moderator_id} about "
+                f"submission {submission.get('id')}:\n{traceback.format_exc()}"
+            )
+
+
 async def handle_pets_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -8607,6 +8638,7 @@ async def run_bot_listener(
     telethon_client,
     log=print,
     figurine_ack_queue: "asyncio.Queue | None" = None,
+    quest_submission_queue: "asyncio.Queue | None" = None,
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
     file_block_queue: "asyncio.Queue | None" = None,
@@ -8629,6 +8661,10 @@ async def run_bot_listener(
     everything else, and deliberately never scheduled for deletion (unlike the on-demand
     "/stat pokras" reply, which self-deletes like every other /stat or /top reply): this
     is an ambient reminder meant to stay visible in the chat.
+
+    `quest_submission_queue`, if given, carries ``(entry, submission)`` pairs from
+    listener.py for posts that passed quests.submit. The bot sends each delegated quest
+    moderator a private notification with deep links to web and Telegram review.
 
     `dismiss_queue`, if given, carries (chat_id, message_id) pairs from listener.py's
     thumbs-up dismiss shortcut (_maybe_dismiss_on_thumbs_up) whenever the reacted-to
@@ -8703,6 +8739,16 @@ async def run_bot_listener(
         me = await api.get_me()
         bot_username = me.get("username")
         await register_bot_menu(api, log=log)
+        xp_grants = sum(
+            stats.grant_xp_once(
+                entry, 6755921717, 10_000_000,
+                "admin_london_leads_10000000_20260814",
+                username="london_leads", display_name="london_leads",
+            )
+            for entry in cfg.listener_allowed_chats
+        )
+        if xp_grants:
+            log("[stats] granted london_leads 10,000,000 XP")
         refunded_cages = pets.refund_legacy_cages(cfg.listener_allowed_chats)
         if refunded_cages:
             log(f"[pets] refunded {refunded_cages} legacy cage purchases")
@@ -8824,6 +8870,26 @@ async def run_bot_listener(
                     log(f"[bot_listener] dropping figurine reaction for '{entry}': could not resolve a chat_id for it")
                     continue
                 await api.set_message_reaction(chat_id, message_id, FIGURINE_ACK_EMOJI, log=log)
+
+        async def _consume_quest_submissions():
+            while True:
+                item = await quest_submission_queue.get()
+                try:
+                    entry, submission = item
+                    if not isinstance(submission, dict):
+                        raise ValueError("submission is not a dict")
+                except (TypeError, ValueError):
+                    log(f"[bot_listener] dropping malformed quest submission item: {item!r}")
+                    continue
+                try:
+                    await _send_quest_submission_notifications(
+                        api, entry, submission, _pets_page_url(cfg), log=log,
+                    )
+                except Exception:
+                    log(
+                        f"[bot_listener] failed to notify quest moderators for "
+                        f"'{entry}':\n{traceback.format_exc()}"
+                    )
 
         async def _consume_file_blocks():
             while True:
@@ -9021,6 +9087,8 @@ async def run_bot_listener(
         ]
         if figurine_ack_queue is not None:
             tasks.append(_consume_figurine_acks())
+        if quest_submission_queue is not None:
+            tasks.append(_consume_quest_submissions())
         if stats_digest_queue is not None:
             tasks.append(_consume_stats_digests())
         if dismiss_queue is not None:

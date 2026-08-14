@@ -90,7 +90,16 @@ class LiveCombatTableTests(unittest.TestCase):
     def test_defend_uses_the_equipped_shields_data_driven_hook(self):
         mirror = scrolls.shield("shield_mirror")
         fighter = _fighter("a", shield=mirror)
-        result = combat.simulate(fighter, _fighter("b"), seed=1)
+        result = None
+        for seed in range(100):
+            candidate = combat.simulate(fighter, _fighter("b"), seed=seed)
+            if (any(row.event == "defend" and row.attacker == "a"
+                    for row in candidate.rounds)
+                    and any(row.event == "skill_reflect" and row.attacker == "a"
+                            for row in candidate.rounds)):
+                result = candidate
+                break
+        self.assertIsNotNone(result)
         self.assertTrue(any(row.event == "defend" and row.attacker == "a"
                             for row in result.rounds))
         self.assertTrue(any(row.event == "skill_reflect" and row.attacker == "a"

@@ -10,6 +10,25 @@ import stats
 
 
 class GamificationTests(unittest.TestCase):
+    def test_one_time_xp_grant_persists_and_uses_normal_coin_conversion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)), patch(
+                "stats.app_now", return_value=datetime(2026, 8, 14, tzinfo=timezone.utc),
+            ):
+                self.assertTrue(stats.grant_xp_once(
+                    "chat", "42", 10_000_000, "admin-grant",
+                    username="london_leads", display_name="London Leads",
+                ))
+                self.assertFalse(stats.grant_xp_once(
+                    "chat", "42", 10_000_000, "admin-grant",
+                ))
+                user = stats.aggregate_all_time("chat", season_start=date(2026, 8, 1))["42"]
+
+        self.assertEqual(user.xp(5.0), 10_000_000)
+        self.assertEqual(user.season_xp(5.0), 10_000_000)
+        self.assertEqual(stats.coins_for_xp(user.xp(5.0)), 2_000_000)
+        self.assertEqual(user.username, "london_leads")
+
     def test_xp_coins_and_levels(self):
         user = stats.UserStats(
             user_id="1",

@@ -152,13 +152,19 @@ def encounters_for_floor(floor: int) -> tuple[dict, ...]:
 
 
 def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
-    """One victory's share of a floor budget; early floors are intentionally modest."""
+    """One victory's share of a floor budget.
+
+    An entry costs five rubies and a full rest costs 300 gold, so the opening rooms must
+    fund at least one recovery before a runner is asked to take on a boss.  The budget
+    remains shared between a room's enemies: crowded rooms ask for more victories, not
+    more total currency.
+    """
     floor = max(1, int(floor))
     enemy_count = max(1, int(enemy_count))
     if boss:
-        gold, xp = 22 + floor * 11, 12 + floor * 7
+        gold, xp = 450 + floor * 70, 80 + floor * 18
     else:
-        gold, xp = (6 + floor * 5) // enemy_count, (4 + floor * 3) // enemy_count
+        gold, xp = (180 + floor * 30) // enemy_count, (35 + floor * 12) // enemy_count
     return {
         "gold": max(1, gold), "xp": max(1, xp),
         "item_chance": min(0.22, 0.012 + floor * 0.004) * (1.5 if boss else 1),

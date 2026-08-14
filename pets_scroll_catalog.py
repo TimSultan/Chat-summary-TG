@@ -346,6 +346,8 @@ def effect_text(effect: dict) -> str:
             parts.append(f"игнорирует {_percent(effect['pierce_armor'])} брони")
         if float(effect.get("pierce_guard") or 0) > 0:
             parts.append(f"пробивает {_percent(effect['pierce_guard'])} блока")
+        if float(effect.get("lifesteal") or 0) > 0:
+            parts.append(f"восстанавливает {_percent(effect['lifesteal'])} нанесённого урона")
         return ", ".join(parts)
     if op == "heal":
         return f"Восстанавливает {_percent(effect.get('percent'))} здоровья"

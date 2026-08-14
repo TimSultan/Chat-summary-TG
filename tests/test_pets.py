@@ -2970,10 +2970,10 @@ class MiscApiTests(PetsTestCase):
         self.assertEqual(gained, 0)
 
         # Enough xp to blow well past several thresholds at once.
-        new_level, gained = pets.award_xp(entry, "1", 10_000)
+        new_level, gained = pets.award_xp(entry, "1", 100_000)
         self.assertGreater(gained, 0)
         self.assertEqual(new_level, pets.get_pet(entry, "1")["level"])
-        self.assertLessEqual(new_level, pets_config.PET_MAX_LEVEL)
+        self.assertGreater(new_level, 50)
 
 
 if __name__ == "__main__":
