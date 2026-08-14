@@ -487,6 +487,23 @@ class RealQuestTests(QuestsTestCase):
 
 
 class ReviewPaymentTests(QuestsTestCase):
+    def test_rune_quest_grants_random_rune_and_magic_after_acceptance(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        day = datetime(2026, 8, 9, 9, 0)
+        quest = quests.rune_quest(entry, "1", now=day)["quest"]
+
+        self.assertTrue(quests.submit(entry, "1", quest["code"], now=day)[0])
+        submission_id = quests.pending(entry)[0]["id"]
+        ok, message, receipt = quests.review(entry, submission_id, "mod1", True, now=day)
+
+        self.assertTrue(ok, message)
+        self.assertEqual(receipt["rubies"], 2)
+        self.assertEqual(receipt["rune"]["granted"], 1)
+        self.assertIn(receipt["rune"]["element"], pets.RUNE_ELEMENTS)
+        self.assertTrue(receipt["scroll"])
+        self.assertTrue(receipt["scroll_name"])
+
     def test_accepting_pays_gold_pet_xp_tickets_and_a_drop_exactly_once(self):
         """The most important behaviour in this module: review is a button pressed from a
         web page, and a moderator on a slow connection WILL double-tap it. All four

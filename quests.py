@@ -452,6 +452,9 @@ def available_quests(entry: str, data: dict | None = None, kind: str = "paint") 
 
 def _quest_payload(entry: str, quest, data: dict) -> dict:
     text = _quest_text(quest, data)
+    reward = _reward_payload(entry, quest.difficulty, data)
+    if quest.kind == "rune":
+        reward.update({"magic_guaranteed": True, "rubies": 2, "random_runes": 1})
     return {
         "code": quest.code,
         "hashtag": catalog.hashtag(quest.code),
@@ -464,7 +467,7 @@ def _quest_payload(entry: str, quest, data: dict) -> dict:
         "proof": quest.proof,
         "badge": quest.badge,
         "cooldown_days": quest.cooldown_days,
-        "reward": _reward_payload(entry, quest.difficulty, data),
+        "reward": reward,
     }
 
 
@@ -1157,13 +1160,14 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
     gold = int(receipt.get("gold", 0) or 0)
     if gold:
         economy.grant_once(entry, user_id, gold, f"quest:{submission_id}")
-    rubies = 10 if receipt.get("kind") == "real" else 5
+    kind = receipt.get("kind")
+    rubies = 10 if kind == "real" else (2 if kind == "rune" else 5)
     pets.grant_rubies_once(entry, user_id, rubies, f"quest:{submission_id}")
     pickaxe_unlocked = receipt.get("code") == "nmm" and pets.unlock_nmm_pickaxe(entry, user_id)
     rune = {"granted": 0}
-    if receipt.get("kind") == "rune":
-        element = str(receipt.get("code") or "").removeprefix("rune_")
-        rune = pets.grant_runes(entry, user_id, element, 5, f"quest:{submission_id}")
+    if kind == "rune":
+        element = random.Random(f"dungeon-quest-rune:{submission_id}").choice(pets.RUNE_ELEMENTS)
+        rune = pets.grant_runes(entry, user_id, element, 1, f"dungeon-quest:{submission_id}")
     xp = int(receipt.get("xp", 0) or 0) if has_pet else 0
     if xp:
         pets.award_xp(entry, user_id, xp)
@@ -1178,8 +1182,14 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
     # Scrolls are their own rare, permanent reward stream.  Only accepted difficulty-4
     # and difficulty-5 quests enter it; the submission id makes the roll deterministic
     # and idempotent even if a worker ever retries this reward receipt.
-    scroll = pets.grant_scroll_for_hard_quest(
-        entry, user_id, submission_id, receipt.get("difficulty", 0),
+    scroll = (
+        pets.grant_scroll_reward(
+            entry, user_id, source=f"dungeon-quest:{submission_id}", kind="dungeon",
+            chance=1.0, pity_after=1, seed=f"dungeon-quest:{submission_id}",
+        )
+        if kind == "rune" else pets.grant_scroll_for_hard_quest(
+            entry, user_id, submission_id, receipt.get("difficulty", 0),
+        )
     )
     return {
         "gold": gold, "xp": xp, "tickets": tickets, "rubies": rubies, "rune": rune,

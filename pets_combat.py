@@ -65,6 +65,7 @@ class Fighter:
     # Snapshot of the equipped live shield's Defend hook (or None for base Defend).
     shield: dict | None = None
     damage_multiplier: float = 1.0
+    physical_damage_taken_multiplier: float = 1.0
     starting_hp: int | None = None
 
 
@@ -1250,6 +1251,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 effect_round(round_number, defender_key, attacker_key, "chill")
             damage = max(1, round(
                 damage * multiplier * fighters[attacker_key].damage_multiplier + flat_retaliation
+            ))
+            damage = max(0, round(
+                damage * fighters[defender_key].physical_damage_taken_multiplier
             ))
 
         if effectful and damage and shield_breaker_attack:

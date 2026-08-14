@@ -5179,13 +5179,16 @@ function pips(level) {
 
 function rewardLine(reward) {
   if (!reward) return "";
+  const dungeonMagic = reward.magic_guaranteed
+    ? " · <span class='gain'>✨ случайная магия · 🔮 случайная руна</span>"
+    : "";
   const scroll = reward.scroll_chance
     ? " · <span class='gain'>📜 " + Math.round(reward.scroll_chance * 100) +
       "% (не позже " + Number(reward.scroll_pity || 0) + "-го)</span>"
     : "";
   return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
     "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
-    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + scroll;
+    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic + scroll;
 }
 
 // Quest calls do not return the game state the way /api/action does -- nothing here

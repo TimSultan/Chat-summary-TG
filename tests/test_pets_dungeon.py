@@ -151,6 +151,20 @@ class DungeonTests(unittest.TestCase):
         self.assertFalse(pets.can_attack_in_arena(self.entry, self.user_id, other_user))
         self.assertTrue(pets.can_attack_in_arena(self.entry, other_user, self.user_id))
 
+    def test_magic_boss_allows_the_fight_without_magic_but_wins_it(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 15, "hp": 500, "max_hp": 500, "cleared": [],
+        }
+        pets._save(self.entry, data)
+
+        ok, message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        self.assertFalse(ok)
+        self.assertIn("Аквариус", message)
+        self.assertIsNotNone(receipt)
+        self.assertIsNone(pets.get_pet(self.entry, self.user_id)["dungeon_run"])
+
 
 if __name__ == "__main__":
     unittest.main()

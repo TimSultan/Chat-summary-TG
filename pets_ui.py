@@ -361,8 +361,8 @@ def dungeon_reward_text(receipt: dict | None) -> str:
     scroll = receipt.get("scroll") or {}
     if scroll.get("granted"):
         lines.append(
-            f"📜 Свиток: {escape(str(scroll.get('icon') or '✨'))} "
-            f"«{escape(str(scroll.get('name') or 'Новый свиток'))}»"
+            f"✨ Магия: {escape(str(scroll.get('icon') or '✨'))} "
+            f"«{escape(str(scroll.get('name') or 'Новое заклинание'))}»"
         )
     rune = receipt.get("rune") or {}
     if rune.get("granted"):
@@ -745,11 +745,13 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     board = quests.real_quest(entry, user_id) if kind == "real" else (quests.rune_quest(entry, user_id) if kind == "rune" else quests.daily_quest(entry, user_id))
     cards = board.get("quests") or []
     paint = kind != "real"
-    title = "🔮 <b>Рунические покрасы · элементы</b>" if kind == "rune" else ("🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>")
+    title = "🕳 <b>Магия подземелья · элементы</b>" if kind == "rune" else ("🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>")
     lines = [title, f"\n⏳ Новая подборка через <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>."]
     lines.append(
         "Успей отправить фото до обновления. Выполни всё раньше — новая подборка придёт через 8 часов."
     )
+    if kind == "rune":
+        lines.append("За качественно принятую работу: случайная руна и случайная магия.")
     buttons = []
     for index, card in enumerate(cards, 1):
         status = card.get("status", "open")
@@ -767,7 +769,7 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         }])
     if not cards:
         lines.append("\nПока доступных заданий нет. Проверим снова через 8 часов.")
-    for other, label in (("paint", "🎯 Три квеста на покрас"), ("real", "🌍 Квест в реале"), ("rune", "🔮 Рунические покрасы")):
+    for other, label in (("paint", "🎯 Три квеста на покрас"), ("real", "🌍 Квест в реале"), ("rune", "🕳 Магия подземелья")):
         if other != kind:
             buttons.append([{"text": label, "callback_data": callback_data(user_id, "quests", other)}])
     buttons.append(_back_row(user_id))
@@ -790,6 +792,10 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"гарантирован не позже {int(reward.get('scroll_pity', 0))}-го сложного квеста."
         if reward.get("scroll_chance") else ""
     )
+    magic_reward = (
+        "\n✨ За качественно принятую работу: случайная магия и случайная руна."
+        if reward.get("magic_guaranteed") else ""
+    )
     lines = [
         f"{'🎯' if paint else '🌍'} <b>{escape(card.get('title') or 'Квест')}</b>",
         f"{quest_pips(difficulty)} {QUEST_DIFFICULTY_NAMES.get(difficulty, '')}",
@@ -804,7 +810,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"5. Выложи фото в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
         f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
-        scroll_reward,
+        magic_reward + scroll_reward,
         f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>",
     ]
     if status == "review":

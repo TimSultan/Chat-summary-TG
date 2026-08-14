@@ -2575,8 +2575,6 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
         if row["index"] in cleared:
             return False, "Этот противник уже побеждён.", None
-        if row["gimmick"] == "spells_only" and not any(_skill_loadout_for(record)):
-            return False, "Призрака можно ранить только свитками.", None
         if row["gimmick"] == "healing_pass" and _dungeon_has_healing(record):
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
@@ -2590,6 +2588,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
                 level=row["level"],
                 effects=(({"code": "thorns", "value": 50},) if row["gimmick"] == "healing_pass" else ()),
+                physical_damage_taken_multiplier=0 if row["gimmick"] == "spells_only" else 1,
                 **row["stats"],
             )
             result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
