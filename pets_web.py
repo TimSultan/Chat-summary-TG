@@ -1007,6 +1007,10 @@ _ACTIONS = {
     "dungeon_quit": _action_dungeon_quit,
 }
 
+_DUNGEON_ACTIONS = {
+    "dungeon_fight", "dungeon_rest", "dungeon_descend", "dungeon_quit",
+}
+
 
 # ------------------------------------------------------------------------------- routes
 
@@ -1045,6 +1049,12 @@ async def handle_action(request: web.Request) -> web.Response:
     action = _ACTIONS.get(str(body.get("action") or ""))
     if action is None:
         return _json_error("Неизвестное действие.", status=400, code="UNKNOWN_ACTION")
+    action_name = str(body.get("action") or "")
+    if action_name not in _DUNGEON_ACTIONS and pets.is_in_dungeon(entry, user["id"]):
+      return _json_error(
+        "Сначала закончи забег в подземелье или выйди из него.",
+        status=409, code="DUNGEON_ACTIVE",
+      )
 
     try:
         outcome = action(entry, user["id"], xp, body)
@@ -1399,6 +1409,11 @@ async def handle_attack(request: web.Request) -> web.Response:
     theirs = pets.get_pet(entry, opponent_id) if opponent_id else None
     if mine is None or theirs is None:
         return _json_error("Соперник больше не доступен.", status=409, code="NO_OPPONENT")
+    if pets.is_in_dungeon(entry, me):
+      return _json_error(
+        "Сначала закончи забег в подземелье или выйди из него.",
+        status=409, code="DUNGEON_ACTIVE",
+      )
     if not pets.can_attack_in_arena(entry, me, opponent_id):
         return _json_error("Сегодня с этим соперником уже хватит.", status=409, code="LIMIT")
 

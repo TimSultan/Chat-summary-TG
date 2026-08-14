@@ -6166,6 +6166,16 @@ async def handle_pets_callback(
         )
         return
     user_id = user.user_id
+    dungeon_actions = {
+        "dungeon", "dungeonfight", "dungeonrest", "dungeondescend", "dungeonquit",
+    }
+    if action not in dungeon_actions and pets.is_in_dungeon(entry, user_id):
+        await _pets_toast_and_redraw(
+            api, chat_id, message_id,
+            "Сначала закончи забег в подземелье или выйди из него.",
+            pets_ui.dungeon_view(entry, user_id, xp), log,
+        )
+        return
     if no_arena_fights:
         # Exhaustion is private player state. Do not resolve or write to the public
         # result chat merely because the tap came from an old opponent card.

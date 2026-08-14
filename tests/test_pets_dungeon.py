@@ -117,6 +117,20 @@ class DungeonTests(unittest.TestCase):
 
         self.assertIsNotNone(receipt)
 
+    def test_dungeon_runner_cannot_attack_but_remains_an_arena_defender(self):
+        other_user = "43"
+        pets.buy_cage(self.entry, other_user, 100_000)
+        pets.tame(self.entry, other_user, 100_000, "Opponent", None, "Tester")
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 1, "hp": 1, "max_hp": 10, "cleared": [],
+        }
+        pets._save(self.entry, data)
+
+        self.assertTrue(pets.is_in_dungeon(self.entry, self.user_id))
+        self.assertFalse(pets.can_attack_in_arena(self.entry, self.user_id, other_user))
+        self.assertTrue(pets.can_attack_in_arena(self.entry, other_user, self.user_id))
+
 
 if __name__ == "__main__":
     unittest.main()

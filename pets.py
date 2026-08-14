@@ -2415,6 +2415,11 @@ def _dungeon_active(record: dict | None) -> bool:
     return bool(isinstance(record, dict) and record.get("dungeon_run"))
 
 
+def is_in_dungeon(entry, user_id) -> bool:
+    """Whether the pet is committed to an active dungeon run."""
+    return _dungeon_active(_tamed_record(_load(entry), user_id))
+
+
 def dungeon_status(entry: str, user_id) -> dict:
     """Public state reconstructed from the server-owned dungeon run."""
     record = _tamed_record(_load(entry), user_id)
@@ -3183,8 +3188,11 @@ def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
     now = now or app_now()
     data = _load(entry)
     uid, opponent_uid = str(user_id), str(opponent_id)
-    if _is_farming_record(_tamed_record(data, uid), now):
+    challenger = _tamed_record(data, uid)
+    if _is_farming_record(challenger, now):
         return False, "Питомец сейчас работает на ферме и не может драться."
+    if _dungeon_active(challenger):
+        return False, "Сначала закончи забег в подземелье или выйди из него."
     record = data.setdefault("duels", {}).setdefault(uid, {})
     today_key = now.date().isoformat()
     if record.get("day") != today_key:
@@ -3231,7 +3239,8 @@ def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None
     """
     day = day or today()
     data = _load(entry)
-    if _is_farming_record(_tamed_record(data, attacker_id)):
+    attacker = _tamed_record(data, attacker_id)
+    if _is_farming_record(attacker) or _dungeon_active(attacker):
         return False
     return (
         sum(
@@ -3430,6 +3439,8 @@ def record_fight(
     # it is a normal, attackable target now, same as everywhere else in the arena.
     if _is_farming_record(attacker):
         raise ValueError("Питомец на ферме и не может участвовать в бою.")
+    if _dungeon_active(attacker):
+        raise ValueError("Сначала закончи забег в подземелье или выйди из него.")
 
     # Only the attacker spends an accumulated fight.  This happens inside the same
     # state mutation as rewards/history, so an exhausted stale callback cannot mint a
