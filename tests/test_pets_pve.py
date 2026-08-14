@@ -163,7 +163,7 @@ class MobRollAndBlockTests(PetsTestCase):
         mine = pets.effective_stats(entry, "1")
         mob = pets_mobs.MOBS[0]
 
-        expected_scale = {"easy": 0.78, "medium": 0.90, "hard": 1.00}
+        expected_scale = {"easy": 0.78, "medium": 0.95, "hard": 1.05}
         variable_power = pets._power_from(mine, mine["armor"]) - pets_config.POWER_RATING_BASE
         for tier, scale in expected_scale.items():
             self.assertEqual(pets_mobs.TIER_SCALING[tier][0], scale)

@@ -295,12 +295,12 @@ class PetsCommandTests(unittest.TestCase):
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
-        # The claimable daily bonus is the only full-width callback row.
+        # Daily bonus and dungeon are the two intentional full-width action rows.
         lone = [
             pets_ui.parse_callback(row[0]["callback_data"])[1]
             for row in keyboard["inline_keyboard"] if len(row) != 2
         ]
-        self.assertEqual(lone, ["dailybonus"])
+        self.assertEqual(lone, ["dailybonus", "dungeon"])
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row
