@@ -68,6 +68,24 @@ class DungeonTests(unittest.TestCase):
 
         self.assertIn("Отдохнуть?", text)
         self.assertTrue(any("🪙" in label for label in labels))
+        self.assertEqual(
+            [button["text"] for button in keyboard["inline_keyboard"][-1]],
+            ["🚪 Выйти", "⬇️ Спуститься"],
+        )
+
+    def test_equipment_can_be_changed_only_after_clearing_a_floor(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["inventory"].append("w001")
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [],
+        }
+        pets._save(self.entry, data)
+        self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
+
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["cleared"] = [0, 1, 2]
+        pets._save(self.entry, data)
+        self.assertTrue(pets.equip(self.entry, self.user_id, "w001")[0])
 
     def test_dungeon_requires_five_rubies_to_enter(self):
         data = pets._load(self.entry)

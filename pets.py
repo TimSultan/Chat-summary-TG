@@ -3160,7 +3160,8 @@ def equip(entry, user_id, code) -> tuple[bool, str]:
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
-    if _dungeon_active(record):
+    run = record.get("dungeon_run")
+    if _dungeon_active(record) and len(run.get("cleared", [])) < len(D.encounters_for_floor(run.get("floor", 1))):
         return False, "Снаряжение можно менять только между этажами подземелья."
     item = C.find_item(code)
     if item is None:
@@ -3181,7 +3182,8 @@ def unequip(entry, user_id, slot) -> tuple[bool, str]:
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
-    if _dungeon_active(record):
+    run = record.get("dungeon_run")
+    if _dungeon_active(record) and len(run.get("cleared", [])) < len(D.encounters_for_floor(run.get("floor", 1))):
         return False, "Снаряжение можно менять только между этажами подземелья."
     equipped = record.setdefault("equipped", {})
     current = equipped.get(slot)

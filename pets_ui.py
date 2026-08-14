@@ -338,8 +338,10 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if state.get("can_rest"):
         lines.append("\nОтдохнуть?")
         rows.append([{"text": f"🩹 +30% · 🪙 {state['partial_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "partial")}, {"text": f"❤️ Полностью · 🪙 {state['full_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "full")}])
-        rows.append([{"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
-    rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
+        rows.append([{"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")}])
+        rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}, {"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
+    else:
+        rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
