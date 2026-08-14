@@ -73,6 +73,18 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(len(state["encounters"]), 3)
         self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
 
+    def test_quit_clears_a_malformed_dungeon_run(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": "broken", "hp": None, "cleared": "broken",
+        }
+        pets._save(self.entry, data)
+
+        ok, message = pets.quit_dungeon(self.entry, self.user_id)
+
+        self.assertTrue(ok, message)
+        self.assertIsNone(pets.get_pet(self.entry, self.user_id)["dungeon_run"])
+
 
 if __name__ == "__main__":
     unittest.main()

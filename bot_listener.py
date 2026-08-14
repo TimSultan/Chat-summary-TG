@@ -6353,8 +6353,16 @@ async def handle_pets_callback(
             reward_text = pets_ui.dungeon_reward_text(receipt)
             if reward_text:
                 note = f"{note}\n{reward_text}"
+            rendered = (
+                pets_ui.main_view(
+                    entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
+                    quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
+                    finance_admin=is_finance_admin,
+                )
+                if action == "dungeonquit" and ok else pets_ui.dungeon_view(entry, user_id, xp)
+            )
             await _pets_toast_and_redraw(
-                api, chat_id, message_id, note, pets_ui.dungeon_view(entry, user_id, xp), log,
+                api, chat_id, message_id, note, rendered, log,
             )
             return
         if action == "mob":

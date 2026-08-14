@@ -2610,12 +2610,16 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
 
 
 def quit_dungeon(entry: str, user_id) -> tuple[bool, str]:
-    data = _load(entry)
-    record = _tamed_record(data, user_id)
-    if record is None or not _dungeon_active(record):
-        return False, "Ты не в подземелье."
-    record["dungeon_run"] = None
-    _save(entry, data)
+    # The exit is deliberately a repair boundary: it must clear any malformed run just
+    # as reliably as a normal one, and cannot race a late dungeon callback that would
+    # otherwise write its stale snapshot back after the player has left.
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None or not _dungeon_active(record):
+            return False, "Ты не в подземелье."
+        record["dungeon_run"] = None
+        _save(entry, data)
     return True, "Ты покинул подземелье."
 
 
