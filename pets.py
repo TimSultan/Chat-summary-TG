@@ -3744,6 +3744,58 @@ def fight_audits(entry: str, limit: int = 100) -> list[dict]:
     return [dict(row) for row in reversed(rows[-limit:])]
 
 
+def fight_audit_browser(entry: str, limit: int = 100, pet_id=None) -> dict:
+    """Pet picker plus newest retained fights, optionally narrowed to one pet owner id."""
+    data = _load(entry)
+    summaries = [row for row in data.get("fight_audits", []) if isinstance(row, dict)]
+    requested = str(pet_id or "").strip()
+    limit = max(1, min(FIGHT_AUDIT_LIMIT, int(limit or 100)))
+
+    def participants(row: dict) -> list[dict]:
+        raw = row.get("fighters") or []
+        if isinstance(raw, dict):
+            return [
+                {"key": str(key), "name": (side.get("fighter") or {}).get("name")}
+                for key, side in raw.items() if isinstance(side, dict)
+            ]
+        return [fighter for fighter in raw if isinstance(fighter, dict)]
+
+    counts: dict[str, int] = {}
+    historic_names: dict[str, str] = {}
+    for row in summaries:
+        for fighter in participants(row):
+            key = str(fighter.get("key") or "")
+            if not key or key.startswith(("mob:", "dungeon:")):
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            if fighter.get("name"):
+                historic_names[key] = str(fighter["name"])
+
+    pets = []
+    for key, count in counts.items():
+        record = data.get("pets", {}).get(key)
+        record = record if isinstance(record, dict) else {}
+        pets.append({
+            "user_id": key,
+            "name": record.get("name") or historic_names.get(key) or f"Pet {key}",
+            "owner_name": record.get("owner_name"),
+            "owner_username": record.get("owner_username"),
+            "fights": count,
+        })
+    pets.sort(key=lambda row: (-row["fights"], str(row["name"]).casefold(), row["user_id"]))
+
+    if requested:
+        summaries = [
+            row for row in summaries
+            if requested in {str(fighter.get("key") or "") for fighter in participants(row)}
+        ]
+    return {
+        "pets": pets,
+        "selected_pet": requested if requested in counts else "",
+        "fights": [dict(row) for row in reversed(summaries[-limit:])],
+    }
+
+
 def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
     wanted = str(fight_id_ or "").strip().upper()
     if not (

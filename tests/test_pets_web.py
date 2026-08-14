@@ -440,7 +440,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_fight_audit_has_separate_page_and_admin_only_lookup(self):
         page = await self.client.get("/audit")
         self.assertEqual(page.status, 200)
-        self.assertIn("Fight audit", await page.text())
+        html = await page.text()
+        self.assertIn("Fight audit", html)
+        self.assertIn('id="petSearch"', html)
+        self.assertIn('id="pet"', html)
 
         data = pets._load(CHAT)
         data["fight_audits"].append({
@@ -448,13 +451,36 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             "at": "2026-08-15T12:00:00+00:00", "winner": "42", "draw": False,
             "fighters": {"42": {"fighter": {"name": "Hero"}}}, "moves": [],
         })
+        data["fight_audits"].append({
+            "fight_id": "F-20260815-222222222222", "kind": "arena",
+            "at": "2026-08-15T12:05:00+00:00", "winner": "43", "draw": False,
+            "fighters": [{"key": "42", "name": "Hero"}, {"key": "43", "name": "Rival"}],
+            "moves": 8,
+        })
+        data["fight_audits"].append({
+            "fight_id": "F-20260815-333333333333", "kind": "pve",
+            "at": "2026-08-15T12:10:00+00:00", "winner": "43", "draw": False,
+            "fighters": [{"key": "43", "name": "Rival"}, {"key": "mob:rat", "name": "Rat"}],
+            "moves": 4,
+        })
         pets._save(CHAT, data)
 
         denied = await self.client.get("/audit/api/fights", headers=self._auth(PLAYER))
         self.assertEqual(denied.status, 403)
         listed = await self.client.get("/audit/api/fights", headers=self._auth(THIRD))
         self.assertEqual(listed.status, 200)
-        self.assertEqual((await listed.json())["fights"][0]["fight_id"], "F-20260815-ABCDEF123456")
+        listed_body = await listed.json()
+        self.assertEqual(listed_body["fights"][0]["fight_id"], "F-20260815-333333333333")
+        self.assertEqual({row["user_id"] for row in listed_body["pets"]}, {"42", "43"})
+        filtered = await self.client.get(
+            "/audit/api/fights?pet_id=42&limit=500", headers=self._auth(THIRD),
+        )
+        filtered_body = await filtered.json()
+        self.assertEqual(filtered_body["selected_pet"], "42")
+        self.assertEqual(
+            [row["fight_id"] for row in filtered_body["fights"]],
+            ["F-20260815-222222222222", "F-20260815-ABCDEF123456"],
+        )
         found = await self.client.get(
             "/audit/api/fights?id=F-20260815-ABCDEF123456", headers=self._auth(THIRD),
         )

@@ -2483,10 +2483,11 @@ async def handle_fight_audit(request: web.Request) -> web.Response:
             return _json_error("Fight not found.", status=404, code="NO_FIGHT")
         return _ok({"fight": row})
     try:
-        limit = int(request.query.get("limit", 100))
+        pet_id = str(request.query.get("pet_id") or "").strip()
+        limit = int(request.query.get("limit", 500 if pet_id else 100))
     except (TypeError, ValueError):
         limit = 100
-    return _ok({"fights": await asyncio.to_thread(pets.fight_audits, entry, limit)})
+    return _ok(await asyncio.to_thread(pets.fight_audit_browser, entry, limit, pet_id))
 
 
 async def _default_fetch_photo(file_id: str):
@@ -2623,7 +2624,7 @@ AUDIT_HTML = r"""<!doctype html>
 :root{color-scheme:dark;--bg:#101720;--card:#1b2633;--line:#334458;--muted:#91a2b5;--blue:#62aef0}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f3f6f9;font:14px system-ui,sans-serif}
 main{max-width:1180px;margin:auto;padding:20px}.top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-input,button{border:1px solid var(--line);background:#131e29;color:inherit;border-radius:10px;padding:11px 13px}
+input,select,button{border:1px solid var(--line);background:#131e29;color:inherit;border-radius:10px;padding:11px 13px}
 input{flex:1;min-width:240px}button{cursor:pointer;background:#2677bd}.muted{color:var(--muted)}
 .list{display:grid;gap:8px;margin:18px 0}.row,.card,.move{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
 .row{cursor:pointer;display:flex;justify-content:space-between;gap:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
@@ -2632,19 +2633,23 @@ h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-w
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
 @media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
 </style></head><body><main>
-<h1>Fight audit</h1><div class="top"><input id="query" placeholder="Fight ID, e.g. F-20260815-…"><button id="load">Load fight</button><button id="recent">Recent</button></div>
+<h1>Fight audit</h1><div class="top" style="margin-bottom:10px"><input id="petSearch" placeholder="Search pet, owner, @username or user ID"><select id="pet"><option value="">All pets</option></select></div>
+<div class="top"><input id="query" placeholder="Fight ID, e.g. F-20260815-…"><button id="load">Load fight</button><button id="recent">Recent</button></div>
 <p id="status" class="muted">Loading recent fights…</p><section id="out"></section>
 </main><script>
 const tg=window.Telegram&&Telegram.WebApp; if(tg){tg.ready();tg.expand()}
 const initData=(tg&&tg.initData)||""; const out=document.getElementById("out"), status=document.getElementById("status");
 const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pretty=v=>esc(JSON.stringify(v??{},null,2));
-async function api(id=""){status.textContent="Loading…";const u="/audit/api/fights"+(id?"?id="+encodeURIComponent(id):"");const r=await fetch(u,{headers:{"X-Telegram-Init-Data":initData}});const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
+async function api(id="",pet=""){status.textContent="Loading…";const q=new URLSearchParams();if(id)q.set("id",id);if(pet){q.set("pet_id",pet);q.set("limit","500")}const u="/audit/api/fights"+(q.size?"?"+q.toString():"");const r=await fetch(u,{headers:{"X-Telegram-Init-Data":initData}});const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
 function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>Level ${esc(f.level)} · STR ${esc(f.strength)} · HP stat ${esc(f.health)} · AGI ${esc(f.agility)} · LUCK ${esc(f.luck)} · ARM ${esc(f.armor)}</div><div class="muted">Derived: max HP ${esc(Math.round(d.max_hp||0))}, damage ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%</div><h4>Items</h4><div class="items">${items.length?items.map(i=>`<span class="tag">${esc(i.name)} · ${esc(i.rarity)} · ${esc(i.code)}</span>`).join(""):"<span class=muted>None</span>"}</div><h4>Scrolls / shield</h4><pre>${pretty({skill_slots:s.skill_slots,shield:s.shield,effects:f.effects})}</pre><details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
 function renderFight(f){const fighters=Object.entries(f.fighters||{});out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Moves (${(f.moves||[]).length})</h2><div class="moves">${(f.moves||[]).map(m=>`<details class="move"><summary><b>#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
 async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){status.textContent=e.message;out.innerHTML=""}}
-async function recent(){try{const d=await api();status.textContent=`${d.fights.length} recent fights`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} moves<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){status.textContent=e.message}}
-const query=document.getElementById("query");document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=recent;query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};recent();
+let auditPets=[];const pet=document.getElementById("pet"),petSearch=document.getElementById("petSearch");
+function petLabel(p){return `${p.name||p.user_id}${p.owner_name?" / "+p.owner_name:""}${p.owner_username?" / @"+p.owner_username:""} / ${p.user_id} / ${p.fights} fights`}
+function renderPets(filter="",selected=pet.value){const wanted=filter.trim().toLowerCase();const rows=auditPets.filter(p=>!wanted||petLabel(p).toLowerCase().includes(wanted));pet.innerHTML='<option value="">All pets</option>'+rows.map(p=>`<option value="${esc(p.user_id)}"${String(p.user_id)===String(selected)?" selected":""}>${esc(petLabel(p))}</option>`).join("")}
+async function recent(chosen=pet.value){try{const d=await api("",chosen);auditPets=d.pets||auditPets;renderPets(petSearch.value,d.selected_pet||chosen);const picked=auditPets.find(p=>String(p.user_id)===String(d.selected_pet));status.textContent=`${d.fights.length} recent fights${picked?" for "+picked.name:""}`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} moves<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){status.textContent=e.message}}
+const query=document.getElementById("query");document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=()=>recent();query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};pet.onchange=()=>recent(pet.value);petSearch.oninput=()=>renderPets(petSearch.value);recent();
 </script></body></html>"""
 
 
