@@ -12,7 +12,8 @@ from typing import Final
 MIN_POWER: Final = 1_000
 ENTRY_RUBY_COST: Final = 15
 ESCALATOR_RUBY_COST: Final = 5
-SHOP_FULL_HEAL_BASE_COST: Final = 60
+SHOP_PARTIAL_HEAL_COST: Final = 160
+SHOP_FULL_HEAL_COST: Final = 300
 SCROLL_LOOT_START_FLOOR: Final = 10
 DUNGEON_OPEN: Final = True
 DUNGEON_CLOSED_NOTICE: Final = (
@@ -106,4 +107,5 @@ def reward_for(floor: int, boss: bool) -> dict:
 
 
 def shop_heal_cost(floor: int) -> int:
-    return SHOP_FULL_HEAL_BASE_COST + max(0, int(floor) - 1) * 20
+    """Compatibility price for callers that still show one healing option."""
+    return SHOP_FULL_HEAL_COST

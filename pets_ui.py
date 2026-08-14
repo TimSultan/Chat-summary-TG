@@ -336,7 +336,8 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         if not enemy.get("cleared"):
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     if state.get("can_rest"):
-        rows.append([{"text": f"🛒 Лечение · {state['heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest")}, {"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
+        rows.append([{"text": f"🩹 +30% · {state['partial_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "partial")}, {"text": f"❤️ Полностью · {state['full_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "full")}])
+        rows.append([{"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
     rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -1429,20 +1430,14 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             ),
         }])
     rune_state = pets.rune_status(entry, user_id)
-    weapons = [C.find_item(code) for code in pet.get("inventory", [])]
-    weapons = [item for item in weapons if item is not None and item.slot == "weapon"]
     rune_names = {"fire": "Огонь", "frost": "Лёд", "water": "Вода", "earth": "Земля", "air": "Воздух", "plants": "Растения"}
     lines.append(f"\n🔮 <b>Зачарования</b> · 1 руна + {rune_state['cost']} рубинов")
-    if weapons:
-        for weapon in weapons:
-            current = rune_state["enchantments"].get(weapon.code)
-            lines.append(f"«{escape(weapon.name)}»" + (f" · {rune_names[current]}" if current else ""))
-            rows.append([{
-                "text": f"🔮 {weapon.name[:20]} · выбрать руну",
-                "callback_data": callback_data(user_id, "enchantmenu", weapon.code),
-            }])
-    else:
-        lines.append("В сумке нет оружия для зачарования.")
+    owned_runes = [f"{rune_names[element]} ×{count}" for element, count in rune_state["runes"].items() if count]
+    lines.append(" · ".join(owned_runes) if owned_runes else "Рун пока нет.")
+    rows.append([{
+        "text": "🔮 Выбрать руну",
+        "callback_data": callback_data(user_id, "runemenu") if owned_runes else callback_data(user_id, "noop"),
+    }])
     rows.append([{
         "text": "🛠️ Ковка оружия — скоро",
         "callback_data": callback_data(user_id, "weaponforge"),
@@ -1465,6 +1460,32 @@ def enchant_weapon_view(entry: str, user_id, code: str) -> tuple[str, dict]:
         rows.append([{"text": f"{label} · {count}", "callback_data": callback_data(user_id, "enchant" if count else "noop", f"{code}:{element}")}])
     rows.append([{"text": "◀️ К кузнице", "callback_data": callback_data(user_id, "forge")}])
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def rune_enchant_view(entry: str, user_id) -> tuple[str, dict]:
+    state = pets.rune_status(entry, user_id)
+    names = {"fire": "🔥 Огонь", "frost": "❄️ Лёд", "water": "💧 Вода", "earth": "🪨 Земля", "air": "💨 Воздух", "plants": "🌿 Растения"}
+    rows = [[{
+        "text": f"{label} · {int(state['runes'].get(element, 0) or 0)}",
+        "callback_data": callback_data(user_id, "enchantrune" if state["runes"].get(element) else "noop", element),
+    }] for element, label in names.items()]
+    rows.append([{"text": "◀️ К кузнице", "callback_data": callback_data(user_id, "forge")}])
+    return "🔮 <b>Выбери руну</b>\nЦена зачарования: 1 руна и 15 рубинов.", {"inline_keyboard": rows}
+
+
+def rune_weapon_view(entry: str, user_id, element: str) -> tuple[str, dict]:
+    state = pets.rune_status(entry, user_id)
+    if element not in state["runes"] or not state["runes"].get(element):
+        return rune_enchant_view(entry, user_id)
+    pet = pets.get_pet(entry, user_id) or {}
+    weapons = [C.find_item(code) for code in pet.get("inventory", [])]
+    weapons = [item for item in weapons if item is not None and item.slot == "weapon"]
+    rows = [[{
+        "text": f"🔮 {item.name[:26]}",
+        "callback_data": callback_data(user_id, "enchant", f"{item.code}:{element}"),
+    }] for item in weapons]
+    rows.append([{"text": "◀️ К рунам", "callback_data": callback_data(user_id, "runemenu")}])
+    return "🔮 <b>Выбери оружие для руны</b>", {"inline_keyboard": rows}
 
 
 def skills_view(entry: str, user_id) -> tuple[str, dict]:

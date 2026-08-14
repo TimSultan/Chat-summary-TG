@@ -2303,7 +2303,9 @@ def dungeon_status(entry: str, user_id) -> dict:
         "floor": floor, "theme": D.floor_name(floor), "hp": max(0, int(run.get("hp", max_hp))),
         "max_hp": max_hp, "cleared": sorted(cleared), "encounters": encounters,
         "can_rest": len(cleared) == len(encounters),
-        "heal_cost": D.shop_heal_cost(floor), "boss_lives": int(run.get("boss_lives", 0) or 0),
+        "partial_heal_cost": D.SHOP_PARTIAL_HEAL_COST,
+        "full_heal_cost": D.SHOP_FULL_HEAL_COST,
+        "boss_lives": int(run.get("boss_lives", 0) or 0),
     })
     return state
 
@@ -2435,6 +2437,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         else:
             fire_bonus = row["gimmick"] == "fire_only" and _dungeon_has_fire_damage(record)
             hero = _dungeon_fighter(record, str(user_id), damage_multiplier=5 if fire_bonus else 1)
+            hero = replace(hero, starting_hp=max(1, int(run.get("hp", 1) or 1)))
             enemy = pets_combat.Fighter(
                 key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
                 level=row["level"],
@@ -2477,7 +2480,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
     return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune}
 
 
-def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:
+def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bool, str]:
     if not D.DUNGEON_OPEN:
         return False, D.DUNGEON_CLOSED_NOTICE
     data = _load(entry)
@@ -2488,13 +2491,15 @@ def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:
     floor = int(run.get("floor", 1) or 1)
     if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
         return False, "Сначала очисти этаж."
-    cost = D.shop_heal_cost(floor)
+    partial = str(amount or "").lower() == "partial"
+    cost = D.SHOP_PARTIAL_HEAL_COST if partial else D.SHOP_FULL_HEAL_COST
     paid, _balance = economy.spend(entry, user_id, xp, cost, "pet_dungeon_heal")
     if not paid:
         return False, f"На лечение нужно {cost} монет."
-    run["hp"] = int(run.get("max_hp", 1))
+    max_hp = int(run.get("max_hp", 1))
+    run["hp"] = min(max_hp, int(run.get("hp", 0)) + max(1, round(max_hp * .30))) if partial else max_hp
     _save(entry, data)
-    return True, "Лавка подземелья полностью восстановила здоровье."
+    return True, "Лавка подземелья восстановила 30% здоровья." if partial else "Лавка подземелья полностью восстановила здоровье."
 
 
 def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:

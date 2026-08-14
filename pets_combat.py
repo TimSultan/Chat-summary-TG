@@ -65,6 +65,7 @@ class Fighter:
     # Snapshot of the equipped live shield's Defend hook (or None for base Defend).
     shield: dict | None = None
     damage_multiplier: float = 1.0
+    starting_hp: int | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,7 @@ def snapshot(fighter: "Fighter") -> dict:
         "skills": list(fighter.skills or ()),
         "shield": dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None,
         "damage_multiplier": fighter.damage_multiplier,
+        "starting_hp": fighter.starting_hp,
     }
 
 
@@ -250,6 +252,7 @@ def restore(data) -> "Fighter | None":
         skills=skills,
         shield=shield,
         damage_multiplier=_stored_number(data.get("damage_multiplier"), 1.0),
+        starting_hp=_stored_number(data.get("starting_hp"), None),
     )
 
 
@@ -522,7 +525,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     derived = {a.key: derive(a, b), b.key: derive(b, a)}
     fighters = {a.key: a, b.key: b}
     max_hp = {a.key: derived[a.key]["max_hp"], b.key: derived[b.key]["max_hp"]}
-    hp = dict(max_hp)
+    hp = {
+        fighter.key: min(max_hp[fighter.key], max(1, int(fighter.starting_hp)))
+        if fighter.starting_hp is not None else max_hp[fighter.key]
+        for fighter in (a, b)
+    }
     total_damage = {a.key: 0, b.key: 0}
     effects = {a.key: derived[a.key]["effects"], b.key: derived[b.key]["effects"]}
     skill_loadouts = {}

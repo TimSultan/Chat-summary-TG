@@ -535,6 +535,8 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
         "owned": owned,
         "equipped": item.code in equipped_codes,
         "locked": item.code in set((record or {}).get("locked_items", [])),
+        "enchantment": ((record or {}).get("weapon_enchantments") or {}).get(item.code)
+          if item.slot == "weapon" else None,
     }
 
 
@@ -947,7 +949,7 @@ def _action_dungeon_fight(entry, user_id, xp, payload):
 
 
 def _action_dungeon_rest(entry, user_id, xp, payload):
-    return pets.dungeon_rest(entry, user_id, xp)
+  return pets.dungeon_rest(entry, user_id, xp, str(payload.get("amount") or "full"))
 
 
 def _action_dungeon_descend(entry, user_id, xp, payload):
@@ -3827,7 +3829,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="dungeon-actions"><button class="go sec" data-dungeon="rest">🛒 Лечение · ' + dungeon.heal_cost + '</button><button class="go" data-dungeon="descend">⬇️ Спуститься</button></div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="dungeon-actions"><button class="go sec" data-dungeon="rest" data-heal="partial">🩹 +30% · ' + dungeon.partial_heal_cost + '</button><button class="go sec" data-dungeon="rest" data-heal="full">❤️ Полностью · ' + dungeon.full_heal_cost + '</button><button class="go" data-dungeon="descend">⬇️ Спуститься</button></div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
 }
 
 function renderOnboarding() {
@@ -3941,8 +3943,10 @@ function forgePanel() {
   const names = { cursed: "проклятых", common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
   const runeState = S.runes || { runes: {}, enchantments: {}, cost: 15 };
-  const weapons = (S.bag || []).filter((item) => item.slot === "weapon");
   const runeNames = { fire: "Огонь", frost: "Лёд", water: "Вода", earth: "Земля", air: "Воздух", plants: "Растения" };
+  const runeIcons = { fire: "🔥", frost: "❄️", water: "💧", earth: "🪨", air: "💨", plants: "🌿" };
+  const runeLine = Object.keys(runeNames).filter((element) => runeState.runes[element])
+    .map((element) => runeIcons[element] + ' ' + runeNames[element] + ' ×' + Number(runeState.runes[element])).join(' · ');
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
     '<div class="small muted" style="margin-bottom:10px">6 проклятых превращаются в редкую проклятую реликвию, ' +
       '5 обычных — в редкий, а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
@@ -3958,15 +3962,27 @@ function forgePanel() {
           (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
     }).join('') +
     '<div class="panel" style="margin:8px 0;padding:10px"><h2>🔮 Зачарования</h2>' +
-      '<div class="tiny muted">Руна добавляет эффект оружию. Цена: ' + runeState.cost + ' 💎 и 1 руна.</div>' +
-      (weapons.length ? weapons.map((weapon) => '<div class="small" style="margin-top:9px"><b>' + esc(weapon.name) +
-        '</b>' + (runeState.enchantments[weapon.code] ? ' · ' + esc(runeNames[runeState.enchantments[weapon.code]]) : '') +
-        '<div class="row" style="flex-wrap:wrap;margin-top:5px">' + Object.keys(runeNames).map((element) =>
-          '<button class="go sec" data-enchant="' + esc(weapon.code) + ':' + element + '"' +
-          (runeState.runes[element] ? '' : ' disabled') + '>' + esc(runeNames[element]) + ' · ' +
-          Number(runeState.runes[element] || 0) + '</button>').join('') + '</div></div>').join('') :
-        '<div class="empty">В сумке нет оружия для зачарования.</div>') + '</div>' +
+      '<div class="tiny muted">Добавь руне оружие за ' + runeState.cost + ' 💎. Выбери руну, затем оружие.</div>' +
+      '<div class="tiny" style="margin:7px 0">' + (runeLine || 'Рун пока нет.') + '</div>' +
+      '<button class="go sec" data-enchantopen' + (runeLine ? '' : ' disabled') + '>Выбрать руну</button></div>' +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
+}
+
+function openEnchantments() {
+  const state = S.runes || { runes: {}, cost: 15 };
+  const names = { fire: "Огненная", frost: "Ледяная", water: "Водная", earth: "Земляная", air: "Воздушная", plants: "Руна растений" };
+  const icons = { fire: "🔥", frost: "❄️", water: "💧", earth: "🪨", air: "💨", plants: "🌿" };
+  sheet('<h3>🔮 Выбери руну</h3><p class="tiny muted">Зачарование стоит ' + Number(state.cost || 15) + ' 💎 и 1 руну.</p>' +
+    Object.keys(names).map((element) => '<button class="go sec" style="margin:5px 0" data-enchantpick="' + element + '"' +
+      (state.runes[element] ? '' : ' disabled') + '>' + icons[element] + ' ' + names[element] + ' · ' + Number(state.runes[element] || 0) + '</button>').join(''));
+}
+
+function openEnchantWeapons(element) {
+  const names = { fire: "Огненная", frost: "Ледяная", water: "Водная", earth: "Земляная", air: "Воздушная", plants: "Руна растений" };
+  const weapons = (S.bag || []).filter((item) => item.slot === "weapon");
+  sheet('<h3>' + esc(names[element]) + ' руна</h3><p class="tiny muted">Выбери оружие для зачарования.</p>' +
+    (weapons.length ? weapons.map((weapon) => '<button class="go sec" style="margin:5px 0" data-enchantapply="' + esc(weapon.code) + ':' + element + '">' +
+      esc(weapon.name) + (weapon.enchantment ? ' · уже зачаровано' : '') + '</button>').join('') : '<div class="empty">В сумке нет оружия.</div>'));
 }
 
 // `skipAll` for the shop, where every equipment slot has its own personal rotation.
@@ -3994,7 +4010,9 @@ function itemArt(item, marks) {
 function itemCard(item, flag) {
   const marks = (item.equipped ? '<span class="flag">надето</span>'
                                : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
-                (item.locked ? '<span class="lockmark">🔒</span>' : "");
+                (item.locked ? '<span class="lockmark">🔒</span>' : "") +
+                (item.enchantment ? '<span class="lockmark" title="Руна">' +
+                  ({ fire: '🔥', frost: '❄️', water: '💧', earth: '🪨', air: '💨', plants: '🌿' }[item.enchantment] || '🔮') + '</span>' : "");
   return '<button class="item r-' + item.rarity + '" data-item="' + esc(item.code) + '">' +
     itemArt(item, marks) +
     '<span class="nm">' + esc(item.name) + "</span>" +
@@ -6037,7 +6055,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchant]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]");
@@ -6045,7 +6063,7 @@ document.addEventListener("click", async (event) => {
   const d = target.dataset;
   if (d.dungeon) {
     const actions = { enter: "dungeon_enter", escalator: "dungeon_escalator", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit" };
-    await act(actions[d.dungeon], d.dungeon === "fight" ? { index: Number(d.index) } : {});
+    await act(actions[d.dungeon], d.dungeon === "fight" ? { index: Number(d.index) } : (d.dungeon === "rest" ? { amount: d.heal || "full" } : {}));
     return;
   }
 
@@ -6093,8 +6111,11 @@ document.addEventListener("click", async (event) => {
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   if (d.reforge) { await act("reforge", { rarity: d.reforge }); return; }
-  if (d.enchant) {
-    const [code, element] = d.enchant.split(":", 2);
+  if (d.enchantopen !== undefined) { openEnchantments(); return; }
+  if (d.enchantpick) { openEnchantWeapons(d.enchantpick); return; }
+  if (d.enchantapply) {
+    const [code, element] = d.enchantapply.split(":", 2);
+    closeSheet();
     await act("enchant_weapon", { code, element });
     return;
   }

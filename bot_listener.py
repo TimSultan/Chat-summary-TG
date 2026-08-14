@@ -6339,7 +6339,7 @@ async def handle_pets_callback(
             elif action == "dungeonescalator":
                 ok, note = pets.enter_dungeon(entry, user_id, escalator=True)
             elif action == "dungeonrest":
-                ok, note = pets.dungeon_rest(entry, user_id, xp)
+                ok, note = pets.dungeon_rest(entry, user_id, xp, argument or "full")
             elif action == "dungeondescend":
                 ok, note = pets.dungeon_descend(entry, user_id)
             elif action == "dungeonquit":
@@ -6657,6 +6657,18 @@ async def handle_pets_callback(
         if action == "enchantmenu":
             await _send_pets_view(
                 api, chat_id, pets_ui.enchant_weapon_view(entry, user_id, argument),
+                message_id=message_id, log=log,
+            )
+            return
+        if action == "runemenu":
+            await _send_pets_view(
+                api, chat_id, pets_ui.rune_enchant_view(entry, user_id),
+                message_id=message_id, log=log,
+            )
+            return
+        if action == "enchantrune":
+            await _send_pets_view(
+                api, chat_id, pets_ui.rune_weapon_view(entry, user_id, argument),
                 message_id=message_id, log=log,
             )
             return
