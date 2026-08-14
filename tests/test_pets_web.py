@@ -443,7 +443,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         html = await page.text()
         self.assertIn("Fight audit", html)
         self.assertIn('id="petSearch"', html)
-        self.assertIn('id="pet"', html)
+        self.assertIn('id="petSuggestions"', html)
+        self.assertIn("showPetSuggestions()", html)
+        self.assertIn('data-pet="', html)
 
         data = pets._load(CHAT)
         data["fight_audits"].append({
