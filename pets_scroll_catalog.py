@@ -13,6 +13,9 @@ EFFECT_OPS = frozenset({
     "damage", "heal", "shield", "burn", "weaken", "blind", "vulnerable",
     "stun", "dodge_next", "reflect_next", "cleanse", "break_shield",
     "regen", "damage_boost", "negative_ward", "self_damage",
+    # Reactive shield hooks.  Unlike the operations above, these live in a shield's
+    # ``on_hit_effects`` and resolve when its wearer actually loses HP.
+    "parry_stun", "damage_heal", "counterattack",
 })
 
 # These are presentation-only for now.  Combat deliberately does not read an element:
@@ -250,6 +253,30 @@ SHIELDS = (
     {"code": "shield_solvent_drum", "name": "Бочка растворителя", "icon": "🛢️",
      "short": "При защите поджигает врага: 45% урона за ход, 3 хода.",
      "defend_effects": ({"op": "burn", "amount": .45, "turns": 3},)},
+    {"code": "shield_duelist_buckler", "name": "Баклер дуэлянта", "icon": "🤺",
+     "short": "При первом полученном уроне: 28% шанс парировать 65% урона и оглушить атакующего.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "parry_stun", "chance": .28, "reduce": .65},)},
+    {"code": "shield_medic_emblem", "name": "Щит полевого медика", "icon": "⚕️",
+     "short": "После каждого полученного урона восстанавливает 30% фактически потерянного HP.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "damage_heal", "percent": .30},)},
+    {"code": "shield_spiked_targe", "name": "Шипованный тарч", "icon": "🦔",
+     "short": "После первого полученного урона отвечает контрударом на 45% обычного урона.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "counterattack", "percent": .45},)},
+    {"code": "shield_royal_riposte", "name": "Королевский рипост", "icon": "👑",
+     "short": "При первом полученном уроне: 45% шанс парировать 80% урона и оглушить атакующего.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "parry_stun", "chance": .45, "reduce": .80},)},
+    {"code": "shield_crimson_reliquary", "name": "Багровый реликварий", "icon": "🩸",
+     "short": "После каждого полученного урона восстанавливает 50% фактически потерянного HP.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "damage_heal", "percent": .50},)},
+    {"code": "shield_judgement", "name": "Щит воздаяния", "icon": "⚖️",
+     "short": "После первого полученного урона отвечает контрударом на 85% обычного урона.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "counterattack", "percent": .85},)},
 )
 
 
@@ -380,12 +407,24 @@ def effect_text(effect: dict) -> str:
         return "Поглощает следующий негативный эффект"
     if op == "self_damage":
         return f"Забирает {_percent(effect.get('percent'))} своего здоровья"
+    if op == "parry_stun":
+        return (
+            f"{_percent(effect.get('chance'))} шанс парировать "
+            f"{_percent(effect.get('reduce'))} полученного урона и оглушить атакующего"
+        )
+    if op == "damage_heal":
+        return f"Восстанавливает {_percent(effect.get('percent'))} фактически потерянного здоровья"
+    if op == "counterattack":
+        return f"Контрудар на {_percent(effect.get('percent'))} обычного урона"
     return ""
 
 
 def effect_lines(row: dict) -> tuple[str, ...]:
     """Every effect of one scroll or shield, in the order the engine applies them."""
-    lines = [effect_text(effect) for effect in row.get("effects") or row.get("defend_effects") or ()]
+    effects = row.get("effects")
+    if effects is None:
+        effects = tuple(row.get("defend_effects", ())) + tuple(row.get("on_hit_effects", ()))
+    lines = [effect_text(effect) for effect in effects]
     return tuple(line for line in lines if line)
 
 
@@ -401,6 +440,7 @@ def public_shield(row: dict) -> dict:
     return {
         **row,
         "defend_effects": [dict(effect) for effect in row.get("defend_effects", ())],
+        "on_hit_effects": [dict(effect) for effect in row.get("on_hit_effects", ())],
         "effects_text": list(effect_lines(row)),
     }
 
@@ -429,8 +469,13 @@ def _validate() -> None:
     if {row["element"] for row in SCROLLS} != set(ELEMENTS):
         raise ValueError("every scroll element must be represented")
     shield_codes = [row["code"] for row in SHIELDS]
-    if len(shield_codes) != 14 or len(set(shield_codes)) != len(shield_codes):
-        raise ValueError("shield catalogue must contain 14 unique entries")
+    if len(shield_codes) != 20 or len(set(shield_codes)) != len(shield_codes):
+        raise ValueError("shield catalogue must contain 20 unique entries")
+    for row in SHIELDS:
+        effects = tuple(row.get("defend_effects", ())) + tuple(row.get("on_hit_effects", ()))
+        for effect in effects:
+            if effect.get("op") not in EFFECT_OPS or not effect_text(effect):
+                raise ValueError(f"shield effect has no valid wording: {row['code']}")
     validate_loadout(SAMPLE_LOADOUT)
     # Four empty slots is the state every creature is tamed into, so it has to survive
     # the same validator every equip goes through, unchanged.

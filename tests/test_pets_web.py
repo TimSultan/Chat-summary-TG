@@ -303,10 +303,28 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(full["skills"]["regular"], [])
         self.assertEqual(full["skills"]["ultimate"], [])
         self.assertTrue(full["skills"]["slots"][3]["ultimate"])
+        # A newly tamed creature watches PVE by default; the preference is stored with
+        # the pet instead of being lost when the Mini App is reopened.
+        self.assertFalse(full["pet"]["skip_pve_replays"])
         self.assertFalse(full["is_economy_admin"])
         self.assertIn("bag", full)
         self.assertIn("arena", full)
         self.assertIn("farm", full)
+
+    async def test_mob_replay_skip_preference_is_persistent_and_defaults_to_watching(self):
+        self._tame(PLAYER)
+
+        initial = await (await self._get("/api/state", PLAYER)).json()
+        self.assertFalse(initial["pet"]["skip_pve_replays"])
+
+        skipped = await self._action(PLAYER, "pve_replays")
+        self.assertTrue(skipped["ok"])
+        self.assertTrue(skipped["state"]["pet"]["skip_pve_replays"])
+        self.assertIn("пропускаться", skipped["message"])
+
+        restored = await self._action(PLAYER, "pve_replays")
+        self.assertTrue(restored["ok"])
+        self.assertFalse(restored["state"]["pet"]["skip_pve_replays"])
 
     async def test_page_defends_hero_rendering_when_equipment_is_empty(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX + "/")).text()
@@ -354,6 +372,30 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(state["farm"]["passive"]["next_hour"], (str, type(None)))
         self.assertTrue(state["farm"]["running"])
 
+    async def test_quarry_exposes_four_reward_cards_and_starts_the_selected_duration(self):
+        self._tame(PLAYER)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["pickaxe_runs"] = 1
+        pets._save(CHAT, data)
+
+        before = await (await self._get("/api/state", PLAYER)).json()
+        previews = before["quarry"]["hour_previews"]
+        self.assertEqual([row["hours"] for row in previews], [1, 2, 4, 8])
+        self.assertTrue(all(
+            row["ruby_min"] > 0 and row["ruby_max"] >= row["ruby_min"]
+            for row in previews
+        ))
+        self.assertTrue(all(
+            row["gold"] > 0 and row["xp"] > 0 and row["drop_chance"] > 0
+            for row in previews
+        ))
+
+        started = await self._action(PLAYER, "quarry_start", hours=2)
+        self.assertTrue(started["ok"], started)
+        self.assertTrue(started["state"]["quarry"]["running"])
+        run = pets._load(CHAT)["pets"][str(PLAYER["id"])]["quarry_run"]
+        self.assertEqual(run["hours"], 2)
+
     async def test_an_unrecognised_action_name_is_a_400(self):
         """A typo'd or outdated action name must fail loudly and specifically, not fall
         through to some default -- there is no default mutation to fall through to."""
@@ -394,6 +436,29 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         denied = await self._get("/api/economy/audit", PLAYER)
         self.assertEqual(denied.status, 403)
         self.assertEqual((await denied.json())["error"], "NOT_AN_ECONOMY_ADMIN")
+
+    async def test_fight_audit_has_separate_page_and_admin_only_lookup(self):
+        page = await self.client.get("/audit")
+        self.assertEqual(page.status, 200)
+        self.assertIn("Fight audit", await page.text())
+
+        data = pets._load(CHAT)
+        data["fight_audits"].append({
+            "fight_id": "F-20260815-ABCDEF123456", "kind": "pve",
+            "at": "2026-08-15T12:00:00+00:00", "winner": "42", "draw": False,
+            "fighters": {"42": {"fighter": {"name": "Hero"}}}, "moves": [],
+        })
+        pets._save(CHAT, data)
+
+        denied = await self.client.get("/audit/api/fights", headers=self._auth(PLAYER))
+        self.assertEqual(denied.status, 403)
+        listed = await self.client.get("/audit/api/fights", headers=self._auth(THIRD))
+        self.assertEqual(listed.status, 200)
+        self.assertEqual((await listed.json())["fights"][0]["fight_id"], "F-20260815-ABCDEF123456")
+        found = await self.client.get(
+            "/audit/api/fights?id=F-20260815-ABCDEF123456", headers=self._auth(THIRD),
+        )
+        self.assertEqual((await found.json())["fight"]["kind"], "pve")
 
     async def test_money_audit_returns_user_picker_hour_graph_and_source_net(self):
         moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
@@ -584,7 +649,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(body["defaults"]["skills"]), 4)
         self.assertEqual(len(body["regular_scrolls"]), 30)
         self.assertEqual(len(body["ultimate_scrolls"]), 10)
-        self.assertEqual(len(body["shields"]), 14)
+        self.assertEqual(len(body["shields"]), 20)
         self.assertTrue(all(row["auto_weight"] == 1 for row in body["regular_scrolls"]))
         self.assertTrue(all(row["effects"] for row in body["regular_scrolls"]))
         self.assertEqual(
@@ -1498,6 +1563,18 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # The live fight and the replay must go through one playback, or they drift.
         self.assertEqual(page.count("function playDuel("), 1)
         self.assertIn(".duel .rerun", page)
+
+    async def test_hero_order_and_pve_replay_controls_are_exposed_by_the_page(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        hero = page.split("function renderHero()", 1)[1].split("function tile(", 1)[0]
+        self.assertLess(hero.index('<h2>Характеристики</h2>'), hero.index('<h2>В бою</h2>'))
+        self.assertLess(hero.index('<h2>В бою</h2>'), hero.index("liveSkillsPanel()"))
+        self.assertIn("Дом существа: увеличивает запас боёв и золото за победы.", page)
+        self.assertIn('if (!(S.pet && S.pet.skip_pve_replays)) { playDuel(data); return; }', page)
+        self.assertIn('"Пропускать бои"', page)
+        self.assertIn('"Не пропускать бои"', page)
+        self.assertIn('data-quarrystart="', page)
+        self.assertIn('grid-template-columns:repeat(4,minmax(0,1fr))', page)
 
     # ---- the mailbox --------------------------------------------------------------------
 

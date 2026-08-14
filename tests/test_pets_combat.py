@@ -73,6 +73,20 @@ class DeriveTests(unittest.TestCase):
         self.assertEqual({round_.event for round_ in notices}, {"deficit_luck", "deficit_agility"})
         self.assertTrue(all(round_.number == 0 and round_.damage == 0 for round_ in notices))
 
+    def test_every_transcript_row_carries_post_event_audit_state(self):
+        result = combat.simulate(_fighter("a", 12), _fighter("b", 12), seed=912)
+
+        self.assertTrue(result.rounds)
+        for row in result.rounds:
+            self.assertEqual(set(row.state["fighters"]), {"a", "b"})
+            for state in row.state["fighters"].values():
+                self.assertIn("hp", state)
+                self.assertIn("stunned", state)
+                self.assertIn("used_scrolls", state)
+                self.assertIn("used_shield_reactions", state)
+        # The audit payload must be safe for the exact JSON store/API boundary.
+        json.dumps([row.state for row in result.rounds])
+
     def test_agility_deficit_increases_damage_in_a_classic_fight(self):
         attacker = _fighter("attacker", 20)
         weak = Fighter(key="weak", name="Медленный", strength=20, health=200, agility=10, luck=20, armor=0)
@@ -403,6 +417,65 @@ class SimulateTests(unittest.TestCase):
         reflected = next(row for row in result.rounds if row.event == "skill_reflect")
         self.assertEqual(reflected.attacker, shielded.key)
         self.assertGreater(reflected.damage, 0)
+
+    def test_reactive_shields_work_against_dungeon_bosses_without_recursing(self):
+        """The new hooks are worn-shield reactions, not scroll-only PvP effects.
+
+        A deterministic boss opening lets this cover the three promised mechanics:
+        parry-stun, healing from actual lost HP, and a single counterattack.  The latter
+        must not recursively trigger the boss's own reactive shield.
+        """
+        import pets_scroll_catalog as scrolls
+
+        class OpeningRng:
+            def __init__(self, rolls=(0.0, 0.0)):
+                self.rolls = iter(rolls)
+
+            def random(self):
+                return next(self.rolls, 0.99)
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return values[0]
+
+        def fighters(shield):
+            boss = Fighter(
+                key="dungeon:boss_5", name="Boss", strength=20, health=200,
+                agility=10, luck=1, armor=0,
+            )
+            hero = Fighter(
+                key="hero", name="Hero", strength=20, health=200, agility=10,
+                luck=1, armor=0, shield=shield, starting_hp=200,
+            )
+            return boss, hero
+
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 100)):
+            boss, hero = fighters(scrolls.shield("shield_royal_riposte"))
+            parry = combat.simulate(boss, hero, rng=OpeningRng(), max_actions=2)
+            self.assertTrue(any(
+                row.event == "amulet_shield_parry_stun" and row.attacker == hero.key
+                for row in parry.rounds
+            ))
+            self.assertTrue(any(
+                row.event == "stun_skip" and row.attacker == boss.key
+                for row in parry.rounds
+            ))
+
+            boss, hero = fighters(scrolls.shield("shield_crimson_reliquary"))
+            healing = combat.simulate(boss, hero, rng=OpeningRng(), max_actions=1)
+            heal = next(row for row in healing.rounds if row.event == "amulet_shield_damage_heal")
+            self.assertEqual(heal.attacker, hero.key)
+            self.assertEqual(heal.damage, 50)
+
+            boss, hero = fighters(scrolls.shield("shield_judgement"))
+            counter = combat.simulate(boss, hero, rng=OpeningRng(), max_actions=2)
+            counters = [row for row in counter.rounds if row.event == "amulet_shield_counterattack"]
+            self.assertEqual(len(counters), 1)
+            self.assertEqual(counters[0].attacker, hero.key)
+            self.assertGreater(counters[0].damage, 0)
 
     def test_stun_skips_a_dungeon_boss_before_items_or_actions_can_trigger(self):
         """A boss uses the same status rules as a pet. In particular, stun resolves

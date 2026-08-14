@@ -646,6 +646,10 @@ def _pet_payload(entry: str, user_id, record: dict, prefix: str) -> dict:
         "owner_username": record.get("owner_username"),
         "created_at": record.get("created_at"),
         "notifications": bool(record.get("fight_result_notifications", True)),
+        # Mob fights are watched by default.  This stays in the pet record rather than
+        # local storage, so a player's choice follows them between Telegram Mini App
+        # sessions and devices.
+        "skip_pve_replays": pets.pve_replays_skipped(entry, user_id),
         "portrait": _portrait_url(prefix, user_id),
         "has_photo": bool(record.get("photo_file_id")),
         # The framing square, in the photo's own pixels, or null for "fit the whole thing".
@@ -735,6 +739,8 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
         "cage": {
             "level": cage,
             "max": C.CAGE_MAX_LEVEL,
+            "fight_bonus": C.CAGE_BONUS_FIGHTS[cage - 1],
+            "gold_bonus_pct": C.CAGE_GOLD_BONUS_PCT[cage - 1],
             "price": C.CAGE_PRICE,
             "upgrade_cost": (
                 C.CAGE_UPGRADE_COSTS[cage] if 0 < cage < len(C.CAGE_UPGRADE_COSTS) else None
@@ -944,7 +950,7 @@ def _action_quarry_buy_pickaxe(entry, user_id, xp, payload):
 
 
 def _action_quarry_start(entry, user_id, xp, payload):
-  return pets.start_quarry(entry, user_id)
+  return pets.start_quarry(entry, user_id, payload.get("hours", C.QUARRY_DURATION_HOURS))
 
 
 def _action_daily_bonus(entry, user_id, xp, payload):
@@ -962,6 +968,14 @@ def _action_portrait_crop(entry, user_id, xp, payload):
 def _action_notifications(entry, user_id, xp, payload):
     enabled = pets.toggle_fight_result_notifications(entry, user_id)
     return True, "Отчёты о боях включены." if enabled else "Отчёты о боях выключены."
+
+
+def _action_pve_replays(entry, user_id, xp, payload):
+    skipped = pets.toggle_pve_replays_skipped(entry, user_id)
+    return True, (
+        "Бои с мобами будут пропускаться."
+        if skipped else "Реплеи боёв с мобами снова включены."
+    )
 
 
 def _action_dungeon_enter(entry, user_id, xp, payload):
@@ -1016,6 +1030,7 @@ _ACTIONS = {
     "quarry_start": _action_quarry_start,
     "daily_bonus": _action_daily_bonus,
     "notifications": _action_notifications,
+    "pve_replays": _action_pve_replays,
     "portrait_crop": _action_portrait_crop,
     "dungeon_enter": _action_dungeon_enter,
     "dungeon_escalator": _action_dungeon_escalator,
@@ -1106,6 +1121,8 @@ async def handle_action(request: web.Request) -> web.Response:
     if str(body.get("action") or "") == "dungeon_fight" and isinstance(extra, dict):
       result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
       encounter = extra.get("encounter") or {}
+      if getattr(result, "fight_id", None):
+        response["message"] += f"\nFight ID: {result.fight_id}"
       if encounter.get("boss") and result is not None and hero is not None and enemy is not None:
         dropped = extra.get("dropped") or {}
         dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
@@ -1488,14 +1505,19 @@ async def handle_attack(request: web.Request) -> web.Response:
     )
     return _ok({
         "ok": True,
-        **_playback_payload(result, me, attacker, opponent_id, defender, theirs.get("name")),
+        **_playback_payload(
+            result, me, attacker, opponent_id, defender, theirs.get("name"),
+            reward.get("fight_id"),
+        ),
         "reward": reward,
         "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
         "state": _state_payload(entry, me, xp, prefix),
     })
 
 
-def _playback_payload(result, me: str, mine, opponent_id: str, theirs, opponent_name) -> dict:
+def _playback_payload(
+    result, me: str, mine, opponent_id: str, theirs, opponent_name, fight_id: str | None = None,
+) -> dict:
     """The part of a fight the page animates, blow by blow.
 
     Shared by the live fight and by /api/replay, so a replay is not a second, subtly
@@ -1508,6 +1530,7 @@ def _playback_payload(result, me: str, mine, opponent_id: str, theirs, opponent_
     tougher one it never emptied.
     """
     return {
+        "fight_id": fight_id or getattr(result, "fight_id", None),
         "you": me,
         # The name as it was WHEN THE FIGHT HAPPENED, straight off the fighter the
         # transcript was written from. The client used to read this off the live pet,
@@ -1527,7 +1550,8 @@ def _playback_payload(result, me: str, mine, opponent_id: str, theirs, opponent_
         },
         "rounds": [
             {"number": r.number, "attacker": r.attacker, "event": r.event, "damage": r.damage,
-             "attacker_hp": r.attacker_hp, "defender_hp": r.defender_hp, "text": r.text}
+             "attacker_hp": r.attacker_hp, "defender_hp": r.defender_hp, "text": r.text,
+             "attack_types": list(r.attack_types), "state": r.state}
             for r in result.rounds
         ],
     }
@@ -1598,7 +1622,7 @@ async def handle_replay(request: web.Request) -> web.Response:
         **_playback_payload(
             result, me,
             attacker if attacked else defender, opponent_id,
-            defender if attacked else attacker, opponent_name,
+            defender if attacked else attacker, opponent_name, pets.fight_id(fight),
         ),
         "reward": {
             "gold": fight.get("gold", 0) if won else 0,
@@ -1688,7 +1712,12 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
     )
     return _ok({
         "ok": True,
-        **_playback_payload(result, me, hero, enemy.key, enemy, block["name"]),
+        **_playback_payload(
+            result, me, hero, enemy.key, enemy, block["name"], reward.get("fight_id"),
+        ),
+        # The client needs to distinguish a mob replay from an arena replay: only the
+        # former offers the persistent "skip fights" control.
+        "pve": True,
         "mob": _jsonable(block),
         "reward": _jsonable(reward),
         "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
@@ -2438,6 +2467,28 @@ async def handle_page(request: web.Request) -> web.Response:
     )
 
 
+async def handle_audit_page(request: web.Request) -> web.Response:
+    request.app[_LOG_KEY]("[pets_web] fight audit page opened")
+    return web.Response(text=AUDIT_HTML, content_type="text/html")
+
+
+async def handle_fight_audit(request: web.Request) -> web.Response:
+    """Admin-only fight lookup; ordinary participants cannot enumerate combat internals."""
+    await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    fight_id_ = str(request.query.get("id") or "").strip()
+    if fight_id_:
+        row = await asyncio.to_thread(pets.find_fight_audit, entry, fight_id_)
+        if row is None:
+            return _json_error("Fight not found.", status=404, code="NO_FIGHT")
+        return _ok({"fight": row})
+    try:
+        limit = int(request.query.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    return _ok({"fights": await asyncio.to_thread(pets.fight_audits, entry, limit)})
+
+
 async def _default_fetch_photo(file_id: str):
     return None
 
@@ -2517,6 +2568,9 @@ def attach(
     # halfway through and nothing would ever say why.
     app[_SPRITE_JOBS_KEY] = set()
     app.add_routes([
+        web.get("/audit", handle_audit_page),
+        web.get("/audit/", handle_audit_page),
+        web.get("/audit/api/fights", handle_fight_audit),
         web.get(prefix, handle_page),
         web.get(prefix + "/", handle_page),
         web.get(prefix + "/api/state", handle_state),
@@ -2559,6 +2613,39 @@ def attach(
     ])
     log(f"[pets_web] pet game mounted at {prefix}")
     return app
+
+
+AUDIT_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fight audit</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{color-scheme:dark;--bg:#101720;--card:#1b2633;--line:#334458;--muted:#91a2b5;--blue:#62aef0}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f3f6f9;font:14px system-ui,sans-serif}
+main{max-width:1180px;margin:auto;padding:20px}.top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input,button{border:1px solid var(--line);background:#131e29;color:inherit;border-radius:10px;padding:11px 13px}
+input{flex:1;min-width:240px}button{cursor:pointer;background:#2677bd}.muted{color:var(--muted)}
+.list{display:grid;gap:8px;margin:18px 0}.row,.card,.move{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.row{cursor:pointer;display:flex;justify-content:space-between;gap:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-wrap:wrap;gap:6px}.tag{background:#26384a;border-radius:20px;padding:5px 9px}
+.moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
+@media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
+</style></head><body><main>
+<h1>Fight audit</h1><div class="top"><input id="query" placeholder="Fight ID, e.g. F-20260815-…"><button id="load">Load fight</button><button id="recent">Recent</button></div>
+<p id="status" class="muted">Loading recent fights…</p><section id="out"></section>
+</main><script>
+const tg=window.Telegram&&Telegram.WebApp; if(tg){tg.ready();tg.expand()}
+const initData=(tg&&tg.initData)||""; const out=document.getElementById("out"), status=document.getElementById("status");
+const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const pretty=v=>esc(JSON.stringify(v??{},null,2));
+async function api(id=""){status.textContent="Loading…";const u="/audit/api/fights"+(id?"?id="+encodeURIComponent(id):"");const r=await fetch(u,{headers:{"X-Telegram-Init-Data":initData}});const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
+function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>Level ${esc(f.level)} · STR ${esc(f.strength)} · HP stat ${esc(f.health)} · AGI ${esc(f.agility)} · LUCK ${esc(f.luck)} · ARM ${esc(f.armor)}</div><div class="muted">Derived: max HP ${esc(Math.round(d.max_hp||0))}, damage ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%</div><h4>Items</h4><div class="items">${items.length?items.map(i=>`<span class="tag">${esc(i.name)} · ${esc(i.rarity)} · ${esc(i.code)}</span>`).join(""):"<span class=muted>None</span>"}</div><h4>Scrolls / shield</h4><pre>${pretty({skill_slots:s.skill_slots,shield:s.shield,effects:f.effects})}</pre><details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
+function renderFight(f){const fighters=Object.entries(f.fighters||{});out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Moves (${(f.moves||[]).length})</h2><div class="moves">${(f.moves||[]).map(m=>`<details class="move"><summary><b>#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
+async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){status.textContent=e.message;out.innerHTML=""}}
+async function recent(){try{const d=await api();status.textContent=`${d.fights.length} recent fights`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} moves<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){status.textContent=e.message}}
+const query=document.getElementById("query");document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=recent;query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};recent();
+</script></body></html>"""
 
 
 PAGE_HTML = """<!doctype html>
@@ -3786,7 +3873,14 @@ function renderHero() {
           "боёв " + pet.fights + " · побед " + pet.wins +
         "</div>" +
       "</div>" +
-    "</div>" + liveSkillsPanel() + dungeonPanel() +
+    "</div>" +
+    '<div class="panel"><h2>Характеристики</h2>' +
+      S.stats.map(statRow).join("") +
+      statRespec() +
+      // Under the stats it is subtracting from. Tapping the portrait right above is how
+      // the picture gets changed, so the way out is one screen away from the explanation.
+      debuffNote(S.debuff) +
+    "</div>" +
 
     '<div class="panel"><h2>В бою</h2><div class="grid4">' +
       tile("❤️ Здоровье", combat.max_hp) +
@@ -3797,13 +3891,7 @@ function renderHero() {
       tile("⚡ Сила героя", money(combat.power)) +
     "</div></div>" +
 
-    '<div class="panel"><h2>Характеристики</h2>' +
-      S.stats.map(statRow).join("") +
-      statRespec() +
-      // Under the stats it is subtracting from. Tapping the portrait right above is how
-      // the picture gets changed, so the way out is one screen away from the explanation.
-      debuffNote(S.debuff) +
-    "</div>" +
+    liveSkillsPanel() + dungeonPanel() +
 
     (Object.values(worn).some((s) => s.item) ? "" :
       '<div class="panel small muted">Снаряжения пока нет. Загляни в лавку или побеждай в боях, чтобы его получить.</div>') +
@@ -3862,6 +3950,9 @@ function cagePanel() {
   return '<div class="panel"><h2>Клетка</h2>' +
     '<div class="row spread"><span>Уровень ' + cage.level + " из " + cage.max + "</span>" +
     (top ? '<span class="muted small">максимум</span>' : "") + "</div>" +
+    '<p class="small muted" style="margin:8px 0 0">Дом существа: увеличивает запас боёв и золото за победы. Сейчас: +' +
+      Number(cage.fight_bonus || 0) + ' к запасу боёв, +' + Number(cage.gold_bonus_pct || 0) +
+      '% золота.</p>' +
     (top ? "" : '<button class="go sec" style="margin-top:10px" data-do="upcage"' +
       (affordable(cage.upgrade_cost) ? "" : " disabled") +
       ">Улучшить · " + money(cage.upgrade_cost) + "</button>") + "</div>";
@@ -4590,6 +4681,13 @@ async function fightMob() {
   MOB_REPLAY = data;
   MOB_FIGHT_BUSY = false;
   render();
+  // Watching PVE is the default. A player who explicitly opted out keeps the old fast
+  // receipt and may still open this one replay to turn the animation back on.
+  if (!(S.pet && S.pet.skip_pve_replays)) { playDuel(data); return; }
+  showMobResult(data);
+}
+
+function showMobResult(data) {
   const reward = data.reward || {};
   const result = data.winner === String(data.you) ? "Победа" : (data.draw ? "Ничья" : "Поражение");
   sheet('<h3>' + esc(result) + '</h3><div class="small">' + esc((data.mob || {}).name || "Моб") +
@@ -4950,12 +5048,18 @@ function renderFarm() {
   const quarryPanel = quarry.running
     ? '<div class="panel"><h2>⛏ Карьер</h2><div class="small">Добыча идёт. Осталось ' +
       clock(quarry.seconds_left) + '.</div></div>'
-    : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">8 часов · 💎 ' +
-      quarry.ruby_min + '–' + quarry.ruby_max + ' рубинов</div><div class="small muted" style="margin-top:4px">' +
+    : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">Один заряд кирки — одна смена. Длинная смена выгоднее.</div><div class="small muted" style="margin-top:4px">' +
       'Зарядов кирки: ' + (quarry.pickaxe_runs || 0) +
       (quarry.pickaxe_upgraded ? ' · улучшена за NMM' : '') + '</div>' +
       ((quarry.pickaxe_runs || 0)
-        ? '<button class="go" style="margin-top:10px" data-do="quarrystart">Начать добычу</button>'
+        ? '<div class="items" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:10px">' +
+          (quarry.hour_previews || []).map((preview) =>
+            '<button class="chip" style="border-radius:12px;padding:9px 3px;text-align:center;display:block" ' +
+            'data-quarrystart="' + preview.hours + '"><b>' + preview.hours + ' ч</b><br>' +
+            '<span class="tiny muted">💎' + preview.ruby_min + '–' + preview.ruby_max +
+            '<br>💰' + money(preview.gold) + '<br>✨' + money(preview.xp) +
+            '<br>🎁' + Math.round(preview.drop_chance * 100) + '%</span></button>'
+          ).join('') + '</div>'
         : '<button class="go sec" style="margin-top:10px" data-do="quarrypickaxe"' +
           (affordable(quarry.cost) ? '' : ' disabled') + '>Купить кирку · ' + money(quarry.cost) + '</button>') +
       '</div>';
@@ -5582,7 +5686,7 @@ function historyRow(row) {
     : '<div class="row spread small" style="margin-bottom:7px">';
   return open + "<span>" +
     (row.attacked ? "Ты напал на " : "На тебя напал ") + "<b>" + esc(row.opponent) + "</b>" +
-    "</span><span class='tiny'>" + esc(row.outcome) + coins +
+    "<br><span class='tiny muted'>" + esc(row.id || "") + "</span></span><span class='tiny'>" + esc(row.outcome) + coins +
     (row.replayable ? " <span class='play'>▶</span>" : "") + "</span>" +
     (row.replayable ? "</button>" : "</div>");
 }
@@ -6051,7 +6155,8 @@ function playDuel(data) {
       '</span><span class="versus">VS</span><span class="fighter-art">' + dungeonArt(data.enemy_art || {}) + '</span></div>'
     : "";
   view.innerHTML =
-    fighterArt + '<div class="side"><div class="row spread small"><b>' + esc(mineName) +
+    fighterArt + (data.fight_id ? '<div class="small muted" style="text-align:center">Fight ID: <span class="id">' + esc(data.fight_id) + '</span></div>' : '') +
+    '<div class="side"><div class="row spread small"><b>' + esc(mineName) +
       '</b><span id="hpMine"></span></div><div class="hpbar"><i id="barMine" style="width:100%"></i></div></div>' +
     '<div class="side"><div class="row spread small"><b>' + esc(theirName) +
       '</b><span id="hpTheirs"></span></div><div class="hpbar"><i id="barTheirs" style="width:100%"></i></div></div>' +
@@ -6059,7 +6164,7 @@ function playDuel(data) {
       (data.at ? " · " + esc(String(data.at).slice(11, 16).replace(":", ".")) : "") + "</div>" : "") +
     '<div class="small muted">' + esc(data.opening || "") + "</div>" +
     '<div class="log" id="duelLog"></div>' +
-    '<button class="go" id="duelDone">Пропустить</button>';
+    '<div class="acts" id="duelControls"><button class="go" id="duelDone">Пропустить</button></div>';
   document.body.appendChild(view);
 
   let index = 0, done = false;
@@ -6084,8 +6189,20 @@ function playDuel(data) {
         "<span class='small muted'>" + (reward.auto_equipped ? "надето сразу" : "лежит в сумке") +
         "</span></div></div>" : ""));
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
-    $("duelDone").textContent = "Закрыть";
+    const controls = $("duelControls");
+    controls.innerHTML = '<button class="go" id="duelDone">Закрыть</button>' +
+      (data.pve ? '<button class="go sec" id="duelReplayPreference">' +
+        ((S.pet && S.pet.skip_pve_replays) ? "Не пропускать бои" : "Пропускать бои") +
+        '</button>' : '');
     $("duelDone").onclick = () => { view.remove(); render(); };
+    const preference = $("duelReplayPreference");
+    if (preference) preference.onclick = async () => {
+      // This is a preference, not a one-off visual skip: `act` persists it and refreshes
+      // the shared state before the next mob is picked.
+      await act("pve_replays");
+      view.remove();
+      render();
+    };
     haptic(won ? "ok" : "no");
   };
 
@@ -6176,7 +6293,7 @@ $("hudCreate").addEventListener("click", () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
-    "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
+    "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
@@ -6241,6 +6358,7 @@ document.addEventListener("click", async (event) => {
     await act("enchant_weapon", { code, element });
     return;
   }
+  if (d.more === "fightaudit") { window.location.href = "/audit"; return; }
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
@@ -6350,7 +6468,7 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "farmticket") { await act("farm_ticket"); }
   else if (d.do === "farmcancel") { await act("farm_cancel"); }
   else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
-  else if (d.do === "quarrystart") { await act("quarry_start"); }
+  else if (d.quarrystart) { await act("quarry_start", {hours:Number(d.quarrystart)}); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tame") { openPetCreation(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }
@@ -6437,6 +6555,11 @@ function tick() {
     if (!S.farm.seconds_left) dirty = true;
     else if (TAB === "farm") renderFarm();
   }
+  if (S.quarry && S.quarry.seconds_left) {
+    S.quarry.seconds_left = Math.max(0, S.quarry.seconds_left - TIMER_TICK_SECONDS);
+    if (!S.quarry.seconds_left) dirty = true;
+    else if (TAB === "farm") renderFarm();
+  }
   if (dirty) refresh();     // something finished -- ask the server what it actually became
 }
 
@@ -6447,6 +6570,11 @@ async function refresh() {
     render();
     for (const receipt of S.farm_receipts || []) {
       toast("Ферма: 💰" + (receipt.gold || 0) + " · ✨" + (receipt.xp || 0));
+    }
+    if (S.quarry_receipt) {
+      const receipt = S.quarry_receipt;
+      toast("Карьер: 💎" + (receipt.rubies || 0) + " · 💰" + (receipt.gold || 0) +
+            " · ✨" + (receipt.xp || 0) + (receipt.dropped ? " · 🎁 " + receipt.dropped.name : ""));
     }
   } catch (e) {
     document.getElementById("main").innerHTML =

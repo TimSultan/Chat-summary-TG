@@ -35,6 +35,7 @@ raises everybody equally. See PETS_BALANCE.md.
 """
 
 import hashlib
+import math
 from datetime import date as _date, datetime as _datetime
 from zoneinfo import ZoneInfo as _ZoneInfo
 
@@ -78,9 +79,10 @@ LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 # A farm run is now a deliberate, player-chosen 1-8 hour shift: the pet cannot start a
 # fight while it works (but, unlike before, CAN still be attacked -- see _is_farming_record
 # call sites in claim_duel/can_attack_in_arena/find_opponent/record_fight), so the reward
-# needs to be useful without replacing the hourly arena loop. Level 10 plus every permanent
-# facility costs 6,785 coins in total and pays at most about 200 coins/day when collected
-# on time at the six-hour anchor length.
+# needs to be useful without replacing the hourly arena loop.  A fully developed farm
+# costs 6,785 coins (levels + permanent facilities), and should pay that back in a few
+# days of deliberate shifts rather than in a month.  It also needs to keep mattering after
+# a pet outgrows the starter economy, so the shift purse scales gently with pet level.
 FARM_MAX_LEVEL = 10
 # FARM_DURATION_HOURS is kept as the balance ANCHOR, not a default a player is steered
 # toward: FARM_GOLD_PER_RUN/FARM_XP_PER_RUN/FARM_DROP_CHANCE_BY_HOURS are all stated "per
@@ -116,9 +118,21 @@ FARM_UPGRADE_COSTS = (10, 100, 150, 225, 325, 450, 625, 850, 1_150, 1_500)
 # farm they paid for, they just end up having paid today's price for it.
 FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # Six-hour REFERENCE payouts -- see farm_gold_for/farm_xp_for for how an actual `hours`
-# length is derived from them. Kept as the anchor rather than rescaled per-hour.
-FARM_GOLD_PER_RUN = (0, 14, 16, 18, 20, 22, 24, 26, 28, 30, 33)
+# length is derived from them.  Level one pays for a basic shop weapon in one shift;
+# level ten with every facility produces about 1,530 coins/day before the pet-level
+# bonus.  The active shift locks the pet out of starting arena/PvE fights, so this is
+# meaningful income, not a free background faucet.
+FARM_GOLD_PER_RUN = (0, 45, 55, 70, 85, 105, 125, 145, 170, 200, 235)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
+# A farm's buildings stop at level 10 while pet levels deliberately do not.  A
+# logarithmic bonus gives established pets a reason to keep farming without allowing an
+# extremely high level to turn the farm into an exponential coin printer:
+#
+#   pet level    1     10     50     100
+#   multiplier 1.00   1.66   2.13    2.33
+#
+# It is snapshotted when the shift starts, just like farm level and facilities.
+FARM_PET_LEVEL_GOLD_LOG2_BONUS = 0.20
 # Index = hours. Long shifts are now the farm's deliberate loot route: eight hours reaches
 # 50%, while short shifts remain useful chiefly for coins and XP. Only 7-8 h can roll a
 # legendary weapon (see FARM_LOOT_RARITY_WEIGHTS below).
@@ -155,13 +169,22 @@ FARM_FEATURES = {
 }
 
 
-def farm_gold_for(level: int, hours: int, gold_multiplier: float = 1.0) -> int:
-    """Gold for one farm shift. The one formula, so it is never re-typed in pets.py."""
+def farm_pet_level_gold_multiplier(pet_level: int = 1) -> float:
+    """The bounded-growth, unbounded-level gold bonus for one farm shift."""
+    level = max(1, int(pet_level or 1))
+    return 1.0 + FARM_PET_LEVEL_GOLD_LOG2_BONUS * math.log2(level)
+
+
+def farm_gold_for(
+    level: int, hours: int, gold_multiplier: float = 1.0, pet_level: int = 1,
+) -> int:
+    """Gold for one farm shift, including its snapshotted pet-level bonus."""
     level = min(max(1, int(level)), FARM_MAX_LEVEL)
     hours = min(max(FARM_MIN_HOURS, int(hours)), FARM_MAX_HOURS)
     return max(1, round(
         FARM_GOLD_PER_RUN[level] * hours / FARM_DURATION_HOURS
         * FARM_DURATION_BONUS[hours] * gold_multiplier
+        * farm_pet_level_gold_multiplier(pet_level)
     ))
 
 
@@ -446,9 +469,18 @@ FARM_RUBY_MIN = 5
 FARM_RUBY_MAX = 8
 ARENA_RUBY_CHANCE = 0.03
 DUNGEON_RUBY_CHANCE = 0.04
-QUARRY_DURATION_HOURS = 8
-QUARRY_RUBY_MIN = 18
-QUARRY_RUBY_MAX = 25
+# One pickaxe charge can fund a short check-in or a full workday.  Longer runs are more
+# efficient per charge, which keeps the 8-hour choice meaningful without locking the
+# quarry behind a single timer.  The 8-hour ruby range preserves the original payout.
+QUARRY_HOUR_CHOICES = (1, 2, 4, 8)
+QUARRY_DURATION_HOURS = 8  # legacy run fallback
+QUARRY_RUBIES_BY_HOURS = {
+    1: (1, 2), 2: (3, 5), 4: (8, 12), 8: (18, 25),
+}
+QUARRY_GOLD_BY_HOURS = {1: 25, 2: 55, 4: 120, 8: 260}
+QUARRY_XP_BY_HOURS = {1: 20, 2: 45, 4: 100, 8: 220}
+QUARRY_DROP_CHANCE_BY_HOURS = {1: .02, 2: .05, 4: .12, 8: .30}
+QUARRY_RUBY_MIN, QUARRY_RUBY_MAX = QUARRY_RUBIES_BY_HOURS[QUARRY_DURATION_HOURS]
 PICKAXE_COST = 150
 PICKAXE_RUNS = 5
 
@@ -801,11 +833,11 @@ if _RAW_GEAR_ITEMS and (
 ):
     raise ValueError("gear catalogue must contain 40 drop-only boots and 40 gloves")
 if _RAW_SHIELD_ITEMS and (
-    len(_catalogue_shields) != 14
+    len(_catalogue_shields) != 20
     or any(item.slot != "shield" for item in _catalogue_shields)
     or sum(item.source == "shop" for item in _catalogue_shields) != 3
 ):
-    raise ValueError("shield catalogue must contain 14 shields, exactly three sold in shops")
+    raise ValueError("shield catalogue must contain 20 shields, exactly three sold in shops")
 _new_catalogue_items = _catalogue_amulets + _catalogue_gear + _catalogue_shields
 if _new_catalogue_items:
     existing_codes = {item.code for item in ITEMS}

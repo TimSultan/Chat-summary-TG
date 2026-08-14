@@ -78,6 +78,36 @@ _ITEM_RULES = {
         "resale_price": 96, "drop_weight": 1,
         "bonuses": {"armor": 28, "strength": 12},
     },
+    "shield_duelist_buckler": {
+        "price": 0, "source": "drop", "rarity": "rare",
+        "resale_price": 70, "drop_weight": 3,
+        "bonuses": {"armor": 24, "agility": 4},
+    },
+    "shield_medic_emblem": {
+        "price": 0, "source": "drop", "rarity": "rare",
+        "resale_price": 70, "drop_weight": 3,
+        "bonuses": {"armor": 26, "health": 10},
+    },
+    "shield_spiked_targe": {
+        "price": 0, "source": "drop", "rarity": "rare",
+        "resale_price": 70, "drop_weight": 3,
+        "bonuses": {"armor": 28, "strength": 5},
+    },
+    "shield_royal_riposte": {
+        "price": 0, "source": "drop", "rarity": "legendary",
+        "resale_price": 140, "drop_weight": 1,
+        "bonuses": {"armor": 36, "luck": 10},
+    },
+    "shield_crimson_reliquary": {
+        "price": 0, "source": "drop", "rarity": "legendary",
+        "resale_price": 140, "drop_weight": 1,
+        "bonuses": {"armor": 38, "health": 15, "agility": -4},
+    },
+    "shield_judgement": {
+        "price": 0, "source": "drop", "rarity": "legendary",
+        "resale_price": 140, "drop_weight": 1,
+        "bonuses": {"armor": 30, "strength": 13, "luck": 6},
+    },
 }
 
 
@@ -92,6 +122,7 @@ RAW_ITEMS = tuple(
             "text": shield["short"],
             "guard": shield.get("guard", .40),
             "defend_effects": tuple(dict(effect) for effect in shield.get("defend_effects", ())),
+            "on_hit_effects": tuple(dict(effect) for effect in shield.get("on_hit_effects", ())),
         },
         **_ITEM_RULES[shield["code"]],
     }
@@ -101,8 +132,8 @@ RAW_ITEMS = tuple(
 
 def _validate() -> None:
     codes = [row["code"] for row in RAW_ITEMS]
-    if len(codes) != 14 or len(set(codes)) != 14:
-        raise ValueError("shield catalogue must contain 14 unique items")
+    if len(codes) != 20 or len(set(codes)) != 20:
+        raise ValueError("shield catalogue must contain 20 unique items")
     if set(codes) != set(_ITEM_RULES):
         raise ValueError("every shield needs live item rules")
     if sum(row["source"] == "shop" for row in RAW_ITEMS) != 3:

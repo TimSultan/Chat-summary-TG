@@ -88,6 +88,9 @@ class Round:
     text: str             # the flavour line, ready to print
     # Elemental damage carries both ELEMENTAL and MAGIC: elemental is a magical subtype.
     attack_types: tuple[str, ...] = (PHYSICAL,)
+    # Complete post-event combat state.  Kept on the immutable transcript row so an
+    # audit never has to infer a stun, guard or proc charge from player-facing prose.
+    state: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,7 @@ class FightResult:
     seed: int | None
     accident: str | None
     final_hp: dict | None = None
+    fight_id: str | None = None
 
 
 # Amulets use these stable machine codes; their catalogue descriptions are player-facing
@@ -188,6 +192,9 @@ _EFFECT_TEXT = {
     "echo_strike": "повторяет попадание эхом: {amount} урона.",
     "crushing_grip": "сжимает хватку: урон соперника ниже на {amount}%.",
     "perfect_parry": "парирует удар и запасает {amount} урона для ответа.",
+    "shield_parry_stun": "щитом парирует {amount} урона и оглушает атакующего.",
+    "shield_damage_heal": "щит возвращает {amount} HP из полученного урона.",
+    "shield_counterattack": "щит отвечает контрударом: {amount} урона.",
     "guard": "держит защиту: поглощено {amount} урона.",
 }
 
@@ -598,6 +605,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     )
     shields = {a.key: 0.0, b.key: 0.0}
     used = {a.key: set() for a in (a, b)}
+    # Reactive shield powers are deliberately separate from item passives: a weapon
+    # and a shield may use the same operation name without silently sharing a charge.
+    used_shield_reactions = {a.key: set() for a in (a, b)}
     landed_hits = {a.key: 0 for a in (a, b)}
     attacks_made = {a.key: 0 for a in (a, b)}
     focused_ready = {a.key: False for a in (a, b)}
@@ -636,7 +646,36 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     order = [a.key, b.key] if rng.random() < min(.95, max(.05, initiative)) else [b.key, a.key]
     opening = pets_flavor.line("opening", fighters[order[0]].name, fighters[order[1]].name, rng=rng)
 
-    rounds = []
+    def combat_state() -> dict:
+        """JSON-safe state immediately after the event being appended."""
+        rows = {}
+        for key in (a.key, b.key):
+            rows[key] = {
+                "hp": max(0, round(hp[key])), "max_hp": round(max_hp[key]),
+                "shield": round(shields[key], 3), "guard": round(guards[key], 3),
+                "stunned": bool(stunned[key]), "cocooned": bool(cocooned[key]),
+                "chilled_hits": int(chilled[key]), "phantom_dodges": int(phantom_dodges[key]),
+                "armor_shredded": round(armor_shredded[key], 4),
+                "venom_miss": round(venom_miss[key], 4),
+                "damage_weakened": round(damage_weakened[key], 4),
+                "burning": list(burning[key]) if burning[key] is not None else None,
+                "bleeding": list(bleeding[key]) if bleeding[key] is not None else None,
+                "pending_poison": list(pending_poison[key]) if pending_poison[key] is not None else None,
+                "pending_venom": list(pending_venom[key]) if pending_venom[key] is not None else None,
+                "skill_statuses": dict(skill_statuses[key]),
+                "attacks_made": int(attacks_made[key]), "landed_hits": int(landed_hits[key]),
+                "total_damage": int(total_damage[key]), "stun_procs": int(stun_procs[key]),
+                "used_effects": sorted(used[key]),
+                "used_shield_reactions": sorted(used_shield_reactions[key]),
+                "used_scrolls": sorted(used_scrolls[key]),
+            }
+        return {"fighters": rows}
+
+    class _AuditedRounds(list):
+        def append(self, row):
+            super().append(replace(row, state=combat_state()))
+
+    rounds = _AuditedRounds()
 
     for owner_key, other_key in ((a.key, b.key), (b.key, a.key)):
         for stat in derived[owner_key]["deficits"]:
@@ -662,10 +701,33 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     def hurt(
         source_key: str, target_key: str, damage: int, number: int,
         pierce_guard: float = 0.0,
+        allow_shield_reactions: bool = False,
     ) -> tuple[int, bool]:
         """Apply damage and one-shot defensive effects. Returns (impact, knockout)."""
         damage = max(0, int(damage))
         damage = round(damage * derived[target_key]["incoming_damage_multiplier"])
+        # The parry is an incoming-hit reaction, not a Defend hook: its wearer may be
+        # attacked while taking any action.  It can proc once per fight, so it buys a
+        # meaningful turn without creating a stun lock against a boss or a pet.
+        if allow_shield_reactions and effectful and damage and source_key != target_key:
+            shield = equipped_shields[target_key] or {}
+            for effect in shield.get("on_hit_effects", ()):
+                if str(effect.get("op") or "") != "parry_stun" \
+                        or "parry_stun" in used_shield_reactions[target_key]:
+                    continue
+                chance = max(0.0, min(1.0, float(effect.get("chance", 0) or 0)))
+                # This is the shield's first-hit roll, whether it succeeds or not.
+                # Retrying a miss on every hit would make the listed chance misleading.
+                used_shield_reactions[target_key].add("parry_stun")
+                if rng.random() >= chance:
+                    continue
+                before_parry = damage
+                reduction = max(0.0, min(1.0, float(effect.get("reduce", 0) or 0)))
+                damage = round(damage * (1.0 - reduction))
+                parried = max(0, before_parry - damage)
+                if parried:
+                    stunned[source_key] = True
+                    effect_round(number, target_key, source_key, "shield_parry_stun", parried)
         if damage and guards[target_key] > 0:
             before_guard = damage
             blocked_share = guards[target_key] * max(0.0, 1.0 - min(1.0, pierce_guard))
@@ -734,7 +796,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     def apply_attack(
         source_key: str, target_key: str, damage: int, number: int, *,
         attack_types=(PHYSICAL,), enchanted: bool = False, pierce_guard: float = 0.0,
-        allow_reflection: bool = True,
+        allow_reflection: bool = True, allow_shield_reactions: bool = True,
     ) -> tuple[int, bool, str | None]:
         """Deal one classified attack and, where applicable, resolve Antimage's return.
 
@@ -745,9 +807,16 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         attack_types = normalize_attack_types(attack_types)
         impact, knocked_out = hurt(
             source_key, target_key, damage, number, pierce_guard=pierce_guard,
+            allow_shield_reactions=allow_shield_reactions,
         )
-        if knocked_out or not allow_reflection or not impact:
+        if knocked_out or not impact:
             return impact, knocked_out, None
+        if allow_shield_reactions:
+            reaction_winner = resolve_shield_on_hit(source_key, target_key, impact, number)
+            if reaction_winner:
+                return impact, False, reaction_winner
+        if not allow_reflection:
+            return impact, False, None
         defender = fighters[target_key]
         reflect = max(
             defender.magic_reflect_multiplier if is_magic_attack(attack_types) else 0.0,
@@ -767,6 +836,47 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attack_types=(MAGIC,),
         ))
         return impact, False, target_key if back_knockout else None
+
+    def resolve_shield_on_hit(
+        source_key: str, target_key: str, impact: int, number: int,
+    ) -> str | None:
+        """Resolve the worn shield's post-hit hooks from actual HP lost.
+
+        ``impact`` is returned by :func:`hurt` after armour, guard, barriers and rescue
+        effects.  Healing from it therefore means exactly what the item says: a share
+        of health actually lost, never a share of an advertised raw attack.  Counter-
+        attacks are one per fight and suppress further shield reactions so two reactive
+        shields cannot ping-pong forever.
+        """
+        if not impact:
+            return None
+        shield = equipped_shields[target_key] or {}
+        for effect in shield.get("on_hit_effects", ()):
+            op = str(effect.get("op") or "")
+            if op == "damage_heal":
+                percent = max(0.0, min(1.0, float(effect.get("percent", 0) or 0)))
+                before = hp[target_key]
+                hp[target_key] = min(max_hp[target_key], hp[target_key] + impact * percent)
+                healed = round(hp[target_key] - before)
+                if healed:
+                    effect_round(number, target_key, source_key, "shield_damage_heal", healed)
+            elif op == "counterattack" and "counterattack" not in used_shield_reactions[target_key]:
+                used_shield_reactions[target_key].add("counterattack")
+                percent = max(0.0, float(effect.get("percent", 0) or 0))
+                raw_counter = max(1, round(derived[target_key]["damage"] * percent))
+                counter_impact, counter_ko, _counter_reflection = apply_attack(
+                    target_key, source_key, raw_counter, number,
+                    attack_types=(PHYSICAL,), allow_reflection=False,
+                    allow_shield_reactions=False,
+                )
+                total_damage[target_key] += counter_impact
+                effect_round(
+                    number, target_key, source_key, "shield_counterattack", counter_impact,
+                    (PHYSICAL,),
+                )
+                if counter_ko:
+                    return target_key
+        return None
 
     def skill_value(key: str, name: str) -> float:
         value = skill_statuses[key].get(name)
@@ -843,7 +953,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         # defensive procs, rather than its advertised raw multiplier: Predator Bite
         # promises to heal from what it dealt, and a fully blocked bite dealt nothing.
         lifesteal = max(0.0, min(1.0, float(effect.get("lifesteal", 0) or 0)))
-        if impact and lifesteal:
+        # A reactive counter can kill the caster before this post-hit step.  A dead
+        # caster must not be revived by a lifesteal record written after the counter.
+        if impact and lifesteal and not reflection_winner:
             before = hp[source_key]
             hp[source_key] = min(max_hp[source_key], hp[source_key] + impact * lifesteal)
             healed = round(hp[source_key] - before)
@@ -1160,6 +1272,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             burn_impact, burn_ko, reflection_winner = apply_attack(
                 source_key, attacker_key, burn_damage, round_number,
                 attack_types=burn_attack_types,
+                # A burn tick is damage over time, not a fresh incoming attack.  It
+                # must not spend a first-hit parry or provoke a counterattack.
+                allow_shield_reactions=False,
             )
             total_damage[source_key] += burn_impact
             effect_round(
@@ -1412,6 +1527,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             impact, knocked_out, reflection_winner = damage, hp[defender_key] <= 0, None
         total_damage[attacker_key] += impact
         text = pets_flavor.line(event, attacker.name, defender.name, damage, rng=rng)
+        attacks_made[attacker_key] += 1
+        if damage:
+            landed_hits[attacker_key] += 1
         rounds.append(Round(
             number=round_number,
             attacker=attacker_key,
@@ -1422,11 +1540,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             text=text,
             attack_types=(PHYSICAL,),
         ))
-        attacks_made[attacker_key] += 1
         if reflection_winner:
             return reflection_winner
-        if damage:
-            landed_hits[attacker_key] += 1
         if impact and not knocked_out:
             reflected_winner = reflect_skill_damage(
                 attacker_key, defender_key, impact, round_number,

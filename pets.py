@@ -52,6 +52,7 @@ PETS_STORE_VERSION = 7
 # -- mirrors economy.py's LOG_LIMIT convention for the same reason: trimming this can
 # never change anybody's stats, wins or gold, all of which live on the per-pet record.
 FIGHT_LOG_LIMIT = 2_000
+FIGHT_AUDIT_LIMIT = 500
 # Store-level marker: this chat's one-off cage-upgrade refund has already been paid out.
 # See refund_cage_upgrades for why the per-user lock alone would keep paying forever.
 CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
@@ -100,6 +101,10 @@ _farm_settlement_lock = threading.RLock()
 
 def _pets_path(entry: str):
     return stats._stats_dir() / f"{stats._cache_key(entry)}_pets.json"
+
+
+def _fight_audit_path(entry: str, fight_id_: str):
+    return stats._stats_dir() / f"{stats._cache_key(entry)}_fight_audits" / f"{fight_id_}.json"
 
 
 def _normalise_dungeon_run(run) -> dict | None:
@@ -153,7 +158,7 @@ def _normalise_dungeon_run(run) -> dict | None:
 
 def _empty() -> dict:
     return {
-        "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
+        "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "fight_audits": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "dungeon_tickets": {}, "rubies": {},
         "scroll_wallets": {}, "scroll_notifications": [],
         "storefront_sales": {},
@@ -191,6 +196,9 @@ def _load(entry: str) -> dict:
         return _empty()
     data.setdefault("pets", {})
     data.setdefault("fights", [])
+    audits = data.setdefault("fight_audits", [])
+    data["fight_audits"] = [row for row in audits if isinstance(row, dict)][-FIGHT_AUDIT_LIMIT:] \
+        if isinstance(audits, list) else []
     data.setdefault("duels", {})
     data.setdefault("gift_history", [])
     # A store written before tickets existed simply has none; nothing to migrate.
@@ -713,6 +721,28 @@ def toggle_fight_result_notifications(entry, user_id) -> bool:
     return record["fight_result_notifications"]
 
 
+def pve_replays_skipped(entry, user_id) -> bool:
+    """Whether mob battles should settle without opening their animated replay.
+
+    This is deliberately separate from private arena-result notifications: it only
+    controls the Mini App's own PVE playback, and old pets retain the new default of
+    watching their mob fights.
+    """
+    pet = get_pet(entry, user_id)
+    return bool(pet and pet.get("skip_pve_replays", False))
+
+
+def toggle_pve_replays_skipped(entry, user_id) -> bool:
+    """Flip the persistent mob-replay preference and return its new skip state."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False
+    record["skip_pve_replays"] = not bool(record.get("skip_pve_replays", False))
+    _save(entry, data)
+    return record["skip_pve_replays"]
+
+
 def has_cage(entry, user_id) -> bool:
     """Every player starts with the free level-one cage needed to create a pet."""
     return True
@@ -1048,6 +1078,7 @@ def _farm_reward(data: dict, record: dict, run: dict) -> dict:
         return {"gold": 0, "xp": 0, "item_code": None}
     run_id = str(run.get("run_id") or "")
     level = min(max(1, int(run.get("level", 1) or 1)), C.FARM_MAX_LEVEL)
+    pet_level = max(1, int(run.get("pet_level", 1) or 1))
     features = run.get("features") if isinstance(run.get("features"), dict) else {}
     # A run started before luck affected drops has no snapshot; zero reproduces exactly
     # the chance it was promised when the pet left.
@@ -1056,7 +1087,7 @@ def _farm_reward(data: dict, record: dict, run: dict) -> dict:
     rng = random.Random(f"{run_id}:{hours}")
     found = _farm_item_for(data, record, rng, hours, drop_chance)
     return {
-        "gold": C.farm_gold_for(level, hours, gold_multiplier),
+        "gold": C.farm_gold_for(level, hours, gold_multiplier, pet_level),
         "xp": C.farm_xp_for(level, hours, xp_multiplier),
         "item_code": found.code if found is not None else None,
     }
@@ -1169,12 +1200,13 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
     # committed by looking, so unlike the frozen `reward` below this always reflects what
     # tapping that button right now would actually pay.
     live_luck = int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0)
+    live_pet_level = max(1, int(record.get("level", 1) or 1))
     hour_previews = []
     for hours in C.FARM_HOUR_CHOICES:
         gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours, live_luck)
         hour_previews.append({
             "hours": hours,
-            "gold": C.farm_gold_for(estimate_level, hours, gold_multiplier),
+            "gold": C.farm_gold_for(estimate_level, hours, gold_multiplier, live_pet_level),
             "xp": C.farm_xp_for(estimate_level, hours, xp_multiplier),
             "drop_chance": drop_chance,
         })
@@ -1220,7 +1252,7 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         "feature_costs": {key: int(spec["cost"]) for key, spec in C.FARM_FEATURES.items()},
         "next_level_cost": C.FARM_UPGRADE_COSTS[level] if level < C.FARM_MAX_LEVEL else None,
         "next_level_bonus": (
-            f"{C.FARM_GOLD_PER_RUN[level + 1]} монет · {C.FARM_XP_PER_RUN[level + 1]} опыта"
+            f"{C.farm_gold_for(level + 1, C.FARM_DURATION_HOURS, pet_level=live_pet_level)} монет · {C.FARM_XP_PER_RUN[level + 1]} опыта"
             f" за {C.FARM_DURATION_HOURS}-часовую смену"
             if level < C.FARM_MAX_LEVEL else None
         ),
@@ -1241,9 +1273,9 @@ def start_farm(
 
     The run snapshots the CURRENT farm level and features onto itself, not the reward --
     the reward is deliberately rolled later, at settlement, from this snapshot and however
-    many hours turn out to have actually been worked (see _farm_reward). Freezing level and
-    features here rather than reading them live at settlement is what still guarantees an
-    upgrade bought while the pet is away only affects the NEXT trip.
+    many hours turn out to have actually been worked (see _farm_reward). Freezing farm and
+    pet level, plus features, here rather than reading them live at settlement guarantees
+    that progress made while the pet is away affects only the NEXT trip.
     """
     moment = now or app_now()
     # Finish a due run first so a user who opens the menu after their shift ends is not
@@ -1272,6 +1304,7 @@ def start_farm(
         "ready_at": ready_at.isoformat(),
         "hours": hours,
         "level": level,
+        "pet_level": max(1, int(record.get("level", 1) or 1)),
         "features": _farm_features(record),
         "luck": int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0),
     }
@@ -1526,12 +1559,25 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
         except (KeyError, TypeError, ValueError):
             ready = True
     upgraded = bool(data.get("pickaxe_nmm", {}).get(str(user_id)))
+    previews = []
+    for hours in C.QUARRY_HOUR_CHOICES:
+        ruby_min, ruby_max = C.QUARRY_RUBIES_BY_HOURS[hours]
+        upgrade_bonus = max(1, round(3 * hours / C.QUARRY_DURATION_HOURS)) if upgraded else 0
+        previews.append({
+            "hours": hours,
+            "ruby_min": ruby_min + upgrade_bonus,
+            "ruby_max": ruby_max + upgrade_bonus,
+            "gold": C.QUARRY_GOLD_BY_HOURS[hours],
+            "xp": C.QUARRY_XP_BY_HOURS[hours],
+            "drop_chance": C.QUARRY_DROP_CHANCE_BY_HOURS[hours],
+        })
     return {
         "available": True, "running": bool(mine) and not ready, "ready": ready,
         "seconds_left": seconds_left, "pickaxe_runs": max(0, int(record.get("pickaxe_runs", 0) or 0)),
         "pickaxe_upgraded": upgraded, "cost": C.PICKAXE_COST,
         "runs_per_pickaxe": C.PICKAXE_RUNS, "duration_hours": C.QUARRY_DURATION_HOURS,
         "ruby_min": C.QUARRY_RUBY_MIN, "ruby_max": C.QUARRY_RUBY_MAX,
+        "hour_previews": previews,
     }
 
 
@@ -1559,7 +1605,13 @@ def unlock_nmm_pickaxe(entry: str, user_id) -> bool:
     return True
 
 
-def start_quarry(entry: str, user_id) -> tuple[bool, str]:
+def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> tuple[bool, str]:
+    try:
+        hours = int(hours)
+    except (TypeError, ValueError):
+        return False, "Выбери 1, 2, 4 или 8 часов."
+    if hours not in C.QUARRY_HOUR_CHOICES:
+        return False, "Выбери 1, 2, 4 или 8 часов."
     moment = app_now()
     settle_quarry(entry, user_id, now=moment)
     with _farm_settlement_lock:
@@ -1574,10 +1626,11 @@ def start_quarry(entry: str, user_id) -> tuple[bool, str]:
             return False, "Нужна кирка с зарядами."
         record["pickaxe_runs"] = runs - 1
         record["quarry_run"] = {
-            "run_id": secrets.token_hex(16), "ready_at": (moment + timedelta(hours=C.QUARRY_DURATION_HOURS)).isoformat(),
+            "run_id": secrets.token_hex(16), "hours": hours,
+            "ready_at": (moment + timedelta(hours=hours)).isoformat(),
         }
         _save(entry, data)
-    return True, "Кирка в карьере. Возвращайся через 8 часов."
+    return True, f"Кирка в карьере. Возвращайся через {hours} ч."
 
 
 def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | None:
@@ -1589,14 +1642,30 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
         if not isinstance(run, dict) or not _farm_run_ready(run, moment):
             return None
         run_id = str(run.get("run_id") or "recovered")
-        rng = random.Random(f"quarry:{run_id}")
-        rubies = rng.randint(C.QUARRY_RUBY_MIN, C.QUARRY_RUBY_MAX)
-        if data.get("pickaxe_nmm", {}).get(str(user_id)):
-            rubies += 3
+        hours = int(run.get("hours", C.QUARRY_DURATION_HOURS) or C.QUARRY_DURATION_HOURS)
+        hours = hours if hours in C.QUARRY_HOUR_CHOICES else C.QUARRY_DURATION_HOURS
+        rng = random.Random(f"quarry:{run_id}:{hours}")
+        ruby_min, ruby_max = C.QUARRY_RUBIES_BY_HOURS[hours]
+        rubies = rng.randint(ruby_min, ruby_max)
+        upgraded = bool(data.get("pickaxe_nmm", {}).get(str(user_id)))
+        if upgraded:
+            rubies += max(1, round(3 * hours / C.QUARRY_DURATION_HOURS))
+        gold = C.QUARRY_GOLD_BY_HOURS[hours]
+        xp = C.QUARRY_XP_BY_HOURS[hours]
+        _apply_xp(record, xp)
         record["quarry_run"] = None
         _save(entry, data)
     grant_rubies_once(entry, user_id, rubies, f"quarry:{run_id}")
-    return {"rubies": rubies, "upgraded": bool(data.get("pickaxe_nmm", {}).get(str(user_id)))}
+    economy.grant_once(entry, user_id, gold, f"pet:quarry:{run_id}")
+    dropped = grant_random_drop(
+        entry, user_id, C.QUARRY_DROP_CHANCE_BY_HOURS[hours],
+        seed=f"quarry-drop:{run_id}:{hours}",
+    )
+    return {
+        "hours": hours, "rubies": rubies, "gold": gold, "xp": xp,
+        "drop_chance": C.QUARRY_DROP_CHANCE_BY_HOURS[hours],
+        "dropped": dropped, "upgraded": upgraded,
+    }
 
 
 def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
@@ -2439,6 +2508,9 @@ def _combat_shield_for(record: dict | None) -> dict | None:
         "defend_effects": tuple(
             dict(row) for row in effect.get("defend_effects", ()) if isinstance(row, dict)
         ),
+        "on_hit_effects": tuple(
+            dict(row) for row in effect.get("on_hit_effects", ()) if isinstance(row, dict)
+        ),
     }
 
 
@@ -2635,6 +2707,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
     if not D.DUNGEON_OPEN:
         return False, D.DUNGEON_CLOSED_NOTICE, None
     reward = None
+    moment = app_now()
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
@@ -2687,6 +2760,19 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63), max_actions=1)
             else:
                 result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
+            fight_id_ = _new_fight_id(moment)
+            try:
+                result = replace(result, fight_id=fight_id_)
+            except TypeError:
+                # Lightweight test doubles and legacy integrations are mutable objects,
+                # not dataclasses; preserve their shape while attaching the receipt id.
+                setattr(result, "fight_id", fight_id_)
+            _store_fight_audit(entry, data, _fight_audit_row(
+                fight_id_, "dungeon", moment, result, (hero, enemy),
+                {str(user_id): record},
+                {"floor": floor, "index": row["index"], "encounter": row["code"],
+                 "boss": bool(row.get("boss")), "gimmick": row.get("gimmick")},
+            ))
             player_hp = 0
             for turn in reversed(result.rounds):
                 if turn.attacker == str(user_id):
@@ -3565,15 +3651,139 @@ def legendary_pity_progress(entry: str, user_id) -> dict:
     }
 
 
+def _new_fight_id(moment: datetime) -> str:
+    return f"F-{moment.strftime('%Y%m%d')}-{secrets.token_hex(6).upper()}"
+
+
+def _audit_item(code) -> dict | None:
+    item = C.find_item(code)
+    if item is None:
+        return None
+    return {
+        "code": item.code, "name": item.name, "slot": item.slot,
+        "rarity": item.rarity, "bonuses": dict(item.bonuses),
+        "effect": dict(item.effect), "description": item.description,
+    }
+
+
+def _fight_audit_row(
+    fight_id_: str, kind: str, moment: datetime, result, fighters: tuple,
+    records: dict | None = None, context: dict | None = None,
+) -> dict:
+    """Immutable inputs and post-event state for an administrator's validity audit."""
+    records = records or {}
+    sides = {}
+    for fighter in fighters:
+        opponent = next((other for other in fighters if other.key != fighter.key), fighter)
+        record = records.get(str(fighter.key)) if isinstance(records, dict) else None
+        equipped = (record or {}).get("equipped") if isinstance(record, dict) else {}
+        items = []
+        for slot, code in (equipped or {}).items():
+            item = _audit_item(code)
+            if item is not None:
+                item["slot"] = slot
+                items.append(item)
+        snapshot = pets_combat.snapshot(fighter)
+        sides[str(fighter.key)] = {
+            "fighter": snapshot,
+            "derived": pets_combat.derive(fighter, opponent),
+            "base_stats": dict((record or {}).get("stats") or {}),
+            "equipped": items,
+            "skill_slots": list(snapshot.get("skills") or ()),
+            "shield": snapshot.get("shield"),
+            "owner_name": (record or {}).get("owner_name"),
+            "owner_username": (record or {}).get("owner_username"),
+        }
+    return {
+        "fight_id": fight_id_, "kind": kind, "at": moment.isoformat(),
+        "seed": getattr(result, "seed", None), "winner": getattr(result, "winner", None),
+        "loser": getattr(result, "loser", None), "draw": bool(getattr(result, "is_draw", False)),
+        "stopped_early": bool(getattr(result, "stopped_early", False)),
+        "opening": getattr(result, "opening", ""), "closing": getattr(result, "closing", ""),
+        "total_damage": dict(getattr(result, "total_damage", {}) or {}),
+        "final_hp": dict(getattr(result, "final_hp", {}) or {}),
+        "fighters": sides, "context": dict(context or {}),
+        "moves": [{
+            "index": index, "round": row.number, "attacker": row.attacker,
+            "event": row.event, "damage": row.damage, "attacker_hp": row.attacker_hp,
+            "defender_hp": row.defender_hp, "attack_types": list(row.attack_types),
+            "text": row.text, "state": row.state,
+        } for index, row in enumerate(getattr(result, "rounds", ()), 1)],
+    }
+
+
+def _store_fight_audit(entry: str, data: dict, row: dict) -> None:
+    """Write the heavy transcript separately; keep only its picker row in hot state."""
+    path = _fight_audit_path(entry, row["fight_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stats._write_json_atomic(path, row)
+    summary = {
+        "fight_id": row.get("fight_id"), "kind": row.get("kind"), "at": row.get("at"),
+        "winner": row.get("winner"), "draw": row.get("draw"),
+        "fighters": [{"key": key, "name": (side.get("fighter") or {}).get("name")}
+                     for key, side in (row.get("fighters") or {}).items()],
+        "moves": len(row.get("moves") or ()),
+    }
+    summaries = data.setdefault("fight_audits", [])
+    summaries.append(summary)
+    expired = summaries[:-FIGHT_AUDIT_LIMIT]
+    del summaries[:-FIGHT_AUDIT_LIMIT]
+    for old in expired:
+        old_id = str((old or {}).get("fight_id") or "")
+        if old_id.startswith("F-") and old_id.replace("-", "").isalnum():
+            try:
+                _fight_audit_path(entry, old_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def fight_audits(entry: str, limit: int = 100) -> list[dict]:
+    """Newest audit summaries. Full state is returned only by ``find_fight_audit``."""
+    rows = _load(entry).get("fight_audits", [])
+    limit = max(1, min(500, int(limit or 100)))
+    return [dict(row) for row in reversed(rows[-limit:])]
+
+
+def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
+    wanted = str(fight_id_ or "").strip().upper()
+    if not (
+        10 <= len(wanted) <= 40 and wanted.startswith("F-")
+        and wanted.replace("-", "").isascii() and wanted.replace("-", "").isalnum()
+    ):
+        return None
+    path = _fight_audit_path(entry, wanted)
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        row = None
+    if isinstance(row, dict) and str(row.get("fight_id") or "").upper() == wanted:
+        return row
+    # Compatibility with audit rows written briefly into the main store during rollout.
+    for row in reversed(_load(entry).get("fight_audits", [])):
+        if str(row.get("fight_id") or "").upper() == wanted:
+            return dict(row) if "moves" in row and isinstance(row.get("moves"), list) else None
+    return None
+
+
 def record_fight(
     entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
     now: datetime | None = None,
 ) -> dict:
     moment = now or app_now()
     data = _load(entry)
+    fight_id_ = _new_fight_id(moment)
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     attacker = data["pets"][attacker_uid]
     defender = data["pets"][defender_uid]
+    audit_records = {
+        uid: {
+            "stats": dict(record.get("stats") or {}),
+            "equipped": dict(record.get("equipped") or {}),
+            "owner_name": record.get("owner_name"),
+            "owner_username": record.get("owner_username"),
+        }
+        for uid, record in ((attacker_uid, attacker), (defender_uid, defender))
+    }
     # Only the ATTACKER's farm status is a hard stop here. This is the last-line safety net
     # behind can_attack_in_arena/claim_duel's own attacker-only check (a stale UI tap could
     # otherwise slip through); the defender being away farming is not a reason to block --
@@ -3596,6 +3806,7 @@ def record_fight(
         _, attacker_levels_gained = _apply_xp(attacker, C.DRAW_XP)
         _, defender_levels_gained = _apply_xp(defender, C.DRAW_XP)
         data["fights"].append({
+            "fight_id": fight_id_,
             "ts": moment.isoformat(),
             "date": today.isoformat(),
             "attacker_id": attacker_uid,
@@ -3615,8 +3826,18 @@ def record_fight(
             "total_damage": dict(getattr(result, "total_damage", {})),
             "combat_snapshot": combat_snapshot,
         })
+        audit_fighters = tuple(filter(None, (
+            pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(attacker_uid)),
+            pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(defender_uid)),
+        )))
+        if len(audit_fighters) == 2:
+            _store_fight_audit(entry, data, _fight_audit_row(
+                fight_id_, "arena", moment, result, audit_fighters,
+                audit_records,
+            ))
         _save(entry, data)
         return {
+            "fight_id": fight_id_,
             "draw": True,
             "gold": 0,
             "loss_gold": 0,
@@ -3785,6 +4006,7 @@ def record_fight(
     # Names/owners are snapshotted INTO the log entry rather than looked up when
     # history() is read, so a later rename does not rewrite what already happened.
     data["fights"].append({
+        "fight_id": fight_id_,
         "ts": moment.isoformat(),
         "date": today.isoformat(),
         "attacker_id": attacker_uid,
@@ -3810,6 +4032,15 @@ def record_fight(
         "total_damage": dict(getattr(result, "total_damage", {})),
         "combat_snapshot": combat_snapshot,
     })
+    audit_fighters = tuple(filter(None, (
+        pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(attacker_uid)),
+        pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(defender_uid)),
+    )))
+    if len(audit_fighters) == 2:
+        _store_fight_audit(entry, data, _fight_audit_row(
+            fight_id_, "arena", moment, result, audit_fighters,
+            audit_records,
+        ))
     _save(entry, data)
 
     ruby_source = f"arena-ruby:{moment.isoformat()}:{winner_uid}:{loser_uid}"
@@ -3820,6 +4051,7 @@ def record_fight(
 
     attacker_won = winner_uid == attacker_uid
     return {
+        "fight_id": fight_id_,
         "draw": False,
         "gold": gold if attacker_won else 0,
         "loss_gold": 0 if attacker_won else paid,
@@ -4322,6 +4554,7 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
     log -- a mob has no history to keep and no name to snapshot.
     """
     moment = now or app_now()
+    fight_id_ = _new_fight_id(moment)
     mob = M.find_mob(block.get("code"))
     if mob is None:
         raise ValueError("Такого моба нет.")
@@ -4332,6 +4565,9 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
             raise ValueError("Сначала приручи существо.")
         if _is_farming_record(record, moment):
             raise ValueError("Питомец на ферме и не может участвовать в бою.")
+        # Snapshot before XP settlement: a level-up earned by this result must not rewrite
+        # the inputs that actually entered combat.
+        audit_hero = _dungeon_fighter(record, str(user_id))
         # PVE's OWN counter -- the arena bank is untouched by a mob fight and vice versa.
         window = _pve_window(moment)
         used = (
@@ -4363,6 +4599,11 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
         _metric_add(data, "pve_fights")
         if gold:
             _metric_add(data, "pve_gold_minted", gold)
+        enemy = mob_fighter(block)
+        _store_fight_audit(entry, data, _fight_audit_row(
+            fight_id_, "pve", moment, result, (audit_hero, enemy), {str(user_id): record},
+            {"mob": {"code": mob.code, "name": mob.name, "tier": tier}},
+        ))
         _save(entry, data)
 
     if gold:
@@ -4387,6 +4628,7 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
             grant_dungeon_ticket(entry, user_id)
             dungeon_ticket = True
     return {
+        "fight_id": fight_id_,
         "won": won, "draw": bool(getattr(result, "is_draw", False)),
         "gold": gold, "xp": xp, "levels_gained": levels_gained,
         "level": get_pet(entry, user_id).get("level", 1) if get_pet(entry, user_id) else 1,
@@ -4436,7 +4678,8 @@ def fight_id(fight: dict) -> str:
     miss instead of an error. "~" is unreserved in a URL and needs no encoding anywhere,
     and the swap is undone on lookup, so what is stored stays a plain ISO timestamp.
     """
-    return str((fight or {}).get("ts") or "").replace("+", "~")
+    stable = str((fight or {}).get("fight_id") or "")
+    return stable or str((fight or {}).get("ts") or "").replace("+", "~")
 
 
 def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) -> dict | None:
@@ -4493,11 +4736,15 @@ def find_fight(entry, user_id, wire_id) -> dict | None:
     read one back out of a chat-wide log by guessing a timestamp.
     """
     uid = str(user_id)
-    wanted = str(wire_id or "").replace("~", "+")
+    wire = str(wire_id or "")
+    wanted = wire.replace("~", "+")
     if not wanted:
         return None
     for fight in _load(entry).get("fights", []):
-        if not isinstance(fight, dict) or str(fight.get("ts") or "") != wanted:
+        if not isinstance(fight, dict) or (
+            str(fight.get("fight_id") or "") != wire
+            and str(fight.get("ts") or "") != wanted
+        ):
             continue
         if uid not in (str(fight.get("attacker_id")), str(fight.get("defender_id"))):
             continue

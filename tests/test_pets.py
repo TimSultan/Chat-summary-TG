@@ -1,3 +1,4 @@
+import json
 import random
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from urllib.parse import parse_qs
 import app_time
 import economy
 import pets
+import pets_combat
 import pets_config
 import pets_ui
 import pets_weapon_catalog
@@ -2518,6 +2520,30 @@ class FarmTicketTests(PetsTestCase):
 
 
 class FightLookupTests(PetsTestCase):
+    def test_live_fight_gets_stable_id_and_full_audit_record(self):
+        entry = "audit"
+        self._tame(entry, "1", "One")
+        self._tame(entry, "2", "Two")
+        a = pets._dungeon_fighter(pets._load(entry)["pets"]["1"], "1")
+        b = pets._dungeon_fighter(pets._load(entry)["pets"]["2"], "2")
+        result = pets_combat.simulate(a, b, seed=441)
+        snapshot = {"seed": 441, "fighters": {
+            "1": pets_combat.snapshot(a), "2": pets_combat.snapshot(b),
+        }}
+
+        reward = pets.record_fight(
+            entry, "1", "2", result, date(2026, 8, 15), combat_snapshot=snapshot,
+            now=datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertRegex(reward["fight_id"], r"^F-20260815-[0-9A-F]{12}$")
+        audit = pets.find_fight_audit(entry, reward["fight_id"])
+        self.assertEqual(audit["fight_id"], reward["fight_id"])
+        self.assertEqual(audit["kind"], "arena")
+        self.assertEqual(set(audit["fighters"]), {"1", "2"})
+        self.assertEqual(len(audit["moves"]), len(result.rounds))
+        self.assertIn("state", audit["moves"][0])
+        json.dumps(audit)
+
     def test_a_fight_id_is_url_safe_and_only_its_participants_can_read_it(self):
         """The id travels in a query string, and a raw "+" from the timezone offset would
         decode there as a space -- a silent miss for any caller that forgot to encode it.
@@ -2547,6 +2573,72 @@ class FightLookupTests(PetsTestCase):
         self.assertIsNone(pets.find_fight(entry, "3", wire_id))
         self.assertIsNone(pets.find_fight(entry, "1", ""))
         self.assertIsNone(pets.find_fight(entry, "1", "2020-01-01T00:00:00"))
+
+
+class QuarryTests(PetsTestCase):
+    def _give_pickaxe_charge(self, entry="quarry", uid="1"):
+        self._tame(entry, uid)
+        data = pets._load(entry)
+        data["pets"][uid]["pickaxe_runs"] = 1
+        pets._save(entry, data)
+
+    def test_quarry_offers_four_reward_previews_in_one_choice_set(self):
+        self._give_pickaxe_charge()
+        status = pets.quarry_status("quarry", "1")
+        previews = status["hour_previews"]
+        self.assertEqual([row["hours"] for row in previews], [1, 2, 4, 8])
+        self.assertTrue(all(
+            row["ruby_min"] > 0 and row["ruby_max"] >= row["ruby_min"]
+            and row["gold"] > 0 and row["xp"] > 0 and row["drop_chance"] > 0
+            for row in previews
+        ))
+        self.assertEqual(
+            [row["gold"] for row in previews],
+            sorted(row["gold"] for row in previews),
+        )
+
+        text, keyboard = pets_ui.farm_view("quarry", "1", 0)
+        quarry_row = next(
+            row for row in keyboard["inline_keyboard"]
+            if len(row) == 4 and all(
+                pets_ui.parse_callback(button["callback_data"])[1] == "quarrystart"
+                for button in row
+            )
+        )
+        self.assertEqual(
+            [pets_ui.parse_callback(button["callback_data"])[2] for button in quarry_row],
+            ["1", "2", "4", "8"],
+        )
+        self.assertIn("🎁 30%", text)
+
+    def test_two_hour_quarry_pays_every_promised_reward_channel(self):
+        entry, uid = "quarry-two", "1"
+        self._give_pickaxe_charge(entry, uid)
+        started = datetime(2026, 8, 15, 10, 0)
+        with patch.object(pets, "app_now", return_value=started):
+            ok, message = pets.start_quarry(entry, uid, 2)
+        self.assertTrue(ok, message)
+        run = pets._load(entry)["pets"][uid]["quarry_run"]
+        self.assertEqual(run["hours"], 2)
+        self.assertEqual(datetime.fromisoformat(run["ready_at"]), started + timedelta(hours=2))
+
+        receipt = pets.settle_quarry(entry, uid, started + timedelta(hours=2))
+        self.assertEqual(receipt["hours"], 2)
+        self.assertEqual(receipt["gold"], pets_config.QUARRY_GOLD_BY_HOURS[2])
+        self.assertEqual(receipt["xp"], pets_config.QUARRY_XP_BY_HOURS[2])
+        self.assertEqual(receipt["drop_chance"], pets_config.QUARRY_DROP_CHANCE_BY_HOURS[2])
+        self.assertGreaterEqual(receipt["rubies"], pets_config.QUARRY_RUBIES_BY_HOURS[2][0])
+        self.assertLessEqual(receipt["rubies"], pets_config.QUARRY_RUBIES_BY_HOURS[2][1])
+        self.assertEqual(economy.balance(entry, uid, 0), receipt["gold"])
+        self.assertEqual(pets.ruby_balance(entry, uid), receipt["rubies"])
+        self.assertEqual(pets.get_pet(entry, uid)["xp"], receipt["xp"])
+        self.assertIsNone(pets._load(entry)["pets"][uid]["quarry_run"])
+
+    def test_quarry_rejects_an_unsupported_duration_without_spending_a_charge(self):
+        self._give_pickaxe_charge()
+        ok, _message = pets.start_quarry("quarry", "1", 3)
+        self.assertFalse(ok)
+        self.assertEqual(pets.quarry_status("quarry", "1")["pickaxe_runs"], 1)
 
 
 class FarmTests(PetsTestCase):
@@ -2802,6 +2894,32 @@ class FarmTests(PetsTestCase):
         # The six-hour anchor is untouched by the rebalance.
         self.assertEqual(pets_config.farm_gold_for(1, 6), pets_config.FARM_GOLD_PER_RUN[1])
         self.assertEqual(pets_config.farm_xp_for(1, 6), pets_config.FARM_XP_PER_RUN[1])
+
+    def test_farm_gold_is_rewarding_at_level_one_and_scales_with_pet_level(self):
+        """A starter can buy basic gear from one six-hour shift, while a developed
+        farm still contributes to the uncapped late-game stat economy."""
+        self.assertEqual(
+            [pets_config.farm_gold_for(1, hours) for hours in (1, 2, 4, 8)],
+            [6, 13, 28, 69],
+        )
+        self.assertEqual(pets_config.farm_gold_for(1, 6), 45)
+        self.assertEqual(pets_config.farm_gold_for(1, 6, pet_level=100), 105)
+        self.assertEqual(
+            [pets_config.farm_gold_for(10, hours, 1.5, 100) for hours in (1, 2, 4, 8)],
+            [116, 241, 514, 1259],
+        )
+
+    def test_farm_pet_level_gold_bonus_is_frozen_when_a_shift_starts(self):
+        entry, start = "farm-level-snapshot", datetime(2026, 8, 1, 10)
+        self._build_farm(entry)
+        self.assertTrue(pets.start_farm(entry, "1", 6, now=start)[0])
+        before = pets.farm_status(entry, "1", start)["reward"]
+        data = pets._load(entry)
+        data["pets"]["1"]["level"] = 100
+        pets._save(entry, data)
+        status = pets.farm_status(entry, "1", start)
+        self.assertEqual(status["reward"], before)
+        self.assertEqual(status["estimated_gold"], 105)
 
     def test_hour_previews_are_monotonic_in_gold_xp_and_drop_chance(self):
         entry = "farm-previews"

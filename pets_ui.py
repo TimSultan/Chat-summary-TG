@@ -349,7 +349,9 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 def dungeon_reward_text(receipt: dict | None) -> str:
     """Compact dungeon reward receipt for the Telegram floor redraw."""
     reward = (receipt or {}).get("reward") or {}
-    if not reward:
+    result = (receipt or {}).get("result")
+    fight_id = getattr(result, "fight_id", None)
+    if not reward and not fight_id:
         return ""
     bits = []
     if reward.get("gold"):
@@ -357,6 +359,8 @@ def dungeon_reward_text(receipt: dict | None) -> str:
     if reward.get("xp"):
         bits.append(f"✨ +{_money(int(reward['xp']))} опыта")
     lines = ["Получено: " + " · ".join(bits)] if bits else []
+    if fight_id:
+        lines.insert(0, f"<code>Fight ID: {escape(str(fight_id))}</code>")
     dropped = receipt.get("dropped") or {}
     if dropped.get("name"):
         equipped = " (надето)" if dropped.get("auto_equipped") else ""
@@ -1249,12 +1253,15 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if quarry.get("running"):
         lines.append(f"Добыча идёт. Осталось: {_farm_duration(int(quarry.get('seconds_left', 0) or 0))}.")
     else:
-        lines.append(
-            f"8 ч · 💎 {int(quarry.get('ruby_min', 18))}–{int(quarry.get('ruby_max', 25))} рубинов · "
-            f"зарядов: {int(quarry.get('pickaxe_runs', 0) or 0)}."
-        )
+        lines.append(f"Зарядов кирки: {int(quarry.get('pickaxe_runs', 0) or 0)}.")
+        for preview in quarry.get("hour_previews", []):
+            lines.append(
+                f"{int(preview['hours'])} ч — 💎 {int(preview['ruby_min'])}–{int(preview['ruby_max'])} · "
+                f"🪙 {_money(int(preview['gold']))} · ✨ {int(preview['xp'])} · "
+                f"🎁 {float(preview['drop_chance']) * 100:g}%"
+            )
         if quarry.get("pickaxe_upgraded"):
-            lines.append("Улучшенная NMM-кирка: +3 рубина за добычу.")
+            lines.append("Улучшенная NMM-кирка: бонус рубинов уже включён в расчёт выше.")
     rows = []
     if status.get("can_start"):
         # Four per row -- two rows of four -- so all eight choices fit without a single
@@ -1305,9 +1312,9 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if not quarry.get("running"):
         if int(quarry.get("pickaxe_runs", 0) or 0) > 0:
             rows.append([{
-                "text": "⛏ В карьер · 8 ч",
-                "callback_data": callback_data(user_id, "quarrystart"),
-            }])
+                "text": f"⛏ {hours}ч",
+                "callback_data": callback_data(user_id, "quarrystart", str(hours)),
+            } for hours in C.QUARRY_HOUR_CHOICES])
         else:
             rows.append([{
                 "text": f"⛏ Купить кирку · {_money(int(quarry.get('cost', 150)))}",
@@ -2318,6 +2325,8 @@ def mob_result_text(reward: dict, report: str) -> str:
         f"👾 <b>{escape(mob.get('name') or 'Моб')}</b> · {escape(mob.get('tier_name') or '')}\n",
         report,
     ]
+    if reward.get("fight_id"):
+        lines.append(f"<code>Fight ID: {escape(str(reward['fight_id']))}</code>")
     bits = []
     if reward.get("gold"):
         bits.append(f"🪙 +{_money(int(reward['gold']))}")
@@ -2406,6 +2415,8 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
     else:
         lines.append("🏆 <b>Победа</b>" if won else "💀 <b>Поражение</b>")
     if reward:
+        if reward.get("fight_id"):
+            lines.append(f"<code>Fight ID: {escape(str(reward['fight_id']))}</code>")
         if reward.get("draw"):
             lines.append(f"✨ +{reward['xp']} опыта")
         else:

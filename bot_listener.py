@@ -6495,7 +6495,7 @@ async def handle_pets_callback(
             )
             return
         if action == "quarrystart":
-            ok, note = pets.start_quarry(entry, user_id)
+            ok, note = pets.start_quarry(entry, user_id, argument or C.QUARRY_DURATION_HOURS)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
@@ -7361,6 +7361,7 @@ async def _pets_run_fight(
     attacker_username = (attacker_username or mine.get("owner_username") or "").lstrip("@")
     attacker_label = f"@{attacker_username}" if attacker_username else mine.get("owner_name") or "соперник"
     defender_reward = {
+        "fight_id": reward.get("fight_id"),
         "draw": reward.get("draw", False),
         "gold": reward.get("opponent_gold", 0),
         "loss_gold": reward.get("opponent_loss_gold", 0),

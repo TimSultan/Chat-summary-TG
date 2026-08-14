@@ -31,19 +31,20 @@ class LiveCombatTableTests(unittest.TestCase):
     def test_catalogue_has_three_regular_slots_one_ultimate_and_the_live_shields(self):
         self.assertEqual(len(scrolls.REGULAR_SCROLLS), 30)
         self.assertEqual(len(scrolls.ULTIMATE_SCROLLS), 10)
-        self.assertEqual(len(scrolls.SHIELDS), 14)
-        self.assertEqual(len(C.items_for_slot("shield")), 14)
+        self.assertEqual(len(scrolls.SHIELDS), 20)
+        self.assertEqual(len(C.items_for_slot("shield")), 20)
 
         shop = C.items_for_slot("shield", "shop")
         drops = [item for item in C.items_for_slot("shield") if item.source == "drop"]
         # The shop stays at three however many shields the loot table grows: a shield you
         # can always buy must not take a roll away from one you have to find.
         self.assertEqual(len(shop), 3)
-        self.assertEqual(len(drops), 11)
-        self.assertEqual(sum(item.rarity == "legendary" for item in drops), 5)
+        self.assertEqual(len(drops), 17)
+        self.assertEqual(sum(item.rarity == "legendary" for item in drops), 8)
         self.assertTrue(all(item.price > 0 and item.drop_weight == 0 for item in shop))
         self.assertTrue(all(item.resale_price > 0 and item.drop_weight > 0 for item in drops))
         self.assertTrue(all(item.effect and item.effect.get("defend_effects") is not None
+                            and item.effect.get("on_hit_effects") is not None
                             for item in C.items_for_slot("shield")))
 
     def test_live_strength_hp_bonus_does_not_rewrite_classic_or_historic_fights(self):
@@ -170,6 +171,7 @@ class LiveLoadoutStorageTests(unittest.TestCase):
         self.assertEqual(snapshot["code"], shield.code)
         self.assertEqual(snapshot["name"], shield.name)
         self.assertEqual(snapshot["defend_effects"], shield.effect["defend_effects"])
+        self.assertEqual(snapshot["on_hit_effects"], shield.effect["on_hit_effects"])
 
     def test_scroll_rewards_are_idempotent_and_survive_until_a_painter_tames(self):
         # Painting belongs to a person, not their current pet ownership: a rare unlock
@@ -283,7 +285,9 @@ class ScrollWordingTests(unittest.TestCase):
             self.assertTrue(all(line.strip() for line in lines), row["code"])
         for row in scrolls.SHIELDS:
             self.assertEqual(
-                len(scrolls.effect_lines(row)), len(row.get("defend_effects", ())), row["code"],
+                len(scrolls.effect_lines(row)),
+                len(row.get("defend_effects", ())) + len(row.get("on_hit_effects", ())),
+                row["code"],
             )
 
     def test_effect_wording_carries_the_tuned_numbers(self):
