@@ -15,9 +15,9 @@ THREE TIERS, priced off the PLAYER rather than off a fixed stat block. A mob is 
 relative to whoever picked the fight, so it stays a real opponent at every pet level
 instead of being trivial at 40 and impossible at 3:
 
-    лёгкий   20% weaker, ±20%    -- usually a win, occasionally a scare
-    средний  10% weaker, ±10%    -- a fight
-    сильный  15% stronger, ±15%  -- usually a loss, and paid like it
+    лёгкий   22% weaker, ±4%     -- usually a win, occasionally a scare
+    средний   5% weaker, ±4%     -- a real fight
+    сильный   5% stronger, ±4%   -- the risky option, paid accordingly
 
 The ± is per-stat, not per-mob, so an easy mob can still be quicker than you while being
 weaker overall, and the same mob is never quite the same twice.
@@ -43,8 +43,8 @@ TIER_NAMES: Final = {"easy": "лёгкий", "medium": "средний", "hard":
 # dodge and crit at once and became much stronger than its displayed tier.
 TIER_SCALING: Final = {
     "easy": (0.78, 0.04),
-    "medium": (0.90, 0.04),
-    "hard": (1.00, 0.04),
+    "medium": (0.95, 0.04),
+    "hard": (1.05, 0.04),
 }
 # What each tier pays, as a multiplier on the halved arena purse. A hard mob is worth
 # picking precisely because it is likely to beat you.

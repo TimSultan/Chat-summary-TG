@@ -91,6 +91,8 @@ _SPRITE_JOBS_KEY = web.AppKey("pets_sprite_jobs", set)
 
 TEST_BATTLE_SESSION_TTL = 30 * 60
 TEST_BATTLE_SESSION_LIMIT = 1000
+PVE_ACTION_COOLDOWN_SECONDS = 1.0
+_pve_action_cooldowns: dict[tuple[str, str], float] = {}
 
 # Item codes are ASCII and short by construction (w001, amulet_red_button, bt01). Anything
 # else never reaches the filesystem -- same two-step guard vote_web.handle_media uses.
@@ -1586,6 +1588,11 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
     if not await request.app[_IS_MEMBER_KEY](user):
         return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
     me = str(user["id"])
+    cooldown_key = (entry, me)
+    current = time.monotonic()
+    if current < _pve_action_cooldowns.get(cooldown_key, 0.0):
+      return _json_error("Подожди секунду перед следующим боем.", status=429, code="PVE_COOLDOWN")
+    _pve_action_cooldowns[cooldown_key] = current + PVE_ACTION_COOLDOWN_SECONDS
     mine = pets.get_pet(entry, me)
     if mine is None:
         return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
@@ -3814,7 +3821,9 @@ function dungeonPanel() {
   }
   if (!dungeon.active) {
     const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
-    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Три врага на этаж. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>⚔️ Войти · ' + dungeon.entry_cost + ' 💎</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · ' + (Number(dungeon.entry_cost || 0) + Number(dungeon.escalator_cost || 0)) + ' 💎</button>' : '') + '</div></div>';
+    const ticket = Number(dungeon.tickets || 0);
+    const entryLabel = ticket ? '⚔️ Войти · билет (' + ticket + ')' : '⚔️ Войти · ' + dungeon.entry_cost + ' 💎';
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Три врага на этаж. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · ' + (Number(dungeon.escalator_cost || 0)) + ' 💎</button>' : '') + '</div></div>';
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
@@ -4058,10 +4067,6 @@ async function renderArena() {
     debuffNote(FOES.my_debuff) +
     "</div>" +
     (blocked ? '<div class="panel"><div class="small">' + esc(blocked) + "</div></div>" : "") +
-    '<div class="panel"><h2>🧪 Пошаговый бой · тест</h2>' +
-      '<div class="small muted" style="margin-bottom:9px">Четыре свитка, щиты, защита и ручные ходы. ' +
-      'Результаты, награды и счётчики не записываются.</div>' +
-      '<button class="go" data-testbattle="open">Открыть боевую песочницу</button></div>' +
     // Above everything, including PVE: it is one day, and the point of it is that
     // nobody has to go looking.
     birthdayPanel() +
@@ -4072,7 +4077,11 @@ async function renderArena() {
       (FOES.opponents.length
         ? FOES.opponents.map((foe) => foeRow(foe, !blocked)).join("")
         : '<div class="empty">Больше ни у кого нет существа.</div>') +
-    "</div>";
+    "</div>" +
+    '<div class="panel"><h2>🧪 Пошаговый бой · тест</h2>' +
+      '<div class="small muted" style="margin-bottom:9px">Четыре свитка, щиты, защита и ручные ходы. ' +
+      'Результаты, награды и счётчики не записываются.</div>' +
+      '<button class="go" data-testbattle="open">Открыть боевую песочницу</button></div>';
   paintShots(box);
 }
 
@@ -4461,6 +4470,8 @@ function showTestCatalog() {
 // ------------------------------------------------------------------------------- PVE
 const TIER_TONE = { easy: "win", medium: "gold", hard: "loss" };
 let MOB = null;
+let MOB_REPLAY = null;
+let MOB_FIGHT_BUSY = false;
 
 async function rollMob() {
   try {
@@ -4471,15 +4482,28 @@ async function rollMob() {
 }
 
 async function fightMob() {
-  if (!MOB) return;
+  if (!MOB || MOB_FIGHT_BUSY) return;
+  MOB_FIGHT_BUSY = true;
+  render();
   let data;
   try {
     data = await api("/api/mob", { code: MOB.code, tier: MOB.tier });
-  } catch (e) { haptic("no"); toast(e.message); MOB = null; render(); return; }
+  } catch (e) { haptic("no"); toast(e.message); MOB = null; render(); MOB_FIGHT_BUSY = false; return; }
   S = data.state;
   MOB = null;
   FOES = null;
-  playDuel(data);
+  MOB_REPLAY = data;
+  MOB_FIGHT_BUSY = false;
+  render();
+  const reward = data.reward || {};
+  const result = data.winner === String(data.you) ? "Победа" : (data.draw ? "Ничья" : "Поражение");
+  sheet('<h3>' + esc(result) + '</h3><div class="small">' + esc((data.mob || {}).name || "Моб") +
+    '</div><div class="qreward">🪙 ' + money(reward.gold || 0) + ' · ✨ ' + Number(reward.xp || 0) +
+    (reward.rubies ? ' · 💎 ' + Number(reward.rubies) : '') +
+    (reward.rune && reward.rune.granted ? ' · 🔮 ' + esc(reward.rune.element) + ' +' + Number(reward.rune.granted) : '') +
+    (reward.farm_ticket ? ' · 🎟️ ферма +1' : '') +
+    (reward.dungeon_ticket ? ' · 🎫 подземелье +1' : '') + '</div>' +
+    '<div class="acts"><button class="go" data-mobreplay="1">Посмотреть бой</button></div>');
 }
 
 function birthdayAdmin(data) {
@@ -4708,7 +4732,7 @@ function mobPanel(farmBlocked) {
   const pve = (S && S.pve) || {};
   const left = pve.available != null ? pve.available : 0;
   // PVE has its own counter, so it is blocked by its own emptiness -- not by the arena's.
-  const blocked = farmBlocked || left <= 0;
+  const blocked = farmBlocked || left <= 0 || MOB_FIGHT_BUSY;
   const counter = '<div class="row spread tiny" style="margin-bottom:9px">' +
     "<span class='muted'>Атаки на мобов</span><span><b>" + left + "</b> / " +
     (pve.capacity || 0) + (pve.seconds_until_reset
@@ -4737,7 +4761,7 @@ function mobPanel(farmBlocked) {
       (MOB.armor ? " 🛡" + MOB.armor : "") + "</span></div>" +
     '<div class="row" style="margin-top:10px;gap:8px">' +
       '<button class="go" data-mob="fight"' + (blocked ? " disabled" : "") + ">⚔️ В бой</button>" +
-      '<button class="go sec" data-mob="roll" style="flex:0 0 42%">🔍 Другой</button>' +
+      '<button class="go sec" data-mob="roll" style="flex:0 0 42%"' + (MOB_FIGHT_BUSY ? " disabled" : "") + '>🔍 Другой</button>' +
     "</div></div>";
 }
 
@@ -6013,7 +6037,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge],[data-enchant]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchant]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]");
@@ -6078,6 +6102,7 @@ document.addEventListener("click", async (event) => {
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "fight") { haptic(); await fightMob(); return; }
+  if (d.mobreplay && MOB_REPLAY) { closeSheet(); playDuel(MOB_REPLAY); return; }
   if (d.questopen) {
     const [kind, code] = d.questopen.split(":", 2);
     openQuestDetail(kind, code);

@@ -434,6 +434,11 @@ PVE_DROP_CHANCE = 0.12
 # whatever they end up buying can be priced against a supply that grew slowly.
 PVE_RUBY_MIN = 1
 PVE_RUBY_MAX = 3
+# Additional rare PvE rewards. The tier multipliers live with the mob roster, while these
+# are global base chances because they are economy dials rather than monster flavour.
+PVE_RUNE_CHANCE = 0.008
+PVE_FARM_TICKET_CHANCE = 0.006
+PVE_DUNGEON_TICKET_CHANCE = 0.004
 # The farm's occasional ruby, "случайно пусть падает с фермы иногда": per SHIFT, not per
 # hour, and rare enough that the arena stays the place rubies actually come from.
 FARM_RUBY_CHANCE = 0.06

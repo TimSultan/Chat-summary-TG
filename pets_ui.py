@@ -318,10 +318,11 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if not state.get("active"):
         power = int(state.get("power", 0))
         needed = int(state.get("min_power", 1000))
+        tickets = int(state.get("tickets", 0) or 0)
         lines = ["🕳 <b>Подземелье</b>", "", f"⚡ Сила: <b>{_money(power)}</b> / {_money(needed)}",
-             f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>",
+             (f"🎫 Билетов в подземелье: <b>{tickets}</b>" if tickets else f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>"),
                  "Три врага на этаж, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
-        rows = [[{"text": f"⚔️ Войти · {state.get('entry_cost', 15)} 💎", "callback_data": callback_data(user_id, "dungeonenter")}]]
+        rows = [[{"text": (f"⚔️ Войти · билет ({tickets})" if tickets else f"⚔️ Войти · {state.get('entry_cost', 15)} 💎"), "callback_data": callback_data(user_id, "dungeonenter")}]]
         if int(state.get("deepest", 1)) > 1:
             cost = int(state.get("entry_cost", 15)) + int(state.get("escalator_cost", 5))
             rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · {cost} 💎", "callback_data": callback_data(user_id, "dungeonescalator")}])
@@ -2236,6 +2237,13 @@ def mob_result_text(reward: dict, report: str) -> str:
         bits.append(f"✨ +{_money(int(reward['xp']))}")
     if reward.get("rubies"):
         bits.append(f"💎 +{int(reward['rubies'])}")
+    rune = reward.get("rune") or {}
+    if rune.get("granted"):
+        bits.append(f"🔮 {escape(str(rune.get('element') or 'руна'))} +{int(rune['granted'])}")
+    if reward.get("farm_ticket"):
+        bits.append("🎟️ ферма +1")
+    if reward.get("dungeon_ticket"):
+        bits.append("🎫 подземелье +1")
     if bits:
         lines.append("\n" + " · ".join(bits))
     if reward.get("dropped_name"):

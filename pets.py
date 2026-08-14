@@ -103,7 +103,7 @@ def _pets_path(entry: str):
 def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "duels": {},
-        "gift_history": [], "farm_tickets": {}, "rubies": {},
+        "gift_history": [], "farm_tickets": {}, "dungeon_tickets": {}, "rubies": {},
         "scroll_wallets": {}, "scroll_notifications": [],
         "storefront_sales": {},
         "economy_metrics": _new_economy_metrics(),
@@ -145,6 +145,8 @@ def _load(entry: str) -> dict:
     # A store written before tickets existed simply has none; nothing to migrate.
     if not isinstance(data.setdefault("farm_tickets", {}), dict):
         data["farm_tickets"] = {}
+    if not isinstance(data.setdefault("dungeon_tickets", {}), dict):
+        data["dungeon_tickets"] = {}
     if not isinstance(data.setdefault("rubies", {}), dict):
         data["rubies"] = {}
     if not isinstance(data.setdefault("scroll_wallets", {}), dict):
@@ -1367,6 +1369,21 @@ def grant_farm_ticket(entry, user_id, reason: str = "") -> bool:
         return True
 
 
+def dungeon_tickets(entry, user_id) -> int:
+    data = _load(entry)
+    return max(0, int(data.get("dungeon_tickets", {}).get(str(user_id), 0) or 0))
+
+
+def grant_dungeon_ticket(entry, user_id) -> int:
+    with _farm_settlement_lock:
+        data = _load(entry)
+        wallet = data.setdefault("dungeon_tickets", {})
+        total = max(0, int(wallet.get(str(user_id), 0) or 0)) + 1
+        wallet[str(user_id)] = total
+        _save(entry, data)
+    return total
+
+
 def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
     """Spend a ticket to cut the running shift down to one minute.
 
@@ -2269,6 +2286,7 @@ def dungeon_status(entry: str, user_id) -> dict:
         "closed_notice": D.DUNGEON_CLOSED_NOTICE, "min_power": D.MIN_POWER,
         "power": _power_rating_for(record), "deepest": int(record.get("dungeon_deepest", 1)),
         "entry_cost": D.ENTRY_RUBY_COST,
+        "tickets": dungeon_tickets(entry, user_id),
         "escalator_cost": D.ESCALATOR_RUBY_COST,
     }
     if not isinstance(run, dict):
@@ -2364,11 +2382,16 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
             return False, "Ты уже в подземелье."
         if _power_rating_for(record) < D.MIN_POWER:
             return False, f"Для подземелья нужно {D.MIN_POWER} силы."
+        tickets = data.setdefault("dungeon_tickets", {})
+        ticket_count = max(0, int(tickets.get(str(user_id), 0) or 0))
         wallet = _ruby_row(data)
         rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
-        if rubies < D.ENTRY_RUBY_COST:
+        if ticket_count:
+            tickets[str(user_id)] = ticket_count - 1
+        elif rubies < D.ENTRY_RUBY_COST:
             return False, f"Вход стоит {D.ENTRY_RUBY_COST} рубинов."
-        wallet[str(user_id)] = rubies - D.ENTRY_RUBY_COST
+        else:
+            wallet[str(user_id)] = rubies - D.ENTRY_RUBY_COST
         floor = 1
         if escalator:
             floor = max(1, int(record.get("dungeon_deepest", 1)))
@@ -2382,7 +2405,8 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
         max_hp = round(pets_combat.derive(hero, hero)["max_hp"])
         record["dungeon_run"] = {"floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": []}
         _save(entry, data)
-    return True, f"{'Эскалатор доставил' if escalator else 'Ты вошёл'} на этаж {floor}."
+    entry_paid = "по билету" if ticket_count else f"за {D.ENTRY_RUBY_COST} рубинов"
+    return True, f"{'Эскалатор доставил' if escalator else 'Ты вошёл'} на этаж {floor} {entry_paid}."
 
 
 def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | None]:
@@ -4028,11 +4052,23 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
         economy.grant(entry, user_id, gold, "pet_mob_win")
     dropped = None
     ruby = 0
+    rune = None
+    farm_ticket = False
+    dungeon_ticket = False
     if won:
         dropped = grant_random_drop(entry, user_id, C.PVE_DROP_CHANCE * mob.loot)
         if random.random() < min(1.0, M.TIER_RUBY_CHANCE[tier] * mob.ruby):
             ruby = random.randint(C.PVE_RUBY_MIN, C.PVE_RUBY_MAX)
             grant_rubies(entry, user_id, ruby)
+        reward_multiplier = M.TIER_REWARD[tier] * mob.loot
+        if random.random() < min(1.0, C.PVE_RUNE_CHANCE * reward_multiplier):
+            rune = grant_runes(entry, user_id, RUNE_ELEMENTS[random.randrange(len(RUNE_ELEMENTS))], 1,
+                               f"pve-rune:{moment.isoformat()}:{mob.code}")
+        if random.random() < min(1.0, C.PVE_FARM_TICKET_CHANCE * reward_multiplier):
+            farm_ticket = grant_farm_ticket(entry, user_id, f"pve-farm:{moment.isoformat()}:{mob.code}")
+        if random.random() < min(1.0, C.PVE_DUNGEON_TICKET_CHANCE * reward_multiplier):
+            grant_dungeon_ticket(entry, user_id)
+            dungeon_ticket = True
     return {
         "won": won, "draw": bool(getattr(result, "is_draw", False)),
         "gold": gold, "xp": xp, "levels_gained": levels_gained,
@@ -4042,6 +4078,9 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
         "dropped_name": dropped.get("name") if dropped else None,
         "dropped_rarity": dropped.get("rarity") if dropped else None,
         "auto_equipped": bool(dropped.get("auto_equipped")) if dropped else False,
+        "rune": rune,
+        "farm_ticket": farm_ticket,
+        "dungeon_ticket": dungeon_ticket,
         "mob": {"code": mob.code, "name": mob.name, "tier": tier,
                 "tier_name": M.TIER_NAMES[tier]},
         "at": moment.isoformat(),
