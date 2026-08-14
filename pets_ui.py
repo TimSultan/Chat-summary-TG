@@ -1129,6 +1129,7 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         return no_pet_view(user_id)
 
     status = pets.farm_status(entry, user_id)
+    quarry = pets.quarry_status(entry, user_id)
     passive_before = pets.passive_income_status(entry, user_id)
     coins = pets.balance_for(entry, user_id, xp)
     level = int(status.get("level", status.get("farm_level", 0)) or 0)
@@ -1214,6 +1215,16 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     lines.append(f"\n🪙 У тебя: {_money(coins)}")
     lines.append(f"🎟 Билетов: {int(status.get('tickets', 0) or 0)}")
+    lines.append("\n<b>⛏ Карьер</b>")
+    if quarry.get("running"):
+        lines.append(f"Добыча идёт. Осталось: {_farm_duration(int(quarry.get('seconds_left', 0) or 0))}.")
+    else:
+        lines.append(
+            f"8 ч · 💎 {int(quarry.get('ruby_min', 18))}–{int(quarry.get('ruby_max', 25))} рубинов · "
+            f"зарядов: {int(quarry.get('pickaxe_runs', 0) or 0)}."
+        )
+        if quarry.get("pickaxe_upgraded"):
+            lines.append("Улучшенная NMM-кирка: +3 рубина за добычу.")
     rows = []
     if status.get("can_start"):
         # Four per row -- two rows of four -- so all eight choices fit without a single
@@ -1261,6 +1272,17 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"⬆️ {label}{cost_text}",
             "callback_data": callback_data(user_id, "farmup", feature),
         }])
+    if not quarry.get("running"):
+        if int(quarry.get("pickaxe_runs", 0) or 0) > 0:
+            rows.append([{
+                "text": "⛏ В карьер · 8 ч",
+                "callback_data": callback_data(user_id, "quarrystart"),
+            }])
+        else:
+            rows.append([{
+                "text": f"⛏ Купить кирку · {_money(int(quarry.get('cost', 150)))}",
+                "callback_data": callback_data(user_id, "quarrybuy"),
+            }])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 

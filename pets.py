@@ -1384,6 +1384,94 @@ def grant_dungeon_ticket(entry, user_id) -> int:
     return total
 
 
+def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
+    moment = now or app_now()
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return {"available": False, "running": False, "pickaxe_runs": 0}
+    mine = record.get("quarry_run") if isinstance(record.get("quarry_run"), dict) else None
+    ready = bool(mine) and _farm_run_ready(mine, moment)
+    seconds_left = 0
+    if mine and not ready:
+        try:
+            seconds_left = max(0, int((datetime.fromisoformat(str(mine["ready_at"])) - moment).total_seconds()))
+        except (KeyError, TypeError, ValueError):
+            ready = True
+    upgraded = bool(data.get("pickaxe_nmm", {}).get(str(user_id)))
+    return {
+        "available": True, "running": bool(mine) and not ready, "ready": ready,
+        "seconds_left": seconds_left, "pickaxe_runs": max(0, int(record.get("pickaxe_runs", 0) or 0)),
+        "pickaxe_upgraded": upgraded, "cost": C.PICKAXE_COST,
+        "runs_per_pickaxe": C.PICKAXE_RUNS, "duration_hours": C.QUARRY_DURATION_HOURS,
+        "ruby_min": C.QUARRY_RUBY_MIN, "ruby_max": C.QUARRY_RUBY_MAX,
+    }
+
+
+def buy_pickaxe(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    ok, balance = economy.spend(entry, user_id, xp, C.PICKAXE_COST, "buy:pickaxe")
+    if not ok:
+        return False, f"Кирка стоит {C.PICKAXE_COST} монет, у тебя {balance}."
+    record["pickaxe_runs"] = max(0, int(record.get("pickaxe_runs", 0) or 0)) + C.PICKAXE_RUNS
+    _save(entry, data)
+    return True, f"Кирка куплена: {C.PICKAXE_RUNS} заходов в карьер."
+
+
+def unlock_nmm_pickaxe(entry: str, user_id) -> bool:
+    with _farm_settlement_lock:
+        data = _load(entry)
+        upgrades = data.setdefault("pickaxe_nmm", {})
+        if upgrades.get(str(user_id)):
+            return False
+        upgrades[str(user_id)] = True
+        _save(entry, data)
+    return True
+
+
+def start_quarry(entry: str, user_id) -> tuple[bool, str]:
+    moment = app_now()
+    settle_quarry(entry, user_id, now=moment)
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        if isinstance(record.get("quarry_run"), dict):
+            return False, "Карьер уже в работе."
+        runs = max(0, int(record.get("pickaxe_runs", 0) or 0))
+        if not runs:
+            return False, "Нужна кирка с зарядами."
+        record["pickaxe_runs"] = runs - 1
+        record["quarry_run"] = {
+            "run_id": secrets.token_hex(16), "ready_at": (moment + timedelta(hours=C.QUARRY_DURATION_HOURS)).isoformat(),
+        }
+        _save(entry, data)
+    return True, "Кирка в карьере. Возвращайся через 8 часов."
+
+
+def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | None:
+    moment = now or app_now()
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("quarry_run") if record else None
+        if not isinstance(run, dict) or not _farm_run_ready(run, moment):
+            return None
+        run_id = str(run.get("run_id") or "recovered")
+        rng = random.Random(f"quarry:{run_id}")
+        rubies = rng.randint(C.QUARRY_RUBY_MIN, C.QUARRY_RUBY_MAX)
+        if data.get("pickaxe_nmm", {}).get(str(user_id)):
+            rubies += 3
+        record["quarry_run"] = None
+        _save(entry, data)
+    grant_rubies_once(entry, user_id, rubies, f"quarry:{run_id}")
+    return {"rubies": rubies, "upgraded": bool(data.get("pickaxe_nmm", {}).get(str(user_id)))}
+
+
 def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
     """Spend a ticket to cut the running shift down to one minute.
 
@@ -1623,10 +1711,8 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             # payout, so a retried settlement pays the same one rather than rolling again
             # -- the same reproducibility contract _farm_reward documents.
             ruby_rng = random.Random(f"{run_id}:ruby")
-            ruby = (
-                ruby_rng.randint(C.FARM_RUBY_MIN, C.FARM_RUBY_MAX)
-                if ruby_rng.random() < C.FARM_RUBY_CHANCE else 0
-            )
+            ruby = round(C.FARM_RUBY_MIN * hours / C.FARM_MAX_HOURS) + ruby_rng.randint(0, max(0, hours // 2))
+            ruby = min(C.FARM_RUBY_MAX, max(1, ruby))
             receipt = _farm_receipt(
                 user_id, record, run_id, hours, moment, levels_gained, reward, item_code, auto_equipped,
             )
@@ -1638,7 +1724,7 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             _metric_add(data, "farm_runs")
             _save(entry, data)
             if ruby:
-                grant_rubies(entry, user_id, ruby)
+                grant_rubies_once(entry, user_id, ruby, f"farm-ruby:{run_id}")
             receipts.append(dict(receipt))
     return receipts
 
@@ -2477,7 +2563,10 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
     scroll = None
     if reward["scroll_chance"]:
         scroll = grant_scroll_reward(entry, user_id, source=f"dungeon:{floor}:{index}", kind="dungeon", chance=float(reward["scroll_chance"]), pity_after=8)
-    return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune}
+    rubies = 1 if random.Random(f"dungeon-ruby:{floor}:{index}:{user_id}").random() < C.DUNGEON_RUBY_CHANCE else 0
+    if rubies:
+        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{floor}:{index}")
+    return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies}
 
 
 def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bool, str]:
@@ -3509,6 +3598,12 @@ def record_fight(
     })
     _save(entry, data)
 
+    ruby_source = f"arena-ruby:{moment.isoformat()}:{winner_uid}:{loser_uid}"
+    ruby_rng = random.Random(ruby_source)
+    rubies = 1 if ruby_rng.random() < C.ARENA_RUBY_CHANCE else 0
+    if rubies:
+        grant_rubies_once(entry, winner_uid, rubies, ruby_source)
+
     attacker_won = winner_uid == attacker_uid
     return {
         "draw": False,
@@ -3534,6 +3629,8 @@ def record_fight(
         "opponent_level": defender.get("level", 1),
         "opponent_dropped_item": dropped_code if not attacker_won else None,
         "opponent_auto_equipped": auto_equipped if not attacker_won else False,
+        "rubies": rubies if attacker_won else 0,
+        "opponent_rubies": rubies if not attacker_won else 0,
     }
 
 

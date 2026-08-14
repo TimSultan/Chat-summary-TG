@@ -441,9 +441,15 @@ PVE_FARM_TICKET_CHANCE = 0.006
 PVE_DUNGEON_TICKET_CHANCE = 0.004
 # The farm's occasional ruby, "случайно пусть падает с фермы иногда": per SHIFT, not per
 # hour, and rare enough that the arena stays the place rubies actually come from.
-FARM_RUBY_CHANCE = 0.06
-FARM_RUBY_MIN = 1
-FARM_RUBY_MAX = 2
+FARM_RUBY_MIN = 5
+FARM_RUBY_MAX = 8
+ARENA_RUBY_CHANCE = 0.03
+DUNGEON_RUBY_CHANCE = 0.04
+QUARRY_DURATION_HOURS = 8
+QUARRY_RUBY_MIN = 18
+QUARRY_RUBY_MAX = 25
+PICKAXE_COST = 150
+PICKAXE_RUNS = 5
 
 HISTORY_LIMIT = 10          # "список последних 10 боев"
 # The mailbox merges three feeds (fights, farm shifts, gifts) into one, so it is capped

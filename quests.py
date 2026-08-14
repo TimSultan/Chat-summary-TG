@@ -1159,6 +1159,7 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
         economy.grant_once(entry, user_id, gold, f"quest:{submission_id}")
     rubies = 10 if receipt.get("kind") == "real" else 5
     pets.grant_rubies_once(entry, user_id, rubies, f"quest:{submission_id}")
+    pickaxe_unlocked = receipt.get("code") == "nmm" and pets.unlock_nmm_pickaxe(entry, user_id)
     rune = {"granted": 0}
     if receipt.get("kind") == "rune":
         element = str(receipt.get("code") or "").removeprefix("rune_")
@@ -1182,6 +1183,7 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
     )
     return {
         "gold": gold, "xp": xp, "tickets": tickets, "rubies": rubies, "rune": rune,
+        "pickaxe_unlocked": pickaxe_unlocked,
         "has_pet": has_pet,
         "item": dropped.get("code") if dropped else None,
         "item_name": dropped.get("name") if dropped else None,

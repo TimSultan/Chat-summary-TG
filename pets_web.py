@@ -703,6 +703,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     # this; a page that did not settle would show "готово" next to a reward that has not
     # been credited, which reads as the game having eaten it.
     receipts = pets.settle_completed_farms(entry)
+    quarry_receipt = pets.settle_quarry(entry, user_id)
     mine = [r for r in receipts if str(r.get("user_id")) == str(user_id)]
 
     record = pets.get_pet(entry, user_id)
@@ -730,6 +731,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
             "table": list(economy.DAILY_BONUS_BY_STREAK),
         },
         "farm_receipts": mine,
+        "quarry_receipt": quarry_receipt,
         "unread_updates": pets_updates.has_unread(entry, user_id),
         "quest_attention": quests.has_available_quests(entry, user_id),
     }
@@ -762,6 +764,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["dungeon"] = pets.dungeon_status(entry, user_id)
     state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
+    state["quarry"] = pets.quarry_status(entry, user_id)
     state["farm"]["passive"] = pets.passive_income_status(entry, user_id)
     state["forge"] = pets.forge_status(entry, user_id)
     return state
@@ -918,6 +921,14 @@ def _action_farm_feature(entry, user_id, xp, payload):
     return pets.upgrade_farm_feature(entry, user_id, xp, str(payload.get("feature") or ""))
 
 
+def _action_quarry_buy_pickaxe(entry, user_id, xp, payload):
+  return pets.buy_pickaxe(entry, user_id, xp)
+
+
+def _action_quarry_start(entry, user_id, xp, payload):
+  return pets.start_quarry(entry, user_id)
+
+
 def _action_daily_bonus(entry, user_id, xp, payload):
     claimed, amount, streak = economy.claim_daily_bonus(entry, user_id)
     if not claimed:
@@ -980,6 +991,8 @@ _ACTIONS = {
     "farm_ticket": _action_farm_ticket,
     "farm_upgrade": _action_farm_upgrade,
     "farm_feature": _action_farm_feature,
+    "quarry_buy_pickaxe": _action_quarry_buy_pickaxe,
+    "quarry_start": _action_quarry_start,
     "daily_bonus": _action_daily_bonus,
     "notifications": _action_notifications,
     "portrait_crop": _action_portrait_crop,
@@ -4059,8 +4072,16 @@ async function renderArena() {
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
   if (TEST_SETUP || TEST_BATTLE) { renderTestBattle(box); return; }
   const arena = S.arena;
-  if (!FOES) { box.innerHTML = '<div class="empty">Ищу соперников…</div>';
-               FOES = await api("/api/opponents"); }
+  if (!FOES) {
+    box.innerHTML = '<div class="empty">Ищу соперников…</div>';
+    try {
+      FOES = await api("/api/opponents");
+    } catch (error) {
+      box.innerHTML = '<div class="panel"><div class="small">Не удалось загрузить соперников.</div>' +
+        '<button class="go sec" style="margin-top:10px" data-arenaretry="1">Повторить</button></div>';
+      return;
+    }
+  }
 
   // Two reasons a fight can be refused, and they stop different things. The farm stops
   // every kind: the creature is not here. An empty arena bank stops arena fights ONLY --
@@ -4869,6 +4890,19 @@ function renderFarm() {
   }
 
   const passive = farm.passive || {};
+  const quarry = S.quarry || {};
+  const quarryPanel = quarry.running
+    ? '<div class="panel"><h2>⛏ Карьер</h2><div class="small">Добыча идёт. Осталось ' +
+      clock(quarry.seconds_left) + '.</div></div>'
+    : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">8 часов · 💎 ' +
+      quarry.ruby_min + '–' + quarry.ruby_max + ' рубинов</div><div class="small muted" style="margin-top:4px">' +
+      'Зарядов кирки: ' + (quarry.pickaxe_runs || 0) +
+      (quarry.pickaxe_upgraded ? ' · улучшена за NMM' : '') + '</div>' +
+      ((quarry.pickaxe_runs || 0)
+        ? '<button class="go" style="margin-top:10px" data-do="quarrystart">Начать добычу</button>'
+        : '<button class="go sec" style="margin-top:10px" data-do="quarrypickaxe"' +
+          (affordable(quarry.cost) ? '' : ' disabled') + '>Купить кирку · ' + money(quarry.cost) + '</button>') +
+      '</div>';
   box.innerHTML = shift +
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
@@ -4890,7 +4924,7 @@ function renderFarm() {
           : '<button class="plus" data-feature="' + key + '"' +
             (affordable(feature.next_cost) ? "" : " disabled") + ">💰" + money(feature.next_cost) +
             "</button>") + "</div>").join("") +
-    "</div>";
+    "</div>" + quarryPanel;
 }
 
 const FEATURE_NAMES = { well: "Колодец", sprinkler: "Поливалка", beds: "Грядка", tractor: "Трактор" };
@@ -6194,6 +6228,7 @@ document.addEventListener("click", async (event) => {
   }
   if (d.foe) { haptic(); fight(d.foe); return; }
   if (d.farmstart) { await act("farm_start", { hours: Number(d.farmstart) }); return; }
+  if (d.arenaretry) { FOES = null; renderArena(); return; }
   if (d.feature) { await act("farm_feature", { feature: d.feature }); return; }
   if (d.gift) { closeSheet(); await act("gift", { code: d.code, receiver_id: d.gift, confirm: true }); return; }
 
@@ -6226,6 +6261,8 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "farmup") { await act("farm_upgrade"); }
   else if (d.do === "farmticket") { await act("farm_ticket"); }
   else if (d.do === "farmcancel") { await act("farm_cancel"); }
+  else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
+  else if (d.do === "quarrystart") { await act("quarry_start"); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }
   else if (d.do === "rename") {

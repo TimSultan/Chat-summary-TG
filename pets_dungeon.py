@@ -10,7 +10,7 @@ from typing import Final
 
 
 MIN_POWER: Final = 1_000
-ENTRY_RUBY_COST: Final = 15
+ENTRY_RUBY_COST: Final = 5
 ESCALATOR_RUBY_COST: Final = 5
 SHOP_PARTIAL_HEAL_COST: Final = 160
 SHOP_FULL_HEAL_COST: Final = 300

@@ -6445,6 +6445,18 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action == "quarrybuy":
+            ok, note = pets.buy_pickaxe(entry, user_id, xp)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
+        if action == "quarrystart":
+            ok, note = pets.start_quarry(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
         if action in ("up", "up10"):
             ok, note, _ = pets.upgrade_stat(
                 entry, user_id, xp, argument, times=10 if action == "up10" else 1

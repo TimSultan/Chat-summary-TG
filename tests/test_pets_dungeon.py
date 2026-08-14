@@ -43,7 +43,12 @@ class DungeonTests(unittest.TestCase):
         self.assertIn("Клинок", text)
         self.assertIn("Комета", text)
 
-    def test_dungeon_requires_fifteen_rubies_to_enter(self):
+    def test_dungeon_requires_five_rubies_to_enter(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
+        }
+        pets._save(self.entry, data)
         ok, message = pets.enter_dungeon(self.entry, self.user_id)
         self.assertFalse(ok)
         self.assertIn(str(dungeon.ENTRY_RUBY_COST), message)
