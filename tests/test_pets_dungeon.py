@@ -26,10 +26,17 @@ class DungeonTests(unittest.TestCase):
         self.patch.stop()
         self.temp.cleanup()
 
-    def test_floor_has_three_fixed_theme_mobs_and_every_fifth_floor_is_a_boss(self):
+    def test_floors_have_variable_story_driven_mob_counts_and_bosses(self):
         first = dungeon.encounters_for_floor(1)
-        self.assertEqual(len(first), 3)
+        self.assertEqual(len(first), 2)
         self.assertEqual(first, dungeon.encounters_for_floor(1))
+        self.assertIn("Два", dungeon.floor_description(1))
+        pack = dungeon.encounters_for_floor(2)
+        self.assertEqual(len(pack), 10)
+        self.assertTrue(all(row["gimmick"] == "pack_fury" for row in pack))
+        self.assertIn("Десять", dungeon.floor_description(2))
+        self.assertGreater(dungeon.pack_strength_multiplier(2, []), 1)
+        self.assertEqual(dungeon.pack_strength_multiplier(2, range(9)), 1)
         boss = dungeon.encounters_for_floor(5)
         self.assertEqual(len(boss), 1)
         self.assertTrue(boss[0]["boss"])
@@ -56,10 +63,19 @@ class DungeonTests(unittest.TestCase):
         self.assertGreater(len({reward["xp"] for reward in rewards}), 1)
         self.assertGreater(len({reward["item_chance"] for reward in rewards}), 1)
 
+    def test_crowded_rooms_pay_less_per_enemy_and_deep_floors_pay_more(self):
+        pack = dungeon.reward_for(2, False, enemy_count=10)
+        duo = dungeon.reward_for(2, False, enemy_count=2)
+        deep = dungeon.reward_for(20, False, enemy_count=2)
+        self.assertLess(pack["gold"], duo["gold"])
+        self.assertLess(pack["xp"], duo["xp"])
+        self.assertGreater(deep["gold"], duo["gold"])
+        self.assertGreater(deep["xp"], duo["xp"])
+
     def test_rest_controls_show_coins_and_prompt(self):
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {
-            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1, 2],
+            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1],
         }
         pets._save(self.entry, data)
 
@@ -83,7 +99,7 @@ class DungeonTests(unittest.TestCase):
         self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
 
         data = pets._load(self.entry)
-        data["pets"][self.user_id]["dungeon_run"]["cleared"] = [0, 1, 2]
+        data["pets"][self.user_id]["dungeon_run"]["cleared"] = [0, 1]
         pets._save(self.entry, data)
         self.assertTrue(pets.equip(self.entry, self.user_id, "w001")[0])
 
@@ -114,7 +130,7 @@ class DungeonTests(unittest.TestCase):
         state = pets.dungeon_status(self.entry, self.user_id)
         self.assertTrue(state["active"])
         self.assertEqual(state["floor"], 1)
-        self.assertEqual(len(state["encounters"]), 3)
+        self.assertEqual(len(state["encounters"]), 2)
         self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
 
     def test_quit_clears_a_malformed_dungeon_run(self):

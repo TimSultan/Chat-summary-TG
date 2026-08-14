@@ -321,14 +321,14 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         tickets = int(state.get("tickets", 0) or 0)
         lines = ["🕳 <b>Подземелье</b>", "", f"⚡ Сила: <b>{_money(power)}</b> / {_money(needed)}",
              (f"🎫 Билетов в подземелье: <b>{tickets}</b>" if tickets else f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>"),
-                 "Три врага на этаж, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
+                 "Состав этажей меняется, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
         rows = [[{"text": (f"⚔️ Войти · билет ({tickets})" if tickets else f"⚔️ Войти · {state.get('entry_cost', 15)} 💎"), "callback_data": callback_data(user_id, "dungeonenter")}]]
         if int(state.get("deepest", 1)) > 1:
             cost = int(state.get("entry_cost", 15)) + int(state.get("escalator_cost", 5))
             rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · {cost} 💎", "callback_data": callback_data(user_id, "dungeonescalator")}])
         rows.append(_back_row(user_id))
         return "\n".join(lines), {"inline_keyboard": rows}
-    lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", ""]
+    lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", escape(str(state.get('description') or '')), ""]
     rows = []
     for enemy in state.get("encounters", []):
         marker = "✅" if enemy.get("cleared") else ("👑" if enemy.get("boss") else "⚔️")

@@ -30,6 +30,23 @@ THEMES: Final = (
     ("Затонувший храм", ("Краб-страж", "Сирена глубин", "Угорь молний")),
 )
 
+# Each room owns its encounter count and short story. A floor's reward budget is shared
+# between these encounters, so a crowded room asks for more fights without printing money.
+ROOMS: Final = (
+    {"count": 2, "kind": "duo", "strength": 1.28, "health": 1.24,
+     "description": "Два брата никого не пускают и даже не делают вид, что слушают.",
+     "hint": "Один держит дверь, второй смотрит из-за плеча."},
+    {"count": 10, "kind": "pack_fury", "strength": .68, "health": .72,
+     "description": "Десять стайных бойцов заняли проход. Пока их много, они слишком смелые.",
+     "hint": "Соседи подбадривают его."},
+    {"count": 1, "kind": "elite", "strength": 1.65, "health": 1.70,
+     "description": "Один старый страж остался у двери. Уходить он явно не собирается.",
+     "hint": "Старые доспехи звенят, когда он делает шаг."},
+    {"count": 4, "kind": "patrol", "strength": 1.02, "health": 1.04,
+     "description": "Дозор заметил тебя раньше, чем ты успел выбрать дорогу.",
+     "hint": "Он перекрывает путь к следующему залу."},
+)
+
 BOSSES: Final = (
     ("Феникс пепельных залов", "reincarnate",
     "На чёрном камне остаются горячие перья, хотя птица давно не взмахивала крыльями."),
@@ -61,6 +78,23 @@ def floor_name(floor: int) -> str:
     return theme
 
 
+def _room(floor: int) -> dict:
+    return ROOMS[(max(1, floor) - 1) % len(ROOMS)]
+
+
+def floor_description(floor: int) -> str:
+    return "Впереди ждёт хозяин этого места." if is_boss_floor(floor) else _room(floor)["description"]
+
+
+def pack_strength_multiplier(floor: int, cleared) -> float:
+    """Crowded packs lose their courage as individual members fall."""
+    if is_boss_floor(floor) or _room(floor)["kind"] != "pack_fury":
+        return 1.0
+    cleared = {int(index) for index in cleared if str(index).isdigit()}
+    remaining = sum(row["index"] not in cleared for row in encounters_for_floor(floor))
+    return 1 + .12 * max(0, remaining - 1)
+
+
 def encounter(floor: int, index: int) -> dict:
     """One reproducible enemy. ``index`` is zero-based within the floor."""
     floor = max(1, int(floor))
@@ -77,32 +111,50 @@ def encounter(floor: int, index: int) -> dict:
         }
 
     _theme, mobs = THEMES[((floor - 1) // 3) % len(THEMES)]
-    index = max(0, min(2, int(index)))
-    value = _scale(floor) + index * 3
+    room = _room(floor)
+    count = room["count"]
+    index = max(0, min(count - 1, int(index)))
+    value = _scale(floor) + index * 2
     profiles = ((7, 12, -5, -6), (10, 2, 6, -4), (3, 18, -3, 5))
-    strength, health, agility, luck = profiles[index]
+    strength, health, agility, luck = profiles[index % len(profiles)]
+    base_name = mobs[index % len(mobs)]
+    if room["kind"] == "duo":
+        name = f"Брат {base_name}"
+    elif room["kind"] == "pack_fury":
+        name = f"Стайный {base_name} {index + 1}"
+    elif room["kind"] == "elite":
+        name = f"Старший {base_name}"
+    else:
+        name = f"Дозорный {base_name} {index + 1}"
     return {
-        "code": f"floor_{floor}_{index}", "name": mobs[index], "floor": floor, "index": index,
-        "theme": floor_name(floor), "boss": False, "gimmick": None, "hint": "",
-        "stats": {"strength": value + strength, "health": value + health,
+        "code": f"floor_{floor}_{index}", "name": name, "floor": floor, "index": index,
+        "theme": floor_name(floor), "boss": False, "gimmick": room["kind"],
+        "hint": room["hint"],
+        "stats": {"strength": round((value + strength) * room["strength"]),
+                  "health": round((value + health) * room["health"]),
                   "agility": max(1, value + agility), "luck": max(1, value + luck)},
         "armor": max(0, value // 5 + index * 2), "level": floor + 2,
-        "reward": reward_for(floor, boss=False),
+        "reward": reward_for(floor, boss=False, enemy_count=count),
     }
 
 
 def encounters_for_floor(floor: int) -> tuple[dict, ...]:
     return (encounter(floor, 0),) if is_boss_floor(floor) else tuple(
-        encounter(floor, index) for index in range(3)
+        encounter(floor, index) for index in range(_room(floor)["count"])
     )
 
 
-def reward_for(floor: int, boss: bool) -> dict:
-    multiplier = 3 if boss else 1
+def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
+    """One victory's share of a floor budget; early floors are intentionally modest."""
+    floor = max(1, int(floor))
+    enemy_count = max(1, int(enemy_count))
+    if boss:
+        gold, xp = 22 + floor * 11, 12 + floor * 7
+    else:
+        gold, xp = (6 + floor * 5) // enemy_count, (4 + floor * 3) // enemy_count
     return {
-        "gold": (20 + floor * 8) * multiplier,
-        "xp": (10 + floor * 5) * multiplier,
-        "item_chance": min(0.22, 0.025 + floor * 0.005) * (1.5 if boss else 1),
+        "gold": max(1, gold), "xp": max(1, xp),
+        "item_chance": min(0.22, 0.012 + floor * 0.004) * (1.5 if boss else 1),
         "scroll_chance": 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
             0.25, 0.04 + (floor - SCROLL_LOOT_START_FLOOR) * 0.01,
         ),
@@ -112,7 +164,8 @@ def reward_for(floor: int, boss: bool) -> dict:
 def roll_reward(floor: int, boss: bool, rng=None) -> dict:
     """Roll one victory's rewards around the floor's public baseline."""
     rng = rng or random.SystemRandom()
-    reward = dict(reward_for(floor, boss))
+    enemy_count = 1 if boss else len(encounters_for_floor(floor))
+    reward = dict(reward_for(floor, boss, enemy_count))
     reward["gold"] = rng.randint(round(reward["gold"] * .8), round(reward["gold"] * 1.2))
     reward["xp"] = rng.randint(max(1, round(reward["xp"] * .7)), round(reward["xp"] * 1.3))
     reward["item_chance"] = min(1.0, max(0.0, reward["item_chance"] * rng.uniform(.7, 1.3)))

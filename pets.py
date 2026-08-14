@@ -2507,6 +2507,7 @@ def dungeon_status(entry: str, user_id) -> dict:
     state.update({
         "floor": floor, "theme": D.floor_name(floor), "hp": max(0, int(run.get("hp", max_hp))),
         "max_hp": max_hp, "cleared": sorted(cleared), "encounters": encounters,
+        "description": D.floor_description(floor),
         "can_rest": len(cleared) == len(encounters),
         "partial_heal_cost": D.SHOP_PARTIAL_HEAL_COST,
         "full_heal_cost": D.SHOP_FULL_HEAL_COST,
@@ -2655,12 +2656,15 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             hydra_head_hp = run.get("hydra_head_hp") if row["gimmick"] == "three_heads" else None
             if not isinstance(hydra_head_hp, list) or len(hydra_head_hp) != 3:
                 hydra_head_hp = None
+            enemy_stats = dict(row["stats"])
+            if row["gimmick"] == "pack_fury":
+                enemy_stats["strength"] = round(enemy_stats["strength"] * D.pack_strength_multiplier(floor, cleared))
             enemy = pets_combat.Fighter(
                 key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
                 level=row["level"],
                 effects=(({"code": "thorns", "value": 50},) if row["gimmick"] == "healing_pass" else ()),
                 physical_damage_taken_multiplier=0 if row["gimmick"] == "spells_only" else 1,
-                **row["stats"],
+                **enemy_stats,
             )
             if row["gimmick"] == "three_heads":
                 head_max_hp = round(pets_combat.derive(enemy, hero)["max_hp"])
