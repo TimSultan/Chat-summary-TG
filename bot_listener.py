@@ -75,6 +75,7 @@ import history
 import pets
 import pets_combat
 import pets_config as C
+import pets_dungeon_image
 import pets_image
 import pets_ui
 import pets_updates
@@ -5694,6 +5695,28 @@ async def _send_pets_view(
         log(f"[pets] failed to send a view:\n{traceback.format_exc()}")
 
 
+async def _send_dungeon_floor_image(api, chat_id, entry: str, user_id, log=print) -> None:
+    """Post the current floor's cached scene as a companion to its interactive menu."""
+    state = pets.dungeon_status(entry, user_id)
+    if not state.get("active") or not hasattr(api, "send_photo_file"):
+        return
+    floor = int(state.get("floor", 1) or 1)
+    encounters = state.get("encounters") or []
+    names = " · ".join(str(row.get("name") or "Неизвестный враг") for row in encounters)
+    boss = bool(encounters and encounters[0].get("boss"))
+    caption = (
+        f"🕳 <b>{html.escape(str(state.get('theme') or 'Подземелье'))}</b>\n"
+        f"Этаж {floor}" + (" · <b>БОСС</b>" if boss else "") + f"\n{html.escape(names)}"
+    )
+    try:
+        await api.send_photo_file(
+            chat_id, pets_dungeon_image.floor_image(floor), caption=caption,
+            parse_mode="HTML", disable_notification=True,
+        )
+    except Exception:
+        log(f"[pets] failed to send dungeon floor image:\n{traceback.format_exc()}")
+
+
 def _quest_completion_caption(row: dict) -> str:
     """Build a player-facing receipt that fits Telegram's photo-caption limit."""
     title = str(row.get("title") or row.get("code") or "Квест")
@@ -6341,6 +6364,7 @@ async def handle_pets_callback(
         if action == "dungeon":
             await _send_pets_view(api, chat_id, pets_ui.dungeon_view(entry, user_id, xp),
                                   message_id=message_id, log=log)
+            await _send_dungeon_floor_image(api, chat_id, entry, user_id, log)
             return
         if action in ("dungeonenter", "dungeonescalator", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
             receipt = None
@@ -6374,6 +6398,8 @@ async def handle_pets_callback(
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note, rendered, log,
             )
+            if ok and action in ("dungeonenter", "dungeonescalator", "dungeondescend"):
+                await _send_dungeon_floor_image(api, chat_id, entry, user_id, log)
             return
         if action == "mob":
             block = pets.roll_mob(entry, user_id)
