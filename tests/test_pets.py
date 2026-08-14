@@ -1,7 +1,7 @@
 import random
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -994,7 +994,7 @@ class EquipmentTradingTests(PetsTestCase):
                 for row in keyboard["inline_keyboard"] for button in row
             ])
 
-    def test_buying_an_accessory_replaces_only_the_buyers_offer(self):
+    def test_buying_an_accessory_leaves_a_hole_only_on_the_buyers_shelf(self):
         self._two_pets()
         before = pets.daily_storefront_items("chat", "boots", user_id="1")
         bought = before[0]
@@ -1002,7 +1002,7 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertTrue(pets.buy_item("chat", "1", 0, bought.code)[0])
         after = pets.daily_storefront_items("chat", "boots", user_id="1")
         other = pets.daily_storefront_items("chat", "boots", user_id="2")
-        self.assertEqual(len(after), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertEqual(len(after), pets_config.DAILY_STOREFRONT_SIZE - 1)
         self.assertNotIn(bought.code, {item.code for item in after})
         self.assertEqual(len(other), pets_config.DAILY_STOREFRONT_SIZE)
 
@@ -1180,7 +1180,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
                 other_player = pets_config.daily_storefront_items(
                     "shop-chat", slot, moment, user_id="2",
                 )
-                self.assertEqual(first, again)
+                self.assertEqual([item.code for item in first], [item.code for item in again])
                 self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 6)
                 self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
                 self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
@@ -1189,6 +1189,21 @@ class StorefrontAndCollectionTests(PetsTestCase):
                 self.assertTrue(all(item.source == "shop" and item.slot == slot for item in first))
                 self.assertEqual(sum(item.rarity == "common" for item in first), 5)
                 self.assertEqual(sum(item.rarity == "rare" for item in first), 1)
+
+    def test_storefront_windows_turn_at_midnight_and_noon_moscow_time(self):
+        before_midnight_moscow = datetime(2026, 8, 8, 20, 59, tzinfo=timezone.utc)
+        midnight_moscow = before_midnight_moscow + timedelta(minutes=1)
+        before_noon_moscow = datetime(2026, 8, 9, 8, 59, tzinfo=timezone.utc)
+        noon_moscow = before_noon_moscow + timedelta(minutes=1)
+
+        self.assertNotEqual(
+            pets_config.storefront_window(before_midnight_moscow),
+            pets_config.storefront_window(midnight_moscow),
+        )
+        self.assertNotEqual(
+            pets_config.storefront_window(before_noon_moscow),
+            pets_config.storefront_window(noon_moscow),
+        )
 
     def test_every_daily_storefront_has_a_weapon_at_the_ordinary_price_floor(self):
         # The rotation advances in twelve-hour windows; a full year guards against a
@@ -1308,22 +1323,22 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
         first_player_stock = pets.daily_storefront_weapons(entry, user_id="1")
         second_player_stock = pets.daily_storefront_weapons(entry, user_id="2")
-        self.assertEqual(len(first_player_stock), pets_config.DAILY_STOREFRONT_SIZE)
+        self.assertEqual(len(first_player_stock), pets_config.DAILY_STOREFRONT_SIZE - 1)
         self.assertNotIn(item.code, {weapon.code for weapon in first_player_stock})
         self.assertEqual(len(second_player_stock), pets_config.DAILY_STOREFRONT_SIZE)
 
-    def test_buying_every_offer_refills_the_personal_store(self):
+    def test_buying_every_offer_leaves_the_personal_store_empty_until_refresh(self):
         entry = "empty-shop"
         self._two_pets(entry)
         moment = datetime(2026, 8, 8, 3)
         with patch("pets.app_now", return_value=moment):
             stock = pets.daily_storefront_weapons(entry, moment, user_id="1")
             economy.grant(entry, "1", sum(item.price for item in stock), "test")
-            for item in stock:
+            for expected_left, item in zip(range(len(stock) - 1, -1, -1), stock):
                 self.assertTrue(pets.buy_item(entry, "1", 0, item.code)[0])
                 self.assertEqual(
                     len(pets.daily_storefront_weapons(entry, moment, user_id="1")),
-                    pets_config.DAILY_STOREFRONT_SIZE,
+                    expected_left,
                 )
 
         refreshed = pets.daily_storefront_weapons(entry, moment.replace(hour=12), user_id="1")

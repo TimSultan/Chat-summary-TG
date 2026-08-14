@@ -2754,7 +2754,8 @@ PAGE_HTML = """<!doctype html>
   .shot img { position: absolute; left: 0; top: 0; max-width: none; display: block; }
   .shot img.cover { width: 100%; height: 100%; object-fit: cover; }
   .slot {
-    aspect-ratio: 1; border-radius: 14px; border: 1.5px dashed var(--line);
+    width: 100%; box-sizing: border-box; aspect-ratio: 1;
+    border-radius: 14px; border: 1.5px dashed var(--line);
     background: var(--sunken); display: flex; align-items: center; justify-content: center;
     position: relative; overflow: hidden; padding: 0;
   }
@@ -4112,7 +4113,7 @@ async function renderShop() {
   box.innerHTML =
     '<div class="chiprow">' + slotChips(shopSlot, "shopslot", true) + "</div>" +
     '<div class="panel"><h2>' +
-      "Витрина · меняется каждые 12 часов" +
+      "Витрина · обновляется в 00:00 и 12:00 по Москве" +
     "</h2>" +
     (items.length ? '<div class="items">' + items.map(shopCard).join("") + "</div>"
                   : '<div class="empty">Сегодня тут пусто.</div>') +

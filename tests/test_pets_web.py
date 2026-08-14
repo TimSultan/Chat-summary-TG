@@ -312,7 +312,21 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX + "/")).text()
         self.assertIn('for (const s of (S.equipment || []))', page)
         self.assertIn('emptySlot("weapon")', page)
+        self.assertRegex(page, r"\.slot \{\s*width: 100%")
         self.assertIn("Снаряжения пока нет.", page)
+
+    async def test_shop_purchase_removes_an_offer_without_replenishing_it(self):
+        self._tame(PLAYER)
+        before = await (await self._get("/api/shop", PLAYER)).json()
+        self.assertEqual(len(before["weapons"]), C.DAILY_STOREFRONT_SIZE)
+
+        bought = before["weapons"][0]
+        result = await self._action(PLAYER, "buy", code=bought["code"])
+        self.assertTrue(result["ok"], result)
+
+        after = await (await self._get("/api/shop", PLAYER)).json()
+        self.assertEqual(len(after["weapons"]), C.DAILY_STOREFRONT_SIZE - 1)
+        self.assertNotIn(bought["code"], {item["code"] for item in after["weapons"]})
 
     async def test_a_mutating_action_returns_state_that_already_reflects_it(self):
         """The point of one action endpoint is that its own response IS the new truth --

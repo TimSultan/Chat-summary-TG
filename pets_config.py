@@ -36,6 +36,7 @@ raises everybody equally. See PETS_BALANCE.md.
 
 import hashlib
 from datetime import date as _date, datetime as _datetime
+from zoneinfo import ZoneInfo as _ZoneInfo
 
 # --------------------------------------------------------------------------- currency
 # The pet game spends the SAME coins /stat and /shop already show. That is deliberate:
@@ -900,11 +901,13 @@ STOREFRONT_NORMAL_COUNT = 5
 STOREFRONT_RARE_COUNT = 1
 STOREFRONT_RARITIES = ("common", "rare")
 DAILY_STOREFRONT_SIZE = STOREFRONT_NORMAL_COUNT + STOREFRONT_RARE_COUNT
+STOREFRONT_TIMEZONE_NAME = "Europe/Moscow"
+_STOREFRONT_TIMEZONE = _ZoneInfo(STOREFRONT_TIMEZONE_NAME)
 
 
 def storefront_window(day: _date | _datetime | str | None = None) -> int:
-    """Stable identifier for the twelve-hour shop window containing ``day``."""
-    moment = day or _datetime.now()
+    """Stable identifier for Moscow's 00:00-12:00 and 12:00-00:00 shop windows."""
+    moment = day or _datetime.now(_STOREFRONT_TIMEZONE)
     if isinstance(moment, str):
         try:
             moment = _datetime.fromisoformat(moment)
@@ -912,6 +915,10 @@ def storefront_window(day: _date | _datetime | str | None = None) -> int:
             moment = _date.fromisoformat(moment)
     if isinstance(moment, _date) and not isinstance(moment, _datetime):
         moment = _datetime.combine(moment, _datetime.min.time())
+    # Naive values are Moscow wall time for deterministic tests and previews. Aware
+    # values may come from another app timezone, so convert before choosing the window.
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(_STOREFRONT_TIMEZONE)
     return moment.date().toordinal() * 2 + moment.hour // STOREFRONT_ROTATION_HOURS
 
 

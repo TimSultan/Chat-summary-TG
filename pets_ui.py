@@ -1682,7 +1682,7 @@ def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
 
     lines = [
         f"🛒 <b>{escape(C.SLOT_NAMES[slot])}</b> {C.SLOT_EMOJI[slot]}",
-        "Твоя витрина: 5 обычных и 1 редкий предмет, обновляется каждые 12 часов.\n",
+        "Твоя витрина: 5 обычных и 1 редкий предмет, обновляется в 00:00 и 12:00 по Москве.\n",
     ]
     rows = []
     for number, item in enumerate(stock, 1):
@@ -1980,7 +1980,7 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
     lines = [
         "🛒 <b>Витрина</b>",
-        "Каждые 12 часов появляются 5 обычных и 1 редкий предмет для каждого слота.",
+        "В 00:00 и 12:00 по Москве появляются 5 обычных и 1 редкий предмет для каждого слота.",
     ]
     lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
     if not visible:

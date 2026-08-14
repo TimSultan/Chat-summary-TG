@@ -206,20 +206,26 @@ def _load(entry: str) -> dict:
     data["scroll_notifications"] = [row for row in notices if isinstance(row, dict)][-400:] \
         if isinstance(notices, list) else []
     sales = data.setdefault("storefront_sales", {})
-    if not isinstance(sales, dict):
-        data["storefront_sales"] = {}
-    else:
-        try:
-            window = int(sales.get("window"))
-        except (TypeError, ValueError):
-            window = None
-        codes = sales.get("codes")
-        data["storefront_sales"] = (
-            {"window": window, "codes": list(dict.fromkeys(
-                code for code in codes if isinstance(code, str)
-            ))}
-            if window is not None and isinstance(codes, list) else {}
-        )
+    normalised_sales = {}
+    if isinstance(sales, dict):
+        for buyer_id, sale in sales.items():
+            if not isinstance(sale, dict):
+                continue
+            try:
+                window = int(sale.get("window"))
+            except (TypeError, ValueError):
+                continue
+            codes = sale.get("codes")
+            if isinstance(codes, list):
+                normalised_sales[str(buyer_id)] = {
+                    "window": window,
+                    "codes": list(dict.fromkeys(
+                        code for code in codes if isinstance(code, str)
+                    )),
+                }
+    # Old saves used one shared {window, codes} row. Personal shelves cannot attribute
+    # those sales to a buyer, so legacy/malformed rows expire during migration.
+    data["storefront_sales"] = normalised_sales
     _economy_metrics(data)
     legal_scrolls = {row["code"] for row in SCROLLS.SCROLLS}
     # Older saves used an append-only list.  Accept their duplicates while reading,
@@ -480,9 +486,17 @@ def _daily_storefront_items(
 ):
     moment = day or app_now()
     record = _tamed_record(data, user_id) or {}
-    return C.daily_storefront_items(
-        entry, slot, moment, excluded_codes=set(record.get("inventory", [])), user_id=user_id,
+    window = C.storefront_window(moment)
+    sale = (data.get("storefront_sales") or {}).get(str(user_id), {})
+    sold_codes = set(sale.get("codes") or []) if sale.get("window") == window else set()
+    # Reconstruct the original six with this window's purchases still eligible, then
+    # remove the sold offers. This leaves holes instead of drawing replacements.
+    stock = C.daily_storefront_items(
+        entry, slot, moment,
+        excluded_codes=set(record.get("inventory", [])) - sold_codes,
+        user_id=user_id,
     )
+    return tuple(item for item in stock if item.code not in sold_codes)
 
 
 def _daily_storefront_weapons(
@@ -2923,6 +2937,14 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
     _discover(record, item.code)
     if item.slot == "weapon":
         _weapon_record(record, item.code)
+    window = C.storefront_window(moment)
+    sales = data.setdefault("storefront_sales", {})
+    sale = sales.get(str(user_id))
+    if not isinstance(sale, dict) or sale.get("window") != window:
+        sale = {"window": window, "codes": []}
+        sales[str(user_id)] = sale
+    if item.code not in sale["codes"]:
+        sale["codes"].append(item.code)
     _save(entry, data)
     return True, f"Куплено: «{item.name}» за {offered.price} монет."
 
