@@ -13,6 +13,7 @@ from typing import Final
 MIN_POWER: Final = 1_000
 ENTRY_RUBY_COST: Final = 5
 ESCALATOR_RUBY_COST: Final = 5
+ANTIMAGIC_REFLECT_SHARE: Final = 0.85
 SHOP_PARTIAL_HEAL_COST: Final = 160
 SHOP_FULL_HEAL_COST: Final = 300
 SCROLL_LOOT_START_FLOOR: Final = 10
@@ -48,18 +49,24 @@ ROOMS: Final = (
 )
 
 BOSSES: Final = (
-    ("Феникс пепельных залов", "reincarnate",
-    "На чёрном камне остаются горячие перья, хотя птица давно не взмахивала крыльями."),
-    ("Ледяной дракон", "fire_only",
-    "Иней на его чешуе не тает даже рядом с факелами; в трещинах мерцает далёкий жар."),
-    ("Призрак Аквариуса", "spells_only",
-    "Пыль вокруг него ложится в страницы сама собой, а старые чернила светятся в темноте."),
-    ("Плачущее дерево", "healing_pass",
-    "Сок медленно затягивает старые зарубки, а у корней журчит невидимый ручей."),
-    ("Трёхглавая гидра", "three_heads",
-    "Три голоса спорят в одном горле, и каждый раз тишина длится подозрительно недолго."),
-    ("Кузнец багровой кузни", "frost_only",
-    "Воздух перед ним дрожит от жара, но на молоте остаётся тонкая белая изморозь."),
+    ("Феникс пепельных залов", "reincarnate", 0,
+     "На чёрном камне остаются горячие перья, хотя птица давно не взмахивала крыльями."),
+    ("Стальной привратник", "standard", 5,
+     "В его забрале нет щели, но старый замок на груди всё ещё отсчитывает чужие шаги."),
+    ("Ледяной дракон", "fire_only", 0,
+     "Иней на его чешуе не тает даже рядом с факелами; в трещинах мерцает далёкий жар."),
+    ("Молчаливый колосс", "standard", 5,
+     "Каменные пальцы сжаты вокруг меча; кажется, он стоял здесь ещё до постройки подземелья."),
+    ("Призрак Аквариуса", "spells_only", 0,
+     "Пыль вокруг него ложится в страницы сама собой, а старые чернила светятся в темноте."),
+    ("Антимаг без имени", "antimagic", 0,
+     "Он возвращает 85% магического и рунного урона; здесь надёжнее простое оружие."),
+    ("Плачущее дерево", "healing_pass", 0,
+     "Сок медленно затягивает старые зарубки, а у корней журчит невидимый ручей."),
+    ("Трёхглавая гидра", "three_heads", 0,
+     "Три голоса спорят в одном горле, и каждый раз тишина длится подозрительно недолго."),
+    ("Кузнец багровой кузни", "frost_only", 0,
+     "Воздух перед ним дрожит от жара, но на молоте остаётся тонкая белая изморозь."),
 )
 
 
@@ -99,14 +106,14 @@ def encounter(floor: int, index: int) -> dict:
     """One reproducible enemy. ``index`` is zero-based within the floor."""
     floor = max(1, int(floor))
     if is_boss_floor(floor):
-        name, gimmick, hint = BOSSES[((floor // 5) - 1) % len(BOSSES)]
-        value = _scale(floor, boss=True)
+        name, gimmick, tier_ahead, hint = BOSSES[((floor // 5) - 1) % len(BOSSES)]
+        value = _scale(floor + tier_ahead, boss=True)
         return {
             "code": f"boss_{floor}", "name": name, "floor": floor, "index": 0,
             "theme": floor_name(floor), "boss": True, "gimmick": gimmick, "hint": hint,
             "stats": {"strength": value + 12, "health": value + 18,
                       "agility": value - 4, "luck": value - 6},
-            "armor": max(0, value // 3), "level": floor + 8,
+            "armor": max(0, value // 3), "level": floor + 8 + tier_ahead,
             "reward": reward_for(floor, boss=True),
         }
 

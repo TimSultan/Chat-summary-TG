@@ -37,6 +37,11 @@ import pets_scroll_catalog as SCROLLS
 
 _STATS = ("strength", "health", "agility", "luck")
 _SIGNATURE_STATS = _STATS + ("armor",)
+PHYSICAL = "physical"
+MAGIC = "magic"
+ELEMENTAL = "elemental"
+ATTACK_TYPES = frozenset((PHYSICAL, MAGIC, ELEMENTAL))
+MAGICAL_ATTACK_TYPES = frozenset((MAGIC, ELEMENTAL))
 _DEFICIT_TEXT = {
     "strength": "🧱 {name} не держит корпус: слабая сила режет уклонение.",
     "health": "🩹 {name} выходит без запаса прочности: максимум HP ниже.",
@@ -66,6 +71,9 @@ class Fighter:
     shield: dict | None = None
     damage_multiplier: float = 1.0
     physical_damage_taken_multiplier: float = 1.0
+    magic_reflect_multiplier: float = 0.0
+    enchant_reflect_multiplier: float = 0.0
+    weapon_enchanted: bool = False
     starting_hp: int | None = None
 
 
@@ -78,6 +86,8 @@ class Round:
     attacker_hp: int     # AFTER the blow
     defender_hp: int
     text: str             # the flavour line, ready to print
+    # Elemental damage carries both ELEMENTAL and MAGIC: elemental is a magical subtype.
+    attack_types: tuple[str, ...] = (PHYSICAL,)
 
 
 @dataclass(frozen=True)
@@ -209,6 +219,9 @@ def snapshot(fighter: "Fighter") -> dict:
         "skills": list(fighter.skills or ()),
         "shield": dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None,
         "damage_multiplier": fighter.damage_multiplier,
+        "magic_reflect_multiplier": fighter.magic_reflect_multiplier,
+        "enchant_reflect_multiplier": fighter.enchant_reflect_multiplier,
+        "weapon_enchanted": fighter.weapon_enchanted,
         "starting_hp": fighter.starting_hp,
     }
 
@@ -216,6 +229,26 @@ def snapshot(fighter: "Fighter") -> dict:
 def _stored_number(value, default):
     """Keep a stored stat's exact value; fall back only when it is not a number at all."""
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+
+def normalize_attack_types(attack_types=()) -> tuple[str, ...]:
+    """Return the stable damage tags for an attack.
+
+    ``elemental`` is not an alternative to magic: it is a more specific magical attack,
+    so it always gains the ``magic`` tag as well.  Unknown values are ignored rather
+    than letting a bad catalogue row take down an otherwise valid fight.
+    """
+    rows = tuple(str(value) for value in (attack_types or ()) if str(value) in ATTACK_TYPES)
+    if not rows:
+        return (PHYSICAL,)
+    if ELEMENTAL in rows and MAGIC not in rows:
+        rows += (MAGIC,)
+    return tuple(dict.fromkeys(rows))
+
+
+def is_magic_attack(attack_types=()) -> bool:
+    """Whether this attack belongs to magic, including elemental magic."""
+    return bool(set(normalize_attack_types(attack_types)) & MAGICAL_ATTACK_TYPES)
 
 
 def restore(data) -> "Fighter | None":
@@ -254,6 +287,9 @@ def restore(data) -> "Fighter | None":
         skills=skills,
         shield=shield,
         damage_multiplier=_stored_number(data.get("damage_multiplier"), 1.0),
+        magic_reflect_multiplier=_stored_number(data.get("magic_reflect_multiplier"), 0.0),
+        enchant_reflect_multiplier=_stored_number(data.get("enchant_reflect_multiplier"), 0.0),
+        weapon_enchanted=bool(data.get("weapon_enchanted", False)),
         starting_hp=_stored_number(data.get("starting_hp"), None),
     )
 
@@ -556,6 +592,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         for fighter_effects in effects.values() for effect in fighter_effects
     ) or any(skill_loadouts.values()) or any(equipped_shields.values()) or any(
         fighter.damage_multiplier != 1.0 for fighter in (a, b)
+    ) or any(
+        fighter.magic_reflect_multiplier or fighter.enchant_reflect_multiplier
+        for fighter in (a, b)
     )
     shields = {a.key: 0.0, b.key: 0.0}
     used = {a.key: set() for a in (a, b)}
@@ -577,7 +616,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     spring_hits_taken = {a.key: 0, b.key: 0}
     spring_ready = {a.key: False, b.key: False}
     armor_shredded = {a.key: 0.0, b.key: 0.0}
-    burning: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
+    burning: dict[str, tuple[str, int, int, tuple[str, ...]] | None] = {a.key: None, b.key: None}
     venom_miss = {a.key: 0.0, b.key: 0.0}
     pending_venom: dict[str, tuple[str, int] | None] = {a.key: None, b.key: None}
     bleeding: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
@@ -607,13 +646,17 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 text=_DEFICIT_TEXT[stat].format(name=fighters[owner_key].name),
             ))
 
-    def effect_round(number: int, owner_key: str, other_key: str, code: str, amount: int = 0):
+    def effect_round(
+        number: int, owner_key: str, other_key: str, code: str, amount: int = 0,
+        attack_types=(PHYSICAL,),
+    ):
         """Put an equipped-item proc in the normal transcript, without flavour RNG."""
         template = _EFFECT_TEXT.get(code, "срабатывает эффект снаряжения.")
         rounds.append(Round(
             number=number, attacker=owner_key, event=f"amulet_{code}", damage=amount,
             attacker_hp=round(hp[owner_key]), defender_hp=round(hp[other_key]),
             text=f"✨ {fighters[owner_key].name} {template.format(amount=amount)}",
+            attack_types=normalize_attack_types(attack_types),
         ))
 
     def hurt(
@@ -688,6 +731,43 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         hp[target_key] = max(0.0, hp[target_key] - damage)
         return round(before - hp[target_key]), hp[target_key] <= 0
 
+    def apply_attack(
+        source_key: str, target_key: str, damage: int, number: int, *,
+        attack_types=(PHYSICAL,), enchanted: bool = False, pierce_guard: float = 0.0,
+        allow_reflection: bool = True,
+    ) -> tuple[int, bool, str | None]:
+        """Deal one classified attack and, where applicable, resolve Antimage's return.
+
+        Reflection happens only after the original hit lands.  Its return is marked as
+        magical but cannot itself be reflected; otherwise two reflective rules could
+        recurse forever instead of producing a readable, deterministic combat log.
+        """
+        attack_types = normalize_attack_types(attack_types)
+        impact, knocked_out = hurt(
+            source_key, target_key, damage, number, pierce_guard=pierce_guard,
+        )
+        if knocked_out or not allow_reflection or not impact:
+            return impact, knocked_out, None
+        defender = fighters[target_key]
+        reflect = max(
+            defender.magic_reflect_multiplier if is_magic_attack(attack_types) else 0.0,
+            defender.enchant_reflect_multiplier if enchanted else 0.0,
+        )
+        if reflect <= 0:
+            return impact, False, None
+        reflected = max(1, round(impact * reflect))
+        back_impact, back_knockout = hurt(target_key, source_key, reflected, number)
+        total_damage[target_key] += back_impact
+        rounds.append(Round(
+            number=number, attacker=target_key, event="antimagic_reflect",
+            damage=back_impact, attacker_hp=round(hp[target_key]),
+            defender_hp=round(hp[source_key]),
+            text=(f"✦ {fighters[target_key].name} отражает {back_impact} магического урона "
+                  f"обратно в {fighters[source_key].name}."),
+            attack_types=(MAGIC,),
+        ))
+        return impact, False, target_key if back_knockout else None
+
     def skill_value(key: str, name: str) -> float:
         value = skill_statuses[key].get(name)
         return float(value[0]) if isinstance(value, list) and value else 0.0
@@ -724,17 +804,21 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         if not reflected or not impact:
             return None
         back = max(1, round(impact * reflected))
-        back_impact, back_ko = hurt(target_key, source_key, back, number)
+        back_impact, back_ko, antimagic_winner = apply_attack(
+            target_key, source_key, back, number, attack_types=(MAGIC,),
+        )
         total_damage[target_key] += back_impact
         rounds.append(Round(
             number=number, attacker=target_key, event="skill_reflect", damage=back_impact,
             attacker_hp=round(hp[target_key]), defender_hp=round(hp[source_key]),
             text=f"🌹 {fighters[target_key].name} отражает {back_impact} урона.",
+            attack_types=(MAGIC,),
         ))
-        return target_key if back_ko else None
+        return antimagic_winner or (target_key if back_ko else None)
 
     def spell_damage(
         source_key: str, target_key: str, effect: Mapping, number: int,
+        attack_types=(MAGIC,),
     ) -> tuple[int, str | None]:
         raw = (derived[source_key]["damage"] * fighters[source_key].damage_multiplier
                * max(0.0, float(effect.get("amount", 1.0))))
@@ -748,22 +832,24 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             0.0, 1.0 - min(1.0, float(effect.get("pierce_armor", 0) or 0)),
         )
         raw *= 1.0 - armor
-        impact, knocked_out = hurt(
+        impact, knocked_out, reflection_winner = apply_attack(
             source_key, target_key, max(1, round(raw)), number,
             pierce_guard=max(0.0, float(effect.get("pierce_guard", 0) or 0)),
+            attack_types=attack_types,
         )
         total_damage[source_key] += impact
-        reflected_winner = (
-            None if knocked_out else reflect_skill_damage(source_key, target_key, impact, number)
+        reflected_winner = None if knocked_out or reflection_winner else reflect_skill_damage(
+            source_key, target_key, impact, number,
         )
-        return impact, reflected_winner or (source_key if knocked_out else None)
+        return impact, reflection_winner or reflected_winner or (source_key if knocked_out else None)
 
     def apply_scroll_effect(
         source_key: str, target_key: str, effect: Mapping, number: int,
+        attack_types=(MAGIC,),
     ) -> tuple[int, str | None]:
         op = str(effect.get("op") or "")
         if op == "damage":
-            return spell_damage(source_key, target_key, effect, number)
+            return spell_damage(source_key, target_key, effect, number, attack_types)
         if op in {"burn", "weaken", "blind", "vulnerable", "stun"} \
                 and not harmful_status_allowed(target_key):
             return 0, None
@@ -783,6 +869,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 source_key,
                 max(1, int(effect.get("turns", 1))),
                 max(1, round(derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 0))))),
+                normalize_attack_types(attack_types),
             )
         elif op in {"weaken", "blind", "vulnerable"}:
             put_skill_status(
@@ -872,7 +959,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             shield = equipped_shields[source_key] or {}
             guards[source_key] = max(.10, min(.80, float(shield.get("guard", .40) or .40)))
             for effect in shield.get("defend_effects", ()):
-                _impact, winner = apply_scroll_effect(source_key, target_key, effect, number)
+                _impact, winner = apply_scroll_effect(
+                    source_key, target_key, effect, number, (MAGIC,),
+                )
                 if winner:
                     return winner
             rounds.append(Round(
@@ -894,6 +983,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             tick_skill_state(source_key)
             return None
         used_scrolls[source_key].add(code)
+        spell_attack_types = (ELEMENTAL, MAGIC) if spell.get("element") else (MAGIC,)
         harmful = any(effect.get("op") in {
             "damage", "burn", "weaken", "blind", "vulnerable", "stun", "break_shield",
         } for effect in spell["effects"])
@@ -912,7 +1002,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         winner = None
         if not dodged:
             for effect in spell["effects"]:
-                dealt, winner = apply_scroll_effect(source_key, target_key, effect, number)
+                dealt, winner = apply_scroll_effect(
+                    source_key, target_key, effect, number, spell_attack_types,
+                )
                 impact += dealt
                 if winner:
                     break
@@ -924,6 +1016,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                   else f"{spell['icon']} {fighters[source_key].name}: "
                        f"{str(spell['short']).rstrip('.')}"
                        + (f" — {impact} урона." if impact else ".")),
+            attack_types=spell_attack_types,
         ))
         tick_skill_state(source_key)
         return winner
@@ -963,30 +1056,37 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if (value := _effect_value(effects[owner_key], "opening_blast")) is None:
                 continue
             damage = max(1, round(hp[other_key] * max(0.0, _fraction(value))))
-            impact, knocked_out = hurt(owner_key, other_key, damage, 0)
+            impact, knocked_out, reflection_winner = apply_attack(
+                owner_key, other_key, damage, 0, attack_types=(MAGIC,),
+            )
             total_damage[owner_key] += impact
-            effect_round(0, owner_key, other_key, "opening_blast", impact)
-            if knocked_out:
+            effect_round(0, owner_key, other_key, "opening_blast", impact, (MAGIC,))
+            if knocked_out or reflection_winner:
+                winner, loser = (
+                    (reflection_winner, owner_key) if reflection_winner else (owner_key, other_key)
+                )
                 return FightResult(
-                    winner=owner_key, loser=other_key, rounds=tuple(rounds), opening=opening,
-                    closing=pets_flavor.result_line(fighters[owner_key].name, fighters[other_key].name, rng=rng),
+                    winner=winner, loser=loser, rounds=tuple(rounds), opening=opening,
+                    closing=pets_flavor.result_line(fighters[winner].name, fighters[loser].name, rng=rng),
                     total_damage=total_damage, stopped_early=False, is_draw=False, seed=seed, accident=None,
                     final_hp={key: max(0, round(value)) for key, value in hp.items()},
                 )
 
     def signature_round(attacker_key: str, defender_key: str, event: str, damage: int) -> bool:
         if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
-            impact, knocked_out = hurt(attacker_key, defender_key, damage, 0)
+            impact, knocked_out, reflection_winner = apply_attack(
+                attacker_key, defender_key, damage, 0, attack_types=(PHYSICAL,),
+            )
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
-            impact, knocked_out = damage, hp[defender_key] <= 0
+            impact, knocked_out, reflection_winner = damage, hp[defender_key] <= 0, None
         total_damage[attacker_key] += impact
         rounds.append(Round(
             number=0, attacker=attacker_key, event=event, damage=damage,
             attacker_hp=round(hp[attacker_key]), defender_hp=round(hp[defender_key]),
             text=pets_flavor.line(event, fighters[attacker_key].name, fighters[defender_key].name, damage, rng=rng),
         ))
-        return knocked_out
+        return knocked_out or reflection_winner is not None
 
     for attacker_key, defender_key in ((a.key, b.key), (b.key, a.key)):
         signature = signatures.get(attacker_key)
@@ -1034,11 +1134,21 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 tick_skill_state(attacker_key)
             return None
         if effectful and (burn := burning[attacker_key]) is not None:
-            source_key, turns, burn_damage = burn
-            burn_impact, burn_ko = hurt(source_key, attacker_key, burn_damage, round_number)
+            source_key, turns, burn_damage, burn_attack_types = burn
+            burn_impact, burn_ko, reflection_winner = apply_attack(
+                source_key, attacker_key, burn_damage, round_number,
+                attack_types=burn_attack_types,
+            )
             total_damage[source_key] += burn_impact
-            effect_round(round_number, source_key, attacker_key, "burn", burn_impact)
-            burning[attacker_key] = (source_key, turns - 1, burn_damage) if turns > 1 else None
+            effect_round(
+                round_number, source_key, attacker_key, "burn", burn_impact,
+                burn_attack_types,
+            )
+            burning[attacker_key] = (
+                source_key, turns - 1, burn_damage, burn_attack_types
+            ) if turns > 1 else None
+            if reflection_winner:
+                return reflection_winner
             if burn_ko:
                 return source_key
         if effectful and (bleed := bleeding[attacker_key]) is not None:
@@ -1272,10 +1382,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             armor_shredded[defender_key] = max(armor_shredded[defender_key], shred)
 
         if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
-            impact, knocked_out = hurt(attacker_key, defender_key, damage, round_number)
+            impact, knocked_out, reflection_winner = apply_attack(
+                attacker_key, defender_key, damage, round_number,
+                attack_types=(PHYSICAL,), enchanted=attacker.weapon_enchanted,
+            )
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
-            impact, knocked_out = damage, hp[defender_key] <= 0
+            impact, knocked_out, reflection_winner = damage, hp[defender_key] <= 0, None
         total_damage[attacker_key] += impact
         text = pets_flavor.line(event, attacker.name, defender.name, damage, rng=rng)
         rounds.append(Round(
@@ -1286,8 +1399,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attacker_hp=round(hp[attacker_key]),
             defender_hp=round(hp[defender_key]),
             text=text,
+            attack_types=(PHYSICAL,),
         ))
         attacks_made[attacker_key] += 1
+        if reflection_winner:
+            return reflection_winner
         if damage:
             landed_hits[attacker_key] += 1
         if skill_loadouts[attacker_key] and impact and not knocked_out:
@@ -1333,7 +1449,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     and not knocked_out:
                 burn_damage = max(1, round(max(0, value)))
                 turns = max(1, round(_param(effects[attacker_key], "burn", "turns", 2)))
-                burning[defender_key] = (attacker_key, turns, burn_damage)
+                burning[defender_key] = (
+                    attacker_key, turns, burn_damage, (ELEMENTAL, MAGIC),
+                )
             if (value := _effect_value(effects[attacker_key], "venom_blade")) is not None \
                     and not knocked_out:
                 venom_damage = max(1, round(_param(
@@ -1429,9 +1547,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     and landed_hits[attacker_key] >= 3 and "tesla" not in used[attacker_key] and not knocked_out:
                 used[attacker_key].add("tesla")
                 shock = max(1, round(max_hp[defender_key] * max(0, _fraction(value))))
-                shock_impact, shock_ko = hurt(attacker_key, defender_key, shock, round_number)
+                shock_impact, shock_ko, reflection_winner = apply_attack(
+                    attacker_key, defender_key, shock, round_number, attack_types=(MAGIC,),
+                )
                 total_damage[attacker_key] += shock_impact
-                effect_round(round_number, attacker_key, defender_key, "tesla", shock_impact)
+                effect_round(round_number, attacker_key, defender_key, "tesla", shock_impact, (MAGIC,))
+                if reflection_winner:
+                    return reflection_winner
                 if shock_ko:
                     return attacker_key
             if not knocked_out and (value := _effect_value(effects[defender_key], "second_wind")) is not None \

@@ -40,7 +40,7 @@ class PetsTestCase(unittest.TestCase):
     def _tame(self, entry, uid, name=None):
         """Fund and walk one member all the way to a named pet."""
         name = name or f"Питомец{uid}"
-        economy.grant(entry, uid, pets_config.CAGE_PRICE + pets_config.TAME_PRICE, "test")
+        economy.grant(entry, uid, pets_config.TAME_PRICE, "test")
         ok, msg = pets.buy_cage(entry, uid, 0)
         self.assertTrue(ok, msg)
         ok, msg = pets.tame(entry, uid, 0, name, f"file{uid}", f"Owner{uid}")
@@ -48,32 +48,24 @@ class PetsTestCase(unittest.TestCase):
 
 
 class CageAndTamingTests(PetsTestCase):
-    def test_buy_cage_debits_exact_price_and_refuses_one_short(self):
+    def test_everyone_starts_with_a_free_base_cage(self):
         entry = "chat"
-        economy.grant(entry, "1", pets_config.CAGE_PRICE - 1, "test")
-
-        ok, msg = pets.buy_cage(entry, "1", 0)
-        self.assertFalse(ok, msg)
-        self.assertFalse(pets.has_cage(entry, "1"))
-        self.assertEqual(pets.cage_level(entry, "1"), 0)
-
-        economy.grant(entry, "1", 1, "test")  # exactly enough now
-        ok, msg = pets.buy_cage(entry, "1", 0)
-        self.assertTrue(ok, msg)
-        self.assertEqual(economy.balance(entry, "1", 0), 0)
         self.assertTrue(pets.has_cage(entry, "1"))
         self.assertEqual(pets.cage_level(entry, "1"), 1)
 
-        # Buying twice is refused outright, no double debit.
-        economy.grant(entry, "1", pets_config.CAGE_PRICE, "test")
-        ok, msg = pets.buy_cage(entry, "1", 0)
-        self.assertFalse(ok, msg)
-        self.assertEqual(economy.balance(entry, "1", 0), pets_config.CAGE_PRICE)
+        ok, msg = pets.buy_cage(entry, "1", 0)  # compatibility for a stale button
+        self.assertTrue(ok, msg)
+        self.assertEqual(economy.balance(entry, "1", 0), 0)
+        self.assertEqual(pets.cage_level(entry, "1"), 1)
 
-    def test_tame_without_cage_refuses(self):
-        ok, msg = pets.tame("chat", "1", 0, "Рекс", "file123", "Owner")
-        self.assertFalse(ok)
-        self.assertIsNone(pets.get_pet("chat", "1"))
+    def test_tame_allocates_the_free_cage_and_charges_only_taming(self):
+        entry = "chat"
+        economy.grant(entry, "1", pets_config.TAME_PRICE, "test")
+        ok, msg = pets.tame(entry, "1", 0, "Рекс", "file123", "Owner")
+        self.assertTrue(ok, msg)
+        self.assertEqual(economy.balance(entry, "1", 0), 0)
+        self.assertIsNotNone(pets.get_pet(entry, "1"))
+        self.assertIn("боях против других игроков", msg)
 
     def test_legacy_cages_are_refunded_once(self):
         entry = "chat"
@@ -190,7 +182,7 @@ class CageAndTamingTests(PetsTestCase):
     def test_duplicate_name_refuses_case_insensitively(self):
         entry = "chat"
         for uid in ("1", "2"):
-            economy.grant(entry, uid, pets_config.CAGE_PRICE + pets_config.TAME_PRICE, "test")
+            economy.grant(entry, uid, pets_config.TAME_PRICE, "test")
             ok, msg = pets.buy_cage(entry, uid, 0)
             self.assertTrue(ok, msg)
 
@@ -2942,7 +2934,7 @@ class MiscApiTests(PetsTestCase):
     def test_today_cage_level_and_balance_for(self):
         entry = "chat"
         self.assertIsInstance(pets.today(), date)
-        self.assertEqual(pets.cage_level(entry, "1"), 0)
+        self.assertEqual(pets.cage_level(entry, "1"), 1)
 
         self._tame(entry, "1")
         self.assertEqual(pets.cage_level(entry, "1"), 1)

@@ -6034,6 +6034,7 @@ def _pets_fighter(entry: str, user_id, pet: dict):
         level=pet.get("level", 1),
         skills=pets.skill_loadout(entry, user_id),
         shield=pets.combat_shield(entry, user_id),
+        weapon_enchanted=pets.combat_weapon_enchanted(entry, user_id),
     )
 
 
@@ -6167,7 +6168,8 @@ async def handle_pets_callback(
         return
     user_id = user.user_id
     dungeon_actions = {
-        "dungeon", "dungeonfight", "dungeonrest", "dungeondescend", "dungeonquit",
+        "dungeon", "dungeonenter", "dungeonescalator", "dungeonfight", "dungeonrest",
+        "dungeondescend", "dungeonquit",
     }
     if action not in dungeon_actions and pets.is_in_dungeon(entry, user_id):
         await _pets_toast_and_redraw(
@@ -6188,12 +6190,6 @@ async def handle_pets_callback(
     try:
         # --- the two flows that need something back from the player ------------------
         if action in ("tame", "rename", "photo", "gift", "giftok"):
-            if action == "tame" and not pets.has_cage(entry, user_id):
-                await _send_pets_view(
-                    api, chat_id, pets_ui.cage_view(entry, user_id, xp),
-                    message_id=message_id, log=log,
-                )
-                return
             if action == "gift" and pets_ui.valuable_item(C.find_item(argument)):
                 ok, note, token = pets.begin_item_confirmation(entry, user_id, "gift", argument)
                 await _send_pets_view(
@@ -6225,8 +6221,8 @@ async def handle_pets_callback(
                 return
             prompts = {
                 "tame": (
-                    "Пришли фото будущего существа — это должна быть твоя собственная "
-                    "раскрашенная фигурка (картинкой, не файлом)."
+                    "Пришли фото своей покрашенной работы — картинкой, не файлом. "
+                    "Она станет твоим существом и будет участвовать в боях против других игроков."
                 ),
                 "photo": "Пришли новое фото существа (картинкой, не файлом).",
                 "rename": "Ответь на это сообщение новым именем существа.",

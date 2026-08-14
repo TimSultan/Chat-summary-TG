@@ -238,8 +238,9 @@ class SimulateTests(unittest.TestCase):
             result = combat.simulate(lucky, unlucky, seed=123)
 
         self.assertIsNone(result.accident)
-        self.assertEqual(result.rounds[0].event, "signature_luck")
-        self.assertGreater(result.rounds[0].damage, 0)
+        self.assertIn("signature_luck", [round_.event for round_ in result.rounds])
+        signature_round = next(round_ for round_ in result.rounds if round_.event == "signature_luck")
+        self.assertGreater(signature_round.damage, 0)
 
     def test_agility_counter_knockout_awards_the_defender(self):
         attacker = Fighter(key="attacker", name="Attacker", strength=10, health=0,
@@ -258,7 +259,7 @@ class SimulateTests(unittest.TestCase):
 
         self.assertEqual(result.winner, "agile")
         self.assertEqual(result.loser, "attacker")
-        self.assertEqual(result.rounds[0].event, "signature_agility_counter")
+        self.assertIn("signature_agility_counter", [round_.event for round_ in result.rounds])
 
     def test_fights_allow_no_more_than_the_action_cap_per_fighter(self):
         # A round is a full exchange (leader strikes, follower counters back in the same
@@ -367,7 +368,10 @@ class SimulateTests(unittest.TestCase):
             result = combat.simulate(a, b, rng=random.Random(1))
 
         self.assertTrue(result.stopped_early)
-        self.assertEqual(len(result.rounds), 2 * C.MAX_SKILL_ACTIONS_PER_FIGHTER)
+        self.assertEqual(
+            sum(round_.event == "hit" for round_ in result.rounds),
+            2 * C.MAX_SKILL_ACTIONS_PER_FIGHTER,
+        )
         # Derived rather than written out, so retuning the budget cannot leave this
         # test asserting a fight length the engine no longer runs.
         self.assertEqual(result.total_damage, {
@@ -723,6 +727,62 @@ class EffectKnobTests(unittest.TestCase):
                         combat.simulate(hero_a, self.OPPONENT, seed=seed).rounds,
                         combat.simulate(hero_b, self.OPPONENT, seed=seed).rounds,
                     )
+
+
+class AttackTypeTests(unittest.TestCase):
+    def test_elemental_damage_is_also_magic(self):
+        self.assertEqual(
+            combat.normalize_attack_types((combat.ELEMENTAL,)),
+            (combat.ELEMENTAL, combat.MAGIC),
+        )
+        self.assertTrue(combat.is_magic_attack((combat.ELEMENTAL,)))
+        self.assertFalse(combat.is_magic_attack((combat.PHYSICAL,)))
+
+    def test_antimage_reflects_elemental_magic_back_to_its_source(self):
+        class SkillRng:
+            def random(self):
+                return .99
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "skill_1" if "skill_1" in values else values[0]
+
+        mage = Fighter(
+            key="mage", name="Mage", strength=20, health=200, agility=20, luck=1,
+            armor=0, skills=("scroll_arcane_spark", None, None, None), starting_hp=1_000,
+        )
+        antimage = Fighter(
+            key="antimage", name="Antimage", strength=1, health=200, agility=1, luck=1,
+            armor=0, starting_hp=1_000, magic_reflect_multiplier=.85,
+            enchant_reflect_multiplier=.85,
+        )
+        with patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(mage, antimage, rng=SkillRng(), max_actions=1)
+
+        spell = next(round_ for round_ in result.rounds if round_.event == "skill_scroll_arcane_spark")
+        reflected = next(round_ for round_ in result.rounds if round_.event == "antimagic_reflect")
+        self.assertEqual(spell.attack_types, (combat.ELEMENTAL, combat.MAGIC))
+        self.assertEqual(reflected.damage, round(spell.damage * .85))
+        self.assertEqual(reflected.attack_types, (combat.MAGIC,))
+
+    def test_antimage_reflects_an_enchanted_physical_weapon(self):
+        attacker = Fighter(
+            key="rune-user", name="Rune user", strength=40, health=200, agility=1, luck=1,
+            armor=0, starting_hp=1_000, weapon_enchanted=True,
+        )
+        antimage = Fighter(
+            key="antimage", name="Antimage", strength=1, health=200, agility=1, luck=1,
+            armor=0, starting_hp=1_000, enchant_reflect_multiplier=.85,
+        )
+        with patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(attacker, antimage, seed=123, max_actions=1)
+
+        hit = next(round_ for round_ in result.rounds if round_.attacker == "rune-user" and round_.damage)
+        reflected = next(round_ for round_ in result.rounds if round_.event == "antimagic_reflect")
+        self.assertEqual(hit.attack_types, (combat.PHYSICAL,))
+        self.assertEqual(reflected.damage, round(hit.damage * .85))
 
 
 if __name__ == "__main__":

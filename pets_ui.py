@@ -142,9 +142,9 @@ def main_view(
         lines.append("У тебя пока нет клетки, а значит и существа.")
         lines.append(f"Клетка стоит {_coins(C.CAGE_PRICE)}, приручение — {_coins(C.TAME_PRICE)}.")
     elif not pet:
-        lines.append(f"🏠 Клетка: уровень {cage} — пустая.")
-        lines.append(f"Осталось приручить существо за {_coins(C.TAME_PRICE)}.")
-        lines.append("Существо должно быть твоей собственной раскрашенной фигуркой.")
+        lines.append(f"🏠 Базовая клетка: уровень {cage} — готова.")
+        lines.append(f"Создай существо за {_coins(C.TAME_PRICE)}.")
+        lines.append("Это должна быть твоя покрашенная работа: она будет участвовать в боях против других игроков.")
     else:
         fights = pets.fight_allowance_breakdown(entry, user_id, pets.today())
         left = fights["available"]
@@ -288,9 +288,9 @@ def info_view(user_id) -> tuple[str, dict]:
         "ℹ️ <b>Как играть</b>\n",
         "Открой /arena в личке бота — здесь живёт вся игра.",
         "\n<b>1. Создай своё существо</b>",
-        "Купи клетку и приручи фигурку. "
+        "Создай существо из своей покрашенной работы. "
         "<b>На картинке существа должен быть именно твой собственный покрас</b> — "
-        "загрузи фотографию своей раскрашенной миниатюры.",
+        "загрузи фотографию своей раскрашенной миниатюры; она будет участвовать в боях против других игроков.",
         "\n<b>2. Развивай его</b>",
         "Прокачивай характеристики, находи оружие и экипировку, собирай подходящий комплект.",
         "\n<b>3. Играй</b>",
@@ -1008,41 +1008,31 @@ def updates_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
 
 
 def cage_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
-    """The cage is the game's convenience track: it was asked for as "buy, then upgrade"
-    without saying what an upgrade buys, so each level is one more fight a day and a cut
+    """The free cage is the game's convenience track: each upgrade adds a fight and a cut
     of the winnings -- things a player feels every day without them changing who wins a
     fight."""
     level = pets.cage_level(entry, user_id)
     coins = pets.balance_for(entry, user_id, xp)
 
     lines = ["🏠 <b>Клетка</b>\n"]
-    if not level:
-        lines.append("Клетки нет. Без неё существо негде держать.")
-        lines.append(f"\nПокупка: {_coins(C.CAGE_PRICE)}.")
+    lines.append(f"Уровень {level} из {C.CAGE_MAX_LEVEL}.")
+    # The cage expands the shared fight bank; the arena screen shows its actual
+    # current fill, while this screen only promises the permanent extra capacity.
+    lines.append(f"⚔️ Мест в запасе боёв: +{C.CAGE_BONUS_FIGHTS[level - 1]}")
+    lines.append(f"🪙 Прибавка к добыче: +{C.CAGE_GOLD_BONUS_PCT[level - 1]}%")
+    if level < C.CAGE_MAX_LEVEL:
+        nxt = C.CAGE_UPGRADE_COSTS[level]
+        lines.append(
+            f"\nСледующий уровень — {_coins(nxt)}:"
+            f" мест в запасе +{C.CAGE_BONUS_FIGHTS[level]},"
+            f" добыча +{C.CAGE_GOLD_BONUS_PCT[level]}%."
+        )
     else:
-        lines.append(f"Уровень {level} из {C.CAGE_MAX_LEVEL}.")
-        # The cage expands the shared fight bank; the arena screen shows its actual
-        # current fill, while this screen only promises the permanent extra capacity.
-        lines.append(f"⚔️ Мест в запасе боёв: +{C.CAGE_BONUS_FIGHTS[level - 1]}")
-        lines.append(f"🪙 Прибавка к добыче: +{C.CAGE_GOLD_BONUS_PCT[level - 1]}%")
-        if level < C.CAGE_MAX_LEVEL:
-            nxt = C.CAGE_UPGRADE_COSTS[level]
-            lines.append(
-                f"\nСледующий уровень — {_coins(nxt)}:"
-                f" мест в запасе +{C.CAGE_BONUS_FIGHTS[level]},"
-                f" добыча +{C.CAGE_GOLD_BONUS_PCT[level]}%."
-            )
-        else:
-            lines.append("\nЭто максимальный уровень.")
+        lines.append("\nЭто максимальный уровень.")
     lines.append(f"\n🪙 У тебя: {_money(coins)}")
 
     rows = []
-    if not level:
-        rows.append([{
-            "text": f"Купить клетку — {_money(C.CAGE_PRICE)}",
-            "callback_data": callback_data(user_id, "buycage"),
-        }])
-    elif level < C.CAGE_MAX_LEVEL:
+    if level < C.CAGE_MAX_LEVEL:
         rows.append([{
             "text": f"⬆️ Улучшить — {_money(C.CAGE_UPGRADE_COSTS[level])}",
             "callback_data": callback_data(user_id, "upcage"),
@@ -2670,28 +2660,16 @@ def pet_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
     buttons only the owner has any business pressing."""
     pet = pets.get_pet(entry, user_id)
     if not pet:
-        cage = pets.cage_level(entry, user_id)
         coins = pets.balance_for(entry, user_id, xp)
-        if not cage:
-            text = (
-                "🖼 <b>Твоё существо</b>\n\nСначала купи клетку. После этого бот попросит "
-                "фото твоей собственной раскрашенной миниатюры — она станет картинкой существа."
-                f"\n\n🪙 У тебя: {_money(coins)}"
-            )
-            action = {
-                "text": f"🏠 Купить клетку — {_money(C.CAGE_PRICE)}",
-                "callback_data": callback_data(user_id, "buycage", "pet"),
-            }
-        else:
-            text = (
-                "🖼 <b>Твоё существо</b>\n\nКлетка готова. Теперь пришли фотографию "
-                "именно своей раскрашенной миниатюры и дай ей имя."
-                f"\n\n🪙 У тебя: {_money(coins)}"
-            )
-            action = {
-                "text": f"🐣 Приручить свой покрас — {_money(C.TAME_PRICE)}",
-                "callback_data": callback_data(user_id, "tame"),
-            }
+        text = (
+            "🖼 <b>Твоё существо</b>\n\nПришли фотографию своей покрашенной работы и дай ей имя. "
+            "Эта работа станет твоим существом и будет участвовать в боях против других игроков."
+            f"\n\n🪙 У тебя: {_money(coins)}"
+        )
+        action = {
+            "text": f"🐣 Создать существо — {_money(C.TAME_PRICE)}",
+            "callback_data": callback_data(user_id, "tame"),
+        }
         return text, {"inline_keyboard": [[action], _back_row(user_id)]}
     rows = [
         [
@@ -2712,9 +2690,8 @@ def pet_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
 def no_pet_view(user_id) -> tuple[str, dict]:
     text = (
         "У тебя ещё нет существа.\n\n"
-        f"Сначала клетка ({_coins(C.CAGE_PRICE)}), потом приручение"
-        f" ({_coins(C.TAME_PRICE)}).\n"
-        "Существо должно быть твоей собственной раскрашенной фигуркой."
+        f"Создай его за {_coins(C.TAME_PRICE)}.\n"
+        "Это должна быть твоя покрашенная работа: она станет существом и будет сражаться с другими игроками."
     )
     return text, {"inline_keyboard": [_back_row(user_id)]}
 

@@ -432,13 +432,14 @@ def _save(entry: str, data: dict) -> None:
 
 
 def _new_record() -> dict:
-    """A cage that has just been bought: real, chargeable, but no creature in it yet."""
+    """A free base cage, allocated when a player creates their first creature."""
     return {
         "name": None,
         "photo_file_id": None,
         "owner_name": None,
         "owner_username": None,
-        "cage_price_paid": C.CAGE_PRICE,
+        # Kept for legacy-refund bookkeeping; zero marks a free post-migration cage.
+        "cage_price_paid": 0,
         "cage_level": 1,
         "stats": {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS},
         "stat_points": 0,
@@ -699,14 +700,14 @@ def toggle_fight_result_notifications(entry, user_id) -> bool:
 
 
 def has_cage(entry, user_id) -> bool:
-    return str(user_id) in _load(entry)["pets"]
+    """Every player starts with the free level-one cage needed to create a pet."""
+    return True
 
 
 def cage_level(entry, user_id) -> int:
-    """0 when there is no cage at all, else the real 1..C.CAGE_MAX_LEVEL -- distinct from
-    has_cage() so the UI can render a level number without a second bool check."""
+    """The actual upgrade level, or the free level-one cage before pet creation."""
     record = _load(entry)["pets"].get(str(user_id))
-    return record.get("cage_level", 0) if record else 0
+    return min(C.CAGE_MAX_LEVEL, max(1, int((record or {}).get("cage_level", 1) or 1)))
 
 
 def _farm_passive_terms(record: dict | None) -> tuple[int, int, int]:
@@ -757,16 +758,14 @@ def balance_for(entry, user_id, xp) -> int:
 
 
 def buy_cage(entry, user_id, xp) -> tuple[bool, str]:
+    """Compatibility action for old buttons; the base cage is now free."""
     data = _load(entry)
     uid = str(user_id)
     if uid in data["pets"]:
         return False, "У тебя уже есть клетка."
-    ok, balance = economy.spend(entry, user_id, xp, C.CAGE_PRICE, "buy:pet_cage")
-    if not ok:
-        return False, f"Нужно {C.CAGE_PRICE} монет на клетку, у тебя {balance}."
     data["pets"][uid] = _new_record()
     _save(entry, data)
-    return True, f"Клетка куплена за {C.CAGE_PRICE} монет. Теперь найди, кого туда поселить."
+    return True, "Базовая клетка уже готова. Теперь создай своё существо."
 
 
 def refund_legacy_cages(entries) -> int:
@@ -1932,9 +1931,7 @@ def reset_scroll_collections(entries) -> dict:
 
 def upgrade_cage(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
     data = _load(entry)
-    record = data["pets"].get(str(user_id))
-    if not record:
-        return False, "Сначала купи клетку."
+    record = data["pets"].setdefault(str(user_id), _new_record())
     level = record.get("cage_level", 1)
     if level >= C.CAGE_MAX_LEVEL:
         return False, f"Клетка уже максимального уровня ({C.CAGE_MAX_LEVEL})."
@@ -1957,9 +1954,7 @@ def tame(
 ) -> tuple[bool, str]:
     data = _load(entry)
     uid = str(user_id)
-    record = data["pets"].get(uid)
-    if record is None:
-        return False, "Сначала купи клетку."
+    record = data["pets"].setdefault(uid, _new_record())
     if record.get("name"):
         return False, "У тебя уже есть существо."
     try:
@@ -1979,7 +1974,7 @@ def tame(
     record["xp"] = 0
     record["created_at"] = app_now().isoformat()
     _save(entry, data)
-    return True, f"Готово! «{clean_name}» теперь твоё существо."
+    return True, f"Готово! «{clean_name}» теперь твоё существо и участвует в боях против других игроков."
 
 
 def rename(entry, user_id, name) -> tuple[bool, str]:
@@ -2437,6 +2432,13 @@ def combat_shield(entry, user_id) -> dict | None:
     return _combat_shield_for(_tamed_record(_load(entry), user_id))
 
 
+def combat_weapon_enchanted(entry, user_id) -> bool:
+    """Whether the currently equipped weapon carries a valid elemental rune."""
+    record = _tamed_record(_load(entry), user_id) or {}
+    weapon = (record.get("equipped") or {}).get("weapon")
+    return (record.get("weapon_enchantments") or {}).get(weapon) in RUNE_ELEMENTS
+
+
 def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
     """Immutable item-effect snapshots for the pure combat engine.
 
@@ -2545,6 +2547,7 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
         effects=tuple(effects), level=int(record.get("level", 1)),
         skills=_skill_loadout_for(record), shield=_combat_shield_for(record),
         damage_multiplier=damage_multiplier,
+        weapon_enchanted=element in RUNE_ELEMENTS,
     )
 
 
@@ -2664,6 +2667,12 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 level=row["level"],
                 effects=(({"code": "thorns", "value": 50},) if row["gimmick"] == "healing_pass" else ()),
                 physical_damage_taken_multiplier=0 if row["gimmick"] == "spells_only" else 1,
+                magic_reflect_multiplier=(
+                    D.ANTIMAGIC_REFLECT_SHARE if row["gimmick"] == "antimagic" else 0
+                ),
+                enchant_reflect_multiplier=(
+                    D.ANTIMAGIC_REFLECT_SHARE if row["gimmick"] == "antimagic" else 0
+                ),
                 **enemy_stats,
             )
             if row["gimmick"] == "three_heads":

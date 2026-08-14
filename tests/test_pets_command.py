@@ -273,6 +273,23 @@ class PetsCommandTests(unittest.TestCase):
         record["fight_bank_cap"] = capacity
         pets._save(CHAT, data)
 
+    def test_dungeon_entry_callback_starts_a_run(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Dungeon hero", "file", "Player")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["stats"] = {
+            "strength": 200, "health": 200, "agility": 200, "luck": 200,
+            "endurance": 1,
+        }
+        pets._save(CHAT, data)
+        pets.grant_dungeon_ticket(CHAT, PLAYER["id"])
+
+        api = self._tap("dungeonenter")
+
+        self.assertTrue(pets.dungeon_status(CHAT, PLAYER["id"])["active"])
+        self.assertTrue(api.edits)
+        self.assertNotIn("Что-то сломалось", api.edits[-1]["text"])
+
     # ---------------------------------------------------------------------- commands
 
     def test_the_menu_opens_in_a_dm(self):
@@ -446,8 +463,9 @@ class PetsCommandTests(unittest.TestCase):
     def test_creature_screen_owns_the_picture_and_cage_controls(self):
         economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.TAME_PRICE + 9999, "test")
         before_text, before_keyboard = pets_ui.pet_view(CHAT, PLAYER["id"], RICH_XP)
-        self.assertIn("собственной раскрашенной миниатюры", before_text)
-        self.assertIn("buycage", str(before_keyboard))
+        self.assertIn("покрашенной работы", before_text)
+        self.assertIn("боях против других игроков", before_text)
+        self.assertIn("tame", str(before_keyboard))
 
         self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)[0])
         self.assertTrue(pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")[0])
@@ -750,24 +768,23 @@ class PetsCommandTests(unittest.TestCase):
         # And nothing was bought.
         self.assertIsNone(pets.get_pet(CHAT, PLAYER["id"]))
 
-    def test_buying_a_cage_through_the_button_actually_debits(self):
+    def test_legacy_cage_button_is_free_and_starts_pet_creation(self):
         before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
         api = self._tap("buycage")
-        self.assertEqual(
-            economy.balance(CHAT, PLAYER["id"], RICH_XP), before - C.CAGE_PRICE
-        )
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before)
         self.assertEqual(pets.cage_level(CHAT, PLAYER["id"]), 1)
         self.assertTrue(api.edits, "the screen should be redrawn in place")
 
-    def test_an_unaffordable_purchase_is_refused_on_screen_not_silently(self):
+    def test_tame_button_starts_the_photo_flow_without_a_cage_purchase(self):
         api = FakeApi()
         with patch.object(stats, "resolve_stat_target", _Resolver(api)), \
                 patch.object(economy, "balance", return_value=0):
             _run(bot_listener.handle_pets_callback(
-                api, None, _cfg(), None, _callback(PLAYER, "buycage"),
+                api, None, _cfg(), None, _callback(PLAYER, "tame"),
                 CHAT, {}, set(), log=lambda *_: None,
             ))
-        self.assertTrue(api.edits)
+        self.assertTrue(api.sent)
+        self.assertIn("покрашенной работы", api.sent[-1]["text"])
         self.assertIsNone(pets.get_pet(CHAT, PLAYER["id"]))
 
     def test_taming_asks_for_a_photo_and_opens_a_flow(self):
@@ -778,7 +795,8 @@ class PetsCommandTests(unittest.TestCase):
         flow = next(iter(flows.values()))
         self.assertEqual(flow["awaiting"], "photo_tame")
         self.assertTrue(api.sent[0]["reply_markup"]["force_reply"])
-        self.assertIn("собственная раскрашенная фигурка", api.sent[0]["text"])
+        self.assertIn("покрашенной работы", api.sent[0]["text"])
+        self.assertIn("боях против других игроков", api.sent[0]["text"])
 
     def test_the_shop_accessory_tab_opens_a_shelf_with_a_working_buy_button(self):
         """End-to-end through the callback router, not just the view function: the tab
@@ -865,10 +883,11 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(api.edits)
         self.assertIn("Обновления", api.edits[-1]["text"])
 
-    def test_taming_without_a_cage_shows_the_cage_screen_rather_than_a_prompt(self):
+    def test_taming_without_a_persisted_cage_opens_a_photo_prompt(self):
         flows = {}
-        self._tap("tame", flows=flows)
-        self.assertEqual(flows, {})
+        api = self._tap("tame", flows=flows)
+        self.assertEqual(len(flows), 1)
+        self.assertIn("боях против других игроков", api.sent[-1]["text"])
 
     def _tame_trade_pair(self):
         for user_id, name in ((PLAYER["id"], "Giver"), (43, "Receiver")):

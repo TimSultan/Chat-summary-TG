@@ -1435,6 +1435,7 @@ async def handle_attack(request: web.Request) -> web.Response:
             level=int(record.get("level", 1)),
             skills=pets.skill_loadout(entry, key),
             shield=pets.combat_shield(entry, key),
+            weapon_enchanted=pets.combat_weapon_enchanted(entry, key),
         )
 
     # Зеркало души goes on BEFORE the fighters are built, or it would not be among the
@@ -1656,6 +1657,7 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
         level=int(mine.get("level", 1)),
         skills=pets.skill_loadout(entry, me),
         shield=pets.combat_shield(entry, me),
+        weapon_enchanted=pets.combat_weapon_enchanted(entry, me),
     )
     enemy = pets.mob_fighter(block)
     seed = secrets.randbits(63)
@@ -3820,13 +3822,6 @@ function statRespec() {
 
 function cagePanel() {
   const cage = S.cage;
-  if (!S.has_cage) {
-    return '<div class="panel"><h2>Клетка</h2>' +
-      '<p class="small muted" style="margin:0 0 10px">Без клетки существо негде держать. ' +
-      "Это первая покупка в игре.</p>" +
-      '<button class="go" data-do="buycage"' + (affordable(cage.price) ? "" : " disabled") +
-      ">Купить клетку · " + money(cage.price) + "</button></div>";
-  }
   const top = cage.level >= cage.max;
   return '<div class="panel"><h2>Клетка</h2>' +
     '<div class="row spread"><span>Уровень ' + cage.level + " из " + cage.max + "</span>" +
@@ -3871,16 +3866,8 @@ function dungeonPanel() {
 }
 
 function renderOnboarding() {
-  const cage = S.cage;
-  if (!S.has_cage) {
-    return '<div class="panel"><h2>Начало</h2>' +
-      "<p>Тут живут существа: их растят, одевают и стравливают на арене.</p>" +
-      "<p class='small muted'>Сначала нужна клетка, потом — своя раскрашенная фигурка.</p>" +
-      '<button class="go" data-do="buycage"' + (affordable(cage.price) ? "" : " disabled") +
-      ">Купить клетку · " + money(cage.price) + "</button></div>" + dailyPanel();
-  }
-  return '<div class="panel"><h2>Клетка готова</h2>' +
-    "<p>Осталось приручить существо — для этого нужна фотография твоей фигурки.</p>" +
+  return '<div class="panel"><h2>Создай существо</h2>' +
+    "<p>Пришли фотографию своей покрашенной работы: она станет твоим существом и будет участвовать в боях против других игроков.</p>" +
     "<p class='small muted'>Фото принимает бот в переписке: приручение и смена фото " +
     "живут там, потому что картинку сюда не передать.</p>" +
     '<button class="go" data-do="tobot">Открыть чат с ботом</button></div>' + dailyPanel();

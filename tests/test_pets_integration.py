@@ -92,15 +92,15 @@ class PetsIntegrationTests(unittest.TestCase):
     # ------------------------------------------------------------------ the walkthrough
 
     def test_a_member_can_play_the_whole_game(self):
-        # Nothing yet: the menu must still render for somebody with no cage at all.
+        # Nothing yet: the menu must still render before the player creates a pet.
         self._render_every_screen(ALICE)
         self.assertIsNone(pets.get_pet(ENTRY, ALICE))
 
         opening = self._balance(ALICE)
         self._found(ALICE, "Кабанчик", "Alice")
         self.assertEqual(
-            self._balance(ALICE), opening - C.CAGE_PRICE - C.TAME_PRICE,
-            "founding a pet must debit exactly the cage plus the taming",
+            self._balance(ALICE), opening - C.TAME_PRICE,
+            "founding a pet must debit only the taming cost",
         )
         self._render_every_screen(ALICE)
 

@@ -274,7 +274,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- state ----------------------------------------------------------------------
 
-    async def test_state_shows_no_pet_before_a_cage_and_the_full_paperdoll_after_taming(self):
+    async def test_state_shows_the_free_cage_before_pet_creation_and_the_full_paperdoll_after_taming(self):
         """GET /api/state is the one shape every screen renders from. A player with
         nothing yet still needs a price to look at; a tamed player needs every panel --
         stats, gear (all five slots, empty ones included), bag, arena, farm -- in that
@@ -282,8 +282,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         ask twice."""
         bare = await (await self._get("/api/state", PLAYER)).json()
         self.assertIsNone(bare["pet"])
-        self.assertFalse(bare["has_cage"])
-        self.assertEqual(bare["cage"]["price"], C.CAGE_PRICE)
+        self.assertTrue(bare["has_cage"])
+        self.assertEqual(bare["cage"]["level"], 1)
 
         self._tame(PLAYER)
         full = await (await self._get("/api/state", PLAYER)).json()

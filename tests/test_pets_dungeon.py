@@ -42,10 +42,23 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(boss[0]["boss"])
         self.assertEqual(boss[0]["gimmick"], "reincarnate")
 
-    def test_each_boss_has_a_distinct_hidden_quirk_and_lore_hint(self):
-        bosses = [dungeon.encounter(floor, 0) for floor in range(5, 35, 5)]
-        self.assertEqual(len({boss["gimmick"] for boss in bosses}), len(bosses))
-        self.assertTrue(all(boss["hint"] and "только" not in boss["hint"].lower() for boss in bosses))
+    def test_gimmick_bosses_are_preceded_by_equally_strong_plain_bosses(self):
+        gatekeeper = dungeon.encounter(10, 0)
+        dragon = dungeon.encounter(15, 0)
+        colossus = dungeon.encounter(20, 0)
+        aquarius = dungeon.encounter(25, 0)
+
+        self.assertEqual(gatekeeper["gimmick"], "standard")
+        self.assertEqual(colossus["gimmick"], "standard")
+        self.assertEqual(gatekeeper["stats"], dragon["stats"])
+        self.assertEqual(colossus["stats"], aquarius["stats"])
+        self.assertEqual(dragon["gimmick"], "fire_only")
+        self.assertEqual(aquarius["gimmick"], "spells_only")
+
+    def test_antimage_is_a_distinct_boss_with_a_clear_reflection_hint(self):
+        boss = dungeon.encounter(30, 0)
+        self.assertEqual(boss["gimmick"], "antimagic")
+        self.assertIn("85%", boss["hint"])
 
     def test_reward_receipt_includes_loot_and_scroll(self):
         text = pets_ui.dungeon_reward_text({
@@ -194,7 +207,7 @@ class DungeonTests(unittest.TestCase):
     def test_magic_boss_allows_the_fight_without_magic_but_wins_it(self):
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {
-            "floor": 15, "hp": 500, "max_hp": 500, "cleared": [],
+            "floor": 25, "hp": 500, "max_hp": 500, "cleared": [],
         }
         pets._save(self.entry, data)
 
@@ -208,7 +221,7 @@ class DungeonTests(unittest.TestCase):
     def test_frost_boss_grants_prepared_pet_elemental_damage_bonus(self):
         data = pets._load(self.entry)
         record = data["pets"][self.user_id]
-        record["dungeon_run"] = {"floor": 30, "hp": 500, "max_hp": 500, "cleared": []}
+        record["dungeon_run"] = {"floor": 45, "hp": 500, "max_hp": 500, "cleared": []}
         record["equipped"]["weapon"] = "w001"
         record.setdefault("weapon_enchantments", {})["w001"] = "frost"
         pets._save(self.entry, data)
@@ -223,12 +236,12 @@ class DungeonTests(unittest.TestCase):
     def test_hydra_restores_all_heads_after_third_incomplete_move(self):
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {
-            "floor": 25, "hp": 500, "max_hp": 500, "cleared": [],
+            "floor": 40, "hp": 500, "max_hp": 500, "cleared": [],
             "hydra_head_hp": [0, 100, 100], "hydra_moves": 2,
         }
         pets._save(self.entry, data)
         round_ = pets.pets_combat.Round(1, self.user_id, "hit", 200, 500, 0, "")
-        result = SimpleNamespace(winner=self.user_id, rounds=(round_,), final_hp={"dungeon:boss_25": 0})
+        result = SimpleNamespace(winner=self.user_id, rounds=(round_,), final_hp={"dungeon:boss_40": 0})
 
         with patch("pets.pets_combat.simulate", return_value=result) as simulate:
             ok, message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
