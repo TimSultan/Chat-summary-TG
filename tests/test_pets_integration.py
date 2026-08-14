@@ -100,7 +100,7 @@ class PetsIntegrationTests(unittest.TestCase):
         self._found(ALICE, "Кабанчик", "Alice")
         self.assertEqual(
             self._balance(ALICE), opening - C.TAME_PRICE,
-            "founding a pet must debit only the taming cost",
+            "founding a pet is free",
         )
         self._render_every_screen(ALICE)
 

@@ -143,7 +143,7 @@ def main_view(
         lines.append(f"Клетка стоит {_coins(C.CAGE_PRICE)}, приручение — {_coins(C.TAME_PRICE)}.")
     elif not pet:
         lines.append(f"🏠 Базовая клетка: уровень {cage} — готова.")
-        lines.append(f"Создай существо за {_coins(C.TAME_PRICE)}.")
+        lines.append("Создай существо бесплатно.")
         lines.append("Это должна быть твоя покрашенная работа: она будет участвовать в боях против других игроков.")
     else:
         fights = pets.fight_allowance_breakdown(entry, user_id, pets.today())
@@ -2667,7 +2667,7 @@ def pet_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
             f"\n\n🪙 У тебя: {_money(coins)}"
         )
         action = {
-            "text": f"🐣 Создать существо — {_money(C.TAME_PRICE)}",
+            "text": "🐣 Создать существо",
             "callback_data": callback_data(user_id, "tame"),
         }
         return text, {"inline_keyboard": [[action], _back_row(user_id)]}
@@ -2690,13 +2690,19 @@ def pet_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
 def no_pet_view(user_id) -> tuple[str, dict]:
     text = (
         "У тебя ещё нет существа.\n\n"
-        f"Создай его за {_coins(C.TAME_PRICE)}.\n"
+        "Создай его бесплатно.\n"
         "Это должна быть твоя покрашенная работа: она станет существом и будет сражаться с другими игроками."
     )
-    return text, {"inline_keyboard": [_back_row(user_id)]}
+    return text, {"inline_keyboard": [[
+        {"text": "🐣 Создать существо", "callback_data": callback_data(user_id, "tame")},
+    ], _back_row(user_id)]}
 
 
 def notice_view(user_id, text: str) -> tuple[str, dict]:
     """A one-line result (bought, refused, renamed) with the way back. Used instead of a
     toast whenever the answer is longer than a callback answer's 200 characters."""
-    return text, {"inline_keyboard": [_back_row(user_id)]}
+    rows = []
+    if "Сначала приручи существо" in text:
+        rows.append([{"text": "🐣 Создать существо", "callback_data": callback_data(user_id, "tame")}])
+    rows.append(_back_row(user_id))
+    return text, {"inline_keyboard": rows}

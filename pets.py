@@ -1963,9 +1963,10 @@ def tame(
         return False, str(error)
     if _name_taken(data, clean_name, exclude_uid=uid):
         return False, f"Имя «{clean_name}» уже занято в этом чате -- выбери другое."
-    ok, balance = economy.spend(entry, user_id, xp, C.TAME_PRICE, "buy:pet_tame")
-    if not ok:
-        return False, f"Нужно {C.TAME_PRICE} монет, у тебя {balance}."
+    if C.TAME_PRICE:
+        ok, balance = economy.spend(entry, user_id, xp, C.TAME_PRICE, "buy:pet_tame")
+        if not ok:
+            return False, f"Нужно {C.TAME_PRICE} монет, у тебя {balance}."
     record["name"] = clean_name
     record["photo_file_id"] = photo_file_id
     record["owner_name"] = owner_name

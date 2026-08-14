@@ -45,7 +45,7 @@ from datetime import date as _date, datetime as _datetime
 
 CAGE_PRICE = 100            # buying the cage at all -- the entry ticket
 LEGACY_CAGE_PRICE = 50      # one-time refund for cages bought before the price change
-TAME_PRICE = 50             # taming the creature that lives in it
+TAME_PRICE = 0              # every player can create their first creature for free
 # Renaming is free, and making it cost something is NOT just a matter of raising this:
 # pets.rename does not take the member's xp, and economy.balance needs it to price
 # anything at all. Charging for a rename means widening that signature first. Left here as

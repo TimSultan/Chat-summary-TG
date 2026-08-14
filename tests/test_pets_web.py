@@ -839,6 +839,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('$("hudCreate").hidden = Boolean(pet);', page)
         self.assertIn('data-do="tame">Создать существо', page)
         self.assertIn("function openPetCreation()", page)
+        self.assertIn('openPetCreation();', page)
 
     # ---- portrait: cropping -------------------------------------------------------------
 

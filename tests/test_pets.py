@@ -58,12 +58,12 @@ class CageAndTamingTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "1", 0), 0)
         self.assertEqual(pets.cage_level(entry, "1"), 1)
 
-    def test_tame_allocates_the_free_cage_and_charges_only_taming(self):
+    def test_tame_allocates_the_free_cage_without_charging(self):
         entry = "chat"
-        economy.grant(entry, "1", pets_config.TAME_PRICE, "test")
+        economy.grant(entry, "1", 123, "test")
         ok, msg = pets.tame(entry, "1", 0, "Рекс", "file123", "Owner")
         self.assertTrue(ok, msg)
-        self.assertEqual(economy.balance(entry, "1", 0), 0)
+        self.assertEqual(economy.balance(entry, "1", 0), 123)
         self.assertIsNotNone(pets.get_pet(entry, "1"))
         self.assertIn("боях против других игроков", msg)
 

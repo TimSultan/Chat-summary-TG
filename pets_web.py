@@ -3597,7 +3597,11 @@ async function api(path, body) {
     : { headers: { "X-Telegram-Init-Data": initData } };
   const response = await fetch(PREFIX + path, options);
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.message || "Не получилось");
+  if (!response.ok) {
+    const error = new Error(data.message || "Не получилось");
+    error.code = data.error;
+    throw error;
+  }
   return data;
 }
 
@@ -3628,11 +3632,15 @@ async function act(action, payload) {
     haptic(data.ok ? "ok" : "no");
     if (data.message) toast(data.message);
     render();
+    if (!data.ok && !S.pet && String(data.message || "").includes("Сначала приручи существо")) {
+      openPetCreation();
+    }
     if (data.battle) playDuel(data.battle);
     return data.ok;
   } catch (e) {
     haptic("no");
     toast(e.message);
+    if (e.code === "NO_PET" && S && !S.pet) openPetCreation();
     return false;
   }
 }
@@ -3887,7 +3895,7 @@ function renderOnboarding() {
   return '<div class="panel"><h2>Создай существо</h2>' +
     "<p>Пришли фотографию своей покрашенной работы: она станет твоим существом и будет участвовать в боях против других игроков.</p>" +
     "<p class='small muted'>Выбери картинку прямо здесь и дай имя существу.</p>" +
-    '<button class="go" data-do="tame">Создать существо · ' + money(S.cage.tame_price) + '</button></div>' + dailyPanel();
+    '<button class="go" data-do="tame">Создать существо</button></div>' + dailyPanel();
 }
 
 // ------------------------------------------------------------------------- bag screen
