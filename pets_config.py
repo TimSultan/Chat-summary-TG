@@ -756,6 +756,20 @@ if _new_catalogue_items:
         raise ValueError("equipment catalogues contain duplicate item codes")
     ITEMS = ITEMS + _new_catalogue_items
 
+# The forge creates this singular rare relic from six discarded cursed weapons. It is a
+# real item rather than a synthetic inventory record so it works with all existing bag,
+# equipment, collection and combat paths.
+ITEMS = ITEMS + (
+    Item(
+        "cursed_relic", "Реликвия шести проклятий", "weapon", 0, "forge",
+        {"strength": 24, "luck": 5, "health": -8},
+        "Шесть проклятий договорились, но одно всё ещё шепчет.", rarity="rare",
+        resale_price=125, drop_weight=0,
+        effect={"code": "candle", "text": "В начале боя: +55% к урону или -25%.",
+                "value": 55, "downside": 25, "chance": 60},
+    ),
+)
+
 # Save files from the starter catalogue keep working after the 500-weapon replacement.
 LEGACY_ITEM_CODES = {"stick": "w001", "fork": "w002", "bone": "w003"} if _RAW_WEAPON_ITEMS else {}
 

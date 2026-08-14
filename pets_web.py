@@ -933,8 +933,8 @@ def _action_dungeon_escalator(entry, user_id, xp, payload):
 
 
 def _action_dungeon_fight(entry, user_id, xp, payload):
-    ok, message, _result = pets.dungeon_fight(entry, user_id, int(payload.get("index") or 0))
-    return ok, message
+  ok, message, result = pets.dungeon_fight(entry, user_id, int(payload.get("index") or 0))
+  return ok, message, result
 
 
 def _action_dungeon_rest(entry, user_id, xp, payload):
@@ -1019,7 +1019,8 @@ async def handle_action(request: web.Request) -> web.Response:
         return _json_error("Неизвестное действие.", status=400, code="UNKNOWN_ACTION")
 
     try:
-        ok, message = action(entry, user["id"], xp, body)
+        outcome = action(entry, user["id"], xp, body)
+        ok, message, extra = (*outcome, None)[:3]
         # Every state change the game makes, with who made it and whether it took. This is
         # the record that says what a player actually did when they report that something
         # went wrong -- the alternative is asking them to remember.
@@ -1041,11 +1042,24 @@ async def handle_action(request: web.Request) -> web.Response:
         )
         return _json_error("Что-то сломалось. Попробуй ещё раз.", status=500, code="FAILED")
 
-    return _ok({
+    response = {
         "ok": bool(ok),
         "message": message,
         "state": _state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY]),
-    })
+    }
+    if str(body.get("action") or "") == "dungeon_fight" and isinstance(extra, dict):
+      result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
+      encounter = extra.get("encounter") or {}
+      if result is not None and hero is not None and enemy is not None:
+        dropped = extra.get("dropped") or {}
+        dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
+        response["battle"] = {
+          **_playback_payload(result, str(user["id"]), hero, enemy.key, enemy, encounter.get("name")),
+          "dungeon": True, "enemy_art": {"boss": bool(encounter.get("boss"))},
+          "reward": extra.get("reward") or {},
+          "dropped": _item_payload(dropped_item, request.app[_PREFIX_KEY], pets.get_pet(entry, user["id"])) if dropped_item else None,
+        }
+    return _ok(response)
 
 
 async def handle_opponents(request: web.Request) -> web.Response:
@@ -3372,6 +3386,11 @@ PAGE_HTML = """<!doctype html>
           flex-direction: column; padding: calc(14px + env(safe-area-inset-top)) 14px
           calc(14px + env(safe-area-inset-bottom)); }
   .duel .side { margin-bottom: 10px; }
+  .duel .fighters { display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:10px; }
+  .duel .fighter-art { width:58px; height:58px; border-radius:8px; overflow:hidden; border:2px solid var(--line); display:grid; place-items:center; background:var(--card); }
+  .duel .fighter-art img { width:100%; height:100%; object-fit:cover; }
+  .duel .fighter-art .dungeon-art { width:100%; height:100%; }
+  .duel .versus { font-weight:700; color:var(--muted); }
   .duel .hpbar { height: 12px; border-radius: 6px; background: var(--sunken); overflow: hidden; }
   .duel .hpbar > i { display: block; height: 100%; background: var(--hp); transition: width .28s; }
   .duel .log { flex: 1; overflow-y: auto; margin: 12px 0; display: flex; flex-direction: column; gap: 7px; }
@@ -3533,6 +3552,7 @@ async function act(action, payload) {
     haptic(data.ok ? "ok" : "no");
     if (data.message) toast(data.message);
     render();
+    if (data.battle) playDuel(data.battle);
     return data.ok;
   } catch (e) {
     haptic("no");
@@ -3784,7 +3804,7 @@ function dungeonPanel() {
   }
   if (!dungeon.active) {
     const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
-    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Три врага на этаж. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>⚔️ Войти</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · 5 💎</button>' : '') + '</div></div>';
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Три врага на этаж. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>⚔️ Войти · ' + dungeon.entry_cost + ' 💎</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · ' + (Number(dungeon.entry_cost || 0) + Number(dungeon.escalator_cost || 0)) + ' 💎</button>' : '') + '</div></div>';
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
@@ -3899,11 +3919,11 @@ function openLiveSkillPicker(slot) {
 }
 
 function forgePanel() {
-  const names = { common: "обычных", rare: "редких", legendary: "легендарный" };
+  const names = { cursed: "проклятых", common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
-    '<div class="small muted" style="margin-bottom:10px">5 обычных превращаются в редкий, ' +
-      'а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
+    '<div class="small muted" style="margin-bottom:10px">6 проклятых превращаются в редкую проклятую реликвию, ' +
+      '5 обычных — в редкий, а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
     recipes.map((recipe) => {
       const ingredients = recipe.ingredients.map((code) => S.bag.find((item) => item.code === code))
         .filter(Boolean);
@@ -5842,8 +5862,12 @@ function playDuel(data) {
   const view = document.createElement("div");
   view.className = "duel";
   view.id = "duel";
+  const fighterArt = data.dungeon
+    ? '<div class="fighters"><span class="fighter-art">' + shot(S.pet && S.pet.portrait, S.pet && S.pet.crop) +
+      '</span><span class="versus">VS</span><span class="fighter-art">' + dungeonArt(data.enemy_art || {}) + '</span></div>'
+    : "";
   view.innerHTML =
-    '<div class="side"><div class="row spread small"><b>' + esc(mineName) +
+    fighterArt + '<div class="side"><div class="row spread small"><b>' + esc(mineName) +
       '</b><span id="hpMine"></span></div><div class="hpbar"><i id="barMine" style="width:100%"></i></div></div>' +
     '<div class="side"><div class="row spread small"><b>' + esc(theirName) +
       '</b><span id="hpTheirs"></span></div><div class="hpbar"><i id="barTheirs" style="width:100%"></i></div></div>' +

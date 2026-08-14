@@ -10,10 +10,11 @@ from typing import Final
 
 
 MIN_POWER: Final = 1_000
+ENTRY_RUBY_COST: Final = 15
 ESCALATOR_RUBY_COST: Final = 5
 SHOP_FULL_HEAL_BASE_COST: Final = 60
 SCROLL_LOOT_START_FLOOR: Final = 10
-DUNGEON_OPEN: Final = False
+DUNGEON_OPEN: Final = True
 DUNGEON_CLOSED_NOTICE: Final = (
     "К подземелью подъехала экспедиция для расследования. "
     "Его оцепили и никого не пускают."
@@ -97,7 +98,7 @@ def reward_for(floor: int, boss: bool) -> dict:
     return {
         "gold": (20 + floor * 8) * multiplier,
         "xp": (10 + floor * 5) * multiplier,
-        "item_chance": min(0.55, 0.08 + floor * 0.012) * (1.6 if boss else 1),
+        "item_chance": min(0.22, 0.025 + floor * 0.005) * (1.5 if boss else 1),
         "scroll_chance": 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
             0.25, 0.04 + (floor - SCROLL_LOOT_START_FLOOR) * 0.01,
         ),

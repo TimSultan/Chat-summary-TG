@@ -319,10 +319,12 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         power = int(state.get("power", 0))
         needed = int(state.get("min_power", 1000))
         lines = ["🕳 <b>Подземелье</b>", "", f"⚡ Сила: <b>{_money(power)}</b> / {_money(needed)}",
+             f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>",
                  "Три врага на этаж, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
-        rows = [[{"text": "⚔️ Войти", "callback_data": callback_data(user_id, "dungeonenter")}]]
+        rows = [[{"text": f"⚔️ Войти · {state.get('entry_cost', 15)} 💎", "callback_data": callback_data(user_id, "dungeonenter")}]]
         if int(state.get("deepest", 1)) > 1:
-            rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · 5 💎", "callback_data": callback_data(user_id, "dungeonescalator")}])
+            cost = int(state.get("entry_cost", 15)) + int(state.get("escalator_cost", 5))
+            rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · {cost} 💎", "callback_data": callback_data(user_id, "dungeonescalator")}])
         rows.append(_back_row(user_id))
         return "\n".join(lines), {"inline_keyboard": rows}
     lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", ""]
@@ -1371,11 +1373,11 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
-    labels = {"common": "обычных", "rare": "редких", "legendary": "легендарный"}
+    labels = {"cursed": "проклятых", "common": "обычных", "rare": "редких", "legendary": "легендарный"}
     status = pets.forge_status(entry, user_id)
     lines = [
         "⚒️ <b>Кузница</b>",
-        "5 обычных предметов превращаются в редкий, а 7 редких — в легендарный.",
+        "6 проклятых предметов превращаются в редкую проклятую реликвию, 5 обычных — в редкий, а 7 редких — в легендарный.",
         "<i>Надетые и защищённые вещи кузница не трогает. Сначала уходят самые слабые.</i>",
     ]
     rows = []

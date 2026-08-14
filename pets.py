@@ -2185,6 +2185,7 @@ def dungeon_status(entry: str, user_id) -> dict:
         "active": bool(run), "available": D.DUNGEON_OPEN,
         "closed_notice": D.DUNGEON_CLOSED_NOTICE, "min_power": D.MIN_POWER,
         "power": _power_rating_for(record), "deepest": int(record.get("dungeon_deepest", 1)),
+        "entry_cost": D.ENTRY_RUBY_COST,
         "escalator_cost": D.ESCALATOR_RUBY_COST,
     }
     if not isinstance(run, dict):
@@ -2206,7 +2207,7 @@ def dungeon_status(entry: str, user_id) -> dict:
     return state
 
 
-def _dungeon_fighter(record: dict, key: str) -> pets_combat.Fighter:
+def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) -> pets_combat.Fighter:
     effective = _effective_stats_for(record)
     effects = []
     for code in (record.get("equipped") or {}).values():
@@ -2220,6 +2221,7 @@ def _dungeon_fighter(record: dict, key: str) -> pets_combat.Fighter:
         agility=effective["agility"], luck=effective["luck"], armor=effective.get("armor", 0),
         effects=tuple(effects), level=int(record.get("level", 1)),
         skills=_skill_loadout_for(record), shield=_combat_shield_for(record),
+        damage_multiplier=damage_multiplier,
     )
 
 
@@ -2240,6 +2242,15 @@ def _dungeon_has_element(record: dict, element: str) -> bool:
                for code in _skill_loadout_for(record) if code)
 
 
+def _dungeon_has_fire_damage(record: dict) -> bool:
+    if _dungeon_has_element(record, "fire"):
+        return True
+    return any(
+        (getattr(C.find_item(code), "effect", {}) or {}).get("code") == "burn"
+        for code in (record.get("equipped") or {}).values() if code
+    )
+
+
 def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool, str]:
     if not D.DUNGEON_OPEN:
         return False, D.DUNGEON_CLOSED_NOTICE
@@ -2254,12 +2265,16 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
             return False, "Ты уже в подземелье."
         if _power_rating_for(record) < D.MIN_POWER:
             return False, f"Для подземелья нужно {D.MIN_POWER} силы."
+        wallet = _ruby_row(data)
+        rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+        if rubies < D.ENTRY_RUBY_COST:
+            return False, f"Вход стоит {D.ENTRY_RUBY_COST} рубинов."
+        wallet[str(user_id)] = rubies - D.ENTRY_RUBY_COST
         floor = 1
         if escalator:
             floor = max(1, int(record.get("dungeon_deepest", 1)))
             if floor <= 1:
                 return False, "Эскалатор откроется, когда доберёшься глубже."
-            wallet = _ruby_row(data)
             rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
             if rubies < D.ESCALATOR_RUBY_COST:
                 return False, f"Нужно {D.ESCALATOR_RUBY_COST} рубинов."
@@ -2287,8 +2302,6 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
         if row["index"] in cleared:
             return False, "Этот противник уже побеждён.", None
-        if row["gimmick"] == "fire_only" and not _dungeon_has_element(record, "fire"):
-            return False, "Ледяного дракона ранит только огненный свиток.", None
         if row["gimmick"] == "spells_only" and not any(_skill_loadout_for(record)):
             return False, "Призрака можно ранить только свитками.", None
         if row["gimmick"] == "healing_pass" and _dungeon_has_healing(record):
@@ -2297,7 +2310,8 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             reward, result = dict(row["reward"]), None
             message = "Лечение успокоило плачущее дерево. Ты проходишь дальше."
         else:
-            hero = _dungeon_fighter(record, str(user_id))
+            fire_bonus = row["gimmick"] == "fire_only" and _dungeon_has_fire_damage(record)
+            hero = _dungeon_fighter(record, str(user_id), damage_multiplier=5 if fire_bonus else 1)
             enemy = pets_combat.Fighter(
                 key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
                 level=row["level"],
@@ -2317,11 +2331,11 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             if result.winner != str(user_id):
                 record["dungeon_run"] = None
                 _save(entry, data)
-                return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result}
+                return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
             if row["gimmick"] == "reincarnate" and not int(run.get("boss_lives", 0) or 0):
                 run["boss_lives"] = 1
                 _save(entry, data)
-                return True, f"{row['name']} возрождается. Добей его ещё раз.", {"encounter": row, "result": result, "reincarnated": True}
+                return True, f"{row['name']} возрождается. Добей его ещё раз.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "reincarnated": True}
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
             reward, message = dict(row["reward"]), f"Побеждён: {row['name']}."
@@ -2333,7 +2347,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
     scroll = None
     if reward["scroll_chance"]:
         scroll = grant_scroll_reward(entry, user_id, source=f"dungeon:{floor}:{index}", kind="dungeon", chance=float(reward["scroll_chance"]), pity_after=8)
-    return True, message, {"encounter": row, "result": result, "reward": reward, "dropped": dropped, "scroll": scroll}
+    return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll}
 
 
 def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:
@@ -2543,8 +2557,8 @@ def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
     return True, note, value
 
 
-FORGE_NEXT_RARITY = {"common": "rare", "rare": "legendary"}
-FORGE_REQUIREMENTS = {"common": 5, "rare": 7}
+FORGE_NEXT_RARITY = {"cursed": "rare", "common": "rare", "rare": "legendary"}
+FORGE_REQUIREMENTS = {"cursed": 6, "common": 5, "rare": 7}
 
 
 def _forge_ingredients(record: dict, rarity: str) -> list:
@@ -2599,11 +2613,12 @@ def reforge_items(entry: str, user_id, rarity: str, rng=None) -> tuple[bool, str
             return False, f"Нужно {required} свободных предметов этой редкости. Надетые и защищённые не считаются.", None
         consumed = ingredients[:required]
         owned = set(record.get("inventory", []))
-        pool = [
+        pool = ([C.find_item("cursed_relic")] if rarity == "cursed" else [
             item for item in C.ITEMS
             if item.source == "drop" and item.rarity == result_rarity
             and item.code not in owned
-        ]
+        ])
+        pool = [item for item in pool if item is not None and item.code not in owned]
         if not pool:
             return False, "Подходящие новые предметы этой редкости закончились.", None
         result = chooser.choice(pool)

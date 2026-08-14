@@ -64,6 +64,7 @@ class Fighter:
     skills: tuple = ()
     # Snapshot of the equipped live shield's Defend hook (or None for base Defend).
     shield: dict | None = None
+    damage_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,7 @@ def snapshot(fighter: "Fighter") -> dict:
         "level": fighter.level,
         "skills": list(fighter.skills or ()),
         "shield": dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None,
+        "damage_multiplier": fighter.damage_multiplier,
     }
 
 
@@ -247,6 +249,7 @@ def restore(data) -> "Fighter | None":
         level=_stored_number(data.get("level"), 1),
         skills=skills,
         shield=shield,
+        damage_multiplier=_stored_number(data.get("damage_multiplier"), 1.0),
     )
 
 
@@ -541,7 +544,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     effectful = any(
         effect["code"] not in non_combat_codes
         for fighter_effects in effects.values() for effect in fighter_effects
-    ) or any(skill_loadouts.values()) or any(equipped_shields.values())
+    ) or any(skill_loadouts.values()) or any(equipped_shields.values()) or any(
+        fighter.damage_multiplier != 1.0 for fighter in (a, b)
+    )
     shields = {a.key: 0.0, b.key: 0.0}
     used = {a.key: set() for a in (a, b)}
     landed_hits = {a.key: 0 for a in (a, b)}
@@ -721,7 +726,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     def spell_damage(
         source_key: str, target_key: str, effect: Mapping, number: int,
     ) -> tuple[int, str | None]:
-        raw = derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 1.0)))
+        raw = (derived[source_key]["damage"] * fighters[source_key].damage_multiplier
+               * max(0.0, float(effect.get("amount", 1.0))))
         raw *= 1 + rng.uniform(-C.DAMAGE_VARIANCE, C.DAMAGE_VARIANCE)
         if rng.random() < derived[source_key]["crit"]:
             raw *= C.CRIT_MULTIPLIER
@@ -1235,7 +1241,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                     effects[defender_key], "chill"
                 ) or 0)))
                 effect_round(round_number, defender_key, attacker_key, "chill")
-            damage = max(1, round(damage * multiplier + flat_retaliation))
+            damage = max(1, round(
+                damage * multiplier * fighters[attacker_key].damage_multiplier + flat_retaliation
+            ))
 
         if effectful and damage and shield_breaker_attack:
             used[attacker_key].add("shield_breaker")

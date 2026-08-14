@@ -32,13 +32,13 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(boss[0]["boss"])
         self.assertEqual(boss[0]["gimmick"], "reincarnate")
 
-    def test_dungeon_is_closed_for_investigation(self):
+    def test_dungeon_requires_fifteen_rubies_to_enter(self):
         ok, message = pets.enter_dungeon(self.entry, self.user_id)
         self.assertFalse(ok)
-        self.assertEqual(message, dungeon.DUNGEON_CLOSED_NOTICE)
+        self.assertIn(str(dungeon.ENTRY_RUBY_COST), message)
         state = pets.dungeon_status(self.entry, self.user_id)
-        self.assertFalse(state["available"])
-        self.assertEqual(state["closed_notice"], dungeon.DUNGEON_CLOSED_NOTICE)
+        self.assertTrue(state["available"])
+        self.assertEqual(state["entry_cost"], dungeon.ENTRY_RUBY_COST)
 
     def test_entry_is_gated_then_persists_the_run(self):
         ok, _ = pets.enter_dungeon(self.entry, self.user_id)
@@ -48,6 +48,7 @@ class DungeonTests(unittest.TestCase):
             "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
         }
         pets._save(self.entry, data)
+        pets.grant_rubies(self.entry, self.user_id, dungeon.ENTRY_RUBY_COST)
         ok, message = pets.enter_dungeon(self.entry, self.user_id)
         self.assertTrue(ok, message)
         state = pets.dungeon_status(self.entry, self.user_id)
