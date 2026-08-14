@@ -437,7 +437,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(denied.status, 403)
         self.assertEqual((await denied.json())["error"], "NOT_AN_ECONOMY_ADMIN")
 
-    async def test_fight_audit_has_separate_page_and_admin_only_lookup(self):
+    async def test_fight_audit_has_public_page_pet_filter_and_lookup(self):
         page = await self.client.get("/audit")
         self.assertEqual(page.status, 200)
         html = await page.text()
@@ -446,7 +446,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="petSuggestions"', html)
         self.assertIn("showPetSuggestions()", html)
         self.assertIn('data-pet="', html)
-        self.assertIn('id="auditKey"', html)
+        self.assertNotIn('id="auditKey"', html)
 
         data = pets._load(CHAT)
         data["fight_audits"].append({
@@ -466,26 +466,21 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             "fighters": [{"key": "43", "name": "Rival"}, {"key": "mob:rat", "name": "Rat"}],
             "moves": 4,
         })
+        data["fights"].append({
+            "ts": "2026-08-15T12:07:00+00:00", "attacker_id": "44", "defender_id": "45",
+            "attacker_name": "Older Hero", "defender_name": "Older Rival",
+            "winner_id": "44", "draw": False,
+        })
         pets._save(CHAT, data)
 
-        with patch.dict(os.environ, {"AUDIT_ACCESS_KEY": "browser-secret"}):
-            browser = await self.client.get(
-                "/audit/api/fights", headers={"X-Audit-Key": "browser-secret"},
-            )
-            self.assertEqual(browser.status, 200)
-            wrong = await self.client.get(
-                "/audit/api/fights", headers={"X-Audit-Key": "wrong"},
-            )
-            self.assertEqual(wrong.status, 401)
-            self.assertEqual((await wrong.json())["error"], "BAD_AUDIT_KEY")
-
-        denied = await self.client.get("/audit/api/fights", headers=self._auth(PLAYER))
-        self.assertEqual(denied.status, 403)
-        listed = await self.client.get("/audit/api/fights", headers=self._auth(THIRD))
+        listed = await self.client.get("/audit/api/fights")
         self.assertEqual(listed.status, 200)
         listed_body = await listed.json()
         self.assertEqual(listed_body["fights"][0]["fight_id"], "F-20260815-333333333333")
-        self.assertEqual({row["user_id"] for row in listed_body["pets"]}, {"42", "43"})
+        self.assertEqual(
+            {row["user_id"] for row in listed_body["pets"]}, {"42", "43", "44", "45"},
+        )
+        self.assertTrue(any(row.get("historic") for row in listed_body["fights"]))
         filtered = await self.client.get(
             "/audit/api/fights?pet_id=42&limit=500", headers=self._auth(THIRD),
         )

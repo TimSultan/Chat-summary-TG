@@ -3748,6 +3748,26 @@ def fight_audit_browser(entry: str, limit: int = 100, pet_id=None) -> dict:
     """Pet picker plus newest retained fights, optionally narrowed to one pet owner id."""
     data = _load(entry)
     summaries = [row for row in data.get("fight_audits", []) if isinstance(row, dict)]
+    audited_ids = {str(row.get("fight_id") or "") for row in summaries}
+    # Arena history predates the detailed audit recorder. It still has both participants,
+    # names, timestamp, seed and fighter snapshots, so include it in the chooser instead
+    # of making the page look as though only post-deployment fights ever happened.
+    for fight in data.get("fights", []):
+        if not isinstance(fight, dict):
+            continue
+        legacy_id = fight_id(fight)
+        if not legacy_id or legacy_id in audited_ids:
+            continue
+        summaries.append({
+            "fight_id": legacy_id, "kind": "arena", "at": fight.get("ts"),
+            "winner": fight.get("winner_id"), "draw": bool(fight.get("draw")),
+            "fighters": [
+                {"key": str(fight.get("attacker_id") or ""), "name": fight.get("attacker_name")},
+                {"key": str(fight.get("defender_id") or ""), "name": fight.get("defender_name")},
+            ],
+            "moves": "historic", "historic": True,
+        })
+    summaries.sort(key=lambda row: str(row.get("at") or ""))
     requested = str(pet_id or "").strip()
     limit = max(1, min(FIGHT_AUDIT_LIMIT, int(limit or 100)))
 
@@ -3797,24 +3817,57 @@ def fight_audit_browser(entry: str, limit: int = 100, pet_id=None) -> dict:
 
 
 def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
-    wanted = str(fight_id_ or "").strip().upper()
-    if not (
+    wire_id = str(fight_id_ or "").strip()
+    wanted = wire_id.upper()
+    stable_id = (
         10 <= len(wanted) <= 40 and wanted.startswith("F-")
         and wanted.replace("-", "").isascii() and wanted.replace("-", "").isalnum()
-    ):
-        return None
-    path = _fight_audit_path(entry, wanted)
-    try:
-        row = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        row = None
-    if isinstance(row, dict) and str(row.get("fight_id") or "").upper() == wanted:
-        return row
+    )
+    if stable_id:
+        path = _fight_audit_path(entry, wanted)
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            row = None
+        if isinstance(row, dict) and str(row.get("fight_id") or "").upper() == wanted:
+            return row
+    data = _load(entry)
     # Compatibility with audit rows written briefly into the main store during rollout.
-    for row in reversed(_load(entry).get("fight_audits", [])):
+    for row in reversed(data.get("fight_audits", [])):
         if str(row.get("fight_id") or "").upper() == wanted:
             return dict(row) if "moves" in row and isinstance(row.get("moves"), list) else None
-    return None
+
+    historic = next(
+        (fight for fight in reversed(data.get("fights", [])) if fight_id(fight) == wire_id),
+        None,
+    )
+    if not isinstance(historic, dict):
+        return None
+    snapshot = historic.get("combat_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    fighters = snapshot.get("fighters") if isinstance(snapshot.get("fighters"), dict) else {}
+    attacker_id = str(historic.get("attacker_id") or "")
+    defender_id = str(historic.get("defender_id") or "")
+    attacker = pets_combat.restore(fighters.get(attacker_id))
+    defender = pets_combat.restore(fighters.get(defender_id))
+    seed = snapshot.get("seed")
+    if attacker is None or defender is None or not isinstance(seed, int):
+        return None
+    result = pets_combat.simulate(attacker, defender, seed=seed)
+    try:
+        moment = datetime.fromisoformat(str(historic.get("ts") or ""))
+    except ValueError:
+        moment = app_now()
+    row = _fight_audit_row(
+        wire_id, "arena", moment, result, (attacker, defender), context={
+            "historic_reconstruction": True,
+            "rules_changed": str(result.winner or "") != str(historic.get("winner_id") or ""),
+        },
+    )
+    row["winner"] = historic.get("winner_id")
+    row["loser"] = historic.get("loser_id")
+    row["draw"] = bool(historic.get("draw"))
+    return row
 
 
 def record_fight(
