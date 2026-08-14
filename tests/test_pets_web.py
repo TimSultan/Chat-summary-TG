@@ -446,6 +446,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="petSuggestions"', html)
         self.assertIn("showPetSuggestions()", html)
         self.assertIn('data-pet="', html)
+        self.assertIn('id="auditKey"', html)
 
         data = pets._load(CHAT)
         data["fight_audits"].append({
@@ -466,6 +467,17 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             "moves": 4,
         })
         pets._save(CHAT, data)
+
+        with patch.dict(os.environ, {"AUDIT_ACCESS_KEY": "browser-secret"}):
+            browser = await self.client.get(
+                "/audit/api/fights", headers={"X-Audit-Key": "browser-secret"},
+            )
+            self.assertEqual(browser.status, 200)
+            wrong = await self.client.get(
+                "/audit/api/fights", headers={"X-Audit-Key": "wrong"},
+            )
+            self.assertEqual(wrong.status, 401)
+            self.assertEqual((await wrong.json())["error"], "BAD_AUDIT_KEY")
 
         denied = await self.client.get("/audit/api/fights", headers=self._auth(PLAYER))
         self.assertEqual(denied.status, 403)

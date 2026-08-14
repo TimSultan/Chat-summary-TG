@@ -2472,9 +2472,23 @@ async def handle_audit_page(request: web.Request) -> web.Response:
     return web.Response(text=AUDIT_HTML, content_type="text/html")
 
 
+async def _fight_audit_access(request: web.Request) -> None:
+    """Allow either a signed Telegram admin or the standalone audit password."""
+    expected = str(os.getenv("AUDIT_ACCESS_KEY") or "")
+    supplied = str(request.headers.get("X-Audit-Key") or "")
+    if expected and supplied and secrets.compare_digest(supplied, expected):
+        return
+    if supplied:
+        raise web.HTTPUnauthorized(
+            text=json.dumps({"error": "BAD_AUDIT_KEY", "message": "Wrong audit password."}),
+            content_type="application/json",
+        )
+    await _economy_admin(request)
+
+
 async def handle_fight_audit(request: web.Request) -> web.Response:
     """Admin-only fight lookup; ordinary participants cannot enumerate combat internals."""
-    await _economy_admin(request)
+    await _fight_audit_access(request)
     entry = request.app[_ENTRY_KEY]
     fight_id_ = str(request.query.get("id") or "").strip()
     if fight_id_:
@@ -2636,25 +2650,28 @@ h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-w
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
 @media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
 </style></head><body><main>
-<h1>Fight audit</h1><div class="top" style="margin-bottom:10px"><div class="pet-filter"><input id="petSearch" autocomplete="off" placeholder="Search pet, owner, @username or user ID"><div id="petSuggestions" class="pet-suggestions" hidden></div></div><button id="allPets">All pets</button></div>
+<h1>Fight audit</h1><div class="top" id="unlock" style="margin-bottom:10px"><input id="auditKey" type="password" autocomplete="current-password" placeholder="Audit password"><button id="saveAuditKey">Unlock audit</button></div>
+<div class="top" style="margin-bottom:10px"><div class="pet-filter"><input id="petSearch" autocomplete="off" placeholder="Search pet, owner, @username or user ID"><div id="petSuggestions" class="pet-suggestions" hidden></div></div><button id="allPets">All pets</button></div>
 <div class="top"><input id="query" placeholder="Fight ID, e.g. F-20260815-…"><button id="load">Load fight</button><button id="recent">Recent</button></div>
 <p id="status" class="muted">Loading recent fights…</p><section id="out"></section>
 </main><script>
 const tg=window.Telegram&&Telegram.WebApp; if(tg){tg.ready();tg.expand()}
 const initData=(tg&&tg.initData)||""; const out=document.getElementById("out"), status=document.getElementById("status");
+const unlock=document.getElementById("unlock"),auditKeyInput=document.getElementById("auditKey");let auditKey=localStorage.getItem("fightAuditKey")||"";auditKeyInput.value=auditKey;unlock.hidden=Boolean(initData||auditKey);
 const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pretty=v=>esc(JSON.stringify(v??{},null,2));
-async function api(id="",pet=""){status.textContent="Loading…";const q=new URLSearchParams();if(id)q.set("id",id);if(pet){q.set("pet_id",pet);q.set("limit","500")}const u="/audit/api/fights"+(q.size?"?"+q.toString():"");const r=await fetch(u,{headers:{"X-Telegram-Init-Data":initData}});const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
+async function api(id="",pet=""){status.textContent="Loading…";const q=new URLSearchParams();if(id)q.set("id",id);if(pet){q.set("pet_id",pet);q.set("limit","500")}const u="/audit/api/fights"+(q.size?"?"+q.toString():"");const headers={"X-Telegram-Init-Data":initData};if(auditKey)headers["X-Audit-Key"]=auditKey;const r=await fetch(u,{headers});const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);unlock.hidden=true;return d}
+function auditFailure(e){status.textContent=e.message||"Audit access denied";out.innerHTML="";unlock.hidden=false}
 function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>Level ${esc(f.level)} · STR ${esc(f.strength)} · HP stat ${esc(f.health)} · AGI ${esc(f.agility)} · LUCK ${esc(f.luck)} · ARM ${esc(f.armor)}</div><div class="muted">Derived: max HP ${esc(Math.round(d.max_hp||0))}, damage ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%</div><h4>Items</h4><div class="items">${items.length?items.map(i=>`<span class="tag">${esc(i.name)} · ${esc(i.rarity)} · ${esc(i.code)}</span>`).join(""):"<span class=muted>None</span>"}</div><h4>Scrolls / shield</h4><pre>${pretty({skill_slots:s.skill_slots,shield:s.shield,effects:f.effects})}</pre><details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
 function renderFight(f){const fighters=Object.entries(f.fighters||{});out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Moves (${(f.moves||[]).length})</h2><div class="moves">${(f.moves||[]).map(m=>`<details class="move"><summary><b>#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
-async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){status.textContent=e.message;out.innerHTML=""}}
+async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){auditFailure(e)}}
 let auditPets=[],selectedPet="";const petSearch=document.getElementById("petSearch"),petSuggestions=document.getElementById("petSuggestions");
 function petLabel(p){return `${p.name||p.user_id}${p.owner_name?" / "+p.owner_name:""}${p.owner_username?" / @"+p.owner_username:""} / ${p.user_id} / ${p.fights} fights`}
 function matchingPets(){const wanted=petSearch.value.trim().toLowerCase();return auditPets.filter(p=>!wanted||petLabel(p).toLowerCase().includes(wanted)).slice(0,30)}
 function showPetSuggestions(){const rows=matchingPets();petSuggestions.innerHTML=rows.length?rows.map(p=>`<button type="button" data-pet="${esc(p.user_id)}"><b>${esc(p.name||p.user_id)}</b>${p.owner_name?" · "+esc(p.owner_name):""}${p.owner_username?" · @"+esc(p.owner_username):""}<br><span class="muted">ID ${esc(p.user_id)} · ${esc(p.fights)} fights</span></button>`).join(""):'<div class="muted" style="padding:10px">No matching pets</div>';petSuggestions.hidden=false}
-async function recent(chosen=selectedPet){try{const d=await api("",chosen);auditPets=d.pets||auditPets;selectedPet=d.selected_pet||chosen;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));status.textContent=`${d.fights.length} recent fights${picked?" for "+picked.name:""}`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} moves<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){status.textContent=e.message}}
+async function recent(chosen=selectedPet){try{const d=await api("",chosen);auditPets=d.pets||auditPets;selectedPet=d.selected_pet||chosen;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));status.textContent=`${d.fights.length} recent fights${picked?" for "+picked.name:""}`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} moves<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){auditFailure(e)}}
 petSuggestions.onclick=e=>{const button=e.target.closest("[data-pet]");if(!button)return;selectedPet=button.dataset.pet;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));petSearch.value=picked?petLabel(picked):selectedPet;petSuggestions.hidden=true;recent(selectedPet)};
-const query=document.getElementById("query");document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=()=>recent();document.getElementById("allPets").onclick=()=>{selectedPet="";petSearch.value="";petSuggestions.hidden=true;recent("")};query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};petSearch.oninput=()=>{selectedPet="";showPetSuggestions()};petSearch.onfocus=showPetSuggestions;petSearch.onkeydown=e=>{if(e.key==="Enter"){const first=matchingPets()[0];if(first){selectedPet=String(first.user_id);petSearch.value=petLabel(first);petSuggestions.hidden=true;recent(selectedPet)}}};document.addEventListener("click",e=>{if(!e.target.closest(".pet-filter"))petSuggestions.hidden=true});recent();
+const query=document.getElementById("query");document.getElementById("saveAuditKey").onclick=()=>{auditKey=auditKeyInput.value.trim();if(auditKey)localStorage.setItem("fightAuditKey",auditKey);else localStorage.removeItem("fightAuditKey");recent(selectedPet)};auditKeyInput.onkeydown=e=>{if(e.key==="Enter")document.getElementById("saveAuditKey").click()};document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=()=>recent();document.getElementById("allPets").onclick=()=>{selectedPet="";petSearch.value="";petSuggestions.hidden=true;recent("")};query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};petSearch.oninput=()=>{selectedPet="";showPetSuggestions()};petSearch.onfocus=showPetSuggestions;petSearch.onkeydown=e=>{if(e.key==="Enter"){const first=matchingPets()[0];if(first){selectedPet=String(first.user_id);petSearch.value=petLabel(first);petSuggestions.hidden=true;recent(selectedPet)}}};document.addEventListener("click",e=>{if(!e.target.closest(".pet-filter"))petSuggestions.hidden=true});recent();
 </script></body></html>"""
 
 
