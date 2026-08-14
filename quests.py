@@ -133,6 +133,7 @@ def _empty() -> dict:
         "history": [],         # newest last; one row per finished quest
         "rewards": {},         # difficulty -> partial override of REWARDS_BY_DIFFICULTY
         "real_assignments": {},  # user_id -> the one live Квест в реале
+        "rune_assignments": {},  # user_id -> six elemental rune-paint challenges
         "done": {},            # user_id -> {quest code: when it was last finished}
         "moderators": {},      # user_id -> who may review, delegated by an admin
         "disabled": [],        # quest codes a moderator has taken out of rotation
@@ -160,6 +161,9 @@ def _load(entry: str) -> dict:
     base["real_assignments"] = {
         str(uid): row for uid, row in base["real_assignments"].items() if isinstance(row, dict)
     }
+    base["rune_assignments"] = {
+        str(uid): row for uid, row in base["rune_assignments"].items() if isinstance(row, dict)
+    }
     # Codes are canonicalised on READ rather than migrated on disk -- the same thing
     # pets._load does for legacy item codes. Quest codes used hyphens until Telegram's
     # hashtag parser turned out to end a tag at one (see catalog.normalise_code), and a
@@ -169,7 +173,8 @@ def _load(entry: str) -> dict:
         str(uid): {catalog.normalise_code(code): str(when) for code, when in rows.items()}
         for uid, rows in base["done"].items() if isinstance(rows, dict)
     }
-    for row in list(base["assignments"].values()) + list(base["real_assignments"].values()):
+    for row in (list(base["assignments"].values()) + list(base["real_assignments"].values())
+                + list(base["rune_assignments"].values())):
         if row.get("code"):
             row["code"] = catalog.normalise_code(row["code"])
         for card in row.get("quests", []) if isinstance(row.get("quests"), list) else []:
@@ -436,7 +441,8 @@ def available_quests(entry: str, data: dict | None = None, kind: str = "paint") 
     """Quests of one kind still in a moderator's rotation."""
     data = data if data is not None else _load(entry)
     disabled = set(data.get("disabled", []))
-    everything = catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
+    everything = (catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
+                  if kind == "real" else catalog.RUNE_QUESTS)
     pool = tuple(quest for quest in everything if quest.code not in disabled)
     return pool or everything
 
@@ -516,8 +522,8 @@ def _is_offerable(quest, data: dict, user_id, moment: datetime) -> bool:
 
 
 # Independent storage for the three-card painting board and one-card real-life board.
-SLOTS = {"paint": "assignments", "real": "real_assignments"}
-QUESTS_PER_BOARD = {"paint": 3, "real": 1}
+SLOTS = {"paint": "assignments", "real": "real_assignments", "rune": "rune_assignments"}
+QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 6}
 BOARD_LIFETIME = timedelta(hours=24)
 EMPTY_BOARD_REFRESH = timedelta(hours=8)
 
@@ -673,6 +679,11 @@ def real_quest(entry: str, user_id, now: datetime | None = None) -> dict:
     return quest_board(entry, user_id, "real", now)
 
 
+def rune_quest(entry: str, user_id, now: datetime | None = None) -> dict:
+    """The six thematic elemental painting challenges."""
+    return quest_board(entry, user_id, "rune", now)
+
+
 # Public compatibility name retained for callers that used the old one-slot API.
 quest_slot = quest_board
 
@@ -683,6 +694,7 @@ def has_available_quests(entry: str, user_id, now: datetime | None = None) -> bo
     return bool(
         daily_quest(entry, user_id, moment).get("attention")
         or real_quest(entry, user_id, moment).get("attention")
+        or rune_quest(entry, user_id, moment).get("attention")
     )
 
 
@@ -1145,6 +1157,12 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
     gold = int(receipt.get("gold", 0) or 0)
     if gold:
         economy.grant_once(entry, user_id, gold, f"quest:{submission_id}")
+    rubies = 10 if receipt.get("kind") == "real" else 5
+    pets.grant_rubies_once(entry, user_id, rubies, f"quest:{submission_id}")
+    rune = {"granted": 0}
+    if receipt.get("kind") == "rune":
+        element = str(receipt.get("code") or "").removeprefix("rune_")
+        rune = pets.grant_runes(entry, user_id, element, 5, f"quest:{submission_id}")
     xp = int(receipt.get("xp", 0) or 0) if has_pet else 0
     if xp:
         pets.award_xp(entry, user_id, xp)
@@ -1163,7 +1181,8 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
         entry, user_id, submission_id, receipt.get("difficulty", 0),
     )
     return {
-        "gold": gold, "xp": xp, "tickets": tickets, "has_pet": has_pet,
+        "gold": gold, "xp": xp, "tickets": tickets, "rubies": rubies, "rune": rune,
+        "has_pet": has_pet,
         "item": dropped.get("code") if dropped else None,
         "item_name": dropped.get("name") if dropped else None,
         "item_rarity": dropped.get("rarity") if dropped else None,

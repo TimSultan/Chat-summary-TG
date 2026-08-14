@@ -6411,7 +6411,7 @@ async def handle_pets_callback(
             return
         if action == "questreroll":
             raw_kind, separator, code = str(argument or "").partition(":")
-            kind = "real" if raw_kind == "real" else "paint"
+            kind = raw_kind if raw_kind in {"paint", "real", "rune"} else "paint"
             ok, note = quests.reroll(
                 entry, user_id, kind=kind, code=code if separator else None,
             )
@@ -6654,6 +6654,19 @@ async def handle_pets_callback(
                 pets_ui.forge_view(entry, user_id, xp), log,
             )
             return
+        if action == "enchantmenu":
+            await _send_pets_view(
+                api, chat_id, pets_ui.enchant_weapon_view(entry, user_id, argument),
+                message_id=message_id, log=log,
+            )
+            return
+        if action == "enchant":
+            code, _, element = str(argument or "").partition(":")
+            ok, note = pets.enchant_weapon(entry, user_id, code, element)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.forge_view(entry, user_id, xp), log,
+            )
+            return
 
         if action == "cgame":
             await _send_pets_view(
@@ -6767,7 +6780,7 @@ async def handle_pets_callback(
             "ccombos": lambda: pets_ui.casino_combinations_view(user_id, argument),
             "cpokerstyles": lambda: pets_ui.casino_poker_styles_view(user_id),
             "quests": lambda: pets_ui.quests_view(
-                entry, user_id, "real" if argument == "real" else "paint",
+                entry, user_id, argument if argument in {"paint", "real", "rune"} else "paint",
             ),
             "questdetail": lambda: pets_ui.quest_detail_view(
                 entry, user_id, *(str(argument or "paint:").split(":", 1)),

@@ -1248,6 +1248,77 @@ def grant_rubies(entry, user_id, amount: int) -> int:
     return total
 
 
+RUNE_ELEMENTS = ("fire", "frost", "water", "earth", "air", "plants")
+RUNE_ENCHANT_RUBY_COST = 15
+
+
+def grant_rubies_once(entry, user_id, amount: int, source: str) -> int:
+    """Credit rubies once, using a durable source key for quest settlement retries."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        wallet = _ruby_row(data)
+        sources = data.setdefault("ruby_sources", {})
+        if source in sources:
+            return max(0, int(wallet.get(str(user_id), 0) or 0))
+        total = max(0, int(wallet.get(str(user_id), 0) or 0)) + max(0, int(amount or 0))
+        wallet[str(user_id)] = total
+        sources[source] = {"user_id": str(user_id), "amount": max(0, int(amount or 0))}
+        _metric_add(data, "rubies_minted", max(0, int(amount or 0)))
+        _save(entry, data)
+    return total
+
+
+def rune_status(entry: str, user_id) -> dict:
+    record = _tamed_record(_load(entry), user_id) or {}
+    runes = record.get("runes") if isinstance(record.get("runes"), dict) else {}
+    enchantments = record.get("weapon_enchantments") if isinstance(record.get("weapon_enchantments"), dict) else {}
+    return {
+        "runes": {element: max(0, int(runes.get(element, 0) or 0)) for element in RUNE_ELEMENTS},
+        "enchantments": dict(enchantments), "cost": RUNE_ENCHANT_RUBY_COST,
+    }
+
+
+def grant_runes(entry: str, user_id, element: str, amount: int, source: str) -> dict:
+    if element not in RUNE_ELEMENTS or int(amount or 0) <= 0:
+        return {"granted": 0}
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return {"granted": 0, "element": element}
+        sources = record.setdefault("rune_sources", {})
+        if source in sources:
+            return {"granted": 0, "element": element}
+        runes = record.setdefault("runes", {})
+        runes[element] = max(0, int(runes.get(element, 0) or 0)) + int(amount)
+        sources[source] = {"element": element, "amount": int(amount)}
+        _save(entry, data)
+    return {"granted": int(amount), "element": element}
+
+
+def enchant_weapon(entry: str, user_id, code: str, element: str) -> tuple[bool, str]:
+    if element not in RUNE_ELEMENTS:
+        return False, "Неизвестная руна."
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        item = C.find_item(code)
+        if record is None or item is None or item.slot != "weapon" or code not in record.get("inventory", []):
+            return False, "Выбери оружие из своей сумки."
+        runes = record.setdefault("runes", {})
+        if int(runes.get(element, 0) or 0) < 1:
+            return False, "Не хватает этой руны."
+        wallet = _ruby_row(data)
+        rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+        if rubies < RUNE_ENCHANT_RUBY_COST:
+            return False, f"Зачарование стоит {RUNE_ENCHANT_RUBY_COST} рубинов."
+        runes[element] -= 1
+        wallet[str(user_id)] = rubies - RUNE_ENCHANT_RUBY_COST
+        record.setdefault("weapon_enchantments", {})[code] = element
+        _save(entry, data)
+    return True, f"«{item.name}» зачаровано руной {element}."
+
+
 def farm_tickets(entry, user_id) -> int:
     return _ticket_row(_load(entry), user_id)["count"]
 
@@ -2165,6 +2236,18 @@ def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
         effect = getattr(item, "effect", None) if item else None
         if isinstance(effect, dict) and effect.get("code"):
             effects.append(dict(effect))
+    weapon = (record.get("equipped") or {}).get("weapon")
+    element = (record.get("weapon_enchantments") or {}).get(weapon)
+    enchant_effects = {
+        "fire": {"code": "burn", "value": 5, "turns": 2},
+        "frost": {"code": "chill", "value": 25},
+        "water": {"code": "regen", "value": 5},
+        "earth": {"code": "plating", "value": 3},
+        "air": {"code": "precision", "value": 15},
+        "plants": {"code": "vampiric", "value": 5},
+    }
+    if element in enchant_effects:
+        effects.append(enchant_effects[element])
     return tuple(effects)
 
 
@@ -2215,6 +2298,20 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
         effect = getattr(item, "effect", None) if item else None
         if isinstance(effect, dict) and effect.get("code"):
             effects.append(dict(effect))
+    weapon = (record.get("equipped") or {}).get("weapon")
+    element = (record.get("weapon_enchantments") or {}).get(weapon)
+    if element == "fire":
+        effects.append({"code": "burn", "value": 5, "turns": 2})
+    elif element == "frost":
+        effects.append({"code": "chill", "value": 25})
+    elif element == "water":
+        effects.append({"code": "regen", "value": 5})
+    elif element == "earth":
+        effects.append({"code": "plating", "value": 3})
+    elif element == "air":
+        effects.append({"code": "precision", "value": 15})
+    elif element == "plants":
+        effects.append({"code": "vampiric", "value": 5})
     return pets_combat.Fighter(
         key=str(key), name=record.get("name") or "Существо",
         strength=effective["strength"], health=effective["health"],
@@ -2244,6 +2341,8 @@ def _dungeon_has_element(record: dict, element: str) -> bool:
 
 def _dungeon_has_fire_damage(record: dict) -> bool:
     if _dungeon_has_element(record, "fire"):
+        return True
+    if (record.get("weapon_enchantments") or {}).get((record.get("equipped") or {}).get("weapon")) == "fire":
         return True
     return any(
         (getattr(C.find_item(code), "effect", {}) or {}).get("code") == "burn"
@@ -2344,10 +2443,14 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
 
     economy.grant(entry, user_id, int(reward["gold"]), "pet_dungeon_win")
     dropped = grant_random_drop(entry, user_id, float(reward["item_chance"]), seed=f"dungeon:{floor}:{index}")
+    rune = None
+    if random.Random(f"dungeon-rune:{floor}:{index}:{user_id}").random() < (0.12 if row.get("boss") else 0.025):
+        element = "fire" if row.get("gimmick") == "fire_only" else RUNE_ELEMENTS[floor % len(RUNE_ELEMENTS)]
+        rune = grant_runes(entry, user_id, element, 1, f"dungeon:{floor}:{index}")
     scroll = None
     if reward["scroll_chance"]:
         scroll = grant_scroll_reward(entry, user_id, source=f"dungeon:{floor}:{index}", kind="dungeon", chance=float(reward["scroll_chance"]), pity_after=8)
-    return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll}
+    return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune}
 
 
 def dungeon_rest(entry: str, user_id, xp: int) -> tuple[bool, str]:

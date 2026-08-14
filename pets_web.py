@@ -754,6 +754,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["arena"]["farming"] = pets.is_farming(entry, user_id)
     state["arena"]["pity"] = pets.legendary_pity_progress(entry, user_id)
     state["rubies"] = pets.ruby_balance(entry, user_id)
+    state["runes"] = pets.rune_status(entry, user_id)
     state["dungeon"] = pets.dungeon_status(entry, user_id)
     state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
@@ -826,6 +827,12 @@ def _action_reforge(entry, user_id, xp, payload):
         entry, user_id, str(payload.get("rarity") or ""),
     )
     return ok, message
+
+
+def _action_enchant_weapon(entry, user_id, xp, payload):
+    return pets.enchant_weapon(
+      entry, user_id, str(payload.get("code") or ""), str(payload.get("element") or ""),
+    )
 
 
 def _action_sell(entry, user_id, xp, payload):
@@ -958,6 +965,7 @@ _ACTIONS = {
     "lock": _action_lock,
     "buy": _action_buy,
     "reforge": _action_reforge,
+    "enchant_weapon": _action_enchant_weapon,
     "sell": _action_sell,
     "gift": _action_gift,
     "buy_cage": _action_buy_cage,
@@ -1050,7 +1058,7 @@ async def handle_action(request: web.Request) -> web.Response:
     if str(body.get("action") or "") == "dungeon_fight" and isinstance(extra, dict):
       result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
       encounter = extra.get("encounter") or {}
-      if result is not None and hero is not None and enemy is not None:
+      if encounter.get("boss") and result is not None and hero is not None and enemy is not None:
         dropped = extra.get("dropped") or {}
         dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
         response["battle"] = {
@@ -2170,6 +2178,7 @@ def _quest_board_payload(entry: str, me: str) -> dict:
         # The second slot. Dealt exactly like the painting challenge, and rendered by
         # the same card -- the two differ in what they ask for, not in how they work.
         "real": quests.real_quest(entry, me),
+        "rune": quests.rune_quest(entry, me),
         "stats": quests.stats_for(entry, me),
         "history": quests.history(entry, me, limit=20),
     })
@@ -2186,7 +2195,8 @@ async def handle_quest_reroll(request: web.Request) -> web.Response:
     user, _xp = await _player(request, body)
     entry = request.app[_ENTRY_KEY]
     me = str(user["id"])
-    kind = "real" if str(body.get("kind") or "") == "real" else "paint"
+    kind = str(body.get("kind") or "paint")
+    kind = kind if kind in {"paint", "real", "rune"} else "paint"
     ok, message = quests.reroll(
         entry, me, kind=kind, code=str(body.get("code") or "") or None,
     )
@@ -3921,6 +3931,9 @@ function openLiveSkillPicker(slot) {
 function forgePanel() {
   const names = { cursed: "проклятых", common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
+  const runeState = S.runes || { runes: {}, enchantments: {}, cost: 15 };
+  const weapons = (S.bag || []).filter((item) => item.slot === "weapon");
+  const runeNames = { fire: "Огонь", frost: "Лёд", water: "Вода", earth: "Земля", air: "Воздух", plants: "Растения" };
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
     '<div class="small muted" style="margin-bottom:10px">6 проклятых превращаются в редкую проклятую реликвию, ' +
       '5 обычных — в редкий, а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
@@ -3935,6 +3948,15 @@ function forgePanel() {
         '<button class="go sec" data-reforge="' + recipe.rarity + '"' +
           (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
     }).join('') +
+    '<div class="panel" style="margin:8px 0;padding:10px"><h2>🔮 Зачарования</h2>' +
+      '<div class="tiny muted">Руна добавляет эффект оружию. Цена: ' + runeState.cost + ' 💎 и 1 руна.</div>' +
+      (weapons.length ? weapons.map((weapon) => '<div class="small" style="margin-top:9px"><b>' + esc(weapon.name) +
+        '</b>' + (runeState.enchantments[weapon.code] ? ' · ' + esc(runeNames[runeState.enchantments[weapon.code]]) : '') +
+        '<div class="row" style="flex-wrap:wrap;margin-top:5px">' + Object.keys(runeNames).map((element) =>
+          '<button class="go sec" data-enchant="' + esc(weapon.code) + ':' + element + '"' +
+          (runeState.runes[element] ? '' : ' disabled') + '>' + esc(runeNames[element]) + ' · ' +
+          Number(runeState.runes[element] || 0) + '</button>').join('') + '</div></div>').join('') :
+        '<div class="empty">В сумке нет оружия для зачарования.</div>') + '</div>' +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
 }
 
@@ -5184,8 +5206,9 @@ function questCompactCard(card, kind, index) {
 }
 
 function questCard(board, kind) {
-  const paint = kind === "paint";
-  const heading = paint ? "🎯 Квесты на покрас · 3 карточки" : "🌍 Квест в реале";
+  const paint = kind !== "real";
+  const heading = kind === "rune" ? "🔮 Рунические покрасы · элементы" :
+    (paint ? "🎯 Квесты на покрас · 3 карточки" : "🌍 Квест в реале");
   const cards = (board && board.quests) || [];
   return '<div class="panel"><h2>' + heading + '</h2>' +
     '<div class="tiny muted" style="margin-bottom:9px">⏳ Новая подборка через ' +
@@ -5203,12 +5226,14 @@ function questBoard(data) {
     S.quest_attention = Boolean(
       ((ACTIVE_QUEST_BOARD.quests || []).some((row) => row.status === "open")) ||
       (((ACTIVE_QUEST_BOARD.real || {}).quests || []).some((row) => row.status === "open"))
+      || (((ACTIVE_QUEST_BOARD.rune || {}).quests || []).some((row) => row.status === "open"))
     );
   }
   const done = (ACTIVE_QUEST_BOARD.stats || {}).done || 0;
   const rows = ACTIVE_QUEST_BOARD.history || [];
   return questCard(ACTIVE_QUEST_BOARD, "paint") +
     questCard(ACTIVE_QUEST_BOARD.real || {}, "real") +
+    questCard(ACTIVE_QUEST_BOARD.rune || {}, "rune") +
     '<button class="go sec" data-questidea>💡 Предложить идею</button>' +
     '<div class="panel"><h2>Сдано квестов · ' + done + '</h2>' + (rows.length
       ? rows.map((row) => '<div class="row spread small" style="margin-bottom:7px"><span>' +
@@ -5988,7 +6013,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-reforge],[data-enchant]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]");
@@ -6044,6 +6069,11 @@ document.addEventListener("click", async (event) => {
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   if (d.reforge) { await act("reforge", { rarity: d.reforge }); return; }
+  if (d.enchant) {
+    const [code, element] = d.enchant.split(":", 2);
+    await act("enchant_weapon", { code, element });
+    return;
+  }
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }

@@ -41,7 +41,7 @@ _CODE_CHARS: Final = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 HASHTAG_PREFIX: Final = "quest_"
 
 
-KINDS: Final = ("paint", "real")
+KINDS: Final = ("paint", "real", "rune")
 # What a paint challenge always asks for, so the 60 of them need not repeat it 60 times.
 DEFAULT_PAINT_PROOF: Final = "фото покрашенной детали"
 
@@ -976,13 +976,25 @@ _REAL_DATA: Final = (
      "real", "фото результата плюс ссылка или название обучающего материала", "", 14),
 )
 
+_RUNE_DATA: Final = (
+    ("rune_fire", "Огненная руна", "огненный элемент: клинок, факел или жар на доспехе", "Покажи горячий источник света с жёлтым центром, оранжевой серединой и красным краем.", 2, "brush", "Самые яркие точки оставь почти белыми, а тени вокруг сделай холоднее."),
+    ("rune_frost", "Ледяная руна", "лёд, иней или морозный кристалл", "Собери холодный градиент от синей тени к почти белому блику.", 2, "brush", "Добавь тонкие резкие грани: лёд любит контраст."),
+    ("rune_water", "Водная руна", "воду, волну или мокрую поверхность", "Нарисуй отражения и направленные блики, чтобы поверхность читалась влажной.", 2, "any", "Блики повторяют форму поверхности и не должны быть случайными."),
+    ("rune_earth", "Земная руна", "камень, грунт или скалу", "Сделай объём через тёплые и холодные оттенки камня.", 2, "brush", "Сухой кистью отметь выступы, а углубления оставь темнее."),
+    ("rune_air", "Воздушная руна", "ветер, облако или магический поток", "Покажи движение плавными переходами и направлением мазка.", 2, "airbrush", "Оставь края потока мягкими, а центр — более светлым."),
+    ("rune_plants", "Руна растений", "листья, лозу или живую магию", "Раздели зелень на тёплые освещённые и холодные теневые участки.", 2, "brush", "Не используй один зелёный: смешай хотя бы три разных оттенка."),
+)
+
 
 
 QUESTS: Final[tuple[Quest, ...]] = tuple(
     _row_to_quest(row) for row in _DATA
-) + tuple(_row_to_quest(row) for row in _REAL_DATA)
+) + tuple(_row_to_quest(row) for row in _REAL_DATA) + tuple(
+    _row_to_quest((*row, "rune")) for row in _RUNE_DATA
+)
 PAINT_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "paint")
 REAL_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "real")
+RUNE_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "rune")
 QUEST_COUNT: Final = len(QUESTS)
 PAINT_COUNT: Final = len(PAINT_QUESTS)
 REAL_COUNT: Final = len(REAL_QUESTS)

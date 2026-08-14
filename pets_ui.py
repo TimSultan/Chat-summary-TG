@@ -361,6 +361,9 @@ def dungeon_reward_text(receipt: dict | None) -> str:
             f"📜 Свиток: {escape(str(scroll.get('icon') or '✨'))} "
             f"«{escape(str(scroll.get('name') or 'Новый свиток'))}»"
         )
+    rune = receipt.get("rune") or {}
+    if rune.get("granted"):
+        lines.append(f"🔮 Руна: {escape(str(rune.get('element') or 'магия'))} +{int(rune['granted'])}")
     return "\n".join(lines)
 
 
@@ -735,11 +738,11 @@ def _quest_timer(seconds: int) -> str:
 
 def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     """Compact quest shelf: three readable cards and three matching buttons."""
-    kind = "real" if kind == "real" else "paint"
-    board = quests.real_quest(entry, user_id) if kind == "real" else quests.daily_quest(entry, user_id)
+    kind = kind if kind in {"paint", "real", "rune"} else "paint"
+    board = quests.real_quest(entry, user_id) if kind == "real" else (quests.rune_quest(entry, user_id) if kind == "rune" else quests.daily_quest(entry, user_id))
     cards = board.get("quests") or []
-    paint = kind == "paint"
-    title = "🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>"
+    paint = kind != "real"
+    title = "🔮 <b>Рунические покрасы · элементы</b>" if kind == "rune" else ("🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>")
     lines = [title, f"\n⏳ Новая подборка через <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>."]
     lines.append(
         "Успей отправить фото до обновления. Выполни всё раньше — новая подборка придёт через 8 часов."
@@ -761,23 +764,21 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         }])
     if not cards:
         lines.append("\nПока доступных заданий нет. Проверим снова через 8 часов.")
-    other = "real" if paint else "paint"
-    buttons.append([{
-        "text": "🌍 Квест в реале" if paint else "🎯 Три квеста на покрас",
-        "callback_data": callback_data(user_id, "quests", other),
-    }])
+    for other, label in (("paint", "🎯 Три квеста на покрас"), ("real", "🌍 Квест в реале"), ("rune", "🔮 Рунические покрасы")):
+        if other != kind:
+            buttons.append([{"text": label, "callback_data": callback_data(user_id, "quests", other)}])
     buttons.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": buttons}
 
 
 def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, dict]:
     """Full brief and a practical step-by-step tutorial for one selected card."""
-    kind = "real" if kind == "real" else "paint"
-    board = quests.real_quest(entry, user_id) if kind == "real" else quests.daily_quest(entry, user_id)
+    kind = kind if kind in {"paint", "real", "rune"} else "paint"
+    board = quests.real_quest(entry, user_id) if kind == "real" else (quests.rune_quest(entry, user_id) if kind == "rune" else quests.daily_quest(entry, user_id))
     card = next((row for row in board.get("quests", []) if row.get("code") == code), None)
     if card is None:
         return quests_view(entry, user_id, kind)
-    paint = kind == "paint"
+    paint = kind != "real"
     reward = card.get("reward") or {}
     difficulty = int(card.get("difficulty", 1) or 1)
     status = card.get("status", "open")
@@ -1426,11 +1427,42 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 user_id, "reforge" if recipe.get("can_forge") else "noop", rarity,
             ),
         }])
+    rune_state = pets.rune_status(entry, user_id)
+    weapons = [C.find_item(code) for code in pet.get("inventory", [])]
+    weapons = [item for item in weapons if item is not None and item.slot == "weapon"]
+    rune_names = {"fire": "Огонь", "frost": "Лёд", "water": "Вода", "earth": "Земля", "air": "Воздух", "plants": "Растения"}
+    lines.append(f"\n🔮 <b>Зачарования</b> · 1 руна + {rune_state['cost']} рубинов")
+    if weapons:
+        for weapon in weapons:
+            current = rune_state["enchantments"].get(weapon.code)
+            lines.append(f"«{escape(weapon.name)}»" + (f" · {rune_names[current]}" if current else ""))
+            rows.append([{
+                "text": f"🔮 {weapon.name[:20]} · выбрать руну",
+                "callback_data": callback_data(user_id, "enchantmenu", weapon.code),
+            }])
+    else:
+        lines.append("В сумке нет оружия для зачарования.")
     rows.append([{
         "text": "🛠️ Ковка оружия — скоро",
         "callback_data": callback_data(user_id, "weaponforge"),
     }])
     rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def enchant_weapon_view(entry: str, user_id, code: str) -> tuple[str, dict]:
+    item = C.find_item(code)
+    pet = pets.get_pet(entry, user_id)
+    if item is None or item.slot != "weapon" or pet is None or code not in pet.get("inventory", []):
+        return forge_view(entry, user_id, 0)
+    state = pets.rune_status(entry, user_id)
+    names = {"fire": "🔥 Огонь", "frost": "❄️ Лёд", "water": "💧 Вода", "earth": "🪨 Земля", "air": "💨 Воздух", "plants": "🌿 Растения"}
+    lines = [f"🔮 <b>Зачаровать «{escape(item.name)}»</b>", f"Цена: {state['cost']} рубинов и 1 руна."]
+    rows = []
+    for element, label in names.items():
+        count = int(state["runes"].get(element, 0) or 0)
+        rows.append([{"text": f"{label} · {count}", "callback_data": callback_data(user_id, "enchant" if count else "noop", f"{code}:{element}")}])
+    rows.append([{"text": "◀️ К кузнице", "callback_data": callback_data(user_id, "forge")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
