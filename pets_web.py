@@ -3746,6 +3746,9 @@ function renderHero() {
   if (!S.pet) { box.innerHTML = renderOnboarding(); return; }
   const pet = S.pet, combat = S.combat;
   const slot = (s) => {
+    // A newly created pet owns all five empty slots. Still tolerate a partial/stale
+    // state payload so a missing inventory record can never blank the Hero tab.
+    s = s || { slot: "", name: "Снаряжение", emoji: "", item: null };
     const item = s.item;
     return '<button class="slot ' + (item ? "filled r-" + item.rarity : "") + '" ' +
       'data-slot="' + s.slot + '" data-code="' + (item ? esc(item.code) : "") + '">' +
@@ -3756,22 +3759,26 @@ function renderHero() {
       "</button>";
   };
   const worn = {};
-  for (const s of S.equipment) worn[s.slot] = s;
+  for (const s of (S.equipment || [])) worn[s.slot] = s;
+  const emptySlot = (slotName) => ({
+    slot: slotName, name: ({ weapon: "Оружие", shield: "Щит", gloves: "Перчатки", amulet: "Амулет", boots: "Сапоги" })[slotName] || slotName,
+    emoji: ({ weapon: "🗡", shield: "🛡", gloves: "🧤", amulet: "📿", boots: "👢" })[slotName] || "", item: null,
+  });
 
   box.innerHTML =
     '<div class="panel">' +
       '<div class="doll">' +
-        "<div>" + slot(worn.weapon) + "</div>" +
+        "<div>" + slot(worn.weapon || emptySlot("weapon")) + "</div>" +
         // Tapping the portrait is how you change and frame the photo. It is the one thing
         // on this screen that is a picture, so it is where a hand goes looking.
         '<button class="portrait" data-do="portrait">' +
           shot(pet.portrait, pet.crop) +
           '<span class="edit">✏️</span>' +
           '<span class="pw">⚡ ' + money(combat.power) + "</span></button>" +
-        "<div>" + slot(worn.shield) + "</div>" +
-        "<div>" + slot(worn.gloves) + "</div>" +
-        "<div>" + slot(worn.amulet) + "</div>" +
-        "<div>" + slot(worn.boots) + "</div>" +
+        "<div>" + slot(worn.shield || emptySlot("shield")) + "</div>" +
+        "<div>" + slot(worn.gloves || emptySlot("gloves")) + "</div>" +
+        "<div>" + slot(worn.amulet || emptySlot("amulet")) + "</div>" +
+        "<div>" + slot(worn.boots || emptySlot("boots")) + "</div>" +
         '<div class="tiny muted pet-equipment-summary">' +
           esc(pet.name) + " · ур. " + pet.level + "<br>" +
           pet.xp + " / " + pet.xp_needed + " опыта<br>" +
@@ -3797,6 +3804,8 @@ function renderHero() {
       debuffNote(S.debuff) +
     "</div>" +
 
+    (Object.values(worn).some((s) => s.item) ? "" :
+      '<div class="panel small muted">Снаряжения пока нет. Загляни в лавку или побеждай в боях, чтобы его получить.</div>') +
     cagePanel() + dailyPanel() +
     '<button class="go sec" data-do="rename">✏️ Переименовать</button>';
   paintShots(box);

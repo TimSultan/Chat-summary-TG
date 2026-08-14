@@ -290,6 +290,11 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(api.edits)
         self.assertNotIn("Что-то сломалось", api.edits[-1]["text"])
 
+    def test_dungeon_menu_callback_renders_without_an_image_helper(self):
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Dungeon hero", "file", "Player")
+        api = self._tap("dungeon")
+        self.assertTrue(api.edits or api.sent)
+
     # ---------------------------------------------------------------------- commands
 
     def test_the_menu_opens_in_a_dm(self):

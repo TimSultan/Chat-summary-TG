@@ -6337,7 +6337,6 @@ async def handle_pets_callback(
         if action == "dungeon":
             await _send_pets_view(api, chat_id, pets_ui.dungeon_view(entry, user_id, xp),
                                   message_id=message_id, log=log)
-            await _send_dungeon_floor_image(api, chat_id, entry, user_id, log)
             return
         if action in ("dungeonenter", "dungeonescalator", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
             receipt = None
