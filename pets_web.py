@@ -419,7 +419,7 @@ async def handle_portrait_upload(request: web.Request) -> web.Response:
     record = pets.get_pet(entry, user["id"])
     # A first portrait is also the Mini App's pet-creation flow.  Keep it on this route
     # so the browser uses the exact same bounded, normalised image upload as a re-photo.
-    pet_name = (request.headers.get("X-Pet-Name") or "").strip()
+    pet_name = (request.query.get("pet_name") or "").strip()
     if record is None and not pet_name:
         return _json_error("Назови существо перед загрузкой фото.", code="PET_NAME_REQUIRED")
 
@@ -5899,12 +5899,13 @@ async function uploadPortrait(file, petName) {
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
     if (!blob) throw new Error("Не получилось прочитать картинку");
 
-    const response = await fetch(PREFIX + "/api/portrait", {
+    // Names can be Cyrillic. HTTP header values are ByteStrings and reject those before
+    // fetch sends anything, while a query component is explicitly UTF-8 encoded.
+    const uploadUrl = PREFIX + "/api/portrait" +
+      (petName ? "?pet_name=" + encodeURIComponent(petName) : "");
+    const response = await fetch(uploadUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "image/jpeg", "X-Telegram-Init-Data": initData,
-        ...(petName ? { "X-Pet-Name": petName } : {}),
-      },
+      headers: { "Content-Type": "image/jpeg", "X-Telegram-Init-Data": initData },
       body: blob,
     });
     const data = await response.json().catch(() => ({}));

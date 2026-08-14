@@ -241,10 +241,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         body IS the image, so initData travels in the header instead of the JSON payload
         every other mutation uses."""
         headers = {**self._auth(user), "Content-Type": "image/jpeg"}
-        if pet_name:
-            headers["X-Pet-Name"] = pet_name
+        suffix = "?pet_name=" + pet_name if pet_name else ""
         return await self.client.post(
-            pets_web.ROUTE_PREFIX + "/api/portrait", data=data,
+            pets_web.ROUTE_PREFIX + "/api/portrait" + suffix, data=data,
             headers=headers,
         )
 
@@ -840,6 +839,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-do="tame">Создать существо', page)
         self.assertIn("function openPetCreation()", page)
         self.assertIn('openPetCreation();', page)
+        self.assertIn('"?pet_name=" + encodeURIComponent(petName)', page)
 
     # ---- portrait: cropping -------------------------------------------------------------
 
