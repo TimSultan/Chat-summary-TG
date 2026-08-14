@@ -33,6 +33,7 @@ import json
 import random
 import secrets
 import threading
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 import economy

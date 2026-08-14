@@ -104,6 +104,19 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
 
+    def test_first_dungeon_fight_resolves_without_callback_error(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
+
+        _ok, _message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        self.assertIsNotNone(receipt)
+
 
 if __name__ == "__main__":
     unittest.main()
