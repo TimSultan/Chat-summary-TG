@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pets
 import pets_dungeon as dungeon
+import pets_ui
 
 
 class DungeonTests(unittest.TestCase):
@@ -31,6 +32,16 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(len(boss), 1)
         self.assertTrue(boss[0]["boss"])
         self.assertEqual(boss[0]["gimmick"], "reincarnate")
+
+    def test_reward_receipt_includes_loot_and_scroll(self):
+        text = pets_ui.dungeon_reward_text({
+            "reward": {"gold": 25, "xp": 15},
+            "dropped": {"name": "Клинок", "auto_equipped": True},
+            "scroll": {"granted": True, "icon": "🔥", "name": "Комета"},
+        })
+        self.assertIn("+25", text)
+        self.assertIn("Клинок", text)
+        self.assertIn("Комета", text)
 
     def test_dungeon_requires_fifteen_rubies_to_enter(self):
         ok, message = pets.enter_dungeon(self.entry, self.user_id)

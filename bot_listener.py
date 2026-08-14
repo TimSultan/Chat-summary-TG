@@ -6333,6 +6333,7 @@ async def handle_pets_callback(
                                   message_id=message_id, log=log)
             return
         if action in ("dungeonenter", "dungeonescalator", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
+            receipt = None
             if action == "dungeonenter":
                 ok, note = pets.enter_dungeon(entry, user_id)
             elif action == "dungeonescalator":
@@ -6348,7 +6349,10 @@ async def handle_pets_callback(
                     index = int(argument)
                 except (TypeError, ValueError):
                     index = 0
-                ok, note, _result = pets.dungeon_fight(entry, user_id, index)
+                ok, note, receipt = pets.dungeon_fight(entry, user_id, index)
+            reward_text = pets_ui.dungeon_reward_text(receipt)
+            if reward_text:
+                note = f"{note}\n{reward_text}"
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note, pets_ui.dungeon_view(entry, user_id, xp), log,
             )

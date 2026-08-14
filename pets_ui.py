@@ -340,6 +340,30 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def dungeon_reward_text(receipt: dict | None) -> str:
+    """Compact dungeon reward receipt for the Telegram floor redraw."""
+    reward = (receipt or {}).get("reward") or {}
+    if not reward:
+        return ""
+    bits = []
+    if reward.get("gold"):
+        bits.append(f"🪙 +{_money(int(reward['gold']))}")
+    if reward.get("xp"):
+        bits.append(f"✨ +{_money(int(reward['xp']))} опыта")
+    lines = ["<b>Получено:</b> " + " · ".join(bits)] if bits else []
+    dropped = receipt.get("dropped") or {}
+    if dropped.get("name"):
+        equipped = " (надето)" if dropped.get("auto_equipped") else ""
+        lines.append(f"🎁 Предмет: «{escape(str(dropped['name']))}»{equipped}")
+    scroll = receipt.get("scroll") or {}
+    if scroll.get("granted"):
+        lines.append(
+            f"📜 Свиток: {escape(str(scroll.get('icon') or '✨'))} "
+            f"«{escape(str(scroll.get('name') or 'Новый свиток'))}»"
+        )
+    return "\n".join(lines)
+
+
 def casino_view(entry: str, user_id, xp: int = 0) -> tuple[str, dict]:
     """The coin-only casino lobby."""
     coins = pets.balance_for(entry, user_id, xp)
