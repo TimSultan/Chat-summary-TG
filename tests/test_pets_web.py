@@ -236,13 +236,16 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200, await response.text())
         return await response.json()
 
-    async def _upload_portrait(self, user, data: bytes):
+    async def _upload_portrait(self, user, data: bytes, pet_name: str | None = None):
         """POST raw bytes to /api/portrait the way the page's canvas upload does -- the
         body IS the image, so initData travels in the header instead of the JSON payload
         every other mutation uses."""
+        headers = {**self._auth(user), "Content-Type": "image/jpeg"}
+        if pet_name:
+            headers["X-Pet-Name"] = pet_name
         return await self.client.post(
             pets_web.ROUTE_PREFIX + "/api/portrait", data=data,
-            headers={**self._auth(user), "Content-Type": "image/jpeg"},
+            headers=headers,
         )
 
     # ---- authentication -----------------------------------------------------------------
@@ -807,15 +810,20 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())["error"], "TOO_BIG")
         self.assertEqual(self.save_calls, [])
 
-    async def test_upload_is_gated_like_every_other_mutation(self):
-        """A picture upload is still a mutation of the pet, so it inherits the same three
-        gates the rest of the game enforces: something to attach the photo to, membership
-        to be allowed to act at all, and a signed caller in the first place."""
-        no_pet = await self._upload_portrait(PLAYER, _jpeg_bytes())
-        self.assertEqual(no_pet.status, 409)
-        self.assertEqual((await no_pet.json())["error"], "NO_PET")
+    async def test_upload_creates_a_first_pet_and_still_enforces_membership_and_auth(self):
+        """The same web upload used for a new portrait creates the first pet when a name
+        is supplied; it remains a members-only authenticated mutation."""
+        missing_name = await self._upload_portrait(PLAYER, _jpeg_bytes())
+        self.assertEqual(missing_name.status, 400)
+        self.assertEqual((await missing_name.json())["error"], "PET_NAME_REQUIRED")
 
-        self._tame(PLAYER)
+        created = await self._upload_portrait(PLAYER, _jpeg_bytes(), pet_name="Брауни")
+        self.assertEqual(created.status, 200, await created.text())
+        created_body = await created.json()
+        self.assertTrue(created_body["ok"], created_body["message"])
+        self.assertEqual(created_body["state"]["pet"]["name"], "Брауни")
+        self.assertEqual(pets.get_pet(CHAT, PLAYER["id"])["photo_file_id"], "uploaded_file_id")
+
         non_member = await self._upload_portrait(NONMEMBER, _jpeg_bytes())
         self.assertEqual(non_member.status, 403)
 
@@ -824,6 +832,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             headers={"Content-Type": "image/jpeg"},
         )
         self.assertEqual(unsigned.status, 401)
+
+    async def test_page_offers_pet_creation_at_the_top_and_in_onboarding(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX + "/")).text()
+        self.assertIn('id="hudCreate"', page)
+        self.assertIn('$("hudCreate").hidden = Boolean(pet);', page)
+        self.assertIn('data-do="tame">Создать существо', page)
+        self.assertIn("function openPetCreation()", page)
 
     # ---- portrait: cropping -------------------------------------------------------------
 

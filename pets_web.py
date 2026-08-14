@@ -404,7 +404,7 @@ async def _read_bounded(request: web.Request, limit: int) -> bytes | None:
 
 
 async def handle_portrait_upload(request: web.Request) -> web.Response:
-    """Replace the pet's photo from the page: raw image bytes in, new file_id out.
+    """Create a pet or replace its photo: raw image bytes in, new file_id out.
 
     The Mini App CAN produce a picture -- it is a web page, and a file input plus a canvas
     is all it takes. What it cannot produce is a Telegram file_id, so the bytes are handed
@@ -416,8 +416,12 @@ async def handle_portrait_upload(request: web.Request) -> web.Response:
     entry = request.app[_ENTRY_KEY]
     if not await request.app[_IS_MEMBER_KEY](user):
         return _json_error("Только участники чата.", status=403, code="NOT_A_MEMBER")
-    if pets.get_pet(entry, user["id"]) is None:
-        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
+    record = pets.get_pet(entry, user["id"])
+    # A first portrait is also the Mini App's pet-creation flow.  Keep it on this route
+    # so the browser uses the exact same bounded, normalised image upload as a re-photo.
+    pet_name = (request.headers.get("X-Pet-Name") or "").strip()
+    if record is None and not pet_name:
+        return _json_error("Назови существо перед загрузкой фото.", code="PET_NAME_REQUIRED")
 
     body = await _read_bounded(request, PORTRAIT_MAX_BYTES)
     if body is None:
@@ -444,7 +448,14 @@ async def handle_portrait_upload(request: web.Request) -> web.Response:
         log(f"[pets_web] portrait upload from {user['id']}: Telegram gave no file_id")
         return _json_error("Не получилось сохранить фото.", status=502, code="UPLOAD_FAILED")
 
-    ok, message = pets.set_photo(entry, user["id"], file_id)
+    if record is None:
+        ok, message = pets.tame(
+            entry, user["id"], xp, pet_name, file_id,
+            user.get("first_name") or user.get("username") or "Игрок",
+            user.get("username"),
+        )
+    else:
+        ok, message = pets.set_photo(entry, user["id"], file_id)
     log(
         f"[pets_web] portrait upload from {user['id']}: {len(body)} -> {len(photo)} bytes, "
         f"file_id {file_id[:16]}…, stored={ok}"
@@ -2640,6 +2651,11 @@ PAGE_HTML = """<!doctype html>
     border-radius: 12px; font-size: 20px; line-height: 1;
     border: 1px solid var(--line); background: var(--sunken);
   }
+  .hud .hud-create {
+    flex: none; border: 0; border-radius: 10px; padding: 9px 10px;
+    background: var(--accent); color: var(--accent-fg); font-size: 12px;
+    font-weight: 700; line-height: 1.1;
+  }
   .bar { height: 5px; border-radius: 3px; background: var(--sunken); overflow: hidden; margin-top: 5px; }
   .bar > i { display: block; height: 100%; background: var(--xp); border-radius: 3px; transition: width .35s; }
 
@@ -3519,6 +3535,7 @@ PAGE_HTML = """<!doctype html>
     </div>
     <div class="bar"><i id="hudXp" style="width:0%"></i></div>
   </div>
+  <button class="hud-create" id="hudCreate" hidden>Создать существо</button>
   <button class="post" id="hudMail" title="Почта">📬</button>
 </header>
 
@@ -3703,6 +3720,7 @@ function renderHud() {
     if (pet) paintShots($("hudFace"));
   }
   const rubies = (S && S.rubies) || 0;
+  $("hudCreate").hidden = Boolean(pet);
   $("hudRubyBox").hidden = !rubies;
   $("hudRuby").textContent = money(rubies);
   const arena = (S && S.arena) || {};
@@ -3868,9 +3886,8 @@ function dungeonPanel() {
 function renderOnboarding() {
   return '<div class="panel"><h2>Создай существо</h2>' +
     "<p>Пришли фотографию своей покрашенной работы: она станет твоим существом и будет участвовать в боях против других игроков.</p>" +
-    "<p class='small muted'>Фото принимает бот в переписке: приручение и смена фото " +
-    "живут там, потому что картинку сюда не передать.</p>" +
-    '<button class="go" data-do="tobot">Открыть чат с ботом</button></div>' + dailyPanel();
+    "<p class='small muted'>Выбери картинку прямо здесь и дай имя существу.</p>" +
+    '<button class="go" data-do="tame">Создать существо · ' + money(S.cage.tame_price) + '</button></div>' + dailyPanel();
 }
 
 // ------------------------------------------------------------------------- bag screen
@@ -5777,6 +5794,26 @@ function openPortrait() {
   };
 }
 
+function openPetCreation() {
+  sheet(
+    "<h3>Создать существо</h3>" +
+    "<p class='small muted'>Выбери фото своей покрашенной работы. Она станет существом для боёв против других игроков.</p>" +
+    '<input id="tameName" class="go sec" style="text-align:left" maxlength="24" placeholder="Имя существа">' +
+    '<input type="file" id="tameFile" accept="image/*" hidden>' +
+    '<div class="acts"><button class="go" id="tamePick">🖼 Выбрать фотографию</button></div>'
+  );
+  $("tamePick").onclick = () => {
+    if (!$("tameName").value.trim()) {
+      toast("Сначала дай существу имя.");
+      return;
+    }
+    $("tameFile").click();
+  };
+  $("tameFile").onchange = () => uploadPortrait(
+    $("tameFile").files[0], $("tameName").value.trim(),
+  );
+}
+
 function wireCropGestures() {
   const stage = $("cropStage");
   const pointers = new Map();
@@ -5841,7 +5878,7 @@ function wireCropGestures() {
 // upload is the slowest thing in this whole page over a mobile connection.
 const UPLOAD_EDGE = 1280;
 
-async function uploadPortrait(file) {
+async function uploadPortrait(file, petName) {
   if (!file) return;
   toast("Загружаю фото…");
   try {
@@ -5856,11 +5893,14 @@ async function uploadPortrait(file) {
 
     const response = await fetch(PREFIX + "/api/portrait", {
       method: "POST",
-      headers: { "Content-Type": "image/jpeg", "X-Telegram-Init-Data": initData },
+      headers: {
+        "Content-Type": "image/jpeg", "X-Telegram-Init-Data": initData,
+        ...(petName ? { "X-Pet-Name": petName } : {}),
+      },
       body: blob,
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.message || "Не получилось загрузить");
+    if (!response.ok || !data.ok) throw new Error(data.message || "Не получилось загрузить");
     S = data.state;
     closeSheet();
     haptic("ok");
@@ -6104,6 +6144,11 @@ $("hudMail").addEventListener("click", () => {
   render();
 });
 
+$("hudCreate").addEventListener("click", () => {
+  haptic();
+  openPetCreation();
+});
+
 // One delegated handler for the whole game. Every control is a data- attribute rather than
 // a bound listener, so a re-render (which replaces all of it) cannot leave a dead button
 // or a duplicated one behind.
@@ -6286,6 +6331,7 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
   else if (d.do === "quarrystart") { await act("quarry_start"); }
   else if (d.do === "portrait") { openPortrait(); }
+  else if (d.do === "tame") { openPetCreation(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }
   else if (d.do === "rename") {
     sheet("<h3>Новое имя</h3><input id='newName' class='go sec' style='text-align:left' " +
