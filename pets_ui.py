@@ -336,7 +336,8 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         if not enemy.get("cleared"):
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     if state.get("can_rest"):
-        rows.append([{"text": f"🩹 +30% · {state['partial_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "partial")}, {"text": f"❤️ Полностью · {state['full_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "full")}])
+        lines.append("\nОтдохнуть?")
+        rows.append([{"text": f"🩹 +30% · 🪙 {state['partial_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "partial")}, {"text": f"❤️ Полностью · 🪙 {state['full_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "full")}])
         rows.append([{"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
     rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -352,7 +353,7 @@ def dungeon_reward_text(receipt: dict | None) -> str:
         bits.append(f"🪙 +{_money(int(reward['gold']))}")
     if reward.get("xp"):
         bits.append(f"✨ +{_money(int(reward['xp']))} опыта")
-    lines = ["<b>Получено:</b> " + " · ".join(bits)] if bits else []
+    lines = ["Получено: " + " · ".join(bits)] if bits else []
     dropped = receipt.get("dropped") or {}
     if dropped.get("name"):
         equipped = " (надето)" if dropped.get("auto_equipped") else ""

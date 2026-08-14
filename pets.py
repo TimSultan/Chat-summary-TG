@@ -2580,7 +2580,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         if row["gimmick"] == "healing_pass" and _dungeon_has_healing(record):
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
-            reward, result = dict(row["reward"]), None
+            reward, result = D.roll_reward(floor, bool(row.get("boss"))), None
             message = "Лечение успокоило плачущее дерево. Ты проходишь дальше."
         else:
             fire_bonus = row["gimmick"] == "fire_only" and _dungeon_has_fire_damage(record)
@@ -2612,7 +2612,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 return True, f"{row['name']} возрождается. Добей его ещё раз.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "reincarnated": True}
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
-            reward, message = dict(row["reward"]), f"Побеждён: {row['name']}."
+            reward, message = D.roll_reward(floor, bool(row.get("boss"))), f"Побеждён: {row['name']}."
         _apply_xp(record, int(reward["xp"]))
         _save(entry, data)
 

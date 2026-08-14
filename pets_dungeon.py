@@ -6,6 +6,7 @@ recreated after a restart without trusting anything supplied by the client.
 
 from __future__ import annotations
 
+import random
 from typing import Final
 
 
@@ -104,6 +105,16 @@ def reward_for(floor: int, boss: bool) -> dict:
             0.25, 0.04 + (floor - SCROLL_LOOT_START_FLOOR) * 0.01,
         ),
     }
+
+
+def roll_reward(floor: int, boss: bool, rng=None) -> dict:
+    """Roll one victory's rewards around the floor's public baseline."""
+    rng = rng or random.SystemRandom()
+    reward = dict(reward_for(floor, boss))
+    reward["gold"] = rng.randint(round(reward["gold"] * .8), round(reward["gold"] * 1.2))
+    reward["xp"] = rng.randint(max(1, round(reward["xp"] * .7)), round(reward["xp"] * 1.3))
+    reward["item_chance"] = min(1.0, max(0.0, reward["item_chance"] * rng.uniform(.7, 1.3)))
+    return reward
 
 
 def shop_heal_cost(floor: int) -> int:

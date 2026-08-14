@@ -1,4 +1,5 @@
 import sys
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,25 @@ class DungeonTests(unittest.TestCase):
         self.assertIn("+25", text)
         self.assertIn("Клинок", text)
         self.assertIn("Комета", text)
+        self.assertNotIn("<b>", text)
+
+    def test_rewards_vary_between_mobs(self):
+        rewards = [dungeon.roll_reward(3, False, random.Random(seed)) for seed in range(5)]
+        self.assertGreater(len({reward["xp"] for reward in rewards}), 1)
+        self.assertGreater(len({reward["item_chance"] for reward in rewards}), 1)
+
+    def test_rest_controls_show_coins_and_prompt(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1, 2],
+        }
+        pets._save(self.entry, data)
+
+        text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn("Отдохнуть?", text)
+        self.assertTrue(any("🪙" in label for label in labels))
 
     def test_dungeon_requires_five_rubies_to_enter(self):
         data = pets._load(self.entry)
