@@ -2,6 +2,7 @@ import sys
 import random
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,11 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(len(boss), 1)
         self.assertTrue(boss[0]["boss"])
         self.assertEqual(boss[0]["gimmick"], "reincarnate")
+
+    def test_each_boss_has_a_distinct_hidden_quirk_and_lore_hint(self):
+        bosses = [dungeon.encounter(floor, 0) for floor in range(5, 35, 5)]
+        self.assertEqual(len({boss["gimmick"] for boss in bosses}), len(bosses))
+        self.assertTrue(all(boss["hint"] and "только" not in boss["hint"].lower() for boss in bosses))
 
     def test_reward_receipt_includes_loot_and_scroll(self):
         text = pets_ui.dungeon_reward_text({
@@ -164,6 +170,43 @@ class DungeonTests(unittest.TestCase):
         self.assertIn("Аквариус", message)
         self.assertIsNotNone(receipt)
         self.assertIsNone(pets.get_pet(self.entry, self.user_id)["dungeon_run"])
+
+    def test_frost_boss_grants_prepared_pet_elemental_damage_bonus(self):
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["dungeon_run"] = {"floor": 30, "hp": 500, "max_hp": 500, "cleared": []}
+        record["equipped"]["weapon"] = "w001"
+        record.setdefault("weapon_enchantments", {})["w001"] = "frost"
+        pets._save(self.entry, data)
+        result = SimpleNamespace(winner=self.user_id, rounds=(), final_hp={})
+
+        with patch("pets.pets_combat.simulate", return_value=result) as simulate:
+            ok, _message, _receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        self.assertTrue(ok)
+        self.assertEqual(simulate.call_args.args[0].damage_multiplier, 5)
+
+    def test_hydra_restores_all_heads_after_third_incomplete_move(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 25, "hp": 500, "max_hp": 500, "cleared": [],
+            "hydra_head_hp": [0, 100, 100], "hydra_moves": 2,
+        }
+        pets._save(self.entry, data)
+        round_ = pets.pets_combat.Round(1, self.user_id, "hit", 200, 500, 0, "")
+        result = SimpleNamespace(winner=self.user_id, rounds=(round_,), final_hp={"dungeon:boss_25": 0})
+
+        with patch("pets.pets_combat.simulate", return_value=result) as simulate:
+            ok, message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertTrue(ok)
+        self.assertTrue(receipt["regenerated"])
+        self.assertIn("зазвучали вновь", message)
+        self.assertEqual(simulate.call_args.kwargs["max_actions"], 1)
+        self.assertEqual(run["hydra_moves"], 0)
+        self.assertEqual(len(set(run["hydra_head_hp"])), 1)
+        self.assertGreater(run["hydra_head_hp"][0], 0)
 
 
 if __name__ == "__main__":

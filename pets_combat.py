@@ -92,6 +92,7 @@ class FightResult:
     is_draw: bool
     seed: int | None
     accident: str | None
+    final_hp: dict | None = None
 
 
 # Amulets use these stable machine codes; their catalogue descriptions are player-facing
@@ -509,7 +510,8 @@ def _resolve_blow(attacker: dict, defender: dict, rng) -> tuple:
     return event, damage
 
 
-def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "FightResult":
+def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
+             max_actions: int | None = None) -> "FightResult":
     """Run one fight to a finish. Deterministic for a given seeded `rng`.
 
     Leadership alternates once a first mover is picked; the pick and every roll after it
@@ -969,6 +971,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                     winner=owner_key, loser=other_key, rounds=tuple(rounds), opening=opening,
                     closing=pets_flavor.result_line(fighters[owner_key].name, fighters[other_key].name, rng=rng),
                     total_damage=total_damage, stopped_early=False, is_draw=False, seed=seed, accident=None,
+                    final_hp={key: max(0, round(value)) for key, value in hp.items()},
                 )
 
     def signature_round(attacker_key: str, defender_key: str, event: str, damage: int) -> bool:
@@ -1000,6 +1003,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
                 winner=attacker_key, loser=defender_key, rounds=tuple(rounds), opening=opening,
                 closing=pets_flavor.result_line(fighters[attacker_key].name, fighters[defender_key].name, rng=rng),
                 total_damage=total_damage, stopped_early=False, is_draw=False, seed=seed, accident=None,
+                final_hp={key: max(0, round(value)) for key, value in hp.items()},
             )
 
     def strike(attacker_key: str, defender_key: str, round_number: int) -> str | None:
@@ -1519,7 +1523,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
     winner_key = loser_key = None
     is_draw = False
 
-    for round_number in range(1, C.MAX_SKILL_ACTIONS_PER_FIGHTER + 1):
+    action_limit = max(1, int(max_actions or C.MAX_SKILL_ACTIONS_PER_FIGHTER))
+    for round_number in range(1, action_limit + 1):
         leader_key = order[(round_number - 1) % 2]
         follower_key = order[round_number % 2]
 
@@ -1565,4 +1570,5 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None) -> "
         is_draw=is_draw,
         seed=seed,
         accident=None,
+        final_hp={key: max(0, round(value)) for key, value in hp.items()},
     )

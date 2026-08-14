@@ -135,7 +135,20 @@ def _normalise_dungeon_run(run) -> dict | None:
         boss_lives = max(0, min(1, int(run.get("boss_lives", 0) or 0)))
     except (TypeError, ValueError):
         boss_lives = 0
-    return {"floor": floor, "hp": hp, "max_hp": max_hp, "cleared": sorted(repaired), "boss_lives": boss_lives}
+    repaired_run = {
+        "floor": floor, "hp": hp, "max_hp": max_hp,
+        "cleared": sorted(repaired), "boss_lives": boss_lives,
+    }
+    if D.encounter(floor, 0).get("gimmick") == "three_heads":
+        raw_head_hp = run.get("hydra_head_hp")
+        if isinstance(raw_head_hp, (list, tuple)) and len(raw_head_hp) == 3:
+            repaired_run["hydra_head_hp"] = [max(0, int(value or 0)) for value in raw_head_hp]
+        for key in ("hydra_moves",):
+            try:
+                repaired_run[key] = max(0, min(2, int(run.get(key, 0) or 0)))
+            except (TypeError, ValueError):
+                repaired_run[key] = 0
+    return repaired_run
 
 
 def _empty() -> dict:
@@ -2562,6 +2575,14 @@ def _dungeon_has_fire_damage(record: dict) -> bool:
     )
 
 
+def _dungeon_has_frost_damage(record: dict) -> bool:
+    if _dungeon_has_element(record, "frost"):
+        return True
+    return (record.get("weapon_enchantments") or {}).get(
+        (record.get("equipped") or {}).get("weapon")
+    ) == "frost"
+
+
 def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool, str]:
     if not D.DUNGEON_OPEN:
         return False, D.DUNGEON_CLOSED_NOTICE
@@ -2625,9 +2646,15 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             reward, result = D.roll_reward(floor, bool(row.get("boss"))), None
             message = "Лечение успокоило плачущее дерево. Ты проходишь дальше."
         else:
-            fire_bonus = row["gimmick"] == "fire_only" and _dungeon_has_fire_damage(record)
-            hero = _dungeon_fighter(record, str(user_id), damage_multiplier=5 if fire_bonus else 1)
+            elemental_bonus = (
+                (row["gimmick"] == "fire_only" and _dungeon_has_fire_damage(record))
+                or (row["gimmick"] == "frost_only" and _dungeon_has_frost_damage(record))
+            )
+            hero = _dungeon_fighter(record, str(user_id), damage_multiplier=5 if elemental_bonus else 1)
             hero = replace(hero, starting_hp=max(1, int(run.get("hp", 1) or 1)))
+            hydra_head_hp = run.get("hydra_head_hp") if row["gimmick"] == "three_heads" else None
+            if not isinstance(hydra_head_hp, list) or len(hydra_head_hp) != 3:
+                hydra_head_hp = None
             enemy = pets_combat.Fighter(
                 key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
                 level=row["level"],
@@ -2635,7 +2662,16 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 physical_damage_taken_multiplier=0 if row["gimmick"] == "spells_only" else 1,
                 **row["stats"],
             )
-            result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
+            if row["gimmick"] == "three_heads":
+                head_max_hp = round(pets_combat.derive(enemy, hero)["max_hp"])
+                if hydra_head_hp is None:
+                    hydra_head_hp = [head_max_hp] * 3
+                head_index = next((index for index, hp in enumerate(hydra_head_hp) if hp > 0), 0)
+                enemy = replace(enemy, name=f"{row['name']} · голова {head_index + 1}",
+                                starting_hp=max(1, int(hydra_head_hp[head_index])))
+                result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63), max_actions=1)
+            else:
+                result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
             player_hp = 0
             for turn in reversed(result.rounds):
                 if turn.attacker == str(user_id):
@@ -2645,6 +2681,26 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                     player_hp = turn.defender_hp
                     break
             run["hp"] = min(max(0, int(run.get("hp", 0))), max(0, int(player_hp)))
+            if row["gimmick"] == "three_heads":
+                final_hp = (result.final_hp or {}).get(enemy.key, max(0, int(hydra_head_hp[head_index])))
+                hydra_head_hp[head_index] = max(0, int(final_hp))
+                if run["hp"] <= 0:
+                    record["dungeon_run"] = None
+                    _save(entry, data)
+                    return False, f"{row['name']} победила. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
+                moves = max(0, int(run.get("hydra_moves", 0) or 0)) + 1
+                if not any(hydra_head_hp):
+                    run.pop("hydra_head_hp", None)
+                    run.pop("hydra_moves", None)
+                elif moves >= 3:
+                    hydra_head_hp = [max(1, round(head_max_hp * .5))] * 3
+                    run["hydra_head_hp"], run["hydra_moves"] = hydra_head_hp, 0
+                    _save(entry, data)
+                    return True, "Три голоса смолкли на миг, затем зазвучали вновь. Забег продолжается.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "regenerated": True}
+                else:
+                    run["hydra_head_hp"], run["hydra_moves"] = hydra_head_hp, moves
+                    _save(entry, data)
+                    return True, "Одна из голов отшатнулась, но спор в темноте не утихает.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "heads": sum(hp <= 0 for hp in hydra_head_hp)}
             if result.winner != str(user_id):
                 record["dungeon_run"] = None
                 _save(entry, data)
@@ -2710,6 +2766,8 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
         return False, "Сначала очисти этаж."
     run["floor"], run["cleared"] = floor + 1, []
     run.pop("boss_lives", None)
+    run.pop("hydra_head_hp", None)
+    run.pop("hydra_moves", None)
     record["dungeon_deepest"] = max(int(record.get("dungeon_deepest", 1)), floor + 1)
     _save(entry, data)
     return True, f"Ты спускаешься на этаж {floor + 1}."
