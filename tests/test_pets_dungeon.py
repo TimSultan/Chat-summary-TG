@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import economy
 import pets
 import pets_config
 import pets_dungeon as dungeon
@@ -279,6 +280,7 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(run.pop("run_id"))
         self.assertEqual(run, {
             "kills": 0, "floor": 1, "hp": 1, "max_hp": 1, "cleared": [], "boss_lives": 0,
+            "partial_heals_used": 0, "full_heals_used": 0,
         })
 
     def test_the_run_identity_survives_the_normaliser_that_rebuilds_the_run(self):
@@ -434,27 +436,174 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(simulate.call_args.args[0].damage_multiplier, 5)
 
-    def test_hydra_restores_all_heads_after_third_incomplete_move(self):
+class DungeonRestTests(DungeonTests):
+    """Rests are rationed per run, and the ration is printed on the button that spends it."""
+
+    def _cleared_floor(self, gold=100_000):
+        economy.grant(self.entry, self.user_id, gold, "rest-test")
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {
-            "floor": 40, "hp": 500, "max_hp": 500, "cleared": [],
-            "hydra_head_hp": [0, 100, 100], "hydra_moves": 2,
+            "floor": 1, "hp": 10, "max_hp": 1000,
+            "cleared": [row["index"] for row in dungeon.encounters_for_floor(1)],
         }
         pets._save(self.entry, data)
-        round_ = pets.pets_combat.Round(1, self.user_id, "hit", 200, 500, 0, "")
-        result = SimpleNamespace(winner=self.user_id, rounds=(round_,), final_hp={"dungeon:boss_40": 0})
 
-        with patch("pets.pets_combat.simulate", return_value=result) as simulate:
+    def test_each_rest_runs_out_after_its_own_allowance(self):
+        self._cleared_floor()
+        for remaining in range(dungeon.SHOP_PARTIAL_HEAL_USES - 1, -1, -1):
+            ok, message = pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
+            self.assertTrue(ok, message)
+            self.assertIn(f"Осталось таких лечений: {remaining}", message)
+
+        ok, message = pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
+        self.assertFalse(ok)
+        self.assertIn("кончилось", message)
+        # The two allowances are separate: burning every partial leaves the full rests.
+        self.assertTrue(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
+
+    def test_a_refused_rest_does_not_take_the_coins(self):
+        """The limit is checked before economy.spend, or the ration would be charged for."""
+        self._cleared_floor()
+        for _ in range(dungeon.SHOP_FULL_HEAL_USES):
+            self.assertTrue(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
+        before = economy.balance(self.entry, self.user_id, 0)
+
+        self.assertFalse(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
+
+        self.assertEqual(economy.balance(self.entry, self.user_id, 0), before)
+
+    def test_the_remaining_count_reaches_the_buttons(self):
+        self._cleared_floor()
+        pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
+
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertEqual(state["partial_heals_left"], dungeon.SHOP_PARTIAL_HEAL_USES - 1)
+        self.assertEqual(state["full_heals_left"], dungeon.SHOP_FULL_HEAL_USES)
+        self.assertEqual(state["partial_heal_percent"], 30)
+
+        _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertTrue(any("+30% HP (2)" in label for label in labels), labels)
+        self.assertTrue(any("+100% HP (3)" in label for label in labels), labels)
+
+    def test_the_ration_survives_the_normaliser_that_rebuilds_the_run(self):
+        """That rebuild is a whitelist: dropped here, the count would reset on every load."""
+        self._cleared_floor()
+        pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
+        pets.dungeon_rest(self.entry, self.user_id, 0, "full")
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["partial_heals_used"], 1)
+        self.assertEqual(run["full_heals_used"], 1)
+
+
+class HydraTests(DungeonTests):
+    """The three-headed boss, which used to be mathematically unwinnable.
+
+    Every head carried a FULL boss's health pool, each press resolved a single action, and
+    every third press healed all three heads back up to half -- including heads already
+    beaten below that, so a hit could leave a head healthier than it started. Net progress
+    was structurally zero. These tests pin the properties that make it a fight again.
+    """
+
+    HYDRA_FLOOR = 40
+
+    def _park_on_the_hydra(self, heads=None, hp=500):
+        data = pets._load(self.entry)
+        run = {
+            "floor": self.HYDRA_FLOOR, "hp": hp, "max_hp": hp, "cleared": [],
+        }
+        if heads is not None:
+            run["hydra_head_hp"] = list(heads)
+        data["pets"][self.user_id]["dungeon_run"] = run
+        pets._save(self.entry, data)
+
+    def _win_one_head(self, remaining_hp=0):
+        """A press the hero wins, leaving the current head at `remaining_hp`."""
+        round_ = pets.pets_combat.Round(1, self.user_id, "hit", 200, 500, 0, "")
+        return SimpleNamespace(
+            winner=self.user_id, rounds=(round_,),
+            final_hp={f"dungeon:boss_{self.HYDRA_FLOOR}": remaining_hp},
+        )
+
+    def test_three_heads_share_one_boss_rather_than_owning_a_boss_each(self):
+        self._park_on_the_hydra()
+        with patch("pets.pets_combat.simulate", return_value=self._win_one_head(1)) as simulate:
+            pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(len(run["hydra_head_hp"]), dungeon.HYDRA_HEADS)
+        # A press is a whole exchange now. One action per press is what made three
+        # full-health heads hopeless: a head needed hundreds of them.
+        self.assertNotIn("max_actions", simulate.call_args.kwargs)
+
+    def test_a_head_left_alive_grows_back_but_never_past_its_own_maximum(self):
+        self._park_on_the_hydra(heads=[80, 100, 100])
+        with patch("pets.pets_combat.simulate", return_value=self._win_one_head(40)):
             ok, message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
 
         run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
         self.assertTrue(ok)
         self.assertTrue(receipt["regenerated"])
-        self.assertIn("зазвучали вновь", message)
-        self.assertEqual(simulate.call_args.kwargs["max_actions"], 1)
-        self.assertEqual(run["hydra_moves"], 0)
-        self.assertEqual(len(set(run["hydra_head_hp"])), 1)
-        self.assertGreater(run["hydra_head_hp"][0], 0)
+        self.assertIn("затягивает раны", message)
+        # It grew from the 40 it was left on, and it is still the wounded head -- the
+        # other two are untouched, and nothing was healed above its own ceiling.
+        self.assertGreater(run["hydra_head_hp"][0], 40)
+        self.assertEqual(run["hydra_head_hp"][1:], [100, 100])
+
+    def test_a_felled_head_stays_felled_even_while_another_grows_back(self):
+        """The old rule healed dead heads back to half. Progress has to be permanent.
+
+        Head 0 is already down, so the press lands on head 1 and leaves it alive -- the
+        one case where regrowth fires. The dead head must not come along for the ride.
+        """
+        self._park_on_the_hydra(heads=[0, 100, 100])
+        with patch("pets.pets_combat.simulate", return_value=self._win_one_head(60)):
+            ok, _message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertTrue(ok)
+        self.assertTrue(receipt["regenerated"], "the wounded head 1 is the one regrowing")
+        self.assertEqual(run["hydra_head_hp"][0], 0, "a felled head must stay felled")
+        self.assertGreater(run["hydra_head_hp"][1], 60)
+
+    def test_the_last_head_falling_clears_the_floor_instead_of_ending_the_run(self):
+        """Killing the hydra used to be able to register as a defeat.
+
+        The victory path opens by checking `result.winner`, and the last head can take the
+        hero's final blow while still out-damaging them on the tally -- so falling through
+        to that check deleted the whole run at the moment of victory.
+        """
+        self._park_on_the_hydra(heads=[0, 0, 40])
+        # The hero kills the head but LOSES the damage tally for this one exchange.
+        losing_tally = SimpleNamespace(
+            winner="dungeon:boss_40",
+            rounds=(pets.pets_combat.Round(1, self.user_id, "hit", 40, 500, 0, ""),),
+            final_hp={"dungeon:boss_40": 0},
+        )
+        with patch("pets.pets_combat.simulate", return_value=losing_tally):
+            ok, message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertTrue(ok, message)
+        self.assertIsNotNone(run, "the run must survive killing the hydra")
+        self.assertIn(0, run["cleared"])
+        self.assertIsNone(run.get("hydra_head_hp"))
+        self.assertIn("reward", receipt)
+
+    def test_a_run_saved_under_the_old_rules_is_rescued_rather_than_left_stuck(self):
+        """Heads stored at a full boss's HP each are three times what the fight can hold.
+
+        Somebody was soft-locked mid-hydra when the numbers changed under them; the clamp
+        has to bring those heads down to the new maximum instead of leaving that run
+        permanently unwinnable.
+        """
+        self._park_on_the_hydra(heads=[14060, 14060, 14060], hp=5000)
+        with patch("pets.pets_combat.simulate", return_value=self._win_one_head(99_999)):
+            pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertTrue(all(hp < 14060 for hp in run["hydra_head_hp"]), run["hydra_head_hp"])
 
 
 if __name__ == "__main__":

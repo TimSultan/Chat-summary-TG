@@ -4276,6 +4276,18 @@ function dungeonArt(enemy) {
   return '<span class="dungeon-art"><svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" fill="' + (enemy.boss ? '#301d2c' : '#17312c') + '"/><path d="M5 55L19 35 29 42 40 20 59 55Z" fill="#0e1b24"/><path d="M17 52c0-17 7-29 16-29s16 12 16 29" fill="' + fill + '"/><circle cx="27" cy="34" r="3" fill="' + eye + '"/><circle cx="39" cy="34" r="3" fill="' + eye + '"/>' + (enemy.boss ? '<path d="M24 24l-7-12 13 8 4-14 4 14 13-8-7 12" fill="#f0c85a"/>' : '') + '</svg></span>';
 }
 
+// One rest button, carrying the ration left on its face. Rendered as disabled rather than
+// dropped when it runs out: a button that vanishes looks like a bug, while "(0)" reads as
+// the rule it is, and the player can plan the rest of the descent around it.
+function healButton(dungeon, kind) {
+  const partial = kind === "partial";
+  const left = Number((partial ? dungeon.partial_heals_left : dungeon.full_heals_left) || 0);
+  const cost = partial ? dungeon.partial_heal_cost : dungeon.full_heal_cost;
+  const label = partial ? "🩹 +" + Number(dungeon.partial_heal_percent || 30) + "%" : "❤️ +100%";
+  return '<button class="go sec" data-dungeon="rest" data-heal="' + kind + '"' +
+    (left ? "" : " disabled") + ">" + label + " HP (" + left + ") · 🪙 " + cost + "</button>";
+}
+
 function dungeonPanel() {
   const dungeon = S.dungeon || {};
   if (!S.pet) return "";
@@ -4292,7 +4304,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions"><button class="go sec" data-dungeon="rest" data-heal="partial">🩹 +30% · 🪙 ' + dungeon.partial_heal_cost + '</button><button class="go sec" data-dungeon="rest" data-heal="full">❤️ Полностью · 🪙 ' + dungeon.full_heal_cost + '</button><button class="go" data-dungeon="descend">⬇️ Спуститься</button></div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + '<button class="go" data-dungeon="descend">⬇️ Спуститься</button></div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
 }
 
 function renderOnboarding() {

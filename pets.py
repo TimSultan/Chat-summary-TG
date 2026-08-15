@@ -169,16 +169,16 @@ def _normalise_dungeon_run(run) -> dict | None:
         "kills": kills,
         "floor": floor, "hp": hp, "max_hp": max_hp,
         "cleared": sorted(repaired), "boss_lives": boss_lives,
+        # Rest rations are per run, so they belong to the run and have to survive this
+        # whitelist like everything else on it -- dropped here they would silently reset
+        # to full on every single load, which is the same as having no limit at all.
+        "partial_heals_used": _safe_nonnegative_int(run.get("partial_heals_used")),
+        "full_heals_used": _safe_nonnegative_int(run.get("full_heals_used")),
     }
     if D.encounter(floor, 0).get("gimmick") == "three_heads":
         raw_head_hp = run.get("hydra_head_hp")
         if isinstance(raw_head_hp, (list, tuple)) and len(raw_head_hp) == 3:
             repaired_run["hydra_head_hp"] = [max(0, int(value or 0)) for value in raw_head_hp]
-        for key in ("hydra_moves",):
-            try:
-                repaired_run[key] = max(0, min(2, int(run.get(key, 0) or 0)))
-            except (TypeError, ValueError):
-                repaired_run[key] = 0
     return repaired_run
 
 
@@ -3225,6 +3225,12 @@ def dungeon_status(entry: str, user_id) -> dict:
         "can_rest": len(cleared) == len(encounters),
         "partial_heal_cost": D.SHOP_PARTIAL_HEAL_COST,
         "full_heal_cost": D.SHOP_FULL_HEAL_COST,
+        # How many of each rest this run has left. On the button rather than in a rule
+        # somewhere: a ration nobody can see is indistinguishable from a broken button
+        # the moment it runs out.
+        "partial_heal_percent": round(D.SHOP_PARTIAL_HEAL_SHARE * 100),
+        "partial_heals_left": max(0, D.SHOP_PARTIAL_HEAL_USES - int(run.get("partial_heals_used", 0) or 0)),
+        "full_heals_left": max(0, D.SHOP_FULL_HEAL_USES - int(run.get("full_heals_used", 0) or 0)),
         "boss_lives": int(run.get("boss_lives", 0) or 0),
         "gold_multiplier": C.hero_gold_multiplier(hero_level, "dungeon"),
     })
@@ -3372,8 +3378,11 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             hero = _dungeon_fighter(record, str(user_id), damage_multiplier=5 if elemental_bonus else 1)
             hero = replace(hero, starting_hp=max(1, int(run.get("hp", 1) or 1)))
             hydra_head_hp = run.get("hydra_head_hp") if row["gimmick"] == "three_heads" else None
-            if not isinstance(hydra_head_hp, list) or len(hydra_head_hp) != 3:
+            if not isinstance(hydra_head_hp, list) or len(hydra_head_hp) != D.HYDRA_HEADS:
                 hydra_head_hp = None
+            # Set once the last head falls, so the victory path below can tell "the hydra
+            # is dead" from "this one exchange was lost on damage".
+            hydra_defeated = False
             enemy_stats = dict(row["stats"])
             if row["gimmick"] == "pack_fury":
                 enemy_stats["strength"] = round(enemy_stats["strength"] * D.pack_strength_multiplier(floor, cleared))
@@ -3395,13 +3404,24 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 **enemy_stats,
             )
             if row["gimmick"] == "three_heads":
-                head_max_hp = round(pets_combat.derive(enemy, hero)["max_hp"])
+                # One boss's health split three ways, not a full boss per head. Clamped
+                # against the live maximum on every press, which is also what rescues a
+                # run saved under the old rules: heads stored at a full boss's HP each
+                # (three times what the whole fight should hold) come down to size here
+                # instead of leaving that run permanently unwinnable.
+                head_max_hp = max(1, round(
+                    pets_combat.derive(enemy, hero)["max_hp"] * D.HYDRA_HEAD_HP_SHARE
+                ))
                 if hydra_head_hp is None:
-                    hydra_head_hp = [head_max_hp] * 3
+                    hydra_head_hp = [head_max_hp] * D.HYDRA_HEADS
+                hydra_head_hp = [min(head_max_hp, max(0, int(hp))) for hp in hydra_head_hp]
                 head_index = next((index for index, hp in enumerate(hydra_head_hp) if hp > 0), 0)
                 enemy = replace(enemy, name=f"{row['name']} · голова {head_index + 1}",
                                 starting_hp=max(1, int(hydra_head_hp[head_index])))
-                result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63), max_actions=1)
+                # A full exchange, like every other encounter. One action per press was
+                # what made three full-HP heads hopeless: a head took hundreds of presses
+                # while the regrowth timer ran every three.
+                result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
             else:
                 result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
             fight_id_ = _new_fight_id(moment)
@@ -3428,25 +3448,44 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             run["hp"] = min(max(0, int(run.get("hp", 0))), max(0, int(player_hp)))
             if row["gimmick"] == "three_heads":
                 final_hp = (result.final_hp or {}).get(enemy.key, max(0, int(hydra_head_hp[head_index])))
-                hydra_head_hp[head_index] = max(0, int(final_hp))
+                hydra_head_hp[head_index] = min(head_max_hp, max(0, int(final_hp)))
                 if run["hp"] <= 0:
                     record["dungeon_run"] = None
                     _save(entry, data)
                     return False, f"{row['name']} победила. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
-                moves = max(0, int(run.get("hydra_moves", 0) or 0)) + 1
-                if not any(hydra_head_hp):
-                    run.pop("hydra_head_hp", None)
-                    run.pop("hydra_moves", None)
-                elif moves >= 3:
-                    hydra_head_hp = [max(1, round(head_max_hp * .5))] * 3
-                    run["hydra_head_hp"], run["hydra_moves"] = hydra_head_hp, 0
+                felled = hydra_head_hp[head_index] <= 0
+                if any(hydra_head_hp):
+                    # Only the head still standing grows back, and only part of itself:
+                    # the punishment is for being too slow, never for the damage already
+                    # done, so a head that fell stays down and the run always moves
+                    # forward. Capped at that head's own maximum -- regrowth restores, it
+                    # does not build something bigger than the hydra ever had.
+                    if not felled:
+                        hydra_head_hp[head_index] = min(head_max_hp, hydra_head_hp[head_index] + max(
+                            1, round(head_max_hp * D.HYDRA_REGROWTH_SHARE),
+                        ))
+                    run["hydra_head_hp"] = hydra_head_hp
                     _save(entry, data)
-                    return True, "Три голоса смолкли на миг, затем зазвучали вновь. Забег продолжается.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "regenerated": True}
-                else:
-                    run["hydra_head_hp"], run["hydra_moves"] = hydra_head_hp, moves
-                    _save(entry, data)
-                    return True, "Одна из голов отшатнулась, но спор в темноте не утихает.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "heads": sum(hp <= 0 for hp in hydra_head_hp)}
-            if result.winner != str(user_id):
+                    standing = sum(1 for hp in hydra_head_hp if hp > 0)
+                    return True, (
+                        f"Голова {head_index + 1} падает. Осталось голов: {standing}."
+                        if felled else
+                        "Голова отшатнулась и на глазах затягивает раны. Бей быстрее."
+                    ), {
+                        "encounter": row, "result": result, "hero": hero, "enemy": enemy,
+                        "heads": sum(hp <= 0 for hp in hydra_head_hp),
+                        "regenerated": not felled,
+                    }
+                # Every head is down: the hydra is dead. Fall through to the ordinary
+                # victory path below -- but clear the per-head state first, and skip the
+                # `result.winner` check that path opens with. That check reads the LAST
+                # head's fight, and the last head can take the hero's final blow while
+                # still out-damaging them on the tally; letting it stand meant killing
+                # the hydra could be recorded as a loss and delete the whole run.
+                run.pop("hydra_head_hp", None)
+                run.pop("hydra_moves", None)
+                hydra_defeated = True
+            if not hydra_defeated and result.winner != str(user_id):
                 record["dungeon_run"] = None
                 _save(entry, data)
                 return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
@@ -3509,13 +3548,28 @@ def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bo
         return False, "Сначала очисти этаж."
     partial = str(amount or "").lower() == "partial"
     cost = D.SHOP_PARTIAL_HEAL_COST if partial else D.SHOP_FULL_HEAL_COST
+    used_key = "partial_heals_used" if partial else "full_heals_used"
+    limit = D.SHOP_PARTIAL_HEAL_USES if partial else D.SHOP_FULL_HEAL_USES
+    used = max(0, int(run.get(used_key, 0) or 0))
+    # Checked BEFORE the coins are taken: a rest that cannot happen must not be paid for.
+    if used >= limit:
+        return False, (
+            f"Это лечение за забег кончилось ({limit} из {limit}). "
+            "Следующее будет в новом забеге."
+        )
     paid, _balance = economy.spend(entry, user_id, xp, cost, "pet_dungeon_heal")
     if not paid:
         return False, f"На лечение нужно {cost} монет."
     max_hp = int(run.get("max_hp", 1))
-    run["hp"] = min(max_hp, int(run.get("hp", 0)) + max(1, round(max_hp * .30))) if partial else max_hp
+    share = max(1, round(max_hp * D.SHOP_PARTIAL_HEAL_SHARE))
+    run["hp"] = min(max_hp, int(run.get("hp", 0)) + share) if partial else max_hp
+    run[used_key] = used + 1
     _save(entry, data)
-    return True, "Лавка подземелья восстановила 30% здоровья." if partial else "Лавка подземелья полностью восстановила здоровье."
+    left = limit - run[used_key]
+    percent = round(D.SHOP_PARTIAL_HEAL_SHARE * 100) if partial else 100
+    return True, (
+        f"Лавка подземелья восстановила {percent}% здоровья. Осталось таких лечений: {left}."
+    )
 
 
 def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:

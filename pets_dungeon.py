@@ -16,6 +16,12 @@ ESCALATOR_RUBY_COST: Final = 5
 ANTIMAGIC_REFLECT_SHARE: Final = 0.85
 SHOP_PARTIAL_HEAL_COST: Final = 160
 SHOP_FULL_HEAL_COST: Final = 300
+SHOP_PARTIAL_HEAL_SHARE: Final = 0.30
+# Per RUN, not per floor. Unlimited healing turned a deep run into a question of how much
+# gold the player had rather than how far they could actually get, so each kind of rest is
+# rationed and the remaining count is printed on the button that spends it.
+SHOP_PARTIAL_HEAL_USES: Final = 3
+SHOP_FULL_HEAL_USES: Final = 3
 SCROLL_LOOT_START_FLOOR: Final = 10
 # A boss is the one enemy on a floor worth building a run around, so it is also the one
 # worth a real jump in loot rather than a rounding difference.
@@ -25,6 +31,21 @@ BOSS_SCROLL_MULTIPLIER: Final = 3.0
 # Wide on purpose: identical mobs on identical floors should not feel like a vending
 # machine, and the spread is what makes a lucky kill feel lucky.
 LOOT_CHANCE_JITTER: Final = (0.55, 1.45)
+
+# --- the hydra ------------------------------------------------------------------------
+# Three heads that share ONE boss's health rather than owning a full boss each. The old
+# encounter gave every head the boss's whole HP pool and then, every third press, healed
+# all three back up to half -- including heads already beaten below that, so a hit could
+# leave a head healthier than it started. Net progress was structurally zero and the fight
+# could not be won at any stat level.
+#
+# What makes it a hydra now is per-head regrowth: a head you fail to finish in one go
+# grows a slice of itself back, so a slow runner races the regrowth while a decisive one
+# does not. A head that actually dies stays dead -- the threat is being too slow, never
+# having your work taken away.
+HYDRA_HEADS: Final = 3
+HYDRA_HEAD_HP_SHARE: Final = 1 / HYDRA_HEADS
+HYDRA_REGROWTH_SHARE: Final = 0.20
 DUNGEON_OPEN: Final = True
 DUNGEON_CLOSED_NOTICE: Final = (
     "К подземелью подъехала экспедиция для расследования. "
@@ -72,7 +93,7 @@ BOSSES: Final = (
     ("Плачущее дерево", "healing_pass", 0,
      "Сок медленно затягивает старые зарубки, а у корней журчит невидимый ручей."),
     ("Трёхглавая гидра", "three_heads", 0,
-     "Три голоса спорят в одном горле, и каждый раз тишина длится подозрительно недолго."),
+     "Недобитая голова затягивает раны на глазах; срубленная не отрастает. Бей до конца."),
     ("Кузнец багровой кузни", "frost_only", 0,
      "Воздух перед ним дрожит от жара, но на молоте остаётся тонкая белая изморозь."),
 )

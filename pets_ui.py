@@ -389,7 +389,27 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     if state.get("can_rest"):
         lines.append("\nОтдохнуть?")
-        rows.append([{"text": f"🩹 +30% · 🪙 {state['partial_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "partial")}, {"text": f"❤️ Полностью · 🪙 {state['full_heal_cost']}", "callback_data": callback_data(user_id, "dungeonrest", "full")}])
+        # The remaining count rides on the button itself. A rest button that simply
+        # refuses once the ration is gone reads as a bug; one that says «(0)» reads as
+        # a rule, and the player can plan the rest of the run around it.
+        partial_left = int(state.get("partial_heals_left", 0) or 0)
+        full_left = int(state.get("full_heals_left", 0) or 0)
+        percent = int(state.get("partial_heal_percent", 30) or 30)
+        heal_row = []
+        if partial_left:
+            heal_row.append({
+                "text": f"🩹 +{percent}% HP ({partial_left}) · 🪙 {state['partial_heal_cost']}",
+                "callback_data": callback_data(user_id, "dungeonrest", "partial"),
+            })
+        if full_left:
+            heal_row.append({
+                "text": f"❤️ +100% HP ({full_left}) · 🪙 {state['full_heal_cost']}",
+                "callback_data": callback_data(user_id, "dungeonrest", "full"),
+            })
+        if heal_row:
+            rows.append(heal_row)
+        else:
+            lines.append("<i>Лечения на этот забег кончились.</i>")
         rows.append([{"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")}])
         rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}, {"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
     else:
