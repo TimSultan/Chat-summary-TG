@@ -3008,11 +3008,17 @@ PAGE_HTML = """<!doctype html>
   /* --------------------------------------------------------------- the tab bar */
   .tabs {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-    display: grid; grid-template-columns: repeat(7, 1fr);
+    display: grid; grid-template-columns: repeat(8, 1fr);
     background: var(--card); border-top: 1px solid var(--line);
     padding-bottom: env(safe-area-inset-bottom);
   }
-  .tabs.has-review { grid-template-columns: repeat(8, 1fr); }
+  .tabs.has-review { grid-template-columns: repeat(9, 1fr); }
+  /* Nine tabs on a narrow phone leave each label about 36px wide. Shrinking the label
+     rather than the icon keeps the row scannable: the glyph is what a thumb aims at. */
+  @media (max-width: 400px) {
+    .tabs button { font-size: 9px; }
+    .tabs button .ic { font-size: 17px; }
+  }
   .tabs button {
     border: 0; background: none; padding: 7px 0 8px; color: var(--muted);
     display: flex; flex-direction: column; align-items: center; gap: 2px;
@@ -3931,6 +3937,7 @@ PAGE_HTML = """<!doctype html>
   <section class="screen" id="scr-bag" hidden></section>
   <section class="screen" id="scr-shop" hidden></section>
   <section class="screen" id="scr-arena" hidden></section>
+  <section class="screen" id="scr-dungeon" hidden></section>
   <section class="screen" id="scr-farm" hidden></section>
   <section class="screen" id="scr-quests" hidden></section>
   <section class="screen" id="scr-more" hidden></section>
@@ -3941,6 +3948,7 @@ PAGE_HTML = """<!doctype html>
   <button data-tab="bag"><span class="ic">🎒</span>Сумка</button>
   <button data-tab="shop"><span class="ic">🛒</span>Лавка</button>
   <button data-tab="arena"><span class="ic">⚔️</span>Арена</button>
+  <button data-tab="dungeon"><span class="ic">🏰</span>Данж</button>
   <button data-tab="farm"><span class="ic">🌾</span>Ферма</button>
   <button data-tab="quests"><span class="ic">📜</span>Квесты</button>
   <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
@@ -4192,7 +4200,10 @@ function renderHero() {
       tile("⚡ Сила героя", money(combat.power)) +
     "</div></div>" +
 
-    liveSkillsPanel() + dungeonPanel() +
+    // The dungeon used to live here, wedged between the hero's skills and their gear.
+    // It is a whole game mode with its own floor, health bar and shop, and it now has
+    // the tab it was always asking for -- see renderDungeon.
+    liveSkillsPanel() +
 
     (Object.values(worn).some((s) => s.item) ? "" :
       '<div class="panel small muted">Снаряжения пока нет. Загляни в лавку или побеждай в боях, чтобы его получить.</div>') +
@@ -4286,6 +4297,22 @@ function healButton(dungeon, kind) {
   const label = partial ? "🩹 +" + Number(dungeon.partial_heal_percent || 30) + "%" : "❤️ +100%";
   return '<button class="go sec" data-dungeon="rest" data-heal="' + kind + '"' +
     (left ? "" : " disabled") + ">" + label + " HP (" + left + ") · 🪙 " + cost + "</button>";
+}
+
+// ------------------------------------------------------------------- dungeon screen
+// dungeonPanel() renders the mode itself and is deliberately left as one self-contained
+// block: it was written to sit inside another screen and it still has to survive being
+// moved again. This wrapper owns only what belongs to a whole tab -- the empty state for
+// somebody with no creature, which the panel used to answer with a blank string that read
+// as a broken page once it was alone on screen.
+function renderDungeon() {
+  const box = $("scr-dungeon");
+  if (!S.pet) {
+    box.innerHTML = '<div class="empty">Сначала нужно существо.</div>';
+    return;
+  }
+  box.innerHTML = dungeonPanel();
+  paintShots(box);
 }
 
 function dungeonPanel() {
@@ -6935,7 +6962,7 @@ async function renderQuests() {
 
 function render() {
   renderHud();
-  for (const name of ["hero", "bag", "shop", "arena", "farm", "quests", "more"]) {
+  for (const name of ["hero", "bag", "shop", "arena", "dungeon", "farm", "quests", "more"]) {
     $("scr-" + name).hidden = name !== TAB;
   }
   const reviewTab = $("questReviewTab");
@@ -6951,6 +6978,7 @@ function render() {
   else if (TAB === "bag") renderBag();
   else if (TAB === "shop") renderShop();
   else if (TAB === "arena") renderArena();
+  else if (TAB === "dungeon") renderDungeon();
   else if (TAB === "farm") renderFarm();
   else if (TAB === "quests") renderQuests();
   else if (TAB === "more") renderMore();

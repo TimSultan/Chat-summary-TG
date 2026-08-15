@@ -1771,6 +1771,25 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-mobfight="', page)
         self.assertIn("MOBS.splice(Number(index), 1);", page)
 
+    async def test_the_dungeon_is_its_own_tab_beside_the_arena(self):
+        """It is a whole game mode; it used to be wedged into the middle of the hero page."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('<button data-tab="dungeon"><span class="ic">🏰</span>Данж</button>', page)
+        self.assertIn('id="scr-dungeon"', page)
+        self.assertIn('else if (TAB === "dungeon") renderDungeon();', page)
+        self.assertIn("function renderDungeon()", page)
+        self.assertIn('"hero", "bag", "shop", "arena", "dungeon", "farm", "quests", "more"', page)
+
+        # Right OF the arena, and the hero page no longer renders it.
+        tabs = page.split('<nav class="tabs"', 1)[-1] if '<nav class="tabs"' in page else page
+        self.assertLess(tabs.index('data-tab="arena"'), tabs.index('data-tab="dungeon"'))
+        self.assertLess(tabs.index('data-tab="dungeon"'), tabs.index('data-tab="farm"'))
+        hero = page.split("function renderHero()", 1)[1].split("function tile(", 1)[0]
+        self.assertNotIn("dungeonPanel()", hero)
+        # The grid has to grow with the row, or the new tab overflows the bar.
+        self.assertIn("grid-template-columns: repeat(8, 1fr);", page)
+        self.assertIn(".tabs.has-review { grid-template-columns: repeat(9, 1fr); }", page)
+
     async def test_the_quarry_offers_the_same_early_recall_the_farm_does(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn('data-do="quarrycancel"', page)
