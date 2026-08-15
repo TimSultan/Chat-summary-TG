@@ -97,8 +97,6 @@ _SPRITE_JOBS_KEY = web.AppKey("pets_sprite_jobs", set)
 
 TEST_BATTLE_SESSION_TTL = 30 * 60
 TEST_BATTLE_SESSION_LIMIT = 1000
-PVE_ACTION_COOLDOWN_SECONDS = 1.0
-_pve_action_cooldowns: dict[tuple[str, str], float] = {}
 
 # Item codes are ASCII and short by construction (w001, amulet_red_button, bt01). Anything
 # else never reaches the filesystem -- same two-step guard vote_web.handle_media uses.
@@ -1904,11 +1902,10 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
     if not await request.app[_IS_MEMBER_KEY](user):
         return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
     me = str(user["id"])
-    cooldown_key = (entry, me)
-    current = time.monotonic()
-    if current < _pve_action_cooldowns.get(cooldown_key, 0.0):
-      return _json_error("Подожди секунду перед следующим боем.", status=429, code="PVE_COOLDOWN")
-    _pve_action_cooldowns[cooldown_key] = current + PVE_ACTION_COOLDOWN_SECONDS
+    # No artificial per-request cooldown here: record_mob_fight already serialises the
+    # read-check-increment-save of pve_used under _farm_settlement_lock, so a burst of
+    # legitimate clicks can't double-spend an attack or outrun PVE_ATTACKS_PER_WINDOW --
+    # it just queues on the lock like any other concurrent write, one fight at a time.
     mob = pets_mobs.find_mob(str(body.get("code") or ""))
     tier = str(body.get("tier") or "")
     if mob is None or tier not in pets_mobs.TIERS:
@@ -4110,12 +4107,16 @@ async function api(path, body) {
   return data;
 }
 
-function toast(text) {
+function toast(text, onTap) {
   const old = document.querySelector(".toast");
   if (old) old.remove();
   const node = document.createElement("div");
   node.className = "toast";
   node.textContent = text;
+  // Optional: a toast that came with something worth a second look (a mob fight's own
+  // replay) stays tappable to open it, instead of forcing a sheet the player has to
+  // dismiss before their next tap can land.
+  if (onTap) { node.style.cursor = "pointer"; node.addEventListener("click", onTap, { once: true }); }
   document.body.appendChild(node);
   setTimeout(() => node.remove(), 2600);
 }
@@ -5188,8 +5189,11 @@ const TIER_TONE = { easy: "win", medium: "gold", hard: "loss" };
 let MOBS = null;
 let MOB_INDEX = 0;                     // which of the loaded batch is the one on screen
 let MOB_REFILLING = false;
-let MOB_REPLAY = null;
 let MOB_FIGHT_BUSY = false;
+// Taps that landed while a fight was already in flight. Remembered rather than dropped,
+// so mashing the attack button through a batch of ten mobs lands every tap instead of
+// losing whichever ones arrived before the previous request came back.
+let MOB_FIGHT_QUEUED = 0;
 
 async function rollMob() {
   try {
@@ -5230,22 +5234,33 @@ async function refillMobs() {
 }
 
 async function fightMob(index) {
+  if (MOB_FIGHT_BUSY) { MOB_FIGHT_QUEUED++; return; }
   const mob = MOBS && MOBS[Number(index)];
-  if (!mob || MOB_FIGHT_BUSY) return;
+  if (!mob) { MOB_FIGHT_QUEUED = 0; return; }        // nothing left to fight -- give up quietly
   MOB_FIGHT_BUSY = true;
   render();
   let data;
   try {
     data = await api("/api/mob", { code: mob.code, tier: mob.tier });
-  } catch (e) { haptic("no"); toast(e.message); MOB_FIGHT_BUSY = false; render(); return; }
+  } catch (e) {
+    haptic("no"); toast(e.message);
+    MOB_FIGHT_BUSY = false; MOB_FIGHT_QUEUED = 0; render(); return;
+  }
   S = data.state;
   MOBS.splice(Number(index), 1);
   // The splice shifts the rest left, so the same slot now holds the next mob and the
   // screen simply moves on. Only a fight on the last card needs the pointer pulled back.
   if (MOB_INDEX >= MOBS.length) MOB_INDEX = 0;
   FOES = null;
-  MOB_REPLAY = data;
   MOB_FIGHT_BUSY = false;
+  if (MOB_FIGHT_QUEUED > 0) {
+    // Chain straight into the next queued tap rather than waiting for render + another
+    // click: whatever is now on screen (same formula the button itself reads) is what the
+    // queued tap meant to hit. Its own result replaces this one when the chain ends.
+    MOB_FIGHT_QUEUED--;
+    fightMob(MOBS.length ? Math.min(MOB_INDEX, MOBS.length - 1) : 0);
+    return;
+  }
   render();
   // Watching PVE is the default. A player who explicitly opted out keeps the old fast
   // receipt and may still open this one replay to turn the animation back on.
@@ -5254,15 +5269,19 @@ async function fightMob(index) {
 }
 
 function showMobResult(data) {
+  // A toast, not a sheet: skip_pve_replays means the player asked for speed, and a sheet
+  // has to be dismissed by hand before the next attack tap can land -- exactly the
+  // friction that makes clicking through a run of ten mobs feel slow. Tapping the toast
+  // still opens the replay, same as the old sheet's button did.
   const reward = data.reward || {};
   const result = data.winner === String(data.you) ? "Победа" : (data.draw ? "Ничья" : "Поражение");
-  sheet('<h3>' + esc(result) + '</h3><div class="small">' + esc((data.mob || {}).name || "Моб") +
-    '</div><div class="qreward">🪙 ' + money(reward.gold || 0) + ' · ✨ ' + Number(reward.xp || 0) +
-    (reward.rubies ? ' · 💎 ' + Number(reward.rubies) : '') +
-    (reward.rune && reward.rune.granted ? ' · 🔮 ' + esc(reward.rune.element) + ' +' + Number(reward.rune.granted) : '') +
-    (reward.farm_ticket ? ' · 🎟️ ферма +1' : '') +
-    (reward.dungeon_ticket ? ' · 🎫 подземелье +1' : '') + '</div>' +
-    '<div class="acts"><button class="go" data-mobreplay="1">Посмотреть бой</button></div>');
+  const parts = [result + ": " + ((data.mob || {}).name || "Моб"),
+                 "🪙" + money(reward.gold || 0), "✨" + Number(reward.xp || 0)];
+  if (reward.rubies) parts.push("💎" + Number(reward.rubies));
+  if (reward.rune && reward.rune.granted) parts.push("🔮" + reward.rune.element + " +" + Number(reward.rune.granted));
+  if (reward.farm_ticket) parts.push("🎟️ ферма +1");
+  if (reward.dungeon_ticket) parts.push("🎫 подземелье +1");
+  toast(parts.join(" · "), () => playDuel(data));
 }
 
 function birthdayAdmin(data) {
@@ -5546,6 +5565,10 @@ function mobPanel(farmBlocked) {
   const left = pve.available != null ? pve.available : 0;
   // PVE has its own counter, so it is blocked by its own emptiness -- not by the arena's.
   const blocked = farmBlocked || left <= 0 || MOB_FIGHT_BUSY;
+  // The attack button deliberately does NOT grey out while a fight is in flight: fightMob
+  // queues a tap that arrives mid-request instead of dropping it, so clicking through a
+  // run of ten mobs stays a burst of taps rather than tap-wait-tap-wait.
+  const fightBlocked = farmBlocked || left <= 0;
   const counter = '<div class="row spread tiny" style="margin-bottom:9px">' +
     "<span class='muted'>Атаки на мобов</span><span><b>" + left + "</b> / " +
     (pve.capacity || 0) + (pve.seconds_until_reset
@@ -5578,7 +5601,7 @@ function mobPanel(farmBlocked) {
         (mob.armor ? " 🛡" + mob.armor : "") + '</span></div>' +
       '<div class="mobacts">' +
         '<button class="go" data-mobfight="' + index + '"' +
-          (blocked ? " disabled" : "") + '>⚔️ В бой</button>' +
+          (fightBlocked ? " disabled" : "") + '>⚔️ В бой</button>' +
         '<button class="go sec" data-mob="next"' +
           (MOBS.length > 1 && !MOB_FIGHT_BUSY ? "" : " disabled") + '>🔄 Другой</button>' +
       "</div></div>";
@@ -7191,7 +7214,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
@@ -7271,7 +7294,6 @@ document.addEventListener("click", async (event) => {
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "next") { nextMob(); return; }
   if (d.mobfight !== undefined) { haptic(); await fightMob(Number(d.mobfight)); return; }
-  if (d.mobreplay && MOB_REPLAY) { closeSheet(); playDuel(MOB_REPLAY); return; }
   if (d.questopen) {
     const [kind, code] = d.questopen.split(":", 2);
     openQuestDetail(kind, code);

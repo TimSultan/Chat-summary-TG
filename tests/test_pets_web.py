@@ -1872,6 +1872,39 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # Only a batch the player has seen through costs a request, and it runs detached.
         self.assertIn("if (MOB_INDEX === 0) refillMobs();", swap)
 
+    async def test_back_to_back_mob_fights_both_land_with_no_artificial_wait(self):
+        """The web app used to force a full second between mob-fight requests -- a delay
+        the bot side never had. record_mob_fight already serialises the attack counter
+        under its own lock, so two fights fired immediately one after another must both
+        be counted, neither dropped nor double-counted, and neither refused as a replay."""
+        self._tame(PLAYER)
+        offer = await (await self._get("/api/mob", PLAYER)).json()
+        first_mob = offer["mob"]
+
+        first = await self.client.post(pets_web.ROUTE_PREFIX + "/api/mob", json={
+            "init_data": _init_data(PLAYER["id"]),
+            "code": first_mob["code"], "tier": first_mob["tier"],
+        })
+        self.assertEqual(first.status, 200, await first.text())
+
+        second_offer = await (await self._get("/api/mob", PLAYER)).json()
+        second_mob = second_offer["mob"]
+        second = await self.client.post(pets_web.ROUTE_PREFIX + "/api/mob", json={
+            "init_data": _init_data(PLAYER["id"]),
+            "code": second_mob["code"], "tier": second_mob["tier"],
+        })
+        self.assertEqual(second.status, 200, await second.text())
+
+        record = pets.get_pet(CHAT, PLAYER["id"])
+        self.assertEqual(record["fights"], 2)
+
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertNotIn("PVE_ACTION_COOLDOWN_SECONDS", page)
+        self.assertNotIn("_pve_action_cooldowns", page)
+        # Fast clicks queue instead of vanishing while a fight is already in flight.
+        self.assertIn("MOB_FIGHT_QUEUED", page)
+        self.assertIn("MOB_FIGHT_QUEUED++", page)
+
     async def test_hero_order_and_pve_replay_controls_are_exposed_by_the_page(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         hero = page.split("function renderHero()", 1)[1].split("function tile(", 1)[0]
