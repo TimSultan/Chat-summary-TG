@@ -1771,6 +1771,33 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-mobfight="', page)
         self.assertIn("MOBS.splice(Number(index), 1);", page)
 
+    async def test_a_fight_refused_at_the_last_moment_still_takes_the_mirror_back_off(self):
+        """The automatic Зеркало души goes on BEFORE record_fight and comes off after.
+
+        record_fight raises when the bank emptied or the pet walked off to the farm
+        between drawing the page and pressing the button, and returning from that used to
+        skip the restore -- leaving the mirror worn and the player's own amulet stranded.
+        """
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        me = data["pets"][str(PLAYER["id"])]
+        me["level"] = 20
+        data["pets"][str(OPPONENT["id"])]["level"] = 1
+        me["inventory"] = ["amulet_red_button", pets.MIRROR_AMULET_CODE]
+        me["equipped"]["amulet"] = "amulet_red_button"
+        pets._save(CHAT, data)
+
+        with patch.object(pets, "record_fight", side_effect=ValueError("Бои кончились.")):
+            response = await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+                "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+            })
+
+        self.assertEqual(response.status, 409)
+        after = pets.get_pet(CHAT, PLAYER["id"])
+        self.assertEqual(after["equipped"]["amulet"], "amulet_red_button")
+        self.assertNotIn("mirror_restore", after)
+
     async def test_the_dungeon_is_its_own_tab_beside_the_arena(self):
         """It is a whole game mode; it used to be wedged into the middle of the hero page."""
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()

@@ -72,6 +72,9 @@ DUNGEON_TICKET_GIFT_FLAG = "dungeon_ticket_gift_20260814"
 # Зеркало души. Named here rather than looked up by effect code because two call sites
 # need the ITEM (equip it, check it is owned) and only combat needs the effect.
 MIRROR_AMULET_CODE = "amulet_soul_mirror"
+# `mirror_restore` legitimately holds None (the slot was empty when the mirror went on),
+# so "absent" and "None" have to be told apart when recovering a stranded swap.
+_MISSING = object()
 # PVE counterparts to the mirror: when owned, they are temporarily worn for a mob fight
 # and the player's normal loadout is restored immediately afterwards.
 MOB_GEAR_CODES = {"weapon": "w009", "amulet": "amulet_mob_ward"}
@@ -4285,6 +4288,19 @@ def auto_equip_mirror(entry, attacker_id, defender_id) -> str | None:
             return None
         equipped = attacker.setdefault("equipped", {})
         if equipped.get("amulet") == MIRROR_AMULET_CODE:
+            # Already wearing it. If a restore slip is ALSO still on the record, this is
+            # not a deliberate choice -- it is a fight that died between the swap and the
+            # swap back, and the real amulet has been stranded ever since. Nothing else
+            # would ever put it back, because this early return is what a later fight
+            # hits too. Hand it over now and leave the mirror on for this fight, which
+            # is what the gap qualified for anyway.
+            stranded = attacker.pop("mirror_restore", _MISSING)
+            if stranded is not _MISSING:
+                if stranded in attacker.get("inventory", []):
+                    attacker["mirror_restore"] = stranded
+                    _save(entry, data)
+                    return MIRROR_AMULET_CODE
+                _save(entry, data)
             return None
         attacker["mirror_restore"] = equipped.get("amulet")
         equipped["amulet"] = MIRROR_AMULET_CODE

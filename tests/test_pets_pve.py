@@ -568,6 +568,52 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
         self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
         self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
 
+    def test_a_swap_stranded_by_a_crashed_fight_is_handed_back_on_the_next_one(self):
+        """A fight that died between the swap and the swap back used to strand the amulet.
+
+        The stranded state is self-sustaining: auto_equip_mirror returns early when the
+        mirror is already worn, so no later fight would reach the restore either. The
+        player's own amulet sat in `mirror_restore` for good.
+        """
+        entry = "chat"
+        self._tame(entry, "attacker", "Attacker")
+        self._tame(entry, "defender", "Defender")
+        data = pets._load(entry)
+        data["pets"]["attacker"]["level"] = 6
+        data["pets"]["defender"]["level"] = 1
+        data["pets"]["attacker"]["inventory"] = ["bead", pets.MIRROR_AMULET_CODE]
+        # Exactly what a crashed fight leaves behind: mirror worn, real amulet in limbo.
+        data["pets"]["attacker"]["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
+        data["pets"]["attacker"]["mirror_restore"] = "bead"
+        pets._save(entry, data)
+
+        # The next fight recognises the strand and reports the swap, so its caller
+        # restores at the end instead of walking past it again.
+        self.assertEqual(
+            pets.auto_equip_mirror(entry, "attacker", "defender"), pets.MIRROR_AMULET_CODE,
+        )
+        self.assertTrue(pets.restore_after_mirror(entry, "attacker"))
+
+        attacker = pets.get_pet(entry, "attacker")
+        self.assertEqual(attacker["equipped"]["amulet"], "bead")
+        self.assertNotIn("mirror_restore", attacker)
+
+    def test_a_stranded_slip_for_an_amulet_no_longer_owned_is_simply_dropped(self):
+        """Sold or reforged since: there is nothing to give back, so clear the slip."""
+        entry = "chat"
+        self._tame(entry, "attacker", "Attacker")
+        self._tame(entry, "defender", "Defender")
+        data = pets._load(entry)
+        data["pets"]["attacker"]["level"] = 6
+        data["pets"]["defender"]["level"] = 1
+        data["pets"]["attacker"]["inventory"] = [pets.MIRROR_AMULET_CODE]
+        data["pets"]["attacker"]["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
+        data["pets"]["attacker"]["mirror_restore"] = "bead"
+        pets._save(entry, data)
+
+        self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
+        self.assertNotIn("mirror_restore", pets.get_pet(entry, "attacker"))
+
     def test_winning_with_the_mirror_equipped_is_not_docked_by_the_level_multiplier(self):
         """«Награда за победу при этом не режется» -- the reward multiplier for a
         lopsided win is clamped to 1.0 while wearing the mirror instead of being

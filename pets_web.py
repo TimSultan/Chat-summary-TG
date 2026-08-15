@@ -1703,9 +1703,14 @@ async def handle_attack(request: web.Request) -> web.Response:
         # pressing the button. Nothing has been recorded -- say so and let the client
         # refresh rather than showing a fight that did not count.
         return _json_error(str(e), status=409, code="CANNOT_FIGHT")
-
-    if mirrored:
-        pets.restore_after_mirror(entry, me)
+    finally:
+        # In a `finally`, not after the happy path. record_fight raises on exactly the
+        # races above, and returning from that except used to skip the restore entirely:
+        # the automatic mirror stayed equipped and the player's own amulet was stranded
+        # in `mirror_restore`. Worse, it was permanent -- auto_equip_mirror bails early
+        # when the mirror is already worn, so no later fight would ever put it back.
+        if mirrored:
+            pets.restore_after_mirror(entry, me)
     dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
     request.app[_LOG_KEY](
         f"[pets_web] fight {me} vs {opponent_id}"
