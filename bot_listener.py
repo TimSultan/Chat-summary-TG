@@ -6453,15 +6453,12 @@ async def handle_pets_callback(
             )
             return
         if action == "questreroll":
-            raw_kind, separator, code = str(argument or "").partition(":")
+            raw_kind, _separator, _code = str(argument or "").partition(":")
             kind = raw_kind if raw_kind in {"paint", "real", "rune"} else "paint"
-            ok, note = quests.reroll(
-                entry, user_id, kind=kind, code=code if separator else None,
-            )
+            ok, note = quests.reroll(entry, user_id, kind=kind)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.quest_detail_view(entry, user_id, kind, code)
-                if separator else pets_ui.quests_view(entry, user_id, kind), log,
+                pets_ui.quests_view(entry, user_id, kind), log,
             )
             return
         if action == "farmticket":

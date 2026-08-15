@@ -698,7 +698,8 @@ def _legacy_quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, 
     if reward.get("scroll_chance"):
         lines.append(
             f"📜 Новый свиток: {round(float(reward['scroll_chance']) * 100)}%, "
-            f"гарантирован не позже {int(reward.get('scroll_pity', 0))}-го сложного квеста."
+            f"если не выпал раньше — гарантирован на "
+            f"{int(reward.get('scroll_pity', 0))}-м принятом квесте сложности 4–5."
         )
     if not board.get("has_pet", True):
         # Said here rather than discovered at payout: two of the four reward legs need a
@@ -753,10 +754,14 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     cards = board.get("quests") or []
     paint = kind != "real"
     title = "🕳 <b>Магия подземелья · элементы</b>" if kind == "rune" else ("🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>")
-    lines = [title, f"\n⏳ Новая подборка через <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>."]
-    lines.append(
-        "Успей отправить фото до обновления. Выполни всё раньше — новая подборка придёт через 8 часов."
-    )
+    lines = [title]
+    if board.get("auto_refresh"):
+        lines.append(
+            f"\n⏳ Новая подборка через "
+            f"<b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>."
+        )
+    else:
+        lines.append("\n🕰 Без дедлайна: квесты не обновятся сами.")
     if kind == "rune":
         lines.append("За качественно принятую работу: случайная руна и случайная магия.")
     buttons = []
@@ -775,7 +780,22 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "questdetail", f"{kind}:{card.get('code')}"),
         }])
     if not cards:
-        lines.append("\nПока доступных заданий нет. Проверим снова через 8 часов.")
+        lines.append("\nПока доступных заданий нет.")
+    if board.get("reroll_available"):
+        lines.append("\n🎲 Можно обновить всю эту группу сейчас.")
+        reroll_label = "🎲 Реролл группы"
+    elif board.get("reroll_at_label"):
+        lines.append(
+            f"\nСледующий реролл в <b>{escape(board['reroll_at_label'])}</b> по Москве."
+        )
+        reroll_label = f"⏳ Реролл в {board['reroll_at_label']}"
+    else:
+        lines.append("\nРеролл будет доступен после проверки отправленных работ.")
+        reroll_label = "⏳ Работы на проверке"
+    buttons.append([{
+        "text": reroll_label,
+        "callback_data": callback_data(user_id, "questreroll", kind),
+    }])
     for other, label in (("paint", "🎯 Три квеста на покрас"), ("real", "🌍 Квест в реале"), ("rune", "🕳 Магия подземелья")):
         if other != kind:
             buttons.append([{"text": label, "callback_data": callback_data(user_id, "quests", other)}])
@@ -796,7 +816,8 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
     status = card.get("status", "open")
     scroll_reward = (
         f"\n📜 Новый свиток: {round(float(reward['scroll_chance']) * 100)}%, "
-        f"гарантирован не позже {int(reward.get('scroll_pity', 0))}-го сложного квеста."
+        f"если не выпал раньше — гарантирован на "
+        f"{int(reward.get('scroll_pity', 0))}-м принятом квесте сложности 4–5."
         if reward.get("scroll_chance") else ""
     )
     magic_reward = (
@@ -818,7 +839,8 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
         f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
         magic_reward + scroll_reward,
-        f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>",
+        (f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>"
+         if board.get("auto_refresh") else "\n🕰 Дедлайна нет — квест останется здесь."),
     ]
     if status == "review":
         lines.append("\n⏳ Работа уже на проверке у модератора.")
@@ -827,13 +849,6 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
     else:
         lines.append("\n⚠️ Старые работы не подходят — нужно покрасить что-то новое.")
     rows = []
-    rerolls = int(card.get("rerolls_left", 0) or 0)
-    if status == "open" and rerolls:
-        lines.append("Реролл даст квест на ступень сложнее, и награда тоже вырастет.")
-        rows.append([{
-            "text": f"🎲 Реролл · осталось {rerolls}",
-            "callback_data": callback_data(user_id, "questreroll", f"{kind}:{code}"),
-        }])
     rows.append([{
         "text": "◀️ К карточкам",
         "callback_data": callback_data(user_id, "quests", kind),
@@ -1558,8 +1573,10 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
         "В обычных боях существо само выбирает между атакой, защитой и доступными свитками.",
         "<i>У каждого доступного свитка одинаковый шанс. Четвёртый слот — ультимейт один раз за бой.</i>",
         f"<i>Открыто свитков: {len(unlocked)} из {len(SCROLLS.SCROLLS)}. Новые попадаются за покрас и сложные квесты.</i>",
-        "<i>Новый #япокрасил: шанс 2,5%, свиток не позже 20-го покраса. "
-        "Принятый квест сложности 4/5: шанс 12%/20%, свиток не позже 6-го сложного квеста.</i>",
+        "<i>Новый #япокрасил: шанс 2,5%; если раньше не выпал, "
+        "на 20-м новом покрасе свиток гарантирован. "
+        "Принятый квест сложности 4/5: шанс 12%/20%; если раньше не выпал, "
+        "на 6-м принятом сложном квесте свиток гарантирован.</i>",
     ]
     rows = []
     for index, code in enumerate(pets.skill_loadout(entry, user_id), start=1):

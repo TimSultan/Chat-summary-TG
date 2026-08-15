@@ -8,15 +8,16 @@ it from the Mini App. Only an accepted submission pays.
 
   КВЕСТЫ В РЕАЛЕ -- tidy the bench, walk six kilometres, buy a loupe.
 
-Painting challenges are dealt as three cards; the real-life board always has one. Every
-board lasts 24 hours. If every card is completed early, the next set arrives eight hours
-after the final acceptance (or at the original deadline, whichever comes first). Each
-card has its own two escalating rerolls and follows the same submission and review path.
+Painting challenges are dealt as three cards and stay until the painter completes or
+manually rerolls them; a paint deadline only punishes slow, careful work. The real-life
+board still lasts 24 hours. Each of the three groups can be rerolled as a whole once every
+12 hours and follows the same submission and review path.
 
 THREE RULES THAT SHAPE EVERYTHING HERE
 
-  A BOARD is stable for its full 24-hour window. Its cards change together at the visible
-  deadline, so Telegram and the Mini App always describe the same set.
+  A PAINT BOARD has no automatic deadline. Its cards only change through completion and
+  the player's explicit group reroll, so Telegram and the Mini App always describe the
+  same set.
 
   A REJECTION does not end the quest either -- it clears the submission and lets the
   player try again on the same technique. Rejecting is feedback, not a punishment, and
@@ -55,11 +56,10 @@ from app_time import now as app_now
 STORE_VERSION = 1
 _lock = threading.RLock()
 
-# Two rerolls per quest, as commissioned. Deliberately per ASSIGNMENT rather than per day:
-# rerolling is for "I cannot paint that this week", and a player who rerolls twice and then
-# takes three days over the result should not come back to a fresh pair of rerolls on a
-# quest they have already started.
-REROLLS_PER_QUEST = 2
+# One explicit refresh per group every twelve hours. Kept server-side and shared by the
+# web/Telegram clients so reopening the page or pressing an old callback cannot bypass it.
+REROLLS_PER_QUEST = 1  # compatibility name for older clients; rerolls are group-wide now
+REROLL_COOLDOWN = timedelta(hours=12)
 # Every difficulty a painting challenge can sit at, for reroll's climb.
 DIFFICULTIES = catalog.DIFFICULTIES
 
@@ -139,6 +139,7 @@ def _empty() -> dict:
         "disabled": [],        # quest codes a moderator has taken out of rotation
         "overrides": {},       # quest code -> per-chat editable text fields
         "ideas": [],           # player-suggested quest ideas, newest last
+        "reroll_cooldowns": {},  # user_id -> kind -> last successful group reroll
     }
 
 
@@ -186,6 +187,10 @@ def _load(entry: str) -> dict:
         str(uid): row for uid, row in base["moderators"].items() if isinstance(row, dict)
     }
     base["disabled"] = [catalog.normalise_code(code) for code in base["disabled"]]
+    base["reroll_cooldowns"] = {
+        str(uid): {str(kind): str(when) for kind, when in rows.items()}
+        for uid, rows in base["reroll_cooldowns"].items() if isinstance(rows, dict)
+    }
     return base
 
 
@@ -529,6 +534,7 @@ SLOTS = {"paint": "assignments", "real": "real_assignments", "rune": "rune_assig
 QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 6}
 BOARD_LIFETIME = timedelta(hours=24)
 EMPTY_BOARD_REFRESH = timedelta(hours=8)
+AUTO_REFRESH_KINDS = frozenset({"real"})
 
 
 def _assignment_row(quest, moment: datetime) -> dict:
@@ -544,7 +550,9 @@ def _board_rows(board: dict) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
-def _board_refresh_at(board: dict, moment: datetime) -> datetime:
+def _board_refresh_at(board: dict, moment: datetime, kind: str) -> datetime | None:
+    if kind not in AUTO_REFRESH_KINDS:
+        return None
     issued = _moment_like(board.get("issued_at"), moment) or moment
     expires = _moment_like(board.get("expires_at"), moment) or (issued + BOARD_LIFETIME)
     rows = _board_rows(board)
@@ -601,7 +609,8 @@ def _ensure_board(entry: str, user_id, data: dict, kind: str, moment: datetime) 
     if len(cleaned) != len(_board_rows(stored)):
         stored["quests"] = cleaned
         changed = True
-    if moment >= _board_refresh_at(stored, moment):
+    refresh_at = _board_refresh_at(stored, moment, kind)
+    if refresh_at is not None and moment >= refresh_at:
         return _make_board(
             entry, user_id, data, kind, moment,
             avoid={row.get("code") for row in _board_rows(stored)},
@@ -629,7 +638,7 @@ def _live_assignment(
 
 
 def quest_board(entry: str, user_id, kind: str = "paint", now: datetime | None = None) -> dict:
-    """A 24-hour selection: three painting cards or one real-life card."""
+    """A persistent paint selection or the 24-hour real-life selection."""
     moment = now or app_now()
     with _lock:
         data = _load(entry)
@@ -652,7 +661,14 @@ def quest_board(entry: str, user_id, kind: str = "paint", now: datetime | None =
             })
         open_cards = [card for card in cards if card["status"] == "open"]
         reviewing = [card for card in cards if card["status"] == "review"]
-        refresh_at = _board_refresh_at(board, moment)
+        refresh_at = _board_refresh_at(board, moment, kind)
+        reroll_at = _group_reroll_at(data, user_id, kind, moment)
+        cooldown_ready = reroll_at is None or moment >= reroll_at
+        reroll_available = cooldown_ready and any(
+            live.get("status") != "review" for live in _board_rows(board)
+        )
+        for card in cards:
+            card["rerolls_left"] = 1 if reroll_available else 0
         status = "open" if open_cards else (
             "review" if reviewing else ("resting" if cards else "exhausted")
         )
@@ -664,11 +680,22 @@ def quest_board(entry: str, user_id, kind: str = "paint", now: datetime | None =
             "quests": cards, "kind": kind,
             "has_pet": pets.get_pet(entry, user_id) is not None,
             "status": status,
-            "rerolls_left": primary.get("rerolls_left", 0) if primary else 0,
+            "rerolls_left": 1 if reroll_available else 0,
             "submission": primary.get("submission") if primary else None,
             "available_count": len(open_cards), "attention": bool(open_cards),
-            "refresh_at": refresh_at.isoformat(),
-            "seconds_until_refresh": max(0, int((refresh_at - moment).total_seconds())),
+            "auto_refresh": refresh_at is not None,
+            "refresh_at": refresh_at.isoformat() if refresh_at is not None else None,
+            "seconds_until_refresh": (
+                max(0, int((refresh_at - moment).total_seconds()))
+                if refresh_at is not None else None
+            ),
+            "reroll_available": reroll_available,
+            "reroll_at": reroll_at.isoformat() if reroll_at is not None else None,
+            "reroll_at_label": reroll_at.strftime("%H:%M") if reroll_at is not None else "",
+            "seconds_until_reroll": (
+                max(0, int((reroll_at - moment).total_seconds()))
+                if reroll_at is not None else 0
+            ),
         }
 
 
@@ -701,54 +728,63 @@ def has_available_quests(entry: str, user_id, now: datetime | None = None) -> bo
     )
 
 
+def _group_reroll_at(data: dict, user_id, kind: str, reference: datetime) -> datetime | None:
+    rows = data.setdefault("reroll_cooldowns", {}).get(str(user_id), {})
+    last = _moment_like(rows.get(kind), reference) if isinstance(rows, dict) else None
+    return last + REROLL_COOLDOWN if last is not None else None
+
+
 def reroll(
     entry: str, user_id, now: datetime | None = None, kind: str = "paint",
     code: str | None = None,
 ) -> tuple[bool, str]:
-    """Swap the live quest of one kind for a HARDER one, twice per quest.
+    """Replace one quest group, at most once per twelve hours.
 
-    A reroll costs something. Without that it is just a free "spin until I get an easy
-    one", and the reward table -- which pays by difficulty -- would be handing out the
-    top payouts for the least work. Each reroll therefore climbs one rung, so two of them
-    turn a level-1 challenge into a level-3 one, with the money to match.
-
-    At difficulty 5 there is nowhere higher to go, so a reroll there simply deals another
-    5. That is deliberate rather than a refusal: somebody who cannot paint THIS hard
-    technique should still be able to trade it for a different hard one.
+    ``code`` is accepted only so callbacks sent before the group-reroll release remain
+    safe; it no longer narrows the operation to one card. A submitted card is never dealt
+    away while moderators are reviewing it.
     """
     moment = now or app_now()
     with _lock:
         data = _load(entry)
         board, _changed = _ensure_board(entry, user_id, data, kind, moment)
-        live = (
-            _live_assignment(data, user_id, kind, code=code)
-            if code else _live_assignment(data, user_id, kind)
-        )
-        if live is None:
-            return False, "Сейчас нет активного квеста."
-        if live.get("status") == "review":
-            return False, "Работа уже на проверке — дождись ответа."
-        used = int(live.get("rerolls_used", 0) or 0)
-        if used >= REROLLS_PER_QUEST:
-            return False, "Реролов больше нет."
-        current = catalog.find_quest(live["code"])
-        harder = min(max(1, int(getattr(current, "difficulty", 1) or 1)) + 1, max(DIFFICULTIES))
-        quest = _pick(
-            entry, user_id, data,
-            exclude={row.get("code") for row in _board_rows(board)},
-                      difficulty=harder, kind=kind, moment=moment)
-        if quest is None:
+        next_at = _group_reroll_at(data, user_id, kind, moment)
+        if next_at is not None and moment < next_at:
+            return False, f"Следующий реролл в {next_at.strftime('%H:%M')} по Москве."
+
+        old_rows = _board_rows(board)
+        protected = [row for row in old_rows if row.get("status") == "review"]
+        if len(protected) >= QUESTS_PER_BOARD[kind]:
+            return False, "Вся группа уже на проверке — дождись ответа модераторов."
+        old_codes = {str(row.get("code") or "") for row in old_rows}
+        fresh = list(protected)
+        chosen = {str(row.get("code") or "") for row in protected}
+        while len(fresh) < QUESTS_PER_BOARD[kind]:
+            candidates = [
+                quest for quest in available_quests(entry, data, kind)
+                if quest.code not in chosen
+                and (kind != "real" or _is_offerable(quest, data, user_id, moment))
+            ]
+            if not candidates:
+                break
+            preferred = [quest for quest in candidates if quest.code not in old_codes]
+            quest = random.choice(preferred or candidates)
+            fresh.append(_assignment_row(quest, moment))
+            chosen.add(quest.code)
+        if len(fresh) == len(protected):
             return False, "Больше нечего предложить — все квесты этого вида на отдыхе."
-        live["code"] = quest.code
-        live["rerolls_used"] = used + 1
-        live["assigned_at"] = moment.isoformat()
-        live["submission_id"] = None
-        live["status"] = "open"
+        board.update({
+            "issued_at": moment.isoformat(),
+            "expires_at": (moment + BOARD_LIFETIME).isoformat(),
+            "quests": fresh,
+            "empty_since": None,
+        })
+        cooldowns = data.setdefault("reroll_cooldowns", {}).setdefault(str(user_id), {})
+        cooldowns[kind] = moment.isoformat()
         _save(entry, data)
-    left = REROLLS_PER_QUEST - (used + 1)
     return True, (
-        f"Новый квест: «{quest.title}» (сложность {quest.difficulty}). "
-        f"Реролов осталось: {left}."
+        f"Группа квестов обновлена. Следующий реролл в "
+        f"{(moment + REROLL_COOLDOWN).strftime('%H:%M')} по Москве."
     )
 
 

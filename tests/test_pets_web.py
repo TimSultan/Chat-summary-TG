@@ -1185,8 +1185,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(board["quests"]), 3)
         self.assertEqual(len({card["code"] for card in board["quests"]}), 3)
         self.assertEqual(len(board["real"]["quests"]), 1)
-        self.assertGreater(board["seconds_until_refresh"], 0)
-        self.assertLessEqual(board["seconds_until_refresh"], 24 * 60 * 60)
+        self.assertFalse(board["auto_refresh"])
+        self.assertIsNone(board["seconds_until_refresh"])
+        self.assertTrue(board["real"]["auto_refresh"])
+        self.assertGreater(board["real"]["seconds_until_refresh"], 0)
+        self.assertLessEqual(board["real"]["seconds_until_refresh"], 24 * 60 * 60)
+        self.assertFalse(board["rune"]["auto_refresh"])
+        self.assertIsNone(board["rune"]["seconds_until_refresh"])
         quest = board["quest"]
         for field in ("code", "hashtag", "title", "subject", "technique", "hint",
                       "tool", "difficulty", "reward"):
@@ -1195,11 +1200,37 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # outside letters/digits/underscore, so "#quest-nmm" was never one tag.
         self.assertEqual(quest["hashtag"], "#quest_" + quest["code"])
         self.assertNotIn("-", quest["code"])
-        self.assertEqual(board["rerolls_left"], quests.REROLLS_PER_QUEST)
+        self.assertTrue(board["reroll_available"])
         # A quest board is not an admin surface, and the menu flag must never be the
         # thing that decides -- but it still has to be honest about which menu to draw.
         self.assertFalse(board["is_admin"])
         self.assertTrue((await (await self._get("/api/quests", MODERATOR)).json())["is_admin"])
+
+    async def test_the_web_reroll_replaces_a_whole_group_and_starts_twelve_hour_cooldown(self):
+        before = await (await self._get("/api/quests", PLAYER)).json()
+        old_codes = {card["code"] for card in before["quests"]}
+        response = await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/quests/reroll",
+            json={"init_data": _init_data(PLAYER["id"]), "kind": "paint"},
+            headers=self._auth(PLAYER),
+        )
+        payload = await response.json()
+        self.assertTrue(payload["ok"], payload)
+        self.assertIn("Следующий реролл в", payload["message"])
+        board = payload["board"]
+        self.assertTrue(old_codes.isdisjoint({card["code"] for card in board["quests"]}))
+        self.assertFalse(board["reroll_available"])
+        self.assertIsNotNone(board["reroll_at_label"])
+        self.assertGreater(board["seconds_until_reroll"], 0)
+        self.assertLessEqual(board["seconds_until_reroll"], 12 * 60 * 60)
+
+        refused = await (await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/quests/reroll",
+            json={"init_data": _init_data(PLAYER["id"]), "kind": "paint"},
+            headers=self._auth(PLAYER),
+        )).json()
+        self.assertFalse(refused["ok"])
+        self.assertIn("Следующий реролл в", refused["message"])
 
     async def test_only_a_moderator_can_see_or_decide_a_quest_submission(self):
         """The review queue holds other people's work and the accept button spends real
@@ -1338,6 +1369,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("data-questopen", page)
         self.assertIn("class=\"quest-timer\"", page)
         self.assertIn('id="questReviewTab"', page)
+        self.assertIn('id="scr-quests"', page)
+        self.assertIn('data-tab="quests"', page)
+        self.assertIn('data-questgroup', page)
+        self.assertIn('Без дедлайна:', page)
         self.assertIn('data-questidea', page)
         self.assertIn('data-reviewideas', page)
         self.assertIn('data-questedit', page)

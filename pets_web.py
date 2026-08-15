@@ -2865,11 +2865,11 @@ PAGE_HTML = """<!doctype html>
   /* --------------------------------------------------------------- the tab bar */
   .tabs {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-    display: grid; grid-template-columns: repeat(6, 1fr);
+    display: grid; grid-template-columns: repeat(7, 1fr);
     background: var(--card); border-top: 1px solid var(--line);
     padding-bottom: env(safe-area-inset-bottom);
   }
-  .tabs.has-review { grid-template-columns: repeat(7, 1fr); }
+  .tabs.has-review { grid-template-columns: repeat(8, 1fr); }
   .tabs button {
     border: 0; background: none; padding: 7px 0 8px; color: var(--muted);
     display: flex; flex-direction: column; align-items: center; gap: 2px;
@@ -3767,6 +3767,7 @@ PAGE_HTML = """<!doctype html>
   <section class="screen" id="scr-shop" hidden></section>
   <section class="screen" id="scr-arena" hidden></section>
   <section class="screen" id="scr-farm" hidden></section>
+  <section class="screen" id="scr-quests" hidden></section>
   <section class="screen" id="scr-more" hidden></section>
 </main>
 
@@ -3776,6 +3777,7 @@ PAGE_HTML = """<!doctype html>
   <button data-tab="shop"><span class="ic">🛒</span>Лавка</button>
   <button data-tab="arena"><span class="ic">⚔️</span>Арена</button>
   <button data-tab="farm"><span class="ic">🌾</span>Ферма</button>
+  <button data-tab="quests"><span class="ic">📜</span>Квесты</button>
   <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
   <button data-tab="more"><span class="ic">☰</span>Ещё</button>
 </nav>
@@ -4198,9 +4200,11 @@ function liveSkillsPanel() {
     ).join("") + '</div><div class="tiny muted" style="margin-top:10px">Открыто ' +
       Number(S.skills.owned_count || 0) + ' из ' + Number(S.skills.catalogue_count || 0) +
       '. Новый #япокрасил: ' + Math.round(Number(rewards.paint_chance || 0) * 1000) / 10 +
-      '% (не позже ' + Number(rewards.paint_pity || 0) + '-го). Сложные квесты 4/5: ' +
+      '%; если раньше не выпал, гарантирован на ' + Number(rewards.paint_pity || 0) +
+      '-м новом покрасе. Принятые квесты сложности 4/5: ' +
       Math.round(Number(hard[4] || 0) * 100) + '%/' + Math.round(Number(hard[5] || 0) * 100) +
-      '% (не позже ' + Number(rewards.hard_quest_pity || 0) + '-го).</div></div>';
+      '%; если раньше не выпал, гарантирован на ' + Number(rewards.hard_quest_pity || 0) +
+      '-м принятом квесте сложности 4–5.</div></div>';
 }
 
 function openLiveSkillPicker(slot) {
@@ -5460,7 +5464,8 @@ function rewardLine(reward) {
     : "";
   const scroll = reward.scroll_chance
     ? " · <span class='gain'>📜 " + Math.round(reward.scroll_chance * 100) +
-      "% (не позже " + Number(reward.scroll_pity || 0) + "-го)</span>"
+      "% · если не выпал раньше, гарантирован на " + Number(reward.scroll_pity || 0) +
+      "-м принятом квесте сложности 4–5</span>"
     : "";
   return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
     "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
@@ -5583,13 +5588,22 @@ function questCard(board, kind) {
   const heading = kind === "rune" ? "🔮 Рунические покрасы · элементы" :
     (paint ? "🎯 Квесты на покрас · 3 карточки" : "🌍 Квест в реале");
   const cards = (board && board.quests) || [];
+  const schedule = board.auto_refresh
+    ? '⏳ Новая подборка через <b class="quest-timer" data-seconds="' +
+      Number(board.seconds_until_refresh || 0) + '">' + clock(board.seconds_until_refresh || 0) + '</b>.'
+    : '🕰 Без дедлайна: эти задания не обновятся, пока ты сам не нажмёшь реролл.';
+  const rerollNote = board.reroll_available
+    ? 'Можно обновить всю группу сейчас.'
+    : (board.reroll_at_label
+      ? 'Следующий реролл в <b>' + esc(board.reroll_at_label) + '</b> по Москве.'
+      : 'Дождись проверки отправленных работ.');
   return '<div class="panel"><h2>' + heading + '</h2>' +
-    '<div class="tiny muted" style="margin-bottom:9px">⏳ Новая подборка через ' +
-    '<b class="quest-timer" data-seconds="' + Number(board.seconds_until_refresh || 0) + '">' +
-    clock(board.seconds_until_refresh || 0) + '</b>. Успей отправить фото до обновления. ' +
-    'Если выполнить всё раньше, новые задания придут через 8 часов.</div>' +
+    '<div class="tiny muted" style="margin-bottom:9px">' + schedule + '</div>' +
     (cards.length ? cards.map((card, index) => questCompactCard(card, kind, index + 1)).join("")
-                  : '<div class="empty">Доступных заданий пока нет. Проверим снова через 8 часов.</div>') +
+                  : '<div class="empty">Доступных заданий пока нет.</div>') +
+    '<button class="go sec" style="margin-top:8px" data-questgroup="' + kind + '"' +
+      (board.reroll_available ? '' : ' disabled') + '>🎲 Реролл группы</button>' +
+    '<div class="tiny muted" style="margin-top:5px">' + rerollNote + '</div>' +
     '</div>';
 }
 
@@ -5616,14 +5630,16 @@ function questBoard(data) {
 }
 
 function openQuestDetail(kind, code) {
-  const board = kind === "real" ? (ACTIVE_QUEST_BOARD.real || {}) : ACTIVE_QUEST_BOARD;
+  const board = kind === "real" ? (ACTIVE_QUEST_BOARD.real || {}) :
+    (kind === "rune" ? (ACTIVE_QUEST_BOARD.rune || {}) : ACTIVE_QUEST_BOARD);
   const card = ((board && board.quests) || []).find((row) => row.code === code);
   if (!card) { toast("Подборка уже обновилась."); return; }
+  const paint = kind !== "real";
   const status = questStatus(card);
   const steps = [
     "Возьми новую, ещё не показанную работу и подготовь нужную деталь.",
-    kind === "paint" ? "Нанеси технику небольшими контролируемыми этапами."
-                     : "Выполни действие полностью, не только для фотографии.",
+    paint ? "Нанеси технику небольшими контролируемыми этапами."
+          : "Выполни действие полностью, не только для фотографии.",
     "Сверь результат с подсказкой и поправь самые заметные места.",
     "Сделай чёткое фото: " + (card.proof || "готового результата") + ".",
     "Выложи фото в чат с хештегом " + card.hashtag + ".",
@@ -5631,7 +5647,7 @@ function openQuestDetail(kind, code) {
   sheet('<h3>' + status[0] + ' ' + esc(card.title) + '</h3>' +
     '<div class="tiny muted">' + pips(card.difficulty) + ' · ' +
       esc(DIFF_NAMES[card.difficulty] || '') + '</div>' +
-    '<p class="small"><b>' + (kind === "paint" ? "Что красим: " : "Что делаем: ") +
+    '<p class="small"><b>' + (paint ? "Что красим: " : "Что делаем: ") +
       '</b>' + esc(card.subject) + '</p>' +
     '<p class="small"><b>Техника:</b> ' + esc(card.technique) + '</p>' +
     '<p class="small muted">💡 <b>Подсказка:</b> ' + esc(card.hint) + '</p>' +
@@ -5643,10 +5659,9 @@ function openQuestDetail(kind, code) {
       (card.status === "done" ? "Квест принят и завершён." :
        card.status === "review" ? "Работа на проверке у модератора." :
        "Старые работы не подходят — нужно покрасить что-то новое.") + '</div>' +
-    (card.status === "open" && card.rerolls_left
-      ? '<div class="warn-note">Реролл даст квест на ступень сложнее, и награда тоже вырастет.</div>' +
-        '<div class="acts"><button class="go sec" data-questreroll="' + kind + ':' + esc(code) +
-        '">🎲 Реролл · осталось ' + card.rerolls_left + '</button></div>' : ''));
+    (board.auto_refresh
+      ? '<div class="tiny muted">Эта группа обновляется по своему таймеру.</div>'
+      : '<div class="tiny muted">Дедлайна нет — квест останется здесь.</div>'));
 }
 
 // -------------------------------------------------------------------- quest review
@@ -6456,9 +6471,16 @@ function playDuel(data) {
 }
 
 // ------------------------------------------------------------------------ the router
+async function renderQuests() {
+  const box = $("scr-quests");
+  box.innerHTML = '<div class="empty">Загружаю квесты…</div>';
+  try { box.innerHTML = questBoard(await api("/api/quests")); }
+  catch (e) { box.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+
 function render() {
   renderHud();
-  for (const name of ["hero", "bag", "shop", "arena", "farm", "more"]) {
+  for (const name of ["hero", "bag", "shop", "arena", "farm", "quests", "more"]) {
     $("scr-" + name).hidden = name !== TAB;
   }
   const reviewTab = $("questReviewTab");
@@ -6475,6 +6497,7 @@ function render() {
   else if (TAB === "shop") renderShop();
   else if (TAB === "arena") renderArena();
   else if (TAB === "farm") renderFarm();
+  else if (TAB === "quests") renderQuests();
   else if (TAB === "more") renderMore();
 }
 
@@ -6586,11 +6609,12 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (d.questreroll) {
-    const [kind, code] = d.questreroll.split(":", 2);
+    const [kind] = d.questreroll.split(":", 2);
     closeSheet();
-    await questCall("/api/quests/reroll", { kind, code });
+    await questCall("/api/quests/reroll", { kind });
     return;
   }
+  if (d.questgroup) { await questCall("/api/quests/reroll", { kind: d.questgroup }); return; }
   if (d.quest) { await questCall("/api/quests/reroll", { kind: d.quest }); return; }
   if (d.questidea !== undefined) {
     sheet("<h3>💡 Предложить идею квеста</h3>" +
@@ -6754,7 +6778,7 @@ function tick() {
     const left = Math.max(0, Number(node.dataset.seconds || 0) - TIMER_TICK_SECONDS);
     node.dataset.seconds = String(left);
     node.textContent = clock(left);
-    if (!left && TAB === "more" && moreView === "quests") dirty = true;
+    if (!left && (TAB === "quests" || (TAB === "more" && moreView === "quests"))) dirty = true;
   });
   if (S.arena && S.arena.seconds_until_next) {
     S.arena.seconds_until_next = Math.max(0, S.arena.seconds_until_next - TIMER_TICK_SECONDS);
@@ -6800,6 +6824,10 @@ async function refresh() {
 }
 
 refresh().then(() => {
+  if (START_VIEW === "quests") {
+    TAB = "quests";
+    render();
+  }
   if (START_VIEW === "review" && S && S.is_admin) {
     TAB = "more";
     moreView = "review";

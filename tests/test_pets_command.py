@@ -440,26 +440,22 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn(str(quest["reward"]["gold"]), detail_text)
         self.assertIn("Как выполнить", detail_text)
         self.assertIn("Старые работы не подходят", detail_text)
-        self.assertIn("questreroll", str(detail_keyboard))
+        self.assertNotIn("questreroll", str(detail_keyboard))
+        self.assertIn("questreroll", str(keyboard))
 
-    def test_rerolling_from_the_menu_swaps_the_quest_and_runs_out(self):
-        first = quests.daily_quest(CHAT, PLAYER["id"])["quest"]["code"]
-        seen = {first}
-        for _ in range(quests.REROLLS_PER_QUEST):
-            api = self._tap("questreroll")
-            self.assertIn("Новый квест", api.edits[0]["text"])
-            seen.add(quests.daily_quest(CHAT, PLAYER["id"])["quest"]["code"])
-
-        # Two rerolls used, so the button is gone and the action refuses.
-        _text, keyboard = pets_ui.quests_view(CHAT, PLAYER["id"])
-        actions = {
-            pets_ui.parse_callback(button["callback_data"])[1]
-            for row in keyboard["inline_keyboard"] for button in row
-        }
-        self.assertEqual(actions, {"main", "quests", "questdetail"})
+    def test_rerolling_from_the_menu_swaps_the_group_and_starts_a_cooldown(self):
+        before = {card["code"] for card in quests.daily_quest(CHAT, PLAYER["id"])["quests"]}
         api = self._tap("questreroll")
-        self.assertIn("Реролов больше нет", api.edits[0]["text"])
-        self.assertGreater(len(seen), 1)
+        self.assertIn("Группа квестов обновлена", api.edits[0]["text"])
+        self.assertIn("Следующий реролл", api.edits[0]["text"])
+        after = {card["code"] for card in quests.daily_quest(CHAT, PLAYER["id"])["quests"]}
+        self.assertTrue(before.isdisjoint(after))
+
+        text, keyboard = pets_ui.quests_view(CHAT, PLAYER["id"])
+        self.assertIn("Следующий реролл в", text)
+        self.assertIn("Реролл в", str(keyboard))
+        api = self._tap("questreroll")
+        self.assertIn("Следующий реролл в", api.edits[0]["text"])
 
     def test_fight_result_notifications_can_be_disabled_from_the_menu(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

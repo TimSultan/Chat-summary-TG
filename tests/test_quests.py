@@ -75,7 +75,7 @@ class QuestsTestCase(unittest.TestCase):
 
 
 class AssignmentTests(QuestsTestCase):
-    def test_paint_board_has_three_unique_cards_for_twenty_four_hours(self):
+    def test_paint_board_has_three_unique_cards_without_an_automatic_deadline(self):
         entry = "chat"
         first = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
         codes = {card["code"] for card in first["quests"]}
@@ -85,10 +85,13 @@ class AssignmentTests(QuestsTestCase):
         again_same_day = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 20, 0))
         self.assertEqual({card["code"] for card in again_same_day["quests"]}, codes)
 
-        next_board = quests.daily_quest(entry, "1", now=datetime(2026, 8, 10, 9, 0))
+        next_board = quests.daily_quest(entry, "1", now=datetime(2026, 9, 10, 9, 0))
         next_codes = {card["code"] for card in next_board["quests"]}
         self.assertEqual(len(next_codes), 3)
-        self.assertTrue(codes.isdisjoint(next_codes))
+        self.assertEqual(next_codes, codes)
+        self.assertFalse(next_board["auto_refresh"])
+        self.assertIsNone(next_board["refresh_at"])
+        self.assertIsNone(next_board["seconds_until_refresh"])
 
     def test_finishing_one_card_leaves_the_other_two_available(self):
         entry = "chat"
@@ -102,7 +105,7 @@ class AssignmentTests(QuestsTestCase):
         completed = next(card for card in board["quests"] if card["code"] == quest["code"])
         self.assertEqual(completed["status"], "done")
 
-    def test_empty_paint_board_refreshes_after_eight_hours(self):
+    def test_empty_paint_board_waits_for_an_explicit_group_reroll(self):
         entry = "chat"
         self._tame(entry, "1")
         started = datetime(2026, 8, 9, 9, 0)
@@ -115,7 +118,12 @@ class AssignmentTests(QuestsTestCase):
         self.assertEqual(resting["status"], "resting")
         self.assertEqual(resting["available_count"], 0)
 
-        refreshed = quests.daily_quest(entry, "1", now=started + timedelta(hours=8, minutes=2))
+        still_resting = quests.daily_quest(entry, "1", now=started + timedelta(days=30))
+        self.assertEqual(still_resting["available_count"], 0)
+
+        rerolled_at = started + timedelta(days=30, minutes=1)
+        self.assertTrue(quests.reroll(entry, "1", now=rerolled_at)[0])
+        refreshed = quests.daily_quest(entry, "1", now=rerolled_at)
         new_codes = {card["code"] for card in refreshed["quests"]}
         self.assertEqual(refreshed["available_count"], 3)
         self.assertTrue(old_codes.isdisjoint(new_codes))
@@ -127,21 +135,25 @@ class AssignmentTests(QuestsTestCase):
 
 
 class RerollTests(QuestsTestCase):
-    def test_reroll_swaps_the_quest_and_is_capped_at_rerolls_per_quest(self):
-        first = quests.daily_quest("chat", "1", now=datetime(2026, 8, 9, 9, 0))
-        self.assertEqual(first["rerolls_left"], quests.REROLLS_PER_QUEST)
+    def test_reroll_swaps_the_whole_group_and_unlocks_twelve_hours_later(self):
+        started = datetime(2026, 8, 9, 9, 0)
+        first = quests.daily_quest("chat", "1", now=started)
+        old_codes = {card["code"] for card in first["quests"]}
 
-        for used in range(1, quests.REROLLS_PER_QUEST + 1):
-            ok, msg = quests.reroll("chat", "1", now=datetime(2026, 8, 9, 9, used))
-            self.assertTrue(ok, msg)
-            payload = quests.daily_quest("chat", "1", now=datetime(2026, 8, 9, 9, used))
-            self.assertEqual(payload["rerolls_left"], quests.REROLLS_PER_QUEST - used)
+        used_at = started + timedelta(minutes=1)
+        ok, msg = quests.reroll("chat", "1", now=used_at)
+        self.assertTrue(ok, msg)
+        payload = quests.daily_quest("chat", "1", now=used_at)
+        self.assertTrue(old_codes.isdisjoint({card["code"] for card in payload["quests"]}))
+        self.assertFalse(payload["reroll_available"])
+        self.assertEqual(payload["reroll_at_label"], "21:01")
 
-        ok, msg = quests.reroll("chat", "1", now=datetime(2026, 8, 9, 10, 0))
+        ok, msg = quests.reroll("chat", "1", now=used_at + timedelta(hours=11, minutes=59))
         self.assertFalse(ok)
-        self.assertIn("Реролов", msg)
+        self.assertIn("21:01", msg)
+        self.assertTrue(quests.reroll("chat", "1", now=used_at + timedelta(hours=12))[0])
 
-    def test_reroll_refuses_while_a_submission_is_under_review(self):
+    def test_group_reroll_preserves_a_submission_under_review(self):
         entry = "chat"
         payload = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
         code = payload["quest"]["code"]
@@ -149,24 +161,20 @@ class RerollTests(QuestsTestCase):
         self.assertTrue(ok, msg)
 
         ok, msg = quests.reroll(entry, "1", now=datetime(2026, 8, 9, 9, 10))
-        self.assertFalse(ok)
-        self.assertIn("проверке", msg)
+        self.assertTrue(ok, msg)
+        board = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 10))
+        preserved = next(card for card in board["quests"] if card["code"] == code)
+        self.assertEqual(preserved["status"], "review")
+        self.assertEqual(len(board["quests"]), 3)
 
-    def test_finishing_a_quest_resets_the_reroll_allowance_for_the_next_one(self):
-        """Rerolls are commissioned per ASSIGNMENT, not per day: burn both on a quest you
-        end up finishing anyway, and the NEXT quest still has to start with two, not arrive
-        already half-spent on account of a technique it has nothing to do with."""
+    def test_each_group_has_its_own_twelve_hour_cooldown(self):
         entry = "chat"
         self._tame(entry, "1")
         day = datetime(2026, 8, 9, 9, 0)
-        quests.daily_quest(entry, "1", now=day)
-        for _ in range(quests.REROLLS_PER_QUEST):
-            ok, msg = quests.reroll(entry, "1", now=day)
-            self.assertTrue(ok, msg)
-        self._finish_quest(entry, "1", day)
-
-        next_day = quests.daily_quest(entry, "1", now=day + timedelta(days=1))
-        self.assertEqual(next_day["rerolls_left"], quests.REROLLS_PER_QUEST)
+        self.assertTrue(quests.reroll(entry, "1", now=day, kind="paint")[0])
+        self.assertFalse(quests.daily_quest(entry, "1", now=day)["reroll_available"])
+        self.assertTrue(quests.real_quest(entry, "1", now=day)["reroll_available"])
+        self.assertTrue(quests.rune_quest(entry, "1", now=day)["reroll_available"])
 
 
 class SubmissionTests(QuestsTestCase):
@@ -276,49 +284,34 @@ class ParseHashtagTests(unittest.TestCase):
         self.assertIsNone(quests.parse_hashtag("работа по технике #quest_nmm_v2"))
 
 
-class EscalatingRerollTests(QuestsTestCase):
-    """A reroll climbs a difficulty. Without that it is a free respin, and since the
-    reward table pays BY difficulty, a player would simply spin until the easiest quest
-    came up and collect the same money for less work."""
-
-    def test_each_reroll_hands_out_a_harder_challenge(self):
+class GroupRerollTests(QuestsTestCase):
+    def test_group_reroll_keeps_three_unique_painting_challenges(self):
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
-        first = quests.daily_quest(entry, "1", now=day)["quest"]
-        levels = [first["difficulty"]]
-        for _ in range(quests.REROLLS_PER_QUEST):
-            ok, message = quests.reroll(entry, "1", now=day)
-            self.assertTrue(ok, message)
-            levels.append(quests.daily_quest(entry, "1", now=day)["quest"]["difficulty"])
-
-        # Every step climbs -- unless it is already at the top rung, where there is
-        # nowhere higher to go and another quest of the same difficulty is dealt instead.
-        # Asserted as "never goes DOWN, and rises whenever it can" rather than as strictly
-        # increasing: a first deal of difficulty 4 legitimately produces 4 -> 5 -> 5, and
-        # this test used to fail roughly one run in four because of it.
-        top = max(catalog.DIFFICULTIES)
-        for lower, higher in zip(levels, levels[1:]):
-            self.assertGreaterEqual(higher, lower, levels)
-            if lower < top:
-                self.assertGreater(higher, lower, levels)
-        self.assertLessEqual(max(levels), top)
-
-    def test_a_reroll_at_the_top_deals_another_hard_one_rather_than_refusing(self):
-        """Somebody who cannot paint THIS brutal technique should still be able to trade
-        it for a different brutal one -- the climb is a price, not a dead end."""
-        entry = "chat"
-        day = datetime(2026, 8, 9, 9, 0)
-        hardest = catalog.quests_by_difficulty(max(catalog.DIFFICULTIES))[0]
-        quests.daily_quest(entry, "1", now=day)
-        data = quests._load(entry)
-        data["assignments"]["1"]["quests"][0]["code"] = hardest.code
-        quests._save(entry, data)
+        before = quests.daily_quest(entry, "1", now=day)
+        old_codes = {card["code"] for card in before["quests"]}
 
         ok, message = quests.reroll(entry, "1", now=day)
         self.assertTrue(ok, message)
-        swapped = quests.daily_quest(entry, "1", now=day)["quest"]
-        self.assertNotEqual(swapped["code"], hardest.code)
-        self.assertEqual(swapped["difficulty"], max(catalog.DIFFICULTIES))
+        after = quests.daily_quest(entry, "1", now=day)
+        new_codes = {card["code"] for card in after["quests"]}
+        self.assertEqual(len(new_codes), 3)
+        self.assertTrue(old_codes.isdisjoint(new_codes))
+
+    def test_old_single_card_callback_is_treated_as_a_safe_group_reroll(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        before = quests.daily_quest(entry, "1", now=day)
+        old_codes = {card["code"] for card in before["quests"]}
+
+        ok, message = quests.reroll(
+            entry, "1", now=day, code=before["quests"][0]["code"],
+        )
+        self.assertTrue(ok, message)
+        after_codes = {
+            card["code"] for card in quests.daily_quest(entry, "1", now=day)["quests"]
+        }
+        self.assertTrue(old_codes.isdisjoint(after_codes))
 
     def test_a_reroll_never_deals_a_real_quest(self):
         """The two independently dealt boards must never mix their catalogues."""
@@ -364,7 +357,7 @@ class RealQuestTests(QuestsTestCase):
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
         first = quests.real_quest(entry, "1", now=day)
-        self.assertEqual(first["rerolls_left"], quests.REROLLS_PER_QUEST)
+        self.assertTrue(first["reroll_available"])
         self.assertEqual(
             quests.real_quest(entry, "1", now=day + timedelta(hours=12))["quest"]["code"],
             first["quest"]["code"],
@@ -377,14 +370,10 @@ class RealQuestTests(QuestsTestCase):
         next_day = day + timedelta(days=1)
         quests.daily_quest(entry, "1", now=next_day)
         self.assertTrue(quests.reroll(entry, "1", now=next_day, kind="real")[0])
-        self.assertEqual(
-            quests.real_quest(entry, "1", now=next_day)["rerolls_left"],
-            quests.REROLLS_PER_QUEST - 1,
-        )
-        self.assertEqual(
-            quests.daily_quest(entry, "1", now=next_day)["rerolls_left"],
-            quests.REROLLS_PER_QUEST,
-        )
+        self.assertFalse(quests.real_quest(entry, "1", now=next_day)["reroll_available"])
+        self.assertTrue(quests.daily_quest(entry, "1", now=next_day)["reroll_available"])
+        self.assertTrue(quests.reroll(entry, "1", now=next_day, kind="paint")[0])
+        self.assertFalse(quests.daily_quest(entry, "1", now=next_day)["reroll_available"])
 
     def test_a_hashtag_only_counts_for_the_slot_it_was_dealt_into(self):
         entry = "chat"
