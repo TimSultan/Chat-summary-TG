@@ -2558,7 +2558,7 @@ class FarmTicketTests(PetsTestCase):
         self.assertTrue(ok, note)
         return start
 
-    def test_a_ticket_ends_an_eight_hour_shift_in_a_minute_and_still_pays_for_eight(self):
+    def test_a_ticket_ends_the_shift_immediately_and_still_pays_for_all_eight_hours(self):
         entry = "chat"
         start = self._farming(entry, "1", hours=8)
         expected = pets.farm_status(entry, "1", now=start)["reward"]
@@ -2568,19 +2568,16 @@ class FarmTicketTests(PetsTestCase):
         moment = start + timedelta(minutes=3)
         ok, note = pets.use_farm_ticket(entry, "1", now=moment)
         self.assertTrue(ok, note)
-        self.assertIn("8", note)
+        self.assertIn(f"💰{expected['gold']}", note)
+        self.assertIn(f"✨{expected['xp']}", note)
 
-        # Still farming for the last minute -- and therefore still unable to pick a fight.
-        self.assertTrue(pets.is_farming(entry, "1", now=moment))
+        # The shift is over the instant the ticket is spent -- no more waiting on a poller.
+        self.assertFalse(pets.is_farming(entry, "1", now=moment))
         status = pets.farm_status(entry, "1", now=moment)
-        self.assertEqual(status["seconds_left"], pets_config.FARM_TICKET_SECONDS)
-        self.assertEqual(status["planned_hours"], 8)
+        self.assertIsNone(status["reward"])
         self.assertEqual(status["tickets"], 0)
 
-        settled = pets.settle_completed_farms(
-            entry, now=moment + timedelta(seconds=pets_config.FARM_TICKET_SECONDS))
-        self.assertEqual(len(settled), 1)
-        receipt = settled[0]
+        receipt = pets.get_pet(entry, "1")["farm_notifications"][-1]
         self.assertEqual(receipt["hours"], 8)
         # The whole point: the same money the untouched shift was going to pay.
         self.assertEqual(receipt["gold"], expected["gold"])
@@ -2597,8 +2594,7 @@ class FarmTicketTests(PetsTestCase):
 
         self.assertTrue(pets.grant_farm_ticket(entry, "1", "a"))
         self.assertTrue(pets.use_farm_ticket(entry, "1", now=moment)[0])
-        ticketed = pets.settle_completed_farms(
-            entry, now=moment + timedelta(seconds=pets_config.FARM_TICKET_SECONDS))[0]
+        ticketed = pets.get_pet(entry, "1")["farm_notifications"][-1]
 
         second_start = self._farming("other", "1", hours=8)
         cancel_moment = second_start + timedelta(minutes=3)
@@ -2609,23 +2605,23 @@ class FarmTicketTests(PetsTestCase):
         self.assertEqual(cancelled["hours"], 0)
         self.assertGreater(ticketed["gold"], cancelled["gold"])
 
-    def test_a_ticket_is_refused_when_it_would_buy_nothing(self):
+    def test_a_ticket_still_works_with_only_seconds_left_on_the_shift(self):
         entry = "chat"
         start = self._farming(entry, "1", hours=1)
         self.assertTrue(pets.grant_farm_ticket(entry, "1", "a"))
 
-        # Inside the last minute there is nothing left to cut, so the ticket is kept.
-        late = start + timedelta(hours=1) - timedelta(seconds=30)
+        # Nothing special about the last few seconds any more -- the ticket ends the shift
+        # outright rather than shaving a fixed amount off the clock, so there is no window
+        # where using it would be refused as pointless.
+        late = start + timedelta(hours=1) - timedelta(seconds=5)
         ok, note = pets.use_farm_ticket(entry, "1", now=late)
-        self.assertFalse(ok, note)
-        self.assertEqual(pets.farm_tickets(entry, "1"), 1)
-        self.assertFalse(pets.farm_status(entry, "1", now=late)["can_ticket"])
+        self.assertTrue(ok, note)
+        self.assertEqual(pets.farm_tickets(entry, "1"), 0)
+        self.assertFalse(pets.is_farming(entry, "1", now=late))
 
-        # And with no shift running at all there is nothing to shorten either.
-        pets.settle_completed_farms(entry, now=start + timedelta(hours=2))
+        # And with no shift running at all there is nothing to end either.
         ok, note = pets.use_farm_ticket(entry, "1", now=start + timedelta(hours=2))
         self.assertFalse(ok, note)
-        self.assertEqual(pets.farm_tickets(entry, "1"), 1)
 
     def test_a_ticket_without_one_in_hand_is_refused_and_spends_nothing(self):
         entry = "chat"

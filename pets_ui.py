@@ -1390,7 +1390,7 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             # The distinction that matters, and the one a player will not assume: unlike
             # «Забрать сейчас», a ticket costs nothing off the payout.
             lines.append(
-                f"<i>🎟 Билет закончит её за минуту, а заплатят как за все {planned} ч.</i>"
+                f"<i>🎟 Билет закончит смену сразу, а заплатят как за все {planned} ч.</i>"
             )
     elif status.get("ready"):
         lines.append("✅ Закончилась. Награда уже едет в личные сообщения.")

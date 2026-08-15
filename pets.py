@@ -1442,14 +1442,10 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         "figurine_xp_multiplier": figurine_xp_multiplier,
         "can_cancel": bool(run) and not ready,
         "tickets": _ticket_row(data, user_id)["count"],
-        # The button is offered only when it would actually do something: a ticket in hand,
-        # a shift running, and more than a minute of it left to cut.
-        "can_ticket": (
-            bool(run) and not ready
-            and _ticket_row(data, user_id)["count"] > 0
-            and seconds_left > C.FARM_TICKET_SECONDS
-        ),
-        "ticket_seconds": C.FARM_TICKET_SECONDS,
+        # The button is offered whenever it would actually do something: a ticket in hand
+        # and a shift still running. It ends the shift immediately, so even a few seconds
+        # left is still a real thing to spend it on.
+        "can_ticket": bool(run) and not ready and _ticket_row(data, user_id)["count"] > 0,
         "started_at": run.get("started_at") if run else None,
         "ready_at": ready_at,
         "seconds_left": seconds_left,
@@ -2124,14 +2120,14 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
 
 
 def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
-    """Spend a ticket to cut the running shift down to one minute.
+    """Spend a ticket to end the running shift right now, paid at its full planned length.
 
     Only `ready_at` moves. `hours` -- the field the payout is computed from, and the field
     cancel_farm overwrites with the hours actually worked -- is deliberately left alone, so
     an eight-hour shift redeemed at minute three still pays for eight hours. That IS the
-    ticket: it buys the waiting, not the work. Nothing is granted here either; the ordinary
-    settlement path pays the run a minute later, through the same single grant key it
-    always would have.
+    ticket: it buys the waiting, not the work. The settlement itself is folded in here
+    (see settle_completed_farms) rather than left for the next poll, so the caller can
+    report exactly what the shift paid instead of a promise to check back in a minute.
     """
     moment = now or app_now()
     with _farm_settlement_lock:
@@ -2143,26 +2139,27 @@ def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, 
         if not isinstance(run, dict):
             return False, "Питомец сейчас не работает на ферме."
         if _farm_run_ready(run, moment):
-            return False, "Смена уже закончилась — награда вот-вот придёт."
+            return False, "Смена уже закончилась — открой ферму, чтобы получить награду."
         row = _ticket_row(data, user_id)
         if row["count"] <= 0:
             return False, "Билетов нет. Их дают за новый покрас."
-        ready_at = moment + timedelta(seconds=C.FARM_TICKET_SECONDS)
-        try:
-            # Refuse rather than burn a ticket on a shift that was about to end anyway --
-            # this can only ever move the finish line closer.
-            if datetime.fromisoformat(str(run.get("ready_at"))) <= ready_at:
-                return False, "Смена и так закончится раньше — билет не нужен."
-        except (TypeError, ValueError):
-            pass
         row["count"] -= 1
-        run["ready_at"] = ready_at.isoformat()
+        run["ready_at"] = moment.isoformat()
         _save(entry, data)
-    hours = _farm_run_hours(run)
-    return True, (
-        f"Билет использован: смена на {hours} ч закончится через минуту. "
-        f"Награду заплатят как за полные {hours} ч."
-    )
+    receipts = settle_completed_farms(entry, now=moment)
+    mine = next((r for r in receipts if str(r.get("user_id")) == str(user_id)), None)
+    if mine is None:
+        # Something else already cleared the run between the save above and settlement --
+        # the ticket was still spent and the shift still ended, just report it plainly.
+        return True, "Билет использован: смена окончена."
+    parts = [f"💰{mine.get('gold', 0)}", f"✨{mine.get('xp', 0)}"]
+    if mine.get("rubies"):
+        parts.append(f"💎{mine['rubies']}")
+    if mine.get("item_code"):
+        found = C.find_item(mine["item_code"])
+        if found is not None:
+            parts.append(f"🎁{found.name}")
+    return True, "Билет использован: смена окончена — " + " · ".join(parts)
 
 
 def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:

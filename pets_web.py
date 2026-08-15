@@ -2392,6 +2392,107 @@ async def handle_debuff_set(request: web.Request) -> web.Response:
     })
 
 
+# code, emoji, label -- the same shape the client renders a picker button from.
+_GRANT_RESOURCES = (
+    ("gold", "🪙", "Золото"),
+    ("rubies", "💎", "Рубины"),
+    ("farm_tickets", "🎟️", "Билеты фермы"),
+    ("dungeon_tickets", "🎫", "Билеты подземелья"),
+)
+# Gold and rubies are a single write regardless of amount; a ticket is minted one at a
+# time (see grant_farm_ticket/grant_dungeon_ticket), so a fat-fingered six-digit count
+# would otherwise loop that many separate load/save cycles on the request thread.
+_GRANT_TICKET_MAX = 50
+
+
+def _grant_admin_payload(entry: str) -> dict:
+    data = pets._load(entry)
+    candidates = [
+        {
+            "user_id": str(user_id),
+            "owner_name": record.get("owner_name") or "кто-то",
+            "owner_username": record.get("owner_username"),
+            "pet_name": record.get("name"),
+        }
+        for user_id, record in (data.get("pets") or {}).items()
+        if isinstance(record, dict) and record.get("name")
+    ]
+    candidates.sort(key=lambda row: str(row["owner_name"]).lower())
+    return {
+        "resources": [{"code": code, "emoji": emoji, "label": label}
+                      for code, emoji, label in _GRANT_RESOURCES],
+        "candidates": candidates,
+    }
+
+
+async def handle_grant_admin(request: web.Request) -> web.Response:
+    """Everybody an admin could hand gold, rubies or tickets to. Chat admins only."""
+    await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    return _ok(await asyncio.to_thread(_grant_admin_payload, entry))
+
+
+def _apply_grant(entry: str, user_id: str, resource: str, amount: int, reason: str) -> None:
+    """Go through the exact same library call every in-game path for this currency uses --
+    never write the store directly -- so a manual correction stays honest with the wallet,
+    ledger and metrics an ordinary drop or payout would also touch."""
+    if resource == "gold":
+        economy.grant_once(entry, user_id, amount, reason)
+    elif resource == "rubies":
+        pets.grant_rubies_once(entry, user_id, amount, reason)
+    elif resource == "farm_tickets":
+        for unit in range(1, amount + 1):
+            pets.grant_farm_ticket(entry, user_id, f"{reason}:{unit}")
+    elif resource == "dungeon_tickets":
+        for _ in range(amount):
+            pets.grant_dungeon_ticket(entry, user_id)
+
+
+async def handle_grant_set(request: web.Request) -> web.Response:
+    """Hand one player gold, rubies or tickets. Chat admins only.
+
+    Keyed on a fresh random reason every call, deliberately unlike the idempotent grants a
+    listener event uses: an admin pressing the button twice means twice, not a replay to
+    swallow.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _economy_admin(request, body)
+    entry = request.app[_ENTRY_KEY]
+    target = str(body.get("user_id") or "")
+    resource = str(body.get("resource") or "")
+    labels = {code: (emoji, label) for code, emoji, label in _GRANT_RESOURCES}
+    if resource not in labels:
+        return _json_error("Неизвестный тип ресурса.", status=400, code="BAD_RESOURCE")
+    try:
+        amount = int(body.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if amount <= 0:
+        return _json_error("Количество должно быть больше нуля.", status=400, code="BAD_AMOUNT")
+    if resource in ("farm_tickets", "dungeon_tickets") and amount > _GRANT_TICKET_MAX:
+        return _json_error(
+            f"Билетов не больше {_GRANT_TICKET_MAX} за раз.", status=400, code="BAD_AMOUNT",
+        )
+    record = pets.get_pet(entry, target)
+    if record is None:
+        return _json_error("Игрок не найден.", status=404, code="NOT_FOUND")
+
+    reason = f"admin-grant:{user['id']}:{resource}:{secrets.token_hex(8)}"
+    await asyncio.to_thread(_apply_grant, entry, target, resource, amount, reason)
+    emoji, label = labels[resource]
+    request.app[_LOG_KEY](
+        f"[pets_web] {user['id']} granted {amount} {resource} to {target} "
+        f"({record.get('owner_name')})"
+    )
+    return _ok({
+        "message": f"{emoji} +{amount} {label} — {record.get('owner_name') or 'игроку'}.",
+        **await asyncio.to_thread(_grant_admin_payload, entry),
+    })
+
+
 async def _economy_admin(request: web.Request, body: dict | None = None):
     # `body` for the POST callers: a GET carries initData in the header, but a mutation
     # sends it in the JSON like every other action, and reading only the header would
@@ -2832,6 +2933,8 @@ def attach(
         web.get(prefix + "/img/sprite/{user_id}/{frame}.png", handle_sprite_frame),
         web.get(prefix + "/api/debuff", handle_debuff_admin),
         web.post(prefix + "/api/debuff", handle_debuff_set),
+        web.get(prefix + "/api/grant", handle_grant_admin),
+        web.post(prefix + "/api/grant", handle_grant_set),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
         web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
         web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
@@ -5277,6 +5380,60 @@ async function setDebuff(userId, clear) {
   } catch (e) { haptic("no"); toast(e.message); }
 }
 
+// Which currency the next tap on «выдать» hands out -- same one-picker-for-all-rows shape
+// as debuffPick above. The typed amount is drafted here too, since picking a different
+// currency re-renders the whole panel and an <input>'s value does not survive that.
+let grantPick = "";
+let grantAmountDraft = "";
+
+function grantAdmin(data) {
+  const resources = data.resources || [];
+  const rows = data.candidates || [];
+  if (!resources.some((r) => r.code === grantPick)) grantPick = (resources[0] || {}).code || "";
+  const chosen = resources.find((r) => r.code === grantPick) || {};
+
+  const picker = '<div class="panel"><h2>🎁 Выдать ресурсы</h2>' +
+    resources.map((r) =>
+      '<button class="go sec" style="margin-bottom:8px;text-align:left"' +
+      (r.code === grantPick ? " disabled" : "") +
+      ' data-grantpick="' + esc(r.code) + '">' +
+      esc(r.emoji) + " " + esc(r.label) + "</button>").join("") +
+    '<input class="inp" id="grantAmount" type="number" min="1" step="1" inputmode="numeric" ' +
+    'placeholder="Количество" value="' + esc(grantAmountDraft) + '" style="margin-top:4px">' +
+    "</div>";
+
+  return picker +
+    '<div class="panel"><h2>Кому выдать</h2>' +
+    '<input class="inp" data-grantfilter placeholder="Поиск по имени">' +
+    "<div class='tiny muted' style='margin:8px 0'>Выдаётся: " + esc(chosen.emoji || "") + " " +
+      esc(chosen.label || "") + "</div>" +
+    (rows.length
+      ? rows.map((row) =>
+          // Same in-place filtering the debuff/birthday lists use: re-rendering on every
+          // keystroke would take the focus out of the box being typed into.
+          '<div class="row spread" style="margin-bottom:8px" data-grantrow="' +
+          esc(((row.owner_name || "") + " " + (row.owner_username || "")).toLowerCase()) +
+          '"><span class="small">' + esc(row.owner_name) +
+          (row.owner_username ? " <span class='tiny muted'>@" + esc(row.owner_username) + "</span>" : "") +
+          (row.pet_name ? " <span class='tiny muted'>· " + esc(row.pet_name) + "</span>" : "") +
+          "</span>" +
+          '<button class="chip" data-grantset="' + esc(row.user_id) + '">выдать</button></div>').join("")
+      : '<div class="empty">Пока ни у кого нет существа.</div>') +
+    "</div>";
+}
+
+async function setGrant(userId) {
+  const input = $("grantAmount");
+  const amount = Math.floor(Number((input && input.value) || 0));
+  if (!amount || amount <= 0) { toast("Укажи количество больше нуля."); return; }
+  try {
+    const data = await api("/api/grant", { user_id: userId, resource: grantPick, amount });
+    toast(data.message || "Готово");
+    haptic("ok");
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+}
+
 const PEEKED = {};                 // user_id -> loadout, so reopening never refetches
 
 function statLine(stats) {
@@ -5779,6 +5936,7 @@ async function renderMore() {
     if (S && S.is_economy_admin) menu.push("moneyaudit:🕵️ Денежный аудит");
     if (S && S.is_economy_admin) menu.push("birthday:🎂 День рождения");
     if (S && S.is_economy_admin) menu.push("debuff:🎭 Эффекты игрокам");
+    if (S && S.is_economy_admin) menu.push("grant:🎁 Выдать ресурсы");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -5828,6 +5986,8 @@ async function renderMore() {
     body = birthdayAdmin(await api("/api/birthday"));
   } else if (moreView === "debuff") {
     body = debuffAdmin(await api("/api/debuff"));
+  } else if (moreView === "grant") {
+    body = grantAdmin(await api("/api/grant"));
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -7035,7 +7195,8 @@ document.addEventListener("click", async (event) => {
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
-    "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]");
+    "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
+    "[data-grantpick],[data-grantset]");
   if (!target) return;
   const d = target.dataset;
   if (d.dungeon) {
@@ -7053,6 +7214,8 @@ document.addEventListener("click", async (event) => {
   if (d.debuffpick !== undefined) { debuffPick = d.debuffpick; render(); return; }
   if (d.debuffset !== undefined) { await setDebuff(d.debuffset, false); return; }
   if (d.debuffclear !== undefined) { await setDebuff(d.debuffclear, true); return; }
+  if (d.grantpick !== undefined) { grantPick = d.grantpick; render(); return; }
+  if (d.grantset !== undefined) { await setGrant(d.grantset); return; }
 
   if (d.testbattle === "open") { await openTestBattle(); return; }
   if (d.testbattle === "close") {
@@ -7251,6 +7414,15 @@ document.addEventListener("input", (event) => {
     });
     return;
   }
+  const granted = event.target.closest("[data-grantfilter]");
+  if (granted) {
+    const term = granted.value.trim().toLowerCase();
+    document.querySelectorAll("[data-grantrow]").forEach((row) => {
+      row.hidden = Boolean(term) && !row.dataset.grantrow.includes(term);
+    });
+    return;
+  }
+  if (event.target.id === "grantAmount") { grantAmountDraft = event.target.value; return; }
   const input = event.target.closest("[data-auditfilter]");
   if (!input) return;
   auditFilter = input.value;

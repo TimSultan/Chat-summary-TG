@@ -1475,7 +1475,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- the farm ticket ----------------------------------------------------------------
 
-    async def test_a_farm_ticket_ends_the_shift_in_a_minute_without_touching_the_payout(self):
+    async def test_a_farm_ticket_ends_the_shift_immediately_without_touching_the_payout(self):
         """The ticket buys the waiting, not the work: the eight-hour reward has to survive
         being collected eight hours early, or the button is just a worse «Забрать сейчас»."""
         self._tame(PLAYER)
@@ -1490,13 +1490,16 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         answer = await self._action(PLAYER, "farm_ticket")
         self.assertTrue(answer["ok"], answer)
+        # The settlement happens inside the ticket action itself, so the payout is in the
+        # toast message -- by the time the response's own state is assembled a moment
+        # later, the run is already gone and there is nothing left for farm_receipts to
+        # report a second time.
+        self.assertIn(f"💰{expected['gold']}", answer["message"])
+        self.assertIn(f"✨{expected['xp']}", answer["message"])
         farm = answer["state"]["farm"]
-        self.assertTrue(farm["running"])
-        self.assertLessEqual(farm["seconds_left"], C.FARM_TICKET_SECONDS)
-        self.assertEqual(farm["planned_hours"], 8)
+        self.assertFalse(farm["running"])
         self.assertEqual(farm["tickets"], 0)
         self.assertFalse(farm["can_ticket"])
-        self.assertEqual(farm["reward"], expected)
 
         # Spending the only ticket means the button is gone, not broken.
         again = await self._action(PLAYER, "farm_ticket")
@@ -2247,6 +2250,82 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         no_pet = await self._debuff(THIRD, user_id=MODERATOR["id"], code="impostor")
         self.assertEqual(no_pet.status, 400, await no_pet.text())
+
+    # ---- admin resource grants -----------------------------------------------------------
+
+    async def _grant(self, user, **payload):
+        return await self.client.post(
+            pets_web.ROUTE_PREFIX + "/api/grant",
+            json={"init_data": _init_data(user["id"]), **payload},
+        )
+
+    async def test_only_a_chat_admin_can_open_or_use_the_grant_panel(self):
+        """Same narrow gate as debuffs and the birthday -- both routes ask for themselves."""
+        self._tame(PLAYER)
+        for user in (PLAYER, MODERATOR):
+            with self.subTest(user=user["username"]):
+                read = await self._get("/api/grant", user)
+                self.assertEqual(read.status, 403, await read.text())
+                write = await self._grant(user, user_id=PLAYER["id"], resource="gold", amount=100)
+                self.assertEqual(write.status, 403, await write.text())
+
+        read = await self._get("/api/grant", THIRD)
+        self.assertEqual(read.status, 200, await read.text())
+        body = await read.json()
+        self.assertEqual(
+            {row["code"] for row in body["resources"]},
+            {"gold", "rubies", "farm_tickets", "dungeon_tickets"},
+        )
+        self.assertIn(str(PLAYER["id"]), [row["user_id"] for row in body["candidates"]])
+
+    async def test_granting_each_resource_moves_the_real_balance(self):
+        self._tame(PLAYER)
+        before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+        gold = await self._grant(THIRD, user_id=PLAYER["id"], resource="gold", amount=500)
+        self.assertEqual(gold.status, 200, await gold.text())
+        self.assertIn("500", (await gold.json())["message"])
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), before + 500)
+
+        rubies = await self._grant(THIRD, user_id=PLAYER["id"], resource="rubies", amount=250)
+        self.assertEqual(rubies.status, 200, await rubies.text())
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 250)
+
+        farm = await self._grant(THIRD, user_id=PLAYER["id"], resource="farm_tickets", amount=3)
+        self.assertEqual(farm.status, 200, await farm.text())
+        self.assertEqual(pets.farm_tickets(CHAT, PLAYER["id"]), 3)
+
+        dungeon = await self._grant(THIRD, user_id=PLAYER["id"], resource="dungeon_tickets", amount=2)
+        self.assertEqual(dungeon.status, 200, await dungeon.text())
+        self.assertEqual(pets.dungeon_tickets(CHAT, PLAYER["id"]), 2)
+
+    async def test_granting_the_same_resource_twice_adds_up_rather_than_replaying(self):
+        """Unlike a listener event, an admin pressing the button twice means twice -- the
+        reason key is fresh every call specifically so this is never swallowed as a replay."""
+        self._tame(PLAYER)
+        first = await self._grant(THIRD, user_id=PLAYER["id"], resource="rubies", amount=100)
+        second = await self._grant(THIRD, user_id=PLAYER["id"], resource="rubies", amount=100)
+        self.assertEqual(first.status, 200, await first.text())
+        self.assertEqual(second.status, 200, await second.text())
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 200)
+
+    async def test_grant_rejects_bad_resource_amount_and_unknown_player(self):
+        self._tame(PLAYER)
+        bad_resource = await self._grant(THIRD, user_id=PLAYER["id"], resource="diamonds", amount=10)
+        self.assertEqual(bad_resource.status, 400, await bad_resource.text())
+        self.assertEqual((await bad_resource.json())["error"], "BAD_RESOURCE")
+
+        zero_amount = await self._grant(THIRD, user_id=PLAYER["id"], resource="gold", amount=0)
+        self.assertEqual(zero_amount.status, 400, await zero_amount.text())
+        self.assertEqual((await zero_amount.json())["error"], "BAD_AMOUNT")
+
+        too_many_tickets = await self._grant(
+            THIRD, user_id=PLAYER["id"], resource="farm_tickets", amount=51,
+        )
+        self.assertEqual(too_many_tickets.status, 400, await too_many_tickets.text())
+
+        no_pet = await self._grant(THIRD, user_id=MODERATOR["id"], resource="gold", amount=10)
+        self.assertEqual(no_pet.status, 404, await no_pet.text())
+        self.assertEqual((await no_pet.json())["error"], "NOT_FOUND")
 
     # ---- birthdays ----------------------------------------------------------------------
 
