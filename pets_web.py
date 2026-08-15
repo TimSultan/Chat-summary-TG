@@ -3239,10 +3239,12 @@ PAGE_HTML = """<!doctype html>
   }
   .foe .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .foe.out { opacity: .45; }
-  /* Five mob offers arrive together. Choosing the next one is therefore local and
-     instant; only asking for a fresh batch needs another request. */
+  /* Five mob offers arrive together but only ONE is ever on screen. "Другой" is a local
+     index step through the batch that already loaded, so it repaints instantly; only a
+     used-up batch costs another request, and even that one is fetched in the background. */
   .moboffers { display:grid; gap:8px; }
   .moboffer { padding:9px; border:1px solid var(--line); border-radius:11px; background:var(--sunken); }
+  .mobacts { display: grid; grid-template-columns: 1.4fr 1fr; gap: 8px; margin-top: 8px; }
   .mobcard .mobtaunt { margin-top: 8px; font-size: 13px; font-style: italic;
                        color: var(--muted); border-left: 2px solid var(--line);
                        padding-left: 9px; }
@@ -4570,7 +4572,7 @@ async function renderArena() {
   if (TEST_SETUP || TEST_BATTLE) { renderTestBattle(box); return; }
   const arena = S.arena;
   if (!FOES || !MOBS) {
-    box.innerHTML = '<div class="empty">Ищу соперников и готовлю 5 мобов…</div>';
+    box.innerHTML = '<div class="empty">Ищу соперников…</div>';
     try {
       const results = await Promise.all([
         FOES ? Promise.resolve(FOES) : api("/api/opponents"),
@@ -5011,6 +5013,8 @@ function showTestCatalog() {
 // ------------------------------------------------------------------------------- PVE
 const TIER_TONE = { easy: "win", medium: "gold", hard: "loss" };
 let MOBS = null;
+let MOB_INDEX = 0;                     // which of the loaded batch is the one on screen
+let MOB_REFILLING = false;
 let MOB_REPLAY = null;
 let MOB_FIGHT_BUSY = false;
 
@@ -5018,9 +5022,38 @@ async function rollMob() {
   try {
     const data = await api("/api/mob");
     MOBS = data.mobs || (data.mob ? [data.mob] : []);
+    MOB_INDEX = 0;
   } catch (e) { haptic("no"); toast(e.message); return; }
   haptic();
   render();
+}
+
+// The whole point of prefetching five: this press never touches the network. It steps the
+// pointer through the batch already in memory and repaints, so the next opponent is on
+// screen in the same frame as the tap.
+function nextMob() {
+  if (!MOBS || MOBS.length < 2) return;
+  MOB_INDEX = (MOB_INDEX + 1) % MOBS.length;
+  haptic();
+  render();
+  // Wrapping back to the first card means the player has seen all five. Top the batch up
+  // in the background so the NEXT press is still instant and still shows somebody new.
+  if (MOB_INDEX === 0) refillMobs();
+}
+
+async function refillMobs() {
+  if (MOB_REFILLING) return;
+  MOB_REFILLING = true;
+  try {
+    const data = await api("/api/mob");
+    const fresh = data.mobs || (data.mob ? [data.mob] : []);
+    // A fight that started while this was in flight owns the roster: dropping the fresh
+    // batch beats swapping the card out from under a player who is already attacking.
+    if (fresh.length && !MOB_FIGHT_BUSY) { MOBS = fresh; MOB_INDEX = 0; render(); }
+  } catch (e) {
+    // Silent on purpose. The batch on screen is still fightable, and a failed top-up is
+    // not something the player asked for or needs to be told about.
+  } finally { MOB_REFILLING = false; }
 }
 
 async function fightMob(index) {
@@ -5034,6 +5067,9 @@ async function fightMob(index) {
   } catch (e) { haptic("no"); toast(e.message); MOB_FIGHT_BUSY = false; render(); return; }
   S = data.state;
   MOBS.splice(Number(index), 1);
+  // The splice shifts the rest left, so the same slot now holds the next mob and the
+  // screen simply moves on. Only a fight on the last card needs the pointer pulled back.
+  if (MOB_INDEX >= MOBS.length) MOB_INDEX = 0;
   FOES = null;
   MOB_REPLAY = data;
   MOB_FIGHT_BUSY = false;
@@ -5297,9 +5333,14 @@ function mobPanel(farmBlocked) {
         ? "<div class='tiny muted' style='text-align:center'>Атаки кончились. " +
           "Новые придут сразу у всех на сервере.</div>"
         : '<button class="go" data-mob="roll"' + (blocked ? " disabled" : "") +
-          ">🔍 Загрузить 5 мобов</button>") + "</div>";
+          ">🔍 Найти соперника</button>") + "</div>";
   }
-  const offers = MOBS.map((mob, index) =>
+  // One card, never the whole batch: a roster of five is a wall to read through, and the
+  // other four are only there so that "Другой" costs nothing. The index is clamped here
+  // rather than trusted -- a stale pointer would blank the card instead of the mob.
+  const index = MOBS.length ? Math.min(MOB_INDEX, MOBS.length - 1) : 0;
+  const mob = MOBS[index];
+  const offer =
     '<div class="moboffer mobcard"><div class="row spread"><b>👾 ' + esc(mob.name) + '</b>' +
       '<span class="tierchip ' + (TIER_TONE[mob.tier] || "") + '">' + esc(mob.tier_name) +
       '</span></div><div class="tiny muted" style="margin-top:4px">' + esc(mob.flavour) + '</div>' +
@@ -5308,11 +5349,16 @@ function mobPanel(farmBlocked) {
         ["strength", "health", "agility", "luck"].map((key) =>
           (STAT_ICON[key] || key) + (mob.stats[key] || 0)).join(" ") +
         (mob.armor ? " 🛡" + mob.armor : "") + '</span></div>' +
-      '<button class="go" style="margin-top:8px" data-mobfight="' + index + '"' +
-        (blocked ? " disabled" : "") + '>⚔️ В бой</button></div>').join("");
-  return '<div class="panel"><h2>👾 ПВЕ · противники · ' + MOBS.length + '</h2>' + counter +
-    '<div class="small muted" style="margin-bottom:9px">Все уже загружены. Выбор следующего моба не требует поиска.</div>' +
-    '<div class="moboffers">' + offers + '</div></div>';
+      '<div class="mobacts">' +
+        '<button class="go" data-mobfight="' + index + '"' +
+          (blocked ? " disabled" : "") + '>⚔️ В бой</button>' +
+        '<button class="go sec" data-mob="next"' +
+          (MOBS.length > 1 && !MOB_FIGHT_BUSY ? "" : " disabled") + '>🔄 Другой</button>' +
+      "</div></div>";
+  return '<div class="panel"><h2>👾 ПВЕ · противник</h2>' + counter +
+    '<div class="small muted" style="margin-bottom:9px">«Другой» меняет соперника мгновенно — ' +
+    'следующие уже загружены, искать заново не нужно.</div>' +
+    '<div class="moboffers">' + offer + '</div></div>';
 }
 
 // A granted mark, drawn the same way wherever it appears. Three shapes for three amounts
@@ -6940,6 +6986,7 @@ document.addEventListener("click", async (event) => {
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
+  if (d.mob === "next") { nextMob(); return; }
   if (d.mobfight !== undefined) { haptic(); await fightMob(Number(d.mobfight)); return; }
   if (d.mobreplay && MOB_REPLAY) { closeSheet(); playDuel(MOB_REPLAY); return; }
   if (d.questopen) {
@@ -7013,7 +7060,7 @@ document.addEventListener("click", async (event) => {
   }
   if (d.foe) { haptic(); fight(d.foe); return; }
   if (d.farmstart) { await act("farm_start", { hours: Number(d.farmstart) }); return; }
-  if (d.arenaretry) { FOES = null; MOBS = null; renderArena(); return; }
+  if (d.arenaretry) { FOES = null; MOBS = null; MOB_INDEX = 0; renderArena(); return; }
   if (d.feature) { await act("farm_feature", { feature: d.feature }); return; }
   if (d.gift) { closeSheet(); await act("gift", { code: d.code, receiver_id: d.gift, confirm: true }); return; }
 

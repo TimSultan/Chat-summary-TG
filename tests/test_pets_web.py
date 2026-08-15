@@ -1726,9 +1726,25 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Promise.all([", arena)
         self.assertIn('api("/api/mob")', arena)
         self.assertIn("MOBS = results[1].mobs", arena)
-        self.assertIn("MOBS.map((mob, index)", page)
         self.assertIn('data-mobfight="', page)
         self.assertIn("MOBS.splice(Number(index), 1);", page)
+
+    async def test_pve_shows_one_mob_and_swaps_it_without_a_request(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        panel = page.split("function mobPanel(farmBlocked)", 1)[1].split(
+            "function debuffTag(", 1,
+        )[0]
+        # One card on screen, chosen by the pointer -- not the whole prefetched batch.
+        self.assertNotIn("MOBS.map(", panel)
+        self.assertIn("const mob = MOBS[index];", panel)
+        self.assertIn('data-mob="next"', panel)
+        # The swap itself must stay local: an index step and a repaint, no api() call.
+        swap = page.split("function nextMob()", 1)[1].split("async function refillMobs()", 1)[0]
+        self.assertIn("MOB_INDEX = (MOB_INDEX + 1) % MOBS.length;", swap)
+        self.assertNotIn("api(", swap)
+        self.assertIn('if (d.mob === "next") { nextMob(); return; }', page)
+        # Only a batch the player has seen through costs a request, and it runs detached.
+        self.assertIn("if (MOB_INDEX === 0) refillMobs();", swap)
 
     async def test_hero_order_and_pve_replay_controls_are_exposed_by_the_page(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
