@@ -248,10 +248,10 @@ SHIELDS = (
      "short": "При защите усиливает свои следующие два удара на 35%.",
      "defend_effects": ({"op": "damage_boost", "value": .35, "turns": 2},)},
     {"code": "shield_solvent_jar", "name": "Баночка растворителя", "icon": "🧪",
-     "short": "При защите поджигает врага: 35% урона за ход, 2 хода.",
+     "short": "При защите поджигает врага: 35% базового урона владельца в начале каждого из 2 ходов врага (всего 70%).",
      "defend_effects": ({"op": "burn", "amount": .35, "turns": 2},)},
     {"code": "shield_solvent_drum", "name": "Бочка растворителя", "icon": "🛢️",
-     "short": "При защите поджигает врага: 45% урона за ход, 3 хода.",
+     "short": "При защите поджигает врага: 45% базового урона владельца в начале каждого из 3 ходов врага (всего 135%).",
      "defend_effects": ({"op": "burn", "amount": .45, "turns": 3},)},
     {"code": "shield_duelist_buckler", "name": "Баклер дуэлянта", "icon": "🤺",
      "short": "При первом полученном уроне: 28% шанс парировать 65% урона и оглушить атакующего.",
@@ -381,7 +381,10 @@ def effect_text(effect: dict) -> str:
     if op == "shield":
         return f"Щит на {_percent(effect.get('percent'))} здоровья"
     if op == "burn":
-        return f"Поджигает: {_percent(effect.get('amount'))} удара за ход, {_turns(effect)}"
+        return (
+            f"Поджигает: {_percent(effect.get('amount'))} базового урона владельца "
+            f"за ход, {_turns(effect)}"
+        )
     if op == "weaken":
         return f"Враг бьёт слабее на {_percent(effect.get('value'))}, {_turns(effect)}"
     if op == "blind":

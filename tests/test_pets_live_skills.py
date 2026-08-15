@@ -301,7 +301,7 @@ class ScrollWordingTests(unittest.TestCase):
         )
         self.assertEqual(
             scrolls.effect_text({"op": "burn", "amount": .45, "turns": 2}),
-            "Поджигает: 45% удара за ход, 2 хода",
+            "Поджигает: 45% базового урона владельца за ход, 2 хода",
         )
         # Clamped to what the engine will actually do with a large catalogue value.
         self.assertEqual(

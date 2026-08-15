@@ -446,6 +446,40 @@ class SimulateTests(unittest.TestCase):
         self.assertEqual(reflected.attacker, shielded.key)
         self.assertGreater(reflected.damage, 0)
 
+    def test_solvent_shield_burn_is_a_share_of_the_wearers_derived_damage(self):
+        import pets_scroll_catalog as scrolls
+
+        class DefendWhenPossible:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "defend" if "defend" in values else values[0]
+
+        shielded = Fighter(
+            key="owner", name="Owner", strength=40, health=200,
+            agility=10, luck=1, armor=0, shield=scrolls.shield("shield_solvent_jar"),
+        )
+        target = Fighter(
+            key="target", name="Target", strength=40, health=200,
+            agility=10, luck=1, armor=0,
+        )
+        expected_tick = round(combat.derive(shielded, target)["damage"] * .35)
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 1)):
+            result = combat.simulate(
+                shielded, target, rng=DefendWhenPossible(), max_actions=4,
+            )
+
+        burn = [
+            row for row in result.rounds
+            if row.event == "amulet_burn" and row.attacker == shielded.key
+        ]
+        self.assertEqual([row.damage for row in burn], [expected_tick, expected_tick])
+
     def test_reactive_shields_work_against_dungeon_bosses_without_recursing(self):
         """The new hooks are worn-shield reactions, not scroll-only PvP effects.
 
