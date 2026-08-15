@@ -76,6 +76,12 @@ class Fighter:
     shield: dict | None = None
     damage_multiplier: float = 1.0
     physical_damage_taken_multiplier: float = 1.0
+    # True turns an unruned weapon's swing into healing rather than merely wasting it
+    # (see the dungeon's spells_only boss). Kept as its own bool instead of folding into
+    # physical_damage_taken_multiplier because "does nothing" and "actively heals" are
+    # different player-facing claims, and a future gimmick may want partial resistance
+    # (a nonzero multiplier) combined with a heal on top of it.
+    physical_damage_heals: bool = False
     magic_reflect_multiplier: float = 0.0
     enchant_reflect_multiplier: float = 0.0
     weapon_enchanted: bool = False
@@ -205,6 +211,7 @@ _EFFECT_TEXT = {
     "shield_damage_heal": "щит возвращает {amount} HP из полученного урона.",
     "shield_counterattack": "щит отвечает контрударом: {amount} урона.",
     "guard": "держит защиту: поглощено {amount} урона.",
+    "steel_heal": "впитывает стальной удар вместо урона: +{amount} HP.",
 }
 
 
@@ -236,6 +243,12 @@ def snapshot(fighter: "Fighter") -> dict:
         "personal_enchanted_scrolls": list(fighter.personal_enchanted_scrolls or ()),
         "shield": dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None,
         "damage_multiplier": fighter.damage_multiplier,
+        # This one was missing entirely, which meant a replayed Аквариус fight rebuilt the
+        # ghost WITHOUT its immunity and played out a fight that never happened. It matters
+        # more now that physical_damage_heals rides alongside it: restoring one without the
+        # other would give the replay a boss that both heals from steel and takes it.
+        "physical_damage_taken_multiplier": fighter.physical_damage_taken_multiplier,
+        "physical_damage_heals": fighter.physical_damage_heals,
         "magic_reflect_multiplier": fighter.magic_reflect_multiplier,
         "enchant_reflect_multiplier": fighter.enchant_reflect_multiplier,
         "weapon_enchanted": fighter.weapon_enchanted,
@@ -308,6 +321,10 @@ def restore(data) -> "Fighter | None":
         ),
         shield=shield,
         damage_multiplier=_stored_number(data.get("damage_multiplier"), 1.0),
+        physical_damage_taken_multiplier=_stored_number(
+            data.get("physical_damage_taken_multiplier"), 1.0,
+        ),
+        physical_damage_heals=bool(data.get("physical_damage_heals", False)),
         magic_reflect_multiplier=_stored_number(data.get("magic_reflect_multiplier"), 0.0),
         enchant_reflect_multiplier=_stored_number(data.get("enchant_reflect_multiplier"), 0.0),
         weapon_enchanted=bool(data.get("weapon_enchanted", False)),
@@ -659,7 +676,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         for fighter in (a, b)
     ) or any(fighter.weapon_enchanted for fighter in (a, b)) or any(
         fighter.physical_damage_taken_multiplier != 1.0 for fighter in (a, b)
-    )
+    ) or any(fighter.physical_damage_heals for fighter in (a, b))
     shields = {a.key: 0.0, b.key: 0.0}
     used = {a.key: set() for a in (a, b)}
     # Reactive shield powers are deliberately separate from item passives: a weapon
@@ -1725,6 +1742,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         # Set before the modifier block because a dodge skips that block entirely and the
         # classification still has to be right for whatever reaches apply_attack below.
         basic_attack_types = (PHYSICAL, MAGIC) if attacker.weapon_enchanted else (PHYSICAL,)
+        # Set alongside basic_attack_types for the same reason: a dodge must leave it at
+        # its default (no heal) rather than skip past an undefined name.
+        steel_heal = 0
         if effectful and damage:
             # Attack-side modifiers are evaluated after dodge/crit, which keeps a dodge
             # absolute and makes the combat log's primary hit number truthful.
@@ -1851,6 +1871,15 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     steel_half * fighters[defender_key].physical_damage_taken_multiplier
                 ))
                 basic_attack_types = (PHYSICAL, MAGIC)
+            elif fighters[defender_key].physical_damage_heals:
+                # A plain blade is not merely wasted here, it is the wrong tool: the
+                # whole swing (crit, multipliers and all) becomes HP for the target
+                # instead of leaving the fight. Only a runed weapon (the branch above)
+                # still gets through as damage. Applied and capped below, alongside the
+                # ordinary hit row, so the transcript shows the heal as its consequence.
+                steel_heal = damage
+                damage = 0
+                basic_attack_types = (PHYSICAL,)
             else:
                 damage = max(0, round(
                     damage * fighters[defender_key].physical_damage_taken_multiplier
@@ -1917,6 +1946,18 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             )
             if reflected_winner:
                 return reflected_winner
+
+        # steel_heal never coexists with impact (the branch above zeroed damage before
+        # apply_attack ran), so this is the hit's only HP consequence -- appended right
+        # after the ordinary attack row, same placement as any other consequence of it,
+        # and outside the `effectful and damage` gate below because damage is 0 here by
+        # design. Capped at max_hp like every other heal in this file.
+        if steel_heal:
+            before_heal = hp[defender_key]
+            hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + steel_heal)
+            healed = round(hp[defender_key] - before_heal)
+            if healed:
+                effect_round(round_number, defender_key, attacker_key, "steel_heal", healed)
 
         # Post-hit effects occur after the ordinary attack line so the sequence reads
         # naturally in Telegram.  They can knock out the attacker too.

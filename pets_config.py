@@ -293,6 +293,12 @@ def total_stat_cost(target_level: int, from_level: int = STAT_MIN_LEVEL) -> int:
 # Tuned so an even fight naturally runs for ~20 blows -- about ten from each side -- at
 # EVERY level. `MAX_SKILL_ACTIONS_PER_FIGHTER` is the ceiling rather than the target: a
 # fight that reaches it is awarded by total damage rather than continuing past the limit.
+# Doubled from 24 to 48 on the owner's call: fights that went the distance were being
+# settled by the total-damage tiebreak rather than by a knockout, and a longer rope lets
+# more of them finish on their own terms. This is headroom only -- it does not move the
+# ~10-blow median below, which is set by the HP and damage curves rather than by the cap.
+# What it does change is anything paid per action: damage over time gets more ticks, while
+# a once-per-fight scroll is diluted across a longer fight.
 #
 #   HP     = BASE_HP + health * HP_PER_POINT             (500 + 19/pt -> 2,020 at 80)
 #   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT  (49.5 + 2.42/pt -> 243 at 80)
@@ -378,7 +384,7 @@ ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 # turns. Scrolls and Defend spend actions without always dealing damage, so the budget
 # stays at the larger number: at 10, a healing or guard build would run out of fight
 # before it had used its loadout.
-MAX_SKILL_ACTIONS_PER_FIGHTER = 24
+MAX_SKILL_ACTIONS_PER_FIGHTER = 48
 
 # ------------------------------------------------------------------ stat lead bonus
 # Every lead matters: a stat that is 10% higher contributes 10% more, rising linearly to
@@ -654,7 +660,7 @@ def pet_xp_for_next_level(level: int) -> int:
 
 
 # A rune is a paid, permanent weapon enhancement, so its benefit must remain visible as
-# pets' combat stats grow.  Flat 3--5 point effects disappeared into a 10--24 action
+# pets' combat stats grow.  Flat 3--5 point effects disappeared into a 10--48 action
 # fight once a pet had progressed beyond its starter stats.  Values are derived from the
 # same base HP/damage equations as combat; percentage effects retain safe hard ceilings.
 RUNE_REGEN_MAX_HP_SHARE = .015

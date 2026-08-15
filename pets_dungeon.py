@@ -66,7 +66,7 @@ BOSSES: Final = (
     ("Молчаливый колосс", "standard", 5,
      "Каменные пальцы сжаты вокруг меча; кажется, он стоял здесь ещё до постройки подземелья."),
     ("Призрак Аквариуса", "spells_only", 0,
-     "Пыль вокруг него ложится в страницы сама собой, а старые чернила светятся в темноте."),
+     "Клинок без руны он впитывает как воду: простая сталь его лечит, а не ранит."),
     ("Антимаг без имени", "antimagic", 0,
      "Он возвращает 85% магического и рунного урона; здесь надёжнее простое оружие."),
     ("Плачущее дерево", "healing_pass", 0,
@@ -173,15 +173,17 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
         gold, xp = 450 + floor * 70, 80 + floor * 18
     else:
         gold, xp = (180 + floor * 30) // enemy_count, (35 + floor * 12) // enemy_count
+    # Base, ramp and cap all cut in half here -- the live drop rate was far too high, so
+    # every number in this curve pays out at half its previous odds, floor for floor.
     scroll_chance = 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
-        0.25, 0.04 + (floor - SCROLL_LOOT_START_FLOOR) * 0.01,
+        0.125, 0.02 + (floor - SCROLL_LOOT_START_FLOOR) * 0.005,
     )
     return {
         "gold": max(1, gold), "xp": max(1, xp),
         "item_chance": min(0.22, 0.012 + floor * 0.004) * (BOSS_ITEM_MULTIPLIER if boss else 1),
         # The boss multiplier is applied AFTER the ordinary cap, not inside it: capping
         # first and multiplying after is what lets a boss actually out-drop the corridor
-        # it stands at the end of instead of flattening into the same 25%.
+        # it stands at the end of instead of flattening into the same 12.5%.
         "scroll_chance": min(1.0, scroll_chance * (BOSS_SCROLL_MULTIPLIER if boss else 1)),
     }
 

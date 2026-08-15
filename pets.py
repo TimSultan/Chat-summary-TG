@@ -3382,6 +3382,10 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 level=row["level"],
                 effects=(({"code": "thorns", "value": 50},) if row["gimmick"] == "healing_pass" else ()),
                 physical_damage_taken_multiplier=0 if row["gimmick"] == "spells_only" else 1,
+                # Plain steel does not just fail here, it feeds the ghost: see
+                # pets_combat.Fighter.physical_damage_heals and the block that reads it
+                # in the basic-attack path.
+                physical_damage_heals=row["gimmick"] == "spells_only",
                 magic_reflect_multiplier=(
                     D.ANTIMAGIC_REFLECT_SHARE if row["gimmick"] == "antimagic" else 0
                 ),

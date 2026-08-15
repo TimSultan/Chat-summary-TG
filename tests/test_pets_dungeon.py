@@ -362,12 +362,14 @@ class DungeonTests(unittest.TestCase):
         floor = 41
         self.assertFalse(dungeon.is_boss_floor(floor))
         self._unstoppable_runner(floor)
+        # The floor caps at a 12.5% baseline (halved from the old 25%), so the sample is
+        # doubled to 240 to keep the same margin of safety the old 120-kill/25% pair had.
         granted = [
             payload["scroll"]["code"]
-            for payload in self._rekill(floor, times=120)
+            for payload in self._rekill(floor, times=240)
             if payload.get("scroll") and payload["scroll"].get("granted")
         ]
-        self.assertGreater(len(granted), 3, "a 25% baseline over 120 kills must pay out")
+        self.assertGreater(len(granted), 3, "a 12.5% baseline over 240 kills must pay out")
         self.assertGreater(len(set(granted)), 1, "the same scroll every time is the bug")
 
     def test_existing_pet_owners_receive_three_dungeon_tickets_once(self):

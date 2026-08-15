@@ -1351,5 +1351,88 @@ class EnchantedWeaponTests(unittest.TestCase):
         )
 
 
+class PhysicalDamageHealsTests(unittest.TestCase):
+    """Призрак Аквариуса: plain steel feeds it, only a rune still hurts it."""
+
+    def _fight(self, *, enchanted, starting_hp=None):
+        attacker = Fighter(
+            key="a", name="A", strength=40, health=200, agility=20, luck=20, armor=0,
+            level=10, weapon_enchanted=enchanted,
+        )
+        defender = Fighter(
+            key="b", name="B", strength=10, health=20, agility=20, luck=20, armor=0,
+            level=10, physical_damage_heals=True, physical_damage_taken_multiplier=0.0,
+            starting_hp=starting_hp,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 100)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(attacker, defender, seed=1, max_actions=1)
+        return result
+
+    def test_a_plain_weapon_heals_the_boss_instead_of_damaging_it(self):
+        result = self._fight(enchanted=False, starting_hp=1)
+        hit = next(row for row in result.rounds if row.attacker == "a" and row.is_action)
+        heal = next(row for row in result.rounds if row.event == "amulet_steel_heal")
+        # The hit itself lands for zero -- the would-be damage shows up as the heal
+        # row's amount instead, not as a number on the attack row.
+        self.assertEqual(hit.damage, 0)
+        self.assertEqual(heal.damage, 100)
+        self.assertFalse(heal.is_action)
+        self.assertEqual(result.final_hp["b"], 101)
+
+    def test_heal_is_capped_at_max_hp(self):
+        with patch.object(combat, "_signature", return_value=None):
+            probe = Fighter(
+                key="b", name="B", strength=10, health=20, agility=20, luck=20, armor=0,
+                level=10,
+            )
+            attacker_probe = Fighter(
+                key="a", name="A", strength=40, health=200, agility=20, luck=20, armor=0,
+                level=10,
+            )
+            max_hp = round(combat.derive(probe, attacker_probe)["max_hp"])
+
+        result = self._fight(enchanted=False, starting_hp=max_hp - 10)
+        heal = next(row for row in result.rounds if row.event == "amulet_steel_heal")
+        # A 100-power blow would overheal past the cap by 90 -- only the missing 10
+        # HP is actually restored, and the transcript reports that real number.
+        self.assertEqual(heal.damage, 10)
+        self.assertEqual(result.final_hp["b"], max_hp)
+
+    def test_an_enchanted_weapon_is_unaffected_and_still_deals_its_magic_half(self):
+        """weapon_enchanted takes priority: the elif never fires against a rune."""
+        result = self._fight(enchanted=True, starting_hp=1)
+        hit = next(row for row in result.rounds if row.attacker == "a" and row.is_action)
+        self.assertGreater(hit.damage, 0)
+        self.assertEqual(hit.attack_types, (combat.PHYSICAL, combat.MAGIC))
+        self.assertEqual(hit.damage, round(
+            round(100 * (1 + C.RUNE_WEAPON_POWER_BONUS)) * C.RUNE_WEAPON_MAGIC_SHARE
+        ))
+        self.assertFalse(any(row.event == "amulet_steel_heal" for row in result.rounds))
+
+    def test_transcript_line_is_russian_and_explains_the_reversal(self):
+        result = self._fight(enchanted=False, starting_hp=1)
+        heal = next(row for row in result.rounds if row.event == "amulet_steel_heal")
+        self.assertIn("B", heal.text)
+        self.assertIn("HP", heal.text)
+        # Not asserting exact wording (flavour text is free to be reworded), but the
+        # line must be Russian prose, not a bare template placeholder.
+        self.assertNotIn("{", heal.text)
+
+    def test_field_round_trips_through_snapshot_and_restore(self):
+        fighter = Fighter(
+            key="ghost", name="Призрак", strength=1, health=1, agility=1, luck=1,
+            armor=0, physical_damage_heals=True,
+        )
+        restored = combat.restore(combat.snapshot(fighter))
+        self.assertTrue(restored.physical_damage_heals)
+
+        default_fighter = Fighter(
+            key="plain", name="Plain", strength=1, health=1, agility=1, luck=1, armor=0,
+        )
+        restored_default = combat.restore(combat.snapshot(default_fighter))
+        self.assertFalse(restored_default.physical_damage_heals)
+
+
 if __name__ == "__main__":
     unittest.main()
