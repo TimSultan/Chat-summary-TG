@@ -2637,6 +2637,17 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
         )
         lines.append(f"<i>{escape(their_mark['description'])}</i>")
 
+    # And the one that is about YOU rather than them: the same face all day costs stats,
+    # and this is the screen where the choice to pay is actually made.
+    familiar = pets.familiar_face(entry, user_id, opponent_id)
+    if familiar:
+        lines.append(
+            f"\n{familiar['emoji']} <b>{escape(familiar['title'])} ×{familiar['stacks']}</b>"
+            f" — {escape(familiar['line'])}"
+        )
+        lines.append(f"<i>{escape(familiar['description'])}</i>")
+        lines.append(f"<i>{escape(familiar['hint'])}</i>")
+
     rows = [
         [{
             "text": "⚔️ Напасть",

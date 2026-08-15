@@ -1582,13 +1582,18 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
             # scale -- so the badge explains a number the player can otherwise only wonder
             # about.
             "debuff": pets.debuff_for(record),
-            "attackable": attacker_can_fight and used < C.ARENA_SAME_OPPONENT_DAILY_LIMIT,
+            # What YOU would carry into this particular fight, which is why it is on the
+            # opponent's card and not on your own: the shake belongs to the pairing.
+            "familiar_face": pets.familiar_face_for(used),
+            # No per-opponent cap any more -- hitting the same face again is allowed and
+            # merely expensive (see familiar_face above).
+            "attackable": attacker_can_fight,
             "attacks_today": used,
             "gap": abs(power - mine),
         })
     # An even fight first: the roster is sorted by how near each opponent's power is to
-    # yours, with everyone you have already fought out today pushed to the bottom.
-    opponents.sort(key=lambda o: (not o["attackable"], o["gap"]))
+    # yours, with the faces you are already sick of pushed down behind the fresh ones.
+    opponents.sort(key=lambda o: (not o["attackable"], o["attacks_today"], o["gap"]))
 
     # The celebrant goes to the very top and stops being a target for the day: the card
     # in their place offers a greeting, not an attack. Marked on the row rather than
@@ -1642,10 +1647,12 @@ async def handle_attack(request: web.Request) -> web.Response:
         status=409, code="DUNGEON_ACTIVE",
       )
     if not pets.can_attack_in_arena(entry, me, opponent_id):
-        return _json_error("Сегодня с этим соперником уже хватит.", status=409, code="LIMIT")
+        return _json_error("Существо сейчас занято и не может драться.", status=409, code="LIMIT")
 
-    def fighter(key, record):
-        effective = pets.effective_stats(entry, key)
+    # Both sides carry their OWN history with the other: farming somebody all morning
+    # leaves you shaky against them even in the fight where they hit back.
+    def fighter(key, record, versus):
+        effective = pets.effective_stats(entry, key, vs=versus)
         return pets_combat.Fighter(
             key=str(key), name=record.get("name") or "Существо",
             strength=effective["strength"], health=effective["health"],
@@ -1663,7 +1670,8 @@ async def handle_attack(request: web.Request) -> web.Response:
     # effects they carry. See pets.auto_equip_mirror: only fires on a big level gap, only
     # for somebody who owns it, and is put back straight after the fight is recorded.
     mirrored = pets.auto_equip_mirror(entry, me, opponent_id)
-    attacker, defender = fighter(me, mine), fighter(opponent_id, theirs)
+    attacker = fighter(me, mine, opponent_id)
+    defender = fighter(opponent_id, theirs, me)
     prefix = request.app[_PREFIX_KEY]
     playback_records = {
         me: _fight_record_snapshot(pets.get_pet(entry, me), prefix),
@@ -3119,6 +3127,9 @@ PAGE_HTML = """<!doctype html>
     padding: 1px 6px; border-radius: 999px; white-space: nowrap; vertical-align: middle;
     color: var(--muted); background: rgba(128, 128, 128, .16);
   }
+  /* Знакомое лицо. Same pill as a mark, but warm rather than grey: this one is not an
+     accusation, it is a price the player chose to pay by picking the same name again. */
+  .dbf.fam { color: var(--gold); background: rgba(232, 185, 35, .14); }
   .dbfnote {
     margin-top: 9px; padding: 8px 10px; border-radius: 10px;
     background: rgba(128, 128, 128, .12); border: 1px solid rgba(128, 128, 128, .22);
@@ -5382,16 +5393,29 @@ function debuffNote(mark, extra) {
     "</div>";
 }
 
+// Знакомое лицо, as small as the mark beside it. The card is the only place a player can
+// see the price before paying it, so the pill carries the count and its title tells them
+// what it costs and when it lifts.
+function familiarTag(mark) {
+  if (!mark || !mark.stacks) return "";
+  return "<span class='dbf fam' title='" + esc(mark.description || "") + " " +
+    esc(mark.line || "") + ". " + esc(mark.hint || "") + "'>" +
+    esc(mark.emoji || "") + " " + esc(mark.title || "") + " ×" + Number(mark.stacks) + "</span>";
+}
+
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
+  const familiar = foe.familiar_face;
   return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
     (usable ? "" : " disabled") + '>' +
     '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
     "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
-      "</span> " + debuffTag(foe.debuff) +
+      "</span> " + debuffTag(foe.debuff) + " " + familiarTag(familiar) +
       "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
       " · побед " + foe.wins + " из " + foe.fights +
-      (foe.attackable ? "" : " · сегодня уже хватит") + "</span></span>" +
+      // The number the tag stands for, spelled out: a pill saying ×3 is a badge, but
+      // "−30% к твоим статам" is the actual decision in front of the player.
+      (familiar ? " · " + esc(familiar.line) : "") + "</span></span>" +
     "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";
 }
 

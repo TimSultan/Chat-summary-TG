@@ -6075,11 +6075,14 @@ async def handle_duel_command(
         attacker_username=actor.get("username"),
     )
 
-def _pets_fighter(entry: str, user_id, pet: dict):
+def _pets_fighter(entry: str, user_id, pet: dict, vs=None):
     """A pets_combat.Fighter built from EFFECTIVE stats -- purchased levels plus the pet's
     own level plus whatever it is wearing. Combat never reads the store itself, which is
-    what lets a fight be replayed from a seed in a test."""
-    effective = pets.effective_stats(entry, user_id)
+    what lets a fight be replayed from a seed in a test.
+
+    `vs` is the creature on the other side of THIS fight, and passing it is what applies
+    Знакомое лицо. Omitted for a mob: there is no history with a mob to be sick of."""
+    effective = pets.effective_stats(entry, user_id, vs=vs)
     return pets_combat.Fighter(
         key=str(user_id),
         name=pet.get("name") or "Существо",
@@ -7228,8 +7231,8 @@ async def handle_test_fight_command(
         )
         return
 
-    attacker_fighter = _pets_fighter(entry, attacker_id, attacker)
-    defender_fighter = _pets_fighter(entry, defender_id, defender)
+    attacker_fighter = _pets_fighter(entry, attacker_id, attacker, vs=defender_id)
+    defender_fighter = _pets_fighter(entry, defender_id, defender, vs=attacker_id)
     result = pets_combat.simulate(
         attacker_fighter, defender_fighter, seed=secrets.randbits(63),
     )
@@ -7385,8 +7388,10 @@ async def _pets_run_fight(
     # Зеркало души, if this is a long punch downward -- before the fighters are built,
     # because it changes the stats they are built from (see pets.auto_equip_mirror).
     mirrored = pets.auto_equip_mirror(entry, user_id, opponent_id)
-    attacker_fighter = _pets_fighter(entry, user_id, mine)
-    defender_fighter = _pets_fighter(entry, opponent_id, theirs)
+    # Both sides carry their OWN history with the other: farming somebody all morning
+    # leaves you shaky against them even in the fight where they hit back.
+    attacker_fighter = _pets_fighter(entry, user_id, mine, vs=opponent_id)
+    defender_fighter = _pets_fighter(entry, opponent_id, theirs, vs=user_id)
     seed = secrets.randbits(63)
     result = pets_combat.simulate(attacker_fighter, defender_fighter, seed=seed)
     fight_hp = {

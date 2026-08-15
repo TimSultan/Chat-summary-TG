@@ -1263,25 +1263,31 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], 43])
         self.assertFalse(any(item["chat_id"] == MAIN_CHAT_ID for item in api.photo_files))
 
-    def test_stale_daily_capped_arena_card_silently_deals_another_opponent(self):
-        """A card can become stale between search and tap; never publish that refusal."""
+    def test_stale_arena_card_redraws_privately_instead_of_publishing_a_refusal(self):
+        """A card can become stale between search and tap; never publish that refusal.
+
+        The staleness used to be a per-opponent daily cap. That cap is gone -- Знакомое
+        лицо prices a repeat instead of banning it -- so what makes a card stale now is the
+        attacker's own state: it walked off to the farm while the card sat on screen.
+        """
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Attacker", "file_a", "Player")
-        for opponent_id, name in ((43, "Capped"), (44, "Available")):
+        for opponent_id, name in ((43, "Target"), (44, "Available")):
             pets.buy_cage(CHAT, opponent_id, RICH_XP)
             pets.tame(CHAT, opponent_id, RICH_XP, name, f"file_{opponent_id}", name)
-        result = SimpleNamespace(winner=str(PLAYER["id"]), loser="43")
-        with patch("random.random", return_value=1.0):
-            for _ in range(C.ARENA_SAME_OPPONENT_DAILY_LIMIT):
-                pets.record_fight(CHAT, PLAYER["id"], "43", result, pets.today())
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["farm_level"] = 1
+        pets._save(CHAT, data)
+        self.assertTrue(pets.start_farm(CHAT, PLAYER["id"], 8)[0])
+        self.assertFalse(pets.can_attack_in_arena(CHAT, PLAYER["id"], "43"))
 
         api = self._tap("attack", "43")
 
+        # Nothing reaches the group, and no fight image is produced.
         self.assertEqual(api.sent, [])
         self.assertEqual(api.photo_files, [])
         self.assertTrue(api.edits)
-        self.assertIn("Available", api.edits[-1]["text"])
-        self.assertNotIn("можно атаковать", api.edits[-1]["text"])
+        self.assertIn("Арена", api.edits[-1]["text"])
 
     def test_exhausted_arena_card_shows_private_popup_and_never_posts_to_group(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

@@ -2551,8 +2551,18 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
     return True, message, total_cost
 
 
-def effective_stats(entry, user_id) -> dict:
-    return _effective_stats_for(_tamed_record(_load(entry), user_id) or {})
+def effective_stats(entry, user_id, vs=None, day: date | None = None) -> dict:
+    """This creature's combat stats. Pass `vs` for the stats it brings to THAT matchup.
+
+    Without `vs` this is the creature in the abstract -- the power rating, the cards, the
+    leaderboard. With it, Знакомое лицо is folded in: the same creature is weaker against
+    an opponent it has already fought today, and unchanged against everybody else.
+    """
+    data = _load(entry)
+    stacks = (
+        _familiar_face_stacks(data, user_id, vs, day or today()) if vs is not None else 0
+    )
+    return _effective_stats_for(_tamed_record(data, user_id) or {}, stacks)
 
 
 def _skill_loadout_for(record: dict | None) -> tuple:
@@ -3457,7 +3467,7 @@ def _effect_fraction(effect: dict | None) -> float:
         return 0.0
 
 
-def _effective_stats_for(record: dict) -> dict:
+def _effective_stats_for(record: dict, familiar_stacks: int = 0) -> dict:
     stat_levels = record.get("stats") or {}
     pet_level = record.get("level", 1)
     equipped = record.get("equipped") or {}
@@ -3486,7 +3496,11 @@ def _effective_stats_for(record: dict) -> dict:
     # fully geared one. This is the ONLY place it is applied: everything downstream --
     # the fight, the power rating, both pet cards, the leaderboard -- reads its stats
     # through here, so none of them needs to know that debuffs exist.
-    scale = debuff_scale(record)
+    # Знакомое лицо multiplies on top of the mark rather than replacing it. The two are
+    # different kinds of thing -- a mark is worn by the creature and follows it into every
+    # fight, this one exists only for one particular matchup -- so a marked creature that
+    # keeps punching the same face pays for both.
+    scale = debuff_scale(record) * familiar_face_scale(familiar_stacks)
     result = {
         key: max(1, round(
             (stat_levels.get(key, C.STAT_MIN_LEVEL)
@@ -4008,40 +4022,83 @@ def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
     return True, f"Дуэлей осталось: {C.DUEL_DAILY_LIMIT - record['uses']}."
 
 
-def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
-    """How often this attacker has already selected this defender on `day`."""
+def _familiar_face_stacks(data: dict, attacker_id, defender_id, day: date) -> int:
+    """How often this attacker has already selected this defender on `day`.
+
+    Derived from the fight log rather than stored, which is what makes the reset at 00:00
+    free: tomorrow simply counts a different date and every stack is gone. Directional on
+    purpose -- being punched repeatedly does not make YOUR hand shake.
+    """
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     return sum(
         1
-        for fight in _load(entry).get("fights", [])
+        for fight in data.get("fights", [])
         if fight.get("date") == day.isoformat()
         and fight.get("attacker_id") == attacker_uid
         and fight.get("defender_id") == defender_uid
     )
 
 
+def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
+    """How often this attacker has already selected this defender on `day`."""
+    return _familiar_face_stacks(_load(entry), attacker_id, defender_id, day)
+
+
+def familiar_face_scale(stacks: int) -> float:
+    """The multiplier one attacker's stats are under for one particular matchup."""
+    try:
+        stacks = max(0, int(stacks or 0))
+    except (TypeError, ValueError):
+        return 1.0
+    return max(C.FAMILIAR_FACE_SCALE_FLOOR, 1.0 - stacks * C.FAMILIAR_FACE_STEP)
+
+
+def familiar_face(entry, attacker_id, defender_id, day: date | None = None) -> dict | None:
+    """Display data for the stacks one attacker carries into one matchup, or None.
+
+    Every screen that shows the tag shows the same three things: how many stacks, what
+    they cost, and when they go away. A bare «👁 ×3» with a third of somebody's stats
+    missing behind it is indistinguishable from a bug.
+    """
+    stacks = _familiar_face_stacks(
+        _load(entry), attacker_id, defender_id, day or today(),
+    )
+    return familiar_face_for(stacks)
+
+
+def familiar_face_for(stacks: int) -> dict | None:
+    try:
+        stacks = max(0, int(stacks or 0))
+    except (TypeError, ValueError):
+        stacks = 0
+    if not stacks:
+        return None
+    scale = familiar_face_scale(stacks)
+    return {
+        "stacks": stacks,
+        "emoji": C.FAMILIAR_FACE["emoji"],
+        "title": C.FAMILIAR_FACE["title"],
+        "tag": f"{C.FAMILIAR_FACE['emoji']} {C.FAMILIAR_FACE['title']} ×{stacks}",
+        "percent": round((1 - scale) * 100),
+        "line": f"−{round((1 - scale) * 100)}% ко всем статам против этого соперника",
+        "description": C.FAMILIAR_FACE["description"],
+        "hint": C.FAMILIAR_FACE["hint"],
+        # True once the cut has stopped deepening, so a screen can say so instead of
+        # promising another 10% that will not arrive.
+        "capped": scale <= C.FAMILIAR_FACE_SCALE_FLOOR,
+    }
+
+
 def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None) -> bool:
     """Whether `attacker_id` may spend an arena fight on `defender_id` today.
 
-    Only the ATTACKER's farm status gates this: a farming pet cannot start a fight, but is
-    an ordinary, attackable defender -- the reason weapons used to be excluded from farm
-    drops was a reservation race, not a claim that farming should be a hiding place.
+    There is deliberately no per-opponent cap any more: hitting the same face all day is
+    allowed and simply costs more every time (see Знакомое лицо). Only the ATTACKER's own
+    state gates this -- a farming or dungeon-bound pet cannot start a fight, but is an
+    ordinary, attackable defender.
     """
-    day = day or today()
-    data = _load(entry)
-    attacker = _tamed_record(data, attacker_id)
-    if _is_farming_record(attacker) or _dungeon_active(attacker):
-        return False
-    return (
-        sum(
-            1
-            for fight in data.get("fights", [])
-            if fight.get("date") == day.isoformat()
-            and fight.get("attacker_id") == str(attacker_id)
-            and fight.get("defender_id") == str(defender_id)
-        )
-        < C.ARENA_SAME_OPPONENT_DAILY_LIMIT
-    )
+    attacker = _tamed_record(_load(entry), attacker_id)
+    return not (_is_farming_record(attacker) or _dungeon_active(attacker))
 
 
 def auto_equip_mirror(entry, attacker_id, defender_id) -> str | None:
@@ -4151,9 +4208,10 @@ def find_opponent(
 
     ``exclude_ids`` is a soft exclusion: it prevents the card currently on screen from
     being dealt again when another eligible opponent exists, but a one-person arena can
-    still show its only opponent.  ``attackable_only`` is used by the arena UI so a
-    search never displays somebody the player has already reached the daily limit
-    against.
+    still show its only opponent.  ``attackable_only`` is used by the arena UI so a search
+    never displays a card the player could not act on -- which, now that the per-opponent
+    cap is gone, means it is all-or-nothing: the seeker is either free to fight or is
+    farming/in a dungeon and can fight nobody.
     """
     # The normal arena draw is fresh OS-backed randomness.  Tests and simulations can
     # still inject a seeded RNG to make a particular draw reproducible.

@@ -692,6 +692,42 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(str(PLAYER["id"]), ids)
         self.assertEqual(ids, {str(OPPONENT["id"]), str(THIRD["id"])})
 
+    async def test_a_repeatedly_fought_opponent_stays_attackable_and_carries_the_tag(self):
+        """The per-opponent cap is gone; the card now says what a repeat costs instead."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._tame(THIRD, name="Третий")
+        result = SimpleNamespace(winner=str(PLAYER["id"]), loser=str(OPPONENT["id"]))
+        for _ in range(4):
+            data = pets._load(CHAT)
+            data["pets"][str(PLAYER["id"])]["fight_bank"] = 99
+            pets._save(CHAT, data)
+            pets.record_fight(CHAT, PLAYER["id"], OPPONENT["id"], result, pets.today())
+
+        body = await (await self._get("/api/opponents", PLAYER)).json()
+        rows = {row["user_id"]: row for row in body["opponents"]}
+        fought, fresh = rows[str(OPPONENT["id"])], rows[str(THIRD["id"])]
+
+        self.assertTrue(fought["attackable"])
+        self.assertEqual(fought["familiar_face"]["stacks"], 4)
+        self.assertEqual(fought["familiar_face"]["percent"], 40)
+        self.assertIn("×4", fought["familiar_face"]["tag"])
+        # A face you have not seen today carries nothing, and sorts above the tired one.
+        self.assertIsNone(fresh["familiar_face"])
+        self.assertLess(
+            [row["user_id"] for row in body["opponents"]].index(str(THIRD["id"])),
+            [row["user_id"] for row in body["opponents"]].index(str(OPPONENT["id"])),
+        )
+
+    async def test_the_arena_card_renders_the_familiar_face_tag(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function familiarTag(mark)", page)
+        self.assertIn("familiarTag(familiar)", page)
+        self.assertIn('"<span class=\'dbf fam\'', page)
+        # The pill is a badge; the line beside it is the actual decision.
+        self.assertIn('" · " + esc(familiar.line)', page)
+        self.assertNotIn("сегодня уже хватит", page)
+
     # ---- isolated turn-based prototype ----------------------------------------------
 
     async def test_turn_based_setup_exposes_four_slots_and_the_editable_catalogues(self):
