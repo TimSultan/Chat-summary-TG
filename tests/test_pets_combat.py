@@ -898,6 +898,20 @@ class AmuletEffectTests(unittest.TestCase):
         )
         starting_hp = combat.derive(opponent, self._fighter_with(effect))["max_hp"]
         self.assertLessEqual(removed, round(starting_hp * 0.06) + 1)
+        wound_indexes = [
+            index for index, row in enumerate(result.rounds)
+            if row.event == "amulet_wound"
+        ]
+        self.assertTrue(wound_indexes)
+        for index in wound_indexes:
+            wound = result.rounds[index]
+            before = result.rounds[index - 1].state["fighters"][opponent.key]
+            after = wound.state["fighters"][opponent.key]
+            # Wound is not merely a smaller bar: the same unmitigated amount leaves
+            # current HP immediately and can no longer be recovered by healing.
+            self.assertEqual(before["hp"] - after["hp"], wound.damage)
+            self.assertEqual(before["max_hp"] - after["max_hp"], wound.damage)
+            self.assertIn("текущего и максимального HP", wound.text)
 
     def test_start_stats_and_visible_procs_use_catalogue_percentages(self):
         opponent = _fighter("b", 40, name="B")
