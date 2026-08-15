@@ -149,6 +149,19 @@ class MobRollAndBlockTests(PetsTestCase):
         self.assertEqual(block["level"], pets.get_pet(entry, "1")["level"])
         self.assertEqual(block["power"], pets._power_from(block["stats"], block["armor"]))
 
+    def test_prefetched_roster_has_five_distinct_mobs_and_every_difficulty(self):
+        entry = "chat"
+        self.assertIsNone(pets.roll_mobs(entry, "nobody", rng=random.Random(7)))
+        self._tame(entry, "1")
+
+        roster = pets.roll_mobs(entry, "1", count=5, rng=random.Random(7))
+
+        self.assertEqual(len(roster), 5)
+        self.assertEqual(len({row["code"] for row in roster}), 5)
+        self.assertEqual({row["tier"] for row in roster}, set(pets_mobs.TIERS))
+        self.assertTrue(all(row["power"] == pets._power_from(row["stats"], row["armor"])
+                            for row in roster))
+
     def test_each_tier_scales_one_combat_profile_as_documented(self):
         """With jitter pinned, a tier changes total variable combat power once.
 

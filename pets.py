@@ -5035,24 +5035,38 @@ def _spend_pve_fight(record: dict, moment: datetime) -> None:
 
 
 def roll_mob(entry, user_id, rng=None) -> dict | None:
-    """Deal one mob at one tier, scaled against THIS player. None without a pet.
-
-    Both the mob and its tier are drawn at random, as commissioned -- there is no picking
-    a soft target off a list. The stat block is generated from the seeker's own effective
-    stats (see pets_mobs.TIER_SCALING), so a mob is a real fight at level 3 and still a
-    real fight at level 40 instead of being outgrown.
-
-    Nothing is stored. The returned block is handed straight to `fight_mob`, which rolls
-    its own fresh one -- a mob a player could re-roll and then bank would be a mob they
-    could shop for.
-    """
+    """Deal one random mob, kept for Telegram and older API clients."""
     rng = rng or secrets.SystemRandom()
     record = _tamed_record(_load(entry), user_id)
     if record is None:
         return None
     mob = rng.choice(list(M.MOBS))
     tier = rng.choice(list(M.TIERS))
-    return _mob_block(entry, user_id, record, mob, tier, rng)
+    return _mob_block(record, mob, tier, rng)
+
+
+def roll_mobs(entry, user_id, count: int = 5, rng=None) -> list[dict] | None:
+    """Deal a prefetched, distinct mob roster covering every available difficulty.
+
+    The web arena can now show another opponent instantly instead of making a round trip
+    for every press.  Five offers contain every tier at least once; their stat profiles
+    are all derived from the same loaded pet record so this also avoids five storage
+    reads.  Nothing is persisted, and `mob_block` still rebuilds the chosen fight from
+    its trusted code and tier.
+    """
+    rng = rng or secrets.SystemRandom()
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return None
+    amount = max(1, min(int(count or 1), len(M.MOBS)))
+    mobs = rng.sample(list(M.MOBS), amount)
+    if amount >= len(M.TIERS):
+        tiers = list(M.TIERS)
+        tiers.extend(rng.choice(list(M.TIERS)) for _ in range(amount - len(tiers)))
+        rng.shuffle(tiers)
+    else:
+        tiers = [rng.choice(list(M.TIERS)) for _ in range(amount)]
+    return [_mob_block(record, mob, tier, rng) for mob, tier in zip(mobs, tiers)]
 
 
 def mob_block(entry, user_id, code: str, tier: str, rng=None) -> dict | None:
@@ -5068,12 +5082,22 @@ def mob_block(entry, user_id, code: str, tier: str, rng=None) -> dict | None:
     record = _tamed_record(_load(entry), user_id)
     if mob is None or record is None or tier not in M.TIERS:
         return None
-    return _mob_block(entry, user_id, record, mob, tier, rng)
+    return _mob_block(record, mob, tier, rng)
 
 
-def _mob_block(entry, user_id, record: dict, mob, tier: str, rng) -> dict:
+def prepare_mob_fight(entry, user_id, code: str, tier: str, rng=None):
+    """Build the trusted mob, pet snapshot and combatant from one storage read."""
+    rng = rng or secrets.SystemRandom()
+    mob = M.find_mob(code)
+    record = _tamed_record(_load(entry), user_id)
+    if mob is None or record is None or tier not in M.TIERS:
+        return None
+    return record, _mob_block(record, mob, tier, rng), _dungeon_fighter(record, str(user_id))
+
+
+def _mob_block(record: dict, mob, tier: str, rng) -> dict:
     scale, spread = M.TIER_SCALING[tier]
-    mine = effective_stats(entry, user_id)
+    mine = _effective_stats_for(record)
     # Scale the *whole combat profile* once.  The old implementation gave every stat
     # its own high/low roll, so a hard mob could luck into a full set of peaks at once.
     # Power has a fixed base, therefore only its variable part is scaled; otherwise the

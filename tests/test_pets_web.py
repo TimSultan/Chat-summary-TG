@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import economy
 import pets
 import pets_config as C
+import pets_mobs
 import pets_scroll_catalog as SCROLLS
 import pets_sprite
 import pets_sprite_store
@@ -331,6 +332,18 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         restored = await self._action(PLAYER, "pve_replays")
         self.assertTrue(restored["ok"])
         self.assertFalse(restored["state"]["pet"]["skip_pve_replays"])
+
+    async def test_mob_search_prefetches_five_distinct_opponents_across_all_tiers(self):
+        self._tame(PLAYER)
+
+        response = await self._get("/api/mob", PLAYER)
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+
+        self.assertEqual(len(body["mobs"]), 5)
+        self.assertEqual(len({row["code"] for row in body["mobs"]}), 5)
+        self.assertEqual({row["tier"] for row in body["mobs"]}, set(pets_mobs.TIERS))
+        self.assertEqual(body["mob"], body["mobs"][0])
 
     async def test_page_defends_hero_rendering_when_equipment_is_empty(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX + "/")).text()
@@ -1700,6 +1713,22 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("data-fight-detail=", page)
         self.assertIn("function openFightDetail(key)", page)
         self.assertIn("Точные параметры:", page)
+        self.assertNotIn("duel-effects", page)
+        self.assertIn("function openDuelPortrait(key)", page)
+        self.assertIn("data-duel-portrait=", page)
+        self.assertIn("overlay.onclick = close;", page)
+
+    async def test_arena_prefetches_five_mobs_and_fights_a_selected_local_offer(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        arena = page.split("async function renderArena()", 1)[1].split(
+            "// --------------------------------------------------------- turn-based", 1,
+        )[0]
+        self.assertIn("Promise.all([", arena)
+        self.assertIn('api("/api/mob")', arena)
+        self.assertIn("MOBS = results[1].mobs", arena)
+        self.assertIn("MOBS.map((mob, index)", page)
+        self.assertIn('data-mobfight="', page)
+        self.assertIn("MOBS.splice(Number(index), 1);", page)
 
     async def test_hero_order_and_pve_replay_controls_are_exposed_by_the_page(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()

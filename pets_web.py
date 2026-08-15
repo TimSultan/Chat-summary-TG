@@ -1851,13 +1851,18 @@ async def handle_replay(request: web.Request) -> web.Response:
 
 
 async def handle_mob(request: web.Request) -> web.Response:
-    """Deal one mob, scaled against this player. Nothing is stored -- see pets.roll_mob."""
+    """Prefetch five distinct mobs spanning all difficulty tiers."""
     user, _xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
-    block = await asyncio.to_thread(pets.roll_mob, entry, str(user["id"]))
-    if block is None:
+    blocks = await asyncio.to_thread(pets.roll_mobs, entry, str(user["id"]), 5)
+    if blocks is None:
         return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
-    return _ok({"mob": _jsonable(block), "pve": _jsonable(pets.pve_allowance(entry, str(user["id"])))})
+    return _ok({
+        "mobs": _jsonable(blocks),
+        # Compatibility for clients that have not switched to the roster yet.
+        "mob": _jsonable(blocks[0]),
+        "pve": _jsonable(pets.pve_allowance(entry, str(user["id"]))),
+    })
 
 
 async def handle_mob_attack(request: web.Request) -> web.Response:
@@ -1885,35 +1890,21 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
     if current < _pve_action_cooldowns.get(cooldown_key, 0.0):
       return _json_error("Подожди секунду перед следующим боем.", status=429, code="PVE_COOLDOWN")
     _pve_action_cooldowns[cooldown_key] = current + PVE_ACTION_COOLDOWN_SECONDS
-    mine = pets.get_pet(entry, me)
-    if mine is None:
-        return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
-
     mob = pets_mobs.find_mob(str(body.get("code") or ""))
     tier = str(body.get("tier") or "")
     if mob is None or tier not in pets_mobs.TIERS:
         return _json_error("Соперник больше не доступен.", status=409, code="NO_MOB")
-    # Re-rolled here, from the tier the client asked for and nothing else it sent.
-    block = pets.mob_block(entry, me, mob.code, tier)
-    if block is None:
+    # Rebuild the selected mob and the complete player fighter from one pet snapshot.
+    # Previously each effect/scroll/shield helper re-read the same JSON file separately.
+    prepared = await asyncio.to_thread(pets.prepare_mob_fight, entry, me, mob.code, tier)
+    if prepared is None:
         return _json_error("Сначала приручи существо.", status=409, code="NO_PET")
-
-    effective = pets.effective_stats(entry, me)
-    hero = pets_combat.Fighter(
-        key=me, name=mine.get("name") or "Существо",
-        strength=effective["strength"], health=effective["health"],
-        agility=effective["agility"], luck=effective["luck"],
-        armor=effective.get("armor", 0),
-        effects=pets.equipped_combat_effects(entry, me),
-        level=int(mine.get("level", 1)),
-        skills=pets.skill_loadout(entry, me),
-        personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, me),
-        shield=pets.combat_shield(entry, me),
-        weapon_enchanted=pets.combat_weapon_enchanted(entry, me),
-    )
+    mine, block, hero = prepared
     enemy = pets.mob_fighter(block)
     seed = secrets.randbits(63)
-    result = pets_combat.simulate(hero, enemy, seed=seed)
+    # Effect-heavy simulations are CPU work. Keep them off the aiohttp event loop so
+    # one long battle cannot stall mob search and every other player's web request.
+    result = await asyncio.to_thread(pets_combat.simulate, hero, enemy, seed=seed)
     try:
         reward = await asyncio.to_thread(pets.record_mob_fight, entry, me, block, result)
     except ValueError as e:
@@ -3247,9 +3238,10 @@ PAGE_HTML = """<!doctype html>
   }
   .foe .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .foe.out { opacity: .45; }
-  /* The mob card. A single opponent rather than a row in a list, so it gets a card of
-     its own -- and the tier chip carries the whole decision: easy is a payday, hard is
-     a gamble, and the colour says which before the numbers are read. */
+  /* Five mob offers arrive together. Choosing the next one is therefore local and
+     instant; only asking for a fresh batch needs another request. */
+  .moboffers { display:grid; gap:8px; }
+  .moboffer { padding:9px; border:1px solid var(--line); border-radius:11px; background:var(--sunken); }
   .mobcard .mobtaunt { margin-top: 8px; font-size: 13px; font-style: italic;
                        color: var(--muted); border-left: 2px solid var(--line);
                        padding-left: 9px; }
@@ -3812,8 +3804,9 @@ PAGE_HTML = """<!doctype html>
                    gap:6px; align-items:start; margin-bottom:9px; max-height:38vh; overflow-y:auto; }
   .duel-fighter { min-width:0; text-align:center; background:var(--card); border:1px solid var(--line);
                   border-radius:12px; padding:8px 6px; }
-  .duel-avatar { width:68px; height:68px; margin:0 auto 5px; border-radius:50%; overflow:hidden;
-                 display:grid; place-items:center; background:var(--sunken); border:2px solid var(--line); font-size:30px; }
+  .duel-avatar { width:68px; height:68px; margin:0 auto 5px; padding:0; border-radius:50%; overflow:hidden;
+                 display:grid; place-items:center; background:var(--sunken); color:var(--fg);
+                 border:2px solid var(--line); font-size:30px; cursor:zoom-in; }
   .duel-avatar img { width:100%; height:100%; object-fit:cover; }
   .duel-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .duel-stats { font-size:11px; line-height:1.55; margin:4px 0; }
@@ -3824,7 +3817,13 @@ PAGE_HTML = """<!doctype html>
   .duel-item img { width:28px; height:28px; object-fit:cover; border-radius:5px; }
   .duel-item b,.duel-item small { display:block; overflow:hidden; text-overflow:ellipsis; }
   .duel-item small { color:var(--muted); font-size:9px; line-height:1.25; white-space:normal; }
-  .duel-effects { margin-top:4px; font-size:9px; line-height:1.3; color:var(--muted); text-align:left; }
+  .portrait-lightbox { position:fixed; inset:0; z-index:90; width:100%; height:100%; padding:24px;
+                       border:0; background:rgba(0,0,0,.88); color:#fff; cursor:zoom-out;
+                       display:grid; place-items:center; }
+  .portrait-lightbox-art { display:block; width:min(86vw,78vh,520px); height:min(86vw,78vh,520px);
+                           border-radius:18px; overflow:hidden; background:var(--card);
+                           box-shadow:0 18px 55px rgba(0,0,0,.55); font-size:120px; }
+  .portrait-lightbox-art img { width:100%; height:100%; object-fit:cover; }
   .duel .match-vs { align-self:center; text-align:center; color:var(--muted); font-weight:800; }
   .duel .hpbar { height: 12px; border-radius: 6px; background: var(--sunken); overflow: hidden; }
   .duel .hpbar > i { display: block; height: 100%; background: var(--hp); transition: width .28s; }
@@ -4560,10 +4559,15 @@ async function renderArena() {
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
   if (TEST_SETUP || TEST_BATTLE) { renderTestBattle(box); return; }
   const arena = S.arena;
-  if (!FOES) {
-    box.innerHTML = '<div class="empty">Ищу соперников…</div>';
+  if (!FOES || !MOBS) {
+    box.innerHTML = '<div class="empty">Ищу соперников и готовлю 5 мобов…</div>';
     try {
-      FOES = await api("/api/opponents");
+      const results = await Promise.all([
+        FOES ? Promise.resolve(FOES) : api("/api/opponents"),
+        MOBS ? Promise.resolve({ mobs:MOBS }) : api("/api/mob"),
+      ]);
+      FOES = results[0];
+      MOBS = results[1].mobs || (results[1].mob ? [results[1].mob] : []);
     } catch (error) {
       box.innerHTML = '<div class="panel"><div class="small">Не удалось загрузить соперников.</div>' +
         '<button class="go sec" style="margin-top:10px" data-arenaretry="1">Повторить</button></div>';
@@ -4996,28 +5000,30 @@ function showTestCatalog() {
 
 // ------------------------------------------------------------------------------- PVE
 const TIER_TONE = { easy: "win", medium: "gold", hard: "loss" };
-let MOB = null;
+let MOBS = null;
 let MOB_REPLAY = null;
 let MOB_FIGHT_BUSY = false;
 
 async function rollMob() {
   try {
-    MOB = (await api("/api/mob")).mob;
+    const data = await api("/api/mob");
+    MOBS = data.mobs || (data.mob ? [data.mob] : []);
   } catch (e) { haptic("no"); toast(e.message); return; }
   haptic();
   render();
 }
 
-async function fightMob() {
-  if (!MOB || MOB_FIGHT_BUSY) return;
+async function fightMob(index) {
+  const mob = MOBS && MOBS[Number(index)];
+  if (!mob || MOB_FIGHT_BUSY) return;
   MOB_FIGHT_BUSY = true;
   render();
   let data;
   try {
-    data = await api("/api/mob", { code: MOB.code, tier: MOB.tier });
-  } catch (e) { haptic("no"); toast(e.message); MOB = null; render(); MOB_FIGHT_BUSY = false; return; }
+    data = await api("/api/mob", { code: mob.code, tier: mob.tier });
+  } catch (e) { haptic("no"); toast(e.message); MOB_FIGHT_BUSY = false; render(); return; }
   S = data.state;
-  MOB = null;
+  MOBS.splice(Number(index), 1);
   FOES = null;
   MOB_REPLAY = data;
   MOB_FIGHT_BUSY = false;
@@ -5272,7 +5278,7 @@ function mobPanel(farmBlocked) {
     (pve.capacity || 0) + (pve.seconds_until_reset
       ? " <span class='muted'>· сброс через " + clock(pve.seconds_until_reset) + "</span>"
       : "") + "</span></div>";
-  if (!MOB) {
+  if (!MOBS || !MOBS.length) {
     return '<div class="panel"><h2>👾 ПВЕ · мобы</h2>' + counter +
       "<div class='small muted' style='margin-bottom:9px'>Соперник из реального мира. " +
       "Платят вдвое меньше, чем за игрока, зато бои для них свои — арену они не " +
@@ -5281,22 +5287,22 @@ function mobPanel(farmBlocked) {
         ? "<div class='tiny muted' style='text-align:center'>Атаки кончились. " +
           "Новые придут сразу у всех на сервере.</div>"
         : '<button class="go" data-mob="roll"' + (blocked ? " disabled" : "") +
-          ">🔍 Найти моба</button>") + "</div>";
+          ">🔍 Загрузить 5 мобов</button>") + "</div>";
   }
-  return '<div class="panel mobcard"><h2>👾 ' + esc(MOB.name) + "</h2>" + counter +
-    "<div class='row spread'><span class='tiny muted'>" + esc(MOB.flavour) + "</span>" +
-    '<span class="tierchip ' + (TIER_TONE[MOB.tier] || "") + '">' + esc(MOB.tier_name) +
-    "</span></div>" +
-    "<div class='mobtaunt'>" + esc(MOB.taunt) + "</div>" +
-    "<div class='row spread small' style='margin-top:9px'><span class='pw'>⚡ " +
-      money(MOB.power) + "</span><span class='tiny muted'>" +
-      ["strength", "health", "agility", "luck"].map((key) =>
-        (STAT_ICON[key] || key) + (MOB.stats[key] || 0)).join(" ") +
-      (MOB.armor ? " 🛡" + MOB.armor : "") + "</span></div>" +
-    '<div class="row" style="margin-top:10px;gap:8px">' +
-      '<button class="go" data-mob="fight"' + (blocked ? " disabled" : "") + ">⚔️ В бой</button>" +
-      '<button class="go sec" data-mob="roll" style="flex:0 0 42%"' + (MOB_FIGHT_BUSY ? " disabled" : "") + '>🔍 Другой</button>' +
-    "</div></div>";
+  const offers = MOBS.map((mob, index) =>
+    '<div class="moboffer mobcard"><div class="row spread"><b>👾 ' + esc(mob.name) + '</b>' +
+      '<span class="tierchip ' + (TIER_TONE[mob.tier] || "") + '">' + esc(mob.tier_name) +
+      '</span></div><div class="tiny muted" style="margin-top:4px">' + esc(mob.flavour) + '</div>' +
+      '<div class="row spread small" style="margin-top:7px"><span class="pw">⚡ ' +
+        money(mob.power) + '</span><span class="tiny muted">' +
+        ["strength", "health", "agility", "luck"].map((key) =>
+          (STAT_ICON[key] || key) + (mob.stats[key] || 0)).join(" ") +
+        (mob.armor ? " 🛡" + mob.armor : "") + '</span></div>' +
+      '<button class="go" style="margin-top:8px" data-mobfight="' + index + '"' +
+        (blocked ? " disabled" : "") + '>⚔️ В бой</button></div>').join("");
+  return '<div class="panel"><h2>👾 ПВЕ · противники · ' + MOBS.length + '</h2>' + counter +
+    '<div class="small muted" style="margin-bottom:9px">Все уже загружены. Выбор следующего моба не требует поиска.</div>' +
+    '<div class="moboffers">' + offers + '</div></div>';
 }
 
 // A granted mark, drawn the same way wherever it appears. Three shapes for three amounts
@@ -6513,6 +6519,7 @@ function paintBlow(round, mineName, theirName) {
 }
 
 let DUEL_DETAILS = {};
+let DUEL_PORTRAITS = {};
 
 function fightMechanics(value, skipped) {
   if (!value || typeof value !== "object") return "";
@@ -6546,6 +6553,25 @@ function openFightDetail(key) {
     (detail.description ? '<p class="small muted">' + esc(detail.description) + "</p>" : "") +
     (effect.text ? '<p class="small">✨ ' + esc(effect.text) + "</p>" : "") +
     (fightMechanics(effect) ? '<div class="tiny muted">Точные параметры: ' + fightMechanics(effect) + "</div>" : ""));
+}
+
+function openDuelPortrait(key) {
+  const art = DUEL_PORTRAITS[key];
+  if (!art) return;
+  const overlay = document.createElement("button");
+  overlay.type = "button";
+  overlay.className = "portrait-lightbox";
+  overlay.setAttribute("aria-label", "Закрыть увеличенную аватарку");
+  overlay.innerHTML = '<span class="portrait-lightbox-art">' + art + '</span>';
+  const close = () => {
+    document.removeEventListener("keydown", onKey);
+    overlay.remove();
+  };
+  const onKey = (event) => { if (event.key === "Escape") close(); };
+  overlay.onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  paintShots(overlay);
 }
 
 function duelStats(fighter) {
@@ -6583,13 +6609,12 @@ function duelLoadout(fighter) {
 function duelFighter(fighter, fallbackArt) {
   fighter = fighter || {};
   const portrait = fighter.portrait ? shot(fighter.portrait, fighter.crop) : fallbackArt;
-  const effects = (fighter.effects || []).map((effect) =>
-    (effect && typeof effect === "object" ? (effect.text || fightMechanics(effect, ["text"])) : String(effect || "")))
-    .filter(Boolean);
-  return '<article class="duel-fighter"><div class="duel-avatar">' + (portrait || "👤") +
-    '</div><b class="duel-name">' + esc(fighter.name || fighter.user_id || "Соперник") +
+  const portraitKey = "fighter:" + Object.keys(DUEL_PORTRAITS).length;
+  DUEL_PORTRAITS[portraitKey] = portrait || "👤";
+  return '<article class="duel-fighter"><button type="button" class="duel-avatar" data-duel-portrait="' +
+    portraitKey + '">' + (portrait || "👤") +
+    '</button><b class="duel-name">' + esc(fighter.name || fighter.user_id || "Соперник") +
     '</b><div class="duel-stats">' + duelStats(fighter) + "</div>" + duelLoadout(fighter) +
-    (effects.length ? '<div class="duel-effects">✨ ' + effects.map(esc).join("<br>✨ ") + "</div>" : "") +
     "</article>";
 }
 
@@ -6610,6 +6635,7 @@ function playDuel(data) {
   view.className = "duel";
   view.id = "duel";
   DUEL_DETAILS = {};
+  DUEL_PORTRAITS = {};
   const fighters = data.fighters || {};
   const mine = fighters[String(me)] || {user_id:me,name:mineName,level:(S.pet&&S.pet.level),stats:(S.pet&&S.pet.stats)||{},portrait:S.pet&&S.pet.portrait,crop:S.pet&&S.pet.crop};
   const foe = fighters[String(data.opponent.user_id)] || {user_id:data.opponent.user_id,name:theirName,level:1,stats:{}};
@@ -6631,6 +6657,9 @@ function playDuel(data) {
   paintShots(view);
   view.querySelectorAll("[data-fight-detail]").forEach((node) => {
     node.onclick = () => openFightDetail(node.dataset.fightDetail);
+  });
+  view.querySelectorAll("[data-duel-portrait]").forEach((node) => {
+    node.onclick = () => openDuelPortrait(node.dataset.duelPortrait);
   });
 
   let index = 0, done = false;
@@ -6768,7 +6797,7 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
@@ -6843,7 +6872,7 @@ document.addEventListener("click", async (event) => {
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   if (d.mob === "roll") { await rollMob(); return; }
-  if (d.mob === "fight") { haptic(); await fightMob(); return; }
+  if (d.mobfight !== undefined) { haptic(); await fightMob(Number(d.mobfight)); return; }
   if (d.mobreplay && MOB_REPLAY) { closeSheet(); playDuel(MOB_REPLAY); return; }
   if (d.questopen) {
     const [kind, code] = d.questopen.split(":", 2);
@@ -6916,7 +6945,7 @@ document.addEventListener("click", async (event) => {
   }
   if (d.foe) { haptic(); fight(d.foe); return; }
   if (d.farmstart) { await act("farm_start", { hours: Number(d.farmstart) }); return; }
-  if (d.arenaretry) { FOES = null; renderArena(); return; }
+  if (d.arenaretry) { FOES = null; MOBS = null; renderArena(); return; }
   if (d.feature) { await act("farm_feature", { feature: d.feature }); return; }
   if (d.gift) { closeSheet(); await act("gift", { code: d.code, receiver_id: d.gift, confirm: true }); return; }
 
