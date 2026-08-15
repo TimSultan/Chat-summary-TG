@@ -4320,6 +4320,16 @@ function renderDungeon() {
   paintShots(box);
 }
 
+// On the deepest floor that exists, this is the finish line rather than a way down. It
+// still ends the run -- there is simply no floor below to stand on -- so it says so
+// instead of promising a floor nobody has built.
+function descendButton(dungeon) {
+  const last = Number(dungeon.floor || 1) >= Number(dungeon.last_floor || 0);
+  if (!last) return '<button class="go" data-dungeon="descend">⬇️ Спуститься</button>';
+  return '<button class="go" data-dungeon="descend" title="' +
+    esc(dungeon.cleared_notice || "") + '">🏁 Закончить</button>';
+}
+
 function dungeonPanel() {
   const dungeon = S.dungeon || {};
   if (!S.pet) return "";
@@ -4336,7 +4346,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + '<button class="go" data-dungeon="descend">⬇️ Спуститься</button></div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
 }
 
 function renderOnboarding() {

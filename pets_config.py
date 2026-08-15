@@ -933,7 +933,9 @@ _dropped_amulets = tuple(item for item in _catalogue_amulets if item.source == "
 if _RAW_AMULET_ITEMS and (
     len(_dropped_amulets) != 40
     or any(item.slot != "amulet" for item in _catalogue_amulets)
-    or any(item.source not in ("drop", "shop") for item in _catalogue_amulets)
+    # "vault" is a withdrawn item kept only so old fight snapshots still resolve its code.
+    # Every shelf and every loot pool filters on an exact source, so it appears in neither.
+    or any(item.source not in ("drop", "shop", "vault") for item in _catalogue_amulets)
     or any(item.price <= 0 for item in _catalogue_amulets if item.source == "shop")
 ):
     raise ValueError("amulet catalogue must contain exactly 40 drop-only amulets, plus priced shop ones")

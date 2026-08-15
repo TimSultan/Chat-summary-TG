@@ -222,6 +222,27 @@ _SHOP_DATA: Final = (
      {"luck": 4, "armor": -2}, _effect(
          "trophy_compass", "Победа над соперником выше уровнем: +35% к шансу дропа.", 35,
      ), 36, 0, 170),
+    ("amulet_mob_ward", "Оберег охотника",
+     "Не любит рычание и предпочитает, чтобы оно било мимо.", "rare",
+     {}, _effect(
+         "mob_ward",
+         "От мобов: на 30% меньше получаемого урона.",
+         30,
+     ), 44, 0, 220),
+)
+
+
+# --- the vault ------------------------------------------------------------------------
+# Withdrawn from the game but NOT deleted. Every stored fight snapshot, audit row and
+# replay names the items its fighters wore, and a code that stops resolving turns those
+# into blanks or crashes -- so a retired item keeps its catalogue entry and merely stops
+# being obtainable. `source="vault"` is what does it: every shop shelf filters on
+# source == "shop" and every loot pool on source == "drop", so a third value is excluded
+# from both without either of them needing to learn about retirement.
+#
+# amulet_soul_mirror was withdrawn on 2026-08-16. pets.retire_soul_mirror takes it out of
+# the inventories that already hold it and pays the purchase price back.
+_VAULT_DATA: Final = (
     ("amulet_soul_mirror", "Зеркало души",
      "Показывает тебя ровно таким, каков соперник.", "rare",
      {}, _effect(
@@ -230,13 +251,6 @@ _SHOP_DATA: Final = (
          "на ±20%. Награда за победу при этом не режется.",
          20,
      ), 50, 0, 250),
-    ("amulet_mob_ward", "Оберег охотника",
-     "Не любит рычание и предпочитает, чтобы оно било мимо.", "rare",
-     {}, _effect(
-         "mob_ward",
-         "От мобов: на 30% меньше получаемого урона.",
-         30,
-     ), 44, 0, 220),
 )
 
 
@@ -254,8 +268,16 @@ AMULET_SPECS: Final[tuple[AmuletSpec, ...]] = tuple(
         drop_weight=weight, source="shop", price=price,
     )
     for code, name, description, rarity, bonuses, effect, resale, weight, price in _SHOP_DATA
+) + tuple(
+    AmuletSpec(
+        code=code, name=name, description=description, rarity=rarity,
+        bonuses=tuple(bonuses.items()), effect=effect, resale_price=resale,
+        drop_weight=weight, source="vault", price=price,
+    )
+    for code, name, description, rarity, bonuses, effect, resale, weight, price in _VAULT_DATA
 )
 SHOP_AMULET_CODES: Final = frozenset(code for code, *_rest in _SHOP_DATA)
+VAULT_AMULET_CODES: Final = frozenset(code for code, *_rest in _VAULT_DATA)
 RAW_ITEMS: Final[tuple[dict[str, object], ...]] = tuple(item.raw_item() for item in AMULET_SPECS)
 AMULET_COUNT: Final = len(AMULET_SPECS)
 RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in AMULET_SPECS) for rarity in RARITIES}
@@ -264,7 +286,7 @@ RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in AMULET_SPE
 def _validate_catalogue() -> None:
     # 40 dropped plus however many are sold. Split rather than a single total, so adding
     # a shop amulet cannot quietly shrink the loot table it is meant to sit outside of.
-    assert AMULET_COUNT == 40 + len(SHOP_AMULET_CODES)
+    assert AMULET_COUNT == 40 + len(SHOP_AMULET_CODES) + len(VAULT_AMULET_CODES)
     assert len(_DATA) == 40
     assert len({item.code for item in AMULET_SPECS}) == AMULET_COUNT
     assert len({item.name for item in AMULET_SPECS}) == AMULET_COUNT
@@ -273,12 +295,20 @@ def _validate_catalogue() -> None:
     # Two populations with opposite invariants. A dropped amulet is free and must be
     # rollable (drop_weight > 0); a shop amulet is bought and must NOT be in the drop
     # table, or the thing you can always buy would also be taking up loot rolls.
-    dropped = [item for item in AMULET_SPECS if item.code not in SHOP_AMULET_CODES]
+    retired = [item for item in AMULET_SPECS if item.code in VAULT_AMULET_CODES]
+    dropped = [
+        item for item in AMULET_SPECS
+        if item.code not in SHOP_AMULET_CODES and item.code not in VAULT_AMULET_CODES
+    ]
     bought = [item for item in AMULET_SPECS if item.code in SHOP_AMULET_CODES]
     assert all(item.source == "drop" and item.price == 0 for item in dropped)
     assert all(item.drop_weight > 0 for item in dropped)
     assert all(item.source == "shop" and item.price > 0 for item in bought)
     assert all(item.drop_weight == 0 for item in bought)
+    # A vaulted amulet is in neither population: it keeps its price so the retirement can
+    # pay it back, and its weight stays at zero so it can never re-enter the loot table.
+    assert all(item.source == "vault" and item.price > 0 for item in retired)
+    assert all(item.drop_weight == 0 for item in retired)
     assert all(item.resale_price > 0 for item in AMULET_SPECS)
     assert all(item.rarity in RARITIES for item in AMULET_SPECS)
     assert all(item.effect_dict()["code"] in EFFECT_HOOKS for item in AMULET_SPECS)

@@ -99,6 +99,16 @@ BOSSES: Final = (
 )
 
 
+# Where the dungeon actually ends. BOSSES is indexed modulo its own length, so floor 50
+# used to serve the floor-5 boss again and the descent ran for ever -- an endless corridor
+# of enemies the players had already beaten, dressed up as progress. The last boss stands
+# on the last boss floor the list can fill, and past it there is nothing built yet.
+LAST_FLOOR: Final = len(BOSSES) * 5
+DUNGEON_CLEARED_NOTICE: Final = (
+    "Ты отпинал всех наших боссов, приходи позже, мы завезём новых."
+)
+
+
 def is_boss_floor(floor: int) -> bool:
     return floor > 0 and floor % 5 == 0
 

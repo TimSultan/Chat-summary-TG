@@ -8844,6 +8844,13 @@ async def run_bot_listener(
                 f"[pets] retired hamsterators: refunded {retired_hamsterators['gold']} gold "
                 f"to {retired_hamsterators['players']} players"
             )
+        vaulted_mirror = pets.retire_soul_mirror(cfg.listener_allowed_chats)
+        if vaulted_mirror["players"]:
+            log(
+                f"[pets] vaulted Зеркало души: refunded {vaulted_mirror['gold']} gold to "
+                f"{vaulted_mirror['players']} players, returned {vaulted_mirror['runes']} "
+                "personal paint runes"
+            )
         scroll_reset = pets.reset_scroll_collections(cfg.listener_allowed_chats)
         if scroll_reset["players"]:
             log(

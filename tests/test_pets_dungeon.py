@@ -436,6 +436,77 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(simulate.call_args.args[0].damage_multiplier, 5)
 
+class DungeonEndTests(DungeonTests):
+    """The descent has a bottom now.
+
+    BOSSES is indexed modulo its own length, so floor 50 served the floor-5 boss again and
+    the corridor ran for ever -- enemies the player had already beaten, dressed as
+    progress.
+    """
+
+    def test_the_last_floor_is_the_last_boss_the_catalogue_can_fill(self):
+        self.assertEqual(dungeon.LAST_FLOOR, len(dungeon.BOSSES) * 5)
+        self.assertTrue(dungeon.is_boss_floor(dungeon.LAST_FLOOR))
+        # And the floor after it would have wrapped back to the very first boss.
+        wrapped = dungeon.encounter(dungeon.LAST_FLOOR + 5, 0)
+        self.assertEqual(wrapped["name"], dungeon.encounter(5, 0)["name"])
+
+    def _standing_on(self, floor):
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["dungeon_run"] = {
+            "floor": floor, "hp": 100, "max_hp": 100,
+            "cleared": [row["index"] for row in dungeon.encounters_for_floor(floor)],
+        }
+        record["dungeon_deepest"] = floor
+        pets._save(self.entry, data)
+
+    def test_clearing_the_last_floor_ends_the_run_with_the_notice(self):
+        self._standing_on(dungeon.LAST_FLOOR)
+
+        ok, message = pets.dungeon_descend(self.entry, self.user_id)
+
+        self.assertTrue(ok)
+        self.assertEqual(message, dungeon.DUNGEON_CLEARED_NOTICE)
+        self.assertIn("приходи позже", message)
+        # The run ends rather than parking the player on a finished floor with a dead
+        # button -- that would be the same endless-corridor lie in a smaller shape.
+        self.assertIsNone(pets.get_pet(self.entry, self.user_id)["dungeon_run"])
+
+    def test_the_floor_below_the_last_one_still_descends(self):
+        self._standing_on(dungeon.LAST_FLOOR - 1)
+        ok, message = pets.dungeon_descend(self.entry, self.user_id)
+        self.assertTrue(ok)
+        self.assertIn(str(dungeon.LAST_FLOOR), message)
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["floor"], dungeon.LAST_FLOOR)
+
+    def test_the_escalator_can_never_be_sent_past_the_last_floor(self):
+        """`dungeon_deepest` is what the escalator flies to, so it is capped as well."""
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_deepest"] = 200   # a value from the old rules
+        pets._save(self.entry, data)
+
+        state = pets.dungeon_status(self.entry, self.user_id)
+
+        self.assertEqual(state["deepest"], dungeon.LAST_FLOOR)
+        self.assertTrue(state["cleared_everything"])
+        self.assertEqual(state["last_floor"], dungeon.LAST_FLOOR)
+
+    def test_the_screen_calls_the_last_descent_a_finish_rather_than_a_way_down(self):
+        self._standing_on(dungeon.LAST_FLOOR)
+        text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("🏁 Закончить", labels)
+        self.assertNotIn("⬇️ Спуститься", labels)
+        self.assertIn("приходи позже", text)
+
+        self._standing_on(dungeon.LAST_FLOOR - 5)
+        _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertIn("⬇️ Спуститься", labels)
+
+
 class DungeonRestTests(DungeonTests):
     """Rests are rationed per run, and the ration is printed on the button that spends it."""
 

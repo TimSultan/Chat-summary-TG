@@ -21,10 +21,12 @@ import stats
 # Shop items priced on utility rather than on stat bonuses. Enumerated here on purpose:
 # the pricing test below waives the power formula only for these exact codes, so a future
 # hand-added three-figure accessory still has to justify itself against the formula.
+# amulet_soul_mirror is deliberately absent: it was vaulted (source="vault"), so it is no
+# longer a shop item and no longer part of this count.
 UTILITY_SHOP_CODES = frozenset({
     "amulet_leech_fang", "amulet_armor_capsule", "amulet_initiative_pendulum",
     "amulet_first_aid_heart", "amulet_crit_catcher", "amulet_trophy_compass",
-    "amulet_soul_mirror", "amulet_mob_ward",
+    "amulet_mob_ward",
 })
 
 
@@ -932,11 +934,17 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(pet["equipped"]["weapon"], "w003")
 
     def test_new_drop_catalogues_are_integrated_into_all_three_equipment_slots(self):
-        # 40 dropped amulets + 2 starter shop ones + the utility shelf.
+        # 40 dropped amulets + 2 starter shop ones + the utility shelf + the vault.
+        # A vaulted amulet stays in ITEMS on purpose: every stored fight snapshot names
+        # the codes its fighters wore, and one that stops resolving turns an old replay
+        # into blanks. It is simply obtainable from nowhere -- see the source assertions
+        # in pets_amulet_catalog._validate_catalogue.
+        vaulted = [item for item in pets_config.ITEMS if item.source == "vault"]
         self.assertEqual(
             len([item for item in pets_config.ITEMS if item.slot == "amulet"]),
-            42 + len(UTILITY_SHOP_CODES),
+            42 + len(UTILITY_SHOP_CODES) + len(vaulted),
         )
+        self.assertTrue(all(item.drop_weight == 0 for item in vaulted))
         self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 42)
         self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 42)
         # The three DROP catalogues. Matched on source as well as prefix: the amulet

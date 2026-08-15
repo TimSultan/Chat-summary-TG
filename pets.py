@@ -62,6 +62,7 @@ CAGE_UPGRADE_REFUND_FLAG = "cage_upgrade_refund_202608"
 # ran it still has those four to lose -- see reset_scroll_collections.
 SCROLL_RESET_FLAG = "scroll_wipe_all_202608"
 HAMSTERATOR_RETIREMENT_REASON = "pet_hamsterator_retirement_202608"
+MIRROR_RETIREMENT_REASON = "pet_soul_mirror_retirement_202608"
 # Same two-lock shape as the cage refund above, for the farm's 75 -> 10 build price.
 FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 # One free common weapon for anybody who never got one. Also two-locked: the per-chat flag
@@ -1034,6 +1035,77 @@ def grant_starter_weapons(entries) -> int:
         data[STARTER_WEAPON_GIFT_FLAG] = True
         _save(entry, data)
     return granted
+
+
+def retire_soul_mirror(entries) -> dict:
+    """Take Зеркало души out of every inventory and pay its price back, exactly once.
+
+    The amulet stays in the catalogue (source="vault") so every stored fight that names it
+    still resolves; this is only about the copies people are holding. Four things move,
+    and missing any one of them would leave somebody worse off than before:
+
+    * the copy in the bag, and the copy WORN, since unequipping is not automatic;
+    * the `mirror_restore` slip, which the automatic swap leaves on the record and which
+      would otherwise strand whatever amulet it was holding for;
+    * a personal paint rune bound to it -- that is somebody's own painted miniature, and
+      it goes back to their wallet to be applied to something they can still use;
+    * the gold, once per copy, through economy.grant_once so a restart cannot pay twice.
+    """
+    players = 0
+    refunded_gold = 0
+    returned_runes = 0
+    price = getattr(C.find_item(MIRROR_AMULET_CODE), "price", 0) or 0
+    for entry in entries:
+        data = _load(entry)
+        changed = False
+        for user_id, record in data.get("pets", {}).items():
+            if not isinstance(record, dict):
+                continue
+            inventory = record.get("inventory")
+            inventory = inventory if isinstance(inventory, list) else []
+            copies = sum(1 for code in inventory if code == MIRROR_AMULET_CODE)
+            equipped = record.get("equipped") if isinstance(record.get("equipped"), dict) else {}
+            worn = equipped.get("amulet") == MIRROR_AMULET_CODE
+            stranded = "mirror_restore" in record
+            enchantments = record.get("personal_enchantments")
+            enchantments = enchantments if isinstance(enchantments, dict) else {}
+            painted = enchantments.get(MIRROR_AMULET_CODE)
+            if not (copies or worn or stranded or painted):
+                continue
+
+            if worn:
+                # Put back whatever the automatic swap displaced, if it is still owned;
+                # otherwise the slot simply empties rather than keeping a vaulted item on.
+                previous = record.pop("mirror_restore", None) if stranded else None
+                equipped["amulet"] = previous if previous in inventory else None
+            elif stranded:
+                record.pop("mirror_restore", None)
+            record["inventory"] = [code for code in inventory if code != MIRROR_AMULET_CODE]
+
+            if isinstance(painted, dict):
+                wallet = _personal_paint_rune_wallet(data, user_id)
+                wallet.append({
+                    "id": str(painted.get("rune_id") or f"paint-{secrets.token_hex(8)}"),
+                    "target": str(painted.get("target") or "amulet"),
+                    "source": f"{MIRROR_RETIREMENT_REASON}:{user_id}",
+                    "quest_code": painted.get("quest_code"),
+                    "photo_file_id": painted.get("photo_file_id"),
+                    "earned_at": app_now().isoformat(),
+                })
+                del wallet[:-100]
+                enchantments.pop(MIRROR_AMULET_CODE, None)
+                returned_runes += 1
+
+            refund = price * copies
+            if refund and economy.grant_once(
+                entry, user_id, refund, f"{MIRROR_RETIREMENT_REASON}:{user_id}",
+            ):
+                refunded_gold += refund
+            players += 1
+            changed = True
+        if changed:
+            _save(entry, data)
+    return {"players": players, "gold": refunded_gold, "runes": returned_runes}
 
 
 def retire_hamsterators(entries) -> dict:
@@ -3199,7 +3271,13 @@ def dungeon_status(entry: str, user_id) -> dict:
     state = {
         "active": bool(run), "available": D.DUNGEON_OPEN,
         "closed_notice": D.DUNGEON_CLOSED_NOTICE, "min_power": D.MIN_POWER,
-        "power": _power_rating_for(record), "deepest": int(record.get("dungeon_deepest", 1)),
+        "power": _power_rating_for(record),
+        "deepest": min(D.LAST_FLOOR, int(record.get("dungeon_deepest", 1))),
+        "last_floor": D.LAST_FLOOR,
+        # True once this player has stood on the deepest floor there is. The screens use
+        # it to say so instead of offering a descent into floors nobody has built.
+        "cleared_everything": int(record.get("dungeon_deepest", 1)) >= D.LAST_FLOOR,
+        "cleared_notice": D.DUNGEON_CLEARED_NOTICE,
         "entry_cost": D.ENTRY_RUBY_COST,
         "tickets": dungeon_tickets(entry, user_id),
         "escalator_cost": D.ESCALATOR_RUBY_COST,
@@ -3586,11 +3664,21 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
     floor = int(run.get("floor", 1) or 1)
     if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
         return False, "Сначала очисти этаж."
+    if floor >= D.LAST_FLOOR:
+        # Nothing is built past here. The run ENDS rather than refusing in place: the
+        # player has cleared the last floor and there is no next one to stand on, so
+        # leaving them parked on a finished floor with a dead button would be the same
+        # endless-corridor lie in a smaller shape.
+        record["dungeon_run"] = None
+        _save(entry, data)
+        return True, D.DUNGEON_CLEARED_NOTICE
     run["floor"], run["cleared"] = floor + 1, []
     run.pop("boss_lives", None)
     run.pop("hydra_head_hp", None)
     run.pop("hydra_moves", None)
-    record["dungeon_deepest"] = max(int(record.get("dungeon_deepest", 1)), floor + 1)
+    record["dungeon_deepest"] = min(
+        D.LAST_FLOOR, max(int(record.get("dungeon_deepest", 1)), floor + 1),
+    )
     _save(entry, data)
     return True, f"Ты спускаешься на этаж {floor + 1}."
 

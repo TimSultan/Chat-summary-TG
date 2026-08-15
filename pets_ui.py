@@ -411,7 +411,19 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         else:
             lines.append("<i>Лечения на этот забег кончились.</i>")
         rows.append([{"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")}])
-        rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}, {"text": "⬇️ Спуститься", "callback_data": callback_data(user_id, "dungeondescend")}])
+        # On the deepest floor there is, the descent button becomes the finish line: it
+        # still ends the run, but it says what it is doing rather than promising a floor
+        # 46 that does not exist.
+        last = int(state.get("floor", 1) or 1) >= int(state.get("last_floor", 0) or 0)
+        if last:
+            lines.append(f"\n🏁 <b>{escape(state.get('cleared_notice', ''))}</b>")
+        rows.append([
+            {"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")},
+            {
+                "text": "🏁 Закончить" if last else "⬇️ Спуститься",
+                "callback_data": callback_data(user_id, "dungeondescend"),
+            },
+        ])
     else:
         rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
     return "\n".join(lines), {"inline_keyboard": rows}

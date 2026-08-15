@@ -568,6 +568,67 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
         self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
         self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
 
+    def test_vaulting_the_mirror_strips_every_copy_and_pays_for_it(self):
+        """Withdrawn from the game, but nobody may end up worse off for it."""
+        entry = "chat"
+        self._tame(entry, "owner", "Owner")
+        data = pets._load(entry)
+        record = data["pets"]["owner"]
+        record["inventory"] = ["bead", pets.MIRROR_AMULET_CODE]
+        record["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
+        record["mirror_restore"] = "bead"          # a swap caught mid-flight
+        pets._save(entry, data)
+        before = economy.balance(entry, "owner", 0)
+        price = pets_config.find_item(pets.MIRROR_AMULET_CODE).price
+
+        result = pets.retire_soul_mirror([entry])
+
+        after = pets.get_pet(entry, "owner")
+        self.assertNotIn(pets.MIRROR_AMULET_CODE, after["inventory"])
+        self.assertEqual(after["equipped"]["amulet"], "bead", "the displaced amulet returns")
+        self.assertNotIn("mirror_restore", after)
+        self.assertEqual(economy.balance(entry, "owner", 0), before + price)
+        self.assertEqual(result["gold"], price)
+
+        # Idempotent: a restart re-runs this on every boot and must not pay twice.
+        again = pets.retire_soul_mirror([entry])
+        self.assertEqual(again["gold"], 0)
+        self.assertEqual(economy.balance(entry, "owner", 0), before + price)
+
+    def test_vaulting_returns_a_personal_paint_rune_bound_to_the_mirror(self):
+        """That rune is somebody's own painted miniature; it must not go down with it."""
+        entry = "chat"
+        self._tame(entry, "owner", "Owner")
+        data = pets._load(entry)
+        record = data["pets"]["owner"]
+        record["inventory"] = [pets.MIRROR_AMULET_CODE]
+        record["personal_enchantments"] = {
+            pets.MIRROR_AMULET_CODE: {
+                "target": "amulet", "rune_id": "paint-abc", "quest_code": "rune_paint_amulet",
+                "photo_file_id": "photo-1", "applied_at": "2026-08-01T00:00:00+03:00",
+            },
+        }
+        pets._save(entry, data)
+
+        result = pets.retire_soul_mirror([entry])
+
+        self.assertEqual(result["runes"], 1)
+        after = pets.get_pet(entry, "owner")
+        self.assertNotIn(pets.MIRROR_AMULET_CODE, after.get("personal_enchantments", {}))
+        wallet = pets._personal_paint_rune_wallet(pets._load(entry), "owner")
+        returned = next(row for row in wallet if row["id"] == "paint-abc")
+        self.assertEqual(returned["photo_file_id"], "photo-1")
+        self.assertEqual(returned["target"], "amulet")
+
+    def test_the_vaulted_mirror_still_resolves_so_old_fights_keep_rendering(self):
+        """It leaves the shelves, not the catalogue: stored snapshots name its code."""
+        item = pets_config.find_item(pets.MIRROR_AMULET_CODE)
+        self.assertIsNotNone(item, "an unresolvable code turns an old replay into blanks")
+        self.assertEqual(item.source, "vault")
+        self.assertEqual(item.drop_weight, 0)
+        # And it is on no shelf and in no loot pool, because both filter on an exact source.
+        self.assertNotIn(item, [i for i in pets_config.ITEMS if i.source in ("shop", "drop")])
+
     def test_a_swap_stranded_by_a_crashed_fight_is_handed_back_on_the_next_one(self):
         """A fight that died between the swap and the swap back used to strand the amulet.
 

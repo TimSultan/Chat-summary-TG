@@ -13,8 +13,12 @@ import pets_amulet_catalog as catalogue
 
 
 def _dropped():
+    # Three populations, not two: a vaulted amulet is withdrawn from the game but kept in
+    # the catalogue so stored fight snapshots still resolve its code. It belongs to
+    # neither the loot table nor the shelves.
     return [item for item in catalogue.AMULET_SPECS
-            if item.code not in catalogue.SHOP_AMULET_CODES]
+            if item.code not in catalogue.SHOP_AMULET_CODES
+            and item.code not in catalogue.VAULT_AMULET_CODES]
 
 
 def _bought():
@@ -22,10 +26,19 @@ def _bought():
             if item.code in catalogue.SHOP_AMULET_CODES]
 
 
+def _vaulted():
+    return [item for item in catalogue.AMULET_SPECS
+            if item.code in catalogue.VAULT_AMULET_CODES]
+
+
 def test_exactly_forty_unique_drop_only_amulets():
     dropped = _dropped()
     assert len(dropped) == 40
-    assert catalogue.AMULET_COUNT == 40 + len(catalogue.SHOP_AMULET_CODES)
+    assert catalogue.AMULET_COUNT == (
+        40 + len(catalogue.SHOP_AMULET_CODES) + len(catalogue.VAULT_AMULET_CODES)
+    )
+    # A vaulted amulet may never leak back into the loot table or onto a shelf.
+    assert all(item.source == "vault" and item.drop_weight == 0 for item in _vaulted())
     assert len({item.code for item in catalogue.AMULET_SPECS}) == catalogue.AMULET_COUNT
     assert len({item.name for item in catalogue.AMULET_SPECS}) == catalogue.AMULET_COUNT
     assert all(item.slot == "amulet" for item in catalogue.AMULET_SPECS)
