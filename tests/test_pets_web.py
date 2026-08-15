@@ -96,6 +96,11 @@ def _large_jpeg_bytes(edge: int = 2000, quality: int = 95) -> bytes:
 
 class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # Both are module-level and keyed on (entry, user id), which every test here
+        # shares -- a resolution held from the previous test would otherwise stand in for
+        # one this test expects to be made.
+        pets_web._xp_cache.clear()
+        pets_web._member_cache.clear()
         self._temporary = tempfile.TemporaryDirectory()
         root = Path(self._temporary.name)
         self._patchers = [
@@ -130,10 +135,17 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             # Financial records use a separate, narrower gate from quest review.
             return user.get("id") == THIRD["id"]
 
+        # Both gates cost a Telegram round trip in production and pets_web caches a
+        # confirmed answer, so how OFTEN they are consulted is behaviour under test.
+        self.member_calls: list[int] = []
+        self.resolve_calls: list[int] = []
+
         async def is_member(user):
+            self.member_calls.append(user.get("id"))
             return user.get("id") != NONMEMBER["id"]
 
         async def resolve_player(user):
+            self.resolve_calls.append(user.get("id"))
             if user.get("id") == UNTRACKED["id"]:
                 return None, None
             return None, RICH_XP
@@ -435,6 +447,45 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         state = await self._get("/api/state", NONMEMBER)
         self.assertEqual(state.status, 200)
+
+    async def test_a_confirmed_member_is_asked_about_once_not_once_per_button(self):
+        """Both the XP resolve and the membership check are Telegram round trips, and the
+        page makes one of each per tap. A confirmed answer is reused briefly so a burst of
+        clicking costs one lookup rather than one per click."""
+        self._tame(PLAYER)
+        self.member_calls.clear()
+        self.resolve_calls.clear()
+
+        for _ in range(5):
+            answer = await self._action(PLAYER, "notifications")
+            self.assertTrue(answer["ok"], answer)
+        self.assertEqual(self.member_calls, [PLAYER["id"]])
+        self.assertEqual(self.resolve_calls, [PLAYER["id"]])
+
+    async def test_a_refusal_is_never_cached(self):
+        """The dangerous half of caching a gate. A denial must always be re-derived: a
+        stranger who joins, or somebody who writes their first chat message, has to be let
+        in on their very next tap rather than after a cache expires -- and a 'no' that
+        could be served from memory is a 'no' that outlives the fact behind it."""
+        self.member_calls.clear()
+        self.resolve_calls.clear()
+
+        # A non-member is refused, and asked about again every single time.
+        for _ in range(3):
+            blocked = await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+                "init_data": _init_data(NONMEMBER["id"]), "action": "notifications",
+            })
+            self.assertEqual(blocked.status, 403)
+        self.assertEqual(self.member_calls.count(NONMEMBER["id"]), 3)
+
+        # Same for somebody the chat has never seen: never cached, so writing their first
+        # message lets them straight in.
+        for _ in range(3):
+            ghost = await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+                "init_data": _init_data(UNTRACKED["id"]), "action": "notifications",
+            })
+            self.assertEqual(ghost.status, 403)
+        self.assertEqual(self.resolve_calls.count(UNTRACKED["id"]), 3)
 
     # ---- money audit -----------------------------------------------------------------
 
@@ -811,7 +862,52 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(body["ok"])
         self.assertEqual(body["battle"]["rounds"], [])
-        self.assertIn("Fight ID: F-20260815-ABCDEF123456", body["message"])
+
+    async def test_a_dungeon_kill_reports_its_loot_and_never_the_fight_id(self):
+        """«Побеждён: X» used to be followed by the fight's internal id, which means
+        nothing to a player. It carries what the kill actually paid instead."""
+        self._tame(PLAYER)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["dungeon_run"] = {
+            "floor": 3, "hp": 500, "max_hp": 500, "cleared": [],
+        }
+        pets._save(CHAT, data)
+        receipt = {
+            "encounter": {"boss": False, "name": "Стайный вампир"},
+            "reward": {"gold": 140, "xp": 55},
+            "rubies": 1,
+            "dropped": {"code": "w001", "name": "Ржавый меч", "auto_equipped": True},
+            "scroll": {"granted": True, "name": "Искра"},
+            "rune": {"granted": 1, "element": "fire"},
+        }
+        with patch.object(pets, "dungeon_fight",
+                          return_value=(True, "Побеждён: Стайный вампир.", receipt)):
+            body = await self._action(PLAYER, "dungeon_fight", index=0)
+
+        self.assertTrue(body["ok"])
+        message = body["message"]
+        self.assertIn("Побеждён: Стайный вампир.", message)
+        self.assertNotIn("Fight ID", message)
+        for expected in ("🪙 +140", "✨ +55", "💎 +1", "🎁 Ржавый меч", "(надето)",
+                         "📜 Искра", "🔮 fire +1"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, message)
+
+    async def test_a_dungeon_kill_that_paid_nothing_adds_no_loot_line(self):
+        """A gimmick floor can pay nothing at all -- that must read as the plain result,
+        not as an empty «Забрал:» with nothing after it."""
+        self._tame(PLAYER)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["dungeon_run"] = {
+            "floor": 3, "hp": 500, "max_hp": 500, "cleared": [],
+        }
+        pets._save(CHAT, data)
+        with patch.object(pets, "dungeon_fight",
+                          return_value=(True, "Голова падает.", {"encounter": {}, "reward": {}})):
+            body = await self._action(PLAYER, "dungeon_fight", index=0)
+
+        self.assertEqual(body["message"], "Голова падает.")
+        self.assertNotIn("Забрал", body["message"])
 
     async def test_automatic_and_multiplayer_placeholder_create_no_live_results(self):
         self._tame(PLAYER)

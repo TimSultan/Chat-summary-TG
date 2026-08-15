@@ -439,6 +439,8 @@ def dungeon_reward_text(receipt: dict | None) -> str:
         bits.append(f"🪙 +{_money(int(reward['gold']))}")
     if reward.get("xp"):
         bits.append(f"✨ +{_money(int(reward['xp']))} опыта")
+    if receipt.get("rubies"):
+        bits.append(f"💎 +{int(receipt['rubies'])}")
     lines = ["Получено: " + " · ".join(bits)] if bits else []
     dropped = receipt.get("dropped") or {}
     if dropped.get("name"):

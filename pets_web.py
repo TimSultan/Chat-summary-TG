@@ -161,6 +161,26 @@ async def _default_resolve_player(user: dict):
     return None, None
 
 
+# How long a resolved XP figure and a confirmed membership are reused before being asked
+# for again. Both answers cost a round trip to Telegram, and the page asks for them on
+# EVERY button -- which is most of why a tap used to take a visible moment to land.
+#
+# Short enough to be invisible, and it costs no freshness worth having: the chat activity
+# XP is derived from a transcript cache that is itself allowed to be half an hour stale
+# (transcript_cache.TODAY_TTL_SECONDS), so this cannot make the number older than it
+# already was by any margin that shows.
+PLAYER_CACHE_SECONDS = 30.0
+# (entry, user_id) -> (expires_at, xp) and -> expires_at, both success-only. See _player.
+_xp_cache: dict[tuple[str, str], tuple[float, int]] = {}
+_member_cache: dict[tuple[str, str], float] = {}
+
+
+def _prune_expired(cache: dict, now: float, deadline_of) -> None:
+    """Drop timed-out rows so a cache keyed on player identity cannot grow forever."""
+    for key in [key for key, row in cache.items() if deadline_of(row) <= now]:
+        cache.pop(key, None)
+
+
 async def _player(request: web.Request, body: dict | None = None):
     """(telegram user, chat-activity xp) or an HTTP error.
 
@@ -168,9 +188,21 @@ async def _player(request: web.Request, body: dict | None = None):
     earned half from live chat XP -- so nothing can be priced, bought or sold before the
     player has been resolved against the chat's statistics. That resolution is also the
     check that stops somebody who has never written in the chat from farming the arena,
-    which is why it is not optional and not cached.
+    which is why it is not optional.
+
+    Only a SUCCESSFUL resolution is cached (see PLAYER_CACHE_SECONDS). Somebody who is not
+    tracked yet is therefore asked about again on their very next tap, so writing a first
+    message in the chat lets them in immediately rather than after a cache expires -- and
+    the gate keeps failing closed the whole time.
     """
     user = await _authenticate(request, body)
+    entry = request.app[_ENTRY_KEY]
+    key = (entry, str(user.get("id")))
+    now = time.monotonic()
+    fresh = _xp_cache.get(key)
+    if fresh is not None and fresh[0] > now:
+        return user, fresh[1]
+
     resolve = request.app[_RESOLVE_KEY]
     _, xp = await resolve(user)
     if xp is None:
@@ -182,7 +214,28 @@ async def _player(request: web.Request, body: dict | None = None):
             ),
             content_type="application/json",
         )
+    _prune_expired(_xp_cache, now, lambda row: row[0])
+    _xp_cache[key] = (now + PLAYER_CACHE_SECONDS, int(xp))
     return user, int(xp)
+
+
+async def _is_member(request: web.Request, user: dict) -> bool:
+    """The "играть могут только участники чата" gate, with a confirmed yes reused briefly.
+
+    Success-only for the same reason _player is: a stranger and a brand-new member are both
+    re-asked on every tap, so joining the chat takes effect at once and a denial is never
+    something a cache can hand out. Only "yes, still a member" is held, and only for
+    PLAYER_CACHE_SECONDS -- long enough to spare a Telegram round trip per button press.
+    """
+    key = (request.app[_ENTRY_KEY], str(user.get("id")))
+    now = time.monotonic()
+    if _member_cache.get(key, 0.0) > now:
+        return True
+    if not await request.app[_IS_MEMBER_KEY](user):
+        return False
+    _prune_expired(_member_cache, now, lambda row: row)
+    _member_cache[key] = now + PLAYER_CACHE_SECONDS
+    return True
 
 
 # --------------------------------------------------------------------------- item art
@@ -460,7 +513,7 @@ async def handle_portrait_upload(request: web.Request) -> web.Response:
     """
     user, xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Только участники чата.", status=403, code="NOT_A_MEMBER")
     record = pets.get_pet(entry, user["id"])
     # A first portrait is also the Mini App's pet-creation flow.  Keep it on this route
@@ -1227,12 +1280,17 @@ _DUNGEON_ACTIONS = {
 async def handle_state(request: web.Request) -> web.Response:
     user, xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
-    state = _state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY])
-    # Whether the moderation entry is even drawn. A convenience for the menu, never a
-    # permission: every route behind it asks the same gate again for itself.
-    is_admin, is_economy_admin = await asyncio.gather(
-        request.app[_IS_ADMIN_KEY](user),
-        request.app[_IS_ECONOMY_ADMIN_KEY](user),
+    # Assembled in a worker and alongside the two admin gates rather than before them:
+    # it is the better part of the request's blocking work, and holding the event loop
+    # for it makes every other player waiting on a button press wait for this one too.
+    state, (is_admin, is_economy_admin) = await asyncio.gather(
+        asyncio.to_thread(_state_payload, entry, user["id"], xp, request.app[_PREFIX_KEY]),
+        # Whether the moderation entry is even drawn. A convenience for the menu, never a
+        # permission: every route behind it asks the same gate again for itself.
+        asyncio.gather(
+            request.app[_IS_ADMIN_KEY](user),
+            request.app[_IS_ECONOMY_ADMIN_KEY](user),
+        ),
     )
     state["is_admin"] = is_admin
     # Financial history is more sensitive than quest review and uses its own, narrower
@@ -1244,6 +1302,33 @@ async def handle_state(request: web.Request) -> web.Response:
     return _ok(state)
 
 
+def _dungeon_loot_line(extra: dict) -> str:
+    """Everything one dungeon kill paid, as one plain-text line.
+
+    Plain text, not the HTML pets_ui.dungeon_reward_text builds for Telegram: this rides
+    the ordinary action message, which the page shows through a toast's textContent, so
+    an escaped entity would be printed literally rather than rendered.
+    """
+    reward = extra.get("reward") or {}
+    bits = []
+    if reward.get("gold"):
+        bits.append(f"🪙 +{int(reward['gold'])}")
+    if reward.get("xp"):
+        bits.append(f"✨ +{int(reward['xp'])}")
+    if extra.get("rubies"):
+        bits.append(f"💎 +{int(extra['rubies'])}")
+    dropped = extra.get("dropped") or {}
+    if dropped.get("name"):
+        bits.append(f"🎁 {dropped['name']}" + (" (надето)" if dropped.get("auto_equipped") else ""))
+    scroll = extra.get("scroll") or {}
+    if scroll.get("granted"):
+        bits.append(f"📜 {scroll.get('name') or 'новый свиток'}")
+    rune = extra.get("rune") or {}
+    if rune.get("granted"):
+        bits.append(f"🔮 {rune.get('element') or 'руна'} +{int(rune['granted'])}")
+    return "Забрал: " + " · ".join(bits) if bits else ""
+
+
 async def handle_action(request: web.Request) -> web.Response:
     try:
         body = await request.json()
@@ -1252,7 +1337,7 @@ async def handle_action(request: web.Request) -> web.Response:
     user, xp = await _player(request, body)
     entry = request.app[_ENTRY_KEY]
 
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Играть могут только участники чата.", status=403, code="NOT_A_MEMBER")
 
     action = _ACTIONS.get(str(body.get("action") or ""))
@@ -1266,7 +1351,10 @@ async def handle_action(request: web.Request) -> web.Response:
       )
 
     try:
-        outcome = action(entry, user["id"], xp, body)
+        # Off the event loop: an action is blocking work (a dungeon fight runs a whole
+        # combat simulation) and pets.py guards its own critical sections with a lock, so
+        # leaving it here made every other player's request wait behind this one.
+        outcome = await asyncio.to_thread(action, entry, user["id"], xp, body)
         ok, message, extra = (*outcome, None)[:3]
         # Every state change the game makes, with who made it and whether it took. This is
         # the record that says what a player actually did when they report that something
@@ -1292,13 +1380,18 @@ async def handle_action(request: web.Request) -> web.Response:
     response = {
         "ok": bool(ok),
         "message": message,
-        "state": _state_payload(entry, user["id"], xp, request.app[_PREFIX_KEY]),
+        "state": await asyncio.to_thread(
+            _state_payload, entry, user["id"], xp, request.app[_PREFIX_KEY],
+        ),
     }
     if str(body.get("action") or "") == "dungeon_fight" and isinstance(extra, dict):
       result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
       encounter = extra.get("encounter") or {}
-      if getattr(result, "fight_id", None):
-        response["message"] += f"\nFight ID: {result.fight_id}"
+      # What the kill actually paid, rather than the fight's internal id: the id meant
+      # nothing to a player and crowded out the one thing they wanted to read.
+      loot = _dungeon_loot_line(extra)
+      if loot:
+        response["message"] += "\n" + loot
       if encounter.get("boss") and result is not None and hero is not None and enemy is not None:
         dropped = extra.get("dropped") or {}
         dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
@@ -1419,7 +1512,7 @@ def _prune_test_battles(app: web.Application) -> None:
 
 async def handle_test_battle_setup(request: web.Request) -> web.Response:
     user, _xp = await _player(request)
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Тестировать бой могут только участники чата.", status=403,
                            code="NOT_A_MEMBER")
     entry = request.app[_ENTRY_KEY]
@@ -1437,7 +1530,7 @@ async def handle_test_battle_start(request: web.Request) -> web.Response:
     except (json.JSONDecodeError, ValueError):
         return _json_error("malformed request body")
     user, _xp = await _player(request, body)
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Тестировать бой могут только участники чата.", status=403,
                            code="NOT_A_MEMBER")
     mode = str(body.get("mode") or "manual")
@@ -1505,7 +1598,7 @@ async def handle_test_battle_action(request: web.Request) -> web.Response:
     except (json.JSONDecodeError, ValueError):
         return _json_error("malformed request body")
     user, _xp = await _player(request, body)
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Тестировать бой могут только участники чата.", status=403,
                            code="NOT_A_MEMBER")
     _prune_test_battles(request.app)
@@ -1622,7 +1715,7 @@ async def handle_attack(request: web.Request) -> web.Response:
     user, xp = await _player(request, body)
     entry = request.app[_ENTRY_KEY]
 
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
 
     me = str(user["id"])
@@ -1886,7 +1979,7 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
         return _json_error("malformed request body")
     user, xp = await _player(request, body)
     entry = request.app[_ENTRY_KEY]
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
     me = str(user["id"])
     # No artificial per-request cooldown here: record_mob_fight already serialises the
@@ -2081,7 +2174,7 @@ async def handle_congratulate(request: web.Request) -> web.Response:
         body = {}
     user, _xp = await _player(request, body)
     entry = request.app[_ENTRY_KEY]
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Поздравлять могут только участники чата.", status=403, code="NOT_A_MEMBER")
 
     me = str(user["id"])
@@ -2617,7 +2710,7 @@ async def handle_quest_idea(request: web.Request) -> web.Response:
     except (json.JSONDecodeError, ValueError):
         return _json_error("malformed request body")
     user, _xp = await _player(request, body)
-    if not await request.app[_IS_MEMBER_KEY](user):
+    if not await _is_member(request, user):
         return _json_error("Играть могут только участники чата.", status=403, code="NOT_A_MEMBER")
     ok, message = await asyncio.to_thread(
         quests.suggest_idea, request.app[_ENTRY_KEY], user["id"], body.get("text") or "",

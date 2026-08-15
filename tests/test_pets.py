@@ -51,6 +51,66 @@ class PetsTestCase(unittest.TestCase):
         self.assertTrue(ok, msg)
 
 
+class StoreReadCacheTests(PetsTestCase):
+    """_load memoises the normalised store because one screen reads it twenty-odd times.
+
+    A cache over the file every game rule reads and writes is only safe if it can never
+    hand back something the disk no longer says, and never hand two callers the same
+    mutable object. Both are asserted here rather than assumed.
+    """
+
+    def test_a_save_is_visible_to_the_very_next_read(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        self.assertEqual(pets.get_pet(entry, "1")["name"], "Питомец1")
+
+        data = pets._load(entry)
+        data["pets"]["1"]["name"] = "Переименован"
+        pets._save(entry, data)
+        self.assertEqual(pets._load(entry)["pets"]["1"]["name"], "Переименован")
+        self.assertEqual(pets.get_pet(entry, "1")["name"], "Переименован")
+
+    def test_two_readers_never_share_one_mutable_store(self):
+        """The whole hazard of caching this: callers mutate what they are handed and only
+        some of them go on to save it. An edit that is abandoned must not be visible to
+        anybody else."""
+        entry = "chat"
+        self._tame(entry, "1")
+        first = pets._load(entry)
+        second = pets._load(entry)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["pets"], second["pets"])
+        self.assertIsNot(first["pets"]["1"], second["pets"]["1"])
+
+        first["pets"]["1"]["name"] = "Испорчено"
+        first["pets"]["1"]["inventory"].append("w001")
+        self.assertEqual(second["pets"]["1"]["name"], "Питомец1")
+        self.assertNotIn("w001", second["pets"]["1"]["inventory"])
+        # And nothing was written, so a fresh read still shows the untouched creature.
+        self.assertEqual(pets._load(entry)["pets"]["1"]["name"], "Питомец1")
+
+    def test_a_write_from_another_process_is_picked_up(self):
+        """admin_grant.py edits the same file from outside this process, so a cache that
+        only listened to its own _save calls would serve the pre-grant wallet for ever."""
+        entry = "chat"
+        self._tame(entry, "1")
+        pets._load(entry)                      # prime the cache
+
+        path = pets._pets_path(entry)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["rubies"] = {"1": 4242}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+
+        self.assertEqual(pets.ruby_balance(entry, "1"), 4242)
+
+    def test_two_entries_do_not_share_a_cache_row(self):
+        entry_a, entry_b = "chat-a", "chat-b"
+        self._tame(entry_a, "1", name="Первый")
+        self._tame(entry_b, "1", name="Второй")
+        self.assertEqual(pets.get_pet(entry_a, "1")["name"], "Первый")
+        self.assertEqual(pets.get_pet(entry_b, "1")["name"], "Второй")
+
+
 class HeroGoldBalanceTests(unittest.TestCase):
     def test_first_five_levels_are_unchanged_then_every_source_grows_forever(self):
         for source in pets_config.HERO_GOLD_SOURCE_WEIGHTS:

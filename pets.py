@@ -218,10 +218,43 @@ def _new_economy_metrics() -> dict:
     }
 
 
+# Normalised stores, keyed by the FILE they were read from and stamped with that file's
+# identity: {path: (mtime_ns, size, blob)}. Assembling one screen calls _load twenty-odd
+# times (every balance, status and wallet helper reads the store for itself), and measured
+# against a 40-player store the file read and the JSON parse together are under a fifth of
+# that cost -- the rest is re-running the normalisation below over identical bytes.
+#
+# Keyed on the path rather than the entry because an entry name does not identify a file
+# on its own: stats._stats_dir() is redirected under test, so the same entry legitimately
+# means a different store from one moment to the next.
+#
+# What is cached is the normalised store re-serialised to TEXT, and a hit parses it afresh.
+# Callers mutate what they are handed and then _save it, so handing out the cached object
+# itself would let an abandoned edit leak into the next reader; a string cannot be mutated
+# by anybody, which makes that impossible rather than merely unlikely. It is also the
+# fastest of the safe options -- measured at roughly half the cost of a deepcopy, and a
+# quarter of redoing the normalisation.
+_store_cache: dict[str, tuple[int, int, str]] = {}
+_store_cache_lock = threading.Lock()
+
+
 def _load(entry: str) -> dict:
     path = _pets_path(entry)
     if not path.exists():
         return _empty()
+    try:
+        stamp = path.stat()
+        identity = (stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        return _empty()
+    cache_key = str(path)
+    with _store_cache_lock:
+        cached = _store_cache.get(cache_key)
+    if cached is not None and cached[:2] == identity:
+        try:
+            return json.loads(cached[2])
+        except json.JSONDecodeError:
+            pass                       # unreachable in practice; fall through to the file
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
@@ -459,6 +492,16 @@ def _load(entry: str) -> dict:
         if isinstance(source, str) and isinstance(row, dict)
         and isinstance(row.get("user_id"), str) and isinstance(row.get("rune_id"), str)
     }
+    # Stamped with the file identity read at the top, not a fresh stat(): a write that
+    # lands while this normalisation is running would otherwise be cached under ITS
+    # identity while holding the older content, and the next reader would accept it.
+    # Recording the identity we actually read means such a write simply misses instead.
+    try:
+        blob = json.dumps(data)
+    except (TypeError, ValueError):
+        return data                    # not cacheable; still a perfectly good result
+    with _store_cache_lock:
+        _store_cache[cache_key] = (*identity, blob)
     return data
 
 
@@ -543,7 +586,13 @@ def _save(entry: str, data: dict) -> None:
     data["version"] = PETS_STORE_VERSION
     if len(data.get("fights", [])) > FIGHT_LOG_LIMIT:
         data["fights"] = data["fights"][-FIGHT_LOG_LIMIT:]
-    stats._write_json_atomic(_pets_path(entry), data)
+    path = _pets_path(entry)
+    # Drop the read cache outright rather than trusting the new file stamp to differ from
+    # the old one. _load's mtime+size check is what catches a write from ANOTHER process
+    # (admin_grant.py), but for our own writes this is exact and costs nothing.
+    with _store_cache_lock:
+        _store_cache.pop(str(path), None)
+    stats._write_json_atomic(path, data)
 
 
 def _new_record() -> dict:
