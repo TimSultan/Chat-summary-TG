@@ -432,8 +432,8 @@ FIGHT_BANK_RECHARGE_SECONDS = 60 * 60
 # against you, and nothing at all about either of you against a third player. Nothing is
 # stored -- the stack count is derived from today's fight log, so it clears itself at
 # midnight along with the day it was counted from.
-FAMILIAR_FACE_STEP = 0.10        # per stack, off every stat
-FAMILIAR_FACE_SCALE_FLOOR = 0.10  # nine stacks in, and a tenth fight is still a fight
+FAMILIAR_FACE_STEP = 0.05        # per stack, off every stat
+FAMILIAR_FACE_SCALE_FLOOR = 0.10  # eighteen stacks in, and a nineteenth fight is still a fight
 FAMILIAR_FACE = {
     "emoji": "👁",
     "title": "Знакомое лицо",

@@ -5393,13 +5393,14 @@ function debuffNote(mark, extra) {
     "</div>";
 }
 
-// Знакомое лицо, as small as the mark beside it. The card is the only place a player can
-// see the price before paying it, so the pill carries the count and its title tells them
-// what it costs and when it lifts.
+// Знакомое лицо, as small as the mark beside it. Deliberately just the count: the roster
+// is a list of faces to pick from, and a percentage on every row turns choosing an
+// opponent into arithmetic. The number of stacks is the whole signal a card needs to
+// carry -- what they cost is spelled out where the mark itself is explained.
 function familiarTag(mark) {
   if (!mark || !mark.stacks) return "";
   return "<span class='dbf fam' title='" + esc(mark.description || "") + " " +
-    esc(mark.line || "") + ". " + esc(mark.hint || "") + "'>" +
+    esc(mark.hint || "") + "'>" +
     esc(mark.emoji || "") + " " + esc(mark.title || "") + " ×" + Number(mark.stacks) + "</span>";
 }
 
@@ -5412,10 +5413,7 @@ function foeRow(foe, canFight) {
     "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
       "</span> " + debuffTag(foe.debuff) + " " + familiarTag(familiar) +
       "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
-      " · побед " + foe.wins + " из " + foe.fights +
-      // The number the tag stands for, spelled out: a pill saying ×3 is a badge, but
-      // "−30% к твоим статам" is the actual decision in front of the player.
-      (familiar ? " · " + esc(familiar.line) : "") + "</span></span>" +
+      " · побед " + foe.wins + " из " + foe.fights + "</span></span>" +
     "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";
 }
 

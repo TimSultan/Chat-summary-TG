@@ -455,16 +455,16 @@ class FamiliarFaceTests(PetsTestCase):
                 pets._save(entry, data)
                 pets.record_fight(entry, attacker, defender, result, day or pets.today())
 
-    def test_each_stack_takes_ten_percent_and_the_floor_keeps_a_fight_fightable(self):
+    def test_each_stack_takes_five_percent_and_the_floor_keeps_a_fight_fightable(self):
         self.assertEqual(pets.familiar_face_scale(0), 1.0)
-        self.assertAlmostEqual(pets.familiar_face_scale(1), 0.9)
-        self.assertAlmostEqual(pets.familiar_face_scale(3), 0.7)
-        # Nine stacks would reach the floor exactly; a hundred must not go below it.
+        self.assertAlmostEqual(pets.familiar_face_scale(1), 0.95)
+        self.assertAlmostEqual(pets.familiar_face_scale(3), 0.85)
+        # Eighteen stacks reach the floor exactly; a hundred must not go below it.
         self.assertEqual(pets.familiar_face_scale(100), pets_config.FAMILIAR_FACE_SCALE_FLOOR)
         self.assertIsNone(pets.familiar_face_for(0))
         mark = pets.familiar_face_for(2)
         self.assertEqual(mark["stacks"], 2)
-        self.assertEqual(mark["percent"], 20)
+        self.assertEqual(mark["percent"], 10)
         self.assertIn("×2", mark["tag"])
         self.assertTrue(pets.familiar_face_for(50)["capped"])
 
@@ -479,15 +479,20 @@ class FamiliarFaceTests(PetsTestCase):
         against_three = pets.effective_stats(entry, "1", vs="3")
         for key in (*pets_config.STAT_KEYS, "armor"):
             self.assertEqual(against_three.get(key), clean.get(key), key)
-            expected = round(clean[key] * 0.7) if key == "armor" else max(1, round(clean[key] * 0.7))
+            scaled = clean[key] * pets.familiar_face_scale(3)
+            expected = round(scaled) if key == "armor" else max(1, round(scaled))
             self.assertEqual(against_two.get(key), expected, key)
         # Nothing is stored: the stacks are read back out of today's fight log.
         self.assertEqual(pets.effective_stats(entry, "1"), clean)
 
     def test_the_shake_is_directional_and_belongs_to_the_attacker(self):
         entry = self._pair("familiar-direction")
-        clean_two = pets.effective_stats(entry, "2")
+        # A stat big enough that one 5% step cannot hide inside the rounding.
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"]["strength"] = 40
+        pets._save(entry, data)
         self._beat(entry, "1", "2", 2)
+        clean_two = pets.effective_stats(entry, "2")
         # "1" has been staring at "2" all day. "2" has been on the receiving end and is
         # exactly as strong against "1" as against anybody.
         self.assertEqual(pets.effective_stats(entry, "2", vs="1"), clean_two)
@@ -513,7 +518,7 @@ class FamiliarFaceTests(PetsTestCase):
         self.assertEqual(pets.effective_stats(entry, "1")["strength"], max(1, round(raw * mark_scale)))
         self.assertEqual(
             pets.effective_stats(entry, "1", vs="2")["strength"],
-            max(1, round(raw * mark_scale * 0.9)),
+            max(1, round(raw * mark_scale * pets.familiar_face_scale(1))),
         )
 
     def test_the_cap_is_gone_and_a_tenth_fight_is_allowed(self):

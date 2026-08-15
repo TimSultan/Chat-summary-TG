@@ -710,7 +710,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(fought["attackable"])
         self.assertEqual(fought["familiar_face"]["stacks"], 4)
-        self.assertEqual(fought["familiar_face"]["percent"], 40)
+        self.assertEqual(fought["familiar_face"]["percent"], 20)
         self.assertIn("×4", fought["familiar_face"]["tag"])
         # A face you have not seen today carries nothing, and sorts above the tired one.
         self.assertIsNone(fresh["familiar_face"])
@@ -719,13 +719,19 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             [row["user_id"] for row in body["opponents"]].index(str(OPPONENT["id"])),
         )
 
-    async def test_the_arena_card_renders_the_familiar_face_tag(self):
+    async def test_the_arena_card_shows_the_stack_count_and_no_percentage(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn("function familiarTag(mark)", page)
         self.assertIn("familiarTag(familiar)", page)
         self.assertIn('"<span class=\'dbf fam\'', page)
-        # The pill is a badge; the line beside it is the actual decision.
-        self.assertIn('" · " + esc(familiar.line)', page)
+        self.assertIn('" ×" + Number(mark.stacks)', page)
+        # The count alone. A percentage on every row turns picking an opponent into
+        # arithmetic, so `line` must not reach the roster -- not in the row, not in the
+        # tooltip. Scoped to these two functions: debuffNote still spells its own out.
+        tag = page.split("function familiarTag(mark)", 1)[1].split("function foeRow(", 1)[0]
+        row = page.split("function foeRow(foe, canFight)", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn(".line", tag)
+        self.assertNotIn(".line", row)
         self.assertNotIn("сегодня уже хватит", page)
 
     # ---- isolated turn-based prototype ----------------------------------------------
