@@ -96,6 +96,10 @@ class Round:
     # Complete post-event combat state.  Kept on the immutable transcript row so an
     # audit never has to infer a stun, guard or proc charge from player-facing prose.
     state: dict | None = None
+    # False for a consequence attached to somebody else's action: guard absorption,
+    # burn tick, healing reaction, counterattack and similar transcript detail.  These
+    # rows are valuable evidence but must never look as though they spent another turn.
+    is_action: bool = True
 
 
 @dataclass(frozen=True)
@@ -678,6 +682,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     spring_ready = {a.key: False, b.key: False}
     armor_shredded = {a.key: 0.0, b.key: 0.0}
     burning: dict[str, tuple[str, int, int, tuple[str, ...]] | None] = {a.key: None, b.key: None}
+    # A shield burn needs different wording from a scroll/weapon burn even though the
+    # damage lifecycle is identical. Kept outside the tuple for snapshot compatibility.
+    burning_shield = {a.key: None, b.key: None}
     venom_miss = {a.key: 0.0, b.key: 0.0}
     pending_venom: dict[str, tuple[str, int] | None] = {a.key: None, b.key: None}
     bleeding: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
@@ -753,11 +760,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 number=0, attacker=owner_key, event=f"deficit_{stat}", damage=0,
                 attacker_hp=round(hp[owner_key]), defender_hp=round(hp[other_key]),
                 text=_DEFICIT_TEXT[stat].format(name=fighters[owner_key].name),
+                is_action=False,
             ))
 
     def effect_round(
         number: int, owner_key: str, other_key: str, code: str, amount: int = 0,
-        attack_types=(PHYSICAL,),
+        attack_types=(PHYSICAL,), *, is_action: bool = False,
     ):
         """Put an equipped-item proc in the normal transcript, without flavour RNG."""
         template = _EFFECT_TEXT.get(code, "срабатывает эффект снаряжения.")
@@ -766,7 +774,65 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attacker_hp=round(hp[owner_key]), defender_hp=round(hp[other_key]),
             text=f"✨ {fighters[owner_key].name} {template.format(amount=amount)}",
             attack_types=normalize_attack_types(attack_types),
+            is_action=is_action,
         ))
+
+    def shield_round(
+        number: int, owner_key: str, other_key: str, code: str, text: str,
+        amount: int = 0, attack_types=(PHYSICAL,),
+    ) -> None:
+        """Append one explicitly named shield consequence, never an extra action."""
+        rounds.append(Round(
+            number=number, attacker=owner_key, event=f"shield_{code}", damage=amount,
+            attacker_hp=round(hp[owner_key]), defender_hp=round(hp[other_key]),
+            text=f"↳ 🛡 {text}", attack_types=normalize_attack_types(attack_types),
+            is_action=False,
+        ))
+
+    def shield_name(key: str) -> str:
+        return str((equipped_shields[key] or {}).get("name") or "Базовая защита")
+
+    def display_shield_consequences(
+        rows_to_order: list[Round], source_key: str, target_key: str,
+    ) -> tuple[list[Round], int, int]:
+        """Give the replay truthful HP frames: hit, then heal/counter consequences."""
+        healed = sum(
+            -row.damage for row in rows_to_order
+            if row.event == "shield_damage_heal" and row.damage < 0
+        )
+        countered = sum(
+            row.damage for row in rows_to_order
+            if row.event == "shield_counterattack" and row.damage > 0
+        )
+        view_hp = {
+            source_key: max(0, round(hp[source_key]) + countered),
+            target_key: max(0, round(hp[target_key]) - healed),
+        }
+        primary_source_hp = view_hp[source_key]
+        primary_target_hp = view_hp[target_key]
+        ordered = []
+        for row in rows_to_order:
+            if row.event == "shield_damage_heal":
+                view_hp[target_key] += max(0, -row.damage)
+            elif row.event == "shield_counterattack":
+                view_hp[source_key] = max(0, view_hp[source_key] - max(0, row.damage))
+            other_key = target_key if row.attacker == source_key else source_key
+            state = dict(row.state or {})
+            state_fighters = {
+                key: dict(value) for key, value in (state.get("fighters") or {}).items()
+            }
+            for key, value in view_hp.items():
+                if key in state_fighters:
+                    state_fighters[key]["hp"] = round(value)
+            if state_fighters:
+                state["fighters"] = state_fighters
+            ordered.append(replace(
+                row,
+                attacker_hp=round(view_hp[row.attacker]),
+                defender_hp=round(view_hp[other_key]),
+                state=state or row.state,
+            ))
+        return ordered, primary_source_hp, primary_target_hp
 
     def hurt(
         source_key: str, target_key: str, damage: int, number: int,
@@ -797,13 +863,25 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 parried = max(0, before_parry - damage)
                 if parried:
                     stunned[source_key] = True
-                    effect_round(number, target_key, source_key, "shield_parry_stun", parried)
+                    shield_round(
+                        number, target_key, source_key, "parry_stun",
+                        f"{fighters[target_key].name} щитом «{shield_name(target_key)}» "
+                        f"парирует {parried} урона и оглушает {fighters[source_key].name}. "
+                        f"{fighters[source_key].name} пропустит следующий ход.",
+                        parried,
+                    )
         if damage and guards[target_key] > 0:
             before_guard = damage
             blocked_share = guards[target_key] * max(0.0, 1.0 - min(1.0, pierce_guard))
             damage = round(damage * max(0.0, 1.0 - blocked_share))
             guards[target_key] = 0.0
-            effect_round(number, target_key, source_key, "guard", before_guard - damage)
+            absorbed = before_guard - damage
+            shield_round(
+                number, target_key, source_key, "guard",
+                f"защита {fighters[target_key].name} щитом «{shield_name(target_key)}» "
+                f"поглощает {absorbed} урона из этой атаки. Защита израсходована.",
+                absorbed,
+            )
         if effectful and damage and str(source_key).startswith("mob:") \
                 and (value := _effect_value(effects[target_key], "mob_ward")) is not None:
             damage = round(damage * max(.10, 1 - max(0, _fraction(value))))
@@ -904,6 +982,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             text=(f"✦ {fighters[target_key].name} отражает {back_impact} магического урона "
                   f"обратно в {fighters[source_key].name}."),
             attack_types=(MAGIC,),
+            is_action=False,
         ))
         return impact, False, target_key if back_knockout else None
 
@@ -929,7 +1008,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 hp[target_key] = min(max_hp[target_key], hp[target_key] + impact * percent)
                 healed = round(hp[target_key] - before)
                 if healed:
-                    effect_round(number, target_key, source_key, "shield_damage_heal", healed)
+                    net = max(0, impact - healed)
+                    shield_round(
+                        number, target_key, source_key, "damage_heal",
+                        f"«{shield_name(target_key)}» после прямого попадания возвращает "
+                        f"{fighters[target_key].name} {healed} HP. Получено {impact}, "
+                        f"итоговая потеря — {net} HP.",
+                        -healed,
+                    )
             elif op == "counterattack" and "counterattack" not in used_shield_reactions[target_key]:
                 used_shield_reactions[target_key].add("counterattack")
                 percent = max(0.0, float(effect.get("percent", 0) or 0))
@@ -940,9 +1026,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     allow_shield_reactions=False,
                 )
                 total_damage[target_key] += counter_impact
-                effect_round(
-                    number, target_key, source_key, "shield_counterattack", counter_impact,
-                    (PHYSICAL,),
+                shield_round(
+                    number, target_key, source_key, "counterattack",
+                    f"{fighters[target_key].name} щитом «{shield_name(target_key)}» отвечает "
+                    f"контрударом и наносит {fighters[source_key].name} {counter_impact} урона. "
+                    "Контрудар не расходует отдельный ход.",
+                    counter_impact, (PHYSICAL,),
                 )
                 if counter_ko:
                     return target_key
@@ -973,6 +1062,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             number=0, attacker=target_key, event="skill_ward", damage=0,
             attacker_hp=round(hp[target_key]), defender_hp=round(hp[_other_key(target_key)]),
             text=f"🎗 {fighters[target_key].name} блокирует негативный эффект.",
+            is_action=False,
         ))
         return False
 
@@ -993,6 +1083,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attacker_hp=round(hp[target_key]), defender_hp=round(hp[source_key]),
             text=f"🌹 {fighters[target_key].name} отражает {back_impact} урона.",
             attack_types=(MAGIC,),
+            is_action=False,
         ))
         return antimagic_winner or (target_key if back_ko else None)
 
@@ -1035,6 +1126,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     attacker_hp=round(hp[source_key]), defender_hp=round(hp[target_key]),
                     text=f"💚 {fighters[source_key].name} восстанавливает {healed} HP от удара.",
                     attack_types=normalize_attack_types(attack_types),
+                    is_action=False,
                 ))
         reflected_winner = None if knocked_out or reflection_winner else reflect_skill_damage(
             source_key, target_key, impact, number,
@@ -1069,6 +1161,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 max(1, round(derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 0))))),
                 normalize_attack_types(attack_types),
             )
+            # Generic scroll/weapon burns replace the attribution left by a shield.
+            burning_shield[target_key] = None
         elif op in {"weaken", "blind", "vulnerable"}:
             put_skill_status(
                 target_key, op, max(0.0, float(effect.get("value", 0))),
@@ -1085,6 +1179,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             )
         elif op == "cleanse":
             burning[source_key] = None
+            burning_shield[source_key] = None
             stunned[source_key] = False
             for name in ("burn", "blind", "weaken", "vulnerable"):
                 skill_statuses[source_key].pop(name, None)
@@ -1162,6 +1257,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     number=number, attacker=key, event="skill_regen", damage=-healed,
                     attacker_hp=round(hp[key]), defender_hp=round(hp[other_key]),
                     text=f"💧 {fighters[key].name} восстанавливает {healed} HP.",
+                    is_action=False,
                 ))
 
     def take_active_action(
@@ -1170,18 +1266,73 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         if action == "defend":
             shield = equipped_shields[source_key] or {}
             guards[source_key] = max(.10, min(.80, float(shield.get("guard", .40) or .40)))
-            for effect in shield.get("defend_effects", ()):
-                _impact, winner = apply_scroll_effect(
-                    source_key, target_key, effect, number, (MAGIC,),
-                )
-                if winner:
-                    return winner
+            name = shield_name(source_key)
             rounds.append(Round(
                 number=number, attacker=source_key, event="defend", damage=0,
                 attacker_hp=round(hp[source_key]), defender_hp=round(hp[target_key]),
-                text=(f"🛡 {fighters[source_key].name} защищается"
-                      + (f" щитом «{shield.get('name')}»." if shield.get("name") else ".")),
+                text=(f"🛡 {fighters[source_key].name} поднимает щит «{name}»: "
+                      f"следующая прямая атака будет слабее на "
+                      f"{round(guards[source_key] * 100)}%. Это не лечение."),
             ))
+            for effect in shield.get("defend_effects", ()):
+                op = str(effect.get("op") or "effect")
+                before_hp = hp[source_key]
+                before_barrier = shields[source_key]
+                _impact, winner = apply_scroll_effect(
+                    source_key, target_key, effect, number, (MAGIC,),
+                )
+                if op == "burn":
+                    burning_shield[target_key] = name
+                    burn = burning[target_key]
+                    if burn is not None:
+                        _owner, turns, damage, _types = burn
+                        detail = (
+                            f"«{name}» поджигает {fighters[target_key].name}: "
+                            f"{damage} урона перед каждым из {turns} следующих ходов. "
+                            "Огонь не расходует ход."
+                        )
+                        shield_round(number, source_key, target_key, "defend_burn", detail)
+                elif op == "heal":
+                    healed = max(0, round(hp[source_key] - before_hp))
+                    detail = (
+                        f"особый эффект «{name}» лечит "
+                        f"{fighters[source_key].name} на {healed} HP. "
+                        "Базовая защита сама по себе HP не восстанавливает."
+                    )
+                    shield_round(number, source_key, target_key, "defend_heal", detail, -healed)
+                elif op == "shield":
+                    barrier = max(0, round(shields[source_key] - before_barrier))
+                    shield_round(
+                        number, source_key, target_key, "defend_barrier",
+                        f"«{name}» создаёт барьер на {barrier} HP. Барьер — не лечение.",
+                        barrier,
+                    )
+                elif op == "reflect_next":
+                    value = round(max(0.0, float(effect.get("value", 0))) * 100)
+                    shield_round(number, source_key, target_key, "defend_reflect",
+                                 f"«{name}» отразит {value}% урона следующей прямой атаки.")
+                elif op == "blind":
+                    value = round(max(0.0, float(effect.get("value", 0))) * 100)
+                    shield_round(number, source_key, target_key, "defend_blind",
+                                 f"«{name}» ослепляет {fighters[target_key].name}: следующая атака промахнётся с шансом {value}%.")
+                elif op == "weaken":
+                    value = round(max(0.0, float(effect.get("value", 0))) * 100)
+                    shield_round(number, source_key, target_key, "defend_weaken",
+                                 f"«{name}» ослабляет следующую атаку {fighters[target_key].name} на {value}%.")
+                elif op == "cleanse":
+                    shield_round(number, source_key, target_key, "defend_cleanse",
+                                 f"«{name}» снимает с {fighters[source_key].name} огонь, оглушение, ослепление и ослабления.")
+                elif op == "dodge_next":
+                    shield_round(number, source_key, target_key, "defend_dodge",
+                                 f"«{name}» позволит {fighters[source_key].name} гарантированно уклониться от следующей атаки.")
+                elif op == "damage_boost":
+                    value = round(max(0.0, float(effect.get("value", 0))) * 100)
+                    turns = max(1, int(effect.get("turns", 1)))
+                    attacks_text = "следующую атаку" if turns == 1 else f"следующие {turns} атаки"
+                    shield_round(number, source_key, target_key, "defend_damage_boost",
+                                 f"«{name}» усиливает {attacks_text} {fighters[source_key].name} на {value}%.")
+                if winner:
+                    return winner
             tick_skill_state(source_key)
             return None
 
@@ -1286,6 +1437,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 )
 
     def signature_round(attacker_key: str, defender_key: str, event: str, damage: int) -> bool:
+        shield_rows_from = len(rounds)
         if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
             impact, knocked_out, reflection_winner = apply_attack(
                 attacker_key, defender_key, damage, 0, attack_types=(PHYSICAL,),
@@ -1293,12 +1445,30 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
             impact, knocked_out, reflection_winner = damage, hp[defender_key] <= 0, None
+        # hurt() must resolve guard/parry/heal/counter before it can return the final
+        # combat state, but the readable transcript starts with the attack that caused
+        # them. Temporarily lift only shield consequences and put them immediately after
+        # the primary attack row; their captured state remains untouched.
+        shield_consequences = [
+            row for row in rounds[shield_rows_from:]
+            if row.event.startswith("shield_")
+        ]
+        if shield_consequences:
+            rounds[shield_rows_from:] = [
+                row for row in rounds[shield_rows_from:]
+                if not row.event.startswith("shield_")
+            ]
+        shield_consequences, primary_attacker_hp, primary_defender_hp = \
+            display_shield_consequences(
+                shield_consequences, attacker_key, defender_key,
+            )
         total_damage[attacker_key] += impact
         rounds.append(Round(
             number=0, attacker=attacker_key, event=event, damage=damage,
-            attacker_hp=round(hp[attacker_key]), defender_hp=round(hp[defender_key]),
+            attacker_hp=primary_attacker_hp, defender_hp=primary_defender_hp,
             text=pets_flavor.line(event, fighters[attacker_key].name, fighters[defender_key].name, damage, rng=rng),
         ))
+        rounds.extend(shield_consequences)
         return knocked_out or reflection_winner is not None
 
     for attacker_key, defender_key in ((a.key, b.key), (b.key, a.key)):
@@ -1346,7 +1516,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             used[attacker_key].add("cocoon")
             cocooned[attacker_key] = True
             attacks_made[attacker_key] += 1
-            effect_round(round_number, attacker_key, defender_key, "cocoon")
+            effect_round(round_number, attacker_key, defender_key, "cocoon", is_action=True)
             tick_skill_state(attacker_key)
             return None
         if effectful and (burn := burning[attacker_key]) is not None:
@@ -1359,13 +1529,26 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 allow_shield_reactions=False,
             )
             total_damage[source_key] += burn_impact
-            effect_round(
-                round_number, source_key, attacker_key, "burn", burn_impact,
-                burn_attack_types,
-            )
+            shield_source = burning_shield[attacker_key]
+            if shield_source:
+                shield_round(
+                    round_number, source_key, attacker_key, "burn_tick",
+                    f"огонь от щита «{shield_source}» наносит "
+                    f"{fighters[attacker_key].name} {burn_impact} урона перед ходом. "
+                    + (f"Ход {fighters[attacker_key].name} продолжается."
+                       if not burn_ko else f"{fighters[attacker_key].name} повержен огнём."),
+                    burn_impact, burn_attack_types,
+                )
+            else:
+                effect_round(
+                    round_number, source_key, attacker_key, "burn", burn_impact,
+                    burn_attack_types,
+                )
             burning[attacker_key] = (
                 source_key, turns - 1, burn_damage, burn_attack_types
             ) if turns > 1 else None
+            if turns <= 1:
+                burning_shield[attacker_key] = None
             if reflection_winner:
                 return reflection_winner
             if burn_ko:
@@ -1599,6 +1782,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             )))
             armor_shredded[defender_key] = max(armor_shredded[defender_key], shred)
 
+        shield_rows_from = len(rounds)
         if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
             impact, knocked_out, reflection_winner = apply_attack(
                 attacker_key, defender_key, damage, round_number,
@@ -1607,6 +1791,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
             impact, knocked_out, reflection_winner = damage, hp[defender_key] <= 0, None
+        shield_consequences = [
+            row for row in rounds[shield_rows_from:]
+            if row.event.startswith("shield_")
+        ]
+        if shield_consequences:
+            rounds[shield_rows_from:] = [
+                row for row in rounds[shield_rows_from:]
+                if not row.event.startswith("shield_")
+            ]
+        shield_consequences, primary_attacker_hp, primary_defender_hp = \
+            display_shield_consequences(
+                shield_consequences, attacker_key, defender_key,
+            )
         total_damage[attacker_key] += impact
         text = pets_flavor.line(event, attacker.name, defender.name, damage, rng=rng)
         attacks_made[attacker_key] += 1
@@ -1617,11 +1814,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attacker=attacker_key,
             event=event,
             damage=damage,
-            attacker_hp=round(hp[attacker_key]),
-            defender_hp=round(hp[defender_key]),
+            attacker_hp=primary_attacker_hp,
+            defender_hp=primary_defender_hp,
             text=text,
             attack_types=(PHYSICAL,),
         ))
+        rounds.extend(shield_consequences)
         if reflection_winner:
             return reflection_winner
         if impact and not knocked_out:
@@ -1670,6 +1868,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 burning[defender_key] = (
                     attacker_key, turns, burn_damage, (ELEMENTAL, MAGIC),
                 )
+                burning_shield[defender_key] = None
             if (value := _effect_value(effects[attacker_key], "venom_blade")) is not None \
                     and not knocked_out:
                 venom_damage = scaled_flat_damage(attacker_key, _param(

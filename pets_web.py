@@ -1758,7 +1758,8 @@ def _playback_payload(
         "rounds": [
             {"number": r.number, "attacker": r.attacker, "event": r.event, "damage": r.damage,
              "attacker_hp": r.attacker_hp, "defender_hp": r.defender_hp, "text": r.text,
-             "attack_types": list(r.attack_types), "state": r.state}
+             "attack_types": list(r.attack_types), "state": r.state,
+             "is_action": bool(getattr(r, "is_action", True))}
             for r in result.rounds
         ],
     }
@@ -2861,7 +2862,7 @@ input{flex:1;min-width:240px}button{cursor:pointer;background:#2677bd}.muted{col
 .row{cursor:pointer;display:flex;justify-content:space-between;gap:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-wrap:wrap;gap:6px}.tag{background:#26384a;border-radius:20px;padding:5px 9px}
 .audit-item{background:#121c27;border:1px solid var(--line);border-radius:10px;padding:10px;margin:7px 0}.audit-item img{width:54px;height:54px;object-fit:cover;border-radius:8px;float:left;margin:0 9px 6px 0}.audit-item h4{margin:0 0 5px}.audit-item p{margin:5px 0}.mechanics{color:#bed2e6;font:12px ui-monospace,monospace}.effect-line{border-left:3px solid var(--blue);padding-left:8px}
-.moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+.moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.move.effect{margin-left:24px;border-left:3px solid var(--blue)}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
 @media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
 </style></head><body><main>
@@ -2881,13 +2882,13 @@ function auditItem(i){const e=i.effect||{};return `<div class="audit-item">${i.a
 function auditScroll(s){if(!s)return"";return `<div class="audit-item">${s.art?`<img src="${esc(s.art)}" alt="">`:""}<h4>${esc(s.icon||"📜")} ${esc(s.name)} <span class="muted">${esc(s.code)}</span></h4>${s.personal_paint?`<p>🎨 Personal paint · useful power ×${esc(s.personal_power_multiplier||1.3)}; chance and duration unchanged</p>`:""}${s.description?`<p>${esc(s.description)}</p>`:""}${(s.effects_text||[]).map(x=>`<p class="effect-line">${esc(x)}</p>`).join("")}${mechanics({element:s.element,uses:s.uses,dodgeable:s.dodgeable,ultimate:s.ultimate})}${(s.effects||[]).map(e=>mechanics(e)).join("")}</div>`}
 function auditEffect(e){if(typeof e==="string")return `<div class="audit-item">${esc(e)}</div>`;return `<div class="audit-item">${e.text?`<p class="effect-line">${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
 function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[],scrolls=s.scrolls||[],effects=f.effects||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>⭐ ${esc(f.level)} · ⚔️ ${esc(f.strength)} · ❤️ ${esc(f.health)} · 💨 ${esc(f.agility)} · 🍀 ${esc(f.luck)} · 🛡️ ${esc(f.armor)}</div><div class="muted">Derived: ❤️ ${esc(Math.round(d.max_hp||0))}, ⚔️ ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%, reduction ${esc(((d.reduction||0)*100).toFixed(1))}%</div><h4>Items and exact effects</h4>${items.length?items.map(auditItem).join(""):"<span class=muted>None recorded</span>"}<h4>Scrolls</h4>${scrolls.filter(Boolean).length?scrolls.map(auditScroll).join(""):"<span class=muted>None</span>"}<h4>Combat effect snapshot</h4>${effects.length?effects.map(auditEffect).join(""):"<span class=muted>None</span>"}<h4>Shield</h4>${s.shield?auditEffect(s.shield):"<span class=muted>None</span>"}<details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
-function renderFight(f){const fighters=Object.entries(f.fighters||{});out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Moves (${(f.moves||[]).length})</h2><div class="moves">${(f.moves||[]).map(m=>`<details class="move"><summary><b>#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
+function renderFight(f){const fighters=Object.entries(f.fighters||{}),moves=f.moves||[],actions=moves.filter(m=>m.is_action!==false).length;out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Actions (${actions}) · transcript events (${moves.length})</h2><div class="moves">${moves.map(m=>`<details class="move ${m.is_action===false?"effect":""}"><summary><b>${m.is_action===false?"EFFECT":"ACTION"} · #${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
 async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){auditFailure(e)}}
 let auditPets=[],selectedPet="";const petSearch=document.getElementById("petSearch"),petSuggestions=document.getElementById("petSuggestions");
 function petLabel(p){return `${p.name||p.user_id}${p.owner_name?" / "+p.owner_name:""}${p.owner_username?" / @"+p.owner_username:""} / ${p.user_id} / ${p.fights} fights`}
 function matchingPets(){const wanted=petSearch.value.trim().toLowerCase();return auditPets.filter(p=>!wanted||petLabel(p).toLowerCase().includes(wanted)).slice(0,30)}
 function showPetSuggestions(){const rows=matchingPets();petSuggestions.innerHTML=rows.length?rows.map(p=>`<button type="button" data-pet="${esc(p.user_id)}"><b>${esc(p.name||p.user_id)}</b>${p.owner_name?" · "+esc(p.owner_name):""}${p.owner_username?" · @"+esc(p.owner_username):""}<br><span class="muted">ID ${esc(p.user_id)} · ${esc(p.fights)} fights</span></button>`).join(""):'<div class="muted" style="padding:10px">No matching pets</div>';petSuggestions.hidden=false}
-async function recent(chosen=selectedPet){try{const d=await api("",chosen);auditPets=d.pets||auditPets;selectedPet=d.selected_pet||chosen;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));status.textContent=`${d.fights.length} recent fights${picked?" for "+picked.name:""}`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} moves<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){auditFailure(e)}}
+async function recent(chosen=selectedPet){try{const d=await api("",chosen);auditPets=d.pets||auditPets;selectedPet=d.selected_pet||chosen;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));status.textContent=`${d.fights.length} recent fights${picked?" for "+picked.name:""}`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} actions${f.events!==undefined?" · "+esc(f.events)+" events":""}<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){auditFailure(e)}}
 petSuggestions.onclick=e=>{const button=e.target.closest("[data-pet]");if(!button)return;selectedPet=button.dataset.pet;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));petSearch.value=picked?petLabel(picked):selectedPet;petSuggestions.hidden=true;recent(selectedPet)};
 const query=document.getElementById("query");document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=()=>recent();document.getElementById("allPets").onclick=()=>{selectedPet="";petSearch.value="";petSuggestions.hidden=true;recent("")};query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};petSearch.oninput=()=>{selectedPet="";showPetSuggestions()};petSearch.onfocus=showPetSuggestions;petSearch.onkeydown=e=>{if(e.key==="Enter"){const first=matchingPets()[0];if(first){selectedPet=String(first.user_id);petSearch.value=petLabel(first);petSuggestions.hidden=true;recent(selectedPet)}}};document.addEventListener("click",e=>{if(!e.target.closest(".pet-filter"))petSuggestions.hidden=true});recent("");
 </script></body></html>"""
@@ -3842,6 +3843,7 @@ PAGE_HTML = """<!doctype html>
   .duel .blow.dodge { border-left-color: var(--muted); opacity: .8; }
   .duel .blow.mine { border-left-color: var(--accent); }
   .duel .blow.amulet { border-left-color: var(--r-legendary); }
+  .duel .blow.shield-effect { border-left-color: #62aef0; margin-left: 18px; opacity: .9; }
   .duel .blow.skill { border-left-color: var(--r-rare); }
   .duel .blow.defend { border-left-color: #4c82b8; }
   /* The flavour text is prose with three things buried in it -- who acted, who was hit,
@@ -6520,6 +6522,12 @@ const UTILITY_PROCS = ["gambler", "candle", "armor_shred"];
 
 function amountTone(round) {
   const event = String(round.event || "");
+  if (event.indexOf("shield_") === 0) {
+    if (event === "shield_damage_heal" || event === "shield_defend_heal") return "heal";
+    if (["shield_guard", "shield_parry_stun", "shield_defend_barrier"].indexOf(event) >= 0) return "soak";
+    if (["shield_counterattack", "shield_burn_tick"].indexOf(event) >= 0) return "harm";
+    return "";
+  }
   if (event.indexOf("amulet_") !== 0) return "harm";
   const code = event.slice(7);
   if (HEAL_PROCS.indexOf(code) >= 0) return "heal";
@@ -6770,15 +6778,18 @@ function playDuel(data) {
     $("hpMine").textContent = mineHp;
     $("hpTheirs").textContent = theirsHp;
     const eventName = String(round.event || "");
-    const kind = eventName.indexOf("amulet_") === 0 ? "amulet"
+    const kind = eventName.indexOf("shield_") === 0 ? "shield-effect"
+      : (eventName.indexOf("amulet_") === 0 ? "amulet"
       : (eventName === "dodge" || eventName === "skill_dodge" ? "dodge"
       : (eventName === "defend" ? "defend"
       : (eventName.indexOf("skill_") === 0 ? "skill"
-      : (eventName.indexOf("crit") >= 0 ? "crit" : (mineTurn ? "mine" : "")))));
+      : (eventName.indexOf("crit") >= 0 ? "crit" : (mineTurn ? "mine" : ""))))));
     $("duelLog").insertAdjacentHTML("beforeend",
       '<div class="blow ' + kind + '">' + paintBlow(round, mineName, theirName) + "</div>");
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
-    setTimeout(step, 520);
+    // Passive consequences stay visually attached to the action that caused them.
+    // They are quick transcript details, never an implied extra combat turn.
+    setTimeout(step, round.is_action === false ? 160 : 520);
   };
   $("duelDone").onclick = () => {
     // Skipping fast-forwards the animation, not the formatting: the lines it dumps are

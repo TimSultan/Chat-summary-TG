@@ -349,7 +349,7 @@ class SimulateTests(unittest.TestCase):
                 armor=8, level=8, skills=scrolls.SAMPLE_LOADOUT, shield=shield,
             )
 
-        acting = {"defend", "hit", "crit", "blocked", "low_damage", "dodge", "amulet_guard"}
+        acting = {"defend", "hit", "crit", "blocked", "low_damage", "dodge", "shield_guard"}
         # Once bare and once with a shield that heals on Defend -- the case where a
         # second Defend still did something, and so the tempting one to leave alone.
         for shield in (None, scrolls.shield("shield_lantern")):
@@ -476,9 +476,71 @@ class SimulateTests(unittest.TestCase):
 
         burn = [
             row for row in result.rounds
-            if row.event == "amulet_burn" and row.attacker == shielded.key
+            if row.event == "shield_burn_tick" and row.attacker == shielded.key
         ]
         self.assertEqual([row.damage for row in burn], [expected_tick, expected_tick])
+        for row in burn:
+            self.assertFalse(row.is_action)
+            self.assertIn("Ход Target продолжается", row.text)
+            self.assertTrue(any(
+                action.number == row.number
+                and action.attacker == target.key
+                and action.is_action
+                for action in result.rounds
+            ))
+
+    def test_all_shields_explain_defend_and_passive_hooks_without_extra_actions(self):
+        import pets_scroll_catalog as scrolls
+
+        class DefendWhenPossible:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "defend" if "defend" in values else values[0]
+
+        event_for_op = {
+            "shield": "shield_defend_barrier",
+            "reflect_next": "shield_defend_reflect",
+            "blind": "shield_defend_blind",
+            "weaken": "shield_defend_weaken",
+            "cleanse": "shield_defend_cleanse",
+            "heal": "shield_defend_heal",
+            "dodge_next": "shield_defend_dodge",
+            "damage_boost": "shield_defend_damage_boost",
+            "burn": "shield_defend_burn",
+        }
+        target = Fighter(
+            key="target", name="Target", strength=5, health=300,
+            agility=5, luck=1, armor=0,
+        )
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 1)):
+            for shield in scrolls.SHIELDS:
+                with self.subTest(shield=shield["code"]):
+                    owner = Fighter(
+                        key="owner", name="Owner", strength=5, health=300,
+                        agility=5, luck=1, armor=0, starting_hp=200,
+                        shield=shield,
+                    )
+                    result = combat.simulate(
+                        owner, target, rng=DefendWhenPossible(), max_actions=2,
+                    )
+                    defend = next(
+                        row for row in result.rounds
+                        if row.attacker == owner.key and row.event == "defend"
+                    )
+                    self.assertTrue(defend.is_action)
+                    self.assertIn(shield["name"], defend.text)
+                    self.assertIn("Это не лечение", defend.text)
+                    for effect in shield.get("defend_effects", ()):
+                        event = event_for_op[effect["op"]]
+                        detail = next(row for row in result.rounds if row.event == event)
+                        self.assertFalse(detail.is_action)
+                        self.assertIn(shield["name"], detail.text)
 
     def test_reactive_shields_work_against_dungeon_bosses_without_recursing(self):
         """The new hooks are worn-shield reactions, not scroll-only PvP effects.
@@ -518,7 +580,7 @@ class SimulateTests(unittest.TestCase):
             boss, hero = fighters(scrolls.shield("shield_royal_riposte"))
             parry = combat.simulate(boss, hero, rng=OpeningRng(), max_actions=2)
             self.assertTrue(any(
-                row.event == "amulet_shield_parry_stun" and row.attacker == hero.key
+                row.event == "shield_parry_stun" and row.attacker == hero.key
                 for row in parry.rounds
             ))
             self.assertTrue(any(
@@ -528,16 +590,77 @@ class SimulateTests(unittest.TestCase):
 
             boss, hero = fighters(scrolls.shield("shield_crimson_reliquary"))
             healing = combat.simulate(boss, hero, rng=OpeningRng(), max_actions=1)
-            heal = next(row for row in healing.rounds if row.event == "amulet_shield_damage_heal")
+            heal = next(row for row in healing.rounds if row.event == "shield_damage_heal")
+            primary = next(row for row in healing.rounds if row.event == "hit")
             self.assertEqual(heal.attacker, hero.key)
-            self.assertEqual(heal.damage, 50)
+            self.assertEqual(heal.damage, -50)
+            self.assertFalse(heal.is_action)
+            self.assertEqual(heal.attacker_hp, primary.defender_hp + 50)
+            self.assertEqual(
+                heal.state["fighters"][hero.key]["hp"], heal.attacker_hp,
+            )
+            self.assertIn("фактически", (scrolls.effect_lines(
+                scrolls.shield("shield_crimson_reliquary")
+            )[0]))
 
             boss, hero = fighters(scrolls.shield("shield_judgement"))
             counter = combat.simulate(boss, hero, rng=OpeningRng(), max_actions=2)
-            counters = [row for row in counter.rounds if row.event == "amulet_shield_counterattack"]
+            counters = [row for row in counter.rounds if row.event == "shield_counterattack"]
             self.assertEqual(len(counters), 1)
             self.assertEqual(counters[0].attacker, hero.key)
             self.assertGreater(counters[0].damage, 0)
+            self.assertFalse(counters[0].is_action)
+            self.assertIn("не расходует отдельный ход", counters[0].text)
+
+    def test_every_reactive_shield_hook_is_secondary_and_clearly_logged(self):
+        import pets_scroll_catalog as scrolls
+
+        class ProcFirstHit:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return values[0]
+
+        event_for_op = {
+            "parry_stun": "shield_parry_stun",
+            "damage_heal": "shield_damage_heal",
+            "counterattack": "shield_counterattack",
+        }
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 100)):
+            for shield in scrolls.SHIELDS:
+                for effect in shield.get("on_hit_effects", ()):
+                    with self.subTest(shield=shield["code"], op=effect["op"]):
+                        attacker = Fighter(
+                            key="attacker", name="Attacker", strength=20, health=300,
+                            agility=10, luck=1, armor=0,
+                        )
+                        wearer = Fighter(
+                            key="wearer", name="Wearer", strength=20, health=300,
+                            agility=10, luck=1, armor=0, starting_hp=200,
+                            shield=shield,
+                        )
+                        result = combat.simulate(
+                            attacker, wearer, rng=ProcFirstHit(), max_actions=1,
+                        )
+                        primary = next(row for row in result.rounds if row.event == "hit")
+                        reaction = next(
+                            row for row in result.rounds
+                            if row.event == event_for_op[effect["op"]]
+                        )
+                        self.assertGreater(result.rounds.index(reaction), result.rounds.index(primary))
+                        self.assertFalse(reaction.is_action)
+                        self.assertIn(shield["name"], reaction.text)
+                        if effect["op"] == "parry_stun":
+                            self.assertIn("пропустит следующий ход", reaction.text)
+                        elif effect["op"] == "damage_heal":
+                            self.assertIn("итоговая потеря", reaction.text)
+                        else:
+                            self.assertIn("не расходует отдельный ход", reaction.text)
 
     def test_stun_skips_a_dungeon_boss_before_items_or_actions_can_trigger(self):
         """A boss uses the same status rules as a pet. In particular, stun resolves

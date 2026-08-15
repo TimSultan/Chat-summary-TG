@@ -4202,6 +4202,7 @@ def _fight_audit_row(
             "event": row.event, "damage": row.damage, "attacker_hp": row.attacker_hp,
             "defender_hp": row.defender_hp, "attack_types": list(row.attack_types),
             "text": row.text, "state": row.state,
+            "is_action": bool(getattr(row, "is_action", True)),
         } for index, row in enumerate(getattr(result, "rounds", ()), 1)],
     }
 
@@ -4216,7 +4217,11 @@ def _store_fight_audit(entry: str, data: dict, row: dict) -> None:
         "winner": row.get("winner"), "draw": row.get("draw"),
         "fighters": [{"key": key, "name": (side.get("fighter") or {}).get("name")}
                      for key, side in (row.get("fighters") or {}).items()],
-        "moves": len(row.get("moves") or ()),
+        "moves": sum(
+            1 for move in (row.get("moves") or ())
+            if bool((move or {}).get("is_action", True))
+        ),
+        "events": len(row.get("moves") or ()),
     }
     summaries = data.setdefault("fight_audits", [])
     summaries.append(summary)
