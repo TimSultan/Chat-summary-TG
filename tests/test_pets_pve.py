@@ -434,6 +434,30 @@ class RubyWalletTests(PetsTestCase):
         # Unchanged by the loss, even though the same forced-low roll would have hit.
         self.assertEqual(pets.ruby_balance(entry, "1"), win["rubies"])
 
+    def test_an_easy_win_never_pays_a_ruby_but_medium_and_hard_can(self):
+        """Rubies track risk: an easy mob is no risk at all, so TIER_RUBY_CHANCE zeroes it
+        out entirely rather than just making it rare -- a forced-guaranteed roll must still
+        come back empty-handed."""
+        entry = "chat"
+        self._tame(entry, "1")
+        now = datetime(2026, 8, 9, 9, 0)
+        self.assertEqual(pets_mobs.TIER_RUBY_CHANCE["easy"], 0.0)
+
+        easy_block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "easy", rng=random.Random(1))
+        with patch("random.random", return_value=0.0):
+            easy_win = pets.record_mob_fight(
+                entry, "1", easy_block, SimpleNamespace(winner="1", is_draw=False), now=now,
+            )
+        self.assertEqual(easy_win["rubies"], 0)
+
+        for tier in ("medium", "hard"):
+            block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, tier, rng=random.Random(1))
+            with patch("random.random", return_value=0.0):
+                win = pets.record_mob_fight(
+                    entry, "1", block, SimpleNamespace(winner="1", is_draw=False), now=now,
+                )
+            self.assertGreaterEqual(win["rubies"], pets_config.PVE_RUBY_MIN, tier)
+
     def test_a_farm_shift_can_drop_a_ruby_seeded_on_the_run_id_exactly_once(self):
         """Seeded on the run id (like the rest of the payout) rather than rolled fresh,
         so a settlement that runs twice for the same finished shift cannot mint rubies

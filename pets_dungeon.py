@@ -11,7 +11,10 @@ from typing import Final
 
 
 MIN_POWER: Final = 1_000
-ENTRY_RUBY_COST: Final = 5
+# Raised from 5 alongside the PVE ruby rework (see TIER_RUBY_CHANCE in pets_mobs.py) so
+# five entries a day -- 50 rubies -- is roughly what a full day of PVE and quarrying
+# actually earns, with a little left over.
+ENTRY_RUBY_COST: Final = 10
 ESCALATOR_RUBY_COST: Final = 5
 ANTIMAGIC_REFLECT_SHARE: Final = 0.85
 SHOP_PARTIAL_HEAL_COST: Final = 160

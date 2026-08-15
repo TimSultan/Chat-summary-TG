@@ -49,9 +49,13 @@ TIER_SCALING: Final = {
 # What each tier pays, as a multiplier on the halved arena purse. A hard mob is worth
 # picking precisely because it is likely to beat you.
 TIER_REWARD: Final = {"easy": 0.75, "medium": 1.0, "hard": 1.6}
-# Rubies only ever come off a mob (and rarely off the farm). The chance rises steeply with
-# tier so the currency tracks risk rather than time spent.
-TIER_RUBY_CHANCE: Final = {"easy": 0.10, "medium": 0.20, "hard": 0.38}
+# Rubies only ever come off a mob (and rarely off the farm). An easy mob never pays one --
+# rubies track risk, and there is no risk in an easy fight -- medium pays occasionally and
+# hard a bit more often than that. Tuned against simulated win rates (not just the raw
+# chance below, since win rate drops sharply from easy to hard) so a full day's 30 PVE
+# attacks plus two 8-hour quarry runs land around 55 rubies total -- enough for five
+# 10-ruby dungeon entries with a little left over.
+TIER_RUBY_CHANCE: Final = {"easy": 0.0, "medium": 0.33, "hard": 0.43}
 
 
 @dataclass(frozen=True, slots=True)

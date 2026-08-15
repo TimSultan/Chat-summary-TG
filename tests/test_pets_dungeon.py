@@ -141,7 +141,12 @@ class DungeonTests(unittest.TestCase):
         pets._save(self.entry, data)
         self.assertTrue(pets.equip(self.entry, self.user_id, "w001")[0])
 
-    def test_dungeon_requires_five_rubies_to_enter(self):
+    def test_dungeon_requires_ten_rubies_to_enter(self):
+        # Pinned literally, not just against dungeon.ENTRY_RUBY_COST: this number is a
+        # balance decision (five 10-ruby entries a day should roughly match a day's PVE +
+        # quarry income, see pets_mobs.TIER_RUBY_CHANCE), so an accidental edit to the
+        # constant should fail a test, not just silently retune the economy.
+        self.assertEqual(dungeon.ENTRY_RUBY_COST, 10)
         data = pets._load(self.entry)
         data["pets"][self.user_id]["stats"] = {
             "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
