@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pets_config as C
 import pets_combat as combat
+import pets_scroll_catalog as SCROLLS
 from pets_amulet_catalog import AMULET_SPECS
 from pets_gear_catalog import GEAR_SPECS
 from pets_weapon_catalog import WEAPON_SPECS
@@ -1244,7 +1245,7 @@ class AttackTypeTests(unittest.TestCase):
         self.assertEqual(reflected.damage, round(spell.damage * .85))
         self.assertEqual(reflected.attack_types, (combat.MAGIC,))
 
-    def test_antimage_reflects_an_enchanted_physical_weapon(self):
+    def test_antimage_reflects_an_enchanted_weapon_that_is_now_half_magic(self):
         attacker = Fighter(
             key="rune-user", name="Rune user", strength=40, health=200, agility=1, luck=1,
             armor=0, starting_hp=1_000, weapon_enchanted=True,
@@ -1258,8 +1259,96 @@ class AttackTypeTests(unittest.TestCase):
 
         hit = next(round_ for round_ in result.rounds if round_.attacker == "rune-user" and round_.damage)
         reflected = next(round_ for round_ in result.rounds if round_.event == "antimagic_reflect")
-        self.assertEqual(hit.attack_types, (combat.PHYSICAL,))
+        # A rune no longer merely marks the blow as "enchanted" for the Antimage's benefit:
+        # half of it genuinely is magic now, and the transcript says so.
+        self.assertEqual(hit.attack_types, (combat.PHYSICAL, combat.MAGIC))
         self.assertEqual(reflected.damage, round(hit.damage * .85))
+
+
+class BurnStackingTests(unittest.TestCase):
+    """Two fires on one body are one fire that hurts more."""
+
+    def _fight(self, *, skills=(None, None, None, None), actions=12):
+        passive = {"code": "burn", "value": 30, "turns": 2, "level_scaled": False}
+        attacker = Fighter(
+            key="a", name="A", strength=40, health=900, agility=20, luck=20, armor=0,
+            effects=(passive,), level=10, skills=skills,
+        )
+        defender = Fighter(
+            key="b", name="B", strength=10, health=900, agility=20, luck=20, armor=0,
+            level=10,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(attacker, defender, seed=3, max_actions=actions)
+        return result
+
+    def test_a_passive_that_retriggers_every_hit_refreshes_instead_of_stacking(self):
+        """Otherwise a ten-hit fight ends with a burn ten times its printed value."""
+        ticks = [row.damage for row in self._fight().rounds if row.event == "amulet_burn"]
+        self.assertGreater(len(ticks), 4)
+        self.assertEqual(set(ticks), {30})
+
+    def test_a_second_source_of_fire_adds_to_the_first_and_expires_on_its_own(self):
+        burner = next(
+            row for row in SCROLLS.SCROLLS
+            if not row["ultimate"] and any(e.get("op") == "burn" for e in row.get("effects", ()))
+        )
+        result = self._fight(skills=(burner["code"], None, None, None))
+        ticks = [row.damage for row in result.rounds if row.event == "amulet_burn"]
+        cast = next(row for row in result.rounds if row.event == f"skill_{burner['code']}")
+
+        combined = [value for value in ticks if value > 30]
+        self.assertTrue(combined, "the scroll's flame must add to the passive one")
+        # Both fires burn at once...
+        self.assertTrue(all(value > 30 for value in combined))
+        # ...and the scroll's component times out on its own schedule, leaving the
+        # passive still ticking at its own value rather than taking it down with it.
+        self.assertEqual(ticks[-1], 30)
+        self.assertLess(cast.number, result.rounds[-1].number)
+
+
+class EnchantedWeaponTests(unittest.TestCase):
+    """A rune is worth 10% more swing, and half of that swing stops being steel."""
+
+    def _hit(self, *, enchanted, physical_taken=1.0):
+        attacker = Fighter(
+            key="a", name="A", strength=40, health=200, agility=20, luck=20, armor=0,
+            level=10, weapon_enchanted=enchanted,
+        )
+        defender = Fighter(
+            key="b", name="B", strength=10, health=200, agility=20, luck=20, armor=0,
+            level=10, physical_damage_taken_multiplier=physical_taken,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 100)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(attacker, defender, seed=1, max_actions=1)
+        return next(row for row in result.rounds if row.attacker == "a" and row.is_action)
+
+    def test_a_rune_adds_ten_percent_and_tags_the_blow_as_magic_too(self):
+        plain = self._hit(enchanted=False)
+        runed = self._hit(enchanted=True)
+        self.assertEqual(plain.attack_types, (combat.PHYSICAL,))
+        self.assertEqual(runed.attack_types, (combat.PHYSICAL, combat.MAGIC))
+        self.assertEqual(runed.damage, round(plain.damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
+
+    def test_half_the_swing_still_lands_on_something_immune_to_physical_damage(self):
+        """The dungeon's spells_only boss takes no steel at all. A rune is the answer."""
+        self.assertEqual(self._hit(enchanted=False, physical_taken=0.0).damage, 0)
+        runed = self._hit(enchanted=True, physical_taken=0.0)
+        full = self._hit(enchanted=True).damage
+        self.assertEqual(runed.damage, round(full * C.RUNE_WEAPON_MAGIC_SHARE))
+
+    def test_a_rune_alone_is_enough_to_switch_on_the_modifier_pipeline(self):
+        """`effectful` gates the whole damage-modifier block.
+
+        A creature whose only special thing is a runed weapon has no item effects, no
+        scrolls and no shield, so leaving weapon_enchanted out of that flag silently threw
+        the entire enchantment away for exactly the players it was sold to.
+        """
+        self.assertGreater(
+            self._hit(enchanted=True).damage, self._hit(enchanted=False).damage,
+        )
 
 
 if __name__ == "__main__":

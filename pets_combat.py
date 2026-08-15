@@ -657,6 +657,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     ) or any(
         fighter.magic_reflect_multiplier or fighter.enchant_reflect_multiplier
         for fighter in (a, b)
+    ) or any(fighter.weapon_enchanted for fighter in (a, b)) or any(
+        fighter.physical_damage_taken_multiplier != 1.0 for fighter in (a, b)
     )
     shields = {a.key: 0.0, b.key: 0.0}
     used = {a.key: set() for a in (a, b)}
@@ -685,6 +687,73 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     # A shield burn needs different wording from a scroll/weapon burn even though the
     # damage lifecycle is identical. Kept outside the tuple for snapshot compatibility.
     burning_shield = {a.key: None, b.key: None}
+
+    # One live component per source of flame: {origin: [source, turns_left, damage, types]}.
+    # `burning` above stays the single combined view the tick and the transcript read, so
+    # nothing downstream (or in a stored snapshot) has to learn a new shape.
+    burn_stacks: dict[str, dict[str, list]] = {a.key: {}, b.key: {}}
+    burn_source = {a.key: None, b.key: None}
+
+    def sync_burn(target_key: str) -> None:
+        rows = burn_stacks[target_key]
+        if not rows:
+            burning[target_key] = None
+            burning_shield[target_key] = None
+            return
+        types: list[str] = []
+        for row in rows.values():
+            types.extend(row[3])
+        burning[target_key] = (
+            burn_source[target_key] or next(iter(rows.values()))[0],
+            max(row[1] for row in rows.values()),
+            sum(row[2] for row in rows.values()),
+            normalize_attack_types(types),
+        )
+
+    def ignite(
+        target_key: str, source_key: str, damage: int, turns: int, attack_types,
+        origin: str,
+    ) -> None:
+        """Lay a burn on somebody who may already be burning.
+
+        Fire from DIFFERENT sources combines: a weapon rune, a scroll and a shield burning
+        the same target are three flames on one body, and the tick is their sum. A plain
+        assignment here used to throw the previous one away, so lighting a second fire
+        could actively reduce the damage already ticking.
+
+        The SAME source flaring up again does not stack -- it refreshes. `origin` is what
+        separates the two cases, and it matters most for a passive that re-triggers on
+        every landed hit: without it a ten-hit fight would end with a burn ten times its
+        printed value. Each component keeps its own countdown and expires on its own
+        schedule, so the newest flame always gets its full duration and a long burn is
+        never cut short by a short one landing on top of it.
+        """
+        damage, turns = max(1, round(damage)), max(1, int(turns))
+        row = burn_stacks[target_key].get(origin)
+        if row is None:
+            burn_stacks[target_key][origin] = [
+                source_key, turns, damage, normalize_attack_types(attack_types),
+            ]
+        else:
+            row[0] = source_key
+            row[1] = max(row[1], turns)   # refresh, never shorten what is already burning
+            row[2] = damage
+            row[3] = normalize_attack_types(attack_types)
+        burn_source[target_key] = source_key
+        sync_burn(target_key)
+
+    def tick_burn(target_key: str) -> None:
+        """Age every component by one turn and drop the ones that have burned out."""
+        rows = burn_stacks[target_key]
+        for origin in list(rows):
+            rows[origin][1] -= 1
+            if rows[origin][1] <= 0:
+                del rows[origin]
+        sync_burn(target_key)
+
+    def douse(target_key: str) -> None:
+        burn_stacks[target_key].clear()
+        sync_burn(target_key)
     venom_miss = {a.key: 0.0, b.key: 0.0}
     pending_venom: dict[str, tuple[str, int] | None] = {a.key: None, b.key: None}
     bleeding: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
@@ -1135,7 +1204,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
 
     def apply_scroll_effect(
         source_key: str, target_key: str, effect: Mapping, number: int,
-        attack_types=(MAGIC,),
+        attack_types=(MAGIC,), origin: str = "scroll",
     ) -> tuple[int, str | None]:
         op = str(effect.get("op") or "")
         if op == "damage":
@@ -1155,11 +1224,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 ),
             )
         elif op == "burn":
-            burning[target_key] = (
-                source_key,
-                max(1, int(effect.get("turns", 1))),
+            ignite(
+                target_key, source_key,
                 max(1, round(derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 0))))),
-                normalize_attack_types(attack_types),
+                max(1, int(effect.get("turns", 1))),
+                attack_types, origin,
             )
             # Generic scroll/weapon burns replace the attribution left by a shield.
             burning_shield[target_key] = None
@@ -1178,8 +1247,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 max(0.0, float(effect.get("value", 0))),
             )
         elif op == "cleanse":
-            burning[source_key] = None
-            burning_shield[source_key] = None
+            douse(source_key)
             stunned[source_key] = False
             for name in ("burn", "blind", "weaken", "vulnerable"):
                 skill_statuses[source_key].pop(name, None)
@@ -1280,6 +1348,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 before_barrier = shields[source_key]
                 _impact, winner = apply_scroll_effect(
                     source_key, target_key, effect, number, (MAGIC,),
+                    origin=f"shield:{name}",
                 )
                 if op == "burn":
                     burning_shield[target_key] = name
@@ -1368,6 +1437,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             for effect in spell_effects:
                 dealt, winner = apply_scroll_effect(
                     source_key, target_key, effect, number, spell_attack_types,
+                    origin=f"scroll:{code}",
                 )
                 impact += dealt
                 if winner:
@@ -1520,7 +1590,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             tick_skill_state(attacker_key)
             return None
         if effectful and (burn := burning[attacker_key]) is not None:
-            source_key, turns, burn_damage, burn_attack_types = burn
+            source_key, _turns, burn_damage, burn_attack_types = burn
             burn_impact, burn_ko, reflection_winner = apply_attack(
                 source_key, attacker_key, burn_damage, round_number,
                 attack_types=burn_attack_types,
@@ -1544,11 +1614,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     round_number, source_key, attacker_key, "burn", burn_impact,
                     burn_attack_types,
                 )
-            burning[attacker_key] = (
-                source_key, turns - 1, burn_damage, burn_attack_types
-            ) if turns > 1 else None
-            if turns <= 1:
-                burning_shield[attacker_key] = None
+            # Each component ages on its own countdown, so a short flame can burn out
+            # while a longer one laid on top of it keeps ticking.
+            tick_burn(attacker_key)
             if reflection_winner:
                 return reflection_winner
             if burn_ko:
@@ -1654,6 +1722,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             damage = round(damage * 0.3)
             event = "signature_armor"
 
+        # Set before the modifier block because a dodge skips that block entirely and the
+        # classification still has to be right for whatever reaches apply_attack below.
+        basic_attack_types = (PHYSICAL, MAGIC) if attacker.weapon_enchanted else (PHYSICAL,)
         if effectful and damage:
             # Attack-side modifiers are evaluated after dodge/crit, which keeps a dodge
             # absolute and makes the combat log's primary hit number truthful.
@@ -1767,9 +1838,24 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             damage = max(1, round(
                 damage * multiplier * fighters[attacker_key].damage_multiplier + flat_retaliation
             ))
-            damage = max(0, round(
-                damage * fighters[defender_key].physical_damage_taken_multiplier
-            ))
+            # A runed weapon is worth more and is no longer purely steel. The bonus goes on
+            # first so the half that turns magical is a half of the improved swing, and the
+            # physical resistance is then applied to the STEEL half alone -- which is the
+            # whole point: a rune is what lets a blade hurt something physical damage
+            # cannot touch at all (see the dungeon's spells_only boss).
+            if attacker.weapon_enchanted:
+                damage = max(1, round(damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
+                magic_half = round(damage * C.RUNE_WEAPON_MAGIC_SHARE)
+                steel_half = damage - magic_half
+                damage = magic_half + max(0, round(
+                    steel_half * fighters[defender_key].physical_damage_taken_multiplier
+                ))
+                basic_attack_types = (PHYSICAL, MAGIC)
+            else:
+                damage = max(0, round(
+                    damage * fighters[defender_key].physical_damage_taken_multiplier
+                ))
+                basic_attack_types = (PHYSICAL,)
 
         if effectful and damage and shield_breaker_attack:
             used[attacker_key].add("shield_breaker")
@@ -1786,7 +1872,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         if effectful or derived[defender_key]["incoming_damage_multiplier"] != 1.0:
             impact, knocked_out, reflection_winner = apply_attack(
                 attacker_key, defender_key, damage, round_number,
-                attack_types=(PHYSICAL,), enchanted=attacker.weapon_enchanted,
+                attack_types=basic_attack_types, enchanted=attacker.weapon_enchanted,
             )
         else:
             hp[defender_key] = max(0.0, hp[defender_key] - damage)
@@ -1817,7 +1903,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             attacker_hp=primary_attacker_hp,
             defender_hp=primary_defender_hp,
             text=text,
-            attack_types=(PHYSICAL,),
+            # The transcript has to agree with what actually resolved: a runed blow is
+            # tagged as magic too, and the fight log is where a player works out why a
+            # physically immune enemy still took damage.
+            attack_types=basic_attack_types,
         ))
         rounds.extend(shield_consequences)
         if reflection_winner:
@@ -1865,8 +1954,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     and not knocked_out:
                 burn_damage = scaled_flat_damage(attacker_key, value, "burn")
                 turns = max(1, round(_param(effects[attacker_key], "burn", "turns", 2)))
-                burning[defender_key] = (
-                    attacker_key, turns, burn_damage, (ELEMENTAL, MAGIC),
+                # One origin for the whole passive: it re-triggers on every landed hit, so
+                # stacking it against itself would multiply the printed value by the length
+                # of the fight. Each new hit refreshes its own flame instead.
+                ignite(
+                    defender_key, attacker_key, burn_damage, turns, (ELEMENTAL, MAGIC),
+                    origin="passive:burn",
                 )
                 burning_shield[defender_key] = None
             if (value := _effect_value(effects[attacker_key], "venom_blade")) is not None \

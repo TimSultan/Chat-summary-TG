@@ -671,6 +671,14 @@ RUNE_VAMPIRIC_BASE = 5
 RUNE_VAMPIRIC_STRENGTH_DIVISOR = 20
 RUNE_VAMPIRIC_MAX = 15
 
+# What carrying ANY elemental rune does to the weapon itself, on top of that element's own
+# effect. Half the blade's damage stops being steel, which is the point: a runed weapon
+# still bites something that shrugs off physical damage entirely, and it pays for that by
+# becoming reflectable by anything that returns magic. The flat power bump is the reason
+# to enchant a weapon you already like rather than treating a rune as a side effect.
+RUNE_WEAPON_MAGIC_SHARE = .50
+RUNE_WEAPON_POWER_BONUS = .10
+
 
 def rune_enchantment_effect(element: str, stats: dict) -> dict | None:
     """Build a combat-effect snapshot for one elemental weapon rune.
