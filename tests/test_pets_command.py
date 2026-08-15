@@ -439,7 +439,8 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn(quest["hashtag"], detail_text)
         self.assertIn(str(quest["reward"]["gold"]), detail_text)
         self.assertIn("Как выполнить", detail_text)
-        self.assertIn("Старые работы не подходят", detail_text)
+        self.assertIn("новую, ещё не опубликованную работу", detail_text)
+        self.assertNotIn("Старые работы не подходят", detail_text)
         self.assertNotIn("questreroll", str(detail_keyboard))
         self.assertIn("questreroll", str(keyboard))
 
@@ -1123,6 +1124,35 @@ class PetsCommandTests(unittest.TestCase):
             self.assertEqual(group["count"], 2)
             self.assertNotEqual(group["paths"][0], group["paths"][1])
         self.assertNotIn("send_photo_file", api.calls)
+
+    def test_dungeon_boss_log_is_sent_before_the_saved_dungeon_menu_is_redrawn(self):
+        """Boss transcripts are separate chat messages; the navigation message stays put."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["dungeon_run"] = {
+            "floor": 5, "hp": 500, "max_hp": 500, "cleared": [],
+        }
+        pets._save(CHAT, data)
+        result = SimpleNamespace(
+            opening="Кабанчик против Стального привратника.", accident=None,
+            rounds=(SimpleNamespace(text="Удар.",),), closing="Бой окончен.",
+            fight_id="F-20260815-ABCDEF123456",
+        )
+        receipt = {
+            "encounter": {"boss": True, "name": "Стальной привратник"},
+            "result": result, "reward": {"gold": 100, "xp": 50},
+        }
+        with patch.object(pets, "dungeon_fight", return_value=(True, "Победа.", receipt)):
+            api = self._tap("dungeonfight", "0")
+
+        self.assertEqual(len(api.sent), 1)
+        self.assertIn("Лог боя", api.sent[0]["text"])
+        self.assertNotIn("Fight ID", api.sent[0]["text"])
+        self.assertTrue(api.edits)
+        self.assertIn("Этаж 5", api.edits[-1]["text"])
+        self.assertNotIn("Fight ID", api.edits[-1]["text"])
+        self.assertLess(api.calls.index("send_message"), api.calls.index("edit_message_text"))
 
     def test_the_attacker_keeps_action_buttons_that_an_album_cannot_carry(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

@@ -370,9 +370,7 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 def dungeon_reward_text(receipt: dict | None) -> str:
     """Compact dungeon reward receipt for the Telegram floor redraw."""
     reward = (receipt or {}).get("reward") or {}
-    result = (receipt or {}).get("result")
-    fight_id = getattr(result, "fight_id", None)
-    if not reward and not fight_id:
+    if not reward:
         return ""
     bits = []
     if reward.get("gold"):
@@ -380,8 +378,6 @@ def dungeon_reward_text(receipt: dict | None) -> str:
     if reward.get("xp"):
         bits.append(f"✨ +{_money(int(reward['xp']))} опыта")
     lines = ["Получено: " + " · ".join(bits)] if bits else []
-    if fight_id:
-        lines.insert(0, f"<code>Fight ID: {escape(str(fight_id))}</code>")
     dropped = receipt.get("dropped") or {}
     if dropped.get("name"):
         equipped = " (надето)" if dropped.get("auto_equipped") else ""
@@ -748,7 +744,6 @@ def _legacy_quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, 
         # to be readable before the tap rather than explained by the result.
         top = difficulty >= max(catalog_difficulties())
         lines.append(
-            "\nСначала покрась что-то новое: старые работы не подходят."
             "\n⚠️ Реролл даёт квест на ступень сложнее"
             + (" — но выше пятой ступени некуда, придёт другой такой же."
                if top else " — и награда тоже вырастет.")
@@ -869,7 +864,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"\n<b>Техника:</b> {escape(card.get('technique') or '')}",
         f"\n💡 <b>Подсказка:</b> {escape(card.get('hint') or '')}",
         "\n<b>Как выполнить:</b>",
-        "1. Возьми новую, ещё не показанную работу и подготовь нужную деталь.",
+        "1. Используй новую, ещё не опубликованную работу и подготовь нужную деталь.",
         f"2. {'Нанеси технику из описания небольшими контролируемыми этапами.' if paint else 'Выполни действие полностью, не только для фотографии.'}",
         "3. Сверь результат с подсказкой и поправь самые заметные места.",
         f"4. Сделай чёткое фото: {escape(card.get('proof') or 'готового результата')}.",
@@ -884,8 +879,6 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         lines.append("\n⏳ Работа уже на проверке у модератора.")
     elif status == "done":
         lines.append("\n✅ Квест принят и завершён.")
-    else:
-        lines.append("\n⚠️ Старые работы не подходят — нужно покрасить что-то новое.")
     rows = []
     rows.append([{
         "text": "◀️ К карточкам",
@@ -2470,8 +2463,6 @@ def mob_result_text(reward: dict, report: str) -> str:
         f"👾 <b>{escape(mob.get('name') or 'Моб')}</b> · {escape(mob.get('tier_name') or '')}\n",
         report,
     ]
-    if reward.get("fight_id"):
-        lines.append(f"<code>Fight ID: {escape(str(reward['fight_id']))}</code>")
     bits = []
     if reward.get("gold"):
         bits.append(f"🪙 +{_money(int(reward['gold']))}")
@@ -2560,8 +2551,6 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
     else:
         lines.append("🏆 <b>Победа</b>" if won else "💀 <b>Поражение</b>")
     if reward:
-        if reward.get("fight_id"):
-            lines.append(f"<code>Fight ID: {escape(str(reward['fight_id']))}</code>")
         if reward.get("draw"):
             lines.append(f"✨ +{reward['xp']} опыта")
         else:

@@ -6417,6 +6417,18 @@ async def handle_pets_callback(
                 )
                 if action == "dungeonquit" and ok else pets_ui.dungeon_view(entry, user_id, xp)
             )
+            boss_result = (receipt or {}).get("result")
+            boss_encounter = (receipt or {}).get("encounter") or {}
+            if action == "dungeonfight" and boss_encounter.get("boss") and boss_result is not None:
+                # The transcript is a separate, permanent message.  Then the original
+                # menu is redrawn in place from the already-saved dungeon state, so a
+                # player can continue exactly where the boss fight left them.
+                try:
+                    await api.send_message(
+                        chat_id, pets_ui.battle_log(boss_result), parse_mode="HTML",
+                    )
+                except Exception:
+                    log("[pets] failed to send dungeon boss log:\n" + traceback.format_exc())
             await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
             return
         if action == "mob":
@@ -9209,6 +9221,10 @@ async def run_bot_listener(
                         parse_mode=None,
                     )
 
+                async def _send_web_boss_log(user_id, text: str):
+                    """Keep a Mini-App boss transcript in the player's bot chat."""
+                    await api.send_message(user_id, text, parse_mode="HTML")
+
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
                     is_member=_is_vote_member,
@@ -9221,7 +9237,9 @@ async def run_bot_listener(
                     fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
                     quest_feedback=_send_quest_feedback,
                     quest_completion=_send_web_quest_completion,
-                    birthday_notify=_send_birthday_greeting, log=log,
+                    birthday_notify=_send_birthday_greeting,
+                    boss_fight_log=_send_web_boss_log,
+                    log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token

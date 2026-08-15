@@ -63,6 +63,7 @@ import pets_updates
 import quests
 import stats
 import voting
+import pets_ui
 from pets_ui import mail_day_label, valuable_item  # rules defined once, used by both UIs
 
 ROUTE_PREFIX = "/pets"
@@ -78,6 +79,11 @@ _IS_ECONOMY_ADMIN_KEY = web.AppKey(
 )
 _BIRTHDAY_NOTIFY_KEY = web.AppKey(
     "pets_birthday_notify", Callable[[str, str, int, int], Awaitable[None]],
+)
+# A dungeon boss log is deliberately delivered to the player's Telegram chat: the Mini
+# App has no durable chat transcript of its own, while the bot conversation does.
+_BOSS_FIGHT_LOG_KEY = web.AppKey(
+    "pets_boss_fight_log", Callable[[str, str], Awaitable[None]],
 )
 _RESOLVE_KEY = web.AppKey("pets_resolve_player")
 _FETCH_PHOTO_KEY = web.AppKey("pets_fetch_photo")
@@ -1296,6 +1302,14 @@ async def handle_action(request: web.Request) -> web.Response:
       if getattr(result, "fight_id", None):
         response["message"] += f"\nFight ID: {result.fight_id}"
       if encounter.get("boss") and result is not None and hero is not None and enemy is not None:
+        # The live replay remains in this response.  The complete textual transcript is
+        # also posted to the player's bot chat, where they can return to it later.
+        try:
+          await request.app[_BOSS_FIGHT_LOG_KEY](str(user["id"]), pets_ui.battle_log(result))
+        except Exception:
+          request.app[_LOG_KEY](
+              "[pets_web] failed to deliver dungeon boss log:\n" + traceback.format_exc()
+          )
         dropped = extra.get("dropped") or {}
         dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
         response["battle"] = {
@@ -2724,6 +2738,10 @@ async def _default_birthday_notify(celebrant, greeter_name: str, gold: int, xp: 
     return None
 
 
+async def _default_boss_fight_log(user_id: str, text: str):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
@@ -2737,6 +2755,7 @@ def attach(
     quest_feedback=None,
     quest_completion=None,
     birthday_notify=None,
+    boss_fight_log=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
@@ -2751,6 +2770,8 @@ def attach(
           a Bot API client.
       save_photo(user_id, bytes) -> file_id | None   the reverse, for an upload from the
           page: hands the bytes to Telegram and reports the id it assigned.
+      boss_fight_log(user_id, text) posts a completed dungeon-boss transcript to the
+          player's Telegram chat.  It is best-effort, like other game notifications.
 
     Each has a default that simply declines, so the module stays constructible (and
     testable) without a bot -- a missing photo shows a placeholder rather than an error.
@@ -2773,6 +2794,7 @@ def attach(
     # Declines silently when absent: without a bot to send it, a greeting still pays and
     # still lands in the celebrant's stored notifications.
     app[_BIRTHDAY_NOTIFY_KEY] = birthday_notify or _default_birthday_notify
+    app[_BOSS_FIGHT_LOG_KEY] = boss_fight_log or _default_boss_fight_log
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
@@ -5743,8 +5765,7 @@ function legacyQuestCard(board, kind) {
         (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
     "</div>" +
     (board.rerolls_left && !reviewing
-      ? "<div class='warn-note'>Сначала покрась что-то новое: старые работы не подходят." +
-        "<br>⚠️ Реролл даёт квест на ступень сложнее" +
+      ? "<div class='warn-note'>⚠️ Реролл даёт квест на ступень сложнее" +
         (quest.difficulty >= 5 ? " — но выше пятой ступени уже некуда, придёт другой такой же."
                                : " — и награда тоже вырастет.") + "</div>"
       : "") +
@@ -5842,7 +5863,7 @@ function openQuestDetail(kind, code) {
   const paint = kind !== "real";
   const status = questStatus(card);
   const steps = [
-    "Возьми новую, ещё не показанную работу и подготовь нужную деталь.",
+    "Используй новую, ещё не опубликованную работу и подготовь нужную деталь.",
     paint ? "Нанеси технику небольшими контролируемыми этапами."
           : "Выполни действие полностью, не только для фотографии.",
     "Сверь результат с подсказкой и поправь самые заметные места.",
@@ -5863,7 +5884,7 @@ function openQuestDetail(kind, code) {
     '<div class="qtag ' + (card.status === "review" ? "review" : "") + '">' +
       (card.status === "done" ? "Квест принят и завершён." :
        card.status === "review" ? "Работа на проверке у модератора." :
-       "Старые работы не подходят — нужно покрасить что-то новое.") + '</div>' +
+       "Квест доступен.") + '</div>' +
     (board.auto_refresh
       ? '<div class="tiny muted">Эта группа обновляется по своему таймеру.</div>'
       : '<div class="tiny muted">Дедлайна нет — квест останется здесь.</div>'));

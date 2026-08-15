@@ -155,6 +155,33 @@ class RunePaintCatalogTests(unittest.TestCase):
         self.assertIn("кожу", rows["rune_paint_boots"].technique.lower())
         self.assertIn("потёртости", rows["rune_paint_boots"].technique.lower())
 
+    def test_specialist_paint_quests_explain_the_real_object_and_permanent_reward(self):
+        rows = {quest.code: quest for quest in catalog.RUNE_QUESTS}
+        expected_titles = {
+            "rune_paint_weapon": "Покрас оружия",
+            "rune_paint_shield": "Покрас щита",
+            "rune_paint_boots": "Покрас ботинок",
+            "rune_paint_amulet": "Покрас амулета",
+            "rune_paint_pickaxe": "Покрас кирки",
+            "rune_paint_shovel": "Покрас лопаты",
+            "rune_paint_vial": "Покрас лечебного пузырька",
+            "rune_paint_scroll": "Покрас свитка",
+        }
+        for code, title in expected_titles.items():
+            with self.subTest(code=code):
+                quest = rows[code]
+                self.assertEqual(quest.title, title)
+                self.assertIn("миниатюр", quest.subject.lower())
+                self.assertIn("постоян", f"{quest.subject} {quest.technique}")
+
+        self.assertIn("бесконечные заряды", rows["rune_paint_pickaxe"].technique)
+        self.assertIn("бесконечные заряды", rows["rune_paint_shovel"].technique)
+        for code in (
+            "rune_paint_weapon", "rune_paint_shield", "rune_paint_boots",
+            "rune_paint_amulet", "rune_paint_vial", "rune_paint_scroll",
+        ):
+            self.assertIn("уникальную картинку", rows[code].technique)
+
 
 class RerollTests(QuestsTestCase):
     def test_reroll_swaps_the_whole_group_and_unlocks_twelve_hours_later(self):

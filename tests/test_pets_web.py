@@ -181,6 +181,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 raise self.birthday_notify_raises
             self.birthday_greetings.append((str(celebrant), greeter_name, gold, xp))
 
+        self.boss_fight_logs: list[tuple[str, str]] = []
+
+        async def boss_fight_log(user_id, text):
+            self.boss_fight_logs.append((str(user_id), text))
+
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
         app = vote_web.create_app(
@@ -193,6 +198,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 quest_feedback=quest_feedback,
                 quest_completion=quest_completion,
                 birthday_notify=birthday_notify,
+                boss_fight_log=boss_fight_log,
                 log=self.logs.append,
             ),
         )
@@ -729,6 +735,36 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished.status, 200, await finished.text())
         self.assertTrue((await finished.json())["battle"]["finished"])
         self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True), before)
+
+    async def test_dungeon_boss_log_is_sent_to_telegram_without_changing_the_replay_response(self):
+        self._tame(PLAYER)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["dungeon_run"] = {
+            "floor": 5, "hp": 500, "max_hp": 500, "cleared": [],
+        }
+        pets._save(CHAT, data)
+        result = SimpleNamespace(
+            opening="Герой против босса.", accident=None,
+            rounds=(SimpleNamespace(text="Удар."),), closing="Бой окончен.",
+            fight_id="F-20260815-ABCDEF123456",
+        )
+        receipt = {
+            "encounter": {"boss": True, "name": "Стальной привратник"},
+            "result": result, "hero": object(),
+            "enemy": SimpleNamespace(key="dungeon:boss"), "reward": {},
+        }
+        with patch.object(pets, "dungeon_fight", return_value=(True, "Победа.", receipt)), \
+                patch.object(pets_web, "_playback_payload", return_value={"rounds": []}):
+            body = await self._action(PLAYER, "dungeon_fight", index=0)
+
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["battle"]["rounds"], [])
+        self.assertIn("Fight ID: F-20260815-ABCDEF123456", body["message"])
+        self.assertEqual(len(self.boss_fight_logs), 1)
+        user_id, log_text = self.boss_fight_logs[0]
+        self.assertEqual(user_id, str(PLAYER["id"]))
+        self.assertIn("Лог боя", log_text)
+        self.assertNotIn("Fight ID", log_text)
 
     async def test_automatic_and_multiplayer_placeholder_create_no_live_results(self):
         self._tame(PLAYER)
