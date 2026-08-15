@@ -2641,6 +2641,70 @@ class QuarryTests(PetsTestCase):
         self.assertEqual(pets.quarry_status("quarry", "1")["pickaxe_runs"], 1)
 
 
+class ToolMasterworkTests(PetsTestCase):
+    def test_rune_pickaxe_is_unlimited_and_scales_every_quarry_reward(self):
+        entry, uid = "masterwork-pickaxe", "1"
+        self._tame(entry, uid)
+        self.assertEqual(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_pickaxe"), "pickaxe")
+        self.assertIsNone(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_pickaxe"))
+        status = pets.quarry_status(entry, uid)
+        self.assertTrue(status["pickaxe_unlimited"])
+        self.assertEqual(status["pickaxe_efficiency"], 1.5)
+        preview = next(row for row in status["hour_previews"] if row["hours"] == 2)
+        self.assertEqual(preview["gold"], round(pets_config.QUARRY_GOLD_BY_HOURS[2] * 1.5))
+        self.assertEqual(preview["xp"], round(pets_config.QUARRY_XP_BY_HOURS[2] * 1.5))
+        self.assertEqual(preview["drop_chance"], pets_config.QUARRY_DROP_CHANCE_BY_HOURS[2] * 1.5)
+
+        start = datetime(2026, 8, 15, 10, 0)
+        with patch.object(pets, "app_now", return_value=start):
+            self.assertTrue(pets.start_quarry(entry, uid, 2)[0])
+        receipt = pets.settle_quarry(entry, uid, start + timedelta(hours=2))
+        self.assertEqual(receipt["gold"], preview["gold"])
+        self.assertEqual(receipt["xp"], preview["xp"])
+        self.assertEqual(receipt["drop_chance"], preview["drop_chance"])
+        self.assertTrue(pets.start_quarry(entry, uid, 1)[0])  # no purchased charge required
+
+    def test_shovel_consumes_one_farm_charge_then_masterwork_is_unlimited(self):
+        entry, uid = "masterwork-shovel", "1"
+        self._tame(entry, uid)
+        data = pets._load(entry)
+        data["pets"][uid]["farm_level"] = 1
+        pets._save(entry, data)
+        _text, keyboard = pets_ui.farm_view(entry, uid, 0)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertIn("shovelbuy", actions)
+        economy.grant(entry, uid, pets_config.SHOVEL_COST, "test:shovel")
+        self.assertTrue(pets.buy_shovel(entry, uid, 0)[0])
+        status = pets.farm_status(entry, uid)
+        self.assertEqual(status["shovel_runs"], pets_config.SHOVEL_RUNS)
+        self.assertEqual(status["shovel_gold_multiplier"], 1.25)
+        six = next(row for row in status["hour_previews"] if row["hours"] == 6)
+        self.assertEqual(six["gold"], round(pets_config.farm_gold_for(1, 6) * 1.25))
+        _text, keyboard = pets_ui.farm_view(entry, uid, 0)
+        actions = {
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        }
+        self.assertNotIn("shovelbuy", actions)  # bought charges are used automatically
+
+        start = datetime(2026, 8, 15, 10, 0)
+        self.assertTrue(pets.start_farm(entry, uid, 6, now=start)[0])
+        self.assertEqual(pets.farm_status(entry, uid, start)["shovel_runs"], pets_config.SHOVEL_RUNS - 1)
+        self.assertEqual(pets.farm_status(entry, uid, start)["reward"]["gold"], six["gold"])
+        pets.settle_completed_farms(entry, start + timedelta(hours=6))
+
+        self.assertEqual(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_shovel"), "shovel")
+        status = pets.farm_status(entry, uid)
+        self.assertTrue(status["shovel_upgraded"])
+        self.assertEqual(status["shovel_gold_multiplier"], 1.5)
+        before = status["shovel_runs"]
+        self.assertTrue(pets.start_farm(entry, uid, 1, now=start + timedelta(hours=7))[0])
+        self.assertEqual(pets.farm_status(entry, uid, start + timedelta(hours=7))["shovel_runs"], before)
+
+
 class FarmTests(PetsTestCase):
     def _build_farm(self, entry="farm", uid="1", level=1):
         self._tame(entry, uid)

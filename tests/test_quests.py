@@ -48,7 +48,9 @@ class QuestsTestCase(unittest.TestCase):
         """Fund and walk one member all the way to a named pet -- copied verbatim from
         tests/test_pets.py's PetsTestCase so both suites tame the same way."""
         name = name or f"Питомец{uid}"
-        economy.grant(entry, uid, pets_config.CAGE_PRICE + pets_config.TAME_PRICE, "test")
+        # The base cage and taming are free now. Funding the retired prices here leaves
+        # 100 coins in every fixture and makes payout assertions measure the fixture
+        # rather than the quest.
         ok, msg = pets.buy_cage(entry, uid, 0)
         self.assertTrue(ok, msg)
         ok, msg = pets.tame(entry, uid, 0, name, f"file{uid}", f"Owner{uid}")
@@ -133,6 +135,26 @@ class AssignmentTests(QuestsTestCase):
         self.assertEqual(len(board["quests"]), 1)
         self.assertEqual(board["available_count"], 1)
 
+    def test_rune_board_has_five_unique_cards(self):
+        board = quests.rune_quest("chat", "1", now=datetime(2026, 8, 9, 9, 0))
+        self.assertEqual(len(board["quests"]), 5)
+        self.assertEqual(len({card["code"] for card in board["quests"]}), 5)
+
+
+class RunePaintCatalogTests(unittest.TestCase):
+    def test_every_enchantable_painted_item_has_its_own_rune_quest(self):
+        rows = {quest.code: quest for quest in catalog.RUNE_QUESTS}
+        expected = {
+            "rune_paint_weapon", "rune_paint_shield", "rune_paint_boots",
+            "rune_paint_amulet", "rune_paint_pickaxe", "rune_paint_shovel",
+            "rune_paint_vial", "rune_paint_scroll",
+        }
+        self.assertTrue(expected <= rows.keys())
+        self.assertIn("NMM", rows["rune_paint_pickaxe"].technique)
+        self.assertIn("NMM", rows["rune_paint_shovel"].technique)
+        self.assertIn("кожу", rows["rune_paint_boots"].technique.lower())
+        self.assertIn("потёртости", rows["rune_paint_boots"].technique.lower())
+
 
 class RerollTests(QuestsTestCase):
     def test_reroll_swaps_the_whole_group_and_unlocks_twelve_hours_later(self):
@@ -178,6 +200,32 @@ class RerollTests(QuestsTestCase):
 
 
 class SubmissionTests(QuestsTestCase):
+    def test_bot_photo_arriving_before_submission_is_attached_to_the_reward(self):
+        entry = "chat"
+        board = quests.rune_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        code = board["quests"][0]["code"]
+        self.assertTrue(quests.attach_submission_photo(
+            entry, -100123, 77, "telegram-photo", now=datetime(2026, 8, 9, 9, 1),
+        ))
+        self.assertTrue(quests.submit(
+            entry, "1", code, chat_id=-100123, message_id=77,
+            now=datetime(2026, 8, 9, 9, 2),
+        )[0])
+        self.assertEqual(quests.pending(entry)[0]["photo_file_id"], "telegram-photo")
+
+    def test_bot_photo_arriving_after_submission_enriches_the_pending_row(self):
+        entry = "chat"
+        board = quests.rune_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        code = board["quests"][0]["code"]
+        self.assertTrue(quests.submit(
+            entry, "1", code, chat_id=-100123, message_id=78,
+            now=datetime(2026, 8, 9, 9, 1),
+        )[0])
+        self.assertTrue(quests.attach_submission_photo(
+            entry, -100123, 78, "telegram-photo", now=datetime(2026, 8, 9, 9, 2),
+        ))
+        self.assertEqual(quests.pending(entry)[0]["photo_file_id"], "telegram-photo")
+
     def test_submit_refuses_a_hashtag_that_is_not_the_players_own_live_quest(self):
         """Otherwise the hashtag becomes the whole game: paste #quest-nmm under anything
         and collect, with the daily assignment reduced to decoration."""
@@ -476,11 +524,49 @@ class RealQuestTests(QuestsTestCase):
 
 
 class ReviewPaymentTests(QuestsTestCase):
+    def test_personal_paint_review_requires_and_then_mints_the_submission_photo(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        day = datetime(2026, 8, 9, 9, 0)
+        quests.rune_quest(entry, "1", now=day)
+        data = quests._load(entry)
+        data["rune_assignments"]["1"]["quests"][0]["code"] = "rune_paint_weapon"
+        quests._save(entry, data)
+        self.assertTrue(quests.submit(
+            entry, "1", "rune_paint_weapon", chat_id=-100123, message_id=90, now=day,
+        )[0])
+        submission_id = quests.pending(entry)[0]["id"]
+
+        ok, message, receipt = quests.review(entry, submission_id, "mod1", True, now=day)
+        self.assertFalse(ok)
+        self.assertIn("фотографии", message)
+        self.assertEqual(receipt, {})
+        self.assertEqual(quests.pending(entry)[0]["status"], "pending")
+
+        quests.attach_submission_photo(entry, -100123, 90, "telegram-photo", now=day)
+        ok, message, receipt = quests.review(entry, submission_id, "mod1", True, now=day)
+        self.assertTrue(ok, message)
+        self.assertTrue(receipt["personal_paint_rune"]["granted"])
+        self.assertEqual(receipt["personal_paint_rune"]["rune"]["photo_file_id"], "telegram-photo")
+
     def test_rune_quest_grants_random_rune_and_magic_after_acceptance(self):
         entry = "chat"
         self._tame(entry, "1")
         day = datetime(2026, 8, 9, 9, 0)
-        quest = quests.rune_quest(entry, "1", now=day)["quest"]
+        board = quests.rune_quest(entry, "1", now=day)
+        quest = next(
+            (card for card in board["quests"] if not card["code"].startswith("rune_paint_")),
+            None,
+        )
+        if quest is None:
+            # The board is sampled from both ordinary and specialist tasks; make this
+            # old reward-stream test explicitly exercise an ordinary rune task.
+            ordinary = next(row for row in catalog.RUNE_QUESTS if not row.code.startswith("rune_paint_"))
+            data = quests._load(entry)
+            data["rune_assignments"]["1"]["quests"][0]["code"] = ordinary.code
+            quests._save(entry, data)
+            quest = next(card for card in quests.rune_quest(entry, "1", now=day)["quests"]
+                         if card["code"] == ordinary.code)
 
         self.assertTrue(quests.submit(entry, "1", quest["code"], now=day)[0])
         submission_id = quests.pending(entry)[0]["id"]

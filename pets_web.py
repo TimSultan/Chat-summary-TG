@@ -350,6 +350,53 @@ async def handle_portrait(request: web.Request) -> web.Response:
     return web.FileResponse(cached, headers={"Cache-Control": "public, max-age=300"})
 
 
+async def handle_personal_paint_image(request: web.Request) -> web.Response:
+    """Image proxy for a personal rune or applied artwork, addressed by opaque rune id.
+
+    Like pet portraits, this must work in a plain ``img`` tag and in another player's
+    fight replay, neither of which can attach Telegram initData. The id has 64 bits of
+    random entropy and the source photo was already posted in the shared chat.
+    """
+    entry = request.app[_ENTRY_KEY]
+    rune_id = str(request.match_info.get("rune_id") or "")
+    if not _SAFE_CODE.match(rune_id):
+        raise web.HTTPNotFound()
+    data = pets._load(entry)
+    image_id = None
+    for wallet in (data.get("personal_paint_runes", {}) or {}).values():
+        for row in wallet if isinstance(wallet, list) else ():
+            if isinstance(row, dict) and str(row.get("id") or "") == rune_id:
+                image_id = row.get("photo_file_id")
+                break
+        if image_id:
+            break
+    if not image_id:
+        for record in (data.get("pets", {}) or {}).values():
+            if not isinstance(record, dict):
+                continue
+            for row in (record.get("personal_enchantments") or {}).values():
+                if isinstance(row, dict) and str(row.get("rune_id") or "") == rune_id:
+                    image_id = row.get("photo_file_id")
+                    break
+            if image_id:
+                break
+    if not image_id:
+        raise web.HTTPNotFound()
+    cached = portrait_cache_path(str(image_id))
+    if not cached.is_file():
+        try:
+            photo = await request.app[_FETCH_PHOTO_KEY](str(image_id))
+        except Exception:
+            photo = None
+        if not photo:
+            raise web.HTTPNotFound()
+        try:
+            await asyncio.to_thread(_write_portrait, cached, photo)
+        except Exception:
+            raise web.HTTPNotFound()
+    return web.FileResponse(cached, headers={"Cache-Control": "public, max-age=300"})
+
+
 def _normalise_photo(data: bytes) -> bytes | None:
     """Prove the bytes are an image, then bound and re-encode them. None if they are not.
 
@@ -529,6 +576,10 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
     equipped_codes = set((record or {}).get("equipped", {}).values())
     owned = item.code in set((record or {}).get("inventory", []))
     weapon = (record or {}).get("weapon_records", {}).get(item.code, {}) if item.slot == "weapon" else {}
+    personal_paint = ((record or {}).get("personal_enchantments") or {}).get(item.code)
+    personal_payload = dict(personal_paint) if isinstance(personal_paint, dict) else None
+    if personal_payload and personal_payload.get("rune_id"):
+        personal_payload["image_url"] = f"{prefix}/img/personal-paint/{personal_payload['rune_id']}.jpg"
     return {
         "code": item.code,
         "name": item.name,
@@ -543,12 +594,13 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
         "bonuses": dict(item.bonuses),
         "description": item.description,
         "effect": dict(item.effect or {}),
-        "art": f"{prefix}/img/{item.code}.svg",
+        "art": (personal_payload or {}).get("image_url") or f"{prefix}/img/{item.code}.svg",
         "owned": owned,
         "equipped": item.code in equipped_codes,
         "locked": item.code in set((record or {}).get("locked_items", [])),
         "enchantment": ((record or {}).get("weapon_enchantments") or {}).get(item.code)
           if item.slot == "weapon" else None,
+        "personal_paint": personal_payload,
         "weapon_details": {
             "first_owner": str(weapon.get("first_owner") or (record or {}).get("name") or ""),
             "pet_wins": max(0, int(weapon.get("pet_wins", 0) or 0)),
@@ -570,6 +622,7 @@ def _fight_record_snapshot(record: dict | None, prefix: str) -> dict:
     return {
         "equipped": equipped,
         "items": items,
+        "personal_enchantments": _jsonable(record.get("personal_enchantments") or {}),
         "portrait_crop": _jsonable(record.get("portrait_crop")),
         "stats": dict(record.get("stats") or {}),
         "owner_name": record.get("owner_name"),
@@ -587,19 +640,35 @@ def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dic
             if item is not None:
                 items.append(_item_payload(item, prefix, record))
     for item in items:
-        item["art"] = f"{prefix}/img/{item.get('code')}.svg" if item.get("code") else ""
+        personal = item.get("personal_paint") if isinstance(item.get("personal_paint"), dict) else None
+        if personal and personal.get("rune_id"):
+            item["art"] = f"{prefix}/img/personal-paint/{personal['rune_id']}.jpg"
+            personal["image_url"] = item["art"]
+        else:
+            item["art"] = f"{prefix}/img/{item.get('code')}.svg" if item.get("code") else ""
 
     scrolls = []
+    personal_enchantments = record.get("personal_enchantments") or {}
     for code in getattr(fighter, "skills", ()) or ():
         spell = pets_scroll_catalog.scroll(code) if code else None
-        scrolls.append({
+        personal = personal_enchantments.get(code) if isinstance(personal_enchantments, dict) else None
+        painted = code in set(getattr(fighter, "personal_enchanted_scrolls", ()) or ())
+        effects = pets_combat.resolved_scroll_effects(spell, painted) if spell else ()
+        described = {**dict(spell), "effects": effects} if spell else None
+        scroll = {
             "code": spell.get("code"), "name": spell.get("name"),
             "icon": spell.get("icon"), "description": spell.get("short"),
             "element": spell.get("element"), "uses": spell.get("uses"),
             "dodgeable": spell.get("dodgeable"), "ultimate": spell.get("ultimate"),
-            "effects": [dict(effect) for effect in spell.get("effects", ())],
-            "effects_text": list(pets_scroll_catalog.effect_lines(spell)),
-        } if spell else None)
+            "effects": [dict(effect) for effect in effects],
+            "effects_text": list(pets_scroll_catalog.effect_lines(described)),
+        } if spell else None
+        if scroll is not None and isinstance(personal, dict) and personal.get("rune_id"):
+            scroll["personal_paint"] = {
+                **dict(personal),
+                "image_url": f"{prefix}/img/personal-paint/{personal['rune_id']}.jpg",
+            }
+        scrolls.append(scroll)
 
     derived = pets_combat.derive(fighter, opponent)
     return {
@@ -745,7 +814,22 @@ def _equipment_payload(record: dict, prefix: str) -> list[dict]:
     return slots
 
 
-def _skills_payload(record: dict) -> dict:
+def _skills_payload(record: dict, prefix: str = "") -> dict:
+    def payload(spell: dict) -> dict:
+        row = pets_scroll_catalog.public_scroll(spell)
+        personal = (record.get("personal_enchantments") or {}).get(row["code"])
+        row["personal_paint"] = dict(personal) if isinstance(personal, dict) else None
+        if isinstance(row["personal_paint"], dict) and row["personal_paint"].get("rune_id"):
+            effects = pets_combat.resolved_scroll_effects(spell, True)
+            row["effects"] = [dict(effect) for effect in effects]
+            row["effects_text"] = list(pets_scroll_catalog.effect_lines({
+                **dict(spell), "effects": effects,
+            }))
+            row["personal_paint"]["image_url"] = (
+                f"{prefix}/img/personal-paint/{row['personal_paint']['rune_id']}.jpg"
+            )
+        return row
+
     loadout = pets._skill_loadout_for(record)
     selected = []
     for index, code in enumerate(loadout, start=1):
@@ -757,7 +841,7 @@ def _skills_payload(record: dict) -> dict:
                              "ultimate": index == 4, "name": "", "icon": "",
                              "short": "", "element": "", "effects_text": []})
             continue
-        row = pets_scroll_catalog.public_scroll(spell)
+        row = payload(spell)
         row["slot"] = index
         row["empty"] = False
         selected.append(row)
@@ -773,11 +857,11 @@ def _skills_payload(record: dict) -> dict:
             "hard_quest_pity": pets.HARD_QUEST_SCROLL_PITY,
         },
         "regular": [
-            pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.REGULAR_SCROLLS
+            payload(row) for row in pets_scroll_catalog.REGULAR_SCROLLS
             if row["code"] in owned
         ],
         "ultimate": [
-            pets_scroll_catalog.public_scroll(row) for row in pets_scroll_catalog.ULTIMATE_SCROLLS
+            payload(row) for row in pets_scroll_catalog.ULTIMATE_SCROLLS
             if row["code"] in owned
         ],
     }
@@ -827,7 +911,13 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
         "quarry_receipt": quarry_receipt,
         "unread_updates": pets_updates.has_unread(entry, user_id),
         "quest_attention": quests.has_available_quests(entry, user_id),
+        "personal_paint": pets.personal_paint_status(entry, user_id),
     }
+    # Opaque image URLs are usable by plain img tags and inside another player's replay.
+    for row in [*state["personal_paint"].get("runes", []), *state["personal_paint"].get("applied", [])]:
+        if isinstance(row, dict) and (row.get("id") or row.get("rune_id")):
+            rune_id = row.get("id") or row.get("rune_id")
+            row["image_url"] = f"{prefix}/img/personal-paint/{rune_id}.jpg"
 
     if not record:
         state["pet"] = None
@@ -843,7 +933,7 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["stats"] = _stat_payload(entry, user_id, record, state["stat_points"])
     state["combat"] = _combat_payload(entry, user_id, record)
     state["equipment"] = _equipment_payload(record, prefix)
-    state["skills"] = _skills_payload(record)
+    state["skills"] = _skills_payload(record, prefix)
     state["bag"] = [
         _item_payload(item, prefix, record)
         for item in (C.find_item(code) for code in record.get("inventory", []))
@@ -1018,6 +1108,10 @@ def _action_quarry_buy_pickaxe(entry, user_id, xp, payload):
   return pets.buy_pickaxe(entry, user_id, xp)
 
 
+def _action_farm_buy_shovel(entry, user_id, xp, payload):
+  return pets.buy_shovel(entry, user_id, xp)
+
+
 def _action_quarry_start(entry, user_id, xp, payload):
   return pets.start_quarry(entry, user_id, payload.get("hours", C.QUARRY_DURATION_HOURS))
 
@@ -1045,6 +1139,13 @@ def _action_pve_replays(entry, user_id, xp, payload):
         "Бои с мобами будут пропускаться."
         if skipped else "Реплеи боёв с мобами снова включены."
     )
+
+
+def _action_apply_personal_paint(entry, user_id, xp, payload):
+    ok, message, _receipt = pets.apply_personal_paint_rune(
+        entry, user_id, str(payload.get("rune_id") or ""), str(payload.get("code") or ""),
+    )
+    return ok, message
 
 
 def _action_dungeon_enter(entry, user_id, xp, payload):
@@ -1085,6 +1186,7 @@ _ACTIONS = {
     "buy": _action_buy,
     "reforge": _action_reforge,
     "enchant_weapon": _action_enchant_weapon,
+    "apply_personal_paint": _action_apply_personal_paint,
     "sell": _action_sell,
     "gift": _action_gift,
     "buy_cage": _action_buy_cage,
@@ -1095,6 +1197,7 @@ _ACTIONS = {
     "farm_ticket": _action_farm_ticket,
     "farm_upgrade": _action_farm_upgrade,
     "farm_feature": _action_farm_feature,
+    "farm_buy_shovel": _action_farm_buy_shovel,
     "quarry_buy_pickaxe": _action_quarry_buy_pickaxe,
     "quarry_start": _action_quarry_start,
     "daily_bonus": _action_daily_bonus,
@@ -1537,6 +1640,7 @@ async def handle_attack(request: web.Request) -> web.Response:
             effects=pets.equipped_combat_effects(entry, key),
             level=int(record.get("level", 1)),
             skills=pets.skill_loadout(entry, key),
+            personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, key),
             shield=pets.combat_shield(entry, key),
             weapon_enchanted=pets.combat_weapon_enchanted(entry, key),
         )
@@ -1789,6 +1893,7 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
         effects=pets.equipped_combat_effects(entry, me),
         level=int(mine.get("level", 1)),
         skills=pets.skill_loadout(entry, me),
+        personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, me),
         shield=pets.combat_shield(entry, me),
         weapon_enchanted=pets.combat_weapon_enchanted(entry, me),
     )
@@ -2580,6 +2685,16 @@ async def handle_fight_audit(request: web.Request) -> web.Response:
         row = await asyncio.to_thread(pets.find_fight_audit, entry, fight_id_)
         if row is None:
             return _json_error("Fight not found.", status=404, code="NO_FIGHT")
+        prefix = request.app[_PREFIX_KEY]
+        for side in (row.get("fighters") or {}).values():
+            for item in side.get("equipped", ()) if isinstance(side, dict) else ():
+                personal = item.get("personal_paint") if isinstance(item, dict) else None
+                if isinstance(personal, dict) and personal.get("rune_id"):
+                    item["art"] = f"{prefix}/img/personal-paint/{personal['rune_id']}.jpg"
+            for scroll in side.get("scrolls", ()) if isinstance(side, dict) else ():
+                personal = scroll.get("personal_paint") if isinstance(scroll, dict) else None
+                if isinstance(personal, dict) and personal.get("rune_id"):
+                    scroll["art"] = f"{prefix}/img/personal-paint/{personal['rune_id']}.jpg"
         return _ok({"fight": row})
     try:
         pet_id = str(request.query.get("pet_id") or "").strip()
@@ -2707,6 +2822,7 @@ def attach(
         web.get(prefix + "/api/collection", handle_collection),
         web.get(prefix + "/api/updates", handle_updates),
         web.post(prefix + "/api/portrait", handle_portrait_upload),
+        web.get(prefix + "/img/personal-paint/{rune_id}.jpg", handle_personal_paint_image),
         # Before the item route: "pet/12.jpg" must not be read as an item code.
         web.get(prefix + "/img/pet/{user_id}.jpg", handle_portrait),
         web.get(prefix + "/img/{code}.svg", handle_item_art),
@@ -2731,7 +2847,7 @@ input{flex:1;min-width:240px}button{cursor:pointer;background:#2677bd}.muted{col
 .list{display:grid;gap:8px;margin:18px 0}.row,.card,.move{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
 .row{cursor:pointer;display:flex;justify-content:space-between;gap:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-wrap:wrap;gap:6px}.tag{background:#26384a;border-radius:20px;padding:5px 9px}
-.audit-item{background:#121c27;border:1px solid var(--line);border-radius:10px;padding:10px;margin:7px 0}.audit-item h4{margin:0 0 5px}.audit-item p{margin:5px 0}.mechanics{color:#bed2e6;font:12px ui-monospace,monospace}.effect-line{border-left:3px solid var(--blue);padding-left:8px}
+.audit-item{background:#121c27;border:1px solid var(--line);border-radius:10px;padding:10px;margin:7px 0}.audit-item img{width:54px;height:54px;object-fit:cover;border-radius:8px;float:left;margin:0 9px 6px 0}.audit-item h4{margin:0 0 5px}.audit-item p{margin:5px 0}.mechanics{color:#bed2e6;font:12px ui-monospace,monospace}.effect-line{border-left:3px solid var(--blue);padding-left:8px}
 .moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
 @media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
@@ -2748,8 +2864,8 @@ async function api(id="",pet=""){status.textContent="Loading…";const q=new URL
 function auditFailure(e){status.textContent=e.message||"Could not load fights";out.innerHTML=""}
 function mechanics(v,skip=[]){if(!v||typeof v!=="object")return"";const rows=Object.entries(v).filter(([k,x])=>!skip.includes(k)&&x!==null&&x!==""&&!(Array.isArray(x)&&!x.length));return rows.length?`<div class="mechanics">${rows.map(([k,x])=>`${esc(k)}: ${esc(typeof x==="object"?JSON.stringify(x):x)}`).join(" · ")}</div>`:""}
 function bonuses(v){const labels={strength:"⚔️",health:"❤️",agility:"💨",luck:"🍀",armor:"🛡️",endurance:"🫁"};return Object.entries(v||{}).map(([k,x])=>`${labels[k]||esc(k)} ${Number(x)>0?"+":""}${esc(x)}`).join(" · ")}
-function auditItem(i){const e=i.effect||{};return `<div class="audit-item"><h4>${esc(i.name)} <span class="muted">${esc(i.rarity)} · ${esc(i.slot)} · ${esc(i.code)}</span></h4>${bonuses(i.bonuses)?`<p>${bonuses(i.bonuses)}</p>`:""}${i.description?`<p>${esc(i.description)}</p>`:""}${e.text?`<p class="effect-line"><b>Effect:</b> ${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
-function auditScroll(s){if(!s)return"";return `<div class="audit-item"><h4>${esc(s.icon||"📜")} ${esc(s.name)} <span class="muted">${esc(s.code)}</span></h4>${s.description?`<p>${esc(s.description)}</p>`:""}${(s.effects_text||[]).map(x=>`<p class="effect-line">${esc(x)}</p>`).join("")}${mechanics({element:s.element,uses:s.uses,dodgeable:s.dodgeable,ultimate:s.ultimate})}${(s.effects||[]).map(e=>mechanics(e)).join("")}</div>`}
+function auditItem(i){const e=i.effect||{};return `<div class="audit-item">${i.art?`<img src="${esc(i.art)}" alt="">`:""}<h4>${esc(i.name)} <span class="muted">${esc(i.rarity)} · ${esc(i.slot)} · ${esc(i.code)}</span></h4>${i.personal_paint?`<p>🎨 Personal paint · +30% safe power</p>`:""}${bonuses(i.bonuses)?`<p>${bonuses(i.bonuses)}</p>`:""}${i.description?`<p>${esc(i.description)}</p>`:""}${e.text?`<p class="effect-line"><b>Effect:</b> ${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
+function auditScroll(s){if(!s)return"";return `<div class="audit-item">${s.art?`<img src="${esc(s.art)}" alt="">`:""}<h4>${esc(s.icon||"📜")} ${esc(s.name)} <span class="muted">${esc(s.code)}</span></h4>${s.personal_paint?`<p>🎨 Personal paint · useful power ×${esc(s.personal_power_multiplier||1.3)}; chance and duration unchanged</p>`:""}${s.description?`<p>${esc(s.description)}</p>`:""}${(s.effects_text||[]).map(x=>`<p class="effect-line">${esc(x)}</p>`).join("")}${mechanics({element:s.element,uses:s.uses,dodgeable:s.dodgeable,ultimate:s.ultimate})}${(s.effects||[]).map(e=>mechanics(e)).join("")}</div>`}
 function auditEffect(e){if(typeof e==="string")return `<div class="audit-item">${esc(e)}</div>`;return `<div class="audit-item">${e.text?`<p class="effect-line">${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
 function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[],scrolls=s.scrolls||[],effects=f.effects||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>⭐ ${esc(f.level)} · ⚔️ ${esc(f.strength)} · ❤️ ${esc(f.health)} · 💨 ${esc(f.agility)} · 🍀 ${esc(f.luck)} · 🛡️ ${esc(f.armor)}</div><div class="muted">Derived: ❤️ ${esc(Math.round(d.max_hp||0))}, ⚔️ ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%, reduction ${esc(((d.reduction||0)*100).toFixed(1))}%</div><h4>Items and exact effects</h4>${items.length?items.map(auditItem).join(""):"<span class=muted>None recorded</span>"}<h4>Scrolls</h4>${scrolls.filter(Boolean).length?scrolls.map(auditScroll).join(""):"<span class=muted>None</span>"}<h4>Combat effect snapshot</h4>${effects.length?effects.map(auditEffect).join(""):"<span class=muted>None</span>"}<h4>Shield</h4>${s.shield?auditEffect(s.shield):"<span class=muted>None</span>"}<details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
 function renderFight(f){const fighters=Object.entries(f.fighters||{});out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Moves (${(f.moves||[]).length})</h2><div class="moves">${(f.moves||[]).map(m=>`<details class="move"><summary><b>#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
@@ -4151,6 +4267,7 @@ function renderBag() {
     : b.resale - a.resale);
 
   box.innerHTML =
+    personalPaintPanel() +
     '<div class="chiprow">' + slotChips(bagSlot, "bagslot") + "</div>" +
     '<div class="chiprow">' + rarityChips(bagRarity, "bagrarity") +
       '<button class="chip' + (bagSort === "price" ? " on" : "") + '" data-bagsort="1">💰 по цене</button>' +
@@ -4163,6 +4280,67 @@ function renderBag() {
       (items.length ? '<div class="items">' + items.map((i) => itemCard(i)).join("") + "</div>"
                     : '<div class="empty">Пусто. Загляни в лавку или выиграй в арене.</div>') +
     "</div>" + forgePanel();
+}
+
+const PERSONAL_TARGET_NAMES = {
+  weapon: "оружие", shield: "щит", boots: "сапоги или ботинки",
+  amulet: "амулет", vial: "лечащий предмет", scroll: "свиток",
+};
+const PERSONAL_HEALING_EFFECTS = new Set([
+  "medkit", "second_wind", "regen", "dodge_heal", "vampiric", "bite", "blood_pact",
+]);
+
+function personalPaintBonusText(target) {
+  if (target === "scroll") return "сила полезных чисел свитка +30%; шанс и длительность не меняются";
+  if (target === "vial") return "сила лечения +30%; порог и частота срабатывания не меняются";
+  return "положительные статы предмета +30%";
+}
+
+function personalPaintPanel() {
+  const rows = (S.personal_paint && S.personal_paint.runes) || [];
+  if (!rows.length) return "";
+  return '<div class="panel"><h2>🎨 Персональные руны · ' + rows.length + '</h2>' +
+    '<div class="small muted" style="margin-bottom:10px">Каждая хранит фото принятого покраса и применяется один раз только к своему типу. Для экипировки растут положительные статы, для хилки — лечение, для свитка — сила полезных чисел. Шансы и длительность не увеличиваются.</div>' +
+    '<div class="items">' + rows.map((rune) =>
+      '<button class="item r-rare" data-personalrune="' + esc(rune.id) + '">' +
+      '<span class="art"><img src="' + esc(rune.image_url || "") + '" alt="" loading="lazy"><span class="flag">+30%</span></span>' +
+      '<span class="nm">Руна · ' + esc(PERSONAL_TARGET_NAMES[rune.target] || rune.target) + '</span>' +
+      '<span class="meta">Выбрать цель</span></button>'
+    ).join("") + '</div></div>';
+}
+
+function personalPaintCandidates(target) {
+  if (target === "scroll") {
+    const rows = [...((S.skills && S.skills.regular) || []), ...((S.skills && S.skills.ultimate) || [])];
+    const seen = new Set();
+    return rows.filter((row) => !seen.has(row.code) && seen.add(row.code) && !row.personal_paint);
+  }
+  const rows = [...(S.bag || []), ...(S.equipment || []).map((slot) => slot.item).filter(Boolean)];
+  const seen = new Set();
+  return rows.filter((item) => {
+    if (!item || seen.has(item.code) || item.personal_paint) return false;
+    seen.add(item.code);
+    if (target === "vial") return PERSONAL_HEALING_EFFECTS.has((item.effect || {}).code);
+    return item.slot === target;
+  });
+}
+
+function openPersonalPaintRune(runeId) {
+  const rune = ((S.personal_paint && S.personal_paint.runes) || []).find((row) => row.id === runeId);
+  if (!rune) { toast("Руна уже использована или недоступна."); return; }
+  const candidates = personalPaintCandidates(rune.target);
+  sheet('<div class="hd"><img src="' + esc(rune.image_url || "") + '" alt=""><div><h3>🎨 Персональная руна</h3>' +
+    '<div class="small muted">Цель: ' + esc(PERSONAL_TARGET_NAMES[rune.target] || rune.target) + '</div></div></div>' +
+    '<p class="small">После применения фото станет аватаркой цели; ' + esc(personalPaintBonusText(rune.target)) + '. Руна исчезнет; второй персональный покрас на ту же цель наложить нельзя.</p>' +
+    (candidates.length ? '<div class="items">' + candidates.map((target) => {
+      const scroll = rune.target === "scroll";
+      const art = scroll
+        ? '<span class="art" style="display:grid;place-items:center;font-size:50px">' + esc(target.icon || "📜") + '</span>'
+        : itemArt(target, "");
+      return '<button class="item r-' + esc(target.rarity || "rare") + '" data-personalapply="' +
+        esc(rune.id) + '" data-personalcode="' + esc(target.code) + '">' + art +
+        '<span class="nm">' + esc(target.name) + '</span><span class="meta">Применить +30%</span></button>';
+    }).join("") + '</div>' : '<div class="empty">Подходящей цели пока нет.</div>'));
 }
 
 function shortSkillName(name) { return String(name || "").replace(/^.*?: /, ""); }
@@ -4192,7 +4370,8 @@ function liveSkillsPanel() {
           '"><b>' + spell.slot + ' · Пусто</b><small>' +
           (spell.ultimate ? 'слот под ультимейт' : 'слот свободен') + '</small></button>'
         : '<button class="go sec live-skill' + (spell.ultimate ? " ultimate" : "") +
-          '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' + esc(spell.icon) + " " +
+          '" data-liveskill="' + spell.slot + '"><b>' + spell.slot + ' · ' +
+          (spell.personal_paint ? '<img src="' + esc(spell.personal_paint.image_url || "") + '" alt="" style="width:28px;height:28px;object-fit:cover;border-radius:6px;vertical-align:middle"> 🎨 ' : esc(spell.icon) + " ") +
           esc(shortSkillName(spell.name)) + '</b>' + scrollEffects(spell) +
           '<small>' + esc(scrollElement(spell)) +
           (spell.dodgeable === false ? ' · нельзя увернуться' : '') + " · " +
@@ -4220,7 +4399,8 @@ function openLiveSkillPicker(slot) {
     (pool.length
       ? ''
       : '<div class="empty">Открытых свитков для этого слота пока нет. Они выпадают за #япокрасил и за принятые сложные квесты.</div>') +
-    pool.map((spell) => '<div class="panel"><b>' + esc(spell.icon) + " " + esc(spell.name) +
+    pool.map((spell) => '<div class="panel"><b>' +
+      (spell.personal_paint ? '<img src="' + esc(spell.personal_paint.image_url || "") + '" alt="" style="width:36px;height:36px;object-fit:cover;border-radius:7px;vertical-align:middle"> 🎨 ' : esc(spell.icon) + " ") + esc(spell.name) +
       '</b><div class="small">' + esc(spell.short) + '</div>' + scrollEffects(spell) +
       '<div class="tiny muted">' +
       esc(scrollElement(spell)) + (spell.dodgeable === false ? ' · нельзя увернуться' : '') +
@@ -4310,7 +4490,8 @@ function itemCard(item, flag) {
                                : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
                 (item.locked ? '<span class="lockmark">🔒</span>' : "") +
                 (item.enchantment ? '<span class="lockmark" title="Руна">' +
-                  ({ fire: '🔥', frost: '❄️', water: '💧', earth: '🪨', air: '💨', plants: '🌿' }[item.enchantment] || '🔮') + '</span>' : "");
+                  ({ fire: '🔥', frost: '❄️', water: '💧', earth: '🪨', air: '💨', plants: '🌿' }[item.enchantment] || '🔮') + '</span>' : "") +
+                (item.personal_paint ? '<span class="flag" title="Персональный покрас">🎨 +30%</span>' : "");
   return '<button class="item r-' + item.rarity + '" data-item="' + esc(item.code) + '">' +
     itemArt(item, marks) +
     '<span class="nm">' + esc(item.name) + "</span>" +
@@ -5183,13 +5364,22 @@ function renderFarm() {
 
   const passive = farm.passive || {};
   const quarry = S.quarry || {};
+  const shovelPanel = '<div class="panel"><h2>🪏 Лопата фермы</h2><div class="small muted">Каждая смена с лопатой даёт +25% золота.</div><div class="small muted" style="margin-top:4px">' +
+    (farm.shovel_upgraded
+      ? 'Руническая лопата · бесконечные заряды · +50% золота'
+      : (farm.shovel_runs || 0) + ' зарядов' + ((farm.shovel_runs || 0) ? ' · бонус уже включён в расчёт смены' : '')) +
+    '</div>' +
+    (!farm.shovel_upgraded && !(farm.shovel_runs || 0)
+      ? '<button class="go sec" style="margin-top:10px" data-do="farmshovel"' +
+        (affordable(farm.shovel_cost) ? '' : ' disabled') + '>Купить лопату · ' + money(farm.shovel_cost) + '</button>'
+      : '') + '</div>';
   const quarryPanel = quarry.running
     ? '<div class="panel"><h2>⛏ Карьер</h2><div class="small">Добыча идёт. Осталось ' +
       clock(quarry.seconds_left) + '.</div></div>'
     : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">Один заряд кирки — одна смена. Длинная смена выгоднее.</div><div class="small muted" style="margin-top:4px">' +
-      'Зарядов кирки: ' + (quarry.pickaxe_runs || 0) +
-      (quarry.pickaxe_upgraded ? ' · улучшена за NMM' : '') + '</div>' +
-      ((quarry.pickaxe_runs || 0)
+      'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
+      (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
+      ((quarry.pickaxe_unlimited || quarry.pickaxe_runs || 0)
         ? '<div class="items" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:10px">' +
           (quarry.hour_previews || []).map((preview) =>
             '<button class="chip" style="border-radius:12px;padding:9px 3px;text-align:center;display:block" ' +
@@ -5222,7 +5412,7 @@ function renderFarm() {
           : '<button class="plus" data-feature="' + key + '"' +
             (affordable(feature.next_cost) ? "" : " disabled") + ">💰" + money(feature.next_cost) +
             "</button>") + "</div>").join("") +
-    "</div>" + quarryPanel;
+    "</div>" + shovelPanel + quarryPanel;
 }
 
 const FEATURE_NAMES = { well: "Колодец", sprinkler: "Поливалка", beds: "Грядка", tractor: "Трактор" };
@@ -5459,8 +5649,22 @@ function pips(level) {
 
 function rewardLine(reward) {
   if (!reward) return "";
+  const personalNames = {
+    weapon: "оружие", shield: "щит", boots: "ботинки", amulet: "амулет",
+    vial: "лечебный пузырёк", scroll: "свиток"
+  };
   const dungeonMagic = reward.magic_guaranteed
     ? " · <span class='gain'>✨ случайная магия · 🔮 случайная руна</span>"
+    : "";
+  const personalPaint = reward.personal_paint_target
+    ? " · <span class='gain'>🎨 персональная руна: " +
+      esc(personalNames[reward.personal_paint_target] || reward.personal_paint_target) +
+      " · аватарка и +30% к положительным боевым числам</span>"
+    : "";
+  const toolNames = { pickaxe: "кирка", shovel: "лопата" };
+  const toolMasterwork = reward.tool_masterwork
+    ? " · <span class='gain'>🛠 " + esc(toolNames[reward.tool_masterwork] || reward.tool_masterwork) +
+      " · бесконечные заряды · +50% эффективности</span>"
     : "";
   const scroll = reward.scroll_chance
     ? " · <span class='gain'>📜 " + Math.round(reward.scroll_chance * 100) +
@@ -5469,7 +5673,8 @@ function rewardLine(reward) {
     : "";
   return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
     "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
-    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic + scroll;
+    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic +
+    personalPaint + toolMasterwork + scroll;
 }
 
 // Quest calls do not return the game state the way /api/action does -- nothing here
@@ -5883,6 +6088,9 @@ function openItem(code) {
     (item.description ? '<div class="small muted">' + esc(item.description) + "</div>" : "") +
     (item.effect && item.effect.text
       ? '<div class="small" style="margin-top:8px">✨ ' + esc(item.effect.text) + "</div>" : "") +
+    (item.personal_paint
+      ? '<div class="small gain" style="margin-top:8px">🎨 Персональный покрас: ' +
+        esc(personalPaintBonusText(item.personal_paint.target)) + '.</div>' : "") +
     (deltas.length && !item.equipped
       ? '<div class="panel" style="margin-top:10px"><h2>Если надеть вместо ' +
         (wornHere ? esc(wornHere.name) : "пустого слота") + "</h2>" + deltas.join(" ") + "</div>"
@@ -6299,7 +6507,10 @@ function openFightDetail(key) {
   const detail = DUEL_DETAILS[key];
   if (!detail) return;
   if (detail.kind === "scroll") {
-    sheet('<h3>' + esc(detail.icon || "📜") + " " + esc(detail.name) + "</h3>" +
+    const scrollArt = detail.personal_paint
+      ? '<img src="' + esc(detail.personal_paint.image_url || "") + '" alt="" style="width:54px;height:54px;object-fit:cover;border-radius:10px;vertical-align:middle"> 🎨 '
+      : esc(detail.icon || "📜") + " ";
+    sheet('<h3>' + scrollArt + esc(detail.name) + "</h3>" +
       (detail.description ? '<p class="small muted">' + esc(detail.description) + "</p>" : "") +
       (detail.effects_text || []).map((line) => '<p class="small">✨ ' + esc(line) + "</p>").join("") +
       '<div class="tiny muted">' + fightMechanics(detail, ["kind", "code", "name", "icon", "description", "effects", "effects_text"]) + "</div>" +
@@ -6336,8 +6547,11 @@ function duelLoadout(fighter) {
   for (const scroll of (fighter.scrolls || []).filter(Boolean)) {
     const key = String(fighter.user_id) + ":scroll:" + scroll.code;
     DUEL_DETAILS[key] = Object.assign({ kind: "scroll" }, scroll);
+    const scrollArt = scroll.personal_paint
+      ? '<img src="' + esc(scroll.personal_paint.image_url || "") + '" alt="" style="width:38px;height:38px;object-fit:cover;border-radius:7px">'
+      : '<span style="font-size:22px;text-align:center">' + esc(scroll.icon || "📜") + '</span>';
     rows.push('<button type="button" class="duel-item" data-fight-detail="' + esc(key) +
-      '"><span style="font-size:22px;text-align:center">' + esc(scroll.icon || "📜") + '</span><span><b>' +
+      '">' + scrollArt + '<span><b>' +
       esc(scroll.name) + "</b><small>" + esc((scroll.effects_text || []).join(" · ") || scroll.description || "Свиток") +
       "</small></span></button>");
   }
@@ -6533,8 +6747,9 @@ document.addEventListener("click", async (event) => {
   const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobreplay],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
+    "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]");
   if (!target) return;
@@ -6564,6 +6779,12 @@ document.addEventListener("click", async (event) => {
   if (d.testaction) { await testBattleAction(d.testaction); return; }
   if (d.testcatalog !== undefined) { showTestCatalog(); return; }
   if (d.liveskill) { openLiveSkillPicker(d.liveskill); return; }
+  if (d.personalrune) { openPersonalPaintRune(d.personalrune); return; }
+  if (d.personalapply) {
+    closeSheet();
+    await act("apply_personal_paint", { rune_id: d.personalapply, code: d.personalcode });
+    return;
+  }
   if (d.liveskillset) {
     const split = d.liveskillset.indexOf(":");
     const slot = Number(d.liveskillset.slice(0, split));
@@ -6707,6 +6928,7 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "farmup") { await act("farm_upgrade"); }
   else if (d.do === "farmticket") { await act("farm_ticket"); }
   else if (d.do === "farmcancel") { await act("farm_cancel"); }
+  else if (d.do === "farmshovel") { await act("farm_buy_shovel"); }
   else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
   else if (d.quarrystart) { await act("quarry_start", {hours:Number(d.quarrystart)}); }
   else if (d.do === "portrait") { openPortrait(); }

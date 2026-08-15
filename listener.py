@@ -1275,12 +1275,15 @@ async def run_listener(
                 entry = matched_allowed_chat(chat)
                 if entry is not None:
                     sender = await event.get_sender()
-                    ok, note = quests.submit(
-                        entry, msg.sender_id, quest_code,
-                        chat_id=event.chat_id, message_id=msg.id,
-                        author_name=sender_display_name(sender),
-                        author_username=getattr(sender, "username", None) or "",
-                    )
+                    if pets.personal_paint_target_for_quest(quest_code) and not is_image_message(msg):
+                        ok, note = False, "Для персональной руны нужна фотография, не видео."
+                    else:
+                        ok, note = quests.submit(
+                            entry, msg.sender_id, quest_code,
+                            chat_id=event.chat_id, message_id=msg.id,
+                            author_name=sender_display_name(sender),
+                            author_username=getattr(sender, "username", None) or "",
+                        )
                     log(
                         f"[listener] quest '{quest_code}' from "
                         f"{sender_display_name(sender)} in '{entry}': "

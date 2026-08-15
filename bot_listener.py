@@ -5705,8 +5705,26 @@ def _quest_completion_caption(row: dict) -> str:
     paid = row.get("paid") if isinstance(row.get("paid"), dict) else row
     scroll_name = str(paid.get("scroll_name") or "").strip()
     scroll_line = f"\n📜 Открыт свиток: {scroll_name}" if scroll_name else ""
-    ending = (f"\n\n{hashtag}{scroll_line}\nТак держать! 💪"
-              if hashtag else f"{scroll_line}\n\nТак держать! 💪")
+    personal = paid.get("personal_paint_rune") if isinstance(paid.get("personal_paint_rune"), dict) else {}
+    personal_target = str((personal.get("rune") or {}).get("target") or "")
+    target_names = {
+        "weapon": "оружия", "shield": "щита", "boots": "ботинок",
+        "amulet": "амулета", "vial": "лечебного пузырька", "scroll": "свитка",
+    }
+    personal_line = (
+        f"\n🎨 Получена персональная руна для {target_names.get(personal_target, personal_target)}: "
+        "аватарка из этого фото и +30% к положительным боевым числам. Применить: /arena → Снаряжение."
+        if personal.get("granted") and personal_target else ""
+    )
+    tool = str(paid.get("tool_masterwork") or "")
+    tool_line = (
+        f"\n🛠 {('Кирка' if tool == 'pickaxe' else 'Лопата')} улучшена: "
+        "бесконечные заряды и +50% эффективности."
+        if tool in {"pickaxe", "shovel"} else ""
+    )
+    reward_lines = scroll_line + personal_line + tool_line
+    ending = (f"\n\n{hashtag}{reward_lines}\nТак держать! 💪"
+              if hashtag else f"{reward_lines}\n\nТак держать! 💪")
     # Telegram counts astral emoji as two UTF-16 units. Staying below the documented
     # 1024-character cap leaves enough headroom for those surrogate pairs.
     available = max(0, 1000 - len(heading) - len(ending) - 2)
@@ -6064,6 +6082,7 @@ def _pets_fighter(entry: str, user_id, pet: dict):
         effects=pets.equipped_combat_effects(entry, user_id),
         level=pet.get("level", 1),
         skills=pets.skill_loadout(entry, user_id),
+        personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, user_id),
         shield=pets.combat_shield(entry, user_id),
         weapon_enchanted=pets.combat_weapon_enchanted(entry, user_id),
     )
@@ -6491,6 +6510,26 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action == "paintapply":
+            rune_id, separator, raw_index = str(argument or "").partition(",")
+            candidates = pets.personal_paint_candidates(entry, user_id, rune_id)
+            if not separator or not raw_index.isdecimal() or int(raw_index) >= len(candidates):
+                note = "Этот выбор уже устарел. Открой руну заново."
+            else:
+                ok, note, _receipt = pets.apply_personal_paint_rune(
+                    entry, user_id, rune_id, candidates[int(raw_index)]["code"],
+                )
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.personal_paint_runes_view(entry, user_id), log,
+            )
+            return
+        if action == "shovelbuy":
+            ok, note = pets.buy_shovel(entry, user_id, xp)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
+            )
+            return
         if action == "quarrystart":
             ok, note = pets.start_quarry(entry, user_id, argument or C.QUARRY_DURATION_HOURS)
             await _pets_toast_and_redraw(
@@ -6820,6 +6859,10 @@ async def handle_pets_callback(
             "farm": lambda: pets_ui.farm_view(entry, user_id, xp),
             "train": lambda: pets_ui.train_view(entry, user_id, xp),
             "bag": lambda: pets_ui.bag_view(entry, user_id, xp),
+            "paintrunes": lambda: pets_ui.personal_paint_runes_view(entry, user_id),
+            "paintrune": lambda: pets_ui.personal_paint_targets_view(
+                entry, user_id, argument,
+            ),
             "skills": lambda: pets_ui.skills_view(entry, user_id),
             "skillpick": lambda: pets_ui.skill_picker_view(
                 entry, user_id, *pets_ui.parse_slot_argument(argument),
@@ -8073,6 +8116,16 @@ async def _dispatch_update(
     matched_entry = _match_allowed_chat(chat, cfg.listener_allowed_chats)
     if matched_entry is not None:
         known_chat_ids[matched_entry] = chat["id"]
+        # The Bot API gives us the reusable file_id that Telethon's user-session update
+        # cannot. Preserve it for personal-paint quest rewards before the ordinary
+        # command router ignores this non-command group post. quests.py handles either
+        # arrival order relative to listener.py's submission record.
+        photos = message.get("photo") or []
+        if photos and quests.parse_hashtag(message_text) is not None:
+            quests.attach_submission_photo(
+                matched_entry, chat.get("id"), message.get("message_id"),
+                photos[-1].get("file_id"),
+            )
 
     command_text = stats.strip_command_bot_mention(message_text, bot_username)
     start_match = re.match(r"^/start(?:\s+(\S+))?\s*$", command_text, re.IGNORECASE)

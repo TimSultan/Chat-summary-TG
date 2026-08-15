@@ -89,6 +89,22 @@ PAINT_SCROLL_PITY = 20
 HARD_QUEST_SCROLL_CHANCES = {4: 0.12, 5: 0.20}
 HARD_QUEST_SCROLL_PITY = 6
 ULTIMATE_SCROLL_SHARE = 0.12
+# A personal paint rune is earned from one accepted rune-paint quest and consumed when
+# it is put on its matching target.  This is deliberately a closed list: accepting a
+# client-provided arbitrary slot here would make catalogue mistakes a balance exploit.
+PERSONAL_PAINT_RUNE_QUEST_TARGETS = {
+    "rune_paint_weapon": "weapon",
+    "rune_paint_shield": "shield",
+    "rune_paint_boots": "boots",
+    "rune_paint_amulet": "amulet",
+    "rune_paint_vial": "vial",
+    "rune_paint_scroll": "scroll",
+}
+PERSONAL_PAINT_ITEM_SLOTS = frozenset({"weapon", "shield", "boots", "amulet"})
+PERSONAL_PAINT_STAT_MULTIPLIER = 1.30
+PERSONAL_PAINT_HEALING_EFFECTS = frozenset({
+    "medkit", "second_wind", "regen", "dodge_heal", "vampiric", "bite", "blood_pact",
+})
 # The poller and a button press can settle the same finished run in one process.  The
 # run id also keys the economy grant, so a process restart cannot mint a second payout.
 # It also guards the ticket wallet and the shift a ticket shortens, both of which are
@@ -161,6 +177,10 @@ def _empty() -> dict:
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "fight_audits": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "dungeon_tickets": {}, "rubies": {},
         "scroll_wallets": {}, "scroll_notifications": [],
+        # Earned before a creature exists just like scrolls/tickets.  Each row contains
+        # the submitted Telegram image file id, never image bytes.
+        "personal_paint_runes": {},
+        "personal_paint_rune_sources": {},
         "storefront_sales": {},
         "economy_metrics": _new_economy_metrics(),
     }
@@ -210,6 +230,10 @@ def _load(entry: str) -> dict:
         data["rubies"] = {}
     if not isinstance(data.setdefault("scroll_wallets", {}), dict):
         data["scroll_wallets"] = {}
+    if not isinstance(data.setdefault("personal_paint_runes", {}), dict):
+        data["personal_paint_runes"] = {}
+    if not isinstance(data.setdefault("personal_paint_rune_sources", {}), dict):
+        data["personal_paint_rune_sources"] = {}
     notices = data.setdefault("scroll_notifications", [])
     data["scroll_notifications"] = [row for row in notices if isinstance(row, dict)][-400:] \
         if isinstance(notices, list) else []
@@ -262,6 +286,32 @@ def _load(entry: str) -> dict:
                 seen.add(code)
                 unique.append(code)
         record["inventory"] = unique
+        personal = record.get("personal_enchantments")
+        if not isinstance(personal, dict):
+            personal = {}
+        # Only durable entries applied by this module are retained.  The code must
+        # still be owned, which makes a sale/gift unable to carry someone's artwork.
+        repaired_personal = {}
+        for code, row in personal.items():
+            if not isinstance(row, dict) or not isinstance(code, str):
+                continue
+            target = str(row.get("target") or "")
+            if target == "scroll":
+                if code in legal_scrolls:
+                    repaired_personal[code] = dict(row)
+                continue
+            item = C.find_item(code)
+            healing_target = bool(
+                target == "vial" and item is not None
+                and str((getattr(item, "effect", {}) or {}).get("code") or "")
+                in PERSONAL_PAINT_HEALING_EFFECTS
+            )
+            if item is not None and code in unique and (
+                (item.slot == target and target in PERSONAL_PAINT_ITEM_SLOTS)
+                or healing_target
+            ):
+                repaired_personal[code] = dict(row)
+        record["personal_enchantments"] = repaired_personal
         equipped = record.get("equipped")
         if not isinstance(equipped, dict):
             equipped = {}
@@ -358,6 +408,38 @@ def _load(entry: str) -> dict:
             record["owned_scrolls"] = list(dict.fromkeys([
                 *record.get("owned_scrolls", []), *wallet["unlocked"],
             ]))
+    # A personal rune is a single-use owner-bound receipt.  Do not try to infer or
+    # recreate historic ones: missing image/source data must never become a free buff.
+    valid_targets = set(PERSONAL_PAINT_RUNE_QUEST_TARGETS.values())
+    for user_id, rows in list(data["personal_paint_runes"].items()):
+        if not isinstance(rows, list):
+            data["personal_paint_runes"][str(user_id)] = []
+            continue
+        seen_ids = set()
+        repaired = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rune_id = str(row.get("id") or "")
+            target = str(row.get("target") or "")
+            source = str(row.get("source") or "")
+            image = row.get("photo_file_id")
+            if not rune_id or rune_id in seen_ids or target not in valid_targets or not source \
+                    or not isinstance(image, str) or not image:
+                continue
+            seen_ids.add(rune_id)
+            repaired.append({
+                "id": rune_id, "target": target, "source": source,
+                "quest_code": str(row.get("quest_code") or ""),
+                "photo_file_id": image, "earned_at": str(row.get("earned_at") or ""),
+            })
+        data["personal_paint_runes"][str(user_id)] = repaired[-100:]
+    sources = data["personal_paint_rune_sources"]
+    data["personal_paint_rune_sources"] = {
+        str(source): dict(row) for source, row in sources.items()
+        if isinstance(source, str) and isinstance(row, dict)
+        and isinstance(row.get("user_id"), str) and isinstance(row.get("rune_id"), str)
+    }
     return data
 
 
@@ -1084,10 +1166,21 @@ def _farm_reward(data: dict, record: dict, run: dict) -> dict:
     # the chance it was promised when the pet left.
     luck = max(0, int(run.get("luck", 0) or 0))
     gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours, luck)
+    # A shovel is consumed (or, for a masterwork, applied for free) when the shift
+    # starts.  Read its multiplier from the run rather than the live inventory so a
+    # quest accepted while the pet is away cannot rewrite an already promised payout.
+    try:
+        shovel_gold_multiplier = float(run.get("shovel_gold_multiplier", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        shovel_gold_multiplier = 1.0
+    shovel_gold_multiplier = min(
+        1.0 + C.SHOVEL_MASTERWORK_GOLD_BONUS,
+        max(1.0, shovel_gold_multiplier),
+    )
     rng = random.Random(f"{run_id}:{hours}")
     found = _farm_item_for(data, record, rng, hours, drop_chance)
     return {
-        "gold": C.farm_gold_for(level, hours, gold_multiplier, pet_level),
+        "gold": round(C.farm_gold_for(level, hours, gold_multiplier, pet_level) * shovel_gold_multiplier),
         "xp": C.farm_xp_for(level, hours, xp_multiplier),
         "item_code": found.code if found is not None else None,
     }
@@ -1160,6 +1253,11 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
             "tickets": _ticket_row(data, user_id)["count"], "can_ticket": False,
         }
     level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
+    tools = _tool_masterworks(data, user_id)
+    shovel_upgraded = bool(tools["shovel"])
+    shovel_runs = max(0, int(record.get("shovel_runs", 0) or 0))
+    shovel_active = shovel_upgraded or shovel_runs > 0
+    shovel_gold_multiplier = _shovel_gold_multiplier(shovel_upgraded) if shovel_active else 1.0
     run = record.get("farm_run") if isinstance(record.get("farm_run"), dict) else None
     ready = bool(run) and _farm_run_ready(run, moment)
     ready_at = run.get("ready_at") if run else None
@@ -1206,7 +1304,7 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         gold_multiplier, xp_multiplier, drop_chance = _farm_multipliers(features, hours, live_luck)
         hour_previews.append({
             "hours": hours,
-            "gold": C.farm_gold_for(estimate_level, hours, gold_multiplier, live_pet_level),
+            "gold": round(C.farm_gold_for(estimate_level, hours, gold_multiplier, live_pet_level) * shovel_gold_multiplier),
             "xp": C.farm_xp_for(estimate_level, hours, xp_multiplier),
             "drop_chance": drop_chance,
         })
@@ -1257,6 +1355,13 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
             if level < C.FARM_MAX_LEVEL else None
         ),
         "hour_previews": hour_previews,
+        "shovel_runs": shovel_runs,
+        "shovel_upgraded": shovel_upgraded,
+        "shovel_active": shovel_active,
+        "shovel_cost": C.SHOVEL_COST,
+        "shovel_runs_per_purchase": C.SHOVEL_RUNS,
+        "shovel_gold_bonus": C.SHOVEL_GOLD_BONUS,
+        "shovel_gold_multiplier": shovel_gold_multiplier,
         # Kept for backward compatibility with anything still reading a single number:
         # the six-hour anchor row of hour_previews, byte-for-byte what these three fields
         # meant before durations existed.
@@ -1296,6 +1401,12 @@ def start_farm(
         hours = C.FARM_DURATION_HOURS
     if hours not in C.FARM_HOUR_CHOICES:
         return False, f"Выбери смену от {C.FARM_MIN_HOURS} до {C.FARM_MAX_HOURS} часов."
+    tools = _tool_masterworks(data, user_id)
+    shovel_upgraded = bool(tools["shovel"])
+    shovel_runs = max(0, int(record.get("shovel_runs", 0) or 0))
+    shovel_active = shovel_upgraded or shovel_runs > 0
+    if shovel_active and not shovel_upgraded:
+        record["shovel_runs"] = shovel_runs - 1
     run_id = secrets.token_hex(16)
     ready_at = moment + timedelta(hours=hours)
     record["farm_run"] = {
@@ -1307,6 +1418,7 @@ def start_farm(
         "pet_level": max(1, int(record.get("level", 1) or 1)),
         "features": _farm_features(record),
         "luck": int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0),
+        "shovel_gold_multiplier": _shovel_gold_multiplier(shovel_upgraded) if shovel_active else 1.0,
     }
     _save(entry, data)
     return True, f"Питомец отправлен на ферму на {hours} ч."
@@ -1544,6 +1656,70 @@ def grant_dungeon_ticket_gift(entries, amount: int = 3) -> int:
     return granted
 
 
+TOOL_MASTERWORKS = frozenset({"pickaxe", "shovel"})
+RUNE_TOOL_MASTERWORKS = {
+    # `nmm` was the original one-off pickaxe quest. Keep every live completion useful.
+    "nmm": "pickaxe",
+    "rune_paint_pickaxe": "pickaxe",
+    "rune_paint_shovel": "shovel",
+}
+
+
+def _tool_masterworks(data: dict, user_id) -> dict[str, bool]:
+    """Return the permanent, per-player tool upgrades with old NMM data folded in."""
+    all_rows = data.get("tool_masterworks")
+    row = all_rows.get(str(user_id)) if isinstance(all_rows, dict) else None
+    row = row if isinstance(row, dict) else {}
+    # The first version stored only this pickaxe flag. It remains an authoritative
+    # source so deploys never make an existing NMM pickaxe start consuming charges.
+    legacy_pickaxes = data.get("pickaxe_nmm")
+    legacy_pickaxes = legacy_pickaxes if isinstance(legacy_pickaxes, dict) else {}
+    return {
+        "pickaxe": bool(row.get("pickaxe") or legacy_pickaxes.get(str(user_id))),
+        "shovel": bool(row.get("shovel")),
+    }
+
+
+def _shovel_gold_multiplier(masterwork: bool) -> float:
+    return 1.0 + (
+        C.SHOVEL_MASTERWORK_GOLD_BONUS if masterwork else C.SHOVEL_GOLD_BONUS
+    )
+
+
+def unlock_tool_masterwork(entry: str, user_id, tool: str) -> bool:
+    """Make one tool permanent after its accepted rune-paint quest.
+
+    These upgrades deliberately live outside the rune inventory: they cannot be moved
+    between gear pieces, traded, or stacked. A masterwork has unlimited uses and its own
+    base effect is 50% stronger.
+    """
+    tool = str(tool or "").strip().lower()
+    if tool not in TOOL_MASTERWORKS:
+        return False
+    with _farm_settlement_lock:
+        data = _load(entry)
+        if _tool_masterworks(data, user_id).get(tool):
+            return False
+        all_rows = data.setdefault("tool_masterworks", {})
+        if not isinstance(all_rows, dict):
+            all_rows = data["tool_masterworks"] = {}
+        row = all_rows.setdefault(str(user_id), {})
+        if not isinstance(row, dict):
+            row = all_rows[str(user_id)] = {}
+        row[tool] = True
+        # Retain the legacy field for old readers during a rolling deploy.
+        if tool == "pickaxe":
+            data.setdefault("pickaxe_nmm", {})[str(user_id)] = True
+        _save(entry, data)
+    return True
+
+
+def unlock_tool_for_rune_quest(entry: str, user_id, quest_code: str) -> str | None:
+    """Apply a direct tool reward, returning the upgraded tool only on first unlock."""
+    tool = RUNE_TOOL_MASTERWORKS.get(str(quest_code or "").strip().lower())
+    return tool if tool and unlock_tool_masterwork(entry, user_id, tool) else None
+
+
 def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
     moment = now or app_now()
     data = _load(entry)
@@ -1558,23 +1734,24 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
             seconds_left = max(0, int((datetime.fromisoformat(str(mine["ready_at"])) - moment).total_seconds()))
         except (KeyError, TypeError, ValueError):
             ready = True
-    upgraded = bool(data.get("pickaxe_nmm", {}).get(str(user_id)))
+    upgraded = _tool_masterworks(data, user_id)["pickaxe"]
+    efficiency = C.TOOL_MASTERWORK_MULTIPLIER if upgraded else 1.0
     previews = []
     for hours in C.QUARRY_HOUR_CHOICES:
         ruby_min, ruby_max = C.QUARRY_RUBIES_BY_HOURS[hours]
-        upgrade_bonus = max(1, round(3 * hours / C.QUARRY_DURATION_HOURS)) if upgraded else 0
         previews.append({
             "hours": hours,
-            "ruby_min": ruby_min + upgrade_bonus,
-            "ruby_max": ruby_max + upgrade_bonus,
-            "gold": C.QUARRY_GOLD_BY_HOURS[hours],
-            "xp": C.QUARRY_XP_BY_HOURS[hours],
-            "drop_chance": C.QUARRY_DROP_CHANCE_BY_HOURS[hours],
+            "ruby_min": round(ruby_min * efficiency),
+            "ruby_max": round(ruby_max * efficiency),
+            "gold": round(C.QUARRY_GOLD_BY_HOURS[hours] * efficiency),
+            "xp": round(C.QUARRY_XP_BY_HOURS[hours] * efficiency),
+            "drop_chance": min(1.0, C.QUARRY_DROP_CHANCE_BY_HOURS[hours] * efficiency),
         })
     return {
         "available": True, "running": bool(mine) and not ready, "ready": ready,
         "seconds_left": seconds_left, "pickaxe_runs": max(0, int(record.get("pickaxe_runs", 0) or 0)),
-        "pickaxe_upgraded": upgraded, "cost": C.PICKAXE_COST,
+        "pickaxe_upgraded": upgraded, "pickaxe_unlimited": upgraded,
+        "pickaxe_efficiency": efficiency, "cost": C.PICKAXE_COST,
         "runs_per_pickaxe": C.PICKAXE_RUNS, "duration_hours": C.QUARRY_DURATION_HOURS,
         "ruby_min": C.QUARRY_RUBY_MIN, "ruby_max": C.QUARRY_RUBY_MAX,
         "hour_previews": previews,
@@ -1595,14 +1772,23 @@ def buy_pickaxe(entry: str, user_id, xp: int) -> tuple[bool, str]:
 
 
 def unlock_nmm_pickaxe(entry: str, user_id) -> bool:
-    with _farm_settlement_lock:
-        data = _load(entry)
-        upgrades = data.setdefault("pickaxe_nmm", {})
-        if upgrades.get(str(user_id)):
-            return False
-        upgrades[str(user_id)] = True
-        _save(entry, data)
-    return True
+    """Legacy public name for the original `nmm` quest reward."""
+    return unlock_tool_masterwork(entry, user_id, "pickaxe")
+
+
+def buy_shovel(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return False, "Сначала приручи существо."
+    if _tool_masterworks(data, user_id)["shovel"]:
+        return False, "Руническая лопата уже бесконечна — покупать заряды не нужно."
+    ok, balance = economy.spend(entry, user_id, xp, C.SHOVEL_COST, "buy:shovel")
+    if not ok:
+        return False, f"Лопата стоит {C.SHOVEL_COST} монет, у тебя {balance}."
+    record["shovel_runs"] = max(0, int(record.get("shovel_runs", 0) or 0)) + C.SHOVEL_RUNS
+    _save(entry, data)
+    return True, f"Лопата куплена: {C.SHOVEL_RUNS} смен фермы с +25% золота."
 
 
 def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> tuple[bool, str]:
@@ -1621,13 +1807,16 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
             return False, "Сначала приручи существо."
         if isinstance(record.get("quarry_run"), dict):
             return False, "Карьер уже в работе."
+        upgraded = _tool_masterworks(data, user_id)["pickaxe"]
         runs = max(0, int(record.get("pickaxe_runs", 0) or 0))
-        if not runs:
+        if not runs and not upgraded:
             return False, "Нужна кирка с зарядами."
-        record["pickaxe_runs"] = runs - 1
+        if not upgraded:
+            record["pickaxe_runs"] = runs - 1
         record["quarry_run"] = {
             "run_id": secrets.token_hex(16), "hours": hours,
             "ready_at": (moment + timedelta(hours=hours)).isoformat(),
+            "masterwork_multiplier": C.TOOL_MASTERWORK_MULTIPLIER if upgraded else 1.0,
         }
         _save(entry, data)
     return True, f"Кирка в карьере. Возвращайся через {hours} ч."
@@ -1646,24 +1835,27 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
         hours = hours if hours in C.QUARRY_HOUR_CHOICES else C.QUARRY_DURATION_HOURS
         rng = random.Random(f"quarry:{run_id}:{hours}")
         ruby_min, ruby_max = C.QUARRY_RUBIES_BY_HOURS[hours]
-        rubies = rng.randint(ruby_min, ruby_max)
-        upgraded = bool(data.get("pickaxe_nmm", {}).get(str(user_id)))
-        if upgraded:
-            rubies += max(1, round(3 * hours / C.QUARRY_DURATION_HOURS))
-        gold = C.QUARRY_GOLD_BY_HOURS[hours]
-        xp = C.QUARRY_XP_BY_HOURS[hours]
+        try:
+            efficiency = float(run.get("masterwork_multiplier", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            efficiency = 1.0
+        efficiency = C.TOOL_MASTERWORK_MULTIPLIER if efficiency > 1.0 else 1.0
+        upgraded = efficiency > 1.0
+        rubies = round(rng.randint(ruby_min, ruby_max) * efficiency)
+        gold = round(C.QUARRY_GOLD_BY_HOURS[hours] * efficiency)
+        xp = round(C.QUARRY_XP_BY_HOURS[hours] * efficiency)
         _apply_xp(record, xp)
         record["quarry_run"] = None
         _save(entry, data)
     grant_rubies_once(entry, user_id, rubies, f"quarry:{run_id}")
     economy.grant_once(entry, user_id, gold, f"pet:quarry:{run_id}")
     dropped = grant_random_drop(
-        entry, user_id, C.QUARRY_DROP_CHANCE_BY_HOURS[hours],
+        entry, user_id, min(1.0, C.QUARRY_DROP_CHANCE_BY_HOURS[hours] * efficiency),
         seed=f"quarry-drop:{run_id}:{hours}",
     )
     return {
         "hours": hours, "rubies": rubies, "gold": gold, "xp": xp,
-        "drop_chance": C.QUARRY_DROP_CHANCE_BY_HOURS[hours],
+        "drop_chance": min(1.0, C.QUARRY_DROP_CHANCE_BY_HOURS[hours] * efficiency),
         "dropped": dropped, "upgraded": upgraded,
     }
 
@@ -2438,6 +2630,231 @@ def grant_scroll_for_hard_quest(entry: str, user_id, submission_id, difficulty) 
     )
 
 
+# --- personal paint runes -------------------------------------------------------------
+
+
+def personal_paint_target_for_quest(code: str) -> str | None:
+    """Return the one safe target type an accepted rune-paint quest can create."""
+    return PERSONAL_PAINT_RUNE_QUEST_TARGETS.get(str(code or ""))
+
+
+def _personal_paint_rune_wallet(data: dict, user_id) -> list[dict]:
+    wallet = data.setdefault("personal_paint_runes", {})
+    if not isinstance(wallet, dict):
+        wallet = data["personal_paint_runes"] = {}
+    rows = wallet.setdefault(str(user_id), [])
+    if not isinstance(rows, list):
+        rows = wallet[str(user_id)] = []
+    return rows
+
+
+def _public_personal_paint_rune(row: dict) -> dict:
+    """Minimal UI/API payload; image is a Telegram file id, not public storage."""
+    return {
+        "id": str(row.get("id") or ""), "target": str(row.get("target") or ""),
+        "quest_code": str(row.get("quest_code") or ""),
+        "photo_file_id": str(row.get("photo_file_id") or ""),
+        "earned_at": str(row.get("earned_at") or ""), "stat_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER,
+    }
+
+
+def grant_personal_paint_rune(
+    entry: str, user_id, quest_code: str, submission_id: str, photo_file_id: str | None,
+) -> dict:
+    """Mint the owner-bound artwork rune paid by one accepted specialist quest.
+
+    The source id is durable/idempotent because moderator taps and payment recovery may
+    replay.  A real Telegram photo is required: no synthetic fallback image means a
+    non-photo submission cannot turn into a generic permanent stat item.
+    """
+    target = personal_paint_target_for_quest(quest_code)
+    source = f"quest-personal-paint:{str(submission_id or '').strip()}"
+    image = str(photo_file_id or "").strip()
+    if target is None:
+        return {"granted": False, "reason": "not_personal_paint_quest"}
+    if not source.endswith(":") and not image:
+        return {"granted": False, "reason": "missing_submission_image", "target": target}
+    if source.endswith(":"):
+        return {"granted": False, "reason": "invalid_source", "target": target}
+    with _farm_settlement_lock:
+        data = _load(entry)
+        sources = data.setdefault("personal_paint_rune_sources", {})
+        prior = sources.get(source) if isinstance(sources, dict) else None
+        if isinstance(prior, dict):
+            return {
+                "granted": False, "reason": "already_granted",
+                "rune": {"id": str(prior.get("rune_id") or ""), "target": target,
+                         "quest_code": str(quest_code), "photo_file_id": image,
+                         "stat_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER},
+            }
+        wallet = _personal_paint_rune_wallet(data, user_id)
+        existing = next((row for row in wallet if str(row.get("source") or "") == source), None)
+        if isinstance(existing, dict):
+            return {"granted": False, "reason": "already_granted", "rune": _public_personal_paint_rune(existing)}
+        row = {
+            "id": f"paint-{secrets.token_hex(8)}", "target": target, "source": source,
+            "quest_code": str(quest_code), "photo_file_id": image,
+            "earned_at": app_now().isoformat(),
+        }
+        wallet.append(row)
+        del wallet[:-100]
+        sources[source] = {"user_id": str(user_id), "rune_id": row["id"]}
+        if len(sources) > 5_000:
+            for stale in list(sources)[:len(sources) - 5_000]:
+                sources.pop(stale, None)
+        _save(entry, data)
+    return {"granted": True, "rune": _public_personal_paint_rune(row)}
+
+
+def personal_paint_status(entry: str, user_id) -> dict:
+    """UI-ready state for the personal-rune panel, safe before a pet is tamed."""
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    runes = [_public_personal_paint_rune(row) for row in _personal_paint_rune_wallet(data, user_id)]
+    applied = []
+    if record is not None:
+        for code, row in (record.get("personal_enchantments") or {}).items():
+            if not isinstance(row, dict):
+                continue
+            applied.append({
+                "code": str(code), "target": str(row.get("target") or ""),
+                "rune_id": str(row.get("rune_id") or ""),
+                "photo_file_id": str(row.get("photo_file_id") or ""),
+                "quest_code": str(row.get("quest_code") or ""),
+                "stat_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER,
+            })
+    return {"runes": runes, "applied": applied, "stat_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER}
+
+
+def personal_paint_candidates(entry: str, user_id, rune_id: str) -> list[dict]:
+    """Return owned, unpainted targets that match one wallet rune.
+
+    Telegram callbacks use the position in this server-generated list to stay below
+    Telegram's 64-byte callback limit. ``apply_personal_paint_rune`` still validates
+    the selected code again, so a stale button cannot bypass ownership or type rules.
+    """
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return []
+    rune = next(
+        (row for row in _personal_paint_rune_wallet(data, user_id)
+         if str(row.get("id") or "") == str(rune_id or "")),
+        None,
+    )
+    if not isinstance(rune, dict):
+        return []
+    target = str(rune.get("target") or "")
+    painted = record.get("personal_enchantments") or {}
+    rows = []
+    if target == "scroll":
+        for code in sorted(_owned_scroll_codes_for(record)):
+            spell = SCROLLS.scroll(code)
+            if spell is not None and code not in painted:
+                rows.append({"code": code, "name": str(spell.get("name") or code), "kind": "scroll"})
+        return rows
+    for code in record.get("inventory", []):
+        item = C.find_item(code)
+        if item is None or code in painted or not _personal_paint_target_is_owned(record, target, code):
+            continue
+        rows.append({"code": code, "name": item.name, "kind": "item"})
+    rows.sort(key=lambda row: (str(row["name"]).casefold(), str(row["code"])))
+    return rows
+
+
+def _personal_paint_target_is_owned(record: dict, target: str, code: str) -> bool:
+    if target == "scroll":
+        return code in _owned_scroll_codes_for(record) and SCROLLS.scroll(code) is not None
+    item = C.find_item(code)
+    if item is None or code not in record.get("inventory", []):
+        return False
+    if target == "vial":
+        # A healing vial uses the existing healing-equipment family rather than a sixth
+        # paper-doll slot. The explicit effect whitelist prevents a potion painting from
+        # buffing an unrelated legendary amulet.
+        return str((getattr(item, "effect", {}) or {}).get("code") or "") \
+            in PERSONAL_PAINT_HEALING_EFFECTS
+    return target in PERSONAL_PAINT_ITEM_SLOTS and item.slot == target
+
+
+def apply_personal_paint_rune(entry: str, user_id, rune_id: str, target_code: str) -> tuple[bool, str, dict]:
+    """Consume exactly one matching personal rune and bind it to one owned target.
+
+    The function accepts identifiers only and performs every ownership/type/stack check
+    server-side.  This is intentionally separate from normal elemental weapon runes:
+    the artwork buff is an image-and-stat provenance record, not a second combat effect.
+    """
+    rune_id = str(rune_id or "").strip()
+    target_code = str(target_code or "").strip()
+    if not rune_id or not target_code:
+        return False, "Выбери руну и предмет.", {}
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо: руна сохранится до этого момента.", {}
+        wallet = _personal_paint_rune_wallet(data, user_id)
+        index = next((i for i, row in enumerate(wallet) if str(row.get("id") or "") == rune_id), None)
+        if index is None:
+            return False, "Эта персональная руна не найдена.", {}
+        rune = wallet[index]
+        target = str(rune.get("target") or "")
+        if target not in PERSONAL_PAINT_RUNE_QUEST_TARGETS.values() or not rune.get("photo_file_id"):
+            return False, "Руна повреждена и не может быть применена.", {}
+        if not _personal_paint_target_is_owned(record, target, target_code):
+            return False, "Эта руна подходит только к своему типу и только к твоему предмету.", {}
+        enchantments = record.setdefault("personal_enchantments", {})
+        if target_code in enchantments:
+            return False, "Этот предмет уже несёт персональный покрас; второй нельзя наложить.", {}
+        enchantment = {
+            "target": target, "rune_id": rune["id"], "quest_code": rune.get("quest_code"),
+            "photo_file_id": rune["photo_file_id"], "applied_at": app_now().isoformat(),
+        }
+        enchantments[target_code] = enchantment
+        wallet.pop(index)
+        _save(entry, data)
+    label = (SCROLLS.scroll(target_code) or C.find_item(target_code))
+    name = label.get("name") if isinstance(label, dict) else getattr(label, "name", target_code)
+    return True, f"Персональный покрас применён к «{name}»: боевые числа +30%.", {
+        "code": target_code, **dict(enchantment), "stat_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER,
+    }
+
+
+def _personal_paint_item_multiplier(record: dict, code: str) -> float:
+    row = (record.get("personal_enchantments") or {}).get(code)
+    if not isinstance(row, dict) or str(row.get("target") or "") not in PERSONAL_PAINT_ITEM_SLOTS:
+        return 1.0
+    return PERSONAL_PAINT_STAT_MULTIPLIER
+
+
+def _personal_paint_effect(record: dict, item, effect: dict) -> dict:
+    """Boost only a painted healing-vial effect's healing power, never its trigger."""
+    result = dict(effect)
+    row = (record.get("personal_enchantments") or {}).get(getattr(item, "code", ""))
+    if not isinstance(row, dict) or row.get("target") != "vial" \
+            or str(result.get("code") or "") not in PERSONAL_PAINT_HEALING_EFFECTS:
+        return result
+    value = result.get("value")
+    if isinstance(value, (int, float)) and value > 0:
+        result["value"] = round(value * PERSONAL_PAINT_STAT_MULTIPLIER, 4)
+        if result.get("text"):
+            result["text"] = str(result["text"]).rstrip() + " Персональный покрас усиливает лечение на 30%."
+    return result
+
+
+def _personal_paint_scroll_codes(record: dict) -> tuple[str, ...]:
+    rows = record.get("personal_enchantments") or {}
+    if not isinstance(rows, dict):
+        return ()
+    return tuple(code for code, row in rows.items()
+                 if isinstance(row, dict) and row.get("target") == "scroll" and SCROLLS.scroll(code))
+
+
+def personal_enchanted_scrolls(entry: str, user_id) -> tuple[str, ...]:
+    """Scroll codes with an active personal-paint boost, for a combat snapshot."""
+    return _personal_paint_scroll_codes(_tamed_record(_load(entry), user_id) or {})
+
+
 def skill_loadout(entry, user_id) -> tuple:
     """The pet's four scroll slots, in order. An empty slot reads as None."""
     return _skill_loadout_for(_tamed_record(_load(entry), user_id))
@@ -2541,7 +2958,7 @@ def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
         item = C.find_item(code) if code else None
         effect = getattr(item, "effect", None) if item else None
         if isinstance(effect, dict) and effect.get("code"):
-            effects.append(dict(effect))
+            effects.append(_personal_paint_effect(record, item, effect))
     weapon = (record.get("equipped") or {}).get("weapon")
     element = (record.get("weapon_enchantments") or {}).get(weapon)
     enchant_effect = C.rune_enchantment_effect(element, _effective_stats_for(record))
@@ -2605,7 +3022,7 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
         item = C.find_item(code) if code else None
         effect = getattr(item, "effect", None) if item else None
         if isinstance(effect, dict) and effect.get("code"):
-            effects.append(dict(effect))
+            effects.append(_personal_paint_effect(record, item, effect))
     weapon = (record.get("equipped") or {}).get("weapon")
     element = (record.get("weapon_enchantments") or {}).get(weapon)
     enchant_effect = C.rune_enchantment_effect(element, effective)
@@ -2616,7 +3033,8 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
         strength=effective["strength"], health=effective["health"],
         agility=effective["agility"], luck=effective["luck"], armor=effective.get("armor", 0),
         effects=tuple(effects), level=int(record.get("level", 1)),
-        skills=_skill_loadout_for(record), shield=_combat_shield_for(record),
+        skills=_skill_loadout_for(record), personal_enchanted_scrolls=_personal_paint_scroll_codes(record),
+        shield=_combat_shield_for(record),
         damage_multiplier=damage_multiplier,
         weapon_enchanted=element in RUNE_ELEMENTS,
     )
@@ -2918,11 +3336,18 @@ def _effective_stats_for(record: dict) -> dict:
         item = C.find_item(code) if code else None
         if item is None:
             continue
+        personal_multiplier = _personal_paint_item_multiplier(record, item.code)
         for stat_key, amount in item.bonuses.items():
+            # The personal-paint promise is a 30% increase to the item's usable combat
+            # stats.  Never deepen a catalogue drawback: an enchanted glass-cannon must
+            # not lose *more* health merely for receiving its own artwork.
+            boosted_amount = (
+                round(amount * personal_multiplier) if amount > 0 else amount
+            )
             if stat_key == "armor":
-                armor += amount
+                armor += boosted_amount
             elif stat_key in bonuses:
-                bonuses[stat_key] += amount
+                bonuses[stat_key] += boosted_amount
 
     # A granted debuff scales the finished numbers rather than any one of their parts, so
     # it cannot be dodged by re-equipping and applies identically to a bare pet and a
@@ -3179,6 +3604,9 @@ def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tu
         return False, "Редкий предмет нужно подтвердить отдельной кнопкой.", 0
     value = C.resale_value(item)
     record["inventory"].remove(item.code)
+    # Artwork buffs belong to the painter, not the catalogue object.  Selling destroys
+    # its applied instance instead of letting a future re-buy inherit it.
+    record.setdefault("personal_enchantments", {}).pop(item.code, None)
     if item.slot == "weapon":
         record.setdefault("weapon_enchantments", {}).pop(item.code, None)
         record.setdefault("weapon_records", {}).pop(item.code, None)
@@ -3242,6 +3670,9 @@ def gift_item(
         giver.setdefault("weapon_enchantments", {}).pop(item.code, None)
         if item.slot == "weapon" else None
     )
+    # Personal paints are explicitly non-transferable; the recipient receives the base
+    # item only, while the spent rune cannot be recovered or duplicated.
+    giver.setdefault("personal_enchantments", {}).pop(item.code, None)
     giver["inventory"].remove(item.code)
     if item.code in giver.get("locked_items", []):
         giver["locked_items"].remove(item.code)
@@ -3655,28 +4086,45 @@ def _new_fight_id(moment: datetime) -> str:
     return f"F-{moment.strftime('%Y%m%d')}-{secrets.token_hex(6).upper()}"
 
 
-def _audit_item(code) -> dict | None:
+def _audit_item(code, record: dict | None = None) -> dict | None:
     item = C.find_item(code)
     if item is None:
         return None
+    record = record if isinstance(record, dict) else {}
+    personal = (record.get("personal_enchantments") or {}).get(item.code)
+    personal = dict(personal) if isinstance(personal, dict) else None
+    multiplier = _personal_paint_item_multiplier(record, item.code)
+    bonuses = {
+        key: (round(value * multiplier) if value > 0 else value)
+        for key, value in item.bonuses.items()
+    }
+    effect = _personal_paint_effect(record, item, dict(item.effect))
     return {
         "code": item.code, "name": item.name, "slot": item.slot,
-        "rarity": item.rarity, "bonuses": dict(item.bonuses),
-        "effect": dict(item.effect), "description": item.description,
+        "rarity": item.rarity, "bonuses": bonuses,
+        "catalog_bonuses": dict(item.bonuses),
+        "effect": effect, "description": item.description,
+        "personal_paint": personal,
     }
 
 
-def _audit_scroll(code) -> dict | None:
+def _audit_scroll(code, record: dict | None = None) -> dict | None:
     spell = SCROLLS.scroll(code) if code else None
     if spell is None:
         return None
+    personal = ((record or {}).get("personal_enchantments") or {}).get(code)
+    personal = dict(personal) if isinstance(personal, dict) and personal.get("target") == "scroll" else None
+    effects = pets_combat.resolved_scroll_effects(spell, bool(personal))
+    described = {**dict(spell), "effects": effects}
     return {
         "code": spell.get("code"), "name": spell.get("name"),
         "icon": spell.get("icon"), "description": spell.get("short"),
         "element": spell.get("element"), "uses": spell.get("uses"),
         "dodgeable": spell.get("dodgeable"), "ultimate": spell.get("ultimate"),
-        "effects": [dict(effect) for effect in spell.get("effects", ())],
-        "effects_text": list(SCROLLS.effect_lines(spell)),
+        "effects": [dict(effect) for effect in effects],
+        "effects_text": list(SCROLLS.effect_lines(described)),
+        "personal_paint": personal,
+        "personal_power_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER if personal else 1.0,
     }
 
 
@@ -3693,7 +4141,7 @@ def _fight_audit_row(
         equipped = (record or {}).get("equipped") if isinstance(record, dict) else {}
         items = []
         for slot, code in (equipped or {}).items():
-            item = _audit_item(code)
+            item = _audit_item(code, record)
             if item is not None:
                 item["slot"] = slot
                 items.append(item)
@@ -3705,7 +4153,7 @@ def _fight_audit_row(
             "equipped": items,
             "skill_slots": list(snapshot.get("skills") or ()),
             "scrolls": [
-                _audit_scroll(code) if code else None
+                _audit_scroll(code, record) if code else None
                 for code in (snapshot.get("skills") or ())
             ],
             "shield": snapshot.get("shield"),

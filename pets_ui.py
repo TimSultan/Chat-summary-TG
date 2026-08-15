@@ -25,6 +25,7 @@ from html import escape
 import economy
 import casino
 import pets
+import pets_combat
 import pets_config as C
 import pets_scroll_catalog as SCROLLS
 import pets_updates
@@ -47,6 +48,26 @@ RARITY_FILTER_NAMES = {
     "all": "Все", "cursed": "Проклятые", "common": "Обычные",
     "rare": "Редкие", "legendary": "Легендарные",
 }
+
+PERSONAL_PAINT_TARGET_NAMES = {
+    "weapon": "оружие", "shield": "щит", "boots": "ботинки",
+    "amulet": "амулет", "vial": "лечебный пузырёк", "scroll": "свиток",
+}
+
+
+def _personal_paint_bonus_text(target: str) -> str:
+    if target == "scroll":
+        return "сила полезных чисел свитка +30%; шанс и длительность не меняются"
+    if target == "vial":
+        return "сила лечения +30%; порог и частота срабатывания не меняются"
+    return "положительные статы предмета +30%"
+
+
+def _scroll_effect_lines(spell: dict, painted: bool = False) -> tuple[str, ...]:
+    if not painted:
+        return SCROLLS.effect_lines(spell)
+    effects = pets_combat.resolved_scroll_effects(spell, True)
+    return SCROLLS.effect_lines({**dict(spell), "effects": effects})
 
 
 def callback_data(owner_id, action: str, argument: str = "") -> str:
@@ -763,7 +784,11 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     else:
         lines.append("\n🕰 Без дедлайна: квесты не обновятся сами.")
     if kind == "rune":
-        lines.append("За качественно принятую работу: случайная руна и случайная магия.")
+        lines.append(
+            "Обычный рунический квест даёт случайную руну и магию. Специальный "
+            "квест на вещь даёт персональный покрас +30%; квесты кирки и лопаты "
+            "сразу улучшают инструмент навсегда."
+        )
     buttons = []
     for index, card in enumerate(cards, 1):
         status = card.get("status", "open")
@@ -824,6 +849,19 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         "\n✨ За качественно принятую работу: случайная магия и случайная руна."
         if reward.get("magic_guaranteed") else ""
     )
+    personal_target_code = str(reward.get("personal_paint_target") or "")
+    personal_target = PERSONAL_PAINT_TARGET_NAMES.get(personal_target_code)
+    personal_reward = (
+        f"\n🎨 Персональная руна для типа «{escape(personal_target)}»: фотография станет "
+        f"аватаркой выбранной цели; {_personal_paint_bonus_text(personal_target_code)}."
+        if personal_target else ""
+    )
+    tool_names = {"pickaxe": "кирка", "shovel": "лопата"}
+    tool_name = tool_names.get(reward.get("tool_masterwork"))
+    tool_reward = (
+        f"\n🛠 «{escape(tool_name)}» улучшается напрямую: бесконечные заряды и +50% эффективности."
+        if tool_name else ""
+    )
     lines = [
         f"{'🎯' if paint else '🌍'} <b>{escape(card.get('title') or 'Квест')}</b>",
         f"{quest_pips(difficulty)} {QUEST_DIFFICULTY_NAMES.get(difficulty, '')}",
@@ -838,7 +876,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"5. Выложи фото в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
         f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
-        magic_reward + scroll_reward,
+        magic_reward + personal_reward + tool_reward + scroll_reward,
         (f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>"
          if board.get("auto_refresh") else "\n🕰 Дедлайна нет — квест останется здесь."),
     ]
@@ -1264,11 +1302,18 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     lines.append(f"\n🪙 У тебя: {_money(coins)}")
     lines.append(f"🎟 Билетов: {int(status.get('tickets', 0) or 0)}")
+    lines.append("\n<b>🪏 Лопата фермы</b>")
+    if status.get("shovel_upgraded"):
+        lines.append("Руническая лопата: бесконечные заряды · +50% золота на каждой смене.")
+    else:
+        shovel_runs = int(status.get("shovel_runs", 0) or 0)
+        lines.append(f"Зарядов лопаты: {shovel_runs}. Каждый заряд даёт +25% золота на одну смену.")
     lines.append("\n<b>⛏ Карьер</b>")
     if quarry.get("running"):
         lines.append(f"Добыча идёт. Осталось: {_farm_duration(int(quarry.get('seconds_left', 0) or 0))}.")
     else:
-        lines.append(f"Зарядов кирки: {int(quarry.get('pickaxe_runs', 0) or 0)}.")
+        charges = "∞" if quarry.get("pickaxe_unlimited") else str(int(quarry.get("pickaxe_runs", 0) or 0))
+        lines.append(f"Зарядов кирки: {charges}.")
         for preview in quarry.get("hour_previews", []):
             lines.append(
                 f"{int(preview['hours'])} ч — 💎 {int(preview['ruby_min'])}–{int(preview['ruby_max'])} · "
@@ -1276,7 +1321,7 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 f"🎁 {float(preview['drop_chance']) * 100:g}%"
             )
         if quarry.get("pickaxe_upgraded"):
-            lines.append("Улучшенная NMM-кирка: бонус рубинов уже включён в расчёт выше.")
+            lines.append("Руническая кирка: бесконечные заряды · +50% ко всей добыче уже включены в расчёт выше.")
     rows = []
     if status.get("can_start"):
         # Four per row -- two rows of four -- so all eight choices fit without a single
@@ -1324,8 +1369,13 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"⬆️ {label}{cost_text}",
             "callback_data": callback_data(user_id, "farmup", feature),
         }])
+    if not status.get("shovel_upgraded") and not int(status.get("shovel_runs", 0) or 0):
+        rows.append([{
+            "text": f"🪏 Купить лопату · {_money(int(status.get('shovel_cost', C.SHOVEL_COST)))}",
+            "callback_data": callback_data(user_id, "shovelbuy"),
+        }])
     if not quarry.get("running"):
-        if int(quarry.get("pickaxe_runs", 0) or 0) > 0:
+        if quarry.get("pickaxe_unlimited") or int(quarry.get("pickaxe_runs", 0) or 0) > 0:
             rows.append([{
                 "text": f"⛏ {hours}ч",
                 "callback_data": callback_data(user_id, "quarrystart", str(hours)),
@@ -1456,6 +1506,18 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         "text": "📜 Боевые свитки · 4 слота",
         "callback_data": callback_data(user_id, "skills"),
     }])
+    personal = pets.personal_paint_status(entry, user_id)
+    rune_count = len(personal.get("runes", []))
+    applied_count = len(personal.get("applied", []))
+    rows.append([{
+        "text": f"🎨 Персональные руны · {rune_count}",
+        "callback_data": callback_data(user_id, "paintrunes"),
+    }])
+    if rune_count or applied_count:
+        lines.append(
+            f"\n🎨 Персональные покрасы: {rune_count} готово к применению · "
+            f"{applied_count} уже на предметах и свитках."
+        )
     rows.append([{
         "text": "🛒 Магазин", "callback_data": callback_data(user_id, "store"),
     }])
@@ -1467,6 +1529,61 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             f"\n<i>В сумке: {_plural(len(owned), 'предмет', 'предмета', 'предметов')}.</i>"
         )
     rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def personal_paint_runes_view(entry: str, user_id) -> tuple[str, dict]:
+    """Owner-bound artwork runes earned by accepted specialist paint quests."""
+    state = pets.personal_paint_status(entry, user_id)
+    runes = state.get("runes", [])
+    applied = state.get("applied", [])
+    lines = [
+        "🎨 <b>Персональные руны</b>",
+        "Руна хранит фотографию твоего покраса. Применяется один раз к предмету "
+        "того же типа: изображение становится его аватаркой, положительные боевые "
+        "параметры усиливаются на 30%.",
+        "<i>Шансы срабатывания, длительность и отрицательные параметры не растут.</i>",
+    ]
+    rows = []
+    if runes:
+        lines.append("\n<b>Готовы к применению:</b>")
+    for index, rune in enumerate(runes, 1):
+        target = PERSONAL_PAINT_TARGET_NAMES.get(str(rune.get("target") or ""), "предмет")
+        lines.append(f"{index}. 🎨 {escape(target)} · +30%")
+        rows.append([{
+            "text": f"🎨 Выбрать {target}",
+            "callback_data": callback_data(user_id, "paintrune", str(rune.get("id") or "")),
+        }])
+    if not runes:
+        lines.append("\nПока нет свободных персональных рун. Они выдаются после принятия отдельного рунического квеста.")
+    if applied:
+        lines.append(f"\n<i>Уже применено: {len(applied)}. Снять или сложить два покраса нельзя.</i>")
+    rows.append([{"text": "🎒 К снаряжению", "callback_data": callback_data(user_id, "bag")}])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def personal_paint_targets_view(entry: str, user_id, rune_id: str) -> tuple[str, dict]:
+    state = pets.personal_paint_status(entry, user_id)
+    rune = next((row for row in state.get("runes", []) if row.get("id") == rune_id), None)
+    if rune is None:
+        return personal_paint_runes_view(entry, user_id)
+    target = PERSONAL_PAINT_TARGET_NAMES.get(str(rune.get("target") or ""), "предмет")
+    candidates = pets.personal_paint_candidates(entry, user_id, rune_id)
+    lines = [
+        f"🎨 <b>Выбери {escape(target)}</b>",
+        "Руна расходуется навсегда. У выбранной вещи появится твоя картинка, "
+        f"а {_personal_paint_bonus_text(str(rune.get('target') or ''))}.",
+    ]
+    rows = []
+    for index, row in enumerate(candidates):
+        rows.append([{
+            "text": f"🎨 {str(row.get('name') or row.get('code'))[:42]}",
+            "callback_data": callback_data(user_id, "paintapply", f"{rune_id},{index}"),
+        }])
+    if not candidates:
+        lines.append("\n<i>Подходящих непрокрашенных вещей этого типа пока нет.</i>")
+    rows.append([{"text": "◀️ К персональным рунам", "callback_data": callback_data(user_id, "paintrunes")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -1568,6 +1685,7 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
     if not pet:
         return no_pet_view(user_id)
     unlocked = pets.owned_scrolls(entry, user_id)
+    personal_scrolls = set(pets.personal_enchanted_scrolls(entry, user_id))
     lines = [
         "📜 <b>Боевые свитки</b>",
         "В обычных боях существо само выбирает между атакой, защитой и доступными свитками.",
@@ -1602,10 +1720,12 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
         lines.extend([
             "",
             f"<b>{index}. {escape(spell['icon'])} {escape(title)}</b>"
-            + (" · УЛЬТИМЕЙТ" if spell["ultimate"] else "") + " · один раз за бой",
+            + (" · УЛЬТИМЕЙТ" if spell["ultimate"] else "")
+            + (" · 🎨 ПОКРАС +30%" if code in personal_scrolls else "")
+            + " · один раз за бой",
             escape(spell["short"]),
         ])
-        lines.extend(f"▸ {escape(line)}" for line in SCROLLS.effect_lines(spell))
+        lines.extend(f"▸ {escape(line)}" for line in _scroll_effect_lines(spell, code in personal_scrolls))
         lines.append(
             SCROLLS.element_label(spell["element"])
             + (" · Нельзя увернуться." if not spell["dodgeable"] else "")
@@ -1638,6 +1758,7 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
     page = min(max(0, int(page)), total_pages - 1)
     visible = pool[page * page_size:(page + 1) * page_size]
     current = pets.skill_loadout(entry, user_id)[slot - 1]
+    personal_scrolls = set(pets.personal_enchanted_scrolls(entry, user_id))
     lines = [
         f"📜 <b>Слот {slot}</b> · {page + 1}/{total_pages}",
         "Ультимейт используется не больше одного раза за бой." if slot == 4
@@ -1661,10 +1782,15 @@ def skill_picker_view(entry: str, user_id, slot: int, page: int = 0) -> tuple[st
         chosen = spell["code"] == current
         lines.extend([
             "",
-            f"<b>{escape(spell['icon'])} {escape(spell['name'])}</b>" + (" ✅" if chosen else ""),
+            f"<b>{escape(spell['icon'])} {escape(spell['name'])}</b>"
+            + (" 🎨 +30%" if spell["code"] in personal_scrolls else "")
+            + (" ✅" if chosen else ""),
             escape(spell["short"]),
         ])
-        lines.extend(f"▸ {escape(line)}" for line in SCROLLS.effect_lines(spell))
+        lines.extend(
+            f"▸ {escape(line)}"
+            for line in _scroll_effect_lines(spell, spell["code"] in personal_scrolls)
+        )
         lines.append(
             SCROLLS.element_label(spell["element"])
             + (" · Нельзя увернуться" if not spell["dodgeable"] else "")
@@ -1898,6 +2024,7 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
     ]
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
+    personal_enchantments = pet.get("personal_enchantments") or {}
     owned.sort(key=lambda item: (item.code != worn, item.code))
     total_pages = max(1, (len(owned) + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
     page = min(max(0, page), total_pages - 1)
@@ -1915,8 +2042,9 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         is_worn = item.code == worn
         mark = " ✅ надето" if is_worn else ""
         lock_mark = " 🔒" if item.code in locked else ""
+        paint_mark = " 🎨 +30%" if item.code in personal_enchantments else ""
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
-        lines.append(f"\n{number}. <b>{escape(item.name)}</b>{mark}{lock_mark}")
+        lines.append(f"\n{number}. <b>{escape(item.name)}</b>{mark}{lock_mark}{paint_mark}")
         lines.append(f"{label} · {_bonus_text(item)}")
         if item.slot == "weapon":
             details = pets.weapon_details(entry, user_id, item.code)

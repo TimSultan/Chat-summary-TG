@@ -1192,6 +1192,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(board["real"]["seconds_until_refresh"], 24 * 60 * 60)
         self.assertFalse(board["rune"]["auto_refresh"])
         self.assertIsNone(board["rune"]["seconds_until_refresh"])
+        self.assertEqual(len(board["rune"]["quests"]), 5)
         quest = board["quest"]
         for field in ("code", "hashtag", "title", "subject", "technique", "hint",
                       "tool", "difficulty", "reward"):
@@ -1372,6 +1373,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="scr-quests"', page)
         self.assertIn('data-tab="quests"', page)
         self.assertIn('data-questgroup', page)
+        self.assertIn('[data-questgroup]', page)
         self.assertIn('Без дедлайна:', page)
         self.assertIn('data-questidea', page)
         self.assertIn('data-reviewideas', page)

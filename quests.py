@@ -133,13 +133,17 @@ def _empty() -> dict:
         "history": [],         # newest last; one row per finished quest
         "rewards": {},         # difficulty -> partial override of REWARDS_BY_DIFFICULTY
         "real_assignments": {},  # user_id -> the one live Квест в реале
-        "rune_assignments": {},  # user_id -> six elemental rune-paint challenges
+        "rune_assignments": {},  # user_id -> five rune-paint challenges
         "done": {},            # user_id -> {quest code: when it was last finished}
         "moderators": {},      # user_id -> who may review, delegated by an admin
         "disabled": [],        # quest codes a moderator has taken out of rotation
         "overrides": {},       # quest code -> per-chat editable text fields
         "ideas": [],           # player-suggested quest ideas, newest last
         "reroll_cooldowns": {},  # user_id -> kind -> last successful group reroll
+        # Bot API photo ids may arrive just before Telethon records the matching quest
+        # submission. Keep that tiny race durable so an accepted personal-paint reward
+        # never loses the artwork it is meant to carry.
+        "submission_photos": {},  # "chat_id:message_id" -> {file_id, ts}
     }
 
 
@@ -191,6 +195,10 @@ def _load(entry: str) -> dict:
         str(uid): {str(kind): str(when) for kind, when in rows.items()}
         for uid, rows in base["reroll_cooldowns"].items() if isinstance(rows, dict)
     }
+    base["submission_photos"] = {
+        str(key): dict(row) for key, row in base["submission_photos"].items()
+        if isinstance(row, dict) and row.get("file_id")
+    }
     return base
 
 
@@ -199,6 +207,43 @@ def _save(entry: str, data: dict) -> None:
     data["submissions"] = data["submissions"][-SUBMISSION_LIMIT:]
     data["history"] = data["history"][-HISTORY_LIMIT:]
     stats._write_json_atomic(_path(entry), data)
+
+
+def _submission_photo_key(chat_id, message_id) -> str:
+    return f"{chat_id}:{message_id}"
+
+
+def attach_submission_photo(
+    entry: str, chat_id, message_id, photo_file_id: str,
+    now: datetime | None = None,
+) -> bool:
+    """Attach the Bot API image id to a quest post, regardless of listener order.
+
+    Telegram's Bot API and the Telethon listener observe the same group post on separate
+    update streams. Either one can win the race: if the submission exists we enrich it
+    immediately; otherwise ``submit`` consumes this small pending record moments later.
+    """
+    file_id = str(photo_file_id or "").strip()
+    if not file_id or chat_id is None or message_id is None:
+        return False
+    moment = now or app_now()
+    key = _submission_photo_key(chat_id, message_id)
+    with _lock:
+        data = _load(entry)
+        for row in reversed(data.get("submissions", [])):
+            if (_submission_photo_key(row.get("chat_id"), row.get("message_id")) == key):
+                row["photo_file_id"] = file_id
+                data.setdefault("submission_photos", {}).pop(key, None)
+                _save(entry, data)
+                return True
+        pending = data.setdefault("submission_photos", {})
+        pending[key] = {"file_id": file_id, "ts": moment.isoformat()}
+        # A normal match is consumed within one event-loop turn. The cap only protects
+        # against unrelated photos carrying a quest-looking caption forever.
+        while len(pending) > 500:
+            pending.pop(next(iter(pending)))
+        _save(entry, data)
+    return True
 
 
 # --- who may review -------------------------------------------------------------------
@@ -459,7 +504,18 @@ def _quest_payload(entry: str, quest, data: dict) -> dict:
     text = _quest_text(quest, data)
     reward = _reward_payload(entry, quest.difficulty, data)
     if quest.kind == "rune":
-        reward.update({"magic_guaranteed": True, "rubies": 2, "random_runes": 1})
+        reward["rubies"] = 2
+        personal_target = pets.personal_paint_target_for_quest(quest.code)
+        tool_masterwork = pets.RUNE_TOOL_MASTERWORKS.get(quest.code)
+        if personal_target:
+            reward.update({
+                "personal_paint_target": personal_target,
+                "personal_paint_multiplier": pets.PERSONAL_PAINT_STAT_MULTIPLIER,
+            })
+        elif tool_masterwork:
+            reward.update({"tool_masterwork": tool_masterwork, "tool_efficiency": 1.5})
+        else:
+            reward.update({"magic_guaranteed": True, "random_runes": 1})
     return {
         "code": quest.code,
         "hashtag": catalog.hashtag(quest.code),
@@ -531,7 +587,7 @@ def _is_offerable(quest, data: dict, user_id, moment: datetime) -> bool:
 
 # Independent storage for the three-card painting board and one-card real-life board.
 SLOTS = {"paint": "assignments", "real": "real_assignments", "rune": "rune_assignments"}
-QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 6}
+QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 5}
 BOARD_LIFETIME = timedelta(hours=24)
 EMPTY_BOARD_REFRESH = timedelta(hours=8)
 AUTO_REFRESH_KINDS = frozenset({"real"})
@@ -710,7 +766,7 @@ def real_quest(entry: str, user_id, now: datetime | None = None) -> dict:
 
 
 def rune_quest(entry: str, user_id, now: datetime | None = None) -> dict:
-    """The six thematic elemental painting challenges."""
+    """The five-card rune-painting challenge board."""
     return quest_board(entry, user_id, "rune", now)
 
 
@@ -916,6 +972,12 @@ def submit(
             )
         if live.get("status") == "review":
             return False, "Работа по этому квесту уже на проверке."
+        photo_key = _submission_photo_key(chat_id, message_id)
+        cached_photo = data.setdefault("submission_photos", {}).pop(photo_key, None)
+        resolved_photo_file_id = str(
+            photo_file_id or ((cached_photo or {}).get("file_id") if isinstance(cached_photo, dict) else "")
+            or ""
+        ).strip() or None
         row = {
             "id": f"{moment.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}",
             "kind": quest.kind,
@@ -927,7 +989,7 @@ def submit(
             "difficulty": quest.difficulty,
             "chat_id": chat_id,
             "message_id": message_id,
-            "photo_file_id": photo_file_id,
+            "photo_file_id": resolved_photo_file_id,
             "ts": moment.isoformat(),
             "status": "pending",
             "reviewed_by": None,
@@ -1070,6 +1132,12 @@ def review(
         quest = catalog.find_quest(row.get("code"))
         if quest is None:
             return False, "Квест больше не существует.", receipt
+        if accept and pets.personal_paint_target_for_quest(quest.code) \
+                and not str(row.get("photo_file_id") or "").strip():
+            return False, (
+                "У заявки нет доступной фотографии для аватарки руны. "
+                "Попроси игрока пересдать квест именно фотографией."
+            ), receipt
 
         row["status"] = "accepted" if accept else "rejected"
         row["reviewed_by"] = str(reviewer_id)
@@ -1086,6 +1154,10 @@ def review(
                 "user_id": row["user_id"], "code": quest.code, "title": quest.title,
                 "difficulty": quest.difficulty, "kind": quest.kind,
                 "badge": quest.badge, "author_name": row.get("author_name", ""),
+                # The personal-paint rune keeps this Telegram file id as its artwork.
+                # It is copied from the immutable submitted proof, never from a client
+                # review request.
+                "photo_file_id": row.get("photo_file_id"),
                 **reward,
             }
             row["paid"] = dict(reward)
@@ -1199,9 +1271,19 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
     kind = receipt.get("kind")
     rubies = 10 if kind == "real" else (2 if kind == "rune" else 5)
     pets.grant_rubies_once(entry, user_id, rubies, f"quest:{submission_id}")
-    pickaxe_unlocked = receipt.get("code") == "nmm" and pets.unlock_nmm_pickaxe(entry, user_id)
+    # Pickaxe and shovel rune-paint quests are direct permanent tool upgrades; every
+    # other specialist paint quest may mint exactly one owner-bound artwork rune.
+    tool_masterwork = pets.unlock_tool_for_rune_quest(entry, user_id, receipt.get("code"))
+    pickaxe_unlocked = tool_masterwork == "pickaxe"
+    personal_paint_rune = pets.grant_personal_paint_rune(
+        entry, user_id, receipt.get("code"), submission_id, receipt.get("photo_file_id"),
+    )
+    specialist_paint = bool(
+        pets.personal_paint_target_for_quest(receipt.get("code"))
+        or pets.RUNE_TOOL_MASTERWORKS.get(str(receipt.get("code") or ""))
+    )
     rune = {"granted": 0}
-    if kind == "rune":
+    if kind == "rune" and not specialist_paint:
         element = random.Random(f"dungeon-quest-rune:{submission_id}").choice(pets.RUNE_ELEMENTS)
         rune = pets.grant_runes(entry, user_id, element, 1, f"dungeon-quest:{submission_id}")
     xp = int(receipt.get("xp", 0) or 0) if has_pet else 0
@@ -1219,17 +1301,20 @@ def _pay(entry: str, receipt: dict, submission_id) -> dict:
     # and difficulty-5 quests enter it; the submission id makes the roll deterministic
     # and idempotent even if a worker ever retries this reward receipt.
     scroll = (
+        {"granted": False, "reason": "specialist_paint_reward"}
+        if kind == "rune" and specialist_paint else
         pets.grant_scroll_reward(
             entry, user_id, source=f"dungeon-quest:{submission_id}", kind="dungeon",
             chance=1.0, pity_after=1, seed=f"dungeon-quest:{submission_id}",
-        )
-        if kind == "rune" else pets.grant_scroll_for_hard_quest(
+        ) if kind == "rune" else pets.grant_scroll_for_hard_quest(
             entry, user_id, submission_id, receipt.get("difficulty", 0),
         )
     )
     return {
         "gold": gold, "xp": xp, "tickets": tickets, "rubies": rubies, "rune": rune,
         "pickaxe_unlocked": pickaxe_unlocked,
+        "tool_masterwork": tool_masterwork,
+        "personal_paint_rune": personal_paint_rune,
         "has_pet": has_pet,
         "item": dropped.get("code") if dropped else None,
         "item_name": dropped.get("name") if dropped else None,

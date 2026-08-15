@@ -68,6 +68,10 @@ class Fighter:
     # Active combat loadout. Empty means a historic/classic fighter and preserves the
     # old simulator byte-for-byte; current pets carry 3 regular scrolls + one ultimate.
     skills: tuple = ()
+    # Codes of scrolls carrying a personal paint rune.  The engine scales only their
+    # numerical power fields, never duration or probability; kept on the fighter so an
+    # audit/replay is independent of later inventory changes.
+    personal_enchanted_scrolls: tuple = ()
     # Snapshot of the equipped live shield's Defend hook (or None for base Defend).
     shield: dict | None = None
     damage_multiplier: float = 1.0
@@ -225,6 +229,7 @@ def snapshot(fighter: "Fighter") -> dict:
         ],
         "level": fighter.level,
         "skills": list(fighter.skills or ()),
+        "personal_enchanted_scrolls": list(fighter.personal_enchanted_scrolls or ()),
         "shield": dict(fighter.shield) if isinstance(fighter.shield, Mapping) else None,
         "damage_multiplier": fighter.damage_multiplier,
         "magic_reflect_multiplier": fighter.magic_reflect_multiplier,
@@ -293,6 +298,10 @@ def restore(data) -> "Fighter | None":
         ),
         level=_stored_number(data.get("level"), 1),
         skills=skills,
+        personal_enchanted_scrolls=tuple(
+            code for code in (data.get("personal_enchanted_scrolls") or ())
+            if isinstance(code, str) and SCROLLS.scroll(code) is not None
+        ),
         shield=shield,
         damage_multiplier=_stored_number(data.get("damage_multiplier"), 1.0),
         magic_reflect_multiplier=_stored_number(data.get("magic_reflect_multiplier"), 0.0),
@@ -570,6 +579,29 @@ def _resolve_blow(attacker: dict, defender: dict, rng) -> tuple:
     if damage <= 15 and event == "hit":
         event = "low_damage"
     return event, damage
+
+
+def resolved_scroll_effects(spell: Mapping, personal_paint: bool = False) -> tuple[dict, ...]:
+    """Return exact effects used by combat, including the safe artwork boost."""
+    if not personal_paint:
+        return tuple(dict(effect) for effect in spell.get("effects", ()) if isinstance(effect, Mapping))
+    scaled = []
+    for raw in spell.get("effects", ()):
+        if not isinstance(raw, Mapping):
+            continue
+        effect = dict(raw)
+        op = str(effect.get("op") or "")
+        if op in {"damage", "burn"} and isinstance(effect.get("amount"), (int, float)):
+            effect["amount"] = float(effect["amount"]) * 1.30
+        elif op in {"heal", "shield", "regen", "self_damage"} \
+                and isinstance(effect.get("percent"), (int, float)):
+            if op != "self_damage":
+                effect["percent"] = float(effect["percent"]) * 1.30
+        elif op in {"weaken", "vulnerable", "damage_boost", "reflect_next"} \
+                and isinstance(effect.get("value"), (int, float)):
+            effect["value"] = float(effect["value"]) * 1.30
+        scaled.append(effect)
+    return tuple(scaled)
 
 
 def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
@@ -1083,6 +1115,17 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             total_damage[target_key] += round(before - hp[source_key])
         return 0, None
 
+    def personal_paint_scroll_effects(source_key: str, code: str, spell: Mapping) -> tuple[dict, ...]:
+        """Return a spell's effects, with a personal paint rune's safe +30% boost.
+
+        Damage multipliers, heals, barriers and deterministic status strengths are
+        numeric power.  We intentionally leave ``turns``, stun, dodge, cleanse and the
+        blind chance untouched: the artwork is stronger, not longer or more random.
+        """
+        return resolved_scroll_effects(
+            spell, code in set(fighters[source_key].personal_enchanted_scrolls or ()),
+        )
+
     def active_actions(key: str) -> list[str]:
         loadout = skill_loadouts[key]
         actions = ["attack"]
@@ -1151,11 +1194,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             # loadout must never be the thing that takes a live battle down.
             tick_skill_state(source_key)
             return None
+        spell_effects = personal_paint_scroll_effects(source_key, code, spell)
         used_scrolls[source_key].add(code)
         spell_attack_types = (ELEMENTAL, MAGIC) if spell.get("element") else (MAGIC,)
         harmful = any(effect.get("op") in {
             "damage", "burn", "weaken", "blind", "vulnerable", "stun", "break_shield",
-        } for effect in spell["effects"])
+        } for effect in spell_effects)
         dodged = False
         if harmful and spell["dodgeable"]:
             if skill_statuses[target_key].pop("dodge_next", False):
@@ -1170,7 +1214,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         impact = 0
         winner = None
         if not dodged:
-            for effect in spell["effects"]:
+            for effect in spell_effects:
                 dealt, winner = apply_scroll_effect(
                     source_key, target_key, effect, number, spell_attack_types,
                 )

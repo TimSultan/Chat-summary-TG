@@ -495,6 +495,15 @@ QUARRY_DROP_CHANCE_BY_HOURS = {1: .02, 2: .05, 4: .12, 8: .30}
 QUARRY_RUBY_MIN, QUARRY_RUBY_MAX = QUARRY_RUBIES_BY_HOURS[QUARRY_DURATION_HOURS]
 PICKAXE_COST = 150
 PICKAXE_RUNS = 5
+# The shovel is deliberately parallel to the pickaxe: a bought tool has five jobs, but
+# a masterpiece upgrade earned from its dedicated rune-paint quest never runs dry.  The
+# upgraded tool is 50% more effective than the base tool, not a blanket 50% bonus to the
+# entire farm/quarry economy.
+SHOVEL_COST = 150
+SHOVEL_RUNS = 5
+SHOVEL_GOLD_BONUS = 0.25
+SHOVEL_MASTERWORK_GOLD_BONUS = 0.50
+TOOL_MASTERWORK_MULTIPLIER = 1.50
 
 HISTORY_LIMIT = 10          # "список последних 10 боев"
 # The mailbox merges three feeds (fights, farm shifts, gifts) into one, so it is capped
