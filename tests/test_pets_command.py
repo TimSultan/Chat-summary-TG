@@ -1131,8 +1131,9 @@ class PetsCommandTests(unittest.TestCase):
             self.assertNotEqual(group["paths"][0], group["paths"][1])
         self.assertNotIn("send_photo_file", api.calls)
 
-    def test_dungeon_boss_log_is_sent_before_the_saved_dungeon_menu_is_redrawn(self):
-        """Boss transcripts are separate chat messages; the navigation message stays put."""
+    def test_a_dungeon_boss_fight_never_dms_a_transcript(self):
+        """A boss fight used to also post the complete text transcript as a separate,
+        permanent chat message. That DM is gone -- only the navigation message redraws."""
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         data = pets._load(CHAT)
@@ -1152,13 +1153,11 @@ class PetsCommandTests(unittest.TestCase):
         with patch.object(pets, "dungeon_fight", return_value=(True, "Победа.", receipt)):
             api = self._tap("dungeonfight", "0")
 
-        self.assertEqual(len(api.sent), 1)
-        self.assertIn("Лог боя", api.sent[0]["text"])
-        self.assertNotIn("Fight ID", api.sent[0]["text"])
+        self.assertEqual(api.sent, [])
         self.assertTrue(api.edits)
         self.assertIn("Этаж 5", api.edits[-1]["text"])
         self.assertNotIn("Fight ID", api.edits[-1]["text"])
-        self.assertLess(api.calls.index("send_message"), api.calls.index("edit_message_text"))
+        self.assertNotIn("send_message", api.calls)
 
     def test_the_attacker_keeps_action_buttons_that_an_album_cannot_carry(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

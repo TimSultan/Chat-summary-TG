@@ -182,11 +182,6 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 raise self.birthday_notify_raises
             self.birthday_greetings.append((str(celebrant), greeter_name, gold, xp))
 
-        self.boss_fight_logs: list[tuple[str, str]] = []
-
-        async def boss_fight_log(user_id, text):
-            self.boss_fight_logs.append((str(user_id), text))
-
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
         app = vote_web.create_app(
@@ -199,7 +194,6 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 quest_feedback=quest_feedback,
                 quest_completion=quest_completion,
                 birthday_notify=birthday_notify,
-                boss_fight_log=boss_fight_log,
                 log=self.logs.append,
             ),
         )
@@ -791,7 +785,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await finished.json())["battle"]["finished"])
         self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True), before)
 
-    async def test_dungeon_boss_log_is_sent_to_telegram_without_changing_the_replay_response(self):
+    async def test_a_dungeon_boss_fight_never_dms_a_transcript(self):
+        """A boss fight used to also post the complete text transcript to the player's
+        private chat with the bot. That DM is gone -- the live replay in this response is
+        the only place the fight is shown."""
         self._tame(PLAYER)
         data = pets._load(CHAT)
         data["pets"][str(PLAYER["id"])]["dungeon_run"] = {
@@ -815,11 +812,6 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["battle"]["rounds"], [])
         self.assertIn("Fight ID: F-20260815-ABCDEF123456", body["message"])
-        self.assertEqual(len(self.boss_fight_logs), 1)
-        user_id, log_text = self.boss_fight_logs[0]
-        self.assertEqual(user_id, str(PLAYER["id"]))
-        self.assertIn("Лог боя", log_text)
-        self.assertNotIn("Fight ID", log_text)
 
     async def test_automatic_and_multiplayer_placeholder_create_no_live_results(self):
         self._tame(PLAYER)

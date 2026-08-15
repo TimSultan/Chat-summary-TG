@@ -2756,17 +2756,6 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
     return "\n".join(lines)
 
 
-def battle_log(result) -> str:
-    """The complete readable fight transcript sent after a persistent result image."""
-    lines = ["<b>Лог боя</b>", escape(result.opening)]
-    if result.accident:
-        lines.append(f"<b>{escape(result.accident)}</b>")
-    else:
-        lines.extend(escape(round_.text) for round_ in result.rounds)
-        lines.append(f"<b>{escape(result.closing)}</b>")
-    return "\n".join(lines)
-
-
 def fight_report_keyboard(user_id) -> dict:
     return {"inline_keyboard": [
         [{"text": "⚔️ Ещё бой", "callback_data": callback_data(user_id, "search")}],
