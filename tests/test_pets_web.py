@@ -1771,6 +1771,25 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-mobfight="', page)
         self.assertIn("MOBS.splice(Number(index), 1);", page)
 
+    async def test_the_quarry_offers_the_same_early_recall_the_farm_does(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('data-do="quarrycancel"', page)
+        self.assertIn('d.do === "quarrycancel"', page)
+        self.assertIn("Заплатят по ближайшей меньшей смене", page)
+        self.assertIn("quarry_cancel", pets_web._ACTIONS)
+
+        self._tame(PLAYER)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["pickaxe_runs"] = 1
+        pets._save(CHAT, data)
+        self.assertTrue(pets.start_quarry(CHAT, PLAYER["id"], 8)[0])
+
+        response = await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+            "init_data": _init_data(PLAYER["id"]), "action": "quarry_cancel",
+        })
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertFalse((await response.json())["state"]["quarry"]["running"])
+
     async def test_farm_screen_hides_start_buttons_while_the_creature_is_elsewhere(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         farm = page.split("function renderFarm()", 1)[1].split(

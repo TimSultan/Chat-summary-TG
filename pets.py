@@ -1858,6 +1858,7 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
         "hour_previews": previews,
         # Mirrors farm_status: the same one-place-at-a-time rule, read from this side.
         "can_start": not busy["quarry"] and has_pickaxe and (parallel or not busy["farm"]),
+        "can_cancel": bool(mine) and not ready,
         "farm_busy": busy["farm"],
         "blocked_by_farm": busy["farm"] and not parallel,
         "parallel_work": parallel,
@@ -1932,6 +1933,9 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
             record["pickaxe_runs"] = runs - 1
         record["quarry_run"] = {
             "run_id": secrets.token_hex(16), "hours": hours,
+            # Written so an early recall can tell how long the pickaxe was actually down
+            # there without inferring it backwards from ready_at.
+            "started_at": moment.isoformat(),
             "ready_at": (moment + timedelta(hours=hours)).isoformat(),
             "masterwork_multiplier": C.TOOL_MASTERWORK_MULTIPLIER if upgraded else 1.0,
             # Freeze the level payout just like the tool: levelling while the pickaxe is
@@ -1941,6 +1945,57 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
         }
         _save(entry, data)
     return True, f"Кирка в карьере. Возвращайся через {hours} ч."
+
+
+def cancel_quarry(entry: str, user_id, now: datetime | None = None) -> tuple[bool, str]:
+    """Pull the pickaxe out of the quarry early, paying for the shift actually served.
+
+    Deliberately the same shape as cancel_farm: nothing is minted here. The run is stamped
+    with the hours worked and marked ready, and the ordinary settle_quarry path pays it
+    through the one grant key it always would have.
+
+    Where it has to differ is the hours. A quarry payout is a TABLE lookup, not a formula
+    (QUARRY_RUBIES_BY_HOURS and friends are keyed by 1/2/4/8), so a recall at three hours
+    is paid at the two-hour rate rather than prorated. That is the same bargain the farm
+    offers -- leaving early costs the better rate the longer stay would have earned, it
+    does not merely truncate it -- and it keeps settle_quarry reading a real row instead of
+    silently falling back to the eight-hour one.
+    """
+    moment = now or app_now()
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        run = record.get("quarry_run")
+        if not isinstance(run, dict):
+            return False, "Кирка сейчас не в карьере."
+        if _farm_run_ready(run, moment):
+            return False, "Добыча уже закончилась — открой ферму, чтобы забрать её."
+        planned = int(run.get("hours", C.QUARRY_DURATION_HOURS) or C.QUARRY_DURATION_HOURS)
+        planned = planned if planned in C.QUARRY_HOUR_CHOICES else C.QUARRY_DURATION_HOURS
+        try:
+            started_at = datetime.fromisoformat(str(run.get("started_at")))
+        except (TypeError, ValueError):
+            # A run started before started_at was written: reconstruct it from the end.
+            try:
+                started_at = datetime.fromisoformat(str(run["ready_at"])) - timedelta(hours=planned)
+            except (KeyError, TypeError, ValueError):
+                started_at = moment
+        worked = max(0, int((moment - started_at).total_seconds() // 3600))
+        paid = max((row for row in C.QUARRY_HOUR_CHOICES if row <= worked), default=0)
+        if not paid:
+            record["quarry_run"] = None
+            _save(entry, data)
+            return True, "Кирка вернулась из карьера: меньше часа работы добычи не даёт."
+        run["hours"] = paid
+        run["ready_at"] = moment.isoformat()
+        _save(entry, data)
+    receipt = settle_quarry(entry, user_id, now=moment) or {}
+    return True, (
+        f"Кирка досрочно вернулась из карьера: засчитано {paid} ч из {planned}. "
+        f"💎 {int(receipt.get('rubies', 0) or 0)} · 🪙 {int(receipt.get('gold', 0) or 0)}"
+    )
 
 
 def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | None:

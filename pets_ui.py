@@ -1251,24 +1251,28 @@ def _feature_summary(status: dict) -> str:
     return "Апгрейды: " + " ".join(owned) + " · не хватает " + ", ".join(missing)
 
 
-def _shovel_line(status: dict) -> str:
+# Every owned thing in «Хозяйство» is written as a pair of lines: what it IS, then an
+# italic line for what to do about it. Squeezing both onto one line is what turned this
+# block into a wall -- a sentence ending in «+50%.» followed by another sentence starting
+# with «🎨 Покрась» reads as one run-on string at Telegram's line length.
+def _shovel_lines(status: dict) -> list[str]:
     if status.get("shovel_upgraded"):
-        return "🪏 Лопата: руническая, ∞ зарядов · +50% золота за смену"
+        return ["🪏 Лопата — руническая, ∞ зарядов, +50% золота за смену"]
     runs = int(status.get("shovel_runs", 0) or 0)
-    return (
-        f"🪏 Лопата: зарядов {runs} · +25% золота за смену. "
-        "🎨 Покрась её в NMM в «Квестах» — станет бесконечной, +50%."
-    )
+    return [
+        f"🪏 Лопата — зарядов {runs}, +25% золота за смену",
+        "<i>🎨 покрась в NMM в «Квестах»: станет бесконечной, +50%</i>",
+    ]
 
 
-def _pickaxe_line(quarry: dict) -> str:
+def _pickaxe_lines(quarry: dict) -> list[str]:
     if quarry.get("pickaxe_upgraded"):
-        return "⛏ Кирка: руническая, ∞ зарядов · +50% ко всей добыче"
+        return ["⛏ Кирка — руническая, ∞ зарядов, +50% ко всей добыче"]
     runs = int(quarry.get("pickaxe_runs", 0) or 0)
-    return (
-        f"⛏ Кирка: зарядов {runs}. "
-        "🎨 Покрась её в NMM в «Квестах» — станет бесконечной, +50% ко всей добыче."
-    )
+    return [
+        f"⛏ Кирка — зарядов {runs}",
+        "<i>🎨 покрась в NMM в «Квестах»: станет бесконечной, +50% ко всей добыче</i>",
+    ]
 
 
 FIGURINE_LABELS = {"farmer": "🧑‍🌾 Фигурка фермера", "miner": "⛏️ Фигурка шахтёра"}
@@ -1278,15 +1282,15 @@ def _figurine_lines(status: dict) -> list[str]:
     """The pair, and what the pair is FOR -- the point is only made by owning both."""
     painted = status.get("figurines") or {}
     if status.get("parallel_work"):
-        return ["🧑‍🌾⛏️ Обе фигурки покрашены — ферма и карьер работают одновременно."]
+        return ["🧑‍🌾⛏️ Обе фигурки покрашены — ферма и карьер работают одновременно"]
     marks = " · ".join(
-        f"{label}: {'✅' if painted.get(key) else '—'}"
+        f"{label} — {'есть' if painted.get(key) else 'нет'}"
         for key, label in FIGURINE_LABELS.items()
     )
     return [
         marks,
-        "🎨 Покрась обе в «Квестах» — тогда ферма и карьер пойдут одновременно "
-        "(каждая сама по себе даёт +25% опыта со своей работы).",
+        "<i>🎨 покрась обе в «Квестах»: ферма и карьер пойдут одновременно.</i>",
+        "<i>Каждая сама по себе даёт +25% опыта со своей работы.</i>",
     ]
 
 
@@ -1335,25 +1339,27 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines = [f"🌾 <b>Ферма</b> · уровень {level} из {max_level}"]
     lines.append(f"🐾 Работник: <b>{_name(pet)}</b>")
 
-    lines.append("\n<b>Смена</b>")
+    lines.append("\n<b>🌾 Смена</b>")
     if active:
         planned = int(status.get("planned_hours") or 0)
         worked = int(status.get("worked_hours") or 0)
         reward = status.get("reward") or {}
-        earned = (
-            f" Принесёт 🪙 {_money(int(reward.get('gold', 0) or 0))} · "
-            f"✨ {int(reward.get('xp', 0) or 0)}."
-            if reward else ""
-        )
-        lines.append(f"⏳ Идёт {planned} ч, отработано {worked}.{earned}")
+        lines.append(f"⏳ Идёт {planned} ч · отработано {worked} ч")
+        if reward:
+            lines.append(
+                f"Принесёт 🪙 {_money(int(reward.get('gold', 0) or 0))} · "
+                f"✨ {int(reward.get('xp', 0) or 0)}"
+            )
         # No more attack immunity: a farming pet cannot pick a fight itself, but it is an
         # ordinary target for everyone else's.
-        lines.append("В бой сам не пойдёт, но напасть на него можно.")
-        lines.append("Забрать раньше — заплатят только за целые часы.")
+        lines.append("<i>В бой сам не пойдёт, но напасть на него можно.</i>")
+        lines.append("<i>Забрать раньше — заплатят только за целые часы.</i>")
         if status.get("can_ticket"):
             # The distinction that matters, and the one a player will not assume: unlike
             # «Забрать сейчас», a ticket costs nothing off the payout.
-            lines.append(f"🎟 Билет закончит её за минуту, а заплатят как за все {planned} ч.")
+            lines.append(
+                f"<i>🎟 Билет закончит её за минуту, а заплатят как за все {planned} ч.</i>"
+            )
     elif status.get("ready"):
         lines.append("✅ Закончилась. Награда уже едет в личные сообщения.")
     elif level <= 0:
@@ -1373,11 +1379,12 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines.append("\n<b>⛏ Карьер</b>")
     charges = "∞" if quarry.get("pickaxe_unlimited") else str(int(quarry.get("pickaxe_runs", 0) or 0))
     if quarry.get("running"):
-        lines.append(f"⛏ Добыча идёт. Зарядов кирки: {charges}.")
+        lines.append(f"⏳ Добыча идёт · зарядов кирки: {charges}")
+        lines.append("<i>Забрать раньше — заплатят по ближайшей меньшей смене.</i>")
     elif quarry.get("blocked_by_farm"):
         lines.append(_busy_elsewhere_line("на ферме"))
     else:
-        lines.append(f"Зарядов кирки: {charges}. Один заряд — одна смена.")
+        lines.append(f"<i>один заряд — одна смена · зарядов: {charges}</i>")
         for preview in quarry.get("hour_previews", []):
             lines.append(
                 f"{int(preview['hours'])} ч — 💎 {int(preview['ruby_min'])}–{int(preview['ruby_max'])} · "
@@ -1389,22 +1396,31 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines.append("\n<b>🏡 Хозяйство</b>")
     if level < max_level:
         bonus = status.get("next_level_bonus")
-        # The old line printed the price and the payout as two bare "N монет" halves in a
-        # row, which read as one contradictory number. The payout is parenthesised now.
-        suffix = f" (даст {escape(str(bonus))})" if bonus else ""
+        # Price on the headline, payout on its own italic line underneath. Printed as one
+        # sentence these were two bare "N монет" halves in a row and read as a single
+        # contradictory number.
         lines.append(
             f"Уровень {level} → {level + 1}"
-            + (f" за {_coins(int(next_cost))}" if next_cost is not None else "")
-            + suffix
+            + (f" — {_coins(int(next_cost))}" if next_cost is not None else "")
         )
+        if bonus:
+            lines.append(f"<i>даст {escape(str(bonus))}</i>")
     else:
         lines.append("🏆 Прокачано полностью.")
+    # A blank line between each owned thing. Four kinds of kit stacked without one is the
+    # «каша» this block was: every line starts with an emoji and ends in a percentage, so
+    # nothing tells the eye where one item stops and the next begins.
+    lines.append("")
     lines.append(_feature_summary(status))
-    lines.append(_shovel_line(status))
-    lines.append(_pickaxe_line(quarry))
+    lines.append("")
+    lines.extend(_shovel_lines(status))
+    lines.append("")
+    lines.extend(_pickaxe_lines(quarry))
+    lines.append("")
     lines.extend(_figurine_lines(status))
 
-    lines.append(f"\n🪙 {_money(coins)} · 🎟 билетов: {int(status.get('tickets', 0) or 0)}")
+    lines.append("\n<b>💰 Кошелёк</b>")
+    lines.append(f"🪙 {_money(coins)} · 🎟 билетов: {int(status.get('tickets', 0) or 0)}")
 
     # Every countdown on the screen, collected in one block at the very bottom.
     timers = []
@@ -1483,6 +1499,13 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"⛏ {hours}ч",
             "callback_data": callback_data(user_id, "quarrystart", str(hours)),
         } for hours in C.QUARRY_HOUR_CHOICES])
+    elif quarry.get("can_cancel"):
+        # The quarry's half of «Забрать сейчас». Same wording as the farm's on purpose:
+        # it is the same promise, and the two sit on the same screen.
+        rows.append([{
+            "text": "❌ Забрать добычу сейчас",
+            "callback_data": callback_data(user_id, "quarrycancel"),
+        }])
     elif not quarry.get("running") and not (
         quarry.get("pickaxe_unlimited") or int(quarry.get("pickaxe_runs", 0) or 0) > 0
     ):

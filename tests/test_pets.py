@@ -867,11 +867,33 @@ class FarmPassiveIncomeTests(PetsTestCase):
         # The passive rate now lives in the timer block at the very bottom, because it is
         # a countdown rather than something the player presses.
         self.assertIn("Пассив +1/ч — начисление в", text)
-        self.assertLess(text.index("<b>Смена</b>"), text.index("<b>⏱ Таймеры</b>"))
+        self.assertLess(text.index("<b>🌾 Смена</b>"), text.index("<b>⏱ Таймеры</b>"))
         callbacks = [pets_ui.parse_callback(button["callback_data"])[1]
                      for row in keyboard["inline_keyboard"] for button in row]
         self.assertIn("upfarm", callbacks)
         self.assertNotIn("uphamsterator", callbacks)
+
+    def test_the_farm_screen_separates_its_blocks_instead_of_running_them_together(self):
+        """Layout, not wording: every kit line used to butt straight against the next.
+
+        Four consecutive lines that all start with an emoji and end in a percentage read
+        as one paragraph, which is what made this screen a wall.
+        """
+        self._build_farm()
+        text, _keyboard = pets_ui.farm_view("chat", "1", 0)
+
+        # Each section headline is preceded by a blank line.
+        for header in ("<b>🌾 Смена</b>", "<b>⛏ Карьер</b>", "<b>🏡 Хозяйство</b>",
+                       "<b>💰 Кошелёк</b>", "<b>⏱ Таймеры</b>"):
+            self.assertIn(f"\n\n{header}", text, header)
+
+        # And inside Хозяйство every piece of kit is its own paragraph, with the advice
+        # about it on a separate italic line rather than glued to the fact.
+        plot = text.split("<b>🏡 Хозяйство</b>", 1)[1].split("<b>💰 Кошелёк</b>", 1)[0]
+        for fact in ("🪏 Лопата —", "⛏ Кирка —", "🧑‍🌾 Фигурка фермера —"):
+            self.assertIn(f"\n\n{fact}", plot, fact)
+        self.assertNotIn("за смену. 🎨", plot)
+        self.assertIn("<i>🎨 покрась в NMM в «Квестах»", plot)
 
     def test_retired_facility_is_removed_and_refunded_exactly_once(self):
         self._tame("chat", "1")
@@ -2800,6 +2822,75 @@ class QuarryTests(PetsTestCase):
             receipt["gold_multiplier"],
             pets_config.hero_gold_multiplier(100, "quarry"),
         )
+
+    def test_an_early_recall_pays_the_nearest_shorter_shift_and_frees_the_creature(self):
+        """A quarry payout is a table keyed by 1/2/4/8, not a formula.
+
+        So a recall at three hours forty is paid the TWO-hour row rather than a prorated
+        slice of the eight-hour one -- the same bargain the farm offers, and the thing
+        that keeps settle_quarry reading a real row instead of falling back to 8h.
+        """
+        entry, uid = "quarry-cancel", "1"
+        self._give_pickaxe_charge(entry, uid)
+        started = datetime(2026, 8, 15, 10, 0)
+        with patch.object(pets, "app_now", return_value=started):
+            self.assertTrue(pets.start_quarry(entry, uid, 8)[0])
+        two_hour = next(
+            row for row in pets.quarry_status(entry, uid)["hour_previews"] if row["hours"] == 2
+        )
+        self.assertTrue(pets.quarry_status(entry, uid, started)["can_cancel"])
+
+        ok, note = pets.cancel_quarry(entry, uid, now=started + timedelta(hours=3, minutes=40))
+
+        self.assertTrue(ok)
+        self.assertIn("2 ч из 8", note)
+        self.assertEqual(economy.balance(entry, uid, 0), two_hour["gold"])
+        status = pets.quarry_status(entry, uid)
+        self.assertFalse(status["running"])
+        self.assertFalse(status["can_cancel"])
+        # And the station is free again: the creature is no longer held by the quarry.
+        self.assertFalse(pets.farm_status(entry, uid)["blocked_by_quarry"])
+
+    def test_recalling_under_an_hour_pays_nothing_but_still_ends_the_run(self):
+        entry, uid = "quarry-cancel-early", "1"
+        self._give_pickaxe_charge(entry, uid)
+        started = datetime(2026, 8, 15, 10, 0)
+        with patch.object(pets, "app_now", return_value=started):
+            self.assertTrue(pets.start_quarry(entry, uid, 4)[0])
+
+        ok, note = pets.cancel_quarry(entry, uid, now=started + timedelta(minutes=59))
+
+        self.assertTrue(ok)
+        self.assertIn("меньше часа", note)
+        self.assertEqual(economy.balance(entry, uid, 0), 0)
+        self.assertEqual(pets.ruby_balance(entry, uid), 0)
+        self.assertFalse(pets.quarry_status(entry, uid)["running"])
+        # The spent charge is NOT refunded, exactly like a cancelled farm shift's shovel.
+        self.assertEqual(pets.quarry_status(entry, uid)["pickaxe_runs"], 0)
+
+    def test_cancelling_an_idle_quarry_is_refused_rather_than_silently_ignored(self):
+        entry, uid = "quarry-cancel-idle", "1"
+        self._give_pickaxe_charge(entry, uid)
+        ok, note = pets.cancel_quarry(entry, uid)
+        self.assertFalse(ok)
+        self.assertIn("не в карьере", note)
+
+    def test_the_farm_screen_offers_the_recall_only_while_the_quarry_runs(self):
+        entry, uid = "quarry-cancel-button", "1"
+        self._give_pickaxe_charge(entry, uid)
+
+        def actions():
+            _text, keyboard = pets_ui.farm_view(entry, uid, 0)
+            return [
+                pets_ui.parse_callback(button["callback_data"])[1]
+                for row in keyboard["inline_keyboard"] for button in row
+            ]
+
+        self.assertNotIn("quarrycancel", actions())
+        self.assertTrue(pets.start_quarry(entry, uid, 8)[0])
+        self.assertIn("quarrycancel", actions())
+        # And the start chips are gone while it runs, so the row cannot offer both.
+        self.assertNotIn("quarrystart", actions())
 
 
 class ToolMasterworkTests(PetsTestCase):

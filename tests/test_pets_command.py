@@ -534,13 +534,13 @@ class PetsCommandTests(unittest.TestCase):
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
         # The passive rate is a countdown, so it sits in the timer block at the bottom.
         self.assertIn("Пассив +1/ч — начисление в", rendered[0])
-        self.assertLess(rendered[0].index("<b>Смена</b>"), rendered[0].index("<b>⏱ Таймеры</b>"))
+        self.assertLess(rendered[0].index("<b>🌾 Смена</b>"), rendered[0].index("<b>⏱ Таймеры</b>"))
         # Four useful presets keep the farm screen and keyboard compact.
         self.assertIn("8 ч — 🪙", rendered[0])
         self.assertNotIn("6 ч — 🪙", rendered[0])
-        self.assertIn("Покрась её в NMM в «Квестах»", rendered[0])
+        self.assertIn("покрась в NMM в «Квестах»", rendered[0])
         self.assertIn("Фигурка фермера", rendered[0])
-        self.assertIn("Покрась обе в «Квестах»", rendered[0])
+        self.assertIn("покрась обе в «Квестах»", rendered[0])
         parsed_buttons = [
             pets_ui.parse_callback(button["callback_data"])
             for row in rendered[1]["inline_keyboard"] for button in row

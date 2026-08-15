@@ -1122,6 +1122,10 @@ def _action_quarry_start(entry, user_id, xp, payload):
   return pets.start_quarry(entry, user_id, payload.get("hours", C.QUARRY_DURATION_HOURS))
 
 
+def _action_quarry_cancel(entry, user_id, xp, payload):
+  return pets.cancel_quarry(entry, user_id)
+
+
 def _action_daily_bonus(entry, user_id, xp, payload):
     claimed, amount, streak = economy.claim_daily_bonus(entry, user_id)
     if not claimed:
@@ -1206,6 +1210,7 @@ _ACTIONS = {
     "farm_buy_shovel": _action_farm_buy_shovel,
     "quarry_buy_pickaxe": _action_quarry_buy_pickaxe,
     "quarry_start": _action_quarry_start,
+    "quarry_cancel": _action_quarry_cancel,
     "daily_bonus": _action_daily_bonus,
     "notifications": _action_notifications,
     "pve_replays": _action_pve_replays,
@@ -5532,7 +5537,13 @@ function renderFarm() {
         ).join('') + '</div>');
   const quarryPanel = quarry.running
     ? '<div class="panel"><h2>⛏ Карьер</h2><div class="small">Добыча идёт. Осталось ' +
-      clock(quarry.seconds_left) + '.</div>' + pickaxeQuestNote + '</div>'
+      clock(quarry.seconds_left) + '.</div>' + pickaxeQuestNote +
+      // The quarry's half of «Забрать сейчас». A quarry payout is a table keyed by
+      // 1/2/4/8 hours, so an early recall pays the nearest SHORTER shift rather than a
+      // prorated slice -- said here, because that is not what «сейчас» implies.
+      '<button class="go sec" style="margin-top:10px" data-do="quarrycancel">❌ Забрать добычу сейчас</button>' +
+      "<div class='tiny muted' style='margin-top:6px;text-align:center'>Заплатят по ближайшей меньшей смене</div>" +
+      '</div>'
     : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">Один заряд кирки — одна смена. Длинная смена выгоднее.</div><div class="small muted" style="margin-top:4px">' +
       'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
       (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
@@ -7149,6 +7160,7 @@ document.addEventListener("click", async (event) => {
   else if (d.do === "farmcancel") { await act("farm_cancel"); }
   else if (d.do === "farmshovel") { await act("farm_buy_shovel"); }
   else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
+  else if (d.do === "quarrycancel") { await act("quarry_cancel"); }
   else if (d.quarrystart) { await act("quarry_start", {hours:Number(d.quarrystart)}); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tame") { openPetCreation(); }
