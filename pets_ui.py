@@ -71,6 +71,16 @@ def _quest_benefit_text(card: dict) -> str:
         return "После приёмки: бесконечная лопата и +50% золота с каждой смены — навсегда."
     if tool == "pickaxe":
         return "После приёмки: бесконечная кирка и +50% ко всей добыче — навсегда."
+    if tool == "farmer":
+        return (
+            "После приёмки навсегда: +25% опыта со смены фермы. "
+            "А вместе с фигуркой шахтёра — ферма и карьер работают одновременно."
+        )
+    if tool == "miner":
+        return (
+            "После приёмки навсегда: +25% опыта из карьера. "
+            "А вместе с фигуркой фермера — ферма и карьер работают одновременно."
+        )
     target = str(reward.get("personal_paint_target") or "")
     target_name = PERSONAL_PAINT_TARGET_NAMES.get(target)
     if target_name:
@@ -1197,6 +1207,89 @@ def _farm_seconds_left(status: dict) -> int:
     return 0
 
 
+def _drop_pct(chance) -> str:
+    """A find chance a human can hold in their head.
+
+    The raw number carries six decimals off the luck multiplier; «7.76203%» is noise
+    dressed as precision. Rounded to whole percent, with <1% kept as «<1%» rather than
+    collapsing to a flat 0 that would read as impossible.
+    """
+    try:
+        value = float(chance or 0.0) * 100
+    except (TypeError, ValueError):
+        return "0%"
+    if 0 < value < 1:
+        return "<1%"
+    return f"{round(value)}%"
+
+
+def _busy_elsewhere_line(where: str) -> str:
+    """One creature, one place -- said the same way from both sides of the screen."""
+    return (
+        f"🔒 Существо {where}. В двух местах сразу — только когда покрашены "
+        "обе фигурки: фермера и шахтёра."
+    )
+
+
+def _feature_summary(status: dict) -> str:
+    """Four plot upgrades on ONE line: bought ones are a row of icons, the rest are named.
+
+    They used to take four lines listing a percentage each, permanently, long after every
+    one of them was bought and there was nothing left to decide.
+    """
+    owned, missing = [], []
+    for feature, label in FARM_FEATURE_LABELS.items():
+        data = _farm_feature_status(status, feature)
+        if int(data.get("level", 0) or 0) >= int(data.get("max_level", 1) or 1):
+            owned.append(label.split(" ", 1)[0])
+        else:
+            missing.append(label)
+    if not missing:
+        return "Апгрейды: " + " ".join(owned) + " — все куплены"
+    if not owned:
+        return "Апгрейды не куплены: " + ", ".join(missing)
+    return "Апгрейды: " + " ".join(owned) + " · не хватает " + ", ".join(missing)
+
+
+def _shovel_line(status: dict) -> str:
+    if status.get("shovel_upgraded"):
+        return "🪏 Лопата: руническая, ∞ зарядов · +50% золота за смену"
+    runs = int(status.get("shovel_runs", 0) or 0)
+    return (
+        f"🪏 Лопата: зарядов {runs} · +25% золота за смену. "
+        "🎨 Покрась её в NMM в «Квестах» — станет бесконечной, +50%."
+    )
+
+
+def _pickaxe_line(quarry: dict) -> str:
+    if quarry.get("pickaxe_upgraded"):
+        return "⛏ Кирка: руническая, ∞ зарядов · +50% ко всей добыче"
+    runs = int(quarry.get("pickaxe_runs", 0) or 0)
+    return (
+        f"⛏ Кирка: зарядов {runs}. "
+        "🎨 Покрась её в NMM в «Квестах» — станет бесконечной, +50% ко всей добыче."
+    )
+
+
+FIGURINE_LABELS = {"farmer": "🧑‍🌾 Фигурка фермера", "miner": "⛏️ Фигурка шахтёра"}
+
+
+def _figurine_lines(status: dict) -> list[str]:
+    """The pair, and what the pair is FOR -- the point is only made by owning both."""
+    painted = status.get("figurines") or {}
+    if status.get("parallel_work"):
+        return ["🧑‍🌾⛏️ Обе фигурки покрашены — ферма и карьер работают одновременно."]
+    marks = " · ".join(
+        f"{label}: {'✅' if painted.get(key) else '—'}"
+        for key, label in FIGURINE_LABELS.items()
+    )
+    return [
+        marks,
+        "🎨 Покрась обе в «Квестах» — тогда ферма и карьер пойдут одновременно "
+        "(каждая сама по себе даёт +25% опыта со своей работы).",
+    ]
+
+
 def _farm_feature_status(status: dict, feature: str) -> dict:
     """Normalise the small presentation shape while farm records stay backward-compatible."""
     features = status.get("features") or status.get("upgrades") or {}
@@ -1233,124 +1326,107 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     level = int(status.get("level", status.get("farm_level", 0)) or 0)
     max_level = int(status.get("max_level", 10) or 10)
     active = bool(status.get("running"))
-    lines = ["🌾 <b>Ферма</b>\n"]
-    lines.append(f"🐾 Работник: <b>{_name(pet)}</b>")
-    lines.append(f"🏡 Уровень фермы: {level} из {max_level}.")
-    if level > 0:
-        lines.append(
-            f"🪙 Пассивно: +{passive_before['rate']} монет/ч · "
-            f"склад до {_money(passive_before['cap'])}."
-        )
-        if passive_before.get("stored"):
-            lines.append(f"✅ Пассивно собрано сейчас: +{_money(passive_before['stored'])}.")
-        else:
-            lines.append(f"⏱ Следующее начисление — в {passive_before['next_hour'].strftime('%H:%M')}.")
 
+    # The screen is built as four fixed blocks -- work, plot, wallet, timers -- in that
+    # order, because that is the order the questions come in: what can I send it to do,
+    # what can I buy, what do I have, and only then how long is left. Timers last is the
+    # rule the whole layout hangs on: they are the one part that changes by itself, so
+    # putting them at the top pushed everything a player actually presses off the screen.
+    lines = [f"🌾 <b>Ферма</b> · уровень {level} из {max_level}"]
+    lines.append(f"🐾 Работник: <b>{_name(pet)}</b>")
+
+    lines.append("\n<b>Смена</b>")
     if active:
-        remaining = _farm_seconds_left(status)
         planned = int(status.get("planned_hours") or 0)
         worked = int(status.get("worked_hours") or 0)
-        lines.append(
-            f"\n⏳ Питомец на ферме ({planned} ч). Вернётся через <b>{_farm_duration(remaining)}</b>."
+        reward = status.get("reward") or {}
+        earned = (
+            f" Принесёт 🪙 {_money(int(reward.get('gold', 0) or 0))} · "
+            f"✨ {int(reward.get('xp', 0) or 0)}."
+            if reward else ""
         )
+        lines.append(f"⏳ Идёт {planned} ч, отработано {worked}.{earned}")
         # No more attack immunity: a farming pet cannot pick a fight itself, but it is an
         # ordinary target for everyone else's.
-        lines.append("Сам он в бой не пойдёт, пока работает, — но напасть на него можно.")
-        lines.append(f"Полностью отработано: {worked} ч из {planned}.")
-        reward = status.get("reward") or {}
-        if reward:
-            lines.append(
-                f"Смена принесёт: 🪙 {_money(int(reward.get('gold', 0) or 0))} · "
-                f"✨ {int(reward.get('xp', 0) or 0)} опыта."
-            )
-        lines.append("Забрать раньше срока можно — но заплатит смена только за целые отработанные часы.")
+        lines.append("В бой сам не пойдёт, но напасть на него можно.")
+        lines.append("Забрать раньше — заплатят только за целые часы.")
         if status.get("can_ticket"):
             # The distinction that matters, and the one a player will not assume: unlike
             # «Забрать сейчас», a ticket costs nothing off the payout.
-            lines.append(
-                f"🎟 Есть билет ({int(status.get('tickets', 0) or 0)} шт.) — смена закончится "
-                f"через минуту, а заплатят как за все {planned} ч."
-            )
+            lines.append(f"🎟 Билет закончит её за минуту, а заплатят как за все {planned} ч.")
     elif status.get("ready"):
-        lines.append("\n✅ Смена закончилась. Награда уже едет в личные сообщения.")
+        lines.append("✅ Закончилась. Награда уже едет в личные сообщения.")
+    elif level <= 0:
+        lines.append("Сначала построй ферму — первый уровень откроет смены от 1 до 8 часов.")
+    elif status.get("blocked_by_quarry"):
+        lines.append(_busy_elsewhere_line("в карьере"))
     else:
-        if level <= 0:
-            lines.append("\nСначала построй ферму. Первый уровень откроет смены от 1 до 8 часов.")
-        else:
+        lines.append("<i>чем длиннее, тем больше монет, опыта и шанс находки</i>")
+        for row in status.get("hour_previews", []):
+            if int(row.get("hours", 0) or 0) not in C.FARM_QUICK_HOUR_CHOICES:
+                continue
             lines.append(
-                "\nВыбери длину смены: чем дольше пропадает питомец, тем больше монет, "
-                "опыта и шанс привезти находку получше."
+                f"{row['hours']} ч — 🪙 {_money(int(row['gold']))} · "
+                f"✨ {int(row['xp'])} · 🎁 {_drop_pct(row.get('drop_chance'))}"
             )
-            lines.append("<i>смена — 🪙 монет · ✨ опыта · 🎁 шанс находки</i>")
-            for row in status.get("hour_previews", []):
-                if int(row.get("hours", 0) or 0) not in C.FARM_QUICK_HOUR_CHOICES:
-                    continue
-                drop_pct = float(row.get("drop_chance", 0.0) or 0.0) * 100
-                lines.append(
-                    f"{row['hours']} ч — 🪙 {_money(int(row['gold']))} · "
-                    f"✨ {int(row['xp'])} · 🎁 {drop_pct:g}%"
-                )
 
-    next_cost = status.get("next_level_cost")
-    if level < max_level:
-        next_level = level + 1
-        bonus = status.get("next_level_bonus")
-        suffix = f" · {escape(str(bonus))}" if bonus else ""
-        lines.append(
-            f"\nСледующий уровень: {next_level}"
-            + (f" — {_coins(int(next_cost))}" if next_cost is not None else "")
-            + suffix
-        )
-    else:
-        lines.append("\n🏆 Ферма прокачана полностью.")
-
-    lines.append("\n<b>Апгрейды участка</b>")
-    for feature, label in FARM_FEATURE_LABELS.items():
-        data = _farm_feature_status(status, feature)
-        feature_level = int(data.get("level", 0) or 0)
-        feature_max = int(data.get("max_level", 1) or 1)
-        effect = data.get("effect") or data.get("description") or ""
-        effect_text = f" — {escape(str(effect))}" if effect else ""
-        lines.append(f"{label}: {feature_level}/{feature_max}{effect_text}")
-
-    lines.append(f"\n🪙 У тебя: {_money(coins)}")
-    lines.append(f"🎟 Билетов: {int(status.get('tickets', 0) or 0)}")
-    lines.append("\n<b>🪏 Лопата фермы</b>")
-    if status.get("shovel_upgraded"):
-        lines.append("Руническая лопата: бесконечные заряды · +50% золота на каждой смене.")
-    else:
-        shovel_runs = int(status.get("shovel_runs", 0) or 0)
-        lines.append(f"Зарядов лопаты: {shovel_runs}. Каждый заряд даёт +25% золота на одну смену.")
-        lines.append(
-            "🎨 <b>Покрась лопату в NMM (НММ) в «Квестах»:</b> после принятия она "
-            "навсегда станет бесконечной и будет давать +50% золота с каждой смены."
-        )
     lines.append("\n<b>⛏ Карьер</b>")
+    charges = "∞" if quarry.get("pickaxe_unlimited") else str(int(quarry.get("pickaxe_runs", 0) or 0))
     if quarry.get("running"):
-        lines.append(f"Добыча идёт. Осталось: {_farm_duration(int(quarry.get('seconds_left', 0) or 0))}.")
-        if quarry.get("pickaxe_upgraded"):
-            lines.append("Руническая кирка: бесконечные заряды · +50% ко всей добыче.")
-        else:
-            lines.append(
-                "🎨 <b>Покрась кирку в NMM (НММ) в «Квестах»:</b> после принятия она "
-                "навсегда станет бесконечной и будет давать +50% ко всей добыче."
-            )
+        lines.append(f"⛏ Добыча идёт. Зарядов кирки: {charges}.")
+    elif quarry.get("blocked_by_farm"):
+        lines.append(_busy_elsewhere_line("на ферме"))
     else:
-        charges = "∞" if quarry.get("pickaxe_unlimited") else str(int(quarry.get("pickaxe_runs", 0) or 0))
-        lines.append(f"Зарядов кирки: {charges}.")
+        lines.append(f"Зарядов кирки: {charges}. Один заряд — одна смена.")
         for preview in quarry.get("hour_previews", []):
             lines.append(
                 f"{int(preview['hours'])} ч — 💎 {int(preview['ruby_min'])}–{int(preview['ruby_max'])} · "
                 f"🪙 {_money(int(preview['gold']))} · ✨ {int(preview['xp'])} · "
-                f"🎁 {float(preview['drop_chance']) * 100:g}%"
+                f"🎁 {_drop_pct(preview.get('drop_chance'))}"
             )
-        if quarry.get("pickaxe_upgraded"):
-            lines.append("Руническая кирка: бесконечные заряды · +50% ко всей добыче уже включены в расчёт выше.")
+
+    next_cost = status.get("next_level_cost")
+    lines.append("\n<b>🏡 Хозяйство</b>")
+    if level < max_level:
+        bonus = status.get("next_level_bonus")
+        # The old line printed the price and the payout as two bare "N монет" halves in a
+        # row, which read as one contradictory number. The payout is parenthesised now.
+        suffix = f" (даст {escape(str(bonus))})" if bonus else ""
+        lines.append(
+            f"Уровень {level} → {level + 1}"
+            + (f" за {_coins(int(next_cost))}" if next_cost is not None else "")
+            + suffix
+        )
+    else:
+        lines.append("🏆 Прокачано полностью.")
+    lines.append(_feature_summary(status))
+    lines.append(_shovel_line(status))
+    lines.append(_pickaxe_line(quarry))
+    lines.extend(_figurine_lines(status))
+
+    lines.append(f"\n🪙 {_money(coins)} · 🎟 билетов: {int(status.get('tickets', 0) or 0)}")
+
+    # Every countdown on the screen, collected in one block at the very bottom.
+    timers = []
+    if level > 0:
+        if passive_before.get("stored"):
+            timers.append(
+                f"Пассив +{passive_before['rate']}/ч — накоплено "
+                f"🪙 {_money(passive_before['stored'])} из {_money(passive_before['cap'])}"
+            )
         else:
-            lines.append(
-                "🎨 <b>Покрась кирку в NMM (НММ) в «Квестах»:</b> после принятия она "
-                "навсегда станет бесконечной и будет давать +50% ко всей добыче."
+            timers.append(
+                f"Пассив +{passive_before['rate']}/ч — начисление в "
+                f"{passive_before['next_hour'].strftime('%H:%M')}"
             )
+    if active:
+        timers.append(f"Смена — осталось {_farm_duration(_farm_seconds_left(status))}")
+    if quarry.get("running"):
+        timers.append(f"Карьер — осталось {_farm_duration(int(quarry.get('seconds_left', 0) or 0))}")
+    if timers:
+        lines.append("\n<b>⏱ Таймеры</b>")
+        lines.extend(timers)
+
     rows = []
     if status.get("can_start"):
         # The four useful presets fit on one row and leave the menu readable.
@@ -1399,17 +1475,21 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"🪏 Купить лопату · {_money(int(status.get('shovel_cost', C.SHOVEL_COST)))}",
             "callback_data": callback_data(user_id, "shovelbuy"),
         }])
-    if not quarry.get("running"):
-        if quarry.get("pickaxe_unlimited") or int(quarry.get("pickaxe_runs", 0) or 0) > 0:
-            rows.append([{
-                "text": f"⛏ {hours}ч",
-                "callback_data": callback_data(user_id, "quarrystart", str(hours)),
-            } for hours in C.QUARRY_HOUR_CHOICES])
-        else:
-            rows.append([{
-                "text": f"⛏ Купить кирку · {_money(int(quarry.get('cost', 150)))}",
-                "callback_data": callback_data(user_id, "quarrybuy"),
-            }])
+    # Buying a pickaxe is not going anywhere, so it stays offered even while the creature
+    # is on the farm; only the START row obeys the one-place-at-a-time rule. A row of
+    # buttons that answer with "существо на ферме" is exactly what this removes.
+    if quarry.get("can_start"):
+        rows.append([{
+            "text": f"⛏ {hours}ч",
+            "callback_data": callback_data(user_id, "quarrystart", str(hours)),
+        } for hours in C.QUARRY_HOUR_CHOICES])
+    elif not quarry.get("running") and not (
+        quarry.get("pickaxe_unlimited") or int(quarry.get("pickaxe_runs", 0) or 0) > 0
+    ):
+        rows.append([{
+            "text": f"⛏ Купить кирку · {_money(int(quarry.get('cost', 150)))}",
+            "callback_data": callback_data(user_id, "quarrybuy"),
+        }])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 

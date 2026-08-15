@@ -5717,11 +5717,20 @@ def _quest_completion_caption(row: dict) -> str:
         if personal.get("granted") and personal_target else ""
     )
     tool = str(paid.get("tool_masterwork") or "")
-    tool_line = (
-        f"\n🛠 {('Кирка' if tool == 'pickaxe' else 'Лопата')} улучшена: "
-        "бесконечные заряды и +50% эффективности."
-        if tool in {"pickaxe", "shovel"} else ""
-    )
+    if tool in {"pickaxe", "shovel"}:
+        tool_line = (
+            f"\n🛠 {('Кирка' if tool == 'pickaxe' else 'Лопата')} улучшена: "
+            "бесконечные заряды и +50% эффективности."
+        )
+    elif tool in {"farmer", "miner"}:
+        where = "на ферме" if tool == "farmer" else "в карьере"
+        tool_line = (
+            f"\n🎨 Фигурка {'фермера' if tool == 'farmer' else 'шахтёра'} встала "
+            f"{where}: +25% опыта оттуда навсегда. Покрась вторую — и ферма с карьером "
+            "заработают одновременно."
+        )
+    else:
+        tool_line = ""
     reward_lines = scroll_line + personal_line + tool_line
     ending = (f"\n\n{hashtag}{reward_lines}\nТак держать! 💪"
               if hashtag else f"{reward_lines}\n\nТак держать! 💪")

@@ -547,6 +547,17 @@ SHOVEL_GOLD_BONUS = 0.25
 SHOVEL_MASTERWORK_GOLD_BONUS = 0.50
 TOOL_MASTERWORK_MULTIPLIER = 1.50
 
+# --- workplace figurines --------------------------------------------------------------
+# A creature works in ONE place at a time: the farm shift and the quarry are the same
+# creature's day, so starting one locks the other out.  A painted figurine is a stand-in
+# worker for its own station -- and only owning BOTH lifts the rule, because only then is
+# there somebody to leave at each of the two places at once.  Earned by their rune-paint
+# quests (rune_paint_farmer / rune_paint_miner), never bought.
+WORKPLACE_FIGURINES = ("farmer", "miner")
+# What ONE painted figurine is worth on its own, so that the first of the pair is not a
+# dead reward while its partner is still unpainted: its own station pays more experience.
+FIGURINE_XP_BONUS = 0.25
+
 HISTORY_LIMIT = 10          # "список последних 10 боев"
 # The mailbox merges three feeds (fights, farm shifts, gifts) into one, so it is capped
 # at what one Telegram message can carry comfortably rather than at HISTORY_LIMIT: it is

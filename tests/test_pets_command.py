@@ -522,7 +522,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(pets.grant_farm_ticket(CHAT, PLAYER["id"], "test-ticket"))
 
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
-        self.assertIn("🎟 Билетов: 1", rendered[0])
+        self.assertIn("🎟 билетов: 1", rendered[0])
         initial_actions = {
             pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})
         }
@@ -532,12 +532,15 @@ class PetsCommandTests(unittest.TestCase):
         api = self._tap("upfarm")
         self.assertEqual(pets.farm_level(CHAT, PLAYER["id"]), 1)
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
-        self.assertIn("Пассивно: +1 монет/ч", rendered[0])
+        # The passive rate is a countdown, so it sits in the timer block at the bottom.
+        self.assertIn("Пассив +1/ч — начисление в", rendered[0])
+        self.assertLess(rendered[0].index("<b>Смена</b>"), rendered[0].index("<b>⏱ Таймеры</b>"))
         # Four useful presets keep the farm screen and keyboard compact.
         self.assertIn("8 ч — 🪙", rendered[0])
         self.assertNotIn("6 ч — 🪙", rendered[0])
-        self.assertIn("Покрась лопату в NMM (НММ)", rendered[0])
-        self.assertIn("Покрась кирку в NMM (НММ)", rendered[0])
+        self.assertIn("Покрась её в NMM в «Квестах»", rendered[0])
+        self.assertIn("Фигурка фермера", rendered[0])
+        self.assertIn("Покрась обе в «Квестах»", rendered[0])
         parsed_buttons = [
             pets_ui.parse_callback(button["callback_data"])
             for row in rendered[1]["inline_keyboard"] for button in row

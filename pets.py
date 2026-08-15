@@ -1178,11 +1178,20 @@ def _farm_reward(data: dict, record: dict, run: dict) -> dict:
         1.0 + C.SHOVEL_MASTERWORK_GOLD_BONUS,
         max(1.0, shovel_gold_multiplier),
     )
+    # Same snapshot treatment for the farmer figurine. A run started before figurines
+    # existed has no field, and 1.0 reproduces exactly what it was promised.
+    try:
+        figurine_xp_multiplier = float(run.get("figurine_xp_multiplier", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        figurine_xp_multiplier = 1.0
+    figurine_xp_multiplier = min(
+        1.0 + C.FIGURINE_XP_BONUS, max(1.0, figurine_xp_multiplier),
+    )
     rng = random.Random(f"{run_id}:{hours}")
     found = _farm_item_for(data, record, rng, hours, drop_chance)
     return {
         "gold": round(C.farm_gold_for(level, hours, gold_multiplier, pet_level) * shovel_gold_multiplier),
-        "xp": C.farm_xp_for(level, hours, xp_multiplier),
+        "xp": round(C.farm_xp_for(level, hours, xp_multiplier) * figurine_xp_multiplier),
         "item_code": found.code if found is not None else None,
     }
 
@@ -1255,6 +1264,9 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         }
     level = min(max(0, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL)
     tools = _tool_masterworks(data, user_id)
+    busy = _station_busy(record)
+    parallel = all(tools.get(name) for name in WORKPLACE_FIGURINES)
+    figurine_xp_multiplier = _figurine_xp_multiplier(bool(tools["farmer"]))
     shovel_upgraded = bool(tools["shovel"])
     shovel_runs = max(0, int(record.get("shovel_runs", 0) or 0))
     shovel_active = shovel_upgraded or shovel_runs > 0
@@ -1306,7 +1318,7 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         hour_previews.append({
             "hours": hours,
             "gold": round(C.farm_gold_for(estimate_level, hours, gold_multiplier, live_pet_level) * shovel_gold_multiplier),
-            "xp": C.farm_xp_for(estimate_level, hours, xp_multiplier),
+            "xp": round(C.farm_xp_for(estimate_level, hours, xp_multiplier) * figurine_xp_multiplier),
             "drop_chance": drop_chance,
         })
     six_hour_preview = next(row for row in hour_previews if row["hours"] == C.FARM_DURATION_HOURS)
@@ -1330,7 +1342,14 @@ def farm_status(entry, user_id, now: datetime | None = None) -> dict:
         # ``active`` is retained for the Telegram view's simple boolean contract.
         "active": bool(run) and not ready,
         "ready": ready,
-        "can_start": level > 0 and not run,
+        # A shift can only start if the creature is not already down the quarry. Both
+        # figurines painted is the one thing that lets the two run side by side.
+        "can_start": level > 0 and not run and (parallel or not busy["quarry"]),
+        "quarry_busy": busy["quarry"],
+        "blocked_by_quarry": busy["quarry"] and not parallel,
+        "parallel_work": parallel,
+        "figurines": {name: bool(tools.get(name)) for name in WORKPLACE_FIGURINES},
+        "figurine_xp_multiplier": figurine_xp_multiplier,
         "can_cancel": bool(run) and not ready,
         "tickets": _ticket_row(data, user_id)["count"],
         # The button is offered only when it would actually do something: a ticket in hand,
@@ -1384,9 +1403,11 @@ def start_farm(
     that progress made while the pet is away affects only the NEXT trip.
     """
     moment = now or app_now()
-    # Finish a due run first so a user who opens the menu after their shift ends is not
-    # stuck waiting for the background poller before starting the next one.
+    # Finish both due runs first so a user who opens the menu after a shift ends is not
+    # stuck waiting for the background poller -- and, since the quarry now blocks the farm,
+    # so that a run which has merely ENDED is never mistaken for one still holding the pet.
     settle_completed_farms(entry, now=moment)
+    settle_quarry(entry, user_id, now=moment)
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -1396,6 +1417,9 @@ def start_farm(
         return False, "Сначала построй ферму: прокачай её до 1 уровня."
     if isinstance(record.get("farm_run"), dict):
         return False, "Питомец уже работает на ферме."
+    # One creature, one place -- unless both figurines are painted to mind both stations.
+    if isinstance(record.get("quarry_run"), dict) and not _both_figurines(data, user_id):
+        return False, BUSY_ELSEWHERE_FARM
     try:
         hours = int(hours)
     except (TypeError, ValueError):
@@ -1420,6 +1444,9 @@ def start_farm(
         "features": _farm_features(record),
         "luck": int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0),
         "shovel_gold_multiplier": _shovel_gold_multiplier(shovel_upgraded) if shovel_active else 1.0,
+        # Frozen for the same reason as the shovel: a figurine painted while the pet is
+        # away improves the NEXT shift, never one already promised.
+        "figurine_xp_multiplier": _figurine_xp_multiplier(bool(tools["farmer"])),
     }
     _save(entry, data)
     return True, f"Питомец отправлен на ферму на {hours} ч."
@@ -1658,16 +1685,23 @@ def grant_dungeon_ticket_gift(entries, amount: int = 3) -> int:
 
 
 TOOL_MASTERWORKS = frozenset({"pickaxe", "shovel"})
+WORKPLACE_FIGURINES = frozenset(C.WORKPLACE_FIGURINES)
+# Both kinds of reward are the same thing to storage: a permanent, per-player flag set
+# once by an accepted rune-paint quest and never spent. They differ only in what reads
+# them -- a tool changes a payout, a figurine changes who may be sent where.
+PAINTED_UNLOCKS = TOOL_MASTERWORKS | WORKPLACE_FIGURINES
 RUNE_TOOL_MASTERWORKS = {
     # `nmm` was the original one-off pickaxe quest. Keep every live completion useful.
     "nmm": "pickaxe",
     "rune_paint_pickaxe": "pickaxe",
     "rune_paint_shovel": "shovel",
+    "rune_paint_farmer": "farmer",
+    "rune_paint_miner": "miner",
 }
 
 
 def _tool_masterworks(data: dict, user_id) -> dict[str, bool]:
-    """Return the permanent, per-player tool upgrades with old NMM data folded in."""
+    """Return the permanent, per-player painted unlocks with old NMM data folded in."""
     all_rows = data.get("tool_masterworks")
     row = all_rows.get(str(user_id)) if isinstance(all_rows, dict) else None
     row = row if isinstance(row, dict) else {}
@@ -1678,6 +1712,36 @@ def _tool_masterworks(data: dict, user_id) -> dict[str, bool]:
     return {
         "pickaxe": bool(row.get("pickaxe") or legacy_pickaxes.get(str(user_id))),
         "shovel": bool(row.get("shovel")),
+        "farmer": bool(row.get("farmer")),
+        "miner": bool(row.get("miner")),
+    }
+
+
+def _figurine_xp_multiplier(painted: bool) -> float:
+    """One figurine's own consolation prize, applied to ITS station's experience only."""
+    return 1.0 + C.FIGURINE_XP_BONUS if painted else 1.0
+
+
+def _both_figurines(data: dict, user_id) -> bool:
+    """Whether this player may run the farm and the quarry at the same time.
+
+    The rule this gates is one creature, one place: a farm shift and a quarry run are the
+    same animal's day. Both figurines painted is the ONLY thing that lifts it, and
+    deliberately so -- one figurine can mind one station, and there are two.
+    """
+    unlocks = _tool_masterworks(data, user_id)
+    return all(unlocks.get(name) for name in WORKPLACE_FIGURINES)
+
+
+def _station_busy(record: dict) -> dict[str, bool]:
+    """Which stations are occupied right now.
+
+    A finished-but-unsettled run still counts as occupied: the creature is on its way back
+    with the payout, and letting a second job start in that window would double-book it.
+    """
+    return {
+        "farm": isinstance(record.get("farm_run"), dict),
+        "quarry": isinstance(record.get("quarry_run"), dict),
     }
 
 
@@ -1688,14 +1752,15 @@ def _shovel_gold_multiplier(masterwork: bool) -> float:
 
 
 def unlock_tool_masterwork(entry: str, user_id, tool: str) -> bool:
-    """Make one tool permanent after its accepted rune-paint quest.
+    """Set one permanent painted unlock after its accepted rune-paint quest.
 
     These upgrades deliberately live outside the rune inventory: they cannot be moved
-    between gear pieces, traded, or stacked. A masterwork has unlimited uses and its own
-    base effect is 50% stronger.
+    between gear pieces, traded, or stacked. A masterwork tool has unlimited uses and its
+    own base effect is 50% stronger; a workplace figurine instead pays +25% experience at
+    its station and, once BOTH are painted, lets the farm and the quarry run at once.
     """
     tool = str(tool or "").strip().lower()
-    if tool not in TOOL_MASTERWORKS:
+    if tool not in PAINTED_UNLOCKS:
         return False
     with _farm_settlement_lock:
         data = _load(entry)
@@ -1716,9 +1781,19 @@ def unlock_tool_masterwork(entry: str, user_id, tool: str) -> bool:
 
 
 def unlock_tool_for_rune_quest(entry: str, user_id, quest_code: str) -> str | None:
-    """Apply a direct tool reward, returning the upgraded tool only on first unlock."""
+    """Apply a direct tool or figurine reward, returning it only on the FIRST unlock."""
     tool = RUNE_TOOL_MASTERWORKS.get(str(quest_code or "").strip().lower())
     return tool if tool and unlock_tool_masterwork(entry, user_id, tool) else None
+
+
+BUSY_ELSEWHERE_FARM = (
+    "Существо в карьере — на ферму оно уйдёт только после смены. "
+    "Работать в двух местах сразу можно, когда покрашены обе фигурки: фермера и шахтёра."
+)
+BUSY_ELSEWHERE_QUARRY = (
+    "Существо на ферме — в карьер оно уйдёт только после смены. "
+    "Работать в двух местах сразу можно, когда покрашены обе фигурки: фермера и шахтёра."
+)
 
 
 def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
@@ -1735,7 +1810,11 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
             seconds_left = max(0, int((datetime.fromisoformat(str(mine["ready_at"])) - moment).total_seconds()))
         except (KeyError, TypeError, ValueError):
             ready = True
-    upgraded = _tool_masterworks(data, user_id)["pickaxe"]
+    tools = _tool_masterworks(data, user_id)
+    upgraded = tools["pickaxe"]
+    busy = _station_busy(record)
+    parallel = all(tools.get(name) for name in WORKPLACE_FIGURINES)
+    figurine_xp_multiplier = _figurine_xp_multiplier(bool(tools["miner"]))
     efficiency = C.TOOL_MASTERWORK_MULTIPLIER if upgraded else 1.0
     hero_level = max(1, int(record.get("level", 1) or 1))
     gold_multiplier = C.hero_gold_multiplier(hero_level, "quarry")
@@ -1749,9 +1828,10 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
             "gold": C.gold_for_hero(
                 C.QUARRY_GOLD_BY_HOURS[hours] * efficiency, hero_level, "quarry",
             ),
-            "xp": round(C.QUARRY_XP_BY_HOURS[hours] * efficiency),
+            "xp": round(C.QUARRY_XP_BY_HOURS[hours] * efficiency * figurine_xp_multiplier),
             "drop_chance": min(1.0, C.QUARRY_DROP_CHANCE_BY_HOURS[hours] * efficiency),
         })
+    has_pickaxe = upgraded or max(0, int(record.get("pickaxe_runs", 0) or 0)) > 0
     return {
         "available": True, "running": bool(mine) and not ready, "ready": ready,
         "seconds_left": seconds_left, "pickaxe_runs": max(0, int(record.get("pickaxe_runs", 0) or 0)),
@@ -1761,6 +1841,13 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
         "runs_per_pickaxe": C.PICKAXE_RUNS, "duration_hours": C.QUARRY_DURATION_HOURS,
         "ruby_min": C.QUARRY_RUBY_MIN, "ruby_max": C.QUARRY_RUBY_MAX,
         "hour_previews": previews,
+        # Mirrors farm_status: the same one-place-at-a-time rule, read from this side.
+        "can_start": not busy["quarry"] and has_pickaxe and (parallel or not busy["farm"]),
+        "farm_busy": busy["farm"],
+        "blocked_by_farm": busy["farm"] and not parallel,
+        "parallel_work": parallel,
+        "figurines": {name: bool(tools.get(name)) for name in WORKPLACE_FIGURINES},
+        "figurine_xp_multiplier": figurine_xp_multiplier,
     }
 
 
@@ -1806,6 +1893,9 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
         return False, "Выбери 1, 2, 4 или 8 часов."
     moment = app_now()
     settle_quarry(entry, user_id, now=moment)
+    # The farm blocks the quarry now, so a shift that has merely ENDED must be paid out and
+    # cleared before it is allowed to stand in the way of the next job.
+    settle_completed_farms(entry, now=moment)
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
@@ -1813,7 +1903,13 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
             return False, "Сначала приручи существо."
         if isinstance(record.get("quarry_run"), dict):
             return False, "Карьер уже в работе."
-        upgraded = _tool_masterworks(data, user_id)["pickaxe"]
+        tools = _tool_masterworks(data, user_id)
+        # One creature, one place -- unless both figurines are painted to mind both.
+        if isinstance(record.get("farm_run"), dict) and not all(
+            tools.get(name) for name in WORKPLACE_FIGURINES
+        ):
+            return False, BUSY_ELSEWHERE_QUARRY
+        upgraded = tools["pickaxe"]
         runs = max(0, int(record.get("pickaxe_runs", 0) or 0))
         if not runs and not upgraded:
             return False, "Нужна кирка с зарядами."
@@ -1826,6 +1922,7 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
             # Freeze the level payout just like the tool: levelling while the pickaxe is
             # away cannot rewrite what this run promised at departure.
             "hero_gold_multiplier": C.hero_gold_multiplier(record.get("level", 1), "quarry"),
+            "figurine_xp_multiplier": _figurine_xp_multiplier(bool(tools["miner"])),
         }
         _save(entry, data)
     return True, f"Кирка в карьере. Возвращайся через {hours} ч."
@@ -1854,9 +1951,16 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
             hero_gold_multiplier = max(1.0, float(run.get("hero_gold_multiplier", 1.0) or 1.0))
         except (TypeError, ValueError):
             hero_gold_multiplier = 1.0
+        try:
+            figurine_xp_multiplier = float(run.get("figurine_xp_multiplier", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            figurine_xp_multiplier = 1.0
+        figurine_xp_multiplier = min(
+            1.0 + C.FIGURINE_XP_BONUS, max(1.0, figurine_xp_multiplier),
+        )
         rubies = round(rng.randint(ruby_min, ruby_max) * efficiency)
         gold = max(1, round(C.QUARRY_GOLD_BY_HOURS[hours] * efficiency * hero_gold_multiplier))
-        xp = round(C.QUARRY_XP_BY_HOURS[hours] * efficiency)
+        xp = round(C.QUARRY_XP_BY_HOURS[hours] * efficiency * figurine_xp_multiplier)
         _apply_xp(record, xp)
         record["quarry_run"] = None
         _save(entry, data)

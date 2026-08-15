@@ -5398,6 +5398,30 @@ function foeRow(foe, canFight) {
 // ------------------------------------------------------------------------ farm screen
 const FARM_QUICK_HOURS = [1, 2, 4, 8];
 
+// One creature, one place -- said the same way from both sides of the screen, and the
+// only place either half explains what would lift the rule.
+function busyElsewhere(where) {
+  return '<div class="tool-quest-note">🔒 Существо ' + where +
+    '. В двух местах сразу — только когда покрашены обе фигурки: фермера и шахтёра.</div>';
+}
+
+// The pair, and what the pair is FOR: one figurine is worth +25% experience at its own
+// station, but the simultaneous work only arrives with the second one.
+function figurinePanel(farm) {
+  const painted = (farm && farm.figurines) || {};
+  if (farm && farm.parallel_work) {
+    return '<div class="panel"><h2>🧑‍🌾⛏️ Фигурки</h2>' +
+      '<div class="tool-quest-note">✅ Обе покрашены — ферма и карьер работают одновременно.</div></div>';
+  }
+  const row = (key, label) => '<div class="row spread small" style="margin-top:4px"><span>' +
+    label + "</span><span>" + (painted[key] ? "✅ покрашена" : "—") + "</span></div>";
+  return '<div class="panel"><h2>🧑‍🌾 Фигурки</h2>' +
+    '<div class="small muted">Существо работает в одном месте. Обе фигурки снимают это правило.</div>' +
+    row("farmer", "🧑‍🌾 Фермер") + row("miner", "⛏️ Шахтёр") +
+    '<div class="tool-quest-note">🎨 Покрась обе в разделе «Квесты» — тогда ферма и карьер ' +
+    'пойдут <b>одновременно</b>. Каждая сама по себе даёт <b>+25% опыта</b> со своей работы.</div></div>';
+}
+
 function renderFarm() {
   const box = $("scr-farm");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
@@ -5437,6 +5461,10 @@ function renderFarm() {
   } else if (farm.ready) {
     shift = '<div class="panel"><h2>Смена готова</h2>' +
       '<button class="go" data-do="farmcancel">Забрать награду</button></div>';
+  } else if (farm.blocked_by_quarry) {
+    // One creature, one place: no hour buttons at all rather than four that would each
+    // come back with "существо в карьере".
+    shift = '<div class="panel"><h2>Отправить на смену</h2>' + busyElsewhere("в карьере") + "</div>";
   } else {
     shift = '<div class="panel"><h2>Отправить на смену</h2>' +
       '<div class="items" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr))">' +
@@ -5464,25 +5492,29 @@ function renderFarm() {
   const pickaxeQuestNote = quarry.pickaxe_upgraded
     ? '<div class="tool-quest-note">✅ Покрас NMM принят: кирка навсегда бесконечная, а золото, опыт, руби и шанс вещи увеличены на 50%.</div>'
     : '<div class="tool-quest-note">🎨 Покрась кирку в технике <b>NMM</b> в разделе «Квесты». После принятия она навсегда станет бесконечной и будет давать <b>+50% ко всей добыче</b>.</div>';
+  // Buying a pickaxe is not going anywhere, so it stays offered while the creature is on
+  // the farm; only the START chips obey the one-place-at-a-time rule.
+  const hasPickaxe = quarry.pickaxe_unlimited || (quarry.pickaxe_runs || 0);
+  const quarryControls = !hasPickaxe
+    ? '<button class="go sec" style="margin-top:10px" data-do="quarrypickaxe"' +
+      (affordable(quarry.cost) ? '' : ' disabled') + '>Купить кирку · ' + money(quarry.cost) + '</button>'
+    : (quarry.blocked_by_farm
+      ? busyElsewhere("на ферме")
+      : '<div class="items" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:10px">' +
+        (quarry.hour_previews || []).map((preview) =>
+          '<button class="chip" style="border-radius:12px;padding:9px 3px;text-align:center;display:block" ' +
+          'data-quarrystart="' + preview.hours + '"><b>' + preview.hours + ' ч</b><br>' +
+          '<span class="tiny muted">💎' + preview.ruby_min + '–' + preview.ruby_max +
+          '<br>💰' + money(preview.gold) + '<br>✨' + money(preview.xp) +
+          '<br>🎁' + Math.round(preview.drop_chance * 100) + '%</span></button>'
+        ).join('') + '</div>');
   const quarryPanel = quarry.running
     ? '<div class="panel"><h2>⛏ Карьер</h2><div class="small">Добыча идёт. Осталось ' +
       clock(quarry.seconds_left) + '.</div>' + pickaxeQuestNote + '</div>'
     : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">Один заряд кирки — одна смена. Длинная смена выгоднее.</div><div class="small muted" style="margin-top:4px">' +
       'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
       (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
-      pickaxeQuestNote +
-      ((quarry.pickaxe_unlimited || quarry.pickaxe_runs || 0)
-        ? '<div class="items" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:10px">' +
-          (quarry.hour_previews || []).map((preview) =>
-            '<button class="chip" style="border-radius:12px;padding:9px 3px;text-align:center;display:block" ' +
-            'data-quarrystart="' + preview.hours + '"><b>' + preview.hours + ' ч</b><br>' +
-            '<span class="tiny muted">💎' + preview.ruby_min + '–' + preview.ruby_max +
-            '<br>💰' + money(preview.gold) + '<br>✨' + money(preview.xp) +
-            '<br>🎁' + Math.round(preview.drop_chance * 100) + '%</span></button>'
-          ).join('') + '</div>'
-        : '<button class="go sec" style="margin-top:10px" data-do="quarrypickaxe"' +
-          (affordable(quarry.cost) ? '' : ' disabled') + '>Купить кирку · ' + money(quarry.cost) + '</button>') +
-      '</div>';
+      pickaxeQuestNote + quarryControls + '</div>';
   box.innerHTML = shift + quarryPanel +
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
@@ -5504,7 +5536,7 @@ function renderFarm() {
           : '<button class="plus" data-feature="' + key + '"' +
             (affordable(feature.next_cost) ? "" : " disabled") + ">💰" + money(feature.next_cost) +
             "</button>") + "</div>").join("") +
-    "</div>" + shovelPanel;
+    "</div>" + shovelPanel + figurinePanel(farm);
 }
 
 const FEATURE_NAMES = { well: "Колодец", sprinkler: "Поливалка", beds: "Грядка", tractor: "Трактор" };

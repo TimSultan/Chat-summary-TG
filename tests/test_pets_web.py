@@ -1729,6 +1729,22 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-mobfight="', page)
         self.assertIn("MOBS.splice(Number(index), 1);", page)
 
+    async def test_farm_screen_hides_start_buttons_while_the_creature_is_elsewhere(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        farm = page.split("function renderFarm()", 1)[1].split(
+            "const FEATURE_NAMES", 1,
+        )[0]
+        # One creature, one place: the hour chips are replaced by the reason, not merely
+        # disabled, on both sides.
+        self.assertIn("farm.blocked_by_quarry", farm)
+        self.assertIn("quarry.blocked_by_farm", farm)
+        self.assertIn('busyElsewhere("в карьере")', farm)
+        self.assertIn('busyElsewhere("на ферме")', farm)
+        self.assertIn("обе фигурки: фермера и шахтёра", page)
+        # Buying a pickaxe is not going anywhere, so it survives the block.
+        self.assertIn('const hasPickaxe = quarry.pickaxe_unlimited', farm)
+        self.assertIn("figurinePanel(farm)", farm)
+
     async def test_pve_shows_one_mob_and_swaps_it_without_a_request(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         panel = page.split("function mobPanel(farmBlocked)", 1)[1].split(

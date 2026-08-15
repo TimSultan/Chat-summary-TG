@@ -535,6 +535,14 @@ def _quest_payload(entry: str, quest, data: dict, *, user_id=None) -> dict:
                 "personal_paint_target": personal_target,
                 "personal_paint_multiplier": pets.PERSONAL_PAINT_STAT_MULTIPLIER,
             })
+        elif tool_masterwork in pets.WORKPLACE_FIGURINES:
+            # A figurine is not a tool: it multiplies nothing, it buys the right to leave
+            # somebody at a station. Sending tool_efficiency here would promise +50%.
+            reward.update({
+                "workplace_figurine": tool_masterwork,
+                "tool_masterwork": tool_masterwork,
+                "figurine_xp_bonus": C.FIGURINE_XP_BONUS,
+            })
         elif tool_masterwork:
             reward.update({"tool_masterwork": tool_masterwork, "tool_efficiency": 1.5})
         else:

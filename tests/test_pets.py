@@ -759,7 +759,10 @@ class FarmPassiveIncomeTests(PetsTestCase):
     def test_farm_view_shows_passive_rate_and_upgrade_callback(self):
         self._build_farm()
         text, keyboard = pets_ui.farm_view("chat", "1", 0)
-        self.assertIn("Пассивно: +1 монет/ч", text)
+        # The passive rate now lives in the timer block at the very bottom, because it is
+        # a countdown rather than something the player presses.
+        self.assertIn("Пассив +1/ч — начисление в", text)
+        self.assertLess(text.index("<b>Смена</b>"), text.index("<b>⏱ Таймеры</b>"))
         callbacks = [pets_ui.parse_callback(button["callback_data"])[1]
                      for row in keyboard["inline_keyboard"] for button in row]
         self.assertIn("upfarm", callbacks)
@@ -2756,6 +2759,107 @@ class ToolMasterworkTests(PetsTestCase):
         before = status["shovel_runs"]
         self.assertTrue(pets.start_farm(entry, uid, 1, now=start + timedelta(hours=7))[0])
         self.assertEqual(pets.farm_status(entry, uid, start + timedelta(hours=7))["shovel_runs"], before)
+
+
+class WorkplaceFigurineTests(PetsTestCase):
+    """One creature, one place -- and the pair of figurines that lifts the rule."""
+
+    def _worker(self, entry="figurine", uid="1"):
+        self._tame(entry, uid)
+        data = pets._load(entry)
+        data["pets"][uid]["farm_level"] = 3
+        data["pets"][uid]["pickaxe_runs"] = 5
+        pets._save(entry, data)
+
+    def test_quarry_locks_the_farm_out_until_both_figurines_are_painted(self):
+        entry, uid = "figurine-lock", "1"
+        self._worker(entry, uid)
+        start = datetime(2026, 8, 15, 10, 0)
+        with patch.object(pets, "app_now", return_value=start):
+            self.assertTrue(pets.start_quarry(entry, uid, 4)[0])
+
+        ok, message = pets.start_farm(entry, uid, 8, now=start)
+        self.assertFalse(ok)
+        self.assertIn("обе фигурки", message)
+        status = pets.farm_status(entry, uid, start)
+        self.assertFalse(status["can_start"])
+        self.assertTrue(status["blocked_by_quarry"])
+
+        # ONE figurine is not a second worker: the pair is the unlock, deliberately.
+        self.assertEqual(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_farmer"), "farmer")
+        self.assertFalse(pets.start_farm(entry, uid, 8, now=start)[0])
+        self.assertFalse(pets.farm_status(entry, uid, start)["can_start"])
+
+        self.assertEqual(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_miner"), "miner")
+        self.assertTrue(pets.farm_status(entry, uid, start)["parallel_work"])
+        self.assertTrue(pets.start_farm(entry, uid, 8, now=start)[0])
+        self.assertTrue(pets.farm_status(entry, uid, start)["running"])
+        self.assertTrue(pets.quarry_status(entry, uid, start)["running"])
+
+    def test_farm_locks_the_quarry_out_and_hides_its_buttons(self):
+        entry, uid = "figurine-farm-lock", "1"
+        self._worker(entry, uid)
+        start = datetime(2026, 8, 15, 10, 0)
+        self.assertTrue(pets.start_farm(entry, uid, 8, now=start)[0])
+
+        with patch.object(pets, "app_now", return_value=start):
+            ok, message = pets.start_quarry(entry, uid, 4)
+        self.assertFalse(ok)
+        self.assertIn("обе фигурки", message)
+        self.assertFalse(pets.quarry_status(entry, uid, start)["can_start"])
+
+        # The screen must not offer what the core would refuse.
+        _text, keyboard = pets_ui.farm_view(entry, uid, 0)
+        actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"] for button in row
+        ]
+        self.assertNotIn("quarrystart", actions)
+        self.assertNotIn("farmstart", actions)
+
+    def test_a_finished_but_unsettled_run_still_holds_the_creature(self):
+        """The pet is on its way home with the payout; a second job would double-book it."""
+        entry, uid = "figurine-settle", "1"
+        self._worker(entry, uid)
+        start = datetime(2026, 8, 15, 10, 0)
+        self.assertTrue(pets.start_farm(entry, uid, 1, now=start)[0])
+        done = start + timedelta(hours=1, minutes=1)
+        self.assertTrue(pets.farm_status(entry, uid, done)["ready"])
+        # start_quarry settles the finished shift itself rather than refusing on a run
+        # that is over in everything but the bookkeeping.
+        with patch.object(pets, "app_now", return_value=done):
+            self.assertTrue(pets.start_quarry(entry, uid, 4)[0])
+
+    def test_one_figurine_still_pays_extra_experience_at_its_own_station(self):
+        entry, uid = "figurine-xp", "1"
+        self._worker(entry, uid)
+        plain = next(row for row in pets.farm_status(entry, uid)["hour_previews"] if row["hours"] == 8)
+        plain_quarry = next(
+            row for row in pets.quarry_status(entry, uid)["hour_previews"] if row["hours"] == 8
+        )
+
+        self.assertEqual(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_farmer"), "farmer")
+        painted = next(row for row in pets.farm_status(entry, uid)["hour_previews"] if row["hours"] == 8)
+        self.assertEqual(painted["xp"], round(plain["xp"] * (1 + pets_config.FIGURINE_XP_BONUS)))
+        self.assertEqual(painted["gold"], plain["gold"])           # experience only
+        # The farmer figurine is not a miner: the quarry is untouched by it.
+        self.assertEqual(
+            next(row for row in pets.quarry_status(entry, uid)["hour_previews"] if row["hours"] == 8)["xp"],
+            plain_quarry["xp"],
+        )
+
+        start = datetime(2026, 8, 15, 10, 0)
+        self.assertTrue(pets.start_farm(entry, uid, 8, now=start)[0])
+        self.assertEqual(pets.farm_status(entry, uid, start)["reward"]["xp"], painted["xp"])
+
+    def test_a_figurine_painted_mid_shift_only_improves_the_next_one(self):
+        entry, uid = "figurine-frozen", "1"
+        self._worker(entry, uid)
+        start = datetime(2026, 8, 15, 10, 0)
+        promised = next(row for row in pets.farm_status(entry, uid)["hour_previews"] if row["hours"] == 8)
+        self.assertTrue(pets.start_farm(entry, uid, 8, now=start)[0])
+        self.assertEqual(pets.unlock_tool_for_rune_quest(entry, uid, "rune_paint_farmer"), "farmer")
+        self.assertEqual(pets.farm_status(entry, uid, start)["reward"]["xp"], promised["xp"])
 
 
 class FarmTests(PetsTestCase):
