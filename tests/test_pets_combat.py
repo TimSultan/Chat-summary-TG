@@ -235,6 +235,34 @@ class SnapshotTests(unittest.TestCase):
 
 
 class SimulateTests(unittest.TestCase):
+    def test_echo_at_one_hundred_percent_repeats_actual_damage_once(self):
+        class AttackerFirst:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return values[0]
+
+        attacker = Fighter(
+            key="a", name="Echo", strength=10, health=200, agility=10, luck=1,
+            armor=0, effects=({"code": "echo_strike", "value": 100},),
+        )
+        defender = Fighter(
+            key="b", name="Target", strength=10, health=200, agility=10, luck=1,
+            armor=0,
+        )
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 20)):
+            result = combat.simulate(attacker, defender, rng=AttackerFirst(), max_actions=1)
+
+        echo_rows = [row for row in result.rounds if row.event == "amulet_echo_strike"]
+        self.assertEqual(len(echo_rows), 1)
+        self.assertEqual(echo_rows[0].damage, 20)
+        self.assertEqual(result.total_damage["a"], 40)
+
     def test_same_seed_replays_the_identical_fight(self):
         a, b = _fighter("a", 40, name="Alpha"), _fighter("b", 40, name="Beta")
         result_1 = combat.simulate(a, b, seed=12345)

@@ -65,6 +65,15 @@ def test_every_rare_and_legendary_build_item_carries_a_declared_effect():
     assert {item.effect_dict()["code"] for item in effectful} == catalogue.EFFECT_CODES
 
 
+def test_echo_repeats_the_first_landed_damage_once_not_twice():
+    echo = next(
+        item for item in catalogue.GEAR_SPECS
+        if item.effect_dict().get("code") == "echo_strike"
+    )
+    assert echo.rarity == "legendary"
+    assert echo.effect_dict()["value"] == 100
+
+
 def test_raw_items_match_the_existing_trade_record_schema_and_are_fresh_records():
     required = {
         "code", "name", "slot", "price", "source", "bonuses", "description",

@@ -3666,6 +3666,20 @@ def _audit_item(code) -> dict | None:
     }
 
 
+def _audit_scroll(code) -> dict | None:
+    spell = SCROLLS.scroll(code) if code else None
+    if spell is None:
+        return None
+    return {
+        "code": spell.get("code"), "name": spell.get("name"),
+        "icon": spell.get("icon"), "description": spell.get("short"),
+        "element": spell.get("element"), "uses": spell.get("uses"),
+        "dodgeable": spell.get("dodgeable"), "ultimate": spell.get("ultimate"),
+        "effects": [dict(effect) for effect in spell.get("effects", ())],
+        "effects_text": list(SCROLLS.effect_lines(spell)),
+    }
+
+
 def _fight_audit_row(
     fight_id_: str, kind: str, moment: datetime, result, fighters: tuple,
     records: dict | None = None, context: dict | None = None,
@@ -3690,6 +3704,10 @@ def _fight_audit_row(
             "base_stats": dict((record or {}).get("stats") or {}),
             "equipped": items,
             "skill_slots": list(snapshot.get("skills") or ()),
+            "scrolls": [
+                _audit_scroll(code) if code else None
+                for code in (snapshot.get("skills") or ())
+            ],
             "shield": snapshot.get("shield"),
             "owner_name": (record or {}).get("owner_name"),
             "owner_username": (record or {}).get("owner_username"),
@@ -3859,7 +3877,9 @@ def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
     except ValueError:
         moment = app_now()
     row = _fight_audit_row(
-        wire_id, "arena", moment, result, (attacker, defender), context={
+        wire_id, "arena", moment, result, (attacker, defender),
+        records=snapshot.get("records") if isinstance(snapshot.get("records"), dict) else None,
+        context={
             "historic_reconstruction": True,
             "rules_changed": str(result.winner or "") != str(historic.get("winner_id") or ""),
         },

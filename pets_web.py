@@ -558,6 +558,75 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
     }
 
 
+def _fight_record_snapshot(record: dict | None, prefix: str) -> dict:
+    """Small immutable visual/equipment record stored beside a replay seed."""
+    record = record if isinstance(record, dict) else {}
+    equipped = dict(record.get("equipped") or {})
+    items = []
+    for code in equipped.values():
+        item = C.find_item(code) if code else None
+        if item is not None:
+            items.append(_item_payload(item, prefix, record))
+    return {
+        "equipped": equipped,
+        "items": items,
+        "portrait_crop": _jsonable(record.get("portrait_crop")),
+        "stats": dict(record.get("stats") or {}),
+        "owner_name": record.get("owner_name"),
+        "owner_username": record.get("owner_username"),
+    }
+
+
+def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dict | None) -> dict:
+    """Everything the replay header needs without consulting mutable live equipment."""
+    record = record if isinstance(record, dict) else {}
+    items = [dict(item) for item in record.get("items", ()) if isinstance(item, dict)]
+    if not items:
+        for code in (record.get("equipped") or {}).values():
+            item = C.find_item(code) if code else None
+            if item is not None:
+                items.append(_item_payload(item, prefix, record))
+    for item in items:
+        item["art"] = f"{prefix}/img/{item.get('code')}.svg" if item.get("code") else ""
+
+    scrolls = []
+    for code in getattr(fighter, "skills", ()) or ():
+        spell = pets_scroll_catalog.scroll(code) if code else None
+        scrolls.append({
+            "code": spell.get("code"), "name": spell.get("name"),
+            "icon": spell.get("icon"), "description": spell.get("short"),
+            "element": spell.get("element"), "uses": spell.get("uses"),
+            "dodgeable": spell.get("dodgeable"), "ultimate": spell.get("ultimate"),
+            "effects": [dict(effect) for effect in spell.get("effects", ())],
+            "effects_text": list(pets_scroll_catalog.effect_lines(spell)),
+        } if spell else None)
+
+    derived = pets_combat.derive(fighter, opponent)
+    return {
+        "user_id": str(key), "name": getattr(fighter, "name", "") or str(key),
+        "level": int(getattr(fighter, "level", 1) or 1),
+        "portrait": _portrait_url(prefix, key) if prefix and str(key).isdigit() else None,
+        "crop": _jsonable(record.get("portrait_crop")),
+        "stats": {
+            "strength": int(getattr(fighter, "strength", 0) or 0),
+            "health": int(getattr(fighter, "health", 0) or 0),
+            "agility": int(getattr(fighter, "agility", 0) or 0),
+            "luck": int(getattr(fighter, "luck", 0) or 0),
+            "armor": int(getattr(fighter, "armor", 0) or 0),
+        },
+        "derived": {
+            "max_hp": round(derived.get("max_hp", 0)),
+            "damage": round(derived.get("damage", 0)),
+            "dodge": derived.get("dodge", 0), "crit": derived.get("crit", 0),
+            "reduction": derived.get("reduction", 0),
+        },
+        "items": items,
+        "effects": [dict(effect) if isinstance(effect, dict) else {"code": str(effect)}
+                    for effect in getattr(fighter, "effects", ())],
+        "scrolls": scrolls, "shield": _jsonable(getattr(fighter, "shield", None)),
+    }
+
+
 def _stat_payload(entry: str, user_id, record: dict, stat_points: int = 0) -> list[dict]:
     """A stat row: what it cost, what it is now, and what the gear adds on top.
 
@@ -1127,7 +1196,13 @@ async def handle_action(request: web.Request) -> web.Response:
         dropped = extra.get("dropped") or {}
         dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
         response["battle"] = {
-          **_playback_payload(result, str(user["id"]), hero, enemy.key, enemy, encounter.get("name")),
+          **_playback_payload(
+              result, str(user["id"]), hero, enemy.key, enemy, encounter.get("name"),
+              prefix=request.app[_PREFIX_KEY],
+              records={str(user["id"]): _fight_record_snapshot(
+                  pets.get_pet(entry, user["id"]), request.app[_PREFIX_KEY],
+              )},
+          ),
           "dungeon": True, "enemy_art": {"boss": bool(encounter.get("boss"))},
           "reward": extra.get("reward") or {},
           "dropped": _item_payload(dropped_item, request.app[_PREFIX_KEY], pets.get_pet(entry, user["id"])) if dropped_item else None,
@@ -1471,6 +1546,11 @@ async def handle_attack(request: web.Request) -> web.Response:
     # for somebody who owns it, and is put back straight after the fight is recorded.
     mirrored = pets.auto_equip_mirror(entry, me, opponent_id)
     attacker, defender = fighter(me, mine), fighter(opponent_id, theirs)
+    prefix = request.app[_PREFIX_KEY]
+    playback_records = {
+        me: _fight_record_snapshot(pets.get_pet(entry, me), prefix),
+        opponent_id: _fight_record_snapshot(pets.get_pet(entry, opponent_id), prefix),
+    }
     seed = secrets.randbits(63)
     result = pets_combat.simulate(attacker, defender, seed=seed)
     # The seed plus both fighters as they stood is the entire fight -- simulate() reads
@@ -1482,6 +1562,7 @@ async def handle_attack(request: web.Request) -> web.Response:
             me: pets_combat.snapshot(attacker),
             opponent_id: pets_combat.snapshot(defender),
         },
+        "records": playback_records,
     }
     try:
         reward = pets.record_fight(entry, me, opponent_id, result, pets.today(),
@@ -1495,7 +1576,6 @@ async def handle_attack(request: web.Request) -> web.Response:
     if mirrored:
         pets.restore_after_mirror(entry, me)
     dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
-    prefix = request.app[_PREFIX_KEY]
     request.app[_LOG_KEY](
         f"[pets_web] fight {me} vs {opponent_id}"
         + (" (зеркало души)" if mirrored else "") + ": "
@@ -1508,6 +1588,7 @@ async def handle_attack(request: web.Request) -> web.Response:
         **_playback_payload(
             result, me, attacker, opponent_id, defender, theirs.get("name"),
             reward.get("fight_id"),
+            prefix=prefix, records=playback_records,
         ),
         "reward": reward,
         "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
@@ -1517,6 +1598,7 @@ async def handle_attack(request: web.Request) -> web.Response:
 
 def _playback_payload(
     result, me: str, mine, opponent_id: str, theirs, opponent_name, fight_id: str | None = None,
+    *, prefix: str = "", records: dict | None = None,
 ) -> dict:
     """The part of a fight the page animates, blow by blow.
 
@@ -1529,6 +1611,7 @@ def _playback_payload(
     frailer opponent their bar started full and then fell off a cliff, and against a
     tougher one it never emptied.
     """
+    records = records if isinstance(records, dict) else {}
     return {
         "fight_id": fight_id or getattr(result, "fight_id", None),
         "you": me,
@@ -1539,6 +1622,12 @@ def _playback_payload(
         # and none of the highlighting below can find it.
         "you_name": getattr(mine, "name", "") or "",
         "opponent": {"user_id": opponent_id, "name": opponent_name},
+        "fighters": {
+            str(me): _playback_side_payload(mine, theirs, str(me), prefix, records.get(str(me))),
+            str(opponent_id): _playback_side_payload(
+                theirs, mine, str(opponent_id), prefix, records.get(str(opponent_id)),
+            ),
+        },
         "winner": result.winner,
         "draw": result.is_draw,
         "stopped_early": result.stopped_early,
@@ -1615,6 +1704,14 @@ async def handle_replay(request: web.Request) -> web.Response:
     # number invented here would be indistinguishable from a real one.
     dropped = C.find_item(fight.get("dropped_item")) if won and fight.get("dropped_item") else None
     prefix = request.app[_PREFIX_KEY]
+    playback_records = snapshot.get("records") if isinstance(snapshot.get("records"), dict) else {}
+    # Old snapshots predate immutable appearance/equipment records. They can still show
+    # the combat stats exactly; use current portraits/items only as a visual fallback.
+    if not playback_records:
+        playback_records = {
+            attacker_id: _fight_record_snapshot(pets.get_pet(entry, attacker_id), prefix),
+            defender_id: _fight_record_snapshot(pets.get_pet(entry, defender_id), prefix),
+        }
     return _ok({
         "ok": True,
         "replay": True,
@@ -1623,6 +1720,7 @@ async def handle_replay(request: web.Request) -> web.Response:
             result, me,
             attacker if attacked else defender, opponent_id,
             defender if attacked else attacker, opponent_name, pets.fight_id(fight),
+            prefix=prefix, records=playback_records,
         ),
         "reward": {
             "gold": fight.get("gold", 0) if won else 0,
@@ -1704,6 +1802,7 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
 
     dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
     prefix = request.app[_PREFIX_KEY]
+    playback_records = {me: _fight_record_snapshot(mine, prefix)}
     request.app[_LOG_KEY](
         f"[pets_web] mob {me} vs {mob.code} ({tier}): "
         f"{'win' if reward['won'] else 'loss'}, {len(result.rounds)} rounds, "
@@ -1714,6 +1813,7 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
         "ok": True,
         **_playback_payload(
             result, me, hero, enemy.key, enemy, block["name"], reward.get("fight_id"),
+            prefix=prefix, records=playback_records,
         ),
         # The client needs to distinguish a mob replay from an arena replay: only the
         # former offers the persistent "skip fights" control.
@@ -2631,6 +2731,7 @@ input{flex:1;min-width:240px}button{cursor:pointer;background:#2677bd}.muted{col
 .list{display:grid;gap:8px;margin:18px 0}.row,.card,.move{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
 .row{cursor:pointer;display:flex;justify-content:space-between;gap:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-wrap:wrap;gap:6px}.tag{background:#26384a;border-radius:20px;padding:5px 9px}
+.audit-item{background:#121c27;border:1px solid var(--line);border-radius:10px;padding:10px;margin:7px 0}.audit-item h4{margin:0 0 5px}.audit-item p{margin:5px 0}.mechanics{color:#bed2e6;font:12px ui-monospace,monospace}.effect-line{border-left:3px solid var(--blue);padding-left:8px}
 .moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
 @media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
@@ -2645,7 +2746,12 @@ const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&
 const pretty=v=>esc(JSON.stringify(v??{},null,2));
 async function api(id="",pet=""){status.textContent="Loading…";const q=new URLSearchParams();if(id)q.set("id",id);if(pet){q.set("pet_id",pet);q.set("limit","500")}const u="/audit/api/fights"+(q.size?"?"+q.toString():"");const r=await fetch(u);const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
 function auditFailure(e){status.textContent=e.message||"Could not load fights";out.innerHTML=""}
-function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>Level ${esc(f.level)} · STR ${esc(f.strength)} · HP stat ${esc(f.health)} · AGI ${esc(f.agility)} · LUCK ${esc(f.luck)} · ARM ${esc(f.armor)}</div><div class="muted">Derived: max HP ${esc(Math.round(d.max_hp||0))}, damage ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%</div><h4>Items</h4><div class="items">${items.length?items.map(i=>`<span class="tag">${esc(i.name)} · ${esc(i.rarity)} · ${esc(i.code)}</span>`).join(""):"<span class=muted>None</span>"}</div><h4>Scrolls / shield</h4><pre>${pretty({skill_slots:s.skill_slots,shield:s.shield,effects:f.effects})}</pre><details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
+function mechanics(v,skip=[]){if(!v||typeof v!=="object")return"";const rows=Object.entries(v).filter(([k,x])=>!skip.includes(k)&&x!==null&&x!==""&&!(Array.isArray(x)&&!x.length));return rows.length?`<div class="mechanics">${rows.map(([k,x])=>`${esc(k)}: ${esc(typeof x==="object"?JSON.stringify(x):x)}`).join(" · ")}</div>`:""}
+function bonuses(v){const labels={strength:"⚔️",health:"❤️",agility:"💨",luck:"🍀",armor:"🛡️",endurance:"🫁"};return Object.entries(v||{}).map(([k,x])=>`${labels[k]||esc(k)} ${Number(x)>0?"+":""}${esc(x)}`).join(" · ")}
+function auditItem(i){const e=i.effect||{};return `<div class="audit-item"><h4>${esc(i.name)} <span class="muted">${esc(i.rarity)} · ${esc(i.slot)} · ${esc(i.code)}</span></h4>${bonuses(i.bonuses)?`<p>${bonuses(i.bonuses)}</p>`:""}${i.description?`<p>${esc(i.description)}</p>`:""}${e.text?`<p class="effect-line"><b>Effect:</b> ${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
+function auditScroll(s){if(!s)return"";return `<div class="audit-item"><h4>${esc(s.icon||"📜")} ${esc(s.name)} <span class="muted">${esc(s.code)}</span></h4>${s.description?`<p>${esc(s.description)}</p>`:""}${(s.effects_text||[]).map(x=>`<p class="effect-line">${esc(x)}</p>`).join("")}${mechanics({element:s.element,uses:s.uses,dodgeable:s.dodgeable,ultimate:s.ultimate})}${(s.effects||[]).map(e=>mechanics(e)).join("")}</div>`}
+function auditEffect(e){if(typeof e==="string")return `<div class="audit-item">${esc(e)}</div>`;return `<div class="audit-item">${e.text?`<p class="effect-line">${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
+function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[],scrolls=s.scrolls||[],effects=f.effects||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>⭐ ${esc(f.level)} · ⚔️ ${esc(f.strength)} · ❤️ ${esc(f.health)} · 💨 ${esc(f.agility)} · 🍀 ${esc(f.luck)} · 🛡️ ${esc(f.armor)}</div><div class="muted">Derived: ❤️ ${esc(Math.round(d.max_hp||0))}, ⚔️ ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%, reduction ${esc(((d.reduction||0)*100).toFixed(1))}%</div><h4>Items and exact effects</h4>${items.length?items.map(auditItem).join(""):"<span class=muted>None recorded</span>"}<h4>Scrolls</h4>${scrolls.filter(Boolean).length?scrolls.map(auditScroll).join(""):"<span class=muted>None</span>"}<h4>Combat effect snapshot</h4>${effects.length?effects.map(auditEffect).join(""):"<span class=muted>None</span>"}<h4>Shield</h4>${s.shield?auditEffect(s.shield):"<span class=muted>None</span>"}<details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
 function renderFight(f){const fighters=Object.entries(f.fighters||{});out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Moves (${(f.moves||[]).length})</h2><div class="moves">${(f.moves||[]).map(m=>`<details class="move"><summary><b>#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
 async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){auditFailure(e)}}
 let auditPets=[],selectedPet="";const petSearch=document.getElementById("petSearch"),petSuggestions=document.getElementById("petSuggestions");
@@ -3101,7 +3207,7 @@ PAGE_HTML = """<!doctype html>
 
   /* ----------------------------------------------------------- sheets and overlays */
   .veil {
-    position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.6);
+    position: fixed; inset: 0; z-index: 70; background: rgba(0,0,0,.6);
     display: flex; align-items: flex-end; justify-content: center;
   }
   .sheet {
@@ -3564,6 +3670,24 @@ PAGE_HTML = """<!doctype html>
   .duel .fighter-art img { width:100%; height:100%; object-fit:cover; }
   .duel .fighter-art .dungeon-art { width:100%; height:100%; }
   .duel .versus { font-weight:700; color:var(--muted); }
+  .duel .matchup { display:grid; grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr);
+                   gap:6px; align-items:start; margin-bottom:9px; max-height:38vh; overflow-y:auto; }
+  .duel-fighter { min-width:0; text-align:center; background:var(--card); border:1px solid var(--line);
+                  border-radius:12px; padding:8px 6px; }
+  .duel-avatar { width:68px; height:68px; margin:0 auto 5px; border-radius:50%; overflow:hidden;
+                 display:grid; place-items:center; background:var(--sunken); border:2px solid var(--line); font-size:30px; }
+  .duel-avatar img { width:100%; height:100%; object-fit:cover; }
+  .duel-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .duel-stats { font-size:11px; line-height:1.55; margin:4px 0; }
+  .duel-loadout { display:grid; gap:4px; text-align:left; }
+  .duel-item { width:100%; min-width:0; display:grid; grid-template-columns:28px minmax(0,1fr); gap:5px;
+               align-items:center; padding:4px; border-radius:7px; border:1px solid var(--line);
+               background:var(--sunken); color:var(--fg); text-align:left; }
+  .duel-item img { width:28px; height:28px; object-fit:cover; border-radius:5px; }
+  .duel-item b,.duel-item small { display:block; overflow:hidden; text-overflow:ellipsis; }
+  .duel-item small { color:var(--muted); font-size:9px; line-height:1.25; white-space:normal; }
+  .duel-effects { margin-top:4px; font-size:9px; line-height:1.3; color:var(--muted); text-align:left; }
+  .duel .match-vs { align-self:center; text-align:center; color:var(--muted); font-weight:800; }
   .duel .hpbar { height: 12px; border-radius: 6px; background: var(--sunken); overflow: hidden; }
   .duel .hpbar > i { display: block; height: 100%; background: var(--hp); transition: width .28s; }
   .duel .log { flex: 1; overflow-y: auto; margin: 12px 0; display: flex; flex-direction: column; gap: 7px; }
@@ -6144,6 +6268,81 @@ function paintBlow(round, mineName, theirName) {
   return out;
 }
 
+let DUEL_DETAILS = {};
+
+function fightMechanics(value, skipped) {
+  if (!value || typeof value !== "object") return "";
+  const omit = skipped || ["text"];
+  return Object.entries(value)
+    .filter(([key, item]) => !omit.includes(key) && item !== null && item !== "" &&
+      !(Array.isArray(item) && !item.length))
+    .map(([key, item]) => esc(key) + ": <b>" + esc(typeof item === "object" ? JSON.stringify(item) : item) + "</b>")
+    .join(" · ");
+}
+
+function openFightDetail(key) {
+  const detail = DUEL_DETAILS[key];
+  if (!detail) return;
+  if (detail.kind === "scroll") {
+    sheet('<h3>' + esc(detail.icon || "📜") + " " + esc(detail.name) + "</h3>" +
+      (detail.description ? '<p class="small muted">' + esc(detail.description) + "</p>" : "") +
+      (detail.effects_text || []).map((line) => '<p class="small">✨ ' + esc(line) + "</p>").join("") +
+      '<div class="tiny muted">' + fightMechanics(detail, ["kind", "code", "name", "icon", "description", "effects", "effects_text"]) + "</div>" +
+      (detail.effects || []).map((effect) => '<div class="tiny muted" style="margin-top:6px">' + fightMechanics(effect, []) + "</div>").join(""));
+    return;
+  }
+  const effect = detail.effect || {};
+  sheet('<div class="hd"><img src="' + esc(detail.art || "") + '" alt=""><div><h3>' +
+    esc(detail.name) + '</h3><div class="small" style="color:var(--r-' + esc(detail.rarity || "common") + ')">' +
+    esc(detail.rarity_name || detail.rarity || "") + " · " + esc(detail.slot_name || detail.slot || "") +
+    '</div><div class="small" style="margin-top:5px">' + bonusText(detail.bonuses || {}) + "</div></div></div>" +
+    (detail.description ? '<p class="small muted">' + esc(detail.description) + "</p>" : "") +
+    (effect.text ? '<p class="small">✨ ' + esc(effect.text) + "</p>" : "") +
+    (fightMechanics(effect) ? '<div class="tiny muted">Точные параметры: ' + fightMechanics(effect) + "</div>" : ""));
+}
+
+function duelStats(fighter) {
+  const stats = fighter.stats || {};
+  return "⭐ " + Number(fighter.level || 1) + " · " +
+    ["strength", "health", "agility", "luck", "armor"]
+      .map((key) => (STAT_ICON[key] || key) + " " + Number(stats[key] || 0)).join(" · ");
+}
+
+function duelLoadout(fighter) {
+  const rows = [];
+  for (const item of (fighter.items || [])) {
+    const key = String(fighter.user_id) + ":item:" + item.code;
+    DUEL_DETAILS[key] = Object.assign({ kind: "item" }, item);
+    rows.push('<button type="button" class="duel-item r-' + esc(item.rarity || "common") +
+      '" data-fight-detail="' + esc(key) + '"><img src="' + esc(item.art || "") + '" alt=""><span><b>' +
+      esc(item.name) + "</b><small>" + esc((item.effect && item.effect.text) || item.description || "Без особого эффекта") +
+      "</small></span></button>");
+  }
+  for (const scroll of (fighter.scrolls || []).filter(Boolean)) {
+    const key = String(fighter.user_id) + ":scroll:" + scroll.code;
+    DUEL_DETAILS[key] = Object.assign({ kind: "scroll" }, scroll);
+    rows.push('<button type="button" class="duel-item" data-fight-detail="' + esc(key) +
+      '"><span style="font-size:22px;text-align:center">' + esc(scroll.icon || "📜") + '</span><span><b>' +
+      esc(scroll.name) + "</b><small>" + esc((scroll.effects_text || []).join(" · ") || scroll.description || "Свиток") +
+      "</small></span></button>");
+  }
+  return rows.length ? '<div class="duel-loadout">' + rows.join("") + "</div>" :
+    '<div class="tiny muted">Предметов и свитков нет</div>';
+}
+
+function duelFighter(fighter, fallbackArt) {
+  fighter = fighter || {};
+  const portrait = fighter.portrait ? shot(fighter.portrait, fighter.crop) : fallbackArt;
+  const effects = (fighter.effects || []).map((effect) =>
+    (effect && typeof effect === "object" ? (effect.text || fightMechanics(effect, ["text"])) : String(effect || "")))
+    .filter(Boolean);
+  return '<article class="duel-fighter"><div class="duel-avatar">' + (portrait || "👤") +
+    '</div><b class="duel-name">' + esc(fighter.name || fighter.user_id || "Соперник") +
+    '</b><div class="duel-stats">' + duelStats(fighter) + "</div>" + duelLoadout(fighter) +
+    (effects.length ? '<div class="duel-effects">✨ ' + effects.map(esc).join("<br>✨ ") + "</div>" : "") +
+    "</article>";
+}
+
 function playDuel(data) {
   const me = data.you;
   const maxHp = data.max_hp || {};
@@ -6160,10 +6359,13 @@ function playDuel(data) {
   const view = document.createElement("div");
   view.className = "duel";
   view.id = "duel";
-  const fighterArt = data.dungeon
-    ? '<div class="fighters"><span class="fighter-art">' + shot(S.pet && S.pet.portrait, S.pet && S.pet.crop) +
-      '</span><span class="versus">VS</span><span class="fighter-art">' + dungeonArt(data.enemy_art || {}) + '</span></div>'
-    : "";
+  DUEL_DETAILS = {};
+  const fighters = data.fighters || {};
+  const mine = fighters[String(me)] || {user_id:me,name:mineName,level:(S.pet&&S.pet.level),stats:(S.pet&&S.pet.stats)||{},portrait:S.pet&&S.pet.portrait,crop:S.pet&&S.pet.crop};
+  const foe = fighters[String(data.opponent.user_id)] || {user_id:data.opponent.user_id,name:theirName,level:1,stats:{}};
+  const foeArt = (data.dungeon || data.mob) ? dungeonArt(data.enemy_art || {}) : "👤";
+  const fighterArt = '<div class="matchup">' + duelFighter(mine, "👤") +
+    '<div class="match-vs">VS</div>' + duelFighter(foe, foeArt) + "</div>";
   view.innerHTML =
     fighterArt + (data.fight_id ? '<div class="small muted" style="text-align:center">Fight ID: <span class="id">' + esc(data.fight_id) + '</span></div>' : '') +
     '<div class="side"><div class="row spread small"><b>' + esc(mineName) +
@@ -6176,6 +6378,10 @@ function playDuel(data) {
     '<div class="log" id="duelLog"></div>' +
     '<div class="acts" id="duelControls"><button class="go" id="duelDone">Пропустить</button></div>';
   document.body.appendChild(view);
+  paintShots(view);
+  view.querySelectorAll("[data-fight-detail]").forEach((node) => {
+    node.onclick = () => openFightDetail(node.dataset.fightDetail);
+  });
 
   let index = 0, done = false;
   const finish = () => {

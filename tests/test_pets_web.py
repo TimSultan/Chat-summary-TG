@@ -446,6 +446,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="petSuggestions"', html)
         self.assertIn("showPetSuggestions()", html)
         self.assertIn('data-pet="', html)
+        self.assertIn("function auditItem(i)", html)
+        self.assertIn("Items and exact effects", html)
+        self.assertIn("Combat effect snapshot", html)
         self.assertNotIn('id="auditKey"', html)
 
         data = pets._load(CHAT)
@@ -1396,6 +1399,14 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         showing players a fight that never happened."""
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
+        # Freeze one effect-bearing item into the replay. Its explanatory copy is part of
+        # the audit contract just as much as the stats and rounds are.
+        echo_item = next(i for i in C.ITEMS if dict(i.effect or {}).get("code") == "echo_strike")
+        stored = pets._load(CHAT)
+        hero = stored["pets"][str(PLAYER["id"])]
+        hero["inventory"].append(echo_item.code)
+        hero["equipped"][echo_item.slot] = echo_item.code
+        pets._save(CHAT, stored)
 
         live = await (await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
             "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
@@ -1411,6 +1422,19 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["closing"], live["closing"])
         self.assertEqual(again["rounds"], live["rounds"])
         self.assertEqual(again["max_hp"], live["max_hp"])
+        self.assertEqual(again["fighters"], live["fighters"])
+        hero_header = live["fighters"][str(PLAYER["id"])]
+        self.assertEqual(set(hero_header["stats"]), {"strength", "health", "agility", "luck", "armor"})
+        self.assertTrue(hero_header["portrait"].endswith(f"/{PLAYER['id']}.jpg"))
+        displayed = next(i for i in hero_header["items"] if i["code"] == echo_item.code)
+        self.assertEqual(displayed["description"], echo_item.description)
+        self.assertEqual(displayed["effect"]["value"], 100)
+
+        audited = await self.client.get(f"/audit/api/fights?id={fight_id}")
+        audit_hero = (await audited.json())["fight"]["fighters"][str(PLAYER["id"])]
+        audit_item = next(i for i in audit_hero["equipped"] if i["code"] == echo_item.code)
+        self.assertEqual(audit_item["description"], echo_item.description)
+        self.assertEqual(audit_item["effect"]["value"], 100)
 
     async def test_a_replay_pays_nothing_and_reports_what_was_paid(self):
         """Watching a fight again must not re-run it: no coins, no XP, no fight spent, and
@@ -1598,6 +1622,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # The live fight and the replay must go through one playback, or they drift.
         self.assertEqual(page.count("function playDuel("), 1)
         self.assertIn(".duel .rerun", page)
+        self.assertIn('class="matchup"', page)
+        self.assertIn("function duelFighter(fighter, fallbackArt)", page)
+        self.assertIn("data-fight-detail=", page)
+        self.assertIn("function openFightDetail(key)", page)
+        self.assertIn("Точные параметры:", page)
 
     async def test_hero_order_and_pve_replay_controls_are_exposed_by_the_page(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
