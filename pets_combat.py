@@ -27,6 +27,7 @@ is stuck permanently swinging second. `MAX_SKILL_ACTIONS_PER_FIGHTER` is a hard 
 each fighter's actions, so there can be no more than that many blows from either side.
 """
 
+import math
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -399,6 +400,24 @@ def _param(effects: tuple[dict, ...], code: str, key: str, default: float) -> fl
         return default
 
 
+def _scaled_flat_damage(value: float, fighter: "Fighter", attack_damage: float) -> int:
+    """Scale old flat damage with its owner's level and effective attack power.
+
+    Percentage-based effects already grow with the combatants (echo, thorns, wounds,
+    scroll burns, rune fire, and so on). This is only for legacy catalogue values such
+    as ``6 poison`` or ``2 bleed``. The stronger of the level and damage curves wins,
+    rather than multiplying them together, so the effect stays useful without double-
+    dipping every stat increase.
+    """
+    base = max(0.0, float(value or 0))
+    level = max(1, int(fighter.level or 1))
+    level_factor = 1.0 + C.FLAT_EFFECT_LEVEL_SQRT_GROWTH * math.sqrt(level - 1)
+    damage_factor = math.sqrt(max(
+        1.0, float(attack_damage or 0) / C.FLAT_EFFECT_DAMAGE_REFERENCE,
+    ))
+    return max(1, round(base * max(level_factor, damage_factor)))
+
+
 def _saturate(mx: float, k: float, s: float) -> float:
     """The shared dodge/crit/armor curve: `mx * s / (s + k)`, 0 below zero.
 
@@ -636,6 +655,25 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     guards = {a.key: 0.0, b.key: 0.0}
     used_scrolls = {a.key: set() for a in (a, b)}
     skill_statuses = {a.key: {} for a in (a, b)}
+
+    def scaled_flat_damage(source_key: str, value: float, code: str) -> int:
+        spec = _effect(effects[source_key], code) or {}
+        if spec.get("level_scaled") is False:
+            return max(1, round(max(0, value)))
+        fighter = fighters[source_key]
+        return _scaled_flat_damage(
+            value, fighter, C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT,
+        )
+
+    def queue_damage(
+        queue: dict[str, tuple[str, int] | None], target_key: str,
+        source_key: str, damage: int,
+    ) -> None:
+        """Keep every advertised poison hit until the target's next action."""
+        pending = queue[target_key]
+        if pending is not None and pending[0] == source_key:
+            damage += pending[1]
+        queue[target_key] = (source_key, damage)
 
     initiative = .5
     if effectful:
@@ -1579,21 +1617,21 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 if healed:
                     effect_round(round_number, attacker_key, defender_key, "vampiric", healed)
             if (value := _effect_value(effects[attacker_key], "poison")) is not None and not knocked_out:
-                poison = max(1, round(max(0, value)))
-                pending_poison[defender_key] = (attacker_key, poison)
+                poison = scaled_flat_damage(attacker_key, value, "poison")
+                queue_damage(pending_poison, defender_key, attacker_key, poison)
             if (value := _effect_value(effects[attacker_key], "burn")) is not None \
                     and not knocked_out:
-                burn_damage = max(1, round(max(0, value)))
+                burn_damage = scaled_flat_damage(attacker_key, value, "burn")
                 turns = max(1, round(_param(effects[attacker_key], "burn", "turns", 2)))
                 burning[defender_key] = (
                     attacker_key, turns, burn_damage, (ELEMENTAL, MAGIC),
                 )
             if (value := _effect_value(effects[attacker_key], "venom_blade")) is not None \
                     and not knocked_out:
-                venom_damage = max(1, round(_param(
+                venom_damage = scaled_flat_damage(attacker_key, _param(
                     effects[attacker_key], "venom_blade", "poison", 2,
-                )))
-                pending_venom[defender_key] = (attacker_key, venom_damage)
+                ), "venom_blade")
+                queue_damage(pending_venom, defender_key, attacker_key, venom_damage)
                 venom_miss[defender_key] = max(venom_miss[defender_key], max(0, _fraction(value)))
             if (value := _effect_value(effects[attacker_key], "bleed")) is not None \
                     and not knocked_out:
@@ -1601,7 +1639,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 old_stacks = old[1] if old and old[0] == attacker_key else 0
                 cap = max(1, round(_param(effects[attacker_key], "bleed", "cap", 3)))
                 bleeding[defender_key] = (
-                    attacker_key, min(cap, old_stacks + 1), max(1, round(value)),
+                    attacker_key, min(cap, old_stacks + 1),
+                    scaled_flat_damage(attacker_key, value, "bleed"),
                 )
             if (value := _effect_value(effects[attacker_key], "armor_shred")) is not None \
                     and not knocked_out:
@@ -1739,8 +1778,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     if recoil_ko:
                         return defender_key
                 if (value := _effect_value(effects[defender_key], "retaliation")) is not None:
-                    retaliation_bonus[defender_key] += max(0, value)
-                    effect_round(round_number, defender_key, attacker_key, "retaliation", round(value))
+                    retaliation = scaled_flat_damage(defender_key, value, "retaliation")
+                    retaliation_bonus[defender_key] += retaliation
+                    effect_round(round_number, defender_key, attacker_key, "retaliation", retaliation)
         elif effectful and event == "dodge" and (value := _effect_value(effects[defender_key], "dodge_heal")) is not None:
             landed_hits[attacker_key] = 0
             if _effect_value(effects[attacker_key], "focused") is not None:

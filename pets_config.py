@@ -274,6 +274,18 @@ DAMAGE_PER_POINT = 2.42
 # Every blow is nudged by +-15% so two identical pets do not play out identically.
 DAMAGE_VARIANCE = 0.15
 
+# Fixed catalogue damage (poison, weapon fire, venom, bleeding and retaliation) used to
+# stay at its level-one number forever. Six poison beside a 2,000+ HP pet is decorative,
+# while simply multiplying it by level would explode now that pet levels are unbounded.
+# A square-root curve keeps every level meaningful without turning a very old pet's DoT
+# into a one-tick kill. Combat also compares this curve with a soft Strength/damage curve,
+# so a deliberately damage-heavy build is not worse at statuses than a low-Strength peer.
+#
+#   level       1      10      25      50      100
+#   multiplier 1.00   1.60    1.98    2.40     2.99
+FLAT_EFFECT_LEVEL_SQRT_GROWTH = 0.20
+FLAT_EFFECT_DAMAGE_REFERENCE = BASE_DAMAGE + DAMAGE_PER_POINT
+
 # Dodge, crit and armor all use the same saturating curve,
 #
 #     chance = MAX * stat / (stat + K)
@@ -592,7 +604,12 @@ def rune_enchantment_effect(element: str, stats: dict) -> dict | None:
     max_hp = BASE_HP + health * HP_PER_POINT
     damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT
     if element == "fire":
-        return {"code": "burn", "value": max(15, round(damage * RUNE_FIRE_DAMAGE_SHARE)), "turns": 2}
+        # This value already scales from effective Strength. The passive combat layer
+        # must not apply its legacy flat-damage curve a second time.
+        return {
+            "code": "burn", "value": max(15, round(damage * RUNE_FIRE_DAMAGE_SHARE)),
+            "turns": 2, "level_scaled": False,
+        }
     if element == "frost":
         return {"code": "chill", "value": min(RUNE_CHILL_MAX, RUNE_CHILL_BASE + agility // RUNE_CHILL_AGILITY_DIVISOR)}
     if element == "water":

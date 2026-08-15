@@ -655,6 +655,62 @@ class AmuletEffectTests(unittest.TestCase):
         self.assertEqual(specs[0]["value"], 14)
         self.assertEqual(specs[0]["text"], "amulet")
 
+    def test_flat_damage_effects_scale_with_the_owners_level(self):
+        low = Fighter("low", "Low", 40, 40, 40, 40, 0, level=1)
+        high = Fighter("high", "High", 40, 40, 40, 40, 0, level=25)
+        self.assertEqual(combat._scaled_flat_damage(6, low, 100), 8)
+        self.assertEqual(combat._scaled_flat_damage(6, high, 100), 12)
+
+    def test_every_legacy_flat_damage_hook_uses_the_level_curve(self):
+        opponent = Fighter("b", "B", 10, 200, 20, 20, 0, level=25)
+        cases = (
+            ({"code": "poison", "value": 15}, "amulet_poison", 15),
+            ({"code": "burn", "value": 12, "turns": 2}, "amulet_burn", 12),
+            ({"code": "venom_blade", "value": 20, "poison": 6}, "amulet_venom_blade", 6),
+            ({"code": "bleed", "value": 5, "cap": 4}, "amulet_bleed", 5),
+            ({"code": "retaliation", "value": 8}, "amulet_retaliation", 8),
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
+                patch.object(combat, "_signature", return_value=None):
+            for effect, event, old_flat_damage in cases:
+                with self.subTest(effect=effect["code"]):
+                    owner = Fighter(
+                        "a", "A", 40, 200, 20, 20, 0,
+                        effects=(effect,), level=25,
+                    )
+                    result = combat.simulate(owner, opponent, seed=0, max_actions=3)
+                    rows = [row for row in result.rounds if row.event == event]
+                    self.assertTrue(rows)
+                    self.assertGreater(rows[0].damage, old_flat_damage)
+
+    def test_consecutive_poison_hits_accumulate_until_the_target_acts(self):
+        poison = {"code": "poison", "value": 10}
+        owner = Fighter(
+            "a", "A", 40, 200, 20, 20, 0, effects=(poison,), level=25,
+        )
+        opponent = Fighter("b", "B", 10, 200, 20, 20, 0, level=25)
+        single = combat._scaled_flat_damage(
+            poison["value"], owner, C.BASE_DAMAGE + owner.strength * C.DAMAGE_PER_POINT,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(owner, opponent, seed=0, max_actions=3)
+        poison_rows = [row for row in result.rounds if row.event == "amulet_poison"]
+        self.assertEqual([row.damage for row in poison_rows], [single * 2])
+
+    def test_stat_scaled_rune_fire_is_not_level_scaled_twice(self):
+        rune = {"code": "burn", "value": 30, "turns": 2, "level_scaled": False}
+        owner = Fighter(
+            "a", "A", 40, 200, 20, 20, 0, effects=(rune,), level=25,
+        )
+        opponent = Fighter("b", "B", 10, 200, 20, 20, 0, level=25)
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
+                patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(owner, opponent, seed=0, max_actions=3)
+        burn_rows = [row for row in result.rounds if row.event == "amulet_burn"]
+        self.assertTrue(burn_rows)
+        self.assertTrue(all(row.damage == 30 for row in burn_rows))
+
     def test_all_catalogue_effects_are_seeded_and_safe_to_replay(self):
         """A malformed metadata deployment must not make one arena click non-replayable."""
         effect_specs = [
