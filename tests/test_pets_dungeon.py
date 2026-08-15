@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pets
+import pets_config
 import pets_dungeon as dungeon
 import pets_ui
 
@@ -145,6 +146,26 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(state["floor"], 1)
         self.assertEqual(len(state["encounters"]), 2)
         self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
+
+    def test_dungeon_preview_scales_floor_reward_only_mildly_by_hero_level(self):
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["level"] = 100
+        record["dungeon_run"] = {
+            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [],
+        }
+        pets._save(self.entry, data)
+
+        reward = pets.dungeon_status(self.entry, self.user_id)["encounters"][0]["reward"]
+
+        self.assertEqual(
+            reward["gold"],
+            pets_config.gold_for_hero(reward["gold_base"], 100, "dungeon"),
+        )
+        self.assertGreater(reward["gold"], reward["gold_base"])
+        self.assertLess(
+            reward["gold_multiplier"], pets_config.hero_gold_multiplier(100, "arena"),
+        )
 
     def test_dungeon_ticket_replaces_the_ruby_entry_fee_and_is_consumed(self):
         data = pets._load(self.entry)

@@ -54,6 +54,43 @@ TAME_PRICE = 0              # every player can create their first creature for f
 # the marker for where the decision lives.
 RENAME_PRICE = 0
 
+# ---------------------------------------------------------------- level-scaled payouts
+# Stat prices grow as level^1.2 while several reward faucets used to stay flat forever.
+# The common square-root curve grows forever but more slowly than the main stat sink. A
+# source weight says how much of that curve it needs: arena/PVE had no scaling at all,
+# while dungeon floors and farm buildings already do much of the work themselves.
+HERO_GOLD_SQRT_BONUS = 0.45
+HERO_GOLD_FREE_LEVEL = 5
+HERO_GOLD_SOURCE_WEIGHTS = {
+    "arena": 1.00,
+    "pve": 1.00,
+    "quest": 0.65,
+    "quarry": 0.45,
+    "farm": 0.68,
+    "passive": 0.35,
+    "dungeon": 0.20,
+    "birthday": 0.50,
+}
+
+
+def hero_gold_multiplier(hero_level: int = 1, source: str = "arena") -> float:
+    """Unbounded, diminishing gold growth for one reward source.
+
+    Levels one through five remain byte-for-byte unchanged. Even at very high levels the
+    multiplier grows slower than stat costs, so progression becomes longer without
+    becoming stuck.
+    """
+    level = max(1, int(hero_level or 1))
+    weight = float(HERO_GOLD_SOURCE_WEIGHTS.get(source, 1.0))
+    growth = max(0.0, math.sqrt(level) - math.sqrt(HERO_GOLD_FREE_LEVEL))
+    return 1.0 + HERO_GOLD_SQRT_BONUS * growth * weight
+
+
+def gold_for_hero(base_gold: int | float, hero_level: int = 1, source: str = "arena") -> int:
+    """Scale a non-negative base payout and keep zero as zero."""
+    base = max(0.0, float(base_gold or 0))
+    return 0 if base <= 0 else max(1, round(base * hero_gold_multiplier(hero_level, source)))
+
 # --------------------------------------------------------------------------- the cage
 # The cage was asked for as "buy, then upgrade" without saying what an upgrade does, so
 # it is the game's convenience track: each level buys one more fight-bank slot and a cut
@@ -128,12 +165,12 @@ FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # meaningful income, not a free background faucet.
 FARM_GOLD_PER_RUN = (0, 45, 55, 70, 85, 105, 125, 145, 170, 200, 235)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
-# A farm's buildings stop at level 10 while pet levels deliberately do not.  A
-# logarithmic bonus gives established pets a reason to keep farming without allowing an
-# extremely high level to turn the farm into an exponential coin printer:
+# A farm's buildings stop at level 10 while pet levels deliberately do not. It uses the
+# shared diminishing hero curve at the farm weight: stronger than the old logarithmic
+# bonus at established levels, but still slower than the level^1.2 stat-cost sink:
 #
 #   pet level    1     10     50     100
-#   multiplier 1.00   1.66   2.13    2.33
+#   multiplier 1.00   1.66   2.48    3.37
 #
 # It is snapshotted when the shift starts, just like farm level and facilities.
 FARM_PET_LEVEL_GOLD_LOG2_BONUS = 0.20
@@ -174,9 +211,10 @@ FARM_FEATURES = {
 
 
 def farm_pet_level_gold_multiplier(pet_level: int = 1) -> float:
-    """The bounded-growth, unbounded-level gold bonus for one farm shift."""
+    """Farm share of the common curve, never nerfing its previous logarithmic bonus."""
     level = max(1, int(pet_level or 1))
-    return 1.0 + FARM_PET_LEVEL_GOLD_LOG2_BONUS * math.log2(level)
+    legacy = 1.0 + FARM_PET_LEVEL_GOLD_LOG2_BONUS * math.log2(level)
+    return max(legacy, hero_gold_multiplier(level, "farm"))
 
 
 def farm_gold_for(

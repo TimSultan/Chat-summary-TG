@@ -370,6 +370,7 @@ class MobFightBankAndRewardTests(PetsTestCase):
         with patch("random.randint", return_value=pets_config.WIN_GOLD_MAX):
             for mob in pets_mobs.MOBS:
                 data = pets._load(entry)
+                hero_level = data["pets"]["1"]["level"]
                 # Refill the bank to exactly one fight before each mob, independent of
                 # cage/capacity bookkeeping -- this test is only about the payout formula.
                 data["pets"]["1"]["fight_bank"] = 1
@@ -380,10 +381,12 @@ class MobFightBankAndRewardTests(PetsTestCase):
                 outcome = pets.record_mob_fight(
                     entry, "1", block, SimpleNamespace(winner="1", is_draw=False), now=now,
                 )
-                expected = max(1, round(
+                expected_base = max(1, round(
                     pets_config.WIN_GOLD_MAX * pets_config.PVE_GOLD_SHARE
                     * pets_mobs.TIER_REWARD["medium"] * mob.gold
                 ))
+                expected = pets_config.gold_for_hero(expected_base, hero_level, "pve")
+                self.assertEqual(outcome["gold_base"], expected_base, mob.code)
                 self.assertEqual(outcome["gold"], expected, mob.code)
 
 
@@ -596,10 +599,15 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
                 now.date(), now=now,
             )
 
-        self.assertEqual(without_mirror["gold"], round(pinned_roll * multiplier))
+        self.assertEqual(
+            without_mirror["gold"],
+            pets_config.gold_for_hero(round(pinned_roll * multiplier), 10, "arena"),
+        )
         # Clamped to 1.0, not replaced by it -- the mirror removes the penalty, it does
         # not also hand out the bonus a genuine upward win would earn.
-        self.assertEqual(with_mirror["gold"], pinned_roll)
+        self.assertEqual(
+            with_mirror["gold"], pets_config.gold_for_hero(pinned_roll, 10, "arena"),
+        )
         self.assertGreater(with_mirror["gold"], without_mirror["gold"])
 
 

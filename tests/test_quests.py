@@ -553,6 +553,32 @@ class RealQuestTests(QuestsTestCase):
 
 
 class ReviewPaymentTests(QuestsTestCase):
+    def test_quest_gold_scales_with_level_and_is_frozen_when_submitted(self):
+        entry = "level-scaled-quest"
+        self._tame(entry, "1")
+        day = datetime(2026, 8, 9, 9, 0)
+        data = pets._load(entry)
+        data["pets"]["1"]["level"] = 100
+        pets._save(entry, data)
+        card = quests.daily_quest(entry, "1", now=day)["quest"]
+        base = quests.rewards_for(entry, card["difficulty"])["gold"]
+        promised = quests.rewards_for_player(entry, "1", card["difficulty"])
+        self.assertEqual(promised["gold_base"], base)
+        self.assertGreater(promised["gold"], base)
+        self.assertTrue(quests.submit(entry, "1", card["code"], now=day)[0])
+        submission_id = quests.pending(entry)[0]["id"]
+        data = pets._load(entry)
+        data["pets"]["1"]["level"] = 200
+        pets._save(entry, data)
+
+        ok, message, receipt = quests.review(
+            entry, submission_id, "mod1", True, now=day,
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(receipt["gold"], promised["gold"])
+        self.assertEqual(economy.balance(entry, "1", 0), promised["gold"])
+
     def test_personal_paint_review_requires_and_then_mints_the_submission_photo(self):
         entry = "chat"
         self._tame(entry, "1")

@@ -49,6 +49,28 @@ class PetsTestCase(unittest.TestCase):
         self.assertTrue(ok, msg)
 
 
+class HeroGoldBalanceTests(unittest.TestCase):
+    def test_first_five_levels_are_unchanged_then_every_source_grows_forever(self):
+        for source in pets_config.HERO_GOLD_SOURCE_WEIGHTS:
+            self.assertEqual(pets_config.gold_for_hero(100, 1, source), 100)
+            self.assertEqual(pets_config.gold_for_hero(100, 5, source), 100)
+            payouts = [
+                pets_config.gold_for_hero(100, level, source)
+                for level in (5, 10, 25, 50, 100, 200)
+            ]
+            self.assertEqual(payouts, sorted(payouts), source)
+            self.assertGreater(payouts[-1], payouts[0], source)
+
+    def test_source_weights_avoid_double_scaling_existing_progression(self):
+        level = 100
+        arena = pets_config.hero_gold_multiplier(level, "arena")
+        self.assertGreater(arena, pets_config.hero_gold_multiplier(level, "quest"))
+        self.assertGreater(
+            pets_config.hero_gold_multiplier(level, "quest"),
+            pets_config.hero_gold_multiplier(level, "dungeon"),
+        )
+
+
 class CageAndTamingTests(PetsTestCase):
     def test_everyone_starts_with_a_free_base_cage(self):
         entry = "chat"
@@ -1533,8 +1555,11 @@ class RecordFightTests(PetsTestCase):
         cases = {
             delta: (
                 expected_xp,
-                round(pets_config.WIN_GOLD_MAX
-                      * pets_config.arena_level_reward_multiplier(10 + delta, 10)),
+                pets_config.gold_for_hero(
+                    round(pets_config.WIN_GOLD_MAX
+                          * pets_config.arena_level_reward_multiplier(10 + delta, 10)),
+                    10 + delta, "arena",
+                ),
             )
             for delta, expected_xp in {
                 -3: 125, -2: 116, 0: 100, 2: 85, 3: 75,
@@ -1577,9 +1602,12 @@ class RecordFightTests(PetsTestCase):
         # can be re-tuned without this test having to be re-derived by hand.
         self.assertEqual(
             outcome["gold"],
-            round(pets_config.WIN_GOLD_MAX
-                  * (1 + pets_config.CAGE_GOLD_BONUS_PCT[4] / 100)
-                  * pets_config.arena_level_reward_multiplier(13, 10)),
+            pets_config.gold_for_hero(
+                round(pets_config.WIN_GOLD_MAX
+                      * (1 + pets_config.CAGE_GOLD_BONUS_PCT[4] / 100)
+                      * pets_config.arena_level_reward_multiplier(13, 10)),
+                13, "arena",
+            ),
         )
 
     def test_luck_raises_the_find_chance_on_a_saturating_curve(self):
@@ -2640,6 +2668,31 @@ class QuarryTests(PetsTestCase):
         self.assertFalse(ok)
         self.assertEqual(pets.quarry_status("quarry", "1")["pickaxe_runs"], 1)
 
+    def test_quarry_freezes_the_departure_level_gold_in_its_preview_and_receipt(self):
+        entry, uid = "quarry-level", "1"
+        self._give_pickaxe_charge(entry, uid)
+        data = pets._load(entry)
+        data["pets"][uid]["level"] = 100
+        pets._save(entry, data)
+        preview = next(
+            row for row in pets.quarry_status(entry, uid)["hour_previews"]
+            if row["hours"] == 2
+        )
+        started = datetime(2026, 8, 15, 10, 0)
+        with patch.object(pets, "app_now", return_value=started):
+            self.assertTrue(pets.start_quarry(entry, uid, 2)[0])
+        data = pets._load(entry)
+        data["pets"][uid]["level"] = 200
+        pets._save(entry, data)
+
+        receipt = pets.settle_quarry(entry, uid, started + timedelta(hours=2))
+
+        self.assertEqual(receipt["gold"], preview["gold"])
+        self.assertAlmostEqual(
+            receipt["gold_multiplier"],
+            pets_config.hero_gold_multiplier(100, "quarry"),
+        )
+
 
 class ToolMasterworkTests(PetsTestCase):
     def test_rune_pickaxe_is_unlimited_and_scales_every_quarry_reward(self):
@@ -2967,10 +3020,10 @@ class FarmTests(PetsTestCase):
             [6, 13, 28, 69],
         )
         self.assertEqual(pets_config.farm_gold_for(1, 6), 45)
-        self.assertEqual(pets_config.farm_gold_for(1, 6, pet_level=100), 105)
+        self.assertEqual(pets_config.farm_gold_for(1, 6, pet_level=100), 152)
         self.assertEqual(
             [pets_config.farm_gold_for(10, hours, 1.5, 100) for hours in (1, 2, 4, 8)],
-            [116, 241, 514, 1259],
+            [169, 349, 746, 1825],
         )
 
     def test_farm_pet_level_gold_bonus_is_frozen_when_a_shift_starts(self):
@@ -2983,7 +3036,7 @@ class FarmTests(PetsTestCase):
         pets._save(entry, data)
         status = pets.farm_status(entry, "1", start)
         self.assertEqual(status["reward"], before)
-        self.assertEqual(status["estimated_gold"], 105)
+        self.assertEqual(status["estimated_gold"], 152)
 
     def test_hour_previews_are_monotonic_in_gold_xp_and_drop_chance(self):
         entry = "farm-previews"

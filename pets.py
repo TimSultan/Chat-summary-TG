@@ -840,10 +840,11 @@ def _farm_passive_terms(record: dict | None) -> tuple[int, int, int]:
     level = min(
         max(0, int((record or {}).get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL,
     )
+    hero_level = max(1, int((record or {}).get("level", 1) or 1))
     return (
         level,
-        C.FARM_PASSIVE_GOLD_PER_HOUR[level],
-        C.FARM_PASSIVE_STORAGE_CAP[level],
+        C.gold_for_hero(C.FARM_PASSIVE_GOLD_PER_HOUR[level], hero_level, "passive"),
+        C.gold_for_hero(C.FARM_PASSIVE_STORAGE_CAP[level], hero_level, "passive"),
     )
 
 
@@ -1736,6 +1737,8 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
             ready = True
     upgraded = _tool_masterworks(data, user_id)["pickaxe"]
     efficiency = C.TOOL_MASTERWORK_MULTIPLIER if upgraded else 1.0
+    hero_level = max(1, int(record.get("level", 1) or 1))
+    gold_multiplier = C.hero_gold_multiplier(hero_level, "quarry")
     previews = []
     for hours in C.QUARRY_HOUR_CHOICES:
         ruby_min, ruby_max = C.QUARRY_RUBIES_BY_HOURS[hours]
@@ -1743,7 +1746,9 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
             "hours": hours,
             "ruby_min": round(ruby_min * efficiency),
             "ruby_max": round(ruby_max * efficiency),
-            "gold": round(C.QUARRY_GOLD_BY_HOURS[hours] * efficiency),
+            "gold": C.gold_for_hero(
+                C.QUARRY_GOLD_BY_HOURS[hours] * efficiency, hero_level, "quarry",
+            ),
             "xp": round(C.QUARRY_XP_BY_HOURS[hours] * efficiency),
             "drop_chance": min(1.0, C.QUARRY_DROP_CHANCE_BY_HOURS[hours] * efficiency),
         })
@@ -1752,6 +1757,7 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
         "seconds_left": seconds_left, "pickaxe_runs": max(0, int(record.get("pickaxe_runs", 0) or 0)),
         "pickaxe_upgraded": upgraded, "pickaxe_unlimited": upgraded,
         "pickaxe_efficiency": efficiency, "cost": C.PICKAXE_COST,
+        "hero_level": hero_level, "gold_multiplier": gold_multiplier,
         "runs_per_pickaxe": C.PICKAXE_RUNS, "duration_hours": C.QUARRY_DURATION_HOURS,
         "ruby_min": C.QUARRY_RUBY_MIN, "ruby_max": C.QUARRY_RUBY_MAX,
         "hour_previews": previews,
@@ -1817,6 +1823,9 @@ def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> t
             "run_id": secrets.token_hex(16), "hours": hours,
             "ready_at": (moment + timedelta(hours=hours)).isoformat(),
             "masterwork_multiplier": C.TOOL_MASTERWORK_MULTIPLIER if upgraded else 1.0,
+            # Freeze the level payout just like the tool: levelling while the pickaxe is
+            # away cannot rewrite what this run promised at departure.
+            "hero_gold_multiplier": C.hero_gold_multiplier(record.get("level", 1), "quarry"),
         }
         _save(entry, data)
     return True, f"Кирка в карьере. Возвращайся через {hours} ч."
@@ -1841,8 +1850,12 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
             efficiency = 1.0
         efficiency = C.TOOL_MASTERWORK_MULTIPLIER if efficiency > 1.0 else 1.0
         upgraded = efficiency > 1.0
+        try:
+            hero_gold_multiplier = max(1.0, float(run.get("hero_gold_multiplier", 1.0) or 1.0))
+        except (TypeError, ValueError):
+            hero_gold_multiplier = 1.0
         rubies = round(rng.randint(ruby_min, ruby_max) * efficiency)
-        gold = round(C.QUARRY_GOLD_BY_HOURS[hours] * efficiency)
+        gold = max(1, round(C.QUARRY_GOLD_BY_HOURS[hours] * efficiency * hero_gold_multiplier))
         xp = round(C.QUARRY_XP_BY_HOURS[hours] * efficiency)
         _apply_xp(record, xp)
         record["quarry_run"] = None
@@ -1857,6 +1870,7 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
         "hours": hours, "rubies": rubies, "gold": gold, "xp": xp,
         "drop_chance": min(1.0, C.QUARRY_DROP_CHANCE_BY_HOURS[hours] * efficiency),
         "dropped": dropped, "upgraded": upgraded,
+        "gold_multiplier": hero_gold_multiplier,
     }
 
 
@@ -1934,6 +1948,7 @@ def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]
     # Only a run started before this feature shipped can be missing these -- fall back to
     # the pet's current level/features for it, since no true start-of-shift snapshot exists.
     run.setdefault("level", min(max(1, int(record.get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL))
+    run.setdefault("pet_level", max(1, int(record.get("level", 1) or 1)))
     run.setdefault("features", _farm_features(record))
     run.setdefault("luck", int((record.get("stats") or {}).get("luck", C.STAT_MIN_LEVEL) or 0))
     run.pop("reward", None)  # force a fresh, hours-scaled roll instead of a stale legacy one
@@ -2999,8 +3014,15 @@ def dungeon_status(entry: str, user_id) -> dict:
     max_hp = max(1, int(run.get("max_hp", 1) or 1))
     cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
     encounters = []
+    hero_level = max(1, int(record.get("level", 1) or 1))
     for row in D.encounters_for_floor(floor):
         copy = dict(row)
+        reward = dict(copy.get("reward") or {})
+        if reward:
+            reward["gold_base"] = int(reward.get("gold", 0) or 0)
+            reward["gold_multiplier"] = C.hero_gold_multiplier(hero_level, "dungeon")
+            reward["gold"] = C.gold_for_hero(reward["gold_base"], hero_level, "dungeon")
+            copy["reward"] = reward
         copy["cleared"] = copy["index"] in cleared
         encounters.append(copy)
     state.update({
@@ -3011,6 +3033,7 @@ def dungeon_status(entry: str, user_id) -> dict:
         "partial_heal_cost": D.SHOP_PARTIAL_HEAL_COST,
         "full_heal_cost": D.SHOP_FULL_HEAL_COST,
         "boss_lives": int(run.get("boss_lives", 0) or 0),
+        "gold_multiplier": C.hero_gold_multiplier(hero_level, "dungeon"),
     })
     return state
 
@@ -3232,6 +3255,11 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             run["cleared"] = sorted(cleared)
             reward, message = D.roll_reward(floor, bool(row.get("boss"))), f"Побеждён: {row['name']}."
             _record_weapon_win(record, "boss_wins" if row.get("boss") else "mob_wins")
+        reward["gold_base"] = int(reward.get("gold", 0) or 0)
+        reward["gold_multiplier"] = C.hero_gold_multiplier(record.get("level", 1), "dungeon")
+        reward["gold"] = C.gold_for_hero(
+            reward["gold_base"], record.get("level", 1), "dungeon",
+        )
         _apply_xp(record, int(reward["xp"]))
         _save(entry, data)
 
@@ -4442,7 +4470,7 @@ def record_fight(
     # not also hand out the bonus for punching UP.
     if _equipped_effect(winner, "mirror_soul"):
         reward_multiplier = max(1.0, reward_multiplier)
-    gold = round(
+    gold_base = round(
         random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
         * (1 + bonus_pct / 100)
         * reward_multiplier
@@ -4465,7 +4493,9 @@ def record_fight(
             cap = max(0, int(coin_rake.get("cap", 5) or 0))
         except (TypeError, ValueError):
             per_hit, cap = 0, 0
-        gold += min(cap, landed * per_hit)
+        gold_base += min(cap, landed * per_hit)
+    gold_multiplier = C.hero_gold_multiplier(winner.get("level", 1), "arena")
+    gold = C.gold_for_hero(gold_base, winner.get("level", 1), "arena")
     economy.grant(entry, winner_uid, gold, "pet_fight_win")
     _metric_add(data, "arena_reward_gold", gold)
 
@@ -4506,7 +4536,13 @@ def record_fight(
         # balance, unlike economy.spend/economy.balance it never has to read one first.
         # That is also why this never needed the `_chat_xp_for` fallback the old shared
         # penalty path carried for a defender it could not get live XP for.
-        consolation = C.defender_consolation_for(gold)
+        # Scale this payout for the recipient, not for the winner. Otherwise a level-one
+        # defender could inherit a veteran attacker's economy multiplier simply by being
+        # selected as their target.
+        consolation_base = C.defender_consolation_for(gold_base)
+        consolation = C.gold_for_hero(
+            consolation_base, loser.get("level", 1), "arena",
+        )
         if consolation > 0:
             economy.grant(entry, loser_uid, consolation, "pet_fight_defender_consolation")
 
@@ -4592,6 +4628,8 @@ def record_fight(
         "attacker_owner": attacker.get("owner_name"),
         "defender_owner": defender.get("owner_name"),
         "gold": gold,
+        "gold_base": gold_base,
+        "gold_multiplier": gold_multiplier,
         # What the LOSER actually paid, which is not always C.loss_gold_for(gold): an
         # empty wallet pays what it has. Stored so a history line can show the real
         # number rather than recomputing an amount that was never charged. Exactly one of
@@ -4627,6 +4665,8 @@ def record_fight(
         "fight_id": fight_id_,
         "draw": False,
         "gold": gold if attacker_won else 0,
+        "gold_base": gold_base if attacker_won else 0,
+        "gold_multiplier": gold_multiplier,
         "loss_gold": 0 if attacker_won else paid,
         # An attacker never gets a consolation -- only a losing defender does, below. Kept
         # as an explicit field (not a sign-flipped loss_gold) so a reader can tell "paid a
@@ -4956,8 +4996,16 @@ def congratulate(entry, user_id, day: date | None = None) -> dict:
         greeter_record = _tamed_record(data, user_id)
         celebrant_record = _tamed_record(data, celebrant)
         # Each side rolls its own purse, the same way two arena wins would.
-        gold = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
-        celebrant_gold = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        gold_base = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        celebrant_gold_base = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        gold_multiplier = C.hero_gold_multiplier((greeter_record or {}).get("level", 1), "birthday")
+        celebrant_gold_multiplier = C.hero_gold_multiplier(
+            (celebrant_record or {}).get("level", 1), "birthday",
+        )
+        gold = C.gold_for_hero(gold_base, (greeter_record or {}).get("level", 1), "birthday")
+        celebrant_gold = C.gold_for_hero(
+            celebrant_gold_base, (celebrant_record or {}).get("level", 1), "birthday",
+        )
         economy.grant(entry, user_id, gold, "pet_birthday_greeting")
         economy.grant(entry, celebrant, celebrant_gold, "pet_birthday_greeted")
         _metric_add(data, "arena_reward_gold", gold + celebrant_gold)
@@ -4977,7 +5025,10 @@ def congratulate(entry, user_id, day: date | None = None) -> dict:
             "greeter": user_id,
             "greeter_name": (greeter_record or {}).get("owner_name") or "кто-то",
             "gold": gold, "xp": xp,
+            "gold_base": gold_base, "gold_multiplier": gold_multiplier,
             "celebrant_gold": celebrant_gold, "celebrant_xp": celebrant_xp,
+            "celebrant_gold_base": celebrant_gold_base,
+            "celebrant_gold_multiplier": celebrant_gold_multiplier,
             "ts": app_now().isoformat(),
         }
         row["greeted"][user_id] = receipt
@@ -5182,13 +5233,15 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
 
         won = str(result.winner or "") == str(user_id)
         tier = block.get("tier", "medium")
-        gold = xp = 0
+        gold = gold_base = xp = 0
+        gold_multiplier = C.hero_gold_multiplier(record.get("level", 1), "pve")
         if won:
             record["wins"] = record.get("wins", 0) + 1
             _record_weapon_win(record, "mob_wins")
             # Half an arena purse before the mob's own multiplier -- see pets_mobs.
             base = random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX) * C.PVE_GOLD_SHARE
-            gold = max(1, round(base * M.TIER_REWARD[tier] * mob.gold))
+            gold_base = max(1, round(base * M.TIER_REWARD[tier] * mob.gold))
+            gold = C.gold_for_hero(gold_base, record.get("level", 1), "pve")
             xp = max(1, round(C.WIN_XP * C.PVE_XP_SHARE * M.TIER_REWARD[tier]))
         else:
             xp = C.LOSS_XP
@@ -5199,7 +5252,9 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
         enemy = mob_fighter(block)
         _store_fight_audit(entry, data, _fight_audit_row(
             fight_id_, "pve", moment, result, (audit_hero, enemy), {str(user_id): record},
-            {"mob": {"code": mob.code, "name": mob.name, "tier": tier}},
+            {"mob": {"code": mob.code, "name": mob.name, "tier": tier},
+             "reward": {"gold": gold, "gold_base": gold_base,
+                        "gold_multiplier": gold_multiplier}},
         ))
         _save(entry, data)
 
@@ -5227,7 +5282,8 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
     return {
         "fight_id": fight_id_,
         "won": won, "draw": bool(getattr(result, "is_draw", False)),
-        "gold": gold, "xp": xp, "levels_gained": levels_gained,
+        "gold": gold, "gold_base": gold_base, "gold_multiplier": gold_multiplier,
+        "xp": xp, "levels_gained": levels_gained,
         "level": get_pet(entry, user_id).get("level", 1) if get_pet(entry, user_id) else 1,
         "rubies": ruby, "ruby_total": ruby_balance(entry, user_id),
         "dropped_item": dropped.get("code") if dropped else None,

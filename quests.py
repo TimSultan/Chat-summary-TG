@@ -49,6 +49,7 @@ from datetime import datetime, timedelta
 
 import economy
 import pets
+import pets_config as C
 import pets_quest_catalog as catalog
 import stats
 from app_time import now as app_now
@@ -357,14 +358,36 @@ def rewards_for(entry: str, difficulty: int, data: dict | None = None) -> dict:
     return reward
 
 
-def _reward_payload(entry: str, difficulty: int, data: dict | None = None) -> dict:
+def rewards_for_player(
+    entry: str, user_id, difficulty: int, data: dict | None = None,
+) -> dict:
+    """Quest reward with its gold scaled to the player's current hero level."""
+    reward = rewards_for(entry, difficulty, data)
+    pet = pets.get_pet(entry, user_id)
+    hero_level = max(1, int((pet or {}).get("level", 1) or 1))
+    gold_base = max(0, int(reward.get("gold", 0) or 0))
+    reward.update({
+        "gold_base": gold_base,
+        "gold_multiplier": C.hero_gold_multiplier(hero_level, "quest"),
+        "hero_level": hero_level,
+        "gold": C.gold_for_hero(gold_base, hero_level, "quest"),
+    })
+    return reward
+
+
+def _reward_payload(
+    entry: str, difficulty: int, data: dict | None = None, *, user_id=None,
+) -> dict:
     """Player-facing quest rewards, including the fixed rare-scroll roll.
 
     Gold, XP, tickets and item chance remain moderator-editable. Scroll acquisition is
     deliberately a separate global balance table, so a quest moderator cannot
     accidentally turn a rare permanent ability into a guaranteed routine payout.
     """
-    reward = rewards_for(entry, difficulty, data)
+    reward = (
+        rewards_for_player(entry, user_id, difficulty, data)
+        if user_id is not None else rewards_for(entry, difficulty, data)
+    )
     scroll_chance = pets.HARD_QUEST_SCROLL_CHANCES.get(int(difficulty or 0))
     if scroll_chance is not None:
         reward.update({
@@ -500,9 +523,9 @@ def available_quests(entry: str, data: dict | None = None, kind: str = "paint") 
 # --- assignment -----------------------------------------------------------------------
 
 
-def _quest_payload(entry: str, quest, data: dict) -> dict:
+def _quest_payload(entry: str, quest, data: dict, *, user_id=None) -> dict:
     text = _quest_text(quest, data)
-    reward = _reward_payload(entry, quest.difficulty, data)
+    reward = _reward_payload(entry, quest.difficulty, data, user_id=user_id)
     if quest.kind == "rune":
         reward["rubies"] = 2
         personal_target = pets.personal_paint_target_for_quest(quest.code)
@@ -708,7 +731,7 @@ def quest_board(entry: str, user_id, kind: str = "paint", now: datetime | None =
                 continue
             submission = _find_submission(data, live.get("submission_id"))
             cards.append({
-                **_quest_payload(entry, quest, data),
+                **_quest_payload(entry, quest, data, user_id=user_id),
                 "status": live.get("status", "open"),
                 "rerolls_left": max(
                     0, REROLLS_PER_QUEST - int(live.get("rerolls_used", 0) or 0)
@@ -978,6 +1001,7 @@ def submit(
             photo_file_id or ((cached_photo or {}).get("file_id") if isinstance(cached_photo, dict) else "")
             or ""
         ).strip() or None
+        promised_reward = rewards_for_player(entry, user_id, quest.difficulty, data)
         row = {
             "id": f"{moment.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}",
             "kind": quest.kind,
@@ -997,6 +1021,12 @@ def submit(
             "reviewed_at": None,
             "note": "",
             "paid": None,
+            # Freeze the displayed level-scaled gold when the work is submitted. A slow
+            # moderator review must not silently change what the accepted card promised.
+            "gold_base": promised_reward["gold_base"],
+            "gold_promised": promised_reward["gold"],
+            "gold_multiplier": promised_reward["gold_multiplier"],
+            "hero_level": promised_reward["hero_level"],
         }
         data.setdefault("submissions", []).append(row)
         live["submission_id"] = row["id"]
@@ -1018,7 +1048,17 @@ def pending(entry: str) -> list[dict]:
         row["hint"] = text.get("hint", "")
         row["proof"] = text.get("proof", "")
         row["hashtag"] = catalog.hashtag(row.get("code"))
-        row["reward"] = _reward_payload(entry, row.get("difficulty", 1), data)
+        reward = _reward_payload(
+            entry, row.get("difficulty", 1), data, user_id=row.get("user_id"),
+        )
+        if row.get("gold_promised") is not None:
+            reward.update({
+                "gold": int(row.get("gold_promised", 0) or 0),
+                "gold_base": int(row.get("gold_base", reward.get("gold_base", 0)) or 0),
+                "gold_multiplier": float(row.get("gold_multiplier", 1.0) or 1.0),
+                "hero_level": int(row.get("hero_level", 1) or 1),
+            })
+        row["reward"] = reward
     return rows
 
 
@@ -1149,7 +1189,14 @@ def review(
             data, row["user_id"], quest.kind, submission_id=str(row["id"]),
         )
         if accept:
-            reward = rewards_for(entry, quest.difficulty, data)
+            reward = rewards_for_player(entry, row["user_id"], quest.difficulty, data)
+            if row.get("gold_promised") is not None:
+                reward.update({
+                    "gold": int(row.get("gold_promised", 0) or 0),
+                    "gold_base": int(row.get("gold_base", reward.get("gold_base", 0)) or 0),
+                    "gold_multiplier": float(row.get("gold_multiplier", 1.0) or 1.0),
+                    "hero_level": int(row.get("hero_level", 1) or 1),
+                })
             receipt = {
                 "user_id": row["user_id"], "code": quest.code, "title": quest.title,
                 "difficulty": quest.difficulty, "kind": quest.kind,
