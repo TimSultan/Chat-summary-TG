@@ -3263,6 +3263,12 @@ PAGE_HTML = """<!doctype html>
   .pips.d4, .pips.d5 { color: var(--hp); }
   .qreward { background: var(--sunken); border-radius: 10px; padding: 8px 10px;
              font-size: 12px; text-align: center; }
+  .quest-benefit, .tool-quest-note { margin-top:7px; border:1px solid rgba(231,183,90,.55);
+                   border-radius:9px; padding:7px 9px; background:rgba(231,183,90,.09);
+                   color:var(--gold); font-size:11px; line-height:1.4; }
+  .quest-technique { margin-top:6px; font-size:11px; line-height:1.35; color:var(--muted);
+                     display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
+                     overflow:hidden; }
   .qtag { margin-top: 9px; border: 1px dashed var(--accent); border-radius: 10px;
           padding: 8px 10px; font-size: 12px; text-align: center; }
   .qtag b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -3343,8 +3349,10 @@ PAGE_HTML = """<!doctype html>
   .sheet {
     background: var(--bg); width: 100%; max-width: 560px; max-height: 88vh; overflow-y: auto;
     border-radius: 18px 18px 0 0; padding: 14px 14px calc(18px + env(safe-area-inset-bottom));
-    animation: rise .18s ease-out;
+    animation: rise .18s ease-out; min-height:0; overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch; touch-action:pan-y;
   }
+  .sheet.quest-sheet { max-height:94dvh; }
   @keyframes rise { from { transform: translateY(14px); opacity: .5; } to { transform: none; opacity: 1; } }
   .sheet .hd { display: flex; gap: 12px; margin-bottom: 12px; }
   .sheet .hd img { width: 96px; height: 96px; border-radius: 12px; flex: none; }
@@ -5340,6 +5348,8 @@ function foeRow(foe, canFight) {
 }
 
 // ------------------------------------------------------------------------ farm screen
+const FARM_QUICK_HOURS = [1, 2, 4, 8];
+
 function renderFarm() {
   const box = $("scr-farm");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
@@ -5381,8 +5391,8 @@ function renderFarm() {
       '<button class="go" data-do="farmcancel">Забрать награду</button></div>';
   } else {
     shift = '<div class="panel"><h2>Отправить на смену</h2>' +
-      '<div class="items" style="grid-template-columns:repeat(auto-fill,minmax(74px,1fr))">' +
-      (farm.hour_previews || []).map((preview) =>
+      '<div class="items" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr))">' +
+      (farm.hour_previews || []).filter((preview) => FARM_QUICK_HOURS.includes(Number(preview.hours))).map((preview) =>
         '<button class="chip" style="border-radius:12px;padding:9px 4px;text-align:center;display:block" ' +
         'data-farmstart="' + preview.hours + '">' +
         "<b>" + preview.hours + " ч</b><br><span class='tiny muted'>💰" + money(preview.gold) +
@@ -5392,21 +5402,27 @@ function renderFarm() {
 
   const passive = farm.passive || {};
   const quarry = S.quarry || {};
-  const shovelPanel = '<div class="panel"><h2>🪏 Лопата фермы</h2><div class="small muted">Каждая смена с лопатой даёт +25% золота.</div><div class="small muted" style="margin-top:4px">' +
+  const shovelPanel = '<div class="panel"><h2>🪏 Лопата фермы</h2><div class="small muted">Каждая обычная лопата даёт +25% золота на одну смену.</div><div class="small muted" style="margin-top:4px">' +
     (farm.shovel_upgraded
       ? 'Руническая лопата · бесконечные заряды · +50% золота'
       : (farm.shovel_runs || 0) + ' зарядов' + ((farm.shovel_runs || 0) ? ' · бонус уже включён в расчёт смены' : '')) +
-    '</div>' +
+    '</div>' + (farm.shovel_upgraded
+      ? '<div class="tool-quest-note">✅ Покрас NMM принят: лопата навсегда бесконечная и даёт +50% золота с каждой смены.</div>'
+      : '<div class="tool-quest-note">🎨 Покрась лопату в технике <b>NMM</b> в разделе «Квесты». После принятия она навсегда станет бесконечной и будет давать <b>+50% золота</b> с каждой смены.</div>') +
     (!farm.shovel_upgraded && !(farm.shovel_runs || 0)
       ? '<button class="go sec" style="margin-top:10px" data-do="farmshovel"' +
         (affordable(farm.shovel_cost) ? '' : ' disabled') + '>Купить лопату · ' + money(farm.shovel_cost) + '</button>'
       : '') + '</div>';
+  const pickaxeQuestNote = quarry.pickaxe_upgraded
+    ? '<div class="tool-quest-note">✅ Покрас NMM принят: кирка навсегда бесконечная, а золото, опыт, руби и шанс вещи увеличены на 50%.</div>'
+    : '<div class="tool-quest-note">🎨 Покрась кирку в технике <b>NMM</b> в разделе «Квесты». После принятия она навсегда станет бесконечной и будет давать <b>+50% ко всей добыче</b>.</div>';
   const quarryPanel = quarry.running
     ? '<div class="panel"><h2>⛏ Карьер</h2><div class="small">Добыча идёт. Осталось ' +
-      clock(quarry.seconds_left) + '.</div></div>'
+      clock(quarry.seconds_left) + '.</div>' + pickaxeQuestNote + '</div>'
     : '<div class="panel"><h2>⛏ Карьер</h2><div class="small muted">Один заряд кирки — одна смена. Длинная смена выгоднее.</div><div class="small muted" style="margin-top:4px">' +
       'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
       (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
+      pickaxeQuestNote +
       ((quarry.pickaxe_unlimited || quarry.pickaxe_runs || 0)
         ? '<div class="items" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:10px">' +
           (quarry.hour_previews || []).map((preview) =>
@@ -5419,7 +5435,7 @@ function renderFarm() {
         : '<button class="go sec" style="margin-top:10px" data-do="quarrypickaxe"' +
           (affordable(quarry.cost) ? '' : ' disabled') + '>Купить кирку · ' + money(quarry.cost) + '</button>') +
       '</div>';
-  box.innerHTML = shift +
+  box.innerHTML = shift + quarryPanel +
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
         money(passive.stored || 0) + " из " + money(passive.cap || 0) + "</div>" +
@@ -5440,7 +5456,7 @@ function renderFarm() {
           : '<button class="plus" data-feature="' + key + '"' +
             (affordable(feature.next_cost) ? "" : " disabled") + ">💰" + money(feature.next_cost) +
             "</button>") + "</div>").join("") +
-    "</div>" + shovelPanel + quarryPanel;
+    "</div>" + shovelPanel;
 }
 
 const FEATURE_NAMES = { well: "Колодец", sprinkler: "Поливалка", beds: "Грядка", tractor: "Трактор" };
@@ -5804,14 +5820,41 @@ function questStatus(card) {
   return ["❗", "доступен"];
 }
 
+function questBenefit(card) {
+  const reward = (card && card.reward) || {};
+  if (reward.tool_masterwork === "shovel") {
+    return "После приёмки: бесконечная лопата и +50% золота с каждой смены — навсегда.";
+  }
+  if (reward.tool_masterwork === "pickaxe") {
+    return "После приёмки: бесконечная кирка и +50% ко всей добыче — навсегда.";
+  }
+  const target = reward.personal_paint_target;
+  const names = { weapon:"оружия", shield:"щита", boots:"ботинок", amulet:"амулета" };
+  if (names[target]) {
+    return "После приёмки навсегда: персональная руна, +30% положительных статов выбранного " +
+      names[target] + ", а фото покраса можно поставить его картинкой.";
+  }
+  if (target === "vial") {
+    return "После приёмки навсегда: персональная руна, лечение выбранной хилки +30%, а фото станет её картинкой.";
+  }
+  if (target === "scroll") {
+    return "После приёмки навсегда: персональная руна, полезная сила выбранного свитка +30%, а фото станет его картинкой.";
+  }
+  if (reward.magic_guaranteed) return "После приёмки: случайная магия и случайная руна.";
+  return "";
+}
+
 function questCompactCard(card, kind, index) {
   const status = questStatus(card);
+  const benefit = questBenefit(card);
   return '<button class="panel" data-questopen="' + kind + ':' + esc(card.code) + '" ' +
     'style="width:100%;text-align:left;border:1px solid var(--line);margin-bottom:9px">' +
     '<div class="row spread"><b>' + index + '. ' + status[0] + ' ' + esc(card.title) + '</b>' +
     '<span class="tiny muted">' + status[1] + '</span></div>' +
     '<div class="tiny muted" style="margin-top:5px">' + pips(card.difficulty) + ' · ' +
-    esc(card.subject) + '</div><div class="tiny gain" style="margin-top:6px">' +
+    esc(card.subject) + '</div><div class="quest-technique">🖌 ' + esc(card.technique || "") + '</div>' +
+    (benefit ? '<div class="quest-benefit">🎁 ' + esc(benefit) + '</div>' : '') +
+    '<div class="tiny gain" style="margin-top:6px">' +
     rewardLine(card.reward) + '</div></button>';
 }
 
@@ -5868,22 +5911,28 @@ function openQuestDetail(kind, code) {
   if (!card) { toast("Подборка уже обновилась."); return; }
   const paint = kind !== "real";
   const status = questStatus(card);
-  const steps = [
+  const benefit = questBenefit(card);
+  const specialistPaint = String(card.code || "").startsWith("rune_paint_");
+  const steps = specialistPaint ? [
+    "Возьми новую, ещё не опубликованную работу и выполни три шага из блока «Техника».",
+    "Сделай чёткое фото — " + (card.proof || "готового результата") +
+      " — и выложи в чат с хештегом " + card.hashtag + ".",
+  ] : [
     "Используй новую, ещё не опубликованную работу и подготовь нужную деталь.",
-    paint ? "Нанеси технику небольшими контролируемыми этапами."
-          : "Выполни действие полностью, не только для фотографии.",
-    "Сверь результат с подсказкой и поправь самые заметные места.",
-    "Сделай чёткое фото: " + (card.proof || "готового результата") + ".",
-    "Выложи фото в чат с хештегом " + card.hashtag + ".",
+    paint ? "Повтори технику из описания и сверь результат с подсказкой."
+          : "Выполни действие полностью, затем сверь результат с подсказкой.",
+    "Сделай чёткое фото — " + (card.proof || "готового результата") +
+      " — и выложи в чат с хештегом " + card.hashtag + ".",
   ];
   sheet('<h3>' + status[0] + ' ' + esc(card.title) + '</h3>' +
     '<div class="tiny muted">' + pips(card.difficulty) + ' · ' +
       esc(DIFF_NAMES[card.difficulty] || '') + '</div>' +
     '<p class="small"><b>' + (paint ? "Что красим: " : "Что делаем: ") +
       '</b>' + esc(card.subject) + '</p>' +
+    (benefit ? '<div class="quest-benefit">🎁 <b>Что получишь:</b> ' + esc(benefit) + '</div>' : '') +
     '<p class="small"><b>Техника:</b> ' + esc(card.technique) + '</p>' +
     '<p class="small muted">💡 <b>Подсказка:</b> ' + esc(card.hint) + '</p>' +
-    '<div class="panel"><h2>Как выполнить</h2>' + steps.map((step, index) =>
+    '<div class="panel"><h2>' + (specialistPaint ? "Как сдать" : "Как выполнить") + '</h2>' + steps.map((step, index) =>
       '<div class="small" style="margin-bottom:7px"><b>' + (index + 1) + '.</b> ' +
       esc(step) + '</div>').join("") + '</div>' +
     '<div class="qreward">' + rewardLine(card.reward) + '</div>' +
@@ -5893,7 +5942,7 @@ function openQuestDetail(kind, code) {
        "Квест доступен.") + '</div>' +
     (board.auto_refresh
       ? '<div class="tiny muted">Эта группа обновляется по своему таймеру.</div>'
-      : '<div class="tiny muted">Дедлайна нет — квест останется здесь.</div>'));
+      : '<div class="tiny muted">Дедлайна нет — квест останется здесь.</div>'), "quest-sheet");
 }
 
 // -------------------------------------------------------------------- quest review
@@ -6177,16 +6226,24 @@ function btn(label, action, argument, kind) {
     esc(argument) + '">' + label + "</button>";
 }
 
-function sheet(html) {
+function sheet(html, extraClass) {
   closeSheet();
   const veil = document.createElement("div");
   veil.className = "veil";
   veil.id = "veil";
-  veil.innerHTML = '<div class="sheet">' + html + "</div>";
+  const sheetClass = extraClass === "quest-sheet" ? " quest-sheet" : "";
+  veil.innerHTML = '<div class="sheet' + sheetClass + '">' + html + "</div>";
   veil.addEventListener("click", (event) => { if (event.target === veil) closeSheet(); });
   document.body.appendChild(veil);
+  // Telegram otherwise treats an upward drag on a long bottom sheet as an attempt to
+  // collapse the Mini App. While a sheet is open, the drag belongs to its own scroller.
+  try { if (tg && tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
 }
-function closeSheet() { const v = $("veil"); if (v) v.remove(); }
+function closeSheet() {
+  const v = $("veil");
+  if (v) v.remove();
+  try { if (tg && tg.enableVerticalSwipes) tg.enableVerticalSwipes(); } catch (e) {}
+}
 
 // A rare item is worth a second look before it is gone -- the same rule pets.py enforces
 // with its one-time token, shown as a dialog rather than a screen you navigate to.

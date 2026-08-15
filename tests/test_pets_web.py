@@ -1742,6 +1742,28 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-quarrystart="', page)
         self.assertIn('grid-template-columns:repeat(4,minmax(0,1fr))', page)
 
+    async def test_farm_quarry_tool_prompts_and_scrollable_quest_briefs_are_exposed(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        farm = page.split("function renderFarm()", 1)[1].split(
+            "// ------------------------------------------------------------------------ more screen", 1,
+        )[0]
+
+        self.assertIn("const FARM_QUICK_HOURS = [1, 2, 4, 8];", page)
+        self.assertIn("FARM_QUICK_HOURS.includes(Number(preview.hours))", farm)
+        self.assertIn("box.innerHTML = shift + quarryPanel +", farm)
+        self.assertIn("Покрась лопату в технике <b>NMM</b>", farm)
+        self.assertIn("+50% золота", farm)
+        self.assertIn("Покрась кирку в технике <b>NMM</b>", farm)
+        self.assertIn("+50% ко всей добыче", farm)
+
+        self.assertIn("function questBenefit(card)", page)
+        self.assertIn('class="quest-technique"', page)
+        self.assertIn('class="quest-benefit"', page)
+        self.assertIn('"quest-sheet"', page)
+        self.assertIn("touch-action:pan-y", page)
+        self.assertIn("tg.disableVerticalSwipes", page)
+        self.assertIn("tg.enableVerticalSwipes", page)
+
     # ---- the mailbox --------------------------------------------------------------------
 
     async def test_mail_returns_the_readers_own_feed_with_server_side_times(self):

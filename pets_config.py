@@ -92,6 +92,10 @@ FARM_DURATION_HOURS = 6
 FARM_MIN_HOURS = 1
 FARM_MAX_HOURS = 8
 FARM_HOUR_CHOICES = tuple(range(FARM_MIN_HOURS, FARM_MAX_HOURS + 1))
+# The backend still accepts every whole duration from 1 through 8 (including old
+# Telegram callbacks), but the two current interfaces deliberately present only four
+# useful presets instead of an eight-button wall.
+FARM_QUICK_HOUR_CHOICES = (1, 2, 4, 8)
 # What a «Билет на ферму» leaves on the clock. A minute rather than nothing at all, so a
 # redeemed shift still finishes through the ordinary settlement path -- the poller pays it
 # exactly the way it pays every other run, under the same single grant key -- and so the

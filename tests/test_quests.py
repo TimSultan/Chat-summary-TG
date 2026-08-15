@@ -155,7 +155,7 @@ class RunePaintCatalogTests(unittest.TestCase):
         self.assertIn("кожу", rows["rune_paint_boots"].technique.lower())
         self.assertIn("потёртости", rows["rune_paint_boots"].technique.lower())
 
-    def test_specialist_paint_quests_explain_the_real_object_and_permanent_reward(self):
+    def test_specialist_paint_quests_are_compact_three_step_tutorials(self):
         rows = {quest.code: quest for quest in catalog.RUNE_QUESTS}
         expected_titles = {
             "rune_paint_weapon": "Покрас оружия",
@@ -171,16 +171,18 @@ class RunePaintCatalogTests(unittest.TestCase):
             with self.subTest(code=code):
                 quest = rows[code]
                 self.assertEqual(quest.title, title)
-                self.assertIn("миниатюр", quest.subject.lower())
-                self.assertIn("постоян", f"{quest.subject} {quest.technique}")
+                self.assertTrue(quest.subject)
+                for marker in ("1)", "2)", "3)"):
+                    self.assertIn(marker, quest.technique)
+                self.assertLess(len(quest.technique), 430)
 
-        self.assertIn("бесконечные заряды", rows["rune_paint_pickaxe"].technique)
-        self.assertIn("бесконечные заряды", rows["rune_paint_shovel"].technique)
+        self.assertIn("навсегда", rows["rune_paint_pickaxe"].subject)
+        self.assertIn("навсегда", rows["rune_paint_shovel"].subject)
         for code in (
             "rune_paint_weapon", "rune_paint_shield", "rune_paint_boots",
             "rune_paint_amulet", "rune_paint_vial", "rune_paint_scroll",
         ):
-            self.assertIn("уникальную картинку", rows[code].technique)
+            self.assertIn("персональную руну", rows[code].subject)
 
 
 class RerollTests(QuestsTestCase):

@@ -63,6 +63,26 @@ def _personal_paint_bonus_text(target: str) -> str:
     return "положительные статы предмета +30%"
 
 
+def _quest_benefit_text(card: dict) -> str:
+    """One plain-language outcome line shared by Telegram quest shelves/details."""
+    reward = card.get("reward") or {}
+    tool = reward.get("tool_masterwork")
+    if tool == "shovel":
+        return "После приёмки: бесконечная лопата и +50% золота с каждой смены — навсегда."
+    if tool == "pickaxe":
+        return "После приёмки: бесконечная кирка и +50% ко всей добыче — навсегда."
+    target = str(reward.get("personal_paint_target") or "")
+    target_name = PERSONAL_PAINT_TARGET_NAMES.get(target)
+    if target_name:
+        return (
+            f"После приёмки навсегда: персональная руна для типа «{target_name}», "
+            f"{_personal_paint_bonus_text(target)}; фото покраса можно поставить картинкой цели."
+        )
+    if reward.get("magic_guaranteed"):
+        return "После приёмки: случайная магия и случайная руна."
+    return ""
+
+
 def _scroll_effect_lines(spell: dict, painted: bool = False) -> tuple[str, ...]:
     if not painted:
         return SCROLLS.effect_lines(spell)
@@ -795,6 +815,9 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
             f"\n<b>{index}. {marker} {escape(card.get('title') or 'Квест')}</b>",
             f"{quest_pips(card.get('difficulty', 1))} · {escape(subject)}",
         ])
+        benefit = _quest_benefit_text(card)
+        if benefit:
+            lines.append(f"🎁 <b>{escape(benefit)}</b>")
         buttons.append([{
             "text": f"{index}. {marker} {str(card.get('title') or 'Квест')[:45]}",
             "callback_data": callback_data(user_id, "questdetail", f"{kind}:{card.get('code')}"),
@@ -840,38 +863,33 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"{int(reward.get('scroll_pity', 0))}-м принятом квесте сложности 4–5."
         if reward.get("scroll_chance") else ""
     )
-    magic_reward = (
-        "\n✨ За качественно принятую работу: случайная магия и случайная руна."
-        if reward.get("magic_guaranteed") else ""
-    )
-    personal_target_code = str(reward.get("personal_paint_target") or "")
-    personal_target = PERSONAL_PAINT_TARGET_NAMES.get(personal_target_code)
-    personal_reward = (
-        f"\n🎨 Персональная руна для типа «{escape(personal_target)}»: фотография станет "
-        f"аватаркой выбранной цели; {_personal_paint_bonus_text(personal_target_code)}."
-        if personal_target else ""
-    )
-    tool_names = {"pickaxe": "кирка", "shovel": "лопата"}
-    tool_name = tool_names.get(reward.get("tool_masterwork"))
-    tool_reward = (
-        f"\n🛠 «{escape(tool_name)}» улучшается напрямую: бесконечные заряды и +50% эффективности."
-        if tool_name else ""
-    )
+    benefit = _quest_benefit_text(card)
+    specialist_paint = str(card.get("code") or "").startswith("rune_paint_")
+    if specialist_paint:
+        how_lines = [
+            "1. Возьми новую, ещё не опубликованную работу и выполни три шага из блока «Техника».",
+            f"2. Сделай чёткое фото ({escape(card.get('proof') or 'готового результата')}) и "
+            f"выложи его в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
+        ]
+    else:
+        how_lines = [
+            "1. Используй новую, ещё не опубликованную работу и подготовь нужную деталь.",
+            f"2. {'Повтори технику из описания и сверь результат с подсказкой.' if paint else 'Выполни действие полностью, затем сверь результат с подсказкой.'}",
+            f"3. Сделай чёткое фото ({escape(card.get('proof') or 'готового результата')}) и "
+            f"выложи его в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
+        ]
     lines = [
         f"{'🎯' if paint else '🌍'} <b>{escape(card.get('title') or 'Квест')}</b>",
         f"{quest_pips(difficulty)} {QUEST_DIFFICULTY_NAMES.get(difficulty, '')}",
         f"\n<b>{'Что красим' if paint else 'Что делаем'}:</b> {escape(card.get('subject') or '')}",
+        (f"\n🎁 <b>Что получишь:</b> {escape(benefit)}" if benefit else ""),
         f"\n<b>Техника:</b> {escape(card.get('technique') or '')}",
         f"\n💡 <b>Подсказка:</b> {escape(card.get('hint') or '')}",
-        "\n<b>Как выполнить:</b>",
-        "1. Используй новую, ещё не опубликованную работу и подготовь нужную деталь.",
-        f"2. {'Нанеси технику из описания небольшими контролируемыми этапами.' if paint else 'Выполни действие полностью, не только для фотографии.'}",
-        "3. Сверь результат с подсказкой и поправь самые заметные места.",
-        f"4. Сделай чёткое фото: {escape(card.get('proof') or 'готового результата')}.",
-        f"5. Выложи фото в чат с хештегом <code>{escape(card.get('hashtag') or '')}</code>.",
+        f"\n<b>{'Как сдать' if specialist_paint else 'Как выполнить'}:</b>",
+        *how_lines,
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
         f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
-        magic_reward + personal_reward + tool_reward + scroll_reward,
+        scroll_reward,
         (f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>"
          if board.get("auto_refresh") else "\n🕰 Дедлайна нет — квест останется здесь."),
     ]
@@ -1265,6 +1283,8 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             )
             lines.append("<i>смена — 🪙 монет · ✨ опыта · 🎁 шанс находки</i>")
             for row in status.get("hour_previews", []):
+                if int(row.get("hours", 0) or 0) not in C.FARM_QUICK_HOUR_CHOICES:
+                    continue
                 drop_pct = float(row.get("drop_chance", 0.0) or 0.0) * 100
                 lines.append(
                     f"{row['hours']} ч — 🪙 {_money(int(row['gold']))} · "
@@ -1301,9 +1321,20 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     else:
         shovel_runs = int(status.get("shovel_runs", 0) or 0)
         lines.append(f"Зарядов лопаты: {shovel_runs}. Каждый заряд даёт +25% золота на одну смену.")
+        lines.append(
+            "🎨 <b>Покрась лопату в NMM (НММ) в «Квестах»:</b> после принятия она "
+            "навсегда станет бесконечной и будет давать +50% золота с каждой смены."
+        )
     lines.append("\n<b>⛏ Карьер</b>")
     if quarry.get("running"):
         lines.append(f"Добыча идёт. Осталось: {_farm_duration(int(quarry.get('seconds_left', 0) or 0))}.")
+        if quarry.get("pickaxe_upgraded"):
+            lines.append("Руническая кирка: бесконечные заряды · +50% ко всей добыче.")
+        else:
+            lines.append(
+                "🎨 <b>Покрась кирку в NMM (НММ) в «Квестах»:</b> после принятия она "
+                "навсегда станет бесконечной и будет давать +50% ко всей добыче."
+            )
     else:
         charges = "∞" if quarry.get("pickaxe_unlimited") else str(int(quarry.get("pickaxe_runs", 0) or 0))
         lines.append(f"Зарядов кирки: {charges}.")
@@ -1315,19 +1346,20 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             )
         if quarry.get("pickaxe_upgraded"):
             lines.append("Руническая кирка: бесконечные заряды · +50% ко всей добыче уже включены в расчёт выше.")
+        else:
+            lines.append(
+                "🎨 <b>Покрась кирку в NMM (НММ) в «Квестах»:</b> после принятия она "
+                "навсегда станет бесконечной и будет давать +50% ко всей добыче."
+            )
     rows = []
     if status.get("can_start"):
-        # Four per row -- two rows of four -- so all eight choices fit without a single
-        # row running past what Telegram comfortably shows on a phone.
+        # The four useful presets fit on one row and leave the menu readable.
         hour_row = []
-        for hours in C.FARM_HOUR_CHOICES:
+        for hours in C.FARM_QUICK_HOUR_CHOICES:
             hour_row.append({
                 "text": f"{hours} ч",
                 "callback_data": callback_data(user_id, "farmstart", str(hours)),
             })
-            if len(hour_row) == 4:
-                rows.append(hour_row)
-                hour_row = []
         if hour_row:
             rows.append(hour_row)
     if status.get("can_ticket"):

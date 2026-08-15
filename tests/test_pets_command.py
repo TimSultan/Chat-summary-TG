@@ -515,7 +515,7 @@ class PetsCommandTests(unittest.TestCase):
         }
         self.assertNotIn("search", actions)
 
-    def test_farm_menu_offers_eight_duration_buttons_then_starts_and_cancels(self):
+    def test_farm_menu_offers_four_quick_duration_buttons_then_starts_and_cancels(self):
         economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.FARM_UPGRADE_COSTS[0], "test")
         self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
         self.assertTrue(pets.tame(CHAT, PLAYER["id"], RICH_XP, "Фермер", "file", "Player")[0])
@@ -533,25 +533,28 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(pets.farm_level(CHAT, PLAYER["id"]), 1)
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
         self.assertIn("Пассивно: +1 монет/ч", rendered[0])
-        # One preview line and one button per selectable duration, 1-8 hours.
-        self.assertIn("6 ч — 🪙", rendered[0])
+        # Four useful presets keep the farm screen and keyboard compact.
+        self.assertIn("8 ч — 🪙", rendered[0])
+        self.assertNotIn("6 ч — 🪙", rendered[0])
+        self.assertIn("Покрась лопату в NMM (НММ)", rendered[0])
+        self.assertIn("Покрась кирку в NMM (НММ)", rendered[0])
         parsed_buttons = [
             pets_ui.parse_callback(button["callback_data"])
             for row in rendered[1]["inline_keyboard"] for button in row
         ]
         farmstart_hours = {argument for _, action, argument in parsed_buttons if action == "farmstart"}
-        self.assertEqual(farmstart_hours, {str(hours) for hours in C.FARM_HOUR_CHOICES})
+        self.assertEqual(farmstart_hours, {str(hours) for hours in C.FARM_QUICK_HOUR_CHOICES})
         self.assertNotIn("uphamsterator", {action for _, action, _ in parsed_buttons})
-        # Four per row, two rows of four, as asked.
+        # Exactly one row of four.
         hour_rows = [
             row for row in rendered[1]["inline_keyboard"]
             if {pets_ui.parse_callback(b["callback_data"])[1] for b in row} == {"farmstart"}
         ]
-        self.assertEqual([len(row) for row in hour_rows], [4, 4])
+        self.assertEqual([len(row) for row in hour_rows], [4])
 
-        api = self._tap("farmstart", "3")
+        api = self._tap("farmstart", "4")
         self.assertTrue(pets.is_farming(CHAT, PLAYER["id"]))
-        self.assertIn("Питомец отправлен на ферму на 3 ч", api.edits[0]["text"])
+        self.assertIn("Питомец отправлен на ферму на 4 ч", api.edits[0]["text"])
         rendered = pets_ui.farm_view(CHAT, PLAYER["id"], RICH_XP)
         actions = {pets_ui.parse_callback(button["callback_data"])[1] for button in _buttons({"reply_markup": rendered[1]})}
         self.assertNotIn("farmstart", actions)
