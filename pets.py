@@ -156,7 +156,17 @@ def _normalise_dungeon_run(run) -> dict | None:
         boss_lives = max(0, min(1, int(run.get("boss_lives", 0) or 0)))
     except (TypeError, ValueError):
         boss_lives = 0
+    try:
+        kills = max(0, int(run.get("kills", 0) or 0))
+    except (TypeError, ValueError):
+        kills = 0
     repaired_run = {
+        # This dict is a WHITELIST -- anything not rebuilt here is dropped on every load.
+        # The run's own identity has to survive that: without it every kill's loot token
+        # collapses to the same string, and a memoised reward key that never changes is a
+        # mob that drops the same scroll for ever. A run predating the field gets one now.
+        "run_id": str(run.get("run_id") or "") or secrets.token_hex(8),
+        "kills": kills,
         "floor": floor, "hp": hp, "max_hp": max_hp,
         "cleared": sorted(repaired), "boss_lives": boss_lives,
     }
@@ -399,6 +409,11 @@ def _load(entry: str) -> dict:
         ))
         wallet["reward_log"] = wallet.get("reward_log") if isinstance(wallet.get("reward_log"), dict) else {}
         wallet_pity = wallet.get("pity") if isinstance(wallet.get("pity"), dict) else {}
+        # Only the two sources that HAVE a guarantee behind them. "dungeon" is absent on
+        # purpose: a run is entered voluntarily and repeatedly, so a floor that owes a
+        # scroll every Nth kill is a vending machine rather than a drop. (It was absent
+        # here before the guarantee was removed too, which is why the dungeon's advertised
+        # pity counter never actually fired -- this whitelist dropped it on every load.)
         wallet["pity"] = {
             "paint": _safe_nonnegative_int(wallet_pity.get("paint")),
             "hard_quest": _safe_nonnegative_int(wallet_pity.get("hard_quest")),
@@ -2666,23 +2681,29 @@ def _remember_scroll_notification(data: dict, user_id, receipt: dict) -> None:
 
 
 def grant_scroll_reward(
-    entry: str, user_id, *, source: str, kind: str, chance: float, pity_after: int,
+    entry: str, user_id, *, source: str, kind: str, chance: float, pity_after: int | None,
     seed: str | None = None,
 ) -> dict:
     """Try to unlock one previously unknown scroll, exactly once for an earned event.
 
-    The caller supplies a stable source identity (a figurine's message id or a quest
-    submission id).  We persist a miss too, so retries cannot farm randomness.  A pity
-    counter only advances on eligible, unique events and resets solely after an actual
-    unlock.  Ultimates are selected from the same permanent collection but only have a
-    12% share while ordinary scrolls remain, making them meaningfully rarer without a
-    second loot table to tune.
+    The caller supplies a source identity that is unique to the EVENT (a figurine's
+    message id, a quest submission id, one dungeon kill).  We persist a miss too, so
+    retries cannot farm randomness -- which also means a source shared between two real
+    events makes the second one replay the first one's receipt verbatim.
+
+    `pity_after` counts eligible, unique misses and resets solely after an actual unlock.
+    Pass None to switch the guarantee off entirely: a source that can be repeated at will
+    (the dungeon) must not be able to promise a scroll on a schedule.
+
+    Ultimates are selected from the same permanent collection but only have a 12% share
+    while ordinary scrolls remain, making them meaningfully rarer without a second loot
+    table to tune.
     """
     source = str(source or "").strip()
     if kind not in ("paint", "hard_quest", "dungeon") or not source:
         return {"granted": False, "reason": "invalid_source"}
     chance = max(0.0, min(1.0, float(chance or 0.0)))
-    pity_after = max(1, int(pity_after or 1))
+    pity_after = None if pity_after is None else max(1, int(pity_after or 1))
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
@@ -2703,10 +2724,13 @@ def grant_scroll_reward(
 
         entropy = f"{entry}|{user_id}|{kind}|{source}|{seed or source}"
         rng = random.Random(hashlib.sha256(entropy.encode("utf-8")).hexdigest())
-        forced = pity[kind] + 1 >= pity_after
+        forced = pity_after is not None and pity[kind] + 1 >= pity_after
         won = forced or rng.random() < chance
         if not won:
-            pity[kind] += 1
+            # A miss only counts toward something when there IS something to count
+            # toward; otherwise this is a number that grows forever and is never read.
+            if pity_after is not None:
+                pity[kind] += 1
             receipt = {
                 "granted": False, "reason": "miss", "source": source, "kind": kind,
                 "pity": pity[kind], "pity_after": pity_after,
@@ -3251,7 +3275,13 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
             wallet[str(user_id)] = rubies - ruby_cost
         hero = _dungeon_fighter(record, str(user_id))
         max_hp = round(pets_combat.derive(hero, hero)["max_hp"])
-        record["dungeon_run"] = {"floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": []}
+        # `run_id` and `kills` exist so every victory in this run has an identity of its
+        # own. Loot used to be keyed on floor+index alone, which made a given mob pay the
+        # same thing forever -- see the loot token in dungeon_fight.
+        record["dungeon_run"] = {
+            "run_id": secrets.token_hex(8), "kills": 0,
+            "floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": [],
+        }
         _save(entry, data)
     entry_paid = "по билету" if ticket_count else f"за {D.ENTRY_RUBY_COST} рубинов"
     return True, f"{'Эскалатор доставил' if escalator else 'Ты вошёл'} на этаж {floor} {entry_paid}."
@@ -3369,6 +3399,13 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             run["cleared"] = sorted(cleared)
             reward, message = D.roll_reward(floor, bool(row.get("boss"))), f"Побеждён: {row['name']}."
             _record_weapon_win(record, "boss_wins" if row.get("boss") else "mob_wins")
+        # One identity per KILL, minted inside the lock that owns the run. Everything paid
+        # out below keys off this instead of floor+index, which is what used to make the
+        # same mob drop the same scroll, the same item and the same rune for ever: those
+        # keys are memoised (grant_scroll_reward, grant_rubies_once) or used as an RNG seed
+        # (grant_random_drop), so a re-killable enemy behind a fixed key is a fixed reward.
+        run["kills"] = int(run.get("kills", 0) or 0) + 1
+        loot_token = f"{run.get('run_id') or 'legacy'}:{floor}:{index}:{run['kills']}"
         reward["gold_base"] = int(reward.get("gold", 0) or 0)
         reward["gold_multiplier"] = C.hero_gold_multiplier(record.get("level", 1), "dungeon")
         reward["gold"] = C.gold_for_hero(
@@ -3378,17 +3415,25 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         _save(entry, data)
 
     economy.grant(entry, user_id, int(reward["gold"]), "pet_dungeon_win")
-    dropped = grant_random_drop(entry, user_id, float(reward["item_chance"]), seed=f"dungeon:{floor}:{index}")
+    # Unseeded: a dungeon kill is not a settlement that might be retried, so there is
+    # nothing to reproduce -- and a seed is what made the pool always land on one item.
+    dropped = grant_random_drop(entry, user_id, float(reward["item_chance"]))
     rune = None
-    if random.Random(f"dungeon-rune:{floor}:{index}:{user_id}").random() < (0.12 if row.get("boss") else 0.025):
+    if secrets.SystemRandom().random() < (0.12 if row.get("boss") else 0.025):
         element = "fire" if row.get("gimmick") == "fire_only" else RUNE_ELEMENTS[floor % len(RUNE_ELEMENTS)]
-        rune = grant_runes(entry, user_id, element, 1, f"dungeon:{floor}:{index}")
+        rune = grant_runes(entry, user_id, element, 1, f"dungeon:{loot_token}")
     scroll = None
     if reward["scroll_chance"]:
-        scroll = grant_scroll_reward(entry, user_id, source=f"dungeon:{floor}:{index}", kind="dungeon", chance=float(reward["scroll_chance"]), pity_after=8)
-    rubies = 1 if random.Random(f"dungeon-ruby:{floor}:{index}:{user_id}").random() < C.DUNGEON_RUBY_CHANCE else 0
+        # pity_after=None on purpose: the dungeon is the one source with no guarantee
+        # behind it. A run is entered voluntarily and repeatedly, so a floor that owes you
+        # a scroll every eighth kill is a scroll vending machine rather than a drop.
+        scroll = grant_scroll_reward(
+            entry, user_id, source=f"dungeon:{loot_token}", kind="dungeon",
+            chance=float(reward["scroll_chance"]), pity_after=None,
+        )
+    rubies = 1 if secrets.SystemRandom().random() < C.DUNGEON_RUBY_CHANCE else 0
     if rubies:
-        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{floor}:{index}")
+        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{loot_token}")
     return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies}
 
 

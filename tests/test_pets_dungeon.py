@@ -77,6 +77,29 @@ class DungeonTests(unittest.TestCase):
         self.assertGreater(len({reward["xp"] for reward in rewards}), 1)
         self.assertGreater(len({reward["item_chance"] for reward in rewards}), 1)
 
+    def test_both_drop_chances_are_rolled_per_kill_not_fixed_per_floor(self):
+        """Identical mobs on an identical floor must not offer identical odds."""
+        floor = dungeon.SCROLL_LOOT_START_FLOOR + 5
+        rolls = [dungeon.roll_reward(floor, False) for _ in range(20)]
+        self.assertGreater(len({round(row["scroll_chance"], 6) for row in rolls}), 1)
+        self.assertGreater(len({round(row["item_chance"], 6) for row in rolls}), 1)
+        # The jitter is a spread around the baseline, not a licence to invent loot.
+        baseline = dungeon.reward_for(floor, False, len(dungeon.encounters_for_floor(floor)))
+        low, high = dungeon.LOOT_CHANCE_JITTER
+        for row in rolls:
+            self.assertLessEqual(row["scroll_chance"], baseline["scroll_chance"] * high + 1e-9)
+            self.assertGreaterEqual(row["scroll_chance"], baseline["scroll_chance"] * low - 1e-9)
+
+    def test_a_boss_is_worth_a_real_jump_in_scroll_chance(self):
+        floor = dungeon.SCROLL_LOOT_START_FLOOR + 12   # deep enough to hit the mob cap
+        mob = dungeon.reward_for(floor, False, enemy_count=1)
+        boss = dungeon.reward_for(floor, True)
+        self.assertGreater(boss["scroll_chance"], mob["scroll_chance"])
+        self.assertAlmostEqual(
+            boss["scroll_chance"], mob["scroll_chance"] * dungeon.BOSS_SCROLL_MULTIPLIER,
+        )
+        self.assertGreater(boss["item_chance"], mob["item_chance"])
+
     def test_crowded_rooms_pay_less_per_enemy_and_deep_floors_pay_more(self):
         pack = dungeon.reward_for(2, False, enemy_count=10)
         duo = dungeon.reward_for(2, False, enemy_count=2)
@@ -251,9 +274,101 @@ class DungeonTests(unittest.TestCase):
 
         run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
 
+        # A run predating the identity fields is given one rather than left to collapse
+        # every kill's loot token onto the same string.
+        self.assertTrue(run.pop("run_id"))
         self.assertEqual(run, {
-            "floor": 1, "hp": 1, "max_hp": 1, "cleared": [], "boss_lives": 0,
+            "kills": 0, "floor": 1, "hp": 1, "max_hp": 1, "cleared": [], "boss_lives": 0,
         })
+
+    def test_the_run_identity_survives_the_normaliser_that_rebuilds_the_run(self):
+        """The normaliser is a whitelist, so anything it forgets is dropped on every load.
+
+        run_id and kills are what make each victory's loot key unique; losing them is
+        exactly how the same mob came to pay out the same scroll for ever.
+        """
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "run_id": "abc123", "kills": 7, "floor": 4, "hp": 50, "max_hp": 50, "cleared": [],
+        }
+        pets._save(self.entry, data)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["run_id"], "abc123")
+        self.assertEqual(run["kills"], 7)
+
+    def _unstoppable_runner(self, floor):
+        """A runner that always wins, parked on `floor` with a fresh run."""
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["level"] = 200
+        for key in pets_config.STAT_KEYS:
+            record["stats"][key] = 4_000
+        record["dungeon_run"] = {
+            "run_id": "run-a", "kills": 0, "floor": floor,
+            "hp": 99_999, "max_hp": 99_999, "cleared": [],
+        }
+        pets._save(self.entry, data)
+
+    def _rekill(self, floor, index=0, times=1):
+        """Kill the same encounter `times` over, resetting only what a re-entry resets."""
+        payloads = []
+        for _ in range(times):
+            data = pets._load(self.entry)
+            data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
+            data["pets"][self.user_id]["dungeon_run"]["hp"] = 99_999
+            pets._save(self.entry, data)
+            ok, _message, payload = pets.dungeon_fight(self.entry, self.user_id, index)
+            self.assertTrue(ok)
+            payloads.append(payload)
+        return payloads
+
+    def test_killing_the_same_mob_twice_does_not_replay_the_first_kills_loot(self):
+        """The bug this guards: loot was keyed on floor+index alone.
+
+        Those keys are memoised (grant_scroll_reward) or used as an RNG seed
+        (grant_random_drop), so a re-killable enemy behind a fixed key paid out the same
+        scroll and the same item for ever.
+        """
+        floor = dungeon.SCROLL_LOOT_START_FLOOR + 5
+        self._unstoppable_runner(floor)
+        self._rekill(floor, times=6)
+
+        log = pets._load(self.entry)["scroll_wallets"][self.user_id]["reward_log"]
+        sources = [key for key in log if key.startswith("dungeon:")]
+        self.assertEqual(len(sources), 6, "each kill must own its loot key")
+        self.assertEqual(len(set(sources)), 6)
+
+    def test_a_run_of_dungeon_misses_never_forces_a_guaranteed_scroll(self):
+        """No pity in the dungeon: a floor that owes a scroll every Nth kill is a shop."""
+        receipts = [
+            pets.grant_scroll_reward(
+                self.entry, self.user_id, source=f"dungeon:none:{n}", kind="dungeon",
+                chance=0.0, pity_after=None,
+            )
+            for n in range(40)
+        ]
+        self.assertTrue(all(not row["granted"] for row in receipts))
+        self.assertTrue(all(row["reason"] == "miss" for row in receipts))
+        self.assertTrue(all(row["pity_after"] is None for row in receipts))
+        # And no counter is quietly ticking behind it: the dungeon has no pity bucket.
+        self.assertNotIn(
+            "dungeon", pets._load(self.entry)["scroll_wallets"][self.user_id]["pity"],
+        )
+
+    def test_scrolls_still_drop_and_are_not_the_same_one_every_time(self):
+        # A deep ORDINARY floor: the gimmick bosses (hydra, reincarnate) deliberately end
+        # a turn without paying anything, so they are useless for measuring drop rates.
+        floor = 41
+        self.assertFalse(dungeon.is_boss_floor(floor))
+        self._unstoppable_runner(floor)
+        granted = [
+            payload["scroll"]["code"]
+            for payload in self._rekill(floor, times=120)
+            if payload.get("scroll") and payload["scroll"].get("granted")
+        ]
+        self.assertGreater(len(granted), 3, "a 25% baseline over 120 kills must pay out")
+        self.assertGreater(len(set(granted)), 1, "the same scroll every time is the bug")
 
     def test_existing_pet_owners_receive_three_dungeon_tickets_once(self):
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 1)

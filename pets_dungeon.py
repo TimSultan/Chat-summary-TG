@@ -17,6 +17,14 @@ ANTIMAGIC_REFLECT_SHARE: Final = 0.85
 SHOP_PARTIAL_HEAL_COST: Final = 160
 SHOP_FULL_HEAL_COST: Final = 300
 SCROLL_LOOT_START_FLOOR: Final = 10
+# A boss is the one enemy on a floor worth building a run around, so it is also the one
+# worth a real jump in loot rather than a rounding difference.
+BOSS_ITEM_MULTIPLIER: Final = 1.5
+BOSS_SCROLL_MULTIPLIER: Final = 3.0
+# How far a single kill's chances may wander either side of the floor's public baseline.
+# Wide on purpose: identical mobs on identical floors should not feel like a vending
+# machine, and the spread is what makes a lucky kill feel lucky.
+LOOT_CHANCE_JITTER: Final = (0.55, 1.45)
 DUNGEON_OPEN: Final = True
 DUNGEON_CLOSED_NOTICE: Final = (
     "К подземелью подъехала экспедиция для расследования. "
@@ -165,23 +173,36 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
         gold, xp = 450 + floor * 70, 80 + floor * 18
     else:
         gold, xp = (180 + floor * 30) // enemy_count, (35 + floor * 12) // enemy_count
+    scroll_chance = 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
+        0.25, 0.04 + (floor - SCROLL_LOOT_START_FLOOR) * 0.01,
+    )
     return {
         "gold": max(1, gold), "xp": max(1, xp),
-        "item_chance": min(0.22, 0.012 + floor * 0.004) * (1.5 if boss else 1),
-        "scroll_chance": 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
-            0.25, 0.04 + (floor - SCROLL_LOOT_START_FLOOR) * 0.01,
-        ),
+        "item_chance": min(0.22, 0.012 + floor * 0.004) * (BOSS_ITEM_MULTIPLIER if boss else 1),
+        # The boss multiplier is applied AFTER the ordinary cap, not inside it: capping
+        # first and multiplying after is what lets a boss actually out-drop the corridor
+        # it stands at the end of instead of flattening into the same 25%.
+        "scroll_chance": min(1.0, scroll_chance * (BOSS_SCROLL_MULTIPLIER if boss else 1)),
     }
 
 
 def roll_reward(floor: int, boss: bool, rng=None) -> dict:
-    """Roll one victory's rewards around the floor's public baseline."""
+    """Roll one victory's rewards around the floor's public baseline.
+
+    Every number here is rolled per KILL, including both drop chances: two runners who
+    kill the same mob on the same floor are not owed the same odds, and neither is the
+    same runner on their second pass. Defaults to SystemRandom -- nothing about a dungeon
+    kill needs to be reproducible, and a seed shared across kills is exactly how identical
+    mobs started paying out identical loot.
+    """
     rng = rng or random.SystemRandom()
     enemy_count = 1 if boss else len(encounters_for_floor(floor))
     reward = dict(reward_for(floor, boss, enemy_count))
     reward["gold"] = rng.randint(round(reward["gold"] * .8), round(reward["gold"] * 1.2))
     reward["xp"] = rng.randint(max(1, round(reward["xp"] * .7)), round(reward["xp"] * 1.3))
-    reward["item_chance"] = min(1.0, max(0.0, reward["item_chance"] * rng.uniform(.7, 1.3)))
+    low, high = LOOT_CHANCE_JITTER
+    for key in ("item_chance", "scroll_chance"):
+        reward[key] = min(1.0, max(0.0, reward[key] * rng.uniform(low, high)))
     return reward
 
 
