@@ -843,6 +843,59 @@ def grant_xp_once(
     return True
 
 
+def xp_grants_for(entry: str, user_id) -> dict:
+    """This member's named XP adjustments: {key: {"amount", "granted_at"}}.
+
+    Read-only, and the only way to see what an XP grant actually did after the fact --
+    bonus_xp is summed into the totals and is otherwise indistinguishable from XP somebody
+    earned by writing in the chat.
+    """
+    row = _load_xp_grants(entry)["users"].get(str(user_id))
+    grants = (row or {}).get("grants")
+    if not isinstance(grants, dict):
+        return {}
+    return {
+        str(key): {
+            "amount": max(0, int(grant.get("amount", 0) or 0)),
+            "granted_at": str(grant.get("granted_at") or ""),
+        }
+        for key, grant in grants.items()
+        if isinstance(grant, dict)
+    }
+
+
+def revoke_xp_grants(entry: str, user_id, key: str | None = None) -> int:
+    """Take back one XP grant, or all of them. Returns the XP actually removed.
+
+    The counterpart grant_xp_once never had, which is why an XP grant used to be a
+    one-way door. It matters because XP is the WRONG lever for handing somebody money:
+    coins are derived from it (see economy.balance), so a grant meant to top up a wallet
+    also lands in /top and /stat and quietly rewrites the chat's leaderboard.
+
+    Removing the XP therefore removes the coins it was standing in for. Whoever calls this
+    is expected to put those coins back through economy.grant_once, which is the lever
+    that should have been used in the first place -- see admin_xp.py, which does both.
+    """
+    data = _load_xp_grants(entry)
+    row = data["users"].get(str(user_id))
+    grants = (row or {}).get("grants")
+    if not isinstance(grants, dict):
+        return 0
+    if key is None:
+        removed = sum(max(0, int((g or {}).get("amount", 0) or 0)) for g in grants.values())
+        row["grants"] = {}
+    else:
+        grant = grants.pop(str(key), None)
+        if grant is None:
+            return 0
+        removed = max(0, int((grant or {}).get("amount", 0) or 0))
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _xp_grants_path(entry).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return removed
+
+
 def _deleted_figurines_path(entry: str) -> Path:
     return _stats_dir() / f"{_cache_key(entry)}_deleted_figurines.json"
 
