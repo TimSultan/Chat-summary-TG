@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -)",
-      "Bash(python -c ' *)",
-      "Bash(rm -f scratch_js.js)"
-    ]
-  }
-}

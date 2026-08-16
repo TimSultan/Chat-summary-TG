@@ -16,3 +16,6 @@ session_string_output.txt
 # shipped with it. arena_core.py and the README cite it by path.
 import/
 sprite_preview/
+
+# Local Claude Code tool permissions -- per-machine, not part of the project.
+.claude/
