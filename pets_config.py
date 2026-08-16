@@ -1192,10 +1192,17 @@ def daily_storefront_weapons(
     return daily_storefront_items(entry, "weapon", day, excluded_codes, user_id=user_id)
 
 
+# Code -> item, built once. find_item used to walk all 596 items looking for one code, and
+# it is called thousands of times to serve a single screen: normalising a stored creature
+# alone resolves every code in every inventory, and there are as many inventories as there
+# are players. Profiled at over seven thousand calls for ONE dungeon fight, which is a few
+# million string comparisons for work a dict does in one hop.
+_ITEMS_BY_CODE: dict = {item.code: item for item in ITEMS}
+
+
 def find_item(code: str):
     needle = (code or "").strip().lower()
-    needle = LEGACY_ITEM_CODES.get(needle, needle)
-    return next((item for item in ITEMS if item.code == needle), None)
+    return _ITEMS_BY_CODE.get(LEGACY_ITEM_CODES.get(needle, needle))
 
 
 def items_for_slot(slot: str, source: str | None = None):

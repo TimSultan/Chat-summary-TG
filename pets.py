@@ -28,6 +28,7 @@ be online, and still shows up correctly in their own /history because the fight 
 appended once and `history()` filters by either role.
 """
 
+import contextlib
 import hashlib
 import json
 import random
@@ -237,8 +238,44 @@ def _new_economy_metrics() -> dict:
 _store_cache: dict[str, tuple[int, int, str]] = {}
 _store_cache_lock = threading.Lock()
 
+# The cache above removes the re-normalisation but not the copy, and the copy IS the parse
+# -- measured, one screen was 26 parses of the whole store, which is most of what a button
+# press cost. `pinned_store` collapses those into one by serving the SAME object for the
+# duration of a block.
+#
+# That is only sound because of the rule enforced below: the moment anything inside the
+# block writes, the pin for that store is dropped and every later _load goes back to
+# reading fresh. So a pinned block can never hand out a stale object across a write, and
+# the worst an abandoned in-place repair can do is be visible to the rest of ONE screen
+# assembly -- repairs which are idempotent and identical to what _load itself produces.
+#
+# Thread-local because payloads are assembled in worker threads (see pets_web), and two
+# players' screens must never share one store object.
+#
+# Deliberately NOT wrapped around gameplay: it is for read-only assembly only. Anything
+# that decides an outcome should keep loading for itself.
+_pinned = threading.local()
+
+
+@contextlib.contextmanager
+def pinned_store(entry: str):
+    """Serve every _load of `entry` in this block from a single parse.
+
+    For read-only assembly of a screen. See the note above for why a write inside the
+    block silently ends the pin rather than being made to work.
+    """
+    previous = getattr(_pinned, "stores", None)
+    _pinned.stores = {} if previous is None else dict(previous)
+    try:
+        yield
+    finally:
+        _pinned.stores = previous
+
 
 def _load(entry: str) -> dict:
+    pinned = getattr(_pinned, "stores", None)
+    if pinned is not None and entry in pinned:
+        return pinned[entry]
     path = _pets_path(entry)
     if not path.exists():
         return _empty()
@@ -252,9 +289,13 @@ def _load(entry: str) -> dict:
         cached = _store_cache.get(cache_key)
     if cached is not None and cached[:2] == identity:
         try:
-            return json.loads(cached[2])
+            fresh = json.loads(cached[2])
         except json.JSONDecodeError:
-            pass                       # unreachable in practice; fall through to the file
+            fresh = None               # unreachable in practice; fall through to the file
+        if fresh is not None:
+            if pinned is not None:
+                pinned[entry] = fresh
+            return fresh
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
@@ -496,6 +537,8 @@ def _load(entry: str) -> dict:
     # lands while this normalisation is running would otherwise be cached under ITS
     # identity while holding the older content, and the next reader would accept it.
     # Recording the identity we actually read means such a write simply misses instead.
+    if pinned is not None:
+        pinned[entry] = data
     try:
         blob = json.dumps(data)
     except (TypeError, ValueError):
@@ -696,6 +739,11 @@ def _save(entry: str, data: dict) -> None:
     # (admin_grant.py), but for our own writes this is exact and costs nothing.
     with _store_cache_lock:
         _store_cache.pop(str(path), None)
+    # And end any pin on this store: everything after a write has to see the write, so a
+    # block that was reusing one parsed object goes back to reading fresh from here on.
+    pinned = getattr(_pinned, "stores", None)
+    if pinned is not None:
+        pinned.pop(entry, None)
     stats._write_json_atomic(path, data)
 
 

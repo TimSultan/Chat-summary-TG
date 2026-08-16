@@ -919,7 +919,19 @@ def _skills_payload(record: dict, prefix: str = "") -> dict:
     }
 
 
-def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
+# The screens known to draw no item cards, which are the only ones the inventory is
+# withheld from. Named as a denylist rather than an allowlist on purpose: getting this
+# wrong in one direction costs a few kilobytes, and in the other shows the player an empty
+# bag. So anything unrecognised -- an older client that sends no view at all, a new screen
+# somebody adds later, a direct API call -- still gets it.
+_ITEMLESS_VIEWS = frozenset({"arena", "dungeon", "farm", "quests", "more"})
+
+
+def _view_needs_bag(view: str | None) -> bool:
+    return str(view or "") not in _ITEMLESS_VIEWS
+
+
+def _state_payload(entry: str, user_id, xp: int, prefix: str, view: str | None = None) -> dict:
     """Everything the client draws, in one object.
 
     Assembled fresh on every call, including after a mutation, so no screen can show a
@@ -933,6 +945,19 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     quarry_receipt = pets.settle_quarry(entry, user_id)
     mine = [r for r in receipts if str(r.get("user_id")) == str(user_id)]
 
+    with pets.pinned_store(entry):
+        return _assemble_state(entry, user_id, xp, prefix, mine, quarry_receipt, view)
+
+
+def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_receipt,
+                    view: str | None = None) -> dict:
+    """The read-only half, run under one parse of the store (see pets.pinned_store).
+
+    Split out so the pin wraps exactly the reads and nothing else: the settlement above
+    writes, and a write is precisely what the pin refuses to hold across. Twenty-odd
+    helpers each read the store for themselves here, which was measured as most of the
+    cost of a button press.
+    """
     record = pets.get_pet(entry, user_id)
     balance = pets.balance_for(entry, user_id, xp)
     cage = pets.cage_level(entry, user_id)
@@ -986,11 +1011,20 @@ def _state_payload(entry: str, user_id, xp: int, prefix: str) -> dict:
     state["combat"] = _combat_payload(entry, user_id, record)
     state["equipment"] = _equipment_payload(record, prefix)
     state["skills"] = _skills_payload(record, prefix)
+    # Three quarters of this payload by weight, and it goes out on EVERY button press --
+    # a dungeon fight was re-sending the player's whole inventory, card art URLs, effect
+    # text and prices included, to a screen that does not draw a single item. Measured at
+    # 24 KB of a 32 KB response for forty items, which on a phone is most of what the wait
+    # after a tap actually was.
+    #
+    # So it travels only to the screens that render items. `None` is not "empty": it means
+    # "not sent", and the client must fetch before drawing rather than trust what it last
+    # saw, because a fight it just won may well have put something new in there.
     state["bag"] = [
         _item_payload(item, prefix, record)
         for item in (C.find_item(code) for code in record.get("inventory", []))
         if item is not None
-    ]
+    ] if _view_needs_bag(view) else None
     state["arena"] = pets.fight_allowance_breakdown(entry, user_id)
     state["arena"]["farming"] = pets.is_farming(entry, user_id)
     state["arena"]["pity"] = pets.legendary_pity_progress(entry, user_id)
@@ -1280,11 +1314,14 @@ _DUNGEON_ACTIONS = {
 async def handle_state(request: web.Request) -> web.Response:
     user, xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
+    view = request.query.get("view")
     # Assembled in a worker and alongside the two admin gates rather than before them:
     # it is the better part of the request's blocking work, and holding the event loop
     # for it makes every other player waiting on a button press wait for this one too.
     state, (is_admin, is_economy_admin) = await asyncio.gather(
-        asyncio.to_thread(_state_payload, entry, user["id"], xp, request.app[_PREFIX_KEY]),
+        asyncio.to_thread(
+            _state_payload, entry, user["id"], xp, request.app[_PREFIX_KEY], view,
+        ),
         # Whether the moderation entry is even drawn. A convenience for the menu, never a
         # permission: every route behind it asks the same gate again for itself.
         asyncio.gather(
@@ -1382,6 +1419,7 @@ async def handle_action(request: web.Request) -> web.Response:
         "message": message,
         "state": await asyncio.to_thread(
             _state_payload, entry, user["id"], xp, request.app[_PREFIX_KEY],
+            body.get("view"),
         ),
     }
     if str(body.get("action") or "") == "dungeon_fight" and isinstance(extra, dict):
@@ -4299,9 +4337,22 @@ function haptic(kind) {
 // Every mutation goes through here, and every mutation comes back with the whole state --
 // so there is exactly one place where the screen is allowed to change, and no path where
 // the client guesses what a rule did.
+// Screens that draw item cards. The server sends the inventory only to these, because it
+// is three quarters of the payload and a dungeon fight has no use for it (see
+// _view_needs_bag). Kept in step with that list by name.
+const BAG_VIEWS = new Set(["hero", "bag", "shop"]);
+
+// `bag: null` from the server means "not sent", never "empty". Anything that draws items
+// waits for a real one rather than reusing the last it saw -- the fight that just landed
+// may have put something in there.
+async function ensureBag() {
+  if (S && S.bag === null) await refresh();
+}
+
 async function act(action, payload) {
   try {
-    const data = await api("/api/action", Object.assign({ action }, payload || {}));
+    const data = await api("/api/action",
+      Object.assign({ action, view: TAB }, payload || {}));
     S = data.state;
     haptic(data.ok ? "ok" : "no");
     if (data.message) toast(data.message);
@@ -4638,6 +4689,9 @@ let bagSlot = "all", bagRarity = "all", bagSort = "rarity";
 function renderBag() {
   const box = $("scr-bag");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
+  // null is "not fetched yet", not "empty" -- ensureBag is already on its way and will
+  // re-render. Drawing an empty bag here would say the player owns nothing.
+  if (!S.bag) { box.innerHTML = '<div class="empty">Загружаю сумку…</div>'; return; }
   let items = S.bag.slice();
   if (bagSlot !== "all") items = items.filter((i) => i.slot === bagSlot);
   if (bagRarity !== "all") items = items.filter((i) => i.rarity === bagRarity);
@@ -4801,7 +4855,8 @@ function forgePanel() {
     '<div class="small muted" style="margin-bottom:10px">6 проклятых превращаются в редкую проклятую реликвию, ' +
       '5 обычных — в редкий, а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
     recipes.map((recipe) => {
-      const ingredients = recipe.ingredients.map((code) => S.bag.find((item) => item.code === code))
+      const ingredients = recipe.ingredients
+        .map((code) => (S.bag || []).find((item) => item.code === code))
         .filter(Boolean);
       return '<div class="panel" style="margin:8px 0;padding:10px">' +
         '<div class="small"><b>' + recipe.required + ' ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
@@ -7548,7 +7603,7 @@ function render() {
   else if (TAB === "more") renderMore();
 }
 
-$("tabs").addEventListener("click", (event) => {
+$("tabs").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-tab]");
   if (!button) return;
   TAB = button.dataset.tab === "review" ? "more" : button.dataset.tab;
@@ -7556,6 +7611,11 @@ $("tabs").addEventListener("click", (event) => {
   else if (TAB === "more") moreView = "menu";
   haptic();
   render();
+  // Opening a screen that shows items is the one moment the inventory is worth fetching,
+  // so it is fetched HERE rather than on every button press everywhere else. Deliberately
+  // after the first render: the rest of the screen is already correct and paints at once,
+  // and this fills the items in when they land.
+  if (BAG_VIEWS.has(TAB)) await ensureBag();
 });
 
 // The mailbox lives in "Ещё" like every other read-only screen, but it is the one people
@@ -7915,7 +7975,7 @@ function tick() {
 
 async function refresh() {
   try {
-    S = await api("/api/state");
+    S = await api("/api/state?view=" + encodeURIComponent(TAB));
     FOES = null;
     render();
     for (const receipt of S.farm_receipts || []) {

@@ -610,6 +610,52 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(".finally(release)", page)
         self.assertIn("async function handleClick(event, target)", page)
 
+    async def test_the_inventory_only_travels_to_screens_that_draw_items(self):
+        """The bag was three quarters of every response, re-sent on every button press --
+        including dungeon fights, which draw no items at all. It now goes only where it is
+        rendered, and `null` means "not sent" so the client fetches instead of drawing a
+        stale or empty one."""
+        self._tame(PLAYER)
+        for code in [item.code for item in C.items_for_slot("weapon")[:12]]:
+            pets._load(CHAT)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["inventory"] = [
+            item.code for item in C.items_for_slot("weapon")[:12]
+        ]
+        pets._save(CHAT, data)
+
+        for view in ("hero", "bag", "shop"):
+            with self.subTest(view=view):
+                body = await (await self._get("/api/state?view=" + view, PLAYER)).json()
+                self.assertEqual(len(body["bag"]), 12)
+        for view in ("dungeon", "arena", "farm", "quests", "more"):
+            with self.subTest(view=view):
+                body = await (await self._get("/api/state?view=" + view, PLAYER)).json()
+                self.assertIsNone(body["bag"])
+
+        # An unknown or absent view still gets it: withholding it wrongly shows an empty
+        # bag, while sending it needlessly only costs bytes.
+        self.assertIsNotNone((await (await self._get("/api/state", PLAYER)).json())["bag"])
+        self.assertIsNotNone(
+            (await (await self._get("/api/state?view=whatever", PLAYER)).json())["bag"])
+
+        # And an action carries the same view, so a dungeon fight answers small.
+        fight_view = await self._action(PLAYER, "notifications", view="dungeon")
+        self.assertIsNone(fight_view["state"]["bag"])
+        bag_view = await self._action(PLAYER, "notifications", view="bag")
+        self.assertEqual(len(bag_view["state"]["bag"]), 12)
+
+    async def test_the_page_fetches_the_bag_before_drawing_it(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('const BAG_VIEWS = new Set(["hero", "bag", "shop"]);', page)
+        self.assertIn("async function ensureBag()", page)
+        self.assertIn("if (BAG_VIEWS.has(TAB)) await ensureBag();", page)
+        # Every action tells the server which screen is open.
+        self.assertIn('Object.assign({ action, view: TAB }, payload || {})', page)
+        self.assertIn('api("/api/state?view=" + encodeURIComponent(TAB))', page)
+        # A not-yet-fetched bag must never render as an empty one.
+        self.assertIn('if (!S.bag) { box.innerHTML = \'<div class="empty">Загружаю сумку…</div>\'', page)
+
     async def test_a_dungeon_replay_is_faster_and_obeys_the_skip_preference(self):
         """The dungeon's slowness was never the server -- it was ten seconds of replay
         animation after it had already answered."""
