@@ -95,18 +95,55 @@ def _make_console_utf8_safe() -> None:
             pass
 
 
+def _breakdown(entry: str, user_id: str) -> None:
+    """Where this person's XP actually comes from.
+
+    The question worth answering before touching anything: a grant and a genuinely active
+    member look identical in /top. Printing both halves side by side says which one you
+    are looking at, instead of removing a grant and finding they were top anyway.
+    """
+    with _resolved_paths():
+        rows = stats.aggregate_all_time(entry)
+        baseline = stats._load_words_per_point(entry) or stats.DEFAULT_WORDS_PER_POINT
+    user = rows.get(str(user_id))
+    if user is None:
+        print("  В статистике чата этого человека нет.")
+        return
+    total = user.xp(baseline)
+    granted = user.bonus_xp
+    earned = total - granted
+    print(f"\n  Всего XP: {_num(total)}")
+    print(f"    заработано: {_num(earned)}")
+    print(f"    выдано:     {_num(granted)}")
+    if earned:
+        print("  Из заработанного:")
+        parts = (
+            ("сообщения (старый счёт)", user.legacy_message_points),
+            (f"слова ({user.words} / {baseline:g})", round(user.words / baseline)),
+            (f"медиа ×{user.media}", user.media * stats.XP_PER_MEDIA_MESSAGE),
+            (f"ответы ×{user.replies}", user.replies * stats.XP_PER_REPLY),
+            (f"активные дни ×{user.active_days}", user.active_days * stats.XP_PER_ACTIVE_DAY),
+            (f"покрасы ×{user.figurines_painted}",
+             user.figurines_painted * stats.XP_PER_FIGURINE),
+        )
+        for label, value in parts:
+            if value:
+                print(f"    {_num(value):>12}  {label}")
+
+
 def _show(entry: str, user_id: str) -> dict:
     with _resolved_paths():
         grants = stats.xp_grants_for(entry, user_id)
     if not grants:
-        print("  XP-начислений нет — этот игрок свой XP заработал.")
-        return grants
-    total = sum(row["amount"] for row in grants.values())
-    print(f"  Выданный XP: {_num(total)}")
-    for key, row in sorted(grants.items(), key=lambda item: -item[1]["amount"]):
-        print(f"    {_num(row['amount']):>14} XP  ·  {row['granted_at'] or '?'}"
-              f"  ·  ключ «{key}»")
-    print(f"  Это даёт монет: {_num(total // stats.XP_PER_COIN)}")
+        print("  XP-начислений нет — весь XP этого игрока заработан.")
+    else:
+        total = sum(row["amount"] for row in grants.values())
+        print(f"  Выданный XP: {_num(total)}")
+        for key, row in sorted(grants.items(), key=lambda item: -item[1]["amount"]):
+            print(f"    {_num(row['amount']):>14} XP  ·  {row['granted_at'] or '?'}"
+                  f"  ·  ключ «{key}»")
+        print(f"  Это даёт монет: {_num(total // stats.XP_PER_COIN)}")
+    _breakdown(entry, user_id)
     return grants
 
 
