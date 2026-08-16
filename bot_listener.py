@@ -5773,6 +5773,7 @@ async def _send_quest_submission_notifications(
     if not moderators:
         log(f"[pets] quest submission {submission.get('id')} in '{entry}' has no delegated moderators")
         return
+    delivered = []
     for moderator in moderators:
         moderator_id = str(moderator.get("user_id") or "").strip()
         if not moderator_id:
@@ -5781,13 +5782,64 @@ async def _send_quest_submission_notifications(
             moderator_id, submission, webapp_url,
         )
         try:
-            await api.send_message(moderator_id, text, reply_markup=keyboard, parse_mode="HTML")
+            sent = await api.send_message(
+                moderator_id, text, reply_markup=keyboard, parse_mode="HTML",
+            )
+            if sent and "message_id" in sent:
+                delivered.append((moderator_id, sent["message_id"]))
         except Exception:
             # A moderator may not have started the bot yet. Their queue entry remains
             # available in both review surfaces; one unreachable DM cannot block peers.
             log(
                 f"[pets] failed to notify quest moderator {moderator_id} about "
                 f"submission {submission.get('id')}:\n{traceback.format_exc()}"
+            )
+    # Remembered so the verdict can come back and strike these through -- see
+    # mark_quest_submission_reviewed.
+    quests.record_notifications(entry, submission.get("id"), delivered)
+
+
+async def mark_quest_submission_reviewed(
+    api, entry: str, submission: dict, accepted: bool, reviewer_name: str = "", log=print,
+) -> None:
+    """Show, in both places anybody is looking, that a submission has been dealt with.
+
+    Two audiences, two mechanisms:
+
+      THE CHAT sees a reaction on the original photo. It has to be one of Telegram's fixed
+      quick-reaction emoji or setMessageReaction fails silently and nothing appears at all
+      -- 👍/👎 are the two safest members of that set (see FIGURINE_ACK_EMOJI's note).
+
+      EVERY MODERATOR sees their own alert rewritten with the outcome and its buttons
+      taken away, so the queue does not keep offering work that is already settled. All of
+      them, not just whoever pressed: the other alerts are exactly where a duplicate
+      review comes from.
+
+    Best-effort throughout. The verdict and its payment are already durable by the time
+    this runs, so nothing here may raise its way into undoing them.
+    """
+    chat_id = submission.get("chat_id")
+    message_id = submission.get("message_id")
+    if chat_id is not None and message_id is not None:
+        await api.set_message_reaction(
+            chat_id, message_id, "👍" if accepted else "👎", log=log,
+        )
+    verdict = "✅ Принято" if accepted else "❌ Отклонено"
+    if reviewer_name:
+        verdict += f" · {reviewer_name}"
+    for row in quests.notifications_for(entry, submission.get("id")):
+        try:
+            await api.edit_message_text(
+                row["chat_id"], row["message_id"],
+                f"{verdict}\n\n{pets_ui.quest_submission_summary(submission)}",
+                reply_markup=None, parse_mode="HTML",
+            )
+        except Exception:
+            # An edit fails for ordinary reasons (the moderator deleted it, the text is
+            # unchanged). The reaction and the payment stand regardless.
+            log(
+                f"[pets] could not mark quest alert {row.get('message_id')} reviewed:\n"
+                f"{traceback.format_exc()}"
             )
 
 
@@ -6444,6 +6496,9 @@ async def handle_pets_callback(
                 if accepted:
                     submission["paid"] = dict(receipt)
                     await _send_quest_completion(api, submission, log)
+                    await mark_quest_submission_reviewed(
+                        api, entry, submission, True, _display_name(actor), log=log,
+                    )
                 await _pets_toast_and_redraw(
                     api, chat_id, message_id, note,
                     pets_ui.quest_review_view(entry, user_id), log,
@@ -7911,6 +7966,9 @@ async def maybe_handle_pets_flow_message(
                     )
                 except Exception:
                     log(f"[pets] failed to send quest feedback:\n{traceback.format_exc()}")
+                await mark_quest_submission_reviewed(
+                    api, entry, row, False, _display_name(actor), log=log,
+                )
             await _send_pets_view(
                 api, chat_id,
                 pets_ui.quest_review_view(entry, user.user_id) if ok
@@ -9371,6 +9429,15 @@ async def run_bot_listener(
                         parse_mode=None,
                     )
 
+                async def _mark_web_quest_reviewed(submission, accepted, reviewer_name):
+                    """A verdict reached in the Mini App marks the work dealt with in the
+                    chat and in every moderator's alert, exactly as one reached in the bot
+                    does -- the two review surfaces must not leave different traces."""
+                    await mark_quest_submission_reviewed(
+                        api, home_chat_ref or "", submission, accepted, reviewer_name,
+                        log=log,
+                    )
+
                 async def _send_web_support_pledge(pledge: dict):
                     """A pledge left in the Mini App reaches the owner the same way one
                     left in the bot does -- same message, same best-effort delivery."""
@@ -9392,6 +9459,7 @@ async def run_bot_listener(
                     quest_completion=_send_web_quest_completion,
                     birthday_notify=_send_birthday_greeting,
                     support_notify=_send_web_support_pledge,
+                    quest_reviewed=_mark_web_quest_reviewed,
                     log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see

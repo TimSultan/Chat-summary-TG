@@ -997,6 +997,37 @@ def _find_submission(data: dict, submission_id) -> dict | None:
     return None
 
 
+def record_notifications(entry: str, submission_id, sent: list[tuple]) -> None:
+    """Remember which moderator DMs announced this submission, as (chat_id, message_id).
+
+    Kept so a verdict can go back and mark those messages decided. Without it a moderator
+    who reviewed in the Mini App would leave every OTHER moderator looking at a live
+    "Принять/Отклонить" card for work that was settled ten minutes ago -- and tapping it
+    is how two people end up reviewing the same photo.
+    """
+    rows = [
+        {"chat_id": chat_id, "message_id": int(message_id)}
+        for chat_id, message_id in sent
+        if message_id is not None
+    ]
+    if not rows:
+        return
+    with _lock:
+        data = _load(entry)
+        row = _find_submission(data, submission_id)
+        if row is None:
+            return
+        row["notifications"] = rows
+        _save(entry, data)
+
+
+def notifications_for(entry: str, submission_id) -> list[dict]:
+    data = _load(entry)
+    row = _find_submission(data, submission_id)
+    stored = (row or {}).get("notifications")
+    return [dict(item) for item in stored] if isinstance(stored, list) else []
+
+
 def _public_submission(row: dict) -> dict:
     return {
         "id": row.get("id"),

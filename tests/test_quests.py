@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import bot_listener
 import economy
 import pets
 import pets_config
@@ -1140,3 +1141,103 @@ class SupportButtonTests(unittest.TestCase):
                 self.assertEqual(
                     pets_ui.parse_callback(rows[-1][0]["callback_data"])[1], "main",
                 )
+
+
+class ReviewedSubmissionIsMarkedTests(unittest.IsolatedAsyncioTestCase):
+    """A verdict has to be visible where people are looking, not only in the database.
+
+    Two audiences: the chat sees a reaction on the photo, and every moderator's private
+    alert is rewritten with the outcome and stripped of its buttons -- all of them, not
+    just whoever pressed, because the other live alerts are exactly where a second review
+    of the same photo comes from.
+    """
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+        class FakeApi:
+            def __init__(self):
+                self.reactions, self.edits, self.sent = [], [], []
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.sent.append((str(chat_id), text))
+                return {"message_id": 900 + len(self.sent)}
+
+            async def set_message_reaction(self, chat_id, message_id, emoji, log=print):
+                self.reactions.append((chat_id, message_id, emoji))
+
+            async def edit_message_text(self, chat_id, message_id, text,
+                                        reply_markup=None, parse_mode=None):
+                self.edits.append((str(chat_id), message_id, text, reply_markup))
+
+        self.api = FakeApi()
+
+    async def _queued(self, entry="chat"):
+        quests.add_moderator(entry, "77", "mod1", "Мод1")
+        quests.add_moderator(entry, "88", "mod2", "Мод2")
+        code = quests.daily_quest(entry, "1")["quests"][0]["code"]
+        self.assertTrue(quests.submit(
+            entry, "1", code, chat_id=-1001, message_id=555, author_name="Вася",
+        )[0])
+        submission = quests.pending(entry)[0]
+        await bot_listener._send_quest_submission_notifications(
+            self.api, entry, submission, None, log=lambda *_: None,
+        )
+        return submission
+
+    async def test_an_accepted_work_is_thumbed_up_and_every_alert_is_settled(self):
+        submission = await self._queued()
+        # Both alerts are remembered, or only the moderator who pressed would see it close.
+        self.assertEqual(len(quests.notifications_for("chat", submission["id"])), 2)
+
+        quests.review("chat", submission["id"], "77", True, reviewer_name="Мод1")
+        await bot_listener.mark_quest_submission_reviewed(
+            self.api, "chat", submission, True, "Мод1", log=lambda *_: None,
+        )
+
+        # The reaction lands on the original post in the chat, not on a bot message.
+        self.assertEqual(self.api.reactions, [(-1001, 555, "👍")])
+        self.assertEqual(len(self.api.edits), 2)
+        for _chat, _mid, text, markup in self.api.edits:
+            self.assertIn("✅ Принято", text)
+            self.assertIn("Мод1", text)
+            # Buttons gone: a settled item must not still offer a review button.
+            self.assertIsNone(markup)
+
+    async def test_a_rejected_work_is_thumbed_down(self):
+        submission = await self._queued()
+        quests.review("chat", submission["id"], "77", False,
+                      reviewer_name="Мод1", note="переделай свет")
+        await bot_listener.mark_quest_submission_reviewed(
+            self.api, "chat", submission, False, "Мод1", log=lambda *_: None,
+        )
+        self.assertEqual(self.api.reactions, [(-1001, 555, "👎")])
+        self.assertTrue(all("❌ Отклонено" in text for _c, _m, text, _k in self.api.edits))
+
+    async def test_the_reaction_uses_emoji_telegram_actually_accepts(self):
+        """setMessageReaction only takes Telegram's fixed quick-reaction set and fails
+        silently on anything else -- which is how the 🎨 figurine ack was broken for
+        months with no symptom at all."""
+        submission = await self._queued()
+        for accepted in (True, False):
+            self.api.reactions.clear()
+            await bot_listener.mark_quest_submission_reviewed(
+                self.api, "chat", submission, accepted, "Мод1", log=lambda *_: None,
+            )
+            emoji = self.api.reactions[0][2]
+            self.assertIn(emoji, {"👍", "👎"})
+
+    async def test_a_submission_posted_outside_the_chat_is_still_settled(self):
+        """A submission can reach the queue without chat coordinates. That must skip the
+        reaction, not skip the moderator alerts along with it."""
+        submission = await self._queued()
+        submission = {**submission, "chat_id": None, "message_id": None}
+        await bot_listener.mark_quest_submission_reviewed(
+            self.api, "chat", submission, True, "Мод1", log=lambda *_: None,
+        )
+        self.assertEqual(self.api.reactions, [])
+        self.assertEqual(len(self.api.edits), 2)

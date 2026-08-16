@@ -984,6 +984,13 @@ def quest_review_view(entry: str, user_id) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": keyboard}
 
 
+def quest_submission_summary(submission: dict) -> str:
+    """Which work, by whom -- the two lines an alert keeps once its buttons are gone."""
+    title = str(submission.get("title") or submission.get("code") or "Квест")
+    author = str(submission.get("author_name") or submission.get("author_username") or "Игрок")
+    return f"<b>{escape(title)}</b>\nАвтор: {escape(author)}"
+
+
 def quest_submission_notification_view(
     moderator_id, submission: dict, webapp_url: str | None = None,
 ) -> tuple[str, dict]:
@@ -993,12 +1000,9 @@ def quest_submission_notification_view(
     two existing review surfaces.  Keeping the moderator id in the Telegram callback
     preserves the same forwarded-message protection as the rest of the pet menu.
     """
-    title = str(submission.get("title") or submission.get("code") or "Квест")
-    author = str(submission.get("author_name") or submission.get("author_username") or "Игрок")
     lines = [
         "🎯 Новая заявка на проверку квеста.",
-        f"<b>{escape(title)}</b>",
-        f"Автор: {escape(author)}",
+        quest_submission_summary(submission),
     ]
     keyboard = []
     if webapp_url:

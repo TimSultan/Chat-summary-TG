@@ -2954,6 +2954,17 @@ async def handle_quest_review(request: web.Request) -> web.Response:
             request.app[_LOG_KEY](
                 "[pets_web] failed to send quest verdict DM:\n" + traceback.format_exc()
             )
+        # Separately guarded from the DM above: telling the author and marking the work
+        # dealt with are different jobs, and a player who has never opened the bot must not
+        # stop the chat and the other moderators from seeing that it is settled.
+        try:
+            await request.app[_QUEST_REVIEWED_KEY](
+                queued, accept, user.get("first_name") or user.get("username") or "",
+            )
+        except Exception:
+            request.app[_LOG_KEY](
+                "[pets_web] failed to mark a quest reviewed:\n" + traceback.format_exc()
+            )
     return _ok({"ok": ok, "message": message, "receipt": _jsonable(receipt)})
 
 
