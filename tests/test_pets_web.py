@@ -590,6 +590,39 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(body["progression"]["measures"]["level"]["mine"])
         self.assertIsNone(body["progression"]["measures"]["level"]["percentile"])
 
+    async def test_a_tap_shows_itself_immediately_and_for_as_long_as_it_takes(self):
+        """A slow answer must not be indistinguishable from a button that never noticed
+        the press. Two halves: :active paints in the same frame as the finger without any
+        JavaScript, and .pressed is held for as long as the handler's work is in flight."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn(".go:active:not(:disabled)", page)
+        self.assertIn(".dungeon-enemy:active:not(:disabled)", page)
+        self.assertIn(".pressed {", page)
+        self.assertIn("@keyframes pressspin", page)
+        # Without this the browser sits on the tap for 300ms before dispatching at all.
+        self.assertIn("touch-action: manipulation", page)
+        self.assertIn("prefers-reduced-motion: reduce", page)
+
+        # The busy class is applied by the delegated handler and released when the work
+        # settles, whatever it was.
+        self.assertIn('target.classList.add("pressed")', page)
+        self.assertIn('target.classList.remove("pressed")', page)
+        self.assertIn(".finally(release)", page)
+        self.assertIn("async function handleClick(event, target)", page)
+
+    async def test_a_dungeon_replay_is_faster_and_obeys_the_skip_preference(self):
+        """The dungeon's slowness was never the server -- it was ten seconds of replay
+        animation after it had already answered."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("const DUEL_ROUND_MS = 300;", page)
+        self.assertNotIn(": 520);", page)
+        # One preference about watching replays, honoured for the dungeon boss too.
+        self.assertIn(
+            "if (data.battle && !(S.pet && S.pet.skip_pve_replays)) playDuel(data.battle);",
+            page,
+        )
+        self.assertIn("data.pve || data.dungeon ?", page)
+
     async def test_the_overview_screen_is_wired_into_the_page(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn('econstats:📊 Экономика и прогресс', page)

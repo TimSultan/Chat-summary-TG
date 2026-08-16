@@ -3264,6 +3264,35 @@ PAGE_HTML = """<!doctype html>
   .go.sec { background: transparent; border: 1px solid var(--line); color: var(--fg); }
   .go.warn { background: var(--hp); color: #fff; }
   .go:disabled { opacity: .4; }
+
+  /* ------------------------------------------------------------------- press feedback
+     A tap has to show something BEFORE the network does, or a slow answer is
+     indistinguishable from a button that never registered the press. :active fires on
+     touch-down, costs nothing and needs no JavaScript, so it lands in the same frame as
+     the finger. `touch-action: manipulation` drops the 300ms double-tap-zoom delay
+     browsers otherwise sit on before dispatching the click at all. */
+  .go, .chip, .dungeon-enemy, .foe, .mobcard button, .item, .slot {
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+    transition: transform .06s ease-out, filter .06s ease-out;
+  }
+  .go:active:not(:disabled), .chip:active, .dungeon-enemy:active:not(:disabled),
+  .foe:active, .item:active, .slot:active {
+    transform: scale(.97); filter: brightness(1.25);
+  }
+  /* And once the press is over, the wait itself needs a face: `.pressed` is held for as
+     long as the request is in flight, so the button stays visibly the one that was
+     tapped instead of going quiet the instant the finger lifts. */
+  .pressed { position: relative; filter: brightness(1.15) saturate(.8); opacity: .75; }
+  .pressed::after {
+    content: ""; position: absolute; top: 50%; right: 9px; width: 13px; height: 13px;
+    margin-top: -7px; border-radius: 50%; border: 2px solid currentColor;
+    border-right-color: transparent; animation: pressspin .5s linear infinite;
+  }
+  @keyframes pressspin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .go, .chip, .dungeon-enemy, .foe, .mobcard button, .item, .slot { transition: none; }
+    .pressed::after { animation: none; }
+  }
   .dungeon { overflow: hidden; padding: 0; border-color: rgba(232,185,35,.45); }
   .dungeon-head { min-height: 142px; position: relative; padding: 15px; display: flex; align-items: flex-end; background: repeating-linear-gradient(135deg, #1d3c3e 0 18px, #162a34 18px 36px); }
   .dungeon-head.boss { background: repeating-linear-gradient(135deg, #502331 0 18px, #201e31 18px 36px); }
@@ -4280,7 +4309,11 @@ async function act(action, payload) {
     if (!data.ok && !S.pet && String(data.message || "").includes("Сначала приручи существо")) {
       openPetCreation();
     }
-    if (data.battle) playDuel(data.battle);
+    // «Пропускать бои» is one preference about watching replays, so it covers the dungeon
+    // boss too -- it used to be honoured for mobs only, which left the player who asked
+    // for speed sitting through the longest animation in the game. The transcript is not
+    // lost: the reward line is toasted above and the fight stays in Историю боёв.
+    if (data.battle && !(S.pet && S.pet.skip_pve_replays)) playDuel(data.battle);
     return data.ok;
   } catch (e) {
     haptic("no");
@@ -7354,6 +7387,13 @@ function duelFighter(fighter, fallbackArt) {
     "</article>";
 }
 
+// Milliseconds an ordinary blow is left on screen before the next one. Was 520, which a
+// twenty-round boss turned into ten seconds of watching before the dungeon would take
+// another tap -- the single biggest reason a dungeon fight FELT slow, long after the
+// server had already answered in about twenty milliseconds. Still slow enough to read a
+// line at a time; the Пропустить button remains for anybody who does not want to.
+const DUEL_ROUND_MS = 300;
+
 function playDuel(data) {
   const me = data.you;
   const maxHp = data.max_hp || {};
@@ -7421,8 +7461,11 @@ function playDuel(data) {
         "</span></div></div>" : ""));
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
     const controls = $("duelControls");
+    // Offered on the dungeon replay as well, not just PVE: it is the same preference, and
+    // the boss animation is where somebody is most likely to want it -- having to go and
+    // find the toggle in «Ещё» is the wrong place to learn it exists.
     controls.innerHTML = '<button class="go" id="duelDone">Закрыть</button>' +
-      (data.pve ? '<button class="go sec" id="duelReplayPreference">' +
+      (data.pve || data.dungeon ? '<button class="go sec" id="duelReplayPreference">' +
         ((S.pet && S.pet.skip_pve_replays) ? "Не пропускать бои" : "Пропускать бои") +
         '</button>' : '');
     $("duelDone").onclick = () => { view.remove(); render(); };
@@ -7460,7 +7503,7 @@ function playDuel(data) {
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
     // Passive consequences stay visually attached to the action that caused them.
     // They are quick transcript details, never an implied extra combat turn.
-    setTimeout(step, round.is_action === false ? 160 : 520);
+    setTimeout(step, round.is_action === false ? 110 : DUEL_ROUND_MS);
   };
   $("duelDone").onclick = () => {
     // Skipping fast-forwards the animation, not the formatting: the lines it dumps are
@@ -7533,8 +7576,7 @@ $("hudCreate").addEventListener("click", () => {
 // One delegated handler for the whole game. Every control is a data- attribute rather than
 // a bound listener, so a re-render (which replaces all of it) cannot leave a dead button
 // or a duplicated one behind.
-document.addEventListener("click", async (event) => {
-  const target = event.target.closest("[data-item],[data-slot],[data-up],[data-do],[data-act]," +
+const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
@@ -7542,8 +7584,9 @@ document.addEventListener("click", async (event) => {
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
-    "[data-grantpick],[data-grantset]");
-  if (!target) return;
+    "[data-grantpick],[data-grantset]";
+
+async function handleClick(event, target) {
   const d = target.dataset;
   if (d.dungeon) {
     const actions = { enter: "dungeon_enter", escalator: "dungeon_escalator", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit" };
@@ -7751,6 +7794,33 @@ document.addEventListener("click", async (event) => {
       if (name) await act("rename", { name });
     };
   }
+}
+
+// The wrapper exists for one reason: to hold `.pressed` on the button for exactly as long
+// as its work is in flight. :active alone ends the moment the finger lifts, which on a
+// slow answer leaves the player looking at a screen that has visibly forgotten the tap --
+// the "нажалось или нет?" this is here to answer. Purely visual: nothing is swallowed or
+// serialised, because the paths that must not double-fire already guard themselves (a
+// queued mob fight, a server-side race check), and blocking here would break the mob
+// queue that deliberately accepts fast repeat taps.
+document.addEventListener("click", (event) => {
+  const target = event.target.closest(CLICKABLE);
+  if (!target) return;
+  target.classList.add("pressed");
+  let settled = false;
+  const release = () => {
+    if (settled) return;
+    settled = true;
+    target.classList.remove("pressed");
+  };
+  // A render replaces the button outright, so most releases are cosmetic cleanup on a
+  // node that is already gone. The timeout is the backstop for a handler that neither
+  // re-renders nor resolves -- a sheet that opens and waits on the player, say.
+  setTimeout(release, 8000);
+  Promise.resolve()
+    .then(() => handleClick(event, target))
+    .catch((error) => { toast(String((error && error.message) || error)); })
+    .finally(release);
 });
 
 // User filtering is entirely local: typing must feel instant and must not turn every
