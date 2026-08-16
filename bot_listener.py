@@ -72,6 +72,7 @@ import button_builder
 import casino
 import donations
 import economy
+import maintenance
 import history
 import pets
 import pets_combat
@@ -6238,6 +6239,26 @@ async def _pets_start_flow(
     return flow
 
 
+# Buttons that only DRAW a screen, and are therefore safe while the game is paused for an
+# update. Kept as an allowlist rather than a list of things to block: a pause should fail
+# closed, so an action somebody adds next month is refused until it has been thought about,
+# instead of quietly slipping through the one gate meant to hold everything still.
+#
+# Navigation stays open so a player who opens the menu mid-update reads the notice on a
+# working screen rather than meeting a wall of refusals.
+PAUSE_SAFE_PET_ACTIONS = frozenset({
+    "main", "info", "noop", "pet", "bag", "bagitems", "cage", "farm", "train", "fight",
+    "history", "mail", "updates", "leaderboard", "slot", "shopslot", "skills", "skillpick",
+    "forge", "weaponforge", "quests", "questdetail", "questmods", "dailybonus",
+    "paintrune", "paintrunes", "casino", "ccombos", "cpokerstyles",
+    # Reviewing is moderation, not play: it changes quest state but touches nothing a
+    # restart can catch mid-write, and holding up the queue during an update helps nobody.
+    "questreview", "questaccept", "questreject",
+    # The collection is a standing offer and takes no game state at all.
+    "support", "supportgive",
+})
+
+
 async def handle_pets_callback(
     api: TelegramBotAPI,
     telethon_client,
@@ -6284,6 +6305,12 @@ async def handle_pets_callback(
         return
     if action == "noop":
         await api.answer_callback_query(callback_id, "Уже максимум.")
+        return
+    paused = maintenance.status()
+    if paused["paused"] and action not in PAUSE_SAFE_PET_ACTIONS:
+        # Answered on the button itself: the player is mid-tap, and a toast is where they
+        # are already looking. The menu behind it is left exactly as it was.
+        await api.answer_callback_query(callback_id, paused["notice"][:200])
         return
     no_arena_fights = (
         action in {"search", "attack"}

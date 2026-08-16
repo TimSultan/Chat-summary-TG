@@ -51,6 +51,7 @@ from aiohttp import web
 
 import donations
 import economy
+import maintenance
 import pets
 import pets_combat
 import pets_config as C
@@ -1009,6 +1010,9 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         },
         "farm_receipts": mine,
         "quarry_receipt": quarry_receipt,
+        # So the page can say WHY a button did nothing, rather than letting the player
+        # discover it one refusal at a time.
+        "maintenance": maintenance.status(),
         "unread_updates": pets_updates.has_unread(entry, user_id),
         "quest_attention": quests.has_available_quests(entry, user_id),
         "personal_paint": pets.personal_paint_status(entry, user_id),
@@ -1402,6 +1406,10 @@ async def handle_action(request: web.Request) -> web.Response:
     if not await _is_member(request, user):
         return _json_error("Играть могут только участники чата.", status=403, code="NOT_A_MEMBER")
 
+    paused = _paused_response()
+    if paused is not None:
+        return paused
+
     action = _ACTIONS.get(str(body.get("action") or ""))
     if action is None:
         return _json_error("Неизвестное действие.", status=400, code="UNKNOWN_ACTION")
@@ -1781,6 +1789,9 @@ async def handle_attack(request: web.Request) -> web.Response:
 
     if not await _is_member(request, user):
         return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    paused = _paused_response()
+    if paused is not None:
+        return paused
 
     me = str(user["id"])
     opponent_id = str(body.get("opponent_id") or "")
@@ -2045,6 +2056,9 @@ async def handle_mob_attack(request: web.Request) -> web.Response:
     entry = request.app[_ENTRY_KEY]
     if not await _is_member(request, user):
         return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    paused = _paused_response()
+    if paused is not None:
+        return paused
     me = str(user["id"])
     # No artificial per-request cooldown here: record_mob_fight already serialises the
     # read-check-increment-save of pve_used under _farm_settlement_lock, so a burst of
@@ -2240,6 +2254,9 @@ async def handle_congratulate(request: web.Request) -> web.Response:
     entry = request.app[_ENTRY_KEY]
     if not await _is_member(request, user):
         return _json_error("Поздравлять могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    paused = _paused_response()
+    if paused is not None:
+        return paused
 
     me = str(user["id"])
     try:
@@ -2566,6 +2583,30 @@ def _grant_admin_payload(entry: str) -> dict:
     }
 
 
+async def handle_maintenance(request: web.Request) -> web.Response:
+    """Read or flip the pause. Chat admins only, and deliberately NOT behind the pause
+    itself -- the switch that reopens the game has to work while the game is closed."""
+    if request.method == "GET":
+        await _economy_admin(request)
+        return _ok(maintenance.status())
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _economy_admin(request, body)
+    who = user.get("first_name") or user.get("username") or str(user.get("id"))
+    if body.get("paused"):
+        state = await asyncio.to_thread(
+            maintenance.pause, str(body.get("notice") or ""), who,
+        )
+    else:
+        state = await asyncio.to_thread(maintenance.resume, who)
+    request.app[_LOG_KEY](
+        f"[pets_web] {user['id']} set maintenance paused={state['paused']}"
+    )
+    return _ok(state)
+
+
 async def handle_grant_admin(request: web.Request) -> web.Response:
     """Everybody an admin could hand gold, rubies or tickets to. Chat admins only."""
     await _economy_admin(request)
@@ -2799,6 +2840,19 @@ async def handle_support_pledge(request: web.Request) -> web.Response:
             "[pets_web] failed to deliver a support pledge:\n" + traceback.format_exc()
         )
     return _ok({"thanks": donations.THANKS, "pledge_id": pledge["id"]})
+
+
+def _paused_response():
+    """A refusal while the game is closed for an update, or None when it is open.
+
+    Called from the routes that START something -- a fight, a run, a purchase. Reading is
+    left alone on purpose: somebody who opens the game mid-update should find their
+    creature and an explanation rather than an error, and the explanation is only useful
+    if the screen around it still draws.
+    """
+    if not maintenance.is_paused():
+        return None
+    return _json_error(maintenance.notice(), status=503, code="PAUSED")
 
 
 def _support_amount(value) -> int | None:
@@ -3201,6 +3255,8 @@ def attach(
         web.get(prefix + "/img/sprite/{user_id}/{frame}.png", handle_sprite_frame),
         web.get(prefix + "/api/debuff", handle_debuff_admin),
         web.post(prefix + "/api/debuff", handle_debuff_set),
+        web.get(prefix + "/api/maintenance", handle_maintenance),
+        web.post(prefix + "/api/maintenance", handle_maintenance),
         web.get(prefix + "/api/grant", handle_grant_admin),
         web.post(prefix + "/api/grant", handle_grant_set),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
@@ -3755,6 +3811,12 @@ PAGE_HTML = """<!doctype html>
   .qtag.review { border-style: solid; border-color: var(--gold); color: var(--gold); }
   /* The reroll trade-off, said next to the button rather than discovered after it: a
      reroll climbs a difficulty, so it is a choice and not a free respin. */
+  /* Pinned above everything while the game is closed for an update. Loud enough not to
+     be missed, calm enough not to read as an error -- nothing is wrong, it is just busy. */
+  .maint-bar { position: sticky; top: 0; z-index: 40; margin: 0 0 10px;
+               background: rgba(232,185,35,.14); border: 1px solid var(--gold);
+               border-radius: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.45;
+               color: var(--fg); }
   .warn-note { margin-top: 7px; font-size: 11px; line-height: 1.4; color: var(--gold);
                text-align: center; }
   .qbadge { flex: none; font-size: 10px; font-weight: 700; color: var(--r-legendary);
@@ -6342,6 +6404,42 @@ function economyAudit(data) {
     (report.log_at_capacity ? '<div class="warn-note">Журнал достиг лимита; самые старые операции уже удалены.</div>' : '');
 }
 
+// ------------------------------------------------------------------------ pause the game
+function maintenancePanel(state) {
+  const paused = Boolean(state && state.paused);
+  return '<div class="panel"><h2>⚠️ Пауза игры</h2>' +
+    '<div class="small" style="margin-bottom:10px">' +
+      (paused
+        ? '🔴 <b>Игра закрыта.</b> Бои, походы и покупки не начинаются; ' +
+          'чтение работает. Ферма и карьер идут как шли.'
+        : '🟢 <b>Игра открыта.</b>') + '</div>' +
+    (paused && state.since
+      ? '<div class="tiny muted" style="margin-bottom:10px">С ' + esc(String(state.since).slice(0, 16).replace("T", " ")) +
+        (state.by ? ' · ' + esc(state.by) : '') + '</div>'
+      : '') +
+    '<div class="small muted" style="margin-bottom:4px">Что увидят игроки</div>' +
+    '<textarea class="inp" id="maintNotice" style="min-height:70px;text-align:left">' +
+      esc(paused ? (state.notice || "") : "") + '</textarea>' +
+    '<button class="go' + (paused ? ' sec' : ' warn') + '" style="margin-top:10px" ' +
+      'data-maint="' + (paused ? "off" : "on") + '">' +
+      (paused ? "🟢 Открыть игру" : "🔴 Закрыть на обновление") + '</button>' +
+    '<div class="tiny muted" style="margin-top:9px">Порядок: закрыть → задеплоить → ' +
+      'проверить → открыть. Этот экран работает и во время паузы.</div></div>';
+}
+
+async function setMaintenance(on) {
+  const field = $("maintNotice");
+  try {
+    const state = await api("/api/maintenance",
+      { paused: Boolean(on), notice: (field && field.value) || "" });
+    haptic("ok");
+    toast(state.paused ? "Игра закрыта." : "Игра открыта.");
+    await refresh();
+    moreView = "maintenance";
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+}
+
 // --------------------------------------------------------------- supporting the project
 // Three steps, each its own sheet: read, confirm, name a number. Split up rather than
 // crammed into one form on purpose -- the confirm step exists so that tapping a new
@@ -6600,6 +6698,7 @@ async function renderMore() {
     if (S && S.is_economy_admin) menu.push("birthday:🎂 День рождения");
     if (S && S.is_economy_admin) menu.push("debuff:🎭 Эффекты игрокам");
     if (S && S.is_economy_admin) menu.push("grant:🎁 Выдать ресурсы");
+    if (S && S.is_economy_admin) menu.push("maintenance:⚠️ Пауза игры");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -6655,6 +6754,8 @@ async function renderMore() {
     body = debuffAdmin(await api("/api/debuff"));
   } else if (moreView === "grant") {
     body = grantAdmin(await api("/api/grant"));
+  } else if (moreView === "maintenance") {
+    body = maintenancePanel(await api("/api/maintenance"));
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -7814,6 +7915,22 @@ async function renderQuests() {
 
 function render() {
   renderHud();
+  // One banner for the whole app rather than a line per screen: a pause applies to
+  // everything, and a screen that forgot to mention it is where "why did nothing happen"
+  // comes from.
+  const maintenance = (S && S.maintenance) || {};
+  let bar = $("maintBar");
+  if (maintenance.paused) {
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "maintBar";
+      bar.className = "maint-bar";
+      $("main").prepend(bar);
+    }
+    bar.textContent = maintenance.notice || "Идёт обновление игры.";
+  } else if (bar) {
+    bar.remove();
+  }
   for (const name of ["hero", "bag", "shop", "arena", "dungeon", "farm", "quests", "more"]) {
     $("scr-" + name).hidden = name !== TAB;
   }
@@ -7903,7 +8020,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
-    "[data-grantpick],[data-grantset],[data-support]";
+    "[data-grantpick],[data-grantset],[data-support],[data-maint]";
 
 async function handleClick(event, target) {
   const d = target.dataset;
@@ -7930,6 +8047,7 @@ async function handleClick(event, target) {
     closeSheet();
     return;
   }
+  if (d.maint) { await setMaintenance(d.maint === "on"); return; }
   if (d.grantpick !== undefined) { grantPick = d.grantpick; render(); return; }
   if (d.grantset !== undefined) { await setGrant(d.grantset); return; }
 

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bot_listener
 import donations
 import economy
+import maintenance
 import pets
 import pets_config as C
 import pets_mobs
@@ -254,6 +255,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def _get(self, path, user):
         return await self.client.get(pets_web.ROUTE_PREFIX + path, headers=self._auth(user))
+
+    async def _action_raw(self, user, action, **payload):
+        """POST /api/action without asserting the transport succeeded -- for the tests
+        that are about the status code itself."""
+        return await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+            "init_data": _init_data(user["id"]), "action": action, **payload,
+        })
 
     async def _action(self, user, action, **payload):
         """POST /api/action, asserting only the transport succeeded (HTTP 200) -- a
@@ -515,6 +523,76 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         denied = await self._get("/api/economy/audit", PLAYER)
         self.assertEqual(denied.status, 403)
         self.assertEqual((await denied.json())["error"], "NOT_AN_ECONOMY_ADMIN")
+
+
+    # ---- the pause switch ----------------------------------------------------------
+    # Methods on the existing suite rather than a subclass of it: a subclass inherits
+    # and re-runs every parent test, which is a hundred-odd duplicates for four new
+    # assertions. Each one reopens the game via addCleanup -- a leaked pause would fail
+    # every later test in the file with a 503 and no obvious cause.
+
+    async def test_actions_are_refused_while_reads_keep_working(self):
+        self._tame(PLAYER)
+        self.addCleanup(maintenance.resume)
+        maintenance.pause("Обновление, минут на пять")
+
+        refused = await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+            "init_data": _init_data(PLAYER["id"]), "action": "notifications",
+        })
+        self.assertEqual(refused.status, 503, await refused.text())
+        body = await refused.json()
+        self.assertEqual(body["error"], "PAUSED")
+        self.assertIn("минут на пять", body["message"])
+
+        # Fighting is the thing most worth stopping mid-deploy.
+        attack = await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+        })
+        self.assertEqual(attack.status, 503, await attack.text())
+
+        # And the screen still draws, carrying the reason with it.
+        state = await self._get("/api/state", PLAYER)
+        self.assertEqual(state.status, 200)
+        payload = await state.json()
+        self.assertTrue(payload["maintenance"]["paused"])
+        self.assertIn("минут на пять", payload["maintenance"]["notice"])
+        self.assertEqual(payload["pet"]["name"], "Кабанчик")
+
+    async def test_everything_works_again_the_moment_it_is_reopened(self):
+        self._tame(PLAYER)
+        self.addCleanup(maintenance.resume)
+        maintenance.pause("Обновление")
+        self.assertEqual(
+            (await self._action_raw(PLAYER, "notifications")).status, 503)
+        maintenance.resume()
+        answer = await self._action(PLAYER, "notifications")
+        self.assertTrue(answer["ok"], answer)
+        self.assertFalse(answer["state"]["maintenance"]["paused"])
+
+    async def test_only_an_admin_can_flip_it_and_that_route_ignores_the_pause(self):
+        """The switch that reopens the game has to work while the game is closed."""
+        self.addCleanup(maintenance.resume)
+        maintenance.pause("Обновление")
+        denied = await self.client.post(pets_web.ROUTE_PREFIX + "/api/maintenance", json={
+            "init_data": _init_data(PLAYER["id"]), "paused": False,
+        })
+        self.assertEqual(denied.status, 403, await denied.text())
+        self.assertTrue(maintenance.is_paused())
+
+        reopened = await self.client.post(pets_web.ROUTE_PREFIX + "/api/maintenance", json={
+            "init_data": _init_data(THIRD["id"]), "paused": False,
+        })
+        self.assertEqual(reopened.status, 200, await reopened.text())
+        self.assertFalse((await reopened.json())["paused"])
+        self.assertFalse(maintenance.is_paused())
+
+    async def test_the_page_shows_one_banner_for_the_whole_app(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn(".maint-bar {", page)
+        self.assertIn('bar.id = "maintBar"', page)
+        self.assertIn("maintenance.paused", page)
+        self.assertIn("function maintenancePanel(state)", page)
+        self.assertIn('data-maint="', page)
 
     # ---- economy + progression overview ------------------------------------------------
 
