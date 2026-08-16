@@ -616,6 +616,49 @@ def _is_offerable(quest, data: dict, user_id, moment: datetime) -> bool:
     return moment >= until
 
 
+def _cooldown_notice(quest, data: dict, user_id, moment: datetime) -> str:
+    """Why a quest on cooldown was turned down, and when it comes back.
+
+    A date, not a bare refusal: the quest IS the player's to do again eventually, and
+    "не сейчас" without a when is the kind of answer that gets the tag posted five more
+    times (see the #quest_zenithal report).
+    """
+    until = _cooldown_until(quest, data, user_id, moment)
+    if until == "never":
+        return f"«{quest.title}» проходят один раз — этот уже сделан."
+    if isinstance(until, datetime):
+        days = max(1, (until.date() - moment.date()).days)
+        return (
+            f"«{quest.title}» уже сдан. Его можно повторить "
+            f"{until.strftime('%d.%m.%Y')} — через {_plural_days(days)}."
+        )
+    return f"«{quest.title}» пока недоступен."
+
+
+def _plural_days(days: int) -> str:
+    tail = days % 100
+    if 11 <= tail <= 14:
+        return f"{days} дней"
+    return f"{days} " + {1: "день", 2: "дня", 3: "дня", 4: "дня"}.get(days % 10, "дней")
+
+
+def _pending_submission(data: dict, user_id, code: str) -> dict | None:
+    """This player's still-unreviewed submission for this quest, if any.
+
+    Asked of the submission list rather than of the board, because a quest that was never
+    dealt has no board row to carry a "review" flag -- and one painted model must still not
+    become several rows in the moderator's queue.
+    """
+    for row in data.get("submissions", []):
+        if (
+            row.get("status") == "pending"
+            and str(row.get("user_id")) == str(user_id)
+            and catalog.normalise_code(row.get("code")) == catalog.normalise_code(code)
+        ):
+            return row
+    return None
+
+
 # Independent storage for the three-card painting board and one-card real-life board.
 SLOTS = {"paint": "assignments", "real": "real_assignments", "rune": "rune_assignments"}
 QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 5}
@@ -971,9 +1014,21 @@ def submit(
 ) -> tuple[bool, str]:
     """Record a photo posted with a quest hashtag, for a moderator to look at.
 
-    Refuses a hashtag that is not the player's OWN live quest. Otherwise the hashtag would
-    be the whole game: post `#quest_nmm` under anything and collect, with the daily
-    assignment reduced to a suggestion.
+    ANY quest may be submitted, whether or not it was ever dealt to this player. The board
+    suggests; it does not restrict. People read each other's cards and remember ones they
+    liked from weeks ago, and painting a technique because you saw somebody else do it is
+    the behaviour this game is for -- refusing that taught nobody anything and mostly
+    produced silent confusion (see the #quest_zenithal report).
+
+    Two things still hold, and neither is about the board:
+
+      A quest already waiting on a moderator cannot be submitted again, or one painted
+      model becomes several entries in the review queue.
+
+      A COOLDOWN is still enforced, and is now enforced here rather than only at the deal.
+      It is the whole of what stops a repeatable quest being farmed, and the deal used to
+      be the only way in. Every real-life quest carries one (14 or 30 days); no painting
+      challenge does, which is exactly right -- repeating a technique is the point of them.
     """
     moment = now or app_now()
     quest = catalog.find_quest(code)
@@ -981,28 +1036,14 @@ def submit(
         return False, "Такого квеста нет."
     with _lock:
         data = _load(entry)
-        # Both kinds are proved against the slot they were DEALT into. The hashtag has to
-        # match a quest the player actually holds -- otherwise the tag alone would be the
-        # whole game, with the assignment reduced to a suggestion.
+        # Still dealt, so the board stays live and a submitted card can be marked done --
+        # it is just no longer a gate on what may be handed in.
         _board, _changed = _ensure_board(entry, user_id, data, quest.kind, moment)
         live = _live_assignment(data, user_id, quest.kind, code=quest.code)
-        if live is None:
-            current = [
-                catalog.hashtag(row.get("code")) for row in _board_rows(_board)
-                if row.get("status") == "open" and catalog.find_quest(row.get("code"))
-            ]
-            if current:
-                return False, "Сейчас доступны другие квесты: " + ", ".join(current) + "."
-            return False, "У тебя нет активного квеста — открой «Квесты» в /arena."
-        if live["code"] != quest.code:
-            active = catalog.find_quest(live["code"])
-            label = "челлендж" if quest.kind == "paint" else "квест в реале"
-            return False, (
-                f"Сейчас у тебя другой {label}: «{active.title}». "
-                f"Его хештег — {catalog.hashtag(active.code)}."
-            )
-        if live.get("status") == "review":
+        if _pending_submission(data, user_id, quest.code) is not None:
             return False, "Работа по этому квесту уже на проверке."
+        if not _is_offerable(quest, data, user_id, moment):
+            return False, _cooldown_notice(quest, data, user_id, moment)
         photo_key = _submission_photo_key(chat_id, message_id)
         cached_photo = data.setdefault("submission_photos", {}).pop(photo_key, None)
         resolved_photo_file_id = str(
@@ -1037,8 +1078,12 @@ def submit(
             "hero_level": promised_reward["hero_level"],
         }
         data.setdefault("submissions", []).append(row)
-        live["submission_id"] = row["id"]
-        live["status"] = "review"
+        # Only when this quest happens to be on the player's board. Submitting one they
+        # were never dealt leaves the board untouched -- review() already handles a
+        # submission with no assignment behind it, and pays it just the same.
+        if isinstance(live, dict):
+            live["submission_id"] = row["id"]
+            live["status"] = "review"
         _save(entry, data)
     return True, f"Работа по квесту «{quest.title}» отправлена на проверку."
 

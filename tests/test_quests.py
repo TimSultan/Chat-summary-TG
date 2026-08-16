@@ -255,17 +255,35 @@ class SubmissionTests(QuestsTestCase):
         ))
         self.assertEqual(quests.pending(entry)[0]["photo_file_id"], "telegram-photo")
 
-    def test_submit_refuses_a_hashtag_that_is_not_the_players_own_live_quest(self):
-        """Otherwise the hashtag becomes the whole game: paste #quest-nmm under anything
-        and collect, with the daily assignment reduced to decoration."""
+    def test_submit_accepts_a_quest_that_was_never_dealt_to_this_player(self):
+        """The board suggests, it does not restrict. People read each other's cards and
+        remember ones they liked weeks ago, and painting a technique because somebody else
+        did it is the behaviour this whole game is for."""
         entry = "chat"
         payload = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
-        live_code = payload["quest"]["code"]
-        other = next(q for q in catalog.QUESTS if q.code != live_code)
+        held = {row["code"] for row in payload["quests"]}
+        stranger = next(q for q in catalog.PAINT_QUESTS if q.code not in held)
 
-        ok, msg = quests.submit(entry, "1", other.code, now=datetime(2026, 8, 9, 9, 5))
+        ok, msg = quests.submit(entry, "1", stranger.code, now=datetime(2026, 8, 9, 9, 5))
+        self.assertTrue(ok, msg)
+        self.assertEqual(quests.pending(entry)[0]["code"], stranger.code)
+        # The board it was never on is untouched -- nothing there claims to be in review.
+        board = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 6))
+        self.assertTrue(all(row["status"] == "open" for row in board["quests"]))
+
+    def test_submit_still_refuses_a_second_go_while_one_waits_on_a_moderator(self):
+        """One painted model, one row in the review queue -- even for a quest that was
+        never dealt and so has no board row to carry the flag."""
+        entry = "chat"
+        payload = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        held = {row["code"] for row in payload["quests"]}
+        stranger = next(q for q in catalog.PAINT_QUESTS if q.code not in held)
+
+        self.assertTrue(quests.submit(entry, "1", stranger.code, now=datetime(2026, 8, 9, 9, 5))[0])
+        ok, msg = quests.submit(entry, "1", stranger.code, now=datetime(2026, 8, 9, 9, 6))
         self.assertFalse(ok)
-        self.assertIn(catalog.hashtag(live_code), msg)
+        self.assertIn("уже на проверке", msg)
+        self.assertEqual(len(quests.pending(entry)), 1)
 
     def test_submit_refuses_a_second_submission_while_one_is_pending(self):
         entry = "chat"
@@ -452,16 +470,29 @@ class RealQuestTests(QuestsTestCase):
         self.assertTrue(quests.reroll(entry, "1", now=next_day, kind="paint")[0])
         self.assertFalse(quests.daily_quest(entry, "1", now=next_day)["reroll_available"])
 
-    def test_a_hashtag_only_counts_for_the_slot_it_was_dealt_into(self):
+    def test_a_real_quest_can_be_done_unprompted_but_its_cooldown_still_binds(self):
+        """Any quest may be handed in, dealt or not -- but a real-life quest's cooldown is
+        the whole of what stops it being farmed, and submitting used to be gated only by
+        the deal. So the cooldown is checked here too, and says when it comes back."""
         entry = "chat"
         day = datetime(2026, 8, 9, 9, 0)
         live = quests.real_quest(entry, "1", now=day)["quest"]["code"]
-        other = next(q for q in catalog.REAL_QUESTS if q.code != live)
+        other = next(
+            q for q in catalog.REAL_QUESTS if q.code != live and q.cooldown_days > 0
+        )
 
-        ok, message = quests.submit(entry, "1", other.code, now=day)
+        # Never dealt to this player, and accepted anyway.
+        self.assertTrue(quests.submit(entry, "1", other.code, now=day)[0])
+        submission = next(r for r in quests.pending(entry) if r["code"] == other.code)
+        self.assertTrue(quests.review(entry, submission["id"], "77", True, now=day)[0])
+
+        # And now it is resting, with a date rather than a bare refusal.
+        ok, message = quests.submit(entry, "1", other.code, now=day + timedelta(hours=1))
         self.assertFalse(ok)
-        self.assertIn(catalog.hashtag(live), message)
-        self.assertTrue(quests.submit(entry, "1", live, now=day)[0])
+        self.assertIn("повторить", message)
+
+        later = day + timedelta(days=other.cooldown_days + 1)
+        self.assertTrue(quests.submit(entry, "1", other.code, now=later)[0])
 
     def test_a_once_ever_quest_is_never_dealt_twice_and_a_repeatable_one_returns(self):
         """A cooldown of 0 means once ever -- you cannot buy the same loupe twice. It is
@@ -1031,20 +1062,23 @@ class RefusedHashtagIsAnsweredTests(unittest.TestCase):
     names the hashtags that WOULD have worked, so it is worth saying out loud.
     """
 
-    def test_the_refusal_names_the_hashtags_that_would_have_worked(self):
+    def test_a_refusal_that_remains_says_when_the_quest_comes_back(self):
+        """Not holding a quest is no longer a refusal at all. What can still be refused is
+        a repeat inside a cooldown -- and that answer has to carry a date, or the tag just
+        gets posted again."""
         with tempfile.TemporaryDirectory() as directory:
             with patch("stats._stats_dir", return_value=Path(directory)):
                 entry = "chat"
-                board = quests.daily_quest(entry, "1")
-                held = {row["code"] for row in board["quests"]}
-                stranger = next(q for q in catalog.PAINT_QUESTS if q.code not in held)
+                resting = next(q for q in catalog.REAL_QUESTS if q.cooldown_days > 0)
+                day = datetime(2026, 8, 9, 9, 0)
+                self.assertTrue(quests.submit(entry, "1", resting.code, now=day)[0])
+                submission = quests.pending(entry)[0]
+                quests.review(entry, submission["id"], "77", True, now=day)
 
-                ok, note = quests.submit(entry, "1", stranger.code)
+                ok, note = quests.submit(entry, "1", resting.code, now=day + timedelta(hours=2))
                 self.assertFalse(ok)
-                # Not a bare "нельзя": it has to be actionable, or the poster still does
-                # not know what to do differently.
-                for code in held:
-                    self.assertIn(catalog.hashtag(code), note)
+                self.assertIn(resting.title, note)
+                self.assertIn("повторить", note)
 
     def test_the_listener_hands_a_refusal_to_the_bot_to_answer(self):
         """The reply goes out through the BOT account like every other outward message,
