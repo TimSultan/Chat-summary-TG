@@ -84,6 +84,12 @@ _IS_ECONOMY_ADMIN_KEY = web.AppKey(
 _SUPPORT_NOTIFY_KEY = web.AppKey(
     "pets_support_notify", Callable[[dict], Awaitable[None]],
 )
+# Marks a reviewed submission as dealt with, in the chat and in every moderator's alert.
+# Injected like the other outward messages: this module decides the verdict, the bot does
+# the telling.
+_QUEST_REVIEWED_KEY = web.AppKey(
+    "pets_quest_reviewed", Callable[[dict, bool, str], Awaitable[None]],
+)
 _BIRTHDAY_NOTIFY_KEY = web.AppKey(
     "pets_birthday_notify", Callable[[str, str, int, int], Awaitable[None]],
 )
@@ -3111,6 +3117,10 @@ async def _default_support_notify(pledge: dict):
     return None
 
 
+async def _default_quest_reviewed(submission: dict, accepted: bool, reviewer_name: str):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
@@ -3125,6 +3135,7 @@ def attach(
     quest_completion=None,
     birthday_notify=None,
     support_notify=None,
+    quest_reviewed=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
@@ -3162,6 +3173,7 @@ def attach(
     # still lands in the celebrant's stored notifications.
     app[_BIRTHDAY_NOTIFY_KEY] = birthday_notify or _default_birthday_notify
     app[_SUPPORT_NOTIFY_KEY] = support_notify or _default_support_notify
+    app[_QUEST_REVIEWED_KEY] = quest_reviewed or _default_quest_reviewed
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to

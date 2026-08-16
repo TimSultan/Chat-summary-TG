@@ -11,6 +11,7 @@ coexists with the rest of the server without colliding.
 import hashlib
 import hmac
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -25,11 +26,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import bot_listener
 import donations
 import economy
 import pets
@@ -2854,3 +2857,45 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttachContractTests(unittest.TestCase):
+    """bot_listener calls pets_web.attach with a fixed set of keywords, and nothing before
+    this checked that attach still accepts them.
+
+    It caught nothing when a keyword was added to the CALL and lost from the DEFINITION:
+    every unit test builds the app itself with its own arguments, the modules import fine
+    because the mismatch only exists at call time, and the failure surfaced as the whole
+    process dying on boot in production.
+    """
+
+    def _attach_kwargs(self) -> list[str]:
+        source = inspect.getsource(bot_listener.run_bot_listener)
+        block = source.split("pets_web.attach(")[1].split(")\n")[0]
+        names = [
+            line.split("=")[0].strip() for line in block.splitlines()
+            if "=" in line and not line.strip().startswith("#")
+        ]
+        return [name for name in names if name.isidentifier()]
+
+    def test_every_keyword_production_passes_is_one_attach_accepts(self):
+        accepted = inspect.signature(pets_web.attach).parameters
+        passed = self._attach_kwargs()
+        self.assertTrue(passed, "could not read the real attach() call")
+        for name in passed:
+            with self.subTest(keyword=name):
+                self.assertIn(name, accepted)
+
+    def test_attach_builds_an_app_with_exactly_that_call(self):
+        """The signature agreeing is not quite enough -- run it."""
+        async def noop(*args, **kwargs):
+            return None
+
+        app = web.Application()
+        pets_web.attach(
+            app, SimpleNamespace(telegram_bot_token=BOT_TOKEN), CHAT,
+            **{name: (lambda *a, **k: None) if name == "log" else noop
+               for name in self._attach_kwargs()},
+        )
+        self.assertIn(pets_web.ROUTE_PREFIX + "/api/state",
+                      [getattr(route.resource, "canonical", "") for route in app.router.routes()])
