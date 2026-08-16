@@ -44,6 +44,7 @@ import pets_sprite
 import pets_sprite_store
 import quests
 import pets_web
+import stats
 import vote_web
 from pets_ui import valuable_item  # the same "needs confirming" rarity rule pets_web uses
 
@@ -2761,7 +2762,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         body = await read.json()
         self.assertEqual(
             {row["code"] for row in body["resources"]},
-            {"gold", "rubies", "farm_tickets", "dungeon_tickets"},
+            {"gold", "rubies", "farm_tickets", "dungeon_tickets", "server_xp", "arena_xp"},
         )
         self.assertIn(str(PLAYER["id"]), [row["user_id"] for row in body["candidates"]])
 
@@ -2784,6 +2785,65 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         dungeon = await self._grant(THIRD, user_id=PLAYER["id"], resource="dungeon_tickets", amount=2)
         self.assertEqual(dungeon.status, 200, await dungeon.text())
         self.assertEqual(pets.dungeon_tickets(CHAT, PLAYER["id"]), 2)
+
+    async def test_xp_can_be_given_and_taken_back_from_the_same_panel(self):
+        """The two XP kinds are the only signed resources: everything else is a wallet
+        that is topped up by hand, but XP is what people are RANKED by, so a mistake in it
+        has to be reversible without a shell."""
+        self._tame(PLAYER)
+
+        # Arena XP moves the creature's level with it.
+        up = await self._grant(THIRD, user_id=PLAYER["id"], resource="arena_xp", amount=50_000)
+        self.assertEqual(up.status, 200, await up.text())
+        self.assertGreater(pets.get_pet(CHAT, PLAYER["id"])["level"], 1)
+
+        down = await self._grant(THIRD, user_id=PLAYER["id"], resource="arena_xp", amount=-50_000)
+        self.assertEqual(down.status, 200, await down.text())
+        after = pets.get_pet(CHAT, PLAYER["id"])
+        self.assertEqual((after["level"], after["xp"]), (1, 0))
+
+        # Server XP is the /top figure.
+        given = await self._grant(THIRD, user_id=PLAYER["id"], resource="server_xp", amount=10_000)
+        self.assertEqual(given.status, 200, await given.text())
+        self.assertEqual(stats.xp_breakdown(CHAT, str(PLAYER["id"]))["granted"], 10_000)
+        taken = await self._grant(THIRD, user_id=PLAYER["id"], resource="server_xp", amount=-10_000)
+        self.assertEqual(taken.status, 200, await taken.text())
+        self.assertEqual(stats.xp_breakdown(CHAT, str(PLAYER["id"]))["granted"], 0)
+
+    async def test_neither_xp_can_be_driven_below_zero(self):
+        """Asking to remove more than exists removes what exists, and says so."""
+        self._tame(PLAYER)
+        await self._grant(THIRD, user_id=PLAYER["id"], resource="arena_xp", amount=1_000)
+        await self._grant(THIRD, user_id=PLAYER["id"], resource="arena_xp", amount=-999_999_999)
+        floored = pets.get_pet(CHAT, PLAYER["id"])
+        self.assertEqual((floored["level"], floored["xp"]), (1, 0))
+
+        await self._grant(THIRD, user_id=PLAYER["id"], resource="server_xp", amount=500)
+        answer = await self._grant(
+            THIRD, user_id=PLAYER["id"], resource="server_xp", amount=-999_999_999)
+        self.assertEqual(answer.status, 200, await answer.text())
+        breakdown = stats.xp_breakdown(CHAT, str(PLAYER["id"]))
+        self.assertGreaterEqual(breakdown["total"], 0)
+        self.assertEqual(breakdown["granted"], -breakdown["earned"])
+
+    async def test_only_xp_may_be_negative(self):
+        """A wallet has no un-grant path, so a minus there would look like it worked and
+        do nothing. Refused outright instead."""
+        self._tame(PLAYER)
+        for resource in ("gold", "rubies", "farm_tickets", "dungeon_tickets"):
+            with self.subTest(resource=resource):
+                answer = await self._grant(
+                    THIRD, user_id=PLAYER["id"], resource=resource, amount=-100)
+                self.assertEqual(answer.status, 400, await answer.text())
+                self.assertEqual((await answer.json())["error"], "BAD_AMOUNT")
+
+    async def test_the_panel_offers_a_direction_only_for_xp(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('const SIGNED_RESOURCES = new Set(["server_xp", "arena_xp"]);', page)
+        self.assertIn('data-grantsign="-1"', page)
+        # Leaving an XP row must disarm the minus, or it follows you to a wallet.
+        self.assertIn("if (!signed) grantSign = 1;", page)
+        self.assertIn("amount: amount * grantSign", page)
 
     async def test_granting_the_same_resource_twice_adds_up_rather_than_replaying(self):
         """Unlike a listener event, an admin pressing the button twice means twice -- the

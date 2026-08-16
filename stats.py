@@ -864,6 +864,88 @@ def xp_grants_for(entry: str, user_id) -> dict:
     }
 
 
+ADMIN_XP_ADJUST_KEY = "admin_adjust"
+
+
+def adjust_bonus_xp(entry: str, user_id, delta: int, *, by: str = "") -> int:
+    """Move somebody's chat XP up or down by hand. Returns the delta actually applied.
+
+    One running adjustment per person under a fixed key, deliberately unlike grant_xp_once
+    (which is a pile of separate idempotent awards). An administrator nudging a number is
+    not awarding anything; they are correcting a total, and correcting it twice should
+    read as one number rather than as a growing list of half-corrections.
+
+    Clamped so TOTAL XP can never go below zero: earned XP is derived from real recorded
+    activity and cannot be reduced, so the floor for the adjustment is -earned. Somebody
+    who asks to remove more than exists gets everything removed, and the return value says
+    so, rather than the leaderboard growing a negative entry.
+    """
+    delta = int(delta)
+    if not delta:
+        return 0
+    rows = aggregate_all_time(entry)
+    user = rows.get(str(user_id))
+    baseline = _load_words_per_point(entry) or DEFAULT_WORDS_PER_POINT
+    total = user.xp(baseline) if user is not None else 0
+    if delta < 0:
+        delta = -min(-delta, max(0, total))
+        if not delta:
+            return 0
+
+    data = _load_xp_grants(entry)
+    row = data["users"].setdefault(str(user_id), {})
+    grants = row.setdefault("grants", {})
+    if not isinstance(grants, dict):
+        grants = row["grants"] = {}
+    current = grants.get(ADMIN_XP_ADJUST_KEY)
+    running = int((current or {}).get("amount", 0) or 0) if isinstance(current, dict) else 0
+    grants[ADMIN_XP_ADJUST_KEY] = {
+        "amount": running + delta,
+        "granted_at": app_now().date().isoformat(),
+        "by": str(by or ""),
+    }
+    _stats_dir().mkdir(parents=True, exist_ok=True)
+    _xp_grants_path(entry).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return delta
+
+
+def xp_breakdown(entry: str, user_id) -> dict:
+    """Total XP split into what was earned and what was handed out, with the earned half
+    itemised. One function so the CLI and the admin page cannot disagree about it.
+
+    The question it exists to answer: somebody at the top of /top is either very active or
+    was given a number, and those look identical from outside.
+    """
+    rows = aggregate_all_time(entry)
+    baseline = _load_words_per_point(entry) or DEFAULT_WORDS_PER_POINT
+    user = rows.get(str(user_id))
+    if user is None:
+        return {"found": False, "total": 0, "granted": 0, "earned": 0, "parts": [], "grants": {}}
+    total = user.xp(baseline)
+    granted = int(user.bonus_xp)
+    parts = [
+        ("сообщения", int(user.legacy_message_points)),
+        ("слова", round(user.words / baseline)),
+        ("медиа", user.media * XP_PER_MEDIA_MESSAGE),
+        ("ответы", user.replies * XP_PER_REPLY),
+        ("активные дни", user.active_days * XP_PER_ACTIVE_DAY),
+        ("покрасы", user.figurines_painted * XP_PER_FIGURINE),
+    ]
+    return {
+        "found": True,
+        "display_name": user.display_name,
+        "username": user.username,
+        "total": total,
+        "granted": granted,
+        "earned": total - granted,
+        "coins_from_granted": granted // XP_PER_COIN,
+        "parts": [{"label": label, "xp": value} for label, value in parts if value],
+        "grants": xp_grants_for(entry, user_id),
+    }
+
+
 def revoke_xp_grants(entry: str, user_id, key: str | None = None) -> int:
     """Take back one XP grant, or all of them. Returns the XP actually removed.
 
@@ -2646,7 +2728,11 @@ def _apply_xp_grants(
             if not isinstance(grant, dict):
                 continue
             try:
-                amount = max(0, int(grant.get("amount", 0)))
+                # Signed, not clamped at zero: an administrator has to be able to take XP
+                # back as well as give it (see adjust_bonus_xp). A stored negative used to
+                # be silently discarded here, which made a correction look like it had
+                # worked while changing nothing at all.
+                amount = int(grant.get("amount", 0))
             except (TypeError, ValueError):
                 continue
             user.bonus_xp += amount

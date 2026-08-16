@@ -2556,7 +2556,13 @@ _GRANT_RESOURCES = (
     ("rubies", "💎", "Рубины"),
     ("farm_tickets", "🎟️", "Билеты фермы"),
     ("dungeon_tickets", "🎫", "Билеты подземелья"),
+    ("server_xp", "📊", "XP сервера"),
+    ("arena_xp", "⚔️", "XP арены"),
 )
+# The two that can also be taken away. Everything above them is a wallet that is only ever
+# topped up by hand; XP is a number people are ranked by, so a mistake in it has to be
+# reversible -- that is the whole reason these exist.
+_SIGNED_RESOURCES = frozenset({"server_xp", "arena_xp"})
 # Gold and rubies are a single write regardless of amount; a ticket is minted one at a
 # time (see grant_farm_ticket/grant_dungeon_ticket), so a fat-fingered six-digit count
 # would otherwise loop that many separate load/save cycles on the request thread.
@@ -2614,10 +2620,15 @@ async def handle_grant_admin(request: web.Request) -> web.Response:
     return _ok(await asyncio.to_thread(_grant_admin_payload, entry))
 
 
-def _apply_grant(entry: str, user_id: str, resource: str, amount: int, reason: str) -> None:
+def _apply_grant(entry: str, user_id: str, resource: str, amount: int, reason: str) -> int:
     """Go through the exact same library call every in-game path for this currency uses --
     never write the store directly -- so a manual correction stays honest with the wallet,
-    ledger and metrics an ordinary drop or payout would also touch."""
+    ledger and metrics an ordinary drop or payout would also touch.
+
+    Returns what was ACTUALLY applied, which is not always what was asked for: XP is
+    clamped so nobody ends up below zero, and the caller reports the real number rather
+    than the request.
+    """
     if resource == "gold":
         economy.grant_once(entry, user_id, amount, reason)
     elif resource == "rubies":
@@ -2628,6 +2639,17 @@ def _apply_grant(entry: str, user_id: str, resource: str, amount: int, reason: s
     elif resource == "dungeon_tickets":
         for _ in range(amount):
             pets.grant_dungeon_ticket(entry, user_id)
+    elif resource == "server_xp":
+        # Chat XP: what /top and /stat rank by. Clamped at a total of zero, since the
+        # earned half comes from real recorded activity and cannot be taken away.
+        return stats.adjust_bonus_xp(entry, user_id, amount, by=reason)
+    elif resource == "arena_xp":
+        # Creature XP: levels move with it, and the floor is level 1 with an empty bar.
+        moved = pets.adjust_pet_xp(entry, user_id, amount)
+        if moved is None:
+            raise ValueError("У игрока нет существа.")
+        return amount
+    return amount
 
 
 async def handle_grant_set(request: web.Request) -> web.Response:
@@ -2652,8 +2674,14 @@ async def handle_grant_set(request: web.Request) -> web.Response:
         amount = int(body.get("amount") or 0)
     except (TypeError, ValueError):
         amount = 0
-    if amount <= 0:
+    # Wallets are only ever topped up by hand; XP can go either way, because it is what
+    # people are ranked by and a mistake in it has to be reversible.
+    if amount == 0:
         return _json_error("Количество должно быть больше нуля.", status=400, code="BAD_AMOUNT")
+    if amount < 0 and resource not in _SIGNED_RESOURCES:
+        return _json_error(
+            "Списывать можно только XP.", status=400, code="BAD_AMOUNT",
+        )
     if resource in ("farm_tickets", "dungeon_tickets") and amount > _GRANT_TICKET_MAX:
         return _json_error(
             f"Билетов не больше {_GRANT_TICKET_MAX} за раз.", status=400, code="BAD_AMOUNT",
@@ -2663,14 +2691,29 @@ async def handle_grant_set(request: web.Request) -> web.Response:
         return _json_error("Игрок не найден.", status=404, code="NOT_FOUND")
 
     reason = f"admin-grant:{user['id']}:{resource}:{secrets.token_hex(8)}"
-    await asyncio.to_thread(_apply_grant, entry, target, resource, amount, reason)
+    try:
+        applied = await asyncio.to_thread(
+            _apply_grant, entry, target, resource, amount, reason,
+        )
+    except ValueError as e:
+        return _json_error(str(e), status=409, code="CANNOT_GRANT")
     emoji, label = labels[resource]
     request.app[_LOG_KEY](
-        f"[pets_web] {user['id']} granted {amount} {resource} to {target} "
+        f"[pets_web] {user['id']} adjusted {resource} by {applied} for {target} "
         f"({record.get('owner_name')})"
     )
+    if not applied:
+        return _ok({
+            "message": f"{emoji} {label}: уже на нуле, списывать нечего.",
+            **await asyncio.to_thread(_grant_admin_payload, entry),
+        })
+    # The applied number, not the requested one: asking to remove more XP than somebody
+    # has removes what they have, and saying otherwise would be a lie on screen.
+    sign = "+" if applied > 0 else "−"
+    clamped = " (больше не было)" if abs(applied) < abs(amount) else ""
     return _ok({
-        "message": f"{emoji} +{amount} {label} — {record.get('owner_name') or 'игроку'}.",
+        "message": f"{emoji} {sign}{abs(applied)} {label}{clamped} — "
+                   f"{record.get('owner_name') or 'игроку'}.",
         **await asyncio.to_thread(_grant_admin_payload, entry),
     })
 
@@ -5860,12 +5903,21 @@ async function setDebuff(userId, clear) {
 // currency re-renders the whole panel and an <input>'s value does not survive that.
 let grantPick = "";
 let grantAmountDraft = "";
+// +1 or -1. Reset whenever a non-XP resource is picked, so a minus left armed on one
+// screen cannot follow you to a wallet that has no way to give it back.
+let grantSign = 1;
+
+// Only XP can be taken away; the wallets are top-up only. Kept in step with
+// _SIGNED_RESOURCES on the server, which is what actually enforces it.
+const SIGNED_RESOURCES = new Set(["server_xp", "arena_xp"]);
 
 function grantAdmin(data) {
   const resources = data.resources || [];
   const rows = data.candidates || [];
   if (!resources.some((r) => r.code === grantPick)) grantPick = (resources[0] || {}).code || "";
   const chosen = resources.find((r) => r.code === grantPick) || {};
+  const signed = SIGNED_RESOURCES.has(grantPick);
+  if (!signed) grantSign = 1;          // leaving an XP row must not arm a hidden minus
 
   const picker = '<div class="panel"><h2>🎁 Выдать ресурсы</h2>' +
     resources.map((r) =>
@@ -5873,14 +5925,32 @@ function grantAdmin(data) {
       (r.code === grantPick ? " disabled" : "") +
       ' data-grantpick="' + esc(r.code) + '">' +
       esc(r.emoji) + " " + esc(r.label) + "</button>").join("") +
+    // The direction lives next to the amount rather than on each player row: it is a
+    // property of what you are about to do, and a minus hidden inside a row button is
+    // how somebody takes away a level meaning to give one.
+    (signed
+      ? '<div class="chiprow" style="margin:2px 0 8px">' +
+        '<button class="chip' + (grantSign > 0 ? " on" : "") + '" data-grantsign="1">➕ выдать</button>' +
+        '<button class="chip' + (grantSign < 0 ? " on" : "") + '" data-grantsign="-1">➖ снять</button>' +
+        '</div>'
+      : "") +
     '<input class="inp" id="grantAmount" type="number" min="1" step="1" inputmode="numeric" ' +
     'placeholder="Количество" value="' + esc(grantAmountDraft) + '" style="margin-top:4px">' +
+    (grantPick === "server_xp"
+      ? "<div class='tiny muted' style='margin-top:7px'>XP чата — то, по чему считается " +
+        "/top и /stat. Ниже нуля не уходит: заработанное снять нельзя.</div>"
+      : grantPick === "arena_xp"
+      ? "<div class='tiny muted' style='margin-top:7px'>XP существа — вместе с ним " +
+        "двигается уровень. Ниже 1 уровня не опускается.</div>"
+      : "") +
     "</div>";
 
+  const verb = signed && grantSign < 0 ? "снять" : "выдать";
   return picker +
-    '<div class="panel"><h2>Кому выдать</h2>' +
+    '<div class="panel"><h2>Кому' + (signed ? "" : " выдать") + '</h2>' +
     '<input class="inp" data-grantfilter placeholder="Поиск по имени">' +
-    "<div class='tiny muted' style='margin:8px 0'>Выдаётся: " + esc(chosen.emoji || "") + " " +
+    "<div class='tiny muted' style='margin:8px 0'>" +
+      (grantSign < 0 ? "Снимается: " : "Выдаётся: ") + esc(chosen.emoji || "") + " " +
       esc(chosen.label || "") + "</div>" +
     (rows.length
       ? rows.map((row) =>
@@ -5892,7 +5962,8 @@ function grantAdmin(data) {
           (row.owner_username ? " <span class='tiny muted'>@" + esc(row.owner_username) + "</span>" : "") +
           (row.pet_name ? " <span class='tiny muted'>· " + esc(row.pet_name) + "</span>" : "") +
           "</span>" +
-          '<button class="chip" data-grantset="' + esc(row.user_id) + '">выдать</button></div>').join("")
+          '<button class="chip" data-grantset="' + esc(row.user_id) + '">' + verb +
+          '</button></div>').join("")
       : '<div class="empty">Пока ни у кого нет существа.</div>') +
     "</div>";
 }
@@ -5902,7 +5973,9 @@ async function setGrant(userId) {
   const amount = Math.floor(Number((input && input.value) || 0));
   if (!amount || amount <= 0) { toast("Укажи количество больше нуля."); return; }
   try {
-    const data = await api("/api/grant", { user_id: userId, resource: grantPick, amount });
+    const data = await api("/api/grant", {
+      user_id: userId, resource: grantPick, amount: amount * grantSign,
+    });
     toast(data.message || "Готово");
     haptic("ok");
     render();
@@ -8020,7 +8093,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
-    "[data-grantpick],[data-grantset],[data-support],[data-maint]";
+    "[data-grantpick],[data-grantset],[data-grantsign],[data-support],[data-maint]";
 
 async function handleClick(event, target) {
   const d = target.dataset;
@@ -8048,6 +8121,7 @@ async function handleClick(event, target) {
     return;
   }
   if (d.maint) { await setMaintenance(d.maint === "on"); return; }
+  if (d.grantsign !== undefined) { grantSign = Number(d.grantsign) || 1; render(); return; }
   if (d.grantpick !== undefined) { grantPick = d.grantpick; render(); return; }
   if (d.grantset !== undefined) { await setGrant(d.grantset); return; }
 

@@ -981,6 +981,53 @@ def _apply_xp(record: dict, amount: int) -> tuple[int, int]:
     return level, level - old_level
 
 
+def adjust_pet_xp(entry, user_id, delta: int) -> dict | None:
+    """Move a creature's arena XP up or down, levels and all. None if there is no pet.
+
+    `record["xp"]` is the progress WITHIN the current level, not a running total, so this
+    cannot just add a number: going up spends XP climbing the ladder (that is _apply_xp),
+    and going down has to walk back the same way -- empty the current bar, drop a level,
+    refill the bar to that level's full cost, keep going.
+
+    The floor is level 1 with 0 XP. Subtracting more than somebody has leaves them there
+    rather than inventing a negative level, and the return value says how much was
+    actually taken so the caller can report the truth instead of what was asked for.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return None
+        before_level = max(1, int(record.get("level", 1) or 1))
+        before_xp = max(0, int(record.get("xp", 0) or 0))
+        record["level"], record["xp"] = before_level, before_xp
+
+        if delta > 0:
+            _apply_xp(record, int(delta))
+        elif delta < 0:
+            remaining = -int(delta)
+            while remaining > 0:
+                if record["xp"] >= remaining:
+                    record["xp"] -= remaining
+                    remaining = 0
+                    break
+                remaining -= record["xp"]
+                record["xp"] = 0
+                if record["level"] <= 1:
+                    break                      # the floor: level 1, nothing left to take
+                record["level"] -= 1
+                # Standing at the top of the level below means holding a full bar of it.
+                record["xp"] = C.pet_xp_for_next_level(record["level"])
+        _save(entry, data)
+
+    applied_levels = record["level"] - before_level
+    return {
+        "level": record["level"], "xp": record["xp"],
+        "level_before": before_level, "xp_before": before_xp,
+        "levels_gained": applied_levels,
+    }
+
+
 # --- cage & taming -------------------------------------------------------------------
 
 
