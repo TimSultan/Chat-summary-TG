@@ -39,6 +39,9 @@ ECONOMY_STORE_VERSION = 1
 # routinely exhausted by casino stakes long before abuse could be reviewed.
 LOG_LIMIT = 50_000
 AUDIT_WINDOW_HOURS = (24, 72, 168)
+# The economy overview reads the same log as the per-user audit, but by DAY and across
+# everybody at once -- an hourly window is the wrong resolution for "is the chat inflating".
+FLOW_WINDOW_DAYS = (7, 30, 90)
 FIGURINE_COIN_REWARD = 500
 
 # Member-to-member transfers were removed. `received` is still read by balance() and
@@ -857,6 +860,142 @@ def audit_report(
         "coverage_start": min(parsed_all).isoformat() if parsed_all else None,
         "log_at_capacity": len(all_log) >= LOG_LIMIT,
         "xp_not_hourly": True,
+    }
+
+
+def flow_report(
+    entry: str, user_id=None, days: int = 30, *, now: datetime | None = None,
+) -> dict:
+    """Where the chat's coins come from and go, by day and by source, for EVERYBODY.
+
+    The per-user audit_report above answers "what did this person do"; this answers "what
+    is the economy doing", which needs the same log read the other way round. Both use the
+    identical _audit_source buckets on purpose, so a number here and a number there can be
+    compared instead of being two different definitions of "farm".
+
+    The comparison line is an average per ACTIVE player -- distinct accounts with at least
+    one transaction in the window -- and that denominator is fixed for the whole window
+    rather than recomputed per day. A per-day denominator would divide a quiet Sunday's
+    coins by the handful of people who happened to play, and draw the average SPIKING on
+    the chat's least active day, which is the opposite of what the line is read as.
+
+    Chat-activity coins are derived from XP and never hit this log (see audit_report), so
+    everything here is the granted/spent half of the economy only.
+    """
+    days = int(days or 30)
+    if days not in FLOW_WINDOW_DAYS:
+        days = 30
+    moment = now or app_now()
+    tz = moment.tzinfo or app_now().tzinfo
+    moment = moment.replace(tzinfo=tz) if moment.tzinfo is None else moment.astimezone(tz)
+    end_day = moment.date()
+    start_day = end_day - timedelta(days=days - 1)
+    key = str(user_id) if user_id is not None else ""
+
+    data = _load(entry)
+    all_log = data.get("log", [])
+
+    buckets = {}
+    for offset in range(days):
+        day = start_day + timedelta(days=offset)
+        buckets[day.isoformat()] = {
+            "day": day.isoformat(), "label": day.strftime("%d.%m"),
+            "total_earned": 0, "total_spent": 0, "total_net": 0, "transactions": 0,
+            "mine_earned": 0, "mine_spent": 0, "mine_net": 0,
+        }
+
+    sources: dict[str, dict] = {}
+    active: set[str] = set()
+    source_players: dict[str, set[str]] = {}
+    totals = {"earned": 0, "spent": 0, "net": 0, "transactions": 0}
+    mine = {"earned": 0, "spent": 0, "net": 0, "transactions": 0}
+
+    for raw in all_log:
+        timestamp = _audit_timestamp(raw.get("ts"), tz)
+        if timestamp is None:
+            continue
+        day = timestamp.date()
+        if day < start_day or day > end_day:
+            continue
+        bucket = buckets.get(day.isoformat())
+        if bucket is None:
+            continue
+        who = str(raw.get("user_id"))
+        delta = int(raw.get("delta", 0) or 0)
+        code = _audit_source(raw.get("reason", ""))
+        source_name, colour = _AUDIT_SOURCES[code]
+        row = sources.setdefault(code, {
+            "code": code, "name": source_name, "color": colour,
+            "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+            "mine_earned": 0, "mine_spent": 0, "mine_net": 0,
+        })
+        active.add(who)
+        source_players.setdefault(code, set()).add(who)
+
+        earned, spent = (delta, 0) if delta >= 0 else (0, -delta)
+        bucket["total_earned"] += earned
+        bucket["total_spent"] += spent
+        bucket["total_net"] += delta
+        bucket["transactions"] += 1
+        row["earned"] += earned
+        row["spent"] += spent
+        row["net"] += delta
+        row["transactions"] += 1
+        totals["earned"] += earned
+        totals["spent"] += spent
+        totals["net"] += delta
+        totals["transactions"] += 1
+        if key and who == key:
+            bucket["mine_earned"] += earned
+            bucket["mine_spent"] += spent
+            bucket["mine_net"] += delta
+            row["mine_earned"] += earned
+            row["mine_spent"] += spent
+            row["mine_net"] += delta
+            mine["earned"] += earned
+            mine["spent"] += spent
+            mine["net"] += delta
+            mine["transactions"] += 1
+
+    players = max(1, len(active))
+    daily = []
+    for bucket in buckets.values():
+        daily.append({
+            **bucket,
+            "average_earned": round(bucket["total_earned"] / players),
+            "average_spent": round(bucket["total_spent"] / players),
+            "average_net": round(bucket["total_net"] / players),
+        })
+
+    source_rows = []
+    for row in sources.values():
+        source_rows.append({
+            **row,
+            "players": len(source_players.get(row["code"], ())),
+            "average_earned": round(row["earned"] / players),
+            "average_spent": round(row["spent"] / players),
+            # Share of everything MINTED in the window, which is what "where do the coins
+            # come from" is asking. A pure sink (purchases) reports 0 here and is read off
+            # the spent column instead.
+            "share": (row["earned"] / totals["earned"]) if totals["earned"] else 0.0,
+        })
+    source_rows.sort(key=lambda row: (-row["earned"], -row["spent"], row["name"]))
+
+    parsed_all = [
+        stamp for stamp in (_audit_timestamp(row.get("ts"), tz) for row in all_log)
+        if stamp is not None
+    ]
+    return {
+        "days": days,
+        "from": start_day.isoformat(), "to": end_day.isoformat(),
+        "players": len(active),
+        "daily": daily,
+        "sources": source_rows,
+        "totals": totals,
+        "mine": mine,
+        "user_id": key,
+        "coverage_start": min(parsed_all).date().isoformat() if parsed_all else None,
+        "log_at_capacity": len(all_log) >= LOG_LIMIT,
     }
 
 

@@ -539,6 +539,110 @@ def economy_telemetry(entry: str) -> dict:
     }
 
 
+def _percentile_of(values: list[int], mine: int) -> int:
+    """What share of the roster this number is at or above, 0-100."""
+    if not values:
+        return 0
+    return round(100 * sum(1 for value in values if value <= mine) / len(values))
+
+
+def _spread(values: list[int], mine: int | None) -> dict:
+    """One measure summarised the way the overview draws it.
+
+    Median as well as mean, deliberately: a single maxed-out player drags the mean far
+    enough that it stops describing anybody, and progression questions ("is the typical
+    creature keeping up") are asked about the middle of the field, not its centre of mass.
+    """
+    ordered = sorted(values)
+    count = len(ordered)
+    median = 0
+    if count:
+        middle = count // 2
+        median = ordered[middle] if count % 2 else round((ordered[middle - 1] + ordered[middle]) / 2)
+    return {
+        "count": count,
+        "total": sum(ordered),
+        "average": round(sum(ordered) / count) if count else 0,
+        "median": median,
+        "max": ordered[-1] if count else 0,
+        "min": ordered[0] if count else 0,
+        "mine": mine,
+        "percentile": _percentile_of(ordered, mine) if mine is not None else None,
+        # Ten buckets between the weakest and the strongest, for the distribution bars.
+        # Equal-width rather than equal-count: the shape of the field is the point, and a
+        # quantile histogram is flat by construction and would show nothing.
+        "histogram": _histogram(ordered),
+    }
+
+
+def _histogram(ordered: list[int], buckets: int = 10) -> list[dict]:
+    if not ordered:
+        return []
+    low, high = ordered[0], ordered[-1]
+    if high == low:
+        return [{"from": low, "to": high, "count": len(ordered)}]
+    width = (high - low) / buckets
+    rows = [{"from": round(low + width * n), "to": round(low + width * (n + 1)), "count": 0}
+            for n in range(buckets)]
+    for value in ordered:
+        index = min(buckets - 1, int((value - low) / width))
+        rows[index]["count"] += 1
+    return rows
+
+
+def progression_report(entry: str, user_id=None) -> dict:
+    """How far along the whole roster is, and where one player sits in it.
+
+    Deliberately a snapshot, not a trend: nothing in the store records what anybody's level
+    was last week, so a line over time here would have to be invented. What CAN be said
+    honestly is the shape of the field right now, which is what the distribution bars show.
+    """
+    data = _load(entry)
+    key = str(user_id) if user_id is not None else ""
+    records = {
+        str(uid): record for uid, record in data.get("pets", {}).items()
+        if isinstance(record, dict) and record.get("name")
+    }
+    rubies = data.get("rubies", {}) if isinstance(data.get("rubies"), dict) else {}
+    farm_tickets = data.get("farm_tickets", {}) if isinstance(data.get("farm_tickets"), dict) else {}
+    dungeon_tickets = (
+        data.get("dungeon_tickets", {}) if isinstance(data.get("dungeon_tickets"), dict) else {}
+    )
+
+    def ruby_of(uid):
+        return max(0, int(rubies.get(uid, 0) or 0))
+
+    def farm_ticket_of(uid):
+        row = farm_tickets.get(uid)
+        return max(0, int((row or {}).get("count", 0) or 0)) if isinstance(row, dict) else 0
+
+    measures = {
+        "level": {uid: max(1, int(r.get("level", 1) or 1)) for uid, r in records.items()},
+        "power": {uid: _power_rating_for(r) for uid, r in records.items()},
+        "fights": {uid: max(0, int(r.get("fights", 0) or 0)) for uid, r in records.items()},
+        "items": {uid: len(r.get("inventory") or []) for uid, r in records.items()},
+        "scrolls": {uid: len(r.get("owned_scrolls") or []) for uid, r in records.items()},
+        "deepest": {uid: max(1, int(r.get("dungeon_deepest", 1) or 1)) for uid, r in records.items()},
+        # Wallets are keyed at the top level, so somebody can hold these before taming --
+        # but the roster is what the rest of the report is about, so stay on it.
+        "rubies": {uid: ruby_of(uid) for uid in records},
+        "farm_tickets": {uid: farm_ticket_of(uid) for uid in records},
+        "dungeon_tickets": {
+            uid: max(0, int(dungeon_tickets.get(uid, 0) or 0)) for uid in records
+        },
+    }
+    return {
+        "user_id": key,
+        "players": len(records),
+        "has_selected": key in records,
+        "measures": {
+            name: _spread(list(values.values()), values.get(key) if key in records else None)
+            for name, values in measures.items()
+        },
+        "metrics": economy_telemetry(entry),
+    }
+
+
 def gift_history(entry: str) -> list[dict]:
     """Newest-first audit of item handoffs, containing only IDs, code and timestamp."""
     data = _load(entry)

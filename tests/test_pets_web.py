@@ -501,6 +501,105 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(denied.status, 403)
         self.assertEqual((await denied.json())["error"], "NOT_AN_ECONOMY_ADMIN")
 
+    # ---- economy + progression overview ------------------------------------------------
+
+    async def test_the_overview_is_behind_the_same_gate_as_the_audit(self):
+        for user in (PLAYER, MODERATOR):
+            with self.subTest(user=user["username"]):
+                denied = await self._get("/api/economy/overview", user)
+                self.assertEqual(denied.status, 403, await denied.text())
+                self.assertEqual((await denied.json())["error"], "NOT_AN_ECONOMY_ADMIN")
+        allowed = await self._get("/api/economy/overview", THIRD)
+        self.assertEqual(allowed.status, 200, await allowed.text())
+
+    async def test_the_overview_totals_reconcile_with_its_own_daily_and_source_columns(self):
+        """Three views of one ledger read. If the day column, the source column and the
+        headline total ever disagree, at least two of them are lying."""
+        self._tame(PLAYER)
+        self._tame(THIRD, name="Второй")
+        economy.grant(CHAT, PLAYER["id"], 300, "pet_mob_win")
+        economy.grant(CHAT, PLAYER["id"], 120, "grant:pet:farm:run-1")
+        economy.grant(CHAT, PLAYER["id"], -80, "buy:pet_item:w001")
+        economy.grant(CHAT, THIRD["id"], 200, "daily_bonus")
+
+        body = await (await self._get(
+            "/api/economy/overview?days=7&user_id=" + str(PLAYER["id"]), THIRD)).json()
+        flow = body["flow"]
+        self.assertEqual(body["selected"], str(PLAYER["id"]))
+        self.assertEqual(flow["days"], 7)
+        self.assertEqual(len(flow["daily"]), 7)
+        self.assertEqual(flow["players"], 2)
+
+        self.assertEqual(sum(d["total_earned"] for d in flow["daily"]), flow["totals"]["earned"])
+        self.assertEqual(sum(s["earned"] for s in flow["sources"]), flow["totals"]["earned"])
+        self.assertEqual(sum(d["mine_earned"] for d in flow["daily"]), flow["mine"]["earned"])
+        self.assertEqual(flow["totals"]["earned"], 620)
+        self.assertEqual(flow["totals"]["spent"], 80)
+        # The selected player's own slice, drawn inside the chat's bar on screen.
+        self.assertEqual(flow["mine"]["earned"], 420)
+        self.assertEqual(flow["mine"]["spent"], 80)
+
+        by_code = {row["code"]: row for row in flow["sources"]}
+        self.assertEqual(by_code["mobs"]["earned"], 300)
+        self.assertEqual(by_code["farm"]["earned"], 120)
+        self.assertEqual(by_code["daily"]["earned"], 200)
+        self.assertEqual(by_code["purchases"]["spent"], 80)
+        # The comparison line is per ACTIVE player, and that denominator is the window's,
+        # not the day's -- 620 minted between two players reads as 310 each.
+        self.assertEqual(by_code["mobs"]["average_earned"], 150)
+        self.assertEqual(by_code["daily"]["players"], 1)
+
+    async def test_the_overview_places_the_selected_player_in_the_field(self):
+        """The progression half: a distribution for everybody plus where one player sits,
+        which is the thing a bare leaderboard cannot show."""
+        self._tame(PLAYER)
+        self._tame(THIRD, name="Второй")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["level"] = 12
+        data["pets"][str(THIRD["id"])]["level"] = 4
+        data["rubies"] = {str(PLAYER["id"]): 50, str(THIRD["id"]): 10}
+        pets._save(CHAT, data)
+
+        body = await (await self._get(
+            "/api/economy/overview?user_id=" + str(PLAYER["id"]), THIRD)).json()
+        progression = body["progression"]
+        self.assertEqual(progression["players"], 2)
+        self.assertTrue(progression["has_selected"])
+
+        level = progression["measures"]["level"]
+        self.assertEqual(level["mine"], 12)
+        self.assertEqual(level["max"], 12)
+        self.assertEqual(level["average"], 8)
+        self.assertEqual(level["percentile"], 100)          # nobody is above them
+        self.assertTrue(level["histogram"])
+        self.assertEqual(sum(b["count"] for b in level["histogram"]), 2)
+
+        self.assertEqual(progression["measures"]["rubies"]["mine"], 50)
+        self.assertEqual(progression["measures"]["rubies"]["median"], 30)
+        # All-time counters ride along so the faucets can be read without a second request.
+        self.assertIn("farm_gold_minted", progression["metrics"])
+
+    async def test_the_overview_survives_an_empty_chat_and_an_unknown_player(self):
+        body = await (await self._get("/api/economy/overview?user_id=999999", THIRD)).json()
+        self.assertEqual(body["flow"]["totals"]["earned"], 0)
+        self.assertEqual(body["flow"]["players"], 0)
+        self.assertEqual(body["progression"]["players"], 0)
+        self.assertFalse(body["progression"]["has_selected"])
+        # Every measure still reports, with no "mine" to place -- the screen draws the
+        # field and says the player has no creature rather than breaking.
+        self.assertIsNone(body["progression"]["measures"]["level"]["mine"])
+        self.assertIsNone(body["progression"]["measures"]["level"]["percentile"])
+
+    async def test_the_overview_screen_is_wired_into_the_page(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn('econstats:📊 Экономика и прогресс', page)
+        self.assertIn('moreView === "econstats"', page)
+        self.assertIn("function economyOverview(data)", page)
+        self.assertIn('api("/api/economy/overview" + query)', page)
+        self.assertIn("data-statsdays=", page)
+        self.assertIn("data-statsmetric=", page)
+        self.assertIn("data-statsuser", page)
+
     async def test_fight_audit_has_public_page_pet_filter_and_lookup(self):
         page = await self.client.get("/audit")
         self.assertEqual(page.status, 200)

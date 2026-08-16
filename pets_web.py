@@ -2643,6 +2643,41 @@ async def handle_economy_audit(request: web.Request) -> web.Response:
     })
 
 
+def _economy_overview_payload(entry: str, selected: str, days: int) -> dict:
+    return {
+        "flow": economy.flow_report(entry, selected, days),
+        "progression": pets.progression_report(entry, selected),
+    }
+
+
+async def handle_economy_overview(request: web.Request) -> web.Response:
+    """The whole chat's economy and progression, with one player drawn against it.
+
+    Same gate, same user picker and the same source buckets as the per-user money audit
+    it grew out of -- this is that report turned around to ask what everybody together is
+    doing, which is the only way to see a faucet running too fast.
+    """
+    caller, _xp = await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    users, _tracked = await asyncio.to_thread(_economy_audit_users, entry)
+    requested = str(request.query.get("user_id") or "")
+    known = {row["user_id"] for row in users}
+    selected = requested if requested in known else (
+        str(caller["id"]) if str(caller["id"]) in known else (users[0]["user_id"] if users else "")
+    )
+    try:
+        days = int(request.query.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    payload = await asyncio.to_thread(_economy_overview_payload, entry, selected, days)
+    return _ok({
+        "users": users,
+        "selected": selected,
+        "windows": list(economy.FLOW_WINDOW_DAYS),
+        **payload,
+    })
+
+
 def _submission_link(row: dict) -> str | None:
     """A t.me link to the post itself.
 
@@ -3014,6 +3049,7 @@ def attach(
         web.get(prefix + "/api/loadout", handle_loadout),
         web.get(prefix + "/api/history", handle_history),
         web.get(prefix + "/api/economy/audit", handle_economy_audit),
+        web.get(prefix + "/api/economy/overview", handle_economy_overview),
         web.get(prefix + "/api/mail", handle_mail),
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
@@ -3357,6 +3393,37 @@ PAGE_HTML = """<!doctype html>
   .audit-select { width:100%; border:1px solid var(--line); border-radius:12px;
                   background:var(--card); color:var(--text); padding:11px; font:inherit; }
   .audit-summary { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; }
+
+  /* ------------------------------------------------- economy overview (average vs one) */
+  /* Two bars per day rather than one stacked one: the whole question this screen answers
+     is "is this player above or below everyone else", and that is a comparison of two
+     heights side by side, not a proportion within a single column. */
+  .flow-graph { display:flex; align-items:flex-end; gap:3px; min-height:180px;
+                overflow-x:auto; padding:12px 2px 5px; }
+  .flow-day { flex:1 0 22px; min-width:22px; display:flex; flex-direction:column;
+              justify-content:flex-end; align-items:stretch; }
+  .flow-pair { height:120px; display:flex; align-items:flex-end; gap:2px;
+               border-bottom:1px solid var(--line); }
+  .flow-bar { flex:1; min-height:1px; border-radius:2px 2px 0 0; }
+  .flow-bar.avg { background:var(--muted); opacity:.55; }
+  .flow-bar.mine { background:var(--accent); }
+  .flow-label { font-size:8px; color:var(--muted); text-align:center; margin-top:5px;
+                writing-mode:vertical-rl; transform:rotate(180deg); height:28px; }
+  .flow-key { display:flex; gap:12px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+  .flow-swatch { width:11px; height:11px; border-radius:3px; display:inline-block;
+                 margin-right:5px; vertical-align:-1px; }
+  /* Source rows: a proportional bar under each name so the biggest faucet is visible
+     without reading four columns of digits. */
+  .flow-source { padding:9px 0; border-bottom:1px solid var(--line); }
+  .flow-track { height:7px; border-radius:4px; background:var(--sunken); overflow:hidden;
+                margin-top:6px; display:flex; }
+  .flow-fill { height:100%; }
+  .flow-mine { height:100%; background:var(--accent); }
+  .flow-hist { display:flex; align-items:flex-end; gap:2px; height:56px; margin-top:8px; }
+  .flow-bucket { flex:1; background:var(--sunken); border-radius:2px 2px 0 0; min-height:2px;
+                 position:relative; }
+  .flow-bucket.here { background:var(--accent); }
+  .flow-measure { padding:10px 0; border-bottom:1px solid var(--line); }
 
   /* --------------------------------------------------------------- stats + combat */
   .grid4 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -5920,7 +5987,9 @@ function auditUserOptions(users, selected) {
 }
 
 function refreshAuditUserFilter() {
-  const select = document.querySelector("[data-audituser]");
+  // Whichever of the two admin screens is open -- they share the roster, the filter box
+  // and the selection, and differ only in what they draw for the player picked.
+  const select = document.querySelector("[data-audituser],[data-statsuser]");
   if (!select) return;
   const users = filteredAuditUsers();
   select.innerHTML = auditUserOptions(users, auditData && auditData.selected);
@@ -6018,6 +6087,183 @@ function economyAudit(data) {
     (report.log_at_capacity ? '<div class="warn-note">Журнал достиг лимита; самые старые операции уже удалены.</div>' : '');
 }
 
+// ------------------------------------------------------- economy + progression overview
+let statsDays = 30;
+let statsMetric = "earned";        // which column the daily comparison chart draws
+let statsData = null;
+
+const STATS_MEASURES = [
+  ["level", "Уровень", ""],
+  ["power", "Сила", "⚡"],
+  ["fights", "Боёв", "⚔️"],
+  ["deepest", "Глубина в данже", "🏰"],
+  ["items", "Предметов", "🎁"],
+  ["scrolls", "Свитков", "📜"],
+  ["rubies", "Алмазов на руках", "💎"],
+  ["farm_tickets", "Билетов фермы", "🎟"],
+  ["dungeon_tickets", "Билетов данжа", "🎫"],
+];
+
+// Average is per player ACTIVE in the window, which is the comparison the selected user's
+// own bar is meaningful against -- said out loud here because "среднее" alone invites the
+// reader to assume it is divided by everyone who ever registered.
+function statsDailyChart(flow) {
+  const days = flow.daily || [];
+  const avgKey = "average_" + statsMetric;
+  const mineKey = "mine_" + statsMetric;
+  const peak = Math.max(1, ...days.map((d) => Math.max(Number(d[avgKey] || 0), Number(d[mineKey] || 0))));
+  const bars = days.map((day, index) => {
+    const avg = Number(day[avgKey] || 0);
+    const mine = Number(day[mineKey] || 0);
+    const label = days.length <= 10 || index % Math.ceil(days.length / 10) === 0 ? day.label : "";
+    return '<div class="flow-day" title="' + esc(day.label) + ' · среднее ' + money(avg) +
+      ' · выбранный ' + money(mine) + '">' +
+      '<div class="flow-pair">' +
+        '<span class="flow-bar avg" style="height:' + Math.max(1, Math.round(118 * avg / peak)) + 'px"></span>' +
+        '<span class="flow-bar mine" style="height:' + Math.max(1, Math.round(118 * mine / peak)) + 'px"></span>' +
+      '</div><span class="flow-label">' + esc(label) + '</span></div>';
+  }).join("");
+  return '<div class="flow-graph">' + (bars || '<div class="empty">Нет данных.</div>') + '</div>' +
+    '<div class="flow-key">' +
+      '<span class="tiny"><span class="flow-swatch" style="background:var(--muted);opacity:.55"></span>' +
+        'Средний игрок</span>' +
+      '<span class="tiny"><span class="flow-swatch" style="background:var(--accent)"></span>Выбранный</span>' +
+      '<span class="tiny muted">пик ' + money(peak) + '</span></div>';
+}
+
+function statsSourceRows(flow) {
+  const rows = flow.sources || [];
+  if (!rows.length) return '<div class="empty">За период операций нет.</div>';
+  const peak = Math.max(1, ...rows.map((r) => Math.max(Number(r.earned || 0), Number(r.spent || 0))));
+  return rows.map((row) => {
+    const earned = Number(row.earned || 0), spent = Number(row.spent || 0);
+    const mineEarned = Number(row.mine_earned || 0);
+    // The player's own slice is drawn INSIDE the chat's bar, so "how much of this faucet
+    // is one person" is a length you can see rather than a division you have to do.
+    const minePart = earned ? Math.min(100, 100 * mineEarned / earned) : 0;
+    const width = 100 * Math.max(earned, spent) / peak;
+    return '<div class="flow-source">' +
+      '<div class="row spread"><span class="small"><span class="audit-dot" style="background:' +
+        esc(row.color) + '"></span>' + esc(row.name) + '</span>' +
+        '<span class="small"><span class="audit-positive">+' + money(earned) + '</span>' +
+        (spent ? ' · <span class="audit-negative">−' + money(spent) + '</span>' : '') + '</span></div>' +
+      '<div class="flow-track" style="width:' + width.toFixed(1) + '%">' +
+        '<span class="flow-mine" style="width:' + minePart.toFixed(1) + '%"></span>' +
+        '<span class="flow-fill" style="width:' + (100 - minePart).toFixed(1) + '%;background:' +
+          esc(row.color) + ';opacity:.55"></span></div>' +
+      '<div class="row spread tiny muted" style="margin-top:5px">' +
+        '<span>' + Math.round(Number(row.share || 0) * 100) + '% всей эмиссии · игроков: ' +
+          Number(row.players || 0) + '</span>' +
+        '<span>средний ' + money(row.average_earned) + ' · выбранный ' + money(mineEarned) + '</span>' +
+      '</div></div>';
+  }).join("");
+}
+
+function statsMeasureRows(progression) {
+  const measures = progression.measures || {};
+  return STATS_MEASURES.map(([key, label, icon]) => {
+    const m = measures[key];
+    if (!m || !m.count) return "";
+    const peak = Math.max(1, ...(m.histogram || []).map((b) => Number(b.count || 0)));
+    // Which bucket the selected player falls in, so their position in the field is marked
+    // on the distribution rather than only stated as a number beside it.
+    const buckets = (m.histogram || []).map((bucket) => {
+      const here = m.mine != null && m.mine >= bucket.from && m.mine <= bucket.to;
+      return '<span class="flow-bucket' + (here ? ' here' : '') + '" style="height:' +
+        Math.max(2, Math.round(52 * Number(bucket.count || 0) / peak)) + 'px" title="' +
+        money(bucket.from) + '–' + money(bucket.to) + ': ' + Number(bucket.count) + ' игр."></span>';
+    }).join("");
+    return '<div class="flow-measure">' +
+      '<div class="row spread"><b class="small">' + (icon ? icon + " " : "") + esc(label) + '</b>' +
+        '<span class="small">' +
+          (m.mine == null ? '<span class="muted">нет существа</span>'
+            : '<b>' + money(m.mine) + '</b> <span class="muted">· топ ' +
+              (100 - Number(m.percentile || 0)) + '%</span>') +
+        '</span></div>' +
+      '<div class="flow-hist">' + buckets + '</div>' +
+      '<div class="row spread tiny muted" style="margin-top:5px">' +
+        '<span>среднее ' + money(m.average) + ' · медиана ' + money(m.median) + '</span>' +
+        '<span>от ' + money(m.min) + ' до ' + money(m.max) + '</span></div></div>';
+  }).join("") || '<div class="empty">Ни у кого ещё нет существа.</div>';
+}
+
+function economyOverview(data) {
+  statsData = data;
+  auditData = data;                  // the user picker is shared with the money audit
+  const flow = data.flow || {};
+  const progression = data.progression || {};
+  const totals = flow.totals || {};
+  const mine = flow.mine || {};
+  const matchingUsers = filteredAuditUsers();
+  const windows = (data.windows || [7, 30, 90]).map((days) =>
+    '<button class="chip' + (Number(days) === Number(flow.days) ? ' on' : '') +
+    '" data-statsdays="' + days + '">' + days + ' дней</button>').join("");
+  const metrics = [["earned", "Приход"], ["spent", "Расход"], ["net", "Чистыми"]].map(([key, label]) =>
+    '<button class="chip' + (key === statsMetric ? ' on' : '') + '" data-statsmetric="' + key +
+    '">' + label + '</button>').join("");
+  const telemetry = progression.metrics || {};
+  const drops = telemetry.drops_by_rarity || {};
+
+  return '<div class="panel"><h2>📊 Экономика и прогресс</h2>' +
+    '<div class="small muted" style="margin-bottom:8px">Весь чат за период, и выбранный игрок ' +
+      'на его фоне. Монеты за активность в чате считаются из XP и в журнал не попадают — ' +
+      'здесь только выданное и потраченное.</div>' +
+    '<input class="audit-select" style="margin-bottom:7px" type="search" autocomplete="off" ' +
+      'placeholder="Имя, @username, существо или ID" value="' + esc(auditFilter) + '" data-auditfilter>' +
+    '<select class="audit-select" data-statsuser' + (matchingUsers.length ? '' : ' disabled') + '>' +
+      auditUserOptions(matchingUsers, data.selected) + '</select>' +
+    '<div class="tiny muted" style="margin-top:5px" data-auditcount>' +
+      (auditFilter.trim() ? 'Найдено: ' + matchingUsers.length
+        : 'Всего игроков: ' + (data.users || []).length) + '</div>' +
+    '<div class="chiprow" style="margin-top:9px">' + windows + '</div>' +
+    '<div class="audit-summary" style="margin-top:10px">' +
+      tile('Выпущено', '+' + money(totals.earned)) +
+      tile('Потрачено', '−' + money(totals.spent)) +
+      tile('Инфляция', signedMoney(totals.net)) + '</div>' +
+    '<div class="row spread tiny muted" style="margin-top:8px">' +
+      '<span>Активных игроков: ' + Number(flow.players || 0) + '</span>' +
+      '<span>Операций: ' + money(totals.transactions) + '</span></div></div>' +
+
+    '<div class="panel"><h2>По дням · средний против выбранного</h2>' +
+      '<div class="chiprow" style="margin-bottom:4px">' + metrics + '</div>' +
+      statsDailyChart(flow) +
+      '<div class="row spread small" style="margin-top:9px">' +
+        '<span class="muted">Выбранный за период</span><span>' +
+          '<span class="audit-positive">+' + money(mine.earned) + '</span> · ' +
+          '<span class="audit-negative">−' + money(mine.spent) + '</span> · <b>' +
+          signedMoney(mine.net) + '</b></span></div></div>' +
+
+    '<div class="panel"><h2>Откуда идут ресурсы</h2>' +
+      '<div class="tiny muted" style="margin-bottom:6px">Синим — доля выбранного игрока ' +
+        'внутри общего столбца.</div>' + statsSourceRows(flow) + '</div>' +
+
+    '<div class="panel"><h2>Прогресс игроков</h2>' +
+      '<div class="tiny muted" style="margin-bottom:4px">Распределение по всему чату; ' +
+        'синий столбец — где стоит выбранный игрок.</div>' +
+      statsMeasureRows(progression) + '</div>' +
+
+    '<details class="panel"><summary><b>Счётчики за всё время</b></summary>' +
+      '<div class="audit-table" style="margin-top:10px">' +
+        '<span class="head">Показатель</span><span class="head"></span>' +
+        '<span class="head"></span><span class="head">Всего</span>' +
+        [["Золото с ферм", telemetry.farm_gold_minted], ["Золото с мобов", telemetry.pve_gold_minted],
+         ["Золото с арены", telemetry.arena_reward_gold], ["Пассивный доход", telemetry.passive_gold_minted],
+         ["Продажи вещей", telemetry.item_sale_gold], ["Алмазов выпущено", telemetry.rubies_minted],
+         ["Смен на ферме", telemetry.farm_runs], ["Боёв с мобами", telemetry.pve_fights],
+         ["Переплавок", telemetry.forges], ["Подарков", telemetry.gifts]].map(([label, value]) =>
+          '<span class="small">' + esc(label) + '</span><span></span><span></span>' +
+          '<b class="small">' + money(value || 0) + '</b>').join("") +
+      '</div>' +
+      '<div class="tiny muted" style="margin-top:9px">Выпало предметов: ' +
+        ["cursed", "common", "uncommon", "rare", "legendary"].map((rarity) =>
+          rarity + " " + Number(drops[rarity] || 0)).join(" · ") + '</div></details>' +
+    (flow.log_at_capacity
+      ? '<div class="warn-note">Журнал достиг лимита; самые старые операции уже удалены.</div>' : '') +
+    (flow.coverage_start
+      ? '<div class="tiny muted" style="margin-top:8px">Журнал начинается с ' +
+        esc(flow.coverage_start) + '.</div>' : '');
+}
+
 async function renderMore() {
   const box = $("scr-more");
   if (moreView === "menu") {
@@ -6028,6 +6274,7 @@ async function renderMore() {
     // all is the server's answer, never a guess from the client -- and every route behind
     // it re-checks, so a hand-typed moreView cannot open anything.
     if (S && S.is_admin) menu.push("review:" + (S.pending_quests ? "🔴 " : "") + "🛡 Проверка квестов");
+    if (S && S.is_economy_admin) menu.push("econstats:📊 Экономика и прогресс");
     if (S && S.is_economy_admin) menu.push("moneyaudit:🕵️ Денежный аудит");
     if (S && S.is_economy_admin) menu.push("birthday:🎂 День рождения");
     if (S && S.is_economy_admin) menu.push("debuff:🎭 Эффекты игрокам");
@@ -6077,6 +6324,10 @@ async function renderMore() {
     const query = "?hours=" + encodeURIComponent(auditHours) +
       (auditUser ? "&user_id=" + encodeURIComponent(auditUser) : "");
     body = economyAudit(await api("/api/economy/audit" + query));
+  } else if (moreView === "econstats") {
+    const query = "?days=" + encodeURIComponent(statsDays) +
+      (auditUser ? "&user_id=" + encodeURIComponent(auditUser) : "");
+    body = economyOverview(await api("/api/economy/overview" + query));
   } else if (moreView === "birthday") {
     body = birthdayAdmin(await api("/api/birthday"));
   } else if (moreView === "debuff") {
@@ -7287,7 +7538,7 @@ document.addEventListener("click", async (event) => {
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
-    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours]," +
+    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
@@ -7338,6 +7589,19 @@ document.addEventListener("click", async (event) => {
   if (d.audithours) {
     auditHours = Number(d.audithours) || 24;
     render();
+    return;
+  }
+  if (d.statsdays) {
+    statsDays = Number(d.statsdays) || 30;
+    render();
+    return;
+  }
+  // Purely which column the existing series is drawn from -- the payload already carries
+  // all three, so switching does not go back to the server.
+  if (d.statsmetric) {
+    statsMetric = d.statsmetric;
+    if (statsData) { $("scr-more").innerHTML =
+      '<button class="go sec" data-more="menu">◀️ Назад</button>' + economyOverview(statsData); }
     return;
   }
 
@@ -7526,9 +7790,11 @@ document.addEventListener("input", (event) => {
 // The reward editor commits on blur/enter rather than on every keystroke -- one number
 // typed is several intermediate numbers, and each would be a saved edit to a live economy.
 document.addEventListener("change", async (event) => {
-  const audit = event.target.closest("[data-audituser]");
-  if (audit) {
-    auditUser = audit.value;
+  // Both admin screens pick a player the same way and share auditUser, so switching on
+  // one and opening the other keeps looking at the same person.
+  const chosen = event.target.closest("[data-audituser],[data-statsuser]");
+  if (chosen) {
+    auditUser = chosen.value;
     render();
     return;
   }
