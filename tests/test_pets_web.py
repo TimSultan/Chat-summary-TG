@@ -645,6 +645,27 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         bag_view = await self._action(PLAYER, "notifications", view="bag")
         self.assertEqual(len(bag_view["state"]["bag"]), 12)
 
+    async def test_a_response_reports_how_long_the_server_itself_took(self):
+        """Without this, "the button waits two seconds" cannot be attributed: server time
+        and connection time are indistinguishable from the outside."""
+        self._tame(PLAYER)
+        state = await self._get("/api/state", PLAYER)
+        self.assertIn("Server-Timing", state.headers)
+        self.assertRegex(state.headers["Server-Timing"], r"^app;dur=[0-9.]+$")
+
+        action = await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+            "init_data": _init_data(PLAYER["id"]), "action": "notifications",
+        })
+        self.assertEqual(action.status, 200)
+        self.assertIn("Server-Timing", action.headers)
+        # A local action is fast; the assertion is that the number is real, not that it
+        # is small -- a slow machine must not fail the suite.
+        self.assertGreaterEqual(float(action.headers["Server-Timing"].split("=")[1]), 0.0)
+
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("LAST_TIMING", page)
+        self.assertIn('response.headers.get("Server-Timing")', page)
+
     async def test_the_page_fetches_the_bag_before_drawing_it(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn('const BAG_VIEWS = new Set(["hero", "bag", "shop"]);', page)

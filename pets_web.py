@@ -124,10 +124,20 @@ def _json_error(message: str, status: int = 400, code: str = "ERROR") -> web.Res
     return web.json_response({"error": code, "message": message}, status=status)
 
 
-def _ok(payload) -> web.Response:
+def _ok(payload, *, took: float | None = None) -> web.Response:
     """The ONE way a handler here returns data. Everything goes out through _jsonable, so
-    a live datetime arriving from the game cannot 500 a route that forgot to convert it."""
-    return web.json_response(_jsonable(payload))
+    a live datetime arriving from the game cannot 500 a route that forgot to convert it.
+
+    `took` (seconds) is reported as a Server-Timing header. It is the only way to tell a
+    slow SERVER from a slow connection from the outside: the browser shows it next to the
+    request's total in devtools, so "the button waits two seconds" stops being a guess
+    about which half is at fault. Standard header, ignored by anything that doesn't read
+    it, and it carries no data about the player.
+    """
+    response = web.json_response(_jsonable(payload))
+    if took is not None:
+        response.headers["Server-Timing"] = f"app;dur={took * 1000:.1f}"
+    return response
 
 
 def _init_data_from(request: web.Request, body: dict | None = None) -> str:
@@ -1312,6 +1322,7 @@ _DUNGEON_ACTIONS = {
 
 
 async def handle_state(request: web.Request) -> web.Response:
+    started = time.monotonic()
     user, xp = await _player(request)
     entry = request.app[_ENTRY_KEY]
     view = request.query.get("view")
@@ -1336,7 +1347,7 @@ async def handle_state(request: web.Request) -> web.Response:
     # The queue is intentionally part of the ordinary state, so both moderation entries
     # can light up from the same server-side fact rather than drifting apart.
     state["pending_quests"] = quests.pending_count(entry) if state["is_admin"] else 0
-    return _ok(state)
+    return _ok(state, took=time.monotonic() - started)
 
 
 def _dungeon_loot_line(extra: dict) -> str:
@@ -1367,6 +1378,7 @@ def _dungeon_loot_line(extra: dict) -> str:
 
 
 async def handle_action(request: web.Request) -> web.Response:
+    started = time.monotonic()
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -1399,7 +1411,8 @@ async def handle_action(request: web.Request) -> web.Response:
         request.app[_LOG_KEY](
             f"[pets_web] {user['id']} {body.get('action')}"
             f"{' ' + str(body.get('code') or body.get('stat') or body.get('feature') or '')}".rstrip()
-            + f" -> {'ok' if ok else 'refused'}: {message}"
+            + f" -> {'ok' if ok else 'refused'} in {(time.monotonic() - started) * 1000:.0f}ms"
+            + f": {message}"
         )
     except ValueError as e:
         # pets.py raises this for a race the UI already gated on -- a stale tab pressing a
@@ -1445,7 +1458,7 @@ async def handle_action(request: web.Request) -> web.Response:
           "reward": extra.get("reward") or {},
           "dropped": _item_payload(dropped_item, request.app[_PREFIX_KEY], pets.get_pet(entry, user["id"])) if dropped_item else None,
         }
-    return _ok(response)
+    return _ok(response, took=time.monotonic() - started)
 
 
 async def handle_opponents(request: web.Request) -> web.Response:
@@ -4297,14 +4310,33 @@ let ticker = null;
 const START_VIEW = new URLSearchParams(window.location.search).get("view");
 
 // --------------------------------------------------------------------------- transport
+// The last request's split: how long the server said it took (Server-Timing) against how
+// long the whole round trip took here. The difference is the network. Kept so "кнопка
+// тормозит" can be answered with which half is at fault instead of a guess -- shown by
+// long-pressing the coin counter (see hudCoins), never on screen by default.
+let LAST_TIMING = null;
+
 async function api(path, body) {
   const options = body
     ? { method: "POST", headers: { "Content-Type": "application/json",
         "X-Telegram-Init-Data": initData },
         body: JSON.stringify(Object.assign({ init_data: initData }, body)) }
     : { headers: { "X-Telegram-Init-Data": initData } };
+  const started = performance.now();
   const response = await fetch(PREFIX + path, options);
-  const data = await response.json().catch(() => ({}));
+  const text = await response.text();
+  const total = performance.now() - started;
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (e) { data = {}; }
+  const timing = response.headers.get("Server-Timing") || "";
+  // Spelled [0-9.] rather than the usual shorthand: this page is one big Python string,
+  // and a backslash escape Python does not recognise is a SyntaxWarning at import time.
+  const match = /dur=([0-9.]+)/.exec(timing);
+  LAST_TIMING = {
+    path, total: Math.round(total),
+    server: match ? Math.round(Number(match[1])) : null,
+    bytes: text.length,
+  };
   if (!response.ok) {
     const error = new Error(data.message || "Не получилось");
     error.code = data.error;
@@ -7632,6 +7664,32 @@ $("hudCreate").addEventListener("click", () => {
   haptic();
   openPetCreation();
 });
+
+// Hold the coin counter for a second to see what the last request actually cost, split
+// into server time and everything else (which is the network). No UI of its own and no
+// way to reach it by accident -- it exists so a report of "кнопки тормозят" can be
+// answered with a number instead of a theory.
+(() => {
+  let timer = null;
+  const box = $("hudCoins");
+  if (!box) return;
+  const show = () => {
+    if (!LAST_TIMING) { toast("Ещё ничего не запрашивали."); return; }
+    const t = LAST_TIMING;
+    const network = t.server == null ? null : Math.max(0, t.total - t.server);
+    haptic();
+    toast(t.path + " · всего " + t.total + " мс" +
+      (t.server == null ? "" : " (сервер " + t.server + " · сеть " + network + ")") +
+      " · " + Math.round(t.bytes / 1024) + " КБ");
+  };
+  const start = () => { timer = setTimeout(show, 900); };
+  const stop = () => { if (timer) clearTimeout(timer); timer = null; };
+  box.addEventListener("touchstart", start, { passive: true });
+  box.addEventListener("mousedown", start);
+  for (const event of ["touchend", "touchmove", "touchcancel", "mouseup", "mouseleave"]) {
+    box.addEventListener(event, stop, { passive: true });
+  }
+})();
 
 // One delegated handler for the whole game. Every control is a data- attribute rather than
 // a bound listener, so a re-render (which replaces all of it) cannot leave a dead button
