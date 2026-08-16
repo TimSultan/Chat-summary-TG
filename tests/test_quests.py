@@ -1020,3 +1020,89 @@ class QuestModeratorTests(QuestsTestCase):
             for row in keyboard["inline_keyboard"] for button in row
         }
         self.assertEqual(actions, {"main", "questaccept", "questreject"})
+
+
+class RefusedHashtagIsAnsweredTests(unittest.TestCase):
+    """A quest hashtag that cannot be accepted used to be logged and nothing else.
+
+    From the poster's side that is indistinguishable from a broken bot -- which is exactly
+    what happened in production with #quest_zenithal: several posts, no reaction, no idea
+    that the quest simply was not one of the three they were holding. The refusal already
+    names the hashtags that WOULD have worked, so it is worth saying out loud.
+    """
+
+    def test_the_refusal_names_the_hashtags_that_would_have_worked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("stats._stats_dir", return_value=Path(directory)):
+                entry = "chat"
+                board = quests.daily_quest(entry, "1")
+                held = {row["code"] for row in board["quests"]}
+                stranger = next(q for q in catalog.PAINT_QUESTS if q.code not in held)
+
+                ok, note = quests.submit(entry, "1", stranger.code)
+                self.assertFalse(ok)
+                # Not a bare "нельзя": it has to be actionable, or the poster still does
+                # not know what to do differently.
+                for code in held:
+                    self.assertIn(catalog.hashtag(code), note)
+
+    def test_the_listener_hands_a_refusal_to_the_bot_to_answer(self):
+        """The reply goes out through the BOT account like every other outward message,
+        so the personal session never posts. Same queue hand-off the blocked-file notice
+        and the figurine reaction use."""
+        import inspect
+        import listener
+        import bot_listener
+
+        source = inspect.getsource(listener.run_listener)
+        self.assertIn("if not ok and quest_refusal_queue is not None:", source)
+        self.assertIn("await quest_refusal_queue.put((entry, msg.id, note))", source)
+
+        # The listener creates it and hands the SAME queue to both halves.
+        wiring = inspect.getsource(listener.main)
+        self.assertEqual(wiring.count("quest_refusal_queue=quest_refusal_queue"), 2)
+
+        # And the bot side consumes it, replying to the post and cleaning up after itself.
+        consumer = inspect.getsource(bot_listener.run_bot_listener)
+        self.assertIn("_consume_quest_refusals", consumer)
+        self.assertIn("reply_to_message_id=message_id", consumer)
+        self.assertIn("QUEST_REFUSAL_NOTICE_DELETE_AFTER", consumer)
+
+    def test_zenithal_is_a_real_quest_so_the_tag_itself_was_never_the_problem(self):
+        """The reported case. If this ever fails the diagnosis changes completely: it
+        would mean the hashtag does not resolve, rather than the poster not holding it."""
+        self.assertEqual(quests.parse_hashtag("#quest_zenithal"), "zenithal")
+        self.assertIsNotNone(catalog.find_quest("zenithal"))
+
+
+class SupportButtonTests(unittest.TestCase):
+    def test_the_arena_menu_offers_the_collection_under_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("stats._stats_dir", return_value=Path(directory)):
+                entry = "chat"
+                economy.grant(entry, "1", pets_config.TAME_PRICE, "test")
+                pets.buy_cage(entry, "1", 0)
+                pets.tame(entry, "1", 0, "Кабанчик", "file", "Player")
+                _text, keyboard = pets_ui.main_view(entry, "1", 0)
+                rows = keyboard["inline_keyboard"]
+                labels = [[button["text"] for button in row] for row in rows]
+                self.assertEqual(labels[-1], ["💜 Поддержать проект"])
+                # Directly under the row holding «Обновить», which is where it was asked for.
+                self.assertIn("🔄 Обновить", labels[-2])
+                self.assertEqual(
+                    pets_ui.parse_callback(rows[-1][0]["callback_data"])[1], "support",
+                )
+
+    def test_the_support_screen_returns_to_the_menu_it_is_opened_from(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("stats._stats_dir", return_value=Path(directory)):
+                text, keyboard = pets_ui.support_view("chat", "1")
+                self.assertIn("Поддержать", text)
+                self.assertIn("Топ поддержавших", text)
+                rows = keyboard["inline_keyboard"]
+                self.assertEqual(
+                    pets_ui.parse_callback(rows[0][0]["callback_data"])[1], "supportgive",
+                )
+                self.assertEqual(
+                    pets_ui.parse_callback(rows[-1][0]["callback_data"])[1], "main",
+                )

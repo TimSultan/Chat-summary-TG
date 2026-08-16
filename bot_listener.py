@@ -95,6 +95,7 @@ from intent import resolve_name_hint
 from intent_v2 import route_request
 from listener import (
     BLOCKED_FILE_NOTICE_DELETE_AFTER,
+    QUEST_REFUSAL_NOTICE_DELETE_AFTER,
     COMMANDS_FOOTER,
     DAY_LIMIT_MESSAGE,
     DISMISS_DELETE_AFTER,
@@ -8798,6 +8799,7 @@ async def run_bot_listener(
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
     file_block_queue: "asyncio.Queue | None" = None,
+    quest_refusal_queue: "asyncio.Queue | None" = None,
 ):
     """Runs until cancelled. Meant to be started as a sibling asyncio task alongside
     listener.py's Telethon client -- both share the same connected `telethon_client` for
@@ -8839,6 +8841,14 @@ async def run_bot_listener(
     itself after BLOCKED_FILE_NOTICE_DELETE_AFTER, with no trigger message to take along:
     the file that prompted it is already gone. It is None for the second and later files
     of a single album -- those are still deleted, just not each answered separately.
+
+    `quest_refusal_queue`, if given, carries (allowed_chats entry, message_id, reason) for
+    a post that DID carry a quest hashtag and a picture but was turned down -- nearly
+    always because that quest is not one of the three the poster currently holds. The
+    reason already names the hashtags that would have worked, so it is answered as a reply
+    to the post itself and sweeps itself away after QUEST_REFUSAL_NOTICE_DELETE_AFTER.
+    Before this existed the refusal was logged and nothing else, which from the poster's
+    side is indistinguishable from a broken bot -- so they post the same tag again.
 
     All queues are left None when run standalone (this module's own main()), which
     just means figurine reactions/digests/dismissals/file blocks never fire, matching
@@ -9090,6 +9100,44 @@ async def run_bot_listener(
                 except Exception:
                     log(f"[bot_listener] failed to handle a blocked file in '{entry}':\n{traceback.format_exc()}")
 
+        async def _consume_quest_refusals():
+            while True:
+                item = await quest_refusal_queue.get()
+                # Guarded like every other consumer here: they share one asyncio.gather
+                # with the poll loop, so an escaping exception takes the bot down.
+                try:
+                    entry, message_id, reason = item
+                except (TypeError, ValueError):
+                    log(f"[bot_listener] dropping malformed quest-refusal item: {item!r}")
+                    continue
+                try:
+                    chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                    if chat_id is None:
+                        log(f"[bot_listener] dropping quest refusal for '{entry}': no chat_id")
+                        continue
+                    # As a reply to the post itself, so the person who tagged it sees which
+                    # of several photos the bot means, and self-deleting so a busy chat is
+                    # not left with a column of these.
+                    sent = await api.send_message(
+                        chat_id, f"🎯 {reason}",
+                        reply_to_message_id=message_id, parse_mode=None,
+                    )
+                    if sent and "message_id" in sent:
+                        # Only this notice is swept. Emphatically NO trigger_message_id:
+                        # that would take the post along with it, and the post is somebody's
+                        # painted model. Getting the hashtag wrong must not cost them their
+                        # photo -- they still want it in the chat, and they will very likely
+                        # re-tag it with the right quest.
+                        schedule_bot_delete(
+                            api, chat_id, [sent["message_id"]],
+                            QUEST_REFUSAL_NOTICE_DELETE_AFTER, log, background_tasks,
+                        )
+                except Exception:
+                    log(
+                        f"[bot_listener] failed to answer a refused quest in '{entry}':\n"
+                        f"{traceback.format_exc()}"
+                    )
+
         async def _consume_stats_digests():
             while True:
                 item = await stats_digest_queue.get()
@@ -9258,6 +9306,8 @@ async def run_bot_listener(
             tasks.append(_consume_dismissals())
         if file_block_queue is not None:
             tasks.append(_consume_file_blocks())
+        if quest_refusal_queue is not None:
+            tasks.append(_consume_quest_refusals())
         if cfg.webapp_port:
             # PORT is set by the host (Railway does this automatically for any service
             # with public networking on); off when running locally without it, same as

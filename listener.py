@@ -183,6 +183,11 @@ BLOCKED_FILE_EXTENSIONS = (".zip", ".7z", ".rar", ".stl", ".obj", ".glb")
 # message that prompted it is already gone, which is the whole point.
 BLOCKED_FILE_NOTICE = "{mention}, пересылка файлов разрешена только в личке. Спасибо за понимание."
 BLOCKED_FILE_NOTICE_DELETE_AFTER = 30  # seconds
+# A refused quest hashtag is answered in the chat, then cleaned up. Longer than the
+# blocked-file notice because this one has to be READ -- it lists the hashtags that would
+# have worked -- but still temporary: the chat is for painted models, not for the bot
+# explaining itself to one person at a time.
+QUEST_REFUSAL_NOTICE_DELETE_AFTER = 120  # seconds
 
 
 def blocked_file_name(msg) -> str | None:
@@ -956,6 +961,7 @@ async def run_listener(
     stats_digest_queue: "asyncio.Queue | None" = None,
     dismiss_queue: "asyncio.Queue | None" = None,
     file_block_queue: "asyncio.Queue | None" = None,
+    quest_refusal_queue: "asyncio.Queue | None" = None,
 ):
     """Registers the mention-trigger handler on an already-connected & authorized
     `client` and blocks until it disconnects (call `client.disconnect()` to stop it).
@@ -1289,6 +1295,12 @@ async def run_listener(
                         f"{sender_display_name(sender)} in '{entry}': "
                         + ("queued for review" if ok else f"refused -- {note}")
                     )
+                    # A refusal used to be logged and nothing else, so somebody tagging a
+                    # quest they do not currently hold saw no reaction at all and simply
+                    # posted again. `note` already says exactly what is wrong and which
+                    # hashtags WOULD work, so it is worth the one short reply.
+                    if not ok and quest_refusal_queue is not None:
+                        await quest_refusal_queue.put((entry, msg.id, note))
                     if ok and quest_submission_queue is not None:
                         submission = next(
                             (row for row in reversed(quests.pending(entry))
@@ -1579,18 +1591,26 @@ async def main():
         # ELSE's message needs the "delete messages" admin right, which the bot account is
         # the one that normally holds, and the notice is a chat post like any other.
         file_block_queue: asyncio.Queue = asyncio.Queue()
+        # quest_refusal_queue carries (allowed_chats entry, message_id, reason) when a post
+        # DOES carry a quest hashtag and a picture, but the submission was refused -- most
+        # often because that quest is not one of the three the poster currently holds.
+        # Refusing silently is what this queue exists to stop: from the poster's side an
+        # ignored hashtag is indistinguishable from a broken bot, so they post it again.
+        quest_refusal_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
             run_listener(
                 client, cfg, tz,
                 figurine_ack_queue=figurine_ack_queue, quest_submission_queue=quest_submission_queue,
                 stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
+                quest_refusal_queue=quest_refusal_queue,
             ),
             bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
                 figurine_ack_queue=figurine_ack_queue, quest_submission_queue=quest_submission_queue,
                 stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
+                quest_refusal_queue=quest_refusal_queue,
             ),
         )
     else:

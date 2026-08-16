@@ -296,6 +296,11 @@ def main_view(
         {"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")},
         {"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")},
     ])
+    # Last row of the menu, sharing it so it stays small: the collection is a standing
+    # offer, and it should be findable without ever being in the way of playing.
+    rows.append([
+        {"text": "💜 Поддержать проект", "callback_data": callback_data(user_id, "support")},
+    ])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -2584,13 +2589,7 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"👾 Найти моба ({pve['available']})",
             "callback_data": callback_data(user_id, "mob"),
         }])
-    # Two on one row, so each takes half the width: the collection is a standing offer,
-    # not an action, and a full-width button at the bottom of the arena would compete with
-    # the ones that actually start a fight.
-    rows.append([
-        {"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")},
-        {"text": "💜 Поддержать", "callback_data": callback_data(user_id, "support")},
-    ])
+    rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -2617,7 +2616,7 @@ def support_view(entry: str, user_id) -> tuple[str, dict]:
 
     rows = [
         [{"text": "💜 Задонатить", "callback_data": callback_data(user_id, "supportgive")}],
-        [{"text": "◀️ В арену", "callback_data": callback_data(user_id, "fight")}],
+        _back_row(user_id),
     ]
     return "\n".join(lines), {"inline_keyboard": rows}
 

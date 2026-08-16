@@ -339,12 +339,13 @@ class PetsCommandTests(unittest.TestCase):
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
-        # Daily bonus and dungeon are the two intentional full-width action rows.
+        # The intentional full-width rows, in order. Support is last on purpose: it is an
+        # offer rather than an action, so it sits below «Обновить» at the very bottom.
         lone = [
             pets_ui.parse_callback(row[0]["callback_data"])[1]
             for row in keyboard["inline_keyboard"] if len(row) != 2
         ]
-        self.assertEqual(lone, ["dailybonus", "dungeon"])
+        self.assertEqual(lone, ["dailybonus", "dungeon", "support"])
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row

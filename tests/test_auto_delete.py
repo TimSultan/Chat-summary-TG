@@ -134,18 +134,36 @@ class CallSiteTests(unittest.TestCase):
         for site in self._call_sites(consumer):
             self.assertNotIn("trigger_message_id", site)
 
+    def _consumer_body(self, name: str) -> str:
+        """One consumer's source, ending at whatever function follows it.
+
+        Sliced to the next `async def` rather than to a named neighbour: bounding it on
+        the consumer that happened to come next made adding one anywhere in between
+        silently widen an unrelated test's reach.
+        """
+        body = inspect.getsource(bot_listener.run_bot_listener).split(f"async def {name}")[1]
+        return body.split("        async def ")[0]
+
     def test_the_blocked_file_notice_sweeps_itself_but_takes_nothing_with_it(self):
         """The "files only in DMs" notice goes on its own 30s clock. It must NOT pass a
         trigger: what prompted it is the attachment, which this same consumer deleted a
         few lines earlier -- passing its id would be a second delete of a message that is
         already gone."""
-        consumer = inspect.getsource(bot_listener.run_bot_listener)
-        consumer = consumer.split("async def _consume_file_blocks")[1].split("async def _consume_stats_digests")[0]
-        sites = self._call_sites(consumer)
+        sites = self._call_sites(self._consumer_body("_consume_file_blocks"))
         self.assertTrue(sites, "the blocked-file notice no longer self-deletes")
         for site in sites:
             self.assertNotIn("trigger_message_id", site)
             self.assertIn("BLOCKED_FILE_NOTICE_DELETE_AFTER", site)
+
+    def test_a_refused_quest_notice_never_takes_the_painted_photo_with_it(self):
+        """The trigger here is somebody's photo of a model they painted. Sweeping the
+        notice is right; sweeping the post because the hashtag named the wrong quest would
+        delete their work over a typo -- and they still want it in the chat."""
+        sites = self._call_sites(self._consumer_body("_consume_quest_refusals"))
+        self.assertTrue(sites, "the refused-quest notice no longer self-deletes")
+        for site in sites:
+            self.assertNotIn("trigger_message_id", site)
+            self.assertIn("QUEST_REFUSAL_NOTICE_DELETE_AFTER", site)
 
 
 if __name__ == "__main__":
