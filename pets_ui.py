@@ -24,6 +24,7 @@ from html import escape
 
 import economy
 import casino
+import donations
 import pets
 import pets_combat
 import pets_config as C
@@ -2583,9 +2584,52 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"👾 Найти моба ({pve['available']})",
             "callback_data": callback_data(user_id, "mob"),
         }])
-    rows.append([{"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")}])
+    # Two on one row, so each takes half the width: the collection is a standing offer,
+    # not an action, and a full-width button at the bottom of the arena would compete with
+    # the ones that actually start a fight.
+    rows.append([
+        {"text": "📜 История боёв", "callback_data": callback_data(user_id, "history")},
+        {"text": "💜 Поддержать", "callback_data": callback_data(user_id, "support")},
+    ])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def support_view(entry: str, user_id) -> tuple[str, dict]:
+    """The pitch, the roll of honour, and one way in."""
+    lines = [f"💜 <b>{escape(donations.PITCH_TITLE)}</b>\n"]
+    lines.extend(escape(paragraph) for paragraph in donations.PITCH_PARAGRAPHS)
+    lines.append("\n<b>Что получают поддержавшие</b>")
+    lines.extend(f"• {escape(perk)}" for perk in donations.PITCH_PERKS)
+    lines.append(f"\n<i>{escape(donations.PITCH_FOOTER)}</i>")
+
+    top = donations.donors(entry)
+    if top:
+        lines.append("\n🏆 <b>Топ поддержавших</b>")
+        for place, donor in enumerate(top, start=1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(place, f"{place}.")
+            note = f" — {escape(donor['note'])}" if donor["note"] else ""
+            lines.append(f"{medal} <b>{escape(donor['name'])}</b> · ${donor['amount']}{note}")
+    else:
+        # An empty list is worth showing rather than hiding: "nobody yet" is an invitation,
+        # while a missing section reads as a feature that does not work.
+        lines.append("\n🏆 <b>Топ поддержавших</b>\nПока пусто — можно стать первым.")
+
+    rows = [
+        [{"text": "💜 Задонатить", "callback_data": callback_data(user_id, "supportgive")}],
+        [{"text": "◀️ В арену", "callback_data": callback_data(user_id, "fight")}],
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def support_confirm_view(user_id) -> tuple[str, dict]:
+    """The speed bump between an impulse and a message about money."""
+    return escape(donations.CONFIRM_QUESTION), {
+        "inline_keyboard": [
+            [{"text": "✅ Да", "callback_data": callback_data(user_id, "supportyes")}],
+            [{"text": "Нет, просто смотрел", "callback_data": callback_data(user_id, "support")}],
+        ],
+    }
 
 
 def mob_view(entry: str, user_id, block: dict | None) -> tuple[str, dict]:

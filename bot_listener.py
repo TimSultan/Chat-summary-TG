@@ -70,6 +70,7 @@ import arena_web
 import cabinet
 import button_builder
 import casino
+import donations
 import economy
 import history
 import pets
@@ -6115,6 +6116,53 @@ def _pets_image_item(pet: dict, slot: str) -> dict | None:
     }
 
 
+def _parse_support_amount(raw: str) -> int | None:
+    """Dollars out of whatever somebody typed, or None if it was not a number.
+
+    Forgiving about how it is written -- "$20", "20$", "20.5", "20 долларов" all mean the
+    same thing to a person -- and strict about the result being a plausible sum, since the
+    only thing downstream of it is a message to a human. A rejection re-asks rather than
+    guessing, because guessing wrong here puts a number nobody typed in front of the owner.
+    """
+    text = str(raw or "").strip().replace(",", ".")
+    # The sign is inside the match rather than skipped over: reading "-5" as five dollars
+    # would put a number in front of the owner that nobody typed.
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if match is None:
+        return None
+    try:
+        value = float(match.group())
+    except ValueError:
+        return None
+    amount = int(value)
+    return amount if 1 <= amount <= 100_000 else None
+
+
+async def _notify_support_owner(
+    api: TelegramBotAPI, telethon_client, pledge: dict, known_chat_ids, log=print,
+) -> None:
+    """Tell the project owner somebody wants to chip in. Best effort, by design.
+
+    A bot cannot open a conversation with someone who has never started it, and the owner
+    is resolved from a username rather than a stored id, so this can legitimately fail. It
+    is called AFTER the pledge is saved for exactly that reason -- donations.pledges is the
+    record, and this is only the tap on the shoulder.
+    """
+    text = donations.pledge_summary(pledge)
+    for username in PRIVILEGED_MANAGEMENT_USERNAMES:
+        try:
+            entity = await telethon_client.get_entity(username)
+            owner_id = getattr(entity, "id", None)
+            if owner_id is None:
+                continue
+            await api.send_message(owner_id, text, parse_mode=None)
+            return
+        except Exception:
+            log(f"[pets] could not deliver a support pledge to @{username}:\n"
+                f"{traceback.format_exc()}")
+    log(f"[pets] support pledge stored but not delivered: {text.splitlines()[0]}")
+
+
 async def _pets_start_flow(
     api: TelegramBotAPI, pets_flows: dict, chat_id, user_id, entry: str,
     awaiting: str, prompt_text: str, reply_to_message_id, owner_username: str | None = None,
@@ -6293,6 +6341,17 @@ async def handle_pets_callback(
                 api, pets_flows, chat_id, actor.get("id"), entry,
                 "name" if action == "rename" else f"photo_{action}",
                 prompts[action], message_id, actor.get("username"),
+            )
+            return
+
+        # --- supporting the project ----------------------------------------------------
+        if action == "supportyes":
+            # Only the amount is asked for, and only as a number: this is a note for a
+            # conversation, never a payment. Nothing here takes card details, and the
+            # prompt says so out loud so nobody types any.
+            await _pets_start_flow(
+                api, pets_flows, chat_id, actor.get("id"), entry, "support_amount",
+                donations.AMOUNT_PROMPT, message_id, actor.get("username"),
             )
             return
 
@@ -6889,6 +6948,8 @@ async def handle_pets_callback(
             "weaponforge": lambda: pets_ui.weapon_forge_view(user_id),
             "fight": lambda: pets_ui.fight_view(entry, user_id, xp),
             "history": lambda: pets_ui.history_view(entry, user_id),
+            "support": lambda: pets_ui.support_view(entry, user_id),
+            "supportgive": lambda: pets_ui.support_confirm_view(user_id),
             "mail": lambda: pets_ui.mail_view(entry, user_id),
             "updates": lambda: pets_ui.updates_view(
                 entry, user_id, int(argument) if argument.isdigit() else 0,
@@ -7944,6 +8005,30 @@ async def maybe_handle_pets_flow_message(
                     # the completed, atomic transfer must never be rolled back for it.
                     log(f"[pets] failed to notify gift recipient:\n{traceback.format_exc()}")
             return True
+        if awaiting == "support_amount":
+            amount = _parse_support_amount(raw)
+            if amount is None:
+                await api.send_message(
+                    chat_id,
+                    "Нужно число — сколько долларов. Например: 5\n"
+                    "Или просто закройте это сообщение, если передумали.",
+                    parse_mode=None,
+                )
+                return True
+            pets_flows.pop(flow_id, None)
+            pledge = donations.record_pledge(
+                entry, user.user_id, amount,
+                name=_display_name(actor), username=actor.get("username") or "",
+            )
+            await api.send_message(chat_id, donations.THANKS, parse_mode=None)
+            await _send_pets_view(
+                api, chat_id, pets_ui.support_view(entry, user.user_id), log=log,
+            )
+            # The pledge is already saved, so a failed DM loses nothing: it is stored for
+            # the owner to read either way (donations.pledges).
+            await _notify_support_owner(api, telethon_client, pledge, known_chat_ids, log=log)
+            return True
+
         if awaiting in ("photo_tame", "photo_photo"):
             photos = message.get("photo") or []
             if not photos:
@@ -9236,6 +9321,13 @@ async def run_bot_listener(
                         parse_mode=None,
                     )
 
+                async def _send_web_support_pledge(pledge: dict):
+                    """A pledge left in the Mini App reaches the owner the same way one
+                    left in the bot does -- same message, same best-effort delivery."""
+                    await _notify_support_owner(
+                        api, telethon_client, pledge, known_chat_ids, log=log,
+                    )
+
                 pets_web.attach(
                     app, cfg, home_chat_ref or "",
                     is_member=_is_vote_member,
@@ -9249,6 +9341,7 @@ async def run_bot_listener(
                     quest_feedback=_send_quest_feedback,
                     quest_completion=_send_web_quest_completion,
                     birthday_notify=_send_birthday_greeting,
+                    support_notify=_send_web_support_pledge,
                     log=log,
                 )
                 # /poststats too, but only when a token is actually configured -- see

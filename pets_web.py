@@ -49,6 +49,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
+import donations
 import economy
 import pets
 import pets_combat
@@ -76,6 +77,12 @@ _IS_MEMBER_KEY = web.AppKey("pets_is_member", Callable[[dict], Awaitable[bool]])
 _IS_ADMIN_KEY = web.AppKey("pets_is_admin", Callable[[dict], Awaitable[bool]])
 _IS_ECONOMY_ADMIN_KEY = web.AppKey(
     "pets_is_economy_admin", Callable[[dict], Awaitable[bool]],
+)
+# Tells the project owner somebody pledged. Injected like every other outward message,
+# so this module stays constructible without a bot -- and a pledge that cannot be
+# delivered is still recorded (see handle_support_pledge).
+_SUPPORT_NOTIFY_KEY = web.AppKey(
+    "pets_support_notify", Callable[[dict], Awaitable[None]],
 )
 _BIRTHDAY_NOTIFY_KEY = web.AppKey(
     "pets_birthday_notify", Callable[[str, str, int, int], Awaitable[None]],
@@ -2729,6 +2736,83 @@ async def handle_economy_overview(request: web.Request) -> web.Response:
     })
 
 
+async def handle_support(request: web.Request) -> web.Response:
+    """The pitch and the roll of honour. Readable by any member -- it is a public page."""
+    user, _xp = await _player(request)
+    if not await _is_member(request, user):
+        return _json_error("Только участники чата.", status=403, code="NOT_A_MEMBER")
+    entry = request.app[_ENTRY_KEY]
+    return _ok({
+        "title": donations.PITCH_TITLE,
+        "paragraphs": list(donations.PITCH_PARAGRAPHS),
+        "perks": list(donations.PITCH_PERKS),
+        "footer": donations.PITCH_FOOTER,
+        "confirm": donations.CONFIRM_QUESTION,
+        "amount_prompt": donations.AMOUNT_PROMPT,
+        "thanks": donations.THANKS,
+        "goal": donations.MONTHLY_GOAL_USD,
+        "donors": await asyncio.to_thread(donations.donors, entry),
+    })
+
+
+async def handle_support_pledge(request: web.Request) -> web.Response:
+    """Record that somebody would like to contribute, and tell the owner.
+
+    Takes a number and nothing else. No card details, no payment redirect, no link out:
+    this writes down an intention and a way to reach the person, and a human takes it from
+    there. Anything that looked like a checkout would be a different feature with a
+    different set of obligations.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await _is_member(request, user):
+        return _json_error("Только участники чата.", status=403, code="NOT_A_MEMBER")
+    entry = request.app[_ENTRY_KEY]
+    amount = _support_amount(body.get("amount"))
+    if amount is None:
+        return _json_error(
+            "Нужно число — сколько долларов.", status=400, code="BAD_AMOUNT",
+        )
+    name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
+    pledge = await asyncio.to_thread(
+        donations.record_pledge, entry, user["id"], amount,
+        name=name or str(user.get("username") or ""), username=user.get("username") or "",
+    )
+    request.app[_LOG_KEY](
+        f"[pets_web] {user['id']} pledged ${amount} (pledge {pledge['id']})"
+    )
+    # Saved first, announced second: a DM the bot is not allowed to send must not lose the
+    # pledge, which is why donations.pledges exists as the real record.
+    try:
+        await request.app[_SUPPORT_NOTIFY_KEY](pledge)
+    except Exception:
+        request.app[_LOG_KEY](
+            "[pets_web] failed to deliver a support pledge:\n" + traceback.format_exc()
+        )
+    return _ok({"thanks": donations.THANKS, "pledge_id": pledge["id"]})
+
+
+def _support_amount(value) -> int | None:
+    """Dollars from whatever was typed, or None. Mirrors the bot's own parser: the two
+    interfaces must not disagree about what counts as a number.
+
+    The sign is part of the match, not skipped over it: reading "-5" as five dollars puts
+    a number in front of the owner that nobody typed.
+    """
+    text = str(value or "").strip().replace(",", ".")
+    match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", text)
+    if match is None:
+        return None
+    try:
+        amount = int(float(match.group()))
+    except ValueError:
+        return None
+    return amount if 1 <= amount <= 100_000 else None
+
+
 def _submission_link(row: dict) -> str | None:
     """A t.me link to the post itself.
 
@@ -3012,6 +3096,10 @@ async def _default_birthday_notify(celebrant, greeter_name: str, gold: int, xp: 
     return None
 
 
+async def _default_support_notify(pledge: dict):
+    return None
+
+
 def attach(
     app: web.Application,
     cfg,
@@ -3025,6 +3113,7 @@ def attach(
     quest_feedback=None,
     quest_completion=None,
     birthday_notify=None,
+    support_notify=None,
     log=print,
     route_prefix: str = ROUTE_PREFIX,
 ) -> web.Application:
@@ -3061,6 +3150,7 @@ def attach(
     # Declines silently when absent: without a bot to send it, a greeting still pays and
     # still lands in the celebrant's stored notifications.
     app[_BIRTHDAY_NOTIFY_KEY] = birthday_notify or _default_birthday_notify
+    app[_SUPPORT_NOTIFY_KEY] = support_notify or _default_support_notify
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
@@ -3101,6 +3191,8 @@ def attach(
         web.get(prefix + "/api/history", handle_history),
         web.get(prefix + "/api/economy/audit", handle_economy_audit),
         web.get(prefix + "/api/economy/overview", handle_economy_overview),
+        web.get(prefix + "/api/support", handle_support),
+        web.post(prefix + "/api/support", handle_support_pledge),
         web.get(prefix + "/api/mail", handle_mail),
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
@@ -3504,6 +3596,22 @@ PAGE_HTML = """<!doctype html>
                  position:relative; }
   .flow-bucket.here { background:var(--accent); }
   .flow-measure { padding:10px 0; border-bottom:1px solid var(--line); }
+
+  /* ------------------------------------------------------------ supporting the project
+     Deliberately the quietest thing on the screen: muted, small, underlined like an
+     ordinary link and given room to breathe. Asking for money in a game people play for
+     fun earns exactly one line, at the very bottom, after everything they came for. */
+  .support-line { text-align:center; margin:18px 0 6px; }
+  .support-line a { color:var(--muted); font-size:12px; text-decoration:underline;
+                    text-underline-offset:3px; cursor:pointer; }
+  .support-line a:active { color:var(--fg); }
+  .support-pitch p { margin:0 0 10px; font-size:13px; line-height:1.45; }
+  .support-perks { margin:0 0 10px; padding-left:18px; font-size:13px; line-height:1.5; }
+  .support-donor { display:flex; gap:8px; align-items:baseline; padding:6px 0;
+                   border-bottom:1px solid var(--line); font-size:13px; }
+  .support-donor .place { width:24px; flex:none; color:var(--muted); }
+  .support-donor .who { flex:1; min-width:0; }
+  .support-donor .sum { color:var(--gold); font-weight:600; }
 
   /* --------------------------------------------------------------- stats + combat */
   .grid4 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
@@ -4572,7 +4680,11 @@ function renderHero() {
     (Object.values(worn).some((s) => s.item) ? "" :
       '<div class="panel small muted">Снаряжения пока нет. Загляни в лавку или побеждай в боях, чтобы его получить.</div>') +
     cagePanel() + dailyPanel() +
-    '<button class="go sec" data-do="rename">✏️ Переименовать</button>';
+    '<button class="go sec" data-do="rename">✏️ Переименовать</button>' +
+    // Last thing on the longest screen, as a quiet line rather than a button: it is an
+    // offer, and an offer that shouts competes with the game for attention every time
+    // somebody opens their own creature.
+    '<div class="support-line"><a data-support="open">💜 Поддержать проект</a></div>';
   paintShots(box);
 }
 
@@ -6207,6 +6319,72 @@ function economyAudit(data) {
     (report.log_at_capacity ? '<div class="warn-note">Журнал достиг лимита; самые старые операции уже удалены.</div>' : '');
 }
 
+// --------------------------------------------------------------- supporting the project
+// Three steps, each its own sheet: read, confirm, name a number. Split up rather than
+// crammed into one form on purpose -- the confirm step exists so that tapping a new
+// button out of curiosity never lands anybody on a page asking for money, and it offers
+// the way out first.
+let SUPPORT = null;
+
+async function openSupport() {
+  try { SUPPORT = SUPPORT || await api("/api/support"); }
+  catch (e) { toast(e.message); return; }
+  const donors = SUPPORT.donors || [];
+  const board = donors.length
+    ? donors.map((donor, index) =>
+        '<div class="support-donor"><span class="place">' +
+        (["🥇", "🥈", "🥉"][index] || (index + 1) + ".") + '</span>' +
+        '<span class="who"><b>' + esc(donor.name) + '</b>' +
+        (donor.note ? '<br><span class="tiny muted">' + esc(donor.note) + '</span>' : '') +
+        '</span><span class="sum">$' + Number(donor.amount || 0) + '</span></div>').join("")
+    : '<div class="small muted">Пока пусто — можно стать первым.</div>';
+  sheet('<h3>💜 ' + esc(SUPPORT.title || "Поддержать проект") + '</h3>' +
+    '<div class="support-pitch">' +
+      (SUPPORT.paragraphs || []).map((p) => '<p>' + esc(p) + '</p>').join("") +
+    '</div>' +
+    '<div class="small" style="margin-bottom:6px"><b>Что получают поддержавшие</b></div>' +
+    '<ul class="support-perks">' +
+      (SUPPORT.perks || []).map((p) => '<li>' + esc(p) + '</li>').join("") + '</ul>' +
+    '<div class="tiny muted" style="margin-bottom:14px">' + esc(SUPPORT.footer || "") + '</div>' +
+    '<div class="small" style="margin-bottom:4px"><b>🏆 Топ поддержавших</b></div>' + board +
+    '<div class="acts"><button class="go" data-support="give">💜 Задонатить</button>' +
+    '<button class="go sec" data-support="close">Закрыть</button></div>');
+}
+
+function openSupportConfirm() {
+  sheet('<h3>Точно?</h3>' +
+    '<div class="small" style="white-space:pre-line">' + esc(SUPPORT.confirm || "") + '</div>' +
+    '<div class="acts"><button class="go" data-support="amount">Да</button>' +
+    '<button class="go sec" data-support="open">Нет, просто смотрел</button></div>');
+}
+
+function openSupportAmount() {
+  sheet('<h3>Сумма</h3>' +
+    '<div class="small" style="white-space:pre-line;margin-bottom:10px">' +
+      esc(SUPPORT.amount_prompt || "") + '</div>' +
+    '<input class="inp" id="supportAmount" type="number" min="1" step="1" ' +
+      'inputmode="numeric" placeholder="$">' +
+    '<div class="acts"><button class="go" data-support="send">Отправить</button>' +
+    '<button class="go sec" data-support="close">Отмена</button></div>');
+  const field = $("supportAmount");
+  if (field) field.focus();
+}
+
+async function sendSupport() {
+  const field = $("supportAmount");
+  const amount = Math.floor(Number((field && field.value) || 0));
+  if (!amount || amount < 1) { toast("Напишите сумму числом, например 5."); return; }
+  try {
+    const data = await api("/api/support", { amount });
+    closeSheet();
+    haptic("ok");
+    sheet('<h3>Спасибо 💜</h3><div class="small" style="white-space:pre-line">' +
+      esc(data.thanks || "") + '</div>' +
+      '<div class="acts"><button class="go" data-support="close">Закрыть</button></div>');
+    SUPPORT = null;                    // the roll of honour may well have moved
+  } catch (e) { haptic("no"); toast(e.message); }
+}
+
 // ------------------------------------------------------- economy + progression overview
 let statsDays = 30;
 let statsMetric = "earned";        // which column the daily comparison chart draws
@@ -7702,7 +7880,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
-    "[data-grantpick],[data-grantset]";
+    "[data-grantpick],[data-grantset],[data-support]";
 
 async function handleClick(event, target) {
   const d = target.dataset;
@@ -7721,6 +7899,14 @@ async function handleClick(event, target) {
   if (d.debuffpick !== undefined) { debuffPick = d.debuffpick; render(); return; }
   if (d.debuffset !== undefined) { await setDebuff(d.debuffset, false); return; }
   if (d.debuffclear !== undefined) { await setDebuff(d.debuffclear, true); return; }
+  if (d.support) {
+    if (d.support === "open") { await openSupport(); return; }
+    if (d.support === "give") { openSupportConfirm(); return; }
+    if (d.support === "amount") { openSupportAmount(); return; }
+    if (d.support === "send") { await sendSupport(); return; }
+    closeSheet();
+    return;
+  }
   if (d.grantpick !== undefined) { grantPick = d.grantpick; render(); return; }
   if (d.grantset !== undefined) { await setGrant(d.grantset); return; }
 

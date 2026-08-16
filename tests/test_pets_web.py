@@ -30,6 +30,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import donations
 import economy
 import pets
 import pets_config as C
@@ -194,6 +195,16 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 raise self.birthday_notify_raises
             self.birthday_greetings.append((str(celebrant), greeter_name, gold, xp))
 
+        # Recorded rather than sent, and able to fail on demand: a pledge the owner cannot
+        # be told about must still be kept, which is a behaviour worth testing.
+        self.support_pledges: list[dict] = []
+        self.support_notify_raises: Exception | None = None
+
+        async def support_notify(pledge):
+            if self.support_notify_raises:
+                raise self.support_notify_raises
+            self.support_pledges.append(dict(pledge))
+
         # Built exactly as production builds it: v1's app, with the pet game attached the
         # way bot_listener's _attach_extra really attaches it.
         app = vote_web.create_app(
@@ -206,6 +217,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 quest_feedback=quest_feedback,
                 quest_completion=quest_completion,
                 birthday_notify=birthday_notify,
+                support_notify=support_notify,
                 log=self.logs.append,
             ),
         )
@@ -2578,6 +2590,80 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             pets_web.ROUTE_PREFIX + "/api/grant",
             json={"init_data": _init_data(user["id"]), **payload},
         )
+
+    # ---- supporting the project --------------------------------------------------------
+
+    async def test_the_support_page_shows_the_pitch_and_the_roll_of_honour(self):
+        donations.add_donor(CHAT, "Кломбик", 25, "своё оружие")
+        donations.add_donor(CHAT, "БИ-2", 10)
+        body = await (await self._get("/api/support", PLAYER)).json()
+        self.assertTrue(body["paragraphs"])
+        self.assertTrue(body["perks"])
+        self.assertEqual([row["name"] for row in body["donors"]], ["Кломбик", "БИ-2"])
+        self.assertEqual(body["donors"][0]["amount"], 25)
+        self.assertEqual(body["donors"][0]["note"], "своё оружие")
+
+        blocked = await self._get("/api/support", NONMEMBER)
+        self.assertEqual(blocked.status, 403)
+
+    async def test_a_pledge_is_recorded_and_the_owner_is_told(self):
+        """The pledge is the record; the message to the owner is only the tap on the
+        shoulder. Nothing here takes payment details -- just a number and who typed it."""
+        answer = await self.client.post(pets_web.ROUTE_PREFIX + "/api/support", json={
+            "init_data": _init_data(PLAYER["id"]), "amount": 20,
+        })
+        self.assertEqual(answer.status, 200, await answer.text())
+        body = await answer.json()
+        self.assertIn("свяжусь", body["thanks"])
+
+        stored = donations.pledges(CHAT)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["amount"], 20)
+        self.assertEqual(stored[0]["user_id"], str(PLAYER["id"]))
+        self.assertEqual(stored[0]["id"], body["pledge_id"])
+
+        self.assertEqual(len(self.support_pledges), 1)
+        summary = donations.pledge_summary(self.support_pledges[0])
+        self.assertIn("$20", summary)
+        self.assertIn(str(PLAYER["id"]), summary)
+
+    async def test_a_pledge_survives_the_owner_being_unreachable(self):
+        """A bot cannot open a chat with somebody who never started it, so the DM is
+        allowed to fail -- but the pledge must not be lost with it."""
+        self.support_notify_raises = RuntimeError("cannot message the owner")
+        answer = await self.client.post(pets_web.ROUTE_PREFIX + "/api/support", json={
+            "init_data": _init_data(PLAYER["id"]), "amount": 15,
+        })
+        self.assertEqual(answer.status, 200, await answer.text())
+        self.assertEqual(len(donations.pledges(CHAT)), 1)
+        self.assertEqual(donations.pledges(CHAT)[0]["amount"], 15)
+
+    async def test_a_pledge_refuses_anything_that_is_not_a_sum(self):
+        for bad in ("", "как-нибудь потом", 0, -5, 999999999):
+            with self.subTest(amount=bad):
+                answer = await self.client.post(pets_web.ROUTE_PREFIX + "/api/support", json={
+                    "init_data": _init_data(PLAYER["id"]), "amount": bad,
+                })
+                self.assertEqual(answer.status, 400, await answer.text())
+                self.assertEqual((await answer.json())["error"], "BAD_AMOUNT")
+        self.assertEqual(donations.pledges(CHAT), [])
+        # And the shapes a person really types all work.
+        for good, expected in (("5", 5), ("$20", 20), ("12.7", 12), ("30 долларов", 30)):
+            with self.subTest(amount=good):
+                self.assertEqual(pets_web._support_amount(good), expected)
+
+    async def test_the_support_entry_is_the_quietest_thing_on_the_main_screen(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        # A muted underlined line at the very bottom of the hero screen, not a button.
+        hero = page.split("function renderHero()", 1)[1].split("function tile(", 1)[0]
+        self.assertIn('<div class="support-line"><a data-support="open">', hero)
+        self.assertLess(hero.index('data-do="rename"'), hero.index('data-support="open"'))
+        self.assertIn(".support-line a { color:var(--muted); font-size:12px;", page)
+        # Read -> confirm -> amount, and the way out is offered on the confirm step.
+        self.assertIn("function openSupportConfirm()", page)
+        self.assertIn('data-support="amount"', page)
+        self.assertIn("Нет, просто смотрел", page)
+        self.assertIn("async function sendSupport()", page)
 
     async def test_only_a_chat_admin_can_open_or_use_the_grant_panel(self):
         """Same narrow gate as debuffs and the birthday -- both routes ask for themselves."""
