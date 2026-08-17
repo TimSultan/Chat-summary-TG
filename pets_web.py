@@ -1015,6 +1015,11 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         "level_up": pets.level_up_status(entry, user_id),
         "maintenance": maintenance.status(),
         "unread_updates": pets_updates.has_unread(entry, user_id),
+        # Separate from "unread": a reward stays owed after the note has been read, so a
+        # player who opened the log and got distracted still sees the gift waiting.
+        "updates_reward": sum(
+            row.reward_rubies for row in pets_updates.claimable(entry, user_id)
+        ),
         "quest_attention": quests.has_available_quests(entry, user_id),
         "personal_paint": pets.personal_paint_status(entry, user_id),
     }
@@ -3148,8 +3153,55 @@ async def handle_updates(request: web.Request) -> web.Response:
     entry = request.app[_ENTRY_KEY]
     updates = pets_updates.all_updates(entry)
     pets_updates.mark_latest_read(entry, user["id"])
+    claimed = pets_updates.claimed_ids(entry, user["id"])
     return _ok({
-        "rows": [{"id": u.id, "title": u.title, "text": u.text} for u in reversed(updates)]
+        "rows": [
+            {
+                "id": u.id, "title": u.title, "text": u.text,
+                "reward": u.reward_rubies,
+                "claimed": u.id in claimed,
+            }
+            for u in reversed(updates)
+        ]
+    })
+
+
+async def handle_update_claim(request: web.Request) -> web.Response:
+    """Pay one note's diamonds, once, to the member asking.
+
+    The grant runs BEFORE the claim is recorded and goes through the idempotent
+    grant_rubies_once, so the two writes can be interrupted between without either
+    double-paying or losing the reward -- see pets_updates.mark_claimed.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    entry = request.app[_ENTRY_KEY]
+    update_id = str(body.get("id") or "").strip()
+    note = pets_updates.find(entry, update_id)
+    if note is None:
+        return _json_error("Такой новости нет.", status=404, code="NO_UPDATE")
+    if note.reward_rubies <= 0:
+        return _json_error("За эту новость награды нет.", status=409, code="NO_REWARD")
+    if update_id in pets_updates.claimed_ids(entry, user["id"]):
+        return _json_error("Награда уже получена.", status=409, code="ALREADY_CLAIMED")
+
+    def _pay() -> int:
+        pets.grant_rubies_once(
+            entry, user["id"], note.reward_rubies,
+            pets_updates.reward_source(update_id, user["id"]),
+        )
+        pets_updates.mark_claimed(entry, user["id"], update_id)
+        return pets.ruby_balance(entry, user["id"])
+
+    balance = await asyncio.to_thread(_pay)
+    request.app[_LOG_KEY](
+        f"[pets_web] {user['id']} claimed {note.reward_rubies} rubies for {update_id}"
+    )
+    return _ok({
+        "message": f"💎 +{note.reward_rubies}", "rubies": balance, "id": update_id,
     })
 
 
@@ -3473,6 +3525,7 @@ def attach(
         web.post(prefix + "/api/quests/config", handle_quest_config),
         web.get(prefix + "/api/collection", handle_collection),
         web.get(prefix + "/api/updates", handle_updates),
+        web.post(prefix + "/api/updates/claim", handle_update_claim),
         web.post(prefix + "/api/portrait", handle_portrait_upload),
         web.get(prefix + "/img/personal-paint/{rune_id}.jpg", handle_personal_paint_image),
         # Before the item route: "pet/12.jpg" must not be read as an item code.
@@ -3830,6 +3883,21 @@ PAGE_HTML = """<!doctype html>
     display: flex; align-items: center; justify-content: center;
     border-radius: 12px; font-size: 20px; line-height: 1;
     border: 1px solid var(--line); background: var(--sunken);
+  }
+  /* Unread news swaps the newspaper for a gift and makes it move. A still icon in a
+     corner is easy to stop seeing; the wobble is what actually gets it opened. It stops
+     the moment the log is read, so it can never become permanent furniture -- and it is
+     dropped entirely for anyone who has asked the OS for less motion. */
+  .hud .post.gift { border-color: var(--accent); animation: nudge 1.7s ease-in-out infinite; }
+  @keyframes nudge {
+     0%, 62%, 100% { transform: rotate(0deg) scale(1); }
+    68%            { transform: rotate(-13deg) scale(1.12); }
+    76%            { transform: rotate(11deg) scale(1.12); }
+    84%            { transform: rotate(-7deg) scale(1.06); }
+    92%            { transform: rotate(4deg) scale(1.02); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hud .post.gift { animation: none; }
   }
   .hud .hud-create {
     flex: none; border: 0; border-radius: 10px; padding: 9px 10px;
@@ -4854,6 +4922,7 @@ PAGE_HTML = """<!doctype html>
   </div>
   <button class="hud-create" id="hudCreate" hidden>Создать существо</button>
   <button class="post" id="hudMail" title="Почта">📬</button>
+  <button class="post" id="hudNews" title="Новости">📰</button>
 </header>
 
 <main id="main">
@@ -5092,6 +5161,14 @@ function renderHud() {
   $("hudCreate").hidden = Boolean(pet);
   $("hudRubyBox").hidden = !rubies;
   $("hudRuby").textContent = money(rubies);
+  // A gift that wobbles when there is something to read or something to collect;
+  // a plain newspaper the rest of the time.
+  const owed = (S && S.updates_reward) || 0;
+  const fresh = Boolean(S && S.unread_updates) || owed > 0;
+  const news = $("hudNews");
+  news.textContent = fresh ? "🎁" : "📰";
+  news.classList.toggle("gift", fresh);
+  news.title = owed ? "Новости · награда " + owed + " 💎" : "Новости";
   const arena = (S && S.arena) || {};
   $("hudFights").textContent = (arena.available != null ? arena.available : 0) +
     "/" + (arena.capacity != null ? arena.capacity : 0);
@@ -6898,6 +6975,20 @@ async function setMaintenance(on) {
   } catch (e) { haptic("no"); toast(e.message); }
 }
 
+// Collect one note's diamonds. Refreshes state before re-rendering so the purse, the HUD
+// gift and the button itself all move together -- the server is the only thing that
+// decides whether a reward is still owed.
+async function claimUpdateReward(id) {
+  try {
+    const result = await api("/api/updates/claim", { id: id });
+    haptic("ok");
+    toast(result.message || "Награда получена.");
+    await refresh();
+    moreView = "updates";
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+}
+
 // --------------------------------------------------------------- supporting the project
 // Three steps, each its own sheet: read, confirm, name a number. Split up rather than
 // crammed into one form on purpose -- the confirm step exists so that tapping a new
@@ -7224,11 +7315,11 @@ async function renderMore() {
       : '<div class="empty">Боёв ещё не было.</div>') + "</div>";
   } else if (moreView === "updates") {
     const data = await api("/api/updates");
+    // Read is now true, but an unclaimed reward keeps the gift on the HUD -- the two
+    // are separate states on purpose (see updates_reward on the server).
     if (S) S.unread_updates = false;
-    body = (data.rows || []).map((row) =>
-      '<div class="panel"><h2>' + esc(row.title || "Обновление") + "</h2>" +
-      '<div class="small" style="white-space:pre-wrap">' + esc(row.text || "") +
-      "</div></div>").join("") || '<div class="empty">Пока тихо.</div>';
+    body = (data.rows || []).map(updatePanel).join("") ||
+      '<div class="empty">Пока тихо.</div>';
   }
   box.innerHTML = '<button class="go sec" data-more="menu">◀️ Назад</button>' + body;
   paintShots(box);
@@ -7558,6 +7649,24 @@ function reviewQueue(data) {
       '" data-enabled="' + (quest.enabled ? "0" : "1") + '">' +
       (quest.enabled ? "в ротации" : "выключен") + "</button></div>").join("") + "</div>";
   return out;
+}
+
+// --------------------------------------------------------------------------- updates
+// One note, plus its reward if it carries one. The button is rendered from the server's
+// `claimed` flag rather than from anything remembered on the client, so a second device
+// or a reload shows the reward as already taken instead of offering it again.
+function updatePanel(row) {
+  let reward = "";
+  if (row.reward > 0) {
+    reward = row.claimed
+      ? '<div class="small" style="margin-top:9px;opacity:.75">🎁 Награда получена: ' +
+        row.reward + " 💎</div>"
+      : '<button class="go" style="margin-top:10px" data-claim="' + esc(row.id) +
+        '">🎁 Забрать награду · ' + row.reward + " 💎</button>";
+  }
+  return '<div class="panel"><h2>' + esc(row.title || "Обновление") + "</h2>" +
+    '<div class="small" style="white-space:pre-wrap">' + esc(row.text || "") + "</div>" +
+    reward + "</div>";
 }
 
 // ------------------------------------------------------------------------------ mail
@@ -8436,6 +8545,16 @@ $("hudMail").addEventListener("click", () => {
   render();
 });
 
+// News sits beside the mailbox for the same reason the mailbox is there: it is checked
+// between fights rather than played, and burying it in «Ещё» is what made an unread note
+// stay unread. «Назад» from it still lands on that menu.
+$("hudNews").addEventListener("click", () => {
+  TAB = "more";
+  moreView = "updates";
+  haptic();
+  render();
+});
+
 $("hudCreate").addEventListener("click", () => {
   haptic();
   openPetCreation();
@@ -8478,7 +8597,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
-    "[data-grantpick],[data-grantset],[data-grantsign],[data-support],[data-maint]";
+    "[data-grantpick],[data-grantset],[data-grantsign],[data-support],[data-maint],[data-claim]";
 
 async function handleClick(event, target) {
   const d = target.dataset;
@@ -8488,6 +8607,7 @@ async function handleClick(event, target) {
     return;
   }
 
+  if (d.claim) { await claimUpdateReward(d.claim); return; }
   if (d.peek) { await togglePeek(d.peek); return; }
   if (d.congratulate) { await congratulate(); return; }
   if (d.birthdayset !== undefined) { await setBirthday(d.birthdayset); return; }

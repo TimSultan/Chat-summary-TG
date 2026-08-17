@@ -1946,7 +1946,8 @@ def ruby_source_of(reason: str) -> str:
         return "quests"
     if value == "pet_mob_win" or value.startswith("pve-ruby"):
         return "mobs"
-    if value.startswith("admin-grant:") or value.startswith("grant:"):
+    if value.startswith("admin-grant:") or value.startswith("grant:") \
+            or value.startswith("update-reward:"):
         return "grants"
     if value.startswith("spend:"):
         sink = value.split(":", 1)[1]

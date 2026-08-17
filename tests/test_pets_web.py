@@ -42,6 +42,7 @@ import pets_mobs
 import pets_scroll_catalog as SCROLLS
 import pets_sprite
 import pets_sprite_store
+import pets_updates
 import quests
 import pets_web
 import stats
@@ -257,6 +258,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     async def _get(self, path, user):
         return await self.client.get(pets_web.ROUTE_PREFIX + path, headers=self._auth(user))
 
+    async def _post(self, path, user, payload=None):
+        """POST a signed mutation, the way every non-/api/action route takes it: initData
+        travels in the JSON body rather than the header."""
+        return await self.client.post(pets_web.ROUTE_PREFIX + path, json={
+            "init_data": _init_data(user["id"]), **(payload or {}),
+        })
+
     async def _action_raw(self, user, action, **payload):
         """POST /api/action without asserting the transport succeeded -- for the tests
         that are about the status code itself."""
@@ -297,6 +305,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             ("get", "/api/economy/audit"),
             ("get", "/api/test-battle"),
             ("post", "/api/action"), ("post", "/api/attack"),
+            ("post", "/api/updates/claim"),
             ("post", "/api/test-battle/start"), ("post", "/api/test-battle/action"),
         ):
             response = await getattr(self.client, method)(pets_web.ROUTE_PREFIX + path, json={})
@@ -1120,6 +1129,95 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                                  "dungeon_boss" if boss else "dungeon_mobs")
         self.assertEqual(economy._audit_source("pet_dungeon_win"), "dungeon_legacy")
         self.assertEqual(pets.ruby_source_of("dungeon-ruby:tok"), "dungeon_legacy")
+
+    # ---- news rewards -------------------------------------------------------------------
+
+    def _rewarded_update(self, amount=1, code="test-reward"):
+        """Pin a rewarding note in place of the shipped log, so these tests keep passing
+        when the real changelog gains entries."""
+        note = pets_updates.Update(code, "Награда", "Текст", reward_rubies=amount)
+        return patch.object(pets_updates, "UPDATES", (note,))
+
+    async def test_a_news_reward_is_paid_once_and_shows_as_claimed_afterwards(self):
+        with self._rewarded_update(amount=3):
+            listing = await self._get("/api/updates", PLAYER)
+            row = (await listing.json())["rows"][0]
+            self.assertEqual((row["id"], row["reward"], row["claimed"]),
+                             ("test-reward", 3, False))
+
+            claimed = await self._post("/api/updates/claim", PLAYER, {"id": "test-reward"})
+            self.assertEqual(claimed.status, 200)
+            self.assertEqual((await claimed.json())["rubies"], 3)
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 3)
+
+            # Pressing it twice must not pay twice, and the feed must say so.
+            again = await self._post("/api/updates/claim", PLAYER, {"id": "test-reward"})
+            self.assertEqual(again.status, 409)
+            self.assertEqual((await again.json())["error"], "ALREADY_CLAIMED")
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 3)
+            reread = await self._get("/api/updates", PLAYER)
+            self.assertTrue((await reread.json())["rows"][0]["claimed"])
+
+        # The payout is a real ledger row, so the income audit sees it as a grant.
+        rows = [r for r in pets._load(CHAT)["ruby_log"] if r["reason"].startswith("update-reward:")]
+        self.assertEqual([(r["user_id"], r["delta"]) for r in rows], [(str(PLAYER["id"]), 3)])
+        self.assertEqual(pets.ruby_source_of(rows[0]["reason"]), "grants")
+
+    async def test_each_player_claims_their_own_copy_of_the_same_reward(self):
+        """The grant key carries the user id; without it the first claimer would take the
+        note's reward and everybody else would be silently refused."""
+        with self._rewarded_update(amount=2):
+            for who in (PLAYER, OPPONENT):
+                response = await self._post("/api/updates/claim", who, {"id": "test-reward"})
+                self.assertEqual(response.status, 200, who["username"])
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 2)
+            self.assertEqual(pets.ruby_balance(CHAT, OPPONENT["id"]), 2)
+
+    async def test_state_advertises_an_owed_reward_until_it_is_taken(self):
+        with self._rewarded_update(amount=5):
+            before = await (await self._get("/api/state", PLAYER)).json()
+            self.assertEqual(before["updates_reward"], 5)
+            self.assertTrue(before["unread_updates"])
+
+            # Reading the log clears "unread" but must NOT clear what is still owed.
+            await self._get("/api/updates", PLAYER)
+            mid = await (await self._get("/api/state", PLAYER)).json()
+            self.assertFalse(mid["unread_updates"])
+            self.assertEqual(mid["updates_reward"], 5)
+
+            await self._post("/api/updates/claim", PLAYER, {"id": "test-reward"})
+            after = await (await self._get("/api/state", PLAYER)).json()
+            self.assertEqual(after["updates_reward"], 0)
+
+    async def test_a_note_without_a_reward_cannot_be_claimed(self):
+        plain = pets_updates.Update("plain", "Без награды", "Текст")
+        with patch.object(pets_updates, "UPDATES", (plain,)):
+            response = await self._post("/api/updates/claim", PLAYER, {"id": "plain"})
+            self.assertEqual(response.status, 409)
+            self.assertEqual((await response.json())["error"], "NO_REWARD")
+            missing = await self._post("/api/updates/claim", PLAYER, {"id": "nope"})
+            self.assertEqual(missing.status, 404)
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 0)
+
+    async def test_a_chat_written_note_can_never_carry_a_reward(self):
+        """/arenanews is a writing tool, not a mint: whatever is stored, it reads as zero."""
+        pets_updates.add(CHAT, "Своя новость", "Текст", author_id=MODERATOR["id"])
+        written = pets_updates.custom(CHAT)[0]
+        self.assertEqual(written.reward_rubies, 0)
+        response = await self._post("/api/updates/claim", PLAYER, {"id": written.id})
+        self.assertEqual(response.status, 409)
+
+    async def test_the_hud_carries_a_news_button_that_turns_into_an_animated_gift(self):
+        page = await self.client.get(pets_web.ROUTE_PREFIX + "/", headers=self._auth(PLAYER))
+        html = await page.text()
+        self.assertIn('id="hudNews"', html)
+        # Beside the mailbox, not buried in «Ещё».
+        self.assertLess(html.index('id="hudMail"'), html.index('id="hudNews"'))
+        self.assertIn("@keyframes nudge", html)
+        self.assertIn('news.classList.toggle("gift", fresh)', html)
+        # Motion is dropped for anyone who asked the OS for less of it.
+        self.assertIn("prefers-reduced-motion", html)
+        self.assertIn("🎁 Забрать награду", html)
 
     async def test_audit_page_offers_an_income_tab_with_all_three_filters(self):
         page = await self.client.get("/audit")

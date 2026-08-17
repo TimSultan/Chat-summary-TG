@@ -19,9 +19,11 @@ import app_time
 import stats
 
 
-# v1 stored only read checkpoints. v2 adds chat-authored entries; a v1 file simply loads
-# with none, so no migration step is needed.
-STORE_VERSION = 2
+# v1 stored only read checkpoints. v2 adds chat-authored entries; v3 adds per-member
+# reward claims. Each older file simply loads with the newer section empty, so there is no
+# migration step -- and an unclaimed reward is exactly what an upgraded v2 file should
+# report, since nobody could have claimed one before this version existed.
+STORE_VERSION = 3
 _lock = threading.RLock()
 
 # A note is one Telegram screen, not an article: the view sends title and body in a single
@@ -41,6 +43,10 @@ class Update:
     id: str
     title: str
     text: str
+    # Diamonds this note pays the first time a member opens it and presses «Забрать
+    # награду». Zero for every entry written before rewards existed and for every
+    # chat-authored note -- an admin typing /arenanews must not be able to mint currency.
+    reward_rubies: int = 0
 
 
 # Writing guide for people and generators: each note is a short player-facing invitation,
@@ -455,6 +461,16 @@ UPDATES: tuple[Update, ...] = (
         "теперь заметно быстрее.\n\n"
         "И всем, у кого есть существо, начислено 10 💎 — как раз на пару уровней.",
     ),
+    Update(
+        "202608-news-rewards",
+        "🎁 Новости с наградой",
+        "Новости переехали наверх — кнопка теперь стоит рядом с почтой, и её видно с "
+        "любого экрана. Когда есть непрочитанное, на ней покачивается подарок.\n\n"
+        "И теперь за новости платят. У обновления может быть награда: открываешь новость, "
+        "жмёшь «Забрать награду» — и алмазы сразу на счету. Забрать можно один раз.\n\n"
+        "За эту новость — 1 💎. Кнопка ниже.",
+        reward_rubies=1,
+    ),
 )
 
 
@@ -463,7 +479,7 @@ def _path(entry: str):
 
 
 def _empty() -> dict:
-    return {"version": STORE_VERSION, "read": {}, "custom": []}
+    return {"version": STORE_VERSION, "read": {}, "custom": [], "claimed": {}}
 
 
 def _clean_custom(raw) -> list[dict]:
@@ -501,10 +517,18 @@ def _load(entry: str) -> dict:
     read = data.get("read")
     if not isinstance(read, dict):
         read = {}
+    claimed = data.get("claimed")
+    claimed = claimed if isinstance(claimed, dict) else {}
     return {
         "version": STORE_VERSION,
         "read": {str(key): str(value) for key, value in read.items()},
         "custom": _clean_custom(data.get("custom")),
+        # Stored as a list per member rather than a flat set of "user:update" strings so
+        # one person's history stays readable in the file by eye.
+        "claimed": {
+            str(key): sorted({str(code) for code in value})
+            for key, value in claimed.items() if isinstance(value, (list, tuple, set))
+        },
     }
 
 
@@ -514,6 +538,8 @@ def _save(entry: str, data: dict) -> None:
 
 
 def _as_update(row: dict) -> Update:
+    # Chat-authored notes never carry a reward: /arenanews is a writing tool, not a
+    # mint, and the field is deliberately not read back off the stored row.
     return Update(row["id"], row["title"], row["text"])
 
 
@@ -583,6 +609,56 @@ def has_unread(entry: str, user_id) -> bool:
         return False
     with _lock:
         return _load(entry)["read"].get(str(user_id)) != newest.id
+
+
+def find(entry: str, update_id: str) -> Update | None:
+    code = str(update_id or "").strip()
+    return next((row for row in all_updates(entry) if row.id == code), None)
+
+
+def claimed_ids(entry: str, user_id) -> set[str]:
+    with _lock:
+        return set(_load(entry)["claimed"].get(str(user_id), ()))
+
+
+def reward_source(update_id: str, user_id) -> str:
+    """The durable key the diamonds are minted under.
+
+    Carries both the note and the member, because grant_rubies_once dedupes on exactly
+    this string -- a key without the user id would pay the first claimer and silently
+    refuse everybody else.
+    """
+    return f"update-reward:{update_id}:{user_id}"
+
+
+def claimable(entry: str, user_id) -> tuple[Update, ...]:
+    """Notes that still owe this member diamonds, oldest first."""
+    already = claimed_ids(entry, user_id)
+    return tuple(
+        row for row in all_updates(entry)
+        if row.reward_rubies > 0 and row.id not in already
+    )
+
+
+def mark_claimed(entry: str, user_id, update_id: str) -> bool:
+    """Record that this member has taken this note's reward. False if already recorded.
+
+    Callers must credit the diamonds BEFORE calling this, through the idempotent
+    grant_rubies_once keyed on reward_source() above. That order is what makes a crash
+    between the two harmless: a retry re-runs a grant that has already happened (a no-op)
+    and then marks it. Marking first would let a crash swallow the payout entirely.
+    """
+    code = str(update_id or "").strip()
+    key = str(user_id)
+    with _lock:
+        data = _load(entry)
+        rows = data["claimed"].setdefault(key, [])
+        if code in rows:
+            return False
+        rows.append(code)
+        data["claimed"][key] = sorted(set(rows))
+        _save(entry, data)
+    return True
 
 
 def mark_latest_read(entry: str, user_id) -> None:

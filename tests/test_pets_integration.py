@@ -155,8 +155,10 @@ class PetsIntegrationTests(unittest.TestCase):
 
         won = result.winner == str(ALICE)
         if won:
-            self.assertGreaterEqual(reward["gold"], C.WIN_GOLD_MIN)
-            self.assertLessEqual(reward["gold"], round(C.WIN_GOLD_MAX * 1.25))
+            # The duel purse has its own constants; the shared WIN_GOLD pair below it is
+            # what mobs and birthday greetings roll.
+            self.assertGreaterEqual(reward["gold"], C.ARENA_WIN_GOLD_MIN)
+            self.assertLessEqual(reward["gold"], round(C.ARENA_WIN_GOLD_MAX * 1.25))
             self.assertEqual(self._balance(ALICE), purse_before + reward["gold"])
         else:
             # Losing now costs half of what the winner took -- and the attacker here is
