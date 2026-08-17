@@ -229,9 +229,16 @@ def main_view(
         # First, and alone on its row: it is the whole game rather than one more screen.
         rows.append([{"text": "🎮 Открыть игру", "web_app": {"url": webapp_url}}])
     quest_button = ("❗ " if quests.has_available_quests(entry, user_id) else "") + "📜 Квесты"
-    updates_button = (
-        "❗ 📰 Обновления" if pets_updates.has_unread(entry, user_id) else "📰 Обновления"
-    )
+    # An owed reward outranks a mere unread mark: it says what is waiting, not just that
+    # something is. Same split as the Mini App's HUD gift -- reading a note clears the
+    # "❗" but leaves the 🎁 until the diamonds are actually taken.
+    owed_rubies = sum(row.reward_rubies for row in pets_updates.claimable(entry, user_id))
+    if owed_rubies:
+        updates_button = f"🎁 Обновления · {owed_rubies} 💎"
+    elif pets_updates.has_unread(entry, user_id):
+        updates_button = "❗ 📰 Обновления"
+    else:
+        updates_button = "📰 Обновления"
 
     # Play first, account utilities second. These four rows remain in the same order for
     # newcomers and established players, so muscle memory survives taming a creature.
@@ -1160,6 +1167,20 @@ def updates_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
     if update.text:
         lines.append(escape(update.text))
     lines.append(f"\n<i>{page + 1}/{total}</i>")
+    keyboard = []
+    # The reward for THIS note, above the pager: it belongs to the entry on screen, and a
+    # player who pages away must not be able to press a button meant for another one.
+    if update.reward_rubies > 0:
+        if update.id in pets_updates.claimed_ids(entry, user_id):
+            lines.insert(-1, f"\n🎁 Награда получена: {update.reward_rubies} 💎")
+        else:
+            lines.insert(-1, f"\n🎁 За эту новость — {update.reward_rubies} 💎")
+            keyboard.append([{
+                "text": f"🎁 Забрать награду · {update.reward_rubies} 💎",
+                # The id rather than the page number: pages shift when a note ships, and a
+                # stale button must never pay out the wrong entry's reward.
+                "callback_data": callback_data(user_id, "newsclaim", update.id),
+            }])
     navigation = []
     if page + 1 < total:
         navigation.append({
@@ -1169,7 +1190,8 @@ def updates_view(entry: str, user_id, page: int = 0) -> tuple[str, dict]:
         navigation.append({
             "text": "▶️", "callback_data": callback_data(user_id, "updates", str(page - 1)),
         })
-    keyboard = [navigation] if navigation else []
+    if navigation:
+        keyboard.append(navigation)
     keyboard.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": keyboard}
 

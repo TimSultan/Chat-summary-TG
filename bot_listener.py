@@ -6872,6 +6872,34 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.daily_bonus_view(entry, user_id, xp), log
             )
             return
+        if action == "newsclaim":
+            # Same order as the Mini App route: credit first through the idempotent
+            # grant_rubies_once, then record the claim. A crash between the two re-runs a
+            # grant that already happened instead of swallowing the reward.
+            note = pets_updates.find(entry, argument)
+            if note is None or note.reward_rubies <= 0:
+                message = "За эту новость награды нет."
+            elif argument in pets_updates.claimed_ids(entry, user_id):
+                message = "Награда уже получена."
+            else:
+                pets.grant_rubies_once(
+                    entry, user_id, note.reward_rubies,
+                    pets_updates.reward_source(argument, user_id),
+                )
+                pets_updates.mark_claimed(entry, user_id, argument)
+                message = f"🎁 +{note.reward_rubies} 💎"
+            # Redraw the page the note actually sits on, so the button it was pressed
+            # from is the one that turns into «Награда получена».
+            page = next(
+                (index for index, row in enumerate(reversed(pets_updates.all_updates(entry)))
+                 if row.id == argument),
+                0,
+            )
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, message,
+                pets_ui.updates_view(entry, user_id, page), log,
+            )
+            return
         if action == "setskill":
             raw_slot, _, code = str(argument or "").partition(":")
             ok, note = pets.set_skill_slot(entry, user_id, raw_slot, code)

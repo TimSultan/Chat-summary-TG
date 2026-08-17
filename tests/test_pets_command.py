@@ -256,6 +256,45 @@ class PetsCommandTests(unittest.TestCase):
                 (moderator_id, "questreview", ""),
             )
 
+    def test_the_news_reward_button_pays_diamonds_in_telegram_and_only_once(self):
+        """The Mini App is not the only client: the same reward has to be collectable
+        from the bot, and the two share one claim record so it cannot be taken twice."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file", "Player")
+        note = pets_updates.Update("note-1", "Награда", "Текст", reward_rubies=4)
+
+        with patch.object(pets_updates, "UPDATES", (note,)):
+            before = pets.ruby_balance(CHAT, PLAYER["id"])
+            api = self._tap("newsclaim", "note-1")
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), before + 4)
+            # The note is prepended to the redrawn screen, not flashed in a toast.
+            self.assertIn("+4", api.edits[-1]["text"])
+
+            # A second press pays nothing and says so.
+            again = self._tap("newsclaim", "note-1")
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), before + 4)
+            self.assertIn("уже получена", again.edits[-1]["text"])
+
+            # The redraw that follows the claim no longer offers the button.
+            drawn = str(api.edits[-1]["reply_markup"]) if api.edits else ""
+            self.assertNotIn("newsclaim", drawn)
+
+        # It is a real ledger row, so the income audit reports it as a grant.
+        rows = [r for r in pets._load(CHAT)["ruby_log"]
+                if r["reason"] == pets_updates.reward_source("note-1", PLAYER["id"])]
+        self.assertEqual([r["delta"] for r in rows], [4])
+        self.assertEqual(pets.ruby_source_of(rows[0]["reason"]), "grants")
+
+    def test_a_news_reward_cannot_be_claimed_for_a_note_that_does_not_pay(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file", "Player")
+        plain = pets_updates.Update("plain", "Без награды", "Текст")
+        with patch.object(pets_updates, "UPDATES", (plain,)):
+            for argument in ("plain", "no-such-note"):
+                api = self._tap("newsclaim", argument)
+                self.assertIn("награды нет", api.edits[-1]["text"], argument)
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 0)
+
     def test_every_menu_action_renders_instead_of_erroring(self):
         """A guard for the whole callback table, not one button.
 

@@ -47,16 +47,20 @@ class PetUpdatesTests(unittest.TestCase):
     def test_menu_button_loses_exclamation_once_log_is_opened(self):
         entry = "chat"
         user_id = 42
-        before = pets_ui.main_view(entry, user_id, 0)[1]
-        self.assertIn("❗ 📰 Обновления", [
-            button["text"] for row in before["inline_keyboard"] for button in row
-        ])
+        # A reward-free note on purpose: an owed reward deliberately outranks the "❗"
+        # (see the gift test below), and this one is about the unread mark alone.
+        plain = pets_updates.Update("plain-note", "Без награды", "Текст")
+        with patch.object(pets_updates, "UPDATES", (plain,)):
+            before = pets_ui.main_view(entry, user_id, 0)[1]
+            self.assertIn("❗ 📰 Обновления", [
+                button["text"] for row in before["inline_keyboard"] for button in row
+            ])
 
-        pets_updates.mark_latest_read(entry, user_id)
-        after = pets_ui.main_view(entry, user_id, 0)[1]
-        self.assertIn("📰 Обновления", [
-            button["text"] for row in after["inline_keyboard"] for button in row
-        ])
+            pets_updates.mark_latest_read(entry, user_id)
+            after = pets_ui.main_view(entry, user_id, 0)[1]
+            self.assertIn("📰 Обновления", [
+                button["text"] for row in after["inline_keyboard"] for button in row
+            ])
 
 
 class ChatAuthoredUpdateTests(unittest.TestCase):
@@ -144,3 +148,71 @@ class ChatAuthoredUpdateTests(unittest.TestCase):
         stored["custom"].append({"title": "Без id", "text": "потеряет якорь"})
         path.write_text(json.dumps(stored), encoding="utf-8")
         self.assertEqual([row.title for row in pets_updates.custom(entry)], ["После миграции"])
+
+    # ---- rewards -----------------------------------------------------------------------
+
+    def _rewarding(self, amount=1, code="note-1"):
+        note = pets_updates.Update(code, "Награда", "Текст", reward_rubies=amount)
+        return patch.object(pets_updates, "UPDATES", (note,))
+
+    def test_the_bot_view_offers_a_claim_button_and_then_reports_it_taken(self):
+        entry, user_id = "chat", 42
+        with self._rewarding(amount=2):
+            text, markup = pets_ui.updates_view(entry, user_id)
+            buttons = [b for row in markup["inline_keyboard"] for b in row]
+            claim = next(b for b in buttons if "Забрать награду" in b["text"])
+            # The id, not the page number: a note shipping later shifts every page, and a
+            # stale button must not pay out a different entry's reward.
+            self.assertTrue(claim["callback_data"].endswith(":newsclaim:note-1"))
+            self.assertLessEqual(
+                len(claim["callback_data"].encode("utf-8")), pets_ui.MAX_CALLBACK_BYTES,
+            )
+            self.assertIn("2 💎", claim["text"])
+            self.assertIn("За эту новость", text)
+
+            pets_updates.mark_claimed(entry, user_id, "note-1")
+            text, markup = pets_ui.updates_view(entry, user_id)
+            buttons = [b for row in markup["inline_keyboard"] for b in row]
+            self.assertFalse([b for b in buttons if "Забрать награду" in b["text"]])
+            self.assertIn("Награда получена", text)
+
+    def test_the_menu_button_shows_what_is_owed_and_survives_being_read(self):
+        entry, user_id = "chat", 42
+        with self._rewarding(amount=7):
+            self.assertIn("🎁 Обновления · 7 💎", _menu_labels(entry, user_id))
+            # Reading clears the "❗" but never the gift: the diamonds are still owed.
+            pets_updates.mark_latest_read(entry, user_id)
+            self.assertIn("🎁 Обновления · 7 💎", _menu_labels(entry, user_id))
+
+            pets_updates.mark_claimed(entry, user_id, "note-1")
+            labels = _menu_labels(entry, user_id)
+            self.assertIn("📰 Обновления", labels)
+            self.assertNotIn("🎁 Обновления · 7 💎", labels)
+
+    def test_only_a_shipped_note_can_pay_and_only_once_per_member(self):
+        entry = "chat"
+        with self._rewarding(amount=3):
+            self.assertEqual([n.id for n in pets_updates.claimable(entry, 42)], ["note-1"])
+            self.assertTrue(pets_updates.mark_claimed(entry, 42, "note-1"))
+            self.assertFalse(pets_updates.mark_claimed(entry, 42, "note-1"))
+            self.assertEqual(pets_updates.claimable(entry, 42), ())
+            # A second member is unaffected by the first one's claim.
+            self.assertEqual([n.id for n in pets_updates.claimable(entry, 43)], ["note-1"])
+            self.assertNotEqual(pets_updates.reward_source("note-1", 42),
+                                pets_updates.reward_source("note-1", 43))
+
+    def test_a_v2_store_upgrades_with_every_reward_still_unclaimed(self):
+        entry = "chat"
+        path = pets_updates._path(entry)
+        path.write_text(json.dumps({"version": 2, "read": {"42": "x"}, "custom": []}),
+                        encoding="utf-8")
+        with self._rewarding(amount=1):
+            # Nobody could have claimed before the field existed, so "unclaimed" is the
+            # only honest reading of an upgraded file.
+            self.assertEqual([n.id for n in pets_updates.claimable(entry, 42)], ["note-1"])
+        self.assertEqual(pets_updates._load(entry)["claimed"], {})
+
+
+def _menu_labels(entry, user_id) -> list[str]:
+    _text, markup = pets_ui.main_view(entry, user_id, 0)
+    return [button["text"] for row in markup["inline_keyboard"] for button in row]
