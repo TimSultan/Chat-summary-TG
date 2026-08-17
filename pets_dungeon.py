@@ -223,6 +223,13 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
     scroll_chance = 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
         0.125, 0.02 + (floor - SCROLL_LOOT_START_FLOOR) * 0.005,
     )
+    # Divided by the room's population for the same reason gold and xp are, and it was
+    # the one number that wasn't: the chance is rolled per KILL, so an undivided 10% on a
+    # ten-enemy pack floor paid a whole scroll per floor while a lone enemy on the next
+    # floor paid a tenth of one. Measured over a full descent that was 13.3 scrolls out of
+    # a 40-scroll catalogue -- a third of everything permanent, in one run. Per floor the
+    # budget is now flat, so crowded rooms mean more victories, not more scrolls.
+    scroll_chance /= enemy_count
     return {
         "gold": max(1, gold), "xp": max(1, xp),
         "item_chance": min(0.22, 0.012 + floor * 0.004) * (BOSS_ITEM_MULTIPLIER if boss else 1),

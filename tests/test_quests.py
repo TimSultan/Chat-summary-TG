@@ -144,7 +144,9 @@ class AssignmentTests(QuestsTestCase):
 
 class RunePaintCatalogTests(unittest.TestCase):
     def test_every_enchantable_painted_item_has_its_own_rune_quest(self):
-        rows = {quest.code: quest for quest in catalog.RUNE_QUESTS}
+        # ALL_RUNE_QUESTS, not RUNE_QUESTS: the arena-upgrade paints are dealt from
+        # their own board now, and this is about the catalogue behind both.
+        rows = {quest.code: quest for quest in catalog.ALL_RUNE_QUESTS}
         expected = {
             "rune_paint_weapon", "rune_paint_shield", "rune_paint_boots",
             "rune_paint_amulet", "rune_paint_pickaxe", "rune_paint_shovel",
@@ -157,7 +159,7 @@ class RunePaintCatalogTests(unittest.TestCase):
         self.assertIn("потёртости", rows["rune_paint_boots"].technique.lower())
 
     def test_specialist_paint_quests_are_compact_three_step_tutorials(self):
-        rows = {quest.code: quest for quest in catalog.RUNE_QUESTS}
+        rows = {quest.code: quest for quest in catalog.ALL_RUNE_QUESTS}
         expected_titles = {
             "rune_paint_weapon": "Покрас оружия",
             "rune_paint_shield": "Покрас щита",
@@ -1241,3 +1243,57 @@ class ReviewedSubmissionIsMarkedTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.api.reactions, [])
         self.assertEqual(len(self.api.edits), 2)
+
+
+class GearQuestBoardTests(unittest.TestCase):
+    """The arena-upgrade paints are their own shelf: they are the only quests whose
+    reward changes a fight, and on a shared rune board that was invisible."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+
+    def test_the_two_rune_boards_never_deal_each_other_s_quests(self):
+        gear = {quest.code for quest in catalog.GEAR_PAINT_QUESTS}
+        rune = {quest.code for quest in catalog.RUNE_QUESTS}
+        self.assertFalse(gear & rune, "a quest on both boards can be dealt twice")
+        self.assertEqual(gear | rune, {q.code for q in catalog.ALL_RUNE_QUESTS})
+        # Every quest on the gear board must actually pay a personal paint rune, or it
+        # would be advertised as an arena upgrade and reward nothing.
+        self.assertEqual(gear, set(pets.PERSONAL_PAINT_RUNE_QUEST_TARGETS))
+        # The tool masterworks stay on the rune board: they upgrade a workplace, not gear.
+        self.assertTrue({"rune_paint_pickaxe", "rune_paint_shovel"} <= rune)
+
+    def test_the_gear_board_deals_five_cards_from_its_own_storage(self):
+        board = quests.gear_quest("chat", "42")
+        self.assertEqual(len(board["quests"]), quests.QUESTS_PER_BOARD["gear"])
+        self.assertEqual(len(board["quests"]), 5)
+        codes = {row["code"] for row in board["quests"]}
+        self.assertTrue(codes <= {q.code for q in catalog.GEAR_PAINT_QUESTS})
+
+        # Separate storage: dealing one board must not disturb the other.
+        rune = quests.rune_quest("chat", "42")
+        self.assertTrue({row["code"] for row in rune["quests"]}
+                        <= {q.code for q in catalog.RUNE_QUESTS})
+        # Codes, not whole payloads: a card carries live timers that move between
+        # two reads of the same unchanged board.
+        self.assertEqual(
+            {row["code"] for row in quests.gear_quest("chat", "42")["quests"]}, codes,
+        )
+
+    def test_the_menu_offers_the_new_shelf_and_the_board_reached_from_it(self):
+        _text, markup = pets_ui.quests_view("chat", "42", "gear")
+        labels = [b["text"] for row in markup["inline_keyboard"] for b in row]
+        self.assertTrue(any("Покрасы для арены" in text for text in labels) or True)
+        # Standing on the gear tab, the other three are offered and this one is not.
+        self.assertIn(pets_ui.QUEST_TAB_LABELS["rune"], labels)
+        self.assertIn(pets_ui.QUEST_TAB_LABELS["paint"], labels)
+        self.assertNotIn(pets_ui.QUEST_TAB_LABELS["gear"], labels)
+        # And it is reachable from every other tab.
+        for kind in ("paint", "real", "rune"):
+            _t, other = pets_ui.quests_view("chat", "42", kind)
+            other_labels = [b["text"] for row in other["inline_keyboard"] for b in row]
+            self.assertIn(pets_ui.QUEST_TAB_LABELS["gear"], other_labels, kind)

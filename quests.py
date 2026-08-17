@@ -134,7 +134,11 @@ def _empty() -> dict:
         "history": [],         # newest last; one row per finished quest
         "rewards": {},         # difficulty -> partial override of REWARDS_BY_DIFFICULTY
         "real_assignments": {},  # user_id -> the one live Квест в реале
-        "rune_assignments": {},  # user_id -> five rune-paint challenges
+        "rune_assignments": {},  # user_id -> five elemental/tool rune challenges
+        # Its own slot. _load rebuilds this store from _empty()'s keys, so a board that
+        # is not declared here is silently discarded on every read -- which reads as a
+        # shelf that re-deals itself on every open.
+        "gear_assignments": {},  # user_id -> five arena-upgrade paint challenges
         "done": {},            # user_id -> {quest code: when it was last finished}
         "moderators": {},      # user_id -> who may review, delegated by an admin
         "disabled": [],        # quest codes a moderator has taken out of rotation
@@ -169,6 +173,9 @@ def _load(entry: str) -> dict:
     }
     base["rune_assignments"] = {
         str(uid): row for uid, row in base["rune_assignments"].items() if isinstance(row, dict)
+    }
+    base["gear_assignments"] = {
+        str(uid): row for uid, row in base["gear_assignments"].items() if isinstance(row, dict)
     }
     # Codes are canonicalised on READ rather than migrated on disk -- the same thing
     # pets._load does for legacy item codes. Quest codes used hyphens until Telegram's
@@ -515,7 +522,8 @@ def available_quests(entry: str, data: dict | None = None, kind: str = "paint") 
     data = data if data is not None else _load(entry)
     disabled = set(data.get("disabled", []))
     everything = (catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
-                  if kind == "real" else catalog.RUNE_QUESTS)
+                  if kind == "real" else catalog.GEAR_PAINT_QUESTS if kind == "gear"
+                  else catalog.RUNE_QUESTS)
     pool = tuple(quest for quest in everything if quest.code not in disabled)
     return pool or everything
 
@@ -660,8 +668,11 @@ def _pending_submission(data: dict, user_id, code: str) -> dict | None:
 
 
 # Independent storage for the three-card painting board and one-card real-life board.
-SLOTS = {"paint": "assignments", "real": "real_assignments", "rune": "rune_assignments"}
-QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 5}
+SLOTS = {"paint": "assignments", "real": "real_assignments", "rune": "rune_assignments",
+         # Its own storage, so splitting the shelf never re-deals somebody's live rune
+         # board or loses a submission already sitting on it.
+         "gear": "gear_assignments"}
+QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 5, "gear": 5}
 BOARD_LIFETIME = timedelta(hours=24)
 EMPTY_BOARD_REFRESH = timedelta(hours=8)
 AUTO_REFRESH_KINDS = frozenset({"real"})
@@ -840,8 +851,13 @@ def real_quest(entry: str, user_id, now: datetime | None = None) -> dict:
 
 
 def rune_quest(entry: str, user_id, now: datetime | None = None) -> dict:
-    """The five-card rune-painting challenge board."""
+    """The five-card elemental and tool rune board."""
     return quest_board(entry, user_id, "rune", now)
+
+
+def gear_quest(entry: str, user_id, now: datetime | None = None) -> dict:
+    """The five-card board of paint quests that upgrade arena gear."""
+    return quest_board(entry, user_id, "gear", now)
 
 
 # Public compatibility name retained for callers that used the old one-slot API.
@@ -855,6 +871,7 @@ def has_available_quests(entry: str, user_id, now: datetime | None = None) -> bo
         daily_quest(entry, user_id, moment).get("attention")
         or real_quest(entry, user_id, moment).get("attention")
         or rune_quest(entry, user_id, moment).get("attention")
+        or gear_quest(entry, user_id, moment).get("attention")
     )
 
 

@@ -1171,9 +1171,26 @@ class PetsCommandTests(unittest.TestCase):
             self.assertNotEqual(group["paths"][0], group["paths"][1])
         self.assertNotIn("send_photo_file", api.calls)
 
-    def test_a_dungeon_boss_fight_never_dms_a_transcript(self):
-        """A boss fight used to also post the complete text transcript as a separate,
-        permanent chat message. That DM is gone -- only the navigation message redraws."""
+    def _boss_receipt(self, boss=True):
+        result = SimpleNamespace(
+            opening="Кабанчик против Стального привратника.", accident=None,
+            rounds=(SimpleNamespace(text="Удар.",),), closing="Бой окончен.",
+            fight_id="F-20260815-ABCDEF123456", winner=str(PLAYER["id"]),
+            is_draw=False, stopped_early=False, final_hp={},
+        )
+        return {
+            "encounter": {"boss": boss, "name": "Стальной привратник"},
+            "result": result, "enemy": None, "reward": {"gold": 100, "xp": 50},
+        }
+
+    def test_a_boss_fight_sends_its_log_and_puts_it_above_the_redrawn_menu(self):
+        """A boss is the one dungeon fight worth reading back move by move.
+
+        The transcript used to be a wall of text in a permanent message and was removed
+        for it; this is the arena's rendered log board instead, and it has to land ABOVE
+        the floor menu -- which means the menu is re-sent below it rather than edited in
+        place further up the chat.
+        """
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         data = pets._load(CHAT)
@@ -1181,23 +1198,36 @@ class PetsCommandTests(unittest.TestCase):
             "floor": 5, "hp": 500, "max_hp": 500, "cleared": [],
         }
         pets._save(CHAT, data)
-        result = SimpleNamespace(
-            opening="Кабанчик против Стального привратника.", accident=None,
-            rounds=(SimpleNamespace(text="Удар.",),), closing="Бой окончен.",
-            fight_id="F-20260815-ABCDEF123456",
-        )
-        receipt = {
-            "encounter": {"boss": True, "name": "Стальной привратник"},
-            "result": result, "reward": {"gold": 100, "xp": 50},
+
+        with patch.object(pets, "dungeon_fight",
+                          return_value=(True, "Победа.", self._boss_receipt())):
+            api = self._tap("dungeonfight", "0")
+
+        # Something carrying the log went out, the stale menu was removed, and the new
+        # menu was SENT (not edited) so it sits underneath.
+        self.assertTrue(api.photo_files or api.sent, "the boss log was not delivered")
+        self.assertTrue(api.deleted, "the old menu was left above the log")
+        self.assertTrue(api.sent, "the menu was not re-sent below the log")
+        self.assertIn("Этаж 5", api.sent[-1]["text"])
+
+    def test_an_ordinary_dungeon_mob_still_redraws_in_place_without_a_log(self):
+        """Ten kills on a pack floor would mean ten transcripts. Only bosses get one."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["dungeon_run"] = {
+            "floor": 5, "hp": 500, "max_hp": 500, "cleared": [],
         }
-        with patch.object(pets, "dungeon_fight", return_value=(True, "Победа.", receipt)):
+        pets._save(CHAT, data)
+
+        with patch.object(pets, "dungeon_fight",
+                          return_value=(True, "Победа.", self._boss_receipt(boss=False))):
             api = self._tap("dungeonfight", "0")
 
         self.assertEqual(api.sent, [])
+        self.assertEqual(api.deleted, [])
         self.assertTrue(api.edits)
         self.assertIn("Этаж 5", api.edits[-1]["text"])
-        self.assertNotIn("Fight ID", api.edits[-1]["text"])
-        self.assertNotIn("send_message", api.calls)
 
     def test_the_attacker_keeps_action_buttons_that_an_album_cannot_carry(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)

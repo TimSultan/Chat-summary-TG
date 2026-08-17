@@ -283,10 +283,34 @@ class DungeonTests(unittest.TestCase):
         # A run predating the identity fields is given one rather than left to collapse
         # every kill's loot token onto the same string.
         self.assertTrue(run.pop("run_id"))
+        empty_haul = {"gold": 0, "xp": 0, "rubies": 0, "kills": 0,
+                      "items": [], "scrolls": [], "runes": []}
         self.assertEqual(run, {
             "kills": 0, "floor": 1, "hp": 1, "max_hp": 1, "cleared": [], "boss_lives": 0,
             "partial_heals_used": 0, "full_heals_used": 0,
+            # A run from before the tallies existed starts them empty rather than
+            # inventing a history for it.
+            "haul": empty_haul, "floor_haul": dict(empty_haul),
         })
+
+    def test_the_loot_tallies_survive_the_whitelist_that_rebuilds_the_run(self):
+        """The exact failure mode DEPLOYMENT.md documents: a field the normaliser forgets
+        is silently dropped on every load, so the summary would always read "nothing"."""
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "run_id": "abc", "floor": 3, "hp": 10, "max_hp": 10, "cleared": [],
+            "haul": {"gold": 900, "xp": 40, "rubies": 2, "kills": 5,
+                     "items": ["Меч"], "scrolls": ["Пламя"], "runes": ["fire"]},
+            "floor_haul": {"gold": 120, "xp": 8, "rubies": 0, "kills": 1,
+                           "items": [], "scrolls": [], "runes": []},
+        }
+        pets._save(self.entry, data)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["haul"]["gold"], 900)
+        self.assertEqual(run["haul"]["items"], ["Меч"])
+        self.assertEqual(run["haul"]["scrolls"], ["Пламя"])
+        self.assertEqual(run["floor_haul"]["gold"], 120)
 
     def test_the_run_identity_survives_the_normaliser_that_rebuilds_the_run(self):
         """The normaliser is a whitelist, so anything it forgets is dropped on every load.
@@ -384,6 +408,69 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
+
+    def test_the_run_tallies_what_each_floor_and_the_whole_descent_paid(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 400, "health": 400, "agility": 400, "luck": 400, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
+
+        for index in range(len(dungeon.encounters_for_floor(1))):
+            self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, index)[0])
+
+        haul = pets.dungeon_haul(self.entry, self.user_id)
+        self.assertEqual(haul["floor"]["kills"], len(dungeon.encounters_for_floor(1)))
+        self.assertEqual(haul["total"]["kills"], haul["floor"]["kills"])
+        self.assertGreater(haul["total"]["gold"], 0)
+        first_floor_gold = haul["floor"]["gold"]
+
+        # Descending resets the per-floor tally but never the running total.
+        self.assertTrue(pets.dungeon_descend(self.entry, self.user_id)[0])
+        after = pets.dungeon_haul(self.entry, self.user_id)
+        self.assertEqual(after["floor"]["kills"], 0)
+        self.assertEqual(after["floor"]["gold"], 0)
+        self.assertEqual(after["total"]["gold"], first_floor_gold)
+
+        # Walking out keeps the receipt, so the screen after the run can still show it.
+        self.assertTrue(pets.quit_dungeon(self.entry, self.user_id)[0])
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertFalse(state["active"])
+        self.assertEqual(state["last_haul"]["gold"], first_floor_gold)
+        self.assertIn("Всего за поход", pets_ui.dungeon_finished_text(state["last_haul"]))
+
+    def test_a_lost_run_still_reports_what_it_had_earned(self):
+        """Dying is exactly when a player most wants to know what the descent was worth,
+        and it is the moment the run record is thrown away."""
+        # Strong enough to be let in, then crippled inside: entering is gated on power,
+        # and the point of this test is what happens on the way out.
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 400, "health": 400, "agility": 400, "luck": 400, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
+
+        data = pets._load(self.entry)
+        run = data["pets"][self.user_id]["dungeon_run"]
+        run["haul"] = {**pets._new_haul(), "gold": 640, "kills": 3, "scrolls": ["Пламя"]}
+        run["hp"] = 1
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 1, "health": 1, "agility": 1, "luck": 1, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+
+        ok, _message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+        self.assertFalse(ok)
+        self.assertTrue(receipt.get("run_over"))
+        self.assertEqual(receipt["haul"]["total"]["gold"], 640)
+        text = pets_ui.dungeon_finished_text(pets.dungeon_status(
+            self.entry, self.user_id)["last_haul"])
+        self.assertIn("оборвался", text)
+        self.assertIn("Пламя", text)
 
     def test_the_update_gift_pays_ten_rubies_once_and_lands_in_the_ledger(self):
         self.assertEqual(pets.grant_ruby_gift([self.entry]), 1)

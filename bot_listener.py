@@ -6582,6 +6582,15 @@ async def handle_pets_callback(
                 )
                 if action == "dungeonquit" and ok else pets_ui.dungeon_view(entry, user_id, xp)
             )
+            # A boss is the one dungeon fight worth reading back move by move, and it was
+            # the only kind of fight in the game that never sent its log anywhere. Corridor
+            # mobs deliberately stay silent: a pack floor is ten kills, and ten transcripts
+            # would bury the run rather than document it.
+            if await _send_dungeon_boss_log(api, chat_id, entry, user_id, receipt, log):
+                # The log has to sit ABOVE the menu, so the menu is re-sent beneath it
+                # rather than edited in place further up the chat.
+                await _delete_quietly(api, chat_id, message_id)
+                message_id = None
             await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
             return
         if action == "mob":
@@ -6638,7 +6647,7 @@ async def handle_pets_callback(
             return
         if action == "questreroll":
             raw_kind, _separator, _code = str(argument or "").partition(":")
-            kind = raw_kind if raw_kind in {"paint", "real", "rune"} else "paint"
+            kind = raw_kind if raw_kind in {"paint", "real", "rune", "gear"} else "paint"
             ok, note = quests.reroll(entry, user_id, kind=kind)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
@@ -7088,7 +7097,8 @@ async def handle_pets_callback(
             "ccombos": lambda: pets_ui.casino_combinations_view(user_id, argument),
             "cpokerstyles": lambda: pets_ui.casino_poker_styles_view(user_id),
             "quests": lambda: pets_ui.quests_view(
-                entry, user_id, argument if argument in {"paint", "real", "rune"} else "paint",
+                entry, user_id,
+                argument if argument in {"paint", "real", "rune", "gear"} else "paint",
             ),
             "questdetail": lambda: pets_ui.quest_detail_view(
                 entry, user_id, *(str(argument or "paint:").split(":", 1)),
@@ -7821,6 +7831,53 @@ def _pets_render_log_image(result, attacker_id, defender_id, attacker: dict, def
         path.unlink(missing_ok=True)
         log(f"[pets] failed to render a fight log:\n{traceback.format_exc()}")
         return None
+
+
+async def _delete_quietly(api, chat_id, message_id) -> None:
+    """Remove a screen we are about to re-send lower down. Never fatal: an undeletable
+    message (too old, already gone) costs a duplicate menu, not the action behind it."""
+    if message_id is None:
+        return
+    try:
+        await api.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def _send_dungeon_boss_log(api, chat_id, entry, user_id, receipt, log) -> bool:
+    """Post the round-by-round transcript of a boss fight. True when something was sent.
+
+    Only bosses, and only when the fight actually resolved: a reincarnating boss's first
+    death and an interrupted run both come back without a usable result, and a transcript
+    of a fight that did not happen is worse than none.
+    """
+    receipt = receipt or {}
+    encounter = receipt.get("encounter") or {}
+    result = receipt.get("result")
+    if not encounter.get("boss") or result is None:
+        return False
+    mine = pets.get_pet(entry, user_id) or {}
+    enemy_name = str(encounter.get("name") or "Босс")
+    caption = pets_ui.fight_report(
+        result, str(user_id),
+        {str(user_id): mine.get("name"), str(receipt.get("enemy").key
+                                              if receipt.get("enemy") is not None
+                                              else enemy_name): enemy_name},
+        None,
+    )
+    path = _pets_render_log_image(
+        result, user_id, enemy_name, mine, {"name": enemy_name}, log,
+    )
+    try:
+        await _pets_send_fight_images(
+            api, chat_id, (path,), f"👑 <b>{html.escape(enemy_name)}</b>\n\n{caption}",
+            disable_notification=True,
+        )
+        return True
+    except Exception:
+        # A boss kill must still redraw the floor even if its picture cannot be delivered.
+        log(f"[pets] could not deliver a dungeon boss log to {user_id}")
+        return False
 
 
 async def _pets_send_fight_images(

@@ -2959,6 +2959,9 @@ def _quest_board_payload(entry: str, me: str) -> dict:
         # the same card -- the two differ in what they ask for, not in how they work.
         "real": quests.real_quest(entry, me),
         "rune": quests.rune_quest(entry, me),
+        # The arena-upgrade paint quests: their own shelf, because they are the only
+        # quests whose reward changes a fight.
+        "gear": quests.gear_quest(entry, me),
         "stats": quests.stats_for(entry, me),
         "history": quests.history(entry, me, limit=20),
     })
@@ -2976,7 +2979,7 @@ async def handle_quest_reroll(request: web.Request) -> web.Response:
     entry = request.app[_ENTRY_KEY]
     me = str(user["id"])
     kind = str(body.get("kind") or "paint")
-    kind = kind if kind in {"paint", "real", "rune"} else "paint"
+    kind = kind if kind in {"paint", "real", "rune", "gear"} else "paint"
     ok, message = quests.reroll(
         entry, me, kind=kind, code=str(body.get("code") or "") or None,
     )
@@ -3906,6 +3909,24 @@ PAGE_HTML = """<!doctype html>
   }
   .bar { height: 5px; border-radius: 3px; background: var(--sunken); overflow: hidden; margin-top: 5px; }
   .bar > i { display: block; height: 100%; background: var(--xp); border-radius: 3px; transition: width .35s; }
+  /* Same shape as the XP bar directly above it, in the health colour so the two are told
+     apart at a glance rather than by position. Turns amber then red as it empties: in the
+     dungeon the difference between "fine" and "one more hit" is the whole decision. */
+  .bar.hp > i { background: var(--hp); }
+  .bar.hp > i.warn { background: var(--gold); }
+  .bar.hp > i.crit { background: #e0484d; }
+  /* Flush against the dungeon header it belongs to, rather than floating in the body. */
+  .bar.hp.dungeon-hp { margin: 0; border-radius: 0; height: 6px; }
+  .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+  .rune-cell { display: grid; gap: 2px; justify-items: center; padding: 9px 4px;
+               border: 1px solid var(--line); border-radius: 12px; background: var(--sunken);
+               color: var(--fg); font: inherit; cursor: pointer; }
+  .rune-cell .rune-icon { font-size: 21px; line-height: 1.1; }
+  .rune-cell .rune-name { font-size: 11px; color: var(--muted); }
+  .rune-cell .rune-count { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  /* Owning none is shown, not hidden: the empty slot is the one still worth chasing. */
+  .rune-cell.empty { opacity: .42; cursor: default; }
+  @media (max-width: 360px) { .rune-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
   /* --------------------------------------------------------------- the tab bar */
   .tabs {
@@ -4919,6 +4940,10 @@ PAGE_HTML = """<!doctype html>
       <span id="hudRubyBox" hidden>💎 <b id="hudRuby">0</b></span>
     </div>
     <div class="bar"><i id="hudXp" style="width:0%"></i></div>
+    <!-- Under the XP bar and only while a descent is running: down there HP does not
+         come back between fights, so it is the number a player has to watch, and it was
+         previously only visible on the dungeon screen itself. -->
+    <div class="bar hp" id="hudHpBar" hidden><i id="hudHp" style="width:100%"></i></div>
   </div>
   <button class="hud-create" id="hudCreate" hidden>Создать существо</button>
   <button class="post" id="hudMail" title="Почта">📬</button>
@@ -5176,6 +5201,19 @@ function renderHud() {
   $("hudRecharge").textContent = left ? " · " + clock(left) : "";
   const xpNeed = pet ? Math.max(1, pet.xp_needed) : 1;
   $("hudXp").style.width = (pet ? Math.min(100, (pet.xp / xpNeed) * 100) : 0) + "%";
+
+  // The health bar rides under the XP one for the duration of a descent only. Outside the
+  // dungeon HP is restored for every fight, so a permanently full bar would be noise.
+  const run = (S && S.dungeon) || {};
+  const inRun = Boolean(run.active) && Number(run.max_hp || 0) > 0;
+  $("hudHpBar").hidden = !inRun;
+  if (inRun) {
+    const share = Math.max(0, Math.min(1, Number(run.hp || 0) / Number(run.max_hp)));
+    const fill = $("hudHp");
+    fill.style.width = (share * 100) + "%";
+    fill.classList.toggle("warn", share <= 0.5 && share > 0.25);
+    fill.classList.toggle("crit", share <= 0.25);
+  }
 }
 
 // ------------------------------------------------------------------------ hero screen
@@ -5391,6 +5429,18 @@ function descendButton(dungeon) {
     esc(dungeon.cleared_notice || "") + '">🏁 Закончить</button>';
 }
 
+// The floor header carries the numbers; this carries the shape of them. Health does not
+// regenerate between fights down here, so how much is left is the decision the whole
+// screen is about -- and a fraction like 143/500 is read much slower than a bar.
+function dungeonHpBar(dungeon) {
+  const max = Number(dungeon.max_hp || 0);
+  if (!max) return "";
+  const share = Math.max(0, Math.min(1, Number(dungeon.hp || 0) / max));
+  const tone = share <= 0.25 ? "crit" : (share <= 0.5 ? "warn" : "");
+  return '<div class="bar hp dungeon-hp"><i class="' + tone +
+    '" style="width:' + (share * 100) + '%"></i></div>';
+}
+
 function dungeonPanel() {
   const dungeon = S.dungeon || {};
   if (!S.pet) return "";
@@ -5407,7 +5457,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
 }
 
 function renderOnboarding() {
@@ -5446,7 +5496,7 @@ function renderBag() {
     '<div class="panel"><h2>В сумке · ' + items.length + "</h2>" +
       (items.length ? '<div class="items">' + items.map((i) => itemCard(i)).join("") + "</div>"
                     : '<div class="empty">Пусто. Загляни в лавку или выиграй в арене.</div>') +
-    "</div>" + forgePanel();
+    "</div>" + runesPanel() + forgePanel();
 }
 
 const PERSONAL_TARGET_NAMES = {
@@ -5580,11 +5630,6 @@ function openLiveSkillPicker(slot) {
 function forgePanel() {
   const names = { cursed: "проклятых", common: "обычных", rare: "редких", legendary: "легендарный" };
   const recipes = (S.forge && S.forge.recipes) || [];
-  const runeState = S.runes || { runes: {}, enchantments: {}, cost: 15 };
-  const runeNames = { fire: "Огонь", frost: "Лёд", water: "Вода", earth: "Земля", air: "Воздух", plants: "Растения" };
-  const runeIcons = { fire: "🔥", frost: "❄️", water: "💧", earth: "🪨", air: "💨", plants: "🌿" };
-  const runeLine = Object.keys(runeNames).filter((element) => runeState.runes[element])
-    .map((element) => runeIcons[element] + ' ' + runeNames[element] + ' ×' + Number(runeState.runes[element])).join(' · ');
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
     '<div class="small muted" style="margin-bottom:10px">6 проклятых превращаются в редкую проклятую реликвию, ' +
       '5 обычных — в редкий, а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
@@ -5600,20 +5645,52 @@ function forgePanel() {
         '<button class="go sec" data-reforge="' + recipe.rarity + '"' +
           (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
     }).join('') +
-    '<div class="panel" style="margin:8px 0;padding:10px"><h2>🔮 Зачарования</h2>' +
-      '<div class="tiny muted">Добавь руне оружие за ' + runeState.cost + ' 💎. Выбери руну, затем оружие.</div>' +
-      '<div class="tiny" style="margin:7px 0">' + (runeLine || 'Рун пока нет.') + '</div>' +
-      '<button class="go sec" data-enchantopen' + (runeLine ? '' : ' disabled') + '>Выбрать руну</button></div>' +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
 }
 
-function openEnchantments() {
-  const state = S.runes || { runes: {}, cost: 15 };
-  const names = { fire: "Огненная", frost: "Ледяная", water: "Водная", earth: "Земляная", air: "Воздушная", plants: "Руна растений" };
-  const icons = { fire: "🔥", frost: "❄️", water: "💧", earth: "🪨", air: "💨", plants: "🌿" };
-  sheet('<h3>🔮 Выбери руну</h3><p class="tiny muted">Зачарование стоит ' + Number(state.cost || 15) + ' 💎 и 1 руну.</p>' +
-    Object.keys(names).map((element) => '<button class="go sec" style="margin:5px 0" data-enchantpick="' + element + '"' +
-      (state.runes[element] ? '' : ' disabled') + '>' + icons[element] + ' ' + names[element] + ' · ' + Number(state.runes[element] || 0) + '</button>').join(''));
+// Runes used to be one comma-joined line squeezed into the bottom of the forge, which is
+// why nobody could tell what they had or what it was for. They get their own panel: every
+// element always shown (an empty slot is information -- it is the one you still need), the
+// weapons already carrying an enchantment listed underneath, and the action on each rune
+// rather than behind a generic "choose a rune" button.
+const RUNE_NAMES = { fire: "Огонь", frost: "Лёд", water: "Вода",
+                     earth: "Земля", air: "Воздух", plants: "Растения" };
+const RUNE_ICONS = { fire: "🔥", frost: "❄️", water: "💧",
+                     earth: "🪨", air: "💨", plants: "🌿" };
+
+function runesPanel() {
+  const state = S.runes || { runes: {}, enchantments: {}, cost: 15 };
+  const owned = state.runes || {};
+  const total = Object.keys(RUNE_NAMES).reduce((sum, key) => sum + Number(owned[key] || 0), 0);
+  const cells = Object.keys(RUNE_NAMES).map((element) => {
+    const count = Number(owned[element] || 0);
+    return '<button class="rune-cell' + (count ? '' : ' empty') + '" data-enchantpick="' +
+      element + '"' + (count ? '' : ' disabled') +
+      ' title="' + esc(RUNE_NAMES[element]) + '">' +
+      '<span class="rune-icon">' + RUNE_ICONS[element] + '</span>' +
+      '<span class="rune-name">' + esc(RUNE_NAMES[element]) + '</span>' +
+      '<span class="rune-count">×' + count + '</span></button>';
+  }).join("");
+
+  // What is already enchanted, read off the bag so the names match what is in it.
+  const applied = Object.entries(state.enchantments || {}).map(([code, element]) => {
+    const item = (S.bag || []).find((row) => row.code === code);
+    return '<div class="row spread tiny" style="margin-top:5px"><span>' +
+      esc(item ? item.name : code) + '</span><span>' + (RUNE_ICONS[element] || "🔮") + " " +
+      esc(RUNE_NAMES[element] || element) + '</span></div>';
+  }).join("");
+
+  return '<div class="panel"><h2>🔮 Руны</h2>' +
+    '<div class="tiny muted" style="margin-bottom:9px">Руна навсегда зачаровывает одно ' +
+      'оружие и добавляет ему свою стихию. Зачарование стоит ' + Number(state.cost || 15) +
+      ' 💎 и одну руну. Руны падают в подземелье и с рунических квестов.</div>' +
+    '<div class="rune-grid">' + cells + '</div>' +
+    (total ? '<div class="tiny muted" style="margin-top:9px">Нажми руну, чтобы выбрать ' +
+      'оружие.</div>'
+     : '<div class="tiny muted" style="margin-top:9px">Рун пока нет.</div>') +
+    (applied ? '<div style="margin-top:11px"><b class="small">Зачаровано</b>' + applied +
+      '</div>' : '') +
+    '</div>';
 }
 
 function openEnchantWeapons(element) {
@@ -7504,7 +7581,8 @@ function questCompactCard(card, kind, index) {
 
 function questCard(board, kind) {
   const paint = kind !== "real";
-  const heading = kind === "rune" ? "🔮 Рунические покрасы · элементы" :
+  const heading = kind === "rune" ? "🔮 Рунические покрасы · элементы и инструменты" :
+    kind === "gear" ? "⚔️ Покрасы для арены · 5 карточек" :
     (paint ? "🎯 Квесты на покрас · 3 карточки" : "🌍 Квест в реале");
   const cards = (board && board.quests) || [];
   const schedule = board.auto_refresh
@@ -7516,7 +7594,13 @@ function questCard(board, kind) {
     : (board.reroll_at_label
       ? 'Следующий реролл в <b>' + esc(board.reroll_at_label) + '</b> по Москве.'
       : 'Дождись проверки отправленных работ.');
-  return '<div class="panel"><h2>' + heading + '</h2>' +
+  // The one shelf whose reward changes a fight says so, once, at the top.
+  const blurb = kind === "gear"
+    ? '<div class="tiny muted" style="margin-bottom:9px">Каждый квест даёт персональный ' +
+      'покрас на боевую вещь: твоя фотография на предмете и +30% к его полезным ' +
+      'характеристикам.</div>'
+    : "";
+  return '<div class="panel"><h2>' + heading + '</h2>' + blurb +
     '<div class="tiny muted" style="margin-bottom:9px">' + schedule + '</div>' +
     (cards.length ? cards.map((card, index) => questCompactCard(card, kind, index + 1)).join("")
                   : '<div class="empty">Доступных заданий пока нет.</div>') +
@@ -7533,12 +7617,14 @@ function questBoard(data) {
       ((ACTIVE_QUEST_BOARD.quests || []).some((row) => row.status === "open")) ||
       (((ACTIVE_QUEST_BOARD.real || {}).quests || []).some((row) => row.status === "open"))
       || (((ACTIVE_QUEST_BOARD.rune || {}).quests || []).some((row) => row.status === "open"))
+      || (((ACTIVE_QUEST_BOARD.gear || {}).quests || []).some((row) => row.status === "open"))
     );
   }
   const done = (ACTIVE_QUEST_BOARD.stats || {}).done || 0;
   const rows = ACTIVE_QUEST_BOARD.history || [];
   return questCard(ACTIVE_QUEST_BOARD, "paint") +
     questCard(ACTIVE_QUEST_BOARD.real || {}, "real") +
+    questCard(ACTIVE_QUEST_BOARD.gear || {}, "gear") +
     questCard(ACTIVE_QUEST_BOARD.rune || {}, "rune") +
     '<button class="go sec" data-questidea>💡 Предложить идею</button>' +
     '<div class="panel"><h2>Сдано квестов · ' + done + '</h2>' + (rows.length
@@ -7550,7 +7636,8 @@ function questBoard(data) {
 
 function openQuestDetail(kind, code) {
   const board = kind === "real" ? (ACTIVE_QUEST_BOARD.real || {}) :
-    (kind === "rune" ? (ACTIVE_QUEST_BOARD.rune || {}) : ACTIVE_QUEST_BOARD);
+    kind === "rune" ? (ACTIVE_QUEST_BOARD.rune || {}) :
+    kind === "gear" ? (ACTIVE_QUEST_BOARD.gear || {}) : ACTIVE_QUEST_BOARD;
   const card = ((board && board.quests) || []).find((row) => row.code === code);
   if (!card) { toast("Подборка уже обновилась."); return; }
   const paint = kind !== "real";
@@ -8592,7 +8679,7 @@ $("hudCreate").addEventListener("click", () => {
 const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantopen],[data-enchantpick],[data-enchantapply]," +
+    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
@@ -8683,7 +8770,6 @@ async function handleClick(event, target) {
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   if (d.reforge) { await act("reforge", { rarity: d.reforge }); return; }
-  if (d.enchantopen !== undefined) { openEnchantments(); return; }
   if (d.enchantpick) { openEnchantWeapons(d.enchantpick); return; }
   if (d.enchantapply) {
     const [code, element] = d.enchantapply.split(":", 2);

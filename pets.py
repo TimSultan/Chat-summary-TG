@@ -93,9 +93,13 @@ FARM_TICKET_GRANT_MEMORY = 50
 # moment a creature is tamed; everything else is a rare permanent unlock rather than a
 # consumable item or a shop purchase.
 SCROLL_REWARD_MEMORY = 1_000
-PAINT_SCROLL_CHANCE = 0.025
+# Raised alongside the dungeon's per-floor fix. Measured against each other, a full
+# descent used to be worth 533 accepted paint quests or 67 hard ones -- painting a real
+# miniature was the worst way in the game to earn a scroll, which is backwards: it is the
+# only reward stream that asks for work outside the game.
+PAINT_SCROLL_CHANCE = 0.06
 PAINT_SCROLL_PITY = 20
-HARD_QUEST_SCROLL_CHANCES = {4: 0.12, 5: 0.20}
+HARD_QUEST_SCROLL_CHANCES = {4: 0.22, 5: 0.35}
 HARD_QUEST_SCROLL_PITY = 6
 ULTIMATE_SCROLL_SHARE = 0.12
 # A personal paint rune is earned from one accepted rune-paint quest and consumed when
@@ -130,6 +134,17 @@ def _pets_path(entry: str):
 
 def _fight_audit_path(entry: str, fight_id_: str):
     return stats._stats_dir() / f"{stats._cache_key(entry)}_fight_audits" / f"{fight_id_}.json"
+
+
+def _clean_haul(raw) -> dict:
+    """Repair one loot tally. Shares its shape with _new_haul below, which is the writer;
+    this is the reader that has to survive a hand-edited or pre-tally store."""
+    raw = raw if isinstance(raw, dict) else {}
+    clean = {key: _safe_nonnegative_int(raw.get(key)) for key in ("gold", "xp", "rubies", "kills")}
+    for key in ("items", "scrolls", "runes"):
+        values = raw.get(key)
+        clean[key] = [str(value) for value in values][:100] if isinstance(values, list) else []
+    return clean
 
 
 def _normalise_dungeon_run(run) -> dict | None:
@@ -183,6 +198,12 @@ def _normalise_dungeon_run(run) -> dict | None:
         # to full on every single load, which is the same as having no limit at all.
         "partial_heals_used": _safe_nonnegative_int(run.get("partial_heals_used")),
         "full_heals_used": _safe_nonnegative_int(run.get("full_heals_used")),
+        # The loot tallies are per run too, and they are exactly the kind of field this
+        # whitelist has silently eaten before: dropped here they would reset to zero on
+        # every load and the summary would always read "nothing". A run that predates them
+        # starts empty rather than being invented.
+        "haul": _clean_haul(run.get("haul")),
+        "floor_haul": _clean_haul(run.get("floor_haul")),
     }
     if D.encounter(floor, 0).get("gimmick") == "three_heads":
         raw_head_hp = run.get("hydra_head_hp")
@@ -3899,6 +3920,64 @@ def is_in_dungeon(entry, user_id) -> bool:
     return _dungeon_active(_tamed_record(_load(entry), user_id))
 
 
+def _new_haul() -> dict:
+    """A running tally of what a descent has actually paid out.
+
+    Kept on the run itself rather than recomputed from the ledgers, because half of it
+    (items, scrolls, runes) never touches a ledger, and the parts that do are mixed in
+    with every other source by the time they land there.
+    """
+    return {"gold": 0, "xp": 0, "rubies": 0, "kills": 0,
+            "items": [], "scrolls": [], "runes": []}
+
+
+def _haul_add(haul: dict, receipt: dict) -> dict:
+    """Fold one kill's receipt into a tally. Tolerant of a missing or damaged tally so an
+    old run started before this existed keeps playing instead of erroring on descent."""
+    if not isinstance(haul, dict):
+        haul = _new_haul()
+    for key in ("gold", "xp", "rubies", "kills"):
+        haul[key] = int(haul.get(key, 0) or 0)
+    for key in ("items", "scrolls", "runes"):
+        if not isinstance(haul.get(key), list):
+            haul[key] = []
+    reward = receipt.get("reward") or {}
+    haul["gold"] += int(reward.get("gold", 0) or 0)
+    haul["xp"] += int(reward.get("xp", 0) or 0)
+    haul["rubies"] += int(receipt.get("rubies", 0) or 0)
+    haul["kills"] += 1
+    dropped = receipt.get("dropped")
+    if dropped is not None:
+        haul["items"].append(getattr(dropped, "name", None) or str(dropped))
+    scroll = receipt.get("scroll")
+    if isinstance(scroll, dict) and scroll.get("granted"):
+        haul["scrolls"].append(str(scroll.get("name") or scroll.get("code") or "свиток"))
+    rune = receipt.get("rune")
+    if rune:
+        haul["runes"].append(str(rune))
+    return haul
+
+
+def _record_dungeon_haul(entry: str, user_id, receipt: dict) -> dict:
+    """Add one kill's loot to the run's floor and total tallies.
+
+    A separate write from the fight itself on purpose: items, scrolls and rubies are
+    granted after the run lock is released (each owns its own idempotency), so this is the
+    first moment the receipt is complete. Losing this write costs a line on a summary
+    screen and nothing else -- it is a display tally, never a source of truth.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return {}
+        run["haul"] = _haul_add(run.get("haul"), receipt)
+        run["floor_haul"] = _haul_add(run.get("floor_haul"), receipt)
+        _save(entry, data)
+        return {"floor": dict(run["floor_haul"]), "total": dict(run["haul"])}
+
+
 def dungeon_status(entry: str, user_id) -> dict:
     """Public state reconstructed from the server-owned dungeon run."""
     record = _tamed_record(_load(entry), user_id)
@@ -3923,6 +4002,11 @@ def dungeon_status(entry: str, user_id) -> dict:
         "escalator_cost": D.ESCALATOR_RUBY_COST,
     }
     if not isinstance(run, dict):
+        # The last descent's receipt outlives the run it describes, so the screen a player
+        # lands on after dying or walking out can still say what they came back with.
+        last = record.get("last_dungeon_haul")
+        if isinstance(last, dict):
+            state["last_haul"] = dict(last)
         return state
     floor = max(1, int(run.get("floor", 1) or 1))
     max_hp = max(1, int(run.get("max_hp", 1) or 1))
@@ -3943,6 +4027,8 @@ def dungeon_status(entry: str, user_id) -> dict:
         "floor": floor, "theme": D.floor_name(floor), "hp": max(0, int(run.get("hp", max_hp))),
         "max_hp": max_hp, "cleared": sorted(cleared), "encounters": encounters,
         "description": D.floor_description(floor),
+        "floor_haul": dict(run.get("floor_haul") or _new_haul()),
+        "haul": dict(run.get("haul") or _new_haul()),
         "can_rest": len(cleared) == len(encounters),
         "partial_heal_cost": D.SHOP_PARTIAL_HEAL_COST,
         "full_heal_cost": D.SHOP_FULL_HEAL_COST,
@@ -4065,6 +4151,8 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
         record["dungeon_run"] = {
             "run_id": secrets.token_hex(8), "kills": 0,
             "floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": [],
+            # What this descent has paid so far, in total and on the current floor.
+            "haul": _new_haul(), "floor_haul": _new_haul(),
         }
         _save(entry, data)
     entry_paid = "по билету" if ticket_count else f"за {D.ENTRY_RUBY_COST} рубинов"
@@ -4173,9 +4261,13 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 final_hp = (result.final_hp or {}).get(enemy.key, max(0, int(hydra_head_hp[head_index])))
                 hydra_head_hp[head_index] = min(head_max_hp, max(0, int(final_hp)))
                 if run["hp"] <= 0:
+                    # Read the tally out BEFORE the run is discarded: the defeat screen is
+                    # the last chance to tell somebody what the descent was worth.
+                    final = dict(run.get("haul") or _new_haul())
+                    record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
                     record["dungeon_run"] = None
                     _save(entry, data)
-                    return False, f"{row['name']} победила. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
+                    return False, f"{row['name']} победила. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "run_over": True, "haul": {"total": final}}
                 felled = hydra_head_hp[head_index] <= 0
                 if any(hydra_head_hp):
                     # Only the head still standing grows back, and only part of itself:
@@ -4209,9 +4301,11 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 run.pop("hydra_moves", None)
                 hydra_defeated = True
             if not hydra_defeated and result.winner != str(user_id):
+                final = dict(run.get("haul") or _new_haul())
+                record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
                 record["dungeon_run"] = None
                 _save(entry, data)
-                return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
+                return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "run_over": True, "haul": {"total": final}}
             if row["gimmick"] == "reincarnate" and not int(run.get("boss_lives", 0) or 0):
                 run["boss_lives"] = 1
                 _save(entry, data)
@@ -4261,7 +4355,9 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         # changes how it READS without weakening what it guarantees.
         kind = "boss" if row.get("boss") else "mob"
         grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{kind}:{loot_token}")
-    return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies}
+    receipt = {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies}
+    receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
+    return True, message, receipt
 
 
 def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bool, str]:
@@ -4301,6 +4397,18 @@ def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bo
     )
 
 
+def dungeon_haul(entry: str, user_id) -> dict:
+    """The live tallies for the run in progress, or empty tallies when there is none."""
+    record = _tamed_record(_load(entry), user_id) or {}
+    run = record.get("dungeon_run")
+    if not isinstance(run, dict):
+        return {}
+    return {
+        "floor": dict(run.get("floor_haul") or _new_haul()),
+        "total": dict(run.get("haul") or _new_haul()),
+    }
+
+
 def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
     if not D.DUNGEON_OPEN:
         return False, D.DUNGEON_CLOSED_NOTICE
@@ -4317,10 +4425,14 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
         # player has cleared the last floor and there is no next one to stand on, so
         # leaving them parked on a finished floor with a dead button would be the same
         # endless-corridor lie in a smaller shape.
+        record["last_dungeon_haul"] = {
+            **dict(run.get("haul") or _new_haul()), "floor": floor, "won": True,
+        }
         record["dungeon_run"] = None
         _save(entry, data)
         return True, D.DUNGEON_CLEARED_NOTICE
     run["floor"], run["cleared"] = floor + 1, []
+    run["floor_haul"] = _new_haul()
     run.pop("boss_lives", None)
     run.pop("hydra_head_hp", None)
     run.pop("hydra_moves", None)
@@ -4340,6 +4452,12 @@ def quit_dungeon(entry: str, user_id) -> tuple[bool, str]:
         record = _tamed_record(data, user_id)
         if record is None or not _dungeon_active(record):
             return False, "Ты не в подземелье."
+        run = record.get("dungeon_run")
+        if isinstance(run, dict):
+            record["last_dungeon_haul"] = {
+                **dict(run.get("haul") or _new_haul()),
+                "floor": int(run.get("floor", 1) or 1), "won": True,
+            }
         record["dungeon_run"] = None
         _save(entry, data)
     return True, "Ты покинул подземелье."

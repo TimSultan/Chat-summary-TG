@@ -1004,7 +1004,27 @@ QUESTS: Final[tuple[Quest, ...]] = tuple(
 )
 PAINT_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "paint")
 REAL_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "real")
-RUNE_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "rune")
+# Every rune-kind quest. Split below into the two boards they are actually dealt from.
+ALL_RUNE_QUESTS: Final = tuple(quest for quest in QUESTS if quest.kind == "rune")
+# The paint quests that upgrade something you take into the ARENA: each one mints a
+# personal paint rune worth +30% on the item it is applied to. They are a separate board
+# from the elemental and tool quests because they are the only ones that change a fight,
+# and mixing them into a six-card rune shelf buried the reason to do them.
+#
+# Codes rather than a flag on the Quest: pets.PERSONAL_PAINT_RUNE_QUEST_TARGETS is already
+# the closed list that decides what a completed one pays out, and a second list that could
+# disagree with it is how a quest ends up offered but unrewardable.
+GEAR_PAINT_QUESTS: Final = tuple(
+    quest for quest in ALL_RUNE_QUESTS
+    if quest.code in (
+        "rune_paint_weapon", "rune_paint_shield", "rune_paint_boots",
+        "rune_paint_amulet", "rune_paint_vial", "rune_paint_scroll",
+    )
+)
+# What is left: the six elements and the four tool/figurine masterworks.
+RUNE_QUESTS: Final = tuple(
+    quest for quest in ALL_RUNE_QUESTS if quest not in GEAR_PAINT_QUESTS
+)
 QUEST_COUNT: Final = len(QUESTS)
 PAINT_COUNT: Final = len(PAINT_QUESTS)
 REAL_COUNT: Final = len(REAL_QUESTS)

@@ -417,6 +417,7 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         lines.append(f"{marker} {escape(str(enemy['name']))}" + (f" — {escape(str(enemy['hint']))}" if enemy.get("hint") else ""))
         if not enemy.get("cleared"):
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
+    lines.extend(dungeon_haul_block(state))
     if state.get("can_rest"):
         lines.append("\nОтдохнуть?")
         # The remaining count rides on the button itself. A rest button that simply
@@ -457,6 +458,54 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     else:
         rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def haul_line(haul: dict | None) -> str:
+    """One line of everything a tally holds, or "" when it holds nothing.
+
+    Names the drops rather than counting them: "🎁 2" tells a player nothing they wanted
+    to know, and the whole point of the summary is what they walked away with.
+    """
+    haul = haul or {}
+    bits = []
+    if int(haul.get("gold", 0) or 0):
+        bits.append(f"🪙 {_money(int(haul['gold']))}")
+    if int(haul.get("xp", 0) or 0):
+        bits.append(f"✨ {_money(int(haul['xp']))}")
+    if int(haul.get("rubies", 0) or 0):
+        bits.append(f"💎 {int(haul['rubies'])}")
+    for icon, key in (("🎁", "items"), ("📜", "scrolls"), ("🔮", "runes")):
+        names = [str(name) for name in (haul.get(key) or []) if name]
+        if names:
+            bits.append(f"{icon} {escape(', '.join(names))}")
+    return " · ".join(bits)
+
+
+def dungeon_haul_block(state: dict) -> list[str]:
+    """The «за этаж» / «за поход» summary lines for a run in progress."""
+    lines = []
+    floor_line = haul_line(state.get("floor_haul"))
+    total_line = haul_line(state.get("haul"))
+    if floor_line:
+        lines.append(f"\n📦 <b>За этаж:</b> {floor_line}")
+    if total_line and total_line != floor_line:
+        kills = int((state.get("haul") or {}).get("kills", 0) or 0)
+        lines.append(f"🎒 <b>За поход</b> ({kills} побед): {total_line}")
+    return lines
+
+
+def dungeon_finished_text(haul: dict | None) -> str:
+    """The closing receipt, shown once the run is over however it ended."""
+    haul = haul or {}
+    line = haul_line(haul)
+    if not line:
+        return ""
+    verdict = "🏁 Поход окончен" if haul.get("won") else "☠️ Поход оборвался"
+    floor = int(haul.get("floor", 0) or 0)
+    where = f" на этаже {floor}" if floor else ""
+    kills = int(haul.get("kills", 0) or 0)
+    return (f"{verdict}{where}. Побед: {kills}.\n"
+            f"🎒 <b>Всего за поход:</b> {line}")
 
 
 def dungeon_reward_text(receipt: dict | None) -> str:
@@ -857,13 +906,36 @@ def _quest_timer(seconds: int) -> str:
     return f"{hours} ч {minutes} мин" if hours else f"{minutes} мин"
 
 
+QUEST_KINDS = ("paint", "real", "rune", "gear")
+QUEST_TAB_LABELS = {
+    "paint": "🎯 Три квеста на покрас",
+    "real": "🌍 Квест в реале",
+    "rune": "🕳 Магия подземелья",
+    "gear": "⚔️ Покрасы для арены",
+}
+
+
+def quest_board_for(entry: str, user_id, kind: str):
+    """The board one tab is dealt from. Single source of truth for the mapping."""
+    if kind == "real":
+        return quests.real_quest(entry, user_id)
+    if kind == "rune":
+        return quests.rune_quest(entry, user_id)
+    if kind == "gear":
+        return quests.gear_quest(entry, user_id)
+    return quests.daily_quest(entry, user_id)
+
+
 def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
     """Compact quest shelf: three readable cards and three matching buttons."""
-    kind = kind if kind in {"paint", "real", "rune"} else "paint"
-    board = quests.real_quest(entry, user_id) if kind == "real" else (quests.rune_quest(entry, user_id) if kind == "rune" else quests.daily_quest(entry, user_id))
+    kind = kind if kind in QUEST_KINDS else "paint"
+    board = quest_board_for(entry, user_id, kind)
     cards = board.get("quests") or []
     paint = kind != "real"
-    title = "🕳 <b>Магия подземелья · элементы</b>" if kind == "rune" else ("🎯 <b>Квесты на покрас · 3 карточки</b>" if paint else "🌍 <b>Квест в реале</b>")
+    title = ("🕳 <b>Магия подземелья · элементы и инструменты</b>" if kind == "rune"
+             else "⚔️ <b>Покрасы для арены · 5 карточек</b>" if kind == "gear"
+             else "🎯 <b>Квесты на покрас · 3 карточки</b>" if paint
+             else "🌍 <b>Квест в реале</b>")
     lines = [title]
     if board.get("auto_refresh"):
         lines.append(
@@ -874,9 +946,14 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         lines.append("\n🕰 Без дедлайна: квесты не обновятся сами.")
     if kind == "rune":
         lines.append(
-            "Обычный рунический квест даёт случайную руну и магию. Специальный "
-            "квест на вещь даёт персональный покрас +30%; квесты кирки и лопаты "
-            "сразу улучшают инструмент навсегда."
+            "Элементальный квест даёт случайную руну и магию. Квесты кирки, лопаты "
+            "и фигурок сразу улучшают инструмент навсегда."
+        )
+    elif kind == "gear":
+        lines.append(
+            "Каждый квест здесь — персональный покрас на вещь, с которой ты выходишь "
+            "в бой: фотография твоей работы на предмете и +30% к его полезным "
+            "характеристикам. Это единственные квесты, которые меняют исход боя."
         )
     buttons = []
     for index, card in enumerate(cards, 1):
@@ -913,17 +990,20 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         "text": reroll_label,
         "callback_data": callback_data(user_id, "questreroll", kind),
     }])
-    for other, label in (("paint", "🎯 Три квеста на покрас"), ("real", "🌍 Квест в реале"), ("rune", "🕳 Магия подземелья")):
+    for other in QUEST_KINDS:
         if other != kind:
-            buttons.append([{"text": label, "callback_data": callback_data(user_id, "quests", other)}])
+            buttons.append([{
+                "text": QUEST_TAB_LABELS[other],
+                "callback_data": callback_data(user_id, "quests", other),
+            }])
     buttons.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": buttons}
 
 
 def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, dict]:
     """Full brief and a practical step-by-step tutorial for one selected card."""
-    kind = kind if kind in {"paint", "real", "rune"} else "paint"
-    board = quests.real_quest(entry, user_id) if kind == "real" else (quests.rune_quest(entry, user_id) if kind == "rune" else quests.daily_quest(entry, user_id))
+    kind = kind if kind in QUEST_KINDS else "paint"
+    board = quest_board_for(entry, user_id, kind)
     card = next((row for row in board.get("quests", []) if row.get("code") == code), None)
     if card is None:
         return quests_view(entry, user_id, kind)
