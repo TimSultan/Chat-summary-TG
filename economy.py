@@ -691,6 +691,14 @@ _AUDIT_SOURCES = {
     "casino_highlow": ("Больше / меньше", "#c95c61"),
     "pvp": ("Бои с игроками", "#4f8fe8"),
     "mobs": ("Бои с мобами", "#e05252"),
+    # The dungeon is split by what was killed, because a corridor mob and a floor boss are
+    # tuned separately and lumping them together hides which of the two is the faucet.
+    # Wins recorded before the split carry no boss flag and cannot be reassigned, so they
+    # keep a bucket of their own rather than being guessed into one of the other two.
+    "dungeon_mobs": ("Подземелье: мобы", "#8f6ad6"),
+    "dungeon_boss": ("Подземелье: боссы", "#b45fc4"),
+    "dungeon_legacy": ("Подземелье: до разделения", "#7d6ba8"),
+    "dungeon_heal": ("Подземелье: лечение", "#6a7fa8"),
     "farm": ("Ферма", "#4ca66a"),
     "daily": ("Ежедневный бонус", "#55b9ad"),
     "activity": ("Активность и призы", "#5dba73"),
@@ -722,6 +730,16 @@ def _audit_source(reason: str) -> str:
         return "pvp"
     if value == "pet_mob_win":
         return "mobs"
+    # Before the generic pet_ rules below: every dungeon reason starts with the same
+    # prefix, and the boss/mob suffix is the whole point of reading it.
+    if value == "pet_dungeon_boss_win":
+        return "dungeon_boss"
+    if value == "pet_dungeon_mob_win":
+        return "dungeon_mobs"
+    if value == "pet_dungeon_win":
+        return "dungeon_legacy"
+    if value == "pet_dungeon_heal":
+        return "dungeon_heal"
     if value.startswith("grant:pet:farm:") or value == "pet:farm_passive_income":
         return "farm"
     if value == "daily_bonus":

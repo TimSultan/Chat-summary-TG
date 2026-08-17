@@ -906,7 +906,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             economy.grant(CHAT, OPPONENT["id"], 100, "grant:pet:farm:shift-1")
             pets.grant_rubies(CHAT, PLAYER["id"], 9, "pet_mob_win")
             pets.grant_rubies_once(CHAT, PLAYER["id"], 3, "quarry:run-1")
-            pets.grant_rubies_once(CHAT, OPPONENT["id"], 6, "dungeon-ruby:token-1")
+            pets.grant_rubies_once(CHAT, OPPONENT["id"], 6, "dungeon-ruby:mob:token-1")
 
     async def test_income_audit_splits_both_currencies_by_source_with_shares(self):
         moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
@@ -928,7 +928,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         rubies = {row["code"]: row for row in body["rubies"]["sources"]}
         self.assertEqual(rubies["mobs"]["earned"], 9)
         self.assertEqual(rubies["quarry"]["earned"], 3)
-        self.assertEqual(rubies["dungeon"]["earned"], 6)
+        self.assertEqual(rubies["dungeon_mobs"]["earned"], 6)
         self.assertEqual(body["rubies"]["totals"]["earned"], 18)
         self.assertAlmostEqual(rubies["mobs"]["share"], 0.5, places=6)
 
@@ -1078,6 +1078,48 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((respec["earned"], respec["spent"]), (0, C.STAT_RESPEC_RUBY_COST))
         # A pure sink is 0% of income and is read off the spent column instead.
         self.assertEqual(respec["share"], 0.0)
+
+    async def test_income_audit_splits_the_dungeon_into_mobs_bosses_and_its_own_sink(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        with patch("economy.app_now", return_value=moment), \
+                patch("pets.app_now", return_value=moment):
+            economy.grant(CHAT, PLAYER["id"], 300, "pet_dungeon_boss_win")
+            economy.grant(CHAT, PLAYER["id"], 120, "pet_dungeon_mob_win")
+            # Written before the split existed: it has no boss flag and must not be
+            # silently counted as either kind.
+            economy.grant(CHAT, PLAYER["id"], 90, "pet_dungeon_win")
+            economy.grant(CHAT, PLAYER["id"], -40, "pet_dungeon_heal")
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 4, "dungeon-ruby:boss:run-1:5:0:1")
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 1, "dungeon-ruby:mob:run-1:5:1:2")
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 7, "dungeon-ruby:legacy-token")
+            body = await self._income("?days=30")
+
+        coins = {row["code"]: row for row in body["coins"]["sources"]}
+        self.assertEqual(coins["dungeon_boss"]["earned"], 300)
+        self.assertEqual(coins["dungeon_mobs"]["earned"], 120)
+        self.assertEqual(coins["dungeon_legacy"]["earned"], 90)
+        self.assertEqual(coins["dungeon_heal"]["spent"], 40)
+        # The whole point of the change: none of it lands in the catch-all any more.
+        self.assertNotIn("other", coins)
+
+        rubies = {row["code"]: row for row in body["rubies"]["sources"]}
+        self.assertEqual(rubies["dungeon_boss"]["earned"], 4)
+        self.assertEqual(rubies["dungeon_mobs"]["earned"], 1)
+        self.assertEqual(rubies["dungeon_legacy"]["earned"], 7)
+        # Both currencies name the dungeon the same way, so the two can be read together.
+        self.assertEqual(coins["dungeon_boss"]["name"], rubies["dungeon_boss"]["name"])
+
+    def test_a_dungeon_kill_records_whether_it_was_a_boss_in_both_currencies(self):
+        for boss, coin_reason, ruby_kind in (
+            (True, "pet_dungeon_boss_win", "boss"), (False, "pet_dungeon_mob_win", "mob"),
+        ):
+            with self.subTest(boss=boss):
+                self.assertEqual(economy._audit_source(coin_reason),
+                                 "dungeon_boss" if boss else "dungeon_mobs")
+                self.assertEqual(pets.ruby_source_of(f"dungeon-ruby:{ruby_kind}:tok"),
+                                 "dungeon_boss" if boss else "dungeon_mobs")
+        self.assertEqual(economy._audit_source("pet_dungeon_win"), "dungeon_legacy")
+        self.assertEqual(pets.ruby_source_of("dungeon-ruby:tok"), "dungeon_legacy")
 
     async def test_audit_page_offers_an_income_tab_with_all_three_filters(self):
         page = await self.client.get("/audit")

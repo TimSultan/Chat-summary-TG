@@ -1897,7 +1897,12 @@ RUBY_LOG_LIMIT = 50_000
 
 RUBY_SOURCES = {
     "mobs": ("Бои с мобами", "#e05252"),
-    "dungeon": ("Подземелье", "#9b6fe8"),
+    # Split by what was killed, matching economy._AUDIT_SOURCES exactly so a dungeon
+    # number here and a dungeon number there mean the same thing. Drops recorded before
+    # the split carry no boss flag and keep their own bucket instead of being guessed.
+    "dungeon_mobs": ("Подземелье: мобы", "#8f6ad6"),
+    "dungeon_boss": ("Подземелье: боссы", "#b45fc4"),
+    "dungeon_legacy": ("Подземелье: до разделения", "#7d6ba8"),
     "quarry": ("Карьер", "#c08a3e"),
     "farm": ("Ферма", "#4ca66a"),
     "pvp": ("Бои с игроками", "#4f8fe8"),
@@ -1923,8 +1928,14 @@ def ruby_source_of(reason: str) -> str:
         return "quarry"
     if value.startswith("farm-ruby:"):
         return "farm"
+    # The boss/mob marker sits between the prefix and the loot token; a key without one
+    # was written before the split and cannot be reassigned now.
+    if value.startswith("dungeon-ruby:boss:"):
+        return "dungeon_boss"
+    if value.startswith("dungeon-ruby:mob:"):
+        return "dungeon_mobs"
     if value.startswith("dungeon-ruby:"):
-        return "dungeon"
+        return "dungeon_legacy"
     if value.startswith("arena-ruby:"):
         return "pvp"
     if value.startswith("quest:"):
@@ -4186,7 +4197,10 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         _apply_xp(record, int(reward["xp"]))
         _save(entry, data)
 
-    economy.grant(entry, user_id, int(reward["gold"]), "pet_dungeon_win")
+    # The kind of kill is recorded in the reason itself: it is the only place the boss
+    # flag still exists by the time the audit reads this back.
+    economy.grant(entry, user_id, int(reward["gold"]),
+                  "pet_dungeon_boss_win" if row.get("boss") else "pet_dungeon_mob_win")
     # Unseeded: a dungeon kill is not a settlement that might be retried, so there is
     # nothing to reproduce -- and a seed is what made the pool always land on one item.
     dropped = grant_random_drop(entry, user_id, float(reward["item_chance"]))
@@ -4205,7 +4219,10 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         )
     rubies = 1 if secrets.SystemRandom().random() < C.DUNGEON_RUBY_CHANCE else 0
     if rubies:
-        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{loot_token}")
+        # loot_token is already unique per kill, so widening the key with the boss marker
+        # changes how it READS without weakening what it guarantees.
+        kind = "boss" if row.get("boss") else "mob"
+        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{kind}:{loot_token}")
     return True, message, {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies}
 
 

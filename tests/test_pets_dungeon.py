@@ -398,6 +398,37 @@ class DungeonTests(unittest.TestCase):
 
         self.assertIsNotNone(receipt)
 
+    def test_a_kill_records_whether_it_was_a_mob_or_a_boss_for_the_income_audit(self):
+        """The boss flag only exists on the encounter row; if it is not written into the
+        reason here it is gone by the time the audit reads the ledger back."""
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 400, "health": 400, "agility": 400, "luck": 400, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
+        self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, 0)[0])
+
+        reasons = [row["reason"] for row in economy._load(self.entry)["log"]]
+        self.assertIn("pet_dungeon_mob_win", reasons)
+        self.assertEqual(economy._audit_source("pet_dungeon_mob_win"), "dungeon_mobs")
+
+        # Floor 5 is the first boss floor, and a boss win has to read differently.
+        run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
+        run["floor"], run["cleared"] = 5, []
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = run
+        pets._save(self.entry, data)
+        for _ in range(4):                       # the floor-5 boss revives once
+            if pets.dungeon_fight(self.entry, self.user_id, 0)[0] and \
+                    "pet_dungeon_boss_win" in [
+                        r["reason"] for r in economy._load(self.entry)["log"]]:
+                break
+        self.assertIn("pet_dungeon_boss_win",
+                      [row["reason"] for row in economy._load(self.entry)["log"]])
+        self.assertEqual(economy._audit_source("pet_dungeon_boss_win"), "dungeon_boss")
+
     def test_dungeon_runner_cannot_attack_but_remains_an_arena_defender(self):
         other_user = "43"
         pets.buy_cage(self.entry, other_user, 100_000)
