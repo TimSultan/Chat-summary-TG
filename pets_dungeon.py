@@ -15,7 +15,6 @@ MIN_POWER: Final = 1_000
 # five entries a day -- 50 rubies -- is roughly what a full day of PVE and quarrying
 # actually earns, with a little left over.
 ENTRY_RUBY_COST: Final = 10
-ESCALATOR_RUBY_COST: Final = 5
 ANTIMAGIC_REFLECT_SHARE: Final = 0.85
 # Cut with the rewards, not independently of them: the dungeon's shop is paid for out of
 # the dungeon's own income, so shrinking one without the other would leave a runner

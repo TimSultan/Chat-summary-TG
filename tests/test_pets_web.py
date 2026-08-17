@@ -390,7 +390,6 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('emptySlot("weapon")', page)
         self.assertRegex(page, r"\.slot \{\s*width: 100%")
         self.assertIn("Снаряжения пока нет.", page)
-        self.assertIn("const escalatorPayment = ticket ?", page)
 
     async def test_shop_purchase_removes_an_offer_without_replenishing_it(self):
         self._tame(PLAYER)

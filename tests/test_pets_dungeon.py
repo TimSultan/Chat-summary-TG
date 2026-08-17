@@ -213,27 +213,29 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 0)
         self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 0)
 
-    def test_failed_escalator_does_not_consume_the_entry_ticket(self):
+    def test_a_refused_entry_never_consumes_the_ticket(self):
+        """The escalator is gone, but the guarantee it was tested for is not: a ticket
+        pays admission and must survive an entry that gets refused."""
         data = pets._load(self.entry)
         data["pets"][self.user_id]["stats"] = {
-            "strength": 200, "health": 200, "agility": 200, "luck": 200, "endurance": 1,
+            "strength": 1, "health": 1, "agility": 1, "luck": 1, "endurance": 1,
         }
-        data["pets"][self.user_id]["dungeon_deepest"] = 2
         pets._save(self.entry, data)
         pets.grant_dungeon_ticket(self.entry, self.user_id)
 
-        _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
-        escalator = next(
-            button for row in keyboard["inline_keyboard"] for button in row
-            if "Эскалатор" in button["text"]
-        )
-        self.assertIn(f"билет + {dungeon.ESCALATOR_RUBY_COST} 💎", escalator["text"])
+        ok, _message = pets.enter_dungeon(self.entry, self.user_id)
 
-        ok, message = pets.enter_dungeon(self.entry, self.user_id, escalator=True)
-
-        self.assertFalse(ok)
-        self.assertIn(str(dungeon.ESCALATOR_RUBY_COST), message)
+        self.assertFalse(ok, "a creature under the power floor must not get in")
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 1)
+
+    def test_the_dungeon_screen_no_longer_offers_an_escalator(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_deepest"] = 7
+        pets._save(self.entry, data)
+        _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        labels = [b["text"] for row in keyboard["inline_keyboard"] for b in row]
+        self.assertFalse([t for t in labels if "Эскалатор" in t])
+
 
     def test_first_two_floor_budgets_pay_for_a_full_rest_even_on_low_rolls(self):
         floor_one = dungeon.reward_for(1, False, enemy_count=2)["gold"]

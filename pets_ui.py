@@ -406,10 +406,6 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
              (f"🎫 Билетов в подземелье: <b>{tickets}</b>" if tickets else f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>"),
                  "Состав этажей меняется, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
         rows = [[{"text": (f"⚔️ Войти · билет ({tickets})" if tickets else f"⚔️ Войти · {state.get('entry_cost', 15)} 💎"), "callback_data": callback_data(user_id, "dungeonenter")}]]
-        if int(state.get("deepest", 1)) > 1:
-            cost = (0 if tickets else int(state.get("entry_cost", 15))) + int(state.get("escalator_cost", 5))
-            payment = f"билет + {cost} 💎" if tickets else f"{cost} 💎"
-            rows.append([{"text": f"🪜 Эскалатор до {state['deepest']} · {payment}", "callback_data": callback_data(user_id, "dungeonescalator")}])
         rows.append(_back_row(user_id))
         return "\n".join(lines), {"inline_keyboard": rows}
     lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", escape(str(state.get('description') or '')), ""]
@@ -479,6 +475,10 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+# How many drop names a summary spells out before it starts counting instead.
+HAUL_NAMES_SHOWN = 6
+
+
 def haul_line(haul: dict | None) -> str:
     """One line of everything a tally holds, or "" when it holds nothing.
 
@@ -495,7 +495,15 @@ def haul_line(haul: dict | None) -> str:
         bits.append(f"💎 {int(haul['rubies'])}")
     for icon, key in (("🎁", "items"), ("📜", "scrolls"), ("🔮", "runes")):
         names = [str(name) for name in (haul.get(key) or []) if name]
-        if names:
+        if not names:
+            continue
+        # A hundred-kill run collects more names than a Telegram message can hold, and a
+        # wall of them is unreadable long before it is too long. The count is the part
+        # that matters once there are more than a handful.
+        if len(names) > HAUL_NAMES_SHOWN:
+            shown = ", ".join(names[:HAUL_NAMES_SHOWN])
+            bits.append(f"{icon} {escape(shown)} и ещё {len(names) - HAUL_NAMES_SHOWN}")
+        else:
             bits.append(f"{icon} {escape(', '.join(names))}")
     return " · ".join(bits)
 

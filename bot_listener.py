@@ -6358,7 +6358,7 @@ async def handle_pets_callback(
         return
     user_id = user.user_id
     dungeon_actions = {
-        "dungeon", "dungeonenter", "dungeonescalator", "dungeonfight", "dungeonrest",
+        "dungeon", "dungeonenter", "dungeonfight", "dungeonrest",
         "dungeondescend", "dungeonquit",
     }
     if action not in dungeon_actions and pets.is_in_dungeon(entry, user_id):
@@ -6553,12 +6553,10 @@ async def handle_pets_callback(
             await _send_pets_view(api, chat_id, pets_ui.dungeon_view(entry, user_id, xp),
                                   message_id=message_id, log=log)
             return
-        if action in ("dungeonenter", "dungeonescalator", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
+        if action in ("dungeonenter", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
             receipt = None
             if action == "dungeonenter":
                 ok, note = pets.enter_dungeon(entry, user_id)
-            elif action == "dungeonescalator":
-                ok, note = pets.enter_dungeon(entry, user_id, escalator=True)
             elif action == "dungeonrest":
                 ok, note = pets.dungeon_rest(entry, user_id, xp, argument or "full")
             elif action == "dungeondescend":

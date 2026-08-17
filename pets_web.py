@@ -1279,10 +1279,6 @@ def _action_dungeon_enter(entry, user_id, xp, payload):
     return pets.enter_dungeon(entry, user_id)
 
 
-def _action_dungeon_escalator(entry, user_id, xp, payload):
-    return pets.enter_dungeon(entry, user_id, escalator=True)
-
-
 def _action_dungeon_fight(entry, user_id, xp, payload):
   try:
       index = int(payload.get("index") or 0)
@@ -1334,7 +1330,6 @@ _ACTIONS = {
     "pve_replays": _action_pve_replays,
     "portrait_crop": _action_portrait_crop,
     "dungeon_enter": _action_dungeon_enter,
-    "dungeon_escalator": _action_dungeon_escalator,
     "dungeon_fight": _action_dungeon_fight,
     "dungeon_rest": _action_dungeon_rest,
     "dungeon_descend": _action_dungeon_descend,
@@ -5468,9 +5463,7 @@ function dungeonPanel() {
     const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
     const ticket = Number(dungeon.tickets || 0);
     const entryLabel = ticket ? '⚔️ Войти · билет (' + ticket + ')' : '⚔️ Войти · ' + dungeon.entry_cost + ' 💎';
-    const escalatorCost = Number(dungeon.escalator_cost || 0) + (ticket ? 0 : Number(dungeon.entry_cost || 0));
-    const escalatorPayment = ticket ? 'билет + ' + escalatorCost + ' 💎' : escalatorCost + ' 💎';
-    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Состав этажей меняется. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button>' + (Number(dungeon.deepest || 1) > 1 ? '<button class="go sec" style="margin-top:8px" data-dungeon="escalator">🪜 Эскалатор до ' + dungeon.deepest + ' · ' + escalatorPayment + '</button>' : '') + '</div></div>';
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Состав этажей меняется. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button>'</div></div>';
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const revived = new Set(dungeon.revived || []);
@@ -8709,7 +8702,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
 async function handleClick(event, target) {
   const d = target.dataset;
   if (d.dungeon) {
-    const actions = { enter: "dungeon_enter", escalator: "dungeon_escalator", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit" };
+    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit" };
     await act(actions[d.dungeon], d.dungeon === "fight" ? { index: Number(d.index) } : (d.dungeon === "rest" ? { amount: d.heal || "full" } : {}));
     return;
   }

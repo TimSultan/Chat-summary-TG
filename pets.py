@@ -3977,6 +3977,30 @@ def _raise_the_fallen(run: dict, floor: int, cleared: set) -> list[int]:
     return raised
 
 
+# What a rune is called on screen. The wallet keys are English because they are also the
+# enchantment codes; nothing a player reads should say "frost".
+RUNE_NAMES = {
+    "fire": "Огонь", "frost": "Лёд", "water": "Вода",
+    "earth": "Земля", "air": "Воздух", "plants": "Растения",
+}
+
+
+def _haul_names(dropped) -> list[str]:
+    """The display name of a drop, however the granting call chose to return it.
+
+    grant_random_drop hands back a DICT, and reading it with getattr() fell through to
+    str() -- which is how a run summary came to print `{'code': 'gl02', 'name': ...}`
+    verbatim, once per item, for a hundred kills.
+    """
+    if dropped is None:
+        return []
+    if isinstance(dropped, dict):
+        name = dropped.get("name") or dropped.get("code")
+        return [str(name)] if name else []
+    name = getattr(dropped, "name", None) or getattr(dropped, "code", None)
+    return [str(name)] if name else []
+
+
 def _new_haul() -> dict:
     """A running tally of what a descent has actually paid out.
 
@@ -4003,15 +4027,13 @@ def _haul_add(haul: dict, receipt: dict) -> dict:
     haul["xp"] += int(reward.get("xp", 0) or 0)
     haul["rubies"] += int(receipt.get("rubies", 0) or 0)
     haul["kills"] += 1
-    dropped = receipt.get("dropped")
-    if dropped is not None:
-        haul["items"].append(getattr(dropped, "name", None) or str(dropped))
+    haul["items"].extend(_haul_names(receipt.get("dropped")))
     scroll = receipt.get("scroll")
     if isinstance(scroll, dict) and scroll.get("granted"):
         haul["scrolls"].append(str(scroll.get("name") or scroll.get("code") or "свиток"))
     rune = receipt.get("rune")
-    if rune:
-        haul["runes"].append(str(rune))
+    if isinstance(rune, dict) and rune.get("granted"):
+        haul["runes"].append(RUNE_NAMES.get(rune.get("element"), str(rune.get("element"))))
     return haul
 
 
@@ -4056,7 +4078,6 @@ def dungeon_status(entry: str, user_id) -> dict:
         "cleared_notice": D.DUNGEON_CLEARED_NOTICE,
         "entry_cost": D.ENTRY_RUBY_COST,
         "tickets": dungeon_tickets(entry, user_id),
-        "escalator_cost": D.ESCALATOR_RUBY_COST,
     }
     if not isinstance(run, dict):
         # The last descent's receipt outlives the run it describes, so the screen a player
@@ -4171,7 +4192,13 @@ def _dungeon_has_frost_damage(record: dict) -> bool:
     ) == "frost"
 
 
-def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool, str]:
+def enter_dungeon(entry: str, user_id) -> tuple[bool, str]:
+    """Start a run on floor one.
+
+    The escalator -- a paid ride straight to your deepest floor -- was removed. It let a
+    run skip everything it was priced against, so the floors that fund a descent were the
+    only ones anybody ever paid full price for.
+    """
     if not D.DUNGEON_OPEN:
         return False, D.DUNGEON_CLOSED_NOTICE
     with _farm_settlement_lock:
@@ -4190,19 +4217,11 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
         wallet = _ruby_row(data)
         rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
         floor = 1
-        if escalator:
-            floor = max(1, int(record.get("dungeon_deepest", 1)))
-            if floor <= 1:
-                return False, "Эскалатор откроется, когда доберёшься глубже."
-        # A ticket replaces the admission fee only.  Validate every separate cost before
-        # consuming it, so a failed escalator attempt cannot silently burn a ticket.
-        ruby_cost = (0 if ticket_count else D.ENTRY_RUBY_COST) + (
-            D.ESCALATOR_RUBY_COST if escalator else 0
-        )
+        # A ticket replaces the admission fee. Checked before it is consumed, so a
+        # refused entry cannot silently burn one.
+        ruby_cost = 0 if ticket_count else D.ENTRY_RUBY_COST
         if rubies < ruby_cost:
-            if not ticket_count and not escalator:
-                return False, f"Вход стоит {D.ENTRY_RUBY_COST} рубинов."
-            return False, f"Нужно {ruby_cost} рубинов."
+            return False, f"Вход стоит {D.ENTRY_RUBY_COST} рубинов."
         if ticket_count:
             tickets[str(user_id)] = ticket_count - 1
         if ruby_cost:
@@ -4222,7 +4241,7 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
         }
         _save(entry, data)
     entry_paid = "по билету" if ticket_count else f"за {D.ENTRY_RUBY_COST} рубинов"
-    return True, f"{'Эскалатор доставил' if escalator else 'Ты вошёл'} на этаж {floor} {entry_paid}."
+    return True, f"Ты вошёл на этаж {floor} {entry_paid}."
 
 
 def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | None]:
