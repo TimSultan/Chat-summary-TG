@@ -204,6 +204,21 @@ def _normalise_dungeon_run(run) -> dict | None:
         # starts empty rather than being invented.
         "haul": _clean_haul(run.get("haul")),
         "floor_haul": _clean_haul(run.get("floor_haul")),
+        # The pack healers' bookkeeping: when each corpse fell, which ones have already
+        # been raised once, and the order the room is currently standing in.
+        "dead_at": {
+            str(key): _safe_nonnegative_int(value)
+            for key, value in (run.get("dead_at") or {}).items()
+            if str(key).isdigit()
+        } if isinstance(run.get("dead_at"), dict) else {},
+        "revived": sorted({
+            int(value) for value in (run.get("revived") or [])
+            if str(value).lstrip("-").isdigit()
+        }) if isinstance(run.get("revived"), (list, tuple, set)) else [],
+        "order": [
+            int(value) for value in (run.get("order") or [])
+            if str(value).lstrip("-").isdigit()
+        ] if isinstance(run.get("order"), (list, tuple)) else [],
     }
     if D.encounter(floor, 0).get("gimmick") == "three_heads":
         raw_head_hp = run.get("hydra_head_hp")
@@ -3917,6 +3932,51 @@ def is_in_dungeon(entry, user_id) -> bool:
     return _dungeon_active(_tamed_record(_load(entry), user_id))
 
 
+def _pack_healers_alive(floor: int, cleared: set) -> list[int]:
+    """Which of the room's healers are still standing."""
+    return [
+        row["index"] for row in D.encounters_for_floor(floor)
+        if row.get("healer") and row["index"] not in cleared
+    ]
+
+
+def _raise_the_fallen(run: dict, floor: int, cleared: set) -> list[int]:
+    """Put back everything the healers have had time to reach. Returns who got up.
+
+    Called at the START of an action rather than the end of the last one, so a kill is
+    visibly a kill for one turn before it is undone -- and so killing the second healer
+    immediately after the first still ends the cycle instead of racing a timer.
+
+    Healers never raise each other: that is the whole reason the room has an answer.
+    """
+    if not _pack_healers_alive(floor, cleared):
+        return []
+    kills = int(run.get("kills", 0) or 0)
+    dead_at = run.get("dead_at") if isinstance(run.get("dead_at"), dict) else {}
+    revived = {int(value) for value in (run.get("revived") or [])}
+    raised = []
+    for index in sorted(cleared):
+        if D.is_pack_healer(floor, index):
+            continue
+        fell_at = int(dead_at.get(str(index), 0) or 0)
+        if kills - fell_at < D.PACK_REVIVE_DELAY:
+            continue
+        cleared.discard(index)
+        dead_at.pop(str(index), None)
+        revived.add(index)
+        raised.append(index)
+    if raised:
+        run["cleared"] = sorted(cleared)
+        run["dead_at"] = dead_at
+        run["revived"] = sorted(revived)
+        # Reshuffled on every revival: the survivors cannot be counted off left to right
+        # while the room keeps rearranging itself.
+        order = [row["index"] for row in D.encounters_for_floor(floor)]
+        random.shuffle(order)
+        run["order"] = order
+    return raised
+
+
 def _new_haul() -> dict:
     """A running tally of what a descent has actually paid out.
 
@@ -4010,7 +4070,14 @@ def dungeon_status(entry: str, user_id) -> dict:
     cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
     encounters = []
     hero_level = max(1, int(record.get("level", 1) or 1))
-    for row in D.encounters_for_floor(floor):
+    # The healers keep reshuffling the room, so the list is rendered in the run's own
+    # order rather than by index. An order from a floor that has since changed is ignored.
+    room = list(D.encounters_for_floor(floor))
+    stored_order = [int(value) for value in (run.get("order") or [])]
+    if sorted(stored_order) == sorted(entry_row["index"] for entry_row in room):
+        by_index = {entry_row["index"]: entry_row for entry_row in room}
+        room = [by_index[index] for index in stored_order]
+    for row in room:
         copy = dict(row)
         reward = dict(copy.get("reward") or {})
         if reward:
@@ -4024,6 +4091,8 @@ def dungeon_status(entry: str, user_id) -> dict:
         "floor": floor, "theme": D.floor_name(floor), "hp": max(0, int(run.get("hp", max_hp))),
         "max_hp": max_hp, "cleared": sorted(cleared), "encounters": encounters,
         "description": D.floor_description(floor),
+        "healers_alive": len(_pack_healers_alive(floor, cleared)),
+        "revived": sorted(int(value) for value in (run.get("revived") or [])),
         "floor_haul": dict(run.get("floor_haul") or _new_haul()),
         "haul": dict(run.get("haul") or _new_haul()),
         "can_rest": len(cleared) == len(encounters),
@@ -4171,8 +4240,13 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         floor = max(1, int(run.get("floor", 1) or 1))
         row = D.encounter(floor, index)
         cleared = {int(value) for value in run.get("cleared", []) if str(value).isdigit()}
+        raised = _raise_the_fallen(run, floor, cleared)
         if row["index"] in cleared:
+            _save(entry, data)
             return False, "Этот противник уже побеждён.", None
+        was_revived = int(row["index"]) in {
+            int(value) for value in (run.get("revived") or [])
+        }
         if row["gimmick"] == "healing_pass" and _dungeon_has_healing(record):
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
@@ -4309,8 +4383,16 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 return True, f"{row['name']} возрождается. Добей его ещё раз.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "reincarnated": True}
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
+            # The kill counter is incremented further down, so this records the count
+            # BEFORE this kill -- which makes the very next action exactly one turn later.
+            run.setdefault("dead_at", {})[str(row["index"])] = int(run.get("kills", 0) or 0)
             reward, message = D.roll_reward(floor, bool(row.get("boss"))), f"Побеждён: {row['name']}."
             _record_weapon_win(record, "boss_wins" if row.get("boss") else "mob_wins")
+            still_healing = _pack_healers_alive(floor, cleared)
+            if still_healing and not row.get("healer"):
+                message += " Целитель поднимет его снова."
+            elif row.get("healer") and not still_healing:
+                message += " Последний целитель пал — теперь стая остаётся лежать."
         # One identity per KILL, minted inside the lock that owns the run. Everything paid
         # out below keys off this instead of floor+index, which is what used to make the
         # same mob drop the same scroll, the same item and the same rune for ever: those
@@ -4325,6 +4407,20 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         )
         _apply_xp(record, int(reward["xp"]))
         _save(entry, data)
+
+    # Something a healer already put back on its feet pays NOTHING -- not gold, not xp,
+    # not a drop. Without this the pack is an infinite loop with a purse attached: the
+    # healers would happily supply the same corpse to farm for as long as anybody cared to
+    # press. Killing it still counts toward clearing the floor, which is the point of
+    # doing it at all.
+    if was_revived:
+        reward = {**reward, "gold": 0, "xp": 0, "item_chance": 0.0, "scroll_chance": 0.0}
+        receipt = {"encounter": row, "result": result, "hero": hero if result else None,
+                   "enemy": enemy if result else None, "reward": reward, "dropped": None,
+                   "scroll": None, "rune": None, "rubies": 0, "revived_kill": True,
+                   "raised": raised}
+        receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
+        return True, f"{message} Поднятый целителем — добычи с него нет.", receipt
 
     # The kind of kill is recorded in the reason itself: it is the only place the boss
     # flag still exists by the time the audit reads this back.
@@ -4352,7 +4448,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         # changes how it READS without weakening what it guarantees.
         kind = "boss" if row.get("boss") else "mob"
         grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{kind}:{loot_token}")
-    receipt = {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies}
+    receipt = {"encounter": row, "result": result, "hero": hero if result else None, "enemy": enemy if result else None, "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune, "rubies": rubies, "raised": raised}
     receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
     return True, message, receipt
 

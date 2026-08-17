@@ -293,6 +293,8 @@ class DungeonTests(unittest.TestCase):
             # A run from before the tallies existed starts them empty rather than
             # inventing a history for it.
             "haul": empty_haul, "floor_haul": dict(empty_haul),
+            # Same for the pack healers' bookkeeping.
+            "dead_at": {}, "revived": [], "order": [],
         })
 
     def test_the_loot_tallies_survive_the_whitelist_that_rebuilds_the_run(self):
@@ -410,6 +412,86 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
+
+    def _enter_pack_floor(self):
+        """Stand a very strong hero on floor 2 -- the ten-enemy pack with two healers."""
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["floor"] = 2
+        data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
+        pets._save(self.entry, data)
+        return [row["index"] for row in dungeon.encounters_for_floor(2)
+                if row.get("healer")]
+
+    def test_the_pack_healers_raise_the_fallen_until_they_are_dead_themselves(self):
+        healers = self._enter_pack_floor()
+        self.assertEqual(len(healers), 2)
+        victim = next(i for i in range(10) if i not in healers)
+        other = next(i for i in range(10) if i not in healers and i != victim)
+
+        # Kill an ordinary member, then act again: the healers have had their turn.
+        self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, victim)[0])
+        self.assertIn(victim, pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"])
+        ok, message, receipt = pets.dungeon_fight(self.entry, self.user_id, other)
+        self.assertTrue(ok, message)
+        self.assertIn(victim, receipt["raised"], "the healers did not raise the fallen")
+        run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
+        self.assertNotIn(victim, run["cleared"])
+        self.assertIn(victim, run["revived"])
+
+        # Killing a raised enemy pays absolutely nothing -- otherwise the pack is an
+        # infinite loop with a purse attached.
+        purse = economy.balance(self.entry, self.user_id, 0)
+        ok, _m, again = pets.dungeon_fight(self.entry, self.user_id, victim)
+        self.assertTrue(ok)
+        self.assertTrue(again["revived_kill"])
+        self.assertEqual(again["reward"]["gold"], 0)
+        self.assertEqual(again["reward"]["xp"], 0)
+        self.assertIsNone(again["dropped"])
+        self.assertIsNone(again["scroll"])
+        self.assertEqual(again["rubies"], 0)
+        self.assertEqual(economy.balance(self.entry, self.user_id, 0), purse)
+
+        # Put both healers down and the cycle stops: the fallen stay fallen.
+        for healer in healers:
+            pets.dungeon_fight(self.entry, self.user_id, healer)
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertEqual(state["healers_alive"], 0)
+        before = set(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"])
+        survivor = next(i for i in range(10) if i not in before)
+        pets.dungeon_fight(self.entry, self.user_id, survivor)
+        after = set(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"])
+        self.assertTrue(before <= after, "a dead healer must not raise anybody")
+
+    def test_a_healer_never_raises_another_healer(self):
+        healers = self._enter_pack_floor()
+        self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, healers[0])[0])
+        # One healer still stands. Act again -- it must not put its colleague back up.
+        other = next(i for i in range(10) if i not in healers)
+        pets.dungeon_fight(self.entry, self.user_id, other)
+        run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
+        self.assertIn(healers[0], run["cleared"])
+
+    def test_a_revival_reshuffles_the_room_so_it_cannot_be_counted_off(self):
+        healers = self._enter_pack_floor()
+        victim = next(i for i in range(10) if i not in healers)
+        other = next(i for i in range(10) if i not in healers and i != victim)
+        pets.dungeon_fight(self.entry, self.user_id, victim)
+        with patch("random.shuffle", lambda seq: seq.reverse()):
+            pets.dungeon_fight(self.entry, self.user_id, other)
+
+        order = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["order"]
+        self.assertEqual(order, list(reversed(range(10))))
+        # And the screen follows that order rather than the index order.
+        shown = [row["index"] for row in
+                 pets.dungeon_status(self.entry, self.user_id)["encounters"]]
+        self.assertEqual(shown, order)
 
     def test_the_run_tallies_what_each_floor_and_the_whole_descent_paid(self):
         data = pets._load(self.entry)

@@ -412,9 +412,18 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         return "\n".join(lines), {"inline_keyboard": rows}
     lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", escape(str(state.get('description') or '')), ""]
     rows = []
+    healers_alive = int(state.get("healers_alive", 0) or 0)
+    if healers_alive:
+        lines.append(
+            f"<i>✚ Целителей в живых: {healers_alive}. Пока они стоят, павшие поднимаются "
+            f"снова и с них уже ничего не падает.</i>"
+        )
+    revived = set(state.get("revived") or [])
     for enemy in state.get("encounters", []):
-        marker = "✅" if enemy.get("cleared") else ("👑" if enemy.get("boss") else "⚔️")
-        lines.append(f"{marker} {escape(str(enemy['name']))}" + (f" — {escape(str(enemy['hint']))}" if enemy.get("hint") else ""))
+        marker = "✅" if enemy.get("cleared") else (
+            "✚" if enemy.get("healer") else "👑" if enemy.get("boss") else "⚔️")
+        raised = " <i>(поднят)</i>" if enemy["index"] in revived and not enemy.get("cleared") else ""
+        lines.append(f"{marker} {escape(str(enemy['name']))}{raised}" + (f" — {escape(str(enemy['hint']))}" if enemy.get("hint") else ""))
         if not enemy.get("cleared"):
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     lines.extend(dungeon_haul_block(state))

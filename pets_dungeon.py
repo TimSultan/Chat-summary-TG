@@ -73,7 +73,9 @@ ROOMS: Final = (
      "description": "Два брата никого не пускают и даже не делают вид, что слушают.",
      "hint": "Один держит дверь, второй смотрит из-за плеча."},
     {"count": 10, "kind": "pack_fury", "strength": .68, "health": .72,
-     "description": "Десять стайных бойцов заняли проход. Пока их много, они слишком смелые.",
+     "description": "Десять стайных бойцов заняли проход. Двое из них — целители: пока "
+                    "хоть один жив, остальные поднимаются снова, и стая всё время "
+                    "перестраивается.",
      "hint": "Соседи подбадривают его."},
     {"count": 1, "kind": "elite", "strength": 1.65, "health": 1.70,
      "description": "Один старый страж остался у двери. Уходить он явно не собирается.",
@@ -134,6 +136,27 @@ def _room(floor: int) -> dict:
     return ROOMS[(max(1, floor) - 1) % len(ROOMS)]
 
 
+# --- the pack's healers ---------------------------------------------------------------
+# Ten enemies in one room was ten identical fights in a row. Two of them are now healers:
+# while either still stands, everything else in the room comes back a turn after it dies,
+# and the order of the list is reshuffled so the survivors cannot simply be counted off
+# left to right. Killing the healers first turns a wall into a puzzle with an answer.
+#
+# Positions rather than a random draw: the floor's enemy list is reproducible from
+# (floor, index) everywhere in the game, and a healer chosen by RNG would move between two
+# reads of the same room.
+PACK_HEALER_INDEXES: Final = (3, 7)
+# One action's grace. Long enough that killing a healer between two revivals is possible,
+# short enough that grinding the pack while a healer lives is visibly pointless.
+PACK_REVIVE_DELAY: Final = 1
+
+
+def is_pack_healer(floor: int, index: int) -> bool:
+    room = _room(floor)
+    return (not is_boss_floor(floor) and room["kind"] == "pack_fury"
+            and int(index) in PACK_HEALER_INDEXES)
+
+
 def floor_description(floor: int) -> str:
     return "Впереди ждёт хозяин этого места." if is_boss_floor(floor) else _room(floor)["description"]
 
@@ -173,15 +196,19 @@ def encounter(floor: int, index: int) -> dict:
     if room["kind"] == "duo":
         name = f"Брат {base_name}"
     elif room["kind"] == "pack_fury":
-        name = f"Стайный {base_name} {index + 1}"
+        name = (f"Целитель стаи {index + 1}" if is_pack_healer(floor, index)
+                else f"Стайный {base_name} {index + 1}")
     elif room["kind"] == "elite":
         name = f"Старший {base_name}"
     else:
         name = f"Дозорный {base_name} {index + 1}"
+    healer = is_pack_healer(floor, index)
     return {
         "code": f"floor_{floor}_{index}", "name": name, "floor": floor, "index": index,
         "theme": floor_name(floor), "boss": False, "gimmick": room["kind"],
-        "hint": room["hint"],
+        "healer": healer,
+        "hint": ("Пока он жив, павшие в этом зале встают снова."
+                 if healer else room["hint"]),
         "stats": {"strength": round((value + strength) * room["strength"]),
                   "health": round((value + health) * room["health"]),
                   "agility": max(1, value + agility), "luck": max(1, value + luck)},
