@@ -380,13 +380,16 @@ class PetsCommandTests(unittest.TestCase):
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
-        # The intentional full-width rows, in order. Support is last on purpose: it is an
-        # offer rather than an action, so it sits below «Обновить» at the very bottom.
-        lone = [
+        # The intentional full-width rows, in order. Support is NOT among them: it is an
+        # offer rather than an action, so it rides the last row as one of three.
+        wide = [
             pets_ui.parse_callback(row[0]["callback_data"])[1]
-            for row in keyboard["inline_keyboard"] if len(row) != 2
+            for row in keyboard["inline_keyboard"] if len(row) == 1
         ]
-        self.assertEqual(lone, ["dailybonus", "dungeon", "support"])
+        self.assertEqual(wide, ["dailybonus", "dungeon"])
+        last = [pets_ui.parse_callback(b["callback_data"])[1]
+                for b in keyboard["inline_keyboard"][-1]]
+        self.assertEqual(last, ["info", "main", "support"])
         actions = {
             pets_ui.parse_callback(button["callback_data"])[1]
             for row in keyboard["inline_keyboard"] for button in row

@@ -316,14 +316,16 @@ def main_view(
             "text": "🕵️ Денежный аудит",
             "web_app": {"url": f"{webapp_url}?view=economy"},
         }])
+    # Three across, so the last row of the menu is three small buttons rather than two
+    # and then a full-width one. The collection is a standing offer: it should be
+    # findable without ever taking up the width of something you actually came here to
+    # press. Telegram sizes a row's buttons equally, so sharing the row IS the size --
+    # which is also why the label loses the word "проект" here and keeps it on the
+    # screen it opens.
     rows.append([
         {"text": "ℹ️ Как играть", "callback_data": callback_data(user_id, "info")},
         {"text": "🔄 Обновить", "callback_data": callback_data(user_id, "main")},
-    ])
-    # Last row of the menu, sharing it so it stays small: the collection is a standing
-    # offer, and it should be findable without ever being in the way of playing.
-    rows.append([
-        {"text": "💜 Поддержать проект", "callback_data": callback_data(user_id, "support")},
+        {"text": "💜 Поддержать", "callback_data": callback_data(user_id, "support")},
     ])
     return "\n".join(lines), {"inline_keyboard": rows}
 

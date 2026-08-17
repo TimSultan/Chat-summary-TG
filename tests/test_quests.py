@@ -1123,11 +1123,11 @@ class SupportButtonTests(unittest.TestCase):
                 _text, keyboard = pets_ui.main_view(entry, "1", 0)
                 rows = keyboard["inline_keyboard"]
                 labels = [[button["text"] for button in row] for row in rows]
-                self.assertEqual(labels[-1], ["💜 Поддержать проект"])
-                # Directly under the row holding «Обновить», which is where it was asked for.
-                self.assertIn("🔄 Обновить", labels[-2])
+                # Three across on the last row, so the offer is a third of the width
+                # rather than a full-width button under everything you came here to press.
+                self.assertEqual(labels[-1], ["ℹ️ Как играть", "🔄 Обновить", "💜 Поддержать"])
                 self.assertEqual(
-                    pets_ui.parse_callback(rows[-1][0]["callback_data"])[1], "support",
+                    pets_ui.parse_callback(rows[-1][-1]["callback_data"])[1], "support",
                 )
 
     def test_the_support_screen_returns_to_the_menu_it_is_opened_from(self):
