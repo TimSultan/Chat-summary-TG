@@ -448,15 +448,23 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         last = int(state.get("floor", 1) or 1) >= int(state.get("last_floor", 0) or 0)
         if last:
             lines.append(f"\n🏁 <b>{escape(state.get('cleared_notice', ''))}</b>")
+        # Leaving throws the run away, so it is never the wide button. Telegram sizes a
+        # row's buttons equally, which means the only way to make it small is to keep it
+        # sharing a row -- on the left, away from the one thumb reaches for.
         rows.append([
-            {"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")},
+            {"text": "🚪", "callback_data": callback_data(user_id, "dungeonquit")},
             {
                 "text": "🏁 Закончить" if last else "⬇️ Спуститься",
                 "callback_data": callback_data(user_id, "dungeondescend"),
             },
         ])
     else:
-        rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
+        # Mid-floor there is nothing to pair it with, so the bag rides along rather than
+        # letting the exit stretch across the whole width on its own.
+        rows.append([
+            {"text": "🚪", "callback_data": callback_data(user_id, "dungeonquit")},
+            {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
+        ])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -2861,16 +2869,12 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
         )
         lines.append(f"<i>{escape(their_mark['description'])}</i>")
 
-    # And the one that is about YOU rather than them: the same face all day costs stats,
-    # and this is the screen where the choice to pay is actually made.
-    familiar = pets.familiar_face(entry, user_id, opponent_id)
-    if familiar:
-        lines.append(
-            f"\n{familiar['emoji']} <b>{escape(familiar['title'])} ×{familiar['stacks']}</b>"
-            f" — {escape(familiar['line'])}"
-        )
-        lines.append(f"<i>{escape(familiar['description'])}</i>")
-        lines.append(f"<i>{escape(familiar['hint'])}</i>")
+    # How many times today, and nothing more: repeating a matchup costs nothing now,
+    # so this is information rather than a warning.
+    repeats = pets.repeat_fights(entry, user_id, opponent_id)
+    if repeats:
+        lines.append("")
+        lines.append(f"{repeats['tag']} <i>{escape(repeats['hint'])}</i>")
 
     rows = [
         [{

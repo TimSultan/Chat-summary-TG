@@ -433,25 +433,16 @@ FIGHTS_PER_RECENT_FIGURINE = 1
 RECENT_FIGURINE_FIGHT_BUFF_DAYS = 7
 FIGHT_BANK_RECHARGE_SECONDS = 60 * 60
 
-# --- Знакомое лицо --------------------------------------------------------------------
-# There used to be a hard cap of three arena fights per opponent per day. A cap is a door
-# that is simply shut, and it made the busiest players stare at a roster of greyed-out
-# names. This replaces it with a price instead of a wall: hitting the SAME creature again
-# and again today makes your own hand shake, one stack per fight already fought, each
-# worth a flat cut of every stat you bring to that particular matchup.
+# --- Fights already had today -------------------------------------------------------
+# There used to be a hard cap of three arena fights per opponent per day, then a stat
+# penalty ("Знакомое лицо") that grew with every repeat. Both are gone: the cap was a shut
+# door, and the penalty quietly decided fights on bookkeeping rather than on the creatures
+# in them -- a player could lose to somebody weaker and have no way to see why.
 #
-# It is directional and per-pair: your stacks against them say nothing about theirs
-# against you, and nothing at all about either of you against a third player. Nothing is
-# stored -- the stack count is derived from today's fight log, so it clears itself at
-# midnight along with the day it was counted from.
-FAMILIAR_FACE_STEP = 0.05        # per stack, off every stat
-FAMILIAR_FACE_SCALE_FLOOR = 0.10  # eighteen stacks in, and a nineteenth fight is still a fight
-FAMILIAR_FACE = {
-    "emoji": "👁",
-    "title": "Знакомое лицо",
-    "description": "Твоя рука дрожит при виде знакомого лица.",
-    "hint": "Копится за каждый бой с одним и тем же соперником и спадает в 00:00.",
-}
+# What is left is the COUNT, shown as «⚔️ ×N» on the opponent's card. It says the same
+# useful thing the penalty was carrying ("you have been here today") and costs nothing.
+# Derived from today's fight log, so it clears itself at midnight along with the day.
+REPEAT_FIGHT_EMOJI = "⚔️"
 
 # Matchmaking uses effective combat stats, including equipment and pet level, rather than
 # a level window that could pair two very differently geared creatures.

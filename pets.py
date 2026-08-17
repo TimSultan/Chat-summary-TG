@@ -3360,15 +3360,12 @@ def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
 def effective_stats(entry, user_id, vs=None, day: date | None = None) -> dict:
     """This creature's combat stats. Pass `vs` for the stats it brings to THAT matchup.
 
-    Without `vs` this is the creature in the abstract -- the power rating, the cards, the
-    leaderboard. With it, Знакомое лицо is folded in: the same creature is weaker against
-    an opponent it has already fought today, and unchanged against everybody else.
+    `vs` and `day` are accepted and ignored. They existed for Знакомое лицо, which made a
+    creature weaker against an opponent it had already fought today; that penalty is gone,
+    so a creature now brings the same stats to every matchup. The parameters are kept so
+    the two dozen call sites that pass them keep working and keep reading honestly.
     """
-    data = _load(entry)
-    stacks = (
-        _familiar_face_stacks(data, user_id, vs, day or today()) if vs is not None else 0
-    )
-    return _effective_stats_for(_tamed_record(data, user_id) or {}, stacks)
+    return _effective_stats_for(_tamed_record(_load(entry), user_id) or {})
 
 
 def _skill_loadout_for(record: dict | None) -> tuple:
@@ -4482,7 +4479,7 @@ def _effect_fraction(effect: dict | None) -> float:
         return 0.0
 
 
-def _effective_stats_for(record: dict, familiar_stacks: int = 0) -> dict:
+def _effective_stats_for(record: dict) -> dict:
     stat_levels = record.get("stats") or {}
     pet_level = record.get("level", 1)
     equipped = record.get("equipped") or {}
@@ -4511,11 +4508,7 @@ def _effective_stats_for(record: dict, familiar_stacks: int = 0) -> dict:
     # fully geared one. This is the ONLY place it is applied: everything downstream --
     # the fight, the power rating, both pet cards, the leaderboard -- reads its stats
     # through here, so none of them needs to know that debuffs exist.
-    # Знакомое лицо multiplies on top of the mark rather than replacing it. The two are
-    # different kinds of thing -- a mark is worn by the creature and follows it into every
-    # fight, this one exists only for one particular matchup -- so a marked creature that
-    # keeps punching the same face pays for both.
-    scale = debuff_scale(record) * familiar_face_scale(familiar_stacks)
+    scale = debuff_scale(record)
     result = {
         key: max(1, round(
             (stat_levels.get(key, C.STAT_MIN_LEVEL)
@@ -5070,48 +5063,30 @@ def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
     return _familiar_face_stacks(_load(entry), attacker_id, defender_id, day)
 
 
-def familiar_face_scale(stacks: int) -> float:
-    """The multiplier one attacker's stats are under for one particular matchup."""
-    try:
-        stacks = max(0, int(stacks or 0))
-    except (TypeError, ValueError):
-        return 1.0
-    return max(C.FAMILIAR_FACE_SCALE_FLOOR, 1.0 - stacks * C.FAMILIAR_FACE_STEP)
+def repeat_fights(entry, attacker_id, defender_id, day: date | None = None) -> dict | None:
+    """How many times this attacker has already fought this defender today, or None.
 
-
-def familiar_face(entry, attacker_id, defender_id, day: date | None = None) -> dict | None:
-    """Display data for the stacks one attacker carries into one matchup, or None.
-
-    Every screen that shows the tag shows the same three things: how many stacks, what
-    they cost, and when they go away. A bare «👁 ×3» with a third of somebody's stats
-    missing behind it is indistinguishable from a bug.
+    A counter, not a penalty. It used to carry a stat cut with it; what survived the
+    removal is the only part players actually read off it -- whether they have been here
+    already today.
     """
-    stacks = _familiar_face_stacks(
+    return repeat_fights_for(_familiar_face_stacks(
         _load(entry), attacker_id, defender_id, day or today(),
-    )
-    return familiar_face_for(stacks)
+    ))
 
 
-def familiar_face_for(stacks: int) -> dict | None:
+def repeat_fights_for(count: int) -> dict | None:
     try:
-        stacks = max(0, int(stacks or 0))
+        count = max(0, int(count or 0))
     except (TypeError, ValueError):
-        stacks = 0
-    if not stacks:
+        count = 0
+    if not count:
         return None
-    scale = familiar_face_scale(stacks)
     return {
-        "stacks": stacks,
-        "emoji": C.FAMILIAR_FACE["emoji"],
-        "title": C.FAMILIAR_FACE["title"],
-        "tag": f"{C.FAMILIAR_FACE['emoji']} {C.FAMILIAR_FACE['title']} ×{stacks}",
-        "percent": round((1 - scale) * 100),
-        "line": f"−{round((1 - scale) * 100)}% ко всем статам против этого соперника",
-        "description": C.FAMILIAR_FACE["description"],
-        "hint": C.FAMILIAR_FACE["hint"],
-        # True once the cut has stopped deepening, so a screen can say so instead of
-        # promising another 10% that will not arrive.
-        "capped": scale <= C.FAMILIAR_FACE_SCALE_FLOOR,
+        "count": count,
+        "emoji": C.REPEAT_FIGHT_EMOJI,
+        "tag": f"{C.REPEAT_FIGHT_EMOJI} ×{count}",
+        "hint": "Столько боёв с этим соперником уже было сегодня. Обнуляется в 00:00.",
     }
 
 

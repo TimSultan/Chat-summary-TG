@@ -1748,11 +1748,11 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
             # scale -- so the badge explains a number the player can otherwise only wonder
             # about.
             "debuff": pets.debuff_for(record),
-            # What YOU would carry into this particular fight, which is why it is on the
-            # opponent's card and not on your own: the shake belongs to the pairing.
-            "familiar_face": pets.familiar_face_for(used),
-            # No per-opponent cap any more -- hitting the same face again is allowed and
-            # merely expensive (see familiar_face above).
+            # How many times you have already fought this one today. A counter only --
+            # repeating a matchup costs nothing.
+            "repeat_fights": pets.repeat_fights_for(used),
+            # No per-opponent cap and no penalty: hitting the same face again is simply
+            # allowed.
             "attackable": attacker_can_fight,
             "attacks_today": used,
             "gap": abs(power - mine),
@@ -3917,6 +3917,13 @@ PAGE_HTML = """<!doctype html>
   .bar.hp > i.crit { background: #e0484d; }
   /* Flush against the dungeon header it belongs to, rather than floating in the body. */
   .bar.hp.dungeon-hp { margin: 0; border-radius: 0; height: 6px; }
+  /* Leaving discards the run, so the exit stops being a full-width bar under the thumb:
+     small, secondary, and pushed to the left away from the descend button. */
+  .dungeon-exit { display: flex; margin-top: 12px; }
+  .go.warn.quit { flex: none; width: auto; padding: 7px 13px; font-size: 12px;
+                  opacity: .75; background: transparent; border: 1px solid var(--hp);
+                  color: var(--hp); }
+  .go.warn.quit:hover { opacity: 1; }
   .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
   .rune-cell { display: grid; gap: 2px; justify-items: center; padding: 9px 4px;
                border: 1px solid var(--line); border-radius: 12px; background: var(--sunken);
@@ -4090,8 +4097,8 @@ PAGE_HTML = """<!doctype html>
     padding: 1px 6px; border-radius: 999px; white-space: nowrap; vertical-align: middle;
     color: var(--muted); background: rgba(128, 128, 128, .16);
   }
-  /* Знакомое лицо. Same pill as a mark, but warm rather than grey: this one is not an
-     accusation, it is a price the player chose to pay by picking the same name again. */
+  /* The rematch counter. Same pill as a mark, but warm rather than grey: a mark is an
+     accusation, this is just how many times you have been here today. */
   .dbf.fam { color: var(--gold); background: rgba(232, 185, 35, .14); }
   .dbfnote {
     margin-top: 9px; padding: 8px 10px; border-radius: 10px;
@@ -5457,7 +5464,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b><br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>').join('');
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<button class="go warn" style="margin-top:9px" data-dungeon="quit">Выйти из подземелья</button></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p><div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
 }
 
 function renderOnboarding() {
@@ -6700,25 +6707,22 @@ function debuffNote(mark, extra) {
     "</div>";
 }
 
-// Знакомое лицо, as small as the mark beside it. Deliberately just the count: the roster
-// is a list of faces to pick from, and a percentage on every row turns choosing an
-// opponent into arithmetic. The number of stacks is the whole signal a card needs to
-// carry -- what they cost is spelled out where the mark itself is explained.
-function familiarTag(mark) {
-  if (!mark || !mark.stacks) return "";
-  return "<span class='dbf fam' title='" + esc(mark.description || "") + " " +
-    esc(mark.hint || "") + "'>" +
-    esc(mark.emoji || "") + " " + esc(mark.title || "") + " ×" + Number(mark.stacks) + "</span>";
+// Swords and a number: how many times you have already fought this one today. It costs
+// nothing, so it is a count on the card rather than a warning that needs explaining.
+function repeatTag(mark) {
+  if (!mark || !mark.count) return "";
+  return "<span class='dbf fam' title='" + esc(mark.hint || "") + "'>" +
+    esc(mark.emoji || "") + " ×" + Number(mark.count) + "</span>";
 }
 
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
-  const familiar = foe.familiar_face;
+  const repeats = foe.repeat_fights;
   return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
     (usable ? "" : " disabled") + '>' +
     '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
     "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
-      "</span> " + debuffTag(foe.debuff) + " " + familiarTag(familiar) +
+      "</span> " + debuffTag(foe.debuff) + " " + repeatTag(repeats) +
       "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
       " · побед " + foe.wins + " из " + foe.fights + "</span></span>" +
     "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";

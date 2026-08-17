@@ -502,8 +502,10 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
         self.assertIsNone(pets.get_pet(entry, "1")["equipped"]["weapon"])
 
 
-class FamiliarFaceTests(PetsTestCase):
-    """The price that replaced the per-opponent daily cap."""
+class RepeatFightCounterTests(PetsTestCase):
+    """Знакомое лицо used to cut a creature's stats for every repeat of a matchup. The
+    penalty is gone -- it decided fights on bookkeeping a player could not see -- and what
+    is left is the count itself, shown as «swords x N»."""
 
     def _pair(self, entry="familiar"):
         for uid in ("1", "2", "3"):
@@ -520,53 +522,19 @@ class FamiliarFaceTests(PetsTestCase):
                 pets._save(entry, data)
                 pets.record_fight(entry, attacker, defender, result, day or pets.today())
 
-    def test_each_stack_takes_five_percent_and_the_floor_keeps_a_fight_fightable(self):
-        self.assertEqual(pets.familiar_face_scale(0), 1.0)
-        self.assertAlmostEqual(pets.familiar_face_scale(1), 0.95)
-        self.assertAlmostEqual(pets.familiar_face_scale(3), 0.85)
-        # Eighteen stacks reach the floor exactly; a hundred must not go below it.
-        self.assertEqual(pets.familiar_face_scale(100), pets_config.FAMILIAR_FACE_SCALE_FLOOR)
-        self.assertIsNone(pets.familiar_face_for(0))
-        mark = pets.familiar_face_for(2)
-        self.assertEqual(mark["stacks"], 2)
-        self.assertEqual(mark["percent"], 10)
-        self.assertIn("×2", mark["tag"])
-        self.assertTrue(pets.familiar_face_for(50)["capped"])
-
-    def test_stats_drop_only_against_the_face_that_was_fought(self):
+    def test_a_creature_brings_the_same_stats_to_every_matchup(self):
         entry = self._pair()
-        self._beat(entry, "1", "2", 3)
+        self._beat(entry, "1", "2", 5)
         # Read AFTER the fights: winning also pays experience, so a before/after snapshot
         # would be measuring the level-up rather than the effect.
         clean = pets.effective_stats(entry, "1")
 
-        against_two = pets.effective_stats(entry, "1", vs="2")
-        against_three = pets.effective_stats(entry, "1", vs="3")
-        for key in (*pets_config.STAT_KEYS, "armor"):
-            self.assertEqual(against_three.get(key), clean.get(key), key)
-            scaled = clean[key] * pets.familiar_face_scale(3)
-            expected = round(scaled) if key == "armor" else max(1, round(scaled))
-            self.assertEqual(against_two.get(key), expected, key)
-        # Nothing is stored: the stacks are read back out of today's fight log.
-        self.assertEqual(pets.effective_stats(entry, "1"), clean)
+        # Five fights against "2" and none against "3" -- and it makes no difference now.
+        self.assertEqual(pets.effective_stats(entry, "1", vs="2"), clean)
+        self.assertEqual(pets.effective_stats(entry, "1", vs="3"), clean)
 
-    def test_the_shake_is_directional_and_belongs_to_the_attacker(self):
-        entry = self._pair("familiar-direction")
-        # A stat big enough that one 5% step cannot hide inside the rounding.
-        data = pets._load(entry)
-        data["pets"]["1"]["stats"]["strength"] = 40
-        pets._save(entry, data)
-        self._beat(entry, "1", "2", 2)
-        clean_two = pets.effective_stats(entry, "2")
-        # "1" has been staring at "2" all day. "2" has been on the receiving end and is
-        # exactly as strong against "1" as against anybody.
-        self.assertEqual(pets.effective_stats(entry, "2", vs="1"), clean_two)
-        self.assertLess(
-            pets.effective_stats(entry, "1", vs="2")["strength"],
-            pets.effective_stats(entry, "1")["strength"],
-        )
-
-    def test_it_multiplies_on_top_of_a_granted_mark_rather_than_replacing_it(self):
+    def test_a_granted_mark_still_cuts_stats_on_its_own(self):
+        """Removing the matchup penalty must not have taken the debuff with it."""
         entry = self._pair("familiar-mark")
         self._beat(entry, "1", "2", 1)
         pets.set_debuff(entry, "1", "impostor")
@@ -578,25 +546,40 @@ class FamiliarFaceTests(PetsTestCase):
             pets.stat_level(entry, "1", "strength")
             + record.get("level", 1) * pets_config.PET_LEVEL_STAT_BONUS
         )
-        # The mark alone, then the mark AND one stack: a marked creature that keeps
-        # punching the same face pays for both.
-        self.assertEqual(pets.effective_stats(entry, "1")["strength"], max(1, round(raw * mark_scale)))
-        self.assertEqual(
-            pets.effective_stats(entry, "1", vs="2")["strength"],
-            max(1, round(raw * mark_scale * pets.familiar_face_scale(1))),
+        expected = max(1, round(raw * mark_scale))
+        self.assertEqual(pets.effective_stats(entry, "1")["strength"], expected)
+        # And the matchup adds nothing on top of it any more.
+        self.assertEqual(pets.effective_stats(entry, "1", vs="2")["strength"], expected)
+
+    def test_the_counter_reports_swords_and_a_number_per_pairing(self):
+        entry = self._pair("familiar-count")
+        self.assertIsNone(pets.repeat_fights_for(0))
+        self.assertIsNone(pets.repeat_fights(entry, "1", "2"))
+
+        self._beat(entry, "1", "2", 3)
+        mark = pets.repeat_fights(entry, "1", "2")
+        self.assertEqual(mark["count"], 3)
+        self.assertEqual(mark["tag"], f"{pets_config.REPEAT_FIGHT_EMOJI} ×3")
+        # Directional and per-pair, exactly as the count always was.
+        self.assertIsNone(pets.repeat_fights(entry, "2", "1"))
+        self.assertIsNone(pets.repeat_fights(entry, "1", "3"))
+        # Yesterday is a different day, so the count starts over.
+        self.assertIsNone(
+            pets.repeat_fights(entry, "1", "2", day=pets.today() - timedelta(days=1)),
         )
 
     def test_the_cap_is_gone_and_a_tenth_fight_is_allowed(self):
         entry = self._pair("familiar-nocap")
         self._beat(entry, "1", "2", 9)
         self.assertTrue(pets.can_attack_in_arena(entry, "1", "2"))
-        self.assertEqual(pets.familiar_face(entry, "1", "2")["stacks"], 9)
+        self.assertEqual(pets.repeat_fights(entry, "1", "2")["count"], 9)
         # A farming attacker is still refused: that gate was never the per-opponent one.
         data = pets._load(entry)
         data["pets"]["1"]["farm_level"] = 1
         pets._save(entry, data)
         self.assertTrue(pets.start_farm(entry, "1", 8)[0])
         self.assertFalse(pets.can_attack_in_arena(entry, "1", "2"))
+
 
 
 class FightBankAndOpponentTests(PetsTestCase):
@@ -633,11 +616,12 @@ class FightBankAndOpponentTests(PetsTestCase):
                 data["pets"]["1"]["fight_bank"] = 99   # the bank is not what is under test
                 pets._save(entry, data)
                 pets.record_fight(entry, "1", "2", result, day)
-        # The arena no longer shuts the door on a repeat opponent -- it charges for them.
+        # The arena no longer shuts the door on a repeat opponent, nor charges for them --
+        # it only counts them.
         self.assertTrue(pets.can_attack_in_arena(entry, "1", "2", day))
-        self.assertEqual(pets.familiar_face(entry, "1", "2", day)["stacks"], 6)
+        self.assertEqual(pets.repeat_fights(entry, "1", "2", day)["count"], 6)
         # And the count is derived from the day, so tomorrow starts clean by itself.
-        self.assertIsNone(pets.familiar_face(entry, "1", "2", day + timedelta(days=1)))
+        self.assertIsNone(pets.repeat_fights(entry, "1", "2", day + timedelta(days=1)))
 
     def test_fight_bank_recharges_one_per_complete_hour_and_keeps_fraction(self):
         entry = "chat"

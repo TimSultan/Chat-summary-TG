@@ -1387,8 +1387,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(str(PLAYER["id"]), ids)
         self.assertEqual(ids, {str(OPPONENT["id"]), str(THIRD["id"])})
 
-    async def test_a_repeatedly_fought_opponent_stays_attackable_and_carries_the_tag(self):
-        """The per-opponent cap is gone; the card now says what a repeat costs instead."""
+    async def test_a_repeatedly_fought_opponent_stays_attackable_and_is_counted(self):
+        """Neither a cap nor a penalty any more -- the card just counts the rematches."""
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
         self._tame(THIRD, name="Третий")
@@ -1404,30 +1404,33 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         fought, fresh = rows[str(OPPONENT["id"])], rows[str(THIRD["id"])]
 
         self.assertTrue(fought["attackable"])
-        self.assertEqual(fought["familiar_face"]["stacks"], 4)
-        self.assertEqual(fought["familiar_face"]["percent"], 20)
-        self.assertIn("×4", fought["familiar_face"]["tag"])
+        self.assertEqual(fought["repeat_fights"]["count"], 4)
+        self.assertIn("×4", fought["repeat_fights"]["tag"])
+        # Nothing about a cost: fighting the same face again is simply free now.
+        self.assertNotIn("percent", fought["repeat_fights"])
         # A face you have not seen today carries nothing, and sorts above the tired one.
-        self.assertIsNone(fresh["familiar_face"])
+        self.assertIsNone(fresh["repeat_fights"])
         self.assertLess(
             [row["user_id"] for row in body["opponents"]].index(str(THIRD["id"])),
             [row["user_id"] for row in body["opponents"]].index(str(OPPONENT["id"])),
         )
 
-    async def test_the_arena_card_shows_the_stack_count_and_no_percentage(self):
+    async def test_the_arena_card_shows_swords_and_a_count_and_nothing_else(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
-        self.assertIn("function familiarTag(mark)", page)
-        self.assertIn("familiarTag(familiar)", page)
+        self.assertIn("function repeatTag(mark)", page)
+        self.assertIn("repeatTag(repeats)", page)
         self.assertIn('"<span class=\'dbf fam\'', page)
-        self.assertIn('" ×" + Number(mark.stacks)', page)
-        # The count alone. A percentage on every row turns picking an opponent into
-        # arithmetic, so `line` must not reach the roster -- not in the row, not in the
-        # tooltip. Scoped to these two functions: debuffNote still spells its own out.
-        tag = page.split("function familiarTag(mark)", 1)[1].split("function foeRow(", 1)[0]
+        self.assertIn('" ×" + Number(mark.count)', page)
+        # No trace of the penalty it replaced: no percentage and no explanation of a cost
+        # that no longer exists. Scoped to these two functions -- debuffNote still spells
+        # out the granted mark, which really does cut stats.
+        tag = page.split("function repeatTag(mark)", 1)[1].split("function foeRow(", 1)[0]
         row = page.split("function foeRow(foe, canFight)", 1)[1].split("\n}", 1)[0]
-        self.assertNotIn(".line", tag)
-        self.assertNotIn(".line", row)
-        self.assertNotIn("сегодня уже хватит", page)
+        for dead in (".line", ".percent", ".stacks"):
+            self.assertNotIn(dead, tag)
+            self.assertNotIn(dead, row)
+        self.assertNotIn("familiarTag", page)
+        self.assertNotIn("Знакомое лицо", page)
 
     # ---- isolated turn-based prototype ----------------------------------------------
 

@@ -122,9 +122,11 @@ class DungeonTests(unittest.TestCase):
 
         self.assertIn("Отдохнуть?", text)
         self.assertTrue(any("🪙" in label for label in labels))
+        # The exit is the narrow one on the left: Telegram sizes a row's buttons equally,
+        # so sharing a row with the descent is what keeps it out from under the thumb.
         self.assertEqual(
             [button["text"] for button in keyboard["inline_keyboard"][-1]],
-            ["🚪 Выйти", "⬇️ Спуститься"],
+            ["🚪", "⬇️ Спуститься"],
         )
 
     def test_equipment_can_be_changed_only_after_clearing_a_floor(self):
