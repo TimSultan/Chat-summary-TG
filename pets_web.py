@@ -3929,6 +3929,8 @@ PAGE_HTML = """<!doctype html>
   .go.warn.quit:hover { opacity: 1; }
   /* A healer is the answer to the room, so it looks different from the wall around it. */
   .dungeon-enemy.healer { border-color: var(--gold); }
+  /* The rule of the fight, not flavour: it gets the warning colour and its own line. */
+  .dungeon-enemy .weakness { color: var(--gold); }
   .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
   .rune-cell { display: grid; gap: 2px; justify-items: center; padding: 9px 4px;
                border: 1px solid var(--line); border-radius: 12px; background: var(--sunken);
@@ -5434,11 +5436,13 @@ function renderDungeon() {
 // On the deepest floor that exists, this is the finish line rather than a way down. It
 // still ends the run -- there is simply no floor below to stand on -- so it says so
 // instead of promising a floor nobody has built.
+// There is no last floor any more. Past the built bosses the roster repeats and the
+// payout stops growing, so the button keeps saying "down" and the title says why.
 function descendButton(dungeon) {
-  const last = Number(dungeon.floor || 1) >= Number(dungeon.last_floor || 0);
-  if (!last) return '<button class="go" data-dungeon="descend">⬇️ Спуститься</button>';
-  return '<button class="go" data-dungeon="descend" title="' +
-    esc(dungeon.cleared_notice || "") + '">🏁 Закончить</button>';
+  const deep = Number(dungeon.floor || 1) >= Number(dungeon.reward_cap_floor || 0);
+  return '<button class="go" data-dungeon="descend"' +
+    (deep ? ' title="Дальше боссы повторяются, а награда больше не растёт."' : '') +
+    '>⬇️ Спуститься' + (deep ? ' ♾' : '') + '</button>';
 }
 
 // The floor header carries the numbers; this carries the shape of them. Health does not
@@ -5467,7 +5471,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const revived = new Set(dungeon.revived || []);
-  const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span></span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>').join('');
+  const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>').join('');
   const healerNote = Number(dungeon.healers_alive || 0)
     ? '<p class="small" style="margin:0 0 10px;color:var(--gold)">✚ Целителей в живых: ' +
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +

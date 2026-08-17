@@ -34,11 +34,13 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(first, dungeon.encounters_for_floor(1))
         self.assertIn("Два", dungeon.floor_description(1))
         pack = dungeon.encounters_for_floor(2)
-        self.assertEqual(len(pack), 10)
+        # Five, not ten: ten was ten near-identical fights in a row.
+        self.assertEqual(len(pack), 5)
         self.assertTrue(all(row["gimmick"] == "pack_fury" for row in pack))
-        self.assertIn("Десять", dungeon.floor_description(2))
+        self.assertEqual(sum(row["healer"] for row in pack), 2)
+        self.assertIn("Пятеро", dungeon.floor_description(2))
         self.assertGreater(dungeon.pack_strength_multiplier(2, []), 1)
-        self.assertEqual(dungeon.pack_strength_multiplier(2, range(9)), 1)
+        self.assertEqual(dungeon.pack_strength_multiplier(2, range(4)), 1)
         boss = dungeon.encounters_for_floor(5)
         self.assertEqual(len(boss), 1)
         self.assertTrue(boss[0]["boss"])
@@ -434,8 +436,8 @@ class DungeonTests(unittest.TestCase):
     def test_the_pack_healers_raise_the_fallen_until_they_are_dead_themselves(self):
         healers = self._enter_pack_floor()
         self.assertEqual(len(healers), 2)
-        victim = next(i for i in range(10) if i not in healers)
-        other = next(i for i in range(10) if i not in healers and i != victim)
+        victim = next(i for i in range(5) if i not in healers)
+        other = next(i for i in range(5) if i not in healers and i != victim)
 
         # Kill an ordinary member, then act again: the healers have had their turn.
         self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, victim)[0])
@@ -466,7 +468,7 @@ class DungeonTests(unittest.TestCase):
         state = pets.dungeon_status(self.entry, self.user_id)
         self.assertEqual(state["healers_alive"], 0)
         before = set(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"])
-        survivor = next(i for i in range(10) if i not in before)
+        survivor = next(i for i in range(5) if i not in before)
         pets.dungeon_fight(self.entry, self.user_id, survivor)
         after = set(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"])
         self.assertTrue(before <= after, "a dead healer must not raise anybody")
@@ -476,18 +478,18 @@ class DungeonTests(unittest.TestCase):
         indices start again at zero on the next one. Carried over, every later enemy --
         the boss at index 0 included -- looked raised and paid out nothing."""
         healers = self._enter_pack_floor()
-        victim = next(i for i in range(10) if i not in healers)
-        other = next(i for i in range(10) if i not in healers and i != victim)
+        victim = next(i for i in range(5) if i not in healers)
+        other = next(i for i in range(5) if i not in healers and i != victim)
         pets.dungeon_fight(self.entry, self.user_id, victim)
         pets.dungeon_fight(self.entry, self.user_id, other)
         self.assertTrue(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["revived"])
 
         # Clear the floor the way it is meant to be cleared -- healers first, or they
         # keep putting the room back up -- and go down.
-        for index in (*healers, *range(10)):
+        for index in (*healers, *range(5)):
             pets.dungeon_fight(self.entry, self.user_id, index)
         self.assertEqual(
-            len(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"]), 10,
+            len(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"]), 5,
         )
         self.assertTrue(pets.dungeon_descend(self.entry, self.user_id)[0])
 
@@ -503,7 +505,7 @@ class DungeonTests(unittest.TestCase):
         data = pets._load(self.entry)
         run = data["pets"][self.user_id]["dungeon_run"]
         run["floor"], run["cleared"] = 5, []
-        run["revived"] = list(range(10))          # exactly the leak that shipped
+        run["revived"] = list(range(5))           # exactly the leak that shipped
         data["pets"][self.user_id]["stats"] = {
             "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
         }
@@ -521,21 +523,21 @@ class DungeonTests(unittest.TestCase):
         healers = self._enter_pack_floor()
         self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, healers[0])[0])
         # One healer still stands. Act again -- it must not put its colleague back up.
-        other = next(i for i in range(10) if i not in healers)
+        other = next(i for i in range(5) if i not in healers)
         pets.dungeon_fight(self.entry, self.user_id, other)
         run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
         self.assertIn(healers[0], run["cleared"])
 
     def test_a_revival_reshuffles_the_room_so_it_cannot_be_counted_off(self):
         healers = self._enter_pack_floor()
-        victim = next(i for i in range(10) if i not in healers)
-        other = next(i for i in range(10) if i not in healers and i != victim)
+        victim = next(i for i in range(5) if i not in healers)
+        other = next(i for i in range(5) if i not in healers and i != victim)
         pets.dungeon_fight(self.entry, self.user_id, victim)
         with patch("random.shuffle", lambda seq: seq.reverse()):
             pets.dungeon_fight(self.entry, self.user_id, other)
 
         order = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["order"]
-        self.assertEqual(order, list(reversed(range(10))))
+        self.assertEqual(order, list(reversed(range(5))))
         # And the screen follows that order rather than the index order.
         shown = [row["index"] for row in
                  pets.dungeon_status(self.entry, self.user_id)["encounters"]]
@@ -748,17 +750,32 @@ class DungeonEndTests(DungeonTests):
         record["dungeon_deepest"] = floor
         pets._save(self.entry, data)
 
-    def test_clearing_the_last_floor_ends_the_run_with_the_notice(self):
+    def test_the_descent_no_longer_stops_at_the_last_built_floor(self):
+        """It is endless again. What keeps that from being a money printer is the reward
+        cap, not a wall -- see the payout test below."""
         self._standing_on(dungeon.LAST_FLOOR)
 
         ok, message = pets.dungeon_descend(self.entry, self.user_id)
 
-        self.assertTrue(ok)
-        self.assertEqual(message, dungeon.DUNGEON_CLEARED_NOTICE)
-        self.assertIn("приходи позже", message)
-        # The run ends rather than parking the player on a finished floor with a dead
-        # button -- that would be the same endless-corridor lie in a smaller shape.
-        self.assertIsNone(pets.get_pet(self.entry, self.user_id)["dungeon_run"])
+        self.assertTrue(ok, message)
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertIsNotNone(run, "the run must continue past the built bosses")
+        self.assertEqual(run["floor"], dungeon.LAST_FLOOR + 1)
+
+    def test_past_the_built_floors_enemies_grow_and_the_purse_does_not(self):
+        cap = dungeon.REWARD_CAP_FLOOR
+        at_cap = dungeon.reward_for(cap, boss=False, enemy_count=1)
+        deeper = dungeon.reward_for(cap + 40, boss=False, enemy_count=1)
+        self.assertEqual(deeper["gold"], at_cap["gold"])
+        self.assertEqual(deeper["xp"], at_cap["xp"])
+        self.assertEqual(deeper["scroll_chance"], at_cap["scroll_chance"])
+        self.assertEqual(deeper["item_chance"], at_cap["item_chance"])
+        self.assertEqual(
+            dungeon.reward_for(cap + 40, boss=True)["gold"],
+            dungeon.reward_for(cap, boss=True)["gold"],
+        )
+        # The enemies most certainly do keep growing -- that is the trade.
+        self.assertGreater(dungeon._scale(cap + 40), dungeon._scale(cap))
 
     def test_the_floor_below_the_last_one_still_descends(self):
         self._standing_on(dungeon.LAST_FLOOR - 1)
@@ -768,25 +785,25 @@ class DungeonEndTests(DungeonTests):
         run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
         self.assertEqual(run["floor"], dungeon.LAST_FLOOR)
 
-    def test_the_escalator_can_never_be_sent_past_the_last_floor(self):
-        """`dungeon_deepest` is what the escalator flies to, so it is capped as well."""
+    def test_a_record_past_the_built_floors_is_kept_rather_than_clamped(self):
         data = pets._load(self.entry)
-        data["pets"][self.user_id]["dungeon_deepest"] = 200   # a value from the old rules
+        data["pets"][self.user_id]["dungeon_deepest"] = 200
         pets._save(self.entry, data)
 
         state = pets.dungeon_status(self.entry, self.user_id)
 
-        self.assertEqual(state["deepest"], dungeon.LAST_FLOOR)
+        self.assertEqual(state["deepest"], 200)
         self.assertTrue(state["cleared_everything"])
-        self.assertEqual(state["last_floor"], dungeon.LAST_FLOOR)
+        self.assertEqual(state["reward_cap_floor"], dungeon.REWARD_CAP_FLOOR)
 
-    def test_the_screen_calls_the_last_descent_a_finish_rather_than_a_way_down(self):
-        self._standing_on(dungeon.LAST_FLOOR)
+    def test_the_screen_warns_that_the_deep_floors_stop_paying_more(self):
+        self._standing_on(dungeon.REWARD_CAP_FLOOR)
         text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
-        self.assertIn("🏁 Закончить", labels)
-        self.assertNotIn("⬇️ Спуститься", labels)
-        self.assertIn("приходи позже", text)
+        # Still a way down, never a finish line.
+        self.assertIn("⬇️ Спуститься", labels)
+        self.assertNotIn("🏁 Закончить", labels)
+        self.assertIn("награда больше не растёт", text)
 
         self._standing_on(dungeon.LAST_FLOOR - 5)
         _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
@@ -1015,4 +1032,55 @@ class ChestAndMimicModelTests(unittest.TestCase):
         self.assertAlmostEqual(
             shallow / dungeon.reward_for(3, boss=False)["gold"],
             dungeon.CHEST_GOLD_SHARE, delta=0.05,
+        )
+
+
+class BossWeaknessTests(unittest.TestCase):
+    """A boss whose rule is hidden is a boss that kills you for something you had no way
+    to know. Every gimmick that changes how damage lands says so on the floor screen."""
+
+    def test_every_gimmick_in_the_roster_explains_itself(self):
+        for name, gimmick, _tier, _hint in dungeon.BOSSES:
+            with self.subTest(boss=name):
+                if gimmick == "standard":
+                    continue
+                self.assertTrue(dungeon.boss_weakness(gimmick),
+                                f"{name} fights by a rule nothing explains")
+
+    def test_the_line_describes_the_boss_rather_than_ordering_the_player(self):
+        """"Возьми огненное оружие" tells somebody what to do without telling them why.
+        The same fact as a property of the enemy is what a hint is for."""
+        fire = dungeon.boss_weakness("fire_only")
+        self.assertIn("Уязвим к огню", fire)
+        self.assertNotIn("Возьми", fire)
+        for gimmick in ("fire_only", "frost_only", "spells_only", "antimagic"):
+            self.assertNotIn("Возьми", dungeon.boss_weakness(gimmick))
+
+    def test_the_encounter_carries_it_separately_from_the_flavour(self):
+        boss = dungeon.encounter(15, 0)
+        self.assertEqual(boss["weakness"], dungeon.boss_weakness("fire_only"))
+        # The scene-setting line stays its own thing; the rule must not be buried in it.
+        self.assertNotEqual(boss["hint"], boss["weakness"])
+        self.assertEqual(dungeon.encounter(10, 0)["weakness"], "")
+        # And an ordinary corridor mob has no rule at all.
+        self.assertEqual(dungeon.encounter(2, 0).get("weakness", ""), "")
+
+
+class DungeonCoinBonusTests(unittest.TestCase):
+    def test_dungeon_coins_carry_the_thirty_percent_bonus(self):
+        self.assertEqual(dungeon.COIN_REWARD_BONUS, 1.30)
+        for floor, boss in ((3, False), (12, False), (15, True), (45, True)):
+            with self.subTest(floor=floor, boss=boss):
+                count = 1 if boss else len(dungeon.encounters_for_floor(floor))
+                paid = dungeon.reward_for(floor, boss=boss, enemy_count=count)["gold"]
+                base = (200 + floor * 15) if boss else (120 + floor * 6) // count
+                self.assertEqual(paid, round(base * dungeon.COIN_REWARD_BONUS))
+
+    def test_experience_is_deliberately_left_alone(self):
+        """XP buys levels, which cost diamonds. Paying more of it would pay twice."""
+        floor = 12
+        count = len(dungeon.encounters_for_floor(floor))
+        self.assertEqual(
+            dungeon.reward_for(floor, boss=False, enemy_count=count)["xp"],
+            (35 + floor * 12) // count,
         )

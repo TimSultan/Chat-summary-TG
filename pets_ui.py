@@ -422,6 +422,10 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "✚" if enemy.get("healer") else "👑" if enemy.get("boss") else "⚔️")
         raised = " <i>(поднят)</i>" if enemy["index"] in revived and not enemy.get("cleared") else ""
         lines.append(f"{marker} {escape(str(enemy['name']))}{raised}" + (f" — {escape(str(enemy['hint']))}" if enemy.get("hint") else ""))
+        # The rule of the fight, on its own line and never folded into the flavour: it is
+        # the one thing a player has to act on before pressing attack.
+        if enemy.get("weakness") and not enemy.get("cleared"):
+            lines.append(f"   ⚠️ <b>{escape(str(enemy['weakness']))}</b>")
         if not enemy.get("cleared"):
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     lines.extend(dungeon_haul_block(state))
@@ -452,16 +456,21 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # On the deepest floor there is, the descent button becomes the finish line: it
         # still ends the run, but it says what it is doing rather than promising a floor
         # 46 that does not exist.
-        last = int(state.get("floor", 1) or 1) >= int(state.get("last_floor", 0) or 0)
-        if last:
-            lines.append(f"\n🏁 <b>{escape(state.get('cleared_notice', ''))}</b>")
+        # No finish line any more. Past the built bosses the roster repeats and the payout
+        # stops growing, so the screen says what actually changes rather than pretending
+        # the descent has ended.
+        if int(state.get("floor", 1) or 1) >= int(state.get("reward_cap_floor", 0) or 0):
+            lines.append(
+                "\n♾ <b>Дальше боссы идут по кругу, а награда больше не растёт.</b>"
+                " Спускайся ради глубины, а не ради денег."
+            )
         # Leaving throws the run away, so it is never the wide button. Telegram sizes a
         # row's buttons equally, which means the only way to make it small is to keep it
         # sharing a row -- on the left, away from the one thumb reaches for.
         rows.append([
             {"text": "🚪", "callback_data": callback_data(user_id, "dungeonquit")},
             {
-                "text": "🏁 Закончить" if last else "⬇️ Спуститься",
+                "text": "⬇️ Спуститься",
                 "callback_data": callback_data(user_id, "dungeondescend"),
             },
         ])
@@ -509,16 +518,17 @@ def haul_line(haul: dict | None) -> str:
 
 
 def dungeon_haul_block(state: dict) -> list[str]:
-    """The «за этаж» / «за поход» summary lines for a run in progress."""
-    lines = []
-    floor_line = haul_line(state.get("floor_haul"))
-    total_line = haul_line(state.get("haul"))
-    if floor_line:
-        lines.append(f"\n📦 <b>За этаж:</b> {floor_line}")
-    if total_line and total_line != floor_line:
-        kills = int((state.get("haul") or {}).get("kills", 0) or 0)
-        lines.append(f"🎒 <b>За поход</b> ({kills} побед): {total_line}")
-    return lines
+    """Nothing, deliberately.
+
+    The floor screen used to carry a running «за этаж» and «за поход» tally, so the same
+    ever-growing list of item names was reprinted on every redraw of every floor. The
+    haul is the number you walk out with: it is reported once, when the run ends, by
+    dungeon_finished_text.
+
+    Kept as a function rather than deleted at the call site, so the floor view has one
+    obvious place to grow a summary back if it is ever wanted again.
+    """
+    return []
 
 
 def dungeon_finished_text(haul: dict | None) -> str:

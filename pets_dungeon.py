@@ -28,6 +28,9 @@ SHOP_PARTIAL_HEAL_SHARE: Final = 0.30
 SHOP_PARTIAL_HEAL_USES: Final = 3
 SHOP_FULL_HEAL_USES: Final = 3
 SCROLL_LOOT_START_FLOOR: Final = 10
+# Applied to dungeon COINS only, after the floor budget is split between a room's
+# enemies. See reward_for.
+COIN_REWARD_BONUS: Final = 1.30
 # A boss is the one enemy on a floor worth building a run around, so it is also the one
 # worth a real jump in loot rather than a rounding difference.
 BOSS_ITEM_MULTIPLIER: Final = 1.5
@@ -71,8 +74,12 @@ ROOMS: Final = (
     {"count": 2, "kind": "duo", "strength": 1.28, "health": 1.24,
      "description": "Два брата никого не пускают и даже не делают вид, что слушают.",
      "hint": "Один держит дверь, второй смотрит из-за плеча."},
-    {"count": 10, "kind": "pack_fury", "strength": .68, "health": .72,
-     "description": "Десять стайных бойцов заняли проход. Двое из них — целители: пока "
+    # Five, not ten. Ten was ten near-identical fights in a row, and two healers inside
+    # it meant a player could be pressing the same button twenty times before the room
+    # stayed down. Five keeps the puzzle -- two healers, three bodies -- and cuts the
+    # typing. The per-enemy stats rise to match, so the ROOM is as dangerous as it was.
+    {"count": 5, "kind": "pack_fury", "strength": 1.02, "health": 1.08,
+     "description": "Пятеро стайных бойцов заняли проход. Двое из них — целители: пока "
                     "хоть один жив, остальные поднимаются снова, и стая всё время "
                     "перестраивается.",
      "hint": "Соседи подбадривают его."},
@@ -83,6 +90,31 @@ ROOMS: Final = (
      "description": "Дозор заметил тебя раньше, чем ты успел выбрать дорогу.",
      "hint": "Он перекрывает путь к следующему залу."},
 )
+
+# What each boss's rule actually MEANS for the fight, in one line, phrased as the boss's
+# property rather than as an order to the player. "Возьми огненное оружие" tells somebody
+# what to do without telling them why, and reads as a puzzle they have already failed if
+# they are standing there without one; "уязвим к огню" is the same information as a fact
+# about the enemy, which is what a hint is for.
+#
+# Every gimmick that changes how damage lands MUST have an entry here -- a boss with a
+# hidden rule is a boss that kills you for something you had no way to know.
+BOSS_WEAKNESS: Final = {
+    "fire_only": "Уязвим к огню: огненный урон проходит в полную силу, обычная сталь — почти нет.",
+    "frost_only": "Уязвим к холоду: ледяной урон проходит в полную силу, обычная сталь — почти нет.",
+    "spells_only": "Неуязвим к простой стали: она его лечит. Ранят только магия и зачарованное оружие.",
+    "antimagic": "Отражает 85% магического и рунного урона обратно. Простое оружие безопаснее.",
+    "reincarnate": "Поднимается один раз после смерти. Его нужно добить второй раз.",
+    "three_heads": "Три головы делят одно здоровье. Недобитая голова затягивает раны, срубленная не отрастает.",
+    "healing_pass": "Его можно не убивать: лечение успокаивает его, и он пропускает дальше.",
+    "standard": "",
+}
+
+
+def boss_weakness(gimmick: str) -> str:
+    """The one-line explanation of a boss's rule, or "" when it fights plainly."""
+    return BOSS_WEAKNESS.get(str(gimmick or ""), "")
+
 
 BOSSES: Final = (
     ("Феникс пепельных залов", "reincarnate", 0,
@@ -106,10 +138,18 @@ BOSSES: Final = (
 )
 
 
-# Where the dungeon actually ends. BOSSES is indexed modulo its own length, so floor 50
-# used to serve the floor-5 boss again and the descent ran for ever -- an endless corridor
-# of enemies the players had already beaten, dressed up as progress. The last boss stands
-# on the last boss floor the list can fill, and past it there is nothing built yet.
+# The descent is endless again. BOSSES is indexed modulo its own length, so past floor 45
+# the roster repeats -- which is the honest trade for letting somebody who has cleared
+# everything keep going, rather than parking them on a finished floor.
+#
+# What must NOT repeat is the payout. Enemy stats keep climbing (see _scale), but coins
+# and experience stop at the last built floor's value: below it a descent is a curve, past
+# it it is a treadmill that gets harder and pays the same. That is the whole reason an
+# endless corridor was closed the first time -- it printed money for ever -- and capping
+# the reward instead of the floor is what makes reopening it safe.
+REWARD_CAP_FLOOR: Final = len(BOSSES) * 5
+# Kept as the deepest floor the BOSS ROSTER covers, which is what the screens mean when
+# they talk about having cleared everything. It is no longer a wall.
 LAST_FLOOR: Final = len(BOSSES) * 5
 DUNGEON_CLEARED_NOTICE: Final = (
     "Ты отпинал всех наших боссов, приходи позже, мы завезём новых."
@@ -144,7 +184,7 @@ def _room(floor: int) -> dict:
 # Positions rather than a random draw: the floor's enemy list is reproducible from
 # (floor, index) everywhere in the game, and a healer chosen by RNG would move between two
 # reads of the same room.
-PACK_HEALER_INDEXES: Final = (3, 7)
+PACK_HEALER_INDEXES: Final = (1, 3)
 # One action's grace. Long enough that killing a healer between two revivals is possible,
 # short enough that grinding the pack while a healer lives is visibly pointless.
 PACK_REVIVE_DELAY: Final = 1
@@ -175,9 +215,13 @@ def encounter(floor: int, index: int) -> dict:
     if is_boss_floor(floor):
         name, gimmick, tier_ahead, hint = BOSSES[((floor // 5) - 1) % len(BOSSES)]
         value = _scale(floor + tier_ahead, boss=True)
+        weakness = boss_weakness(gimmick)
         return {
             "code": f"boss_{floor}", "name": name, "floor": floor, "index": 0,
-            "theme": floor_name(floor), "boss": True, "gimmick": gimmick, "hint": hint,
+            "theme": floor_name(floor), "boss": True, "gimmick": gimmick,
+            # The flavour line and the rule, kept apart: one sets the scene, the other is
+            # the thing a player has to act on and must never be buried inside it.
+            "hint": hint, "weakness": weakness,
             "stats": {"strength": value + 12, "health": value + 18,
                       "agility": value - 4, "luck": value - 6},
             "armor": max(0, value // 3), "level": floor + 8 + tier_ahead,
@@ -232,6 +276,8 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
     """
     floor = max(1, int(floor))
     enemy_count = max(1, int(enemy_count))
+    # Past the built floors the enemies keep growing and the purse does not.
+    paid_floor = min(floor, REWARD_CAP_FLOOR)
     # Cut, and above all FLATTENED. The dungeon was 93% of every player's daily gold, and
     # the floor ramp is what made that unbalanceable: it grew without limit while nothing
     # it fed grew with it. The ramp is cut five times harder than the base, so floor 30 is
@@ -241,13 +287,17 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
     # XP is untouched. XP now buys LEVELS, which cost rubies, so the dungeon handing out
     # experience no longer hands out progression on its own.
     if boss:
-        gold, xp = 200 + floor * 15, 80 + floor * 18
+        gold, xp = 200 + paid_floor * 15, 80 + paid_floor * 18
     else:
-        gold, xp = (120 + floor * 6) // enemy_count, (35 + floor * 12) // enemy_count
+        gold, xp = (120 + paid_floor * 6) // enemy_count, (35 + paid_floor * 12) // enemy_count
+    # Coins only, +30%: the dungeon asks for ten diamonds and a run's worth of health, and
+    # the rests it has to fund come out of the same purse. XP is untouched -- it buys
+    # levels, which cost diamonds, so paying more of it would be paying twice.
+    gold = round(gold * COIN_REWARD_BONUS)
     # Base, ramp and cap all cut in half here -- the live drop rate was far too high, so
     # every number in this curve pays out at half its previous odds, floor for floor.
     scroll_chance = 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(
-        0.125, 0.02 + (floor - SCROLL_LOOT_START_FLOOR) * 0.005,
+        0.125, 0.02 + (paid_floor - SCROLL_LOOT_START_FLOOR) * 0.005,
     )
     # Divided by the room's population for the same reason gold and xp are, and it was
     # the one number that wasn't: the chance is rolled per KILL, so an undivided 10% on a
@@ -258,7 +308,7 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
     scroll_chance /= enemy_count
     return {
         "gold": max(1, gold), "xp": max(1, xp),
-        "item_chance": min(0.22, 0.012 + floor * 0.004) * (BOSS_ITEM_MULTIPLIER if boss else 1),
+        "item_chance": min(0.22, 0.012 + paid_floor * 0.004) * (BOSS_ITEM_MULTIPLIER if boss else 1),
         # The boss multiplier is applied AFTER the ordinary cap, not inside it: capping
         # first and multiplying after is what lets a boss actually out-drop the corridor
         # it stands at the end of instead of flattening into the same 12.5%.

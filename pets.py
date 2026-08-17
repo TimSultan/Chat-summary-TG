@@ -4070,8 +4070,11 @@ def dungeon_status(entry: str, user_id) -> dict:
         "active": bool(run), "available": D.DUNGEON_OPEN,
         "closed_notice": D.DUNGEON_CLOSED_NOTICE, "min_power": D.MIN_POWER,
         "power": _power_rating_for(record),
-        "deepest": min(D.LAST_FLOOR, int(record.get("dungeon_deepest", 1))),
+        "deepest": max(1, int(record.get("dungeon_deepest", 1))),
+        # The deepest floor the BOSS ROSTER covers, and no longer a wall: it is what the
+        # screens mean by "you have seen everything built", not where the descent stops.
         "last_floor": D.LAST_FLOOR,
+        "reward_cap_floor": D.REWARD_CAP_FLOOR,
         # True once this player has stood on the deepest floor there is. The screens use
         # it to say so instead of offering a descent into floors nobody has built.
         "cleared_everything": int(record.get("dungeon_deepest", 1)) >= D.LAST_FLOOR,
@@ -4537,17 +4540,9 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
     floor = int(run.get("floor", 1) or 1)
     if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
         return False, "Сначала очисти этаж."
-    if floor >= D.LAST_FLOOR:
-        # Nothing is built past here. The run ENDS rather than refusing in place: the
-        # player has cleared the last floor and there is no next one to stand on, so
-        # leaving them parked on a finished floor with a dead button would be the same
-        # endless-corridor lie in a smaller shape.
-        record["last_dungeon_haul"] = {
-            **dict(run.get("haul") or _new_haul()), "floor": floor, "won": True,
-        }
-        record["dungeon_run"] = None
-        _save(entry, data)
-        return True, D.DUNGEON_CLEARED_NOTICE
+    # No ceiling. Past the built bosses the roster repeats, and the payout does not grow
+    # with it (see REWARD_CAP_FLOOR) -- so a descent past 45 is harder for the same money
+    # rather than an endless corridor that prints it.
     run["floor"], run["cleared"] = floor + 1, []
     run["floor_haul"] = _new_haul()
     # All three are keyed by the enemy's INDEX within a floor, and indices start again at
@@ -4559,9 +4554,7 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
     run.pop("boss_lives", None)
     run.pop("hydra_head_hp", None)
     run.pop("hydra_moves", None)
-    record["dungeon_deepest"] = min(
-        D.LAST_FLOOR, max(int(record.get("dungeon_deepest", 1)), floor + 1),
-    )
+    record["dungeon_deepest"] = max(int(record.get("dungeon_deepest", 1)), floor + 1)
     _save(entry, data)
     return True, f"Ты спускаешься на этаж {floor + 1}."
 
