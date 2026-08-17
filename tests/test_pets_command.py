@@ -282,7 +282,7 @@ class PetsCommandTests(unittest.TestCase):
             self.assertNotIn("newsclaim", drawn)
 
         # It is a real ledger row, so the income audit reports it as a grant.
-        rows = [r for r in pets._load(CHAT)["ruby_log"]
+        rows = [r for r in pets.ruby_log_rows(CHAT)
                 if r["reason"] == pets_updates.reward_source("note-1", PLAYER["id"])]
         self.assertEqual([r["delta"] for r in rows], [4])
         self.assertEqual(pets.ruby_source_of(rows[0]["reason"]), "grants")

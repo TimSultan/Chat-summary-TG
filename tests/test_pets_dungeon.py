@@ -610,7 +610,7 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.grant_ruby_gift([self.entry]), 1)
         self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 10)
         # A handout that skipped the ledger would read as a balance grown from nowhere.
-        rows = [row for row in pets._load(self.entry)["ruby_log"]
+        rows = [row for row in pets.ruby_log_rows(self.entry)
                 if row["reason"] == pets.RUBY_GIFT_REASON]
         self.assertEqual([(row["user_id"], row["delta"]) for row in rows],
                          [(self.user_id, 10)])
@@ -1084,3 +1084,66 @@ class DungeonCoinBonusTests(unittest.TestCase):
             dungeon.reward_for(floor, boss=False, enemy_count=count)["xp"],
             (35 + floor * 12) // count,
         )
+
+
+class RubyLedgerLivesOutsideTheHotStoreTests(unittest.TestCase):
+    """The ledger is written once per ruby and read only by the audit. Kept inside the
+    pets store it was parsed and rewritten by EVERY pet action: at its old 50,000-row cap
+    the store reached 8 MB and one dungeon press cost a quarter of a second before the
+    game had done anything."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self.temp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.temp.cleanup)
+        self.entry, self.user_id = "ledger", "42"
+        pets.buy_cage(self.entry, self.user_id, 100_000)
+        pets.tame(self.entry, self.user_id, 100_000, "Hero", None, "Tester")
+
+    def test_the_pets_store_never_carries_the_ledger(self):
+        for _ in range(30):
+            pets.grant_rubies(self.entry, self.user_id, 1, "pet_mob_win")
+        self.assertEqual(len(pets.ruby_log_rows(self.entry)), 30)
+        self.assertNotIn("ruby_log", pets._load(self.entry))
+        self.assertTrue(pets._ruby_log_path(self.entry).exists())
+
+    def test_a_store_with_the_old_inline_ledger_is_migrated_off_it(self):
+        # Written straight to the file, because _save now drains the key on the way out
+        # -- which is the fix. This is the shape production is actually carrying.
+        import stats
+        data = pets._load(self.entry)
+        data["ruby_log"] = [
+            {"ts": "2026-08-18T10:00:00+03:00", "user_id": self.user_id,
+             "delta": 1, "reason": "dungeon-ruby:mob:a", "ref": ""}
+            for _ in range(500)
+        ]
+        stats._write_json_atomic(pets._pets_path(self.entry), data)
+        fat = pets._pets_path(self.entry).stat().st_size
+
+        rows = pets.ruby_log_rows(self.entry)
+        self.assertEqual(len(rows), 500, "no row may be lost moving house")
+        self.assertEqual(
+            pets.ruby_income_report(self.entry, days=None)["totals"]["earned"], 500,
+        )
+
+        # The next ordinary write is what actually drops it, and it must stay dropped even
+        # though this caller loaded its copy before the ledger moved.
+        stale = pets._load(self.entry)
+        pets._save(self.entry, stale)
+        self.assertNotIn("ruby_log", pets._load(self.entry))
+        self.assertLess(pets._pets_path(self.entry).stat().st_size, fat // 4)
+        self.assertEqual(len(pets.ruby_log_rows(self.entry)), 500, "and no row is lost")
+
+    def test_the_ledger_is_capped_where_the_audit_stops_looking(self):
+        self.assertEqual(pets.RUBY_LOG_LIMIT, 10_000)
+        data = pets._load(self.entry)
+        data["ruby_log"] = [
+            {"ts": "2026-08-18T10:00:00+03:00", "user_id": self.user_id,
+             "delta": 1, "reason": "x", "ref": ""}
+            for _ in range(pets.RUBY_LOG_LIMIT + 250)
+        ]
+        pets._save(self.entry, data)
+        pets.grant_rubies(self.entry, self.user_id, 1, "pet_mob_win")
+        self.assertLessEqual(len(pets.ruby_log_rows(self.entry)), pets.RUBY_LOG_LIMIT)

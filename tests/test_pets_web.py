@@ -1074,7 +1074,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             pets._save(CHAT, data)
             self.assertTrue(pets.respec_stats(CHAT, PLAYER["id"])[0])
 
-        rows = [(row["reason"], row["delta"]) for row in pets._load(CHAT)["ruby_log"]]
+        rows = [(row["reason"], row["delta"]) for row in pets.ruby_log_rows(CHAT)]
         self.assertEqual(rows, [
             ("pet_mob_win", 50),
             ("arena-ruby:a:1:2", 5),
@@ -1160,7 +1160,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((await reread.json())["rows"][0]["claimed"])
 
         # The payout is a real ledger row, so the income audit sees it as a grant.
-        rows = [r for r in pets._load(CHAT)["ruby_log"] if r["reason"].startswith("update-reward:")]
+        rows = [r for r in pets.ruby_log_rows(CHAT) if r["reason"].startswith("update-reward:")]
         self.assertEqual([(r["user_id"], r["delta"]) for r in rows], [(str(PLAYER["id"]), 3)])
         self.assertEqual(pets.ruby_source_of(rows[0]["reason"]), "grants")
 

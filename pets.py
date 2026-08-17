@@ -231,9 +231,6 @@ def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "fight_audits": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "dungeon_tickets": {}, "rubies": {},
-        # Timestamped ruby movements. The wallet above stays the balance of record; this
-        # is the rolling audit trail behind it (see _append_ruby_log).
-        "ruby_log": [],
         "scroll_wallets": {}, "scroll_notifications": [],
         # Earned before a creature exists just like scrolls/tickets.  Each row contains
         # the submitted Telegram image file id, never image bytes.
@@ -359,11 +356,10 @@ def _load(entry: str) -> dict:
         data["dungeon_tickets"] = {}
     if not isinstance(data.setdefault("rubies", {}), dict):
         data["rubies"] = {}
-    # A store written before the ruby ledger existed simply has no rows. Nothing is
-    # back-filled here: see ruby_backfill_report for what CAN be said about that period.
-    ruby_rows = data.setdefault("ruby_log", [])
-    data["ruby_log"] = [row for row in ruby_rows if isinstance(row, dict)] \
-        if isinstance(ruby_rows, list) else []
+    # The ruby ledger is deliberately NOT normalised here. It lives in its own file now
+    # (see ruby_log_rows); a store still carrying the old inline list keeps it untouched
+    # until that function migrates it out, and normalising it here would mean parsing the
+    # whole ledger on every single load -- which is exactly what was slow.
     if not isinstance(data.setdefault("scroll_wallets", {}), dict):
         data["scroll_wallets"] = {}
     if not isinstance(data.setdefault("personal_paint_runes", {}), dict):
@@ -777,12 +773,27 @@ def discovered_weapon_collection(entry: str) -> list[dict]:
     ]
 
 
+def _drain_ruby_log(entry: str, data: dict) -> None:
+    """Move any inline ruby ledger out of the store on its way to disk.
+
+    Done HERE rather than on read because every writer holds its own copy of the store: a
+    migration that removed the key elsewhere would be undone by the next caller saving a
+    copy it had loaded moments earlier. Draining it as part of the write is the one point
+    every path goes through, so the key can never come back.
+    """
+    rows = data.pop("ruby_log", None)
+    if not isinstance(rows, list) or not rows:
+        return
+    existing = _ruby_sidecar_rows(entry)
+    merged = [row for row in rows if isinstance(row, dict)] + existing
+    stats._write_json_atomic(_ruby_log_path(entry), merged[-RUBY_LOG_LIMIT:])
+
+
 def _save(entry: str, data: dict) -> None:
     data["version"] = PETS_STORE_VERSION
+    _drain_ruby_log(entry, data)
     if len(data.get("fights", [])) > FIGHT_LOG_LIMIT:
         data["fights"] = data["fights"][-FIGHT_LOG_LIMIT:]
-    if len(data.get("ruby_log", [])) > RUBY_LOG_LIMIT:
-        data["ruby_log"] = data["ruby_log"][-RUBY_LOG_LIMIT:]
     path = _pets_path(entry)
     # Drop the read cache outright rather than trusting the new file stamp to differ from
     # the old one. _load's mtime+size check is what catches a write from ANOTHER process
@@ -1099,7 +1110,7 @@ def claim_pet_level(entry, user_id) -> tuple[bool, str]:
         record["xp"] = max(0, int(record.get("xp", 0) or 0)) - C.pet_xp_for_next_level(level)
         record["level"] = level + 1
         wallet[str(user_id)] = rubies - C.PET_LEVEL_UP_RUBY_COST
-        _append_ruby_log(data, user_id, -C.PET_LEVEL_UP_RUBY_COST, "spend:levelup",
+        _append_ruby_log(entry, user_id, -C.PET_LEVEL_UP_RUBY_COST, "spend:levelup",
                          ref=str(level + 1))
         _save(entry, data)
     bonus = C.PET_LEVEL_STAT_BONUS
@@ -1933,7 +1944,10 @@ def _ruby_row(data: dict) -> dict:
 # What can honestly be said about that period is in ruby_backfill_report, kept separate
 # from these rows rather than blended into them.
 
-RUBY_LOG_LIMIT = 50_000
+# Sized for what the audit actually shows (90 days) rather than for how much a file can
+# hold. It lives in its own file now, but a ledger nobody reads past is still a file
+# somebody has to write.
+RUBY_LOG_LIMIT = 10_000
 
 RUBY_SOURCES = {
     "mobs": ("Бои с мобами", "#e05252"),
@@ -1991,12 +2005,51 @@ def ruby_source_of(reason: str) -> str:
     return "other"
 
 
-def _append_ruby_log(data: dict, user_id, delta: int, reason: str, ref: str = "") -> None:
-    """Record one ruby movement. Callers must already hold `data` and go on to _save it,
-    so the row and the wallet change it describes land in the same atomic write."""
-    rows = data.setdefault("ruby_log", [])
-    if not isinstance(rows, list):
-        rows = data["ruby_log"] = []
+def _ruby_log_path(entry: str):
+    return stats._stats_dir() / f"{stats._cache_key(entry)}_pets_rubylog.json"
+
+
+def ruby_log_rows(entry: str) -> list[dict]:
+    """The ledger, read from its own file.
+
+    It used to live inside the pets store, which every single pet action loads and
+    rewrites in full. At the 50,000-row cap that store reached 8 MB and one dungeon
+    action cost a quarter of a second before the game had done anything -- the ledger is
+    written once per ruby and read only by the audit, so it had no business in the file
+    the whole game reads.
+
+    A store still carrying the old inline list is migrated on read.
+    """
+    # Purely a read. Writing here would double the rows the moment _save drains the
+    # store's own copy into the same file -- the drain owns the move, this only reports
+    # both halves while one is still in flight.
+    legacy = _load(entry).get("ruby_log")
+    legacy = [row for row in legacy if isinstance(row, dict)] if isinstance(legacy, list) else []
+    return (legacy + _ruby_sidecar_rows(entry))[-RUBY_LOG_LIMIT:]
+
+
+def _ruby_sidecar_rows(entry: str) -> list[dict]:
+    path = _ruby_log_path(entry)
+    if not path.exists():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [row for row in loaded if isinstance(row, dict)] if isinstance(loaded, list) else []
+
+
+def _append_ruby_log(entry: str, user_id, delta: int, reason: str, ref: str = "") -> None:
+    """Record one ruby movement, in the ledger's own file.
+
+    Deliberately NOT part of the wallet's atomic write any more. The ledger is an audit
+    trail and never a source of truth (the wallet is), so a row lost to a crash costs a
+    line in a report -- which is a far better trade than every pet action in the game
+    carrying the whole ledger through a parse and a rewrite.
+    """
+    # The sidecar alone: anything still inline in the store belongs to the drain, and
+    # copying it here would write it twice.
+    rows = _ruby_sidecar_rows(entry)
     rows.append({
         "ts": app_now().isoformat(),
         "user_id": str(user_id),
@@ -2004,6 +2057,7 @@ def _append_ruby_log(data: dict, user_id, delta: int, reason: str, ref: str = ""
         "reason": str(reason or ""),
         "ref": str(ref or ""),
     })
+    stats._write_json_atomic(_ruby_log_path(entry), rows[-RUBY_LOG_LIMIT:])
 
 
 def ruby_balance(entry, user_id) -> int:
@@ -2034,7 +2088,7 @@ def grant_rubies(entry, user_id, amount: int, reason: str = "grant") -> int:
         total = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
         wallet[str(user_id)] = total
         _metric_add(data, "rubies_minted", amount)
-        _append_ruby_log(data, user_id, amount, reason)
+        _append_ruby_log(entry, user_id, amount, reason)
         _save(entry, data)
     return total
 
@@ -2059,7 +2113,7 @@ def grant_rubies_once(entry, user_id, amount: int, source: str) -> int:
         # Inside the dedupe guard on purpose: a replayed settlement must not add a second
         # row for rubies it did not actually mint.
         if credited:
-            _append_ruby_log(data, user_id, credited, source)
+            _append_ruby_log(entry, user_id, credited, source)
         _save(entry, data)
     return total
 
@@ -2090,7 +2144,7 @@ def ruby_income_report(
     start_day = moment.date() - timedelta(days=window - 1) if window else None
     wanted = {str(uid) for uid in user_ids} if user_ids is not None else None
 
-    rows = [row for row in _load(entry).get("ruby_log", []) if isinstance(row, dict)]
+    rows = ruby_log_rows(entry)
     sources: dict[str, dict] = {}
     players: dict[str, dict] = {}
     source_players: dict[str, set[str]] = {}
@@ -2326,7 +2380,7 @@ def enchant_weapon(entry: str, user_id, code: str, element: str) -> tuple[bool, 
         runes[element] -= 1
         wallet[str(user_id)] = rubies - RUNE_ENCHANT_RUBY_COST
         record.setdefault("weapon_enchantments", {})[code] = element
-        _append_ruby_log(data, user_id, -RUNE_ENCHANT_RUBY_COST, "spend:enchant", ref=code)
+        _append_ruby_log(entry, user_id, -RUNE_ENCHANT_RUBY_COST, "spend:enchant", ref=code)
         _save(entry, data)
     return True, f"«{item.name}» зачаровано руной {element}."
 
@@ -2440,7 +2494,7 @@ def grant_ruby_gift(entries, amount: int = 10) -> int:
                     continue
                 wallet[str(user_id)] = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
                 _metric_add(data, "rubies_minted", amount)
-                _append_ruby_log(data, user_id, amount, RUBY_GIFT_REASON)
+                _append_ruby_log(entry, user_id, amount, RUBY_GIFT_REASON)
                 granted += 1
             data[RUBY_GIFT_FLAG] = True
             _save(entry, data)
@@ -3304,7 +3358,7 @@ def respec_stats(entry, user_id) -> tuple[bool, str, int]:
         wallet[str(user_id)] = rubies - C.STAT_RESPEC_RUBY_COST
         record["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
         record["stat_points"] = available_stat_points(record) + refundable
-        _append_ruby_log(data, user_id, -C.STAT_RESPEC_RUBY_COST, "spend:respec",
+        _append_ruby_log(entry, user_id, -C.STAT_RESPEC_RUBY_COST, "spend:respec",
                          ref=str(refundable))
         _save(entry, data)
     return True, f"Статы сброшены. Свободных очков: {record['stat_points']}.", refundable
@@ -4229,7 +4283,7 @@ def enter_dungeon(entry: str, user_id) -> tuple[bool, str]:
             tickets[str(user_id)] = ticket_count - 1
         if ruby_cost:
             wallet[str(user_id)] = rubies - ruby_cost
-            _append_ruby_log(data, user_id, -ruby_cost, "spend:dungeon_entry",
+            _append_ruby_log(entry, user_id, -ruby_cost, "spend:dungeon_entry",
                              ref=f"floor {floor}")
         hero = _dungeon_fighter(record, str(user_id))
         max_hp = round(pets_combat.derive(hero, hero)["max_hp"])
