@@ -15,6 +15,8 @@ import inspect
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -3399,3 +3401,40 @@ class AttachContractTests(unittest.TestCase):
         )
         self.assertIn(pets_web.ROUTE_PREFIX + "/api/state",
                       [getattr(route.resource, "canonical", "") for route in app.router.routes()])
+
+
+class PageScriptSyntaxTests(unittest.TestCase):
+    """The page is one <script>. A single broken string literal in it does not degrade
+    anything -- it stops the whole file parsing, and the Mini App opens as a blank screen.
+
+    That shipped: removing the escalator button left `'</button>'</div></div>';` behind,
+    and every route still answered 200 while the app was unusable. Nothing else in this
+    suite reads the page as JavaScript, so nothing else could have caught it.
+    """
+
+    def _check(self, html: str, label: str):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available to parse the page")
+        body = re.findall(r"<script>(.*?)</script>", html, re.S)
+        self.assertTrue(body, f"{label} has no inline script to check")
+        for index, script in enumerate(body):
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                             encoding="utf-8") as handle:
+                handle.write(script)
+                path = handle.name
+            try:
+                result = subprocess.run([node, "--check", path],
+                                        capture_output=True, text=True)
+                self.assertEqual(
+                    result.returncode, 0,
+                    f"{label} script #{index} does not parse:\n{result.stderr}",
+                )
+            finally:
+                os.unlink(path)
+
+    def test_the_mini_app_page_is_valid_javascript(self):
+        self._check(pets_web.PAGE_HTML.replace("__PREFIX__", "/pets"), "PAGE_HTML")
+
+    def test_the_audit_page_is_valid_javascript(self):
+        self._check(pets_web.AUDIT_HTML, "AUDIT_HTML")
