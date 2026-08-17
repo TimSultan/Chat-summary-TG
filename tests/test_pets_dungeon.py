@@ -966,3 +966,53 @@ class HydraTests(DungeonTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChestAndMimicModelTests(unittest.TestCase):
+    """The pure half of the between-floors find: what it is and what it is worth.
+
+    Nothing calls this yet -- the run state and the buttons are the next step -- so these
+    pin the numbers before any of it can quietly drift.
+    """
+
+    def test_a_find_is_rare_and_about_half_of_them_bite(self):
+        rng = random.Random(3)
+        found = [dungeon.roll_chest(6, rng) for _ in range(4000)]
+        hits = [row for row in found if row]
+        self.assertAlmostEqual(len(hits) / 4000, dungeon.CHEST_CHANCE, delta=0.02)
+        mimics = sum(row["kind"] == "mimic" for row in hits)
+        self.assertAlmostEqual(mimics / len(hits), dungeon.MIMIC_SHARE, delta=0.06)
+        self.assertEqual({row["floor"] for row in hits}, {6})
+
+    def test_nine_descents_in_ten_find_nothing_at_all(self):
+        """None, not an empty chest: the common case must cost no screen and no tap."""
+        class _Never:
+            def random(self):
+                return 0.99
+        self.assertIsNone(dungeon.roll_chest(6, _Never()))
+
+    def test_a_mimic_is_a_shade_stronger_than_the_floor_it_hides_on(self):
+        floor = 12
+        beast = dungeon.mimic(floor)
+        ordinary = dungeon.encounter(floor, 0)
+        self.assertGreater(beast["stats"]["strength"], ordinary["stats"]["strength"])
+        self.assertGreater(beast["stats"]["health"], ordinary["stats"]["health"])
+        # A shade, not a boss: it must not read as the floor's real threat.
+        boss = dungeon.encounter(15, 0)
+        self.assertLess(beast["stats"]["strength"], boss["stats"]["strength"])
+        self.assertFalse(beast["boss"])
+        self.assertEqual(beast["gimmick"], "mimic")
+
+    def test_a_bite_is_a_share_of_max_hp_so_it_stings_at_every_depth(self):
+        self.assertEqual(dungeon.MIMIC_BITE_SHARE, 0.15)
+        for max_hp in (500, 9000):
+            self.assertEqual(round(max_hp * dungeon.MIMIC_BITE_SHARE), round(max_hp * 0.15))
+
+    def test_chest_coins_follow_the_floor_they_were_found_between(self):
+        shallow, deep = dungeon.chest_gold(3), dungeon.chest_gold(25)
+        self.assertGreater(deep, shallow)
+        # Worth a couple of ordinary kills, not a floor's whole budget.
+        self.assertAlmostEqual(
+            shallow / dungeon.reward_for(3, boss=False)["gold"],
+            dungeon.CHEST_GOLD_SHARE, delta=0.05,
+        )

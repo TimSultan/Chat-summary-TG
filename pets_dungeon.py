@@ -289,3 +289,63 @@ def roll_reward(floor: int, boss: bool, rng=None) -> dict:
 def shop_heal_cost(floor: int) -> int:
     """Compatibility price for callers that still show one healing option."""
     return SHOP_FULL_HEAL_COST
+
+
+# --- chests and mimics ----------------------------------------------------------------
+# Between floors, a one-in-ten find. Half the point is that it might not be a find at all:
+# a chest that is always a chest is just a slower reward, whereas one that bites teaches a
+# player to read the floor before reaching for it.
+#
+# The choice is deliberately real on both sides. Walking away from a mimic costs the bite
+# and nothing else; fighting it risks the run for loot that is better than the corridor's.
+CHEST_CHANCE: Final = 0.10
+MIMIC_SHARE: Final = 0.45
+# What opening the wrong box costs before you have decided anything. A share of MAX hp, so
+# it stings equally at every depth rather than being a rounding error deep down.
+MIMIC_BITE_SHARE: Final = 0.15
+# A mimic is the floor's elite, slightly over: worth a real decision, not a free chest.
+MIMIC_STRENGTH: Final = 1.15
+MIMIC_HEALTH: Final = 1.10
+# Even a beaten mimic can turn out to have been empty. It is the joke the encounter is
+# built around, and it keeps "fight it" from being an automatic yes.
+MIMIC_EMPTY_SHARE: Final = 0.25
+MIMIC_EMPTY_NOTICE: Final = "Этот мимик был пустым."
+
+CHEST_RUBY_RANGE: Final = (1, 3)
+# Read against reward_for: a chest is worth a couple of ordinary kills in coin, and its
+# real value is the cursed item and the rune, which the corridor hands out far more rarely.
+CHEST_GOLD_SHARE: Final = 2.0
+
+
+def chest_gold(floor: int) -> int:
+    """Coins in a plain chest, priced off the floor it was found between."""
+    return max(1, round(reward_for(max(1, int(floor)), boss=False)["gold"] * CHEST_GOLD_SHARE))
+
+
+def mimic(floor: int) -> dict:
+    """The enemy a mimic turns into, shaped like any other encounter on this floor."""
+    floor = max(1, int(floor))
+    value = _scale(floor)
+    return {
+        "code": f"mimic_{floor}", "name": "Мимик", "floor": floor, "index": 0,
+        "theme": floor_name(floor), "boss": False, "gimmick": "mimic", "healer": False,
+        "hint": "Он ждал, пока ты потянешься к крышке.",
+        "stats": {"strength": round((value + 9) * MIMIC_STRENGTH),
+                  "health": round((value + 15) * MIMIC_HEALTH),
+                  "agility": max(1, value - 2), "luck": max(1, value + 3)},
+        "armor": max(0, value // 4), "level": floor + 3,
+        "reward": reward_for(floor, boss=False),
+    }
+
+
+def roll_chest(floor: int, rng=None) -> dict | None:
+    """Decide what, if anything, is standing between two floors.
+
+    Returns None nine times out of ten. Unseeded by default: this is rolled once when a
+    descent happens and never replayed, so there is nothing to reproduce -- and a seed
+    shared across descents is exactly how every chest on a floor became the same chest.
+    """
+    rng = rng or random.SystemRandom()
+    if rng.random() >= CHEST_CHANCE:
+        return None
+    return {"kind": "mimic" if rng.random() < MIMIC_SHARE else "chest", "floor": max(1, int(floor))}
