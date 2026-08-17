@@ -590,7 +590,12 @@ def _resolve_blow(attacker: dict, defender: dict, rng) -> tuple:
     raw = attacker["damage"]
     event = "hit"
     if rng.random() < attacker["crit"]:
-        raw *= C.CRIT_MULTIPLIER
+        # The crit's own bonus is NOT applied here. It is added into the attack-side
+        # bonus bundle in the main loop instead, so it stacks WITH the item passives
+        # rather than multiplying the total of them -- see the "crit" term there.
+        # Applied here it turned a +100% crit into a doubling of everything else too,
+        # which is how four legendary passives came to land an 18,891 hit on a 7,809 HP
+        # target. This branch only names the event now.
         event = "crit"
 
     raw *= 1 + rng.uniform(-C.DAMAGE_VARIANCE, C.DAMAGE_VARIANCE)
@@ -1753,6 +1758,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             # absolute and makes the combat log's primary hit number truthful.
             attack_no = attacks_made[attacker_key]
             multiplier = 1.0
+            # Additive, like every other attack-side bonus below it: a crit is worth
+            # +100% of the swing, not a doubling of whatever the passives have already
+            # built. _resolve_blow deliberately leaves it to this line.
+            if event == "crit":
+                multiplier += max(0.0, C.CRIT_MULTIPLIER - 1.0)
             multiplier *= max(.10, 1 - damage_weakened[attacker_key])
             multiplier *= max(.10, 1 - skill_value(attacker_key, "weaken"))
             multiplier *= 1 + skill_value(attacker_key, "damage_boost")
@@ -1851,7 +1861,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if event == "crit" and "countercrit" not in used[defender_key] \
                     and (value := _effect_value(effects[defender_key], "countercrit")) is not None:
                 used[defender_key].add("countercrit")
-                multiplier /= max(1, C.CRIT_MULTIPLIER)
+                multiplier = max(0.1, multiplier - max(0.0, C.CRIT_MULTIPLIER - 1.0))
                 retaliation_bonus[defender_key] += max(1, round(damage * max(0, _fraction(value))))
                 effect_round(round_number, defender_key, attacker_key, "countercrit")
             if chilled[attacker_key]:

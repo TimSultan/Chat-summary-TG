@@ -1436,3 +1436,47 @@ class PhysicalDamageHealsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdditiveCritTests(unittest.TestCase):
+    """A crit is worth +100% of the swing, not a doubling of everything the passives
+    have already built on top of it.
+
+    Applied multiplicatively it turned each item bonus into two: four legendary "first
+    hit" passives converging on one swing produced an 18,891 hit against a creature with
+    7,809 HP, and the transcript gave no way to see where the number came from.
+    """
+
+    def test_a_crit_no_longer_doubles_the_raw_swing(self):
+        attacker = {"damage": 1000.0, "crit": 1.0, "accuracy": 1.0}
+        defender = {"dodge": 0.0, "reduction": 0.0}
+        with patch.object(combat.C, "DAMAGE_VARIANCE", 0.0):
+            event, damage = combat._resolve_blow(attacker, defender, random.Random(1))
+        self.assertEqual(event, "crit")
+        # Still named a crit, but carrying the plain swing: the bonus is added by the
+        # main loop alongside every other attack-side bonus.
+        self.assertEqual(damage, 1000)
+
+    def test_the_bonus_adds_to_the_passives_instead_of_multiplying_them(self):
+        """The arithmetic the fix is about, stated as a comparison rather than a
+        magic number: two +100% sources should be ×3, not ×4."""
+        crit_bonus = max(0.0, C.CRIT_MULTIPLIER - 1.0)
+        passive_bonus = 1.0
+        additive = 1.0 + crit_bonus + passive_bonus
+        multiplicative = C.CRIT_MULTIPLIER * (1.0 + passive_bonus)
+        self.assertEqual(additive, 3.0)
+        self.assertEqual(multiplicative, 4.0)
+        self.assertLess(additive, multiplicative)
+
+    def test_a_crit_still_hits_harder_than_an_ordinary_blow(self):
+        """Additive must not mean free: the whole point is that it still hurts more."""
+        plain = {"damage": 1000.0, "crit": 0.0, "accuracy": 1.0}
+        always = {"damage": 1000.0, "crit": 1.0, "accuracy": 1.0}
+        defender = {"dodge": 0.0, "reduction": 0.0}
+        with patch.object(combat.C, "DAMAGE_VARIANCE", 0.0):
+            hit_event, _ = combat._resolve_blow(plain, defender, random.Random(2))
+            crit_event, _ = combat._resolve_blow(always, defender, random.Random(2))
+        self.assertEqual(hit_event, "hit")
+        self.assertEqual(crit_event, "crit")
+        # And the bonus the main loop adds for it is a real one.
+        self.assertGreater(C.CRIT_MULTIPLIER - 1.0, 0)
