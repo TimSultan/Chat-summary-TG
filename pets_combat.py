@@ -189,7 +189,10 @@ _EFFECT_TEXT = {
     "tesla": "выпускает разряд: {amount} урона.",
     "death_shield": "цепляется за медаль и поднимает аварийный щит.",
     "acid": "обливает оружие кислотой: следующий удар не увернуть.",
-    "spring": "сжимает пружину: следующий удар двойной.",
+    # {amount} is the multiplier the spring is ACTUALLY worth. It read "двойной" for
+    # every spring, including the legendary one that triples -- so a transcript showing a
+    # tripled hit explained it as a doubling and the arithmetic looked broken.
+    "spring": "сжимает пружину: следующий удар ×{amount}.",
     "candle": "зажигает чёрную свечу: {amount:+d}% к урону.",
     "armor_shred": "крошит броню: защита слабее ещё на {amount}%.",
     "wound": "оставляет глубокую рану: −{amount} текущего и максимального HP.",
@@ -1824,10 +1827,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 # The value used to be ignored -- a hardcoded double meant the rare and
                 # the legendary spring were the same item with different copy, and all
                 # three measured identically. 100 keeps the original doubling exactly.
-                multiplier *= 1 + max(0, _fraction(
+                spring_multiplier = 1 + max(0, _fraction(
                     _effect_value(effects[attacker_key], "spring") or 100
                 ))
-                effect_round(round_number, attacker_key, defender_key, "spring")
+                multiplier *= spring_multiplier
+                effect_round(round_number, attacker_key, defender_key, "spring",
+                             round(spring_multiplier))
             multiplier += gambler_bonus[attacker_key]
             flat_retaliation = retaliation_bonus[attacker_key]
             retaliation_bonus[attacker_key] = 0.0

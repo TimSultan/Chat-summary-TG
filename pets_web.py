@@ -3581,7 +3581,11 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;b
 .bar-fill{height:100%;border-radius:0 4px 4px 0;min-width:2px}
 .bar-value{font:600 13px ui-monospace,monospace;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
 .bar-value i{font-style:normal;font-weight:400;color:var(--muted);margin-left:9px}
-.inc{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+/* A seven-column table of every player cannot fit a phone, and letting it push the PAGE
+   sideways is what turned this screen into "the audit is broken": every other section
+   then scrolled away from the left edge too. It scrolls inside its own box instead. */
+.inc-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:10px}
+.inc{width:100%;border-collapse:collapse;font-size:13px;min-width:520px}
 .inc th{text-align:left;font:600 10px/1.4 system-ui,sans-serif;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:0 10px 8px 0}
 .inc td{padding:7px 10px 7px 0;border-top:1px solid var(--line);font-variant-numeric:tabular-nums;vertical-align:top}
 .inc td.num,.inc th.num{text-align:right}
@@ -3594,6 +3598,10 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;b
 .sec{margin:26px 0 0}.sec h2{margin:0 0 2px}.sec>p{margin:3px 0 0;color:var(--muted);font-size:12px}
 .sec h3{margin:22px 0 0;font:600 11px/1.4 system-ui,sans-serif;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
 @media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}.bar{grid-template-columns:1fr auto;gap:4px 10px}.bar-track{grid-column:1/-1}}
+/* On a phone the share bars and the "main source" column are the first things worth
+   giving up: the percentage beside them already says it, and dropping both brings the
+   table under the width of the screen so it needs no sideways scroll at all. */
+@media(max-width:560px){.inc{min-width:0}.mini{display:none}.inc .src{display:none}}
 </style></head><body><main>
 <h1>Chat audit</h1>
 <nav class="tabs"><button id="tabFights" class="on">Fights</button><button id="tabIncome">Income</button></nav>
@@ -3701,8 +3709,8 @@ function playerTable(coins,rubies){
   const names={};for(const s of coins.sources.concat(rubies.sources))names[s.code]=s.name;
   const mini=(share,hue)=>`<span class="mini"><i style="width:${(100*(share||0)).toFixed(1)}%;background:${hue}"></i></span>`;
   return `<section class="sec"><h2>Per player</h2><p>Each person's share of everything the selected group earned.</p>
-  <table class="inc"><thead><tr><th>Player</th><th class="num">Lvl</th><th class="num">Coins</th><th class="num">Share</th>
-  <th class="num">Diamonds</th><th class="num">Share</th><th>Main coin source</th></tr></thead><tbody>${
+  <div class="inc-scroll"><table class="inc"><thead><tr><th>Player</th><th class="num">Lvl</th><th class="num">Coins</th><th class="num">Share</th>
+  <th class="num">Diamonds</th><th class="num">Share</th><th class="src">Main coin source</th></tr></thead><tbody>${
   list.map(row=>{const r=incRoster.find(x=>String(x.user_id)===String(row.id));
     return `<tr><td>${esc(who(row.id))}${r&&r.username?` <span class="muted">@${esc(r.username)}</span>`:""}</td>
     <td class="num">${r&&r.level?esc(r.level):"—"}</td>
@@ -3710,7 +3718,7 @@ function playerTable(coins,rubies){
     <td class="num">${row.coins?pct(row.coins.share):"—"}${mini(row.coins?.share,"var(--coin)")}</td>
     <td class="num">${num(row.rubies?.earned)}</td>
     <td class="num">${row.rubies?pct(row.rubies.share):"—"}${mini(row.rubies?.share,"var(--gem)")}</td>
-    <td>${esc(names[best(row.coins)]||"—")}</td></tr>`}).join("")}</tbody></table></section>`}
+    <td class="src">${esc(names[best(row.coins)]||"—")}</td></tr>`}).join("")}</tbody></table></div></section>`}
 
 function historySection(history){
   if(!history.sources.length&&!history.minted_all_time)return "";
