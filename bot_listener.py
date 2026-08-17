@@ -6586,9 +6586,13 @@ async def handle_pets_callback(
             # the only kind of fight in the game that never sent its log anywhere. Corridor
             # mobs deliberately stay silent: a pack floor is ten kills, and ten transcripts
             # would bury the run rather than document it.
-            if await _send_dungeon_boss_log(api, chat_id, entry, user_id, receipt, log):
+            in_dm = (message.get("chat") or {}).get("type") == "private"
+            if await _send_dungeon_boss_log(api, chat_id, entry, user_id, receipt, log) \
+                    and in_dm:
                 # The log has to sit ABOVE the menu, so the menu is re-sent beneath it
-                # rather than edited in place further up the chat.
+                # rather than edited in place further up the chat. Only in a DM: the log
+                # always goes to the player's private chat, and a menu being driven from a
+                # group must not be torn down to reorder it against a log it cannot see.
                 await _delete_quietly(api, chat_id, message_id)
                 message_id = None
             await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
@@ -7845,38 +7849,56 @@ async def _delete_quietly(api, chat_id, message_id) -> None:
 
 
 async def _send_dungeon_boss_log(api, chat_id, entry, user_id, receipt, log) -> bool:
-    """Post the round-by-round transcript of a boss fight. True when something was sent.
+    """DM the round-by-round transcript of a boss fight. True when something was sent.
 
-    Only bosses, and only when the fight actually resolved: a reincarnating boss's first
-    death and an interrupted run both come back without a usable result, and a transcript
-    of a fight that did not happen is worse than none.
+    Addressed to the PLAYER, not to `chat_id`: the pet menu can be driven from a group,
+    and a combat log belongs in the same private chat the arena delivers its own to.
+
+    Only a FINISHED boss fight. A reincarnating boss's first death comes back with
+    `reincarnated` set and the fight is not over yet, so a transcript there would tell
+    half the story and then tell it again.
     """
     receipt = receipt or {}
     encounter = receipt.get("encounter") or {}
     result = receipt.get("result")
-    if not encounter.get("boss") or result is None:
+    if not encounter.get("boss") or result is None or receipt.get("reincarnated"):
         return False
     mine = pets.get_pet(entry, user_id) or {}
     enemy_name = str(encounter.get("name") or "Босс")
-    caption = pets_ui.fight_report(
-        result, str(user_id),
-        {str(user_id): mine.get("name"), str(receipt.get("enemy").key
-                                              if receipt.get("enemy") is not None
-                                              else enemy_name): enemy_name},
+    enemy = receipt.get("enemy")
+    enemy_key = str(getattr(enemy, "key", None) or enemy_name)
+    caption = f"👑 <b>{html.escape(enemy_name)}</b>\n\n" + pets_ui.fight_report(
+        result, str(user_id), {str(user_id): mine.get("name"), enemy_key: enemy_name},
         None,
     )
-    path = _pets_render_log_image(
-        result, user_id, enemy_name, mine, {"name": enemy_name}, log,
-    )
+    # Every step below is best-effort in its own right, and each failure is logged with
+    # its traceback rather than swallowed: this shipped once already as a silent no-op,
+    # and "the log never arrives" with nothing in the log to say why is unfixable.
     try:
-        await _pets_send_fight_images(
-            api, chat_id, (path,), f"👑 <b>{html.escape(enemy_name)}</b>\n\n{caption}",
-            disable_notification=True,
+        path = _pets_render_log_image(
+            result, user_id, enemy_key, mine, {"name": enemy_name}, log,
+        )
+    except Exception:
+        log(f"[pets] boss log could not be drawn:\n{traceback.format_exc()}")
+        path = None
+    if path is not None:
+        try:
+            await _pets_send_fight_images(
+                api, user_id, (path,), caption, disable_notification=True,
+            )
+            return True
+        except Exception:
+            log(f"[pets] boss log picture failed to send:\n{traceback.format_exc()}")
+    # The words on their own. A bot that cannot upload a file can usually still write.
+    try:
+        await api.send_message(
+            user_id, caption, parse_mode="HTML", disable_notification=True,
         )
         return True
     except Exception:
-        # A boss kill must still redraw the floor even if its picture cannot be delivered.
-        log(f"[pets] could not deliver a dungeon boss log to {user_id}")
+        # A bot cannot message somebody who has never opened it. The floor still redraws.
+        log(f"[pets] could not deliver a dungeon boss log to {user_id}:\n"
+            f"{traceback.format_exc()}")
         return False
 
 

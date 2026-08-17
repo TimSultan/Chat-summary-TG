@@ -469,6 +469,52 @@ class DungeonTests(unittest.TestCase):
         after = set(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"])
         self.assertTrue(before <= after, "a dead healer must not raise anybody")
 
+    def test_descending_forgets_who_was_raised_on_the_floor_above(self):
+        """Shipped as a bug: `revived` is keyed by the enemy's index within a floor, and
+        indices start again at zero on the next one. Carried over, every later enemy --
+        the boss at index 0 included -- looked raised and paid out nothing."""
+        healers = self._enter_pack_floor()
+        victim = next(i for i in range(10) if i not in healers)
+        other = next(i for i in range(10) if i not in healers and i != victim)
+        pets.dungeon_fight(self.entry, self.user_id, victim)
+        pets.dungeon_fight(self.entry, self.user_id, other)
+        self.assertTrue(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["revived"])
+
+        # Clear the floor the way it is meant to be cleared -- healers first, or they
+        # keep putting the room back up -- and go down.
+        for index in (*healers, *range(10)):
+            pets.dungeon_fight(self.entry, self.user_id, index)
+        self.assertEqual(
+            len(pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"]), 10,
+        )
+        self.assertTrue(pets.dungeon_descend(self.entry, self.user_id)[0])
+
+        run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
+        self.assertEqual(run["revived"], [])
+        self.assertEqual(run["dead_at"], {})
+        self.assertEqual(run["order"], [])
+
+    def test_a_boss_is_never_treated_as_something_a_healer_raised(self):
+        """Belt and braces over the reset above: a room with no healers in it cannot
+        contain anything they put back up, whatever stale state says."""
+        self._enter_pack_floor()
+        data = pets._load(self.entry)
+        run = data["pets"][self.user_id]["dungeon_run"]
+        run["floor"], run["cleared"] = 5, []
+        run["revived"] = list(range(10))          # exactly the leak that shipped
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+
+        for _ in range(4):
+            ok, _message, receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+            self.assertTrue(ok)
+            self.assertFalse(receipt.get("revived_kill"), "a boss must never pay nothing")
+            if pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]["cleared"]:
+                break
+        self.assertGreater(receipt["reward"]["gold"], 0)
+
     def test_a_healer_never_raises_another_healer(self):
         healers = self._enter_pack_floor()
         self.assertTrue(pets.dungeon_fight(self.entry, self.user_id, healers[0])[0])

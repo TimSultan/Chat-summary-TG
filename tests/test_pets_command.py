@@ -204,8 +204,10 @@ class PetsCommandTests(unittest.TestCase):
             ))
         return api
 
-    def _tap(self, action, argument="", user=PLAYER, owner=None, flows=None):
-        api = FakeApi()
+    def _tap(self, action, argument="", user=PLAYER, owner=None, flows=None, api=None):
+        """`api` lets a caller keep one recorder across several taps, which is what a
+        multi-press fight (a boss that revives once) needs to be counted correctly."""
+        api = api if api is not None else FakeApi()
         with patch.object(stats, "resolve_stat_target", _Resolver(api)):
             _run(bot_listener.handle_pets_callback(
                 api, None, _cfg(), None, _callback(user, action, argument, owner),
@@ -1182,6 +1184,54 @@ class PetsCommandTests(unittest.TestCase):
             "encounter": {"boss": boss, "name": "Стальной привратник"},
             "result": result, "enemy": None, "reward": {"gold": 100, "xp": 50},
         }
+
+    def _stand_on_boss_floor(self, floor=5):
+        """A hero strong enough to finish a boss, standing on its floor."""
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["stats"] = {
+            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+        }
+        pets._save(CHAT, data)
+        pets.grant_dungeon_ticket(CHAT, PLAYER["id"])
+        self.assertTrue(pets.enter_dungeon(CHAT, PLAYER["id"])[0])
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["dungeon_run"]["floor"] = floor
+        data["pets"][str(PLAYER["id"])]["dungeon_run"]["cleared"] = []
+        pets._save(CHAT, data)
+
+    def test_a_real_boss_kill_dms_exactly_one_log_to_the_player(self):
+        """Driven through the real fight rather than a stubbed receipt.
+
+        The stubbed version of this test passed while production sent nothing, because a
+        fabricated receipt cannot reproduce the reincarnating boss on floor 5 -- whose
+        first death is not the end of the fight.
+        """
+        self._stand_on_boss_floor()
+        api = None
+        for _ in range(4):
+            api = self._tap("dungeonfight", "0", api=api)
+            if pets._load(CHAT)["pets"][str(PLAYER["id"])]["dungeon_run"]["cleared"]:
+                break
+
+        delivered = api.photo_files + [row for row in api.sent if "👑" in row["text"]]
+        self.assertEqual(len(delivered), 1, "a boss must send exactly one transcript")
+        # Addressed to the PLAYER, not to whatever chat the button was pressed in.
+        self.assertEqual(str(delivered[0]["chat_id"]), str(PLAYER["id"]))
+
+    def test_a_boss_log_still_arrives_as_text_when_the_picture_cannot_be_drawn(self):
+        """The image is best-effort; the transcript is not."""
+        self._stand_on_boss_floor()
+        with patch.object(bot_listener, "_pets_render_log_image", return_value=None):
+            api = None
+            for _ in range(4):
+                api = self._tap("dungeonfight", "0", api=api)
+                if pets._load(CHAT)["pets"][str(PLAYER["id"])]["dungeon_run"]["cleared"]:
+                    break
+        written = [row for row in api.sent if "👑" in row["text"]]
+        self.assertEqual(len(written), 1)
+        self.assertEqual(str(written[0]["chat_id"]), str(PLAYER["id"]))
 
     def test_a_boss_fight_sends_its_log_and_puts_it_above_the_redrawn_menu(self):
         """A boss is the one dungeon fight worth reading back move by move.

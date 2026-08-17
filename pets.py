@@ -4244,9 +4244,14 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         if row["index"] in cleared:
             _save(entry, data)
             return False, "Этот противник уже побеждён.", None
-        was_revived = int(row["index"]) in {
-            int(value) for value in (run.get("revived") or [])
-        }
+        # Only a room that HAS healers can contain something they raised. Belt and braces
+        # over the reset in dungeon_descend: this state is index-keyed, indices repeat on
+        # every floor, and leaking it once already made bosses pay nothing.
+        was_revived = bool(
+            any(candidate.get("healer") for candidate in D.encounters_for_floor(floor))
+            and not row.get("boss")
+            and int(row["index"]) in {int(value) for value in (run.get("revived") or [])}
+        )
         if row["gimmick"] == "healing_pass" and _dungeon_has_healing(record):
             cleared.add(row["index"])
             run["cleared"] = sorted(cleared)
@@ -4526,6 +4531,12 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
         return True, D.DUNGEON_CLEARED_NOTICE
     run["floor"], run["cleared"] = floor + 1, []
     run["floor_haul"] = _new_haul()
+    # All three are keyed by the enemy's INDEX within a floor, and indices start again at
+    # zero on the next one. Carried over they made every later enemy -- a boss at index 0
+    # included -- look like something a healer had already raised, which paid out nothing.
+    run["revived"] = []
+    run["dead_at"] = {}
+    run["order"] = []
     run.pop("boss_lives", None)
     run.pop("hydra_head_hp", None)
     run.pop("hydra_moves", None)
