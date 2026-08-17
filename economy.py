@@ -999,6 +999,167 @@ def flow_report(
     }
 
 
+# The one coin faucet with no ledger rows behind it. Chat XP is converted to coins on
+# read (see the module docstring), so it can only ever be ESTIMATED here -- from the
+# recorded day files, which is the same data /stat derives a balance from. It is given a
+# code and a colour like a real source because leaving the chat's largest faucet off the
+# chart entirely would misstate every other source's share.
+CHAT_ACTIVITY_SOURCE = ("chat_activity", "Сообщения в чате (из XP)", "#3f9b6b")
+
+
+def chat_activity_coins(
+    entry: str, *, days: int | None = 30, user_ids=None, now: datetime | None = None,
+) -> dict:
+    """Coins the recorded day files imply people earned by talking, per player.
+
+    An estimate, and labelled as one everywhere it surfaces, for three honest reasons:
+    coins_for_xp floors at ten XP per coin so a window's worth of XP rounds differently
+    than a lifetime's; today's day file is not closed yet; and words_per_point is the
+    chat's live calibration, which is read from cache here rather than re-measured.
+
+    `days=None` reads every recorded day, matching income_report's whole-ledger window.
+    """
+    moment = now or app_now()
+    tz = moment.tzinfo or app_now().tzinfo
+    moment = moment.replace(tzinfo=tz) if moment.tzinfo is None else moment.astimezone(tz)
+    window = int(days) if days else None
+    baseline = stats._load_words_per_point(entry) or stats.DEFAULT_WORDS_PER_POINT
+    end_day = moment.date()
+    start_day = end_day - timedelta(days=window - 1) if window else None
+    users = (
+        stats.aggregate(entry, start_day, end_day) if start_day is not None
+        else stats.aggregate_all_time(entry)
+    )
+    wanted = {str(uid) for uid in user_ids} if user_ids is not None else None
+    players = {}
+    for user_id, user in users.items():
+        if wanted is not None and str(user_id) not in wanted:
+            continue
+        coins = stats.coins_for_xp(user.xp(baseline))
+        if coins:
+            players[str(user_id)] = coins
+    return {
+        "code": CHAT_ACTIVITY_SOURCE[0],
+        "name": CHAT_ACTIVITY_SOURCE[1],
+        "color": CHAT_ACTIVITY_SOURCE[2],
+        "players": players,
+        "total": sum(players.values()),
+        "words_per_point": baseline,
+        "from": start_day.isoformat() if start_day else None,
+        "to": end_day.isoformat(),
+        "estimate": True,
+    }
+
+
+def income_report(
+    entry: str, *, days: int | None = 30, user_ids=None, now: datetime | None = None,
+) -> dict:
+    """Where coins came from and went, by source and by player, over a window.
+
+    The coin half of the income audit, and the sibling of pets.ruby_income_report -- same
+    return shape, same reading of a filter: `user_ids=None` means everybody, and passing a
+    set restricts both the rows and the percentages to that set, so a share is always
+    "of the selected population", never of a total the filter has already excluded.
+
+    flow_report above answers the neighbouring question by DAY; this one drops the time
+    series and adds the per-player split, which is what a share needs and what a level or
+    player filter is applied to. Both read the same _audit_source buckets, so a number
+    here and a number there are the same definition of "farm".
+
+    THIS REPORT SEES ONLY THE LEDGER. Coins earned by talking in the chat are derived from
+    XP (see the module docstring) and never create a row, so they are not here -- the
+    caller is responsible for adding that faucet from stats and labelling it as the
+    estimate it is. Reading these percentages as "all income" without it would badly
+    understate chat activity.
+    """
+    moment = now or app_now()
+    tz = moment.tzinfo or app_now().tzinfo
+    moment = moment.replace(tzinfo=tz) if moment.tzinfo is None else moment.astimezone(tz)
+    window = int(days) if days else None
+    start_day = moment.date() - timedelta(days=window - 1) if window else None
+    wanted = {str(uid) for uid in user_ids} if user_ids is not None else None
+
+    data = _load(entry)
+    rows = [row for row in data.get("log", []) if isinstance(row, dict)]
+    sources: dict[str, dict] = {}
+    players: dict[str, dict] = {}
+    source_players: dict[str, set[str]] = {}
+    totals = {"earned": 0, "spent": 0, "net": 0, "transactions": 0}
+
+    for raw in rows:
+        who = str(raw.get("user_id"))
+        if wanted is not None and who not in wanted:
+            continue
+        stamp = _audit_timestamp(raw.get("ts"), tz)
+        if stamp is None or (start_day is not None and stamp.date() < start_day):
+            continue
+        delta = int(raw.get("delta", 0) or 0)
+        code = _audit_source(raw.get("reason", ""))
+        name, colour = _AUDIT_SOURCES[code]
+        earned, spent = (delta, 0) if delta >= 0 else (0, -delta)
+
+        source = sources.setdefault(code, {
+            "code": code, "name": name, "color": colour,
+            "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+        })
+        source["earned"] += earned
+        source["spent"] += spent
+        source["net"] += delta
+        source["transactions"] += 1
+        source_players.setdefault(code, set()).add(who)
+
+        player = players.setdefault(who, {
+            "user_id": who, "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+            "by_source": {},
+        })
+        player["earned"] += earned
+        player["spent"] += spent
+        player["net"] += delta
+        player["transactions"] += 1
+        if earned:
+            player["by_source"][code] = player["by_source"].get(code, 0) + earned
+
+        totals["earned"] += earned
+        totals["spent"] += spent
+        totals["net"] += delta
+        totals["transactions"] += 1
+
+    minted = totals["earned"]
+    source_rows = sorted(
+        (
+            {
+                **source,
+                "players": len(source_players.get(source["code"], ())),
+                "share": (source["earned"] / minted) if minted else 0.0,
+            }
+            for source in sources.values()
+        ),
+        key=lambda row: (-row["earned"], -row["spent"], row["name"]),
+    )
+    player_rows = sorted(
+        (
+            {**player, "share": (player["earned"] / minted) if minted else 0.0}
+            for player in players.values()
+        ),
+        key=lambda row: (-row["earned"], row["user_id"]),
+    )
+    stamps = [
+        stamp for stamp in (_audit_timestamp(row.get("ts"), tz) for row in rows)
+        if stamp is not None
+    ]
+    return {
+        "currency": "coins",
+        "days": window,
+        "from": start_day.isoformat() if start_day else None,
+        "to": moment.date().isoformat(),
+        "sources": source_rows,
+        "players": player_rows,
+        "totals": totals,
+        "ledger_start": min(stamps).isoformat() if stamps else None,
+        "log_at_capacity": len(rows) >= LOG_LIMIT,
+    }
+
+
 def casino_winnings_for_user(entry: str, user_id) -> int:
     """All-time net casino profit, kept beside the wager records in the shared ledger."""
     try:

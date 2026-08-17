@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -875,6 +875,223 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         quest = next(row for row in body["report"]["sources"] if row["code"] == "quests")
         self.assertEqual(quest["earned"], 40)
         self.assertTrue(body["report"]["xp_not_hourly"])
+
+    async def _income(self, query=""):
+        response = await self.client.get("/audit/api/income" + query)
+        self.assertEqual(response.status, 200)
+        return await response.json()
+
+    def _record_chat_day(self, day, who, messages=30):
+        """One recorded day of real chatter, so the XP-derived coin faucet has something
+        to derive from -- it reads the day files, not the ledger."""
+        start = datetime(day.year, day.month, day.day, 9, tzinfo=timezone.utc)
+        stats.record_day(CHAT, day, [
+            SimpleNamespace(
+                sender_id=who["id"], sender_name=who["first_name"],
+                sender_username=who["username"],
+                text="достаточно длинное сообщение для подсчёта очков",
+                dt_local=start + timedelta(minutes=index), message_id=index,
+                is_reply=False,
+            )
+            for index in range(1, messages + 1)
+        ])
+
+    def _seed_income(self, moment):
+        """Two players earning both currencies from different faucets, so every filter
+        below has something it can actually change."""
+        with patch("economy.app_now", return_value=moment), \
+                patch("pets.app_now", return_value=moment):
+            economy.grant(CHAT, PLAYER["id"], 300, "grant:quest:submission-1")
+            economy.grant(CHAT, PLAYER["id"], 100, "pet_mob_win")
+            economy.grant(CHAT, OPPONENT["id"], 100, "grant:pet:farm:shift-1")
+            pets.grant_rubies(CHAT, PLAYER["id"], 9, "pet_mob_win")
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 3, "quarry:run-1")
+            pets.grant_rubies_once(CHAT, OPPONENT["id"], 6, "dungeon-ruby:token-1")
+
+    async def test_income_audit_splits_both_currencies_by_source_with_shares(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        self._seed_income(moment)
+        with patch("economy.app_now", return_value=moment), \
+                patch("pets.app_now", return_value=moment):
+            body = await self._income("?days=30")
+
+        coins = {row["code"]: row for row in body["coins"]["sources"]}
+        self.assertEqual(coins["quests"]["earned"], 300)
+        self.assertEqual(coins["mobs"]["earned"], 100)
+        self.assertEqual(coins["farm"]["earned"], 100)
+        # Shares are of everything minted in the window and must account for all of it.
+        self.assertAlmostEqual(
+            sum(row["share"] for row in body["coins"]["sources"]), 1.0, places=6,
+        )
+        self.assertAlmostEqual(coins["quests"]["share"], 0.6, places=6)
+
+        rubies = {row["code"]: row for row in body["rubies"]["sources"]}
+        self.assertEqual(rubies["mobs"]["earned"], 9)
+        self.assertEqual(rubies["quarry"]["earned"], 3)
+        self.assertEqual(rubies["dungeon"]["earned"], 6)
+        self.assertEqual(body["rubies"]["totals"]["earned"], 18)
+        self.assertAlmostEqual(rubies["mobs"]["share"], 0.5, places=6)
+
+        # The two currencies stay separate -- a coin source never leaks into the diamonds.
+        self.assertNotIn("quests", rubies)
+        self.assertEqual(body["windows"], [1, 7, 30, 90, 365])
+
+    async def test_income_audit_reports_per_player_shares_and_filters_to_chosen_players(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        self._seed_income(moment)
+        with patch("economy.app_now", return_value=moment), \
+                patch("pets.app_now", return_value=moment):
+            everybody = await self._income("?days=30")
+            filtered = await self._income(f"?days=30&user_ids={PLAYER['id']}")
+
+        rows = {row["user_id"]: row for row in everybody["coins"]["players"]}
+        self.assertEqual(rows[str(PLAYER["id"])]["earned"], 400)
+        self.assertEqual(rows[str(PLAYER["id"])]["by_source"]["quests"], 300)
+        self.assertEqual(rows[str(OPPONENT["id"])]["earned"], 100)
+        self.assertAlmostEqual(rows[str(OPPONENT["id"])]["share"], 0.2, places=6)
+
+        # Filtering restricts the population AND restates the percentages against it, so
+        # the one remaining player is 100% of the income being looked at.
+        self.assertEqual(
+            [row["user_id"] for row in filtered["coins"]["players"]], [str(PLAYER["id"])],
+        )
+        self.assertAlmostEqual(filtered["coins"]["players"][0]["share"], 1.0, places=6)
+        self.assertEqual(filtered["rubies"]["totals"]["earned"], 12)
+        self.assertEqual(filtered["filters"]["matched"], 1)
+        # The picker still offers everybody, or a filter could never be widened again.
+        self.assertIn(str(OPPONENT["id"]), {row["user_id"] for row in filtered["roster"]})
+
+    async def test_income_audit_filters_by_pet_level_and_excludes_the_petless(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        self._seed_income(moment)
+        data = pets._load(CHAT)
+        data["pets"] = {
+            str(PLAYER["id"]): {"name": "Hero", "level": 12},
+            str(OPPONENT["id"]): {"name": "Rival", "level": 3},
+        }
+        pets._save(CHAT, data)
+        with patch("economy.app_now", return_value=moment), \
+                patch("pets.app_now", return_value=moment):
+            high = await self._income("?days=30&min_level=10")
+            low = await self._income("?days=30&min_level=1&max_level=5")
+
+        self.assertEqual(
+            [row["user_id"] for row in high["coins"]["players"]], [str(PLAYER["id"])],
+        )
+        self.assertEqual(
+            [row["user_id"] for row in low["coins"]["players"]], [str(OPPONENT["id"])],
+        )
+        self.assertEqual(low["rubies"]["totals"]["earned"], 6)
+        self.assertEqual(high["level_range"], {"min": 3, "max": 12})
+        self.assertEqual(
+            {row["user_id"]: row["level"] for row in high["roster"]}[str(PLAYER["id"])], 12,
+        )
+
+    async def test_income_audit_window_excludes_older_rows(self):
+        old = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        recent = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        with patch("economy.app_now", return_value=old), patch("pets.app_now", return_value=old):
+            economy.grant(CHAT, PLAYER["id"], 500, "grant:quest:old-one")
+            pets.grant_rubies(CHAT, PLAYER["id"], 40, "pet_mob_win")
+        with patch("economy.app_now", return_value=recent), \
+                patch("pets.app_now", return_value=recent):
+            economy.grant(CHAT, PLAYER["id"], 20, "grant:quest:new-one")
+            pets.grant_rubies(CHAT, PLAYER["id"], 2, "pet_mob_win")
+            week = await self._income("?days=7")
+            forever = await self._income("?days=all")
+
+        self.assertEqual(week["coins"]["totals"]["ledger_earned"], 20)
+        self.assertEqual(week["rubies"]["totals"]["earned"], 2)
+        self.assertEqual(forever["coins"]["totals"]["ledger_earned"], 520)
+        self.assertEqual(forever["rubies"]["totals"]["earned"], 42)
+        self.assertIsNone(forever["filters"]["days"])
+
+    async def test_income_audit_counts_chat_xp_coins_as_their_own_estimated_source(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        self._record_chat_day(date(2026, 8, 11), PLAYER)
+        with patch("economy.app_now", return_value=moment), \
+                patch("pets.app_now", return_value=moment):
+            economy.grant(CHAT, PLAYER["id"], 100, "grant:quest:submission-1")
+            body = await self._income("?days=30")
+
+        chat = next(
+            row for row in body["coins"]["sources"] if row["code"] == "chat_activity"
+        )
+        # Derived from XP rather than from a ledger row, and it has to say so on screen.
+        self.assertTrue(chat["estimate"])
+        self.assertEqual(chat["transactions"], 0)
+        self.assertGreater(chat["earned"], 0)
+        self.assertEqual(
+            body["coins"]["totals"]["earned"],
+            body["coins"]["totals"]["ledger_earned"] + chat["earned"],
+        )
+        # The ledger-only sources are diluted by it, which is the entire point.
+        quests_row = next(r for r in body["coins"]["sources"] if r["code"] == "quests")
+        self.assertLess(quests_row["share"], 1.0)
+        self.assertAlmostEqual(
+            sum(row["share"] for row in body["coins"]["sources"]), 1.0, places=6,
+        )
+
+    async def test_income_audit_reconstructs_all_time_diamonds_and_admits_its_gaps(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        with patch("pets.app_now", return_value=moment):
+            # Only grant_rubies_once writes ruby_sources; the mob drop never did, so the
+            # reconstruction must under-report and the coverage figure must show it.
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 30, "quarry:run-1")
+            pets.grant_rubies(CHAT, PLAYER["id"], 70, "pet_mob_win")
+            body = await self._income("?days=30")
+
+        history = body["rubies_all_time"]
+        self.assertEqual(history["minted_all_time"], 100)
+        self.assertEqual(history["explained"], 30)
+        self.assertAlmostEqual(history["coverage"], 0.3, places=6)
+        self.assertEqual(
+            [(row["code"], row["earned"]) for row in history["sources"]], [("quarry", 30)],
+        )
+
+    async def test_ruby_ledger_records_every_faucet_and_sink(self):
+        moment = datetime(2026, 8, 12, 18, 20, tzinfo=timezone.utc)
+        with patch("pets.app_now", return_value=moment):
+            pets.grant_rubies(CHAT, PLAYER["id"], 50, "pet_mob_win")
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 5, "arena-ruby:a:1:2")
+            # A replayed settlement must not be logged twice.
+            pets.grant_rubies_once(CHAT, PLAYER["id"], 5, "arena-ruby:a:1:2")
+            data = pets._load(CHAT)
+            data["pets"] = {str(PLAYER["id"]): {
+                "name": "Hero", "level": 1, "xp": 10_000,
+                "stats": {key: C.STAT_MIN_LEVEL + 2 for key in C.STAT_KEYS},
+            }}
+            pets._save(CHAT, data)
+            self.assertTrue(pets.respec_stats(CHAT, PLAYER["id"])[0])
+
+        rows = [(row["reason"], row["delta"]) for row in pets._load(CHAT)["ruby_log"]]
+        self.assertEqual(rows, [
+            ("pet_mob_win", 50),
+            ("arena-ruby:a:1:2", 5),
+            ("spend:respec", -C.STAT_RESPEC_RUBY_COST),
+        ])
+        self.assertEqual(pets.ruby_source_of("spend:respec"), "respec")
+
+        with patch("pets.app_now", return_value=moment):
+            report = pets.ruby_income_report(CHAT, days=30)
+        respec = next(row for row in report["sources"] if row["code"] == "respec")
+        self.assertEqual((respec["earned"], respec["spent"]), (0, C.STAT_RESPEC_RUBY_COST))
+        # A pure sink is 0% of income and is read off the spent column instead.
+        self.assertEqual(respec["share"], 0.0)
+
+    async def test_audit_page_offers_an_income_tab_with_all_three_filters(self):
+        page = await self.client.get("/audit")
+        html = await page.text()
+        self.assertIn('<button id="tabIncome">Income</button>', html)
+        for control in ("incDays", "incMinLevel", "incMaxLevel", "incSearch"):
+            self.assertIn(f'id="{control}"', html)
+        self.assertIn("/audit/api/income?", html)
+        # Both currencies get their own single-hue chart; neither shares an axis with the
+        # other, and no bar is shaded by its own value.
+        self.assertIn("--coin:#c98500", html)
+        self.assertIn("--gem:#3987e5", html)
+        self.assertIn('currencySection("Coins"', html)
+        self.assertIn('currencySection("Diamonds"', html)
 
     async def test_page_contains_admin_money_button_graph_and_user_selector(self):
         page = await self.client.get(pets_web.ROUTE_PREFIX + "/", headers=self._auth(THIRD))

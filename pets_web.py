@@ -3196,6 +3196,146 @@ async def handle_fight_audit(request: web.Request) -> web.Response:
     return _ok(await asyncio.to_thread(pets.fight_audit_browser, entry, limit, pet_id))
 
 
+# Windows the income audit offers. 1 day is here because a faucet that has just been
+# retuned is judged on today, not on an average that still contains the old rate.
+INCOME_WINDOW_DAYS = (1, 7, 30, 90, 365)
+
+
+def _merge_chat_activity(report: dict, activity: dict) -> dict:
+    """Fold the XP-derived coin faucet into a ledger report and restate every share.
+
+    Chat coins are the chat's biggest faucet and have no ledger rows at all (see
+    economy.chat_activity_coins), so a percentage computed without them would tell an
+    administrator that, say, the dungeon mints 40% of all coins when it mints 12%. The
+    merged row keeps its `estimate` flag all the way to the screen, which is why this
+    adds a source rather than silently inflating the totals.
+    """
+    total = int(activity.get("total", 0) or 0)
+    players = {str(uid): int(coins) for uid, coins in (activity.get("players") or {}).items()}
+    code = activity["code"]
+    sources = [dict(row) for row in report["sources"]]
+    if total:
+        sources.append({
+            "code": code, "name": activity["name"], "color": activity["color"],
+            "earned": total, "spent": 0, "net": total,
+            "transactions": 0, "players": len(players), "estimate": True,
+        })
+    rows = {str(row["user_id"]): {**row, "by_source": dict(row["by_source"])}
+            for row in report["players"]}
+    for user_id, coins in players.items():
+        row = rows.setdefault(user_id, {
+            "user_id": user_id, "earned": 0, "spent": 0, "net": 0,
+            "transactions": 0, "by_source": {},
+        })
+        row["earned"] += coins
+        row["net"] += coins
+        row["by_source"][code] = coins
+
+    minted = int(report["totals"]["earned"]) + total
+    for row in sources:
+        row["share"] = (row["earned"] / minted) if minted else 0.0
+    for row in rows.values():
+        row["share"] = (row["earned"] / minted) if minted else 0.0
+    return {
+        **report,
+        "sources": sorted(sources, key=lambda row: (-row["earned"], -row["spent"], row["name"])),
+        "players": sorted(rows.values(), key=lambda row: (-row["earned"], row["user_id"])),
+        "totals": {
+            **report["totals"],
+            "earned": minted,
+            "net": int(report["totals"]["net"]) + total,
+            "ledger_earned": int(report["totals"]["earned"]),
+            "chat_activity": total,
+        },
+        "chat_activity": {
+            key: activity[key] for key in ("code", "name", "color", "total",
+                                           "words_per_point", "from", "to", "estimate")
+        },
+    }
+
+
+def _income_payload(entry: str, days: int | None, levels: tuple[int, int] | None,
+                    chosen: set[str] | None) -> dict:
+    """Both currencies over one filtered population, plus the roster the filters ran on.
+
+    The roster is always the FULL one, never the filtered subset: the page has to keep
+    offering everybody in its player picker after a filter has been applied, or a filter
+    could not be widened again without reloading.
+    """
+    roster, _tracked = _economy_audit_users(entry)
+    levels_by_user = pets.pet_levels(entry)
+    for row in roster:
+        row["level"] = levels_by_user.get(row["user_id"])
+
+    selected = None
+    if levels is not None or chosen is not None:
+        low, high = levels or (0, 0)
+        selected = {
+            row["user_id"] for row in roster
+            if (chosen is None or row["user_id"] in chosen)
+            # A player with no creature has no level, so any level filter excludes them.
+            # That is the honest reading of "levels 5-10", not a silent pass-through.
+            and (levels is None or (row["level"] is not None and low <= row["level"] <= high))
+        }
+
+    coins = economy.income_report(entry, days=days, user_ids=selected)
+    activity = economy.chat_activity_coins(entry, days=days, user_ids=selected)
+    known_levels = sorted(value for value in levels_by_user.values())
+    return {
+        "roster": roster,
+        "windows": list(INCOME_WINDOW_DAYS),
+        "level_range": {
+            "min": known_levels[0] if known_levels else 1,
+            "max": known_levels[-1] if known_levels else 1,
+        },
+        "filters": {
+            "days": days,
+            "min_level": levels[0] if levels else None,
+            "max_level": levels[1] if levels else None,
+            "user_ids": sorted(chosen) if chosen is not None else None,
+            "matched": len(selected) if selected is not None else len(roster),
+        },
+        "coins": _merge_chat_activity(coins, activity),
+        "rubies": pets.ruby_income_report(entry, days=days, user_ids=selected),
+        "rubies_all_time": pets.ruby_backfill_report(entry, user_ids=selected),
+    }
+
+
+async def handle_income_audit(request: web.Request) -> web.Response:
+    """Public read-only income breakdown for the standalone audit page.
+
+    Deliberately the same gate as the fight audit beside it -- none -- which is a wider
+    audience than the in-app money audit's admin check. It reports what each source pays
+    and what each player earned; it never reports balances, and nothing here can be
+    written to.
+    """
+    entry = request.app[_ENTRY_KEY]
+    raw_days = str(request.query.get("days") or "30").strip().lower()
+    if raw_days in ("all", "0", ""):
+        days = None
+    else:
+        try:
+            days = min(3650, max(1, int(raw_days)))
+        except (TypeError, ValueError):
+            days = 30
+
+    def _level(name: str) -> int | None:
+        try:
+            return max(1, int(request.query[name]))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    low, high = _level("min_level"), _level("max_level")
+    # One bound given means an open-ended range, not a broken filter.
+    levels = (low or 1, high or 10_000) if (low is not None or high is not None) else None
+    raw_users = str(request.query.get("user_ids") or "").strip()
+    chosen = {part for part in (bit.strip() for bit in raw_users.split(",")) if part} or None
+    request.app[_LOG_KEY](
+        f"[pets_web] income audit read days={raw_days} levels={levels} users={len(chosen or ())}"
+    )
+    return _ok(await asyncio.to_thread(_income_payload, entry, days, levels, chosen))
+
+
 async def _default_fetch_photo(file_id: str):
     return None
 
@@ -3290,6 +3430,7 @@ def attach(
         web.get("/audit", handle_audit_page),
         web.get("/audit/", handle_audit_page),
         web.get("/audit/api/fights", handle_fight_audit),
+        web.get("/audit/api/income", handle_income_audit),
         web.get(prefix, handle_page),
         web.get(prefix + "/", handle_page),
         web.get(prefix + "/api/state", handle_state),
@@ -3347,7 +3488,11 @@ AUDIT_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fight audit</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{color-scheme:dark;--bg:#101720;--card:#1b2633;--line:#334458;--muted:#91a2b5;--blue:#62aef0}
+/* Two data colours only, one per currency, and every bar in a chart wears its
+   currency's single hue -- length already encodes magnitude, so shading bars by value
+   would spend the colour channel restating it. Both were validated against this card
+   surface for contrast and for colour-vision separation from each other. */
+:root{color-scheme:dark;--bg:#101720;--card:#1b2633;--line:#334458;--muted:#91a2b5;--blue:#62aef0;--coin:#c98500;--gem:#3987e5;--track:#131e29}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f3f6f9;font:14px system-ui,sans-serif}
 main{max-width:1180px;margin:auto;padding:20px}.top{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 input,select,button{border:1px solid var(--line);background:#131e29;color:inherit;border-radius:10px;padding:11px 13px}
@@ -3361,11 +3506,58 @@ h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-w
 .audit-item{background:#121c27;border:1px solid var(--line);border-radius:10px;padding:10px;margin:7px 0}.audit-item img{width:54px;height:54px;object-fit:cover;border-radius:8px;float:left;margin:0 9px 6px 0}.audit-item h4{margin:0 0 5px}.audit-item p{margin:5px 0}.mechanics{color:#bed2e6;font:12px ui-monospace,monospace}.effect-line{border-left:3px solid var(--blue);padding-left:8px}
 .moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.move.effect{margin-left:24px;border-left:3px solid var(--blue)}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
-@media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}}
+.tabs{display:flex;gap:8px;margin:0 0 16px}.tabs button{background:var(--track)}.tabs button.on{background:#2677bd;border-color:#2677bd}
+.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
+.filters label{display:flex;flex-direction:column;gap:5px;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.filters input,.filters select{flex:none;min-width:0}.filters input[type=number]{width:96px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px;margin:0 0 20px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.kpi span{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.kpi b{display:block;font:700 25px/1.15 ui-monospace,monospace;font-variant-numeric:tabular-nums;margin-top:5px}
+.kpi em{font-style:normal;font-size:11px;color:var(--muted)}
+/* A ranked bar list, not a stack: identity is carried by the row label, so no legend
+   and no second hue are needed, and every row keeps a visible value (the numbers are
+   never gated behind reading a colour). */
+.bars{display:grid;gap:9px;margin:12px 0 2px}
+.bar{display:grid;grid-template-columns:minmax(116px,250px) minmax(60px,1fr) auto;gap:14px;align-items:center;cursor:default}
+.bar-name{font-size:13px;overflow-wrap:anywhere}
+.bar-track{height:14px;background:var(--track);border-radius:3px}
+.bar-fill{height:100%;border-radius:0 4px 4px 0;min-width:2px}
+.bar-value{font:600 13px ui-monospace,monospace;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.bar-value i{font-style:normal;font-weight:400;color:var(--muted);margin-left:9px}
+.inc{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+.inc th{text-align:left;font:600 10px/1.4 system-ui,sans-serif;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:0 10px 8px 0}
+.inc td{padding:7px 10px 7px 0;border-top:1px solid var(--line);font-variant-numeric:tabular-nums;vertical-align:top}
+.inc td.num,.inc th.num{text-align:right}
+.mini{display:inline-block;width:52px;height:6px;border-radius:2px;background:var(--track);margin-left:8px;vertical-align:middle}
+.mini i{display:block;height:100%;border-radius:0 2px 2px 0;min-width:1px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.chip{background:#26384a;border:0;border-radius:20px;padding:5px 10px;font-size:12px;color:inherit;cursor:pointer}
+.note{background:#19222e;border-left:3px solid var(--coin);border-radius:0 8px 8px 0;padding:10px 12px;font-size:12px;color:#cbd8e6;margin:14px 0}
+.tip{position:fixed;z-index:60;pointer-events:none;background:#0b131b;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;box-shadow:0 10px 26px rgba(0,0,0,.55);max-width:270px}
+.sec{margin:26px 0 0}.sec h2{margin:0 0 2px}.sec>p{margin:3px 0 0;color:var(--muted);font-size:12px}
+.sec h3{margin:22px 0 0;font:600 11px/1.4 system-ui,sans-serif;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
+@media(max-width:700px){.grid,.state{grid-template-columns:1fr}.row{display:block}.row>*{margin:3px 0}.bar{grid-template-columns:1fr auto;gap:4px 10px}.bar-track{grid-column:1/-1}}
 </style></head><body><main>
-<h1>Fight audit</h1><div class="top" style="margin-bottom:10px"><div class="pet-filter"><input id="petSearch" autocomplete="off" placeholder="Search pet, owner, @username or user ID"><div id="petSuggestions" class="pet-suggestions" hidden></div></div><button id="allPets">All pets</button></div>
+<h1>Chat audit</h1>
+<nav class="tabs"><button id="tabFights" class="on">Fights</button><button id="tabIncome">Income</button></nav>
+<section id="fightsView">
+<div class="top" style="margin-bottom:10px"><div class="pet-filter"><input id="petSearch" autocomplete="off" placeholder="Search pet, owner, @username or user ID"><div id="petSuggestions" class="pet-suggestions" hidden></div></div><button id="allPets">All pets</button></div>
 <div class="top"><input id="query" placeholder="Fight ID, e.g. F-20260815-…"><button id="load">Load fight</button><button id="recent">Recent</button></div>
 <p id="status" class="muted">Loading recent fights…</p><section id="out"></section>
+</section>
+<section id="incomeView" hidden>
+<div class="filters">
+<label>Period<select id="incDays"><option value="1">Today</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">365 days</option><option value="all">All time</option></select></label>
+<label>Level from<input id="incMinLevel" type="number" min="1" placeholder="any"></label>
+<label>Level to<input id="incMaxLevel" type="number" min="1" placeholder="any"></label>
+<div class="pet-filter"><label style="width:100%">Players<input id="incSearch" autocomplete="off" placeholder="Name, @username, creature or ID"></label><div id="incSuggestions" class="pet-suggestions" hidden></div></div>
+<button id="incReset">Everybody</button>
+</div>
+<div id="incChips" class="chips"></div>
+<p id="incStatus" class="muted">Loading income…</p>
+<div id="incOut"></div>
+</section>
 </main><script>
 const tg=window.Telegram&&Telegram.WebApp; if(tg){tg.ready();tg.expand()}
 const initData=(tg&&tg.initData)||""; const out=document.getElementById("out"), status=document.getElementById("status");
@@ -3388,6 +3580,164 @@ function showPetSuggestions(){const rows=matchingPets();petSuggestions.innerHTML
 async function recent(chosen=selectedPet){try{const d=await api("",chosen);auditPets=d.pets||auditPets;selectedPet=d.selected_pet||chosen;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));status.textContent=`${d.fights.length} recent fights${picked?" for "+picked.name:""}`;out.innerHTML=`<div class="list">${d.fights.map(f=>`<div class="row" data-id="${esc(f.fight_id)}"><span><span class="id">${esc(f.fight_id)}</span><br>${esc((f.fighters||[]).map(x=>x.name||x.key).join(" vs "))}</span><span>${esc(f.kind)} · ${esc(f.moves)} actions${f.events!==undefined?" · "+esc(f.events)+" events":""}<br><span class="muted">${esc(f.at)}</span></span></div>`).join("")}</div>`;out.querySelectorAll("[data-id]").forEach(x=>x.onclick=()=>{query.value=x.dataset.id;load(x.dataset.id)})}catch(e){auditFailure(e)}}
 petSuggestions.onclick=e=>{const button=e.target.closest("[data-pet]");if(!button)return;selectedPet=button.dataset.pet;const picked=auditPets.find(p=>String(p.user_id)===String(selectedPet));petSearch.value=picked?petLabel(picked):selectedPet;petSuggestions.hidden=true;recent(selectedPet)};
 const query=document.getElementById("query");document.getElementById("load").onclick=()=>load(query.value.trim());document.getElementById("recent").onclick=()=>recent();document.getElementById("allPets").onclick=()=>{selectedPet="";petSearch.value="";petSuggestions.hidden=true;recent("")};query.onkeydown=e=>{if(e.key==="Enter")load(query.value.trim())};petSearch.oninput=()=>{selectedPet="";showPetSuggestions()};petSearch.onfocus=showPetSuggestions;petSearch.onkeydown=e=>{if(e.key==="Enter"){const first=matchingPets()[0];if(first){selectedPet=String(first.user_id);petSearch.value=petLabel(first);petSuggestions.hidden=true;recent(selectedPet)}}};document.addEventListener("click",e=>{if(!e.target.closest(".pet-filter"))petSuggestions.hidden=true});recent("");
+
+/* ---- income audit -------------------------------------------------------------
+   Where every coin and every diamond comes from, as a share of everything minted in
+   the window, over whichever slice of the roster the filters select. Coins and
+   diamonds are drawn as two separate single-hue ranked lists rather than one chart
+   with two scales -- their magnitudes differ by two orders and a shared axis would
+   invent a comparison the data does not support. */
+const incOut=document.getElementById("incOut"),incStatus=document.getElementById("incStatus"),
+      incDays=document.getElementById("incDays"),incMin=document.getElementById("incMinLevel"),
+      incMax=document.getElementById("incMaxLevel"),incSearch=document.getElementById("incSearch"),
+      incSuggestions=document.getElementById("incSuggestions"),incChips=document.getElementById("incChips");
+let incRoster=[],incChosen=new Set(),incLoaded=false,incBusy=false;
+const num=v=>Number(v||0).toLocaleString("ru-RU");
+const pct=v=>(Number(v||0)*100).toFixed(1)+"%";
+const who=id=>{const r=incRoster.find(x=>String(x.user_id)===String(id));return r?(r.name||("ID "+id)):("ID "+id)};
+const incLabel=r=>`${r.name}${r.username?" / @"+r.username:""}${r.pet_name?" / "+r.pet_name:""} / ${r.user_id}${r.level?" / lvl "+r.level:""}`;
+
+/* One hover layer for every bar and mini-bar on the page: the rows carry their text in
+   data-tip, so nothing has to be re-derived on mouseover. */
+const incTip=document.createElement("div");incTip.className="tip";incTip.hidden=true;document.body.appendChild(incTip);
+document.addEventListener("mousemove",e=>{const host=e.target.closest("[data-tip]");
+  if(!host){incTip.hidden=true;return}
+  incTip.innerHTML=host.dataset.tip;incTip.hidden=false;
+  const box=incTip.getBoundingClientRect();
+  incTip.style.left=Math.max(8,Math.min(e.clientX+14,innerWidth-box.width-8))+"px";
+  incTip.style.top=Math.max(8,Math.min(e.clientY+16,innerHeight-box.height-8))+"px"});
+
+function barList(rows,field,hue,unit){
+  if(!rows.length)return `<p class="muted">Nothing in this window.</p>`;
+  const top=Math.max(...rows.map(r=>r[field]))||1;
+  return `<div class="bars">${rows.map(r=>{
+    const tip=[`<b>${esc(r.name)}</b>`,`Earned: ${num(r.earned)} ${unit}`,
+      r.spent?`Spent: ${num(r.spent)} ${unit}`:"",
+      `Net: ${num(r.net)} ${unit}`,
+      r.players!==undefined?`Players: ${num(r.players)}`:"",
+      r.transactions?`Transactions: ${num(r.transactions)}`:"",
+      r.estimate?"Estimated from XP, not from ledger rows":""].filter(Boolean).join("<br>");
+    return `<div class="bar" data-tip="${esc(tip)}"><div class="bar-name">${esc(r.name)}${
+      r.estimate?' <span class="muted">· est.</span>':""}</div><div class="bar-track"><div class="bar-fill" style="width:${
+      (100*r[field]/top).toFixed(2)}%;background:${hue}"></div></div><div class="bar-value">${
+      field==="earned"?pct(r.share):num(r.spent)}<i>${field==="earned"?num(r.earned):"spent"}</i></div></div>`}).join("")}</div>`}
+
+function currencySection(title, report, hue, unit, extra){
+  const earners=report.sources.filter(r=>r.earned>0),
+        sinks=report.sources.filter(r=>r.spent>0).sort((a,b)=>b.spent-a.spent);
+  return `<section class="sec"><h2>${esc(title)}</h2>
+    <p>Share of every ${esc(unit.replace(/s$/,""))} minted in the window. ${
+      num(report.totals.earned)} minted · ${num(report.totals.spent)} spent · net ${
+      num(report.totals.net)}.</p>
+    ${barList(earners,"earned",hue,unit)}
+    ${extra||""}
+    <h3>Where it goes</h3>
+    ${sinks.length?barList(sinks,"spent",hue,unit):'<p class="muted">Nothing is spent in this window — this currency only accumulates.</p>'}
+  </section>`}
+
+function playerTable(coins,rubies){
+  const rows=new Map();
+  for(const r of coins.players)rows.set(r.user_id,{id:r.user_id,coins:r,rubies:null});
+  for(const r of rubies.players){const row=rows.get(r.user_id)||{id:r.user_id,coins:null,rubies:null};row.rubies=r;rows.set(r.user_id,row)}
+  const list=[...rows.values()].sort((a,b)=>(b.coins?.earned||0)-(a.coins?.earned||0));
+  if(!list.length)return "";
+  const best=r=>{const e=Object.entries(r?.by_source||{}).sort((a,b)=>b[1]-a[1])[0];return e?e[0]:""};
+  const names={};for(const s of coins.sources.concat(rubies.sources))names[s.code]=s.name;
+  const mini=(share,hue)=>`<span class="mini"><i style="width:${(100*(share||0)).toFixed(1)}%;background:${hue}"></i></span>`;
+  return `<section class="sec"><h2>Per player</h2><p>Each person's share of everything the selected group earned.</p>
+  <table class="inc"><thead><tr><th>Player</th><th class="num">Lvl</th><th class="num">Coins</th><th class="num">Share</th>
+  <th class="num">Diamonds</th><th class="num">Share</th><th>Main coin source</th></tr></thead><tbody>${
+  list.map(row=>{const r=incRoster.find(x=>String(x.user_id)===String(row.id));
+    return `<tr><td>${esc(who(row.id))}${r&&r.username?` <span class="muted">@${esc(r.username)}</span>`:""}</td>
+    <td class="num">${r&&r.level?esc(r.level):"—"}</td>
+    <td class="num">${num(row.coins?.earned)}</td>
+    <td class="num">${row.coins?pct(row.coins.share):"—"}${mini(row.coins?.share,"var(--coin)")}</td>
+    <td class="num">${num(row.rubies?.earned)}</td>
+    <td class="num">${row.rubies?pct(row.rubies.share):"—"}${mini(row.rubies?.share,"var(--gem)")}</td>
+    <td>${esc(names[best(row.coins)]||"—")}</td></tr>`}).join("")}</tbody></table></section>`}
+
+function historySection(history){
+  if(!history.sources.length&&!history.minted_all_time)return "";
+  return `<section class="sec"><h2>Diamonds, all time</h2>
+  <p>Rebuilt from the grant keys, which carry a source but no timestamp — so this one
+  block ignores the period filter entirely.</p>
+  ${barList(history.sources.map(r=>({...r,net:r.earned,spent:0,transactions:r.grants})),"earned","var(--gem)","diamonds")}
+  <div class="note">Charted above: <b>${num(history.total)}</b> diamonds, for the players
+  the filters select. Chat-wide, these keys account for <b>${num(history.explained)}</b> of
+  the <b>${num(history.minted_all_time)}</b> diamonds ever minted — ${pct(history.coverage)}
+  of the total. The remainder, mob drops above all, was paid out before anything recorded
+  where it came from and cannot be recovered. The dated chart higher up is the one to
+  trust; it starts the day the diamond ledger was added.</div></section>`}
+
+function renderIncome(d){
+  const coins=d.coins,rubies=d.rubies,chat=coins.chat_activity;
+  const period=d.filters.days?`last ${d.filters.days} day${d.filters.days>1?"s":""}`:"all time";
+  incStatus.textContent=`${d.filters.matched} of ${d.roster.length} players · ${period}`;
+  incOut.innerHTML=`<div class="kpis">
+    <div class="kpi"><span>Coins minted</span><b>${num(coins.totals.earned)}</b><em>${
+      num(coins.totals.ledger_earned)} logged + ${num(coins.totals.chat_activity)} from chat XP</em></div>
+    <div class="kpi"><span>Coins spent</span><b>${num(coins.totals.spent)}</b><em>net ${num(coins.totals.net)}</em></div>
+    <div class="kpi"><span>Diamonds minted</span><b>${num(rubies.totals.earned)}</b><em>${
+      num(rubies.totals.transactions)} ledger rows</em></div>
+    <div class="kpi"><span>Diamonds spent</span><b>${num(rubies.totals.spent)}</b><em>net ${num(rubies.totals.net)}</em></div>
+    <div class="kpi"><span>Players</span><b>${num(d.filters.matched)}</b><em>of ${num(d.roster.length)} on the roster</em></div>
+  </div>
+  ${currencySection("Coins",coins,"var(--coin)","coins",
+    chat?`<div class="note">“${esc(chat.name)}” has no ledger rows behind it: those coins are
+      derived from recorded chat XP at ${esc(chat.words_per_point)} words per point, so it is an
+      estimate — and today's day file is not closed yet. It is charted anyway because leaving
+      the chat's largest faucet out would overstate every other source's share.</div>`:"")}
+  ${currencySection("Diamonds",rubies,"var(--gem)","diamonds",
+    rubies.ledger_start?"":`<div class="note">The diamond ledger has no rows yet. It only
+      records movements made after it was added, so this fills in as people play — the
+      all-time reconstruction below is what covers the period before it.</div>`)}
+  ${playerTable(coins,rubies)}
+  ${historySection(d.rubies_all_time)}`}
+
+async function loadIncome(){
+  if(incBusy)return; incBusy=true; incStatus.textContent="Loading…";
+  const q=new URLSearchParams({days:incDays.value});
+  if(incMin.value)q.set("min_level",incMin.value);
+  if(incMax.value)q.set("max_level",incMax.value);
+  if(incChosen.size)q.set("user_ids",[...incChosen].join(","));
+  try{
+    const r=await fetch("/audit/api/income?"+q.toString()),d=await r.json();
+    if(!r.ok)throw Error(d.message||d.error||r.status);
+    incRoster=d.roster||incRoster; incLoaded=true; renderIncome(d); renderIncChips();
+  }catch(e){incStatus.textContent=e.message||"Could not load income";incOut.innerHTML=""}
+  finally{incBusy=false}}
+
+function renderIncChips(){
+  incChips.innerHTML=incChosen.size
+    ?[...incChosen].map(id=>`<button class="chip" data-drop="${esc(id)}">${esc(who(id))} ✕</button>`).join("")
+    :"";}
+incChips.onclick=e=>{const b=e.target.closest("[data-drop]");if(!b)return;incChosen.delete(b.dataset.drop);renderIncChips();loadIncome()};
+
+function matchingIncPlayers(){const w=incSearch.value.trim().toLowerCase();
+  return incRoster.filter(r=>!incChosen.has(String(r.user_id))&&(!w||incLabel(r).toLowerCase().includes(w))).slice(0,30)}
+function showIncSuggestions(){const rows=matchingIncPlayers();
+  incSuggestions.innerHTML=rows.length?rows.map(r=>`<button type="button" data-pick="${esc(r.user_id)}"><b>${esc(r.name)}</b>${
+    r.username?" · @"+esc(r.username):""}<br><span class="muted">ID ${esc(r.user_id)}${
+    r.level?" · level "+esc(r.level):" · no creature"}</span></button>`).join(""):'<div class="muted" style="padding:10px">Nobody matches</div>';
+  incSuggestions.hidden=false}
+incSuggestions.onclick=e=>{const b=e.target.closest("[data-pick]");if(!b)return;
+  incChosen.add(b.dataset.pick);incSearch.value="";incSuggestions.hidden=true;renderIncChips();loadIncome()};
+incSearch.oninput=showIncSuggestions; incSearch.onfocus=showIncSuggestions;
+document.addEventListener("click",e=>{if(!e.target.closest(".pet-filter"))incSuggestions.hidden=true});
+incDays.onchange=loadIncome;
+let incLevelTimer=0;
+for(const box of [incMin,incMax])box.oninput=()=>{clearTimeout(incLevelTimer);incLevelTimer=setTimeout(loadIncome,350)};
+document.getElementById("incReset").onclick=()=>{incChosen.clear();incMin.value="";incMax.value="";incSearch.value="";renderIncChips();loadIncome()};
+
+const fightsView=document.getElementById("fightsView"),incomeView=document.getElementById("incomeView"),
+      tabFights=document.getElementById("tabFights"),tabIncome=document.getElementById("tabIncome");
+function showView(income){
+  fightsView.hidden=income; incomeView.hidden=!income;
+  tabFights.classList.toggle("on",!income); tabIncome.classList.toggle("on",income);
+  // Fetched on first open rather than at page load: the income report walks two whole
+  // ledgers and the roster, and most visits here are about a fight.
+  if(income&&!incLoaded)loadIncome()}
+tabFights.onclick=()=>showView(false); tabIncome.onclick=()=>showView(true);
 </script></body></html>"""
 
 

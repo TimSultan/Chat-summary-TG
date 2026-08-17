@@ -191,6 +191,9 @@ def _empty() -> dict:
     return {
         "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "fight_audits": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "dungeon_tickets": {}, "rubies": {},
+        # Timestamped ruby movements. The wallet above stays the balance of record; this
+        # is the rolling audit trail behind it (see _append_ruby_log).
+        "ruby_log": [],
         "scroll_wallets": {}, "scroll_notifications": [],
         # Earned before a creature exists just like scrolls/tickets.  Each row contains
         # the submitted Telegram image file id, never image bytes.
@@ -316,6 +319,11 @@ def _load(entry: str) -> dict:
         data["dungeon_tickets"] = {}
     if not isinstance(data.setdefault("rubies", {}), dict):
         data["rubies"] = {}
+    # A store written before the ruby ledger existed simply has no rows. Nothing is
+    # back-filled here: see ruby_backfill_report for what CAN be said about that period.
+    ruby_rows = data.setdefault("ruby_log", [])
+    data["ruby_log"] = [row for row in ruby_rows if isinstance(row, dict)] \
+        if isinstance(ruby_rows, list) else []
     if not isinstance(data.setdefault("scroll_wallets", {}), dict):
         data["scroll_wallets"] = {}
     if not isinstance(data.setdefault("personal_paint_runes", {}), dict):
@@ -733,6 +741,8 @@ def _save(entry: str, data: dict) -> None:
     data["version"] = PETS_STORE_VERSION
     if len(data.get("fights", [])) > FIGHT_LOG_LIMIT:
         data["fights"] = data["fights"][-FIGHT_LOG_LIMIT:]
+    if len(data.get("ruby_log", [])) > RUBY_LOG_LIMIT:
+        data["ruby_log"] = data["ruby_log"][-RUBY_LOG_LIMIT:]
     path = _pets_path(entry)
     # Drop the read cache outright rather than trusting the new file stamp to differ from
     # the old one. _load's mtime+size check is what catches a write from ANOTHER process
@@ -1049,6 +1059,8 @@ def claim_pet_level(entry, user_id) -> tuple[bool, str]:
         record["xp"] = max(0, int(record.get("xp", 0) or 0)) - C.pet_xp_for_next_level(level)
         record["level"] = level + 1
         wallet[str(user_id)] = rubies - C.PET_LEVEL_UP_RUBY_COST
+        _append_ruby_log(data, user_id, -C.PET_LEVEL_UP_RUBY_COST, "spend:levelup",
+                         ref=str(level + 1))
         _save(entry, data)
     bonus = C.PET_LEVEL_STAT_BONUS
     return True, (
@@ -1869,6 +1881,79 @@ def _ruby_row(data: dict) -> dict:
     return wallet
 
 
+# --- the ruby ledger ----------------------------------------------------------------
+#
+# The wallet above is the balance of record; this is the rolling audit trail behind it,
+# the exact shape economy.py's coin log already has (ts / user_id / delta / reason / ref)
+# so the income report can read both currencies through one set of buckets.
+#
+# It was added late. Every ruby minted BEFORE it exists is invisible here and always will
+# be -- no back-fill is attempted, because `ruby_sources` (the idempotency map this grew
+# out of) carries no timestamps and does not cover the plain grant_rubies path at all.
+# What can honestly be said about that period is in ruby_backfill_report, kept separate
+# from these rows rather than blended into them.
+
+RUBY_LOG_LIMIT = 50_000
+
+RUBY_SOURCES = {
+    "mobs": ("Бои с мобами", "#e05252"),
+    "dungeon": ("Подземелье", "#9b6fe8"),
+    "quarry": ("Карьер", "#c08a3e"),
+    "farm": ("Ферма", "#4ca66a"),
+    "pvp": ("Бои с игроками", "#4f8fe8"),
+    "quests": ("Квесты", "#55b9ad"),
+    "grants": ("Выдачи и миграции", "#b884c9"),
+    "levelup": ("Уровни питомца", "#78838f"),
+    "dungeon_entry": ("Вход в подземелье", "#78a843"),
+    "enchant": ("Зачарование рун", "#7fa9c9"),
+    "respec": ("Сброс статов", "#a2867c"),
+    "other": ("Другое", "#8f98a3"),
+}
+
+
+def ruby_source_of(reason: str) -> str:
+    """Stable bucket for one raw ruby-ledger reason.
+
+    Matches on the SAME source keys grant_rubies_once has always been called with
+    ("quarry:", "farm-ruby:", ...), so the reconstruction in ruby_backfill_report and the
+    live ledger sort identically and can be read against each other.
+    """
+    value = str(reason or "").lower()
+    if value.startswith("quarry:"):
+        return "quarry"
+    if value.startswith("farm-ruby:"):
+        return "farm"
+    if value.startswith("dungeon-ruby:"):
+        return "dungeon"
+    if value.startswith("arena-ruby:"):
+        return "pvp"
+    if value.startswith("quest:"):
+        return "quests"
+    if value == "pet_mob_win" or value.startswith("pve-ruby"):
+        return "mobs"
+    if value.startswith("admin-grant:") or value.startswith("grant:"):
+        return "grants"
+    if value.startswith("spend:"):
+        sink = value.split(":", 1)[1]
+        return sink if sink in RUBY_SOURCES else "other"
+    return "other"
+
+
+def _append_ruby_log(data: dict, user_id, delta: int, reason: str, ref: str = "") -> None:
+    """Record one ruby movement. Callers must already hold `data` and go on to _save it,
+    so the row and the wallet change it describes land in the same atomic write."""
+    rows = data.setdefault("ruby_log", [])
+    if not isinstance(rows, list):
+        rows = data["ruby_log"] = []
+    rows.append({
+        "ts": app_now().isoformat(),
+        "user_id": str(user_id),
+        "delta": int(delta),
+        "reason": str(reason or ""),
+        "ref": str(ref or ""),
+    })
+
+
 def ruby_balance(entry, user_id) -> int:
     """How many Руби this member holds.
 
@@ -1881,8 +1966,13 @@ def ruby_balance(entry, user_id) -> int:
     return max(0, int(_ruby_row(_load(entry)).get(str(user_id), 0) or 0))
 
 
-def grant_rubies(entry, user_id, amount: int) -> int:
-    """Add rubies and return the new balance. Nothing spends them yet, by design."""
+def grant_rubies(entry, user_id, amount: int, reason: str = "grant") -> int:
+    """Add rubies and return the new balance.
+
+    `reason` is what the income report buckets the row by (see ruby_source_of). It has a
+    default only so the pre-ledger call signature keeps working; every caller should name
+    the faucet, because an unnamed one lands in "Другое" and tells nobody anything.
+    """
     amount = max(0, int(amount or 0))
     if not amount:
         return ruby_balance(entry, user_id)
@@ -1892,6 +1982,7 @@ def grant_rubies(entry, user_id, amount: int) -> int:
         total = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
         wallet[str(user_id)] = total
         _metric_add(data, "rubies_minted", amount)
+        _append_ruby_log(data, user_id, amount, reason)
         _save(entry, data)
     return total
 
@@ -1908,12 +1999,188 @@ def grant_rubies_once(entry, user_id, amount: int, source: str) -> int:
         sources = data.setdefault("ruby_sources", {})
         if source in sources:
             return max(0, int(wallet.get(str(user_id), 0) or 0))
-        total = max(0, int(wallet.get(str(user_id), 0) or 0)) + max(0, int(amount or 0))
+        credited = max(0, int(amount or 0))
+        total = max(0, int(wallet.get(str(user_id), 0) or 0)) + credited
         wallet[str(user_id)] = total
-        sources[source] = {"user_id": str(user_id), "amount": max(0, int(amount or 0))}
-        _metric_add(data, "rubies_minted", max(0, int(amount or 0)))
+        sources[source] = {"user_id": str(user_id), "amount": credited}
+        _metric_add(data, "rubies_minted", credited)
+        # Inside the dedupe guard on purpose: a replayed settlement must not add a second
+        # row for rubies it did not actually mint.
+        if credited:
+            _append_ruby_log(data, user_id, credited, source)
         _save(entry, data)
     return total
+
+
+def _ruby_timestamp(value, tz) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=tz) if parsed.tzinfo is None else parsed.astimezone(tz)
+
+
+def ruby_income_report(
+    entry: str, *, days: int | None = 30, user_ids=None, now: datetime | None = None,
+) -> dict:
+    """Where rubies came from and went, by source and by player, over a window.
+
+    The diamond half of the income audit. `days=None` reads the whole retained ledger;
+    `user_ids=None` reads everybody, and passing a set restricts BOTH the rows and the
+    percentages to that set -- the shares are of the filtered population, which is the
+    only reading that makes sense once a filter is applied ("of the people I selected,
+    where does their income come from").
+    """
+    moment = now or app_now()
+    tz = moment.tzinfo or app_now().tzinfo
+    moment = moment.replace(tzinfo=tz) if moment.tzinfo is None else moment.astimezone(tz)
+    window = int(days) if days else None
+    start_day = moment.date() - timedelta(days=window - 1) if window else None
+    wanted = {str(uid) for uid in user_ids} if user_ids is not None else None
+
+    rows = [row for row in _load(entry).get("ruby_log", []) if isinstance(row, dict)]
+    sources: dict[str, dict] = {}
+    players: dict[str, dict] = {}
+    source_players: dict[str, set[str]] = {}
+    totals = {"earned": 0, "spent": 0, "net": 0, "transactions": 0}
+
+    for raw in rows:
+        who = str(raw.get("user_id"))
+        if wanted is not None and who not in wanted:
+            continue
+        stamp = _ruby_timestamp(raw.get("ts"), tz)
+        if stamp is None or (start_day is not None and stamp.date() < start_day):
+            continue
+        delta = int(raw.get("delta", 0) or 0)
+        code = ruby_source_of(raw.get("reason", ""))
+        name, colour = RUBY_SOURCES.get(code, RUBY_SOURCES["other"])
+        earned, spent = (delta, 0) if delta >= 0 else (0, -delta)
+
+        source = sources.setdefault(code, {
+            "code": code, "name": name, "color": colour,
+            "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+        })
+        source["earned"] += earned
+        source["spent"] += spent
+        source["net"] += delta
+        source["transactions"] += 1
+        source_players.setdefault(code, set()).add(who)
+
+        player = players.setdefault(who, {
+            "user_id": who, "earned": 0, "spent": 0, "net": 0, "transactions": 0,
+            "by_source": {},
+        })
+        player["earned"] += earned
+        player["spent"] += spent
+        player["net"] += delta
+        player["transactions"] += 1
+        if earned:
+            player["by_source"][code] = player["by_source"].get(code, 0) + earned
+
+        totals["earned"] += earned
+        totals["spent"] += spent
+        totals["net"] += delta
+        totals["transactions"] += 1
+
+    minted = totals["earned"]
+    source_rows = sorted(
+        (
+            {
+                **source,
+                "players": len(source_players.get(source["code"], ())),
+                # Share of everything MINTED in the window: a pure sink reports 0 here and
+                # is read off the spent column instead.
+                "share": (source["earned"] / minted) if minted else 0.0,
+            }
+            for source in sources.values()
+        ),
+        key=lambda row: (-row["earned"], -row["spent"], row["name"]),
+    )
+    player_rows = sorted(
+        (
+            {**player, "share": (player["earned"] / minted) if minted else 0.0}
+            for player in players.values()
+        ),
+        key=lambda row: (-row["earned"], row["user_id"]),
+    )
+    stamps = [
+        stamp for stamp in (_ruby_timestamp(row.get("ts"), tz) for row in rows)
+        if stamp is not None
+    ]
+    return {
+        "currency": "rubies",
+        "days": window,
+        "from": start_day.isoformat() if start_day else None,
+        "to": moment.date().isoformat(),
+        "sources": source_rows,
+        "players": player_rows,
+        "totals": totals,
+        "ledger_start": min(stamps).isoformat() if stamps else None,
+        "log_at_capacity": len(rows) >= RUBY_LOG_LIMIT,
+    }
+
+
+def ruby_backfill_report(entry: str, user_ids=None) -> dict:
+    """All-time ruby minting reconstructed from the idempotency map, WITHOUT timestamps.
+
+    `ruby_sources` has recorded {source key -> user, amount} since long before the ledger
+    existed, and those keys already carry the faucet name -- so lifetime totals per source
+    can be recovered even for the period the ledger cannot see. What cannot be recovered
+    is WHEN, which is why this is a separate report rather than rows merged into
+    ruby_income_report: blending an undated total into a time-filtered chart would put
+    invented dates on real money.
+
+    It is also incomplete, and says so: grant_rubies (the PVE mob drop, the single largest
+    faucet) never wrote to `ruby_sources` at all. `coverage` is the share of lifetime
+    minting these rows actually explain -- read it before reading anything else here.
+    """
+    data = _load(entry)
+    wanted = {str(uid) for uid in user_ids} if user_ids is not None else None
+    raw_sources = data.get("ruby_sources", {})
+    raw_sources = raw_sources if isinstance(raw_sources, dict) else {}
+
+    sources: dict[str, dict] = {}
+    players: dict[str, dict] = {}
+    covered = 0
+    for key, row in raw_sources.items():
+        if not isinstance(row, dict):
+            continue
+        who = str(row.get("user_id"))
+        amount = max(0, int(row.get("amount", 0) or 0))
+        # Every row counts toward coverage, including filtered-out players: coverage is a
+        # statement about the DATA, not about the current selection.
+        covered += amount
+        if not amount or (wanted is not None and who not in wanted):
+            continue
+        code = ruby_source_of(key)
+        name, colour = RUBY_SOURCES.get(code, RUBY_SOURCES["other"])
+        source = sources.setdefault(code, {
+            "code": code, "name": name, "color": colour, "earned": 0, "grants": 0,
+        })
+        source["earned"] += amount
+        source["grants"] += 1
+        player = players.setdefault(who, {"user_id": who, "earned": 0, "by_source": {}})
+        player["earned"] += amount
+        player["by_source"][code] = player["by_source"].get(code, 0) + amount
+
+    total = sum(source["earned"] for source in sources.values())
+    minted = max(0, int(_economy_metrics(data).get("rubies_minted", 0) or 0))
+    return {
+        "sources": sorted(
+            ({**source, "share": (source["earned"] / total) if total else 0.0}
+             for source in sources.values()),
+            key=lambda row: (-row["earned"], row["name"]),
+        ),
+        "players": sorted(
+            ({**player, "share": (player["earned"] / total) if total else 0.0}
+             for player in players.values()),
+            key=lambda row: (-row["earned"], row["user_id"]),
+        ),
+        "total": total,
+        "minted_all_time": minted,
+        "explained": covered,
+        "coverage": (covered / minted) if minted else 0.0,
+    }
 
 
 def rune_status(entry: str, user_id) -> dict:
@@ -2007,6 +2274,7 @@ def enchant_weapon(entry: str, user_id, code: str, element: str) -> tuple[bool, 
         runes[element] -= 1
         wallet[str(user_id)] = rubies - RUNE_ENCHANT_RUBY_COST
         record.setdefault("weapon_enchantments", {})[code] = element
+        _append_ruby_log(data, user_id, -RUNE_ENCHANT_RUBY_COST, "spend:enchant", ref=code)
         _save(entry, data)
     return True, f"«{item.name}» зачаровано руной {element}."
 
@@ -2951,6 +3219,8 @@ def respec_stats(entry, user_id) -> tuple[bool, str, int]:
         wallet[str(user_id)] = rubies - C.STAT_RESPEC_RUBY_COST
         record["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
         record["stat_points"] = available_stat_points(record) + refundable
+        _append_ruby_log(data, user_id, -C.STAT_RESPEC_RUBY_COST, "spend:respec",
+                         ref=str(refundable))
         _save(entry, data)
     return True, f"Статы сброшены. Свободных очков: {record['stat_points']}.", refundable
 
@@ -3736,6 +4006,8 @@ def enter_dungeon(entry: str, user_id, *, escalator: bool = False) -> tuple[bool
             tickets[str(user_id)] = ticket_count - 1
         if ruby_cost:
             wallet[str(user_id)] = rubies - ruby_cost
+            _append_ruby_log(data, user_id, -ruby_cost, "spend:dungeon_entry",
+                             ref=f"floor {floor}")
         hero = _dungeon_fighter(record, str(user_id))
         max_hp = round(pets_combat.derive(hero, hero)["max_hp"])
         # `run_id` and `kills` exist so every victory in this run has an identity of its
@@ -4100,6 +4372,17 @@ def _power_rating_for(record: dict) -> int:
         stats.get(key, 0) * C.POWER_RATING_WEIGHTS[key]
         for key in (*C.STAT_KEYS, "armor")
     )
+
+
+def pet_levels(entry: str) -> dict[str, int]:
+    """Every tamed creature's level, keyed by owner. What the income audit's level filter
+    is applied to; somebody who never tamed anything simply has no entry, rather than a
+    level 1 they never reached."""
+    return {
+        str(user_id): max(1, int(record.get("level", 1) or 1))
+        for user_id, record in _load(entry).get("pets", {}).items()
+        if isinstance(record, dict) and record.get("name")
+    }
 
 
 def pet_leaderboard(entry: str) -> list[dict]:
@@ -6019,7 +6302,7 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
         dropped = grant_random_drop(entry, user_id, C.PVE_DROP_CHANCE * mob.loot)
         if random.random() < min(1.0, M.TIER_RUBY_CHANCE[tier] * mob.ruby):
             ruby = random.randint(C.PVE_RUBY_MIN, C.PVE_RUBY_MAX)
-            grant_rubies(entry, user_id, ruby)
+            grant_rubies(entry, user_id, ruby, "pet_mob_win")
         reward_multiplier = M.TIER_REWARD[tier] * mob.loot
         if random.random() < min(1.0, C.PVE_RUNE_CHANCE * reward_multiplier):
             rune = grant_runes(entry, user_id, RUNE_ELEMENTS[random.randrange(len(RUNE_ELEMENTS))], 1,
