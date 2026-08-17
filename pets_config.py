@@ -477,6 +477,19 @@ OPPONENT_POWER_WINDOW = 125
 # thing the whole arena is for.
 WIN_GOLD_MIN = 38
 WIN_GOLD_MAX = 75
+# The ARENA purse, doubled on 2026-08-17: a duel is the only mode with a live opponent,
+# real gear and real tactics, and it should pay accordingly.
+#
+# Deliberately its own pair rather than a doubling of WIN_GOLD_MIN/MAX above, because
+# that pair is ALSO the base for mob gold (PVE_GOLD_SHARE, tuned against it) and for the
+# birthday greeting. Doubling it in place would have quietly doubled two other faucets
+# nobody asked to change -- the exact kind of accident the income audit exists to catch.
+#
+# Everything derived from a duel's purse follows this number, not the base: the attacker's
+# loss penalty (LOSS_GOLD_SHARE) and the defender's consolation (DEFENDER_CONSOLATION_SHARE)
+# are shares of what the winner actually took, and that relationship is the design.
+ARENA_WIN_GOLD_MIN = 76
+ARENA_WIN_GOLD_MAX = 150
 # The loser pays 30% of what the winner just took. This replaces the original "проигравший
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.
@@ -668,7 +681,7 @@ PET_LEVEL_STAT_BONUS = 1    # +1 to every stat per pet level
 # almost no rubies, so this is what stops the richest faucet from being a substitute for
 # playing everything else (see the economy audit: one undifferentiated input is what lets
 # a rational player ignore four fifths of the game).
-PET_LEVEL_UP_RUBY_COST = 5
+PET_LEVEL_UP_RUBY_COST = 3
 
 
 def pet_xp_for_next_level(level: int) -> int:

@@ -2547,7 +2547,8 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         "Ограничений по уровню и боевой силе нет."
     )
     lines.append(
-        f"Базовая награда за победу: {C.WIN_GOLD_MIN}–{C.WIN_GOLD_MAX} монет и {C.WIN_XP} опыта;"
+        f"Базовая награда за победу: {C.ARENA_WIN_GOLD_MIN}–{C.ARENA_WIN_GOLD_MAX} монет"
+        f" и {C.WIN_XP} опыта;"
         f" за соперника ниже уровнем — меньше, выше — больше (до ±25%)."
         f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
     )

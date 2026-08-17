@@ -360,6 +360,29 @@ class MobFightBankAndRewardTests(PetsTestCase):
         # A mob has no duel history to keep -- nothing was ever appended to data["fights"].
         self.assertEqual(pets._load(entry)["fights"], [])
 
+    def test_mob_gold_still_rolls_the_undoubled_base_after_the_duel_purse_doubled(self):
+        """The arena purse was doubled into its own constants. A mob reads the shared base
+        pair, and must keep reading it -- otherwise doubling duels doubled PVE by accident."""
+        entry = "chat"
+        self._tame(entry, "1")
+        now = datetime(2026, 8, 9, 9, 0)
+        rolled = []
+
+        def echo(low, high):
+            rolled.append((low, high))
+            return high
+
+        block = pets.mob_block(entry, "1", pets_mobs.MOBS[0].code, "medium",
+                               rng=random.Random(1))
+        with patch("random.randint", echo):
+            pets.record_mob_fight(
+                entry, "1", block, SimpleNamespace(winner="1", is_draw=False), now=now,
+            )
+        self.assertIn((pets_config.WIN_GOLD_MIN, pets_config.WIN_GOLD_MAX), rolled)
+        self.assertNotIn(
+            (pets_config.ARENA_WIN_GOLD_MIN, pets_config.ARENA_WIN_GOLD_MAX), rolled,
+        )
+
     def test_mob_gold_matches_half_the_arena_purse_times_tier_and_the_mobs_own_purse(self):
         """Every mob's gold multiplier is checked against the formula, not a table of
         expected numbers, so this still passes if the roster or its prices change."""

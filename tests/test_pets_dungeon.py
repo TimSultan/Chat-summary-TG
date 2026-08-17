@@ -385,6 +385,38 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
 
+    def test_the_update_gift_pays_ten_rubies_once_and_lands_in_the_ledger(self):
+        self.assertEqual(pets.grant_ruby_gift([self.entry]), 1)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 10)
+        # A handout that skipped the ledger would read as a balance grown from nowhere.
+        rows = [row for row in pets._load(self.entry)["ruby_log"]
+                if row["reason"] == pets.RUBY_GIFT_REASON]
+        self.assertEqual([(row["user_id"], row["delta"]) for row in rows],
+                         [(self.user_id, 10)])
+        self.assertEqual(pets.ruby_source_of(pets.RUBY_GIFT_REASON), "grants")
+        # Minted counter moves too, so the all-time coverage figure stays honest.
+        self.assertEqual(pets.economy_telemetry(self.entry)["rubies_minted"], 10)
+
+        # A restart must not pay twice.
+        self.assertEqual(pets.grant_ruby_gift([self.entry]), 0)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 10)
+
+    def test_a_level_costs_three_rubies_and_the_gift_buys_three_of_them(self):
+        self.assertEqual(pets_config.PET_LEVEL_UP_RUBY_COST, 3)
+        pets.grant_ruby_gift([self.entry])
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["xp"] = 10_000_000
+        pets._save(self.entry, data)
+
+        for expected_level in (2, 3, 4):
+            ok, message = pets.claim_pet_level(self.entry, self.user_id)
+            self.assertTrue(ok, message)
+            self.assertEqual(pets._load(self.entry)["pets"][self.user_id]["level"],
+                             expected_level)
+        # 10 rubies buys three levels at 3 apiece, and the fourth is refused.
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 1)
+        self.assertFalse(pets.claim_pet_level(self.entry, self.user_id)[0])
+
     def test_first_dungeon_fight_resolves_without_callback_error(self):
         data = pets._load(self.entry)
         data["pets"][self.user_id]["stats"] = {

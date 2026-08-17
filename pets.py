@@ -71,6 +71,10 @@ FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 # restart, forever.
 STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
 DUNGEON_TICKET_GIFT_FLAG = "dungeon_ticket_gift_20260814"
+# Dated, like the flag above: a future gift is a NEW flag, never a reset of this one.
+RUBY_GIFT_FLAG = "ruby_gift_20260817"
+# Reads as "grants" in the income audit (see ruby_source_of), which is what it is.
+RUBY_GIFT_REASON = "grant:update_gift_20260817"
 # Зеркало души. Named here rather than looked up by effect code because two call sites
 # need the ITEM (equip it, check it is owned) and only combat needs the effect.
 MIRROR_AMULET_CODE = "amulet_soul_mirror"
@@ -2369,6 +2373,39 @@ def grant_dungeon_ticket_gift(entries, amount: int = 3) -> int:
                 wallet[str(user_id)] = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
                 granted += 1
             data[DUNGEON_TICKET_GIFT_FLAG] = True
+            _save(entry, data)
+    return granted
+
+
+def grant_ruby_gift(entries, amount: int = 10) -> int:
+    """Give the update gift once to every existing creature owner.
+
+    Goes through the wallet, the minted counter AND the ruby ledger, exactly the way an
+    ordinary drop does. A handout that skipped the ledger would show up in the economy as
+    balances that grew from nowhere, which is the one thing the ledger exists to prevent.
+
+    The per-chat flag and the payout share a single _save, so a restart part-way through
+    the roster cannot pay anybody twice -- the same guarantee grant_dungeon_ticket_gift
+    above relies on.
+    """
+    granted = 0
+    amount = max(0, int(amount or 0))
+    if not amount:
+        return 0
+    for entry in entries:
+        with _farm_settlement_lock:
+            data = _load(entry)
+            if data.get(RUBY_GIFT_FLAG):
+                continue
+            wallet = _ruby_row(data)
+            for user_id, record in data.get("pets", {}).items():
+                if not isinstance(record, dict) or not record.get("name"):
+                    continue
+                wallet[str(user_id)] = max(0, int(wallet.get(str(user_id), 0) or 0)) + amount
+                _metric_add(data, "rubies_minted", amount)
+                _append_ruby_log(data, user_id, amount, RUBY_GIFT_REASON)
+                granted += 1
+            data[RUBY_GIFT_FLAG] = True
             _save(entry, data)
     return granted
 
@@ -5521,7 +5558,7 @@ def record_fight(
     if _equipped_effect(winner, "mirror_soul"):
         reward_multiplier = max(1.0, reward_multiplier)
     gold_base = round(
-        random.randint(C.WIN_GOLD_MIN, C.WIN_GOLD_MAX)
+        random.randint(C.ARENA_WIN_GOLD_MIN, C.ARENA_WIN_GOLD_MAX)
         * (1 + bonus_pct / 100)
         * reward_multiplier
     )

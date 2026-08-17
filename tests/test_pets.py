@@ -2248,6 +2248,32 @@ class RecordFightTests(PetsTestCase):
         self.assertIn(legendary.code, pets.get_pet(entry, "1")["inventory"])
         self.assertIn(legendary.code, pets.get_pet(entry, "2")["inventory"])
 
+    def test_doubling_the_duel_purse_left_mob_and_birthday_gold_untouched(self):
+        """WIN_GOLD_MIN/MAX is the base for THREE modes. The arena purse was doubled; the
+        other two read the same constants and must not have moved with it."""
+        self.assertEqual(
+            (pets_config.ARENA_WIN_GOLD_MIN, pets_config.ARENA_WIN_GOLD_MAX),
+            (pets_config.WIN_GOLD_MIN * 2, pets_config.WIN_GOLD_MAX * 2),
+        )
+        entry = "chat"
+        self._tame(entry, "1", "Attacker")
+        self._tame(entry, "2", "Defender")
+        rolled = []
+
+        # Echo the upper bound the caller asked for, so each mode reveals which pair of
+        # constants it actually reads instead of a value the patch handed to all of them.
+        def echo(low, high):
+            rolled.append((low, high))
+            return high
+
+        with patch("random.randint", echo), patch("random.random", return_value=1.0):
+            pets.record_fight(entry, "1", "2", SimpleNamespace(winner="1", loser="2"),
+                              date(2026, 8, 1))
+        self.assertIn((pets_config.ARENA_WIN_GOLD_MIN, pets_config.ARENA_WIN_GOLD_MAX), rolled)
+        self.assertEqual(pets.history(entry, "1")[0]["gold"], pets_config.ARENA_WIN_GOLD_MAX)
+        # And it never touched the base pair the other two modes read.
+        self.assertNotIn((pets_config.WIN_GOLD_MIN, pets_config.WIN_GOLD_MAX), rolled)
+
     def test_history_snapshots_names_and_owners_and_zeroes_gold_on_the_losers_row(self):
         entry = "chat"
         self._tame(entry, "1", "Attacker")
