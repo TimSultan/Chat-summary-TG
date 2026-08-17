@@ -6436,6 +6436,17 @@ async def handle_pets_callback(
             return
 
         # --- purchases ---------------------------------------------------------------
+        if action == "claimlevel":
+            ok, note = pets.claim_pet_level(entry, user_id)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.main_view(
+                    entry, user_id, xp, webapp_url=pets_webapp_url, quest_mod=is_quest_mod,
+                    quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
+                    finance_admin=is_finance_admin,
+                ), log,
+            )
+            return
         if action == "buycage":
             ok, note = pets.buy_cage(entry, user_id, xp)
             await _pets_toast_and_redraw(

@@ -202,12 +202,29 @@ def main_view(
         left = fights["available"]
         capacity = fights["capacity"]
         lines.append(f"🐾 {_name(pet)} — уровень {pet.get('level', 1)}")
+        # Announced before anything else about the creature: a level waiting to be bought
+        # is the one thing on this screen the player can act on right now.
+        ready = pets.level_up_status(entry, user_id)
+        if ready.get("pending"):
+            more = f" (ещё {ready['pending'] - 1})" if ready["pending"] > 1 else ""
+            lines.append(
+                f"⬆️ <b>Уровень {ready['level'] + 1} готов{more}</b> — "
+                f"+{ready['stat_bonus']} ко всем статам за {ready['cost']} 💎"
+            )
         lines.append(f"🏠 Клетка: уровень {cage}")
         lines.append(f"⚔️ Боёв в запасе: {left} из {capacity}")
         lines.append(f"🏆 Боёв: {pet.get('fights', 0)} / побед: {pet.get('wins', 0)}")
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows = []
+    # Above even «Открыть игру»: it is a reward the player has already earned and only has
+    # to collect, and burying that under navigation is how it goes unnoticed for a week.
+    if pet and pets.level_up_status(entry, user_id).get("pending"):
+        rows.append([{
+            "text": (f"⬆️ Поднять уровень · {C.PET_LEVEL_UP_RUBY_COST} 💎 "
+                     f"(+{C.PET_LEVEL_STAT_BONUS} ко всем статам)"),
+            "callback_data": callback_data(user_id, "claimlevel"),
+        }])
     if webapp_url:
         # First, and alone on its row: it is the whole game rather than one more screen.
         rows.append([{"text": "🎮 Открыть игру", "web_app": {"url": webapp_url}}])

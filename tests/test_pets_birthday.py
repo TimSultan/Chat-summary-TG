@@ -73,8 +73,12 @@ class BirthdayTests(PetsTestCase):
         self.assertEqual(
             economy.balance(self.ENTRY, "2", 0) - celebrant_before, receipt["celebrant_gold"],
         )
-        self.assertGreater(pets.get_pet(self.ENTRY, "1")["level"], greeter_level)
-        self.assertGreater(pets.get_pet(self.ENTRY, "2")["level"], celebrant_level)
+        # XP lands, but the LEVEL does not: levelling is bought with rubies now, so a
+        # greeting banks progress rather than granting it (see pets.claim_pet_level).
+        self.assertEqual(pets.get_pet(self.ENTRY, "1")["level"], greeter_level)
+        self.assertEqual(pets.get_pet(self.ENTRY, "2")["level"], celebrant_level)
+        self.assertGreaterEqual(pets.get_pet(self.ENTRY, "1")["xp"], C.WIN_XP)
+        self.assertGreaterEqual(pets.get_pet(self.ENTRY, "2")["xp"], C.WIN_XP)
         # The whole point of it being free: an empty bank must never block a greeting.
         self.assertEqual(pets.fights_left(self.ENTRY, "1"), fights_before)
 

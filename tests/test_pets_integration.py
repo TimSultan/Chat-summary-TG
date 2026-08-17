@@ -353,11 +353,17 @@ class PetsIntegrationTests(unittest.TestCase):
         reach the fight, not just the card."""
         self._found(ALICE, "Кабанчик", "Alice")
         before = pets.effective_stats(ENTRY, ALICE)
-        level, gained = pets.award_xp(ENTRY, ALICE, 50_000)
-        self.assertGreater(gained, 0)
+        # XP alone changes nothing now -- a level is bought, not granted.
+        pets.award_xp(ENTRY, ALICE, 50_000)
+        self.assertEqual(pets.effective_stats(ENTRY, ALICE), before)
+
+        bought = 3
+        pets.grant_rubies(ENTRY, ALICE, C.PET_LEVEL_UP_RUBY_COST * bought)
+        for _ in range(bought):
+            self.assertTrue(pets.claim_pet_level(ENTRY, ALICE)[0])
         after = pets.effective_stats(ENTRY, ALICE)
         for key in C.STAT_KEYS:
-            self.assertEqual(after[key] - before[key], gained * C.PET_LEVEL_STAT_BONUS)
+            self.assertEqual(after[key] - before[key], bought * C.PET_LEVEL_STAT_BONUS)
 
         fighter = _fighter(ALICE, "Кабанчик")
         derived = pets_combat.derive(fighter, fighter)

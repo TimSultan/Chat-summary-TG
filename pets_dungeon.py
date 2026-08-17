@@ -17,8 +17,11 @@ MIN_POWER: Final = 1_000
 ENTRY_RUBY_COST: Final = 10
 ESCALATOR_RUBY_COST: Final = 5
 ANTIMAGIC_REFLECT_SHARE: Final = 0.85
-SHOP_PARTIAL_HEAL_COST: Final = 160
-SHOP_FULL_HEAL_COST: Final = 300
+# Cut with the rewards, not independently of them: the dungeon's shop is paid for out of
+# the dungeon's own income, so shrinking one without the other would leave a runner
+# unable to afford the recovery their floor was supposed to fund (see reward_for).
+SHOP_PARTIAL_HEAL_COST: Final = 100
+SHOP_FULL_HEAL_COST: Final = 180
 SHOP_PARTIAL_HEAL_SHARE: Final = 0.30
 # Per RUN, not per floor. Unlimited healing turned a deep run into a question of how much
 # gold the player had rather than how far they could actually get, so each kind of rest is
@@ -203,10 +206,18 @@ def reward_for(floor: int, boss: bool, enemy_count: int = 1) -> dict:
     """
     floor = max(1, int(floor))
     enemy_count = max(1, int(enemy_count))
+    # Cut, and above all FLATTENED. The dungeon was 93% of every player's daily gold, and
+    # the floor ramp is what made that unbalanceable: it grew without limit while nothing
+    # it fed grew with it. The ramp is cut five times harder than the base, so floor 30 is
+    # now worth about 2.4x floor 1 rather than 30x. The dungeon stays the best gold in the
+    # game for somebody who can survive down there -- it just stops being the only gold.
+    #
+    # XP is untouched. XP now buys LEVELS, which cost rubies, so the dungeon handing out
+    # experience no longer hands out progression on its own.
     if boss:
-        gold, xp = 450 + floor * 70, 80 + floor * 18
+        gold, xp = 200 + floor * 15, 80 + floor * 18
     else:
-        gold, xp = (180 + floor * 30) // enemy_count, (35 + floor * 12) // enemy_count
+        gold, xp = (120 + floor * 6) // enemy_count, (35 + floor * 12) // enemy_count
     # Base, ramp and cap all cut in half here -- the live drop rate was far too high, so
     # every number in this curve pays out at half its previous odds, floor for floor.
     scroll_chance = 0.0 if floor < SCROLL_LOOT_START_FLOOR else min(

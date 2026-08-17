@@ -1012,6 +1012,7 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         "quarry_receipt": quarry_receipt,
         # So the page can say WHY a button did nothing, rather than letting the player
         # discover it one refusal at a time.
+        "level_up": pets.level_up_status(entry, user_id),
         "maintenance": maintenance.status(),
         "unread_updates": pets_updates.has_unread(entry, user_id),
         "quest_attention": quests.has_available_quests(entry, user_id),
@@ -1185,6 +1186,10 @@ def _action_buy_cage(entry, user_id, xp, payload):
     return pets.buy_cage(entry, user_id, xp)
 
 
+def _action_claim_level(entry, user_id, xp, payload):
+    return pets.claim_pet_level(entry, user_id)
+
+
 def _action_upgrade_cage(entry, user_id, xp, payload):
     return pets.upgrade_cage(entry, user_id, xp)
 
@@ -1308,6 +1313,7 @@ _ACTIONS = {
     "gift": _action_gift,
     "buy_cage": _action_buy_cage,
     "upgrade_cage": _action_upgrade_cage,
+    "claim_level": _action_claim_level,
     "rename": _action_rename,
     "farm_start": _action_farm_start,
     "farm_cancel": _action_farm_cancel,
@@ -3856,6 +3862,14 @@ PAGE_HTML = """<!doctype html>
      reroll climbs a difficulty, so it is a choice and not a free respin. */
   /* Pinned above everything while the game is closed for an update. Loud enough not to
      be missed, calm enough not to read as an error -- nothing is wrong, it is just busy. */
+  /* The level-up card. Gold-edged and slightly lifted -- it is the one panel that
+     appears only when there is something good waiting, so it should read as an event
+     rather than as another row of the interface. */
+  .levelup { border-color: var(--gold); background:
+             linear-gradient(180deg, rgba(232,185,35,.10), transparent 70%); }
+  .levelup-head { font-size: 17px; font-weight: 700; }
+  .levelup-more { font-size: 12px; font-weight: 500; color: var(--muted); }
+  .levelup-gain { font-size: 13px; color: var(--gold); margin: 3px 0 11px; }
   .maint-bar { position: sticky; top: 0; z-index: 40; margin: 0 0 10px;
                background: rgba(232,185,35,.14); border: 1px solid var(--gold);
                border-radius: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.45;
@@ -4738,6 +4752,26 @@ function renderHud() {
 }
 
 // ------------------------------------------------------------------------ hero screen
+// The reward moment. Top of the hero screen and impossible to miss when a level is
+// waiting -- the whole point of charging for it is that levelling stops being a number
+// that ticks over silently and becomes something the player does and sees.
+function levelUpPanel() {
+  const up = (S && S.level_up) || {};
+  if (!up.available || !up.pending) return "";
+  const short = up.rubies < up.cost;
+  return '<div class="panel levelup">' +
+    '<div class="levelup-head">⬆️ Уровень ' + (up.level + 1) + ' готов' +
+      (up.pending > 1 ? ' <span class="levelup-more">ещё ' + (up.pending - 1) + '</span>' : '') +
+    '</div>' +
+    '<div class="levelup-gain">+' + (up.stat_bonus || 1) + ' ко всем статам</div>' +
+    '<button class="go" data-do="claimlevel"' + (short ? " disabled" : "") + '>' +
+      (short ? 'Нужно ' + up.cost + ' 💎 · есть ' + up.rubies
+             : 'Поднять уровень · ' + up.cost + ' 💎') + '</button>' +
+    (short ? "<div class='tiny muted' style='margin-top:7px;text-align:center'>" +
+             "Алмазы падают с мобов и добываются в карьере.</div>" : "") +
+    '</div>';
+}
+
 function renderHero() {
   const box = $("scr-hero");
   if (!S.pet) { box.innerHTML = renderOnboarding(); return; }
@@ -4763,6 +4797,7 @@ function renderHero() {
   });
 
   box.innerHTML =
+    levelUpPanel() +
     '<div class="panel">' +
       '<div class="doll">' +
         "<div>" + slot(worn.weapon || emptySlot("weapon")) + "</div>" +
@@ -8300,6 +8335,7 @@ async function handleClick(event, target) {
   else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
   else if (d.do === "quarrycancel") { await act("quarry_cancel"); }
   else if (d.quarrystart) { await act("quarry_start", {hours:Number(d.quarrystart)}); }
+  else if (d.do === "claimlevel") { await act("claim_level"); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tame") { openPetCreation(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }

@@ -2795,7 +2795,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # Arena XP moves the creature's level with it.
         up = await self._grant(THIRD, user_id=PLAYER["id"], resource="arena_xp", amount=50_000)
         self.assertEqual(up.status, 200, await up.text())
-        self.assertGreater(pets.get_pet(CHAT, PLAYER["id"])["level"], 1)
+        # Granted XP BANKS levels rather than granting them -- an admin top-up gives a
+        # stack of levels the player can afford to buy, not fifty free ones.
+        self.assertEqual(pets.get_pet(CHAT, PLAYER["id"])["level"], 1)
+        self.assertGreater(pets.pending_level_ups(pets.get_pet(CHAT, PLAYER["id"])), 1)
 
         down = await self._grant(THIRD, user_id=PLAYER["id"], resource="arena_xp", amount=-50_000)
         self.assertEqual(down.status, 200, await down.text())

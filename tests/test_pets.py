@@ -370,7 +370,10 @@ class StatUpgradeTests(PetsTestCase):
             pets.get_pet(entry, "1")["stats"]["endurance"], pets_config.STAT_MIN_LEVEL,
         )
         before = pets.power_rating(entry, "1")
-        economy.grant(entry, "1", 100, "test")
+        # Funded from the curve rather than a fixed number: what ten points cost moves
+        # whenever STAT_COST_EXPONENT is retuned, and this test is about endurance not
+        # reaching the power rating, not about what it happens to cost this month.
+        economy.grant(entry, "1", pets_config.total_stat_cost(11), "test")
         ok, message, _spent = pets.upgrade_stat(entry, "1", 0, "endurance", times=10)
         self.assertTrue(ok, message)
         self.assertEqual(pets.stat_level(entry, "1", "endurance"), 11)
@@ -3381,13 +3384,16 @@ class FarmTests(PetsTestCase):
         farm still contributes to the uncapped late-game stat economy."""
         self.assertEqual(
             [pets_config.farm_gold_for(1, hours) for hours in (1, 2, 4, 8)],
-            [6, 13, 28, 69],
+            [7, 15, 31, 77],
         )
-        self.assertEqual(pets_config.farm_gold_for(1, 6), 45)
-        self.assertEqual(pets_config.farm_gold_for(1, 6, pet_level=100), 152)
+        self.assertEqual(pets_config.farm_gold_for(1, 6), 50)
+        self.assertEqual(pets_config.farm_gold_for(1, 6, pet_level=100), 169)
+        # One first shift must stay under the cheapest weapon (60), or the opening hour
+        # hands out gear nobody chose anything to earn.
+        self.assertLess(pets_config.farm_gold_for(1, 6), 60)
         self.assertEqual(
             [pets_config.farm_gold_for(10, hours, 1.5, 100) for hours in (1, 2, 4, 8)],
-            [169, 349, 746, 1825],
+            [337, 698, 1491, 3649],
         )
 
     def test_farm_pet_level_gold_bonus_is_frozen_when_a_shift_starts(self):
@@ -3400,7 +3406,7 @@ class FarmTests(PetsTestCase):
         pets._save(entry, data)
         status = pets.farm_status(entry, "1", start)
         self.assertEqual(status["reward"], before)
-        self.assertEqual(status["estimated_gold"], 152)
+        self.assertEqual(status["estimated_gold"], 169)
 
     def test_hour_previews_are_monotonic_in_gold_xp_and_drop_chance(self):
         entry = "farm-previews"
@@ -3561,18 +3567,57 @@ class MiscApiTests(PetsTestCase):
         moment = datetime(2026, 8, 9, 18, 35, 20)
         self.assertEqual(pets.fight_refresh_seconds(moment), 24 * 60 + 40)
 
-    def test_award_xp_reports_level_ups(self):
+    def test_award_xp_banks_levels_instead_of_granting_them(self):
+        """Levelling is bought now, not given: XP piles up and the player spends rubies to
+        turn it into +1 to every stat. So award_xp never levels anybody up, however much
+        it hands over -- it just makes levels available to buy."""
         entry = "chat"
         self._tame(entry, "1")
         new_level, gained = pets.award_xp(entry, "1", 1)
         self.assertEqual(new_level, 1)
         self.assertEqual(gained, 0)
 
-        # Enough xp to blow well past several thresholds at once.
+        # Enough XP to have blown past dozens of thresholds under the old rules.
         new_level, gained = pets.award_xp(entry, "1", 100_000)
-        self.assertGreater(gained, 0)
-        self.assertEqual(new_level, pets.get_pet(entry, "1")["level"])
-        self.assertGreater(new_level, 50)
+        self.assertEqual(gained, 0, "nothing may level a creature up on its own any more")
+        self.assertEqual(new_level, 1)
+        self.assertEqual(pets.get_pet(entry, "1")["level"], 1)
+        # It is all waiting to be claimed instead.
+        self.assertGreater(pets.pending_level_ups(pets.get_pet(entry, "1")), 50)
+
+    def test_a_banked_level_is_bought_with_rubies_and_pays_every_stat(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        pets.award_xp(entry, "1", 100_000)
+        before = pets.effective_stats(entry, "1")
+
+        refused, note = pets.claim_pet_level(entry, "1")
+        self.assertFalse(refused, note)          # no rubies yet
+        self.assertIn("алмаз", note)
+
+        pets.grant_rubies(entry, "1", pets_config.PET_LEVEL_UP_RUBY_COST)
+        ok, note = pets.claim_pet_level(entry, "1")
+        self.assertTrue(ok, note)
+        self.assertEqual(pets.get_pet(entry, "1")["level"], 2)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 0)
+
+        after = pets.effective_stats(entry, "1")
+        for key in pets_config.STAT_KEYS:
+            self.assertEqual(
+                after[key] - before[key], pets_config.PET_LEVEL_STAT_BONUS, key,
+            )
+
+    def test_one_press_buys_one_level_even_with_many_banked(self):
+        """Several levels waiting must not silently spend several lots of rubies."""
+        entry = "chat"
+        self._tame(entry, "1")
+        pets.award_xp(entry, "1", 100_000)
+        pets.grant_rubies(entry, "1", pets_config.PET_LEVEL_UP_RUBY_COST * 4)
+        self.assertTrue(pets.claim_pet_level(entry, "1")[0])
+        self.assertEqual(pets.get_pet(entry, "1")["level"], 2)
+        self.assertEqual(
+            pets.ruby_balance(entry, "1"), pets_config.PET_LEVEL_UP_RUBY_COST * 3,
+        )
 
 
 if __name__ == "__main__":

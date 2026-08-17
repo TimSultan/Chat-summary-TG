@@ -967,31 +967,107 @@ def _settle_fight_bank(record: dict, capacity: int, now: datetime) -> tuple[int,
 
 
 def _apply_xp(record: dict, amount: int) -> tuple[int, int]:
-    """Feed `amount` pet-xp into `record` in place. Returns (new_level, levels_gained)."""
-    old_level = record.get("level", 1)
-    record["xp"] = record.get("xp", 0) + amount
-    level = old_level
-    while C.PET_MAX_LEVEL is None or level < C.PET_MAX_LEVEL:
-        needed = C.pet_xp_for_next_level(level)
-        if needed <= 0 or record["xp"] < needed:
+    """Bank `amount` pet-xp in place. Returns (level, 0) -- levelling is no longer automatic.
+
+    XP simply accumulates now. Turning it into a level is a thing the player DOES, for
+    rubies, in claim_pet_level. The second element of the tuple is kept so the two dozen
+    call sites that unpack it keep working; it is always 0, because nothing here can level
+    anybody up any more. What used to read "you levelled up" now reads "a level is waiting".
+
+    Two reasons for the change. It makes progress an event with a visible price and a
+    stated reward instead of a number that silently ticks over -- and it makes levelling
+    cost RUBIES, which the dungeon barely produces, so the richest gold faucet in the game
+    stops being a complete substitute for playing anything else.
+    """
+    record["xp"] = record.get("xp", 0) + int(amount)
+    return record.get("level", 1), 0
+
+
+def pending_level_ups(record: dict) -> int:
+    """How many levels this creature has banked the XP for but not yet bought."""
+    if not isinstance(record, dict):
+        return 0
+    level = max(1, int(record.get("level", 1) or 1))
+    banked = max(0, int(record.get("xp", 0) or 0))
+    waiting = 0
+    while C.PET_MAX_LEVEL is None or level + waiting < C.PET_MAX_LEVEL:
+        needed = C.pet_xp_for_next_level(level + waiting)
+        if needed <= 0 or banked < needed:
             break
-        record["xp"] -= needed
-        level += 1
-    record["level"] = level
-    return level, level - old_level
+        banked -= needed
+        waiting += 1
+        if waiting > 500:                  # a runaway grant must not spin forever
+            break
+    return waiting
+
+
+def level_up_status(entry, user_id) -> dict:
+    """What the level-up button needs to draw itself."""
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return {"available": False, "pending": 0, "cost": C.PET_LEVEL_UP_RUBY_COST,
+                "rubies": 0, "level": 1, "xp": 0, "needed": 0}
+    level = max(1, int(record.get("level", 1) or 1))
+    pending = pending_level_ups(record)
+    return {
+        "available": True,
+        "pending": pending,
+        "cost": C.PET_LEVEL_UP_RUBY_COST,
+        "rubies": ruby_balance(entry, user_id),
+        "can_buy": pending > 0 and ruby_balance(entry, user_id) >= C.PET_LEVEL_UP_RUBY_COST,
+        "level": level,
+        "xp": max(0, int(record.get("xp", 0) or 0)),
+        "needed": C.pet_xp_for_next_level(level),
+        "stat_bonus": C.PET_LEVEL_STAT_BONUS,
+    }
+
+
+def claim_pet_level(entry, user_id) -> tuple[bool, str]:
+    """Buy one banked level for rubies. +1 to every stat.
+
+    One level per press, deliberately, even when several are waiting: each one is a
+    separate decision costing separate rubies, and a button that silently spent forty
+    rubies because the XP happened to cover eight levels would be a nasty surprise.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        if pending_level_ups(record) <= 0:
+            needed = C.pet_xp_for_next_level(max(1, int(record.get("level", 1) or 1)))
+            short = needed - max(0, int(record.get("xp", 0) or 0))
+            return False, f"До следующего уровня не хватает {short} опыта."
+        wallet = _ruby_row(data)
+        rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+        if rubies < C.PET_LEVEL_UP_RUBY_COST:
+            return False, (
+                f"Нужно {C.PET_LEVEL_UP_RUBY_COST} алмазов, а есть {rubies}. "
+                "Алмазы дают мобы и карьер."
+            )
+        level = max(1, int(record.get("level", 1) or 1))
+        record["xp"] = max(0, int(record.get("xp", 0) or 0)) - C.pet_xp_for_next_level(level)
+        record["level"] = level + 1
+        wallet[str(user_id)] = rubies - C.PET_LEVEL_UP_RUBY_COST
+        _save(entry, data)
+    bonus = C.PET_LEVEL_STAT_BONUS
+    return True, (
+        f"⬆️ Уровень {level + 1}. +{bonus} ко всем статам "
+        f"(−{C.PET_LEVEL_UP_RUBY_COST} 💎)."
+    )
 
 
 def adjust_pet_xp(entry, user_id, delta: int) -> dict | None:
-    """Move a creature's arena XP up or down, levels and all. None if there is no pet.
+    """Move a creature's arena XP up or down. None if there is no pet.
 
-    `record["xp"]` is the progress WITHIN the current level, not a running total, so this
-    cannot just add a number: going up spends XP climbing the ladder (that is _apply_xp),
-    and going down has to walk back the same way -- empty the current bar, drop a level,
-    refill the bar to that level's full cost, keep going.
+    Adding only banks XP -- it never grants a level, because levels are bought now (see
+    claim_pet_level). An admin handing somebody 50 000 XP gives them a stack of levels
+    they can afford to claim, not fifty free levels.
 
-    The floor is level 1 with 0 XP. Subtracting more than somebody has leaves them there
-    rather than inventing a negative level, and the return value says how much was
-    actually taken so the caller can report the truth instead of what was asked for.
+    Going DOWN still has to walk the ladder back, because XP is progress within the
+    current level rather than a running total: empty the bar, drop a level, refill the bar
+    to that level's full cost, keep going. The floor is level 1 with 0 XP, so subtracting
+    more than somebody has leaves them there instead of inventing a negative level.
     """
     with _farm_settlement_lock:
         data = _load(entry)

@@ -25,8 +25,8 @@ The cage, farm and recent painted miniatures expand that bank (see
 daily_fight_allowance); losing costs a share of what winning pays (LOSS_GOLD_SHARE), so
 part of every fight is paid by a player rather than minted.
 
-Against that, STAT_COST_EXPONENT = 1.2 puts one stat at 1 -> 80 at 6,896 gold and three
-at 20,688. Arena gold stays comparable to, rather than overpowering, coins earned from
+Against that, STAT_COST_EXPONENT = 1.5 puts one stat at 1 -> 80 at 22,557 gold and three
+at 67,671. Arena gold stays comparable to, rather than overpowering, coins earned from
 ordinary chat activity; cage bonuses remain the game-specific progression path.
 
 If it should move further, the levers are BASE_FIGHT_BANK_CAPACITY,
@@ -156,7 +156,14 @@ FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # level ten with every facility produces about 1,530 coins/day before the pet-level
 # bonus.  The active shift locks the pet out of starting arena/PvE fights, so this is
 # meaningful income, not a free background faucet.
-FARM_GOLD_PER_RUN = (0, 45, 55, 70, 85, 105, 125, 145, 170, 200, 235)
+# Roughly doubled at the top, but NOT at the bottom, and the difference is the point.
+# The farm was 2.0% of a day's gold -- a station with ten upgrade levels and its own tools
+# that moved nothing. Raising it flat would have broken a pacing rule worth keeping: one
+# first shift must not pay for a weapon (the cheapest is 60), or the opening hour hands
+# out gear the player has not chosen anything to earn. So level 1 stays under that line
+# and the curve steepens instead -- 1 -> 10 was x5.2, it is now x9.4, which pays for
+# upgrading the farm rather than merely owning one.
+FARM_GOLD_PER_RUN = (0, 50, 70, 95, 125, 160, 205, 255, 315, 385, 470)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
 # A farm's buildings stop at level 10 while pet levels deliberately do not. It uses the
 # shared diminishing hero curve at the farm weight: stronger than the old logarithmic
@@ -239,14 +246,20 @@ def farm_xp_for(level: int, hours: int, xp_multiplier: float = 1.0) -> int:
 #
 #     exponent   1 stat -> 40   1 stat -> 80   3 stats -> 80
 #     1.0                 780          3,160           9,480
-#     1.2  (chosen)     1,481          6,896          20,688
+#     1.2               1,481          6,896          20,688
 #     1.35              2,437         12,446          37,338
-#     1.5               4,005         22,557          67,671
+#     1.5  (chosen)     4,005         22,557          67,671
+#
+# Raised from 1.2 because the sink was the wrong SHAPE for the faucet, not merely too
+# small: dungeon gold scales with floor and has no ceiling, while 1.2 is barely steeper
+# than a straight line, so income outran the only thing that absorbed it. At 1.2 a
+# mid-level player finished all six stats to 80 in about a day and a half and then had
+# nowhere to put gold at all; at 1.5 that is roughly three weeks of ordinary play.
 
 STAT_MIN_LEVEL = 1
 STAT_MAX_LEVEL = None
 STAT_COST_BASE = 1.0
-STAT_COST_EXPONENT = 1.2
+STAT_COST_EXPONENT = 1.5
 STAT_RESPEC_RUBY_COST = 15
 
 STAT_KEYS = ("strength", "health", "agility", "luck", "endurance")
@@ -459,8 +472,11 @@ OPPONENT_POWER_WINDOW = 125
 # ten fights a day at a 50% win rate netted about 26 coins after losses, against 1,481 for
 # one stat to level 40 -- roughly a month of daily play for a single stat, which is what
 # "everyone is poor" actually measured. At 15-30 the same day nets about 79.
-WIN_GOLD_MIN = 15
-WIN_GOLD_MAX = 30
+# Was 15-30. PVP was 1.0% of daily gold: the only mode with a live opponent, real gear
+# and tactics paid less than pressing a farm button and walking away. 2.5x fixes the
+# thing the whole arena is for.
+WIN_GOLD_MIN = 38
+WIN_GOLD_MAX = 75
 # The loser pays 30% of what the winner just took. This replaces the original "проигравший
 # ничего не теряет": with a free loss, the best strategy was to press "напасть" without
 # reading anything, and a fight nobody can lose is not a fight.
@@ -512,7 +528,9 @@ MIRROR_LEVEL_GAP = 5
 # of nothing at all, with nobody on the other side to lose anything, so the identical
 # purse would be a faucet running at twice the arena's real rate. Half, then, as asked:
 # "мобы давали примерно в два раза меньше денег".
-PVE_GOLD_SHARE = 0.5
+# Was 0.5. A mob paid half an arena purse, and PVE came to 1.5% of daily gold -- a mode
+# that existed without mattering. 1.2 makes thirty mob fights a real part of a day.
+PVE_GOLD_SHARE = 1.2
 # PVE has its OWN allowance, not a share of the arena bank. Ten attacks per window, and
 # the window is a fixed 8-hour block of the chat's own clock -- 00:00, 08:00, 16:00 --
 # so it refills for everybody on the server at the same moment rather than trickling back
@@ -549,7 +567,9 @@ QUARRY_DURATION_HOURS = 8  # legacy run fallback
 QUARRY_RUBIES_BY_HOURS = {
     1: (1, 2), 2: (3, 5), 4: (8, 12), 8: (18, 25),
 }
-QUARRY_GOLD_BY_HOURS = {1: 25, 2: 55, 4: 120, 8: 260}
+# Raised ~1.6x with the farm/PVE/PVP lifts: at 2.6% of a day's gold the quarry was a
+# whole station nobody had a reason to use.
+QUARRY_GOLD_BY_HOURS = {1: 40, 2: 88, 4: 192, 8: 416}
 QUARRY_XP_BY_HOURS = {1: 20, 2: 45, 4: 100, 8: 220}
 QUARRY_DROP_CHANCE_BY_HOURS = {1: .02, 2: .05, 4: .12, 8: .30}
 QUARRY_RUBY_MIN, QUARRY_RUBY_MAX = QUARRY_RUBIES_BY_HOURS[QUARRY_DURATION_HOURS]
@@ -643,6 +663,12 @@ PET_MAX_LEVEL = None
 PET_XP_BASE = 80.0
 PET_XP_EXPONENT = 0.8
 PET_LEVEL_STAT_BONUS = 1    # +1 to every stat per pet level
+# A level is BOUGHT, not granted: the XP banks up and the player spends rubies to turn it
+# into the +1. Priced in rubies rather than gold on purpose -- the dungeon prints gold and
+# almost no rubies, so this is what stops the richest faucet from being a substitute for
+# playing everything else (see the economy audit: one undifferentiated input is what lets
+# a rational player ignore four fifths of the game).
+PET_LEVEL_UP_RUBY_COST = 5
 
 
 def pet_xp_for_next_level(level: int) -> int:
