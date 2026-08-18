@@ -131,19 +131,44 @@ class DungeonTests(unittest.TestCase):
             ["🚪", "⬇️ Спуститься"],
         )
 
-    def test_equipment_can_be_changed_only_after_clearing_a_floor(self):
+    def test_equipment_can_be_changed_at_any_point_of_a_run(self):
+        """Gear used to be frozen until a floor was cleared. Every boss now states the
+        damage it is weak to, so swapping a weapon to answer that is the play the hint
+        invites -- freezing it only stopped players reacting to what they were told."""
         data = pets._load(self.entry)
         data["pets"][self.user_id]["inventory"].append("w001")
         data["pets"][self.user_id]["dungeon_run"] = {
             "floor": 1, "hp": 10, "max_hp": 10, "cleared": [],
         }
         pets._save(self.entry, data)
-        self.assertFalse(pets.equip(self.entry, self.user_id, "w001")[0])
 
+        # Mid-floor, with enemies still standing.
+        ok, message = pets.equip(self.entry, self.user_id, "w001")
+        self.assertTrue(ok, message)
+        self.assertTrue(pets.unequip(self.entry, self.user_id, "weapon")[0])
+
+        # And the run itself is untouched by it: no healing, no reset, no free floor.
+        run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
+        self.assertEqual(run["hp"], 10)
+        self.assertEqual(run["floor"], 1)
+        self.assertEqual(run["cleared"], [])
+
+    def test_a_weapon_can_be_enchanted_without_leaving_the_dungeon(self):
         data = pets._load(self.entry)
-        data["pets"][self.user_id]["dungeon_run"]["cleared"] = [0, 1]
+        record = data["pets"][self.user_id]
+        record["inventory"].append("w001")
+        record["runes"] = {"fire": 1}
+        record["dungeon_run"] = {"floor": 1, "hp": 10, "max_hp": 10, "cleared": []}
+        data["rubies"] = {self.user_id: pets.RUNE_ENCHANT_RUBY_COST}
         pets._save(self.entry, data)
-        self.assertTrue(pets.equip(self.entry, self.user_id, "w001")[0])
+
+        ok, message = pets.enchant_weapon(self.entry, self.user_id, "w001", "fire")
+
+        self.assertTrue(ok, message)
+        self.assertEqual(
+            pets._load(self.entry)["pets"][self.user_id]["weapon_enchantments"]["w001"],
+            "fire",
+        )
 
     def test_dungeon_requires_ten_rubies_to_enter(self):
         # Pinned literally, not just against dungeon.ENTRY_RUBY_COST: this number is a

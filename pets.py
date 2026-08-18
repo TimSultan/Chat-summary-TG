@@ -5038,9 +5038,11 @@ def equip(entry, user_id, code) -> tuple[bool, str]:
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
-    run = record.get("dungeon_run")
-    if _dungeon_active(record) and len(run.get("cleared", [])) < len(D.encounters_for_floor(run.get("floor", 1))):
-        return False, "Снаряжение можно менять только между этажами подземелья."
+    # Deliberately unguarded inside a dungeon run. The gear used to be frozen until a
+    # floor was cleared, which read as a rule about fairness but was really a rule against
+    # reacting: every boss states the damage it is weak to, so swapping a weapon to answer
+    # it is the play the hint exists to invite, not a way around the fight. Health, the
+    # rest ration and the enemies in front of you do not reset when you change gloves.
     item = C.find_item(code)
     if item is None:
         return False, "Такого предмета не существует."
@@ -5060,9 +5062,11 @@ def unequip(entry, user_id, slot) -> tuple[bool, str]:
     record = _tamed_record(data, user_id)
     if record is None:
         return False, "Сначала приручи существо."
-    run = record.get("dungeon_run")
-    if _dungeon_active(record) and len(run.get("cleared", [])) < len(D.encounters_for_floor(run.get("floor", 1))):
-        return False, "Снаряжение можно менять только между этажами подземелья."
+    # Deliberately unguarded inside a dungeon run. The gear used to be frozen until a
+    # floor was cleared, which read as a rule about fairness but was really a rule against
+    # reacting: every boss states the damage it is weak to, so swapping a weapon to answer
+    # it is the play the hint exists to invite, not a way around the fight. Health, the
+    # rest ration and the enemies in front of you do not reset when you change gloves.
     equipped = record.setdefault("equipped", {})
     current = equipped.get(slot)
     if not current:
