@@ -1306,9 +1306,11 @@ class ForgeTests(PetsTestCase):
         ][:count]
 
     def _recipe(self, entry, rarity, slot):
+        """The offered recipe for this pile, or None -- only ready ones are offered."""
         return next(
-            row for row in pets.forge_status(entry, "1")["recipes"]
-            if row["rarity"] == rarity and row["slot"] == slot
+            (row for row in pets.forge_status(entry, "1")["recipes"]
+             if row["rarity"] == rarity and row["slot"] == slot),
+            None,
         )
 
     def test_reforge_consumes_five_weakest_free_items_and_grants_the_same_slot(self):
@@ -1351,8 +1353,11 @@ class ForgeTests(PetsTestCase):
         pets._save("forge-mixed", data)
 
         # Six free common items, and not one recipe can be filled: they are two piles.
+        # Neither is offered at all, because a recipe that cannot be pressed is a grey
+        # button explaining that nothing works.
+        self.assertEqual(pets.forge_status("forge-mixed", "1")["recipes"], [])
         for slot in ("gloves", "boots"):
-            self.assertFalse(self._recipe("forge-mixed", "common", slot)["can_forge"])
+            self.assertIsNone(self._recipe("forge-mixed", "common", slot))
         self.assertFalse(pets.reforge_items("forge-mixed", "1", "common", "gloves")[0])
         self.assertFalse(pets.reforge_items("forge-mixed", "1", "common", "weapon")[0])
         self.assertEqual(len(pets.get_pet("forge-mixed", "1")["inventory"]), 6)
@@ -1379,9 +1384,8 @@ class ForgeTests(PetsTestCase):
         data["pets"]["1"]["inventory"] = [item.code for item in common]
         pets._save("forge-requires-five", data)
 
-        recipe = self._recipe("forge-requires-five", "common", "gloves")
-        self.assertEqual(recipe["required"], pets.FORGE_REQUIREMENTS["common"])
-        self.assertFalse(recipe["can_forge"])
+        # One short, so the screen does not offer it.
+        self.assertIsNone(self._recipe("forge-requires-five", "common", "gloves"))
         ok, _message, result_code = pets.reforge_items(
             "forge-requires-five", "1", "common", "gloves", random.Random(7),
         )
@@ -1447,6 +1451,44 @@ class ForgeTests(PetsTestCase):
         )[0])
         self.assertIn(pets.FORGE_CURSED_RELIC, seen["pool"])
 
+    def test_an_empty_forge_screen_shows_no_blocks_and_no_grey_buttons(self):
+        """What a player asked for, in the words they asked it in: if there is nothing to
+        melt, do not print a list of things that cannot be melted."""
+        self._tame("forge-screen", "1")
+        required = pets.FORGE_REQUIREMENTS["common"]
+        data = pets._load("forge-screen")
+        data["pets"]["1"]["inventory"] = [
+            item.code for item in self._drops("gloves", "common", required - 1)
+        ]
+        pets._save("forge-screen", data)
+
+        text, keyboard = pets_ui.forge_view("forge-screen", "1", 0)
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+
+        # No recipe button at all -- neither a live one nor a greyed-out one. (The rune
+        # picker below it is a separate control and keeps its own empty state.)
+        self.assertFalse(
+            [b for b in buttons
+             if pets_ui.parse_callback(b["callback_data"])[2].startswith("common:")
+             or pets_ui.parse_callback(b["callback_data"])[1] == "reforge"],
+            "одна перчатка до рецепта -- это всё ещё «нечего ковать»",
+        )
+        self.assertIn("Переплавлять пока нечего", text)
+        self.assertNotIn("Перчатки:", text, "и никакого блока про недособранный рецепт")
+
+        # One more glove and the button is simply there, with nothing greyed beside it.
+        data = pets._load("forge-screen")
+        data["pets"]["1"]["inventory"] = [
+            item.code for item in self._drops("gloves", "common", required)
+        ]
+        pets._save("forge-screen", data)
+
+        text, keyboard = pets_ui.forge_view("forge-screen", "1", 0)
+        actions = [pets_ui.parse_callback(button["callback_data"])[1]
+                   for row in keyboard["inline_keyboard"] for button in row]
+        self.assertEqual(actions.count("reforge"), 1)
+        self.assertNotIn("Переплавлять пока нечего", text)
+
     def test_reforge_never_consumes_equipped_or_locked_items(self):
         self._tame("forge-safe", "1")
         common = self._drops("gloves", "common", pets.FORGE_REQUIREMENTS["common"] - 1)
@@ -1463,12 +1505,17 @@ class ForgeTests(PetsTestCase):
         self.assertEqual(pets.get_pet("forge-safe", "1")["inventory"],
                          [item.code for item in common])
 
-    def test_the_screen_only_offers_recipes_the_bag_could_ever_fill(self):
-        """Fifteen recipes exist. A player owning gloves wants to read about gloves."""
+    def test_the_screen_offers_only_what_can_be_forged_right_now(self):
+        """Fifteen recipes exist. Fourteen grey buttons saying "not yet" is not a screen
+        about what you can make -- it is a screen about what you cannot."""
         self._tame("forge-listing", "1")
+        required = pets.FORGE_REQUIREMENTS["common"]
         data = pets._load("forge-listing")
+        # Enough boots to forge, one glove short of it.
         data["pets"]["1"]["inventory"] = [
-            item.code for item in self._drops("boots", "common", 2)
+            item.code for item in
+            self._drops("boots", "common", required)
+            + self._drops("gloves", "common", required - 1)
         ]
         pets._save("forge-listing", data)
 
@@ -1476,6 +1523,15 @@ class ForgeTests(PetsTestCase):
 
         self.assertEqual([(row["rarity"], row["slot"]) for row in recipes],
                          [("common", "boots")])
+        self.assertTrue(all(row["can_forge"] for row in recipes))
+
+        # And with nothing ready, nothing at all is offered.
+        data = pets._load("forge-listing")
+        data["pets"]["1"]["inventory"] = [
+            item.code for item in self._drops("boots", "common", required - 1)
+        ]
+        pets._save("forge-listing", data)
+        self.assertEqual(pets.forge_status("forge-listing", "1")["recipes"], [])
 
 
 class StorefrontAndCollectionTests(PetsTestCase):

@@ -5758,7 +5758,7 @@ function forgePanel() {
     '<div class="small muted" style="margin-bottom:10px">Кузница берёт предметы одного типа и одной редкости ' +
       'и возвращает предмет того же типа редкостью выше: перчатки в перчатки, пушки в пушки. ' +
       'Сколько нужно — написано на каждом рецепте. Надетые и защищённые вещи не расходуются.</div>' +
-    (recipes.length ? '' : '<div class="small muted">В сумке пока нет ничего, что можно было бы переплавить.</div>') +
+    (recipes.length ? '' : '<div class="small muted">Переплавлять пока нечего — не хватает предметов одного типа и одной редкости.</div>') +
     recipes.map((recipe) => {
       const ingredients = recipe.ingredients
         .map((code) => (S.bag || []).find((item) => item.code === code))
@@ -5766,11 +5766,12 @@ function forgePanel() {
       return '<div class="panel" style="margin:8px 0;padding:10px">' +
         '<div class="small"><b>' + esc(slots[recipe.slot] || recipe.slot) + ': ' +
         recipe.required + ' ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
-        '</b> · ' + recipe.available + ' из ' + recipe.required + '</div>' +
+        '</b> · в сумке ' + recipe.available + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
-        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '"' +
-          (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
+        // Never disabled: the server only sends recipes that are ready to go.
+        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '">' +
+          'Перековать</button></div>';
     }).join('') +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
 }

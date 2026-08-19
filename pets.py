@@ -5223,12 +5223,13 @@ def forge_status(entry: str, user_id) -> dict:
     for rarity, result_rarity in FORGE_NEXT_RARITY.items():
         for slot in C.SLOT_KEYS:
             ingredients = _forge_ingredients(record, rarity, slot)
-            # Fifteen recipes exist; a player owning nothing for fourteen of them wants to
-            # read one line, not fifteen empty ones. A recipe appears once there is at
-            # least one thing in the bag it could ever consume.
-            if not ingredients:
-                continue
             required = FORGE_REQUIREMENTS[rarity]
+            # ONLY what can be forged right now. Fifteen recipes exist, and a screen that
+            # listed the fourteen a player cannot use was a wall of dead grey buttons
+            # explaining, at length, that nothing here works -- the answer to "what can I
+            # make" has to be the whole screen, not a needle in it.
+            if len(ingredients) < required:
+                continue
             recipes.append({
                 "rarity": rarity,
                 "slot": slot,
@@ -5236,11 +5237,13 @@ def forge_status(entry: str, user_id) -> dict:
                 "available": len(ingredients),
                 "required": required,
                 "ingredients": [item.code for item in ingredients[:required]],
-                "can_forge": len(ingredients) >= required,
+                # Always true, and kept so a client that reads it keeps working. The list
+                # itself is now the answer: if a recipe is on it, it is ready.
+                "can_forge": True,
             })
-    # Ready first, then by how close it is: the reason to open this screen is to find out
-    # what you can make, and that answer must not be somewhere down a list of fifteen.
-    recipes.sort(key=lambda row: (not row["can_forge"], -row["available"]))
+    # Deepest pile first: with everything on the list ready, the interesting one is the
+    # one that has been waiting longest to be emptied.
+    recipes.sort(key=lambda row: -row["available"])
     return {"recipes": recipes}
 
 

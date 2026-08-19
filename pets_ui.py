@@ -2012,7 +2012,8 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     rows = []
     recipes = status.get("recipes", [])
     if not recipes:
-        lines.append("\nВ сумке пока нет ничего, что можно было бы переплавить.")
+        lines.append("\nПереплавлять пока нечего — не хватает предметов одного типа "
+                     "и одной редкости.")
     for recipe in recipes:
         rarity = recipe["rarity"]
         slot = recipe["slot"]
@@ -2022,20 +2023,19 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         ingredients = [C.find_item(code) for code in recipe.get("ingredients", [])]
         lines.append(
             f"\n<b>{kind}: {required} {labels[rarity]} → {labels[result_rarity]}</b> "
-            f"({recipe['available']} из {required})"
+            f"(в сумке {recipe['available']})"
         )
         if ingredients:
             lines.append("Будут использованы: " + ", ".join(
                 f"«{escape(item.name)}»" for item in ingredients if item is not None
             ))
+        # No disabled state: forge_status only returns recipes that are ready, so every
+        # button on this screen forges.
         rows.append([{
             "text": f"⚒️ {kind} · {required} {labels[rarity]} → {labels[result_rarity]}",
             # rarity:slot, which parse_callback hands back whole -- the recipe is both
             # halves now, and a button carrying only one of them would forge the wrong pile.
-            "callback_data": callback_data(
-                user_id, "reforge" if recipe.get("can_forge") else "noop",
-                f"{rarity}:{slot}",
-            ),
+            "callback_data": callback_data(user_id, "reforge", f"{rarity}:{slot}"),
         }])
     rune_state = pets.rune_status(entry, user_id)
     rune_names = {"fire": "Огонь", "frost": "Лёд", "water": "Вода", "earth": "Земля", "air": "Воздух", "plants": "Растения"}
