@@ -5769,7 +5769,7 @@ function forgePanel() {
         '</b> · ' + recipe.available + ' из ' + recipe.required + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
-        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-slot="' + recipe.slot + '"' +
+        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '"' +
           (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
     }).join('') +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
@@ -8894,7 +8894,9 @@ async function handleClick(event, target) {
   if (d.bagrarity) { bagRarity = d.bagrarity; render(); return; }
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
-  if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.slot || "" }); return; }
+  // NOT data-slot: that attribute is checked further up and opens the equipment slot
+  // sheet, so a forge button carrying it opened the weapon window instead of forging.
+  if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.forgeslot || "" }); return; }
   if (d.enchantpick) { openEnchantWeapons(d.enchantpick); return; }
   if (d.enchantapply) {
     const [code, element] = d.enchantapply.split(":", 2);

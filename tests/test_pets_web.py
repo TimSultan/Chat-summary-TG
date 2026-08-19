@@ -781,6 +781,35 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # A not-yet-fetched bag must never render as an empty one.
         self.assertIn('if (!S.bag) { box.innerHTML = \'<div class="empty">Загружаю сумку…</div>\'', page)
 
+    async def test_the_forge_button_forges_instead_of_opening_a_slot(self):
+        """The whole app is one delegated if-chain over data- attributes, so a button that
+        carries an attribute tested EARLIER than its own is silently answered by the wrong
+        branch. It shipped exactly that way: the forge button carried `data-slot` to say
+        which kind of item to melt, `d.slot` is tested further up and opens the equipment
+        sheet, and pressing «Перековать» opened the weapon window instead of forging.
+        """
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        order = re.findall(r"^  if \(d\.([a-z]+)", page, re.M)
+        self.assertIn("reforge", order, "the forge branch must exist to be reached")
+
+        button = re.search(r"<button class=\"go sec\" data-reforge=[^\n]*", page).group(0)
+        carried = set(re.findall(r"data-([a-z]+)=", button))
+        self.assertIn("reforge", carried)
+        # Every OTHER attribute it carries must be pure payload -- something the chain
+        # never dispatches on -- or the branch that owns it answers first.
+        for name in carried - {"reforge"}:
+            with self.subTest(attribute=name):
+                self.assertNotIn(
+                    name, order,
+                    f"кнопка ковки несёт data-{name}, а d.{name} перехватывает её раньше",
+                )
+        # And the kind of item travels under its own name.
+        self.assertIn("forgeslot", carried)
+        self.assertIn(
+            'if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.forgeslot || "" }); return; }',
+            page,
+        )
+
     async def test_a_dungeon_replay_is_faster_and_obeys_the_skip_preference(self):
         """The dungeon's slowness was never the server -- it was ten seconds of replay
         animation after it had already answered."""
