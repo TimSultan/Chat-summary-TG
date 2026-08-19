@@ -836,7 +836,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             "fighters": [{"key": "43", "name": "Rival"}, {"key": "mob:rat", "name": "Rat"}],
             "moves": 4,
         })
-        data["fights"].append({
+        data.setdefault("fights", []).append({
             "ts": "2026-08-15T12:07:00+00:00", "attacker_id": "44", "defender_id": "45",
             "attacker_name": "Older Hero", "defender_name": "Older Rival",
             "winner_id": "44", "draw": False,
@@ -2425,7 +2425,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         })
 
         data = pets._load(CHAT)
-        data["fights"][0]["combat_snapshot"] = None
+        rows = pets.fight_log_rows(CHAT)
+        rows[0]["combat_snapshot"] = None
+        pets.stats._write_json_atomic(pets._fight_log_path(CHAT), rows)
         pets._save(CHAT, data)
 
         row = (await (await self._get("/api/history", PLAYER)).json())["rows"][0]
@@ -2446,7 +2448,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         })
 
         data = pets._load(CHAT)
-        recorded = data["fights"][0]
+        recorded = pets.fight_log_rows(CHAT)[0]
         # Stand in for "the rules moved" by flipping the recorded winner: the check is
         # simulate-vs-record, so either side of it drifting trips the same wire.
         recorded["winner_id"], recorded["loser_id"] = recorded["loser_id"], recorded["winner_id"]

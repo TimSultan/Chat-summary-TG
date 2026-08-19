@@ -253,7 +253,8 @@ def _normalise_dungeon_run(run) -> dict | None:
 
 def _empty() -> dict:
     return {
-        "version": PETS_STORE_VERSION, "pets": {}, "fights": [], "fight_audits": [], "duels": {},
+        # No "fights" key: the arena log lives in its own file now (see fight_log_rows).
+        "version": PETS_STORE_VERSION, "pets": {}, "fight_audits": [], "duels": {},
         "gift_history": [], "farm_tickets": {}, "dungeon_tickets": {}, "rubies": {},
         "scroll_wallets": {}, "scroll_notifications": [],
         # Earned before a creature exists just like scrolls/tickets.  Each row contains
@@ -367,7 +368,10 @@ def _load(entry: str) -> dict:
     if not isinstance(data, dict):
         return _empty()
     data.setdefault("pets", {})
-    data.setdefault("fights", [])
+    # The arena fight log is deliberately NOT normalised here. It lives in its own file
+    # (see fight_log_rows); a store still carrying the old inline list keeps it untouched
+    # until _save drains it out, and touching it here would mean walking the whole log on
+    # every single load -- which is exactly what was slow.
     audits = data.setdefault("fight_audits", [])
     data["fight_audits"] = [row for row in audits if isinstance(row, dict)][-FIGHT_AUDIT_LIMIT:] \
         if isinstance(audits, list) else []
@@ -797,6 +801,86 @@ def discovered_weapon_collection(entry: str) -> list[dict]:
     ]
 
 
+def _fight_log_path(entry: str):
+    return stats._stats_dir() / f"{stats._cache_key(entry)}_pets_fights.json"
+
+
+# Same shape as _store_cache: keyed on (mtime, size), holding the PARSED rows. The rows
+# are handed out inside a fresh list so a caller can sort or filter it, but the row dicts
+# themselves are shared and every reader treats them as read-only.
+_fight_log_cache: dict[str, tuple[int, int, list]] = {}
+
+
+def _fight_sidecar_rows(entry: str) -> list[dict]:
+    path = _fight_log_path(entry)
+    try:
+        stamp = path.stat()
+    except OSError:
+        return []
+    identity = (stamp.st_mtime_ns, stamp.st_size)
+    key = str(path)
+    with _store_cache_lock:
+        cached = _fight_log_cache.get(key)
+    if cached is not None and cached[:2] == identity:
+        return cached[2]
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = [row for row in loaded if isinstance(row, dict)] if isinstance(loaded, list) else []
+    with _store_cache_lock:
+        _fight_log_cache[key] = (*identity, rows)
+    return rows
+
+
+def fight_log_rows(entry: str) -> list[dict]:
+    """Every recorded arena fight, oldest first, read from its own file.
+
+    It used to live inside the pets store -- the file every single pet action parses in
+    full and writes back. At the 2,000-fight cap it was 97% of that store: 9.5 MB of
+    round-by-round transcripts that a dungeon kill never reads and never writes, dragged
+    through seven parses and rewrites for every press of an attack button.
+
+    A store still carrying the old inline list has both halves reported here while the
+    move is in flight; _save owns the actual migration.
+    """
+    legacy = _load(entry).get("fights")
+    legacy = [row for row in legacy if isinstance(row, dict)] if isinstance(legacy, list) else []
+    return (legacy + _fight_sidecar_rows(entry))[-FIGHT_LOG_LIMIT:] if legacy \
+        else list(_fight_sidecar_rows(entry))
+
+
+def _append_fight(entry: str, row: dict) -> None:
+    """Record one finished fight in the log's own file.
+
+    Deliberately NOT part of the settlement's atomic write. The log is history and a
+    replay archive, never a source of truth -- every counter a fight moves (wins, fights,
+    xp, gold) is written to the record inside that atomic save. A row lost to a crash
+    costs a line in a history screen, which is a far better trade than every action in the
+    game carrying two thousand transcripts through a parse and a rewrite.
+    """
+    rows = _fight_sidecar_rows(entry) + [row]
+    stats._write_json_atomic(_fight_log_path(entry), rows[-FIGHT_LOG_LIMIT:])
+    with _store_cache_lock:
+        _fight_log_cache.pop(str(_fight_log_path(entry)), None)
+
+
+def _drain_fight_log(entry: str, data: dict) -> None:
+    """Move any inline arena log out of the store on its way to disk.
+
+    Done HERE rather than on read for the same reason the ruby ledger is: every writer
+    holds its own copy of the store, so a migration that removed the key elsewhere would
+    be undone by the next caller saving a copy it had loaded moments earlier.
+    """
+    rows = data.pop("fights", None)
+    if not isinstance(rows, list) or not rows:
+        return
+    merged = [row for row in rows if isinstance(row, dict)] + _fight_sidecar_rows(entry)
+    stats._write_json_atomic(_fight_log_path(entry), merged[-FIGHT_LOG_LIMIT:])
+    with _store_cache_lock:
+        _fight_log_cache.pop(str(_fight_log_path(entry)), None)
+
+
 def _drain_ruby_log(entry: str, data: dict) -> None:
     """Move any inline ruby ledger out of the store on its way to disk.
 
@@ -816,8 +900,8 @@ def _drain_ruby_log(entry: str, data: dict) -> None:
 def _save(entry: str, data: dict) -> None:
     data["version"] = PETS_STORE_VERSION
     _drain_ruby_log(entry, data)
-    if len(data.get("fights", [])) > FIGHT_LOG_LIMIT:
-        data["fights"] = data["fights"][-FIGHT_LOG_LIMIT:]
+    # Caps itself in its own file now, so there is no trimming to do here.
+    _drain_fight_log(entry, data)
     path = _pets_path(entry)
     # Drop the read cache outright rather than trusting the new file stamp to differ from
     # the old one. _load's mtime+size check is what catches a write from ANOTHER process
@@ -5541,7 +5625,7 @@ def claim_duel(entry, user_id, opponent_id, now=None) -> tuple[bool, str]:
     return True, f"Дуэлей осталось: {C.DUEL_DAILY_LIMIT - record['uses']}."
 
 
-def _familiar_face_stacks(data: dict, attacker_id, defender_id, day: date) -> int:
+def _familiar_face_stacks(entry: str, attacker_id, defender_id, day: date) -> int:
     """How often this attacker has already selected this defender on `day`.
 
     Derived from the fight log rather than stored, which is what makes the reset at 00:00
@@ -5551,7 +5635,7 @@ def _familiar_face_stacks(data: dict, attacker_id, defender_id, day: date) -> in
     attacker_uid, defender_uid = str(attacker_id), str(defender_id)
     return sum(
         1
-        for fight in data.get("fights", [])
+        for fight in fight_log_rows(entry)
         if fight.get("date") == day.isoformat()
         and fight.get("attacker_id") == attacker_uid
         and fight.get("defender_id") == defender_uid
@@ -5560,7 +5644,7 @@ def _familiar_face_stacks(data: dict, attacker_id, defender_id, day: date) -> in
 
 def arena_attacks_against(entry, attacker_id, defender_id, day: date) -> int:
     """How often this attacker has already selected this defender on `day`."""
-    return _familiar_face_stacks(_load(entry), attacker_id, defender_id, day)
+    return _familiar_face_stacks(entry, attacker_id, defender_id, day)
 
 
 def repeat_fights(entry, attacker_id, defender_id, day: date | None = None) -> dict | None:
@@ -5571,7 +5655,7 @@ def repeat_fights(entry, attacker_id, defender_id, day: date | None = None) -> d
     already today.
     """
     return repeat_fights_for(_familiar_face_stacks(
-        _load(entry), attacker_id, defender_id, day or today(),
+        entry, attacker_id, defender_id, day or today(),
     ))
 
 
@@ -5927,7 +6011,7 @@ def fight_audit_browser(entry: str, limit: int = 100, pet_id=None) -> dict:
     # Arena history predates the detailed audit recorder. It still has both participants,
     # names, timestamp, seed and fighter snapshots, so include it in the chooser instead
     # of making the page look as though only post-deployment fights ever happened.
-    for fight in data.get("fights", []):
+    for fight in fight_log_rows(entry):
         if not isinstance(fight, dict):
             continue
         legacy_id = fight_id(fight)
@@ -6013,7 +6097,7 @@ def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
             return dict(row) if "moves" in row and isinstance(row.get("moves"), list) else None
 
     historic = next(
-        (fight for fight in reversed(data.get("fights", [])) if fight_id(fight) == wire_id),
+        (fight for fight in reversed(fight_log_rows(entry)) if fight_id(fight) == wire_id),
         None,
     )
     if not isinstance(historic, dict):
@@ -6087,7 +6171,9 @@ def record_fight(
     if is_draw:
         _, attacker_levels_gained = _apply_xp(attacker, C.DRAW_XP)
         _, defender_levels_gained = _apply_xp(defender, C.DRAW_XP)
-        data["fights"].append({
+        # Built here, written to the log's own file after the settlement below is safely
+        # on disk. See _append_fight for why it is not part of that atomic write.
+        log_row = {
             "fight_id": fight_id_,
             "ts": moment.isoformat(),
             "date": today.isoformat(),
@@ -6107,7 +6193,7 @@ def record_fight(
             "combat_seed": getattr(result, "seed", None),
             "total_damage": dict(getattr(result, "total_damage", {})),
             "combat_snapshot": combat_snapshot,
-        })
+        }
         audit_fighters = tuple(filter(None, (
             pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(attacker_uid)),
             pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(defender_uid)),
@@ -6118,6 +6204,7 @@ def record_fight(
                 audit_records,
             ))
         _save(entry, data)
+        _append_fight(entry, log_row)
         return {
             "fight_id": fight_id_,
             "draw": True,
@@ -6295,7 +6382,7 @@ def record_fight(
 
     # Names/owners are snapshotted INTO the log entry rather than looked up when
     # history() is read, so a later rename does not rewrite what already happened.
-    data["fights"].append({
+    log_row = {
         "fight_id": fight_id_,
         "ts": moment.isoformat(),
         "date": today.isoformat(),
@@ -6323,7 +6410,7 @@ def record_fight(
         "combat_seed": getattr(result, "seed", None),
         "total_damage": dict(getattr(result, "total_damage", {})),
         "combat_snapshot": combat_snapshot,
-    })
+    }
     audit_fighters = tuple(filter(None, (
         pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(attacker_uid)),
         pets_combat.restore((combat_snapshot or {}).get("fighters", {}).get(defender_uid)),
@@ -6334,6 +6421,7 @@ def record_fight(
             audit_records,
         ))
     _save(entry, data)
+    _append_fight(entry, log_row)
 
     ruby_source = f"arena-ruby:{moment.isoformat()}:{winner_uid}:{loser_uid}"
     ruby_rng = random.Random(ruby_source)
@@ -6981,10 +7069,9 @@ def record_mob_fight(entry, user_id, block: dict, result, now: datetime | None =
 
 
 def history(entry, user_id) -> list[dict]:
-    data = _load(entry)
     uid = str(user_id)
     mine = []
-    for fight in data.get("fights", []):
+    for fight in fight_log_rows(entry):
         if fight.get("attacker_id") != uid and fight.get("defender_id") != uid:
             continue
         row = dict(fight)
@@ -7083,7 +7170,7 @@ def find_fight(entry, user_id, wire_id) -> dict | None:
     wanted = wire.replace("~", "+")
     if not wanted:
         return None
-    for fight in _load(entry).get("fights", []):
+    for fight in fight_log_rows(entry):
         if not isinstance(fight, dict) or (
             str(fight.get("fight_id") or "") != wire
             and str(fight.get("ts") or "") != wanted
@@ -7129,7 +7216,8 @@ def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = No
 
     Read-side only: no new store, nothing written, no migration. The three things worth
     telling somebody about are already persisted by the code that performs them -- fights
-    in ``data["fights"]``, farm shifts in the pet's own ``farm_notifications``, gifts in
+    in the arena log's own file (``fight_log_rows``), farm shifts in the pet's own
+    ``farm_notifications``, gifts in
     ``data["gift_history"]`` -- so the mailbox is a merge of records that already exist.
     That is also why it is retroactive: the first player to open it sees their real
     history rather than an empty box waiting for the next event.
@@ -7163,7 +7251,7 @@ def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = No
         event["day"] = moment.date().isoformat()
         events.append((moment, event))
 
-    for fight in data.get("fights", []):
+    for fight in fight_log_rows(entry):
         if not isinstance(fight, dict):
             continue
         attacked = str(fight.get("attacker_id")) == uid

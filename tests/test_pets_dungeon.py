@@ -1390,6 +1390,137 @@ class DungeonCoinBonusTests(unittest.TestCase):
         )
 
 
+class ArenaLogLivesOutsideTheHotStoreTests(unittest.TestCase):
+    """The arena log is round-by-round transcripts of two thousand duels, and it lived in
+    the file every single pet action parses and rewrites in full.
+
+    Measured on a forty-player store at the cap: 14.3 MB, of which the log was 97.6%. One
+    dungeon press -- which never reads or writes a duel -- dragged it through seven parses
+    and rewrites and took 1.25 seconds, of which the combat simulation was about two
+    milliseconds. It is history and a replay archive, so it belongs in its own file.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self.temp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.temp.cleanup)
+        self.entry = "arena-log"
+        for uid, name in (("1", "Один"), ("2", "Два")):
+            pets.buy_cage(self.entry, uid, 100_000)
+            pets.tame(self.entry, uid, 100_000, name, None, f"Owner{uid}")
+
+    def _row(self, index, day="2026-08-19"):
+        return {
+            "fight_id": f"F-{index}", "ts": f"{day}T10:00:00+03:00", "date": day,
+            "attacker_id": "1", "defender_id": "2", "winner_id": "1", "loser_id": "2",
+            "draw": False, "gold": 10, "loss_gold": 0, "consolation_gold": 0,
+            "rounds": [{"number": 1, "attacker": "1", "event": "hit", "damage": 5,
+                        "attacker_hp": 90, "defender_hp": 80, "text": "x" * 80}],
+        }
+
+    def test_a_finished_duel_lands_in_the_log_file_and_not_in_the_store(self):
+        result = SimpleNamespace(
+            winner="1", loser="2", is_draw=False, seed=1, rounds=(),
+            total_damage={"1": 10, "2": 4}, final_hp={},
+        )
+        pets.record_fight(self.entry, "1", "2", result, pets.today())
+
+        self.assertEqual(len(pets.fight_log_rows(self.entry)), 1)
+        self.assertNotIn("fights", pets._load(self.entry))
+        self.assertTrue(pets._fight_log_path(self.entry).exists())
+        # And the counters the fight moved are still in the store, where they belong:
+        # the log is history, the record is the source of truth.
+        self.assertEqual(pets.get_pet(self.entry, "1")["wins"], 1)
+        self.assertEqual(pets.get_pet(self.entry, "1")["fights"], 1)
+
+    def test_a_store_with_the_old_inline_log_is_migrated_off_it(self):
+        import stats
+        data = pets._load(self.entry)
+        data["fights"] = [self._row(index) for index in range(300)]
+        stats._write_json_atomic(pets._pets_path(self.entry), data)
+        fat = pets._pets_path(self.entry).stat().st_size
+
+        # Readable in full while the move is still in flight, and the screens that read
+        # it still see it -- history shows its own page of the newest.
+        self.assertEqual(len(pets.fight_log_rows(self.entry)), 300)
+        self.assertEqual(len(pets.history(self.entry, "1")), pets_config.HISTORY_LIMIT)
+        self.assertEqual(pets.history(self.entry, "1")[0]["fight_id"], "F-299")
+
+        # The next ordinary write is what drops it, and it stays dropped even though this
+        # caller loaded its copy before the log moved.
+        stale = pets._load(self.entry)
+        pets._save(self.entry, stale)
+
+        self.assertNotIn("fights", pets._load(self.entry))
+        self.assertLess(pets._pets_path(self.entry).stat().st_size, fat // 4)
+        rows = pets.fight_log_rows(self.entry)
+        self.assertEqual(len(rows), 300, "no duel may be lost moving house")
+        self.assertEqual([row["fight_id"] for row in rows],
+                         [f"F-{index}" for index in range(300)], "nor reordered")
+
+    def test_migrating_twice_does_not_double_a_single_row(self):
+        """The drain owns the move and the readers are pure. If reading migrated too, the
+        rows would be written once by the reader and again by the next save."""
+        import stats
+        data = pets._load(self.entry)
+        data["fights"] = [self._row(index) for index in range(20)]
+        stats._write_json_atomic(pets._pets_path(self.entry), data)
+
+        for _ in range(3):
+            pets.fight_log_rows(self.entry)
+            pets.history(self.entry, "1")
+        pets._save(self.entry, pets._load(self.entry))
+        pets._save(self.entry, pets._load(self.entry))
+
+        rows = pets.fight_log_rows(self.entry)
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(len({row["fight_id"] for row in rows}), 20)
+
+    def test_a_dungeon_press_never_touches_the_arena_log_at_all(self):
+        """The whole point. A kill in the dungeon has nothing to do with a duel, and used
+        to rewrite every one of them anyway."""
+        import stats
+        data = pets._load(self.entry)
+        data["pets"]["1"]["stats"] = {
+            "strength": 400, "health": 400, "agility": 400, "luck": 400, "endurance": 1,
+        }
+        data["pets"]["1"]["dungeon_run"] = {
+            "run_id": "r", "kills": 0, "floor": 1, "hp": 5000, "max_hp": 5000,
+            "cleared": [], "haul": pets._new_haul(), "floor_haul": pets._new_haul(),
+        }
+        pets._save(self.entry, data)
+        stats._write_json_atomic(
+            pets._fight_log_path(self.entry), [self._row(index) for index in range(50)],
+        )
+        before = pets._fight_log_path(self.entry).stat().st_mtime_ns
+
+        self.assertTrue(pets.dungeon_fight(self.entry, "1", 0)[0])
+
+        self.assertEqual(pets._fight_log_path(self.entry).stat().st_mtime_ns, before,
+                         "a dungeon kill must not rewrite two thousand duels")
+        self.assertEqual(len(pets.fight_log_rows(self.entry)), 50)
+
+    def test_the_log_is_capped_in_its_own_file(self):
+        import stats
+        stats._write_json_atomic(
+            pets._fight_log_path(self.entry),
+            [self._row(index) for index in range(pets.FIGHT_LOG_LIMIT + 40)],
+        )
+        result = SimpleNamespace(
+            winner="1", loser="2", is_draw=False, seed=1, rounds=(),
+            total_damage={"1": 10, "2": 4}, final_hp={},
+        )
+        pets.record_fight(self.entry, "1", "2", result, pets.today())
+
+        rows = pets.fight_log_rows(self.entry)
+        self.assertEqual(len(rows), pets.FIGHT_LOG_LIMIT)
+        # The newest survives the trim and the oldest is what falls off it.
+        self.assertNotEqual(rows[-1]["fight_id"], f"F-{pets.FIGHT_LOG_LIMIT + 39}")
+        self.assertNotIn("F-0", {row["fight_id"] for row in rows})
+
+
 class RubyLedgerLivesOutsideTheHotStoreTests(unittest.TestCase):
     """The ledger is written once per ruby and read only by the audit. Kept inside the
     pets store it was parsed and rewritten by EVERY pet action: at its old 50,000-row cap

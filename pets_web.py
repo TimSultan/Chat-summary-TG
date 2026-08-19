@@ -1757,7 +1757,10 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
     today = pets.today()
     today_key = today.isoformat()
     attacks_today = {}
-    for fight in data.get("fights", []):
+    # From the arena log's own file, not the store: it moved out because it is 97% of a
+    # file every action in the game parses, and this roster is one of the few screens that
+    # actually wants it.
+    for fight in pets.fight_log_rows(entry):
         if fight.get("date") != today_key or str(fight.get("attacker_id")) != me:
             continue
         defender_id = str(fight.get("defender_id"))

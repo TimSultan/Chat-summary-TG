@@ -369,8 +369,8 @@ class MobFightBankAndRewardTests(PetsTestCase):
         self.assertEqual(loss["gold"], 0)
         self.assertEqual(loss["xp"], pets_config.LOSS_XP)
 
-        # A mob has no duel history to keep -- nothing was ever appended to data["fights"].
-        self.assertEqual(pets._load(entry)["fights"], [])
+        # A mob has no duel history to keep -- nothing was ever appended to the arena log.
+        self.assertEqual(pets.fight_log_rows(entry), [])
 
     def test_mob_gold_still_rolls_the_undoubled_base_after_the_duel_purse_doubled(self):
         """The arena purse was doubled into its own constants. A mob reads the shared base

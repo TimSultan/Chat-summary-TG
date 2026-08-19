@@ -2700,7 +2700,8 @@ class MailTests(PetsTestCase):
         data = pets._load(entry)
         # A row with no usable timestamp cannot be placed in a chronological feed, so it
         # is dropped rather than sorted to an invented position.
-        data["fights"].append({"attacker_id": "1", "defender_id": "2", "ts": "not a date"})
+        data.setdefault("fights", []).append(
+            {"attacker_id": "1", "defender_id": "2", "ts": "not a date"})
         data["gift_history"] = ["nonsense", {"ts": None, "giver_id": "1", "receiver_id": "2"}]
         pets._save(entry, data)
 
@@ -2938,7 +2939,7 @@ class FightLookupTests(PetsTestCase):
         with patch("random.random", return_value=1.0):
             pets.record_fight(entry, "1", "2", result, date(2026, 8, 9))
 
-        stored = pets._load(entry)["fights"][0]
+        stored = pets.fight_log_rows(entry)[0]
         wire_id = pets.fight_id(stored)
         # Not "needs no escaping at all" -- a colon is legal in a query and survives
         # verbatim. The characters that would come back as something else are the ones
