@@ -510,3 +510,82 @@ def public_result_line(winner: str, rng=None) -> str:
     """A compact random winner announcement for the temporary group result card."""
     picker = rng if rng is not None else random
     return picker.choice(PUBLIC_RESULT_VARIANTS).format(winner=winner)
+
+
+# --- reading a transcript ---------------------------------------------------------------
+# A fight log is a wall of prose, and the two things a reader needs first -- whose turn it
+# is, and what KIND of turn it was -- were the two things it never said outright. An
+# administrator reading an audit had to infer "this was a crit" from the wording, and a
+# player watching a replay had to infer whose line it was from the colour of a name.
+#
+# One table, so the Mini App, the audit page and anything else mark a transcript the same
+# way. Keys are matched exactly first, then by prefix, so a family of events (every
+# `shield_defend_*`, every `amulet_*`) is covered without listing all forty of them.
+EVENT_MARKS: dict[str, tuple[str, str]] = {
+    # The basic exchange.
+    "hit": ("⚔️", "Удар"),
+    "crit": ("💥", "Крит"),
+    "dodge": ("💨", "Промах"),
+    "blocked": ("🛡", "Блок"),
+    "low_damage": ("🪶", "Слабый удар"),
+    "defend": ("🛡", "Защита"),
+    "stun_skip": ("💫", "Пропуск хода"),
+    "victory": ("🏁", "Итог"),
+    "opening": ("🎬", "Начало"),
+    "round_flavor": ("💬", "Ремарка"),
+    # Shields.
+    "shield_guard": ("🛡", "Щит"),
+    "shield_counterattack": ("↩️", "Контрудар"),
+    "shield_parry_stun": ("🤺", "Парирование"),
+    "shield_damage_heal": ("💚", "Щит лечит"),
+    "shield_burn_tick": ("🔥", "Горение"),
+    # The `skill_` family is shared: a shield's reflect and a scroll's reflect both land
+    # here, so these five are named for WHAT HAPPENED rather than for where it came from.
+    # Anything else starting with `skill_` really is a spell and falls to the prefix below.
+    "skill_dodge": ("💨", "Уворот"),
+    "skill_reflect": ("↩️", "Отражение"),
+    "skill_lifesteal": ("🩸", "Вампиризм"),
+    "skill_regen": ("💚", "Восстановление"),
+    "skill_ward": ("🔰", "Оберег"),
+    "antimagic_reflect": ("🪞", "Антимагия"),
+}
+
+# Checked in order, so a longer prefix wins over a shorter one.
+EVENT_MARK_PREFIXES: tuple[tuple[str, str, str], ...] = (
+    ("shield_defend_", "🛡", "Щит"),
+    ("shield_", "🛡", "Щит"),
+    ("amulet_", "🧿", "Эффект"),
+    ("signature_", "🌟", "Коронный приём"),
+    ("deficit_", "📉", "Слабое место"),
+    ("skill_", "✨", "Магия"),
+)
+
+EVENT_MARK_DEFAULT: tuple[str, str] = ("•", "Событие")
+
+
+def event_mark(event: str) -> tuple[str, str]:
+    """The emoji and the short name for one transcript event.
+
+    Never raises and never returns nothing: an event added later reads as a neutral dot
+    rather than making a log line disappear or a page throw.
+    """
+    key = str(event or "")
+    if key in EVENT_MARKS:
+        return EVENT_MARKS[key]
+    for prefix, icon, label in EVENT_MARK_PREFIXES:
+        if key.startswith(prefix):
+            return icon, label
+    return EVENT_MARK_DEFAULT
+
+
+def event_mark_table() -> dict:
+    """The whole vocabulary in one shape the browser can use.
+
+    Handed to the pages instead of being re-typed in JavaScript, so a new event is marked
+    the same way everywhere the moment it is added here.
+    """
+    return {
+        "exact": {key: list(value) for key, value in EVENT_MARKS.items()},
+        "prefixes": [[prefix, icon, label] for prefix, icon, label in EVENT_MARK_PREFIXES],
+        "default": list(EVENT_MARK_DEFAULT),
+    }

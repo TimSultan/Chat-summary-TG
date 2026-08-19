@@ -163,3 +163,83 @@ class DeterminismTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranscriptMarkTests(unittest.TestCase):
+    """Whose turn it is and what kind of turn it was: the two things a fight log never
+    said outright, so a reader had to infer the actor from a name buried in the prose and
+    the kind from the wording."""
+
+    def _every_event_the_engine_emits(self):
+        """Fights built to fire as much of the machinery as possible, so the check is
+        against what combat ACTUALLY produces rather than against a list somebody kept
+        up to date by hand."""
+        import random
+        import pets_combat
+        import pets_scroll_catalog as scrolls
+
+        rng = random.Random(4)
+        codes = [row["code"] for row in scrolls.REGULAR_SCROLLS]
+        shields = [row["code"] for row in scrolls.SHIELDS]
+        passives = ["thorns", "lifesteal", "regen", "ward", "crit_up", "dodge_up",
+                    "burn", "venom", "stun", "armor_shred", "double_hit", "combo"]
+        seen = set()
+        for seed in range(120):
+            def fighter(key):
+                return pets_combat.Fighter(
+                    key=key, name=key, strength=rng.randint(40, 200),
+                    health=rng.randint(40, 200), agility=rng.randint(10, 90),
+                    luck=rng.randint(10, 90), armor=rng.randint(0, 40),
+                    level=rng.randint(5, 40),
+                    effects=tuple({"code": code, "value": rng.randint(5, 40)}
+                                  for code in rng.sample(passives, 3)),
+                    skills=tuple(rng.sample(codes, 4)),
+                    shield=scrolls.SHIELD_BY_CODE[rng.choice(shields)],
+                )
+            for row in pets_combat.simulate(fighter("a"), fighter("b"), seed=seed).rounds:
+                seen.add(row.event)
+        return seen
+
+    def test_every_event_combat_can_emit_has_a_mark(self):
+        unmarked = sorted(
+            event for event in self._every_event_the_engine_emits()
+            if flavor.event_mark(event) == flavor.EVENT_MARK_DEFAULT
+        )
+        self.assertFalse(unmarked, f"без метки остались: {unmarked}")
+
+    def test_a_family_of_events_is_covered_by_its_prefix(self):
+        """Forty events, not forty table rows: a shield gains a new defend effect without
+        anybody having to remember to mark it."""
+        for event, expected in (
+            ("shield_defend_something_new", "🛡"),
+            ("amulet_something_new", "🧿"),
+            ("signature_whatever", "🌟"),
+            ("deficit_whatever", "📉"),
+        ):
+            with self.subTest(event=event):
+                self.assertEqual(flavor.event_mark(event)[0], expected)
+
+    def test_an_unknown_event_reads_as_a_neutral_dot_rather_than_breaking(self):
+        icon, label = flavor.event_mark("something_nobody_has_written_yet")
+        self.assertEqual((icon, label), flavor.EVENT_MARK_DEFAULT)
+        self.assertTrue(icon and label)
+        # None and "" must not blow up a log line either.
+        self.assertEqual(flavor.event_mark(None), flavor.EVENT_MARK_DEFAULT)
+        self.assertEqual(flavor.event_mark(""), flavor.EVENT_MARK_DEFAULT)
+
+    def test_the_shared_family_is_named_for_what_happened_not_where_it_came_from(self):
+        """`skill_reflect` is emitted by a shield's thorns as well as by a spell, so
+        calling it «Магия» would be a label that is wrong half the time."""
+        self.assertEqual(flavor.event_mark("skill_reflect")[1], "Отражение")
+        self.assertEqual(flavor.event_mark("skill_lifesteal")[1], "Вампиризм")
+        # Anything else spell-shaped still reads as magic.
+        self.assertEqual(flavor.event_mark("skill_meteor")[1], "Магия")
+
+    def test_the_table_ships_to_the_browser_whole(self):
+        table = flavor.event_mark_table()
+        self.assertEqual(set(table), {"exact", "prefixes", "default"})
+        self.assertEqual(table["exact"]["crit"], ["💥", "Крит"])
+        self.assertEqual(table["default"], list(flavor.EVENT_MARK_DEFAULT))
+        # It has to survive JSON, since that is how it reaches the page.
+        import json
+        self.assertEqual(json.loads(json.dumps(table)), table)

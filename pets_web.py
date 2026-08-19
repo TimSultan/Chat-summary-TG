@@ -55,6 +55,7 @@ import maintenance
 import pets
 import pets_combat
 import pets_config as C
+import pets_flavor
 import pets_mobs
 import pets_gemini
 import pets_scroll_catalog
@@ -3602,6 +3603,23 @@ input{flex:1;min-width:240px}button{cursor:pointer;background:#2677bd}.muted{col
 h1{font-size:23px}h2{font-size:18px}h3{margin:0 0 9px}.items{display:flex;flex-wrap:wrap;gap:6px}.tag{background:#26384a;border-radius:20px;padding:5px 9px}
 .audit-item{background:#121c27;border:1px solid var(--line);border-radius:10px;padding:10px;margin:7px 0}.audit-item img{width:54px;height:54px;object-fit:cover;border-radius:8px;float:left;margin:0 9px 6px 0}.audit-item h4{margin:0 0 5px}.audit-item p{margin:5px 0}.mechanics{color:#bed2e6;font:12px ui-monospace,monospace}.effect-line{border-left:3px solid var(--blue);padding-left:8px}
 .moves{display:grid;gap:8px;margin-top:14px}.move summary{cursor:pointer}.move.effect{margin-left:24px;border-left:3px solid var(--blue)}.state{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+/* Whose turn it is, and what kind of turn it was -- the two things a transcript never
+   said outright, so both are now the first thing on the line rather than something to
+   infer from the prose. The actor's colour is per side, not per player. */
+.mark{font-size:15px;margin-right:6px}
+.who{display:inline-block;min-width:132px;font-weight:700}
+.who.a{color:#7fd4a1}.who.b{color:#f0a2a2}
+.kindtag{display:inline-block;background:#26384a;border-radius:20px;padding:2px 9px;font-size:11px;color:#cfe0f0;margin-right:8px}
+/* The replay: two bars and a scrolling log, the same fight the transcript below lists. */
+.player{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:14px 0}
+.player .sides{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:10px}
+.pbar{height:12px;background:var(--track);border-radius:3px;margin-top:5px;overflow:hidden}
+.pbar i{display:block;height:100%;background:#7fd4a1;transition:width .18s linear}
+.pbar.b i{background:#f0a2a2}
+.plog{max-height:340px;overflow:auto;display:grid;gap:5px;font-size:13px}
+.plog div{padding:6px 8px;border-radius:8px;background:#121c27}
+.plog div.eff{margin-left:20px;background:#101820;color:#bed2e6;font-size:12px}
+.pctl{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101820;padding:9px;border-radius:8px;font-size:11px;margin:7px 0 0}.id{font:600 13px ui-monospace,monospace;color:var(--blue)}
 .tabs{display:flex;gap:8px;margin:0 0 16px}.tabs button{background:var(--track)}.tabs button.on{background:#2677bd;border-color:#2677bd}
 .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
@@ -3668,6 +3686,11 @@ const tg=window.Telegram&&Telegram.WebApp; if(tg){tg.ready();tg.expand()}
 const initData=(tg&&tg.initData)||""; const out=document.getElementById("out"), status=document.getElementById("status");
 const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pretty=v=>esc(JSON.stringify(v??{},null,2));
+// Generated from pets_flavor.EVENT_MARKS -- one table, so this page and the game mark a
+// transcript identically and a new event never needs marking up twice.
+const EVENT_MARKS=__EVENT_MARKS__;
+function eventMark(event){const k=String(event||"");if(EVENT_MARKS.exact[k])return EVENT_MARKS.exact[k];
+  for(const row of EVENT_MARKS.prefixes){if(k.indexOf(row[0])===0)return [row[1],row[2]]}return EVENT_MARKS.default}
 async function api(id="",pet=""){status.textContent="Loading…";const q=new URLSearchParams();if(id)q.set("id",id);if(pet){q.set("pet_id",pet);q.set("limit","500")}const u="/audit/api/fights"+(q.size?"?"+q.toString():"");const r=await fetch(u);const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
 function auditFailure(e){status.textContent=e.message||"Could not load fights";out.innerHTML=""}
 function mechanics(v,skip=[]){if(!v||typeof v!=="object")return"";const rows=Object.entries(v).filter(([k,x])=>!skip.includes(k)&&x!==null&&x!==""&&!(Array.isArray(x)&&!x.length));return rows.length?`<div class="mechanics">${rows.map(([k,x])=>`${esc(k)}: ${esc(typeof x==="object"?JSON.stringify(x):x)}`).join(" · ")}</div>`:""}
@@ -3676,7 +3699,60 @@ function auditItem(i){const e=i.effect||{};return `<div class="audit-item">${i.a
 function auditScroll(s){if(!s)return"";return `<div class="audit-item">${s.art?`<img src="${esc(s.art)}" alt="">`:""}<h4>${esc(s.icon||"📜")} ${esc(s.name)} <span class="muted">${esc(s.code)}</span></h4>${s.personal_paint?`<p>🎨 Personal paint · useful power ×${esc(s.personal_power_multiplier||1.3)}; chance and duration unchanged</p>`:""}${s.description?`<p>${esc(s.description)}</p>`:""}${(s.effects_text||[]).map(x=>`<p class="effect-line">${esc(x)}</p>`).join("")}${mechanics({element:s.element,uses:s.uses,dodgeable:s.dodgeable,ultimate:s.ultimate})}${(s.effects||[]).map(e=>mechanics(e)).join("")}</div>`}
 function auditEffect(e){if(typeof e==="string")return `<div class="audit-item">${esc(e)}</div>`;return `<div class="audit-item">${e.text?`<p class="effect-line">${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
 function side([key,s]){const f=s.fighter||{},d=s.derived||{},items=s.equipped||[],scrolls=s.scrolls||[],effects=f.effects||[];return `<article class="card"><h3>${esc(f.name||key)} <span class="muted">${esc(key)}</span></h3><div>⭐ ${esc(f.level)} · ⚔️ ${esc(f.strength)} · ❤️ ${esc(f.health)} · 💨 ${esc(f.agility)} · 🍀 ${esc(f.luck)} · 🛡️ ${esc(f.armor)}</div><div class="muted">Derived: ❤️ ${esc(Math.round(d.max_hp||0))}, ⚔️ ${esc(Math.round(d.damage||0))}, dodge ${esc(((d.dodge||0)*100).toFixed(1))}%, crit ${esc(((d.crit||0)*100).toFixed(1))}%, reduction ${esc(((d.reduction||0)*100).toFixed(1))}%</div><h4>Items and exact effects</h4>${items.length?items.map(auditItem).join(""):"<span class=muted>None recorded</span>"}<h4>Scrolls</h4>${scrolls.filter(Boolean).length?scrolls.map(auditScroll).join(""):"<span class=muted>None</span>"}<h4>Combat effect snapshot</h4>${effects.length?effects.map(auditEffect).join(""):"<span class=muted>None</span>"}<h4>Shield</h4>${s.shield?auditEffect(s.shield):"<span class=muted>None</span>"}<details><summary>Full input snapshot</summary><pre>${pretty(s)}</pre></details></article>`}
-function renderFight(f){const fighters=Object.entries(f.fighters||{}),moves=f.moves||[],actions=moves.filter(m=>m.is_action!==false).length;out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p><div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div><h2>Actions (${actions}) · transcript events (${moves.length})</h2><div class="moves">${moves.map(m=>`<details class="move ${m.is_action===false?"effect":""}"><summary><b>${m.is_action===false?"EFFECT":"ACTION"} · #${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)}</b> · ${esc(m.attacker)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}<br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(k)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;status.textContent="Loaded."}
+// Who is who, so a transcript can say "Кабанчик" where it used to print a raw key like
+// "dungeon:boss_15" or a bare user id -- which is most of why the log was unreadable.
+let fightCast={};
+function castOf(f){const cast={};const keys=Object.keys(f.fighters||{});keys.forEach((key,i)=>{
+  const side=(f.fighters[key]||{}).fighter||{};
+  cast[key]={name:side.name||key,cls:i===0?"a":"b",max:Math.round(((f.fighters[key]||{}).derived||{}).max_hp||0)}});
+  return cast}
+function actorOf(key){return fightCast[key]||{name:String(key||"?"),cls:"a",max:0}}
+function moveHead(m){const [icon,label]=eventMark(m.event),who=actorOf(m.attacker);
+  return `<span class="mark">${esc(icon)}</span><span class="who ${who.cls}">${esc(who.name)}</span>`+
+    `<span class="kindtag">${esc(label)}</span>`}
+
+// A replay, not just a list: the point of opening somebody else's fight is watching it go
+// wrong, and reading forty <details> rows is not watching.
+let playTimer=null;
+function stopPlayback(){if(playTimer){clearTimeout(playTimer);playTimer=null}}
+function playFight(f){stopPlayback();const moves=f.moves||[];const keys=Object.keys(fightCast);
+  const [ka,kb]=[keys[0],keys[1]||keys[0]];const a=actorOf(ka),b=actorOf(kb);
+  const log=document.getElementById("plog");log.innerHTML="";
+  const setBar=(which,hp,max)=>{const el=document.getElementById("pbar"+which);
+    if(el)el.style.width=Math.max(0,Math.min(100,max?(hp/max)*100:0))+"%";
+    const num=document.getElementById("php"+which);if(num)num.textContent=Math.max(0,Math.round(hp))};
+  setBar("A",a.max,a.max);setBar("B",b.max,b.max);
+  let i=0;
+  const line=(m)=>{const effect=m.is_action===false;
+    log.insertAdjacentHTML("beforeend",`<div class="${effect?"eff":""}">${moveHead(m)} `+
+      `<span class="muted">р.${esc(m.round)}</span> ${esc(m.text||"")}`+
+      `${m.damage?` <b>${esc(m.damage)}</b>`:""}</div>`);
+    // The transcript stores hp from the ACTOR's point of view, so which bar moves
+    // depends on whose line it is.
+    if(String(m.attacker)===String(ka)){setBar("A",m.attacker_hp,a.max);setBar("B",m.defender_hp,b.max)}
+    else{setBar("B",m.attacker_hp,b.max);setBar("A",m.defender_hp,a.max)}
+    log.scrollTop=log.scrollHeight};
+  const step=()=>{if(i>=moves.length){playTimer=null;document.getElementById("pplay").textContent="↻ Replay";return}
+    const m=moves[i++];line(m);
+    playTimer=setTimeout(step,m.is_action===false?110:320)};
+  step()}
+
+function renderFight(f){fightCast=castOf(f);stopPlayback();
+  const fighters=Object.entries(f.fighters||{}),moves=f.moves||[],actions=moves.filter(m=>m.is_action!==false).length;
+  const keys=Object.keys(fightCast),a=actorOf(keys[0]),b=actorOf(keys[1]||keys[0]);
+  out.innerHTML=`<p class="id">${esc(f.fight_id)}</p><h2>${esc(f.kind)} · ${esc(f.at)}</h2><p>${esc(f.opening)}<br><b>${esc(f.closing)}</b></p>`+
+    `<div class="player"><div class="sides">`+
+      `<div><span class="who a">${esc(a.name)}</span> <span class="muted" id="phpA">${esc(a.max)}</span><div class="pbar"><i id="pbarA" style="width:100%"></i></div></div>`+
+      `<div><span class="who b">${esc(b.name)}</span> <span class="muted" id="phpB">${esc(b.max)}</span><div class="pbar b"><i id="pbarB" style="width:100%"></i></div></div>`+
+    `</div><div class="plog" id="plog"></div>`+
+    `<div class="pctl"><button id="pplay">▶ Play</button><button id="pall">Show all at once</button></div></div>`+
+    `<div class="grid">${fighters.map(side).join("")}</div><div class="card"><b>Outcome</b><pre>${pretty({winner:f.winner,loser:f.loser,draw:f.draw,stopped_early:f.stopped_early,seed:f.seed,total_damage:f.total_damage,final_hp:f.final_hp,context:f.context})}</pre></div>`+
+    `<h2>Actions (${actions}) · transcript events (${moves.length})</h2><div class="moves">${moves.map(m=>`<details class="move ${m.is_action===false?"effect":""}"><summary>${moveHead(m)}<span class="muted">#${esc(m.index)} · round ${esc(m.round)} · ${esc(m.event)} · damage ${esc(m.damage)} · HP ${esc(m.attacker_hp)} / ${esc(m.defender_hp)}</span><br><span class="muted">${esc(m.text)}</span></summary><div class="state">${Object.entries((m.state||{}).fighters||{}).map(([k,v])=>`<div><b>${esc(actorOf(k).name)}</b><pre>${pretty(v)}</pre></div>`).join("")}</div></details>`).join("")}</div>`;
+  document.getElementById("pplay").onclick=()=>{document.getElementById("pplay").textContent="⏸ Playing…";playFight(f)};
+  document.getElementById("pall").onclick=()=>{stopPlayback();const log=document.getElementById("plog");log.innerHTML="";
+    (f.moves||[]).forEach(m=>log.insertAdjacentHTML("beforeend",`<div class="${m.is_action===false?"eff":""}">${moveHead(m)} <span class="muted">р.${esc(m.round)}</span> ${esc(m.text||"")}${m.damage?` <b>${esc(m.damage)}</b>`:""}</div>`));
+    document.getElementById("pplay").textContent="▶ Play"};
+  status.textContent="Loaded."}
 async function load(id){try{const d=await api(id);renderFight(d.fight)}catch(e){auditFailure(e)}}
 let auditPets=[],selectedPet="";const petSearch=document.getElementById("petSearch"),petSuggestions=document.getElementById("petSuggestions");
 function petLabel(p){return `${p.name||p.user_id}${p.owner_name?" / "+p.owner_name:""}${p.owner_username?" / @"+p.owner_username:""} / ${p.user_id} / ${p.fights} fights`}
@@ -4953,6 +5029,15 @@ PAGE_HTML = """<!doctype html>
   .duel .blow.shield-effect { border-left-color: #62aef0; margin-left: 18px; opacity: .9; }
   .duel .blow.skill { border-left-color: var(--r-rare); }
   .duel .blow.defend { border-left-color: #4c82b8; }
+  /* The head of every line: an icon for what kind of turn it was, then whose turn it was,
+     then the kind in words. Fixed-width name column so forty lines read as a column of
+     actors rather than as forty different indents. */
+  .duel .blow .mark { margin-right: 5px; }
+  .duel .blow .who { display: inline-block; min-width: 96px; font-weight: 700; }
+  .duel .blow .who.mine { color: var(--accent); }
+  .duel .blow .who.them { color: var(--r-legendary); }
+  .duel .blow .kindtag { display: inline-block; background: var(--sunken); border-radius: 20px;
+                         padding: 1px 8px; font-size: 11px; color: var(--muted); margin-right: 7px; }
   /* The flavour text is prose with three things buried in it -- who acted, who was hit,
      and how much. They are the only parts anybody actually reads at one line per half
      second, so they are the only parts coloured: two sides, and a number whose colour
@@ -8423,6 +8508,29 @@ const isDigit = (ch) => ch >= "0" && ch <= "9";
 //
 // Matching happens on the raw text and every piece is escaped exactly once on the way
 // out, so inserted markup is never rescanned and a pet called "span" changes nothing.
+// Generated from pets_flavor.EVENT_MARKS, the same table the audit page reads.
+const EVENT_MARKS = __EVENT_MARKS__;
+function eventMark(event) {
+  const key = String(event || "");
+  if (EVENT_MARKS.exact[key]) return EVENT_MARKS.exact[key];
+  for (const row of EVENT_MARKS.prefixes) {
+    if (key.indexOf(row[0]) === 0) return [row[1], row[2]];
+  }
+  return EVENT_MARKS.default;
+}
+
+// Whose turn it is and what kind of turn it was, at the head of the line. Both used to be
+// something you inferred -- the actor from the colour of a name inside the prose, the kind
+// from the wording -- which is what made a long fight unreadable.
+function blowHead(round, mineName, theirName, me) {
+  const mark = eventMark(round.event);
+  const mine = String(round.attacker) === String(me);
+  const who = mine ? mineName : theirName;
+  return '<span class="mark">' + mark[0] + '</span>' +
+    (who ? '<span class="who ' + (mine ? "mine" : "them") + '">' + esc(who) + '</span>' : "") +
+    '<span class="kindtag">' + esc(mark[1]) + '</span>';
+}
+
 function paintBlow(round, mineName, theirName) {
   const rules = [];
   if (mineName) rules.push({ text: mineName, cls: "nm mine" });
@@ -8667,7 +8775,8 @@ function playDuel(data) {
       : (eventName.indexOf("skill_") === 0 ? "skill"
       : (eventName.indexOf("crit") >= 0 ? "crit" : (mineTurn ? "mine" : ""))))));
     $("duelLog").insertAdjacentHTML("beforeend",
-      '<div class="blow ' + kind + '">' + paintBlow(round, mineName, theirName) + "</div>");
+      '<div class="blow ' + kind + '">' + blowHead(round, mineName, theirName, me) +
+      paintBlow(round, mineName, theirName) + "</div>");
     $("duelLog").scrollTop = $("duelLog").scrollHeight;
     // Passive consequences stay visually attached to the action that caused them.
     // They are quick transcript details, never an implied extra combat turn.
@@ -8678,7 +8787,8 @@ function playDuel(data) {
     // the same coloured lines step() would have written one at a time.
     while (index < data.rounds.length) { const r = data.rounds[index++];
       $("duelLog").insertAdjacentHTML("beforeend",
-        '<div class="blow">' + paintBlow(r, mineName, theirName) + "</div>"); }
+        '<div class="blow">' + blowHead(r, mineName, theirName, me) +
+        paintBlow(r, mineName, theirName) + "</div>"); }
     finish();
   };
   step();
@@ -9193,3 +9303,11 @@ refresh().then(() => {
 </body>
 </html>
 """
+
+
+# One vocabulary, two pages. Substituted once at import rather than per request: the table
+# is a constant, and a page that renders a transcript must mark it the same way the game
+# does or an administrator and a player end up reading two different logs.
+_EVENT_MARKS_JS = json.dumps(pets_flavor.event_mark_table(), ensure_ascii=False)
+AUDIT_HTML = AUDIT_HTML.replace("__EVENT_MARKS__", _EVENT_MARKS_JS)
+PAGE_HTML = PAGE_HTML.replace("__EVENT_MARKS__", _EVENT_MARKS_JS)

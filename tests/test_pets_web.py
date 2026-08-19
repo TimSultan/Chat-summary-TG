@@ -2508,6 +2508,46 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # And it really is the name the rounds talk about.
         self.assertTrue(any("Кабанчик" in r["text"] for r in replayed["rounds"]))
 
+    async def test_both_pages_mark_a_transcript_from_the_one_table(self):
+        """The game and the audit must not disagree about what a crit looks like, so the
+        vocabulary is generated from pets_flavor rather than typed into two pages."""
+        import pets_flavor
+
+        app_page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        audit_page = await (await self.client.get("/audit")).text()
+
+        for name, page in (("app", app_page), ("audit", audit_page)):
+            with self.subTest(page=name):
+                # Substituted, not shipped as a placeholder.
+                self.assertNotIn("__EVENT_MARKS__", page)
+                self.assertIn("const EVENT_MARKS=", page.replace("EVENT_MARKS = ", "EVENT_MARKS="))
+                self.assertIn("function eventMark(", page)
+                # A couple of marks the table actually carries, so a page that shipped an
+                # empty object fails here rather than silently drawing no icons.
+                self.assertIn(pets_flavor.EVENT_MARKS["crit"][1], page)
+                self.assertIn(pets_flavor.EVENT_MARKS["dodge"][1], page)
+
+    async def test_the_audit_page_says_whose_turn_it_is_and_can_play_a_fight(self):
+        """Reading somebody else's fight meant reading raw keys like `dungeon:boss_15`
+        down a column of collapsed rows. It names the fighter now, tags what kind of turn
+        it was, and will play the whole thing back."""
+        page = await (await self.client.get("/audit")).text()
+
+        # Whose turn, by name, with the kind beside it.
+        self.assertIn("function moveHead(", page)
+        self.assertIn("function actorOf(", page)
+        self.assertIn("function castOf(", page)
+        self.assertIn("moveHead(m)", page)
+        # A replay, with its own controls and two health bars.
+        self.assertIn("function playFight(", page)
+        self.assertIn('id="pplay"', page)
+        self.assertIn('id="pall"', page)
+        self.assertIn('id="plog"', page)
+        self.assertIn("stopPlayback()", page)
+        # And the pet filter it already had is still how you get to another player.
+        self.assertIn('id="petSearch"', page)
+        self.assertIn('id="allPets"', page)
+
     async def test_the_fight_log_colours_the_three_things_a_line_is_made_of(self):
         """pets_flavor fills exactly {attacker}, {defender} and {amount} into every
         template, so those three are what the log highlights -- and an amulet's amount is
@@ -2522,11 +2562,19 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # vampiric drain gets painted as damage taken.
         for code in ("vampiric", "second_wind", "dodge_heal", "regen"):
             self.assertIn(code, page)
-        # Both the animated path and the skip button go through the same painter, so a
-        # skipped fight is not a differently formatted one.
+        # Both the animated path and the skip button go through the same painter AND the
+        # same head, so a skipped fight is not a differently formatted one. Matched
+        # without pinning whitespace: what matters is that neither call site skips either.
         self.assertEqual(page.count("function paintBlow("), 1)
-        self.assertIn('+ paintBlow(round, mineName, theirName) + "</div>"', page)
-        self.assertIn('+ paintBlow(r, mineName, theirName) + "</div>"', page)
+        self.assertEqual(page.count("function blowHead("), 1)
+        animated = re.search(
+            r"blowHead\(round, mineName, theirName, me\)\s*\+\s*"
+            r"paintBlow\(round, mineName, theirName\)", page)
+        skipped = re.search(
+            r"blowHead\(r, mineName, theirName, me\)\s*\+\s*"
+            r"paintBlow\(r, mineName, theirName\)", page)
+        self.assertTrue(animated, "the animated line lost its head or its painter")
+        self.assertTrue(skipped, "the skipped line lost its head or its painter")
         # The two side colours are their own tokens: --xp/--hp already mean "your money
         # went up/down" everywhere else, and the numbers keep saying that.
         self.assertIn("--mine:", page)
