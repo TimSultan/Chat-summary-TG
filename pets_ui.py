@@ -402,14 +402,27 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         power = int(state.get("power", 0))
         needed = int(state.get("min_power", 1000))
         tickets = int(state.get("tickets", 0) or 0)
-        lines = ["🕳 <b>Подземелье</b>", "", f"⚡ Сила: <b>{_money(power)}</b> / {_money(needed)}",
+        lines = ["🕳 <b>Подземелье</b>", ""]
+        # The last descent's receipt, first and in full. This is the screen a player is
+        # dropped on the instant a run ends, so it is the only place a dead run's takings
+        # can still be read -- and until now it printed the entry price instead.
+        finished = dungeon_finished_text(state.get("last_haul"))
+        if finished:
+            lines.extend([finished, ""])
+        lines.extend([f"⚡ Сила: <b>{_money(power)}</b> / {_money(needed)}",
              (f"🎫 Билетов в подземелье: <b>{tickets}</b>" if tickets else f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>"),
-                 "Состав этажей меняется, боссы каждые пять этажей. Здоровье не восстанавливается после боя."]
+                 "Состав этажей меняется, боссы каждые пять этажей. Здоровье не восстанавливается после боя."])
         rows = [[{"text": (f"⚔️ Войти · билет ({tickets})" if tickets else f"⚔️ Войти · {state.get('entry_cost', 15)} 💎"), "callback_data": callback_data(user_id, "dungeonenter")}]]
         rows.append(_back_row(user_id))
         return "\n".join(lines), {"inline_keyboard": rows}
     lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", escape(str(state.get('description') or '')), ""]
     rows = []
+    # Above the floor, and above its buttons: the find is the one thing on this screen
+    # that was not here a moment ago. It is never a gate -- the enemies below stay
+    # playable with the box still standing, and the next descent clears it either way.
+    chest_lines, chest_rows = dungeon_chest_block(state.get("chest"), user_id)
+    lines.extend(chest_lines)
+    rows.extend(chest_rows)
     healers_alive = int(state.get("healers_alive", 0) or 0)
     if healers_alive:
         lines.append(
@@ -484,6 +497,35 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def dungeon_chest_block(chest: dict | None, user_id) -> tuple[list[str], list[list[dict]]]:
+    """The between-floors find, as lines and one row of buttons.
+
+    Two states and no third: a closed box whose kind is still a secret, and a mimic that
+    has already bitten. A plain chest never reaches a second state -- the press that opens
+    it also empties it.
+    """
+    if not isinstance(chest, dict) or not chest.get("present"):
+        return [], []
+    if not chest.get("revealed"):
+        return ([
+            "🧰 <b>На площадке между этажами стоит сундук.</b>",
+            f"<i>Крышка поддаётся. Такие иногда кусаются — до {int(chest.get('bite_percent', 15))}% здоровья.</i>",
+            "",
+        ], [[
+            {"text": "🧰 Открыть", "callback_data": callback_data(user_id, "dungeonchest", "open")},
+            {"text": "🚶 Мимо", "callback_data": callback_data(user_id, "dungeonchest", "leave")},
+        ]])
+    return ([
+        f"🦷 <b>{escape(str(chest.get('name') or 'Мимик'))}</b> · ур. {int(chest.get('level', 1) or 1)}",
+        f"<i>{escape(str(chest.get('hint') or ''))}</i>",
+        "Он уже укусил. Дальше — твоё дело: добить или отойти.",
+        "",
+    ], [[
+        {"text": "⚔️ Драться", "callback_data": callback_data(user_id, "dungeonchest", "fight")},
+        {"text": "🚶 Уйти", "callback_data": callback_data(user_id, "dungeonchest", "leave")},
+    ]])
+
+
 # How many drop names a summary spells out before it starts counting instead.
 HAUL_NAMES_SHOWN = 6
 
@@ -531,18 +573,45 @@ def dungeon_haul_block(state: dict) -> list[str]:
     return []
 
 
+def haul_praise(haul: dict | None) -> str:
+    """Credit for what a descent brought back, sized to the haul.
+
+    Dying deep with full pockets is the best thing that can happen in the dungeon and it
+    used to be reported like a failure. The line is deliberately plain: it says the run
+    paid, without pretending the ending was anything other than what it was.
+    """
+    haul = haul or {}
+    gold = int(haul.get("gold", 0) or 0)
+    drops = sum(len(haul.get(key) or []) for key in ("items", "scrolls", "runes"))
+    if not gold and not drops and not int(haul.get("rubies", 0) or 0):
+        return ""
+    if gold >= 5000 or drops >= 5:
+        return "Отличная нажива."
+    return "Хорошая нажива."
+
+
 def dungeon_finished_text(haul: dict | None) -> str:
-    """The closing receipt, shown once the run is over however it ended."""
+    """The closing receipt, shown once the run is over however it ended.
+
+    Always says something. An empty tally used to return "" and the whole screen said
+    nothing at all about a run that had just ended, which reads as a lost receipt rather
+    than as an empty one.
+    """
     haul = haul or {}
     line = haul_line(haul)
-    if not line:
-        return ""
     verdict = "🏁 Поход окончен" if haul.get("won") else "☠️ Поход оборвался"
     floor = int(haul.get("floor", 0) or 0)
     where = f" на этаже {floor}" if floor else ""
     kills = int(haul.get("kills", 0) or 0)
-    return (f"{verdict}{where}. Побед: {kills}.\n"
-            f"🎒 <b>Всего за поход:</b> {line}")
+    lines = [f"{verdict}{where}. Побед: {kills}."]
+    if line:
+        lines.append(f"🎒 <b>Всего за поход:</b> {line}")
+        praise = haul_praise(haul)
+        if praise:
+            lines.append(f"<i>{praise}</i>")
+    else:
+        lines.append("<i>Из подземелья ты вышел с пустыми руками.</i>")
+    return "\n".join(lines)
 
 
 def dungeon_reward_text(receipt: dict | None) -> str:
@@ -558,10 +627,14 @@ def dungeon_reward_text(receipt: dict | None) -> str:
     if receipt.get("rubies"):
         bits.append(f"💎 +{int(receipt['rubies'])}")
     lines = ["Получено: " + " · ".join(bits)] if bits else []
+    # A chest empties several items at once, so this field is a LIST there and a single
+    # drop after an ordinary kill. Both are walked the same way rather than the receipt
+    # quietly printing only the first thing a box held.
     dropped = receipt.get("dropped") or {}
-    if dropped.get("name"):
-        equipped = " (надето)" if dropped.get("auto_equipped") else ""
-        lines.append(f"🎁 Предмет: «{escape(str(dropped['name']))}»{equipped}")
+    for row in (dropped if isinstance(dropped, (list, tuple)) else [dropped]):
+        if isinstance(row, dict) and row.get("name"):
+            equipped = " (надето)" if row.get("auto_equipped") else ""
+            lines.append(f"🎁 Предмет: «{escape(str(row['name']))}»{equipped}")
     scroll = receipt.get("scroll") or {}
     if scroll.get("granted"):
         lines.append(
@@ -569,8 +642,15 @@ def dungeon_reward_text(receipt: dict | None) -> str:
             f"«{escape(str(scroll.get('name') or 'Новое заклинание'))}»"
         )
     rune = receipt.get("rune") or {}
-    if rune.get("granted"):
-        lines.append(f"🔮 Руна: {escape(str(rune.get('element') or 'магия'))} +{int(rune['granted'])}")
+    for row in (rune if isinstance(rune, (list, tuple)) else [rune]):
+        if isinstance(row, dict) and row.get("granted"):
+            # By its Russian name, not its internal code: "air +1" is the loot table
+            # leaking onto a receipt a player is meant to read.
+            element = str(row.get("element") or "")
+            lines.append(
+                f"🔮 Руна: {escape(pets.RUNE_NAMES.get(element, element or 'магия'))} "
+                f"+{int(row['granted'])}"
+            )
     return "\n".join(lines)
 
 
@@ -1923,29 +2003,38 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     status = pets.forge_status(entry, user_id)
     lines = [
         "⚒️ <b>Кузница</b>",
-        "6 проклятых предметов превращаются в редкую проклятую реликвию, 5 обычных — в редкий, а 7 редких — в легендарный.",
+        (f"Кузница берёт предметы одного типа и одной редкости и возвращает предмет того "
+         f"же типа редкостью выше: {pets.FORGE_REQUIREMENTS['common']} обычных перчаток — "
+         f"редкие перчатки, {pets.FORGE_REQUIREMENTS['rare']} редких — легендарные, "
+         f"{pets.FORGE_REQUIREMENTS['cursed']} проклятых пушек — редкая пушка."),
         "<i>Надетые и защищённые вещи кузница не трогает. Сначала уходят самые слабые.</i>",
     ]
     rows = []
-    for recipe in status.get("recipes", []):
+    recipes = status.get("recipes", [])
+    if not recipes:
+        lines.append("\nВ сумке пока нет ничего, что можно было бы переплавить.")
+    for recipe in recipes:
         rarity = recipe["rarity"]
+        slot = recipe["slot"]
         result_rarity = recipe["result_rarity"]
         required = recipe["required"]
+        kind = f"{C.SLOT_EMOJI[slot]} {C.SLOT_NAMES[slot]}"
         ingredients = [C.find_item(code) for code in recipe.get("ingredients", [])]
         lines.append(
-            f"\n<b>{required} {labels[rarity]} → {labels[result_rarity]}</b> "
-            f"({recipe['available']} доступно)"
+            f"\n<b>{kind}: {required} {labels[rarity]} → {labels[result_rarity]}</b> "
+            f"({recipe['available']} из {required})"
         )
         if ingredients:
             lines.append("Будут использованы: " + ", ".join(
                 f"«{escape(item.name)}»" for item in ingredients if item is not None
             ))
-        else:
-            lines.append("Подходящих вещей пока нет.")
         rows.append([{
-            "text": f"⚒️ {required} {labels[rarity]} → {labels[result_rarity]}",
+            "text": f"⚒️ {kind} · {required} {labels[rarity]} → {labels[result_rarity]}",
+            # rarity:slot, which parse_callback hands back whole -- the recipe is both
+            # halves now, and a button carrying only one of them would forge the wrong pile.
             "callback_data": callback_data(
-                user_id, "reforge" if recipe.get("can_forge") else "noop", rarity,
+                user_id, "reforge" if recipe.get("can_forge") else "noop",
+                f"{rarity}:{slot}",
             ),
         }])
     rune_state = pets.rune_status(entry, user_id)
@@ -2191,7 +2280,8 @@ def shop_slot_view(entry: str, user_id, xp: int, slot: str) -> tuple[str, dict]:
 
     lines = [
         f"🛒 <b>{escape(C.SLOT_NAMES[slot])}</b> {C.SLOT_EMOJI[slot]}",
-        "Твоя витрина: 5 обычных и 1 редкий предмет, обновляется в 00:00 и 12:00 по Москве.\n",
+        (f"Твоя витрина: {C.STOREFRONT_NORMAL_COUNT} обычных и {C.STOREFRONT_RARE_COUNT} "
+         "редкий предмет, обновляется в 00:00 по Москве.\n"),
     ]
     rows = []
     for number, item in enumerate(stock, 1):
@@ -2491,7 +2581,8 @@ def store_view(entry: str, user_id, xp: int, rarity: str = "all") -> tuple[str, 
     visible = [item for item in stock if rarity == "all" or item.rarity == rarity]
     lines = [
         "🛒 <b>Витрина</b>",
-        "В 00:00 и 12:00 по Москве появляются 5 обычных и 1 редкий предмет для каждого слота.",
+        (f"В 00:00 по Москве появляются {C.STOREFRONT_NORMAL_COUNT} обычных и "
+         f"{C.STOREFRONT_RARE_COUNT} редкий предмет для каждого слота."),
     ]
     lines.append(f"Фильтр: <b>{RARITY_FILTER_NAMES[rarity]}</b>\n")
     if not visible:

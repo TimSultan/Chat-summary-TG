@@ -1277,7 +1277,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         stores -- equip must fill the slot and flip the bag card's `equipped` flag in the
         one response, and unequip must undo exactly that."""
         self._tame(PLAYER)
-        item = C.items_for_slot("amulet", source="shop")[0]
+        # From this player's own shelf: every slot rotates now, and buy_item refuses
+        # anything that is not currently on offer to THEM.
+        item = pets.daily_storefront_items(CHAT, "amulet", user_id=PLAYER["id"])[0]
         self.assertTrue(pets.buy_item(CHAT, PLAYER["id"], RICH_XP, item.code)[0])
 
         equipped = await self._action(PLAYER, "equip", code=item.code)
@@ -1294,16 +1296,47 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- selling ------------------------------------------------------------------------
 
+    async def test_gear_can_still_be_changed_from_inside_a_dungeon_run(self):
+        """The run gate used to refuse every action but the dungeon's own, which included
+        the one thing a boss's stated weakness asks a player to do."""
+        self._tame(PLAYER)
+        data = pets._load(CHAT)
+        record = data["pets"][str(PLAYER["id"])]
+        record["inventory"].append("w001")
+        record["dungeon_run"] = {
+            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [],
+        }
+        pets._save(CHAT, data)
+
+        body = await self._action(PLAYER, "equip", code="w001")
+
+        self.assertTrue(body["ok"], body["message"])
+        self.assertEqual(
+            pets.get_pet(CHAT, PLAYER["id"])["equipped"].get("weapon"), "w001")
+        # The run is untouched by it: no healing, no reset, no free floor.
+        run = pets.get_pet(CHAT, PLAYER["id"])["dungeon_run"]
+        self.assertEqual((run["hp"], run["floor"], run["cleared"]), (10, 1, []))
+
+        # And leaving for another mode is still refused, with the reason spelled out.
+        refused = await self._action_raw(PLAYER, "farm_start", hours=1)
+        self.assertEqual(refused.status, 409)
+        body = await refused.json()
+        self.assertEqual(body["error"], "DUNGEON_ACTIVE")
+        self.assertIn("снаряжение", body["message"])
+
     async def test_selling_a_rare_item_needs_confirm_true(self):
         """valuable_item's rarity gate exists so a stray tap cannot vanish something hard
         to replace. pets.sell_item enforces the real one-time token, but the action
         wrapper is what decides whether the client is even allowed to ask for one --
         without `confirm: true` the sale must be refused outright, not merely queued."""
         self._tame(PLAYER)
-        # Weapon-slot shop items are also gated by the daily rotation; an accessory sidesteps
-        # that and is guaranteed to exist regardless of which catalogue modules are loaded.
+        # Every slot is gated by the daily rotation, so the item under test has to be the
+        # rare one actually on this player's shelf rather than any rare in the catalogue.
         item = next(
-            i for i in C.ITEMS if valuable_item(i) and i.source == "shop" and i.slot != "weapon"
+            offer for offer in pets.daily_storefront_items(
+                CHAT, "amulet", user_id=PLAYER["id"],
+            )
+            if valuable_item(offer)
         )
         self.assertTrue(pets.buy_item(CHAT, PLAYER["id"], RICH_XP, item.code)[0])
 
@@ -1447,7 +1480,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(body["defaults"]["skills"]), 4)
         self.assertEqual(len(body["regular_scrolls"]), 30)
         self.assertEqual(len(body["ultimate_scrolls"]), 10)
-        self.assertEqual(len(body["shields"]), 20)
+        self.assertEqual(len(body["shields"]), len(SCROLLS.SHIELDS))
         self.assertTrue(all(row["auto_weight"] == 1 for row in body["regular_scrolls"]))
         self.assertTrue(all(row["effects"] for row in body["regular_scrolls"]))
         self.assertEqual(
@@ -1543,7 +1576,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Побеждён: Стайный вампир.", message)
         self.assertNotIn("Fight ID", message)
         for expected in ("🪙 +140", "✨ +55", "💎 +1", "🎁 Ржавый меч", "(надето)",
-                         "📜 Искра", "🔮 fire +1"):
+                         # By its Russian name: "fire" is the loot table's word, not a
+                         # word the receipt should be showing a player.
+                         "📜 Искра", "🔮 Огонь +1"):
             with self.subTest(expected=expected):
                 self.assertIn(expected, message)
 

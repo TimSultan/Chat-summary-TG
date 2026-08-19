@@ -1133,7 +1133,7 @@ def _action_buy(entry, user_id, xp, payload):
 
 def _action_reforge(entry, user_id, xp, payload):
     ok, message, _code = pets.reforge_items(
-        entry, user_id, str(payload.get("rarity") or ""),
+        entry, user_id, str(payload.get("rarity") or ""), str(payload.get("slot") or ""),
     )
     return ok, message
 
@@ -1299,6 +1299,21 @@ def _action_dungeon_quit(entry, user_id, xp, payload):
     return pets.quit_dungeon(entry, user_id)
 
 
+def _action_dungeon_chest(entry, user_id, xp, payload):
+    """The between-floors find: open the lid, fight what came out, or walk past it.
+
+    One action with a choice rather than three, so a client that learns about chests
+    learns about all of it at once -- and an unknown choice is treated as walking away,
+    which is the harmless one.
+    """
+    choice = str(payload.get("choice") or "").lower()
+    if choice == "open":
+        return pets.dungeon_chest_open(entry, user_id)
+    if choice == "fight":
+        return pets.dungeon_chest_fight(entry, user_id)
+    return pets.dungeon_chest_leave(entry, user_id)
+
+
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
   "respec_stats": _action_respec_stats,
@@ -1334,10 +1349,21 @@ _ACTIONS = {
     "dungeon_rest": _action_dungeon_rest,
     "dungeon_descend": _action_dungeon_descend,
     "dungeon_quit": _action_dungeon_quit,
+    "dungeon_chest": _action_dungeon_chest,
 }
 
-_DUNGEON_ACTIONS = {
-    "dungeon_fight", "dungeon_rest", "dungeon_descend", "dungeon_quit",
+# What the Mini App may still do while committed to a dungeon run -- the same rule
+# bot_listener.PET_ACTIONS_ALLOWED_IN_A_RUN applies to the buttons in Telegram, and the
+# two must not drift: a player who can re-arm from the chat and not from the app has found
+# a bug, not a feature of one client.
+#
+# Gear is in here on purpose. Bosses state the damage they are weak to, so swapping a
+# weapon or enchanting one is the answer that hint asks for; pets.equip/pets.unequip stopped
+# refusing mid-run for that reason and this gate kept refusing anyway, which meant the
+# change never reached anybody playing through the app.
+_ALLOWED_IN_DUNGEON = {
+    "dungeon_fight", "dungeon_rest", "dungeon_descend", "dungeon_quit", "dungeon_chest",
+    "equip", "unequip", "enchant_weapon", "reforge",
 }
 
 
@@ -1388,15 +1414,22 @@ def _dungeon_loot_line(extra: dict) -> str:
         bits.append(f"✨ +{int(reward['xp'])}")
     if extra.get("rubies"):
         bits.append(f"💎 +{int(extra['rubies'])}")
+    # A chest empties several items and a mimic can hold more than one, so both fields
+    # arrive as a LIST from those two and as a single drop from an ordinary kill.
     dropped = extra.get("dropped") or {}
-    if dropped.get("name"):
-        bits.append(f"🎁 {dropped['name']}" + (" (надето)" if dropped.get("auto_equipped") else ""))
+    for row in (dropped if isinstance(dropped, (list, tuple)) else [dropped]):
+        if isinstance(row, dict) and row.get("name"):
+            bits.append(f"🎁 {row['name']}" + (" (надето)" if row.get("auto_equipped") else ""))
     scroll = extra.get("scroll") or {}
     if scroll.get("granted"):
         bits.append(f"📜 {scroll.get('name') or 'новый свиток'}")
     rune = extra.get("rune") or {}
-    if rune.get("granted"):
-        bits.append(f"🔮 {rune.get('element') or 'руна'} +{int(rune['granted'])}")
+    for row in (rune if isinstance(rune, (list, tuple)) else [rune]):
+        if isinstance(row, dict) and row.get("granted"):
+            element = str(row.get("element") or "")
+            bits.append(
+                f"🔮 {pets.RUNE_NAMES.get(element, element or 'руна')} +{int(row['granted'])}"
+            )
     return "Забрал: " + " · ".join(bits) if bits else ""
 
 
@@ -1420,9 +1453,10 @@ async def handle_action(request: web.Request) -> web.Response:
     if action is None:
         return _json_error("Неизвестное действие.", status=400, code="UNKNOWN_ACTION")
     action_name = str(body.get("action") or "")
-    if action_name not in _DUNGEON_ACTIONS and pets.is_in_dungeon(entry, user["id"]):
+    if action_name not in _ALLOWED_IN_DUNGEON and pets.is_in_dungeon(entry, user["id"]):
       return _json_error(
-        "Сначала закончи забег в подземелье или выйди из него.",
+        "В подземелье можно менять снаряжение и зачаровывать оружие. "
+        "Остальное — после забега.",
         status=409, code="DUNGEON_ACTIVE",
       )
 
@@ -1462,7 +1496,8 @@ async def handle_action(request: web.Request) -> web.Response:
             body.get("view"),
         ),
     }
-    if str(body.get("action") or "") == "dungeon_fight" and isinstance(extra, dict):
+    if str(body.get("action") or "") in ("dungeon_fight", "dungeon_chest") \
+            and isinstance(extra, dict):
       result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
       encounter = extra.get("encounter") or {}
       # What the kill actually paid, rather than the fight's internal id: the id meant
@@ -1470,8 +1505,16 @@ async def handle_action(request: web.Request) -> web.Response:
       loot = _dungeon_loot_line(extra)
       if loot:
         response["message"] += "\n" + loot
-      if encounter.get("boss") and result is not None and hero is not None and enemy is not None:
+      # Bosses and mimics both get the replay. A corridor mob deliberately does not --
+      # a pack floor is ten kills and ten playbacks would bury the run -- but a mimic
+      # happens once in a while and is the fight a player actually chose to take.
+      watchable = encounter.get("boss") or encounter.get("gimmick") == "mimic"
+      if watchable and result is not None and hero is not None and enemy is not None:
         dropped = extra.get("dropped") or {}
+        # A chest hands back a list; the replay card has room for one item, so it shows
+        # the first and the toast line above already named all of them.
+        if isinstance(dropped, (list, tuple)):
+          dropped = dropped[0] if dropped else {}
         dropped_item = C.find_item(dropped.get("code")) if isinstance(dropped, dict) else None
         response["battle"] = {
           **_playback_payload(
@@ -4030,6 +4073,16 @@ PAGE_HTML = """<!doctype html>
   .dungeon-art { width: 48px; height: 48px; border-radius: 7px; overflow: hidden; background: #10171c; }
   .dungeon-art svg { width: 100%; height: 100%; display: block; }
   .dungeon-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 11px; }
+  /* The find between two floors. Gold-edged so it reads as the thing that was not on
+     this screen a moment ago, and sitting above the enemies it does not block. */
+  .dungeon-chest { border: 1px solid var(--gold); border-radius: 9px; background: rgba(232,185,35,.09); padding: 10px; margin: 0 0 11px; }
+  .dungeon-chest.bitten { border-color: #d1584f; background: rgba(209,88,79,.12); }
+  .dungeon-chest b { display: block; margin-bottom: 3px; }
+  .dungeon-chest .chest-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+  .dungeon-chest .chest-actions .go { padding: 9px 8px; font-size: 13px; }
+  /* The closing receipt on the screen a finished run drops you back onto. */
+  .dungeon-receipt { border: 1px solid rgba(255,255,255,.14); border-radius: 9px; background: rgba(0,0,0,.2); padding: 10px; margin: 0 0 11px; }
+  .dungeon-receipt .praise { color: var(--gold); }
   .dungeon-actions .go { padding: 9px 8px; font-size: 13px; }
   .chip {
     border: 1px solid var(--line); background: transparent; border-radius: 999px;
@@ -5457,6 +5510,52 @@ function dungeonHpBar(dungeon) {
     '" style="width:' + (share * 100) + '%"></i></div>';
 }
 
+// The find between two floors: a closed box whose kind is still a secret, or the mimic
+// that has already bitten. Never a gate -- the floor's enemies stay pressable underneath
+// it, and descending again clears it either way.
+function dungeonChestCard(chest) {
+  if (!chest || !chest.present) return "";
+  if (!chest.revealed) {
+    return '<div class="dungeon-chest"><b>🧰 Между этажами стоит сундук.</b>' +
+      '<span class="tiny muted">Крышка поддаётся. Такие иногда кусаются — до ' +
+      Number(chest.bite_percent || 15) + '% здоровья.</span>' +
+      '<div class="chest-actions"><button class="go" data-dungeon="chest" data-choice="open">🧰 Открыть</button>' +
+      '<button class="go sec" data-dungeon="chest" data-choice="leave">🚶 Мимо</button></div></div>';
+  }
+  return '<div class="dungeon-chest bitten"><b>🦷 ' + esc(chest.name || "Мимик") + ' · ур. ' +
+    Number(chest.level || 1) + '</b><span class="tiny muted">' + esc(chest.hint || "") +
+    ' Он уже укусил — добить или отойти.</span>' +
+    '<div class="chest-actions"><button class="go" data-dungeon="chest" data-choice="fight">⚔️ Драться</button>' +
+    '<button class="go sec" data-dungeon="chest" data-choice="leave">🚶 Уйти</button></div></div>';
+}
+
+// What the last descent was worth, on the screen a finished run lands on. Dying with full
+// pockets is the best thing that happens down there and it used to be reported as nothing
+// at all.
+function dungeonReceipt(haul) {
+  if (!haul) return "";
+  const bits = [];
+  if (Number(haul.gold || 0)) bits.push("🪙 " + money(haul.gold));
+  if (Number(haul.xp || 0)) bits.push("✨ " + money(haul.xp));
+  if (Number(haul.rubies || 0)) bits.push("💎 " + Number(haul.rubies));
+  [["🎁", "items"], ["📜", "scrolls"], ["🔮", "runes"]].forEach(([icon, key]) => {
+    const names = (haul[key] || []).filter(Boolean).map(String);
+    if (!names.length) return;
+    bits.push(icon + " " + esc(names.slice(0, 6).join(", ")) +
+      (names.length > 6 ? " и ещё " + (names.length - 6) : ""));
+  });
+  const drops = ["items", "scrolls", "runes"].reduce((sum, key) => sum + (haul[key] || []).length, 0);
+  const praise = Number(haul.gold || 0) >= 5000 || drops >= 5 ? "Отличная нажива." : "Хорошая нажива.";
+  const floor = Number(haul.floor || 0);
+  const head = (haul.won ? "🏁 Поход окончен" : "☠️ Поход оборвался") +
+    (floor ? " на этаже " + floor : "") + ". Побед: " + Number(haul.kills || 0) + ".";
+  return '<div class="dungeon-receipt"><b>' + head + '</b>' + (bits.length
+    ? '<div class="small" style="margin-top:6px">🎒 Всего за поход: ' + bits.join(" · ") + '</div>' +
+      '<div class="tiny praise" style="margin-top:4px">' + praise + '</div>'
+    : '<div class="tiny muted" style="margin-top:6px">Из подземелья ты вышел с пустыми руками.</div>') +
+    '</div>';
+}
+
 function dungeonPanel() {
   const dungeon = S.dungeon || {};
   if (!S.pet) return "";
@@ -5467,7 +5566,7 @@ function dungeonPanel() {
     const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
     const ticket = Number(dungeon.tickets || 0);
     const entryLabel = ticket ? '⚔️ Войти · билет (' + ticket + ')' : '⚔️ Войти · ' + dungeon.entry_cost + ' 💎';
-    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">Состав этажей меняется. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button></div></div>';
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body">' + dungeonReceipt(dungeon.last_haul) + '<p class="small muted" style="margin:0 0 10px">Состав этажей меняется. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button></div></div>';
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const revived = new Set(dungeon.revived || []);
@@ -5477,7 +5576,7 @@ function dungeonPanel() {
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +
       'поднятых уже ничего не падает.</p>'
     : '';
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
 }
 
 function renderOnboarding() {
@@ -5649,20 +5748,25 @@ function openLiveSkillPicker(slot) {
 
 function forgePanel() {
   const names = { cursed: "проклятых", common: "обычных", rare: "редких", legendary: "легендарный" };
+  // A recipe is a rarity AND a type: five common gloves make rare gloves, never a sword.
+  const slots = { weapon: "⚔️ Оружие", amulet: "📿 Амулет", gloves: "🧤 Перчатки", boots: "🥾 Ботинки", shield: "🛡 Щит" };
   const recipes = (S.forge && S.forge.recipes) || [];
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
-    '<div class="small muted" style="margin-bottom:10px">6 проклятых превращаются в редкую проклятую реликвию, ' +
-      '5 обычных — в редкий, а 7 редких — в легендарный. Надетые и защищённые вещи не расходуются.</div>' +
+    '<div class="small muted" style="margin-bottom:10px">Кузница берёт предметы одного типа и одной редкости ' +
+      'и возвращает предмет того же типа редкостью выше: перчатки в перчатки, пушки в пушки. ' +
+      'Сколько нужно — написано на каждом рецепте. Надетые и защищённые вещи не расходуются.</div>' +
+    (recipes.length ? '' : '<div class="small muted">В сумке пока нет ничего, что можно было бы переплавить.</div>') +
     recipes.map((recipe) => {
       const ingredients = recipe.ingredients
         .map((code) => (S.bag || []).find((item) => item.code === code))
         .filter(Boolean);
       return '<div class="panel" style="margin:8px 0;padding:10px">' +
-        '<div class="small"><b>' + recipe.required + ' ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
-        '</b> · доступно ' + recipe.available + '</div>' +
+        '<div class="small"><b>' + esc(slots[recipe.slot] || recipe.slot) + ': ' +
+        recipe.required + ' ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
+        '</b> · ' + recipe.available + ' из ' + recipe.required + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
-        '<button class="go sec" data-reforge="' + recipe.rarity + '"' +
+        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-slot="' + recipe.slot + '"' +
           (recipe.can_forge ? '' : ' disabled') + '>Перековать</button></div>';
     }).join('') +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
@@ -5790,7 +5894,7 @@ async function renderShop() {
   box.innerHTML =
     '<div class="chiprow">' + slotChips(shopSlot, "shopslot", true) + "</div>" +
     '<div class="panel"><h2>' +
-      "Витрина · обновляется в 00:00 и 12:00 по Москве" +
+      "Витрина · обновляется в 00:00 по Москве" +
     "</h2>" +
     (items.length ? '<div class="items">' + items.map(shopCard).join("") + "</div>"
                   : '<div class="empty">Сегодня тут пусто.</div>') +
@@ -8706,8 +8810,9 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
 async function handleClick(event, target) {
   const d = target.dataset;
   if (d.dungeon) {
-    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit" };
-    await act(actions[d.dungeon], d.dungeon === "fight" ? { index: Number(d.index) } : (d.dungeon === "rest" ? { amount: d.heal || "full" } : {}));
+    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest" };
+    const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), chest: () => ({ choice: d.choice || "leave" }) };
+    await act(actions[d.dungeon], (payload[d.dungeon] || (() => ({})))());
     return;
   }
 
@@ -8786,7 +8891,7 @@ async function handleClick(event, target) {
   if (d.bagrarity) { bagRarity = d.bagrarity; render(); return; }
   if (d.bagsort) { bagSort = bagSort === "price" ? "rarity" : "price"; render(); return; }
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
-  if (d.reforge) { await act("reforge", { rarity: d.reforge }); return; }
+  if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.slot || "" }); return; }
   if (d.enchantpick) { openEnchantWeapons(d.enchantpick); return; }
   if (d.enchantapply) {
     const [code, element] = d.enchantapply.split(":", 2);

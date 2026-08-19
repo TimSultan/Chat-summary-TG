@@ -399,3 +399,53 @@ def roll_chest(floor: int, rng=None) -> dict | None:
     if rng.random() >= CHEST_CHANCE:
         return None
     return {"kind": "mimic" if rng.random() < MIMIC_SHARE else "chest", "floor": max(1, int(floor))}
+
+
+# What is actually inside the two boxes. Kept here, next to the odds, so the whole find is
+# one readable table rather than a chance in this module and a payout in pets.py.
+#
+# A plain chest is the smaller, certain half: a cursed item, a handful of diamonds, a
+# couple of kills' worth of coin and one rune. A beaten mimic is the same list paid better
+# -- it cost health and a real fight, so it has to beat the box that cost neither.
+MIMIC_GOLD_MULTIPLIER: Final = 1.6
+MIMIC_RUBY_RANGE: Final = (2, 4)
+MIMIC_CURSED_ITEMS: Final = 2
+# On top of the cursed pair: one roll on the ordinary drop table, where the rare and
+# legendary gear lives. This is the line that makes fighting a mimic worth the bite.
+MIMIC_DROP_ROLLS: Final = 1
+
+
+def chest_loot(floor: int, rng=None) -> dict:
+    """What a plain chest holds. Never empty -- the empty one is the mimic's joke."""
+    rng = rng or random.SystemRandom()
+    return {
+        "gold": chest_gold(floor), "rubies": rng.randint(*CHEST_RUBY_RANGE),
+        "cursed": 1, "drops": 0, "runes": 1,
+    }
+
+
+def mimic_loot(floor: int, rng=None) -> dict | None:
+    """What a beaten mimic was guarding, or None when it was guarding nothing.
+
+    The None is MIMIC_EMPTY_SHARE of the time and is the whole reason the fight is a
+    decision: a mimic that always paid would simply be a chest with extra steps.
+    """
+    rng = rng or random.SystemRandom()
+    if rng.random() < MIMIC_EMPTY_SHARE:
+        return None
+    return {
+        "gold": max(1, round(chest_gold(floor) * MIMIC_GOLD_MULTIPLIER)),
+        "rubies": rng.randint(*MIMIC_RUBY_RANGE),
+        "cursed": MIMIC_CURSED_ITEMS, "drops": MIMIC_DROP_ROLLS, "runes": 1,
+    }
+
+
+def mimic_bite(max_hp: int) -> int:
+    """Damage the lid does before anybody has decided anything.
+
+    A share of MAX health, so it stings the same at every depth. Floored at 1 so a bite is
+    never free; the caller is the one that keeps it from being lethal, because whether a
+    run may end is a rule about the run and not about the tooth.
+    """
+    max_hp = max(1, int(max_hp or 1))
+    return max(1, round(max_hp * MIMIC_BITE_SHARE))

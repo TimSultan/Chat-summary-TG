@@ -942,8 +942,15 @@ class PetsCommandTests(unittest.TestCase):
         api = self._tap("shopslot", "shield")
         shelf = api.edits[-1]
         self.assertIn("Щит", shelf["text"])
-        self.assertIn("При защите", shelf["text"])
         self.assertIn("🛡", shelf["text"])
+        # Every shield on the shelf explains what it does. Asserted against the offers
+        # themselves rather than against one phrase: the catalogue has several wordings
+        # («При защите…», «Отражает…», «После первого полученного урона…»), and which of
+        # them a given day's shelf shows is not what this test is about.
+        offers = pets.daily_storefront_items(CHAT, "shield", user_id=PLAYER["id"])
+        self.assertTrue(offers)
+        for offer in offers:
+            self.assertIn(offer.description, shelf["text"])
         self.assertTrue(any(
             pets_ui.parse_callback(button["callback_data"])[1] == "buy"
             for button in _buttons(shelf) if button.get("callback_data")

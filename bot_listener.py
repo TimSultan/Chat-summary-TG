@@ -6258,6 +6258,29 @@ PAUSE_SAFE_PET_ACTIONS = frozenset({
     "support", "supportgive",
 })
 
+# What a player may still press while committed to a dungeon run. Everything else bounces
+# back to the floor screen: the run is a commitment, and wandering off to the farm or the
+# arena in the middle of it is what the gate exists to stop.
+#
+# Gear is the deliberate exception. Every boss states the damage it is weak to, and
+# answering that by swapping a weapon or burning a rune is the play the hint invites --
+# pets.equip and pets.unequip were unblocked for exactly that reason, and this set is the
+# other half of it. Without it the «🎒 Снаряжение» button on the floor screen bounced off
+# this gate and the change never reached a player at all.
+#
+# The shop, the skills and the other modes stay shut: those are trips out of the dungeon,
+# not reactions inside it.
+PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
+    "dungeon", "dungeonenter", "dungeonfight", "dungeonrest",
+    "dungeondescend", "dungeonquit", "dungeonchest",
+    # Reading the bag and changing what is worn.
+    "bag", "bagitems", "equip", "unequip",
+    # The forge, which is where a weapon is enchanted -- and every screen between it and
+    # the rune that goes on the blade, so none of them is a button that refuses.
+    "forge", "weaponforge", "reforge", "enchantmenu", "runemenu", "enchantrune", "enchant",
+    "noop",
+})
+
 
 async def handle_pets_callback(
     api: TelegramBotAPI,
@@ -6357,14 +6380,11 @@ async def handle_pets_callback(
         )
         return
     user_id = user.user_id
-    dungeon_actions = {
-        "dungeon", "dungeonenter", "dungeonfight", "dungeonrest",
-        "dungeondescend", "dungeonquit",
-    }
-    if action not in dungeon_actions and pets.is_in_dungeon(entry, user_id):
+    if action not in PET_ACTIONS_ALLOWED_IN_A_RUN and pets.is_in_dungeon(entry, user_id):
         await _pets_toast_and_redraw(
             api, chat_id, message_id,
-            "Сначала закончи забег в подземелье или выйди из него.",
+            "В подземелье можно менять снаряжение и зачаровывать оружие. "
+            "Остальное — после забега.",
             pets_ui.dungeon_view(entry, user_id, xp), log,
         )
         return
@@ -6553,9 +6573,20 @@ async def handle_pets_callback(
             await _send_pets_view(api, chat_id, pets_ui.dungeon_view(entry, user_id, xp),
                                   message_id=message_id, log=log)
             return
-        if action in ("dungeonenter", "dungeonrest", "dungeondescend", "dungeonquit", "dungeonfight"):
+        if action in ("dungeonenter", "dungeonrest", "dungeondescend", "dungeonquit",
+                      "dungeonfight", "dungeonchest"):
             receipt = None
-            if action == "dungeonenter":
+            if action == "dungeonchest":
+                # open / fight / leave, all three redrawn by the same floor view below:
+                # a chest is part of the floor it was found on, not a screen of its own.
+                choice = str(argument or "").lower()
+                if choice == "open":
+                    ok, note, receipt = pets.dungeon_chest_open(entry, user_id)
+                elif choice == "fight":
+                    ok, note, receipt = pets.dungeon_chest_fight(entry, user_id)
+                else:
+                    ok, note = pets.dungeon_chest_leave(entry, user_id)
+            elif action == "dungeonenter":
                 ok, note = pets.enter_dungeon(entry, user_id)
             elif action == "dungeonrest":
                 ok, note = pets.dungeon_rest(entry, user_id, xp, argument or "full")
@@ -6949,7 +6980,12 @@ async def handle_pets_callback(
             )
             return
         if action == "reforge":
-            ok, note, _result_code = pets.reforge_items(entry, user_id, argument)
+            # «rarity:slot» -- a recipe is both halves since the forge started returning
+            # the same kind of item it was fed.
+            rarity, _, forge_slot = str(argument or "").partition(":")
+            ok, note, _result_code = pets.reforge_items(
+                entry, user_id, rarity, forge_slot,
+            )
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
                 pets_ui.forge_view(entry, user_id, xp), log,

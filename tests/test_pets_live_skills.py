@@ -31,16 +31,31 @@ class LiveCombatTableTests(unittest.TestCase):
     def test_catalogue_has_three_regular_slots_one_ultimate_and_the_live_shields(self):
         self.assertEqual(len(scrolls.REGULAR_SCROLLS), 30)
         self.assertEqual(len(scrolls.ULTIMATE_SCROLLS), 10)
-        self.assertEqual(len(scrolls.SHIELDS), 20)
-        self.assertEqual(len(C.items_for_slot("shield")), 20)
+        # Shields are no longer a fixed twenty: the slot was the thinnest in the game and
+        # got a second shelf. What still has to hold is that every behaviour in the table
+        # has a live item to sell or drop.
+        self.assertGreaterEqual(len(scrolls.SHIELDS), 20)
+        self.assertEqual(len(C.items_for_slot("shield")), len(scrolls.SHIELDS))
 
         shop = C.items_for_slot("shield", "shop")
         drops = [item for item in C.items_for_slot("shield") if item.source == "drop"]
         # The shop stays at three however many shields the loot table grows: a shield you
         # can always buy must not take a roll away from one you have to find.
         self.assertEqual(len(shop), 3)
-        self.assertEqual(len(drops), 17)
+        self.assertEqual(len(drops), len(scrolls.SHIELDS) - len(shop))
         self.assertEqual(sum(item.rarity == "legendary" for item in drops), 8)
+        # The floors that make the slot playable: three ordinary offers a day that never
+        # repeat what you own, and a forge recipe asking for four ordinary or five rare
+        # shields. Six of each -- what the slot used to hold -- could satisfy neither.
+        import pets_shield_catalog as shields
+        self.assertGreaterEqual(
+            sum(item.rarity == "common" for item in C.items_for_slot("shield")),
+            shields.MIN_ORDINARY_SHIELDS,
+        )
+        self.assertGreaterEqual(
+            sum(item.rarity == "rare" for item in C.items_for_slot("shield")),
+            shields.MIN_RARE_SHIELDS,
+        )
         self.assertTrue(all(item.price > 0 and item.drop_weight == 0 for item in shop))
         self.assertTrue(all(item.resale_price > 0 and item.drop_weight > 0 for item in drops))
         self.assertTrue(all(item.effect and item.effect.get("defend_effects") is not None

@@ -970,11 +970,13 @@ if _RAW_GEAR_ITEMS and (
 ):
     raise ValueError("gear catalogue must contain 40 drop-only boots and 40 gloves")
 if _RAW_SHIELD_ITEMS and (
-    len(_catalogue_shields) != 20
-    or any(item.slot != "shield" for item in _catalogue_shields)
-    or sum(item.source == "shop" for item in _catalogue_shields) != 3
+    # The size floor lives in pets_shield_catalog, next to the reason for it. Here we only
+    # check what this file is responsible for: everything claiming to be a shield is one,
+    # and the slot has a shop to sell them in.
+    any(item.slot != "shield" for item in _catalogue_shields)
+    or sum(item.source == "shop" for item in _catalogue_shields) < 3
 ):
-    raise ValueError("shield catalogue must contain 20 shields, exactly three sold in shops")
+    raise ValueError("shield catalogue must hold only shields, at least three sold in shops")
 _new_catalogue_items = _catalogue_amulets + _catalogue_gear + _catalogue_shields
 if _new_catalogue_items:
     existing_codes = {item.code for item in ITEMS}
@@ -1109,11 +1111,20 @@ GIFT_COOLDOWN_SECONDS = 24 * 60 * 60
 GIFT_AUDIT_LIMIT = 500
 
 # The shop deliberately has small, personal changing windows instead of asking players
-# to scroll through hundreds of items. Every twelve-hour window selects five ordinary
-# and one rare item for each equipment slot.
-STOREFRONT_ROTATION_HOURS = 12
-STOREFRONT_NORMAL_COUNT = 5
+# to scroll through hundreds of items. Each window selects a handful of ordinary items and
+# one rare one for every equipment slot.
+#
+# Cut and slowed together: the shelf used to refresh twice a day with five ordinary offers,
+# which is ten ordinary items a day per slot -- more choice than a player could ever spend
+# on, and it made gold the only thing standing between anybody and a full set. One window a
+# day of three plus one, at twice the price, turns a shopping trip into a decision again.
+STOREFRONT_ROTATION_HOURS = 24
+STOREFRONT_NORMAL_COUNT = 3
 STOREFRONT_RARE_COUNT = 1
+# Applied to the OFFER, never to the catalogue: an item's stated price still drives its
+# resale value and every balance table built on it, so doubling here makes the shop more
+# expensive without quietly doubling what the same item sells back for.
+STOREFRONT_PRICE_MULTIPLIER = 2
 STOREFRONT_RARITIES = ("common", "rare")
 DAILY_STOREFRONT_SIZE = STOREFRONT_NORMAL_COUNT + STOREFRONT_RARE_COUNT
 STOREFRONT_TIMEZONE_NAME = "Europe/Moscow"
@@ -1121,7 +1132,7 @@ _STOREFRONT_TIMEZONE = _ZoneInfo(STOREFRONT_TIMEZONE_NAME)
 
 
 def storefront_window(day: _date | _datetime | str | None = None) -> int:
-    """Stable identifier for Moscow's 00:00-12:00 and 12:00-00:00 shop windows."""
+    """Stable identifier for the shop window a moment falls in, in Moscow time."""
     moment = day or _datetime.now(_STOREFRONT_TIMEZONE)
     if isinstance(moment, str):
         try:
@@ -1134,13 +1145,17 @@ def storefront_window(day: _date | _datetime | str | None = None) -> int:
     # values may come from another app timezone, so convert before choosing the window.
     if moment.tzinfo is not None:
         moment = moment.astimezone(_STOREFRONT_TIMEZONE)
-    return moment.date().toordinal() * 2 + moment.hour // STOREFRONT_ROTATION_HOURS
+    # Derived from the rotation rather than hard-coded at two windows a day, so changing
+    # STOREFRONT_ROTATION_HOURS actually changes the shop instead of silently producing
+    # two identical windows that both look like "today".
+    per_day = max(1, 24 // STOREFRONT_ROTATION_HOURS)
+    return moment.date().toordinal() * per_day + moment.hour // STOREFRONT_ROTATION_HOURS
 
 
 def storefront_price(item: Item) -> int:
     """The sale price for a rotating offer without changing its drop provenance."""
     if item.price > 0:
-        return int(item.price)
+        return int(item.price) * STOREFRONT_PRICE_MULTIPLIER
     power = sum(
         {"strength": 4, "health": 4, "agility": 2, "luck": 2, "armor": 3}.get(key, 0)
         * int(value)
@@ -1148,7 +1163,8 @@ def storefront_price(item: Item) -> int:
     )
     base = 55 if item.rarity == "rare" else 45
     multiplier = 1.20 if item.rarity == "rare" else .60
-    return max(60, min(195, int((base + power * multiplier + 2.5) // 5) * 5))
+    return max(60, min(195, int((base + power * multiplier + 2.5) // 5) * 5)) \
+        * STOREFRONT_PRICE_MULTIPLIER
 
 
 def _storefront_offer(item: Item) -> Item:
@@ -1180,6 +1196,10 @@ def daily_storefront_items(
         (
             item for item in items_for_slot(slot)
             if item.rarity in STOREFRONT_RARITIES
+            # A withdrawn item is kept in ITEMS only so old fight snapshots still resolve
+            # its code -- putting it on a shelf sells the very thing that was withdrawn.
+            # "forge" is likewise a reward you make, not one you buy.
+            and item.source in ("shop", "drop")
             and (slot != "weapon" or item.source == "shop")
         ),
         key=lambda item: item.code,

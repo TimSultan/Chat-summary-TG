@@ -147,6 +147,25 @@ def _clean_haul(raw) -> dict:
     return clean
 
 
+def _clean_chest(raw) -> dict | None:
+    """Repair the between-floors find, or drop it entirely.
+
+    Anything unrecognisable becomes None rather than a half-built encounter: a chest is a
+    bonus, and the one thing it must never do is wedge a run behind a box the screens
+    cannot draw. Every caller treats None as "there was nothing between these floors".
+    """
+    if not isinstance(raw, dict) or raw.get("kind") not in ("chest", "mimic"):
+        return None
+    try:
+        floor = max(1, int(raw.get("floor", 1) or 1))
+    except (TypeError, ValueError):
+        floor = 1
+    # `revealed` is only ever true for a mimic that has already bitten: a plain chest is
+    # consumed by the same press that opens it, so it has no revealed state to store.
+    return {"kind": raw["kind"], "floor": floor,
+            "revealed": bool(raw.get("revealed")) and raw["kind"] == "mimic"}
+
+
 def _normalise_dungeon_run(run) -> dict | None:
     """Repair old or partial dungeon state before any screen or fight consumes it."""
     if not isinstance(run, dict):
@@ -204,6 +223,11 @@ def _normalise_dungeon_run(run) -> dict | None:
         # starts empty rather than being invented.
         "haul": _clean_haul(run.get("haul")),
         "floor_haul": _clean_haul(run.get("floor_haul")),
+        # The find standing between the last two floors, if there was one. It lives on the
+        # whitelist for the same reason the tallies do: dropped here it would vanish on the
+        # first reload, which is indistinguishable from a chest that never appeared -- and
+        # a chest that never appears is exactly the bug this feature shipped with.
+        "chest": _clean_chest(run.get("chest")),
         # The pack healers' bookkeeping: when each corpse fell, which ones have already
         # been raised once, and the order the room is currently standing in.
         "dead_at": {
@@ -1957,6 +1981,7 @@ RUBY_SOURCES = {
     "dungeon_mobs": ("Подземелье: мобы", "#8f6ad6"),
     "dungeon_boss": ("Подземелье: боссы", "#b45fc4"),
     "dungeon_legacy": ("Подземелье: до разделения", "#7d6ba8"),
+    "dungeon_chest": ("Подземелье: сундуки", "#c99a4f"),
     "quarry": ("Карьер", "#c08a3e"),
     "farm": ("Ферма", "#4ca66a"),
     "pvp": ("Бои с игроками", "#4f8fe8"),
@@ -1982,6 +2007,11 @@ def ruby_source_of(reason: str) -> str:
         return "quarry"
     if value.startswith("farm-ruby:"):
         return "farm"
+    # Both halves of the between-floors find share one bucket: a player who opened a box
+    # does not care which way it turned out, and splitting them would turn the smallest
+    # faucet in the game into two even smaller ones.
+    if value.startswith(("dungeon-ruby:chest:", "dungeon-ruby:mimic:")):
+        return "dungeon_chest"
     # The boss/mob marker sits between the prefix and the loot token; a key without one
     # was written before the split and cannot be reassigned now.
     if value.startswith("dungeon-ruby:boss:"):
@@ -4039,6 +4069,13 @@ RUNE_NAMES = {
 }
 
 
+def _haul_runes(rune) -> list[dict]:
+    """Every rune on one receipt, whether it carried one or a list of them."""
+    if isinstance(rune, (list, tuple)):
+        return [row for row in rune if isinstance(row, dict) and row.get("granted")]
+    return [rune] if isinstance(rune, dict) and rune.get("granted") else []
+
+
 def _haul_names(dropped) -> list[str]:
     """The display name of a drop, however the granting call chose to return it.
 
@@ -4048,6 +4085,11 @@ def _haul_names(dropped) -> list[str]:
     """
     if dropped is None:
         return []
+    # A chest hands back SEVERAL items at once, so the field is a list there and a single
+    # drop everywhere else. Flattened here rather than at each call site, because this is
+    # already the one place that knows every shape a drop arrives in.
+    if isinstance(dropped, (list, tuple)):
+        return [name for row in dropped for name in _haul_names(row)]
     if isinstance(dropped, dict):
         name = dropped.get("name") or dropped.get("code")
         return [str(name)] if name else []
@@ -4080,13 +4122,14 @@ def _haul_add(haul: dict, receipt: dict) -> dict:
     haul["gold"] += int(reward.get("gold", 0) or 0)
     haul["xp"] += int(reward.get("xp", 0) or 0)
     haul["rubies"] += int(receipt.get("rubies", 0) or 0)
-    haul["kills"] += 1
+    # Opening a chest is not a kill. The receipt says how many it was worth, so the one
+    # thing on this tally that is a COUNT of fights stays a count of fights.
+    haul["kills"] += max(0, int(receipt.get("kills", 1) or 0))
     haul["items"].extend(_haul_names(receipt.get("dropped")))
     scroll = receipt.get("scroll")
     if isinstance(scroll, dict) and scroll.get("granted"):
         haul["scrolls"].append(str(scroll.get("name") or scroll.get("code") or "свиток"))
-    rune = receipt.get("rune")
-    if isinstance(rune, dict) and rune.get("granted"):
+    for rune in _haul_runes(receipt.get("rune")):
         haul["runes"].append(RUNE_NAMES.get(rune.get("element"), str(rune.get("element"))))
     return haul
 
@@ -4184,8 +4227,29 @@ def dungeon_status(entry: str, user_id) -> dict:
         "full_heals_left": max(0, D.SHOP_FULL_HEAL_USES - int(run.get("full_heals_used", 0) or 0)),
         "boss_lives": int(run.get("boss_lives", 0) or 0),
         "gold_multiplier": C.hero_gold_multiplier(hero_level, "dungeon"),
+        "chest": _chest_payload(run.get("chest")),
     })
     return state
+
+
+def _chest_payload(chest) -> dict | None:
+    """The find as a screen may see it.
+
+    The KIND is withheld until the lid is open. A payload that named the mimic before the
+    player reached for it would answer the only question the encounter asks -- and the
+    client is where anyone curious would look first.
+    """
+    chest = _clean_chest(chest)
+    if not chest:
+        return None
+    floor = int(chest["floor"])
+    if not chest["revealed"]:
+        return {"present": True, "revealed": False, "bite_percent": round(D.MIMIC_BITE_SHARE * 100)}
+    beast = D.mimic(floor)
+    return {
+        "present": True, "revealed": True, "kind": "mimic",
+        "name": beast["name"], "level": beast["level"], "hint": beast["hint"],
+    }
 
 
 def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) -> pets_combat.Fighter:
@@ -4301,6 +4365,21 @@ def enter_dungeon(entry: str, user_id) -> tuple[bool, str]:
     return True, f"Ты вошёл на этаж {floor} {entry_paid}."
 
 
+def _hp_after_fight(result, key: str) -> int:
+    """How much health the hero walked out of one exchange with.
+
+    Read backwards off the transcript rather than from `final_hp`, because a fight that
+    ended on the hero's own swing records their health on the attacking turn. Shared by
+    every dungeon encounter so a mimic drains a run exactly as a corridor mob does.
+    """
+    for turn in reversed(getattr(result, "rounds", ()) or ()):
+        if turn.attacker == key:
+            return max(0, int(turn.attacker_hp))
+        if turn.defender_hp >= 0:
+            return max(0, int(turn.defender_hp))
+    return 0
+
+
 def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | None]:
     """Fight a fixed encounter, recording persistent damage before rewards leave the store."""
     if not D.DUNGEON_OPEN:
@@ -4400,14 +4479,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 {"floor": floor, "index": row["index"], "encounter": row["code"],
                  "boss": bool(row.get("boss")), "gimmick": row.get("gimmick")},
             ))
-            player_hp = 0
-            for turn in reversed(result.rounds):
-                if turn.attacker == str(user_id):
-                    player_hp = turn.attacker_hp
-                    break
-                if turn.defender_hp >= 0:
-                    player_hp = turn.defender_hp
-                    break
+            player_hp = _hp_after_fight(result, str(user_id))
             run["hp"] = min(max(0, int(run.get("hp", 0))), max(0, int(player_hp)))
             if row["gimmick"] == "three_heads":
                 final_hp = (result.final_hp or {}).get(enemy.key, max(0, int(hydra_head_hp[head_index])))
@@ -4608,9 +4680,208 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
     run.pop("boss_lives", None)
     run.pop("hydra_head_hp", None)
     run.pop("hydra_moves", None)
+    # One roll per descent, taken here and nowhere else -- this is the only moment the
+    # game means by "between floors". An unresolved find from the last staircase is
+    # replaced rather than stacked: the corridor behind you is gone.
+    found = D.roll_chest(run["floor"])
+    run["chest"] = {**found, "revealed": False} if found else None
     record["dungeon_deepest"] = max(int(record.get("dungeon_deepest", 1)), floor + 1)
     _save(entry, data)
-    return True, f"Ты спускаешься на этаж {floor + 1}."
+    note = f"Ты спускаешься на этаж {floor + 1}."
+    if run["chest"]:
+        # Deliberately says nothing about which of the two it is. The whole encounter is
+        # the guess, and a message that gave the answer away would delete it.
+        note += " На площадке между этажами стоит сундук."
+    return True, note
+
+
+# --- the find between two floors -------------------------------------------------------
+# Three presses, one state field. The chest is deliberately NOT a gate: the floor it was
+# found on stays playable with the box still standing there, and the next descent replaces
+# it. A bonus that can wedge a run is worse than no bonus at all, so this one cannot.
+
+
+def _chest_token(run: dict, floor: int) -> str:
+    """One durable identity per find, so a retried grant pays once.
+
+    Keyed on the RUN and the floor rather than on a counter: exactly one chest is rolled
+    per descent, so those two together already name it, and they keep naming it after a
+    reload -- which a counter living only in memory would not.
+    """
+    return f"{run.get('run_id') or 'legacy'}:chest:{max(1, int(floor))}"
+
+
+def _grant_chest_loot(entry: str, user_id, loot: dict, *, token: str, kind: str,
+                      floor: int, kills: int = 0) -> dict:
+    """Pay out one opened box.
+
+    Called OUTSIDE the run lock, like every other dungeon reward: each grant below owns
+    its own idempotency key, and holding the run lock across all of them is what would
+    make a slow item roll block every other player's request.
+    """
+    gold = max(0, int(loot.get("gold", 0) or 0))
+    if gold:
+        economy.grant(entry, user_id, gold, "pet_dungeon_chest")
+    dropped = []
+    # Cursed first and BY NAME: the promise is a cursed item, not "an item that might turn
+    # out cursed". A player who already owns all of them simply gets fewer -- the filter in
+    # grant_random_drop is strict rather than falling back to a consolation legendary.
+    for slot in range(max(0, int(loot.get("cursed", 0) or 0))):
+        item = grant_random_drop(entry, user_id, 1.0, rarity="cursed")
+        if item:
+            dropped.append(item)
+    for slot in range(max(0, int(loot.get("drops", 0) or 0))):
+        item = grant_random_drop(entry, user_id, 1.0)
+        if item:
+            dropped.append(item)
+    runes = []
+    for slot in range(max(0, int(loot.get("runes", 0) or 0))):
+        element = secrets.choice(RUNE_ELEMENTS)
+        granted = grant_runes(entry, user_id, element, 1, f"dungeon-rune:{token}:{slot}")
+        if granted.get("granted"):
+            runes.append(granted)
+    rubies = max(0, int(loot.get("rubies", 0) or 0))
+    if rubies:
+        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{kind}:{token}")
+    return {
+        "chest": kind, "floor": int(floor), "reward": {"gold": gold, "xp": 0},
+        "rubies": rubies, "dropped": dropped, "rune": runes, "kills": kills,
+    }
+
+
+def dungeon_chest_open(entry: str, user_id) -> tuple[bool, str, dict | None]:
+    """Reach for the lid. It either pays out or it bites."""
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE, None
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        chest = _clean_chest(run.get("chest"))
+        if not chest:
+            return False, "Здесь нечего открывать.", None
+        if chest["revealed"]:
+            return False, "Мимик уже не спит. Дерись или уходи.", None
+        floor = int(chest["floor"])
+        if chest["kind"] == "mimic":
+            max_hp = max(1, int(run.get("max_hp", 1) or 1))
+            bite = D.mimic_bite(max_hp)
+            # Floored at one HP on purpose. A box that can kill outright turns a bonus into
+            # a trap nobody opens twice; the fight it starts is where the run is allowed to
+            # end.
+            run["hp"] = max(1, min(max_hp, int(run.get("hp", max_hp) or max_hp)) - bite)
+            run["chest"] = {**chest, "revealed": True}
+            _save(entry, data)
+            return True, (
+                f"Крышка оказалась пастью. Мимик рвёт на {bite} HP и ждёт, "
+                "что ты сделаешь дальше."
+            ), {"chest": "mimic", "bite": bite, "revealed": True}
+        loot = D.chest_loot(floor)
+        token = _chest_token(run, floor)
+        run["chest"] = None
+        _save(entry, data)
+    receipt = _grant_chest_loot(entry, user_id, loot, token=token, kind="chest", floor=floor)
+    receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
+    return True, "Сундук настоящий. Внутри лежало вот это.", receipt
+
+
+def dungeon_chest_leave(entry: str, user_id) -> tuple[bool, str]:
+    """Walk past the box, or away from what came out of it."""
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье."
+        chest = _clean_chest(run.get("chest"))
+        if not chest:
+            return False, "Здесь уже ничего нет."
+        run["chest"] = None
+        _save(entry, data)
+    # Walking away from a woken mimic costs the bite and nothing else. That is the whole
+    # point: the bite is the price of curiosity, and the fight stays a decision taken
+    # after paying it rather than one the bite forces.
+    return True, ("Ты пятишься от мимика, и он не идёт следом."
+                  if chest["kind"] == "mimic" and chest["revealed"] else
+                  "Ты проходишь мимо сундука.")
+
+
+def dungeon_chest_fight(entry: str, user_id) -> tuple[bool, str, dict | None]:
+    """Fight the thing that was pretending to be a chest.
+
+    Settles exactly like a corridor encounter -- persistent damage first, the run ended on
+    a loss, loot only once the store is consistent -- so a mimic cannot become a second,
+    slightly different set of rules about what a dungeon fight costs.
+    """
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE, None
+    moment = app_now()
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        chest = _clean_chest(run.get("chest"))
+        if not chest or chest["kind"] != "mimic" or not chest["revealed"]:
+            return False, "Драться тут не с кем.", None
+        floor = int(chest["floor"])
+        row = D.mimic(floor)
+        hero = _dungeon_fighter(record, str(user_id))
+        hero = replace(hero, starting_hp=max(1, int(run.get("hp", 1) or 1)))
+        enemy = pets_combat.Fighter(
+            key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
+            level=row["level"], **row["stats"],
+        )
+        result = pets_combat.simulate(hero, enemy, seed=secrets.randbits(63))
+        fight_id_ = _new_fight_id(moment)
+        try:
+            result = replace(result, fight_id=fight_id_)
+        except TypeError:
+            setattr(result, "fight_id", fight_id_)
+        _store_fight_audit(entry, data, _fight_audit_row(
+            fight_id_, "dungeon", moment, result, (hero, enemy),
+            {str(user_id): record},
+            {"floor": floor, "index": 0, "encounter": row["code"],
+             "boss": False, "gimmick": "mimic"},
+        ))
+        run["hp"] = min(max(0, int(run.get("hp", 0))), _hp_after_fight(result, str(user_id)))
+        if result.winner != str(user_id) or run["hp"] <= 0:
+            # Read the tally out BEFORE the run is discarded -- the defeat screen is the
+            # last chance to tell somebody what the descent was worth.
+            final = dict(run.get("haul") or _new_haul())
+            record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
+            record["dungeon_run"] = None
+            _save(entry, data)
+            return False, f"Мимик оказался сильнее. Забег окончен на этаже {floor}.", {
+                "encounter": row, "result": result, "hero": hero, "enemy": enemy,
+                "run_over": True, "haul": {"total": final},
+            }
+        run["chest"] = None
+        run["kills"] = int(run.get("kills", 0) or 0) + 1
+        token = _chest_token(run, floor)
+        loot = D.mimic_loot(floor)
+        xp = int(row["reward"]["xp"])
+        _apply_xp(record, xp)
+        _save(entry, data)
+    fight = {"encounter": row, "result": result, "hero": hero, "enemy": enemy}
+    if loot is None:
+        # The joke the whole encounter is built around. It still cost a fight and still
+        # paid the experience, so it is a receipt rather than nothing at all.
+        receipt = {**fight, "chest": "mimic", "empty": True, "kills": 1,
+                   "reward": {"gold": 0, "xp": xp}, "rubies": 0, "dropped": [], "rune": []}
+        receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
+        return True, D.MIMIC_EMPTY_NOTICE, receipt
+    receipt = _grant_chest_loot(entry, user_id, loot, token=token, kind="mimic",
+                               floor=floor, kills=1)
+    receipt["reward"]["xp"] = xp
+    receipt.update(fight)
+    receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
+    return True, "Мимик разжал челюсти. Он всё-таки что-то охранял.", receipt
 
 
 def quit_dungeon(entry: str, user_id) -> tuple[bool, str]:
@@ -4763,7 +5034,10 @@ def buy_item(entry, user_id, xp, code) -> tuple[bool, str]:
     offers = _daily_storefront_items(data, entry, user_id, item.slot, moment)
     offered = next((offer for offer in offers if offer.code == item.code), None)
     if offered is None:
-        return False, "Этого предмета сейчас нет на витрине. Она меняется каждые 12 часов."
+        return False, (
+            "Этого предмета сейчас нет на витрине. "
+            f"Она меняется раз в {C.STOREFRONT_ROTATION_HOURS} часа."
+        )
     if item.code in record["inventory"]:
         return False, f"«{item.name}» у тебя уже есть."
     ok, balance = economy.spend(entry, user_id, xp, offered.price, f"buy:pet_item:{item.code}")
@@ -4821,15 +5095,33 @@ def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
 
 
 FORGE_NEXT_RARITY = {"cursed": "rare", "common": "rare", "rare": "legendary"}
-FORGE_REQUIREMENTS = {"cursed": 6, "common": 5, "rare": 7}
+# Cut alongside the slot rule, because that rule multiplied the real cost of every recipe
+# by five: the same five commons that used to be "any five" are now five of ONE kind.
+#
+# The counts are bounded from below by the thinnest slot in the catalogue. Shields have six
+# ordinary and six rare items in existence, so the old «7 редких» was not merely hard for a
+# shield -- it could never be met by anybody, and a recipe nobody can reach is a recipe
+# that is not in the game. Everything here is reachable in every slot.
+FORGE_REQUIREMENTS = {"cursed": 6, "common": 4, "rare": 5}
+# The relic six cursed weapons are worth. It is a rare WEAPON, so it belongs to the same
+# "cursed weapons make a rare weapon" rule as everything else rather than being a separate
+# recipe -- it simply stays in the pool that rule draws from, which is the only way a
+# designed reward survives a rule that is otherwise about rarity and slot alone.
+FORGE_CURSED_RELIC = "cursed_relic"
 
 
-def _forge_ingredients(record: dict, rarity: str) -> list:
+def _forge_ingredients(record: dict, rarity: str, slot: str) -> list:
+    """The free items of one rarity AND one slot, weakest first.
+
+    Slot is part of the recipe now: a forge that accepted five of anything let a pile of
+    junk gloves become a weapon, which made the choice of what to melt no choice at all.
+    You build toward a kind of item, and what comes out is that kind of item.
+    """
     equipped = set((record.get("equipped") or {}).values())
     locked = set(record.get("locked_items") or [])
     items = [
         item for item in (C.find_item(code) for code in record.get("inventory", []))
-        if item is not None and item.rarity == rarity
+        if item is not None and item.rarity == rarity and item.slot == slot
         and item.code not in equipped and item.code not in locked
     ]
     # Consume the least valuable candidates first.  The preview shows these exact items,
@@ -4845,45 +5137,76 @@ def forge_status(entry: str, user_id) -> dict:
         return {"recipes": []}
     recipes = []
     for rarity, result_rarity in FORGE_NEXT_RARITY.items():
-        ingredients = _forge_ingredients(record, rarity)
-        required = FORGE_REQUIREMENTS[rarity]
-        recipes.append({
-            "rarity": rarity,
-            "result_rarity": result_rarity,
-            "available": len(ingredients),
-            "required": required,
-            "ingredients": [item.code for item in ingredients[:required]],
-            "can_forge": len(ingredients) >= required,
-        })
+        for slot in C.SLOT_KEYS:
+            ingredients = _forge_ingredients(record, rarity, slot)
+            # Fifteen recipes exist; a player owning nothing for fourteen of them wants to
+            # read one line, not fifteen empty ones. A recipe appears once there is at
+            # least one thing in the bag it could ever consume.
+            if not ingredients:
+                continue
+            required = FORGE_REQUIREMENTS[rarity]
+            recipes.append({
+                "rarity": rarity,
+                "slot": slot,
+                "result_rarity": result_rarity,
+                "available": len(ingredients),
+                "required": required,
+                "ingredients": [item.code for item in ingredients[:required]],
+                "can_forge": len(ingredients) >= required,
+            })
+    # Ready first, then by how close it is: the reason to open this screen is to find out
+    # what you can make, and that answer must not be somewhere down a list of fifteen.
+    recipes.sort(key=lambda row: (not row["can_forge"], -row["available"]))
     return {"recipes": recipes}
 
 
-def reforge_items(entry: str, user_id, rarity: str, rng=None) -> tuple[bool, str, str | None]:
-    """Turn unlocked, unequipped ingredients into one random next-rarity drop."""
+def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
+                  rng=None) -> tuple[bool, str, str | None]:
+    """Turn same-slot, same-rarity ingredients into one item of the next rarity up.
+
+    Both halves of the recipe are fixed: what goes in is one KIND of item, and what comes
+    out is the same kind one rarity better. Melting five pairs of gloves can only ever make
+    gloves -- which is what makes choosing a pile to melt a decision about what you are
+    building rather than a lottery over the whole catalogue.
+    """
     rarity = "common" if rarity == "uncommon" else str(rarity or "")
+    slot = str(slot or "")
     result_rarity = FORGE_NEXT_RARITY.get(rarity)
     if result_rarity is None:
         return False, "Эту редкость перековать нельзя.", None
+    if slot not in C.SLOT_KEYS:
+        return False, "Выбери, какой тип предметов перековать.", None
     chooser = rng or random
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
         if record is None:
             return False, "Сначала приручи существо.", None
-        ingredients = _forge_ingredients(record, rarity)
+        ingredients = _forge_ingredients(record, rarity, slot)
         required = FORGE_REQUIREMENTS[rarity]
         if len(ingredients) < required:
-            return False, f"Нужно {required} свободных предметов этой редкости. Надетые и защищённые не считаются.", None
+            return False, (
+                f"Нужно {required} свободных предметов «{C.SLOT_NAMES[slot]}» этой "
+                "редкости. Надетые и защищённые не считаются."
+            ), None
         consumed = ingredients[:required]
         owned = set(record.get("inventory", []))
-        pool = ([C.find_item("cursed_relic")] if rarity == "cursed" else [
+        pool = [
             item for item in C.ITEMS
             if item.source == "drop" and item.rarity == result_rarity
-            and item.code not in owned
-        ])
+            and item.slot == slot
+        ]
+        # The relic is the one forge-only item there is, and it is a rare weapon: it joins
+        # the pool cursed weapons draw from instead of being a recipe that bypasses the
+        # rule. Forging six cursed blades can still produce it -- it is no longer the only
+        # thing that can come out.
+        if rarity == "cursed":
+            pool.append(C.find_item(FORGE_CURSED_RELIC))
         pool = [item for item in pool if item is not None and item.code not in owned]
         if not pool:
-            return False, "Подходящие новые предметы этой редкости закончились.", None
+            return False, (
+                f"Новые предметы «{C.SLOT_NAMES[slot]}» этой редкости у тебя уже все есть."
+            ), None
         result = chooser.choice(pool)
         inventory = record.setdefault("inventory", [])
         for item in consumed:
@@ -6693,7 +7016,8 @@ def fight_id(fight: dict) -> str:
     return stable or str((fight or {}).get("ts") or "").replace("+", "~")
 
 
-def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) -> dict | None:
+def grant_random_drop(entry, user_id, chance: float, seed: str | None = None,
+                      rarity: str | None = None) -> dict | None:
     """Roll one loot drop outside a fight, and give it if it lands.
 
     For rewards that are not arena wins -- a completed quest today, whatever else later.
@@ -6704,6 +7028,10 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) ->
     Seeded when a caller passes `seed`, so the same reward paid twice by a retried
     settlement rolls the same item instead of two -- the same reproducibility trick
     _farm_reward uses.
+
+    `rarity` narrows the pool to one tier -- what a chest full of cursed gear needs. It is
+    a strict filter: a caller that asks for cursed and finds the player already owns every
+    cursed item gets None, never a consolation legendary.
     """
     if chance <= 0:
         return None
@@ -6717,7 +7045,11 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None) ->
         if rng.random() >= min(1.0, float(chance)):
             return None
         owned = set(record.get("inventory", []))
-        pool = [item for item in C.ITEMS if item.source == "drop" and item.code not in owned]
+        pool = [
+            item for item in C.ITEMS
+            if item.source == "drop" and item.code not in owned
+            and (rarity is None or item.rarity == rarity)
+        ]
         if not pool:
             return None
         weighted = [item for item in pool for _ in range(max(1, getattr(item, "drop_weight", 1)))]

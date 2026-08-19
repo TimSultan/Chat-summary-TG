@@ -698,6 +698,10 @@ _AUDIT_SOURCES = {
     "dungeon_mobs": ("Подземелье: мобы", "#8f6ad6"),
     "dungeon_boss": ("Подземелье: боссы", "#b45fc4"),
     "dungeon_legacy": ("Подземелье: до разделения", "#7d6ba8"),
+    # Between-floor chests and mimics. Their own bucket rather than folded into the
+    # mobs: they are a separate faucet with separate odds, and the whole reason to
+    # split a source is to be able to see one of them grow on its own.
+    "dungeon_chest": ("Подземелье: сундуки", "#c99a4f"),
     "dungeon_heal": ("Подземелье: лечение", "#6a7fa8"),
     "farm": ("Ферма", "#4ca66a"),
     "daily": ("Ежедневный бонус", "#55b9ad"),
@@ -738,6 +742,8 @@ def _audit_source(reason: str) -> str:
         return "dungeon_mobs"
     if value == "pet_dungeon_win":
         return "dungeon_legacy"
+    if value == "pet_dungeon_chest":
+        return "dungeon_chest"
     if value == "pet_dungeon_heal":
         return "dungeon_heal"
     if value.startswith("grant:pet:farm:") or value == "pet:farm_passive_income":

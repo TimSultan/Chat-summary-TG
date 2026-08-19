@@ -88,10 +88,22 @@ class MobRollAndBlockTests(PetsTestCase):
         self.assertEqual(weapon.name, "Копьё зверобоя")
         self.assertEqual(weapon.effect["code"], "mob_hunter")
         self.assertEqual(amulet.effect["code"], "mob_ward")
-        self.assertTrue(all(
-            weapon.code in {item.code for item in pets_config.daily_storefront_weapons("chat", day)}
-            for day in (pets.today(), pets.today() + timedelta(days=1))
-        ))
+        # Both counters are RARE shop items, so they take the one rare slot on their
+        # shelf when their turn comes rather than sitting there permanently. What has to
+        # hold is that they are genuinely reachable -- in the rotation and turning up
+        # inside a couple of months -- not that they are on sale every single day.
+        for item in (weapon, amulet):
+            with self.subTest(item=item.code):
+                self.assertEqual(item.source, "shop")
+                days = [
+                    day for day in range(90)
+                    if item.code in {
+                        offer.code for offer in pets_config.daily_storefront_items(
+                            "chat", item.slot, pets.today() + timedelta(days=day),
+                        )
+                    }
+                ]
+                self.assertTrue(days, f"{item.code} never reaches the shelf")
 
         def fighter(key, effects=()):
             return pets_combat.Fighter(

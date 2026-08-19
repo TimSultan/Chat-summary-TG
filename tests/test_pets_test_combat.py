@@ -14,7 +14,7 @@ class ScrollCatalogTests(unittest.TestCase):
     def test_catalogue_is_large_editable_and_split_for_four_slots(self):
         self.assertEqual(len(catalog.REGULAR_SCROLLS), 30)
         self.assertEqual(len(catalog.ULTIMATE_SCROLLS), 10)
-        self.assertEqual(len(catalog.SHIELDS), 20)
+        self.assertGreaterEqual(len(catalog.SHIELDS), 20)
         self.assertTrue(all(row["auto_weight"] == 1 for row in catalog.SCROLLS))
         self.assertEqual({row["element"] for row in catalog.SCROLLS}, set(catalog.ELEMENTS))
         self.assertTrue(all(row["element"] in catalog.ELEMENTS for row in catalog.SCROLLS))

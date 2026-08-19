@@ -273,6 +273,57 @@ SHIELDS = (
      "short": "После каждого полученного урона восстанавливает 50% фактически потерянного HP.",
      "defend_effects": (),
      "on_hit_effects": ({"op": "damage_heal", "percent": .50},)},
+    # --- the second shelf ------------------------------------------------------------
+    # Shields were the thinnest slot in the game by a wide margin: six ordinary and six
+    # rare against roughly thirty and ten for every other accessory. That is not a flavour
+    # problem, it is a mechanical one -- the daily shelf ran out of things to offer a
+    # collector, and the forge asked for more rare shields than have ever existed, so the
+    # recipe could not be completed by anybody. These bring the slot in line.
+    {"code": "shield_pot_lid", "name": "Крышка от кастрюли", "icon": "🍲",
+     "short": "При защите создаёт барьер 6% HP.",
+     "defend_effects": ({"op": "shield", "percent": .06},)},
+    {"code": "shield_book_cover", "name": "Обложка энциклопедии", "icon": "📕",
+     "short": "Ослабляет следующий удар врага на 20%.",
+     "defend_effects": ({"op": "weaken", "value": .20, "turns": 1},)},
+    {"code": "shield_tray", "name": "Поднос из столовой", "icon": "🍽️",
+     "short": "При защите лечит 4% HP.",
+     "defend_effects": ({"op": "heal", "percent": .04},)},
+    {"code": "shield_road_sign", "name": "Знак «Стоп» с обочины", "icon": "🛑",
+     "short": "Отражает 30% следующего урона.",
+     "defend_effects": ({"op": "reflect_next", "value": .30},)},
+    {"code": "shield_manhole", "name": "Люк с тротуара", "icon": "🕳️",
+     "short": "Базовая защита поглощает 50% вместо 40%.", "guard": .50,
+     "defend_effects": ()},
+    {"code": "shield_umbrella", "name": "Зонт наизнанку", "icon": "☂️",
+     "short": "После защиты ослепляет врага на ход.",
+     "defend_effects": ({"op": "blind", "value": .15, "turns": 1},)},
+    {"code": "shield_baking_sheet", "name": "Дачный противень", "icon": "🥧",
+     "short": "При защите поджигает врага: 20% базового урона владельца в начале каждого из 2 ходов врага (всего 40%).",
+     "defend_effects": ({"op": "burn", "amount": .20, "turns": 2},)},
+    {"code": "shield_cutting_board", "name": "Разделочная доска", "icon": "🔪",
+     "short": "При защите усиливает свой следующий удар на 18%.",
+     "defend_effects": ({"op": "damage_boost", "value": .18, "turns": 1},)},
+    {"code": "shield_riot_pane", "name": "Лист оргстекла", "icon": "🪟",
+     "short": "При защите создаёт барьер 10% HP.",
+     "defend_effects": ({"op": "shield", "percent": .10},)},
+    {"code": "shield_welding_mask", "name": "Сварочная маска", "icon": "🥽",
+     "short": "После защиты ослепляет врага на два хода.",
+     "defend_effects": ({"op": "blind", "value": .25, "turns": 2},)},
+    {"code": "shield_scaffold_plank", "name": "Доска со стройлесов", "icon": "🪵",
+     "short": "При защите усиливает свои следующие два удара на 22%.",
+     "defend_effects": ({"op": "damage_boost", "value": .22, "turns": 2},)},
+    {"code": "shield_sewer_grate", "name": "Решётка ливнёвки", "icon": "🌧️",
+     "short": "После первого полученного урона отвечает контрударом на 35% обычного урона.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "counterattack", "percent": .35},)},
+    {"code": "shield_iron_skillet", "name": "Чугунная сковорода", "icon": "🍳",
+     "short": "При первом полученном уроне: 22% шанс парировать 55% урона и оглушить атакующего.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "parry_stun", "chance": .22, "reduce": .55},)},
+    {"code": "shield_thermos_cap", "name": "Крышка от термоса", "icon": "☕",
+     "short": "После каждого полученного урона восстанавливает 22% фактически потерянного HP.",
+     "defend_effects": (),
+     "on_hit_effects": ({"op": "damage_heal", "percent": .22},)},
     {"code": "shield_judgement", "name": "Щит воздаяния", "icon": "⚖️",
      "short": "После первого полученного урона отвечает контрударом на 85% обычного урона.",
      "defend_effects": (),
@@ -472,8 +523,10 @@ def _validate() -> None:
     if {row["element"] for row in SCROLLS} != set(ELEMENTS):
         raise ValueError("every scroll element must be represented")
     shield_codes = [row["code"] for row in SHIELDS]
-    if len(shield_codes) != 20 or len(set(shield_codes)) != len(shield_codes):
-        raise ValueError("shield catalogue must contain 20 unique entries")
+    # Counted rather than pinned at a number somebody has to remember to edit: what this
+    # protects is that no two shields share a code, not that there are exactly N of them.
+    if len(set(shield_codes)) != len(shield_codes):
+        raise ValueError("shield catalogue contains a duplicate code")
     for row in SHIELDS:
         effects = tuple(row.get("defend_effects", ())) + tuple(row.get("on_hit_effects", ()))
         for effect in effects:

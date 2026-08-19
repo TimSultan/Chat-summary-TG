@@ -153,6 +153,33 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(run["floor"], 1)
         self.assertEqual(run["cleared"], [])
 
+    def test_both_clients_let_a_runner_reach_their_gear(self):
+        """pets.equip stopped refusing mid-run, and both transports went on refusing for
+        it. The «🎒 Снаряжение» button on the floor screen bounced off the same gate that
+        blocks the farm, so the rule changed in one file and nowhere a player could see.
+
+        Pinned as a pair: the two clients must permit the same things, or re-arming works
+        in the chat and not in the app.
+        """
+        import bot_listener
+        import pets_web
+
+        for action in ("bag", "bagitems", "equip", "unequip", "forge", "enchant"):
+            with self.subTest(telegram=action):
+                self.assertIn(action, bot_listener.PET_ACTIONS_ALLOWED_IN_A_RUN)
+        for action in ("equip", "unequip", "enchant_weapon"):
+            with self.subTest(webapp=action):
+                self.assertIn(action, pets_web._ALLOWED_IN_DUNGEON)
+
+        # The trip OUT of the dungeon is still shut. A run is a commitment, and the gate
+        # exists to stop somebody wandering off to another mode in the middle of one.
+        for action in ("farm", "search", "casino", "quests", "store"):
+            with self.subTest(shut=action):
+                self.assertNotIn(action, bot_listener.PET_ACTIONS_ALLOWED_IN_A_RUN)
+        for action in ("farm_start", "buy", "sell", "quarry_start"):
+            with self.subTest(shut=action):
+                self.assertNotIn(action, pets_web._ALLOWED_IN_DUNGEON)
+
     def test_a_weapon_can_be_enchanted_without_leaving_the_dungeon(self):
         data = pets._load(self.entry)
         record = data["pets"][self.user_id]
@@ -324,6 +351,9 @@ class DungeonTests(unittest.TestCase):
             "haul": empty_haul, "floor_haul": dict(empty_haul),
             # Same for the pack healers' bookkeeping.
             "dead_at": {}, "revived": [], "order": [],
+            # No find between these floors -- and the field is present rather than absent,
+            # because the whitelist is what makes a chest survive a reload at all.
+            "chest": None,
         })
 
     def test_the_loot_tallies_survive_the_whitelist_that_rebuilds_the_run(self):
@@ -1058,6 +1088,255 @@ class ChestAndMimicModelTests(unittest.TestCase):
             shallow / dungeon.reward_for(3, boss=False)["gold"],
             dungeon.CHEST_GOLD_SHARE, delta=0.05,
         )
+
+
+class ChestBetweenFloorsTests(DungeonTests):
+    """The half the model was missing: the chest has to actually turn up, survive a
+    reload, pay out, and above all leave the rest of the floor alone."""
+
+    def _a_win(self, hp_left=500):
+        """A fight the hero wins outright, leaving them on `hp_left`.
+
+        Scripted rather than simulated: combat luck decides whether a real fight on floor
+        two is survived, and none of these tests are about that.
+        """
+        round_ = pets.pets_combat.Round(1, self.user_id, "hit", 200, hp_left, 0, "")
+        return SimpleNamespace(winner=self.user_id, rounds=(round_,), final_hp={})
+
+    def _descend_onto(self, kind, floor=2):
+        """Stand the player on a cleared floor and walk them into a known find."""
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["dungeon_run"] = {
+            "run_id": "runid", "kills": 0, "floor": floor - 1, "hp": 400, "max_hp": 400,
+            "cleared": [row["index"] for row in dungeon.encounters_for_floor(floor - 1)],
+            "haul": pets._new_haul(), "floor_haul": pets._new_haul(),
+        }
+        pets._save(self.entry, data)
+        with patch("pets_dungeon.roll_chest", return_value={"kind": kind, "floor": floor}):
+            ok, message = pets.dungeon_descend(self.entry, self.user_id)
+        self.assertTrue(ok, message)
+        return message
+
+    def test_a_descent_actually_rolls_a_find_and_it_survives_a_reload(self):
+        """The whole feature shipped dead because the run whitelist ate this field on the
+        next load, which looks exactly like a chest that never appeared."""
+        message = self._descend_onto("chest")
+        self.assertIn("сундук", message)
+
+        # Read back through the repair path, which is the one that used to drop it.
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["chest"], {"kind": "chest", "floor": 2, "revealed": False})
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertTrue(state["chest"]["present"])
+        # And it does NOT say which of the two it is: the guess is the encounter.
+        self.assertNotIn("kind", state["chest"])
+
+    def test_nine_descents_in_ten_leave_the_screen_exactly_as_it_was(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "run_id": "runid", "floor": 1, "hp": 400, "max_hp": 400,
+            "cleared": [row["index"] for row in dungeon.encounters_for_floor(1)],
+        }
+        pets._save(self.entry, data)
+        with patch("pets_dungeon.roll_chest", return_value=None):
+            _ok, message = pets.dungeon_descend(self.entry, self.user_id)
+        self.assertNotIn("сундук", message)
+        self.assertIsNone(pets.dungeon_status(self.entry, self.user_id)["chest"])
+
+    def test_a_find_never_blocks_the_floor_it_was_found_on(self):
+        """The answer to "does this break the other floors": it cannot. The box is a card
+        beside the corridor, not a door across it."""
+        self._descend_onto("mimic", floor=2)
+
+        # Every ordinary encounter on the floor still fights, and the floor still clears.
+        # Looped rather than counted: floor two has healers that put the room back up, and
+        # what is being asserted is that the chest changes none of that.
+        for _attempt in range(40):
+            state = pets.dungeon_status(self.entry, self.user_id)
+            standing = [row for row in state["encounters"] if not row["cleared"]]
+            if not standing:
+                break
+            with patch("pets.pets_combat.simulate", return_value=self._a_win()):
+                ok, message, _receipt = pets.dungeon_fight(
+                    self.entry, self.user_id, standing[0]["index"])
+            self.assertTrue(ok, message)
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertTrue(state["can_rest"])
+        self.assertTrue(state["chest"]["present"], "an ignored chest simply waits")
+
+        # And descending past an unopened one works, replacing it rather than stacking.
+        with patch("pets_dungeon.roll_chest", return_value=None):
+            self.assertTrue(pets.dungeon_descend(self.entry, self.user_id)[0])
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertEqual(state["floor"], 3)
+        self.assertIsNone(state["chest"], "the corridor behind you is gone")
+
+    def test_a_plain_chest_pays_coins_diamonds_a_cursed_item_and_a_rune(self):
+        self._descend_onto("chest", floor=4)
+        before = economy.balance(self.entry, self.user_id, 0)
+
+        ok, _message, receipt = pets.dungeon_chest_open(self.entry, self.user_id)
+
+        self.assertTrue(ok)
+        self.assertEqual(receipt["reward"]["gold"], dungeon.chest_gold(4))
+        self.assertEqual(economy.balance(self.entry, self.user_id, 0),
+                         before + dungeon.chest_gold(4))
+        self.assertIn(receipt["rubies"], range(*dungeon.CHEST_RUBY_RANGE[:1] + (4,)))
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), receipt["rubies"])
+        self.assertEqual(len(receipt["dropped"]), 1)
+        self.assertEqual(receipt["dropped"][0]["rarity"], "cursed")
+        self.assertEqual(len(receipt["rune"]), 1)
+        # It lands on the run's tally, so the closing receipt can report it.
+        haul = pets.dungeon_haul(self.entry, self.user_id)["total"]
+        self.assertEqual(haul["gold"], dungeon.chest_gold(4))
+        self.assertEqual(haul["items"], [receipt["dropped"][0]["name"]])
+        self.assertEqual(haul["kills"], 0, "opening a box is not a victory")
+        # One press, one payout: the chest is gone afterwards.
+        self.assertIsNone(pets.dungeon_status(self.entry, self.user_id)["chest"])
+        self.assertFalse(pets.dungeon_chest_open(self.entry, self.user_id)[0])
+
+    def test_the_wrong_box_bites_a_share_of_max_hp_and_then_offers_the_choice(self):
+        self._descend_onto("mimic", floor=4)
+
+        ok, message, receipt = pets.dungeon_chest_open(self.entry, self.user_id)
+
+        self.assertTrue(ok)
+        self.assertEqual(receipt["bite"], dungeon.mimic_bite(400))
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["hp"], 400 - dungeon.mimic_bite(400))
+        self.assertIn("HP", message)
+        state = pets.dungeon_status(self.entry, self.user_id)["chest"]
+        self.assertTrue(state["revealed"])
+        self.assertEqual(state["kind"], "mimic")
+        # The lid is not a second attack: opening it again does nothing.
+        self.assertFalse(pets.dungeon_chest_open(self.entry, self.user_id)[0])
+
+    def test_a_bite_can_hurt_but_never_ends_a_run_on_its_own(self):
+        """A box that kills outright is a trap nobody opens twice. The FIGHT is where the
+        run is allowed to end."""
+        self._descend_onto("mimic", floor=4)
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["hp"] = 3
+        pets._save(self.entry, data)
+
+        pets.dungeon_chest_open(self.entry, self.user_id)
+
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertIsNotNone(run, "the run survives the lid")
+        self.assertEqual(run["hp"], 1)
+
+    def test_walking_away_from_a_woken_mimic_costs_the_bite_and_nothing_else(self):
+        self._descend_onto("mimic", floor=4)
+        pets.dungeon_chest_open(self.entry, self.user_id)
+        bitten = pets.get_pet(self.entry, self.user_id)["dungeon_run"]["hp"]
+
+        ok, message = pets.dungeon_chest_leave(self.entry, self.user_id)
+
+        self.assertTrue(ok)
+        self.assertIn("мимик", message.lower())
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertEqual(run["hp"], bitten)
+        self.assertIsNone(run["chest"])
+        self.assertFalse(pets.dungeon_chest_fight(self.entry, self.user_id)[0])
+
+    def test_beating_a_mimic_pays_better_than_the_chest_it_pretended_to_be(self):
+        self._descend_onto("mimic", floor=4)
+        pets.dungeon_chest_open(self.entry, self.user_id)
+
+        loot = {"gold": 900, "rubies": 3, "cursed": 2, "drops": 1, "runes": 1}
+        with patch("pets_dungeon.mimic_loot", return_value=loot), \
+                patch("pets.pets_combat.simulate", return_value=self._a_win()):
+            ok, _message, receipt = pets.dungeon_chest_fight(self.entry, self.user_id)
+
+        self.assertTrue(ok)
+        self.assertEqual(receipt["reward"]["gold"], 900)
+        self.assertGreater(receipt["reward"]["xp"], 0, "a fight still pays experience")
+        self.assertEqual(len(receipt["dropped"]), 3)
+        # Two cursed by NAME plus one roll on the whole table -- which may itself land on
+        # a cursed item, so the promise is a floor rather than an exact count.
+        self.assertGreaterEqual(
+            sum(row["rarity"] == "cursed" for row in receipt["dropped"]), 2)
+        haul = pets.dungeon_haul(self.entry, self.user_id)["total"]
+        self.assertEqual(haul["kills"], 1, "this one WAS a victory")
+        self.assertEqual(len(haul["items"]), 3)
+        self.assertIsNone(pets.dungeon_status(self.entry, self.user_id)["chest"])
+
+    def test_a_mimic_that_was_empty_after_all_still_says_so(self):
+        self._descend_onto("mimic", floor=4)
+        pets.dungeon_chest_open(self.entry, self.user_id)
+
+        with patch("pets_dungeon.mimic_loot", return_value=None), \
+                patch("pets.pets_combat.simulate", return_value=self._a_win()):
+            ok, message, receipt = pets.dungeon_chest_fight(self.entry, self.user_id)
+
+        self.assertTrue(ok)
+        self.assertEqual(message, dungeon.MIMIC_EMPTY_NOTICE)
+        self.assertEqual(receipt["reward"]["gold"], 0)
+        self.assertEqual(pets.dungeon_haul(self.entry, self.user_id)["total"]["kills"], 1)
+
+    def test_losing_to_a_mimic_ends_the_run_and_keeps_the_receipt(self):
+        self._descend_onto("mimic", floor=4)
+        pets.dungeon_chest_open(self.entry, self.user_id)
+        data = pets._load(self.entry)
+        run = data["pets"][self.user_id]["dungeon_run"]
+        run["haul"] = {**pets._new_haul(), "gold": 640, "kills": 3, "scrolls": ["Пламя"]}
+        run["hp"] = 1
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 1, "health": 1, "agility": 1, "luck": 1, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+
+        ok, _message, receipt = pets.dungeon_chest_fight(self.entry, self.user_id)
+
+        self.assertFalse(ok)
+        self.assertTrue(receipt["run_over"])
+        self.assertEqual(receipt["haul"]["total"]["gold"], 640)
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertFalse(state["active"])
+        self.assertEqual(state["last_haul"]["gold"], 640)
+
+
+class RunSummaryOnTheDefeatScreenTests(DungeonTests):
+    """What a dead run was worth, on the screen the player is standing on when it dies.
+
+    dungeon_finished_text existed and was tested, and no screen in the game ever called
+    it -- so the one moment a player most wants the number showed them the entry price
+    instead.
+    """
+
+    def _dead_run(self, **haul):
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["last_dungeon_haul"] = {**pets._new_haul(), "floor": 7, "won": False, **haul}
+        pets._save(self.entry, data)
+        return pets.dungeon_status(self.entry, self.user_id)
+
+    def test_the_screen_after_a_defeat_prints_the_takings_and_the_praise(self):
+        state = self._dead_run(gold=1240, xp=300, rubies=2, kills=9,
+                               items=["Ржавый клык"], runes=["Огонь"])
+
+        text, _keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+
+        self.assertIn("оборвался на этаже 7", text)
+        self.assertIn("Побед: 9", text)
+        self.assertIn("Всего за поход", text)
+        self.assertIn("1.240", text)
+        self.assertIn("Ржавый клык", text)
+        self.assertIn("Хорошая нажива", text)
+        # The tally the screen printed is the one the state carried.
+        self.assertEqual(state["last_haul"]["gold"], 1240)
+
+    def test_a_bigger_haul_gets_the_bigger_praise(self):
+        self._dead_run(gold=9000, kills=40)
+        text, _keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        self.assertIn("Отличная нажива", text)
+
+    def test_an_empty_run_is_told_it_was_empty_rather_than_told_nothing(self):
+        self._dead_run()
+        text, _keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        self.assertIn("оборвался", text)
+        self.assertIn("пустыми руками", text)
 
 
 class BossWeaknessTests(unittest.TestCase):

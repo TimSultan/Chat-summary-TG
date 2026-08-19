@@ -224,9 +224,14 @@ class PetsIntegrationTests(unittest.TestCase):
         )
         loser = ALICE if result.winner == str(BOB) else BOB
         self.assertEqual(economy.balance(ENTRY, loser, 0), 0)
+
         reward = pets.record_fight(ENTRY, ALICE, BOB, result, pets.today())
-        self.assertEqual(economy.balance(ENTRY, loser, 0), 0)
-        self.assertGreaterEqual(reward["loss_gold"], 0)
+
+        # Nothing can be taken from an empty wallet: the loss is capped by what was there.
+        self.assertEqual(reward["loss_gold"], 0)
+        # The balance may have gone UP -- a beaten defender is paid a consolation now --
+        # but it can never go below zero, which is the invariant this test exists for.
+        self.assertGreaterEqual(economy.balance(ENTRY, loser, 0), 0)
 
     def test_ordinary_chatting_does_not_expand_the_fight_bank(self):
         # The fixed budget deliberately ignores ordinary chat-message volume.

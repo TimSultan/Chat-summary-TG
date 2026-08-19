@@ -1195,7 +1195,15 @@ class EquipmentTradingTests(PetsTestCase):
                 if pets_ui.parse_callback(button["callback_data"])[1] == "buy"
             ]
             # Every personal offer is visible, with no paging to reach any of them.
-            self.assertEqual(len(buys), pets_config.DAILY_STOREFRONT_SIZE)
+            #
+            # Bounded by the catalogue, not fixed at the shelf size: the shelf never offers
+            # what you already own, and the shield slot has only six ordinary and six rare
+            # items in existence -- so a collector's shield shelf is genuinely shorter than
+            # an amulet shelf, and that is the shop working rather than failing.
+            offers = pets.daily_storefront_items("chat", slot, user_id="1")
+            self.assertEqual(len(buys), len(offers))
+            self.assertTrue(buys, f"{slot} shelf must always have something to sell")
+            self.assertLessEqual(len(buys), pets_config.DAILY_STOREFRONT_SIZE)
             self.assertNotIn("только из боёв", text)
             # The full catalogue stays reachable, it is just not what the shop opens onto.
             self.assertIn("slot", [
@@ -1284,87 +1292,190 @@ class EquipmentTradingTests(PetsTestCase):
 
 
 class ForgeTests(PetsTestCase):
-    def test_reforge_consumes_five_weakest_free_items_and_grants_next_rarity(self):
-        self._tame("forge", "1")
-        common = [
+    """The forge takes one KIND of item and returns that kind, one rarity better.
+
+    It used to accept any five items of a rarity and pay out a random drop from the whole
+    catalogue, so melting a pile of gloves could produce a sword. Choosing what to melt was
+    therefore never a decision about what you were building.
+    """
+
+    def _drops(self, slot, rarity, count):
+        return [
             item for item in pets_config.ITEMS
-            if item.source == "drop" and item.rarity == "common"
-        ][:6]
+            if item.source == "drop" and item.rarity == rarity and item.slot == slot
+        ][:count]
+
+    def _recipe(self, entry, rarity, slot):
+        return next(
+            row for row in pets.forge_status(entry, "1")["recipes"]
+            if row["rarity"] == rarity and row["slot"] == slot
+        )
+
+    def test_reforge_consumes_five_weakest_free_items_and_grants_the_same_slot(self):
+        self._tame("forge", "1")
+        common = self._drops("gloves", "common", pets.FORGE_REQUIREMENTS["common"] + 1)
         data = pets._load("forge")
         data["pets"]["1"]["inventory"] = [item.code for item in common]
         data["pets"]["1"]["locked_items"] = [common[-1].code]
         pets._save("forge", data)
 
-        status = pets.forge_status("forge", "1")["recipes"][0]
-        self.assertEqual(status["required"], 5)
-        self.assertEqual(len(status["ingredients"]), 5)
+        status = self._recipe("forge", "common", "gloves")
+        self.assertEqual(status["required"], pets.FORGE_REQUIREMENTS["common"])
+        self.assertEqual(len(status["ingredients"]), pets.FORGE_REQUIREMENTS["common"])
         self.assertTrue(status["can_forge"])
         self.assertNotIn(common[-1].code, status["ingredients"])
-        ok, message, result_code = pets.reforge_items("forge", "1", "common", random.Random(7))
+        ok, message, result_code = pets.reforge_items(
+            "forge", "1", "common", "gloves", random.Random(7),
+        )
 
         self.assertTrue(ok, message)
         result = pets_config.find_item(result_code)
         self.assertEqual(result.rarity, "rare")
         self.assertEqual(result.source, "drop")
+        # The whole point of the rule: gloves in, gloves out.
+        self.assertEqual(result.slot, "gloves")
         inventory = pets.get_pet("forge", "1")["inventory"]
         self.assertIn(common[-1].code, inventory)
         self.assertIn(result.code, inventory)
         self.assertEqual(len(inventory), 2)
 
-    def test_common_reforge_requires_five_free_items(self):
+    def test_a_pile_of_one_slot_cannot_be_melted_into_another(self):
+        """Five common gloves are five common gloves. They are not five common anything,
+        and they are certainly not a sword."""
+        self._tame("forge-mixed", "1")
+        data = pets._load("forge-mixed")
+        data["pets"]["1"]["inventory"] = [
+            item.code for item in
+            self._drops("gloves", "common", 3) + self._drops("boots", "common", 3)
+        ]
+        pets._save("forge-mixed", data)
+
+        # Six free common items, and not one recipe can be filled: they are two piles.
+        for slot in ("gloves", "boots"):
+            self.assertFalse(self._recipe("forge-mixed", "common", slot)["can_forge"])
+        self.assertFalse(pets.reforge_items("forge-mixed", "1", "common", "gloves")[0])
+        self.assertFalse(pets.reforge_items("forge-mixed", "1", "common", "weapon")[0])
+        self.assertEqual(len(pets.get_pet("forge-mixed", "1")["inventory"]), 6)
+
+    def test_a_recipe_without_a_slot_is_refused_rather_than_guessed(self):
+        self._tame("forge-noslot", "1")
+        data = pets._load("forge-noslot")
+        data["pets"]["1"]["inventory"] = [
+            item.code for item in self._drops("gloves", "common", 6)
+        ]
+        pets._save("forge-noslot", data)
+
+        ok, message, result_code = pets.reforge_items("forge-noslot", "1", "common")
+
+        self.assertFalse(ok)
+        self.assertIsNone(result_code)
+        self.assertIn("тип", message)
+        self.assertEqual(len(pets.get_pet("forge-noslot", "1")["inventory"]), 6)
+
+    def test_common_reforge_requires_five_free_items_of_that_slot(self):
         self._tame("forge-requires-five", "1")
-        common = [
-            item for item in pets_config.ITEMS
-            if item.source == "drop" and item.rarity == "common"
-        ][:4]
+        common = self._drops("gloves", "common", pets.FORGE_REQUIREMENTS["common"] - 1)
         data = pets._load("forge-requires-five")
         data["pets"]["1"]["inventory"] = [item.code for item in common]
         pets._save("forge-requires-five", data)
 
-        recipe = pets.forge_status("forge-requires-five", "1")["recipes"][0]
-        self.assertEqual(recipe["required"], 5)
+        recipe = self._recipe("forge-requires-five", "common", "gloves")
+        self.assertEqual(recipe["required"], pets.FORGE_REQUIREMENTS["common"])
         self.assertFalse(recipe["can_forge"])
         ok, _message, result_code = pets.reforge_items(
-            "forge-requires-five", "1", "common", random.Random(7),
+            "forge-requires-five", "1", "common", "gloves", random.Random(7),
         )
         self.assertFalse(ok)
         self.assertIsNone(result_code)
 
     def test_legendary_reforge_requires_and_consumes_seven_rares(self):
         self._tame("forge-legend", "1")
-        rares = [
-            item for item in pets_config.ITEMS
-            if item.source == "drop" and item.rarity == "rare"
-        ][:7]
+        rares = self._drops("amulet", "rare", pets.FORGE_REQUIREMENTS["rare"])
+        self.assertEqual(len(rares), pets.FORGE_REQUIREMENTS["rare"])
         data = pets._load("forge-legend")
         data["pets"]["1"]["inventory"] = [item.code for item in rares]
         pets._save("forge-legend", data)
 
-        recipe = pets.forge_status("forge-legend", "1")["recipes"][1]
-        self.assertEqual(recipe["required"], 7)
+        recipe = self._recipe("forge-legend", "rare", "amulet")
+        self.assertEqual(recipe["required"], pets.FORGE_REQUIREMENTS["rare"])
         self.assertTrue(recipe["can_forge"])
         ok, message, result_code = pets.reforge_items(
-            "forge-legend", "1", "rare", random.Random(11),
+            "forge-legend", "1", "rare", "amulet", random.Random(11),
         )
 
         self.assertTrue(ok, message)
-        self.assertEqual(pets_config.find_item(result_code).rarity, "legendary")
+        result = pets_config.find_item(result_code)
+        self.assertEqual(result.rarity, "legendary")
+        self.assertEqual(result.slot, "amulet")
         self.assertEqual(pets.get_pet("forge-legend", "1")["inventory"], [result_code])
+
+    def test_six_cursed_weapons_make_a_rare_weapon_and_can_still_make_the_relic(self):
+        """Cursed gear only exists on weapons, so its recipe is the same rule as every
+        other one. The designed relic stays reachable by staying IN the pool that rule
+        draws from rather than being a separate recipe that bypasses it."""
+        self._tame("forge-cursed", "1")
+        cursed = self._drops("weapon", "cursed", pets.FORGE_REQUIREMENTS["cursed"])
+        data = pets._load("forge-cursed")
+        data["pets"]["1"]["inventory"] = [item.code for item in cursed]
+        pets._save("forge-cursed", data)
+
+        ok, message, result_code = pets.reforge_items(
+            "forge-cursed", "1", "cursed", "weapon", random.Random(3),
+        )
+
+        self.assertTrue(ok, message)
+        result = pets_config.find_item(result_code)
+        self.assertEqual((result.rarity, result.slot), ("rare", "weapon"))
+        # The relic is one of the things six cursed blades can become.
+        relic = pets_config.find_item(pets.FORGE_CURSED_RELIC)
+        self.assertEqual((relic.rarity, relic.slot), ("rare", "weapon"))
+        # Asserted on the POOL rather than by rolling until it turns up: the relic is one
+        # of forty-odd rare weapons, so "roll enough times" is a test that fails on an
+        # unlucky day rather than on a broken pool.
+        seen = {}
+
+        class _Recorder:
+            def choice(self, pool):
+                seen["pool"] = {item.code for item in pool}
+                return pool[0]
+
+        data = pets._load("forge-cursed")
+        data["pets"]["1"]["inventory"] = [item.code for item in cursed]
+        pets._save("forge-cursed", data)
+        self.assertTrue(pets.reforge_items(
+            "forge-cursed", "1", "cursed", "weapon", _Recorder(),
+        )[0])
+        self.assertIn(pets.FORGE_CURSED_RELIC, seen["pool"])
 
     def test_reforge_never_consumes_equipped_or_locked_items(self):
         self._tame("forge-safe", "1")
-        common = [item for item in pets_config.ITEMS if item.rarity == "common"][:4]
+        common = self._drops("gloves", "common", pets.FORGE_REQUIREMENTS["common"] - 1)
         data = pets._load("forge-safe")
         record = data["pets"]["1"]
         record["inventory"] = [item.code for item in common]
-        record["equipped"][common[0].slot] = common[0].code
+        record["equipped"]["gloves"] = common[0].code
         record["locked_items"] = [common[1].code]
         pets._save("forge-safe", data)
 
-        ok, _message, result_code = pets.reforge_items("forge-safe", "1", "common")
+        ok, _message, result_code = pets.reforge_items("forge-safe", "1", "common", "gloves")
         self.assertFalse(ok)
         self.assertIsNone(result_code)
-        self.assertEqual(pets.get_pet("forge-safe", "1")["inventory"], [item.code for item in common])
+        self.assertEqual(pets.get_pet("forge-safe", "1")["inventory"],
+                         [item.code for item in common])
+
+    def test_the_screen_only_offers_recipes_the_bag_could_ever_fill(self):
+        """Fifteen recipes exist. A player owning gloves wants to read about gloves."""
+        self._tame("forge-listing", "1")
+        data = pets._load("forge-listing")
+        data["pets"]["1"]["inventory"] = [
+            item.code for item in self._drops("boots", "common", 2)
+        ]
+        pets._save("forge-listing", data)
+
+        recipes = pets.forge_status("forge-listing", "1")["recipes"]
+
+        self.assertEqual([(row["rarity"], row["slot"]) for row in recipes],
+                         [("common", "boots")])
 
 
 class StorefrontAndCollectionTests(PetsTestCase):
@@ -1375,31 +1486,45 @@ class StorefrontAndCollectionTests(PetsTestCase):
         data["pets"]["1"]["level"] = pets_config.GIFT_MIN_PET_LEVEL
         pets._save(entry, data)
 
-    def test_daily_storefront_is_stable_sized_and_changes_each_twelve_hours(self):
+    def test_daily_storefront_is_stable_sized_and_turns_once_a_day(self):
         moment = datetime(2026, 8, 8, 3)
         for slot in pets_config.SLOT_KEYS:
             with self.subTest(slot=slot):
                 first = pets_config.daily_storefront_items("shop-chat", slot, moment, user_id="1")
                 again = pets_config.daily_storefront_items(
-                    "shop-chat", slot, moment.replace(hour=11), user_id="1",
+                    "shop-chat", slot, moment.replace(hour=23), user_id="1",
                 )
+                # The shelf holds all day now and turns at midnight, so "later" has to be
+                # tomorrow rather than the afternoon.
                 afternoon = pets_config.daily_storefront_items(
-                    "shop-chat", slot, moment.replace(hour=12), user_id="1",
+                    "shop-chat", slot, moment.replace(day=moment.day + 1), user_id="1",
                 )
                 other_player = pets_config.daily_storefront_items(
                     "shop-chat", slot, moment, user_id="2",
                 )
                 self.assertEqual([item.code for item in first], [item.code for item in again])
-                self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 6)
+                self.assertEqual(pets_config.DAILY_STOREFRONT_SIZE, 4)
                 self.assertEqual(len(first), pets_config.DAILY_STOREFRONT_SIZE)
                 self.assertEqual(len({item.code for item in first}), pets_config.DAILY_STOREFRONT_SIZE)
                 self.assertNotEqual([item.code for item in first], [item.code for item in afternoon])
                 self.assertNotEqual([item.code for item in first], [item.code for item in other_player])
                 self.assertTrue(all(item.source == "shop" and item.slot == slot for item in first))
-                self.assertEqual(sum(item.rarity == "common" for item in first), 5)
+                self.assertEqual(sum(item.rarity == "common" for item in first), 3)
                 self.assertEqual(sum(item.rarity == "rare" for item in first), 1)
+                # Twice the catalogue price, every time. The shelf got smaller and slower;
+                # this is the other half of that.
+                for item in first:
+                    original = pets_config.find_item(item.code)
+                    self.assertEqual(
+                        item.price,
+                        pets_config.storefront_price(original),
+                        item.code,
+                    )
+                    self.assertGreaterEqual(item.price, original.price * 2)
 
-    def test_storefront_windows_turn_at_midnight_and_noon_moscow_time(self):
+    def test_storefront_windows_turn_at_midnight_moscow_time_and_only_there(self):
+        """One window a day. Noon used to start a second one, which meant eight ordinary
+        offers a day per slot -- more shopping than any player had gold or reason for."""
         before_midnight_moscow = datetime(2026, 8, 8, 20, 59, tzinfo=timezone.utc)
         midnight_moscow = before_midnight_moscow + timedelta(minutes=1)
         before_noon_moscow = datetime(2026, 8, 9, 8, 59, tzinfo=timezone.utc)
@@ -1409,21 +1534,24 @@ class StorefrontAndCollectionTests(PetsTestCase):
             pets_config.storefront_window(before_midnight_moscow),
             pets_config.storefront_window(midnight_moscow),
         )
-        self.assertNotEqual(
+        self.assertEqual(
             pets_config.storefront_window(before_noon_moscow),
             pets_config.storefront_window(noon_moscow),
         )
 
     def test_every_daily_storefront_has_a_weapon_at_the_ordinary_price_floor(self):
-        # The rotation advances in twelve-hour windows; a full year guards against a
-        # future catalogue change silently removing the weakest ordinary choice.
+        # A full year guards against a future catalogue change silently removing the
+        # weakest ordinary choice. The ceiling is the catalogue's, scaled by what the shop
+        # charges over it: the guarantee is that the cheapest tier is always represented,
+        # not that some fixed number of coins buys it.
+        floor = pets_config.STARTER_WEAPON_MAX_PRICE * pets_config.STOREFRONT_PRICE_MULTIPLIER
         for entry in ("shop-chat", "other-chat", "-100123"):
             for offset in range(366):
                 stock = pets_config.daily_storefront_weapons(
                     entry, date(2026, 1, 1) + timedelta(days=offset),
                 )
                 self.assertTrue(
-                    any(item.price <= pets_config.STARTER_WEAPON_MAX_PRICE for item in stock),
+                    any(item.price <= floor for item in stock),
                     (entry, offset, [(item.code, item.price) for item in stock]),
                 )
 
@@ -1445,11 +1573,14 @@ class StorefrontAndCollectionTests(PetsTestCase):
         self.assertEqual(len(stock), len(full))
         self.assertNotIn(owned.code, {item.code for item in stock})
 
-    def test_weapon_price_bands_keep_504_unique_weapons_and_rare_goals(self):
+    def test_weapon_price_bands_keep_every_weapon_unique_and_rare_goals(self):
+        # Counted rather than pinned to a number that has to be edited by hand every time
+        # a weapon is added: what this is actually protecting is uniqueness of code and
+        # name across the whole catalogue, not the size of it.
         weapons = pets_config.items_for_slot("weapon")
-        self.assertEqual(len(weapons), 504)
-        self.assertEqual(len({item.code for item in weapons}), 504)
-        self.assertEqual(len({item.name for item in weapons}), 504)
+        self.assertGreater(len(weapons), 500)
+        self.assertEqual(len({item.code for item in weapons}), len(weapons))
+        self.assertEqual(len({item.name for item in weapons}), len(weapons))
         shop = [item for item in weapons if item.source == "shop"]
         prices = {rarity: [item.price for item in shop if item.rarity == rarity]
                   for rarity in ("common", "rare")}
@@ -1550,7 +1681,8 @@ class StorefrontAndCollectionTests(PetsTestCase):
                     expected_left,
                 )
 
-        refreshed = pets.daily_storefront_weapons(entry, moment.replace(hour=12), user_id="1")
+        # Tomorrow, not this afternoon: the shelf turns once a day now.
+        refreshed = pets.daily_storefront_weapons(entry, moment.replace(day=9), user_id="1")
         self.assertEqual(len(refreshed), pets_config.DAILY_STOREFRONT_SIZE)
 
     def test_discovery_survives_sale_and_gift_and_old_inventory_migrates(self):
@@ -1628,7 +1760,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
             separator = text.index("\n\n", text.index(current))
             self.assertLess(separator, text.index(following))
 
-    def test_store_numbers_every_item_and_groups_purchase_numbers_in_three_rows(self):
+    def test_store_numbers_every_item_and_groups_purchase_numbers_into_rows(self):
         entry = "shop-chat"
         self._two_pets(entry)
         stock = pets.daily_storefront_weapons(entry, user_id="1")
@@ -1640,7 +1772,9 @@ class StorefrontAndCollectionTests(PetsTestCase):
             row for row in keyboard["inline_keyboard"]
             if row and all(":buy:" in button["callback_data"] for button in row)
         ]
-        self.assertEqual(len(purchase_rows), 3)
+        # Derived from the shelf rather than pinned: what matters is that every offer has
+        # exactly one numbered button and no row grows unreadably wide.
+        self.assertTrue(purchase_rows)
         self.assertEqual(
             [button["text"] for row in purchase_rows for button in row],
             [str(number) for number in range(1, len(stock) + 1)],
@@ -2184,7 +2318,14 @@ class RecordFightTests(PetsTestCase):
                 self.assertIn(dropped.code, pet["inventory"])
                 self.assertEqual(outcome["auto_equipped"], auto_equipped)
 
-    def test_drop_pool_excludes_code_owned_by_another_player(self):
+    def test_drop_pool_only_excludes_what_the_winner_already_owns(self):
+        """Uniqueness is per BAG, not per chat.
+
+        An item design belongs to whoever finds it, and two players finding the same design
+        is fine -- what nobody gets is two copies of one code in their own bag. The rule
+        used to be chat-wide, which meant a big collection quietly shrank everybody else's
+        drop table.
+        """
         entry = "chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2193,20 +2334,25 @@ class RecordFightTests(PetsTestCase):
             if item.source == "drop" and item.slot == "weapon" and item.rarity != "legendary"
         ][:2]
         data = pets._load(entry)
+        # The defender owns `first`; the winner owns `second`.
         data["pets"]["2"]["inventory"] = [first.code]
+        data["pets"]["1"]["inventory"] = [second.code]
         pets._save(entry, data)
         result = SimpleNamespace(winner="1", loser="2")
 
         with patch("random.randint", return_value=pets_config.WIN_GOLD_MIN), \
              patch("random.random", return_value=0.0), \
-             patch("random.choice", return_value=second) as choose:
+             patch("random.choice", return_value=first) as choose:
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        self.assertEqual(outcome["dropped_item"], second.code)
-        self.assertNotIn(first, choose.call_args.args[0])
+        pool = {item.code for item in choose.call_args.args[0]}
+        # Somebody else owning it changes nothing...
+        self.assertIn(first.code, pool)
+        # ...but a second copy of your own never appears.
+        self.assertNotIn(second.code, pool)
+        self.assertEqual(outcome["dropped_item"], first.code)
         winner_inventory = pets.get_pet(entry, "1")["inventory"]
-        self.assertNotIn(first.code, winner_inventory)
-        self.assertEqual(winner_inventory.count(second.code), 1)
+        self.assertEqual(winner_inventory.count(first.code), 1)
         self.assertEqual(pets.get_pet(entry, "2")["inventory"].count(first.code), 1)
 
     def test_drop_pool_allows_one_legendary_design_for_two_players(self):
@@ -2216,7 +2362,7 @@ class RecordFightTests(PetsTestCase):
         legendary = next(
             item for item in pets_config.ITEMS
             if item.source == "drop" and item.slot == "weapon"
-            and item.rarity == "legendary" and item.code != pets.REMOVED_MOP_CODE
+            and item.rarity == "legendary"
         )
         data = pets._load(entry)
         data["pets"]["2"]["inventory"] = [legendary.code]
