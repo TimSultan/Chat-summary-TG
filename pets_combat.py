@@ -147,8 +147,9 @@ _EFFECT_DEFAULTS = {
     "first_strike": 18, "vitality": 14, "ferocity": 3, "nimble": 5,
     "lucky": 5, "plating": 3, "precision": 8, "berserker": 12,
     "executioner": 16, "vampiric": 9, "piercing": 12, "combo": 5,
-    "poison": 3, "thorns": 7, "second_wind": 18, "last_stand": 1,
-    "dodge_heal": 7, "crit_guard": 30, "retaliation": 3, "regen": 4,
+    # Percent of the owner's swing, like every other damage-over-time number now.
+    "poison": 6, "thorns": 7, "second_wind": 18, "last_stand": 1,
+    "dodge_heal": 7, "crit_guard": 30, "retaliation": 6, "regen": 1,
     "focused": 20, "momentum": 2, "gambler": 18, "safeguard": 35,
     "giant_slayer": 18, "mob_hunter": 15, "mob_ward": 15, "collector": 25,
     "survivor": 30, "mirror_soul": 20,
@@ -156,8 +157,8 @@ _EFFECT_DEFAULTS = {
     "countercrit": 20, "trophy_compass": 35, "stun": 1, "cocoon": 100,
     "glass_crit": 60, "blood_pact": 35, "chill": 40, "tesla": 15,
     "death_shield": 20, "acid": 25, "spring": 100, "candle": 40,
-    "armor_shred": 6, "wound": 1, "burn": 3, "venom_blade": 18,
-    "coin_rake": 1, "bleed": 2, "shield_breaker": 100, "heavy_combo": 50,
+    "armor_shred": 6, "wound": 1, "burn": 6, "venom_blade": 18,
+    "coin_rake": 1, "bleed": 4, "shield_breaker": 100, "heavy_combo": 50,
     "phantom_step": 1, "afterimage": 45, "rewind": 25,
     "echo_strike": 50, "crushing_grip": 10, "perfect_parry": 35,
     # Legendary-only mechanics. Every legendary weapon used to carry a bigger number of a
@@ -208,6 +209,8 @@ _EFFECT_TEXT = {
     "armor_shred": "крошит броню: защита слабее ещё на {amount}%.",
     "wound": "оставляет глубокую рану: −{amount} текущего и максимального HP.",
     "burn": "поджигает соперника: {amount} урона от огня.",
+    "bleed_heal_cut": "раскрывает рану: лечение соперника режется на {amount}%.",
+    "poison_weaken": "отравлен — удар слабее на {amount}%.",
     "venom_blade": "отравляет соперника: {amount} урона.",
     "bleed": "раскрывает кровотечение: {amount} урона.",
     "shield_breaker": "пробивает защиту первым попаданием.",
@@ -463,27 +466,18 @@ def _param(effects: tuple[dict, ...], code: str, key: str, default: float) -> fl
         return default
 
 
-def _scaled_flat_damage(value: float, fighter: "Fighter", attack_damage: float) -> int:
-    """Scale old flat damage with its owner's level and effective attack power.
+def _share_of_swing(percent: float, fighter: "Fighter", attack_damage: float) -> int:
+    """Turn a catalogue percentage into hit points, from the owner's own swing.
 
-    Percentage-based effects already grow with the combatants (echo, thorns, wounds,
-    scroll burns, rune fire, and so on). This is only for legacy catalogue values such
-    as ``6 poison`` or ``2 bleed``. The stronger of the level and damage curves wins,
-    rather than multiplying them together, so the effect stays useful without double-
-    dipping every stat increase.
-
-    The damage curve is linear in the swing. See pets_config's note: as a square root it
-    fell behind the health bars it was ticking against, so every one of these passives got
-    quietly weaker the higher a pet levelled -- the opposite of what the catalogue text
-    promises. Tied to the swing directly, a tick keeps the same share of a fight forever.
+    Fire, poison, venom, bleeding and the retaliation bonus are all written as a share of
+    what their owner hits for (see pets_config). That is the whole implementation: no level
+    curve, no reference constant, no divergence between the number on the item card and the
+    number in the combat log. A pet whose swing doubles doubles what its burn ticks for,
+    which is the only behaviour that keeps a damage-over-time passive worth the same share
+    of a fight at level 5 and at level 500.
     """
-    base = max(0.0, float(value or 0))
-    level = max(1, int(fighter.level or 1))
-    level_factor = 1.0 + C.FLAT_EFFECT_LEVEL_SQRT_GROWTH * math.sqrt(level - 1)
-    damage_factor = max(
-        1.0, float(attack_damage or 0) / C.FLAT_EFFECT_DAMAGE_REFERENCE,
-    )
-    return max(1, round(base * max(level_factor, damage_factor)))
+    swing = max(1.0, float(attack_damage or 0))
+    return max(1, round(swing * max(0.0, float(percent or 0)) / 100.0))
 
 
 def _saturate(mx: float, k: float, s: float) -> float:
@@ -754,7 +748,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     # damage lifecycle is identical. Kept outside the tuple for snapshot compatibility.
     burning_shield = {a.key: None, b.key: None}
 
-    # One live component per source of flame: {origin: [source, turns_left, damage, types]}.
+    # One live component per source of flame:
+    # {origin: [source, turns_left, damage, types, growth]}.
     # `burning` above stays the single combined view the tick and the transcript read, so
     # nothing downstream (or in a stored snapshot) has to learn a new shape.
     burn_stacks: dict[str, dict[str, list]] = {a.key: {}, b.key: {}}
@@ -778,7 +773,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
 
     def ignite(
         target_key: str, source_key: str, damage: int, turns: int, attack_types,
-        origin: str,
+        origin: str, growth: float = 0.0,
     ) -> None:
         """Lay a burn on somebody who may already be burning.
 
@@ -799,22 +794,39 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         if row is None:
             burn_stacks[target_key][origin] = [
                 source_key, turns, damage, normalize_attack_types(attack_types),
+                max(0.0, float(growth)), damage * C.BURN_GROWTH_CEILING,
             ]
         else:
             row[0] = source_key
             row[1] = max(row[1], turns)   # refresh, never shorten what is already burning
-            row[2] = damage
+            # `max`, not assignment: a flame that has already grown must not be doused by
+            # the next hit re-laying it at its opening temperature. Re-lighting a fire
+            # feeds it; it does not start it over.
+            row[2] = max(row[2], damage)
             row[3] = normalize_attack_types(attack_types)
+            row[4] = max(0.0, float(growth))
+            row[5] = max(row[5], damage * C.BURN_GROWTH_CEILING)
         burn_source[target_key] = source_key
         sync_burn(target_key)
 
     def tick_burn(target_key: str) -> None:
-        """Age every component by one turn and drop the ones that have burned out."""
+        """Age every component by one turn, feed the ones still alive, drop the rest.
+
+        Growth is what makes fire a different threat from bleeding and poison rather than
+        a third name for the same tick. Fire is the one that gets WORSE the longer it is
+        left alone: standing in it is the mistake, and putting the fight away quickly is
+        the answer to it.
+        """
         rows = burn_stacks[target_key]
         for origin in list(rows):
             rows[origin][1] -= 1
             if rows[origin][1] <= 0:
                 del rows[origin]
+            elif rows[origin][4]:
+                rows[origin][2] = max(1, min(
+                    round(rows[origin][5]),
+                    round(rows[origin][2] * (1 + rows[origin][4])),
+                ))
         sync_burn(target_key)
 
     def douse(target_key: str) -> None:
@@ -836,6 +848,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     hits_taken = {a.key: 0, b.key: 0}      # pressure: every blow that actually landed
     skip_turn = {a.key: False, b.key: False}  # recoil knocked this fighter out of a turn
     in_followup = {a.key: False, b.key: False}  # this strike is an earned extra attack
+    heal_cut = {a.key: 0.0, b.key: 0.0}    # share of incoming healing bleeding denies
+    poison_weaken = {a.key: 0.0, b.key: 0.0}  # poison sapping this fighter's next blow
     stun_procs = {a.key: 0, b.key: 0}
     guards = {a.key: 0.0, b.key: 0.0}
     used_scrolls = {a.key: set() for a in (a, b)}
@@ -849,13 +863,27 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 effects[_key], "glass_body", "taken", _glass,
             )))
 
-    def scaled_flat_damage(source_key: str, value: float, code: str) -> int:
+    def healed_amount(key: str, amount: float) -> float:
+        """What actually reaches a fighter's health bar, after bleeding takes its share.
+
+        Every heal in the fight is routed through this -- lifesteal, regeneration, a
+        medkit, a scroll, a shield's return. That is the point: bleeding is supposed to be
+        the answer to a build that out-heals its damage, and a cut that only applied to
+        some sources would just push players onto the ones it missed.
+        """
+        return max(0.0, float(amount)) * max(0.0, 1.0 - heal_cut[key])
+
+    def swing_share(source_key: str, percent: float, code: str) -> int:
+        """Hit points for one tick of a passive written as a share of the owner's swing."""
         spec = _effect(effects[source_key], code) or {}
         if spec.get("level_scaled") is False:
-            return max(1, round(max(0, value)))
+            # This value is already hit points and already derived from its owner's power
+            # -- weapon rune fire computes it that way in pets_config. Same flag, same
+            # meaning as before the catalogue moved to percentages: do not transform it.
+            return max(1, round(max(0, percent)))
         fighter = fighters[source_key]
-        return _scaled_flat_damage(
-            value, fighter, C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT,
+        return _share_of_swing(
+            percent, fighter, C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT,
         )
 
     def queue_damage(
@@ -1178,7 +1206,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if op == "damage_heal":
                 percent = max(0.0, min(1.0, float(effect.get("percent", 0) or 0)))
                 before = hp[target_key]
-                hp[target_key] = min(max_hp[target_key], hp[target_key] + impact * percent)
+                hp[target_key] = min(max_hp[target_key], hp[target_key] + healed_amount(target_key, impact * percent))
                 healed = round(hp[target_key] - before)
                 if healed:
                     net = max(0, impact - healed)
@@ -1291,7 +1319,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         # caster must not be revived by a lifesteal record written after the counter.
         if impact and lifesteal and not reflection_winner:
             before = hp[source_key]
-            hp[source_key] = min(max_hp[source_key], hp[source_key] + impact * lifesteal)
+            hp[source_key] = min(max_hp[source_key], hp[source_key] + healed_amount(source_key, impact * lifesteal))
             healed = round(hp[source_key] - before)
             if healed:
                 rounds.append(Round(
@@ -1319,7 +1347,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         if op == "heal":
             hp[source_key] = min(
                 max_hp[source_key],
-                hp[source_key] + max_hp[source_key] * max(0.0, float(effect.get("percent", 0))),
+                hp[source_key] + healed_amount(
+                    source_key, max_hp[source_key] * max(0.0, float(effect.get("percent", 0))),
+                ),
             )
         elif op == "shield":
             shields[source_key] = min(
@@ -1422,7 +1452,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         regen = skill_statuses[key].get("regen")
         if isinstance(regen, list) and regen[0] > 0 and hp[key] > 0:
             before = hp[key]
-            hp[key] = min(max_hp[key], hp[key] + regen[0])
+            hp[key] = min(max_hp[key], hp[key] + healed_amount(key, regen[0]))
             healed = round(hp[key] - before)
             if healed:
                 rounds.append(Round(
@@ -1769,6 +1799,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 return reflection_winner
             if burn_ko:
                 return source_key
+        if effectful and bleeding[attacker_key] is None and heal_cut[attacker_key]:
+            heal_cut[attacker_key] = 0.0
         if effectful and (bleed := bleeding[attacker_key]) is not None:
             source_key, stacks, bleed_damage = bleed
             bleed_impact, bleed_ko = hurt(
@@ -1796,7 +1828,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 return source_key
         if effectful and (value := _effect_value(effects[attacker_key], "regen")) is not None:
             before = hp[attacker_key]
-            hp[attacker_key] = min(max_hp[attacker_key], hp[attacker_key] + max(0, value))
+            hp[attacker_key] = min(max_hp[attacker_key], hp[attacker_key] + healed_amount(attacker_key, max(0, value)))
             healed = round(hp[attacker_key] - before)
             if healed:
                 effect_round(round_number, attacker_key, defender_key, "regen", healed)
@@ -1878,7 +1910,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     effects[attacker_key], "wild_swing", "gift", 15,
                 )))))
                 before_gift = hp[defender_key]
-                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + gift)
+                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + healed_amount(defender_key, gift))
                 attacks_made[attacker_key] += 1
                 landed_hits[attacker_key] = 0
                 healed = round(hp[defender_key] - before_gift)
@@ -1954,6 +1986,16 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if event == "crit":
                 multiplier += max(0.0, C.CRIT_MULTIPLIER - 1.0)
             multiplier *= max(.10, 1 - damage_weakened[attacker_key])
+            if poison_weaken[attacker_key]:
+                multiplier *= max(.10, 1 - poison_weaken[attacker_key])
+                # Filed under the POISONED fighter -- they are who the line is about, and
+                # they are the one currently swinging. The poisoner already has their own
+                # row from the hit that applied it.
+                effect_round(
+                    round_number, attacker_key, defender_key, "poison_weaken",
+                    round(poison_weaken[attacker_key] * 100),
+                )
+                poison_weaken[attacker_key] = 0.0
             multiplier *= max(.10, 1 - skill_value(attacker_key, "weaken"))
             multiplier *= 1 + skill_value(attacker_key, "damage_boost")
             multiplier *= 1 + skill_value(defender_key, "vulnerable")
@@ -2202,7 +2244,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         # design. Capped at max_hp like every other heal in this file.
         if steel_heal:
             before_heal = hp[defender_key]
-            hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + steel_heal)
+            hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + healed_amount(defender_key, steel_heal))
             healed = round(hp[defender_key] - before_heal)
             if healed:
                 effect_round(round_number, defender_key, attacker_key, "steel_heal", healed)
@@ -2232,7 +2274,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 )
             if (value := _effect_value(effects[attacker_key], "vampiric")) is not None:
                 before = hp[attacker_key]
-                hp[attacker_key] = min(max_hp[attacker_key], hp[attacker_key] + impact * max(0, _fraction(value)))
+                hp[attacker_key] = min(max_hp[attacker_key], hp[attacker_key] + healed_amount(attacker_key, impact * max(0, _fraction(value))))
                 healed = round(hp[attacker_key] - before)
                 if healed:
                     effect_round(round_number, attacker_key, defender_key, "vampiric", healed)
@@ -2249,7 +2291,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 if harvest >= 1:
                     before_reap = hp[attacker_key]
                     hp[attacker_key] = min(
-                        max_hp[attacker_key], hp[attacker_key] + harvest,
+                        max_hp[attacker_key],
+                        hp[attacker_key] + healed_amount(attacker_key, harvest),
                     )
                     healed = round(hp[attacker_key] - before_reap)
                     if healed:
@@ -2306,11 +2349,24 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 chained[attacker_key] += round(value)
                 effect_round(round_number, attacker_key, defender_key, "chain_crit")
             if (value := _effect_value(effects[attacker_key], "poison")) is not None and not knocked_out:
-                poison = scaled_flat_damage(attacker_key, value, "poison")
+                poison = swing_share(attacker_key, value, "poison")
                 queue_damage(pending_poison, defender_key, attacker_key, poison)
+                # Poison is the status that attacks the opponent's OFFENCE. It ticks for
+                # less than fire or bleeding on purpose: what a poisoned fighter loses is
+                # the strength of their own next blow, which is worth more than the tick
+                # against anything that hits hard.
+                poison_weaken[defender_key] = max(poison_weaken[defender_key], max(
+                    0.0, _fraction(_param(effects[attacker_key], "poison", "weaken", 0)),
+                ))
+            if (value := _param(effects[attacker_key], "venom_blade", "weaken", 0)) \
+                    and _effect_value(effects[attacker_key], "venom_blade") is not None \
+                    and not knocked_out:
+                poison_weaken[defender_key] = max(
+                    poison_weaken[defender_key], max(0.0, _fraction(value)),
+                )
             if (value := _effect_value(effects[attacker_key], "burn")) is not None \
                     and not knocked_out:
-                burn_damage = scaled_flat_damage(attacker_key, value, "burn")
+                burn_damage = swing_share(attacker_key, value, "burn")
                 turns = max(1, round(_param(effects[attacker_key], "burn", "turns", 2)))
                 # One origin for the whole passive: it re-triggers on every landed hit, so
                 # stacking it against itself would multiply the printed value by the length
@@ -2318,11 +2374,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 ignite(
                     defender_key, attacker_key, burn_damage, turns, (ELEMENTAL, MAGIC),
                     origin="passive:burn",
+                    growth=max(0.0, _fraction(_param(
+                        effects[attacker_key], "burn", "grow", 0,
+                    ))),
                 )
                 burning_shield[defender_key] = None
             if (value := _effect_value(effects[attacker_key], "venom_blade")) is not None \
                     and not knocked_out:
-                venom_damage = scaled_flat_damage(attacker_key, _param(
+                venom_damage = swing_share(attacker_key, _param(
                     effects[attacker_key], "venom_blade", "poison", 2,
                 ), "venom_blade")
                 queue_damage(pending_venom, defender_key, attacker_key, venom_damage)
@@ -2332,10 +2391,24 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 old = bleeding[defender_key]
                 old_stacks = old[1] if old and old[0] == attacker_key else 0
                 cap = max(1, round(_param(effects[attacker_key], "bleed", "cap", 3)))
+                stacks = min(cap, old_stacks + 1)
                 bleeding[defender_key] = (
-                    attacker_key, min(cap, old_stacks + 1),
-                    scaled_flat_damage(attacker_key, value, "bleed"),
+                    attacker_key, stacks,
+                    swing_share(attacker_key, value, "bleed"),
                 )
+                # Bleeding is the counter to a build that out-heals its damage: it is the
+                # only status that closes off the opponent's recovery instead of racing
+                # it. The cut scales with the stacks, so a single scratch is not a
+                # shutdown and a fully opened wound very nearly is.
+                cut = max(0.0, _fraction(_param(
+                    effects[attacker_key], "bleed", "heal_cut", 0,
+                ))) * stacks / max(1, cap)
+                if cut > heal_cut[defender_key]:
+                    heal_cut[defender_key] = min(0.95, cut)
+                    effect_round(
+                        round_number, attacker_key, defender_key, "bleed_heal_cut",
+                        round(heal_cut[defender_key] * 100),
+                    )
             if (value := _effect_value(effects[attacker_key], "armor_shred")) is not None \
                     and not knocked_out:
                 cap = max(0, _fraction(_param(
@@ -2383,7 +2456,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 total_damage[attacker_key] += bite_impact
                 before = hp[attacker_key]
                 hp[attacker_key] = min(
-                    max_hp[attacker_key], hp[attacker_key] + bite_impact * max(0, _fraction(value))
+                    max_hp[attacker_key],
+                    hp[attacker_key] + healed_amount(
+                        attacker_key, bite_impact * max(0, _fraction(value)),
+                    ),
                 )
                 effect_round(round_number, attacker_key, defender_key, "bite", bite_impact)
                 if bite_ko:
@@ -2392,7 +2468,10 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     and landed_hits[attacker_key] % 3 == 0:
                 before = hp[attacker_key]
                 hp[attacker_key] = min(
-                    max_hp[attacker_key], hp[attacker_key] + impact * max(0, _fraction(value))
+                    max_hp[attacker_key],
+                    hp[attacker_key] + healed_amount(
+                        attacker_key, impact * max(0, _fraction(value)),
+                    ),
                 )
                 healed = round(hp[attacker_key] - before)
                 if healed:
@@ -2430,14 +2509,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     and hp[defender_key] <= max_hp[defender_key] * _param(effects[defender_key], "second_wind", "threshold", 30) / 100:
                 used[defender_key].add("second_wind")
                 before = hp[defender_key]
-                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + max_hp[defender_key] * max(0, _fraction(value)))
+                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + healed_amount(defender_key, max_hp[defender_key] * max(0, _fraction(value))))
                 effect_round(round_number, defender_key, attacker_key, "second_wind", round(hp[defender_key] - before))
             if not knocked_out and (value := _effect_value(effects[defender_key], "medkit")) is not None \
                     and "medkit" not in used[defender_key] \
                     and hp[defender_key] <= max_hp[defender_key] * _param(effects[defender_key], "medkit", "threshold", 35) / 100:
                 used[defender_key].add("medkit")
                 before = hp[defender_key]
-                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + max_hp[defender_key] * max(0, _fraction(value)))
+                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + healed_amount(defender_key, max_hp[defender_key] * max(0, _fraction(value))))
                 effect_round(round_number, defender_key, attacker_key, "medkit", round(hp[defender_key] - before))
             if not knocked_out:
                 if _effect_value(effects[defender_key], "armor_burst") is not None \
@@ -2472,7 +2551,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     if recoil_ko:
                         return defender_key
                 if (value := _effect_value(effects[defender_key], "retaliation")) is not None:
-                    retaliation = scaled_flat_damage(defender_key, value, "retaliation")
+                    retaliation = swing_share(defender_key, value, "retaliation")
                     retaliation_bonus[defender_key] += retaliation
                     effect_round(round_number, defender_key, attacker_key, "retaliation", retaliation)
         elif effectful and event == "dodge" and (value := _effect_value(effects[defender_key], "dodge_heal")) is not None:
@@ -2480,7 +2559,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if _effect_value(effects[attacker_key], "focused") is not None:
                 focused_ready[attacker_key] = True
             before = hp[defender_key]
-            hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + max(0, value))
+            hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + healed_amount(defender_key, max(0, value)))
             healed = round(hp[defender_key] - before)
             if healed:
                 effect_round(round_number, defender_key, attacker_key, "dodge_heal", healed)

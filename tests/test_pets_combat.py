@@ -841,29 +841,38 @@ class AmuletEffectTests(unittest.TestCase):
         self.assertEqual(specs[0]["value"], 14)
         self.assertEqual(specs[0]["text"], "amulet")
 
-    def test_flat_damage_effects_scale_with_the_owners_level(self):
-        low = Fighter("low", "Low", 40, 40, 40, 40, 0, level=1)
-        high = Fighter("high", "High", 40, 40, 40, 40, 0, level=25)
-        self.assertEqual(combat._scaled_flat_damage(6, low, 100), 12)
-        self.assertEqual(combat._scaled_flat_damage(6, high, 100), 12)
+    def test_a_dot_percentage_is_exactly_that_share_of_the_owners_swing(self):
+        """The number on the item card is the number the engine uses. That is the point.
 
-    def test_flat_damage_keeps_its_share_of_a_swing_at_every_level(self):
-        """The damage half of the curve is linear, and this is why it has to be.
+        These values used to be flat hit points pushed through a level curve, so an item
+        reading "12 damage a turn" dealt 23 at level 10 and 36 at level 100 and every line
+        of copy had to carry "урон растёт с уровнем владельца" to explain itself.
+        """
+        owner = Fighter("a", "A", 40, 40, 40, 40, 0, level=1)
+        self.assertEqual(combat._share_of_swing(25, owner, 200), 50)
+        self.assertEqual(combat._share_of_swing(9, owner, 100), 9)
+        # Never rounds away to nothing, however small the share or the swing.
+        self.assertEqual(combat._share_of_swing(1, owner, 10), 1)
 
-        As a square root it fell behind the fight it was ticking inside: a swing grows
-        about 4.2x between level 10 and level 100 and a health bar 3.8x, so a sqrt-scaled
-        burn kept barely half the share of a health bar it started with. A legendary whose
-        card reads "12 damage a turn" was worth 2.2% of a bar early and 1.1% late -- the
-        flagship passives decaying exactly where the best gear should matter most.
+    def test_a_dot_keeps_its_share_of_a_swing_at_every_level(self):
+        """A share of the swing needs no level curve, which is why it replaced one.
+
+        The old curve was a square root of the owner's damage, and it fell behind the
+        fight it was ticking inside: a swing grows about 4.2x between level 10 and level
+        100 and a health bar 3.8x, while a sqrt-scaled burn grew only 2.1x. The flagship
+        passives decayed exactly where the best gear is supposed to matter most.
         """
         shares = []
-        for level, stat in ((10, 20), (50, 80), (100, 150)):
+        for level, stat in ((1, 5), (10, 20), (50, 80), (100, 150)):
             owner = Fighter("a", "A", stat, stat, stat, stat, 5, level=level)
             swing = C.BASE_DAMAGE + stat * C.DAMAGE_PER_POINT
-            shares.append(combat._scaled_flat_damage(12, owner, swing) / swing)
-        self.assertAlmostEqual(min(shares), max(shares), places=2)
+            shares.append(combat._share_of_swing(12, owner, swing) / swing)
+        # Integer hit points, so a small swing rounds by up to half a point; the share is
+        # otherwise identical everywhere, which is the whole claim.
+        self.assertAlmostEqual(min(shares), max(shares), delta=0.01)
+        self.assertAlmostEqual(shares[-1], 0.12, delta=0.005)
 
-    def test_every_legacy_flat_damage_hook_uses_the_level_curve(self):
+    def test_every_damage_over_time_hook_reads_its_value_as_a_share_of_the_swing(self):
         opponent = Fighter("b", "B", 10, 200, 20, 20, 0, level=25)
         cases = (
             ({"code": "poison", "value": 15}, "amulet_poison", 15),
@@ -891,7 +900,7 @@ class AmuletEffectTests(unittest.TestCase):
             "a", "A", 40, 200, 20, 20, 0, effects=(poison,), level=25,
         )
         opponent = Fighter("b", "B", 10, 200, 20, 20, 0, level=25)
-        single = combat._scaled_flat_damage(
+        single = combat._share_of_swing(
             poison["value"], owner, C.BASE_DAMAGE + owner.strength * C.DAMAGE_PER_POINT,
         )
         with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
@@ -1279,6 +1288,75 @@ class AttackTypeTests(unittest.TestCase):
         # half of it genuinely is magic now, and the transcript says so.
         self.assertEqual(hit.attack_types, (combat.PHYSICAL, combat.MAGIC))
         self.assertEqual(reflected.damage, round(hit.damage * .85))
+
+
+class StatusIdentityTests(unittest.TestCase):
+    """Fire, bleeding and poison must not be three names for the same tick.
+
+    They were: fire ticked a fixed number for three turns, bleeding ticked a stacking
+    number forever, poison ticked once with a delay, and all three did nothing else. The
+    difference was bookkeeping nobody could see. Each now owns a job -- fire escalates,
+    bleeding shuts down healing, poison saps the victim's own next blow -- and these are
+    the three assertions that keep them from collapsing back into each other.
+    """
+
+    def _fight(self, effect, *, actions=14, opponent_effects=()):
+        attacker = Fighter(
+            key="a", name="A", strength=40, health=900, agility=20, luck=20, armor=0,
+            effects=(effect,), level=10,
+        )
+        defender = Fighter(
+            key="b", name="B", strength=10, health=900, agility=20, luck=20, armor=0,
+            effects=opponent_effects, level=10,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 10)), \
+                patch.object(combat, "_signature", return_value=None):
+            return combat.simulate(attacker, defender, seed=3, max_actions=actions)
+
+    def test_fire_gets_hotter_the_longer_it_is_left_burning(self):
+        ticks = [
+            row.damage for row in
+            self._fight({"code": "burn", "value": 16, "turns": 3, "grow": 45}).rounds
+            if row.event == "amulet_burn"
+        ]
+        self.assertGreater(len(ticks), 3)
+        self.assertGreater(ticks[2], ticks[0])
+
+    def test_fire_growth_cannot_run_away_with_a_long_fight(self):
+        """Re-lighting feeds a flame rather than restarting it, so it needs a ceiling."""
+        result = self._fight(
+            {"code": "burn", "value": 16, "turns": 3, "grow": 45}, actions=40,
+        )
+        ticks = [row.damage for row in result.rounds if row.event == "amulet_burn"]
+        self.assertTrue(ticks)
+        self.assertLessEqual(max(ticks), ticks[0] * C.BURN_GROWTH_CEILING + 1)
+
+    def test_bleeding_denies_the_opponent_their_healing(self):
+        """Two identical bleeds, differing only in the clause under test.
+
+        Comparing against a different status instead would confound the result: any
+        status that deals damage opens room under the health cap for regeneration to heal
+        into, so a harder-hitting control arm can show MORE healing, not less.
+        """
+        regen = {"code": "regen", "value": 40, "level_scaled": False}
+        open_wound = {"code": "bleed", "value": 9, "cap": 4, "heal_cut": 60}
+        scratch = {"code": "bleed", "value": 9, "cap": 4, "heal_cut": 0}
+
+        def healed(effect):
+            result = self._fight(effect, opponent_effects=(regen,))
+            return sum(
+                row.damage for row in result.rounds if row.event == "amulet_regen"
+            )
+
+        self.assertGreater(healed(scratch), 0)
+        self.assertLess(healed(open_wound), healed(scratch))
+
+    def test_poison_saps_the_victims_own_next_blow(self):
+        result = self._fight({"code": "poison", "value": 6, "weaken": 30})
+        weakened = [row for row in result.rounds if row.event == "amulet_poison_weaken"]
+        self.assertTrue(weakened)
+        # Filed under the poisoned fighter, who is the one the line is about.
+        self.assertTrue(all(row.attacker == "b" for row in weakened))
 
 
 class BurnStackingTests(unittest.TestCase):

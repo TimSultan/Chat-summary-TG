@@ -328,28 +328,31 @@ DAMAGE_PER_POINT = 2.42
 # Every blow is nudged by +-15% so two identical pets do not play out identically.
 DAMAGE_VARIANCE = 0.15
 
-# Fixed catalogue damage (poison, weapon fire, venom, bleeding and retaliation) used to
-# stay at its level-one number forever. Six poison beside a 2,000+ HP pet is decorative,
-# while simply multiplying it by level would explode now that pet levels are unbounded.
-# A square-root curve keeps every level meaningful without turning a very old pet's DoT
-# into a one-tick kill. Combat also compares this curve with a Strength/damage curve, so a
-# deliberately damage-heavy build is not worse at statuses than a low-Strength peer.
+# Damage-over-time (fire, poison, venom, bleeding) and the retaliation bonus are written
+# in the catalogue as a PERCENTAGE OF THE OWNER'S OWN SWING, not as a number of hit points.
 #
-#   level       1      10      25      50      100
-#   multiplier 1.00   1.60    1.98    2.40     2.99
+# They used to be flat numbers pushed through a level curve, and every part of that was a
+# problem. The card said "12 damage a turn" while the engine actually dealt 23 at level 10
+# and 36 at level 100, so the printed number was true nowhere; the curve was sublinear, so
+# the same passive quietly lost half its worth as a pet levelled; and "урон растёт с
+# уровнем владельца" had to be stapled onto every single line of copy to explain it.
 #
-# The damage curve is LINEAR in the owner's swing, not a square root of it. It used to be
-# a square root, which quietly made every damage-over-time passive weaker the longer a pet
-# played: from level 10 to level 100 a swing grows 4.2x and a health bar 3.8x, while a
-# sqrt-scaled burn grew only 2.1x. A legendary that reads "12 damage a turn" was therefore
-# worth 2.2% of a health bar at level 10 and 1.1% at level 100 -- the tier's own flagship
-# passives decaying into decoration exactly where the best gear is supposed to matter most.
-# Linear ties the tick to the swing that caused it, so the share of a fight one of these
-# moves is the same at every level. At the balance harness's reference creature (level 10,
-# 98 damage) it is a 1.37x change; the whole correction lands at high level, where the
-# problem was.
-FLAT_EFFECT_LEVEL_SQRT_GROWTH = 0.20
-FLAT_EFFECT_DAMAGE_REFERENCE = BASE_DAMAGE + DAMAGE_PER_POINT
+# A share of the swing needs no curve and no footnote: it grows with the pet exactly as
+# fast as the fight around it does, it is the same number on the card and in the log, and
+# "яд наносит 29% урона" is a sentence a player can act on. Nothing else in the file has
+# to move -- at the balance harness's reference creature the two schemes agree exactly,
+# because the old reference divisor below is precisely one swing's worth of the old value.
+#
+#   percent = old_flat_value / (BASE_DAMAGE + DAMAGE_PER_POINT) * 100
+DOT_PERCENT_OF_SWING = True
+
+# Fire is the damage-over-time that grows: left burning, each tick is hotter than the last
+# (see the `grow` parameter in the catalogues). Because a fresh hit refreshes the flame
+# without cooling it, an uncapped curve compounds for as long as the fight does -- a 16%
+# tick reached 148 damage, 15% of a health bar, by the seventh round of a test fight. This
+# is how many times its opening tick one flame may ever reach. Three is still a dramatic
+# curve; it just cannot run away with a long fight.
+BURN_GROWTH_CEILING = 3.0
 
 # Dodge, crit and armor all use the same saturating curve,
 #
