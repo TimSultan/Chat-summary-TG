@@ -45,6 +45,7 @@ import pets_scroll_catalog as SCROLLS
 import pets_sprite
 import pets_sprite_store
 import pets_updates
+import pets_weapon_catalog
 import quests
 import pets_web
 import stats
@@ -886,8 +887,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 )
         # And the kind of item travels under its own name.
         self.assertIn("forgeslot", carried)
+        # The cursed ladder shares "rare" and "legendary" with the ordinary ladder, so the
+        # button has to carry which one it is -- lost between button and action, a cursed
+        # recipe would silently forge as the ordinary one.
+        self.assertIn("forgecursed", carried)
         self.assertIn(
-            'if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.forgeslot || "" }); return; }',
+            'if (d.reforge) { await act("reforge", '
+            '{ rarity: d.reforge, slot: d.forgeslot || "", cursed: !!d.forgecursed }); return; }',
             page,
         )
 
@@ -1403,6 +1409,66 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slot["item"])
         in_bag = next(b for b in unequipped["state"]["bag"] if b["code"] == item.code)
         self.assertFalse(in_bag["equipped"])
+
+    # ---- forging ------------------------------------------------------------------------
+
+    async def test_reforge_action_with_the_cursed_flag_grants_a_cursed_legendary(self):
+        """The cursed ladder shares "rare" and "legendary" with the ordinary ladder, so
+        the client's `cursed: true` payload is the only thing that tells the server which
+        recipe was pressed. If it got dropped somewhere between the forge button and
+        pets.reforge_items, a player who melted five rare cursed weapons through the Mini
+        App would quietly get a plain legendary back instead of the cursed one they asked
+        for -- which is the exact failure this flag exists to rule out.
+        """
+        self._tame(PLAYER)
+        rare_cursed = [
+            C.find_item(code) for code in sorted(pets_weapon_catalog.RARE_CURSED_CODES)
+        ][:pets.FORGE_REQUIREMENTS["rare"]]
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["inventory"] = [item.code for item in rare_cursed]
+        pets._save(CHAT, data)
+
+        result = await self._action(PLAYER, "reforge", rarity="rare", slot="weapon", cursed=True)
+
+        self.assertTrue(result["ok"], result.get("message"))
+        old_codes = {item.code for item in rare_cursed}
+        inventory = pets.get_pet(CHAT, PLAYER["id"])["inventory"]
+        new_codes = [code for code in inventory if code not in old_codes]
+        self.assertEqual(len(new_codes), 1)
+        forged = C.find_item(new_codes[0])
+        self.assertEqual(forged.rarity, "legendary")
+        self.assertTrue(forged.cursed)
+        # The response's own bag, not a follow-up read: this is what marks the item
+        # cursed on the inventory card the player sees right after forging it.
+        bag_entry = next(row for row in result["state"]["bag"] if row["code"] == forged.code)
+        self.assertTrue(bag_entry["cursed"])
+
+    async def test_reforge_action_without_the_cursed_flag_still_forges_the_ordinary_recipe(self):
+        """Every recipe on the ordinary ladder, and every button drawn before this flag
+        existed, sends no `cursed` field at all. The server default has to keep reading
+        that as "not cursed" -- the only thing an absent field ever meant -- or an old
+        client and the ordinary ladder both break at once.
+        """
+        self._tame(PLAYER)
+        ordinary_rare = [
+            item for item in C.ITEMS
+            if item.slot == "weapon" and item.rarity == "rare" and item.source == "drop"
+            and not getattr(item, "cursed", False)
+        ][:pets.FORGE_REQUIREMENTS["rare"]]
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["inventory"] = [item.code for item in ordinary_rare]
+        pets._save(CHAT, data)
+
+        result = await self._action(PLAYER, "reforge", rarity="rare", slot="weapon")
+
+        self.assertTrue(result["ok"], result.get("message"))
+        old_codes = {item.code for item in ordinary_rare}
+        inventory = pets.get_pet(CHAT, PLAYER["id"])["inventory"]
+        new_codes = [code for code in inventory if code not in old_codes]
+        self.assertEqual(len(new_codes), 1)
+        forged = C.find_item(new_codes[0])
+        self.assertEqual(forged.rarity, "legendary")
+        self.assertFalse(getattr(forged, "cursed", False))
 
     # ---- selling ------------------------------------------------------------------------
 

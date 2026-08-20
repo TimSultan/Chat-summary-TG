@@ -27,6 +27,7 @@ import pets_config as C
 import pets_image
 import pets_scroll_catalog as SCROLLS
 import pets_ui
+import pets_weapon_catalog
 import quests
 import pets_updates
 import stats
@@ -1834,6 +1835,76 @@ class PetsCommandTests(unittest.TestCase):
 
         self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], target.user_id])
         self.assertEqual(api.deleted, [])
+
+    def test_pressing_the_forge_screens_cursed_recipe_button_grants_a_cursed_legendary(self):
+        """The cursed ladder now shares "rare" and "legendary" with the ordinary ladder,
+        so the button text alone can't be trusted -- what matters is whether the cursed
+        flag it carries actually reaches pets.reforge_items. If it got lost on the way, a
+        player who melted five rare cursed weapons hoping for a cursed legendary would
+        quietly get an ordinary one instead, which is the whole risk this flag exists to
+        close.
+        """
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        rare_cursed = [
+            C.find_item(code) for code in sorted(pets_weapon_catalog.RARE_CURSED_CODES)
+        ][:pets.FORGE_REQUIREMENTS["rare"]]
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["inventory"] = [item.code for item in rare_cursed]
+        pets._save(CHAT, data)
+
+        # Read the button the forge screen actually renders, not a hand-typed argument --
+        # this is what closes the loop between what pets_ui encodes and what the handler
+        # decodes.
+        _text, markup = pets_ui.forge_view(CHAT, PLAYER["id"], RICH_XP)
+        parsed_buttons = [
+            (button, pets_ui.parse_callback(button["callback_data"]))
+            for row in markup["inline_keyboard"] for button in row
+        ]
+        cursed_button, parsed = next(
+            (button, parsed) for button, parsed in parsed_buttons
+            if parsed and parsed[1] == "reforge" and parsed[2].split(":")[0] == "rare"
+            and parsed[2].endswith(":1")
+        )
+        self.assertIn("☠️", cursed_button["text"])
+
+        api = self._tap("reforge", parsed[2])
+
+        old_codes = {item.code for item in rare_cursed}
+        inventory = pets.get_pet(CHAT, PLAYER["id"])["inventory"]
+        new_codes = [code for code in inventory if code not in old_codes]
+        self.assertEqual(len(new_codes), 1)
+        result = C.find_item(new_codes[0])
+        self.assertEqual(result.rarity, "legendary")
+        self.assertTrue(result.cursed)
+        self.assertTrue(api.edits)
+
+    def test_old_two_field_reforge_argument_without_a_cursed_flag_still_forges_the_ordinary_recipe(self):
+        """A button drawn before the cursed flag existed only ever carried "rarity:slot".
+        Its missing third field has to keep meaning "not cursed" -- the only thing it ever
+        meant -- so a message rendered before this change stays usable after it.
+        """
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
+        ordinary_rare = [
+            item for item in C.ITEMS
+            if item.slot == "weapon" and item.rarity == "rare" and item.source == "drop"
+            and not getattr(item, "cursed", False)
+        ][:pets.FORGE_REQUIREMENTS["rare"]]
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["inventory"] = [item.code for item in ordinary_rare]
+        pets._save(CHAT, data)
+
+        api = self._tap("reforge", "rare:weapon")  # old two-field argument, no cursed flag
+
+        old_codes = {item.code for item in ordinary_rare}
+        inventory = pets.get_pet(CHAT, PLAYER["id"])["inventory"]
+        new_codes = [code for code in inventory if code not in old_codes]
+        self.assertEqual(len(new_codes), 1)
+        result = C.find_item(new_codes[0])
+        self.assertEqual(result.rarity, "legendary")
+        self.assertFalse(getattr(result, "cursed", False))
+        self.assertTrue(api.edits)
 
 
 class ArenaNewsCommandTests(unittest.TestCase):

@@ -29,6 +29,10 @@ RAW_ITEM_FIELDS: Final = frozenset({
     "code", "name", "slot", "price", "source", "bonuses", "description",
     "rarity", "resale_price", "drop_weight", "effect",
 })
+# Weapons carry one field amulets do not: `cursed` (see pets_config.Item). Amulets are
+# never cursed -- the shelf is weapons only -- so this stays out of the shared set and the
+# weapon catalogue validates its own records.
+
 
 # Engine-facing contract.  Values in effects are intentionally small: one amulet
 # should alter a close fight, not replace the four ordinary stats.

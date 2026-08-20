@@ -665,6 +665,11 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
         "rarity": item.rarity,
         "rarity_name": C.RARITY_LABELS.get(item.rarity, item.rarity),
         "rarity_rank": RARITY_ORDER.index(item.rarity) if item.rarity in RARITY_ORDER else 1,
+        # A rare or legendary cursed weapon carries the same rarity as its uncursed
+        # counterpart now, so the client needs its own flag to tell the two apart --
+        # rarity alone stopped being enough the moment "проклятое" became a property
+        # instead of a rung on the ordinary ladder.
+        "cursed": bool(getattr(item, "cursed", False)),
         "price": item.price,
         "resale": C.resale_value(item),
         "source": item.source,
@@ -1145,6 +1150,7 @@ def _action_buy(entry, user_id, xp, payload):
 def _action_reforge(entry, user_id, xp, payload):
     ok, message, _code = pets.reforge_items(
         entry, user_id, str(payload.get("rarity") or ""), str(payload.get("slot") or ""),
+        cursed=bool(payload.get("cursed")),
     )
     return ok, message
 
@@ -5888,27 +5894,37 @@ function openLiveSkillPicker(slot) {
 
 function forgePanel() {
   const names = { cursed: "проклятых", common: "обычных", rare: "редких", legendary: "легендарный" };
+  // The cursed ladder passes through "rare" and "legendary" too -- six cursed weapons make
+  // a RARE cursed weapon, not a plain rare one -- so those two labels alone can't tell a
+  // cursed rung from the ordinary rung of the same shape.
+  const cursedNames = { rare: "редких проклятых", legendary: "легендарная проклятая" };
   // A recipe is a rarity AND a type: five common gloves make rare gloves, never a sword.
   const slots = { weapon: "⚔️ Оружие", amulet: "📿 Амулет", gloves: "🧤 Перчатки", boots: "🥾 Ботинки", shield: "🛡 Щит" };
   const recipes = (S.forge && S.forge.recipes) || [];
   return '<div class="panel"><h2>⚒️ Кузница</h2>' +
     '<div class="small muted" style="margin-bottom:10px">Кузница берёт предметы одного типа и одной редкости ' +
       'и возвращает предмет того же типа редкостью выше: перчатки в перчатки, пушки в пушки. ' +
+      'У пушек есть отдельная проклятая ветка (☠️): проклятые куются в редкую проклятую, ' +
+      'редкие проклятые — в легендарную проклятую. ' +
       'Сколько нужно — написано на каждом рецепте. Надетые и защищённые вещи не расходуются.</div>' +
     (recipes.length ? '' : '<div class="small muted">Переплавлять пока нечего — не хватает предметов одного типа и одной редкости.</div>') +
     recipes.map((recipe) => {
       const ingredients = recipe.ingredients
         .map((code) => (S.bag || []).find((item) => item.code === code))
         .filter(Boolean);
+      const skull = recipe.cursed ? "☠️ " : "";
+      const ingrLabel = (recipe.cursed && cursedNames[recipe.rarity]) || names[recipe.rarity];
+      const resultLabel = (recipe.cursed && cursedNames[recipe.result_rarity]) || names[recipe.result_rarity];
       return '<div class="panel" style="margin:8px 0;padding:10px">' +
-        '<div class="small"><b>' + esc(slots[recipe.slot] || recipe.slot) + ': ' +
-        recipe.required + ' ' + names[recipe.rarity] + ' → ' + names[recipe.result_rarity] +
+        '<div class="small"><b>' + skull + esc(slots[recipe.slot] || recipe.slot) + ': ' +
+        recipe.required + ' ' + ingrLabel + ' → ' + resultLabel +
         '</b> · в сумке ' + recipe.available + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
-        // Never disabled: the server only sends recipes that are ready to go.
-        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '">' +
-          'Перековать</button></div>';
+        // Never disabled: the server only sends recipes that are ready to go. data-forgecursed
+        // rides along so a tap on this exact recipe can't be mistaken for its ordinary twin.
+        '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '" data-forgecursed="' + (recipe.cursed ? '1' : '') + '">' +
+          (recipe.cursed ? '☠️ Перековать' : 'Перековать') + '</button></div>';
     }).join('') +
     '<button class="go sec" disabled>🛠️ Ковка оружия — скоро</button></div>';
 }
@@ -6004,7 +6020,7 @@ function itemCard(item, flag) {
                 (item.personal_paint ? '<span class="flag" title="Персональный покрас">🎨 +30%</span>' : "");
   return '<button class="item r-' + item.rarity + '" data-item="' + esc(item.code) + '">' +
     itemArt(item, marks) +
-    '<span class="nm">' + esc(item.name) + "</span>" +
+    '<span class="nm">' + (item.cursed ? "☠️ " : "") + esc(item.name) + "</span>" +
     '<span class="meta">' + bonusText(item.bonuses) + "</span>" + weaponStats + "</button>";
 }
 
@@ -8237,9 +8253,9 @@ function openItem(code) {
 
   sheet(
     '<div class="hd"><img src="' + esc(item.art) + '" alt="">' +
-    "<div><h3>" + esc(item.name) + "</h3>" +
+    "<div><h3>" + (item.cursed ? "☠️ " : "") + esc(item.name) + "</h3>" +
     '<div class="small" style="color:var(--r-' + item.rarity + ')">' + esc(item.rarity_name) +
-      " · " + esc(item.slot_name) + "</div>" +
+      (item.cursed ? " · проклятая" : "") + " · " + esc(item.slot_name) + "</div>" +
     '<div class="small" style="margin-top:5px">' + bonusText(item.bonuses) + "</div></div></div>" +
     (item.description ? '<div class="small muted">' + esc(item.description) + "</div>" : "") +
     (item.effect && item.effect.text
@@ -9132,7 +9148,7 @@ async function handleClick(event, target) {
   if (d.shopslot) { shopSlot = d.shopslot; render(); return; }
   // NOT data-slot: that attribute is checked further up and opens the equipment slot
   // sheet, so a forge button carrying it opened the weapon window instead of forging.
-  if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.forgeslot || "" }); return; }
+  if (d.reforge) { await act("reforge", { rarity: d.reforge, slot: d.forgeslot || "", cursed: !!d.forgecursed }); return; }
   if (d.enchantpick) { openEnchantWeapons(d.enchantpick); return; }
   if (d.enchantapply) {
     const [code, element] = d.enchantapply.split(":", 2);

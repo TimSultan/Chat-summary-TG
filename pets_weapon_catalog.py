@@ -74,6 +74,11 @@ class WeaponSpec:
     # resolver -- only this field and its place in ``raw_item``.  Empty means flat stats.
     effect: tuple[tuple[str, str | int | bool], ...] = ()
     slot: str = "weapon"
+    # See pets_config.Item: cursed is a property that rides alongside rarity, so the three
+    # rungs of the cursed ladder can be `cursed`, `rare` and `legendary` without a sixth
+    # rarity existing anywhere. Every entry of the `cursed` RARITY is also cursed by
+    # definition; `_build_catalogue` sets that rather than each row repeating it.
+    cursed: bool = False
 
     @property
     def price(self) -> int:
@@ -119,6 +124,7 @@ class WeaponSpec:
             "resale_price": self.resale_price,
             "drop_weight": self.drop_weight,
             "effect": self.effect_dict(),
+            "cursed": self.cursed,
         }
 
 
@@ -614,6 +620,87 @@ _CURSED_LEGENDARIES: Final = (
 )
 
 
+# Редкие проклятые пушки -- средняя ступень проклятой лестницы.
+#
+# The cursed line used to be two disconnected things: seventy-five junk weapons at the
+# bottom whose only purpose was to be melted, and eight legendary curses at the top. There
+# was no rung between them, so "проклятое" named both the worst items in the game and some
+# of the best. These twelve are that rung, and they are what makes the ladder real:
+# six cursed junk forge into one of these, five of these forge into a legendary curse.
+#
+# Each carries the SMALLER version of a legendary curse, which is the same rare/legendary
+# pairing the ordinary catalogue uses everywhere else -- a player who finds one learns the
+# rule cheaply before meeting it at full strength. The last four have no legendary parent
+# and are the shelf's own ideas.
+_RARE_CURSED_WEAPONS: Final = (
+    (
+        "w515", "Кувалда короткого счёта", "Замахивается коротко. Успевает чаще.",
+        (("strength", 23), ("health", 6), ("agility", -4), ("armor", -3)),
+        # One turn of wind-up, not the legendary's two. The rare rung is a different
+        # RHYTHM rather than a smaller number, because this passive has almost no room
+        # between the two: at a two-turn charge the break-even multiplier is x4 and the
+        # legendary's x5.3 is already worth thirty win points, so a "smaller two-turn
+        # charge" is either dead or nearly the legendary.
+        _effect("charge_crit", "Заряжается ход и всё это время получает на 20% больше урона. Затем бьёт критом ×2.8.", 180, turns=1, taken=20),
+    ),
+    (
+        "w516", "Орлянка драчуна", "Подбрасывает монетку прямо посреди замаха.",
+        (("strength", 22), ("luck", 6), ("agility", -3), ("armor", -3)),
+        _effect("wild_swing", "28%: удар вдвое сильнее. 18%: вместо удара лечит соперника на 10% его максимума.", 110, crit=28, heal=18, gift=10),
+    ),
+    (
+        "w517", "Тесак вслепую", "Два взмаха по делу, два в белый свет.",
+        (("strength", 24), ("agility", -3), ("luck", -3), ("armor", 4)),
+        _effect("blind_fury", "2 хода не может промахнуться и бьёт на 90% сильнее. Следующие 2 хода промахивается всегда.", 2, blind=2, power=90),
+    ),
+    (
+        "w518", "Бутылочная роза", "Острее некуда, держится на честном слове.",
+        (("strength", 23), ("agility", 5), ("health", -5), ("armor", -6)),
+        _effect("glass_body", "+88% своего урона и +45% всего получаемого урона.", 88, taken=45),
+    ),
+    (
+        "w519", "Долговое шило", "Маленький долг, зато ежедневный.",
+        (("strength", 24), ("luck", 4), ("health", -4), ("armor", -3)),
+        _effect("blood_price", "+60% урона, но каждое попадание стоит 6% собственного HP.", 60, toll=6),
+    ),
+    (
+        "w520", "Тощий лом", "Ест мало, но каждый раунд.",
+        (("strength", 22), ("health", 5), ("agility", 3), ("armor", -4)),
+        _effect("hunger", "+5% урона за каждый раунд, без потолка. Каждый ход теряет 3% максимального HP (не ниже 40%).", 5, decay=3, floor=40),
+    ),
+    (
+        "w521", "Мятая расписка", "Отсрочка есть. Условия так себе.",
+        (("strength", 21), ("health", 9), ("luck", 3), ("armor", -4)),
+        _effect("soul_debt", "Один раз переживает смертельный удар и возвращается на 25% HP. После этого получает на 70% больше урона.", 25, debt=70),
+    ),
+    (
+        "w522", "Ручной отбойник", "Отдача в плечо, но какой звук.",
+        (("strength", 23), ("luck", 5), ("agility", -3), ("armor", -3)),
+        _effect("recoil", "Крит в бою: +3%. Критический удар бьёт на 230% сильнее, но отдача забирает следующий ход.", 230, crit=3),
+    ),
+    (
+        "w523", "Пиявочный крюк", "Тянет чужое, забывает своё.",
+        (("strength", 23), ("health", 7), ("agility", -3), ("armor", -4)),
+        _effect("reap", "Каждое попадание забирает себе 4% недостающего здоровья соперника.", 4),
+    ),
+    (
+        "w524", "Ржавая пошлина", "Берёт немного и со всех.",
+        (("strength", 22), ("agility", 5), ("luck", 4), ("armor", -4)),
+        _effect("tax", "Каждое попадание взимает 5% текущего HP соперника. За победу: +2 монеты за попадание, максимум +10.", 5, cap=10),
+    ),
+    (
+        "w525", "Погнутый маятник", "Качается неровно, зато дважды.",
+        (("strength", 23), ("health", 7), ("agility", -4), ("armor", -3)),
+        _effect("double_strike", "Каждый ход бьёт дважды, по 48% урона за удар.", 48),
+    ),
+    (
+        "w526", "Треснувший манометр", "Стрелка давно за красной чертой.",
+        (("strength", 22), ("health", 6), ("armor", -3), ("luck", 3)),
+        _effect("pressure", "За каждый полученный удар: +5% урона, без потолка.", 5),
+    ),
+)
+
+
 def _source_for(rarity: str, rarity_rank: int) -> str:
     # Cursed junk belongs to arena drops, never a shop shelf. The shop offers normal
     # entry/mid-game gear and a few rare aspirational purchases; stronger gear remains
@@ -670,7 +757,7 @@ def _pre_rebalance_buy_price(code: str, rarity: str, source: str) -> int:
     return 900 + (index % 6) * 100
 
 
-def _drop_weight(rarity: str, source: str) -> int:
+def _drop_weight(rarity: str, source: str, cursed: bool = False) -> int:
     """Relative arena-drop chance; zero means this weapon is not in the drop pool.
 
     Forty rare weapons at weight 10, 75 cursed weapons at weight 1 and ten legendary
@@ -679,6 +766,12 @@ def _drop_weight(rarity: str, source: str) -> int:
     """
     if source != "drop":
         return 0
+    if cursed and rarity == "rare":
+        # The rare cursed rung is findable, but the FORGE is the reliable way to it: at the
+        # ordinary rare weight of 10 these twelve would have been a fifth of every weapon
+        # drop, which would make the middle of the cursed ladder something you trip over
+        # rather than something you build toward, and the six-junk recipe pointless.
+        return 2
     return 10 if rarity == "rare" else 1
 
 
@@ -752,12 +845,14 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
     # The word banks offer far more than 500 pairs. The early stop keeps the public range
     # w001..w500 and, crucially, all existing inventory codes stable.
     hand_written = [
-        *((code, name, description, rarity, bonuses, effect)
+        *((code, name, description, rarity, bonuses, effect, False)
           for code, name, description, rarity, bonuses, effect in _NEW_BUILD_WEAPONS),
-        *((code, name, description, "legendary", bonuses, effect)
+        *((code, name, description, "legendary", bonuses, effect, True)
           for code, name, description, bonuses, effect in _CURSED_LEGENDARIES),
+        *((code, name, description, "rare", bonuses, effect, True)
+          for code, name, description, bonuses, effect in _RARE_CURSED_WEAPONS),
     ]
-    for code, name, description, rarity, bonuses, effect in hand_written:
+    for code, name, description, rarity, bonuses, effect, cursed in hand_written:
         buy_price, resale_price = _prices(rarity, "drop", bonuses)
         entries.append(WeaponSpec(
             code=code,
@@ -767,11 +862,17 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             source="drop",
             buy_price=buy_price,
             resale_price=resale_price,
-            drop_weight=_drop_weight(rarity, "drop"),
+            drop_weight=_drop_weight(rarity, "drop", cursed),
             bonuses=bonuses,
             effect=effect,
+            cursed=cursed,
         ))
-    return tuple(entries)
+    # Every entry of the `cursed` RARITY is cursed by definition -- the bottom rung of the
+    # ladder. Set once here rather than repeated on seventy-five generated rows.
+    return tuple(
+        replace(item, cursed=True) if item.rarity == "cursed" else item
+        for item in entries
+    )
 
 
 WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = _build_catalogue()
@@ -784,6 +885,10 @@ WEAPON_COUNT: Final = len(WEAPON_SPECS)
 # re-deriving it from a code list. These items are ordinary legendaries to every drop,
 # forge and inventory path -- the set exists to LABEL them, never to gate them.
 CURSED_LEGENDARY_CODES: Final = frozenset(row[0] for row in _CURSED_LEGENDARIES)
+RARE_CURSED_CODES: Final = frozenset(row[0] for row in _RARE_CURSED_WEAPONS)
+# The whole cursed line, all three rungs. This is what the forge and both front ends read;
+# `rarity == "cursed"` alone would answer only for the bottom one.
+CURSED_CODES: Final = frozenset(item.code for item in WEAPON_SPECS if item.cursed)
 RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in WEAPON_SPECS) for rarity in RARITIES}
 PRE_REBALANCE_BUY_PRICES: Final = {
     item.code: _pre_rebalance_buy_price(item.code, item.rarity, item.source)
@@ -793,7 +898,7 @@ PRE_REBALANCE_BUY_PRICES: Final = {
 
 def _validate_catalogue() -> None:
     """Fail immediately if a future catalogue edit violates its public contract."""
-    assert WEAPON_COUNT == 514
+    assert WEAPON_COUNT == 526
     assert len({item.code for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.name for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.description for item in WEAPON_SPECS}) == WEAPON_COUNT
@@ -809,14 +914,30 @@ def _validate_catalogue() -> None:
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
     # The generated 500 carry 75/250/120/45/10; _NEW_BUILD_WEAPONS then adds two rare and
     # four legendary drops (w501..w506) and _CURSED_LEGENDARIES eight more (w507..w514).
-    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 47, "legendary": 22}
+    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 59, "legendary": 22}
+    # The cursed ladder, all three rungs. 75 junk at the bottom, twelve rare in the middle,
+    # eight legendary at the top -- and the middle rung is what the forge needed to exist
+    # before "проклятое" could be a line a player climbs rather than a pile they melt.
+    cursed_line = [item for item in WEAPON_SPECS if item.cursed]
+    assert len(cursed_line) == 95
+    assert {item.rarity for item in cursed_line} == {"cursed", "rare", "legendary"}
+    assert all(item.source == "drop" for item in cursed_line)
+    assert sum(1 for item in cursed_line if item.rarity == "rare") == 12
+    assert sum(1 for item in cursed_line if item.rarity == "legendary") == 8
     # Every legendary carries a passive; the promoted five come from effect-bearing rare
     # lines, leaving twenty modified rares and twenty-five plain ones out of the generated
     # 500 -- plus the two effect-bearing rares and two legendaries in _NEW_BUILD_WEAPONS.
     with_effect = [item for item in WEAPON_SPECS if item.effect]
     assert all(item.rarity in {"rare", "legendary"} for item in with_effect)
     assert all(item.effect for item in WEAPON_SPECS if item.rarity == "legendary")
-    assert sum(1 for item in WEAPON_SPECS if item.rarity == "rare" and item.effect) == 22
+    # Twenty-two ordinary rares carry a passive, plus the twelve rare CURSED weapons --
+    # every one of those carries one by definition, since a curse with no rule is just a
+    # weapon with worse stats.
+    assert sum(
+        1 for item in WEAPON_SPECS
+        if item.rarity == "rare" and item.effect and not item.cursed
+    ) == 22
+    assert all(item.effect for item in WEAPON_SPECS if item.cursed and item.rarity != "cursed")
     # Guarded: EFFECT_HOOKS is empty when this data module is imported on its own, and
     # the fallback must stay a fallback rather than becoming an import-time failure.
     assert not EFFECT_HOOKS or all(
@@ -830,6 +951,8 @@ def _validate_catalogue() -> None:
         used = {item.effect_dict()["code"] for item in with_effect if item.rarity == rarity}
         expected = {dict(effect)["code"] for effect in declared}
         expected |= {dict(effect)["code"] for _, _, _, r, _, effect in _NEW_BUILD_WEAPONS if r == rarity}
+        if rarity == "rare":
+            expected |= {dict(data[4])["code"] for data in _RARE_CURSED_WEAPONS}
         if rarity == "legendary":
             expected |= {dict(data[3])["code"] for data in _ASCENDED_LEGENDARIES.values()}
             expected |= {dict(data[4])["code"] for data in _CURSED_LEGENDARIES}
@@ -847,5 +970,5 @@ _validate_catalogue()
 __all__ = [
     "RARITIES", "SOURCES", "STAT_KEYS", "WeaponSpec", "WEAPON_SPECS", "RAW_ITEMS", "WEAPON_COUNT",
     "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "STARTER_WEAPON_MAX_PRICE", "shop_price_for_bonuses",
-    "CURSED_LEGENDARY_CODES",
+    "CURSED_LEGENDARY_CODES", "RARE_CURSED_CODES", "CURSED_CODES",
 ]

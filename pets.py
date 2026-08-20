@@ -5436,18 +5436,24 @@ FORGE_REQUIREMENTS = {"cursed": 6, "common": 4, "rare": 5}
 FORGE_CURSED_RELIC = "cursed_relic"
 
 
-def _forge_ingredients(record: dict, rarity: str, slot: str) -> list:
-    """The free items of one rarity AND one slot, weakest first.
+def _forge_ingredients(record: dict, rarity: str, slot: str, cursed: bool = False) -> list:
+    """The free items of one rarity, one slot and one curse state, weakest first.
 
     Slot is part of the recipe now: a forge that accepted five of anything let a pile of
     junk gloves become a weapon, which made the choice of what to melt no choice at all.
     You build toward a kind of item, and what comes out is that kind of item.
+
+    The curse is part of it for the same reason. Cursed weapons are their own line -- junk
+    curses forge into a rare curse, rare curses into a legendary one -- and mixing the two
+    piles would let a player launder five ordinary rares into a legendary curse, or quietly
+    spend a rare curse as filler for an ordinary recipe.
     """
     equipped = set((record.get("equipped") or {}).values())
     locked = set(record.get("locked_items") or [])
     items = [
         item for item in (C.find_item(code) for code in record.get("inventory", []))
         if item is not None and item.rarity == rarity and item.slot == slot
+        and bool(getattr(item, "cursed", False)) == bool(cursed)
         and item.code not in equipped and item.code not in locked
     ]
     # Consume the least valuable candidates first.  The preview shows these exact items,
@@ -5457,32 +5463,53 @@ def _forge_ingredients(record: dict, rarity: str, slot: str) -> list:
     ))
 
 
+def forge_rungs() -> list[tuple[str, str, bool]]:
+    """Every (rarity, slot, cursed) recipe the forge knows, in one place.
+
+    Two ladders. The ordinary one runs common -> rare -> legendary in every slot. The
+    cursed one runs junk -> rare -> legendary in WEAPONS ONLY, because no other slot has a
+    cursed item in it to melt or to hand back. The junk tier belongs to the cursed ladder
+    by definition -- there is no such thing as an uncursed item of that rarity -- so it
+    appears once rather than in both halves.
+    """
+    rungs = [
+        (rarity, slot, False)
+        for rarity in FORGE_NEXT_RARITY if rarity != "cursed"
+        for slot in C.SLOT_KEYS
+    ]
+    rungs += [("cursed", "weapon", True), ("rare", "weapon", True)]
+    return rungs
+
+
 def forge_status(entry: str, user_id) -> dict:
     record = _tamed_record(_load(entry), user_id)
     if record is None:
         return {"recipes": []}
     recipes = []
-    for rarity, result_rarity in FORGE_NEXT_RARITY.items():
-        for slot in C.SLOT_KEYS:
-            ingredients = _forge_ingredients(record, rarity, slot)
-            required = FORGE_REQUIREMENTS[rarity]
-            # ONLY what can be forged right now. Fifteen recipes exist, and a screen that
-            # listed the fourteen a player cannot use was a wall of dead grey buttons
-            # explaining, at length, that nothing here works -- the answer to "what can I
-            # make" has to be the whole screen, not a needle in it.
-            if len(ingredients) < required:
-                continue
-            recipes.append({
-                "rarity": rarity,
-                "slot": slot,
-                "result_rarity": result_rarity,
-                "available": len(ingredients),
-                "required": required,
-                "ingredients": [item.code for item in ingredients[:required]],
-                # Always true, and kept so a client that reads it keeps working. The list
-                # itself is now the answer: if a recipe is on it, it is ready.
-                "can_forge": True,
-            })
+    for rarity, slot, cursed in forge_rungs():
+        result_rarity = FORGE_NEXT_RARITY[rarity]
+        ingredients = _forge_ingredients(record, rarity, slot, cursed)
+        required = FORGE_REQUIREMENTS[rarity]
+        # ONLY what can be forged right now. Seventeen recipes exist, and a screen that
+        # listed the sixteen a player cannot use was a wall of dead grey buttons
+        # explaining, at length, that nothing here works -- the answer to "what can I
+        # make" has to be the whole screen, not a needle in it.
+        if len(ingredients) < required:
+            continue
+        recipes.append({
+            "rarity": rarity,
+            "slot": slot,
+            # Which ladder this rung belongs to. A client that ignores it will label a
+            # cursed recipe as an ordinary one, which is wrong but not broken.
+            "cursed": cursed,
+            "result_rarity": result_rarity,
+            "available": len(ingredients),
+            "required": required,
+            "ingredients": [item.code for item in ingredients[:required]],
+            # Always true, and kept so a client that reads it keeps working. The list
+            # itself is now the answer: if a recipe is on it, it is ready.
+            "can_forge": True,
+        })
     # Deepest pile first: with everything on the list ready, the interesting one is the
     # one that has been waiting longest to be emptied.
     recipes.sort(key=lambda row: -row["available"])
@@ -5490,7 +5517,7 @@ def forge_status(entry: str, user_id) -> dict:
 
 
 def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
-                  rng=None) -> tuple[bool, str, str | None]:
+                  rng=None, cursed: bool = False) -> tuple[bool, str, str | None]:
     """Turn same-slot, same-rarity ingredients into one item of the next rarity up.
 
     Both halves of the recipe are fixed: what goes in is one KIND of item, and what comes
@@ -5500,6 +5527,10 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
     """
     rarity = "common" if rarity == "uncommon" else str(rarity or "")
     slot = str(slot or "")
+    # The junk tier IS the cursed ladder's first rung, so a caller that names it has asked
+    # for the cursed recipe whether or not it said so. Older stored buttons and any client
+    # that has not learned the flag therefore keep working.
+    cursed = bool(cursed) or rarity == "cursed"
     result_rarity = FORGE_NEXT_RARITY.get(rarity)
     if result_rarity is None:
         return False, "Эту редкость перековать нельзя.", None
@@ -5511,19 +5542,26 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
         record = _tamed_record(data, user_id)
         if record is None:
             return False, "Сначала приручи существо.", None
-        ingredients = _forge_ingredients(record, rarity, slot)
+        ingredients = _forge_ingredients(record, rarity, slot, cursed)
         required = FORGE_REQUIREMENTS[rarity]
         if len(ingredients) < required:
+            kind = "проклятых предметов" if cursed else "предметов"
             return False, (
-                f"Нужно {required} свободных предметов «{C.SLOT_NAMES[slot]}» этой "
+                f"Нужно {required} свободных {kind} «{C.SLOT_NAMES[slot]}» этой "
                 "редкости. Надетые и защищённые не считаются."
             ), None
         consumed = ingredients[:required]
         owned = set(record.get("inventory", []))
+        # A curse comes out of a curse. This is the whole of the cursed ladder: melting
+        # junk curses can only ever hand back a RARE CURSE, and melting rare curses can
+        # only ever hand back a legendary one. Without it the two lines would collapse
+        # back into the single ordinary ladder they used to share, which is what made
+        # "проклятое" name both the worst items in the game and some of the best.
         pool = [
             item for item in C.ITEMS
             if item.source == "drop" and item.rarity == result_rarity
             and item.slot == slot
+            and bool(getattr(item, "cursed", False)) == cursed
         ]
         # The relic is the one forge-only item there is, and it is a rare weapon: it joins
         # the pool cursed weapons draw from instead of being a recipe that bypasses the

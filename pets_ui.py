@@ -2128,13 +2128,24 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if not pet:
         return no_pet_view(user_id)
     labels = {"cursed": "проклятых", "common": "обычных", "rare": "редких", "legendary": "легендарный"}
+    # The ordinary ladder and the cursed one both pass through "rare" and "legendary", so
+    # the plain labels above are ambiguous exactly where it matters most -- a player who
+    # can't tell "5 редких → легендарный" from the cursed rung of the same shape would
+    # forge the wrong five hoping for a curse, or the other way round.
+    # Two forms per rung: what goes IN is plural ("6 проклятых"), what comes OUT is one
+    # item ("редкая проклятая"). One shared label read "6 проклятых → редких проклятых",
+    # which promises a pile and hands back a single weapon.
+    cursed_labels = {"rare": "редких проклятых", "legendary": "легендарных проклятых"}
+    cursed_results = {"rare": "редкая проклятая", "legendary": "легендарная проклятая"}
     status = pets.forge_status(entry, user_id)
     lines = [
         "⚒️ <b>Кузница</b>",
         (f"Кузница берёт предметы одного типа и одной редкости и возвращает предмет того "
          f"же типа редкостью выше: {pets.FORGE_REQUIREMENTS['common']} обычных перчаток — "
-         f"редкие перчатки, {pets.FORGE_REQUIREMENTS['rare']} редких — легендарные, "
-         f"{pets.FORGE_REQUIREMENTS['cursed']} проклятых пушек — редкая пушка."),
+         f"редкие перчатки, {pets.FORGE_REQUIREMENTS['rare']} редких — легендарные. "
+         f"Для пушек есть отдельная проклятая ветка: {pets.FORGE_REQUIREMENTS['cursed']} "
+         f"проклятых — редкая проклятая пушка, {pets.FORGE_REQUIREMENTS['rare']} редких "
+         f"проклятых — легендарная проклятая."),
         "<i>Надетые и защищённые вещи кузница не трогает. Сначала уходят самые слабые.</i>",
     ]
     rows = []
@@ -2147,10 +2158,14 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         slot = recipe["slot"]
         result_rarity = recipe["result_rarity"]
         required = recipe["required"]
+        cursed = bool(recipe.get("cursed"))
+        skull = "☠️ " if cursed else ""
+        ingr_label = cursed_labels[rarity] if cursed and rarity in cursed_labels else labels[rarity]
+        result_label = cursed_results[result_rarity] if cursed and result_rarity in cursed_results else labels[result_rarity]
         kind = f"{C.SLOT_EMOJI[slot]} {C.SLOT_NAMES[slot]}"
         ingredients = [C.find_item(code) for code in recipe.get("ingredients", [])]
         lines.append(
-            f"\n<b>{kind}: {required} {labels[rarity]} → {labels[result_rarity]}</b> "
+            f"\n<b>{skull}{kind}: {required} {ingr_label} → {result_label}</b> "
             f"(в сумке {recipe['available']})"
         )
         if ingredients:
@@ -2160,10 +2175,14 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # No disabled state: forge_status only returns recipes that are ready, so every
         # button on this screen forges.
         rows.append([{
-            "text": f"⚒️ {kind} · {required} {labels[rarity]} → {labels[result_rarity]}",
-            # rarity:slot, which parse_callback hands back whole -- the recipe is both
-            # halves now, and a button carrying only one of them would forge the wrong pile.
-            "callback_data": callback_data(user_id, "reforge", f"{rarity}:{slot}"),
+            "text": f"⚒️ {skull}{kind} · {required} {ingr_label} → {result_label}",
+            # rarity:slot:cursed, which parse_callback hands back whole. The cursed flag
+            # rides along because "5 редких" now names two different recipes -- the
+            # ordinary rung and the cursed one -- and a button that dropped it would
+            # silently forge the wrong pile. A bare "rarity:slot" (an already-rendered
+            # button from before this flag existed) still parses: its missing third field
+            # reads as "not cursed", which is exactly what it always meant.
+            "callback_data": callback_data(user_id, "reforge", f"{rarity}:{slot}:{'1' if cursed else '0'}"),
         }])
     rune_state = pets.rune_status(entry, user_id)
     rune_names = {"fire": "Огонь", "frost": "Лёд", "water": "Вода", "earth": "Земля", "air": "Воздух", "plants": "Растения"}

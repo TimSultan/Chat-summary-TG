@@ -848,12 +848,12 @@ class Item:
 
     __slots__ = (
         "code", "name", "slot", "price", "source", "bonuses", "description",
-        "rarity", "resale_price", "drop_weight", "effect",
+        "rarity", "resale_price", "drop_weight", "effect", "cursed",
     )
 
     def __init__(
         self, code, name, slot, price, source, bonuses, description="", rarity="common",
-        resale_price=None, drop_weight=1, effect=None,
+        resale_price=None, drop_weight=1, effect=None, cursed=False,
     ):
         self.code = code
         self.name = name
@@ -869,6 +869,14 @@ class Item:
         self.resale_price = resale_price
         self.drop_weight = drop_weight
         self.effect = dict(effect or {})
+        # Cursed is a PROPERTY, not a rarity. It used to be only the junk tier at the
+        # bottom of the weapon catalogue, while the eight legendary curses were ordinary
+        # legendaries that merely read as cursed -- so one word meant two unrelated things
+        # and the forge could not tell them apart. As a flag it rides alongside rarity,
+        # which is what lets a cursed ladder exist (cursed junk -> rare cursed -> legendary
+        # cursed) without teaching a sixth rarity to the drop tables, the badges, the
+        # filters and both front ends.
+        self.cursed = bool(cursed)
 
 
 # Starter catalogue. Six of these nine entries are the original hand-written items; the
@@ -968,6 +976,7 @@ def _catalog_item(spec):
         spec.get("source", "shop"), spec.get("bonuses", {}),
         spec.get("description", ""), spec.get("rarity", "common"),
         spec.get("resale_price"), spec.get("drop_weight", 1), spec.get("effect"),
+        spec.get("cursed", False),
     )
 
 
@@ -1035,6 +1044,10 @@ ITEMS = ITEMS + (
         resale_price=125, drop_weight=0,
         effect={"code": "candle", "text": "В начале боя: +55% к урону или -25%.",
                 "value": 55, "downside": 25, "chance": 60},
+        # It is called "Реликвия шести проклятий" and it is what six curses become, so it
+        # belongs to the cursed line rather than sitting outside it: that makes it a valid
+        # ingredient for the next rung up instead of a dead end a player cannot spend.
+        cursed=True,
     ),
 )
 

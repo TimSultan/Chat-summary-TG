@@ -7011,11 +7011,17 @@ async def handle_pets_callback(
             )
             return
         if action == "reforge":
-            # «rarity:slot» -- a recipe is both halves since the forge started returning
-            # the same kind of item it was fed.
-            rarity, _, forge_slot = str(argument or "").partition(":")
+            # «rarity:slot:cursed» -- a recipe is three fields since the cursed ladder
+            # started sharing "rare" and "legendary" with the ordinary one. A button drawn
+            # before that flag existed only ever carries the first two, and a missing
+            # third field is exactly "not cursed", so old messages keep forging what they
+            # always forged.
+            parts = str(argument or "").split(":")
+            rarity = parts[0] if parts else ""
+            forge_slot = parts[1] if len(parts) > 1 else ""
+            cursed = parts[2] == "1" if len(parts) > 2 else False
             ok, note, _result_code = pets.reforge_items(
-                entry, user_id, rarity, forge_slot,
+                entry, user_id, rarity, forge_slot, cursed=cursed,
             )
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
