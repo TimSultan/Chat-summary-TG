@@ -630,13 +630,80 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(first, [])
         self.assertEqual(second, [])
 
+    def test_a_hand_granted_badge_stacks_and_only_shows_a_multiplier_past_one(self):
+        """
+        Winning the same thing twice is worth seeing on the card.
+
+        Giving a badge to somebody who already held it used to do nothing at all, so the
+        second week somebody won the contest looked exactly like the first. It now counts,
+        and the count is written on the badge -- but only once there is more than one of
+        them, because "×1" is not a thing anybody says.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                emoji, name = stats.parse_custom_badge_spec("🏆 Победитель")
+                badge = stats.create_custom_badge("chat", emoji, name, 10, "Admin")
+
+                def label():
+                    return stats.custom_badges_for_user("chat", 20)[0].label
+
+                for expected_count in (1, 2, 3):
+                    _, changed, count = stats.give_custom_badge(
+                        "chat", badge.badge_id, 20, "User", 10, "Admin", stack=True,
+                    )
+                    self.assertTrue(changed)
+                    self.assertEqual(count, expected_count)
+                self.assertEqual(label(), "🏆 Победитель ×3")
+
+                # Exactly one badge, not three copies of it in the list.
+                self.assertEqual(len(stats.custom_badges_for_user("chat", 20)), 1)
+
+                # Revoking takes ONE off, so an accidental extra award is fixable with the
+                # same number of presses that caused it.
+                stats.revoke_custom_badge("chat", badge.badge_id, 20)
+                self.assertEqual(label(), "🏆 Победитель ×2")
+                stats.revoke_custom_badge("chat", badge.badge_id, 20)
+                self.assertEqual(label(), "🏆 Победитель")
+                stats.revoke_custom_badge("chat", badge.badge_id, 20)
+                self.assertEqual(stats.custom_badges_for_user("chat", 20), [])
+                self.assertIsNone(
+                    stats.revoke_custom_badge("chat", badge.badge_id, 20)
+                )
+
+    def test_an_automatic_badge_award_never_stacks(self):
+        """
+        Only a human pressing «Выдать значок» means "another one".
+
+        Two callers award badges on their own: a quest hands one out on completion, and
+        `award_founder_badges` re-runs on every retried ceremony post. If those stacked, a
+        repeatable quest would inflate its badge forever and one retried post would give
+        the whole guest list a founder badge ×2. The default is what protects them, so the
+        default is what this pins.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                emoji, name = stats.parse_custom_badge_spec("🌱 Основатель")
+                badge = stats.create_custom_badge("chat", emoji, name, 10, "Admin")
+                for _ in range(3):
+                    _, changed, count = stats.give_custom_badge(
+                        "chat", badge.badge_id, 20, "User", 10, "Admin",
+                    )
+                self.assertFalse(changed)
+                self.assertEqual(count, 1)
+                self.assertEqual(
+                    stats.custom_badges_for_user("chat", 20)[0].label, "🌱 Основатель"
+                )
+
     def test_custom_badges_persist_and_duplicate_awards_are_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 emoji, name = stats.parse_custom_badge_spec("🎯 Меткий глаз")
                 badge = stats.create_custom_badge("chat", emoji, name, 10, "Admin")
-                awarded, created = stats.give_custom_badge("chat", badge.badge_id, 20, "User", 10, "Admin")
-                awarded_again, created_again = stats.give_custom_badge(
+                awarded, created, count = stats.give_custom_badge(
+                    "chat", badge.badge_id, 20, "User", 10, "Admin",
+                )
+                self.assertEqual(count, 1)
+                awarded_again, created_again, _count_again = stats.give_custom_badge(
                     "chat", badge.badge_id, 20, "User", 10, "Admin"
                 )
 
@@ -1181,7 +1248,9 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("победитель Недельного Конкурса №1", api.sent[-1][0]["text"])
                 self.assertEqual(
                     stats.weekly_winner_badges_for_user("chat", 20)[0].label,
-                    "🏆 Победитель Недельного Конкурса ×1",
+                    # One of something is not "×1" -- the multiplier appears on the second
+                    # win and never before. See stats.stacked_badge_name.
+                    "🏆 Победитель Недельного Конкурса",
                 )
 
     async def test_sultan_can_manage_without_group_admin_status(self):
@@ -1231,7 +1300,9 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(
                     stats.weekly_winner_badges_for_user("chat", 20)[0].label,
-                    "🏆 Победитель Недельного Конкурса ×1",
+                    # One of something is not "×1" -- the multiplier appears on the second
+                    # win and never before. See stats.stacked_badge_name.
+                    "🏆 Победитель Недельного Конкурса",
                 )
         self.assertIn("победитель Недельного Конкурса №2", api.sent[-1][0]["text"])
 

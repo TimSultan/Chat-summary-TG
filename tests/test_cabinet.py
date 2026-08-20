@@ -425,7 +425,7 @@ class BadgeAnnouncementTests(unittest.TestCase):
         announced = self._award({"user_id": "20", "display_name": "Без Ника", "username": None})
         self.assertEqual(announced[0]["text"], "Без Ника получил уникальный значок: 🏹 Лучник")
 
-    def test_re_awarding_the_same_badge_does_not_announce_again(self):
+    def test_re_awarding_the_same_badge_announces_it_as_a_repeat(self):
         target = {"user_id": "20", "display_name": "Tester", "username": "user"}
         badge = stats.create_custom_badge("chat", "🏹", "Лучник", 10, "Admin")
         flow = {
@@ -439,8 +439,15 @@ class BadgeAnnouncementTests(unittest.TestCase):
                 )
             )
 
+        # Badges stack, so a second and third award are real awards and the group hears
+        # about them -- but each says which time it is, or three identical posts would
+        # read as the bot repeating itself.
         announced = [m for m in self.api.sent if m["chat_id"] == -1001234]
-        self.assertEqual(len(announced), 1, "the group was told more than once")
+        self.assertEqual(len(announced), 3)
+        self.assertNotIn("×", announced[0]["text"])
+        self.assertIn("снова получил", announced[1]["text"])
+        self.assertIn("(×2)", announced[1]["text"])
+        self.assertIn("(×3)", announced[2]["text"])
 
     def test_a_failed_announcement_does_not_lose_the_badge(self):
         class FailingAPI(FakeAPI):

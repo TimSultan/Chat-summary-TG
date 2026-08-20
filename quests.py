@@ -1386,7 +1386,9 @@ def _award_badge(entry: str, user_id, name: str, display_name: str) -> bool:
                 "created_by_name": "ЕПХ-бот",
             }
             stats._save_custom_badge_data(entry, data)
-        _badge, newly = stats.give_custom_badge(
+        # No stacking: a quest badge marks that the quest was done, and a repeatable
+        # quest would otherwise inflate it every single completion.
+        _badge, newly, _count = stats.give_custom_badge(
             entry, badge_id, user_id, display_name or str(user_id), "bot", "ЕПХ-бот",
         )
         return newly

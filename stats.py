@@ -1271,8 +1271,17 @@ def revoke_custom_badge(entry: str, badge_id: str, user_id: int | str) -> Badge 
     except (json.JSONDecodeError, OSError, ValueError):
         return None
     assigned = data["assignments"].get(str(user_id)) or {}
-    if assigned.pop(badge_id, None) is None:
+    held = assigned.get(badge_id)
+    if held is None:
         return None
+    # One press takes ONE off the stack, which is the exact inverse of one press of
+    # «Выдать значок». Revoking a ×3 down to nothing in a single tap would make an
+    # accidental extra award unfixable without re-granting twice.
+    count = _badge_stack_count(held) - 1
+    if count >= 1 and isinstance(held, dict):
+        held["count"] = count
+    else:
+        assigned.pop(badge_id, None)
     record = data["badges"].get(badge_id)
     _save_custom_badge_data(entry, data)
     if record is None:
@@ -1383,7 +1392,9 @@ def award_founder_badges(entry: str) -> int:
     awarded = 0
     for planter in state["planters"]:
         try:
-            _, newly = give_custom_badge(
+            # No stacking, for the reason in this function's docstring: the 10:00 post is
+            # retried, and a retry must not hand the guest list a founder badge x2.
+            _, newly, _count = give_custom_badge(
                 entry, FOUNDER_BADGE_ID, planter["user_id"],
                 planter.get("display_name") or "", "bot", "ЕПХ-бот",
             )
@@ -1393,6 +1404,30 @@ def award_founder_badges(entry: str) -> int:
     return awarded
 
 
+def _badge_stack_count(record) -> int:
+    """How many times a member holds one custom badge. Missing means one.
+
+    Assignments written before badges could stack are a bare metadata dict with no count
+    in them, and every one of those is a single award -- so the default has to be 1, not 0.
+    """
+    if not isinstance(record, dict):
+        return 1
+    try:
+        return max(1, int(record.get("count", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def stacked_badge_name(name: str, count: int) -> str:
+    """The badge's name with its multiplier, and only when there IS a multiplier.
+
+    One of something is not "×1". The suffix appears the moment a second one is granted
+    and never before, which is the whole visible point of stacking: a player who has won
+    twice should be able to see that they won twice.
+    """
+    return f"{name} ×{count}" if count > 1 else name
+
+
 def give_custom_badge(
     entry: str,
     badge_id: str,
@@ -1400,20 +1435,37 @@ def give_custom_badge(
     user_display_name: str,
     giver_id: int | str,
     giver_name: str,
-) -> tuple[Badge, bool]:
-    """Returns (badge, newly_awarded); awarding the same badge twice is idempotent."""
+    stack: bool = False,
+) -> tuple[Badge, bool, int]:
+    """Give one custom badge. Returns (badge, changed_anything, holder's count after).
+
+    `stack` is off by default, and that default is load-bearing. Two callers award badges
+    automatically and must stay idempotent: a repeatable quest would otherwise inflate its
+    badge every time it is completed, and `award_founder_badges` re-runs on every retried
+    ceremony post, which would hand the whole guest list a founder badge ×5. Only a human
+    pressing «Выдать значок» means "another one", so only that flow passes stack=True.
+
+    The returned Badge keeps its PLAIN name. The count comes back separately rather than
+    baked into it, because the two places that use this want different things: the chat
+    announcement says what the badge is, and the reply to the admin says how many.
+    """
     data = _load_custom_badge_data(entry)
     record = data["badges"].get(badge_id)
     if record is None:
         raise ValueError("Этот значок больше не существует.")
     user_assignments = data["assignments"].setdefault(str(user_id), {})
-    newly_awarded = badge_id not in user_assignments
-    if newly_awarded:
+    held = user_assignments.get(badge_id)
+    count = _badge_stack_count(held) if held is not None else 0
+    changed = held is None or stack
+    if changed:
+        count += 1
         user_assignments[badge_id] = {
+            **(held if isinstance(held, dict) else {}),
             "given_at": app_now().isoformat(),
             "given_by_id": str(giver_id),
             "given_by_name": giver_name,
             "user_display_name": user_display_name,
+            "count": count,
         }
         _save_custom_badge_data(entry, data)
     badge = Badge(
@@ -1423,7 +1475,7 @@ def give_custom_badge(
         description="выдан администратором",
         custom=True,
     )
-    return badge, newly_awarded
+    return badge, changed, count
 
 
 def custom_badges_for_user(entry: str, user_id: int | str) -> list[Badge]:
@@ -1434,15 +1486,19 @@ def custom_badges_for_user(entry: str, user_id: int | str) -> list[Badge]:
         return []
     assigned_ids = data["assignments"].get(str(user_id), {})
     badges = []
-    for badge_id in assigned_ids:
+    for badge_id, assignment in assigned_ids.items():
         record = data["badges"].get(badge_id)
         if record:
+            count = _badge_stack_count(assignment)
             badges.append(
                 Badge(
                     badge_id=record["id"],
                     emoji=record["emoji"],
-                    name=record["name"],
-                    description="выдан администратором",
+                    name=stacked_badge_name(record["name"], count),
+                    description=(
+                        "выдан администратором" if count < 2
+                        else f"выдан администратором, раз: {count}"
+                    ),
                     custom=True,
                 )
             )
@@ -1533,7 +1589,9 @@ def weekly_winner_badges_for_user(entry: str, user_id: int | str) -> list[Badge]
         Badge(
             "weekly_contest_winner",
             "🏆",
-            f"Победитель Недельного Конкурса ×{count}",
+            # Shares stacked_badge_name with custom badges so the two read identically --
+            # and so a single win stops announcing itself as "×1".
+            stacked_badge_name("Победитель Недельного Конкурса", count),
             "победы в неделях: " + ", ".join(f"№{week}" for week in won_weeks),
         )
     ]

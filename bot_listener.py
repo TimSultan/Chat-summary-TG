@@ -629,19 +629,35 @@ async def _award_badge_from_flow(
     badge = None
     awarded, already = [], []
     for target in targets:
-        badge, newly_awarded = stats.give_custom_badge(
+        # A human pressing this button means "another one", so this is the ONE grant path
+        # that stacks -- giving the same badge to somebody who already holds it now makes
+        # it x2 rather than quietly doing nothing. The automatic awarders (quests, the
+        # founder ceremony) deliberately do not pass this.
+        badge, newly_awarded, count = stats.give_custom_badge(
             flow["entry"],
             badge_id,
             target["user_id"],
             target["display_name"],
             flow["admin_id"],
             flow["admin_name"],
+            stack=True,
         )
+        target = {**target, "badge_count": count}
         (awarded if newly_awarded else already).append(target)
+
+    def _with_count(target: dict) -> str:
+        """One recipient, and how many of this badge they now hold if it is more than one.
+
+        Written per recipient rather than once for the whole message: several people can
+        be given the same badge in one go and end on different totals, so a single shared
+        "x2" in the header would be wrong for everybody it did not describe.
+        """
+        count = int(target.get("badge_count", 1) or 1)
+        return target["display_name"] + (f" (×{count})" if count > 1 else "")
 
     lines = []
     if awarded:
-        who = ", ".join(target["display_name"] for target in awarded)
+        who = ", ".join(_with_count(target) for target in awarded)
         lines.append(
             f"🎉 {who} получает значок {badge.label}!" if len(awarded) == 1
             else f"🎉 Значок {badge.label} получают ({len(awarded)}): {who}"
@@ -669,12 +685,16 @@ async def _award_badge_from_flow(
 async def _announce_badge_in_chat(
     api: TelegramBotAPI, chat_id, badge, targets: dict | list[dict], log=print
 ) -> None:
-    """Tell the group somebody was given a unique badge.
+    """Tell the group somebody was given a badge.
 
-    Only for genuinely NEW awards -- give_custom_badge is idempotent, and re-running it
-    must not post the same announcement again. Best-effort: the badge is already
-    recorded by the time this runs, so a failed send costs the announcement, never the
-    badge.
+    A repeat award is announced too, and says which time it is. Badges stack now, so
+    winning the same thing again is news rather than a duplicate message -- but three
+    identical "получил значок" posts would read as a bug, so the count rides along with
+    the name of whoever earned it. Several recipients can be on different counts, which is
+    why it is written per person rather than once in the header.
+
+    Best-effort: the badge is already recorded by the time this runs, so a failed send
+    costs the announcement, never the badge.
 
     Sent as plain text with the @username inline rather than an HTML mention: a display
     name is user-controlled and would have to be escaped, and a plain @username is what
@@ -688,11 +708,19 @@ async def _announce_badge_in_chat(
     if not targets:
         return
     names = []
+    repeat = False
     for target in targets:
         username = (target.get("username") or "").lstrip("@")
-        names.append(f"@{username}" if username else target.get("display_name", "Участник"))
+        name = f"@{username}" if username else target.get("display_name", "Участник")
+        count = int(target.get("badge_count", 1) or 1)
+        if count > 1:
+            repeat = True
+            name += f" (×{count})"
+        names.append(name)
     who = ", ".join(names)
     verb = "получил" if len(names) == 1 else "получили"
+    if repeat:
+        verb = "снова " + verb
     try:
         await api.send_message(
             chat_id,
