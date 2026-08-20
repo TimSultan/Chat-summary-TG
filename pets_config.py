@@ -332,11 +332,22 @@ DAMAGE_VARIANCE = 0.15
 # stay at its level-one number forever. Six poison beside a 2,000+ HP pet is decorative,
 # while simply multiplying it by level would explode now that pet levels are unbounded.
 # A square-root curve keeps every level meaningful without turning a very old pet's DoT
-# into a one-tick kill. Combat also compares this curve with a soft Strength/damage curve,
-# so a deliberately damage-heavy build is not worse at statuses than a low-Strength peer.
+# into a one-tick kill. Combat also compares this curve with a Strength/damage curve, so a
+# deliberately damage-heavy build is not worse at statuses than a low-Strength peer.
 #
 #   level       1      10      25      50      100
 #   multiplier 1.00   1.60    1.98    2.40     2.99
+#
+# The damage curve is LINEAR in the owner's swing, not a square root of it. It used to be
+# a square root, which quietly made every damage-over-time passive weaker the longer a pet
+# played: from level 10 to level 100 a swing grows 4.2x and a health bar 3.8x, while a
+# sqrt-scaled burn grew only 2.1x. A legendary that reads "12 damage a turn" was therefore
+# worth 2.2% of a health bar at level 10 and 1.1% at level 100 -- the tier's own flagship
+# passives decaying into decoration exactly where the best gear is supposed to matter most.
+# Linear ties the tick to the swing that caused it, so the share of a fight one of these
+# moves is the same at every level. At the balance harness's reference creature (level 10,
+# 98 damage) it is a 1.37x change; the whole correction lands at high level, where the
+# problem was.
 FLAT_EFFECT_LEVEL_SQRT_GROWTH = 0.20
 FLAT_EFFECT_DAMAGE_REFERENCE = BASE_DAMAGE + DAMAGE_PER_POINT
 
@@ -391,6 +402,11 @@ ARMOR_K = 100.0             # armor 60 -> 22.5%, armor 150 -> 36%
 # stays at the larger number: at 10, a healing or guard build would run out of fight
 # before it had used its loadout.
 MAX_SKILL_ACTIONS_PER_FIGHTER = 48
+# Two legendary weapons buy extra attacks inside their own turn -- a crit that chains and
+# a weapon that swings twice. This is the hard ceiling on how many a single turn may
+# contain, wherever they came from, so no combination of passives can hold the floor
+# indefinitely. `MAX_SKILL_ACTIONS_PER_FIGHTER` still caps the fight as a whole.
+MAX_EXTRA_ATTACKS_PER_TURN = 3
 
 # ------------------------------------------------------------------ stat lead bonus
 # Every lead matters: a stat that is 10% higher contributes 10% more, rising linearly to
@@ -939,8 +955,13 @@ def _catalog_item(spec):
 
 if _RAW_WEAPON_ITEMS:
     _catalogue_weapons = tuple(_catalog_item(spec) for spec in _RAW_WEAPON_ITEMS)
-    if len(_catalogue_weapons) != 504 or any(item.slot != "weapon" for item in _catalogue_weapons):
-        raise ValueError("weapon catalogue must contain exactly 504 weapon entries")
+    # Counted against the catalogue itself rather than a number written twice: the
+    # literal that used to live here made every addition to the catalogue a
+    # ValueError at import time in a file that has nothing to do with the change.
+    if len(_catalogue_weapons) != len(_RAW_WEAPON_ITEMS) or any(
+        item.slot != "weapon" for item in _catalogue_weapons
+    ):
+        raise ValueError("weapon catalogue must contain only weapon entries")
     _codes = [item.code for item in _catalogue_weapons]
     if len(set(_codes)) != len(_codes):
         raise ValueError("weapon catalogue contains duplicate item codes")

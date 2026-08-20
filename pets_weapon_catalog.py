@@ -1,15 +1,17 @@
 """The clear, comic, fixed weapon catalogue for the pet arena.
 
 This module owns *data*, rather than game logic.  ``WEAPON_SPECS`` is an immutable
-tuple of exactly 504 :class:`WeaponSpec` values.  It is safe for ``pets_config`` to
+tuple of exactly 514 :class:`WeaponSpec` values.  It is safe for ``pets_config`` to
 turn a spec into its mutable ``Item`` object with ``spec.item_arguments()``; the raw
 catalogue itself cannot be changed accidentally during a fight.
 
 The catalogue is generated from curated word banks at import time so that it remains
 reviewable and deterministic without maintaining a 500-line hand-written list.  Codes
-are stable ASCII identifiers (``w001`` through ``w500``), not display names.  Four more
-hand-written drop-only weapons, ``w501``..``w504``, close out a couple of equipment
-builds that had no weapon carrying their signature effect (see ``_NEW_BUILD_WEAPONS``).
+are stable ASCII identifiers (``w001`` through ``w500``), not display names.  Six more
+hand-written drop-only weapons, ``w501``..``w506``, close out a couple of equipment builds
+that had no weapon carrying their signature effect and carry two legendary-only rules (see
+``_NEW_BUILD_WEAPONS``); ``w507``..``w514`` are the cursed legendaries, whose passives buy
+an oversized effect with an equally real penalty (see ``_CURSED_LEGENDARIES``).
 """
 
 from __future__ import annotations
@@ -305,15 +307,21 @@ def _effect(code: str, text: str, value: int, **params: int | bool) -> tuple[tup
 # +19 instead of in one band.  Numbers here are deliberately at the TOP of the plausible
 # range -- a legendary the holder cannot feel is the worse failure.
 # Order matches the names: w003 first, then _LEGENDARY_COPY.
+#
+# Half of this tier used to be a rare weapon's passive with a bigger number on it -- all
+# twelve legendaries were, in fact, and six of them measured at the very bottom of the
+# band they are priced at (`precision` 90 at +19.8 against `precision` 70 at +15.7 is four
+# win points for a trophy that takes hundreds of fights to find). The four below are rules
+# no other item in the game has, and the four kept archetypes are the ones whose fantasy
+# genuinely wanted a bigger version rather than a different one.
 _LEGENDARY_EFFECTS: Final = (
-    # Швабра на изоленте -- the angry mop swings harder the worse it is going.
-    _effect("berserker", "Ниже 50% HP: +45% урона.", 45, threshold=50),
-    # Legendary forms deliberately continue rare weapon archetypes at a higher ceiling.
-    # 75 is the engine's ceiling for precision: derive() clamps the miss multiplier.
-    _effect("precision", "Промахов почти нет: шанс промаха ниже на 90%.", 90),
+    # Старый компрессор -- pressure builds from every blow it absorbs, and never vents.
+    _effect("pressure", "За каждый полученный удар: +9% урона, без потолка.", 9),
+    # Рапира идеальной линии -- the line continues for as long as the crits do.
+    _effect("chain_crit", "Критический удар открывает ещё 3 атаки подряд, и каждая из них тоже критическая.", 3),
     _effect("burn", "Каждое попадание поджигает: от 12 урона на трёх ходах соперника; урон растёт с уровнем владельца.", 12, turns=3),
-    _effect("wound", "Каждое попадание наносит 3% начального максимума HP чистым уроном и на столько же снижает максимум HP до конца боя; всего до 18%.", 3, cap=18),
-    _effect("armor_shred", "Каждое попадание ослабляет броню и добавляет 10% урона, до +36%.", 10, cap=36),
+    _effect("wound", "Каждое попадание наносит 4% начального максимума HP чистым уроном и на столько же снижает максимум HP до конца боя; всего до 24%.", 4, cap=24),
+    _effect("armor_shred", "Каждое попадание ослабляет броню и добавляет 13% урона, до +44%.", 13, cap=44),
 )
 
 # Exactly half of the rare weapons get a passive. Repeating a modifier is deliberate:
@@ -461,7 +469,7 @@ _LEGACY_WEAPONS: Final = (
 # Four generated legendary slots get actual punch-line names instead of inheriting a
 # catalogue suffix.  w003 above is the fifth legendary and remains migration-compatible.
 _LEGENDARY_COPY: Final = (
-    ("Рапира идеальной линии", "Промах для неё считается технической неисправностью."),
+    ("Рапира идеальной линии", "Один точный укол тянет за собой следующий."),
     ("Клинок вечного жара", "Пламя переживает и бой, и победителя."),
     ("Коса пустого здоровья", "Каждый взмах оставляет всё меньше места для жизни."),
     ("Молот нулевой брони", "После него защита остаётся только воспоминанием."),
@@ -477,9 +485,14 @@ _ASCENDED_LEGENDARIES: Final = {
         _effect("venom_blade", "Попадание копит от 12 яда и даёт следующей атаке врага 30% промаха; урон растёт с уровнем владельца.", 30, poison=12),
     ),
     "w129": (
-        "Казначейский клинок", "Считает чужие монеты быстрее, чем наносит удары.",
+        "Казначейский клинок", "Сначала выписывает счёт, потом взыскивает.",
         (("strength", 28), ("agility", 7), ("luck", 5), ("armor", -5)),
-        _effect("coin_rake", "За победу: +3 монеты за попадание, максимум +16.", 3, cap=16),
+        # The old version was a legendary weapon with no combat effect whatsoever: the
+        # balance harness scored it an exact zero because there was nothing in the fight
+        # to score. `tax` keeps the whole purse clause and adds the bite that a trophy
+        # weapon has to have -- a share of what the target has LEFT, so it never finishes
+        # anybody by itself and never stops being felt either.
+        _effect("tax", "Каждое попадание взимает 8% текущего HP соперника. За победу: +3 монеты за попадание, максимум +16.", 8, cap=16),
     ),
     "w147": (
         "Пила алого следа", "После неё бой ещё долго не может остановиться.",
@@ -492,9 +505,13 @@ _ASCENDED_LEGENDARIES: Final = {
         _effect("shield_breaker", "Первое попадание ломает щит, бьёт на 75% сильнее и навсегда снимает 25% брони.", 100, power=75, shred=25),
     ),
     "w189": (
-        "Маятник тяжёлого ритма", "Считает только до двух — третьего удара обычно не нужно.",
+        "Маятник тяжёлого ритма", "Качнулся туда — качнётся и обратно.",
         (("strength", 32), ("health", 10), ("agility", -5)),
-        _effect("heavy_combo", "Каждое второе попадание наносит на 45% больше урона.", 45, every=2),
+        # `heavy_combo` 45 against the rare's 40 was a five-point difference on the item
+        # card and two win points in the harness. A pendulum that swings twice is the same
+        # fantasy as a rhythm weapon and a genuinely different rule: every on-hit passive
+        # in the loadout fires twice a turn, and so does every risk of being countered.
+        _effect("double_strike", "Каждый ход бьёт дважды, по 55% урона за удар.", 55),
     ),
 }
 
@@ -516,7 +533,10 @@ _NEW_BUILD_WEAPONS: Final = (
     (
         "w502", "Зеркальный шар", "Каждый осколок — отдельный шанс на удачу.",
         "legendary", (("strength", 30), ("luck", 9), ("armor", -5)),
-        _effect("lucky", "Крит в бою: +20%.", 20),
+        # Bottom of the legendary band at +20, one win point clear of the RARE crit weapon
+        # it is supposed to tower over. This build still needs a legendary weapon carrying
+        # `lucky` (see the note above), so the fix is the number, not the code.
+        _effect("lucky", "Крит в бою: +30%.", 30),
     ),
     (
         "w503", "Банка с пиявками", "Присасывается быстрее, чем вы успеваете возразить.",
@@ -526,7 +546,70 @@ _NEW_BUILD_WEAPONS: Final = (
     (
         "w504", "Капельница скорой помощи", "Забирает и возвращает — в свою пользу.",
         "legendary", (("strength", 30), ("health", 10), ("agility", -4)),
-        _effect("vampiric", "Лечит 20% нанесённого урона.", 20),
+        _effect("vampiric", "Лечит 30% нанесённого урона.", 30),
+    ),
+    # Two rules the legendary tier owns outright, on their own drop-only codes rather than
+    # on top of an existing build's weapon: adding them here keeps w501..w504 and every
+    # inventory referencing them untouched.
+    (
+        "w505", "Зеркальный шар в осколках", "Копит отражения, пока не лопнет разом.",
+        "legendary", (("strength", 29), ("luck", 7), ("agility", 3), ("armor", -5)),
+        _effect("shatter", "Каждое попадание оставляет осколок. Каждый пятый разбивает их все: 5% максимального HP соперника за осколок.", 5, every=5),
+    ),
+    (
+        "w506", "Серп жатвы", "Тем острее, чем меньше от соперника осталось.",
+        "legendary", (("strength", 30), ("health", 8), ("luck", 4), ("armor", -4)),
+        _effect("reap", "Каждое попадание забирает себе 7% недостающего здоровья соперника.", 7),
+    ),
+)
+
+# Проклятые легендарки. Каждая несёт эффект СИЛЬНЕЕ обычной легендарки и цену, которая
+# может стоить боя -- одно правило, а не бонус со сноской.
+#
+# They are ordinary `legendary` items on purpose. A sixth rarity would have to be taught to
+# the drop tables, the forge, five rarity badge tables, the web cabinet and the filters,
+# and would buy nothing the name and the effect text do not already say. What marks the
+# shelf is that these are the only passives in the game that can lose a fight on their own.
+_CURSED_LEGENDARIES: Final = (
+    (
+        "w507", "Кувалда обратного отсчёта", "Два хода она не бьёт. Третий решает всё.",
+        (("strength", 34), ("health", 12), ("agility", -6), ("armor", -4)),
+        _effect("charge_crit", "Заряжается 2 хода и всё это время получает на 20% больше урона. Затем бьёт критом ×5.", 430, turns=2, taken=20),
+    ),
+    (
+        "w508", "Рулетка слепого гнева", "Бьёт куда-то. Иногда — совсем не туда.",
+        (("strength", 33), ("luck", 8), ("agility", -5), ("armor", -5)),
+        _effect("wild_swing", "30%: удар втрое сильнее. 18%: вместо удара лечит соперника на 15% его максимума.", 200, crit=30, heal=18, gift=15),
+    ),
+    (
+        "w509", "Секира зажмуренных глаз", "Три взмаха видит всё. Потом не видит ничего.",
+        (("strength", 35), ("agility", -4), ("luck", -4), ("armor", 6)),
+        _effect("blind_fury", "3 хода не может промахнуться и бьёт на 95% сильнее. Следующие 2 хода промахивается всегда.", 3, blind=2, power=95),
+    ),
+    (
+        "w510", "Стеклянная катана", "Режет что угодно. И ломается обо что угодно.",
+        (("strength", 34), ("agility", 6), ("health", -8), ("armor", -8)),
+        _effect("glass_body", "+140% своего урона и +55% всего получаемого урона.", 140, taken=55),
+    ),
+    (
+        "w511", "Клинок кровавой пошлины", "Платить приходится вперёд и своим.",
+        (("strength", 35), ("luck", 5), ("health", -6), ("armor", -5)),
+        _effect("blood_price", "+85% урона, но каждое попадание стоит 8% собственного HP.", 85, toll=8),
+    ),
+    (
+        "w512", "Голодный лом", "Ест соперника, хозяина и сам себя.",
+        (("strength", 33), ("health", 8), ("agility", 4), ("armor", -6)),
+        _effect("hunger", "+11% урона за каждый раунд, без потолка. Каждый ход теряет 5% максимального HP (не ниже 30%).", 11, decay=5, floor=30),
+    ),
+    (
+        "w513", "Долговая расписка", "Смерть подождёт. Проценты — нет.",
+        (("strength", 30), ("health", 14), ("luck", 4), ("armor", -6)),
+        _effect("soul_debt", "Один раз переживает смертельный удар и возвращается на 40% HP. После этого получает вдвое больше урона.", 40, debt=100),
+    ),
+    (
+        "w514", "Отбойник", "Отдача сильнее, чем удар. Почти.",
+        (("strength", 34), ("luck", 7), ("agility", -5), ("armor", -4)),
+        _effect("recoil", "Крит в бою: +5%. Критический удар бьёт на 450% сильнее, но отдача забирает следующий ход.", 450, crit=5),
     ),
 )
 
@@ -668,7 +751,13 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
     ]
     # The word banks offer far more than 500 pairs. The early stop keeps the public range
     # w001..w500 and, crucially, all existing inventory codes stable.
-    for code, name, description, rarity, bonuses, effect in _NEW_BUILD_WEAPONS:
+    hand_written = [
+        *((code, name, description, rarity, bonuses, effect)
+          for code, name, description, rarity, bonuses, effect in _NEW_BUILD_WEAPONS),
+        *((code, name, description, "legendary", bonuses, effect)
+          for code, name, description, bonuses, effect in _CURSED_LEGENDARIES),
+    ]
+    for code, name, description, rarity, bonuses, effect in hand_written:
         buy_price, resale_price = _prices(rarity, "drop", bonuses)
         entries.append(WeaponSpec(
             code=code,
@@ -691,6 +780,10 @@ WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = _build_catalogue()
 # not additions, if the total weapon count must remain exactly 504.
 RAW_ITEMS: Final[tuple[dict[str, object], ...]] = tuple(item.raw_item() for item in WEAPON_SPECS)
 WEAPON_COUNT: Final = len(WEAPON_SPECS)
+# Published so the UI, the balance report and the tests can name the cursed shelf without
+# re-deriving it from a code list. These items are ordinary legendaries to every drop,
+# forge and inventory path -- the set exists to LABEL them, never to gate them.
+CURSED_LEGENDARY_CODES: Final = frozenset(row[0] for row in _CURSED_LEGENDARIES)
 RARITY_COUNTS: Final = {rarity: sum(item.rarity == rarity for item in WEAPON_SPECS) for rarity in RARITIES}
 PRE_REBALANCE_BUY_PRICES: Final = {
     item.code: _pre_rebalance_buy_price(item.code, item.rarity, item.source)
@@ -700,7 +793,7 @@ PRE_REBALANCE_BUY_PRICES: Final = {
 
 def _validate_catalogue() -> None:
     """Fail immediately if a future catalogue edit violates its public contract."""
-    assert WEAPON_COUNT == 504
+    assert WEAPON_COUNT == 514
     assert len({item.code for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.name for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.description for item in WEAPON_SPECS}) == WEAPON_COUNT
@@ -714,9 +807,9 @@ def _validate_catalogue() -> None:
                                    for key, value in item.bonuses) for item in WEAPON_SPECS)
     assert all(item.drop_weight == 0 for item in WEAPON_SPECS if item.source == "shop")
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
-    # The generated 500 carry 75/250/120/45/10; _NEW_BUILD_WEAPONS then adds two more
-    # rare drops and two more legendary drops on top (w501..w504).
-    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 47, "legendary": 12}
+    # The generated 500 carry 75/250/120/45/10; _NEW_BUILD_WEAPONS then adds two rare and
+    # four legendary drops (w501..w506) and _CURSED_LEGENDARIES eight more (w507..w514).
+    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 47, "legendary": 22}
     # Every legendary carries a passive; the promoted five come from effect-bearing rare
     # lines, leaving twenty modified rares and twenty-five plain ones out of the generated
     # 500 -- plus the two effect-bearing rares and two legendaries in _NEW_BUILD_WEAPONS.
@@ -739,6 +832,7 @@ def _validate_catalogue() -> None:
         expected |= {dict(effect)["code"] for _, _, _, r, _, effect in _NEW_BUILD_WEAPONS if r == rarity}
         if rarity == "legendary":
             expected |= {dict(data[3])["code"] for data in _ASCENDED_LEGENDARIES.values()}
+            expected |= {dict(data[4])["code"] for data in _CURSED_LEGENDARIES}
         assert used == expected if rarity == "legendary" else used <= expected
     starter_shop_items = [
         item for item in WEAPON_SPECS
@@ -753,4 +847,5 @@ _validate_catalogue()
 __all__ = [
     "RARITIES", "SOURCES", "STAT_KEYS", "WeaponSpec", "WEAPON_SPECS", "RAW_ITEMS", "WEAPON_COUNT",
     "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "STARTER_WEAPON_MAX_PRICE", "shop_price_for_bonuses",
+    "CURSED_LEGENDARY_CODES",
 ]

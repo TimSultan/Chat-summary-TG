@@ -160,6 +160,17 @@ _EFFECT_DEFAULTS = {
     "coin_rake": 1, "bleed": 2, "shield_breaker": 100, "heavy_combo": 50,
     "phantom_step": 1, "afterimage": 45, "rewind": 25,
     "echo_strike": 50, "crushing_grip": 10, "perfect_parry": 35,
+    # Legendary-only mechanics. Every legendary weapon used to carry a bigger number of a
+    # passive a rare weapon already had -- twelve flagships and not one rule the tier owned
+    # by itself. These six are the legendary weapon's own vocabulary; nothing below the tier
+    # carries them.
+    "chain_crit": 100, "double_strike": 65, "shatter": 10, "reap": 20,
+    "pressure": 8, "tax": 4,
+    # Cursed legendaries: a genuinely large upside welded to a genuinely large cost, in one
+    # rule. These are the only passives in the catalogue that can lose a fight on their own,
+    # which is the entire point of the shelf.
+    "charge_crit": 400, "wild_swing": 200, "blind_fury": 3, "glass_body": 90,
+    "blood_price": 80, "hunger": 14, "soul_debt": 40, "recoil": 150,
 }
 
 _EFFECT_TEXT = {
@@ -215,6 +226,25 @@ _EFFECT_TEXT = {
     "shield_counterattack": "щит отвечает контрударом: {amount} урона.",
     "guard": "держит защиту: поглощено {amount} урона.",
     "steel_heal": "впитывает стальной удар вместо урона: +{amount} HP.",
+    "chain_crit": "ведёт линию дальше: крит открывает ещё одну атаку.",
+    "double_strike": "качается обратно и бьёт второй раз.",
+    "shatter": "оставляет осколок на сопернике.",
+    "shatter_burst": "разбивает все осколки разом: {amount} урона.",
+    "reap": "снимает с раненого соперника {amount} HP себе.",
+    "tax": "взимает пошлину: {amount} урона.",
+    "pressure": "поднимает давление: удар сильнее ещё на {amount}%.",
+    "charge_crit": "заводит удар — и открывается ({amount} ход заряда).",
+    "charge_crit_release": "спускает весь заряд разом.",
+    "wild_swing": "бьёт вслепую и попадает идеально.",
+    "wild_swing_heal": "промахивается так, что лечит соперника на {amount} HP.",
+    "wild_swing_miss": "проворачивает рулетку и бьёт мимо всего сразу.",
+    "blind_fury": "открывает глаза: {amount} хода без промаха.",
+    "blind_fury_blind": "зажмуривается и бьёт в пустоту.",
+    "glass_body": "звенит стеклом: бьёт сильнее и держит хуже.",
+    "blood_price": "платит кровью за удар: {amount} HP.",
+    "hunger": "голодает: −{amount} максимального HP, но урон растёт.",
+    "soul_debt": "выкупает себя из смерти: +{amount} HP и вдвое хуже защита.",
+    "recoil": "отдачей выбивает себя из следующего хода.",
 }
 
 
@@ -441,13 +471,18 @@ def _scaled_flat_damage(value: float, fighter: "Fighter", attack_damage: float) 
     as ``6 poison`` or ``2 bleed``. The stronger of the level and damage curves wins,
     rather than multiplying them together, so the effect stays useful without double-
     dipping every stat increase.
+
+    The damage curve is linear in the swing. See pets_config's note: as a square root it
+    fell behind the health bars it was ticking against, so every one of these passives got
+    quietly weaker the higher a pet levelled -- the opposite of what the catalogue text
+    promises. Tied to the swing directly, a tick keeps the same share of a fight forever.
     """
     base = max(0.0, float(value or 0))
     level = max(1, int(fighter.level or 1))
     level_factor = 1.0 + C.FLAT_EFFECT_LEVEL_SQRT_GROWTH * math.sqrt(level - 1)
-    damage_factor = math.sqrt(max(
+    damage_factor = max(
         1.0, float(attack_damage or 0) / C.FLAT_EFFECT_DAMAGE_REFERENCE,
-    ))
+    )
     return max(1, round(base * max(level_factor, damage_factor)))
 
 
@@ -546,6 +581,12 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         dodge = min(.60, max(0.0, dodge + _fraction(value)))
     if (value := _effect_value(effects, "lucky")) is not None:
         crit = min(.60, max(0.0, crit + _fraction(value)))
+    if (value := _effect_value(effects, "recoil")) is not None:
+        # The recoil weapon's whole payload rides on landing a critical, so at an ordinary
+        # luck stat it simply did not fire often enough to pay for the turns it costs --
+        # raising the crit's SIZE past 620% bought almost nothing measurable, because the
+        # blow already overkills. Raising how often it happens is the lever that works.
+        crit = min(.60, max(0.0, crit + _fraction(_param(effects, "recoil", "crit", 0))))
     if (value := _effect_value(effects, "plating")) is not None:
         reduction = min(.70, max(0.0, reduction + _fraction(value)))
     if (value := _effect_value(effects, "precision")) is not None:
@@ -784,10 +825,29 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     bleeding: dict[str, tuple[str, int, int] | None] = {a.key: None, b.key: None}
     afterimage_bonus = {a.key: 0.0, b.key: 0.0}
     damage_weakened = {a.key: 0.0, b.key: 0.0}
+    # Legendary and cursed-legendary state. Every one of these is per fight and dies with
+    # it, exactly like the dicts above, so a snapshot replay still reproduces the fight.
+    extra_attacks = {a.key: 0, b.key: 0}   # chain_crit / double_strike follow-ups owed
+    chained = {a.key: 0, b.key: 0}         # follow-ups owed specifically to chain_crit
+    shatter_stacks = {a.key: 0, b.key: 0}  # shards sitting ON this key, laid by the other
+    vulnerable = {a.key: 0.0, b.key: 0.0}  # extra share of incoming damage taken
+    charging = {a.key: 0, b.key: 0}        # charge_crit turns already spent winding up
+    blind_cycle = {a.key: 0, b.key: 0}     # blind_fury position in its sighted/blind loop
+    hits_taken = {a.key: 0, b.key: 0}      # pressure: every blow that actually landed
+    skip_turn = {a.key: False, b.key: False}  # recoil knocked this fighter out of a turn
+    in_followup = {a.key: False, b.key: False}  # this strike is an earned extra attack
     stun_procs = {a.key: 0, b.key: 0}
     guards = {a.key: 0.0, b.key: 0.0}
     used_scrolls = {a.key: set() for a in (a, b)}
     skill_statuses = {a.key: {} for a in (a, b)}
+    for _key in (a.key, b.key):
+        # Glass is glass from the opening bell, not from the first hit: the penalty half of
+        # the bargain has to be live before anybody swings, or the curse would be a free
+        # damage bonus for whoever moves first.
+        if (_glass := _effect_value(effects[_key], "glass_body")) is not None:
+            vulnerable[_key] += max(0, _fraction(_param(
+                effects[_key], "glass_body", "taken", _glass,
+            )))
 
     def scaled_flat_damage(source_key: str, value: float, code: str) -> int:
         spec = _effect(effects[source_key], code) or {}
@@ -936,6 +996,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         """Apply damage and one-shot defensive effects. Returns (impact, knockout)."""
         damage = max(0, int(damage))
         damage = round(damage * derived[target_key]["incoming_damage_multiplier"])
+        # A curse that trades defence for offence is charged here rather than at the
+        # attacker's multiplier block, so it also applies to burns, bleeds, thorns and
+        # every other source that reaches a fighter without going through an attack roll.
+        # That is the whole bargain: a glass body is glass to everything.
+        if effectful and damage and vulnerable[target_key]:
+            damage = round(damage * (1 + vulnerable[target_key]))
         # The parry is an incoming-hit reaction, not a Defend hook: its wearer may be
         # attacked while taking any action.  It can proc once per fight, so it buys a
         # meaningful turn without creating a stun lock against a boss or a pet.
@@ -1008,12 +1074,25 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             effect_round(number, target_key, source_key, "opening_shield", round(absorbed))
         damage = max(0, damage)
         rescue = next(
-            (code for code in ("rewind", "death_shield", "last_stand")
+            (code for code in ("soul_debt", "rewind", "death_shield", "last_stand")
              if code not in used[target_key] and _effect_value(effects[target_key], code) is not None),
             None,
         )
         if effectful and damage >= hp[target_key] and rescue:
             used[target_key].add(rescue)
+            if rescue == "soul_debt":
+                # Cheaper than rewind at the moment it fires and far more expensive
+                # afterwards: the debt is collected for the rest of the fight, on every
+                # source of damage, which is what makes this a curse and not a second life.
+                restored = max(1, round(max_hp[target_key] * max(0, _fraction(
+                    _effect_value(effects[target_key], "soul_debt") or 0
+                ))))
+                hp[target_key] = restored
+                vulnerable[target_key] += max(0, _fraction(_param(
+                    effects[target_key], "soul_debt", "debt", 100,
+                )))
+                effect_round(number, target_key, source_key, rescue, restored)
+                return 0, False
             if rescue == "rewind":
                 restored = max(1, round(max_hp[target_key] * max(0, _fraction(
                     _effect_value(effects[target_key], "rewind") or 0
@@ -1606,6 +1685,50 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             ))
             tick_skill_state(attacker_key)
             return None
+        if effectful and skip_turn[attacker_key]:
+            # The recoil is charged one turn AFTER the oversized crit that caused it, so
+            # the player reads the reward and its price as two consecutive lines rather
+            # than as a number that silently failed to appear.
+            skip_turn[attacker_key] = False
+            attacks_made[attacker_key] += 1
+            effect_round(round_number, attacker_key, defender_key, "recoil", is_action=True)
+            tick_skill_state(attacker_key)
+            return None
+        if effectful and (value := _effect_value(effects[attacker_key], "hunger")) is not None:
+            # Uncapped damage growth paid for in maximum health, every turn, forever. The
+            # floor keeps the curse from killing its own owner outright -- it starves them
+            # into a shape where one clean hit finishes it, which is a fight worth watching.
+            decay = max(0, _fraction(_param(effects[attacker_key], "hunger", "decay", 4)))
+            floor = derived[attacker_key]["max_hp"] * max(0.05, _fraction(_param(
+                effects[attacker_key], "hunger", "floor", 30,
+            )))
+            lost = max(0.0, min(
+                max_hp[attacker_key] - floor,
+                derived[attacker_key]["max_hp"] * decay,
+            ))
+            if lost >= 1:
+                max_hp[attacker_key] -= lost
+                hp[attacker_key] = min(hp[attacker_key], max_hp[attacker_key])
+                effect_round(round_number, attacker_key, defender_key, "hunger", round(lost))
+                if hp[attacker_key] <= 0:
+                    return defender_key
+        if effectful and (value := _effect_value(effects[attacker_key], "charge_crit")) is not None:
+            turns = max(1, round(_param(effects[attacker_key], "charge_crit", "turns", 3)))
+            if charging[attacker_key] < turns:
+                # Winding up is the whole action, and the wide-open guard it costs is
+                # applied for exactly as long as the wind-up lasts.
+                charging[attacker_key] += 1
+                if charging[attacker_key] == 1:
+                    vulnerable[attacker_key] += max(0, _fraction(_param(
+                        effects[attacker_key], "charge_crit", "taken", 25,
+                    )))
+                attacks_made[attacker_key] += 1
+                effect_round(
+                    round_number, attacker_key, defender_key, "charge_crit",
+                    charging[attacker_key], is_action=True,
+                )
+                tick_skill_state(attacker_key)
+                return None
         if effectful and _effect_value(effects[attacker_key], "cocoon") is not None \
                 and "cocoon" not in used[attacker_key]:
             used[attacker_key].add("cocoon")
@@ -1677,7 +1800,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             healed = round(hp[attacker_key] - before)
             if healed:
                 effect_round(round_number, attacker_key, defender_key, "regen", healed)
-        if skill_loadouts[attacker_key] or equipped_shields[attacker_key]:
+        # An earned extra attack is an ATTACK. Letting the ordinary action roll run here
+        # meant a chained crit could spend itself raising a shield, which is neither what
+        # the item says nor what anybody reading the transcript expects to see.
+        if not in_followup[attacker_key] and (
+            skill_loadouts[attacker_key] or equipped_shields[attacker_key]
+        ):
             choices = active_actions(attacker_key)
             # Every available scroll has the same one-ticket chance. A plain attack has
             # four tickets so active combat does not turn into an endless wall of heals
@@ -1716,6 +1844,54 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 _effect_value(effects[attacker_key], "shield_breaker") or 0
             ))
             defender_numbers["reduction"] *= max(0.0, 1 - ignored)
+        # Blind fury runs a fixed, published loop rather than a chance: so many sighted
+        # swings that cannot miss, then so many that cannot land. The counter advances on
+        # every attack the weapon actually takes, so a stun or a charge-up never desyncs
+        # the player's count from the engine's.
+        blind_sighted = blind_blind = False
+        if effectful and (value := _effect_value(effects[attacker_key], "blind_fury")) is not None:
+            sighted = max(1, round(value))
+            blind = max(1, round(_param(effects[attacker_key], "blind_fury", "blind", 2)))
+            position = blind_cycle[attacker_key] % (sighted + blind)
+            blind_cycle[attacker_key] += 1
+            blind_sighted, blind_blind = position < sighted, position >= sighted
+            if position == 0:
+                effect_round(round_number, attacker_key, defender_key, "blind_fury", sighted)
+        # A blind swing is spent before anything else is rolled: it is not a dodge the
+        # defender earned, so no dodge-side passive may read it as one.
+        if blind_blind:
+            attacks_made[attacker_key] += 1
+            landed_hits[attacker_key] = 0
+            effect_round(round_number, attacker_key, defender_key, "blind_fury_blind", is_action=True)
+            tick_skill_state(attacker_key)
+            return None
+        # The wild swing decides between its two extremes before the ordinary roll, so the
+        # gift to the opponent replaces the attack outright instead of arriving on top of
+        # one. Both branches consume the turn -- that is what makes the coin worth flipping.
+        wild_crit = False
+        if effectful and (value := _effect_value(effects[attacker_key], "wild_swing")) is not None:
+            roll = rng.random()
+            heal_chance = max(0.0, _fraction(_param(effects[attacker_key], "wild_swing", "heal", 18)))
+            crit_chance = max(0.0, _fraction(_param(effects[attacker_key], "wild_swing", "crit", 30)))
+            if roll < heal_chance:
+                gift = max(1, round(max_hp[defender_key] * max(0, _fraction(_param(
+                    effects[attacker_key], "wild_swing", "gift", 15,
+                )))))
+                before_gift = hp[defender_key]
+                hp[defender_key] = min(max_hp[defender_key], hp[defender_key] + gift)
+                attacks_made[attacker_key] += 1
+                landed_hits[attacker_key] = 0
+                healed = round(hp[defender_key] - before_gift)
+                # Against an opponent already at full health the gift heals nothing, and
+                # "лечит соперника на 0 HP" is a sillier line than the wasted turn deserves.
+                effect_round(
+                    round_number, attacker_key, defender_key,
+                    "wild_swing_heal" if healed else "wild_swing_miss",
+                    healed, is_action=True,
+                )
+                tick_skill_state(attacker_key)
+                return None
+            wild_crit = roll < heal_chance + crit_chance
         forced_venom_miss = venom_miss[attacker_key] > 0 and rng.random() < venom_miss[attacker_key]
         venom_miss[attacker_key] = 0.0
         forced_skill_miss = False
@@ -1723,7 +1899,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             forced_skill_miss = True
         elif skill_value(attacker_key, "blind") > 0:
             forced_skill_miss = rng.random() < min(.80, skill_value(attacker_key, "blind"))
-        phantom_dodge = effectful \
+        phantom_dodge = effectful and not (blind_sighted or wild_crit) \
             and _effect_value(effects[defender_key], "phantom_step") is not None \
             and phantom_dodges[defender_key] < max(1, round(_param(
                 effects[defender_key], "phantom_step", "hits", 1,
@@ -1731,10 +1907,24 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         if phantom_dodge:
             phantom_dodges[defender_key] += 1
             effect_round(round_number, defender_key, attacker_key, "phantom_step")
+        # The chain is a chain because each link is another perfect hit -- rolling an
+        # ordinary swing for the follow-up made the passive worth a third of its tier.
+        chain_link = False
+        if effectful and chained[attacker_key] > 0:
+            chained[attacker_key] -= 1
+            chain_link = True
+        if blind_sighted or wild_crit or chain_link:
+            # "Cannot miss" has to mean it, so the sighted half of the loop overrides every
+            # miss source in the engine, not merely the defender's dodge stat.
+            defender_numbers = dict(defender_numbers)
+            defender_numbers["dodge"] = 0.0
+            forced_venom_miss = forced_skill_miss = False
         event, damage = (
             ("dodge", 0) if forced_venom_miss or forced_skill_miss or phantom_dodge
             else _resolve_blow(derived[attacker_key], defender_numbers, rng)
         )
+        if (wild_crit or chain_link) and event != "dodge":
+            event = "crit"
         if signature and signature[0] == "health":
             damage = 0 if signature[1] == 3 else round(damage * 0.5)
             event = "signature_health"
@@ -1803,6 +1993,49 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 if (landed_hits[attacker_key] + 1) % every == 0:
                     multiplier += max(0, _fraction(value))
                     effect_round(round_number, attacker_key, defender_key, "heavy_combo")
+            # --- legendary and cursed multipliers -------------------------------------
+            if (value := _effect_value(effects[attacker_key], "glass_body")) is not None:
+                multiplier += max(0, _fraction(value))
+            if (value := _effect_value(effects[attacker_key], "blood_price")) is not None:
+                multiplier += max(0, _fraction(value))
+            if (value := _effect_value(effects[attacker_key], "hunger")) is not None:
+                # Deliberately uncapped. The starving half of the rule is the cap: the
+                # longer this runs the harder it hits and the less there is left to hit
+                # with, and which of the two arrives first is the fight.
+                multiplier += max(0, _fraction(value)) * max(0, round_number - 1)
+            if (value := _effect_value(effects[attacker_key], "pressure")) is not None:
+                # Rises with blows TAKEN, not rounds survived, so the compressor rewards
+                # standing in the fire rather than merely being in a long fight.
+                multiplier += max(0, _fraction(value)) * hits_taken[attacker_key]
+            if wild_crit and (value := _effect_value(effects[attacker_key], "wild_swing")) is not None:
+                multiplier += max(0, _fraction(value))
+            if blind_sighted:
+                # "Cannot miss" alone is worth about what the defender's dodge stat is
+                # worth -- a fraction of what two guaranteed whiffs cost. The open-eyed
+                # swings carry the weight; the miss immunity is what makes them land.
+                multiplier += max(0, _fraction(_param(
+                    effects[attacker_key], "blind_fury", "power", 0,
+                )))
+            if event == "crit" and (value := _effect_value(
+                effects[attacker_key], "recoil",
+            )) is not None:
+                multiplier += max(0, _fraction(value))
+            if (value := _effect_value(effects[attacker_key], "double_strike")) is not None:
+                # Both halves are charged the same discount, including the follow-up this
+                # same block queues below, so "twice at 65%" is exactly what lands.
+                multiplier *= max(0.10, _fraction(value))
+            if charging[attacker_key] and (value := _effect_value(
+                effects[attacker_key], "charge_crit",
+            )) is not None:
+                # Everything the wind-up bought is spent on this one blow: the stored
+                # multiplier, and the open guard it cost closes again with it.
+                charging[attacker_key] = 0
+                vulnerable[attacker_key] = max(0.0, vulnerable[attacker_key] - max(0, _fraction(
+                    _param(effects[attacker_key], "charge_crit", "taken", 25),
+                )))
+                multiplier += max(0, _fraction(value))
+                event = "crit" if event != "dodge" else event
+                effect_round(round_number, attacker_key, defender_key, "charge_crit_release")
             if _effect_value(effects[attacker_key], "giant_slayer") is not None and attacker.level < defender.level:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "giant_slayer") or 0))
             if _effect_value(effects[attacker_key], "mob_hunter") is not None \
@@ -2003,6 +2236,75 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 healed = round(hp[attacker_key] - before)
                 if healed:
                     effect_round(round_number, attacker_key, defender_key, "vampiric", healed)
+            # Pressure counts ordinary attacks that landed on somebody. Deliberately not
+            # burn or bleed ticks: those arrive several times a round and would wind the
+            # compressor far past anything the number on the item suggests.
+            hits_taken[defender_key] += 1
+            if (value := _effect_value(effects[attacker_key], "reap")) is not None:
+                # A share of what the opponent has already LOST, not of what this blow
+                # dealt: the drip pays nothing against a healthy enemy and pays enormously
+                # against a dying one, which is a different weapon from vampirism.
+                missing = max(0.0, max_hp[defender_key] - hp[defender_key])
+                harvest = round(missing * max(0, _fraction(value)))
+                if harvest >= 1:
+                    before_reap = hp[attacker_key]
+                    hp[attacker_key] = min(
+                        max_hp[attacker_key], hp[attacker_key] + harvest,
+                    )
+                    healed = round(hp[attacker_key] - before_reap)
+                    if healed:
+                        effect_round(round_number, attacker_key, defender_key, "reap", healed)
+            if (value := _effect_value(effects[attacker_key], "tax")) is not None                     and not knocked_out:
+                # Percent of CURRENT health, so it never finishes anybody on its own and
+                # never stops mattering either -- and it is the combat half of a passive
+                # whose other half is paid out of the arena purse in pets.record_fight.
+                levy = max(1, round(hp[defender_key] * max(0, _fraction(value))))
+                levy_impact, levy_ko = hurt(attacker_key, defender_key, levy, round_number)
+                total_damage[attacker_key] += levy_impact
+                effect_round(round_number, attacker_key, defender_key, "tax", levy_impact)
+                if levy_ko:
+                    return attacker_key
+            if (value := _effect_value(effects[attacker_key], "shatter")) is not None                     and not knocked_out:
+                every = max(2, round(_param(effects[attacker_key], "shatter", "every", 5)))
+                shatter_stacks[defender_key] += 1
+                if shatter_stacks[defender_key] % every:
+                    effect_round(round_number, attacker_key, defender_key, "shatter")
+                else:
+                    burst = max(1, round(
+                        max_hp[defender_key] * max(0, _fraction(value)) * every
+                    ))
+                    burst_impact, burst_ko, reflection_winner = apply_attack(
+                        attacker_key, defender_key, burst, round_number,
+                        attack_types=(MAGIC,), allow_shield_reactions=False,
+                    )
+                    total_damage[attacker_key] += burst_impact
+                    effect_round(
+                        round_number, attacker_key, defender_key, "shatter_burst",
+                        burst_impact, (MAGIC,),
+                    )
+                    if reflection_winner:
+                        return reflection_winner
+                    if burst_ko:
+                        return attacker_key
+            if (value := _effect_value(effects[attacker_key], "blood_price")) is not None:
+                # Charged after the blow lands, out of CURRENT health, and never lethal:
+                # the curse is meant to leave its owner one hit from death, not to hand
+                # the win to an opponent who never touched them.
+                toll = max(1, round(hp[attacker_key] * max(0, _fraction(_param(
+                    effects[attacker_key], "blood_price", "toll", 7,
+                )))))
+                toll = int(min(toll, max(0.0, hp[attacker_key] - 1)))
+                if toll:
+                    hp[attacker_key] -= toll
+                    effect_round(round_number, attacker_key, defender_key, "blood_price", toll)
+            if event == "crit" and _effect_value(effects[attacker_key], "recoil") is not None:
+                skip_turn[attacker_key] = True
+            if event == "crit" and (value := _effect_value(
+                effects[attacker_key], "chain_crit",
+            )) is not None and not knocked_out                     and not chain_link                     and extra_attacks[attacker_key] < max(1, round(value)):
+                extra_attacks[attacker_key] += round(value)
+                chained[attacker_key] += round(value)
+                effect_round(round_number, attacker_key, defender_key, "chain_crit")
             if (value := _effect_value(effects[attacker_key], "poison")) is not None and not knocked_out:
                 poison = scaled_flat_damage(attacker_key, value, "poison")
                 queue_damage(pending_poison, defender_key, attacker_key, poison)
@@ -2208,6 +2510,38 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         tick_skill_state(attacker_key)
         return attacker_key if knocked_out else None
 
+    def take_turn(attacker_key: str, defender_key: str, round_number: int) -> str | None:
+        """One fighter's whole turn: the blow, plus any follow-up blows it earned.
+
+        Two legendary passives hand out extra attacks -- a chained crit and a weapon that
+        swings twice -- and both have to resolve inside the turn that produced them rather
+        than stealing the opponent's. The cap is absolute and lives here, not in the
+        passives, so no future combination of them can turn one turn into an endless one.
+        """
+        winner = strike(attacker_key, defender_key, round_number)
+        if winner is not None or not effectful:
+            extra_attacks[attacker_key] = chained[attacker_key] = 0
+            used[attacker_key].discard("double_strike")
+            return winner
+        if _effect_value(effects[attacker_key], "double_strike") is not None                 and "double_strike" not in used[attacker_key]                 and hp[attacker_key] > 0 and hp[defender_key] > 0:
+            used[attacker_key].add("double_strike")
+            extra_attacks[attacker_key] += 1
+            effect_round(round_number, attacker_key, defender_key, "double_strike")
+        for _ in range(C.MAX_EXTRA_ATTACKS_PER_TURN):
+            if extra_attacks[attacker_key] <= 0 or hp[attacker_key] <= 0 or hp[defender_key] <= 0:
+                break
+            extra_attacks[attacker_key] -= 1
+            in_followup[attacker_key] = True
+            try:
+                winner = strike(attacker_key, defender_key, round_number)
+            finally:
+                in_followup[attacker_key] = False
+            if winner is not None:
+                break
+        extra_attacks[attacker_key] = chained[attacker_key] = 0
+        used[attacker_key].discard("double_strike")
+        return winner
+
     stopped_early = False
     winner_key = loser_key = None
     is_draw = False
@@ -2217,11 +2551,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         leader_key = order[(round_number - 1) % 2]
         follower_key = order[round_number % 2]
 
-        winner_key = strike(leader_key, follower_key, round_number)
+        winner_key = take_turn(leader_key, follower_key, round_number)
         if winner_key:
             loser_key = follower_key if winner_key == leader_key else leader_key
             break
-        winner_key = strike(follower_key, leader_key, round_number)
+        winner_key = take_turn(follower_key, leader_key, round_number)
         if winner_key:
             loser_key = leader_key if winner_key == follower_key else follower_key
             break

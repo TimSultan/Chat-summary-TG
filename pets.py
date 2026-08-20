@@ -6250,7 +6250,9 @@ def record_fight(
     # offline defender would break the arena's no-loss guarantee and invite farming one
     # victim. The arena therefore adds the capped amount to the winner's purse. Only
     # ordinary landed attacks count; effect log rows and dodges do not.
-    coin_rake = _equipped_effect(winner, "coin_rake")
+    # `tax` is the legendary form: it bites in combat AND mints on a win, so it settles
+    # here through exactly the same capped path rather than growing a second payout rule.
+    coin_rake = _equipped_effect(winner, "coin_rake") or _equipped_effect(winner, "tax")
     if coin_rake:
         landed = sum(
             1 for blow in getattr(result, "rounds", ())

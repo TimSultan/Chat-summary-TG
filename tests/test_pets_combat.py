@@ -844,8 +844,24 @@ class AmuletEffectTests(unittest.TestCase):
     def test_flat_damage_effects_scale_with_the_owners_level(self):
         low = Fighter("low", "Low", 40, 40, 40, 40, 0, level=1)
         high = Fighter("high", "High", 40, 40, 40, 40, 0, level=25)
-        self.assertEqual(combat._scaled_flat_damage(6, low, 100), 8)
+        self.assertEqual(combat._scaled_flat_damage(6, low, 100), 12)
         self.assertEqual(combat._scaled_flat_damage(6, high, 100), 12)
+
+    def test_flat_damage_keeps_its_share_of_a_swing_at_every_level(self):
+        """The damage half of the curve is linear, and this is why it has to be.
+
+        As a square root it fell behind the fight it was ticking inside: a swing grows
+        about 4.2x between level 10 and level 100 and a health bar 3.8x, so a sqrt-scaled
+        burn kept barely half the share of a health bar it started with. A legendary whose
+        card reads "12 damage a turn" was worth 2.2% of a bar early and 1.1% late -- the
+        flagship passives decaying exactly where the best gear should matter most.
+        """
+        shares = []
+        for level, stat in ((10, 20), (50, 80), (100, 150)):
+            owner = Fighter("a", "A", stat, stat, stat, stat, 5, level=level)
+            swing = C.BASE_DAMAGE + stat * C.DAMAGE_PER_POINT
+            shares.append(combat._scaled_flat_damage(12, owner, swing) / swing)
+        self.assertAlmostEqual(min(shares), max(shares), places=2)
 
     def test_every_legacy_flat_damage_hook_uses_the_level_curve(self):
         opponent = Fighter("b", "B", 10, 200, 20, 20, 0, level=25)

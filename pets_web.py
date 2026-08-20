@@ -8473,9 +8473,13 @@ async function replay(id) {
 // An item's effect amount is not always damage. These are the procs that give HP back, and
 // the ones that stop damage rather than deal it; anything else with a number is a hit.
 // Keyed on the legacy-compatible effect prefix pets_combat uses ("amulet_vampiric").
-const HEAL_PROCS = ["vampiric", "bite", "blood_pact", "second_wind", "medkit", "dodge_heal", "regen", "adrenaline", "rewind"];
+const HEAL_PROCS = ["vampiric", "bite", "blood_pact", "second_wind", "medkit", "dodge_heal", "regen", "adrenaline", "rewind", "reap", "soul_debt", "wild_swing_heal"];
 const SOAK_PROCS = ["opening_shield", "armor_burst", "safeguard", "crit_guard", "countercrit", "death_shield", "last_stand", "perfect_parry"];
-const UTILITY_PROCS = ["gambler", "candle", "armor_shred"];
+// The legendary and cursed procs whose number is a percentage, a turn counter or a cost to
+// the OWNER rather than damage dealt to the opponent. `blood_price` and `hunger` are the
+// odd pair: their number really is HP lost, but by the fighter the row is filed under, so
+// painting it as damage dealt would read as the exact opposite of what happened.
+const UTILITY_PROCS = ["gambler", "candle", "armor_shred", "pressure", "charge_crit", "blind_fury", "blood_price", "hunger"];
 
 function amountTone(round) {
   const event = String(round.event || "");

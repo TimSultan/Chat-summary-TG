@@ -2156,13 +2156,21 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(outcome["dropped_item"], drop_item.code)
 
     def test_coin_rake_adds_only_capped_landed_hit_gold(self):
-        entry = "coin-rake-chat"
+        self._assert_capped_landed_hit_gold("coin_rake", "rare")
+
+    def test_tax_pays_the_same_capped_landed_hit_gold_as_coin_rake(self):
+        """`tax` is the legendary form of the rake: it bites in combat as well, but the
+        purse half must settle through exactly the same capped path, never a second one."""
+        self._assert_capped_landed_hit_gold("tax", "legendary")
+
+    def _assert_capped_landed_hit_gold(self, code, rarity):
+        entry = f"{code}-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
         rake = next(
             item for item in pets_config.ITEMS
-            if getattr(item, "effect", {}).get("code") == "coin_rake"
-            and item.rarity == "legendary"
+            if getattr(item, "effect", {}).get("code") == code
+            and item.rarity == rarity
         )
         data = pets._load(entry)
         data["pets"]["1"]["inventory"] = [rake.code]

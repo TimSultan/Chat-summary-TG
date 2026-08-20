@@ -96,6 +96,23 @@ EFFECT_HOOKS: Final = {
     "echo_strike": "after_first_hit: repeat a share of the damage dealt",
     "crushing_grip": "after_first_hit: permanently weaken enemy damage for this fight",
     "perfect_parry": "after_damage_taken_once: absorb damage and add it to the next attack",
+    # Legendary weapons only. Nothing below the tier carries one of these, which is what
+    # makes a legendary weapon a different rule rather than a larger number.
+    "chain_crit": "on_critical: take an immediate extra attack, up to a chain limit",
+    "double_strike": "on_turn: attack twice at a reduced share of damage each",
+    "shatter": "after_hit: lay a shard, and detonate every shard on the nth one",
+    "reap": "after_hit: heal for a share of the opponent's MISSING health",
+    "pressure": "on_attack: gain uncapped damage for every blow already taken",
+    "tax": "after_hit: deal a share of current enemy health, and mint coins on a win",
+    # Cursed legendaries: one rule holding a large upside and a large cost together.
+    "charge_crit": "on_turn: wind up for n turns wide open, then release one huge blow",
+    "wild_swing": "on_attack: either a far larger critical or a gift of health to the foe",
+    "blind_fury": "on_attack: n attacks that cannot miss, then m that cannot land",
+    "glass_body": "fight_start: deal much more damage and take much more damage",
+    "blood_price": "after_hit: deal much more damage, paid out of own current health",
+    "hunger": "round_start: uncapped damage growth, paid in maximum health every turn",
+    "soul_debt": "on_lethal_once: survive at a share of maximum health, then take double",
+    "recoil": "on_critical: a far larger critical that costs the following turn",
 }
 
 
