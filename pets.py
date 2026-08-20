@@ -47,6 +47,7 @@ import stats
 from app_time import now as app_now
 
 import pets_dungeon as D
+import pets_meadow as MEADOW
 PETS_STORE_VERSION = 7
 # Rolling fight log, capped independently of C.HISTORY_LIMIT (that constant bounds what
 # ONE player is shown per /history call, not how many chat-wide entries are kept on disk)
@@ -2108,6 +2109,8 @@ def ruby_source_of(reason: str) -> str:
         return "pvp"
     if value.startswith("quest:"):
         return "quests"
+    if value.startswith("meadow:"):
+        return "meadow"
     if value == "pet_mob_win" or value.startswith("pve-ruby"):
         return "mobs"
     if value.startswith("admin-grant:") or value.startswith("grant:") \
@@ -2727,6 +2730,231 @@ BUSY_ELSEWHERE_QUARRY = (
 )
 
 
+# --------------------------------------------------------------------------- поляна
+#
+# The board lives in the store from the moment a round starts and is never rebuilt on
+# read. See pets_meadow's module note: rolling it at pick time would make "did I guess
+# right" meaningless, and rolling it on open would turn closing the screen into a reroll.
+
+
+def _meadow_row(data: dict, user_id) -> dict:
+    """This member's meadow wallet and current round, repaired in place.
+
+    Top level of the store rather than on the pet record, for the same reason farm tickets
+    are: a ticket can be earned before a cage is bought, and must not evaporate because
+    there was no pet yet to hang it on.
+    """
+    wallet = data.setdefault("meadow", {})
+    if not isinstance(wallet, dict):
+        wallet = data["meadow"] = {}
+    row = wallet.setdefault(str(user_id), {})
+    if not isinstance(row, dict):
+        row = wallet[str(user_id)] = {}
+    row["tickets"] = _safe_nonnegative_int(row.get("tickets"))
+    if not isinstance(row.get("round"), dict):
+        row["round"] = None
+    return row
+
+
+def meadow_tickets(entry, user_id) -> int:
+    return _meadow_row(_load(entry), user_id)["tickets"]
+
+
+def grant_meadow_ticket(entry, user_id, count: int = 1, reason: str = "") -> int:
+    """Hand over meadow tickets and return the new total.
+
+    `reason` is only for the log: unlike a farm ticket, nothing here is granted off a
+    replayable chat event, so there is no idempotency key to keep.
+    """
+    count = max(0, int(count or 0))
+    if not count:
+        return meadow_tickets(entry, user_id)
+    with _farm_settlement_lock:
+        data = _load(entry)
+        row = _meadow_row(data, user_id)
+        row["tickets"] += count
+        _metric_add(data, "meadow_tickets_granted", count)
+        _save(entry, data)
+        return row["tickets"]
+
+
+def grant_meadow_tickets_once(entry, user_id, count: int, source: str) -> int:
+    """Credit meadow tickets once, keyed on a durable source string.
+
+    The plain `grant_meadow_ticket` is fine for a farm shift or a chest -- those are rolled
+    inside a settlement that already owns its own idempotency. A release-note reward is
+    not: both claim paths credit BEFORE recording the claim, so that a crash between the
+    two replays a grant that already happened rather than swallowing it. That order is only
+    safe if the grant itself refuses to pay twice, which is what this is for.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        row = _meadow_row(data, user_id)
+        sources = data.setdefault("meadow_sources", {})
+        if source in sources:
+            return row["tickets"]
+        credited = max(0, int(count or 0))
+        row["tickets"] += credited
+        sources[source] = {"user_id": str(user_id), "amount": credited}
+        _metric_add(data, "meadow_tickets_granted", credited)
+        _save(entry, data)
+        return row["tickets"]
+
+
+def meadow_status(entry, user_id) -> dict:
+    """Everything a client may know: the wallet, the shelf, and the round in progress.
+
+    The active round is passed through pets_meadow.public_state, which strips every cell
+    nobody has opened yet. The full board is added only once the round is over.
+    """
+    row = _meadow_row(_load(entry), user_id)
+    tickets = row["tickets"]
+    active = row.get("round")
+    current = MEADOW.public_state(active) if isinstance(active, dict) else None
+    if current and current.get("finished"):
+        current["board"] = MEADOW.final_board(active)
+    return {
+        "tickets": tickets,
+        "round": current,
+        "meadows": [
+            {
+                "size": rules.size,
+                "title": rules.title,
+                "side": rules.side,
+                "cells": rules.cells,
+                "diamonds": rules.diamonds,
+                "picks": rules.picks,
+                "tickets": rules.tickets,
+                "has_jackpot": bool(rules.jackpot),
+                "has_refill": bool(rules.refill),
+                "can_start": tickets >= rules.tickets,
+            }
+            for rules in (MEADOW.MEADOWS[size] for size in MEADOW.SIZES)
+        ],
+    }
+
+
+def start_meadow(entry, user_id, size: str) -> tuple[bool, str]:
+    """Pay the tickets and lay out a fresh board.
+
+    A round still holding picks blocks a new one on purpose: otherwise a player who opened
+    two empty squares would simply restart until the first pick paid, and the board's odds
+    would mean nothing.
+    """
+    rules = MEADOW.meadow(size)
+    if rules is None:
+        return False, "Такой поляны нет."
+    with _farm_settlement_lock:
+        data = _load(entry)
+        row = _meadow_row(data, user_id)
+        active = row.get("round")
+        if isinstance(active, dict) and MEADOW.public_state(active).get("picks_left"):
+            return False, "Ты уже на поляне — доиграй начатую."
+        if row["tickets"] < rules.tickets:
+            need = rules.tickets - row["tickets"]
+            return False, (
+                f"Нужно {rules.tickets} 🎫 на {rules.title.lower()}, не хватает {need}. "
+                "Билеты падают со смен на ферме и из подземелья."
+            )
+        row["tickets"] -= rules.tickets
+        round_id = secrets.token_hex(8)
+        row["round"] = {
+            "round_id": round_id,
+            "size": rules.size,
+            "cells": MEADOW.build_board(rules.size, round_id),
+            "picked": [],
+            "rubies_won": 0,
+            "refilled": False,
+            "started_at": app_now().isoformat(),
+        }
+        _metric_add(data, "meadow_rounds_started", 1)
+        _save(entry, data)
+    # "3 попыток" is wrong Russian and this string is the first thing a player reads on
+    # the screen. pets_ui owns the general plural helper; one inline case does not justify
+    # importing the UI layer into the game rules, and the two counts here are fixed.
+    attempts = "попытки" if rules.picks < 5 else "попыток"
+    return True, f"{rules.title}: {rules.picks} {attempts}. Ищи алмазы."
+
+
+def pick_meadow_cell(entry, user_id, index) -> tuple[bool, str, dict | None]:
+    """Open one square. Returns (ok, message, the state the caller should redraw).
+
+    The payout is credited inside the same locked transaction that marks the square
+    opened, so a double tap cannot be paid twice.
+    """
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return False, "Не понял, какая клетка.", None
+    with _farm_settlement_lock:
+        data = _load(entry)
+        row = _meadow_row(data, user_id)
+        active = row.get("round")
+        if not isinstance(active, dict):
+            return False, "Сначала зайди на поляну.", None
+        rules = MEADOW.meadow(str(active.get("size") or ""))
+        if rules is None:
+            row["round"] = None
+            _save(entry, data)
+            return False, "Эта поляна больше не существует.", None
+        picked = [int(value) for value in active.get("picked", []) if isinstance(value, int)]
+        if len(picked) >= rules.picks:
+            return False, "Попытки кончились. Заходи на поляну заново.", None
+        if not 0 <= index < rules.cells:
+            return False, "Такой клетки на поляне нет.", None
+        if index in picked:
+            return False, "Эта клетка уже открыта.", None
+        cells = [str(value) for value in active.get("cells", [])]
+        opened = cells[index] if index < len(cells) else MEADOW.EMPTY
+        # What the jackpot is worth is decided BEFORE this square joins the opened list,
+        # and counts only diamonds still buried -- see pets_meadow.prize_for.
+        buried = sum(
+            1 for position, value in enumerate(cells)
+            if value == MEADOW.DIAMOND and position not in picked and position != index
+        )
+        rubies, refills = MEADOW.prize_for(opened, rules, buried)
+        picked.append(index)
+        active["picked"] = picked
+        active["rubies_won"] = max(0, int(active.get("rubies_won", 0) or 0)) + rubies
+        if refills:
+            active["refilled"] = True
+        _save(entry, data)
+
+    if rubies:
+        grant_rubies(entry, user_id, rubies, f"meadow:{active['round_id']}:{index}")
+    refilled_to = _refill_fight_bank(entry, user_id) if refills else 0
+
+    if opened == MEADOW.JACKPOT:
+        note = f"🏆 Суперприз! Все алмазы поляны твои: +{rubies} 💎"
+    elif opened == MEADOW.REFILL:
+        note = (
+            f"🔄 Клетка обновления: бои восстановлены до {refilled_to}."
+            if refilled_to else "🔄 Клетка обновления: бои уже полные."
+        )
+    elif opened == MEADOW.DIAMOND:
+        note = f"💎 Есть! +{rubies} алмаз."
+    else:
+        note = "Пусто. Здесь ничего не закопали."
+    left = max(0, rules.picks - len(picked))
+    note += f" Осталось попыток: {left}." if left else " Попытки кончились."
+    return True, note, meadow_status(entry, user_id)
+
+
+def _refill_fight_bank(entry, user_id) -> int:
+    """Top the arena fight bank back up to its capacity. Returns the new bank."""
+    now = app_now()
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return 0
+        capacity, *_ = _fight_bank_components(entry, user_id, record, now)
+        _settle_fight_bank(record, capacity, now)
+        record["fight_bank"] = capacity
+        _save(entry, data)
+        return capacity
+
+
 def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
     moment = now or app_now()
     data = _load(entry)
@@ -3211,6 +3439,11 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
                 user_id, record, run_id, hours, moment, levels_gained, reward, item_code, auto_equipped,
             )
             receipt["rubies"] = ruby
+            # A meadow ticket off a finished shift, rolled off the run id like everything
+            # else here so a retried settlement hands out the same one ticket rather than
+            # a fresh roll each time the job is replayed.
+            ticket = random.Random(f"{run_id}:meadow").random() < C.MEADOW_TICKET_FARM_CHANCE
+            receipt["meadow_ticket"] = 1 if ticket else 0
             record.setdefault("farm_notifications", []).append(receipt)
             record["farm_notifications"] = record["farm_notifications"][-50:]
             record["farm_run"] = None
@@ -3219,6 +3452,8 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             _save(entry, data)
             if ruby:
                 grant_rubies_once(entry, user_id, ruby, f"farm-ruby:{run_id}")
+            if receipt.get("meadow_ticket"):
+                grant_meadow_ticket(entry, user_id, 1, f"farm:{run_id}")
             receipts.append(dict(receipt))
     return receipts
 
@@ -4827,9 +5062,16 @@ def _grant_chest_loot(entry: str, user_id, loot: dict, *, token: str, kind: str,
     rubies = max(0, int(loot.get("rubies", 0) or 0))
     if rubies:
         grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:{kind}:{token}")
+    # The dungeon is one of the meadow's two ticket faucets (the other is a finished farm
+    # shift). The count is already rolled in pets_dungeon.chest_loot/mimic_loot, so this
+    # only pays out what the box turned out to be holding.
+    tickets = max(0, int(loot.get("meadow_tickets", 0) or 0))
+    if tickets:
+        grant_meadow_ticket(entry, user_id, tickets, f"dungeon:{kind}:{token}")
     return {
         "chest": kind, "floor": int(floor), "reward": {"gold": gold, "xp": 0},
         "rubies": rubies, "dropped": dropped, "rune": runes, "kills": kills,
+        "meadow_tickets": tickets,
     }
 
 

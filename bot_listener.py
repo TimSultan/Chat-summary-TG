@@ -6749,6 +6749,29 @@ async def handle_pets_callback(
                 api, chat_id, message_id, note, pets_ui.farm_view(entry, user_id, xp), log
             )
             return
+        if action == "meadow":
+            # The same button both opens the screen and starts a round: the "Зайти" button
+            # on the meadow list and the two shortcuts on the farm screen all carry a size
+            # argument, and a bare tap (redrawing an already-open cell, or getting here
+            # from elsewhere) carries none. start_meadow itself explains a missing ticket,
+            # so nothing here needs to check the wallet first.
+            if argument:
+                _ok, note = pets.start_meadow(entry, user_id, argument)
+                await _pets_toast_and_redraw(
+                    api, chat_id, message_id, note, pets_ui.meadow_view(entry, user_id, xp), log
+                )
+            else:
+                await _send_pets_view(
+                    api, chat_id, pets_ui.meadow_view(entry, user_id, xp),
+                    message_id=message_id, log=log,
+                )
+            return
+        if action == "meadowpick":
+            ok, note, _status = pets.pick_meadow_cell(entry, user_id, argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note, pets_ui.meadow_view(entry, user_id, xp), log
+            )
+            return
         if action in ("up", "up10"):
             ok, note, _ = pets.upgrade_stat(
                 entry, user_id, xp, argument, times=10 if action == "up10" else 1
@@ -6919,17 +6942,25 @@ async def handle_pets_callback(
             # grant_rubies_once, then record the claim. A crash between the two re-runs a
             # grant that already happened instead of swallowing the reward.
             note = pets_updates.find(entry, argument)
-            if note is None or note.reward_rubies <= 0:
+            if note is None or (note.reward_rubies <= 0 and note.reward_tickets <= 0):
                 message = "За эту новость награды нет."
             elif argument in pets_updates.claimed_ids(entry, user_id):
                 message = "Награда уже получена."
             else:
-                pets.grant_rubies_once(
-                    entry, user_id, note.reward_rubies,
-                    pets_updates.reward_source(argument, user_id),
-                )
+                source = pets_updates.reward_source(argument, user_id)
+                if note.reward_rubies:
+                    pets.grant_rubies_once(entry, user_id, note.reward_rubies, source)
+                if note.reward_tickets:
+                    pets.grant_meadow_tickets_once(
+                        entry, user_id, note.reward_tickets, source,
+                    )
                 pets_updates.mark_claimed(entry, user_id, argument)
-                message = f"🎁 +{note.reward_rubies} 💎"
+                message = "🎁 " + " · ".join(
+                    part for part in (
+                        f"+{note.reward_rubies} 💎" if note.reward_rubies else "",
+                        f"+{note.reward_tickets} 🎫" if note.reward_tickets else "",
+                    ) if part
+                )
             # Redraw the page the note actually sits on, so the button it was pressed
             # from is the one that turns into «Награда получена».
             page = next(

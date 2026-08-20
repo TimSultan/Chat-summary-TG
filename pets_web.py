@@ -1021,6 +1021,12 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         "updates_reward": sum(
             row.reward_rubies for row in pets_updates.claimable(entry, user_id)
         ),
+        # A note can now owe meadow tickets instead of, or as well as, diamonds. Kept as
+        # its own number rather than folded into the one above: they are different
+        # currencies and the HUD names what is waiting rather than a total of two things.
+        "updates_reward_tickets": sum(
+            row.reward_tickets for row in pets_updates.claimable(entry, user_id)
+        ),
         "quest_attention": quests.has_available_quests(entry, user_id),
         "personal_paint": pets.personal_paint_status(entry, user_id),
     }
@@ -1069,6 +1075,10 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     state["farm"] = pets.farm_status(entry, user_id)
     state["quarry"] = pets.quarry_status(entry, user_id)
     state["farm"]["passive"] = pets.passive_income_status(entry, user_id)
+    # pets.meadow_status already strips unpicked cells (see pets_meadow.public_state) --
+    # this is the one call standing between that and the browser, so it must never be
+    # swapped for something that reads the round's raw `cells` list instead.
+    state["meadow"] = pets.meadow_status(entry, user_id)
     state["forge"] = pets.forge_status(entry, user_id)
     return state
 
@@ -1244,6 +1254,18 @@ def _action_quarry_cancel(entry, user_id, xp, payload):
   return pets.cancel_quarry(entry, user_id)
 
 
+def _action_meadow_start(entry, user_id, xp, payload):
+    return pets.start_meadow(entry, user_id, str(payload.get("size") or ""))
+
+
+def _action_meadow_pick(entry, user_id, xp, payload):
+    # The refreshed round (revealed cells only) travels back through the ordinary state
+    # payload below, not through `extra` -- there is nothing dungeon-fight-shaped about a
+    # pick that a client needs ahead of its next /api/state.
+    ok, message, _status = pets.pick_meadow_cell(entry, user_id, payload.get("index"))
+    return ok, message
+
+
 def _action_daily_bonus(entry, user_id, xp, payload):
     claimed, amount, streak = economy.claim_daily_bonus(entry, user_id)
     if not claimed:
@@ -1341,6 +1363,8 @@ _ACTIONS = {
     "quarry_buy_pickaxe": _action_quarry_buy_pickaxe,
     "quarry_start": _action_quarry_start,
     "quarry_cancel": _action_quarry_cancel,
+    "meadow_start": _action_meadow_start,
+    "meadow_pick": _action_meadow_pick,
     "daily_bonus": _action_daily_bonus,
     "notifications": _action_notifications,
     "pve_replays": _action_pve_replays,
@@ -3228,25 +3252,31 @@ async def handle_update_claim(request: web.Request) -> web.Response:
     note = pets_updates.find(entry, update_id)
     if note is None:
         return _json_error("Такой новости нет.", status=404, code="NO_UPDATE")
-    if note.reward_rubies <= 0:
+    if note.reward_rubies <= 0 and note.reward_tickets <= 0:
         return _json_error("За эту новость награды нет.", status=409, code="NO_REWARD")
     if update_id in pets_updates.claimed_ids(entry, user["id"]):
         return _json_error("Награда уже получена.", status=409, code="ALREADY_CLAIMED")
 
     def _pay() -> int:
-        pets.grant_rubies_once(
-            entry, user["id"], note.reward_rubies,
-            pets_updates.reward_source(update_id, user["id"]),
-        )
+        source = pets_updates.reward_source(update_id, user["id"])
+        if note.reward_rubies:
+            pets.grant_rubies_once(entry, user["id"], note.reward_rubies, source)
+        if note.reward_tickets:
+            pets.grant_meadow_tickets_once(entry, user["id"], note.reward_tickets, source)
         pets_updates.mark_claimed(entry, user["id"], update_id)
         return pets.ruby_balance(entry, user["id"])
 
     balance = await asyncio.to_thread(_pay)
     request.app[_LOG_KEY](
-        f"[pets_web] {user['id']} claimed {note.reward_rubies} rubies for {update_id}"
+        f"[pets_web] {user['id']} claimed {note.reward_rubies} rubies "
+        f"and {note.reward_tickets} meadow tickets for {update_id}"
     )
     return _ok({
-        "message": f"💎 +{note.reward_rubies}", "rubies": balance, "id": update_id,
+        "message": " · ".join(part for part in (
+            f"💎 +{note.reward_rubies}" if note.reward_rubies else "",
+            f"🎫 +{note.reward_tickets}" if note.reward_tickets else "",
+        ) if part),
+        "rubies": balance, "id": update_id,
     })
 
 
@@ -4063,6 +4093,20 @@ PAGE_HTML = """<!doctype html>
   /* Owning none is shown, not hidden: the empty slot is the one still worth chasing. */
   .rune-cell.empty { opacity: .42; cursor: default; }
   @media (max-width: 360px) { .rune-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+  /* The meadow's board. Square cells regardless of side count, because the grid's column
+     count is set inline per round (3 or 5) -- only the cell shape belongs here. */
+  .meadow-board { display: grid; gap: 6px; margin: 10px 0; }
+  .meadow-cell {
+    aspect-ratio: 1; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--sunken); color: var(--fg); font: inherit; font-size: 18px;
+    display: flex; align-items: center; justify-content: center; padding: 0;
+  }
+  /* Opened cells stop being buttons -- there is nothing left to tap under them -- and a
+     diamond or the jackpot gets the gold edge that marks a good find everywhere else. */
+  .meadow-cell.open { cursor: default; }
+  .meadow-cell.hit { border-color: var(--gold); background: rgba(232,185,35,.14); }
+  @media (max-width: 360px) { .meadow-cell { font-size: 15px; } }
 
   /* --------------------------------------------------------------- the tab bar */
   .tabs {
@@ -5155,6 +5199,11 @@ let S = null;            // the server's state, verbatim -- never edited on the 
 let TAB = "hero";
 let SHOP = null, FOES = null, ROSTER = null;
 let TEST_SETUP = null, TEST_BATTLE = null, TEST_SESSION = null, TEST_MODE = null, TEST_BUSY = false;
+// Whether the farm tab is showing the meadow board instead of the farm/quarry panels.
+// Not derived from S.meadow.round alone: a FINISHED round stays in the store until the
+// next one starts, and that must read as "last result, still on screen" only while this
+// stayed true through the session -- not force itself open again after a page reload.
+let MEADOW_OPEN = false;
 let ticker = null;
 const START_VIEW = new URLSearchParams(window.location.search).get("view");
 
@@ -5344,11 +5393,14 @@ function renderHud() {
   // A gift that wobbles when there is something to read or something to collect;
   // a plain newspaper the rest of the time.
   const owed = (S && S.updates_reward) || 0;
-  const fresh = Boolean(S && S.unread_updates) || owed > 0;
+  const owedTickets = (S && S.updates_reward_tickets) || 0;
+  const fresh = Boolean(S && S.unread_updates) || owed > 0 || owedTickets > 0;
   const news = $("hudNews");
   news.textContent = fresh ? "🎁" : "📰";
   news.classList.toggle("gift", fresh);
-  news.title = owed ? "Новости · награда " + owed + " 💎" : "Новости";
+  const prize = [owed ? owed + " 💎" : "", owedTickets ? owedTickets + " 🎫" : ""]
+    .filter(Boolean).join(" · ");
+  news.title = prize ? "Новости · награда " + prize : "Новости";
   const arena = (S && S.arena) || {};
   $("hudFights").textContent = (arena.available != null ? arena.available : 0) +
     "/" + (arena.capacity != null ? arena.capacity : 0);
@@ -6964,6 +7016,12 @@ function figurinePanel(farm) {
 function renderFarm() {
   const box = $("scr-farm");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
+  const meadow = S.meadow || {};
+  // A round with picks left has no cancel action -- on purpose, so it keeps covering the
+  // whole farm tab across a re-render, a tab switch, or a reload rather than letting a
+  // ticket already spent quietly go unaccounted for. A FINISHED round does not force this
+  // open by itself: that would trap a fresh page load on last round's result forever.
+  if (MEADOW_OPEN || (meadow.round && !meadow.round.finished)) { renderMeadowScreen(box, meadow); return; }
   const farm = S.farm;
   if (!farm.level) {
     box.innerHTML = '<div class="panel"><h2>Ферма</h2>' +
@@ -7060,7 +7118,18 @@ function renderFarm() {
       'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
       (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
       pickaxeQuestNote + quarryControls + '</div>';
-  box.innerHTML = shift + quarryPanel +
+  const meadowPanel = '<div class="panel"><h2>🌼 Поляна</h2>' +
+    '<div class="small muted">Копай клетки: под ними алмазы, суперприз или пусто. ' +
+    'Билеты падают со смен на ферме и из подземелья.</div>' +
+    '<div class="small muted" style="margin-top:4px">🎫 Билетов на поляну: ' + (meadow.tickets || 0) + '</div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">' +
+    (meadow.meadows || []).map((row) =>
+      '<button class="go sec" style="font-size:13px;padding:10px 6px" data-meadowstart="' + row.size + '"' +
+      (row.can_start ? '' : ' disabled') + '>' + esc(row.title) + '<br><span class="tiny muted">' +
+      row.side + '×' + row.side + ' · 💎' + row.diamonds + ' · ' + row.picks + ' попыток<br>🎫 ' +
+      row.tickets + '</span></button>'
+    ).join('') + '</div></div>';
+  box.innerHTML = shift + quarryPanel + meadowPanel +
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
         money(passive.stored || 0) + " из " + money(passive.cap || 0) + "</div>" +
@@ -7086,6 +7155,58 @@ function renderFarm() {
 
 const FEATURE_NAMES = { well: "Колодец", sprinkler: "Поливалка", beds: "Грядка", tractor: "Трактор" };
 function featureName(key) { return FEATURE_NAMES[key] || key; }
+
+// ------------------------------------------------------------------------- the meadow
+// What one cell shows once it is known -- either because it was picked, or because the
+// round finished and the server sent the whole board. An index missing from both is drawn
+// closed: that silence (not a hidden value) is the only thing standing between a browser
+// and the layout, per pets_meadow.public_state.
+const MEADOW_CELL_ICON = { empty: "▪️", diamond: "💎", jackpot: "🏆", refill: "🔄" };
+
+function renderMeadowScreen(box, meadow) {
+  const round = meadow.round;
+  if (!round) { MEADOW_OPEN = false; renderFarm(); return; }
+  const board = round.finished ? (round.board || []) : null;
+  const cells = [];
+  for (let index = 0; index < round.cells; index++) {
+    const opened = board ? board[index] : round.revealed[String(index)];
+    cells.push(opened === undefined
+      ? '<button class="meadow-cell" data-meadowpick="' + index + '">⬜</button>'
+      : '<span class="meadow-cell open' +
+        (opened === "diamond" || opened === "jackpot" ? " hit" : "") + '">' +
+        (MEADOW_CELL_ICON[opened] || "▪️") + '</span>');
+  }
+  const legend = (round.has_jackpot || round.has_refill)
+    ? '<div class="small muted" style="margin-top:6px">' +
+      (round.has_jackpot ? '🏆 суперприз забирает разом все закопанные алмазы. ' : '') +
+      (round.has_refill ? '🔄 клетка обновления восстанавливает бои в подземелье.' : '') + '</div>'
+    : '';
+  const footer = round.finished
+    ? '<div class="small" style="margin-top:10px">Раунд закончен. Собрано: 💎' + round.rubies_won +
+      (round.refilled ? ' · бои обновлены' : '') + '</div>' +
+      '<button class="go" style="margin-top:10px" data-do="meadowback">◀️ Назад</button>'
+    : '<div class="small muted" style="margin-top:10px">Попыток осталось: ' + round.picks_left +
+      ' · собрано: 💎' + round.rubies_won + '</div>';
+  box.innerHTML = '<div class="panel"><h2>' + esc(round.title) + '</h2>' +
+    '<div class="small muted">' + round.side + '×' + round.side + ' · алмазов на поляне: ' +
+    round.diamonds + ' · попыток всего: ' + round.picks + '</div>' + legend +
+    '<div class="meadow-board" style="grid-template-columns:repeat(' + round.side + ',1fr)">' +
+    cells.join('') + '</div>' + footer + '</div>';
+}
+
+async function meadowStart(size) {
+  const ok = await act("meadow_start", { size });
+  // Opened only on success: a refusal (not enough tickets, a round still in progress)
+  // must land the player back on the ordinary farm screen with its message, not on an
+  // empty board.
+  if (ok) MEADOW_OPEN = true;
+  render();
+}
+
+async function meadowPick(index) {
+  await act("meadow_pick", { index });
+  render();
+}
 
 // ------------------------------------------------------------------------ more screen
 let moreView = "menu";
@@ -8917,7 +9038,7 @@ $("hudCreate").addEventListener("click", () => {
 // or a duplicated one behind.
 const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
-    "[data-farmstart],[data-quarrystart],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
+    "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
     "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
@@ -9096,6 +9217,8 @@ async function handleClick(event, target) {
   }
   if (d.foe) { haptic(); fight(d.foe); return; }
   if (d.farmstart) { await act("farm_start", { hours: Number(d.farmstart) }); return; }
+  if (d.meadowstart) { await meadowStart(d.meadowstart); return; }
+  if (d.meadowpick !== undefined) { await meadowPick(Number(d.meadowpick)); return; }
   if (d.arenaretry) { FOES = null; MOBS = null; MOB_INDEX = 0; renderArena(); return; }
   if (d.feature) { await act("farm_feature", { feature: d.feature }); return; }
   if (d.gift) { closeSheet(); await act("gift", { code: d.code, receiver_id: d.gift, confirm: true }); return; }
@@ -9133,6 +9256,7 @@ async function handleClick(event, target) {
   else if (d.do === "quarrypickaxe") { await act("quarry_buy_pickaxe"); }
   else if (d.do === "quarrycancel") { await act("quarry_cancel"); }
   else if (d.quarrystart) { await act("quarry_start", {hours:Number(d.quarrystart)}); }
+  else if (d.do === "meadowback") { MEADOW_OPEN = false; render(); }
   else if (d.do === "claimlevel") { await act("claim_level"); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tame") { openPetCreation(); }

@@ -9,6 +9,8 @@ from __future__ import annotations
 import random
 from typing import Final
 
+import pets_config as C
+
 
 MIN_POWER: Final = 1_000
 # Raised from 5 alongside the PVE ruby rework (see TIER_RUBY_CHANCE in pets_mobs.py) so
@@ -413,6 +415,10 @@ MIMIC_CURSED_ITEMS: Final = 2
 # On top of the cursed pair: one roll on the ordinary drop table, where the rare and
 # legendary gear lives. This is the line that makes fighting a mimic worth the bite.
 MIMIC_DROP_ROLLS: Final = 1
+# Tickets for the meadow (see pets_meadow). Read from pets_config so the two faucets --
+# a finished farm shift and a dungeon box -- are tuned side by side in one place.
+MEADOW_TICKET_CHANCE: Final = C.MEADOW_TICKET_DUNGEON_CHANCE
+MEADOW_TICKET_MIMIC_COUNT: Final = C.MEADOW_TICKET_MIMIC_COUNT
 
 
 def chest_loot(floor: int, rng=None) -> dict:
@@ -421,6 +427,9 @@ def chest_loot(floor: int, rng=None) -> dict:
     return {
         "gold": chest_gold(floor), "rubies": rng.randint(*CHEST_RUBY_RANGE),
         "cursed": 1, "drops": 0, "runes": 1,
+        # Meadow tickets are the only way onto the лотто field, and the dungeon is one of
+        # its two faucets. Rolled here rather than granted flat so a chest stays a roll.
+        "meadow_tickets": 1 if rng.random() < MEADOW_TICKET_CHANCE else 0,
     }
 
 
@@ -437,6 +446,10 @@ def mimic_loot(floor: int, rng=None) -> dict | None:
         "gold": max(1, round(chest_gold(floor) * MIMIC_GOLD_MULTIPLIER)),
         "rubies": rng.randint(*MIMIC_RUBY_RANGE),
         "cursed": MIMIC_CURSED_ITEMS, "drops": MIMIC_DROP_ROLLS, "runes": 1,
+        # A beaten mimic pays more of everything it was guarding, tickets included, and
+        # unlike the plain chest it never pays zero of them -- that is the reward for
+        # having fought the lid instead of walking away from it.
+        "meadow_tickets": MEADOW_TICKET_MIMIC_COUNT,
     }
 
 

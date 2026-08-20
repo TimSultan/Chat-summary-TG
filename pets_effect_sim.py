@@ -1,7 +1,7 @@
 """Is an item's passive worth anything at all? One mirror match per distinct passive.
 
 Run directly:  python pets_effect_sim.py            (writes EFFECT_BALANCE.md + .csv)
-               python pets_effect_sim.py --fights 500 --quick
+               python pets_effect_sim.py --quick        (fast smoke run)
 
 The question is narrower than "is this a good weapon". A rare weapon's stats are already
 decided by its rarity band (`_bonus_tuple`), and the passive rides on top of them for
@@ -286,12 +286,17 @@ FIELDS = (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fights", type=int, default=3000, help="боёв на форму соперника")
-    parser.add_argument("--quick", action="store_true", help="600 боёв, для проверки прогона")
+    # 600 a shape is 300,000 fights and about a minute, against the nine minutes 3,000 a
+    # shape cost. The intervals widen from about +-0.8 to about +-1.8 win points, which is
+    # still far tighter than any tuning decision this harness is used to make -- nobody
+    # moves a value because it measured two points differently. Pass --fights for the rare
+    # case that needs the precision (settling two items a point apart, say).
+    parser.add_argument("--fights", type=int, default=600, help="боёв на форму соперника")
+    parser.add_argument("--quick", action="store_true", help="200 боёв, для проверки прогона")
     parser.add_argument("--workers", type=int, default=None, help="1 отключает пул процессов")
     parser.add_argument("--out", default="EFFECT_BALANCE", help="имя файлов без расширения")
     args = parser.parse_args()
-    fights = 600 if args.quick else args.fights
+    fights = 200 if args.quick else args.fights
 
     specs = _specs()
     results = simulate_all(specs, fights, args.workers)

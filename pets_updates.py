@@ -47,6 +47,9 @@ class Update:
     # награду». Zero for every entry written before rewards existed and for every
     # chat-authored note -- an admin typing /arenanews must not be able to mint currency.
     reward_rubies: int = 0
+    # Meadow tickets the same claim pays out. Same rules as the diamonds above: zero for
+    # every chat-authored note, because /arenanews must not mint either currency.
+    reward_tickets: int = 0
 
 
 # Writing guide for people and generators: each note is a short player-facing invitation,
@@ -556,6 +559,21 @@ UPDATES: tuple[Update, ...] = (
         "За эту новость — 15 💎.",
         reward_rubies=15,
     ),
+    Update(
+        "202608-meadow",
+        "🌼 Поляна",
+        "🌼 На ферме открылась Поляна — лотерея, где алмазы просто закопаны в землю. "
+        "Тыкаешь в клетку: угадал — забрал алмаз, не угадал — копай дальше.\n\n"
+        "🟩 Малая поляна: поле 3 на 3, пять алмазов закопано, три попытки. Вход — один билет.\n\n"
+        "🟥 Большая: поле 5 на 5, двенадцать алмазов, пять попыток, три билета за вход. "
+        "И там же спрятаны две особые клетки: одна отдаёт все закопанные алмазы разом, "
+        "вторая восстанавливает все бои на арене. Найти обе за пять попыток — отдельная история.\n\n"
+        "🎫 Билеты не купить. Они падают со смен на ферме и из сундуков в подземелье, "
+        "а у мимика их сразу два.\n\n"
+        "За эту новость — 5 💎 и 10 🎫, чтобы было с чем идти копать.",
+        reward_rubies=5,
+        reward_tickets=10,
+    ),
 )
 
 
@@ -721,7 +739,7 @@ def claimable(entry: str, user_id) -> tuple[Update, ...]:
     already = claimed_ids(entry, user_id)
     return tuple(
         row for row in all_updates(entry)
-        if row.reward_rubies > 0 and row.id not in already
+        if (row.reward_rubies > 0 or row.reward_tickets > 0) and row.id not in already
     )
 
 

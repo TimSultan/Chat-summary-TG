@@ -13,6 +13,7 @@ import economy
 import pets
 import pets_combat
 import pets_config
+import pets_meadow
 import pets_ui
 import pets_weapon_catalog
 import stats
@@ -3839,6 +3840,135 @@ class MiscApiTests(PetsTestCase):
         self.assertEqual(
             pets.ruby_balance(entry, "1"), pets_config.PET_LEVEL_UP_RUBY_COST * 3,
         )
+
+
+class MeadowTests(PetsTestCase):
+    """Поляна: a ticket-gated diamond lotto with a board generated once and never
+    rebuilt on read. See pets_meadow's module note -- the whole anti-cheat design is that
+    a client cannot ever be shown an unopened cell's contents, which is why the tests
+    below poke at meadow_status directly rather than trusting a screen not to print it.
+    """
+
+    def test_entering_spends_the_meadow_ticket_and_a_dry_wallet_is_refused(self):
+        entry, uid = "meadow", "1"
+        self._tame(entry, uid)
+        # No tickets yet: refused, and refused without creating a round at all.
+        ok, note = pets.start_meadow(entry, uid, "small")
+        self.assertFalse(ok)
+        self.assertIn("не хватает", note)
+        self.assertIsNone(pets.meadow_status(entry, uid)["round"])
+
+        pets.grant_meadow_ticket(entry, uid, 1)
+        ok, note = pets.start_meadow(entry, uid, "small")
+        self.assertTrue(ok, note)
+        # The small meadow costs exactly one ticket -- the wallet is drained, not merely
+        # decremented by some other amount.
+        self.assertEqual(pets.meadow_tickets(entry, uid), 0)
+        self.assertIsNotNone(pets.meadow_status(entry, uid)["round"])
+
+    def test_a_round_still_holding_picks_blocks_a_fresh_one(self):
+        """Otherwise a player who opened two empty squares would simply restart until the
+        first pick paid, and the board's odds would mean nothing."""
+        entry, uid = "meadow", "1"
+        self._tame(entry, uid)
+        pets.grant_meadow_ticket(entry, uid, 2)
+        self.assertTrue(pets.start_meadow(entry, uid, "small")[0])
+
+        ok, note = pets.start_meadow(entry, uid, "small")
+
+        self.assertFalse(ok)
+        self.assertIn("доиграй", note)
+        # And the second attempt did not spend the second ticket either.
+        self.assertEqual(pets.meadow_tickets(entry, uid), 1)
+
+        # Finishing the round (all three picks) reopens the door.
+        for index in range(3):
+            self.assertTrue(pets.pick_meadow_cell(entry, uid, index)[0])
+        ok, note = pets.start_meadow(entry, uid, "small")
+        self.assertTrue(ok, note)
+
+    def test_a_cell_cannot_be_opened_twice_or_past_the_pick_limit(self):
+        entry, uid = "meadow", "1"
+        self._tame(entry, uid)
+        pets.grant_meadow_ticket(entry, uid, 1)
+        self.assertTrue(pets.start_meadow(entry, uid, "small")[0])
+
+        self.assertTrue(pets.pick_meadow_cell(entry, uid, 0)[0])
+        ok, note, _status = pets.pick_meadow_cell(entry, uid, 0)
+        self.assertFalse(ok)
+        self.assertIn("уже открыта", note)
+
+        # Small meadow: three picks. Two more distinct cells use them up...
+        self.assertTrue(pets.pick_meadow_cell(entry, uid, 1)[0])
+        self.assertTrue(pets.pick_meadow_cell(entry, uid, 2)[0])
+        # ...and a fourth, never-opened cell is refused on the pick count alone.
+        ok, note, _status = pets.pick_meadow_cell(entry, uid, 3)
+        self.assertFalse(ok)
+        self.assertIn("Попытки кончились", note)
+
+    def test_the_jackpot_pays_exactly_what_is_still_buried_not_the_meadows_full_count(self):
+        """The jackpot must not pay for diamonds already collected (double payment) and
+        must not fall back to the meadow's nominal diamond count -- only what is left
+        under a cell nobody has opened yet."""
+        entry, uid = "meadow", "1"
+        self._tame(entry, uid)
+        pets.grant_meadow_ticket(entry, uid, 3)
+        self.assertTrue(pets.start_meadow(entry, uid, "big")[0])
+
+        # Overwrite the just-rolled board with a known layout: three diamonds and one
+        # jackpot, everything else empty. Reaching into the store like this is the only
+        # way to pin down a board that build_board seeds from a random round id.
+        data = pets._load(entry)
+        board = data["meadow"][uid]["round"]["cells"]
+        for i in range(len(board)):
+            board[i] = pets_meadow.EMPTY
+        board[0] = pets_meadow.DIAMOND
+        board[1] = pets_meadow.DIAMOND
+        board[2] = pets_meadow.DIAMOND
+        board[3] = pets_meadow.JACKPOT
+        pets._save(entry, data)
+
+        self.assertTrue(pets.pick_meadow_cell(entry, uid, 0)[0])  # +1, one diamond gone
+        self.assertTrue(pets.pick_meadow_cell(entry, uid, 1)[0])  # +1, two diamonds gone
+        ok, note, status = pets.pick_meadow_cell(entry, uid, 3)   # jackpot: one still buried
+        self.assertTrue(ok, note)
+
+        self.assertIn("+1", note)  # only the one still-buried diamond, not three
+        self.assertEqual(status["round"]["rubies_won"], 3)  # 1 + 1 + 1, never double-paid
+        self.assertEqual(pets.ruby_balance(entry, uid), 3)
+
+    def test_meadow_status_never_reveals_a_cell_before_it_is_picked(self):
+        """The main anti-cheat test: a client asking for status mid-round must get back
+        only what has actually been opened, and the full board must not exist in that
+        response until the round is finished."""
+        entry, uid = "meadow", "1"
+        self._tame(entry, uid)
+        pets.grant_meadow_ticket(entry, uid, 1)
+        self.assertTrue(pets.start_meadow(entry, uid, "small")[0])
+
+        # Fresh round: nothing picked, nothing revealed, no board at all.
+        status = pets.meadow_status(entry, uid)
+        self.assertEqual(status["round"]["revealed"], {})
+        self.assertNotIn("board", status["round"])
+        self.assertFalse(status["round"]["finished"])
+        # The UI layer must agree: every one of the nine cells is still a closed "⬜"
+        # button, never the emoji for what is actually buried under it.
+        text, keyboard = pets_ui.meadow_view(entry, uid, 0)
+        cell_buttons = [button["text"] for row in keyboard["inline_keyboard"][:3] for button in row]
+        self.assertEqual(cell_buttons, ["⬜"] * 9)
+
+        pets.pick_meadow_cell(entry, uid, 4)
+        status = pets.meadow_status(entry, uid)
+        # Exactly the one opened cell, nothing else -- not even as a placeholder value.
+        self.assertEqual(set(status["round"]["revealed"].keys()), {"4"})
+        self.assertNotIn("board", status["round"])
+
+        # Finish the round: only now may the full board show up.
+        pets.pick_meadow_cell(entry, uid, 0)
+        pets.pick_meadow_cell(entry, uid, 1)
+        status = pets.meadow_status(entry, uid)
+        self.assertTrue(status["round"]["finished"])
+        self.assertEqual(len(status["round"]["board"]), 9)
 
 
 if __name__ == "__main__":

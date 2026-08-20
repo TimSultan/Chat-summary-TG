@@ -232,9 +232,15 @@ def main_view(
     # An owed reward outranks a mere unread mark: it says what is waiting, not just that
     # something is. Same split as the Mini App's HUD gift -- reading a note clears the
     # "❗" but leaves the 🎁 until the diamonds are actually taken.
-    owed_rubies = sum(row.reward_rubies for row in pets_updates.claimable(entry, user_id))
-    if owed_rubies:
-        updates_button = f"🎁 Обновления · {owed_rubies} 💎"
+    owed = pets_updates.claimable(entry, user_id)
+    owed_rubies = sum(row.reward_rubies for row in owed)
+    owed_tickets = sum(row.reward_tickets for row in owed)
+    prize = " · ".join(part for part in (
+        f"{owed_rubies} 💎" if owed_rubies else "",
+        f"{owed_tickets} 🎫" if owed_tickets else "",
+    ) if part)
+    if prize:
+        updates_button = f"🎁 Обновления · {prize}"
     elif pets_updates.has_unread(entry, user_id):
         updates_button = "❗ 📰 Обновления"
     else:
@@ -1605,6 +1611,7 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     status = pets.farm_status(entry, user_id)
     quarry = pets.quarry_status(entry, user_id)
+    meadow_tickets = pets.meadow_tickets(entry, user_id)
     passive_before = pets.passive_income_status(entry, user_id)
     coins = pets.balance_for(entry, user_id, xp)
     level = int(status.get("level", status.get("farm_level", 0)) or 0)
@@ -1671,6 +1678,9 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 f"🪙 {_money(int(preview['gold']))} · ✨ {int(preview['xp'])} · "
                 f"🎁 {_drop_pct(preview.get('drop_chance'))}"
             )
+
+    lines.append("\n<b>🌼 Поляна</b>")
+    lines.append(f"🎫 Билетов на поляну: {meadow_tickets} — копай клетки, ищи алмазы.")
 
     next_cost = status.get("next_level_cost")
     lines.append("\n<b>🏡 Хозяйство</b>")
@@ -1793,6 +1803,124 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "text": f"⛏ Купить кирку · {_money(int(quarry.get('cost', 150)))}",
             "callback_data": callback_data(user_id, "quarrybuy"),
         }])
+    # One tap both opens the meadow screen and starts that round -- see the "meadow"
+    # callback in bot_listener, which starts on any argument and merely redraws without
+    # one. start_meadow explains a short wallet on its own, so the button is drawn
+    # regardless of whether this player can currently afford it.
+    rows.append([
+        {"text": "🌼 Малая поляна", "callback_data": callback_data(user_id, "meadow", "small")},
+        {"text": "🌼 Большая поляна", "callback_data": callback_data(user_id, "meadow", "big")},
+    ])
+    rows.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+# What an opened cell shows. Matches the strings pets_meadow.build_board fills a board
+# with (see pets_meadow.EMPTY/DIAMOND/JACKPOT/REFILL) -- kept as plain strings there, not
+# an enum, so a stored round is plain JSON, and mirrored here as plain strings for the
+# same reason this module has no import of pets_meadow at all: everything this screen
+# needs already comes back through pets.meadow_status.
+_MEADOW_CELL_ICON = {"empty": "▪️", "diamond": "💎", "jackpot": "🏆", "refill": "🔄"}
+
+
+def meadow_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    """The diamond-lotto board: a size picker when nothing is running, the side x side
+    grid itself once it is.
+
+    Every closed cell is the SAME button no matter what is buried under it -- meadow_status
+    never tells this screen what an unopened cell holds, so there is nothing here that
+    could leak it either. An opened cell keeps a callback (the bare "meadow" redraw)
+    rather than being left with none: Telegram does not allow a button with no
+    callback_data at all, and a stray tap on a filled square should just redraw, not error.
+    """
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+
+    status = pets.meadow_status(entry, user_id)
+    tickets = int(status.get("tickets", 0) or 0)
+    active = status.get("round")
+
+    # 🎫, never the farm's 🎟: the two tickets sit on the same farm screen and buy
+    # completely different things.
+    lines = ["🌼 <b>Поляна</b>", f"🎫 {_plural(tickets, 'билет', 'билета', 'билетов')} в кошельке."]
+
+    rows = []
+    if not active:
+        lines.append(
+            "\n<i>Копай клетки и ищи алмазы. Билеты падают со смен на ферме и из "
+            "подземелья.</i>"
+        )
+        for option in status.get("meadows", []):
+            title = escape(str(option.get("title") or ""))
+            side = int(option.get("side", 0) or 0)
+            lines.append(f"\n<b>{title}</b> — поле {side}x{side}")
+            lines.append(
+                f"Закопано {_plural(int(option.get('diamonds', 0) or 0), 'алмаз', 'алмаза', 'алмазов')} · "
+                f"{_plural(int(option.get('picks', 0) or 0), 'попытка', 'попытки', 'попыток')} · вход "
+                f"🎫 {_plural(int(option.get('tickets', 0) or 0), 'билет', 'билета', 'билетов')}"
+            )
+            extras = []
+            if option.get("has_jackpot"):
+                extras.append("🏆 суперприз забирает разом все закопанные алмазы")
+            if option.get("has_refill"):
+                extras.append("🔄 клетка обновления восстанавливает бои на арене")
+            if extras:
+                lines.append("<i>" + " · ".join(extras) + "</i>")
+            rows.append([{
+                "text": f"🌼 {option.get('title') or ''} · {option.get('tickets', 0)} 🎫",
+                "callback_data": callback_data(user_id, "meadow", str(option.get("size") or "")),
+            }])
+    else:
+        title = escape(str(active.get("title") or ""))
+        side = int(active.get("side", 0) or 0)
+        finished = bool(active.get("finished"))
+        lines.append(f"\n<b>{title}</b> — поле {side}x{side}")
+        lines.append(
+            f"Правила: {_plural(int(active.get('diamonds', 0) or 0), 'алмаз', 'алмаза', 'алмазов')} "
+            f"закопано, {_plural(int(active.get('picks', 0) or 0), 'попытка', 'попытки', 'попыток')} на раунд"
+        )
+        lines.append(
+            f"Уже нашёл: {_plural(int(active.get('rubies_won', 0) or 0), 'алмаз', 'алмаза', 'алмазов')}"
+        )
+        if finished:
+            lines.append("✅ Раунд закончен, поле перекопано.")
+            if active.get("refilled"):
+                lines.append("🔄 Бои на арене восстановлены до полного бака.")
+        else:
+            lines.append(
+                f"Осталось {_plural(int(active.get('picks_left', 0) or 0), 'попытка', 'попытки', 'попыток')}."
+            )
+
+        # The full board only exists once finished; before that only opened cells are in
+        # `revealed` at all, by design (see pets_meadow.public_state) -- so a KeyError here
+        # would mean the anti-cheat boundary broke, not that this screen needs a fallback.
+        if finished and active.get("board"):
+            opened = dict(enumerate(active["board"]))
+        else:
+            opened = {int(index): value for index, value in (active.get("revealed") or {}).items()}
+        for row_start in range(0, side * side, side):
+            row = []
+            for index in range(row_start, row_start + side):
+                value = opened.get(index)
+                if value is None:
+                    row.append({
+                        "text": "⬜",
+                        "callback_data": callback_data(user_id, "meadowpick", str(index)),
+                    })
+                else:
+                    row.append({
+                        "text": _MEADOW_CELL_ICON.get(value, "▪️"),
+                        "callback_data": callback_data(user_id, "meadow"),
+                    })
+            rows.append(row)
+
+        if finished:
+            rows.append([{
+                "text": "🔄 Играть ещё раз",
+                "callback_data": callback_data(user_id, "meadow", str(active.get("size") or "")),
+            }])
+
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 

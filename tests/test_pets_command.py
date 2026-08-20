@@ -287,6 +287,43 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual([r["delta"] for r in rows], [4])
         self.assertEqual(pets.ruby_source_of(rows[0]["reason"]), "grants")
 
+    def test_a_news_reward_can_pay_meadow_tickets_and_pays_them_only_once(self):
+        """A release note can owe tickets as well as (or instead of) diamonds.
+
+        The claim credits BEFORE it records the claim, so that a crash between the two
+        replays a grant rather than swallowing it. That order is only safe because the
+        grant refuses to pay twice, and this is the test that keeps it refusing: without
+        an idempotent ticket grant the second press would mint ten more.
+        """
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file", "Player")
+        note = pets_updates.Update(
+            "note-tickets", "Награда", "Текст", reward_rubies=5, reward_tickets=10,
+        )
+
+        with patch.object(pets_updates, "UPDATES", (note,)):
+            rubies = pets.ruby_balance(CHAT, PLAYER["id"])
+            tickets = pets.meadow_tickets(CHAT, PLAYER["id"])
+            api = self._tap("newsclaim", "note-tickets")
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), rubies + 5)
+            self.assertEqual(pets.meadow_tickets(CHAT, PLAYER["id"]), tickets + 10)
+            # Both currencies are named on the screen the button sat on.
+            self.assertIn("+5", api.edits[-1]["text"])
+            self.assertIn("+10", api.edits[-1]["text"])
+
+            again = self._tap("newsclaim", "note-tickets")
+            self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), rubies + 5)
+            self.assertEqual(pets.meadow_tickets(CHAT, PLAYER["id"]), tickets + 10)
+            self.assertIn("уже получена", again.edits[-1]["text"])
+
+    def test_a_note_paying_only_tickets_still_counts_as_claimable(self):
+        """`claimable` gates the gift badge on both clients. A ticket-only note that did
+        not appear in it would pay nothing anybody could see was waiting."""
+        note = pets_updates.Update("note-tickets-only", "Награда", "Текст", reward_tickets=3)
+        with patch.object(pets_updates, "UPDATES", (note,)):
+            owed = pets_updates.claimable(CHAT, PLAYER["id"])
+            self.assertEqual([row.id for row in owed], ["note-tickets-only"])
+
     def test_a_news_reward_cannot_be_claimed_for_a_note_that_does_not_pay(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file", "Player")

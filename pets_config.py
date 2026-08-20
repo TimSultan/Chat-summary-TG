@@ -165,6 +165,21 @@ FARM_BUILD_REFUND = 75 - FARM_UPGRADE_COSTS[0]
 # upgrading the farm rather than merely owning one.
 FARM_GOLD_PER_RUN = (0, 50, 70, 95, 125, 160, 205, 255, 315, 385, 470)
 FARM_XP_PER_RUN = (0, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
+
+# ------------------------------------------------------------------------ поляна
+#
+# The meadow is a ticket sink, not a coin sink: tickets are the only way in, and they drop
+# from finished farm shifts and from the dungeon. That keeps the diamond faucet tied to
+# time already spent playing rather than to a wallet, and it is why the drop chances below
+# are the real balance lever -- the board's payout is fixed and public.
+#
+# Rates are per completed farm shift and per dungeon chest/mimic. A six-hour shift landing
+# a ticket about one time in three means roughly one small entry a day for somebody who
+# farms twice, which is the cadence this is priced for.
+MEADOW_TICKET_FARM_CHANCE = 0.34
+MEADOW_TICKET_DUNGEON_CHANCE = 0.50
+# A mimic already pays more of everything else it guards; tickets follow the same rule.
+MEADOW_TICKET_MIMIC_COUNT = 2
 # A farm's buildings stop at level 10 while pet levels deliberately do not. It uses the
 # shared diminishing hero curve at the farm weight: stronger than the old logarithmic
 # bonus at established levels, but still slower than the level^1.2 stat-cost sink:

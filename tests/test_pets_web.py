@@ -455,6 +455,87 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         run = pets._load(CHAT)["pets"][str(PLAYER["id"])]["quarry_run"]
         self.assertEqual(run["hours"], 2)
 
+    async def test_meadow_start_spends_tickets_and_opens_a_round(self):
+        """Meadow tickets are their own currency -- the same 🎟 glyph the farm's early-
+        recall ticket wears, but a different balance underneath. This is the action wired
+        to pets.start_meadow, and it must actually spend from the meadow wallet and hand
+        back a fresh round rather than reuse the farm's."""
+        self._tame(PLAYER)
+        pets.grant_meadow_ticket(CHAT, PLAYER["id"], 1)
+
+        result = await self._action(PLAYER, "meadow_start", size="small")
+        self.assertTrue(result["ok"], result)
+        meadow = result["state"]["meadow"]
+        self.assertEqual(meadow["tickets"], 0)
+        self.assertEqual(meadow["round"]["size"], "small")
+        self.assertEqual(meadow["round"]["picks"], 3)
+        self.assertEqual(meadow["round"]["picks_left"], 3)
+        self.assertEqual(meadow["round"]["revealed"], {})
+
+    async def test_meadow_pick_opens_a_cell_and_credits_the_diamond_it_finds(self):
+        """meadow_pick is billed on the state it hands back, not on a probability: force a
+        known layout (the same trick the quarry test above uses on pickaxe_runs) so this
+        asserts an exact ruby count rather than "some number greater than zero"."""
+        self._tame(PLAYER)
+        pets.grant_meadow_ticket(CHAT, PLAYER["id"], 1)
+        started = await self._action(PLAYER, "meadow_start", size="small")
+        self.assertTrue(started["ok"], started)
+
+        data = pets._load(CHAT)
+        data["meadow"][str(PLAYER["id"])]["round"]["cells"][0] = "diamond"
+        pets._save(CHAT, data)
+        before_rubies = pets.ruby_balance(CHAT, PLAYER["id"])
+
+        picked = await self._action(PLAYER, "meadow_pick", index=0)
+        self.assertTrue(picked["ok"], picked)
+        round_state = picked["state"]["meadow"]["round"]
+        self.assertEqual(round_state["revealed"], {"0": "diamond"})
+        self.assertEqual(round_state["rubies_won"], 1)
+        self.assertEqual(round_state["picks_left"], 2)
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), before_rubies + 1)
+
+    async def test_meadow_never_exposes_unopened_cells_before_the_round_finishes(self):
+        """The meadow's whole anti-cheat design is that the server never sends an unpicked
+        cell's contents (pets_meadow.public_state strips it). This checks that structurally
+        -- on both responses a browser actually sees, GET /api/state and the meadow_pick
+        action's own returned state -- so a future change that starts forwarding the raw
+        board (say, "for a debug panel") fails a test instead of shipping."""
+        self._tame(PLAYER)
+        pets.grant_meadow_ticket(CHAT, PLAYER["id"], 1)
+        started = await self._action(PLAYER, "meadow_start", size="small")
+        self.assertTrue(started["ok"], started)
+
+        def assert_no_full_board(round_row: dict):
+            # "cells" here is the CELL COUNT (an int, e.g. 9), not the board -- pets_meadow
+            # reuses the name for the tally on purpose, which is exactly the kind of mix-up
+            # that would let a raw board slip through unnoticed. So the real check is
+            # structural: no field in the round is a list as long as the board itself,
+            # because that is the shape a leaked layout would take, whatever it was named.
+            self.assertNotIn("board", round_row)   # only appears once finished
+            self.assertIsInstance(round_row["cells"], int)
+            self.assertFalse(any(
+                isinstance(value, list) and len(value) == round_row["cells"]
+                for value in round_row.values()
+            ), round_row)
+
+        state_after_start = await (await self._get("/api/state", PLAYER)).json()
+        round_after_start = state_after_start["meadow"]["round"]
+        assert_no_full_board(round_after_start)
+        self.assertEqual(round_after_start["revealed"], {})
+
+        picked = await self._action(PLAYER, "meadow_pick", index=4)
+        self.assertTrue(picked["ok"], picked)
+        round_after_pick = picked["state"]["meadow"]["round"]
+        assert_no_full_board(round_after_pick)
+        # Exactly the cell that was picked, nothing more -- a leak of a second index would
+        # still pass the full-board check above but fail this one.
+        self.assertEqual(set(round_after_pick["revealed"]), {"4"})
+
+        state_after_pick = await (await self._get("/api/state", PLAYER)).json()
+        round_after_pick_state = state_after_pick["meadow"]["round"]
+        assert_no_full_board(round_after_pick_state)
+        self.assertEqual(set(round_after_pick_state["revealed"]), {"4"})
+
     async def test_an_unrecognised_action_name_is_a_400(self):
         """A typo'd or outdated action name must fail loudly and specifically, not fall
         through to some default -- there is no default mutation to fall through to."""
