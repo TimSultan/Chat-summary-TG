@@ -1388,13 +1388,17 @@ _ACTIONS = {
 # two must not drift: a player who can re-arm from the chat and not from the app has found
 # a bug, not a feature of one client.
 #
-# Gear is in here on purpose. Bosses state the damage they are weak to, so swapping a
-# weapon or enchanting one is the answer that hint asks for; pets.equip/pets.unequip stopped
-# refusing mid-run for that reason and this gate kept refusing anyway, which meant the
-# change never reached anybody playing through the app.
+# Gear and scrolls are in here on purpose. Bosses state the damage they are weak to, so
+# swapping a weapon, enchanting one or re-slotting a scroll is the answer that hint asks
+# for; pets.equip/pets.unequip stopped refusing mid-run for that reason and this gate kept
+# refusing anyway, which meant the change never reached anybody playing through the app.
+#
+# `set_skill` costs a run nothing it was not already able to spend: a scroll is never
+# consumed by equipping it, and each dungeon fight is a fresh simulation, so a swap made
+# between two fights refreshes no cooldown and duplicates no charge.
 _ALLOWED_IN_DUNGEON = {
     "dungeon_fight", "dungeon_rest", "dungeon_descend", "dungeon_quit", "dungeon_chest",
-    "equip", "unequip", "enchant_weapon", "reforge",
+    "equip", "unequip", "enchant_weapon", "reforge", "set_skill",
 }
 
 
@@ -1486,7 +1490,7 @@ async def handle_action(request: web.Request) -> web.Response:
     action_name = str(body.get("action") or "")
     if action_name not in _ALLOWED_IN_DUNGEON and pets.is_in_dungeon(entry, user["id"]):
       return _json_error(
-        "В подземелье можно менять снаряжение и зачаровывать оружие. "
+        "В подземелье можно менять снаряжение и свитки, зачаровывать оружие. "
         "Остальное — после забега.",
         status=409, code="DUNGEON_ACTIVE",
       )

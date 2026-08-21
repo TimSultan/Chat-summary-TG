@@ -12,6 +12,7 @@ import economy
 import pets
 import pets_config
 import pets_dungeon as dungeon
+import pets_scroll_catalog as SCROLLS
 import pets_ui
 
 
@@ -179,6 +180,87 @@ class DungeonTests(unittest.TestCase):
         for action in ("farm_start", "buy", "sell", "quarry_start"):
             with self.subTest(shut=action):
                 self.assertNotIn(action, pets_web._ALLOWED_IN_DUNGEON)
+
+    def test_the_corridor_compounds_past_the_ramp_and_nothing_before_it_moves(self):
+        """The deep corridor had to start multiplying, and only the deep corridor.
+
+        A flat +7 a floor was priced against a pet whose whole power was its stat block.
+        Measured against a player carrying a legendary weapon, a rune and four scrolls, a
+        floor-24 corridor enemy took a couple of percent of their health and did nothing
+        whatsoever in a large share of fights. Three things are pinned here, because
+        breaking any one of them puts the old complaint back:
+
+        * floors up to the ramp are untouched, so a new runner's first bosses are the
+          fight they always were;
+        * a deep corridor enemy is meaningfully bigger than the old straight line;
+        * bosses are NOT on the ramp -- they were already where every run ended, and the
+          corridor is being lifted toward them rather than the wall being moved again.
+        """
+        for floor in range(1, dungeon.DEPTH_RAMP_START + 1):
+            with self.subTest(unchanged=floor):
+                self.assertEqual(dungeon._scale(floor), 22 + (floor - 1) * 7)
+        for floor in (20, 30, 45):
+            with self.subTest(boss=floor):
+                self.assertEqual(
+                    dungeon._scale(floor, boss=True),
+                    round((22 + (floor - 1) * 7) * 1.80),
+                )
+        for floor, least in ((24, 1.3), (32, 1.6), (44, 2.2)):
+            with self.subTest(corridor=floor):
+                self.assertGreaterEqual(
+                    dungeon._scale(floor) / (22 + (floor - 1) * 7), least,
+                )
+        # Thin armour is a short fight, and a short fight is one the enemy spends dying
+        # rather than hitting back. Deep enemies carry the boss's share of it.
+        shallow = dungeon.encounter(dungeon.DEPTH_RAMP_START - 1, 0)
+        deep = dungeon.encounter(dungeon.DEPTH_RAMP_START, 0)
+        self.assertGreater(deep["armor"], shallow["armor"])
+
+    def test_both_clients_let_a_runner_change_scrolls(self):
+        """Same rule as the gear pair above, for the other half of a reaction.
+
+        A boss prints the damage it is weak to; the fire scroll that answers it lives on
+        the scroll screen, not in the bag. pets.set_skill_slot never refused mid-run, so
+        both transports had to be the ones opening -- and the floor screen has to offer
+        the button, or the permission is one nobody can reach.
+        """
+        import bot_listener
+        import pets_ui
+        import pets_web
+
+        for action in ("skills", "skillpick", "skillclear", "setskill"):
+            with self.subTest(telegram=action):
+                self.assertIn(action, bot_listener.PET_ACTIONS_ALLOWED_IN_A_RUN)
+        self.assertIn("set_skill", pets_web._ALLOWED_IN_DUNGEON)
+
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["dungeon_run"] = {"floor": 1, "hp": 10, "max_hp": 10, "cleared": []}
+        pets._save(self.entry, data)
+        _text, markup = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        buttons = [
+            button["callback_data"]
+            for row in markup["inline_keyboard"] for button in row
+        ]
+        self.assertTrue(
+            any(data.endswith(":skills") or ":skills:" in data for data in buttons),
+            f"the floor screen offers no way to the scrolls: {buttons}",
+        )
+
+    def test_a_scroll_can_be_slotted_without_leaving_the_dungeon(self):
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        code = SCROLLS.REGULAR_SCROLLS[0]["code"]
+        record["owned_scrolls"] = [code]
+        record["dungeon_run"] = {"floor": 1, "hp": 10, "max_hp": 10, "cleared": []}
+        pets._save(self.entry, data)
+
+        ok, message = pets.set_skill_slot(self.entry, self.user_id, 1, code)
+
+        self.assertTrue(ok, message)
+        self.assertEqual(
+            pets._load(self.entry)["pets"][self.user_id]["skill_slots"][0], code,
+        )
 
     def test_a_weapon_can_be_enchanted_without_leaving_the_dungeon(self):
         data = pets._load(self.entry)

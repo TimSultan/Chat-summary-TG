@@ -162,10 +162,43 @@ def is_boss_floor(floor: int) -> bool:
     return floor > 0 and floor % 5 == 0
 
 
+# --- the deep corridor ----------------------------------------------------------------
+# Past DEPTH_RAMP_START an ordinary enemy stops growing by a flat +7 a floor and starts
+# compounding. The flat step was priced against a pet whose whole power WAS its stat
+# block; by the time somebody is walking floor 20 they are carrying a legendary weapon, a
+# rune burning on it and four scrolls, and none of that exists on the mob's side of the
+# fight. Measured, a corridor mob at floor 24 was taking 2--11% of such a player's health
+# bar and doing NOTHING AT ALL in 15--46% of fights -- the enemy died inside two of the
+# player's actions and never got a swing in. A flat ramp cannot answer a multiplying
+# opponent, so this one multiplies too.
+#
+# Bosses are deliberately excluded. They were already the wall -- the same measurement had
+# every build's run ending on a boss floor and never in the corridor -- so the gap is
+# closed by lifting the corridor toward them rather than by moving the wall again.
+DEPTH_RAMP_START: Final = 12
+DEPTH_RAMP_GROWTH: Final = 1.03
+# Ordinary enemies carried a fifth of their stat value as armour against a boss's third,
+# which is most of why a corridor fight was over before it started: thin armour means a
+# short fight, and a short fight is one the enemy spends dying rather than hitting back.
+# Deep floors get the boss's share. Shallow ones keep the old number, so nothing a new
+# runner meets on the way to their first bosses changes at all.
+CORRIDOR_ARMOR_DIVISOR: Final = 5
+DEEP_CORRIDOR_ARMOR_DIVISOR: Final = 3
+
+
 def _scale(floor: int, boss: bool = False) -> int:
     """Fixed stat value for a floor, independent of the challenger."""
     value = 22 + max(0, floor - 1) * 7
+    if not boss:
+        value *= DEPTH_RAMP_GROWTH ** max(0, floor - DEPTH_RAMP_START)
     return round(value * (1.80 if boss else 1.0))
+
+
+def _corridor_armor(floor: int, value: int, index: int) -> int:
+    """Armour for one ordinary enemy, thicker once the corridor is deep enough to need it."""
+    divisor = (DEEP_CORRIDOR_ARMOR_DIVISOR if floor >= DEPTH_RAMP_START
+               else CORRIDOR_ARMOR_DIVISOR)
+    return max(0, value // divisor + max(0, int(index)) * 2)
 
 
 def floor_name(floor: int) -> str:
@@ -257,7 +290,7 @@ def encounter(floor: int, index: int) -> dict:
         "stats": {"strength": round((value + strength) * room["strength"]),
                   "health": round((value + health) * room["health"]),
                   "agility": max(1, value + agility), "luck": max(1, value + luck)},
-        "armor": max(0, value // 5 + index * 2), "level": floor + 2,
+        "armor": _corridor_armor(floor, value, index), "level": floor + 2,
         "reward": reward_for(floor, boss=False, enemy_count=count),
     }
 
@@ -385,7 +418,10 @@ def mimic(floor: int) -> dict:
         "stats": {"strength": round((value + 9) * MIMIC_STRENGTH),
                   "health": round((value + 15) * MIMIC_HEALTH),
                   "agility": max(1, value - 2), "luck": max(1, value + 3)},
-        "armor": max(0, value // 4), "level": floor + 3,
+        # A mimic is the floor's elite, so it is never thinner-skinned than the corridor
+        # mobs standing either side of it -- which //4 quietly became once deep ordinary
+        # enemies moved to the boss's //3.
+        "armor": max(_corridor_armor(floor, value, 0), value // 4), "level": floor + 3,
         "reward": reward_for(floor, boss=False),
     }
 

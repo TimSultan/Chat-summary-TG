@@ -6290,19 +6290,26 @@ PAUSE_SAFE_PET_ACTIONS = frozenset({
 # back to the floor screen: the run is a commitment, and wandering off to the farm or the
 # arena in the middle of it is what the gate exists to stop.
 #
-# Gear is the deliberate exception. Every boss states the damage it is weak to, and
-# answering that by swapping a weapon or burning a rune is the play the hint invites --
-# pets.equip and pets.unequip were unblocked for exactly that reason, and this set is the
-# other half of it. Without it the «🎒 Снаряжение» button on the floor screen bounced off
-# this gate and the change never reached a player at all.
+# Gear and scrolls are the deliberate exception. Every boss states the damage it is weak
+# to, and answering that by swapping a weapon, burning a rune or re-slotting a scroll is
+# the play the hint invites -- pets.equip and pets.unequip were unblocked for exactly that
+# reason, and this set is the other half of it. Without it the «🎒 Снаряжение» button on
+# the floor screen bounced off this gate and the change never reached a player at all.
 #
-# The shop, the skills and the other modes stay shut: those are trips out of the dungeon,
-# not reactions inside it.
+# Scrolls are here for the same reason and nothing about them is spent by the swap: a
+# scroll is never consumed, and every dungeon fight is simulated from scratch, so moving
+# one between slots between two fights refreshes no cooldown and duplicates no charge. It
+# only lets somebody standing in front of «Уязвим к огню» act on what they have just read.
+#
+# The shop and the other modes stay shut: those are trips out of the dungeon, not
+# reactions inside it.
 PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     "dungeon", "dungeonenter", "dungeonfight", "dungeonrest",
     "dungeondescend", "dungeonquit", "dungeonchest",
     # Reading the bag and changing what is worn.
     "bag", "bagitems", "equip", "unequip",
+    # The scroll slots, and the picker screen that stands between them and a scroll.
+    "skills", "skillpick", "skillclear", "setskill",
     # The forge, which is where a weapon is enchanted -- and every screen between it and
     # the rune that goes on the blade, so none of them is a button that refuses.
     "forge", "weaponforge", "reforge", "enchantmenu", "runemenu", "enchantrune", "enchant",
@@ -6411,7 +6418,7 @@ async def handle_pets_callback(
     if action not in PET_ACTIONS_ALLOWED_IN_A_RUN and pets.is_in_dungeon(entry, user_id):
         await _pets_toast_and_redraw(
             api, chat_id, message_id,
-            "В подземелье можно менять снаряжение и зачаровывать оружие. "
+            "В подземелье можно менять снаряжение и свитки, зачаровывать оружие. "
             "Остальное — после забега.",
             pets_ui.dungeon_view(entry, user_id, xp), log,
         )

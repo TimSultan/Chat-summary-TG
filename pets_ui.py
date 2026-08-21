@@ -471,7 +471,13 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             rows.append(heal_row)
         else:
             lines.append("<i>Лечения на этот забег кончились.</i>")
-        rows.append([{"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")}])
+        # Gear AND scrolls, side by side. A boss states the damage it is weak to, and the
+        # answer to that line lives in one of these two screens -- a floor screen that
+        # offers only the bag hides half of the reaction it is inviting.
+        rows.append([
+            {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
+            {"text": "📜 Свитки", "callback_data": callback_data(user_id, "skills")},
+        ])
         # On the deepest floor there is, the descent button becomes the finish line: it
         # still ends the run, but it says what it is doing rather than promising a floor
         # 46 that does not exist.
@@ -494,11 +500,12 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             },
         ])
     else:
-        # Mid-floor there is nothing to pair it with, so the bag rides along rather than
-        # letting the exit stretch across the whole width on its own.
+        # Mid-floor the two reaction screens ride along with the exit rather than letting
+        # it stretch across the whole width on its own.
         rows.append([
             {"text": "🚪", "callback_data": callback_data(user_id, "dungeonquit")},
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
+            {"text": "📜 Свитки", "callback_data": callback_data(user_id, "skills")},
         ])
     return "\n".join(lines), {"inline_keyboard": rows}
 
