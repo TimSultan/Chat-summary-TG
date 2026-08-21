@@ -3687,30 +3687,66 @@ def available_stat_points(record: dict | None) -> int:
         return 0
 
 
-def respec_stats(entry, user_id) -> tuple[bool, str, int]:
-    """Reset purchased stats and turn their invested levels into free stat points."""
+def stat_refund_value(record: dict | None) -> int:
+    """Coins a full reset would hand back: what the current stat levels actually cost.
+
+    Priced off pets_config.total_stat_cost, which is the same walk up the same curve that
+    upgrade_stat charged on the way up -- so the trip down is worth exactly the trip up
+    and a reset is neither a discount nor a tax.
+    """
+    levels = (record or {}).get("stats") or {}
+    return sum(
+        C.total_stat_cost(max(C.STAT_MIN_LEVEL, int(levels.get(key, C.STAT_MIN_LEVEL) or 0)))
+        for key in C.STAT_KEYS
+    )
+
+
+def respec_stats(entry, user_id, xp: int = 0) -> tuple[bool, str, int]:
+    """Reset purchased stats and refund the coins they cost.
+
+    It used to hand back one free stat POINT per invested level, and points ignore the
+    cost curve entirely. The curve is `level ** 1.5`, so a level is cheap low down and
+    ruinous high up, and a point that buys either was worth whatever the most expensive
+    arrangement of it was. Spreading four stats to 25 cost 4,752 coins and returned 96
+    points; poured into one stat those points bought level 97, which honestly costs
+    36,595 -- a 7.7x discount that got WIDER the deeper the pet was, and that 15 diamonds
+    bought again as often as anybody cared to press the button.
+
+    Coins have no such hole. They are refunded at the price the curve charged and spent
+    back at the price the curve charges, so a reset moves a build sideways for the
+    diamond fee and nothing else. Free points are no longer minted; a legacy balance is
+    left alone and still spends through upgrade_stat, because taking one back would be
+    charging players for a hole they did not dig.
+
+    `xp` is needed because the refund goes through economy.refund, which reduces lifetime
+    `spent` rather than paying a bonus -- an admin-granted stat therefore refunds nothing
+    instead of turning a gift into cash.
+    """
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
         if record is None:
             return False, "Сначала приручи существо.", 0
-        refundable = sum(
+        levels = sum(
             max(0, int(record["stats"].get(key, C.STAT_MIN_LEVEL)) - C.STAT_MIN_LEVEL)
             for key in C.STAT_KEYS
         )
-        if refundable <= 0:
+        if levels <= 0:
             return False, "Сбрасывать пока нечего.", 0
+        coins = stat_refund_value(record)
         wallet = _ruby_row(data)
         rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
         if rubies < C.STAT_RESPEC_RUBY_COST:
             return False, f"Нужно {C.STAT_RESPEC_RUBY_COST} 💎, у тебя {rubies}.", 0
         wallet[str(user_id)] = rubies - C.STAT_RESPEC_RUBY_COST
         record["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
-        record["stat_points"] = available_stat_points(record) + refundable
         _append_ruby_log(entry, user_id, -C.STAT_RESPEC_RUBY_COST, "spend:respec",
-                         ref=str(refundable))
+                         ref=str(levels))
         _save(entry, data)
-    return True, f"Статы сброшены. Свободных очков: {record['stat_points']}.", refundable
+    # Outside the store lock, like every other payout: the coin ledger is its own file
+    # with its own lock, and holding both at once is how two locks become one deadlock.
+    economy.refund(entry, user_id, xp, coins, "pet_respec")
+    return True, f"Статы сброшены. Возвращено {coins} монет.", coins
 
 
 def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:

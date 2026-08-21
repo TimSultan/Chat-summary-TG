@@ -1975,6 +1975,10 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         "сила режет уклонение, здоровье — HP, ловкость повышает входящий урон, удача — меткость.</i>"
     )
     lines.append("\n<i>Максимального уровня нет. Чем выше, тем дороже следующий пункт.</i>")
+    lines.append(
+        "<i>Сброс возвращает монеты по той же цене, по какой статы покупались, "
+        "а пересобрать билд стоит только алмазов.</i>"
+    )
 
     rows = []
     for key in C.STAT_KEYS:
@@ -1992,8 +1996,13 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "up10", key),
         })
         rows.append(row)
+    # The refund rides on the button. A reset is a real sum of money now, and how much
+    # is the whole of the decision -- a button that only names its diamond price makes
+    # the player guess at the half that matters.
+    refund = pets.stat_refund_value(pet)
     rows.append([{
-        "text": f"🔄 Сбросить статы — {C.STAT_RESPEC_RUBY_COST} 💎",
+        "text": (f"🔄 Сбросить статы — {C.STAT_RESPEC_RUBY_COST} 💎"
+                 + (f" · 🪙 +{_money(refund)}" if refund else "")),
         "callback_data": callback_data(user_id, "respec"),
     }])
     rows.append(_back_row(user_id))

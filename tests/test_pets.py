@@ -310,32 +310,106 @@ class CageAndTamingTests(PetsTestCase):
 
 
 class StatUpgradeTests(PetsTestCase):
-    def test_respec_costs_rubies_then_spends_points_before_gold(self):
+    def test_respec_refunds_the_gold_the_stats_cost_and_mints_no_free_points(self):
+        """A reset hands back coins now, not free stat points.
+
+        Points ignored the cost curve, and the curve is `level ** 1.5` -- so a point was
+        worth whatever the most expensive arrangement of it was, and 15 diamonds bought
+        that arbitrage over and over. Coins are refunded at the price the curve charged,
+        which is the price the curve charges to buy them back.
+        """
         entry = "respec"
         self._tame(entry, "1")
-        data = pets._load(entry)
-        record = data["pets"]["1"]
-        record["stats"]["strength"] = 6
-        record["stats"]["health"] = 4
-        pets._save(entry, data)
+        economy.grant(entry, "1", 10_000, "test")
         pets.grant_rubies(entry, "1", pets_config.STAT_RESPEC_RUBY_COST)
+        pets.upgrade_stat(entry, "1", 0, "strength", times=5)
+        pets.upgrade_stat(entry, "1", 0, "health", times=3)
+        invested = (pets_config.total_stat_cost(6) + pets_config.total_stat_cost(4))
+        before = economy.balance(entry, "1", 0)
 
-        ok, message, points = pets.respec_stats(entry, "1")
+        ok, message, refunded = pets.respec_stats(entry, "1", 0)
 
         self.assertTrue(ok, message)
-        self.assertEqual(points, 8)
+        self.assertEqual(refunded, invested)
+        self.assertEqual(economy.balance(entry, "1", 0), before + invested)
         self.assertEqual(pets.ruby_balance(entry, "1"), 0)
         pet = pets.get_pet(entry, "1")
         self.assertTrue(all(level == pets_config.STAT_MIN_LEVEL for level in pet["stats"].values()))
-        self.assertEqual(pets.available_stat_points(pet), 8)
+        # The whole point: no free points are minted any more.
+        self.assertEqual(pets.available_stat_points(pet), 0)
         text, keyboard = pets_ui.train_view(entry, "1", 0)
-        self.assertIn("Свободные очки: <b>8</b>", text)
+        self.assertNotIn("Свободные очки", text)
         callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
         self.assertIn(pets_ui.callback_data("1", "respec"), callbacks)
 
+    def test_the_respec_round_trip_is_coin_neutral_and_buys_no_discount(self):
+        """The abuse, run end to end: spread cheap, reset, pour it all into one stat.
+
+        Four stats at 25 cost 4,752 and used to return 96 free points; poured into one
+        stat those bought level 97, which honestly costs 36,595 -- a 7.7x discount that
+        widened the deeper the pet went. Both halves are pinned: the trip down refunds
+        exactly the trip up, and the rebuild is charged full price.
+        """
+        entry = "arbitrage"
+        self._tame(entry, "1")
+        economy.grant(entry, "1", 1_000_000, "test")
+        pets.grant_rubies(entry, "1", pets_config.STAT_RESPEC_RUBY_COST)
+        start = economy.balance(entry, "1", 0)
+        for key in ("strength", "health", "agility", "luck"):
+            pets.upgrade_stat(entry, "1", 0, key, times=24)
+
+        ok, message, _refunded = pets.respec_stats(entry, "1", 0)
+        self.assertTrue(ok, message)
+        self.assertEqual(economy.balance(entry, "1", 0), start)
+
+        after_reset = economy.balance(entry, "1", 0)
+        pets.upgrade_stat(entry, "1", 0, "strength", times=96)
+        self.assertEqual(pets.stat_level(entry, "1", "strength"), 97)
+        self.assertEqual(
+            after_reset - economy.balance(entry, "1", 0),
+            pets_config.total_stat_cost(97),
+        )
+
+    def test_respec_refunds_nothing_for_stats_nobody_paid_for(self):
+        """economy.refund reduces lifetime `spent`, which is clamped at zero.
+
+        That is the property that keeps a hand-granted stat block from being laundered
+        into coins: a reset can only ever give back money that was actually spent.
+        """
+        entry = "granted"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        data["pets"]["1"]["stats"]["strength"] = 40
+        pets._save(entry, data)
+        pets.grant_rubies(entry, "1", pets_config.STAT_RESPEC_RUBY_COST)
+        before = economy.balance(entry, "1", 0)
+
+        ok, message, refunded = pets.respec_stats(entry, "1", 0)
+
+        self.assertTrue(ok, message)
+        self.assertEqual(refunded, pets_config.total_stat_cost(40))
+        # Nothing was ever spent on that 40, so nothing comes back.
+        self.assertEqual(economy.balance(entry, "1", 0), before)
+        self.assertEqual(pets.stat_level(entry, "1", "strength"), pets_config.STAT_MIN_LEVEL)
+
+    def test_a_legacy_point_balance_still_spends_before_gold(self):
+        """Points are no longer minted, but the ones already banked are not confiscated.
+
+        Taking them back would charge players for a hole they did not dig, so
+        upgrade_stat keeps draining an existing balance ahead of the wallet.
+        """
+        entry = "legacy-points"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        data["pets"]["1"]["stat_points"] = 8
+        pets._save(entry, data)
+        before = economy.balance(entry, "1", 0)
+
         ok, message, spent = pets.upgrade_stat(entry, "1", 0, "strength", times=5)
+
         self.assertTrue(ok, message)
         self.assertEqual(spent, 0)
+        self.assertEqual(economy.balance(entry, "1", 0), before)
         self.assertEqual(pets.stat_level(entry, "1", "strength"), 6)
         self.assertEqual(pets.available_stat_points(pets.get_pet(entry, "1")), 3)
 

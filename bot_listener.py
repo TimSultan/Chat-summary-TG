@@ -6816,7 +6816,7 @@ async def handle_pets_callback(
             )
             return
         if action == "respec":
-            ok, note, _ = pets.respec_stats(entry, user_id)
+            ok, note, _ = pets.respec_stats(entry, user_id, xp)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note, pets_ui.train_view(entry, user_id, xp), log
             )

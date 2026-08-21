@@ -1052,6 +1052,9 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     state["debuff"] = pets.debuff_for(record)
     state["stat_points"] = pets.available_stat_points(record)
     state["stat_respec_ruby_cost"] = C.STAT_RESPEC_RUBY_COST
+    # What the reset would actually hand back. On the button rather than in a help text:
+    # a respec is a real sum of money now, and the size of it is the whole decision.
+    state["stat_refund"] = pets.stat_refund_value(record)
     state["stats"] = _stat_payload(entry, user_id, record, state["stat_points"])
     state["combat"] = _combat_payload(entry, user_id, record)
     state["equipment"] = _equipment_payload(record, prefix)
@@ -1120,7 +1123,7 @@ def _action_upgrade_stat(entry, user_id, xp, payload):
 
 
 def _action_respec_stats(entry, user_id, xp, payload):
-    ok, message, _points = pets.respec_stats(entry, user_id)
+    ok, message, _coins = pets.respec_stats(entry, user_id, xp)
     return ok, message
 
 
@@ -5570,11 +5573,14 @@ function statRespec() {
   const points = Number(S.stat_points || 0);
   const cost = Number(S.stat_respec_ruby_cost || 15);
   const disabled = !invested || Number(S.rubies || 0) < cost;
+  const refund = Number(S.stat_refund || 0);
   return '<div class="stat-respec">' +
     (points ? '<span class="tiny">🎯 Свободные очки: <b>' + points + '</b></span>' : "") +
     '<p class="tiny muted">Стат ниже половины от соперника открывает слабость в бою.</p>' +
+    '<p class="tiny muted">Сброс возвращает монеты по той же цене, по какой статы покупались.</p>' +
     '<button class="go sec" data-do="respec"' + (disabled ? " disabled" : "") +
-    '>🔄 Перераспределить статы · ' + cost + ' 💎</button></div>';
+    '>🔄 Перераспределить статы · ' + cost + ' 💎' +
+    (refund ? ' · 🪙 +' + money(refund) : '') + '</button></div>';
 }
 
 function cagePanel() {
@@ -9263,7 +9269,9 @@ async function handleClick(event, target) {
 
   if (d.do === "buycage") { await act("buy_cage"); }
   else if (d.do === "respec") {
-    confirmThen("Сбросить купленные статы за 15 💎? Золото не вернётся, но появятся свободные очки.",
+    confirmThen("Сбросить купленные статы за " +
+                Number(S.stat_respec_ruby_cost || 15) + " 💎? Вернётся " +
+                money(Number(S.stat_refund || 0)) + " монет — всё, что было потрачено на эти статы.",
                 () => act("respec_stats"));
   }
   else if (d.do === "upcage") { await act("upgrade_cage"); }
