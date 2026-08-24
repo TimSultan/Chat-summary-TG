@@ -47,6 +47,7 @@ import pets_sprite_store
 import pets_updates
 import pets_weapon_catalog
 import quests
+import pets_dungeon as dungeon
 import pets_web
 import stats
 import vote_web
@@ -2475,6 +2476,91 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("farm.can_ticket", page)
 
     # ---- replaying a recorded fight -----------------------------------------------------
+
+    # ------------------------------------------------------------- the boss workshop
+    async def test_the_boss_workshop_is_admin_only_on_both_of_its_routes(self):
+        """A menu flag is a hint. Every route re-asks, so a hand-typed one opens nothing."""
+        self._tame(PLAYER)
+        for user in (PLAYER, MODERATOR):
+            with self.subTest(user=user["username"]):
+                self.assertEqual((await self._get("/api/boss-test", user)).status, 403)
+                response = await self._post("/api/boss-test/run", user, {
+                    "floor": 5, "user_id": str(PLAYER["id"]), "fights": 1,
+                })
+                self.assertEqual(response.status, 403)
+        self.assertEqual((await self._get("/api/boss-test", THIRD)).status, 200)
+
+    async def test_the_workshop_lists_every_boss_and_every_pet_strongest_first(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        # Make the ordering a real question rather than a tie.
+        stored = pets._load(CHAT)
+        stored["pets"][str(OPPONENT["id"])]["stats"]["strength"] = 90
+        pets._save(CHAT, stored)
+
+        data = await (await self._get("/api/boss-test", THIRD)).json()
+        self.assertTrue(data["test_only"])
+        floors = [row["floor"] for row in data["bosses"]]
+        self.assertEqual(floors, list(range(dungeon.BOSS_EVERY,
+                                            dungeon.LAST_FLOOR + 1, dungeon.BOSS_EVERY)))
+        # The gimmick and its one-line rule travel with the boss: tuning one without
+        # being told it is the ghost that eats steel is tuning it blind.
+        ghost = next(row for row in data["bosses"] if row["gimmick"] == "spells_only")
+        self.assertTrue(ghost["weakness"])
+        self.assertTrue(ghost["stat_line"])
+
+        powers = [row["power"] for row in data["fighters"]]
+        self.assertEqual(powers, sorted(powers, reverse=True))
+        self.assertEqual(data["fighters"][0]["user_id"], str(OPPONENT["id"]))
+        # Whoever is fighting is described by what they actually carry, because that is
+        # the half of "as this character" a stat line does not cover.
+        self.assertIn("weapon", data["fighters"][0])
+        self.assertEqual(len(data["fighters"][0]["scrolls"]), 4)
+
+    async def test_a_workshop_fight_is_the_real_boss_and_changes_nothing(self):
+        self._tame(PLAYER)
+        before = pets._load(CHAT)["pets"][str(PLAYER["id"])]
+        snapshot = json.dumps(before, sort_keys=True, ensure_ascii=False)
+
+        data = await (await self._post("/api/boss-test/run", THIRD, {
+            "floor": 25, "user_id": str(PLAYER["id"]), "fights": 1,
+        })).json()
+        self.assertTrue(data["test_only"])
+        self.assertEqual(data["fights"], 1)
+        self.assertEqual(data["boss"]["gimmick"], "spells_only")
+        # The transcript is the same payload the dungeon animates, so what the workshop
+        # shows is what a player would see rather than a second rendering of it.
+        self.assertTrue(data["battle"]["dungeon"])
+        self.assertEqual(data["battle"]["you"], str(PLAYER["id"]))
+        self.assertTrue(data["battle"]["rounds"])
+
+        after = pets._load(CHAT)["pets"][str(PLAYER["id"])]
+        self.assertEqual(json.dumps(after, sort_keys=True, ensure_ascii=False), snapshot)
+        self.assertIsNone(after.get("dungeon_run"))
+        self.assertEqual((await (await self._get("/api/history", PLAYER)).json())["rows"], [])
+
+    async def test_a_batch_reports_a_win_rate_and_is_capped(self):
+        """One fight is a story; a boss is tuned against a number."""
+        self._tame(PLAYER)
+        data = await (await self._post("/api/boss-test/run", THIRD, {
+            "floor": 5, "user_id": str(PLAYER["id"]), "fights": 10_000,
+        })).json()
+        self.assertEqual(data["fights"], pets_web.BOSS_TEST_MAX_FIGHTS)
+        self.assertLessEqual(data["wins"], data["fights"])
+        self.assertGreaterEqual(data["win_rate"], 0)
+        self.assertLessEqual(data["win_rate"], 100)
+        self.assertGreater(data["fighter"]["max_hp"], 0)
+
+    async def test_the_workshop_refuses_a_floor_without_a_boss_and_a_pet_without_an_owner(self):
+        self._tame(PLAYER)
+        for payload, code in (
+            ({"floor": 4, "user_id": str(PLAYER["id"]), "fights": 1}, "BAD_BOSS_TEST"),
+            ({"floor": 5, "user_id": "999999", "fights": 1}, "BAD_BOSS_TEST"),
+            ({"floor": 5, "fights": 1}, "BAD_BOSS_TEST"),
+        ):
+            with self.subTest(payload=payload):
+                response = await self._post("/api/boss-test/run", THIRD, payload)
+                self.assertEqual((await response.json())["error"], code)
 
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):
         """Not "a fight like that one" -- that one. The stored seed and the two stored

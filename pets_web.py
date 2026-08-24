@@ -40,8 +40,10 @@ import json
 import os
 import re
 import secrets
+import statistics
 import time
 import traceback
+from dataclasses import replace
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -55,6 +57,7 @@ import maintenance
 import pets
 import pets_combat
 import pets_config as C
+import pets_dungeon as D
 import pets_flavor
 import pets_mobs
 import pets_gemini
@@ -1582,6 +1585,170 @@ async def handle_action(request: web.Request) -> web.Response:
           "dropped": _item_payload(dropped_item, request.app[_PREFIX_KEY], pets.get_pet(entry, user["id"])) if dropped_item else None,
         }
     return _ok(response, took=time.monotonic() - started)
+
+
+
+# ------------------------------------------------------------------- the boss workshop
+#
+# A place to fight a boss before anybody else has to. Admin only, and deliberately built
+# on the LIVE pieces rather than on copies of them: `pets.dungeon_enemy_fighter` is the
+# same constructor a real descent uses, `pets._dungeon_fighter` builds the hero from a
+# real pet record, and the fight is `pets_combat.simulate`. A boss tuned against a
+# near-copy of the dungeon is tuned against nothing.
+#
+# Nothing here writes. No run is entered, no fight bank is spent, no loot is rolled, no
+# audit row is stored and no pet's health moves -- the store is opened read-only and the
+# result is thrown away when the response ends.
+BOSS_TEST_MAX_FIGHTS = 500
+
+
+def _boss_test_roster(entry: str, prefix: str) -> dict:
+    """Every boss the roster holds, and every pet that could be sent at one."""
+    data = pets._load(entry)
+    bosses = []
+    for floor in range(D.BOSS_EVERY, D.LAST_FLOOR + 1, D.BOSS_EVERY):
+        row = D.encounter(floor, 0)
+        bosses.append({
+            "floor": floor,
+            "name": row["name"],
+            "gimmick": row.get("gimmick") or "standard",
+            "hint": row.get("hint") or "",
+            "weakness": row.get("weakness") or "",
+            "level": row["level"],
+            "stats": dict(row["stats"]),
+            "armor": row["armor"],
+            "stat_line": D.enemy_stat_line(row),
+        })
+
+    fighters = []
+    for user_id, record in (data.get("pets") or {}).items():
+        if not isinstance(record, dict) or not record.get("name"):
+            continue
+        effective = pets._effective_stats_for(record)
+        weapon = C.find_item((record.get("equipped") or {}).get("weapon"))
+        fighters.append({
+            "user_id": str(user_id),
+            "name": record.get("name"),
+            "owner_name": record.get("owner_name") or "кто-то",
+            "level": int(record.get("level", 1) or 1),
+            "power": pets._power_rating_for(record),
+            "portrait": _portrait_url(prefix, user_id),
+            "crop": record.get("portrait_crop"),
+            "stats": effective,
+            "stat_line": D.enemy_stat_line({"stats": effective, "armor": effective.get("armor", 0)}),
+            "weapon": weapon.name if weapon else "без оружия",
+            "scaling": C.weapon_scaling(weapon),
+            "scrolls": [
+                (pets_scroll_catalog.scroll(code) or {}).get("name") or "—"
+                for code in pets._skill_loadout_for(record)
+            ],
+        })
+    # Strongest first: picking who to send at a boss is a question about power, and a
+    # roster sorted any other way makes the admin do the sorting by eye.
+    fighters.sort(key=lambda row: (-row["power"], row["user_id"]))
+    return {"test_only": True, "bosses": bosses, "fighters": fighters,
+            "max_fights": BOSS_TEST_MAX_FIGHTS}
+
+
+def _boss_test_run(entry: str, floor: int, user_id: str, fights: int, prefix: str) -> dict:
+    """Fight one boss `fights` times as one pet, and report what happened.
+
+    One fight is the transcript -- the same payload the dungeon animates, so what is read
+    here is exactly what a player would see. Many fights are the win rate, which is the
+    number a boss is actually tuned against: a single transcript of a 50/50 fight looks
+    identical to a single transcript of a 5% one.
+    """
+    data = pets._load(entry)
+    record = pets._tamed_record(data, user_id)
+    if record is None:
+        raise ValueError("У этого игрока нет существа.")
+    if not D.is_boss_floor(floor):
+        raise ValueError("На этом этаже нет босса.")
+    row = D.encounter(floor, 0)
+    hero = pets._dungeon_fighter(record, str(user_id))
+    enemy = pets.dungeon_enemy_fighter(row)
+    # The hydra is three heads sharing one boss's health, and the run tracks which head is
+    # standing. There is no run here, so the workshop fights the first head at its real
+    # size -- honest about being one exchange of three rather than pretending otherwise.
+    heads = None
+    if row.get("gimmick") == "three_heads":
+        head_hp = max(1, round(
+            pets_combat.derive(enemy, hero)["max_hp"] * D.HYDRA_HEAD_HP_SHARE
+        ))
+        enemy = replace(enemy, name=f"{row['name']} · голова 1", starting_hp=head_hp)
+        heads = D.HYDRA_HEADS
+
+    wins = draws = 0
+    rounds_seen = []
+    hp_left = []
+    sample = None
+    for index in range(fights):
+        seed = secrets.randbits(63)
+        result = pets_combat.simulate(hero, enemy, seed=seed)
+        if result.is_draw:
+            draws += 1
+        elif result.winner == str(user_id):
+            wins += 1
+        rounds_seen.append(sum(1 for row_ in result.rounds if getattr(row_, "is_action", True)))
+        hp_left.append(max(0, int((result.final_hp or {}).get(str(user_id), 0))))
+        if index == 0:
+            sample = _playback_payload(
+                result, str(user_id), hero, enemy.key, enemy, row["name"],
+                prefix=prefix,
+                records={str(user_id): _fight_record_snapshot(record, prefix)},
+            )
+    max_hp = round(pets_combat.derive(hero, enemy)["max_hp"])
+    return {
+        "test_only": True,
+        "floor": floor,
+        "boss": {"name": row["name"], "gimmick": row.get("gimmick") or "standard",
+                 "weakness": row.get("weakness") or "", "heads": heads,
+                 "stat_line": D.enemy_stat_line(row), "level": row["level"]},
+        "fighter": {"user_id": str(user_id), "name": record.get("name"),
+                    "power": pets._power_rating_for(record), "max_hp": max_hp},
+        "fights": fights,
+        "wins": wins,
+        "draws": draws,
+        "win_rate": round(wins / fights * 100, 1) if fights else 0.0,
+        "median_rounds": statistics.median(rounds_seen) if rounds_seen else 0,
+        "median_hp_left": statistics.median(hp_left) if hp_left else 0,
+        "median_hp_share": (
+            round(statistics.median(hp_left) / max_hp * 100, 1) if max_hp else 0.0
+        ),
+        "battle": {**sample, "dungeon": True, "enemy_art": {"boss": True}} if sample else None,
+    }
+
+
+async def handle_boss_test(request: web.Request) -> web.Response:
+    """The roster. Admin only, and read-only in the strictest sense."""
+    await _economy_admin(request)
+    entry = request.app[_ENTRY_KEY]
+    return _ok(await asyncio.to_thread(
+        _boss_test_roster, entry, request.app[_PREFIX_KEY],
+    ))
+
+
+async def handle_boss_test_run(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    await _economy_admin(request, body)
+    entry = request.app[_ENTRY_KEY]
+    try:
+        floor = int(body.get("floor") or 0)
+        fights = max(1, min(BOSS_TEST_MAX_FIGHTS, int(body.get("fights") or 1)))
+    except (TypeError, ValueError):
+        return _json_error("Плохие параметры боя.", code="BAD_BOSS_TEST")
+    user_id = str(body.get("user_id") or "").strip()
+    if not user_id:
+        return _json_error("Выбери, кем драться.", code="BAD_BOSS_TEST")
+    try:
+        return _ok(await asyncio.to_thread(
+            _boss_test_run, entry, floor, user_id, fights, request.app[_PREFIX_KEY],
+        ))
+    except ValueError as error:
+        return _json_error(str(error), status=409, code="BAD_BOSS_TEST")
 
 
 async def handle_opponents(request: web.Request) -> web.Response:
@@ -3605,6 +3772,8 @@ def attach(
         web.post(prefix + "/api/maintenance", handle_maintenance),
         web.get(prefix + "/api/grant", handle_grant_admin),
         web.post(prefix + "/api/grant", handle_grant_set),
+        web.get(prefix + "/api/boss-test", handle_boss_test),
+        web.post(prefix + "/api/boss-test/run", handle_boss_test_run),
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
         web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
         web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
@@ -4115,6 +4284,8 @@ PAGE_HTML = """<!doctype html>
   /* The stat block reads as data, not as prose: tabular figures so the columns line up
      between two enemies on the same floor, and quiet enough not to compete with the name. */
   .statline { color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+  .bosspick { text-align: left; margin-bottom: 8px; }
+  .bosspick.on { outline: 2px solid var(--gold); outline-offset: -2px; }
   .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
   .rune-cell { display: grid; gap: 2px; justify-items: center; padding: 9px 4px;
                border: 1px solid var(--line); border-radius: 12px; background: var(--sunken);
@@ -7713,6 +7884,7 @@ async function renderMore() {
     if (S && S.is_economy_admin) menu.push("debuff:🎭 Эффекты игрокам");
     if (S && S.is_economy_admin) menu.push("grant:🎁 Выдать ресурсы");
     if (S && S.is_economy_admin) menu.push("maintenance:⚠️ Пауза игры");
+    if (S && S.is_economy_admin) menu.push("bosstest:🐉 Тест боссов");
     box.innerHTML = '<div class="panel"><h2>Ещё</h2>' +
       menu.map((entry) => {
         const [key, label] = entry.split(":");
@@ -7770,6 +7942,12 @@ async function renderMore() {
     body = grantAdmin(await api("/api/grant"));
   } else if (moreView === "maintenance") {
     body = maintenancePanel(await api("/api/maintenance"));
+  } else if (moreView === "bosstest") {
+    // Re-fetched every time the screen opens rather than cached: the whole point is to
+    // fight a pet AS IT IS RIGHT NOW, and a roster held over from an earlier visit would
+    // quietly test yesterday's gear.
+    if (!BOSS_TEST_RESULT) BOSS_TEST = await api("/api/boss-test");
+    body = bossWorkshop();
   } else if (moreView === "mail") {
     const data = await api("/api/mail");
     body = '<div class="panel"><h2>📬 Почта</h2>' + mailFeed(data.rows || []) + "</div>";
@@ -7788,6 +7966,97 @@ async function renderMore() {
   }
   box.innerHTML = '<button class="go sec" data-more="menu">◀️ Назад</button>' + body;
   paintShots(box);
+}
+
+
+// ------------------------------------------------------------------- the boss workshop
+// Admin only, and a workshop rather than a game mode: it fights the real boss with the
+// real engine, and nothing it does is written anywhere. Whoever is being tested is picked
+// from the live roster sorted by power, because "can the strongest pet in the chat still
+// lose to this" and "can the weakest one still win" are the two questions a boss is
+// tuned between, and both need a real pet with its real gear behind them.
+let BOSS_TEST = null;          // the roster, fetched once per visit
+let BOSS_TEST_PICK = null;     // {floor, user_id}
+let BOSS_TEST_RESULT = null;
+
+const BOSS_GIMMICK_NAMES = {
+  standard: "обычный", fire_only: "только огонь", frost_only: "только лёд",
+  spells_only: "только магия", antimagic: "антимаг", healing_pass: "лечение проходит",
+  three_heads: "три головы", reincarnate: "возрождается",
+};
+
+function bossWorkshop() {
+  const bosses = (BOSS_TEST && BOSS_TEST.bosses) || [];
+  const fighters = (BOSS_TEST && BOSS_TEST.fighters) || [];
+  const pick = BOSS_TEST_PICK || {};
+  const chosenBoss = bosses.find((b) => b.floor === pick.floor);
+  const chosenPet = fighters.find((f) => f.user_id === pick.user_id);
+
+  const bossList = bosses.map((b) =>
+    '<button class="go sec bosspick' + (b.floor === pick.floor ? " on" : "") +
+    '" data-bosstest="boss" data-floor="' + b.floor + '">' +
+    "<span><b>" + esc(b.name) + "</b> <span class='tiny muted'>эт. " + b.floor +
+    " · ур. " + b.level + " · " + esc(BOSS_GIMMICK_NAMES[b.gimmick] || b.gimmick) +
+    "</span><br><span class='tiny statline'>" + esc(b.stat_line) + "</span></span></button>"
+  ).join("") || '<div class="empty">Боссов нет.</div>';
+
+  const petList = fighters.map((f) =>
+    '<button class="foe bosspick' + (f.user_id === pick.user_id ? " on" : "") +
+    '" data-bosstest="pet" data-user="' + esc(f.user_id) + '">' +
+    '<span class="av">' + shot(f.portrait, f.crop) + "</span>" +
+    "<span class='small'><b>" + esc(f.name || "—") + "</b> <span class='tiny muted'>ур. " +
+    f.level + " · " + esc(f.owner_name) + "</span>" +
+    "<br><span class='tiny statline'>" + esc(f.stat_line) + "</span>" +
+    "<br><span class='tiny muted'>" + esc(f.weapon) +
+    (f.scaling !== "strength" ? " · " + esc(SCALING_LABEL[f.scaling] || "") : "") +
+    "</span></span><span class='pw'>⚡ " + money(f.power) + "</span></button>"
+  ).join("") || '<div class="empty">В чате нет существ.</div>';
+
+  const ready = Boolean(chosenBoss && chosenPet);
+  const actions = '<div class="panel"><h2>Драка</h2>' + (ready
+    ? "<div class='small' style='margin-bottom:8px'>" + esc(chosenPet.name) +
+      " против «" + esc(chosenBoss.name) + "»" +
+      (chosenBoss.weakness ? "<br><span class='tiny weakness'>⚠️ " +
+        esc(chosenBoss.weakness) + "</span>" : "") + "</div>" +
+      '<div class="pair"><button class="go" data-bosstest="run" data-fights="1">' +
+      "⚔️ Один бой с логом</button>" +
+      '<button class="go sec" data-bosstest="run" data-fights="100">' +
+      "📊 100 боёв</button></div>" +
+      '<button class="go sec" style="margin-top:8px" data-bosstest="run" data-fights="500">' +
+      "📊 500 боёв — точная цифра</button>"
+    : "<div class='empty'>Выбери босса и того, кем драться.</div>") + "</div>";
+
+  return '<div class="panel"><h2>🐉 Тест боссов</h2>' +
+    "<div class='small muted'>Настоящий босс, настоящий движок, настоящее существо " +
+    "со своими статами и предметами. Ничего не тратится и не начисляется: ни забега, " +
+    "ни боёв из банка, ни лута, ни урона питомцу.</div></div>" +
+    '<div class="panel"><h2>Босс</h2>' + bossList + "</div>" +
+    actions +
+    (BOSS_TEST_RESULT ? bossWorkshopResult(BOSS_TEST_RESULT) : "") +
+    '<div class="panel"><h2>Кем драться · ' + fighters.length +
+    "</h2><div class='tiny muted' style='margin-bottom:9px'>Отсортированы по силе.</div>" +
+    petList + "</div>";
+}
+
+function bossWorkshopResult(data) {
+  const single = data.fights === 1;
+  // A win rate off one fight is 0% or 100% and means neither, so a single fight reports
+  // the transcript and a batch reports the number. Saying "100% (1 бой)" would be the
+  // one line in this screen capable of talking somebody into shipping a broken boss.
+  const verdict = single
+    ? (data.wins ? "победа" : (data.draws ? "ничья" : "поражение"))
+    : data.win_rate + "% побед за " + data.fights + " боёв";
+  return '<div class="panel"><h2>Результат</h2>' +
+    "<div class='row spread small'><span>" + esc(data.fighter.name) + " vs " +
+    esc(data.boss.name) + "</span><b>" + esc(verdict) + "</b></div>" +
+    "<div class='tiny muted' style='margin-top:6px'>Ходов в среднем: " +
+    data.median_rounds + " · HP осталось: " + data.median_hp_left + " из " +
+    data.fighter.max_hp + " (" + data.median_hp_share + "%)" +
+    (data.boss.heads ? " · это одна голова из " + data.boss.heads : "") + "</div>" +
+    (data.battle
+      ? '<button class="go sec" style="margin-top:10px" data-bosstest="watch">' +
+        "▶️ Смотреть " + (single ? "этот бой" : "первый бой") + "</button>"
+      : "") + "</div>";
 }
 
 // ---------------------------------------------------------------------------- quests
@@ -9103,7 +9372,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
-    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
+    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
@@ -9141,6 +9410,41 @@ async function handleClick(event, target) {
   if (d.grantpick !== undefined) { grantPick = d.grantpick; render(); return; }
   if (d.grantset !== undefined) { await setGrant(d.grantset); return; }
 
+  if (d.bosstest) {
+    if (d.bosstest === "boss") {
+      BOSS_TEST_PICK = { ...(BOSS_TEST_PICK || {}), floor: Number(d.floor) };
+      BOSS_TEST_RESULT = null;
+      render();
+      return;
+    }
+    if (d.bosstest === "pet") {
+      BOSS_TEST_PICK = { ...(BOSS_TEST_PICK || {}), user_id: d.user };
+      BOSS_TEST_RESULT = null;
+      render();
+      return;
+    }
+    if (d.bosstest === "watch") {
+      if (BOSS_TEST_RESULT && BOSS_TEST_RESULT.battle) playDuel(BOSS_TEST_RESULT.battle);
+      return;
+    }
+    if (d.bosstest === "run") {
+      const pick = BOSS_TEST_PICK || {};
+      if (!pick.floor || !pick.user_id) { toast("Выбери босса и того, кем драться."); return; }
+      const fights = Number(d.fights) || 1;
+      // 500 real fights is a second or two of somebody else's CPU, so the button says so
+      // rather than looking frozen.
+      if (fights > 1) toast("Считаю " + fights + " боёв…");
+      try {
+        BOSS_TEST_RESULT = await api("/api/boss-test/run", {
+          floor: pick.floor, user_id: pick.user_id, fights,
+        });
+      } catch (e) { haptic("no"); toast(e.message); return; }
+      haptic("ok");
+      render();
+      return;
+    }
+    return;
+  }
   if (d.testbattle === "open") { await openTestBattle(); return; }
   if (d.testbattle === "close") {
     TEST_SETUP = null; TEST_BATTLE = null; TEST_SESSION = null; TEST_MODE = null; render(); return;

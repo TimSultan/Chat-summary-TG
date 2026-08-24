@@ -158,8 +158,14 @@ DUNGEON_CLEARED_NOTICE: Final = (
 )
 
 
+# Every fifth floor belongs to a boss. Named because three other places counted in fives
+# to find them -- the reward cap, the roster length and the admin boss workshop -- and a
+# literal repeated in four files is a rule nobody can change.
+BOSS_EVERY: Final = 5
+
+
 def is_boss_floor(floor: int) -> bool:
-    return floor > 0 and floor % 5 == 0
+    return floor > 0 and floor % BOSS_EVERY == 0
 
 
 # --- the deep corridor ----------------------------------------------------------------

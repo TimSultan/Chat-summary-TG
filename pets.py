@@ -4677,6 +4677,40 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
     )
 
 
+def dungeon_enemy_fighter(row: dict, cleared=()) -> pets_combat.Fighter:
+    """One dungeon enemy as a Fighter, with every gimmick its row asks for.
+
+    Lifted out of `dungeon_fight` so the boss workshop (`pets_web`, admin only) fights the
+    same creature a live descent does. That is the entire point of a workshop: a boss
+    tuned against a near-copy of itself is tuned against nothing, and the two would drift
+    the first time a gimmick changed. `cleared` is only read by the pack, whose remaining
+    members hit harder as their friends fall.
+
+    The hydra's head-splitting stays with the caller: it needs the HERO to size a head
+    against, and it is the one rule that is about the run rather than about the enemy.
+    """
+    stats = dict(row["stats"])
+    if row.get("gimmick") == "pack_fury":
+        stats["strength"] = round(stats["strength"] * D.pack_strength_multiplier(
+            int(row.get("floor", 1) or 1),
+            {int(value) for value in cleared if str(value).isdigit()},
+        ))
+    antimagic = D.ANTIMAGIC_REFLECT_SHARE if row.get("gimmick") == "antimagic" else 0
+    return pets_combat.Fighter(
+        key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
+        level=row["level"],
+        effects=(({"code": "thorns", "value": 50},) if row.get("gimmick") == "healing_pass" else ()),
+        physical_damage_taken_multiplier=0 if row.get("gimmick") == "spells_only" else 1,
+        # Plain steel does not just fail here, it feeds the ghost: see
+        # pets_combat.Fighter.physical_damage_heals and the block that reads it
+        # in the basic-attack path.
+        physical_damage_heals=row.get("gimmick") == "spells_only",
+        magic_reflect_multiplier=antimagic,
+        enchant_reflect_multiplier=antimagic,
+        **stats,
+    )
+
+
 def _dungeon_has_healing(record: dict) -> bool:
     healing_effects = {"vampiric", "second_wind", "dodge_heal", "regen", "medkit", "bite", "blood_pact"}
     for code in _skill_loadout_for(record):
@@ -4825,26 +4859,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             # Set once the last head falls, so the victory path below can tell "the hydra
             # is dead" from "this one exchange was lost on damage".
             hydra_defeated = False
-            enemy_stats = dict(row["stats"])
-            if row["gimmick"] == "pack_fury":
-                enemy_stats["strength"] = round(enemy_stats["strength"] * D.pack_strength_multiplier(floor, cleared))
-            enemy = pets_combat.Fighter(
-                key=f"dungeon:{row['code']}", name=row["name"], armor=row["armor"],
-                level=row["level"],
-                effects=(({"code": "thorns", "value": 50},) if row["gimmick"] == "healing_pass" else ()),
-                physical_damage_taken_multiplier=0 if row["gimmick"] == "spells_only" else 1,
-                # Plain steel does not just fail here, it feeds the ghost: see
-                # pets_combat.Fighter.physical_damage_heals and the block that reads it
-                # in the basic-attack path.
-                physical_damage_heals=row["gimmick"] == "spells_only",
-                magic_reflect_multiplier=(
-                    D.ANTIMAGIC_REFLECT_SHARE if row["gimmick"] == "antimagic" else 0
-                ),
-                enchant_reflect_multiplier=(
-                    D.ANTIMAGIC_REFLECT_SHARE if row["gimmick"] == "antimagic" else 0
-                ),
-                **enemy_stats,
-            )
+            enemy = dungeon_enemy_fighter(row, cleared)
             if row["gimmick"] == "three_heads":
                 # One boss's health split three ways, not a full boss per head. Clamped
                 # against the live maximum on every press, which is also what rescues a
