@@ -6310,7 +6310,7 @@ PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     "dungeondescend", "dungeonquit", "dungeonchest",
     # The hand-fought boss. Both halves belong here or the fight would bounce off this
     # gate on its own floor: starting it, and every turn of it afterwards.
-    "phoenixstart", "phoenixact",
+    "phoenixstart", "phoenixact", "phoenixauto",
     # Reading the bag and changing what is worn.
     "bag", "bagitems", "equip", "unequip",
     # The scroll slots, and the picker screen that stands between them and a scroll.
@@ -6675,9 +6675,11 @@ async def handle_pets_callback(
                 message_id = None
             await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
             return
-        if action in ("phoenixstart", "phoenixact"):
+        if action in ("phoenixstart", "phoenixact", "phoenixauto"):
             if action == "phoenixstart":
                 _, note, state = pets.phoenix_start(entry, user_id)
+            elif action == "phoenixauto":
+                _, note, state = pets.phoenix_auto(entry, user_id)
             else:
                 _, note, state = pets.phoenix_action(entry, user_id, argument or "")
             # A win clears the fight out of the run, so the state that came back with the

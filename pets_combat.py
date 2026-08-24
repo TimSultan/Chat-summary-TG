@@ -2122,10 +2122,32 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             skill_loadouts[attacker_key] or equipped_shields[attacker_key]
         ):
             choices = active_actions(attacker_key)
+            weighted = []
+            missing_hp = max(0.0, max_hp[attacker_key] - hp[attacker_key])
+            for candidate in (row for row in choices if row != "attack"):
+                if not candidate.startswith("skill_"):
+                    weighted.append(candidate)
+                    continue
+                slot = int(candidate.removeprefix("skill_")) - 1
+                spell = SCROLLS.scroll(skill_loadouts[attacker_key][slot]) or {}
+                healing_share = sum(
+                    max(0.0, float(effect.get("percent", 0) or 0))
+                    for effect in spell.get("effects", ())
+                    if effect.get("op") in {"heal", "regen"}
+                )
+                expected_heal = max_hp[attacker_key] * healing_share
+                # Healing scrolls wait while more than half their heal would be wasted.
+                # Once the wound is larger than the whole heal, give them an extra ticket.
+                # Pure barriers never enter this rule and retain their normal chance.
+                if expected_heal and missing_hp <= expected_heal / 2:
+                    continue
+                weighted.append(candidate)
+                if expected_heal and missing_hp > expected_heal:
+                    weighted.append(candidate)
             # Every available scroll has the same one-ticket chance. A plain attack has
             # four tickets so active combat does not turn into an endless wall of heals
             # and shields; Defend keeps one ticket like any single ability.
-            action = rng.choice(["attack"] * 4 + [row for row in choices if row != "attack"])
+            action = rng.choice(["attack"] * 4 + weighted)
             if action != "attack":
                 attacks_made[attacker_key] += 1
                 return take_active_action(attacker_key, defender_key, action, round_number)

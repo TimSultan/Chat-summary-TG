@@ -75,23 +75,46 @@ THEMES: Final = (
 
 # Each room owns its encounter count and short story. A floor's reward budget is shared
 # between these encounters, so a crowded room asks for more fights without printing money.
+# How dangerous each KIND of room is, and the four numbers were out of tune with each
+# other.
+#
+# Measured as the stat level a player needs for a floor to cost 27% of their health --
+# floor by floor, enemies fought in sequence with health carried across exactly as a run
+# carries it, and the pack's fury included. Against the smooth trend of the descent the
+# four kinds came out at 0.85x (elite), 0.88x (duo), 0.91x (patrol) and 1.15x (pack), so
+# the corridor sawtoothed: a run needed 537 to hold the pack floor on 18, then 444 for the
+# elite on 19, then 651 again on 22.
+#
+# That flat stretch is what the complaint is actually about. It reads as a spike on the
+# hard floor, but it is the two cheap floors in front of it that do the damage: a player
+# crosses them without spending a heal, learns nothing about how well their gear is
+# holding up, and walks into the next real room believing they were fine.
+#
+# The multipliers below are those measured ratios divided out, so a floor costs about what
+# the floor before it did and the descent gets harder only with depth. Re-measured after:
+# 0.91x, 0.92x, 0.96x, 0.97x -- a six-point band where there was a thirty-point one.
 ROOMS: Final = (
-    {"count": 2, "kind": "duo", "strength": 1.28, "health": 1.24,
+    {"count": 2, "kind": "duo", "strength": 1.46, "health": 1.42,
      "description": "Два брата никого не пускают и даже не делают вид, что слушают.",
      "hint": "Один держит дверь, второй смотрит из-за плеча."},
     # Five, not ten. Ten was ten near-identical fights in a row, and two healers inside
     # it meant a player could be pressing the same button twenty times before the room
     # stayed down. Five keeps the puzzle -- two healers, three bodies -- and cuts the
     # typing. The per-enemy stats rise to match, so the ROOM is as dangerous as it was.
-    {"count": 5, "kind": "pack_fury", "strength": 1.02, "health": 1.08,
+    {"count": 5, "kind": "pack_fury", "strength": 0.87, "health": 0.92,
      "description": "Пятеро стайных бойцов заняли проход. Двое из них — целители: пока "
                     "хоть один жив, остальные поднимаются снова, и стая всё время "
                     "перестраивается.",
      "hint": "Соседи подбадривают его."},
-    {"count": 1, "kind": "elite", "strength": 1.65, "health": 1.70,
+    # The elite's lift is in HEALTH, not in the swing. It needs about 4.6x an ordinary
+    # enemy's threat to be worth a floor on its own, and taking that as 2.1x on both halves
+    # gave one corridor mob a bigger Сила number than the boss standing five floors along
+    # -- true on the stat line the player reads, and false about which fight is harder. A
+    # long-lived guard is the same difficulty and the honest silhouette for it.
+    {"count": 1, "kind": "elite", "strength": 1.55, "health": 3.00,
      "description": "Один старый страж остался у двери. Уходить он явно не собирается.",
      "hint": "Старые доспехи звенят, когда он делает шаг."},
-    {"count": 4, "kind": "patrol", "strength": 1.02, "health": 1.04,
+    {"count": 4, "kind": "patrol", "strength": 1.06, "health": 1.08,
      "description": "Дозор заметил тебя раньше, чем ты успел выбрать дорогу.",
      "hint": "Он перекрывает путь к следующему залу."},
 )
@@ -122,23 +145,32 @@ def boss_weakness(gimmick: str) -> str:
 
 
 BOSSES: Final = (
-    ("Феникс пепельных залов", "reincarnate", 0,
+    ("Феникс пепельных залов",
+     "reincarnate",
      "На чёрном камне остаются горячие перья, хотя птица давно не взмахивала крыльями."),
-    ("Стальной привратник", "standard", 5,
+    ("Стальной привратник",
+     "standard",
      "В его забрале нет щели, но старый замок на груди всё ещё отсчитывает чужие шаги."),
-    ("Ледяной дракон", "fire_only", 0,
+    ("Ледяной дракон",
+     "fire_only",
      "Иней на его чешуе не тает даже рядом с факелами; в трещинах мерцает далёкий жар."),
-    ("Молчаливый колосс", "standard", 5,
+    ("Молчаливый колосс",
+     "standard",
      "Каменные пальцы сжаты вокруг меча; кажется, он стоял здесь ещё до постройки подземелья."),
-    ("Призрак Аквариуса", "spells_only", 0,
+    ("Призрак Аквариуса",
+     "spells_only",
      "Клинок без руны он впитывает как воду: простая сталь его лечит, а не ранит."),
-    ("Антимаг без имени", "antimagic", 0,
+    ("Антимаг без имени",
+     "antimagic",
      "Он возвращает 85% магического и рунного урона; здесь надёжнее простое оружие."),
-    ("Плачущее дерево", "healing_pass", 0,
+    ("Плачущее дерево",
+     "healing_pass",
      "Сок медленно затягивает старые зарубки, а у корней журчит невидимый ручей."),
-    ("Трёхглавая гидра", "three_heads", 0,
+    ("Трёхглавая гидра",
+     "three_heads",
      "Недобитая голова затягивает раны на глазах; срубленная не отрастает. Бей до конца."),
-    ("Кузнец багровой кузни", "frost_only", 0,
+    ("Кузнец багровой кузни",
+     "frost_only",
      "Воздух перед ним дрожит от жара, но на молоте остаётся тонкая белая изморозь."),
 )
 
@@ -177,10 +209,11 @@ BOSS_EVERY: Final = 5
 # The rations stay. Diamonds make a heal cost something real, but unlimited healing is
 # what turned a deep descent into a question of how much the player could spend rather
 # than how far they could actually get, and that is true of any currency.
-def _stock(code, icon, name, description, currency, price, heal, uses=None):
+def _stock(code, icon, name, description, currency, price, heal=0, uses=None, effect=""):
     return {
         "code": code, "icon": icon, "name": name, "description": description,
         "currency": currency, "price": price, "heal": heal, "uses": uses,
+        "effect": effect,
         # Per-run counters are stored under the item's own key, so a new row cannot
         # collide with an existing one or silently share its ration.
         "used_key": f"shop_used_{code}",
@@ -194,6 +227,10 @@ SHOP_STOCK: Final = (
     _stock("heal_full", "❤️", "Полевой лазарет",
            "Восстанавливает здоровье полностью.",
            "ruby", SHOP_FULL_HEAL_RUBIES, 1.0, SHOP_FULL_HEAL_USES),
+    _stock("phoenix_totem", "🔥", "Тотем Феникса",
+           "Один раз воскрешает в текущем забеге. Покрась фигурку Феникса в квестах, "
+           "чтобы получать этот тотем навсегда.",
+           "ruby", 15, uses=1, effect="resurrect"),
 )
 
 # Both rows keep the keys the old rest counters used, so a run already in progress when
@@ -255,7 +292,27 @@ DEEP_CORRIDOR_STAT_SLOPE: Final = 9
 # How much bigger the floor's owner is than the floor itself. Read against the room
 # multipliers in ROOMS: the elite room is 1.65, so a boss leads its own corridor by
 # roughly a fifth once both are on the ramp.
-BOSS_STAT_MULTIPLIER: Final = 1.80
+# A boss is a LONG fight, not a sharp one, and these two numbers are that sentence.
+#
+# There used to be one multiplier for the whole stat block: 1.80 on everything, and the
+# two boss slots with no gimmick read their stats five floors deeper still. Measured as
+# the stat a player needs for the floor to cost 27% of their health, that is where the
+# descent broke: floor 9 asked for 221 and floor 10 asked for 413, floor 19 asked for 444
+# and floor 20 -- the colossus -- asked for 668. An 87% step and a 50% step, with nothing
+# in between to warn anybody. Both those bosses also carried the stat block of the boss
+# five floors below them, so beating one taught a player nothing about the next.
+#
+# Health carries the difficulty now and power rises far less. A boss that lives three
+# times longer than its stat value suggests is a fight the player watches their resources
+# drain in -- health they cannot get back, scroll charges, a potion -- which is a loss
+# they can see coming and answer. A boss that hits twice as hard is a fight that ends in
+# one bad exchange, which is the loss that arrives as "хуяк, и всё здоровье".
+#
+# Re-measured: the same two steps are +24% and +26%, and every boss floor now asks for
+# 1.0x-1.3x of the corridor trend -- the peak of its block, which a boss should be, rather
+# than a wall standing in the middle of it.
+BOSS_POWER_MULTIPLIER: Final = 1.55
+BOSS_HEALTH_MULTIPLIER: Final = 3.90
 # Ordinary enemies carried a fifth of their stat value as armour against a boss's third,
 # which is most of why a corridor fight was over before it started: thin armour means a
 # short fight, and a short fight is one the enemy spends dying rather than hitting back.
@@ -282,13 +339,17 @@ def _scale(floor: int, boss: bool = False) -> int:
     compounding made the owner of a floor the easiest thing standing on it -- 0.86x the
     elite behind it by floor 25, 0.46x by 45. Moving together is what keeps a wall a wall.
 
-    A boss reads this at `floor + tier_ahead`, which is what keeps a plain boss and the
-    gimmick boss five floors later on an identical stat block -- see BOSSES.
+    A boss reads this at its OWN floor. It used to read five floors ahead when it had no
+    gimmick, so that a plain boss was "the rehearsal" for the gimmick boss five floors
+    later and the two shared a stat block. What that actually bought was a cliff: the
+    floor-20 boss carried floor-25 numbers, so a run walked through floor 19 at a cost of
+    17% of a health bar and hit 45% and a stat block 44% bigger in one step. A rehearsal
+    nobody survives is not a rehearsal.
     """
     shallow = min(max(0, floor - 1), DEPTH_RAMP_START - 1)
     deep = max(0, floor - DEPTH_RAMP_START)
     value = 22 + shallow * CORRIDOR_STAT_SLOPE + deep * DEEP_CORRIDOR_STAT_SLOPE
-    return round(value * (BOSS_STAT_MULTIPLIER if boss else 1.0))
+    return round(value * (BOSS_POWER_MULTIPLIER if boss else 1.0))
 
 
 def _corridor_armor(floor: int, value: int, index: int) -> int:
@@ -367,8 +428,12 @@ def encounter(floor: int, index: int) -> dict:
     """One reproducible enemy. ``index`` is zero-based within the floor."""
     floor = max(1, int(floor))
     if is_boss_floor(floor):
-        name, gimmick, tier_ahead, hint = BOSSES[((floor // 5) - 1) % len(BOSSES)]
-        value = _scale(floor + tier_ahead, boss=True)
+        name, gimmick, hint = BOSSES[((floor // 5) - 1) % len(BOSSES)]
+        value = _scale(floor, boss=True)
+        # Health is read off the corridor value rather than the boss's own, so the two
+        # multipliers stay independent: raising what a boss hits for does not silently
+        # lengthen the fight, and lengthening the fight does not make it hit harder.
+        health = round(_scale(floor) * BOSS_HEALTH_MULTIPLIER)
         weakness = boss_weakness(gimmick)
         return {
             "code": f"boss_{floor}", "name": name, "floor": floor, "index": 0,
@@ -376,10 +441,10 @@ def encounter(floor: int, index: int) -> dict:
             # The flavour line and the rule, kept apart: one sets the scene, the other is
             # the thing a player has to act on and must never be buried inside it.
             "hint": hint, "weakness": weakness,
-            "stats": {"strength": value + 12, "health": value + 18,
+            "stats": {"strength": value + 12, "health": health,
                       "agility": value - 4, "luck": value - 6},
             "armor": max(0, min(BOSS_ARMOR_CAP, value // 3)),
-            "level": floor + 8 + tier_ahead,
+            "level": floor + 8,
             "reward": reward_for(floor, boss=True),
         }
 

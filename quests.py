@@ -685,7 +685,7 @@ AUTO_REFRESH_KINDS = frozenset({"real"})
 # Bumping this retires every stored board at once. The next time a player looks, they are
 # dealt from the catalogue as it stands now -- and anything they have already sent to a
 # moderator is carried across rather than thrown away with the rest.
-BOARD_BUNDLE_VERSION = 2
+BOARD_BUNDLE_VERSION = 3
 
 
 def _assignment_row(quest, moment: datetime) -> dict:

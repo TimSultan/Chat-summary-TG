@@ -586,6 +586,9 @@ def phoenix_view(entry: str, user_id, xp: int, state: dict | None = None) -> tup
         # line explaining it would answer the question the boss is asking.
         lines.extend(["", f"⚠️ <b>{escape(telegraph)}</b>"])
     rows = []
+    record = pets.get_pet(entry, user_id) or {}
+    if max(0, int((record.get("phoenix_record") or {}).get("wins", 0) or 0)) >= 10:
+        rows.append([{"text": "⚡ Автобой", "callback_data": callback_data(user_id, "phoenixauto")}])
     if state.get("over"):
         lines.extend([
             "",

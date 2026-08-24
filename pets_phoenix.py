@@ -832,6 +832,34 @@ def take(state: dict, action: str, *, seed: int | None = None) -> dict:
     return nxt
 
 
+def autoplay(state: dict, *, seed: int | None = None, limit: int = 200) -> dict:
+    """Finish a learned fight using the safest available non-inventory action."""
+    current = copy.deepcopy(dict(state or {}))
+    rng = random.Random(seed)
+    for _ in range(max(1, int(limit))):
+        if is_over(current):
+            return current
+        offered = [row["code"] for row in actions(current)
+                   if row["code"] not in {MAGIC, CANCEL}
+                   and not row["code"].startswith(SPELL_PREFIX)]
+        if not offered:
+            offered = [row["code"] for row in actions(current) if row["code"] != CANCEL]
+        candidates = []
+        for code in offered:
+            trial = take(current, code, seed=rng.randrange(1 << 63))
+            grade = {PERFECT: 3, FINE: 2, BAD: 0, "": 1}.get(str(trial.get("grade") or ""), 0)
+            score = (
+                1 if str(trial.get("phase_state")) == VICTORY else 0,
+                0 if str(trial.get("phase_state")) == DEFEAT else 1,
+                grade,
+                int(current.get("boss_hp", 0) or 0) - int(trial.get("boss_hp", 0) or 0),
+                int(trial.get("hero_hp", 0) or 0),
+            )
+            candidates.append((score, trial))
+        current = max(candidates, key=lambda row: row[0])[1]
+    return current
+
+
 def _spend_spell(state: dict, code: str) -> dict | None:
     """Take the chosen scroll off the shelf for good, or None if this was not a cast."""
     if not code.startswith(SPELL_PREFIX):

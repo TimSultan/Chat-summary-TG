@@ -17,6 +17,17 @@ import pets_ui
 
 
 class DungeonTests(unittest.TestCase):
+    def test_phoenix_totem_is_sold_for_fifteen_diamonds(self):
+        item = dungeon.shop_item("phoenix_totem")
+        self.assertEqual(item["price"], 15)
+        self.assertEqual(item["currency"], "ruby")
+        self.assertEqual(item["effect"], "resurrect")
+        self.assertIn("навсегда", item["description"])
+
+    def test_final_hp_carries_combat_healing_back_into_the_dungeon(self):
+        result = SimpleNamespace(final_hp={self.user_id: 375}, rounds=())
+        self.assertEqual(pets._hp_after_fight(result, self.user_id), 375)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.patch = patch("stats._stats_dir", return_value=Path(self.temp.name))
@@ -47,18 +58,51 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(boss[0]["boss"])
         self.assertEqual(boss[0]["gimmick"], "reincarnate")
 
-    def test_gimmick_bosses_are_preceded_by_equally_strong_plain_bosses(self):
-        gatekeeper = dungeon.encounter(10, 0)
-        dragon = dungeon.encounter(15, 0)
-        colossus = dungeon.encounter(20, 0)
-        aquarius = dungeon.encounter(25, 0)
+    def test_a_boss_without_a_gimmick_reads_its_own_floor_like_every_other_boss(self):
+        """The plain bosses used to borrow the stat block of the boss five floors deeper.
 
-        self.assertEqual(gatekeeper["gimmick"], "standard")
-        self.assertEqual(colossus["gimmick"], "standard")
-        self.assertEqual(gatekeeper["stats"], dragon["stats"])
-        self.assertEqual(colossus["stats"], aquarius["stats"])
-        self.assertEqual(dragon["gimmick"], "fire_only")
-        self.assertEqual(aquarius["gimmick"], "spells_only")
+        It was called a rehearsal -- beat the colossus on 20 and you have met exactly what
+        the ghost on 25 brings. What it actually was is a cliff. Measured as the stat a
+        player needs for a floor to cost a quarter of their health, floor 9 asked for 221
+        and floor 10 asked for 413; floor 19 asked for 444 and floor 20 asked for 668. A
+        run walked two cheap floors and then met the number belonging to a place it had
+        not reached. Every boss reads its own floor now, and the same two steps are +24%
+        and +26%.
+        """
+        for plain, gimmick_floor in ((10, 15), (20, 25)):
+            with self.subTest(boss=plain):
+                plain_boss = dungeon.encounter(plain, 0)
+                deeper = dungeon.encounter(gimmick_floor, 0)
+                self.assertEqual(plain_boss["gimmick"], "standard")
+                self.assertLess(plain_boss["stats"]["strength"],
+                                deeper["stats"]["strength"])
+                self.assertLess(plain_boss["level"], deeper["level"])
+                # And its own floor is what it reads: the plain boss on 10 is built from
+                # floor 10, not from floor 15.
+                self.assertEqual(plain_boss["level"], plain + 8)
+        self.assertEqual(dungeon.encounter(15, 0)["gimmick"], "fire_only")
+        self.assertEqual(dungeon.encounter(25, 0)["gimmick"], "spells_only")
+
+    def test_a_boss_is_the_toughest_thing_standing_on_its_block(self):
+        """A boss outlasts the corridor rather than out-hitting it.
+
+        That is the whole shape of the change: BOSS_HEALTH_MULTIPLIER carries the
+        difficulty and BOSS_POWER_MULTIPLIER barely rises, so a boss is a fight a player
+        watches their resources drain in instead of one that ends in a single exchange.
+        Health is therefore the yardstick here, not Сила -- an elite guard is allowed to
+        swing harder than the boss, and measured, its floor is still the easier one.
+        """
+        for floor in range(10, 46, 5):
+            with self.subTest(boss=floor):
+                boss = dungeon.encounter(floor, 0)
+                corridor = [row for f in range(max(1, floor - 4), floor)
+                            if not dungeon.is_boss_floor(f)
+                            for row in dungeon.encounters_for_floor(f)]
+                self.assertGreater(
+                    boss["stats"]["health"],
+                    max(row["stats"]["health"] for row in corridor) * 1.2,
+                    f"the floor {floor} boss dies as fast as the corridor in front of it",
+                )
 
     def test_antimage_is_a_distinct_boss_with_a_clear_reflection_hint(self):
         boss = dungeon.encounter(30, 0)
@@ -218,18 +262,11 @@ class DungeonTests(unittest.TestCase):
         for floor in range(1, dungeon.DEPTH_RAMP_START + 1):
             with self.subTest(unchanged=floor):
                 self.assertEqual(dungeon._scale(floor), 22 + (floor - 1) * 7)
-        # A plain boss and the gimmick boss five floors later must keep the identical stat
-        # block -- the first is the rehearsal for the second, which is what `tier_ahead`
-        # buys and what putting bosses on the ramp must not quietly undo.
-        for plain, gimmick in ((10, 15), (20, 25)):
-            with self.subTest(rehearsal=(plain, gimmick)):
-                self.assertEqual(
-                    dungeon.encounter(plain, 0)["stats"],
-                    dungeon.encounter(gimmick, 0)["stats"],
-                )
         # Bosses ride the ramp too, and must never fall behind the corridor they cap --
         # leaving them on the straight line made the floor's owner the easiest thing on
-        # it (0.86x the elite by floor 25, 0.46x by 45, 0.20x past the roster).
+        # it (0.86x the elite by floor 25, 0.46x by 45, 0.20x past the roster). The
+        # yardstick is how long a boss LIVES rather than how hard it swings: see
+        # BOSS_HEALTH_MULTIPLIER, and test_a_boss_is_the_toughest_thing_standing_on_its_block.
         for floor in range(5, 81, 5):
             with self.subTest(boss=floor):
                 boss = dungeon.encounter(floor, 0)
@@ -237,11 +274,11 @@ class DungeonTests(unittest.TestCase):
                     (row for f in range(max(1, floor - 4), floor)
                      if not dungeon.is_boss_floor(f)
                      for row in dungeon.encounters_for_floor(f)),
-                    key=lambda row: row["stats"]["strength"],
+                    key=lambda row: row["stats"]["health"],
                 )
                 self.assertGreater(
-                    boss["stats"]["strength"], corridor["stats"]["strength"],
-                    f"the floor {floor} boss is weaker than the corridor in front of it",
+                    boss["stats"]["health"], corridor["stats"]["health"],
+                    f"the floor {floor} boss dies faster than the corridor in front of it",
                 )
         # Past the ramp the corridor is a STRAIGHT LINE, and the step between floors is
         # the same one for ever. It used to compound, which is a different promise: every
@@ -563,6 +600,8 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(run, {
             "kills": 0, "floor": 1, "hp": 1, "max_hp": 1, "cleared": [], "boss_lives": 0,
             "partial_heals_used": 0, "full_heals_used": 0,
+            "shop_used_phoenix_totem": 0,
+            "phoenix_totem": False, "phoenix_totem_used": False,
             # A run from before the tallies existed starts them empty rather than
             # inventing a history for it.
             "haul": empty_haul, "floor_haul": dict(empty_haul),
@@ -1662,7 +1701,7 @@ class BossWeaknessTests(unittest.TestCase):
     to know. Every gimmick that changes how damage lands says so on the floor screen."""
 
     def test_every_gimmick_in_the_roster_explains_itself(self):
-        for name, gimmick, _tier, _hint in dungeon.BOSSES:
+        for name, gimmick, _hint in dungeon.BOSSES:
             with self.subTest(boss=name):
                 if gimmick == "standard":
                     continue

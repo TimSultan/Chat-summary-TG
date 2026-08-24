@@ -128,6 +128,12 @@ def play(hero_profile, boss_profile, policy, *, seed=1, limit=500):
 
 
 class PhoenixFightTests(unittest.TestCase):
+    def test_autoplay_finishes_a_learned_fight(self):
+        state = phoenix.start(hero(damage=500, spell_power=500), boss(), seed=11)
+        finished = phoenix.autoplay(state, seed=12)
+        self.assertTrue(phoenix.is_over(finished))
+        self.assertEqual(finished["phase_state"], phoenix.VICTORY)
+
     def test_a_player_who_reads_every_telegraph_wins_the_whole_fight(self):
         """The fight has to be beatable by KNOWLEDGE, or the telegraphs are decoration.
 

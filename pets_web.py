@@ -1418,6 +1418,10 @@ def _action_phoenix_action(entry, user_id, xp, payload):
     return pets.phoenix_action(entry, user_id, str(payload.get("move") or ""))
 
 
+def _action_phoenix_auto(entry, user_id, xp, payload):
+    return pets.phoenix_auto(entry, user_id)
+
+
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
   "respec_stats": _action_respec_stats,
@@ -1461,6 +1465,7 @@ _ACTIONS = {
     "dungeon_chest": _action_dungeon_chest,
     "phoenix_start": _action_phoenix_start,
     "phoenix_action": _action_phoenix_action,
+    "phoenix_auto": _action_phoenix_auto,
 }
 
 # What the Mini App may still do while committed to a dungeon run -- the same rule
@@ -1478,7 +1483,7 @@ _ACTIONS = {
 # between two fights refreshes no cooldown and duplicates no charge.
 _ALLOWED_IN_DUNGEON = {
     "dungeon_fight", "dungeon_rest", "dungeon_buy", "dungeon_descend", "dungeon_quit",
-    "dungeon_chest", "phoenix_start", "phoenix_action",
+    "dungeon_chest", "phoenix_start", "phoenix_action", "phoenix_auto",
     "equip", "unequip", "enchant_weapon", "reforge", "set_skill",
 }
 
@@ -1614,7 +1619,7 @@ async def handle_action(request: web.Request) -> web.Response:
     }
     # The last state of a Phoenix fight is the one the run no longer holds: settling it
     # clears the fight off the run, so the outcome screen can only be told about it here.
-    if action_name in ("phoenix_start", "phoenix_action") and isinstance(extra, dict):
+    if action_name in ("phoenix_start", "phoenix_action", "phoenix_auto") and isinstance(extra, dict):
         response["phoenix"] = extra
     if action_name == "achievements_open" and isinstance(extra, dict):
         response["achievements"] = extra
@@ -6173,6 +6178,7 @@ function phoenixFight(dungeon, fight) {
     (burn ? '<div class="dungeon-stat phoenix-burn">🔥 Горение × ' + burn + '</div>' : '') +
     '</div><div class="dungeon-body">' +
     phoenixBars(fight) +
+    (dungeon.phoenix_auto ? '<button class="go" data-dungeon="phoenixauto">⚡ Автобой</button>' : '') +
     (fight.vulnerable ? '<div class="phoenix-vuln">💥 УЯЗВИМ</div>' : '') +
     (fight.scene ? '<p class="phoenix-scene">' + esc(fight.scene) + '</p>' : '') +
     // In the order the fight happens: what the last answer cost, and only then what is
@@ -9706,7 +9712,7 @@ async function handleClick(event, target) {
     // Closing the Phoenix outcome is the one dungeon control that touches nothing on the
     // server: the fight is already settled, this only lets go of the screen showing it.
     if (d.dungeon === "phoenixclose") { PHOENIX_END = null; render(); return; }
-    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest", phoenix: "phoenix_start", phoenixmove: "phoenix_action" };
+    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest", phoenix: "phoenix_start", phoenixmove: "phoenix_action", phoenixauto: "phoenix_auto" };
     const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), buy: () => ({ code: d.code || "" }), chest: () => ({ choice: d.choice || "leave" }), phoenixmove: () => ({ move: d.code || "" }) };
     await act(actions[d.dungeon], (payload[d.dungeon] || (() => ({})))());
     return;

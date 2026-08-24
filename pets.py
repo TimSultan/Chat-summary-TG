@@ -221,6 +221,9 @@ def _normalise_dungeon_run(run) -> dict | None:
         # to full on every single load, which is the same as having no limit at all.
         "partial_heals_used": _safe_nonnegative_int(run.get("partial_heals_used")),
         "full_heals_used": _safe_nonnegative_int(run.get("full_heals_used")),
+        "shop_used_phoenix_totem": _safe_nonnegative_int(run.get("shop_used_phoenix_totem")),
+        "phoenix_totem": bool(run.get("phoenix_totem")),
+        "phoenix_totem_used": bool(run.get("phoenix_totem_used")),
         # The Phoenix fight in progress. This whitelist is exactly where it would be lost:
         # dropped here, every redraw would hand the player a brand-new fight, which is the
         # one thing that must never happen -- read a dangerous telegraph, close the screen,
@@ -2641,7 +2644,7 @@ WORKPLACE_FIGURINES = frozenset(C.WORKPLACE_FIGURINES)
 # Both kinds of reward are the same thing to storage: a permanent, per-player flag set
 # once by an accepted rune-paint quest and never spent. They differ only in what reads
 # them -- a tool changes a payout, a figurine changes who may be sent where.
-PAINTED_UNLOCKS = TOOL_MASTERWORKS | WORKPLACE_FIGURINES
+PAINTED_UNLOCKS = TOOL_MASTERWORKS | WORKPLACE_FIGURINES | {"phoenix_totem"}
 RUNE_TOOL_MASTERWORKS = {
     # `nmm` was the original one-off pickaxe quest. Keep every live completion useful.
     "nmm": "pickaxe",
@@ -2649,6 +2652,7 @@ RUNE_TOOL_MASTERWORKS = {
     "rune_paint_shovel": "shovel",
     "rune_paint_farmer": "farmer",
     "rune_paint_miner": "miner",
+    "rune_paint_phoenix": "phoenix_totem",
 }
 
 
@@ -2666,6 +2670,7 @@ def _tool_masterworks(data: dict, user_id) -> dict[str, bool]:
         "shovel": bool(row.get("shovel")),
         "farmer": bool(row.get("farmer")),
         "miner": bool(row.get("miner")),
+        "phoenix_totem": bool(row.get("phoenix_totem")),
     }
 
 
@@ -4579,6 +4584,7 @@ def dungeon_status(entry: str, user_id) -> dict:
         "cleared_notice": D.DUNGEON_CLEARED_NOTICE,
         "entry_cost": D.ENTRY_RUBY_COST,
         "tickets": dungeon_tickets(entry, user_id),
+        "phoenix_auto": max(0, int((record.get("phoenix_record") or {}).get("wins", 0) or 0)) >= 10,
     }
     if not isinstance(run, dict):
         # The last descent's receipt outlives the run it describes, so the screen a player
@@ -4813,6 +4819,8 @@ def enter_dungeon(entry: str, user_id) -> tuple[bool, str]:
             "floor": floor, "hp": max_hp, "max_hp": max_hp, "cleared": [],
             # What this descent has paid so far, in total and on the current floor.
             "haul": _new_haul(), "floor_haul": _new_haul(),
+            "phoenix_totem": bool(_tool_masterworks(data, user_id).get("phoenix_totem")),
+            "phoenix_totem_used": False,
         }
         _save(entry, data)
     entry_paid = "по билету" if ticket_count else f"за {D.ENTRY_RUBY_COST} рубинов"
@@ -4822,16 +4830,28 @@ def enter_dungeon(entry: str, user_id) -> tuple[bool, str]:
 def _hp_after_fight(result, key: str) -> int:
     """How much health the hero walked out of one exchange with.
 
-    Read backwards off the transcript rather than from `final_hp`, because a fight that
-    ended on the hero's own swing records their health on the attacking turn. Shared by
-    every dungeon encounter so a mimic drains a run exactly as a corridor mob does.
+    `final_hp` includes healing which can happen after the last visible attack row. Older
+    test doubles did not provide it, so the transcript remains the compatibility fallback.
     """
+    final = getattr(result, "final_hp", None) or {}
+    if key in final:
+        return max(0, int(final[key]))
     for turn in reversed(getattr(result, "rounds", ()) or ()):
         if turn.attacker == key:
             return max(0, int(turn.attacker_hp))
         if turn.defender_hp >= 0:
             return max(0, int(turn.defender_hp))
     return 0
+
+
+def _dungeon_resurrect(run: dict) -> bool:
+    """Spend this run's Phoenix Totem, restoring the hero for another attempt."""
+    if not run.get("phoenix_totem") or run.get("phoenix_totem_used"):
+        return False
+    run["phoenix_totem_used"] = True
+    run["hp"] = max(1, int(run.get("max_hp", 1) or 1))
+    run.pop("phoenix", None)
+    return True
 
 
 def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | None]:
@@ -4926,6 +4946,9 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 final_hp = (result.final_hp or {}).get(enemy.key, max(0, int(hydra_head_hp[head_index])))
                 hydra_head_hp[head_index] = min(head_max_hp, max(0, int(final_hp)))
                 if run["hp"] <= 0:
+                    if _dungeon_resurrect(run):
+                        _save(entry, data)
+                        return True, "🔥 Тотем Феникса воскресил тебя. Попробуй снова.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "resurrected": True}
                     # Read the tally out BEFORE the run is discarded: the defeat screen is
                     # the last chance to tell somebody what the descent was worth.
                     final = dict(run.get("haul") or _new_haul())
@@ -4966,6 +4989,9 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 run.pop("hydra_moves", None)
                 hydra_defeated = True
             if not hydra_defeated and result.winner != str(user_id):
+                if _dungeon_resurrect(run):
+                    _save(entry, data)
+                    return True, "🔥 Тотем Феникса воскресил тебя. Попробуй снова.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "resurrected": True}
                 final = dict(run.get("haul") or _new_haul())
                 record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
                 record["dungeon_run"] = None
@@ -5108,6 +5134,8 @@ def dungeon_buy(entry: str, user_id, xp: int, code: str) -> tuple[bool, str]:
                 f"({item['uses']} из {item['uses']}). В новом забеге снова будут."
             )
         max_hp = max(1, int(run.get("max_hp", 1) or 1))
+        if item.get("effect") == "resurrect" and run.get("phoenix_totem"):
+            return False, "Тотем Феникса в этом забеге уже получен."
         if item["heal"] and int(run.get("hp", 0) or 0) >= max_hp:
             return False, "Здоровье и так полное."
         if item["currency"] == "ruby":
@@ -5130,6 +5158,9 @@ def dungeon_buy(entry: str, user_id, xp: int, code: str) -> tuple[bool, str]:
             before = int(run.get("hp", 0) or 0)
             run["hp"] = min(max_hp, before + share)
             healed = run["hp"] - before
+        if item.get("effect") == "resurrect":
+            run["phoenix_totem"] = True
+            run["phoenix_totem_used"] = False
         run[item["used_key"]] = used + 1
         _save(entry, data)
     price = f"{item['price']} 💎" if item["currency"] == "ruby" else f"{item['price']} монет"
@@ -5372,6 +5403,37 @@ def phoenix_action(entry: str, user_id, action: str) -> tuple[bool, str, dict | 
     return _phoenix_settle(entry, user_id, won, state)
 
 
+def phoenix_auto(entry: str, user_id) -> tuple[bool, str, dict | None]:
+    """Resolve the Phoenix quickly after the player has proved mastery ten times."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        wins = max(0, int(((record or {}).get("phoenix_record") or {}).get("wins", 0) or 0))
+        if wins < 10:
+            live = ((record or {}).get("dungeon_run") or {}).get("phoenix")
+            return False, "Автобой откроется после 10 побед над Фениксом.", \
+                pets_phoenix.public(live) if isinstance(live, dict) else None
+    ok, note, state = phoenix_start(entry, user_id)
+    if not ok or not isinstance(state, dict):
+        return ok, note, state
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = (record or {}).get("dungeon_run")
+        live = (run or {}).get("phoenix") if isinstance(run, dict) else None
+        if not isinstance(live, dict):
+            return False, "Бой с Фениксом не найден.", state
+        finished = pets_phoenix.autoplay(live, seed=secrets.randbits(63))
+        run["phoenix"] = finished
+        run["hp"] = max(0, int(finished.get("hero_hp", run.get("hp", 0)) or 0))
+        _save(entry, data)
+    return _phoenix_settle(
+        entry, user_id,
+        str(finished.get("phase_state")) == pets_phoenix.VICTORY,
+        finished,
+    )
+
+
 def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, str, dict | None]:
     """End the Phoenix fight the way the dungeon ends every other one."""
     with _farm_settlement_lock:
@@ -5384,6 +5446,9 @@ def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, 
         row = D.encounter(floor, 0)
         run.pop("phoenix", None)
         if not won:
+            if _dungeon_resurrect(run):
+                _save(entry, data)
+                return True, "🔥 Тотем Феникса воскресил тебя. Попробуй бой снова.", pets_phoenix.public(state)
             final = dict(run.get("haul") or _new_haul())
             record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
             record["dungeon_run"] = None
@@ -6001,6 +6066,12 @@ def dungeon_chest_fight(entry: str, user_id) -> tuple[bool, str, dict | None]:
         ))
         run["hp"] = min(max(0, int(run.get("hp", 0))), _hp_after_fight(result, str(user_id)))
         if result.winner != str(user_id) or run["hp"] <= 0:
+            if _dungeon_resurrect(run):
+                _save(entry, data)
+                return True, "🔥 Тотем Феникса воскресил тебя. Попробуй снова.", {
+                    "encounter": row, "result": result, "hero": hero, "enemy": enemy,
+                    "resurrected": True,
+                }
             # Read the tally out BEFORE the run is discarded -- the defeat screen is the
             # last chance to tell somebody what the descent was worth.
             final = dict(run.get("haul") or _new_haul())
