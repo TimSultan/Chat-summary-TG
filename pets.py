@@ -4613,14 +4613,26 @@ def dungeon_status(entry: str, user_id) -> dict:
         "floor_haul": dict(run.get("floor_haul") or _new_haul()),
         "haul": dict(run.get("haul") or _new_haul()),
         "can_rest": len(cleared) == len(encounters),
-        "partial_heal_cost": D.SHOP_PARTIAL_HEAL_COST,
-        "full_heal_cost": D.SHOP_FULL_HEAL_COST,
+        # Diamonds now, and the field names stay so no screen has to be rewired. The
+        # currency travels beside them in `shop` for anything that draws the shelf itself.
+        "partial_heal_cost": D.SHOP_PARTIAL_HEAL_RUBIES,
+        "full_heal_cost": D.SHOP_FULL_HEAL_RUBIES,
+        "heal_currency": "ruby",
         # How many of each rest this run has left. On the button rather than in a rule
         # somewhere: a ration nobody can see is indistinguishable from a broken button
         # the moment it runs out.
         "partial_heal_percent": round(D.SHOP_PARTIAL_HEAL_SHARE * 100),
         "partial_heals_left": max(0, D.SHOP_PARTIAL_HEAL_USES - int(run.get("partial_heals_used", 0) or 0)),
         "full_heals_left": max(0, D.SHOP_FULL_HEAL_USES - int(run.get("full_heals_used", 0) or 0)),
+        # The whole shelf, priced and rationed for this runner. The two counts above are
+        # the same information for the two coin rows, kept because both clients and the
+        # existing screens already read them by name.
+        "shop": [
+            {key: row[key] for key in
+             ("code", "icon", "name", "description", "currency", "price", "left",
+              "sold_out", "affordable")}
+            for row in dungeon_shop(entry, user_id)
+        ],
         "boss_lives": int(run.get("boss_lives", 0) or 0),
         "gold_multiplier": C.hero_gold_multiplier(hero_level, "dungeon"),
         "chest": _chest_payload(run.get("chest")),
@@ -5021,41 +5033,108 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
     return True, message, receipt
 
 
-def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bool, str]:
-    if not D.DUNGEON_OPEN:
-        return False, D.DUNGEON_CLOSED_NOTICE
+def dungeon_shop(entry: str, user_id) -> list[dict]:
+    """The shelf as this runner sees it: price, ration left, and whether it is affordable.
+
+    Answered server-side for the same reason the enemy stat block is: both clients draw
+    the same shop, and a row that says "3 left" in one place and "sold out" in the other
+    is a bug nobody can reproduce.
+    """
     data = _load(entry)
     record = _tamed_record(data, user_id)
-    run = record.get("dungeon_run") if record else None
+    run = (record or {}).get("dungeon_run")
     if not isinstance(run, dict):
-        return False, "Сначала войди в подземелье."
-    floor = int(run.get("floor", 1) or 1)
-    if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
-        return False, "Сначала очисти этаж."
-    partial = str(amount or "").lower() == "partial"
-    cost = D.SHOP_PARTIAL_HEAL_COST if partial else D.SHOP_FULL_HEAL_COST
-    used_key = "partial_heals_used" if partial else "full_heals_used"
-    limit = D.SHOP_PARTIAL_HEAL_USES if partial else D.SHOP_FULL_HEAL_USES
-    used = max(0, int(run.get(used_key, 0) or 0))
-    # Checked BEFORE the coins are taken: a rest that cannot happen must not be paid for.
-    if used >= limit:
-        return False, (
-            f"Это лечение за забег кончилось ({limit} из {limit}). "
-            "Следующее будет в новом забеге."
-        )
-    paid, _balance = economy.spend(entry, user_id, xp, cost, "pet_dungeon_heal")
-    if not paid:
-        return False, f"На лечение нужно {cost} монет."
-    max_hp = int(run.get("max_hp", 1))
-    share = max(1, round(max_hp * D.SHOP_PARTIAL_HEAL_SHARE))
-    run["hp"] = min(max_hp, int(run.get("hp", 0)) + share) if partial else max_hp
-    run[used_key] = used + 1
-    _save(entry, data)
-    left = limit - run[used_key]
-    percent = round(D.SHOP_PARTIAL_HEAL_SHARE * 100) if partial else 100
-    return True, (
-        f"Лавка подземелья восстановила {percent}% здоровья. Осталось таких лечений: {left}."
-    )
+        return []
+    rubies = max(0, int(_ruby_row(data).get(str(user_id), 0) or 0))
+    coins = economy.balance(entry, user_id, 0)
+    rows = []
+    for item in D.SHOP_STOCK:
+        used = max(0, int(run.get(item["used_key"], 0) or 0))
+        left = None if item["uses"] is None else max(0, item["uses"] - used)
+        purse = rubies if item["currency"] == "ruby" else coins
+        rows.append({
+            **item,
+            "left": left,
+            "sold_out": left == 0,
+            "affordable": purse >= item["price"],
+        })
+    return rows
+
+
+def dungeon_buy(entry: str, user_id, xp: int, code: str) -> tuple[bool, str]:
+    """Buy one thing from the dungeon shop and use it immediately.
+
+    There is no inventory: a potion bought on a floor is drunk on that floor. That keeps
+    the shop a decision about THIS run rather than a stockpile carried between runs, and
+    it is why nothing here has to survive a crash halfway through being used.
+    """
+    if not D.DUNGEON_OPEN:
+        return False, D.DUNGEON_CLOSED_NOTICE
+    item = D.shop_item(code)
+    if item is None:
+        return False, "Такого товара в лавке нет."
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье."
+        floor = int(run.get("floor", 1) or 1)
+        if len(run.get("cleared", [])) < len(D.encounters_for_floor(floor)):
+            return False, "Сначала очисти этаж."
+        used = max(0, int(run.get(item["used_key"], 0) or 0))
+        # Checked BEFORE anything is taken: a purchase that cannot happen must not be paid
+        # for, in either currency.
+        if item["uses"] is not None and used >= item["uses"]:
+            # Worded around the item's name rather than agreeing with it: «Бинты»
+            # кончилИСЬ but «Малое зелье» кончилОСЬ, and a shelf that grows cannot carry
+            # a gender for every future row.
+            return False, (
+                f"Лавка: «{item['name']}» — всё на этот забег "
+                f"({item['uses']} из {item['uses']}). В новом забеге снова будут."
+            )
+        max_hp = max(1, int(run.get("max_hp", 1) or 1))
+        if item["heal"] and int(run.get("hp", 0) or 0) >= max_hp:
+            return False, "Здоровье и так полное."
+        if item["currency"] == "ruby":
+            wallet = _ruby_row(data)
+            rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+            if rubies < item["price"]:
+                return False, f"Нужно {item['price']} 💎, у тебя {rubies}."
+            wallet[str(user_id)] = rubies - item["price"]
+            _append_ruby_log(entry, user_id, -item["price"],
+                             f"spend:dungeon_shop:{item['code']}", ref=str(floor))
+        else:
+            paid, _balance = economy.spend(
+                entry, user_id, xp, item["price"], "pet_dungeon_heal",
+            )
+            if not paid:
+                return False, f"На «{item['name']}» нужно {item['price']} монет."
+        healed = 0
+        if item["heal"]:
+            share = max_hp if item["heal"] >= 1 else max(1, round(max_hp * item["heal"]))
+            before = int(run.get("hp", 0) or 0)
+            run["hp"] = min(max_hp, before + share)
+            healed = run["hp"] - before
+        run[item["used_key"]] = used + 1
+        _save(entry, data)
+    price = f"{item['price']} 💎" if item["currency"] == "ruby" else f"{item['price']} монет"
+    note = f"«{item['name']}» за {price}: +{healed} HP." if healed else f"«{item['name']}» куплен."
+    if item["uses"] is not None:
+        note += f" Осталось таких: {item['uses'] - used - 1}."
+    return True, note
+
+
+def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bool, str]:
+    """The two coin rows of the shop, under the name both clients have always used.
+
+    Kept as its own entry point rather than folded away: "отдохнуть" is still what the
+    floor screen offers, and every existing caller, callback and test speaks
+    "partial"/"full". It is now a shorthand for two rows of a shelf instead of the whole
+    of what the dungeon sells.
+    """
+    code = D.SHOP_REST_CODES.get(str(amount or "").lower(), "heal_full")
+    return dungeon_buy(entry, user_id, xp, code)
 
 
 def dungeon_haul(entry: str, user_id) -> dict:

@@ -463,12 +463,12 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         heal_row = []
         if partial_left:
             heal_row.append({
-                "text": f"🩹 +{percent}% HP ({partial_left}) · 🪙 {state['partial_heal_cost']}",
+                "text": f"🩹 +{percent}% HP ({partial_left}) · 💎 {state['partial_heal_cost']}",
                 "callback_data": callback_data(user_id, "dungeonrest", "partial"),
             })
         if full_left:
             heal_row.append({
-                "text": f"❤️ +100% HP ({full_left}) · 🪙 {state['full_heal_cost']}",
+                "text": f"❤️ +100% HP ({full_left}) · 💎 {state['full_heal_cost']}",
                 "callback_data": callback_data(user_id, "dungeonrest", "full"),
             })
         if heal_row:
@@ -479,6 +479,7 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # answer to that line lives in one of these two screens -- a floor screen that
         # offers only the bag hides half of the reaction it is inviting.
         rows.append([
+            {"text": "🧪 Лавка", "callback_data": callback_data(user_id, "dungeonshop")},
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
             {"text": "📜 Свитки", "callback_data": callback_data(user_id, "skills")},
         ])
@@ -511,6 +512,54 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
             {"text": "📜 Свитки", "callback_data": callback_data(user_id, "skills")},
         ])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def dungeon_shop_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
+    """The dungeon shop, rendered straight off the shelf the game hands over.
+
+    Nothing about a row is decided here: its price, its currency, what is left of it and
+    whether this runner can afford it all arrive already answered (pets.dungeon_shop), so
+    the Mini App and this screen cannot disagree about what is on sale -- and a new line
+    of stock is a row of data rather than a change to either client.
+    """
+    pet = pets.get_pet(entry, user_id)
+    if not pet:
+        return no_pet_view(user_id)
+    state = pets.dungeon_status(entry, user_id)
+    if not state.get("active"):
+        return notice_view(user_id, "Лавка открыта только во время забега.")
+    stock = state.get("shop") or []
+    lines = [
+        "🧪 <b>Лавка подземелья</b>",
+        f"💎 Алмазы: {pets.ruby_balance(entry, user_id)}",
+        f"❤️ Здоровье: {state.get('hp', 0)} / {state.get('max_hp', 0)}",
+        "",
+    ]
+    rows = []
+    if not state.get("can_rest"):
+        lines.append("<i>Лавка открывается, когда этаж зачищен.</i>")
+    for item in stock:
+        left = item.get("left")
+        ration = "" if left is None else f" · осталось {left}"
+        lines.append(
+            f"{item['icon']} <b>{escape(str(item['name']))}</b> — "
+            f"{'💎' if item['currency'] == 'ruby' else '🪙'} {item['price']}{ration}"
+        )
+        lines.append(f"<i>{escape(str(item['description']))}</i>")
+        if not state.get("can_rest"):
+            continue
+        if item.get("sold_out"):
+            rows.append([{"text": f"{item['icon']} {item['name']} — кончилось",
+                          "callback_data": callback_data(user_id, "dungeonshop")}])
+        else:
+            price = "💎" if item["currency"] == "ruby" else "🪙"
+            rows.append([{
+                "text": f"{item['icon']} {item['name']} · {price} {item['price']}"
+                        + ("" if item.get("affordable") else " — не хватает"),
+                "callback_data": callback_data(user_id, "dungeonbuy", str(item["code"])),
+            }])
+    rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 

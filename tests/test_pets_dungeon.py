@@ -124,7 +124,10 @@ class DungeonTests(unittest.TestCase):
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
 
         self.assertIn("Отдохнуть?", text)
-        self.assertTrue(any("🪙" in label for label in labels))
+        # Diamonds, and the button has to say so: a price in the wrong currency is the
+        # one label a player cannot recover from misreading.
+        self.assertTrue(any("💎" in label for label in labels), labels)
+        self.assertFalse([label for label in labels if "🪙" in label], labels)
         # The exit is the narrow one on the left: Telegram sizes a row's buttons equally,
         # so sharing a row with the descent is what keeps it out from under the thumb.
         self.assertEqual(
@@ -448,12 +451,20 @@ class DungeonTests(unittest.TestCase):
         self.assertFalse([t for t in labels if "Эскалатор" in t])
 
 
-    def test_first_two_floor_budgets_pay_for_a_full_rest_even_on_low_rolls(self):
+    def test_the_opening_floors_still_pay_more_than_nothing(self):
+        """This used to check that two floors of gold covered a full rest.
+
+        Healing is bought with diamonds now, so a floor's coins no longer have a rest to
+        be measured against -- but the reason the check existed is still live: the opening
+        rooms have to be worth walking into at all, and reward_for is where that is
+        decided for every floor at once.
+        """
         floor_one = dungeon.reward_for(1, False, enemy_count=2)["gold"]
         floor_two = dungeon.reward_for(2, False, enemy_count=10)["gold"]
         low_roll_gold = 2 * round(floor_one * .8) + 10 * round(floor_two * .8)
 
-        self.assertGreaterEqual(low_roll_gold, dungeon.SHOP_FULL_HEAL_COST)
+        self.assertGreater(low_roll_gold, 0)
+        self.assertGreater(floor_two, 0)
 
     def test_rune_effects_scale_with_the_equipped_pet_stats_in_dungeon_and_arena(self):
         data = pets._load(self.entry)
@@ -1043,8 +1054,11 @@ class DungeonEndTests(DungeonTests):
 class DungeonRestTests(DungeonTests):
     """Rests are rationed per run, and the ration is printed on the button that spends it."""
 
-    def _cleared_floor(self, gold=100_000):
+    def _cleared_floor(self, gold=100_000, rubies=50):
         economy.grant(self.entry, self.user_id, gold, "rest-test")
+        # Healing is bought with diamonds. The gold stays because the rest of a run still
+        # runs on it -- it just no longer buys the recovery.
+        pets.grant_rubies_once(self.entry, self.user_id, rubies, "rest-test-rubies")
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {
             "floor": 1, "hp": 10, "max_hp": 1000,
@@ -1057,24 +1071,93 @@ class DungeonRestTests(DungeonTests):
         for remaining in range(dungeon.SHOP_PARTIAL_HEAL_USES - 1, -1, -1):
             ok, message = pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
             self.assertTrue(ok, message)
-            self.assertIn(f"Осталось таких лечений: {remaining}", message)
+            self.assertIn(f"Осталось таких: {remaining}", message)
 
         ok, message = pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
         self.assertFalse(ok)
-        self.assertIn("кончилось", message)
+        self.assertIn("(3 из 3)", message)
+        self.assertIn("новом забеге", message)
         # The two allowances are separate: burning every partial leaves the full rests.
         self.assertTrue(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
 
-    def test_a_refused_rest_does_not_take_the_coins(self):
-        """The limit is checked before economy.spend, or the ration would be charged for."""
+    def _wound(self, hp=10):
+        """Put the runner back in need of the next heal.
+
+        Needed since the shop refuses to sell healing to somebody already at full health
+        -- a kindness for the coin rows and the whole point for the diamond ones, but it
+        means a ration can only be spent by actually taking damage between purchases.
+        """
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["hp"] = hp
+        pets._save(self.entry, data)
+
+    def test_a_refused_rest_does_not_take_the_diamonds(self):
+        """The limit is checked before anything is taken, or the ration would be paid for."""
         self._cleared_floor()
         for _ in range(dungeon.SHOP_FULL_HEAL_USES):
+            self._wound()
             self.assertTrue(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
-        before = economy.balance(self.entry, self.user_id, 0)
+        self._wound()
+        before = pets.ruby_balance(self.entry, self.user_id)
 
         self.assertFalse(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
 
-        self.assertEqual(economy.balance(self.entry, self.user_id, 0), before)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), before)
+
+    def test_healing_is_paid_for_in_diamonds_and_leaves_the_coins_alone(self):
+        self._cleared_floor()
+        self._wound()
+        coins = economy.balance(self.entry, self.user_id, 0)
+        rubies = pets.ruby_balance(self.entry, self.user_id)
+
+        ok, message = pets.dungeon_rest(self.entry, self.user_id, 0, "full")
+
+        self.assertTrue(ok, message)
+        self.assertEqual(economy.balance(self.entry, self.user_id, 0), coins)
+        self.assertEqual(
+            pets.ruby_balance(self.entry, self.user_id),
+            rubies - dungeon.SHOP_FULL_HEAL_RUBIES,
+        )
+        self.assertIn("💎", message)
+
+    def test_the_shop_refuses_to_sell_healing_to_a_healthy_runner(self):
+        """A diamond spent at full health would buy nothing at all."""
+        self._cleared_floor()
+        self._wound()
+        self.assertTrue(pets.dungeon_rest(self.entry, self.user_id, 0, "full")[0])
+        before = pets.ruby_balance(self.entry, self.user_id)
+        ok, message = pets.dungeon_rest(self.entry, self.user_id, 0, "full")
+        self.assertFalse(ok)
+        self.assertIn("полное", message)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), before)
+
+    def test_a_heal_nobody_can_afford_is_refused_without_taking_anything(self):
+        self._cleared_floor(rubies=0)
+        self._wound()
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 0)
+        ok, message = pets.dungeon_buy(self.entry, self.user_id, 0, "heal_full")
+        self.assertFalse(ok)
+        self.assertIn("💎", message)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user_id), 0)
+        # And the ration is untouched, so a refusal costs nothing at all.
+        state = pets.dungeon_status(self.entry, self.user_id)
+        self.assertEqual(state["full_heals_left"], dungeon.SHOP_FULL_HEAL_USES)
+
+    def test_the_shelf_reaches_the_floor_payload_priced_for_this_runner(self):
+        """The shop is data, so both clients draw the same shelf from the same row.
+
+        It holds the two heals today and is written to hold whatever the dungeon turns
+        out to need -- adding stock is adding a row, not teaching a client a button.
+        """
+        self._cleared_floor(rubies=dungeon.SHOP_PARTIAL_HEAL_RUBIES)
+        rows = {row["code"]: row for row in pets.dungeon_status(self.entry, self.user_id)["shop"]}
+        self.assertEqual(set(rows), set(dungeon.SHOP_CODES))
+        self.assertTrue(all(row["currency"] == "ruby" for row in rows.values()))
+        # One diamond reaches the bandages and not the field hospital.
+        self.assertTrue(rows["heal_partial"]["affordable"])
+        self.assertFalse(rows["heal_full"]["affordable"])
+        self.assertEqual(rows["heal_full"]["left"], dungeon.SHOP_FULL_HEAL_USES)
+        self.assertFalse(rows["heal_full"]["sold_out"])
 
     def test_the_remaining_count_reaches_the_buttons(self):
         self._cleared_floor()

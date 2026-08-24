@@ -18,11 +18,14 @@ MIN_POWER: Final = 1_000
 # actually earns, with a little left over.
 ENTRY_RUBY_COST: Final = 10
 ANTIMAGIC_REFLECT_SHARE: Final = 0.85
-# Cut with the rewards, not independently of them: the dungeon's shop is paid for out of
-# the dungeon's own income, so shrinking one without the other would leave a runner
-# unable to afford the recovery their floor was supposed to fund (see reward_for).
-SHOP_PARTIAL_HEAL_COST: Final = 100
-SHOP_FULL_HEAL_COST: Final = 180
+# Healing is bought with DIAMONDS. It used to come out of the run's own coin income --
+# which is why the two are still cut together in reward_for -- but a floor's gold was
+# also the thing being saved up for everything else, so recovery competed with the rest
+# of the game for the same purse. Diamonds are the scarce currency and come from outside
+# the dungeon, which makes a heal a decision about the RUN instead of a rounding error
+# against the day's earnings.
+SHOP_PARTIAL_HEAL_RUBIES: Final = 1
+SHOP_FULL_HEAL_RUBIES: Final = 3
 SHOP_PARTIAL_HEAL_SHARE: Final = 0.30
 # Per RUN, not per floor. Unlimited healing turned a deep run into a question of how much
 # gold the player had rather than how far they could actually get, so each kind of rest is
@@ -162,6 +165,55 @@ DUNGEON_CLEARED_NOTICE: Final = (
 # to find them -- the reward cap, the roster length and the admin boss workshop -- and a
 # literal repeated in four files is a rule nobody can change.
 BOSS_EVERY: Final = 5
+
+
+# --------------------------------------------------------------------- лавка подземелья
+#
+# The shop is a SHELF rather than a pair of buttons, because it is going to grow: potions
+# beyond healing, and whatever else a run turns out to need. Everything a purchase needs
+# to be made, priced, rationed and described lives in one row here, so adding stock is
+# adding a row -- no client learns a new button, no handler learns a new branch.
+#
+# The rations stay. Diamonds make a heal cost something real, but unlimited healing is
+# what turned a deep descent into a question of how much the player could spend rather
+# than how far they could actually get, and that is true of any currency.
+def _stock(code, icon, name, description, currency, price, heal, uses=None):
+    return {
+        "code": code, "icon": icon, "name": name, "description": description,
+        "currency": currency, "price": price, "heal": heal, "uses": uses,
+        # Per-run counters are stored under the item's own key, so a new row cannot
+        # collide with an existing one or silently share its ration.
+        "used_key": f"shop_used_{code}",
+    }
+
+
+SHOP_STOCK: Final = (
+    _stock("heal_partial", "🩹", "Бинты",
+           f"Восстанавливает {round(SHOP_PARTIAL_HEAL_SHARE * 100)}% здоровья.",
+           "ruby", SHOP_PARTIAL_HEAL_RUBIES, SHOP_PARTIAL_HEAL_SHARE, SHOP_PARTIAL_HEAL_USES),
+    _stock("heal_full", "❤️", "Полевой лазарет",
+           "Восстанавливает здоровье полностью.",
+           "ruby", SHOP_FULL_HEAL_RUBIES, 1.0, SHOP_FULL_HEAL_USES),
+)
+
+# Both rows keep the keys the old rest counters used, so a run already in progress when
+# this shipped does not get its ration handed back.
+SHOP_STOCK = tuple(
+    {**row, "used_key": "partial_heals_used"} if row["code"] == "heal_partial"
+    else {**row, "used_key": "full_heals_used"} if row["code"] == "heal_full"
+    else row
+    for row in SHOP_STOCK
+)
+SHOP_CODES: Final = tuple(row["code"] for row in SHOP_STOCK)
+# What `dungeon_rest`'s old "partial"/"full" argument means now. Both clients and every
+# existing test still speak it, and it is a perfectly good shorthand for the two coin
+# rows -- it just is not the whole shelf any more.
+SHOP_REST_CODES: Final = {"partial": "heal_partial", "full": "heal_full"}
+
+
+def shop_item(code: str) -> dict | None:
+    """One row of stock by code, or None. Returns a copy: the shelf is data."""
+    return next((dict(row) for row in SHOP_STOCK if row["code"] == str(code)), None)
 
 
 def is_boss_floor(floor: int) -> bool:
@@ -412,8 +464,8 @@ def roll_reward(floor: int, boss: bool, rng=None) -> dict:
 
 
 def shop_heal_cost(floor: int) -> int:
-    """Compatibility price for callers that still show one healing option."""
-    return SHOP_FULL_HEAL_COST
+    """Compatibility price for callers that still show one healing option. Diamonds."""
+    return SHOP_FULL_HEAL_RUBIES
 
 
 # --- chests and mimics ----------------------------------------------------------------

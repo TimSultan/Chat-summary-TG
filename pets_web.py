@@ -1349,6 +1349,14 @@ def _action_dungeon_rest(entry, user_id, xp, payload):
   return pets.dungeon_rest(entry, user_id, xp, str(payload.get("amount") or "full"))
 
 
+def _action_dungeon_buy(entry, user_id, xp, payload):
+  """One row of the dungeon shop, bought by code.
+
+  Deliberately generic: the shelf lives in pets_dungeon.SHOP_STOCK, so a new line of
+  stock needs no handler here and no button in either client -- it needs a row."""
+  return pets.dungeon_buy(entry, user_id, xp, str(payload.get("code") or ""))
+
+
 def _action_dungeon_descend(entry, user_id, xp, payload):
     return pets.dungeon_descend(entry, user_id)
 
@@ -1407,6 +1415,7 @@ _ACTIONS = {
     "dungeon_enter": _action_dungeon_enter,
     "dungeon_fight": _action_dungeon_fight,
     "dungeon_rest": _action_dungeon_rest,
+    "dungeon_buy": _action_dungeon_buy,
     "dungeon_descend": _action_dungeon_descend,
     "dungeon_quit": _action_dungeon_quit,
     "dungeon_chest": _action_dungeon_chest,
@@ -1426,7 +1435,8 @@ _ACTIONS = {
 # consumed by equipping it, and each dungeon fight is a fresh simulation, so a swap made
 # between two fights refreshes no cooldown and duplicates no charge.
 _ALLOWED_IN_DUNGEON = {
-    "dungeon_fight", "dungeon_rest", "dungeon_descend", "dungeon_quit", "dungeon_chest",
+    "dungeon_fight", "dungeon_rest", "dungeon_buy", "dungeon_descend", "dungeon_quit",
+    "dungeon_chest",
     "equip", "unequip", "enchant_weapon", "reforge", "set_skill",
 }
 
@@ -4292,6 +4302,8 @@ PAGE_HTML = """<!doctype html>
   /* The stat block reads as data, not as prose: tabular figures so the columns line up
      between two enemies on the same floor, and quiet enough not to compete with the name. */
   .statline { color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+  .dungeon-stock { text-align: left; margin-bottom: 6px; }
+  .dungeon-stock small { display: block; opacity: .75; font-weight: 400; }
   .bosspick { text-align: left; margin-bottom: 8px; }
   .bosspick.on { outline: 2px solid var(--gold); outline-offset: -2px; }
   .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
@@ -5829,7 +5841,28 @@ function healButton(dungeon, kind) {
   const cost = partial ? dungeon.partial_heal_cost : dungeon.full_heal_cost;
   const label = partial ? "🩹 +" + Number(dungeon.partial_heal_percent || 30) + "%" : "❤️ +100%";
   return '<button class="go sec" data-dungeon="rest" data-heal="' + kind + '"' +
-    (left ? "" : " disabled") + ">" + label + " HP (" + left + ") · 🪙 " + cost + "</button>";
+    (left ? "" : " disabled") + ">" + label + " HP (" + left + ") · 💎 " + cost + "</button>";
+}
+
+// The shop, drawn straight off the shelf the server hands over: price, currency, ration
+// left and affordability all arrive already answered, so this and the Telegram screen
+// cannot disagree about what is on sale. New stock is a row in pets_dungeon.SHOP_STOCK
+// and nothing here changes.
+function dungeonShop(dungeon) {
+  const stock = dungeon.shop || [];
+  if (!stock.length || !dungeon.can_rest) return "";
+  const rows = stock.map((item) => {
+    const coin = item.currency === "ruby" ? "💎" : "🪙";
+    const ration = item.left === null || item.left === undefined ? "" : " · осталось " + item.left;
+    const blocked = item.sold_out || !item.affordable;
+    return '<button class="go sec dungeon-stock" data-dungeon="buy" data-code="' +
+      esc(item.code) + '"' + (blocked ? " disabled" : "") + "><b>" + esc(item.icon) + " " +
+      esc(item.name) + " · " + coin + " " + item.price + "</b><small>" +
+      esc(item.description) + (item.sold_out ? " · на этот забег всё" : ration) +
+      "</small></button>";
+  }).join("");
+  return '<div class="dungeon-shop"><div class="small muted" style="margin:12px 0 6px">' +
+    "🧪 Лавка подземелья</div>" + rows + "</div>";
 }
 
 // ------------------------------------------------------------------- dungeon screen
@@ -5942,7 +5975,7 @@ function dungeonPanel() {
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +
       'поднятых уже ничего не падает.</p>'
     : '';
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' + dungeonShop(dungeon) : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
 }
 
 function renderOnboarding() {
@@ -9395,8 +9428,8 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
 async function handleClick(event, target) {
   const d = target.dataset;
   if (d.dungeon) {
-    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest" };
-    const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), chest: () => ({ choice: d.choice || "leave" }) };
+    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest" };
+    const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), buy: () => ({ code: d.code || "" }), chest: () => ({ choice: d.choice || "leave" }) };
     await act(actions[d.dungeon], (payload[d.dungeon] || (() => ({})))());
     return;
   }

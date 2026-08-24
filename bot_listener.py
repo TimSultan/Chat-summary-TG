@@ -6306,7 +6306,7 @@ PAUSE_SAFE_PET_ACTIONS = frozenset({
 # The shop and the other modes stay shut: those are trips out of the dungeon, not
 # reactions inside it.
 PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
-    "dungeon", "dungeonenter", "dungeonfight", "dungeonrest",
+    "dungeon", "dungeonenter", "dungeonfight", "dungeonrest", "dungeonshop", "dungeonbuy",
     "dungeondescend", "dungeonquit", "dungeonchest",
     # Reading the bag and changing what is worn.
     "bag", "bagitems", "equip", "unequip",
@@ -6610,8 +6610,13 @@ async def handle_pets_callback(
             await _send_pets_view(api, chat_id, pets_ui.dungeon_view(entry, user_id, xp),
                                   message_id=message_id, log=log)
             return
+        if action == "dungeonshop":
+            await _send_pets_view(api, chat_id,
+                                  pets_ui.dungeon_shop_view(entry, user_id, xp),
+                                  message_id=message_id, log=log)
+            return
         if action in ("dungeonenter", "dungeonrest", "dungeondescend", "dungeonquit",
-                      "dungeonfight", "dungeonchest"):
+                      "dungeonfight", "dungeonchest", "dungeonbuy"):
             receipt = None
             if action == "dungeonchest":
                 # open / fight / leave, all three redrawn by the same floor view below:
@@ -6627,6 +6632,8 @@ async def handle_pets_callback(
                 ok, note = pets.enter_dungeon(entry, user_id)
             elif action == "dungeonrest":
                 ok, note = pets.dungeon_rest(entry, user_id, xp, argument or "full")
+            elif action == "dungeonbuy":
+                ok, note = pets.dungeon_buy(entry, user_id, xp, argument or "")
             elif action == "dungeondescend":
                 ok, note = pets.dungeon_descend(entry, user_id)
             elif action == "dungeonquit":
@@ -6646,7 +6653,9 @@ async def handle_pets_callback(
                     quest_pending=quests.pending_count(entry) if is_quest_mod else 0,
                     finance_admin=is_finance_admin,
                 )
-                if action == "dungeonquit" and ok else pets_ui.dungeon_view(entry, user_id, xp)
+                if action == "dungeonquit" and ok
+                else pets_ui.dungeon_shop_view(entry, user_id, xp)
+                if action == "dungeonbuy" else pets_ui.dungeon_view(entry, user_id, xp)
             )
             # A boss is the one dungeon fight worth reading back move by move, and it was
             # the only kind of fight in the game that never sent its log anywhere. Corridor
