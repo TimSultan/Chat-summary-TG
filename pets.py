@@ -34,6 +34,7 @@ import json
 import random
 import secrets
 import threading
+import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -5439,6 +5440,64 @@ def _achievement_row(record: dict) -> dict:
     return row
 
 
+# The chat aggregate reads and parses one file per recorded day, then applies xp grants
+# and deleted-figurine corrections on top. That is the right price for /stat, which is
+# asked for deliberately; it is the wrong price for a screen somebody opens to look at a
+# list. Cached briefly, so opening the list twice costs it once.
+_ACHIEVEMENT_CHAT_TTL = 300.0
+_achievement_chat_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _achievement_chat_stats(entry: str, user_id) -> dict:
+    """The chat half of the profile: painted miniatures, messages, days seen.
+
+    Best-effort ON PURPOSE. This is the only part of the profile that reads a subsystem
+    outside the pet store, and a hiccup there must not be able to take down a screen that
+    is mostly about weapons and dungeons -- the rows that depend on it simply stay
+    unearned until the next read succeeds.
+    """
+    now = time.monotonic()
+    cached = _achievement_chat_cache.get(str(entry))
+    if cached and now - cached[0] < _ACHIEVEMENT_CHAT_TTL:
+        rows = cached[1]
+    else:
+        try:
+            rows = stats.aggregate_all_time(entry)
+        except Exception:
+            rows = {}
+        _achievement_chat_cache[str(entry)] = (now, rows)
+    row = rows.get(str(user_id))
+    try:
+        quest_stats = quests_module().stats_for(entry, user_id)
+    except Exception:
+        quest_stats = {}
+    return {
+        "figurines_painted": int(getattr(row, "figurines_painted", 0) or 0),
+        "messages": int(getattr(row, "messages", 0) or 0),
+        "active_days": int(getattr(row, "active_days", 0) or 0),
+        "best_work_posts": int(getattr(row, "best_work_posts", 0) or 0),
+        "quests_done": int((quest_stats or {}).get("done", 0) or 0),
+        "quest_best_difficulty": int((quest_stats or {}).get("best_difficulty", 0) or 0),
+    }
+
+
+def quests_module():
+    """Imported on use: quests imports pets, so a module-level import closes the circle."""
+    import quests
+    return quests
+
+
+def _safe_total(values) -> int:
+    """Sum whatever survived a decade of migrations, ignoring what will not add up."""
+    total = 0
+    for value in values or ():
+        try:
+            total += max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def achievement_profile(entry: str, user_id) -> dict:
     """Every counter the catalogue is allowed to read, assembled once.
 
@@ -5463,13 +5522,7 @@ def achievement_profile(entry: str, user_id) -> dict:
 
     phoenix = record.get("phoenix_record") or {}
     money = economy.lifetime(entry, user_id)
-    # Imported here rather than at the top: quests imports pets, so a module-level
-    # import would close the circle and neither would load.
-    import quests
-    quest_stats = quests.stats_for(entry, user_id)
-    # One row out of the chat-wide aggregate. Missing for somebody who has a pet but has
-    # never written in the chat the bot watches, which is a real state and not an error.
-    chat = stats.aggregate_all_time(entry).get(str(user_id))
+    chat = _achievement_chat_stats(entry, user_id)
     return {
         "level": max(1, int(record.get("level", 1) or 1)),
         "cage_level": max(1, int(record.get("cage_level", 1) or 1)),
@@ -5502,7 +5555,7 @@ def achievement_profile(entry: str, user_id) -> dict:
             if item.slot == "weapon" and C.weapon_scaling(item) != C.WEAPON_SCALING_STRENGTH
         ),
         "personal_paints": len(record.get("personal_enchantments") or {}),
-        "runes": sum(max(0, int(value or 0)) for value in (record.get("runes") or {}).values()),
+        "runes": _safe_total((record.get("runes") or {}).values()),
         "scroll_paints": len(record.get("personal_enchantments") or {}),
         "gold_earned": money["received"] + money["bonus"],
         "gold_spent": money["spent"],
@@ -5511,18 +5564,21 @@ def achievement_profile(entry: str, user_id) -> dict:
         "dungeon_tickets": dungeon_tickets(entry, user_id),
         # The chat half. A pet lives inside a group that paints models, and the most
         # interesting rows are the ones that notice both halves of that at once.
-        "quests_done": int(quest_stats.get("done", 0) or 0),
-        "quest_best_difficulty": int(quest_stats.get("best_difficulty", 0) or 0),
-        "figurines_painted": int(getattr(chat, "figurines_painted", 0) or 0),
-        "messages": int(getattr(chat, "messages", 0) or 0),
-        "active_days": int(getattr(chat, "active_days", 0) or 0),
-        "best_work_posts": int(getattr(chat, "best_work_posts", 0) or 0),
+        **chat,
     }
 
 
 def refresh_achievements(entry: str, user_id) -> list[str]:
-    """Record everything newly earned. Returns the codes that just unlocked."""
-    profile = achievement_profile(entry, user_id)
+    """Record everything newly earned. Returns the codes that just unlocked.
+
+    Never raises. The list this feeds is mostly about weapons and dungeons, and a value
+    of an unexpected shape somewhere in a long-migrated save must not be able to close
+    the whole screen -- it costs at most one evaluation, and the next one picks it up.
+    """
+    try:
+        profile = achievement_profile(entry, user_id)
+    except Exception:
+        profile = {}
     if not profile:
         return []
     fresh = []

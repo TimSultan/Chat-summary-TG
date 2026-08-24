@@ -2562,6 +2562,26 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 response = await self._post("/api/boss-test/run", THIRD, payload)
                 self.assertEqual((await response.json())["error"], code)
 
+    async def test_opening_the_achievement_list_answers_instead_of_breaking(self):
+        """The list is fetched by its own action, so it has its own way to fail.
+
+        The badge on the hero screen is a cheap summary; everything the screen actually
+        lists is worked out here, which makes this the one request in the feature that
+        touches the chat history at all.
+        """
+        self._tame(PLAYER)
+
+        response = await self.client.post(pets_web.ROUTE_PREFIX + "/api/action", json={
+            "init_data": _init_data(PLAYER["id"]), "action": "achievements_open",
+        })
+
+        self.assertEqual(response.status, 200, await response.text())
+        data = await response.json()
+        self.assertTrue(data["ok"], data)
+        self.assertIn("achievements", data)
+        self.assertTrue(data["achievements"]["rows"])
+        self.assertIn("claimable", data["achievements"])
+
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):
         """Not "a fight like that one" -- that one. The stored seed and the two stored
         fighters go back through the same pure simulate(), so every round, every flavour

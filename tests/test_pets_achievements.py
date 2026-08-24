@@ -116,6 +116,10 @@ class LiveAchievementTests(unittest.TestCase):
         self._patch.start()
         self.addCleanup(self._temporary.cleanup)
         self.addCleanup(self._patch.stop)
+        # The chat aggregate is cached per chat and the cache outlives one test: every
+        # case here uses the same chat name against a fresh directory, so a warm entry
+        # from the previous test would answer for a store that no longer exists.
+        pets._achievement_chat_cache.clear()
         self.assertTrue(pets.buy_cage(CHAT, USER, RICH_XP)[0])
         self.assertTrue(pets.tame(CHAT, USER, RICH_XP, "Пеструшка", "f", "Хозяин")[0])
 
