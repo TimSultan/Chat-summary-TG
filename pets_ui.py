@@ -460,28 +460,11 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     lines.extend(dungeon_haul_block(state))
     if state.get("can_rest"):
-        lines.append("\nОтдохнуть?")
-        # The remaining count rides on the button itself. A rest button that simply
-        # refuses once the ration is gone reads as a bug; one that says «(0)» reads as
-        # a rule, and the player can plan the rest of the run around it.
-        partial_left = int(state.get("partial_heals_left", 0) or 0)
-        full_left = int(state.get("full_heals_left", 0) or 0)
-        percent = int(state.get("partial_heal_percent", 30) or 30)
-        heal_row = []
-        if partial_left:
-            heal_row.append({
-                "text": f"🩹 +{percent}% HP ({partial_left}) · 💎 {state['partial_heal_cost']}",
-                "callback_data": callback_data(user_id, "dungeonrest", "partial"),
-            })
-        if full_left:
-            heal_row.append({
-                "text": f"❤️ +100% HP ({full_left}) · 💎 {state['full_heal_cost']}",
-                "callback_data": callback_data(user_id, "dungeonrest", "full"),
-            })
-        if heal_row:
-            rows.append(heal_row)
-        else:
-            lines.append("<i>Лечения на этот забег кончились.</i>")
+        # Healing is bought in the shop, and only there. Two buttons sitting on the floor
+        # screen said the same two things the shelf already says, in a second vocabulary
+        # -- and a shelf that is about to grow cannot have half of itself mirrored on the
+        # screen in front of it.
+        lines.append("\n<i>Лечение и припасы — в лавке.</i>")
         # Gear AND scrolls, side by side. A boss states the damage it is weak to, and the
         # answer to that line lives in one of these two screens -- a floor screen that
         # offers only the bag hides half of the reaction it is inviting.

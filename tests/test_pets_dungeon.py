@@ -113,7 +113,15 @@ class DungeonTests(unittest.TestCase):
         self.assertGreater(deep["gold"], duo["gold"])
         self.assertGreater(deep["xp"], duo["xp"])
 
-    def test_rest_controls_show_coins_and_prompt(self):
+    def test_healing_is_sold_in_one_place_and_the_floor_only_points_at_it(self):
+        """The two heals were on the floor screen AND in the shop, in two vocabularies.
+
+        A cleared floor used to offer «🩹 +30% HP (2) · 💎 1» as a button and then list the
+        same purchase again underneath as stock. Two controls for one thing is two places
+        for the ration and the price to drift apart, and the player reading the screen has
+        to work out that they are the same purchase. The shop keeps them; the floor sends
+        the player there.
+        """
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = {
             "floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1],
@@ -123,17 +131,25 @@ class DungeonTests(unittest.TestCase):
         text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
 
-        self.assertIn("Отдохнуть?", text)
-        # Diamonds, and the button has to say so: a price in the wrong currency is the
-        # one label a player cannot recover from misreading.
-        self.assertTrue(any("💎" in label for label in labels), labels)
-        self.assertFalse([label for label in labels if "🪙" in label], labels)
+        self.assertIn("лавке", text)
+        self.assertFalse([label for label in labels if "HP" in label], labels)
+        self.assertTrue(any("Лавка" in label for label in labels), labels)
         # The exit is the narrow one on the left: Telegram sizes a row's buttons equally,
         # so sharing a row with the descent is what keeps it out from under the thumb.
         self.assertEqual(
             [button["text"] for button in keyboard["inline_keyboard"][-1]],
             ["🚪", "⬇️ Спуститься"],
         )
+
+        # Diamonds, and the shelf has to say so: a price in the wrong currency is the one
+        # label a player cannot recover from misreading.
+        shop_text, shop_keys = pets_ui.dungeon_shop_view(self.entry, self.user_id, 0)
+        shop_labels = [button["text"] for row in shop_keys["inline_keyboard"]
+                       for button in row]
+        self.assertIn("💎", shop_text)
+        self.assertNotIn("🪙", shop_text)
+        self.assertTrue(any("HP" in label or "💎" in label for label in shop_labels),
+                        shop_labels)
 
     def test_equipment_can_be_changed_at_any_point_of_a_run(self):
         """Gear used to be frozen until a floor was cleared. Every boss now states the
@@ -1199,8 +1215,14 @@ class DungeonRestTests(DungeonTests):
         self.assertEqual(rows["heal_full"]["left"], dungeon.SHOP_FULL_HEAL_USES)
         self.assertFalse(rows["heal_full"]["sold_out"])
 
-    def test_the_remaining_count_reaches_the_buttons(self):
-        self._cleared_floor()
+    def test_the_remaining_count_reaches_the_shelf(self):
+        """What is left of a ration is the whole reason to hold one back.
+
+        It is on the shelf rather than on the floor screen, because the shelf is the one
+        place a purchase is described -- and the number a player is planning a descent
+        around must not have a second copy of itself somewhere else on the way there.
+        """
+        self._cleared_floor(rubies=99)
         pets.dungeon_rest(self.entry, self.user_id, 0, "partial")
 
         state = pets.dungeon_status(self.entry, self.user_id)
@@ -1208,10 +1230,9 @@ class DungeonRestTests(DungeonTests):
         self.assertEqual(state["full_heals_left"], dungeon.SHOP_FULL_HEAL_USES)
         self.assertEqual(state["partial_heal_percent"], 30)
 
-        _text, keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
-        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
-        self.assertTrue(any("+30% HP (2)" in label for label in labels), labels)
-        self.assertTrue(any("+100% HP (3)" in label for label in labels), labels)
+        text, _keyboard = pets_ui.dungeon_shop_view(self.entry, self.user_id, 0)
+        self.assertIn(f"осталось {dungeon.SHOP_PARTIAL_HEAL_USES - 1}", text)
+        self.assertIn(f"осталось {dungeon.SHOP_FULL_HEAL_USES}", text)
 
     def test_the_ration_survives_the_normaliser_that_rebuilds_the_run(self):
         """That rebuild is a whitelist: dropped here, the count would reset on every load."""

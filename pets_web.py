@@ -5925,18 +5925,6 @@ function dungeonArt(enemy) {
   return '<span class="dungeon-art"><svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" fill="' + (enemy.boss ? '#301d2c' : '#17312c') + '"/><path d="M5 55L19 35 29 42 40 20 59 55Z" fill="#0e1b24"/><path d="M17 52c0-17 7-29 16-29s16 12 16 29" fill="' + fill + '"/><circle cx="27" cy="34" r="3" fill="' + eye + '"/><circle cx="39" cy="34" r="3" fill="' + eye + '"/>' + (enemy.boss ? '<path d="M24 24l-7-12 13 8 4-14 4 14 13-8-7 12" fill="#f0c85a"/>' : '') + '</svg></span>';
 }
 
-// One rest button, carrying the ration left on its face. Rendered as disabled rather than
-// dropped when it runs out: a button that vanishes looks like a bug, while "(0)" reads as
-// the rule it is, and the player can plan the rest of the descent around it.
-function healButton(dungeon, kind) {
-  const partial = kind === "partial";
-  const left = Number((partial ? dungeon.partial_heals_left : dungeon.full_heals_left) || 0);
-  const cost = partial ? dungeon.partial_heal_cost : dungeon.full_heal_cost;
-  const label = partial ? "🩹 +" + Number(dungeon.partial_heal_percent || 30) + "%" : "❤️ +100%";
-  return '<button class="go sec" data-dungeon="rest" data-heal="' + kind + '"' +
-    (left ? "" : " disabled") + ">" + label + " HP (" + left + ") · 💎 " + cost + "</button>";
-}
-
 // The shop, drawn straight off the shelf the server hands over: price, currency, ration
 // left and affordability all arrive already answered, so this and the Telegram screen
 // cannot disagree about what is on sale. New stock is a row in pets_dungeon.SHOP_STOCK
@@ -6250,7 +6238,7 @@ function dungeonPanel() {
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +
       'поднятых уже ничего не падает.</p>'
     : '';
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="small muted" style="margin-top:10px">Отдохнуть?</div><div class="dungeon-actions">' + healButton(dungeon, "partial") + healButton(dungeon, "full") + descendButton(dungeon) + '</div>' + dungeonShop(dungeon) : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? dungeonShop(dungeon) + '<div class="dungeon-actions">' + descendButton(dungeon) + '</div>' : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
 }
 
 function renderOnboarding() {
