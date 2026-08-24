@@ -1220,6 +1220,10 @@ def _apply(state: dict, row: dict, action: str, rng: random.Random,
 
     if row.get("grade") == BAD:
         state["mistake_streak"] = int(state.get("mistake_streak", 0) or 0) + 1
+        # The streak resets; this does not. A flawless run is a thing somebody claims
+        # afterwards, and it cannot be reconstructed from a state that only remembers
+        # how the last few answers went.
+        state["mistakes"] = int(state.get("mistakes", 0) or 0) + 1
     else:
         state["mistake_streak"] = 0
 

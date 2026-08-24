@@ -154,6 +154,21 @@ def _append_log(data: dict, user_id, delta: int, reason: str, ref: str = "") -> 
     )
 
 
+def lifetime(entry: str, user_id) -> dict:
+    """One member's running totals, for anything that rewards a habit rather than a day.
+
+    Read-only and derived from the same record `balance` is: the log is capped, so a
+    total recomputed from it would quietly shrink as old rows aged out.
+    """
+    row = _load(entry)["users"].get(str(user_id)) or {}
+    return {
+        "spent": max(0, int(row.get("spent", 0) or 0)),
+        "received": max(0, int(row.get("received", 0) or 0)),
+        "bonus": max(0, int(row.get("bonus", 0) or 0)),
+        "burned": max(0, int(row.get("burned", 0) or 0)),
+    }
+
+
 def balance(entry: str, user_id, xp: int) -> int:
     """Spendable coins for one member.
 

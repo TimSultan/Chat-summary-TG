@@ -1109,6 +1109,10 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     # along with every state read: an app closed mid-telegraph reopens on the same turn
     # instead of on a floor whose boss is somehow still waiting to be pressed.
     state["dungeon"]["phoenix"] = pets.phoenix_state(entry, user_id)
+    # Carried with the hero state rather than fetched when the list opens: the button
+    # above it has to show what is waiting to be collected without a second round trip,
+    # and the badge is the only reason most people open the screen at all.
+    state["achievements"] = pets.achievements_view(entry, user_id)
     state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
     state["quarry"] = pets.quarry_status(entry, user_id)
@@ -1349,6 +1353,11 @@ def _action_dungeon_fight(entry, user_id, xp, payload):
   return pets.dungeon_fight(entry, user_id, index)
 
 
+def _action_achievements_claim(entry, user_id, xp, payload):
+  ok, note, _paid = pets.claim_achievements(entry, user_id)
+  return ok, note
+
+
 def _action_dungeon_rest(entry, user_id, xp, payload):
   return pets.dungeon_rest(entry, user_id, xp, str(payload.get("amount") or "full"))
 
@@ -1437,6 +1446,7 @@ _ACTIONS = {
     "portrait_crop": _action_portrait_crop,
     "dungeon_enter": _action_dungeon_enter,
     "dungeon_fight": _action_dungeon_fight,
+    "achievements_claim": _action_achievements_claim,
     "dungeon_rest": _action_dungeon_rest,
     "dungeon_buy": _action_dungeon_buy,
     "dungeon_descend": _action_dungeon_descend,
@@ -4479,6 +4489,18 @@ PAGE_HTML = """<!doctype html>
   .phoenix-burn { color: #ff9a5a; }
   .phoenix-moves { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .phoenix-moves .go { padding: 11px 8px; font-size: 14px; }
+  .ach-entry .ach-list { display: grid; gap: 7px; margin-top: 11px; }
+  .ach-row { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; opacity: .55; }
+  /* Earned and unpaid is the only state worth shouting: it is a thing the player can act
+     on right now, and everything else on this list is either history or homework. */
+  .ach-row.ready { opacity: 1; border-color: var(--gold); background: rgba(232,185,35,.07); }
+  .ach-row.done { opacity: .75; }
+  .ach-head { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+  .ach-prize { color: var(--gold); margin-top: 3px; }
+  .ach-old {
+    font-size: 11px; border: 1px solid var(--line); border-radius: 999px;
+    padding: 1px 7px; color: var(--muted);
+  }
   .phoenix-log { display: grid; gap: 3px; margin: 0 0 11px; color: var(--muted); }
   /* A mistake is the one outcome worth interrupting the reader for, so it is the only
      one that gets a border and the damage colour. A perfect answer is confirmed quietly
@@ -5778,6 +5800,7 @@ function renderHero() {
         "</div>" +
       "</div>" +
     "</div>" +
+    achievementsEntry() +
     '<div class="panel"><h2>Характеристики</h2>' +
       S.stats.map(statRow).join("") +
       statRespec() +
@@ -5924,6 +5947,59 @@ function dungeonShop(dungeon) {
   }).join("");
   return '<div class="dungeon-shop"><div class="small muted" style="margin:12px 0 6px">' +
     "🧪 Лавка подземелья</div>" + rows + "</div>";
+}
+
+// -------------------------------------------------------------------------- ачивки
+// The button lives directly under the paperdoll because that is the block a player opens
+// the app to look at, and an unclaimed reward should be the next thing their eye lands on
+// rather than something found by scrolling.
+let ACH_OPEN = false;
+
+function achievementReward(row) {
+  const bits = [];
+  if (Number(row.rubies || 0)) bits.push("💎 " + Number(row.rubies));
+  if (Number(row.farm_tickets || 0)) bits.push("🎫 " + Number(row.farm_tickets));
+  if (Number(row.dungeon_tickets || 0)) bits.push("🎟 " + Number(row.dungeon_tickets));
+  return bits.join(" · ");
+}
+
+function achievementsEntry() {
+  const box = S.achievements;
+  if (!box) return "";
+  const pending = (box.claimable || {}).count || 0;
+  const reward = achievementReward(box.claimable || {});
+  return '<div class="panel ach-entry">' +
+    '<div class="row spread"><h2 style="margin:0">🏅 Ачивки</h2>' +
+    '<span class="tiny muted">' + Number(box.earned || 0) + " из " +
+      Number(box.total || 0) + "</span></div>" +
+    '<button class="go' + (pending ? "" : " sec") + '" style="margin-top:9px" ' +
+      'data-ach="claim"' + (pending ? "" : " disabled") + ">Забрать награды за Ачивки" +
+      (pending ? " · " + pending + (reward ? " · " + reward : "") : "") + "</button>" +
+    '<button class="go sec" style="margin-top:8px" data-ach="toggle">' +
+      (ACH_OPEN ? "▲ Свернуть список" : "▼ Показать список") + "</button>" +
+    (ACH_OPEN ? achievementsList(box) : "") + "</div>";
+}
+
+function achievementsList(box) {
+  const rows = (box.rows || []).slice();
+  if (!rows.length) {
+    return '<div class="empty" style="margin-top:10px">Список пока пуст.</div>';
+  }
+  // Unclaimed first: that is what the screen was opened for. Then what is still ahead,
+  // and only then the finished ones -- a wall of ticks at the top would bury the rest.
+  const weight = (row) => (row.earned && !row.claimed) ? 0 : (row.earned ? 2 : 1);
+  rows.sort((a, b) => weight(a) - weight(b));
+  return '<div class="ach-list">' + rows.map((row) => {
+    const state = (row.earned && !row.claimed) ? " ready" : (row.claimed ? " done" : "");
+    const reward = achievementReward(row);
+    return '<div class="ach-row' + state + '">' +
+      '<div class="ach-head"><b>' + esc(row.icon || "") + " " + esc(row.name || "") +
+        "</b>" + (row.legacy ? '<span class="ach-old">былое</span>' : "") +
+        (row.claimed ? '<span class="tiny muted">✓</span>' : "") + "</div>" +
+      '<div class="tiny muted">' + esc(row.description || "") + "</div>" +
+      (reward ? '<div class="tiny ach-prize">' + reward + "</div>" : "") +
+      "</div>";
+  }).join("") + "</div>";
 }
 
 // ------------------------------------------------------------------- dungeon screen
@@ -9588,7 +9664,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
-    "[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
+    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
@@ -9596,6 +9672,8 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
 
 async function handleClick(event, target) {
   const d = target.dataset;
+  if (d.ach === "toggle") { ACH_OPEN = !ACH_OPEN; render(); return; }
+  if (d.ach === "claim") { await act("achievements_claim", {}); ACH_OPEN = true; return; }
   if (d.dungeon) {
     // Closing the Phoenix outcome is the one dungeon control that touches nothing on the
     // server: the fight is already settled, this only lets go of the screen showing it.

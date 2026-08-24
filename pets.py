@@ -38,6 +38,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 import economy
+import pets_achievements as ACHIEVEMENTS
 import pets_combat
 import pets_phoenix
 import pets_config as C
@@ -5388,6 +5389,16 @@ def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, 
             _save(entry, data)
             return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", \
                 pets_phoenix.public(state)
+        # What the fight was WORTH remembering, kept on the pet rather than the run:
+        # the run ends, and "я убил его без единой ошибки" is a thing somebody claims
+        # long afterwards. Counted here because only the settlement sees the whole fight.
+        phoenix = record.setdefault("phoenix_record", {})
+        phoenix["wins"] = max(0, int(phoenix.get("wins", 0) or 0)) + 1
+        phoenix["best_mistakes"] = min(
+            int(phoenix.get("best_mistakes", 99) or 99),
+            int(state.get("mistakes", 0) or 0),
+        )
+        phoenix["perfect"] = bool(phoenix.get("perfect")) or not int(state.get("mistakes", 0) or 0)
         cleared = {int(v) for v in run.get("cleared", []) if str(v).isdigit()}
         cleared.add(int(row["index"]))
         run["cleared"] = sorted(cleared)
@@ -5400,6 +5411,281 @@ def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, 
     if isinstance(receipt, dict):
         public["reward"] = receipt.get("reward") or {}
     return ok, note, public
+
+
+# ------------------------------------------------------------------------- ачивки
+#
+# The catalogue and its predicates live in pets_achievements; what lives here is the
+# half it deliberately refuses to know about -- reading the save file, and paying out.
+#
+# Two sets per pet, never one. `unlocked` is what has been EARNED and is written the
+# moment a profile satisfies a row; `claimed` is what has been PAID and is written when
+# the player presses the button. Collapsing them would make the reward the achievement:
+# a crash between earning and paying would either lose the row or pay it twice, and the
+# screen could not show "earned, go collect" at all.
+
+
+def _achievement_row(record: dict) -> dict:
+    row = record.setdefault("achievements", {})
+    if not isinstance(row, dict):
+        row = {}
+        record["achievements"] = row
+    for key in ("unlocked", "claimed"):
+        values = row.get(key)
+        row[key] = sorted({
+            str(code) for code in values
+            if isinstance(code, str) and ACHIEVEMENTS.by_code(code) is not None
+        }) if isinstance(values, list) else []
+    return row
+
+
+def achievement_profile(entry: str, user_id) -> dict:
+    """Every counter the catalogue is allowed to read, assembled once.
+
+    Flat and finished on purpose: a predicate is a dict lookup rather than a walk over
+    the save file, so the catalogue can grow to any size without the screen getting
+    slower. See pets_achievements.PROFILE_FIELDS -- that tuple is the contract.
+    """
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    if record is None:
+        return {}
+    effective = _effective_stats_for(record)
+    equipped = {slot: C.find_item(code) for slot, code in (record.get("equipped") or {}).items()}
+    worn = [item for item in equipped.values() if item is not None]
+    rarities = {}
+    for item in worn:
+        rarities[item.rarity] = rarities.get(item.rarity, 0) + 1
+    weapon_records = record.get("weapon_records") or {}
+
+    def _total(key: str) -> int:
+        return sum(max(0, int((row or {}).get(key, 0) or 0)) for row in weapon_records.values())
+
+    phoenix = record.get("phoenix_record") or {}
+    money = economy.lifetime(entry, user_id)
+    # Imported here rather than at the top: quests imports pets, so a module-level
+    # import would close the circle and neither would load.
+    import quests
+    quest_stats = quests.stats_for(entry, user_id)
+    # One row out of the chat-wide aggregate. Missing for somebody who has a pet but has
+    # never written in the chat the bot watches, which is a real state and not an error.
+    chat = stats.aggregate_all_time(entry).get(str(user_id))
+    return {
+        "level": max(1, int(record.get("level", 1) or 1)),
+        "cage_level": max(1, int(record.get("cage_level", 1) or 1)),
+        "farm_level": max(0, int(record.get("farm_level", 0) or 0)),
+        "stats": dict(record.get("stats") or {}),
+        "effective_stats": dict(effective),
+        "power": _power_rating_for(record),
+        "wins": max(0, int(record.get("wins", 0) or 0)),
+        "fights": max(0, int(record.get("fights", 0) or 0)),
+        "boss_wins": _total("boss_wins"),
+        "mob_wins": _total("mob_wins"),
+        "pet_wins": _total("pet_wins"),
+        "best_weapon_wins": max(
+            (sum(max(0, int((row or {}).get(key, 0) or 0))
+                 for key in ("pet_wins", "mob_wins", "boss_wins"))
+             for row in weapon_records.values()), default=0,
+        ),
+        "deepest_floor": max(1, int(record.get("dungeon_deepest", 1) or 1)),
+        "phoenix_perfect": bool(phoenix.get("perfect")),
+        "phoenix_wins": max(0, int(phoenix.get("wins", 0) or 0)),
+        "weapons_found": len(record.get("discovered") or ()),
+        "weapons_total": sum(1 for item in C.ITEMS if item.slot == "weapon"),
+        "scrolls_owned": len(_owned_scroll_codes_for(record)),
+        "scrolls_total": len(SCROLLS.SCROLLS),
+        "equipped_rarities": rarities,
+        "equipped_slots": len(worn),
+        "equipped_cursed": sum(1 for item in worn if getattr(item, "cursed", False)),
+        "equipped_magic": sum(
+            1 for item in worn
+            if item.slot == "weapon" and C.weapon_scaling(item) != C.WEAPON_SCALING_STRENGTH
+        ),
+        "personal_paints": len(record.get("personal_enchantments") or {}),
+        "runes": sum(max(0, int(value or 0)) for value in (record.get("runes") or {}).values()),
+        "scroll_paints": len(record.get("personal_enchantments") or {}),
+        "gold_earned": money["received"] + money["bonus"],
+        "gold_spent": money["spent"],
+        "rubies": ruby_balance(entry, user_id),
+        "farm_tickets": farm_tickets(entry, user_id),
+        "dungeon_tickets": dungeon_tickets(entry, user_id),
+        # The chat half. A pet lives inside a group that paints models, and the most
+        # interesting rows are the ones that notice both halves of that at once.
+        "quests_done": int(quest_stats.get("done", 0) or 0),
+        "quest_best_difficulty": int(quest_stats.get("best_difficulty", 0) or 0),
+        "figurines_painted": int(getattr(chat, "figurines_painted", 0) or 0),
+        "messages": int(getattr(chat, "messages", 0) or 0),
+        "active_days": int(getattr(chat, "active_days", 0) or 0),
+        "best_work_posts": int(getattr(chat, "best_work_posts", 0) or 0),
+    }
+
+
+def refresh_achievements(entry: str, user_id) -> list[str]:
+    """Record everything newly earned. Returns the codes that just unlocked."""
+    profile = achievement_profile(entry, user_id)
+    if not profile:
+        return []
+    fresh = []
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return []
+        row = _achievement_row(record)
+        known = set(row["unlocked"])
+        # The closed rows are settled the first time this pet is ever evaluated, and never
+        # again. Doing it here rather than in a migration pass means it happens for a pet
+        # the moment somebody looks at it, without a startup job that walks every chat.
+        if not record.get("legacy_achievements_checked"):
+            record["legacy_achievements_checked"] = True
+            evidence = _legacy_evidence(record)
+            for item in ACHIEVEMENTS.catalogue():
+                if item.legacy and item.code not in known and item.check(evidence):
+                    known.add(item.code)
+                    fresh.append(item.code)
+        for code in ACHIEVEMENTS.earned(profile):
+            if code not in known:
+                known.add(code)
+                fresh.append(code)
+        # Saved whenever the marker moved too, not only when something unlocked: a pet
+        # that earned no closed row still has to remember that it was asked.
+        row["unlocked"] = sorted(known)
+        _save(entry, data)
+    return fresh
+
+
+def achievements_view(entry: str, user_id) -> dict:
+    """The whole screen: every row, its state, and what pressing the button would pay."""
+    refresh_achievements(entry, user_id)
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return {"rows": [], "claimable": {}, "earned": 0, "total": 0}
+    row = _achievement_row(record)
+    unlocked, claimed = set(row["unlocked"]), set(row["claimed"])
+    rows = []
+    for item in ACHIEVEMENTS.catalogue():
+        got = item.code in unlocked
+        # A hidden row stays off the list until it is earned: naming it would explain the
+        # joke, and explaining the joke is the whole of what it was worth.
+        if item.hidden and not got:
+            continue
+        rows.append({
+            **item.payload(), "earned": got, "claimed": item.code in claimed,
+        })
+    pending = [item for item in ACHIEVEMENTS.catalogue()
+               if item.code in unlocked and item.code not in claimed]
+    return {
+        "rows": rows,
+        "claimable": {
+            "count": len(pending),
+            "rubies": sum(item.rubies for item in pending),
+            "farm_tickets": sum(item.farm_tickets for item in pending),
+            "dungeon_tickets": sum(item.dungeon_tickets for item in pending),
+        },
+        "earned": len(unlocked),
+        "total": sum(1 for item in ACHIEVEMENTS.catalogue() if not item.hidden or item.code in unlocked),
+    }
+
+
+def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
+    """Pay for everything earned and not yet paid, in one press.
+
+    The claim list is written BEFORE the payouts and each payout is keyed on the row's
+    own code, so a crash halfway cannot pay twice -- grant_rubies_once and
+    grant_farm_ticket are both idempotent on their reason string, and the marking is what
+    stops a retry from starting over.
+    """
+    # Evaluated here as well as when the list is drawn: pressing the button is allowed to
+    # be the FIRST thing somebody does, and a claim that only paid for rows a screen had
+    # already noticed would quietly pay nothing at all.
+    refresh_achievements(entry, user_id)
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо.", {}
+        row = _achievement_row(record)
+        pending = [
+            item for item in ACHIEVEMENTS.catalogue()
+            if item.code in set(row["unlocked"]) and item.code not in set(row["claimed"])
+        ]
+        if not pending:
+            return False, "Забирать пока нечего.", {}
+        row["claimed"] = sorted(set(row["claimed"]) | {item.code for item in pending})
+        _save(entry, data)
+    paid = {"rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0, "count": len(pending)}
+    for item in pending:
+        if item.rubies:
+            # Counted off the row rather than off the call: grant_rubies_once returns the
+            # resulting BALANCE, so summing its answers reports somebody's whole purse as
+            # though this one press had paid it. The source key is unique per achievement
+            # and the claim was marked before any of this, so the row's own number is
+            # exactly what was minted.
+            grant_rubies_once(entry, user_id, item.rubies, f"achievement:{item.code}")
+            paid["rubies"] += item.rubies
+        for _ in range(max(0, int(item.farm_tickets))):
+            if grant_farm_ticket(entry, user_id, f"achievement:{item.code}"):
+                paid["farm_tickets"] += 1
+        for _ in range(max(0, int(item.dungeon_tickets))):
+            grant_dungeon_ticket(entry, user_id)
+            paid["dungeon_tickets"] += 1
+    parts = []
+    if paid["rubies"]:
+        parts.append(f"{paid['rubies']} 💎")
+    if paid["farm_tickets"]:
+        parts.append(f"{paid['farm_tickets']} 🎫 на ферму")
+    if paid["dungeon_tickets"]:
+        parts.append(f"{paid['dungeon_tickets']} 🎟 в подземелье")
+    reward = " · ".join(parts) or "ничего"
+    return True, f"Забрано ачивок: {len(pending)}. Награда: {reward}.", paid
+
+
+def backfill_legacy_achievements(entry: str) -> int:
+    """Credit the rows nobody can earn any more, once, from evidence that survived.
+
+    Everything still reachable deliberately starts at zero -- see the module note in
+    pets_achievements. This is only for the handful that closed behind the players who
+    did them, and it runs once per pet: the marker is stored so a later load cannot
+    re-decide a question whose evidence may by then have aged out of the audit log.
+    """
+    granted = 0
+    with _farm_settlement_lock:
+        data = _load(entry)
+        for user_id, record in (data.get("pets") or {}).items():
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            if record.get("legacy_achievements_checked"):
+                continue
+            record["legacy_achievements_checked"] = True
+            row = _achievement_row(record)
+            unlocked = set(row["unlocked"])
+            for item in ACHIEVEMENTS.catalogue():
+                if not item.legacy or item.code in unlocked:
+                    continue
+                if item.check(_legacy_evidence(record)):
+                    unlocked.add(item.code)
+                    granted += 1
+            row["unlocked"] = sorted(unlocked)
+        _save(entry, data)
+    return granted
+
+
+def _legacy_evidence(record: dict) -> dict:
+    """The narrow profile a legacy row is decided from.
+
+    Deliberately not the full `achievement_profile`: these questions are about a world
+    that no longer exists, so they may only read fields whose meaning did not change.
+    `deepest_floor` is the load-bearing one -- reaching floor six required clearing five,
+    and floor five was the Phoenix, so a pet that stands below the sixth floor never beat
+    it and one that stands above it did. The fight audits cannot answer this: they keep
+    the last five hundred fights chat-wide and delete the rest.
+    """
+    return {
+        "deepest_floor": max(1, int(record.get("dungeon_deepest", 1) or 1)),
+        "level": max(1, int(record.get("level", 1) or 1)),
+        "weapons_found": len(record.get("discovered") or ()),
+        "wins": max(0, int(record.get("wins", 0) or 0)),
+    }
 
 
 def dungeon_haul(entry: str, user_id) -> dict:
