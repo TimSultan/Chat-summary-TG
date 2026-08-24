@@ -445,6 +445,10 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # the one thing a player has to act on before pressing attack.
         if enemy.get("weakness") and not enemy.get("cleared"):
             lines.append(f"   ⚠️ <b>{escape(str(enemy['weakness']))}</b>")
+        # The stat block, only while the fight is still ahead: on a cleared row it is
+        # noise about somebody already lying down.
+        if enemy.get("stat_line") and not enemy.get("cleared"):
+            lines.append(f"   <i>{escape(str(enemy['stat_line']))}</i>")
         if not enemy.get("cleared"):
             rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     lines.extend(dungeon_haul_block(state))
@@ -528,12 +532,19 @@ def dungeon_chest_block(chest: dict | None, user_id) -> tuple[list[str], list[li
             {"text": "🧰 Открыть", "callback_data": callback_data(user_id, "dungeonchest", "open")},
             {"text": "🚶 Мимо", "callback_data": callback_data(user_id, "dungeonchest", "leave")},
         ]])
-    return ([
+    revealed = [
         f"🦷 <b>{escape(str(chest.get('name') or 'Мимик'))}</b> · ур. {int(chest.get('level', 1) or 1)}",
+    ]
+    # Before the flavour, not after it: whether to finish a mimic off is a decision about
+    # these five numbers, and the line explaining what it looks like is not.
+    if chest.get("stat_line"):
+        revealed.append(f"<i>{escape(str(chest['stat_line']))}</i>")
+    revealed.extend([
         f"<i>{escape(str(chest.get('hint') or ''))}</i>",
         "Он уже укусил. Дальше — твоё дело: добить или отойти.",
         "",
-    ], [[
+    ])
+    return (revealed, [[
         {"text": "⚔️ Драться", "callback_data": callback_data(user_id, "dungeonchest", "fight")},
         {"text": "🚶 Уйти", "callback_data": callback_data(user_id, "dungeonchest", "leave")},
     ]])

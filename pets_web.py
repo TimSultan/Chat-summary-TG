@@ -4096,6 +4096,9 @@ PAGE_HTML = """<!doctype html>
   .dungeon-enemy.healer { border-color: var(--gold); }
   /* The rule of the fight, not flavour: it gets the warning colour and its own line. */
   .dungeon-enemy .weakness { color: var(--gold); }
+  /* The stat block reads as data, not as prose: tabular figures so the columns line up
+     between two enemies on the same floor, and quiet enough not to compete with the name. */
+  .statline { color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: .2px; }
   .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
   .rune-cell { display: grid; gap: 2px; justify-items: center; padding: 9px 4px;
                border: 1px solid var(--line); border-radius: 12px; background: var(--sunken);
@@ -5679,7 +5682,11 @@ function dungeonChestCard(chest) {
       '<button class="go sec" data-dungeon="chest" data-choice="leave">🚶 Мимо</button></div></div>';
   }
   return '<div class="dungeon-chest bitten"><b>🦷 ' + esc(chest.name || "Мимик") + ' · ур. ' +
-    Number(chest.level || 1) + '</b><span class="tiny muted">' + esc(chest.hint || "") +
+    Number(chest.level || 1) + '</b>' +
+    // Before the flavour: whether to finish a mimic off is a decision about these five
+    // numbers, and the sentence describing it is not.
+    (chest.stat_line ? '<span class="tiny statline">' + esc(chest.stat_line) + '</span>' : "") +
+    '<span class="tiny muted">' + esc(chest.hint || "") +
     ' Он уже укусил — добить или отойти.</span>' +
     '<div class="chest-actions"><button class="go" data-dungeon="chest" data-choice="fight">⚔️ Драться</button>' +
     '<button class="go sec" data-dungeon="chest" data-choice="leave">🚶 Уйти</button></div></div>';
@@ -5726,7 +5733,7 @@ function dungeonPanel() {
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const revived = new Set(dungeon.revived || []);
-  const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>').join('');
+  const enemies = (dungeon.encounters || []).map((enemy) => '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="fight" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + (enemy.stat_line && !enemy.cleared ? '<br><span class="tiny statline">' + esc(enemy.stat_line) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>').join('');
   const healerNote = Number(dungeon.healers_alive || 0)
     ? '<p class="small" style="margin:0 0 10px;color:var(--gold)">✚ Целителей в живых: ' +
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +

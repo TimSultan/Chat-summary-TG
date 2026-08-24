@@ -4562,6 +4562,9 @@ def dungeon_status(entry: str, user_id) -> dict:
             reward["gold"] = C.gold_for_hero(reward["gold_base"], hero_level, "dungeon")
             copy["reward"] = reward
         copy["cleared"] = copy["index"] in cleared
+        # Worded server-side so both clients print the identical block (see
+        # pets_dungeon.enemy_stat_line).
+        copy["stat_line"] = D.enemy_stat_line(row)
         encounters.append(copy)
     state.update({
         "floor": floor, "theme": D.floor_name(floor), "hp": max(0, int(run.get("hp", max_hp))),
@@ -4604,6 +4607,9 @@ def _chest_payload(chest) -> dict | None:
     return {
         "present": True, "revealed": True, "kind": "mimic",
         "name": beast["name"], "level": beast["level"], "hint": beast["hint"],
+        # A revealed mimic is a fight the player is being asked to accept or walk away
+        # from, so it owes them the same numbers the corridor shows.
+        "stat_line": D.enemy_stat_line(beast),
     }
 
 

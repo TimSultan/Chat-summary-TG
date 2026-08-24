@@ -199,11 +199,30 @@ class DungeonTests(unittest.TestCase):
         for floor in range(1, dungeon.DEPTH_RAMP_START + 1):
             with self.subTest(unchanged=floor):
                 self.assertEqual(dungeon._scale(floor), 22 + (floor - 1) * 7)
-        for floor in (20, 30, 45):
-            with self.subTest(boss=floor):
+        # A plain boss and the gimmick boss five floors later must keep the identical stat
+        # block -- the first is the rehearsal for the second, which is what `tier_ahead`
+        # buys and what putting bosses on the ramp must not quietly undo.
+        for plain, gimmick in ((10, 15), (20, 25)):
+            with self.subTest(rehearsal=(plain, gimmick)):
                 self.assertEqual(
-                    dungeon._scale(floor, boss=True),
-                    round((22 + (floor - 1) * 7) * 1.80),
+                    dungeon.encounter(plain, 0)["stats"],
+                    dungeon.encounter(gimmick, 0)["stats"],
+                )
+        # Bosses ride the ramp too, and must never fall behind the corridor they cap --
+        # leaving them on the straight line made the floor's owner the easiest thing on
+        # it (0.86x the elite by floor 25, 0.46x by 45, 0.20x past the roster).
+        for floor in range(5, 81, 5):
+            with self.subTest(boss=floor):
+                boss = dungeon.encounter(floor, 0)
+                corridor = max(
+                    (row for f in range(max(1, floor - 4), floor)
+                     if not dungeon.is_boss_floor(f)
+                     for row in dungeon.encounters_for_floor(f)),
+                    key=lambda row: row["stats"]["strength"],
+                )
+                self.assertGreater(
+                    boss["stats"]["strength"], corridor["stats"]["strength"],
+                    f"the floor {floor} boss is weaker than the corridor in front of it",
                 )
         for floor, least in ((24, 1.3), (32, 1.6), (44, 2.2)):
             with self.subTest(corridor=floor):
@@ -215,6 +234,62 @@ class DungeonTests(unittest.TestCase):
         shallow = dungeon.encounter(dungeon.DEPTH_RAMP_START - 1, 0)
         deep = dungeon.encounter(dungeon.DEPTH_RAMP_START, 0)
         self.assertGreater(deep["armor"], shallow["armor"])
+
+    def test_every_enemy_shows_its_stat_block_to_both_clients(self):
+        """The numbers a player is deciding against, on the floor screen itself.
+
+        Worded once in pets_dungeon so the Mini App and Telegram can never print the same
+        enemy differently -- both are handed the finished string rather than five fields
+        and their own idea of how to lay them out.
+        """
+        import pets_ui
+
+        row = dungeon.encounter(24, 1)
+        line = dungeon.enemy_stat_line(row)
+        for key in dungeon.STAT_LINE_KEYS:
+            with self.subTest(stat=key):
+                self.assertIn(str(row["stats"][key]), line)
+                self.assertIn(pets_config.STAT_EMOJI[key], line)
+        self.assertIn(f"{pets_config.ARMOR_EMOJI} {row['armor']}", line)
+        # A mob has no endurance, so the block must not print an empty fifth column.
+        self.assertNotIn(pets_config.STAT_EMOJI["endurance"], line)
+
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "run_id": "r", "kills": 0, "floor": 24, "hp": 500, "max_hp": 500,
+            "cleared": [0],
+        }
+        pets._save(self.entry, data)
+        state = pets.dungeon_status(self.entry, self.user_id)
+        by_index = {row["index"]: row for row in state["encounters"]}
+        self.assertEqual(
+            by_index[1]["stat_line"], dungeon.enemy_stat_line(dungeon.encounter(24, 1)),
+        )
+        # Nothing to decide about somebody already lying down.
+        text, _keyboard = pets_ui.dungeon_view(self.entry, self.user_id, 0)
+        self.assertIn(by_index[1]["stat_line"], text)
+        self.assertNotIn(by_index[0]["stat_line"], text)
+
+    def test_a_revealed_mimic_shows_the_same_block_as_the_corridor(self):
+        """Fighting a mimic is a decision, and it is a decision about these numbers."""
+        import pets_ui
+
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "run_id": "r", "kills": 0, "floor": 24, "hp": 500, "max_hp": 500,
+            "cleared": [], "chest": {"kind": "mimic", "floor": 24, "revealed": True},
+        }
+        pets._save(self.entry, data)
+
+        chest = pets.dungeon_status(self.entry, self.user_id)["chest"]
+        self.assertEqual(chest["stat_line"], dungeon.enemy_stat_line(dungeon.mimic(24)))
+        lines, _rows = pets_ui.dungeon_chest_block(chest, self.user_id)
+        self.assertTrue(any(chest["stat_line"] in line for line in lines))
+        # A closed box gives nothing away -- naming its stats would answer the only
+        # question the encounter asks.
+        self.assertNotIn("stat_line", pets._chest_payload(
+            {"kind": "mimic", "floor": 24, "revealed": False},
+        ) or {})
 
     def test_both_clients_let_a_runner_change_scrolls(self):
         """Same rule as the gear pair above, for the other half of a reaction.
@@ -474,7 +549,11 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(run["kills"], 7)
 
     def _unstoppable_runner(self, floor):
-        """A runner that always wins, parked on `floor` with a fresh run."""
+        """A runner that always wins, parked on `floor` with a fresh run.
+
+        Unstoppable by STATS, which is only half of a fighter -- see `_rekill`, which
+        keeps the other half still.
+        """
         data = pets._load(self.entry)
         record = data["pets"][self.user_id]
         record["level"] = 200
@@ -487,12 +566,25 @@ class DungeonTests(unittest.TestCase):
         pets._save(self.entry, data)
 
     def _rekill(self, floor, index=0, times=1):
-        """Kill the same encounter `times` over, resetting only what a re-entry resets."""
+        """Kill the same encounter `times` over, resetting only what a re-entry resets.
+
+        The equipment is held still along with the health, and that is not tidiness: every
+        kill rolls a real drop, and a drop auto-equips itself when it scores better than
+        an empty slot -- which the first one always does. Over a long measurement the
+        runner therefore re-dresses itself mid-sample, and one item in the catalogue ends
+        the measurement outright. «Зеркало души» sets its wearer to the OPPONENT's stats,
+        so the moment it lands the runner stops being a runner with 4,000 in everything
+        and starts being an even match for the mob it is farming -- which it then loses
+        22 times out of 30, and `assertTrue(ok)` below fails on a fight that was supposed
+        to be a formality. Rare enough to pass alone and fail in a full suite.
+        """
         payloads = []
+        equipped = dict(pets._load(self.entry)["pets"][self.user_id].get("equipped") or {})
         for _ in range(times):
             data = pets._load(self.entry)
             data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
             data["pets"][self.user_id]["dungeon_run"]["hp"] = 99_999
+            data["pets"][self.user_id]["equipped"] = dict(equipped)
             pets._save(self.entry, data)
             ok, _message, payload = pets.dungeon_fight(self.entry, self.user_id, index)
             self.assertTrue(ok)

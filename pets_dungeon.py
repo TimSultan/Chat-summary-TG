@@ -177,6 +177,10 @@ def is_boss_floor(floor: int) -> bool:
 # closed by lifting the corridor toward them rather than by moving the wall again.
 DEPTH_RAMP_START: Final = 12
 DEPTH_RAMP_GROWTH: Final = 1.03
+# How much bigger the floor's owner is than the floor itself. Read against the room
+# multipliers in ROOMS: the elite room is 1.65, so a boss leads its own corridor by
+# roughly a fifth once both are on the ramp.
+BOSS_STAT_MULTIPLIER: Final = 1.80
 # Ordinary enemies carried a fifth of their stat value as armour against a boss's third,
 # which is most of why a corridor fight was over before it started: thin armour means a
 # short fight, and a short fight is one the enemy spends dying rather than hitting back.
@@ -187,11 +191,19 @@ DEEP_CORRIDOR_ARMOR_DIVISOR: Final = 3
 
 
 def _scale(floor: int, boss: bool = False) -> int:
-    """Fixed stat value for a floor, independent of the challenger."""
-    value = 22 + max(0, floor - 1) * 7
-    if not boss:
-        value *= DEPTH_RAMP_GROWTH ** max(0, floor - DEPTH_RAMP_START)
-    return round(value * (1.80 if boss else 1.0))
+    """Fixed stat value for a floor, independent of the challenger.
+
+    The ramp applies to bosses as well. It did not at first -- they were already the wall,
+    so lifting the corridor toward them was the whole point -- but two dozen floors of
+    compounding inverted that: by floor 25 the boss was 0.86x the elite two floors behind
+    it, by 45 it was 0.46x, and past the roster 0.20x. The owner of a floor had become the
+    easiest thing on it. Both curves move together now, so the wall stays a wall.
+
+    A boss reads this at `floor + tier_ahead`, ramp included, which is what keeps a plain
+    boss and the gimmick boss five floors later on an identical stat block -- see BOSSES.
+    """
+    value = (22 + max(0, floor - 1) * 7) * DEPTH_RAMP_GROWTH ** max(0, floor - DEPTH_RAMP_START)
+    return round(value * (BOSS_STAT_MULTIPLIER if boss else 1.0))
 
 
 def _corridor_armor(floor: int, value: int, index: int) -> int:
@@ -199,6 +211,26 @@ def _corridor_armor(floor: int, value: int, index: int) -> int:
     divisor = (DEEP_CORRIDOR_ARMOR_DIVISOR if floor >= DEPTH_RAMP_START
                else CORRIDOR_ARMOR_DIVISOR)
     return max(0, value // divisor + max(0, int(index)) * 2)
+
+
+# The order the stat block is read in, and the only four a dungeon enemy has -- a mob
+# carries no endurance, so C.STAT_KEYS would print an empty fifth column.
+STAT_LINE_KEYS: Final = ("strength", "health", "agility", "luck")
+
+
+def enemy_stat_line(row: dict) -> str:
+    """One enemy's stat block as a single short line.
+
+    Worded here rather than in either client, for the same reason a scroll's effects are:
+    the Telegram screen and the Mini App must never describe the same enemy differently.
+    Raw effective numbers on purpose -- they are what the player's own stat screen shows,
+    so the halves that trigger «Слабое место» can actually be read off the two side by
+    side instead of being discovered in the fight log afterwards.
+    """
+    stats = (row or {}).get("stats") or {}
+    parts = [f"{C.STAT_EMOJI[key]} {int(stats.get(key, 0) or 0)}" for key in STAT_LINE_KEYS]
+    parts.append(f"{C.ARMOR_EMOJI} {max(0, int((row or {}).get('armor', 0) or 0))}")
+    return " · ".join(parts)
 
 
 def floor_name(floor: int) -> str:
