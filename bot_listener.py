@@ -6308,6 +6308,9 @@ PAUSE_SAFE_PET_ACTIONS = frozenset({
 PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     "dungeon", "dungeonenter", "dungeonfight", "dungeonrest", "dungeonshop", "dungeonbuy",
     "dungeondescend", "dungeonquit", "dungeonchest",
+    # The hand-fought boss. Both halves belong here or the fight would bounce off this
+    # gate on its own floor: starting it, and every turn of it afterwards.
+    "phoenixstart", "phoenixact",
     # Reading the bag and changing what is worn.
     "bag", "bagitems", "equip", "unequip",
     # The scroll slots, and the picker screen that stands between them and a scroll.
@@ -6671,6 +6674,29 @@ async def handle_pets_callback(
                 await _delete_quietly(api, chat_id, message_id)
                 message_id = None
             await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
+            return
+        if action in ("phoenixstart", "phoenixact"):
+            if action == "phoenixstart":
+                _, note, state = pets.phoenix_start(entry, user_id)
+            else:
+                _, note, state = pets.phoenix_action(entry, user_id, argument or "")
+            # A win clears the fight out of the run, so the state that came back with the
+            # answer is the only copy of the last frame there will ever be -- it is handed
+            # to the view rather than looked up again a moment too late. A loss takes the
+            # whole run with it, and then the floor screen, which is also the run's
+            # receipt, is the honest redraw.
+            run_over = not pets.dungeon_status(entry, user_id).get("active")
+            rendered = (
+                pets_ui.dungeon_view(entry, user_id, xp)
+                if state is None or run_over
+                else pets_ui.phoenix_view(entry, user_id, xp, state=state)
+            )
+            # Most turns answer with nothing to say; the screen itself is the answer, and
+            # a toast line prepended to it would just be a blank gap.
+            if note:
+                await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
+            else:
+                await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
         if action == "mob":
             block = pets.roll_mob(entry, user_id)

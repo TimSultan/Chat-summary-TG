@@ -39,6 +39,7 @@ from datetime import date, datetime, timedelta
 
 import economy
 import pets_combat
+import pets_phoenix
 import pets_config as C
 import pets_mobs as M
 import pets_scroll_catalog as SCROLLS
@@ -218,6 +219,11 @@ def _normalise_dungeon_run(run) -> dict | None:
         # to full on every single load, which is the same as having no limit at all.
         "partial_heals_used": _safe_nonnegative_int(run.get("partial_heals_used")),
         "full_heals_used": _safe_nonnegative_int(run.get("full_heals_used")),
+        # The Phoenix fight in progress. This whitelist is exactly where it would be lost:
+        # dropped here, every redraw would hand the player a brand-new fight, which is the
+        # one thing that must never happen -- read a dangerous telegraph, close the screen,
+        # come back knowing the answer. Absent for every other encounter.
+        **({"phoenix": run["phoenix"]} if isinstance(run.get("phoenix"), dict) else {}),
         # The loot tallies are per run too, and they are exactly the kind of field this
         # whitelist has silently eaten before: dropped here they would reset to zero on
         # every load and the summary would always read "nothing". A run that predates them
@@ -4845,6 +4851,12 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         if row["index"] in cleared:
             _save(entry, data)
             return False, "Этот противник уже побеждён.", None
+        # The Phoenix is fought by hand. Refusing here rather than simulating is what
+        # makes that true from every direction: an old client, a stale button or a
+        # hand-made request cannot resolve it in one press behind the player's back.
+        if is_phoenix(row):
+            _save(entry, data)
+            return False, "С этим противником дерутся вручную — начни бой.", None
         # Only a room that HAS healers can contain something they raised. Belt and braces
         # over the reset in dungeon_descend: this state is index-keyed, indices repeat on
         # every floor, and leaking it once already made bosses pay nothing.
@@ -5135,6 +5147,206 @@ def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bo
     """
     code = D.SHOP_REST_CODES.get(str(amount or "").lower(), "heal_full")
     return dungeon_buy(entry, user_id, xp, code)
+
+
+# ------------------------------------------------------------------------- Феникс
+#
+# The Phoenix is the one encounter that is not a call to pets_combat.simulate. Its fight
+# is a state machine the player walks through (pets_phoenix), so what lives here is the
+# plumbing the pure engine deliberately does not have: reading the pet, persisting the
+# state on the run, and paying out through the same reward path every other kill uses.
+PHOENIX_GIMMICK = "reincarnate"
+
+
+def is_phoenix(row: dict) -> bool:
+    """Whether this encounter is fought by hand rather than simulated."""
+    return bool(row) and row.get("boss") and row.get("gimmick") == PHOENIX_GIMMICK
+
+
+def phoenix_hero_profile(record: dict, row: dict) -> dict:
+    """The hero as the Phoenix engine needs them: finished numbers, no pet record.
+
+    Read through pets_combat.derive against the real boss, so every stat, item passive and
+    scroll the player brought is already folded in -- the Phoenix fight uses the SAME
+    numbers as the rest of the game, it just spends them a turn at a time.
+    """
+    hero = _dungeon_fighter(record, "hero")
+    enemy = dungeon_enemy_fighter(row)
+    numbers = pets_combat.derive(hero, enemy)
+    shield = _combat_shield_for(record) or {}
+    return {
+        "name": record.get("name") or "Существо",
+        "max_hp": max(1, round(numbers["max_hp"])),
+        "damage": max(1, round(numbers["damage"])),
+        "spell_power": max(1, round(numbers["spell_power"])),
+        "crit": float(numbers["crit"]),
+        "crit_power": float(numbers["crit_power"]),
+        "reduction": float(numbers["reduction"]),
+        # What a raised guard actually blocks for this pet, which is what makes a good
+        # shield feel different from a bare one on a correctly-read telegraph.
+        "guard": max(.10, min(.80, float(shield.get("guard", .40) or .40))),
+        # Whether ✨ is on the table at all: a pet with no scrolls has no spell to cast,
+        # and offering the button would be offering a dead end.
+        "has_magic": any(_skill_loadout_for(record)),
+        "level": int(record.get("level", 1) or 1),
+    }
+
+
+def phoenix_boss_profile(row: dict, hero: "pets_combat.Fighter | None" = None) -> dict:
+    """The Phoenix's own numbers, straight off its floor. Never scaled to the hero."""
+    enemy = dungeon_enemy_fighter(row)
+    numbers = pets_combat.derive(enemy, hero or enemy)
+    return {
+        "name": row["name"],
+        "max_hp": max(1, round(numbers["max_hp"])),
+        "damage": max(1, round(numbers["damage"])),
+        "level": int(row.get("level", 1) or 1),
+        "floor": int(row.get("floor", 1) or 1),
+    }
+
+
+def _phoenix_reward(entry: str, user_id, floor: int, row: dict) -> tuple[bool, str, dict]:
+    """Pay for a Phoenix kill through the ordinary dungeon payout.
+
+    Every line of this is what `dungeon_fight` does for any other boss -- the same
+    reward roll, the same grant reasons the income audit reads, the same drop, scroll,
+    rune and ruby paths keyed on a unique token. A boss that minted its own rewards would
+    be a second economy nobody could audit, and the Phoenix changed how it is FOUGHT, not
+    what it is worth.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return True, "Побеждён.", {}
+        run = record.get("dungeon_run") or {}
+        loot_token = f"{run.get('run_id') or 'legacy'}:{floor}:{row['index']}:{run.get('kills', 0)}"
+        reward = D.roll_reward(floor, True)
+        reward["gold_base"] = int(reward.get("gold", 0) or 0)
+        reward["gold_multiplier"] = C.hero_gold_multiplier(record.get("level", 1), "dungeon")
+        reward["gold"] = C.gold_for_hero(reward["gold_base"], record.get("level", 1), "dungeon")
+        _apply_xp(record, int(reward["xp"]))
+        _save(entry, data)
+    economy.grant(entry, user_id, int(reward["gold"]), "pet_dungeon_boss_win")
+    dropped = grant_random_drop(entry, user_id, float(reward["item_chance"]))
+    rune = None
+    if secrets.SystemRandom().random() < 0.12:
+        element = RUNE_ELEMENTS[floor % len(RUNE_ELEMENTS)]
+        rune = grant_runes(entry, user_id, element, 1, f"dungeon:{loot_token}")
+    scroll = None
+    if reward["scroll_chance"]:
+        scroll = grant_scroll_reward(
+            entry, user_id, source=f"dungeon:{loot_token}", kind="dungeon",
+            chance=float(reward["scroll_chance"]), pity_after=None,
+        )
+    rubies = 1 if secrets.SystemRandom().random() < C.DUNGEON_RUBY_CHANCE else 0
+    if rubies:
+        grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:boss:{loot_token}")
+    receipt = {"encounter": row, "result": None, "hero": None, "enemy": None,
+               "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune,
+               "rubies": rubies, "raised": ()}
+    receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
+    return True, f"Побеждён: {row['name']}.", receipt
+
+
+def phoenix_state(entry: str, user_id) -> dict | None:
+    """The fight in progress as a screen sees it, or None when there is none."""
+    record = _tamed_record(_load(entry), user_id)
+    run = (record or {}).get("dungeon_run")
+    state = (run or {}).get("phoenix") if isinstance(run, dict) else None
+    return pets_phoenix.public(state) if isinstance(state, dict) else None
+
+
+def phoenix_start(entry: str, user_id) -> tuple[bool, str, dict | None]:
+    """Open the Phoenix fight for the encounter standing on this floor."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        floor = max(1, int(run.get("floor", 1) or 1))
+        row = D.encounter(floor, 0)
+        if not is_phoenix(row):
+            return False, "Здесь не Феникс.", None
+        if int(row["index"]) in {int(v) for v in run.get("cleared", []) if str(v).isdigit()}:
+            return False, "Этот противник уже побеждён.", None
+        existing = run.get("phoenix")
+        if isinstance(existing, dict) and not pets_phoenix.is_over(existing):
+            # Reopening a fight already in progress is a redraw, never a restart: the
+            # whole point of persisting the state is that a closed screen does not undo
+            # the mistakes already made.
+            return True, "", pets_phoenix.public(existing)
+        hero = phoenix_hero_profile(record, row)
+        # The run's own health carries in, like every other dungeon fight.
+        hero["hp"] = max(1, min(hero["max_hp"], int(run.get("hp", hero["max_hp"]) or 1)))
+        state = pets_phoenix.start(hero, phoenix_boss_profile(row), seed=secrets.randbits(63))
+        run["phoenix"] = state
+        _save(entry, data)
+        return True, "", pets_phoenix.public(state)
+
+
+def phoenix_action(entry: str, user_id, action: str) -> tuple[bool, str, dict | None]:
+    """Press one button in the Phoenix fight.
+
+    Returns the state a screen should draw. When the fight ENDS this also settles it the
+    ordinary way -- the reward path, the run's health and the defeat screen are the same
+    ones every other encounter uses, because a boss that paid out through its own code
+    would be a second economy nobody could audit.
+    """
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        state = run.get("phoenix")
+        if not isinstance(state, dict) or pets_phoenix.is_over(state):
+            return False, "Этот бой уже закончен.", None
+        try:
+            state = pets_phoenix.take(state, str(action or ""), seed=secrets.randbits(63))
+        except ValueError as error:
+            return False, str(error), pets_phoenix.public(run["phoenix"])
+        run["phoenix"] = state
+        run["hp"] = max(0, int(state.get("hero_hp", run.get("hp", 0)) or 0))
+        _save(entry, data)
+        if not pets_phoenix.is_over(state):
+            return True, "", pets_phoenix.public(state)
+    # Settled outside the lock's read/modify block, through the ordinary paths.
+    won = str(state.get("phase_state")) == pets_phoenix.VICTORY
+    return _phoenix_settle(entry, user_id, won, state)
+
+
+def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, str, dict | None]:
+    """End the Phoenix fight the way the dungeon ends every other one."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return True, "", pets_phoenix.public(state)
+        floor = max(1, int(run.get("floor", 1) or 1))
+        row = D.encounter(floor, 0)
+        run.pop("phoenix", None)
+        if not won:
+            final = dict(run.get("haul") or _new_haul())
+            record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
+            record["dungeon_run"] = None
+            _save(entry, data)
+            return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", \
+                pets_phoenix.public(state)
+        cleared = {int(v) for v in run.get("cleared", []) if str(v).isdigit()}
+        cleared.add(int(row["index"]))
+        run["cleared"] = sorted(cleared)
+        run.setdefault("dead_at", {})[str(row["index"])] = int(run.get("kills", 0) or 0)
+        run["kills"] = int(run.get("kills", 0) or 0) + 1
+        _record_weapon_win(record, "boss_wins")
+        _save(entry, data)
+    ok, note, receipt = _phoenix_reward(entry, user_id, floor, row)
+    public = pets_phoenix.public(state)
+    if isinstance(receipt, dict):
+        public["reward"] = receipt.get("reward") or {}
+    return ok, note, public
 
 
 def dungeon_haul(entry: str, user_id) -> dict:

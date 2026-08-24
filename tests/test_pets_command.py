@@ -1233,8 +1233,13 @@ class PetsCommandTests(unittest.TestCase):
             "result": result, "enemy": None, "reward": {"gold": 100, "xp": 50},
         }
 
-    def _stand_on_boss_floor(self, floor=5):
-        """A hero strong enough to finish a boss, standing on its floor."""
+    def _stand_on_boss_floor(self, floor=10):
+        """A hero strong enough to finish a boss, standing on its floor.
+
+        Floor 10 rather than 5: the Phoenix is fought a turn at a time now (pets_phoenix)
+        and `dungeon_fight` refuses it outright, so the boss these tests need is the next
+        one down. What they are about is the transcript a boss kill sends, not which boss.
+        """
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         data = pets._load(CHAT)

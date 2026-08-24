@@ -744,7 +744,10 @@ class DungeonTests(unittest.TestCase):
         self._enter_pack_floor()
         data = pets._load(self.entry)
         run = data["pets"][self.user_id]["dungeon_run"]
-        run["floor"], run["cleared"] = 5, []
+        # Floor 10 rather than 5: the floor-5 Phoenix is fought by hand (pets_phoenix),
+        # and dungeon_fight refuses it outright. What this test is about -- a boss never
+        # being mistaken for something a healer raised -- is true of any boss floor.
+        run["floor"], run["cleared"] = 10, []
         run["revived"] = list(range(5))           # exactly the leak that shipped
         data["pets"][self.user_id]["stats"] = {
             "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
@@ -895,8 +898,10 @@ class DungeonTests(unittest.TestCase):
         """The boss flag only exists on the encounter row; if it is not written into the
         reason here it is gone by the time the audit reads the ledger back."""
         data = pets._load(self.entry)
+        # Comfortably above the floor-10 boss below, so this assertion is about the
+        # REASON STRING and never about whether a simulated fight happened to be won.
         data["pets"][self.user_id]["stats"] = {
-            "strength": 400, "health": 400, "agility": 400, "luck": 400, "endurance": 1,
+            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
         }
         pets._save(self.entry, data)
         pets.grant_dungeon_ticket(self.entry, self.user_id)
@@ -907,13 +912,15 @@ class DungeonTests(unittest.TestCase):
         self.assertIn("pet_dungeon_mob_win", reasons)
         self.assertEqual(economy._audit_source("pet_dungeon_mob_win"), "dungeon_mobs")
 
-        # Floor 5 is the first boss floor, and a boss win has to read differently.
+        # Floor 10 is the first boss the auto-battler still resolves -- floor 5 is the
+        # Phoenix, which is fought a turn at a time and pays out through its own path --
+        # and a boss win has to read differently in the ledger either way.
         run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
-        run["floor"], run["cleared"] = 5, []
+        run["floor"], run["cleared"] = 10, []
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = run
         pets._save(self.entry, data)
-        for _ in range(4):                       # the floor-5 boss revives once
+        for _ in range(4):
             if pets.dungeon_fight(self.entry, self.user_id, 0)[0] and \
                     "pet_dungeon_boss_win" in [
                         r["reason"] for r in economy._load(self.entry)["log"]]:

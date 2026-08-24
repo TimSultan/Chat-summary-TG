@@ -450,7 +450,14 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         if enemy.get("stat_line") and not enemy.get("cleared"):
             lines.append(f"   <i>{escape(str(enemy['stat_line']))}</i>")
         if not enemy.get("cleared"):
-            rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
+            # The Phoenix is the one encounter that is not settled by the press that
+            # starts it: its button opens the fight screen, where every turn is answered
+            # by hand. Everything above -- the name, the hint, the weakness, the stat
+            # line -- is the same card as any other boss's.
+            if enemy.get("boss") and enemy.get("gimmick") == "reincarnate":
+                rows.append([{"text": "⚔️ В бой", "callback_data": callback_data(user_id, "phoenixstart")}])
+            else:
+                rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     lines.extend(dungeon_haul_block(state))
     if state.get("can_rest"):
         lines.append("\nОтдохнуть?")
@@ -512,6 +519,107 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
             {"text": "📜 Свитки", "callback_data": callback_data(user_id, "skills")},
         ])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+# How many lines of the running commentary a fight screen keeps. The telegraph is what a
+# player has to read; an unbounded transcript above it competes with the one line that
+# matters and pushes the buttons off a phone screen.
+PHOENIX_LOG_LINES = 4
+
+
+def phoenix_view(entry: str, user_id, xp: int, state: dict | None = None) -> tuple[str, dict]:
+    """The hand-fought Phoenix, drawn entirely from the state the game hands back.
+
+    Nothing on this screen is decided here, the buttons above all: the engine says which
+    moves are on offer this turn and its label is printed verbatim, because a client that
+    assembled its own button set would start lying about the fight the first time a move
+    changed. For the same reason nothing here reads the telegraph and comments on it --
+    working out which answer the telegraph is asking for IS the boss.
+
+    A state may be passed in because of the last frame only. Winning or losing clears the
+    fight out of the run, so a redraw that always re-read the store would lose the scene
+    the player just earned; the callback hands over the state it was answered with, and
+    every other caller reads the live one.
+    """
+    if state is None:
+        state = pets.phoenix_state(entry, user_id)
+    if not isinstance(state, dict):
+        return (
+            "🔥 <b>Бой с фениксом не идёт.</b>\n\n"
+            "Вернись на этаж — оттуда его можно начать заново.",
+            {"inline_keyboard": [
+                [{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}],
+                _back_row(user_id),
+            ]},
+        )
+    boss_hp = max(0, int(state.get("boss_hp", 0) or 0))
+    boss_max = max(1, int(state.get("boss_max_hp", 0) or 1))
+    hero_hp = max(0, int(state.get("hero_hp", 0) or 0))
+    hero_max = max(1, int(state.get("hero_max_hp", 0) or 1))
+    lines = [
+        f"🔥 <b>{escape(str(state.get('boss_name') or 'Феникс'))}</b> · "
+        f"фаза {2 if int(state.get('phase', 1) or 1) >= 2 else 1}",
+        f"👹 {_money(boss_hp)} / {_money(boss_max)}",
+        f"❤️ {_money(hero_hp)} / {_money(hero_max)}",
+    ]
+    # Both marks ride on one line above the prose: they are the state of the fight, and a
+    # player checks them at a glance before reading anything else.
+    marks = []
+    burn = max(0, int(state.get("burn", 0) or 0))
+    if burn:
+        marks.append(f"🔥 Горение × {burn}")
+    if state.get("vulnerable"):
+        marks.append("💥 <b>УЯЗВИМ</b>")
+    if marks:
+        lines.append(" · ".join(marks))
+    scene = str(state.get("scene") or "").strip()
+    if scene:
+        lines.extend(["", escape(scene)])
+    telegraph = str(state.get("telegraph") or "").strip()
+    if telegraph:
+        # The one block on this screen that has to be read rather than skimmed, so it
+        # stands alone and in bold -- and deliberately with nothing under it, because any
+        # line explaining it would answer the question the boss is asking.
+        lines.extend(["", f"⚠️ <b>{escape(telegraph)}</b>"])
+    history = [str(line).strip() for line in (state.get("log") or ()) if str(line).strip()]
+    if history:
+        lines.append("")
+        lines.extend(f"<i>{escape(line)}</i>" for line in history[-PHOENIX_LOG_LINES:])
+    rows = []
+    if state.get("over"):
+        lines.extend([
+            "",
+            "🏆 <b>Феникс повержен.</b>" if state.get("won")
+            else "💀 <b>Феникс тебя одолел.</b>",
+        ])
+        # Reused rather than reformatted: a boss kill pays through the ordinary dungeon
+        # payout, so it should read exactly like every other receipt in the run.
+        receipt_text = dungeon_reward_text({"reward": state.get("reward")})
+        if receipt_text:
+            lines.append(receipt_text)
+        rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
+        return "\n".join(lines), {"inline_keyboard": rows}
+    pair = []
+    for move in state.get("actions") or ():
+        code = str((move or {}).get("code") or "")
+        if not code:
+            continue
+        pair.append({
+            "text": str(move.get("label") or code),
+            "callback_data": callback_data(user_id, "phoenixact", code),
+        })
+        # Two to a row: the direction moves always arrive as a pair, and reading them side
+        # by side is how a player picks between them.
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    if not rows:
+        # A live fight always offers something. If it somehow does not, the way out is a
+        # button rather than a screen with no exit at all.
+        rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 

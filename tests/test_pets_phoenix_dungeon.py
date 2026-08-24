@@ -1,0 +1,202 @@
+"""The Phoenix where it meets the dungeon: persistence, refusal, and the payout.
+
+`pets_phoenix` is a pure state machine with its own tests. What is pinned here is the
+half it deliberately does not have -- reading the pet, keeping the fight on the run
+between two button presses, and settling it through the same reward path every other
+kill uses. A boss that minted its own gold would be a second economy nobody could audit.
+"""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import economy
+import pets
+import pets_dungeon as dungeon
+import pets_phoenix
+
+CHAT = "phoenix-chat"
+USER = 7700
+RICH_XP = 10 ** 9
+PHOENIX_FLOOR = 5
+
+
+class PhoenixDungeonTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self._patch = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        self._patch.start()
+        self.addCleanup(self._temporary.cleanup)
+        self.addCleanup(self._patch.stop)
+        self.assertTrue(pets.buy_cage(CHAT, USER, RICH_XP)[0])
+        self.assertTrue(pets.tame(CHAT, USER, RICH_XP, "Пеструшка", "file", "Хозяин")[0])
+        self._stand_on_the_phoenix()
+
+    def _stand_on_the_phoenix(self, strength=300):
+        data = pets._load(CHAT)
+        record = data["pets"][str(USER)]
+        record["level"] = 20
+        for key in pets.C.STAT_KEYS:
+            record["stats"][key] = strength
+        record["dungeon_run"] = {
+            "run_id": "phoenix-run", "kills": 0, "floor": PHOENIX_FLOOR,
+            "hp": 99_999, "max_hp": 99_999, "cleared": [],
+        }
+        pets._save(CHAT, data)
+
+    # ------------------------------------------------------------------ the refusal
+    def test_the_auto_battler_refuses_the_phoenix_outright(self):
+        """Refused rather than simulated, so no stale button can resolve it in one press.
+
+        The whole rework is that this fight is played a turn at a time; a client that
+        still sends the old action must be told no, not quietly handed a winner.
+        """
+        row = dungeon.encounter(PHOENIX_FLOOR, 0)
+        self.assertTrue(pets.is_phoenix(row))
+
+        ok, message, receipt = pets.dungeon_fight(CHAT, USER, 0)
+
+        self.assertFalse(ok)
+        self.assertIsNone(receipt)
+        self.assertIn("вручную", message)
+        # And nothing about the run moved: no kill, no cleared index, no loot.
+        run = pets.get_pet(CHAT, USER)["dungeon_run"]
+        self.assertEqual(run["cleared"], [])
+        self.assertEqual(int(run.get("kills", 0) or 0), 0)
+
+    def test_every_other_boss_is_still_simulated(self):
+        """One boss changed how it is fought. The rest of the dungeon did not."""
+        data = pets._load(CHAT)
+        data["pets"][str(USER)]["dungeon_run"]["floor"] = 10
+        pets._save(CHAT, data)
+        self.assertFalse(pets.is_phoenix(dungeon.encounter(10, 0)))
+
+        _ok, message, receipt = pets.dungeon_fight(CHAT, USER, 0)
+
+        # Whether this hero WINS is beside the point and would make the test about the
+        # balance of floor 10. What matters is that the fight was resolved at all rather
+        # than refused: a receipt exists either way, and the refusal message does not.
+        self.assertIsNotNone(receipt)
+        self.assertNotIn("вручную", message)
+
+    # ------------------------------------------------------------- the fight itself
+    def test_a_fight_survives_being_closed_and_reopened(self):
+        """A screen closed mid-boss must not hand back the mistakes already made.
+
+        The state lives on the run, so reopening is a redraw. Restarting here would make
+        every dangerous telegraph free: read it, quit, come back knowing the answer.
+        """
+        ok, _note, first = pets.phoenix_start(CHAT, USER)
+        self.assertTrue(ok)
+        self.assertIsNotNone(first)
+
+        action = first["actions"][0]["code"]
+        ok, _note, after = pets.phoenix_action(CHAT, USER, action)
+        self.assertTrue(ok)
+
+        ok, _note, reopened = pets.phoenix_start(CHAT, USER)
+        self.assertTrue(ok)
+        self.assertEqual(reopened["hero_hp"], after["hero_hp"])
+        self.assertEqual(reopened["boss_hp"], after["boss_hp"])
+        self.assertEqual(reopened["phase"], after["phase"])
+
+    def test_the_stored_fight_is_json_safe(self):
+        """It is persisted into the save file, so anything json cannot carry is a crash
+        on the next load rather than here."""
+        pets.phoenix_start(CHAT, USER)
+        run = pets.get_pet(CHAT, USER)["dungeon_run"]
+        stored = run["phoenix"]
+
+        self.assertEqual(json.loads(json.dumps(stored, ensure_ascii=False)), stored)
+
+    def test_a_button_that_is_not_on_offer_is_refused(self):
+        _ok, _note, state = pets.phoenix_start(CHAT, USER)
+        offered = {row["code"] for row in state["actions"]}
+        missing = next(code for code in pets_phoenix.ACTIONS if code not in offered)
+
+        ok, message, unchanged = pets.phoenix_action(CHAT, USER, missing)
+
+        self.assertFalse(ok)
+        self.assertTrue(message)
+        self.assertEqual(unchanged["hero_hp"], state["hero_hp"])
+
+    def test_the_fight_needs_a_run_and_the_right_floor(self):
+        data = pets._load(CHAT)
+        data["pets"][str(USER)]["dungeon_run"]["floor"] = 10
+        pets._save(CHAT, data)
+        ok, message, state = pets.phoenix_start(CHAT, USER)
+        self.assertFalse(ok)
+        self.assertIsNone(state)
+        self.assertIn("Феникс", message)
+
+    # ------------------------------------------------------------------ the payout
+    def test_a_win_pays_through_the_ordinary_boss_path_and_clears_the_floor(self):
+        """Same ledger reason, same haul, same cleared index as any other boss.
+
+        The Phoenix changed how it is FOUGHT, not what it is worth -- and the income
+        audit reads the reason string, which is the only place the boss flag survives.
+        """
+        state = self._play_to_the_end(win=True)
+        self.assertTrue(state["won"], state)
+
+        reasons = [row["reason"] for row in economy._load(CHAT)["log"]]
+        self.assertIn("pet_dungeon_boss_win", reasons)
+        run = pets.get_pet(CHAT, USER)["dungeon_run"]
+        self.assertIn(0, run["cleared"])
+        self.assertNotIn("phoenix", run)
+
+    def test_a_loss_ends_the_run_the_way_every_other_defeat_does(self):
+        state = self._play_to_the_end(win=False)
+        self.assertFalse(state["won"], state)
+
+        record = pets.get_pet(CHAT, USER)
+        self.assertIsNone(record.get("dungeon_run"))
+        self.assertFalse(record["last_dungeon_haul"]["won"])
+
+    def _play_to_the_end(self, win: bool):
+        """Walk a fight to its end, either playing well or pressing ⚔️ forever."""
+        _ok, _note, state = pets.phoenix_start(CHAT, USER)
+        for _ in range(400):
+            if state.get("over"):
+                return state
+            offered = [row["code"] for row in state["actions"]]
+            if not offered:
+                break
+            if win:
+                code = self._best(state, offered)
+            else:
+                code = pets_phoenix.ATTACK if pets_phoenix.ATTACK in offered else offered[0]
+            _ok, _note, state = pets.phoenix_action(CHAT, USER, code)
+            if state is None:
+                break
+        return state or {"won": False, "over": True}
+
+    @staticmethod
+    def _best(state, offered):
+        """The answer a player who has learned the boss would give.
+
+        Chosen by trying each button against the pure engine, which is a harness
+        privilege: the player never sees a hint, and the telegraph never carries one.
+        """
+        stored = pets.get_pet(CHAT, USER)["dungeon_run"]["phoenix"]
+        best, best_score = offered[0], None
+        for code in offered:
+            try:
+                after = pets_phoenix.take(dict(stored), code, seed=99)
+            except ValueError:
+                continue
+            score = (after.get("hero_hp", 0) - stored.get("hero_hp", 0)) * 3 \
+                + (stored.get("boss_hp", 0) - after.get("boss_hp", 0)) \
+                - after.get("burn", 0) * 40
+            if best_score is None or score > best_score:
+                best, best_score = code, score
+        return best
+
+
+if __name__ == "__main__":
+    unittest.main()
