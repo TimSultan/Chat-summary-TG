@@ -163,6 +163,52 @@ class LiveAchievementTests(unittest.TestCase):
             pets.achievements_view(CHAT, USER)
             self.assertEqual(len(seen), 1, "список считается ровно при открытии")
 
+    def test_a_veteran_is_credited_for_fights_the_weapon_ledger_never_saw(self):
+        """The per-weapon ledger is not a record of whether somebody has ever fought.
+
+        It only counts a win taken WITH A WEAPON EQUIPPED, and only since it started
+        being kept, so a player with hundreds of fights behind them can have nothing in
+        it. Asking it "have you won a fight" told the longest-serving players in the chat
+        to go and win their first one -- and handed them the joke about never having
+        fought at all.
+        """
+        data = pets._load(CHAT)
+        record = data["pets"][str(USER)]
+        record.update({"wins": 480, "fights": 900, "dungeon_deepest": 22})
+        record["weapon_records"] = {}
+        pets._save(CHAT, data)
+
+        earned = {row["code"] for row in pets.achievements_view(CHAT, USER)["rows"]
+                  if row["earned"]}
+
+        self.assertIn("first_blood", earned)
+        self.assertNotIn("pacifist", earned)
+
+    def test_a_real_pacifist_still_gets_the_joke(self):
+        data = pets._load(CHAT)
+        record = data["pets"][str(USER)]
+        record.update({"wins": 0, "fights": 0, "dungeon_deepest": 14})
+        pets._save(CHAT, data)
+
+        earned = {code for code in pets.refresh_achievements(CHAT, USER)}
+
+        self.assertIn("pacifist", earned)
+
+    def test_a_failed_evaluation_leaves_a_trace_instead_of_a_silent_nothing(self):
+        """Swallowing the reason turns one bad record into a player who never earns
+        anything, with no way to find out why -- which is indistinguishable from the
+        feature being broken for them alone."""
+        with patch.object(pets, "achievement_profile", side_effect=ValueError("битое поле")):
+            self.assertEqual(pets.refresh_achievements(CHAT, USER), [])
+
+        stored = pets.get_pet(CHAT, USER)["achievements"]
+        self.assertIn("ValueError", stored.get("error", ""))
+
+        # And the trace is cleared by the first evaluation that works, so a fixed record
+        # does not keep accusing itself.
+        pets.refresh_achievements(CHAT, USER)
+        self.assertNotIn("error", pets.get_pet(CHAT, USER)["achievements"])
+
     def test_earning_and_claiming_are_two_separate_states(self):
         """Collapsing them would make the reward the achievement: a crash between the two
         would either lose the row or pay it twice, and the screen could not say
@@ -247,12 +293,15 @@ class LiveAchievementTests(unittest.TestCase):
         )
 
     def _win_a_fight(self):
-        """The cheapest real unlock there is, so the tests above are about the plumbing."""
+        """The cheapest real unlock there is, so the tests above are about the plumbing.
+
+        The pet's own counter, which is what an arena win actually increments -- not the
+        per-weapon ledger, which only sees a win taken with a weapon equipped.
+        """
         data = pets._load(CHAT)
         record = data["pets"][str(USER)]
-        record.setdefault("weapon_records", {})["w001"] = {
-            "pet_wins": 1, "mob_wins": 0, "boss_wins": 0,
-        }
+        record["wins"] = max(1, int(record.get("wins", 0) or 0))
+        record["fights"] = max(1, int(record.get("fights", 0) or 0))
         pets._save(CHAT, data)
 
 

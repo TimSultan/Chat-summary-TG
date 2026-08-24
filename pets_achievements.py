@@ -86,7 +86,10 @@ PROFILE_FIELDS: Final = (
     "power",                # the leaderboard's own number
     # -- fighting -------------------------------------------------------------------
     "wins", "fights",
-    "boss_wins", "mob_wins", "pet_wins",     # totals across every weapon ever carried
+    # Totals across every weapon carried -- but only wins taken WITH ONE EQUIPPED, and
+    # only since the per-weapon ledger began. Never use these to ask "has this player ever
+    # fought": `wins` and `fights` are the pet's own counters and answer that honestly.
+    "boss_wins", "mob_wins", "pet_wins",
     "best_weapon_wins",     # most wins carried on ONE weapon
     "deepest_floor",        # the deepest dungeon floor ever stood on
     "phoenix_wins", "phoenix_perfect",       # the hand-played boss, and a flawless run
@@ -154,10 +157,15 @@ def _stat(profile: dict, key: str) -> int:
 
 ACHIEVEMENTS: Final[tuple[Achievement, ...]] = (
     # ---------------------------------------------------------------- первые шаги
+    # Reads the pet's own win counter rather than the per-weapon ledger. That ledger only
+    # records a win taken WITH A WEAPON EQUIPPED and only since it started being kept, so
+    # a player with four hundred wins behind them can have nothing in it -- and being told
+    # to go and win a first fight is the one thing that would make this screen look broken
+    # to exactly the people who have played longest.
     Achievement(
         "first_blood", "🩸", "Первая кровь",
         "Выиграй свой первый бой на арене ⚔️",
-        lambda p: p.get("pet_wins", 0) >= 1,
+        lambda p: p.get("wins", 0) >= 1,
         farm_tickets=1,
     ),
     Achievement(
@@ -425,10 +433,14 @@ ACHIEVEMENTS: Final[tuple[Achievement, ...]] = (
         lambda p: p.get("phoenix_wins", 0) >= 1 and p.get("equipped_slots", 0) <= 1,
         rubies=3, dungeon_tickets=3, hidden=True,
     ),
+    # Same counter, and here reading the wrong one was worse than a missing row: the
+    # per-weapon ledger is empty for most veterans, so the joke about never having fought
+    # was being handed to the people with the most fights in the chat.
     Achievement(
         "pacifist", "🕊", "Не боец",
         "Дойти до 10-го этажа, ни разу не победив на арене 🌿",
-        lambda p: p.get("deepest_floor", 1) >= 10 and p.get("pet_wins", 0) == 0,
+        lambda p: p.get("deepest_floor", 1) >= 10 and p.get("wins", 0) == 0
+        and p.get("fights", 0) == 0,
         rubies=3, hidden=True,
     ),
     Achievement(

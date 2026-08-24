@@ -5571,15 +5571,25 @@ def achievement_profile(entry: str, user_id) -> dict:
 def refresh_achievements(entry: str, user_id) -> list[str]:
     """Record everything newly earned. Returns the codes that just unlocked.
 
-    Never raises. The list this feeds is mostly about weapons and dungeons, and a value
-    of an unexpected shape somewhere in a long-migrated save must not be able to close
-    the whole screen -- it costs at most one evaluation, and the next one picks it up.
+    Never raises, and never silently. A value of an unexpected shape somewhere in a
+    long-migrated save must not close the screen -- but swallowing the reason would turn
+    one bad record into a player who simply never earns anything and no way to find out
+    why. The failure is recorded on the pet, so the screen still draws whatever was
+    already unlocked and the cause is one save file away instead of invisible.
     """
+    failure = ""
     try:
         profile = achievement_profile(entry, user_id)
-    except Exception:
-        profile = {}
+    except Exception as error:
+        profile, failure = {}, f"{type(error).__name__}: {error}"[:200]
     if not profile:
+        if failure:
+            with _farm_settlement_lock:
+                data = _load(entry)
+                record = _tamed_record(data, user_id)
+                if record is not None:
+                    _achievement_row(record)["error"] = failure
+                    _save(entry, data)
         return []
     fresh = []
     with _farm_settlement_lock:
@@ -5588,6 +5598,7 @@ def refresh_achievements(entry: str, user_id) -> list[str]:
         if record is None:
             return []
         row = _achievement_row(record)
+        row.pop("error", None)
         known = set(row["unlocked"])
         # The closed rows are settled the first time this pet is ever evaluated, and never
         # again. Doing it here rather than in a migration pass means it happens for a pet
