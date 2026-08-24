@@ -105,9 +105,9 @@ class MobRollAndBlockTests(PetsTestCase):
                 ]
                 self.assertTrue(days, f"{item.code} never reaches the shelf")
 
-        def fighter(key, effects=()):
+        def fighter(key, effects=(), health=40):
             return pets_combat.Fighter(
-                key=key, name=key, strength=40, health=40, agility=10, luck=10,
+                key=key, name=key, strength=40, health=health, agility=10, luck=10,
                 armor=0, effects=effects, level=10,
             )
 
@@ -116,10 +116,18 @@ class MobRollAndBlockTests(PetsTestCase):
         vs_pet = pets_combat.simulate(hunter, fighter("pet"), seed=42)
         self.assertGreater(vs_mob.total_damage["player"], vs_pet.total_damage["player"])
 
-        ward = fighter("player", ({"code": "mob_ward", "value": 15},))
+        # Measured on what the WARD's owner has left, not on what the opponent dealt.
+        # Total damage dealt is bounded by the target's health pool, so once the wearer
+        # dies both numbers land on exactly that pool and the two fights compare equal no
+        # matter how well the ward worked -- which is precisely what this assertion used
+        # to read as "the ward does nothing". Given enough health to survive, the wearer
+        # walks away from the mob with more of it, which is the actual claim.
+        ward = fighter("player", ({"code": "mob_ward", "value": 15},), health=400)
         ward_vs_mob = pets_combat.simulate(ward, fighter("mob:orc"), seed=42)
         ward_vs_pet = pets_combat.simulate(ward, fighter("pet"), seed=42)
-        self.assertLess(ward_vs_mob.total_damage["mob:orc"], ward_vs_pet.total_damage["pet"])
+        self.assertGreater(
+            ward_vs_mob.final_hp["player"], ward_vs_pet.final_hp["player"],
+        )
 
     def test_mob_fight_callback_keeps_both_code_and_tier(self):
         """A compound callback argument must survive Telegram's outer separators.

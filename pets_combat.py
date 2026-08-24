@@ -269,6 +269,9 @@ _EFFECT_TEXT = {
     "hunger": "голодает: −{amount} максимального HP, но урон растёт.",
     "soul_debt": "выкупает себя из смерти: +{amount} HP и вдвое хуже защита.",
     "recoil": "отдачей выбивает себя из следующего хода.",
+    "fumble_weapon": "роняет оружие и весь ход поднимает его с пола.",
+    "fumble_self": "заносит удар не туда и бьёт сам себя: {amount} урона.",
+    "fumble_shield": "не успевает поднять щит — тот выскальзывает из лап.",
     "arcane_surge": "разгоняет ману: свитки бьют сильнее.",
     "runic_charge": "накапливает руну с удара: свитки сильнее ещё на {amount}%.",
     "arcane_battery": "копит заряд: с каждым раундом свитки злее.",
@@ -661,6 +664,12 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     elif luck_tier == 2:
         crit = min(1.0, crit + C.LUCK_ADVANTAGE_CRIT_BONUS)
         accuracy = C.LUCK_ADVANTAGE_MISS_MULTIPLIER
+    # How hard a critical lands, as opposed to how often. Both halves read Удача, and a
+    # signature that pins the CHANCE (luck_tier above) deliberately leaves this alone --
+    # an overwhelming lead already rewrites the odds and should not also rewrite the size.
+    crit_power = min(C.CRIT_DAMAGE_MAX_MULTIPLIER, C.CRIT_MULTIPLIER + max(
+        0.0, fighter.luck * factor("luck"),
+    ) * C.CRIT_DAMAGE_PER_POINT)
     reduction = _saturate(C.ARMOR_MAX, C.ARMOR_K, fighter.armor)  # never dominance-boosted
     effects = _effect_specs(fighter)
 
@@ -701,6 +710,12 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     # Read AFTER the fight-start passives above, so `ferocity` and a candle's gamble reach
     # the swing floor too -- a scroll cast by a pet whose weapon just doubled its damage
     # should not be the one number in the fight that pretends nothing happened.
+    # Four scrolls of one element lift every magical thing this fighter does. Read off
+    # the loadout rather than stored, so it follows a scroll swap with no migration and a
+    # replay recomputes exactly what the fight was fought with.
+    element = SCROLLS.loadout_element(fighter.skills)
+    resonance = 1.0 + (C.ELEMENTAL_RESONANCE_BONUS if element else 0.0)
+
     spell = C.spell_power(fighter.magic * magic_factor, damage)
     # Both are flat, fight-long multipliers on the spell line and nothing else, so they
     # belong here rather than in the loop. `mana_burn` also charges its toll at every
@@ -713,8 +728,11 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
         "max_hp": max_hp,
         "damage": damage,
         "spell_power": spell,
+        "element": element,
+        "resonance": resonance,
         "dodge": dodge,
         "crit": crit,
+        "crit_power": crit_power,
         "accuracy": accuracy,
         "luck_tier": luck_tier,
         "signature": signature,
@@ -989,7 +1007,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         the answer to a build that out-heals its damage, and a cut that only applied to
         some sources would just push players onto the ones it missed.
         """
-        return max(0.0, float(amount)) * max(0.0, 1.0 - heal_cut[key])
+        return (max(0.0, float(amount)) * max(0.0, 1.0 - heal_cut[key])
+                * derived[key]["resonance"])
 
     def swing_share(source_key: str, percent: float, code: str) -> int:
         """Hit points for one tick of a passive written as a share of the owner's swing."""
@@ -1069,10 +1088,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     ):
         """Put an equipped-item proc in the normal transcript, without flavour RNG."""
         template = _EFFECT_TEXT.get(code, "срабатывает эффект снаряжения.")
+        # A sparkle is how good news reads. The three неудача rows are the only lines
+        # filed through here that happen TO their owner rather than for them, and marking
+        # them like a proc made a dropped weapon look like a lucky charm going off.
+        mark = "💢" if code.startswith("fumble_") else "✨"
         rounds.append(Round(
             number=number, attacker=owner_key, event=f"amulet_{code}", damage=amount,
             attacker_hp=round(hp[owner_key]), defender_hp=round(hp[other_key]),
-            text=f"✨ {fighters[owner_key].name} {template.format(amount=amount)}",
+            text=f"{mark} {fighters[owner_key].name} {template.format(amount=amount)}",
             attack_types=normalize_attack_types(attack_types),
             is_action=is_action,
         ))
@@ -1272,6 +1295,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         recurse forever instead of producing a readable, deterministic combat log.
         """
         attack_types = normalize_attack_types(attack_types)
+        # Elemental resonance, before anything the defender does about it. Charged here
+        # rather than at each caller because "magical damage" is a dozen sources -- a
+        # scroll, a magic weapon's swing, a burn tick, an echo -- and applying it per
+        # source is how one of them ends up missing it or collecting it twice.
+        if effectful and damage and is_magic_attack(attack_types) \
+                and derived[source_key]["resonance"] > 1:
+            damage = max(1, round(damage * derived[source_key]["resonance"]))
         # A ward is charged before the blow reaches `hurt`, so it also shelters the guard,
         # the barrier and the rescue effects underneath it rather than merely trimming the
         # number printed afterwards. Physical steel walks straight past it.
@@ -1446,7 +1476,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                * max(0.0, float(effect.get("amount", 1.0))))
         raw *= 1 + rng.uniform(-C.DAMAGE_VARIANCE, C.DAMAGE_VARIANCE)
         if rng.random() < derived[source_key]["crit"]:
-            raw *= C.CRIT_MULTIPLIER
+            raw *= derived[source_key]["crit_power"]
         raw *= max(.10, 1.0 - skill_value(source_key, "weaken"))
         raw *= 1.0 + skill_value(source_key, "damage_boost")
         raw *= 1.0 + skill_value(target_key, "vulnerable")
@@ -1628,6 +1658,18 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     is_action=False,
                 ))
 
+    def unlucky(key: str) -> bool:
+        """Whether this fighter is currently short enough of Удача to fumble at all.
+
+        Reads the SAME deficit list every other weakness reads, so it is a real gap
+        against a real opponent (under half their Удача) rather than a tax on any small
+        number -- and, like every deficit, only the two largest ones bite in one fight.
+        """
+        return effectful and "luck" in derived[key]["deficits"]
+
+    def fumbled(key: str) -> bool:
+        return unlucky(key) and rng.random() < C.LUCK_FUMBLE_CHANCE
+
     def resolve_cast_passives(
         source_key: str, target_key: str, number: int, impact: int,
     ) -> str | None:
@@ -1692,6 +1734,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     ) -> str | None:
         if action == "defend":
             shield = equipped_shields[source_key] or {}
+            if fumbled(source_key):
+                # The turn is still spent -- that is the cost. A guard that simply failed
+                # to appear with no line in the log would read as an engine bug.
+                effect_round(number, source_key, target_key, "fumble_shield", is_action=True)
+                tick_skill_state(source_key)
+                return None
             guards[source_key] = max(.10, min(.80, float(shield.get("guard", .40) or .40)))
             name = shield_name(source_key)
             rounds.append(Round(
@@ -2159,6 +2207,32 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 tick_skill_state(attacker_key)
                 return None
             wild_crit = roll < heal_chance + crit_chance
+        # Неудача, before anything else about the swing is decided: a dropped weapon is
+        # not a miss the defender earned, and it must not be cancelled by a rule that
+        # says this attack "cannot miss".
+        if fumbled(attacker_key):
+            attacks_made[attacker_key] += 1
+            if rng.random() < C.LUCK_FUMBLE_SELF_CHANCE:
+                self_harm = max(1, round(
+                    derived[attacker_key]["damage"] * C.LUCK_FUMBLE_SELF_SHARE
+                ))
+                before = hp[attacker_key]
+                hp[attacker_key] = max(0.0, hp[attacker_key] - self_harm)
+                dealt = round(before - hp[attacker_key])
+                total_damage[defender_key] += dealt
+                effect_round(
+                    round_number, attacker_key, defender_key, "fumble_self", dealt,
+                    is_action=True,
+                )
+                if hp[attacker_key] <= 0:
+                    return defender_key
+            else:
+                effect_round(
+                    round_number, attacker_key, defender_key, "fumble_weapon",
+                    is_action=True,
+                )
+            tick_skill_state(attacker_key)
+            return None
         forced_venom_miss = venom_miss[attacker_key] > 0 and rng.random() < venom_miss[attacker_key]
         venom_miss[attacker_key] = 0.0
         forced_skill_miss = False
@@ -2225,7 +2299,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             # +100% of the swing, not a doubling of whatever the passives have already
             # built. _resolve_blow deliberately leaves it to this line.
             if event == "crit":
-                multiplier += max(0.0, C.CRIT_MULTIPLIER - 1.0)
+                multiplier += max(0.0, derived[attacker_key]["crit_power"] - 1.0)
             multiplier *= max(.10, 1 - damage_weakened[attacker_key])
             if poison_weaken[attacker_key]:
                 multiplier *= max(.10, 1 - poison_weaken[attacker_key])
@@ -2383,7 +2457,9 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if event == "crit" and "countercrit" not in used[defender_key] \
                     and (value := _effect_value(effects[defender_key], "countercrit")) is not None:
                 used[defender_key].add("countercrit")
-                multiplier = max(0.1, multiplier - max(0.0, C.CRIT_MULTIPLIER - 1.0))
+                multiplier = max(0.1, multiplier - max(
+                    0.0, derived[attacker_key]["crit_power"] - 1.0,
+                ))
                 retaliation_bonus[defender_key] += max(1, round(damage * max(0, _fraction(value))))
                 effect_round(round_number, defender_key, attacker_key, "countercrit")
             if chilled[attacker_key]:

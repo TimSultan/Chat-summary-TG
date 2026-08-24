@@ -2351,6 +2351,15 @@ def skills_view(entry: str, user_id) -> tuple[str, dict]:
                 "callback_data": callback_data(user_id, "skillclear", str(index)),
             },
         ])
+    # Shown only once the set is actually complete, and nowhere else in the game: a rule
+    # that pays for a restriction is best learned at the moment the restriction is met.
+    element = SCROLLS.loadout_element(pets.skill_loadout(entry, user_id))
+    if element:
+        lines.append(
+            f"\n✨ <b>{escape(SCROLLS.element_label(element))}</b> — четыре свитка одной "
+            f"стихии: <b>+{round(C.ELEMENTAL_RESONANCE_BONUS * 100)}%</b> к магическому "
+            "урону и лечению."
+        )
     rows.append([{"text": "🎒 К снаряжению", "callback_data": callback_data(user_id, "bag")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}

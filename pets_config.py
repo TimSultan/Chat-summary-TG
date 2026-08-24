@@ -367,6 +367,13 @@ DAMAGE_VARIANCE = 0.15
 # wasted turn for everyone who has not respecced yet -- a Strength build's scrolls are
 # cut to 45% of what they were, which is the whole point of the rework, but they still
 # beat standing still and the four-slot loadout is still worth filling.
+# Four scrolls of one element. Small on purpose: it is a reason to prefer one shape of
+# loadout over another, not a reason every loadout has to become mono-element. The four
+# slots already cost a great deal of freedom to align -- a pure-fire set gives up the
+# stun, the barrier and the cleanse that live on other elements -- so the bonus pays for
+# a restriction the player has already accepted rather than handing out free damage.
+ELEMENTAL_RESONANCE_BONUS = 0.10
+
 BASE_SPELL_POWER = 22.0
 SPELL_POWER_PER_POINT = 2.60
 SPELL_POWER_SWING_FLOOR = 0.45
@@ -442,7 +449,43 @@ DODGE_K = 55.0              # agility 40 -> 19%, agility 80 -> 27%
 CRIT_BASE = 0.03            # everybody lands the occasional lucky one
 CRIT_MAX = 0.35
 CRIT_K = 70.0               # luck 40 -> 16%, luck 80 -> 22%
-CRIT_MULTIPLIER = 2.0       # "критического удара (х2)"
+CRIT_MULTIPLIER = 2.0       # "критического удара (х2)" -- the floor, at Удача 0
+# Luck used to buy the CHANCE of a critical and nothing else, and the chance saturates:
+# from Удача 40 to 52 it moves 15.7% -> 17.9%, which is about +2% damage over a fight.
+# Measured against an identical pet with the same coins in another stat, that made Удача
+# the worst purchase in the game by a wide margin -- 55% where Сила and Здоровье bought
+# 89%. It now also buys how HARD a critical lands, which is the half that compounds:
+# more of them AND bigger, so a coin spent here finally curves the way the others do.
+#
+# Written LINEAR, unlike the chance beside it, and that is the whole repair. A chance has
+# to saturate -- it is a probability -- but saturation is also why Удача could not convert
+# a lead: DOMINANCE_BONUS pays +30% of a stat's contribution to whoever is ahead in it,
+# and 30% more of a number already flattened against its ceiling is nothing. Сила and
+# Здоровье are linear and collect that bonus in full, which is most of why they measured
+# 85-89% against Удача's 55%. Damage per critical has no ceiling to flatten against.
+# The gentle end of the useful range, and that is a measurement rather than caution:
+# 0.02, 0.03 and 0.04 all buy the same 64-65% for an ordinary twelve-level purchase --
+# the repair was making this line LINEAR at all, not making it steep. What the steeper
+# values did change is what a deliberate dump costs, from 3.1% down to 1.6%, and a stat
+# whose absence is four times more punishing than Сила's is a tax rather than a choice.
+CRIT_DAMAGE_PER_POINT = 0.02   # luck 40 -> x2.8, luck 80 -> x3.6
+# ...and a hard ceiling on it, because "linear" and "unbounded" are not the same promise.
+# A deep corridor enemy carries Удача in the hundreds (floor 41 is about 700), which an
+# uncapped line turned into a x16 critical -- and the dungeon's own test caught it: a
+# runner with 4,000 in every stat and 125,300 HP was losing 30 fights in 200 to a mob
+# with an eighth of its swing. The cap sits far above anything a player reaches, so the
+# line stays straight everywhere it is actually read and only the absurd tail is clipped.
+CRIT_DAMAGE_MAX_MULTIPLIER = 5.0   # reached at Удача 150
+
+# ------------------------------------------------------------------- неудача
+# A pet whose Удача is under half its opponent's does not merely crit less -- it fumbles.
+# This is the OTHER half of making the stat matter: the first half rewards buying it, and
+# this one is what being caught without it costs. It rides on the existing "слабое место"
+# system (STAT_DEFICIT_RATIO), so it is a real gap against a real opponent rather than a
+# tax on any low number, and like every other deficit only the two largest ones bite.
+LUCK_FUMBLE_CHANCE = 0.12        # per action taken while the luck deficit is live
+LUCK_FUMBLE_SELF_CHANCE = 0.40   # of those, the share that land on the fumbler instead
+LUCK_FUMBLE_SELF_SHARE = 0.45    # of their own swing, when a blow comes back at them
 
 # A fighter whose strongest comparable stat is 2x or 3x their opponent's gets one
 # signature moment per fight at most. It is intentionally one stat, not a stack: a pet
@@ -546,7 +589,11 @@ POWER_RATING_WEIGHTS = {
     "strength": 4,
     "health": 4,
     "agility": 2,
-    "luck": 2,
+    # Raised from 2 with the crit-damage repair. Measured against an identical pet with
+    # the same coins elsewhere, Удача now contributes like Магия (63% against 67%, where
+    # it used to buy 55%), and it still buys the drop rate on top -- so pricing it at half
+    # a stat in matchmaking would have kept telling players it is half a stat.
+    "luck": 3,
     # Scroll damage and, with a magic weapon, every ordinary swing. Weighted below
     # Strength because it buys no health: Strength quietly carries HP_PER_STRENGTH_WITH_SKILLS
     # on top of the swing, and a caster pays for that difference in a shorter health bar.

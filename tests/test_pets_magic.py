@@ -135,6 +135,59 @@ class WeaponScalingTests(unittest.TestCase):
         self.assertIn("strength", combat.derive(empty, brawler)["deficits"])
 
 
+
+class ElementalResonanceTests(unittest.TestCase):
+    """Four scrolls of one element lift every magical thing their owner does."""
+
+    @staticmethod
+    def _pure(element):
+        regular = [row["code"] for row in SCROLLS.REGULAR_SCROLLS
+                   if row["element"] == element][:3]
+        ultimate = [row["code"] for row in SCROLLS.ULTIMATE_SCROLLS
+                    if row["element"] == element][:1]
+        return SCROLLS.validate_loadout(tuple(regular + ultimate))
+
+    def test_it_takes_all_four_slots_and_one_element(self):
+        pure = self._pure("fire")
+        self.assertEqual(SCROLLS.loadout_element(pure), "fire")
+        # An empty slot is a legal resting state everywhere else in the game, so a set of
+        # one scroll would otherwise be a set of one element and collect this for free.
+        self.assertIsNone(SCROLLS.loadout_element((pure[0], None, None, pure[3])))
+        frost = next(row["code"] for row in SCROLLS.REGULAR_SCROLLS
+                     if row["element"] == "frost")
+        self.assertIsNone(SCROLLS.loadout_element((pure[0], pure[1], frost, pure[3])))
+
+    def test_the_bonus_reaches_spell_damage_and_healing_but_not_steel(self):
+        pure, mixed = self._pure("fire"), SCROLLS.validate_loadout((
+            "scroll_arcane_spark", "scroll_crimson_comet", "scroll_royal_barrier",
+            "ultimate_starfall",
+        ))
+        resonant = fighter(skills=pure, magic=60)
+        plain = fighter(skills=mixed, magic=60)
+        foe = fighter(key="b")
+        self.assertAlmostEqual(
+            combat.derive(resonant, foe)["resonance"],
+            1 + C.ELEMENTAL_RESONANCE_BONUS, places=6,
+        )
+        self.assertEqual(combat.derive(plain, foe)["resonance"], 1.0)
+
+        # A magical blow lands harder...
+        rounds = combat.simulate(resonant, fighter(key="b", health=400), seed=5).rounds
+        magic_hits = [row for row in rounds
+                      if row.attacker == "a" and combat.MAGIC in row.attack_types]
+        self.assertTrue(magic_hits)
+        # ...and a steel swing does not, which is what keeps this a caster's rule.
+        steel = fighter(skills=pure, magic=1, strength=60)
+        self.assertEqual(
+            combat.derive(steel, foe)["damage"],
+            combat.derive(fighter(skills=mixed, magic=1, strength=60), foe)["damage"],
+        )
+
+    def test_healing_is_lifted_too(self):
+        heal = ({"op": "heal", "percent": 0.20},)
+        hurt = fighter(key="a", skills=self._pure("fire"), health=100)
+        self.assertGreater(combat.derive(hurt, fighter(key="b"))["resonance"], 1)
+
 class SnapshotTests(unittest.TestCase):
     def test_a_snapshot_round_trip_keeps_magic_and_the_weapon_scaling(self):
         original = fighter(magic=44, attack_scaling="hybrid")

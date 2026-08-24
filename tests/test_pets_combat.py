@@ -9,6 +9,7 @@ import random
 import statistics
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1574,3 +1575,88 @@ class AdditiveCritTests(unittest.TestCase):
         self.assertEqual(crit_event, "crit")
         # And the bonus the main loop adds for it is a real one.
         self.assertGreater(C.CRIT_MULTIPLIER - 1.0, 0)
+
+
+class LuckTests(unittest.TestCase):
+    """Удача buys how HARD a critical lands, and being caught without it fumbles.
+
+    Before this pair the stat bought only the CHANCE of a critical, and that chance
+    saturates: measured against an identical pet with the same coins in another stat,
+    Удача won 55% of fights where Сила and Здоровье won 89%.
+    """
+
+    # With a real loadout, because a fighter carrying neither scrolls nor gear is a
+    # "classic" one and skips the whole effect pipeline -- the same gate that keeps a
+    # historic replay byte-identical. It is also the only way a Defend is ever chosen,
+    # and the shield fumble has nothing to drop without one.
+    LOADOUT = SCROLLS.validate_loadout((
+        "scroll_arcane_spark", "scroll_crimson_comet", "scroll_royal_barrier",
+        "ultimate_starfall",
+    ))
+
+    @classmethod
+    def _fighter(cls, key, luck, **over):
+        stats = dict(strength=40, health=40, agility=40, luck=luck, armor=20)
+        stats.update(over)
+        return Fighter(key=key, name=key, level=10, magic=40,
+                       skills=cls.LOADOUT, **stats)
+
+    def test_crit_damage_rises_with_luck_instead_of_being_a_flat_double(self):
+        low = combat.derive(self._fighter("a", 10), self._fighter("b", 10))
+        high = combat.derive(self._fighter("a", 80), self._fighter("b", 80))
+        self.assertGreater(high["crit_power"], low["crit_power"])
+        self.assertGreaterEqual(low["crit_power"], C.CRIT_MULTIPLIER)
+
+    def test_the_line_is_straight_where_players_live_and_capped_past_it(self):
+        """Linear is the repair; unbounded was a bug.
+
+        A deep corridor enemy carries Удача in the hundreds, and an uncapped line turned
+        that into a x16 critical -- enough for a mob to kill a runner with eight times
+        its swing.
+        """
+        def power(luck):
+            mirror = self._fighter("a", luck)
+            return combat.derive(mirror, replace(mirror, key="b"))["crit_power"]
+
+        # Straight through the range a pet actually reaches...
+        first = power(40) - power(20)
+        second = power(60) - power(40)
+        self.assertAlmostEqual(first, second, places=6)
+        # ...and clipped well above it.
+        self.assertEqual(power(4_000), C.CRIT_DAMAGE_MAX_MULTIPLIER)
+
+    def test_a_luck_deficit_fumbles_and_an_even_match_never_does(self):
+        unlucky = self._fighter("a", 10)
+        lucky = self._fighter("b", 60)
+        self.assertIn("luck", combat.derive(unlucky, lucky)["deficits"])
+
+        fumbles = set()
+        for seed in range(60):
+            for row in combat.simulate(unlucky, lucky, seed=seed).rounds:
+                if row.event.startswith("amulet_fumble") and row.attacker == "a":
+                    fumbles.add(row.event)
+        # All three of them: the weapon on the floor, the blow that comes back, and the
+        # shield that never goes up.
+        self.assertEqual(fumbles, {
+            "amulet_fumble_weapon", "amulet_fumble_self", "amulet_fumble_shield",
+        })
+
+        # An ordinary gap is not a fumble. The rule rides on the same "слабое место"
+        # threshold as every other weakness, so it is a real deficit against a real
+        # opponent rather than a tax on any low number.
+        even = self._fighter("a", 50)
+        self.assertNotIn("luck", combat.derive(even, lucky)["deficits"])
+        for seed in range(40):
+            for row in combat.simulate(even, lucky, seed=seed).rounds:
+                self.assertFalse(row.event.startswith("amulet_fumble"), row.text)
+
+    def test_a_fumbled_turn_is_spent_rather_than_free(self):
+        """The cost IS the turn. A fumble that let its owner swing again would be
+        flavour text rather than a weakness."""
+        unlucky, lucky = self._fighter("a", 10), self._fighter("b", 60)
+        for seed in range(40):
+            rounds = combat.simulate(unlucky, lucky, seed=seed).rounds
+            for index, row in enumerate(rounds):
+                if row.event.startswith("amulet_fumble") and row.attacker == "a":
+                    self.assertTrue(row.is_action, row.text)
+                    break

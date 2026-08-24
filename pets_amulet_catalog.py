@@ -131,6 +131,11 @@ EFFECT_HOOKS: Final = {
     "ward": "on_magic_damage_taken: reduce incoming magical damage",
     "spell_thorns": "on_magic_damage_taken: reflect a share back at the caster",
     "double_cast": "after_first_cast: read the scroll a second time for a share",
+    # Not an item passive at all -- these three are what a Удача deficit does, and they
+    # live here only so the transcript's effect rows have a name to print.
+    "fumble_weapon": "on_action: a luck deficit drops the weapon and spends the turn",
+    "fumble_self": "on_attack: a luck deficit turns the blow back on its owner",
+    "fumble_shield": "on_defend: a luck deficit fumbles the guard away",
 }
 
 

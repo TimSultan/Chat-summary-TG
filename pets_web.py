@@ -946,8 +946,16 @@ def _skills_payload(record: dict, prefix: str = "") -> dict:
         row["empty"] = False
         selected.append(row)
     owned = set(pets._owned_scroll_codes_for(record))
+    # Only ever the finished state. The panel is a hint that a set is complete, not a
+    # progress bar nagging somebody three scrolls short of an element they never chose.
+    resonance = pets_scroll_catalog.loadout_element(loadout)
     return {
         "slots": selected,
+        "resonance": {
+            "element": resonance,
+            "label": pets_scroll_catalog.element_label(resonance) if resonance else "",
+            "percent": round(C.ELEMENTAL_RESONANCE_BONUS * 100),
+        } if resonance else None,
         "owned_count": len(owned),
         "catalogue_count": len(pets_scroll_catalog.SCROLLS),
         "rewards": {
@@ -6070,7 +6078,13 @@ function liveSkillsPanel() {
           '<small>' + esc(scrollElement(spell)) +
           (spell.dodgeable === false ? ' · нельзя увернуться' : '') + " · " +
           esc(spell.short) + '</small></button>'
-    ).join("") + '</div><div class="tiny muted" style="margin-top:10px">Открыто ' +
+    ).join("") +
+    (S.skills && S.skills.resonance
+      ? '<div class="tiny gain" style="margin-top:9px">' +
+        esc(S.skills.resonance.label) + ' · +' + Number(S.skills.resonance.percent) +
+        '% к магическому урону и лечению за четыре свитка одной стихии</div>'
+      : "") +
+    '</div><div class="tiny muted" style="margin-top:10px">Открыто ' +
       Number(S.skills.owned_count || 0) + ' из ' + Number(S.skills.catalogue_count || 0) +
       '. Новый #япокрасил: ' + Math.round(Number(rewards.paint_chance || 0) * 1000) / 10 +
       '%; если раньше не выпал, гарантирован на ' + Number(rewards.paint_pity || 0) +

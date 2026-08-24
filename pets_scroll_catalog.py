@@ -355,6 +355,23 @@ def shield(code: str) -> dict | None:
     return SHIELD_BY_CODE.get(str(code or ""))
 
 
+def loadout_element(codes) -> str | None:
+    """The element all four slots share, or None if they do not share one.
+
+    All FOUR, not "the ones that are filled": an empty slot is a legal resting state
+    everywhere else in the game, but a set of one scroll would otherwise be a set of one
+    element and collect the bonus for free.
+    """
+    slots = tuple(codes or ())
+    if len(slots) != 4 or not all(slots):
+        return None
+    elements = {(scroll(code) or {}).get("element") for code in slots}
+    if len(elements) != 1:
+        return None
+    element = elements.pop()
+    return str(element) if element in ELEMENTS else None
+
+
 def validate_loadout(codes) -> tuple:
     """Four slots, each holding a scroll or nothing. Returns codes with None for empty.
 
