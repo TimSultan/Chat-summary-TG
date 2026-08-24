@@ -4472,6 +4472,7 @@ PAGE_HTML = """<!doctype html>
   .dungeon-art { width: 48px; height: 48px; border-radius: 7px; overflow: hidden; background: #10171c; }
   .dungeon-art svg { width: 100%; height: 100%; display: block; }
   .dungeon-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 11px; }
+  .dungeon-actions .dungeon-descend { grid-column: 1 / -1; width: 100%; }
   /* The find between two floors. Gold-edged so it reads as the thing that was not on
      this screen a moment ago, and sitting above the enemies it does not block. */
   .dungeon-chest { border: 1px solid var(--gold); border-radius: 9px; background: rgba(232,185,35,.09); padding: 10px; margin: 0 0 11px; }
@@ -6005,14 +6006,18 @@ function achievementsEntry() {
 
 function achievementsList(box) {
   const rows = (box.rows || []).slice();
+  const error = box.error
+    ? '<div class="empty" style="margin-top:10px">Не удалось пересчитать часть ачивок: ' +
+      esc(box.error) + '</div>'
+    : '';
   if (!rows.length) {
-    return '<div class="empty" style="margin-top:10px">Список пока пуст.</div>';
+    return error + '<div class="empty" style="margin-top:10px">Список пока пуст.</div>';
   }
   // Unclaimed first: that is what the screen was opened for. Then what is still ahead,
   // and only then the finished ones -- a wall of ticks at the top would bury the rest.
   const weight = (row) => (row.earned && !row.claimed) ? 0 : (row.earned ? 2 : 1);
   rows.sort((a, b) => weight(a) - weight(b));
-  return '<div class="ach-list">' + rows.map((row) => {
+  return error + '<div class="ach-list">' + rows.map((row) => {
     const state = (row.earned && !row.claimed) ? " ready" : (row.claimed ? " done" : "");
     const reward = achievementReward(row);
     return '<div class="ach-row' + state + '">' +
@@ -6048,7 +6053,7 @@ function renderDungeon() {
 // payout stops growing, so the button keeps saying "down" and the title says why.
 function descendButton(dungeon) {
   const deep = Number(dungeon.floor || 1) >= Number(dungeon.reward_cap_floor || 0);
-  return '<button class="go" data-dungeon="descend"' +
+  return '<button class="go dungeon-descend" data-dungeon="descend"' +
     (deep ? ' title="Дальше боссы повторяются, а награда больше не растёт."' : '') +
     '>⬇️ Спуститься' + (deep ? ' ♾' : '') + '</button>';
 }
@@ -6244,7 +6249,7 @@ function dungeonPanel() {
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +
       'поднятых уже ничего не падает.</p>'
     : '';
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? dungeonShop(dungeon) + '<div class="dungeon-actions">' + descendButton(dungeon) + '</div>' : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="dungeon-actions">' + descendButton(dungeon) + '</div>' + dungeonShop(dungeon) : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
 }
 
 function renderOnboarding() {

@@ -178,12 +178,12 @@ class DungeonTests(unittest.TestCase):
         self.assertIn("лавке", text)
         self.assertFalse([label for label in labels if "HP" in label], labels)
         self.assertTrue(any("Лавка" in label for label in labels), labels)
-        # The exit is the narrow one on the left: Telegram sizes a row's buttons equally,
-        # so sharing a row with the descent is what keeps it out from under the thumb.
-        self.assertEqual(
-            [button["text"] for button in keyboard["inline_keyboard"][-1]],
-            ["🚪", "⬇️ Спуститься"],
-        )
+        rows = [[button["text"] for button in row]
+                for row in keyboard["inline_keyboard"]]
+        descend_row = next(i for i, row in enumerate(rows) if "⬇️ Спуститься" in row)
+        shop_row = next(i for i, row in enumerate(rows) if any("Лавка" in x for x in row))
+        self.assertEqual(rows[descend_row], ["⬇️ Спуститься"])
+        self.assertLess(descend_row, shop_row)
 
         # Diamonds, and the shelf has to say so: a price in the wrong currency is the one
         # label a player cannot recover from misreading.

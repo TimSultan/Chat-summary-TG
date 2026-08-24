@@ -163,6 +163,25 @@ class LiveAchievementTests(unittest.TestCase):
             pets.achievements_view(CHAT, USER)
             self.assertEqual(len(seen), 1, "список считается ровно при открытии")
 
+    def test_opening_the_app_refreshes_pet_achievements_without_opening_the_list(self):
+        self._win_a_fight()
+
+        summary = pets.achievements_summary(CHAT, USER)
+
+        self.assertGreaterEqual(summary["earned"], 1)
+        self.assertGreaterEqual(summary["claimable"]["count"], 1)
+
+    def test_an_old_malformed_weapon_ledger_does_not_break_every_achievement(self):
+        data = pets._load(CHAT)
+        record = data["pets"][str(USER)]
+        record.update({"wins": 3, "fights": 4, "weapon_records": ["old", "shape"]})
+        pets._save(CHAT, data)
+
+        view = pets.achievements_view(CHAT, USER)
+
+        self.assertGreaterEqual(view["earned"], 1)
+        self.assertFalse(view.get("error"), view.get("error"))
+
     def test_a_veteran_is_credited_for_fights_the_weapon_ledger_never_saw(self):
         """The per-weapon ledger is not a record of whether somebody has ever fought.
 

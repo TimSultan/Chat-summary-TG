@@ -5563,7 +5563,7 @@ def _safe_total(values) -> int:
     return total
 
 
-def achievement_profile(entry: str, user_id) -> dict:
+def achievement_profile(entry: str, user_id, *, include_chat: bool = True) -> dict:
     """Every counter the catalogue is allowed to read, assembled once.
 
     Flat and finished on purpose: a predicate is a dict lookup rather than a walk over
@@ -5575,19 +5575,31 @@ def achievement_profile(entry: str, user_id) -> dict:
     if record is None:
         return {}
     effective = _effective_stats_for(record)
-    equipped = {slot: C.find_item(code) for slot, code in (record.get("equipped") or {}).items()}
+    raw_equipped = record.get("equipped")
+    raw_equipped = raw_equipped if isinstance(raw_equipped, dict) else {}
+    equipped = {slot: C.find_item(code) for slot, code in raw_equipped.items()}
     worn = [item for item in equipped.values() if item is not None]
     rarities = {}
     for item in worn:
         rarities[item.rarity] = rarities.get(item.rarity, 0) + 1
-    weapon_records = record.get("weapon_records") or {}
+    weapon_records = record.get("weapon_records")
+    weapon_records = weapon_records if isinstance(weapon_records, dict) else {}
 
     def _total(key: str) -> int:
-        return sum(max(0, int((row or {}).get(key, 0) or 0)) for row in weapon_records.values())
+        return sum(_safe_nonnegative_int((row or {}).get(key, 0))
+                   for row in weapon_records.values() if isinstance(row, dict))
 
-    phoenix = record.get("phoenix_record") or {}
+    phoenix = record.get("phoenix_record")
+    phoenix = phoenix if isinstance(phoenix, dict) else {}
     money = economy.lifetime(entry, user_id)
-    chat = _achievement_chat_stats(entry, user_id)
+    chat = (_achievement_chat_stats(entry, user_id) if include_chat else {
+        "figurines_painted": 0, "messages": 0, "active_days": 0,
+        "best_work_posts": 0, "quests_done": 0, "quest_best_difficulty": 0,
+    })
+    runes = record.get("runes")
+    runes = runes if isinstance(runes, dict) else {}
+    paints = record.get("personal_enchantments")
+    paints = paints if isinstance(paints, dict) else {}
     return {
         "level": max(1, int(record.get("level", 1) or 1)),
         "cage_level": max(1, int(record.get("cage_level", 1) or 1)),
@@ -5601,9 +5613,9 @@ def achievement_profile(entry: str, user_id) -> dict:
         "mob_wins": _total("mob_wins"),
         "pet_wins": _total("pet_wins"),
         "best_weapon_wins": max(
-            (sum(max(0, int((row or {}).get(key, 0) or 0))
+            (sum(_safe_nonnegative_int((row or {}).get(key, 0))
                  for key in ("pet_wins", "mob_wins", "boss_wins"))
-             for row in weapon_records.values()), default=0,
+             for row in weapon_records.values() if isinstance(row, dict)), default=0,
         ),
         "deepest_floor": max(1, int(record.get("dungeon_deepest", 1) or 1)),
         "phoenix_perfect": bool(phoenix.get("perfect")),
@@ -5619,9 +5631,9 @@ def achievement_profile(entry: str, user_id) -> dict:
             1 for item in worn
             if item.slot == "weapon" and C.weapon_scaling(item) != C.WEAPON_SCALING_STRENGTH
         ),
-        "personal_paints": len(record.get("personal_enchantments") or {}),
-        "runes": _safe_total((record.get("runes") or {}).values()),
-        "scroll_paints": len(record.get("personal_enchantments") or {}),
+        "personal_paints": len(paints),
+        "runes": _safe_total(runes.values()),
+        "scroll_paints": len(paints),
         "gold_earned": money["received"] + money["bonus"],
         "gold_spent": money["spent"],
         "rubies": ruby_balance(entry, user_id),
@@ -5633,7 +5645,7 @@ def achievement_profile(entry: str, user_id) -> dict:
     }
 
 
-def refresh_achievements(entry: str, user_id) -> list[str]:
+def refresh_achievements(entry: str, user_id, *, include_chat: bool = True) -> list[str]:
     """Record everything newly earned. Returns the codes that just unlocked.
 
     Never raises, and never silently. A value of an unexpected shape somewhere in a
@@ -5644,7 +5656,7 @@ def refresh_achievements(entry: str, user_id) -> list[str]:
     """
     failure = ""
     try:
-        profile = achievement_profile(entry, user_id)
+        profile = achievement_profile(entry, user_id, include_chat=include_chat)
     except Exception as error:
         profile, failure = {}, f"{type(error).__name__}: {error}"[:200]
     if not profile:
@@ -5663,6 +5675,9 @@ def refresh_achievements(entry: str, user_id) -> list[str]:
         if record is None:
             return []
         row = _achievement_row(record)
+        before_unlocked = tuple(row["unlocked"])
+        had_error = bool(row.get("error"))
+        legacy_was_checked = bool(record.get("legacy_achievements_checked"))
         row.pop("error", None)
         known = set(row["unlocked"])
         # The closed rows are settled the first time this pet is ever evaluated, and never
@@ -5682,19 +5697,21 @@ def refresh_achievements(entry: str, user_id) -> list[str]:
         # Saved whenever the marker moved too, not only when something unlocked: a pet
         # that earned no closed row still has to remember that it was asked.
         row["unlocked"] = sorted(known)
-        _save(entry, data)
+        if (tuple(row["unlocked"]) != before_unlocked or had_error
+                or bool(record.get("legacy_achievements_checked")) != legacy_was_checked):
+            _save(entry, data)
     return fresh
 
 
 def achievements_summary(entry: str, user_id) -> dict:
-    """What the badge needs, read straight off what is already stored.
+    """What the badge needs, refreshing cheap pet-local conditions first.
 
-    Deliberately evaluates NOTHING. The full profile reads the chat aggregate, which
-    parses one file per recorded day, and the quest history on top -- fine once, when
-    somebody opens the list, and ruinous on a payload that is rebuilt every time the app
-    is opened. Costing a page load an entire history scan is how the Mini App stops
-    loading at all.
+    Chat and quest history remain lazy because they parse external stores. Pet counters
+    are already in memory and must not depend on whether a player opened the list before.
     """
+    # Pet-local achievements are cheap and must not depend on whether this particular
+    # player has opened the full list before. Chat/quest history remains lazy.
+    refresh_achievements(entry, user_id, include_chat=False)
     record = _tamed_record(_load(entry), user_id)
     if record is None:
         return {"earned": 0, "total": 0, "claimable": {
@@ -5747,6 +5764,7 @@ def achievements_view(entry: str, user_id) -> dict:
         },
         "earned": len(unlocked),
         "total": sum(1 for item in ACHIEVEMENTS.catalogue() if not item.hidden or item.code in unlocked),
+        "error": str(row.get("error") or ""),
     }
 
 

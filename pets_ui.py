@@ -468,6 +468,12 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # Gear AND scrolls, side by side. A boss states the damage it is weak to, and the
         # answer to that line lives in one of these two screens -- a floor screen that
         # offers only the bag hides half of the reaction it is inviting.
+        # Progress is the primary action after a clear: one button, one full Telegram
+        # row, before the optional shop/equipment controls below it.
+        rows.append([{
+            "text": "⬇️ Спуститься",
+            "callback_data": callback_data(user_id, "dungeondescend"),
+        }])
         rows.append([
             {"text": "🧪 Лавка", "callback_data": callback_data(user_id, "dungeonshop")},
             {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
@@ -487,13 +493,7 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         # Leaving throws the run away, so it is never the wide button. Telegram sizes a
         # row's buttons equally, which means the only way to make it small is to keep it
         # sharing a row -- on the left, away from the one thumb reaches for.
-        rows.append([
-            {"text": "🚪", "callback_data": callback_data(user_id, "dungeonquit")},
-            {
-                "text": "⬇️ Спуститься",
-                "callback_data": callback_data(user_id, "dungeondescend"),
-            },
-        ])
+        rows.append([{"text": "🚪 Выйти", "callback_data": callback_data(user_id, "dungeonquit")}])
     else:
         # Mid-floor the two reaction screens ride along with the exit rather than letting
         # it stretch across the whole width on its own.
