@@ -135,6 +135,30 @@ class LiveAchievementTests(unittest.TestCase):
         # And a hidden row is not even listed until it is earned.
         self.assertFalse([row for row in view["rows"] if row["hidden"]])
 
+    def test_opening_the_app_never_scans_the_chat_history(self):
+        """The badge rides on every state payload; the evaluation must not.
+
+        Working out what is newly earned reads the chat aggregate, which parses one file
+        per recorded day, plus the whole quest history. On a chat that has been running
+        for a year that is a page load the Mini App does not finish -- and it did not:
+        putting the full evaluation on the payload stopped the app opening at all.
+        """
+        import pets_web
+        import stats
+
+        seen = []
+        real = stats.aggregate_all_time
+        with patch.object(stats, "aggregate_all_time",
+                          side_effect=lambda *a, **k: (seen.append(1), real(*a, **k))[1]):
+            payload = pets_web._state_payload(CHAT, USER, 0, "")
+            self.assertEqual(seen, [], "загрузка приложения не должна читать историю чата")
+            # And the summary it does carry is enough to draw the badge.
+            self.assertIn("claimable", payload["achievements"])
+            self.assertIn("earned", payload["achievements"])
+
+            pets.achievements_view(CHAT, USER)
+            self.assertEqual(len(seen), 1, "список считается ровно при открытии")
+
     def test_earning_and_claiming_are_two_separate_states(self):
         """Collapsing them would make the reward the achievement: a crash between the two
         would either lose the row or pay it twice, and the screen could not say

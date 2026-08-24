@@ -1109,10 +1109,11 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     # along with every state read: an app closed mid-telegraph reopens on the same turn
     # instead of on a floor whose boss is somehow still waiting to be pressed.
     state["dungeon"]["phoenix"] = pets.phoenix_state(entry, user_id)
-    # Carried with the hero state rather than fetched when the list opens: the button
-    # above it has to show what is waiting to be collected without a second round trip,
-    # and the badge is the only reason most people open the screen at all.
-    state["achievements"] = pets.achievements_view(entry, user_id)
+    # The SUMMARY, never the evaluation. Working out what is newly earned reads the
+    # chat aggregate -- one parsed file per recorded day -- and a payload that is rebuilt
+    # on every open cannot afford a history scan. The list evaluates itself when it is
+    # actually opened; see the achievements_open action.
+    state["achievements"] = pets.achievements_summary(entry, user_id)
     state["pve"] = pets.pve_allowance(entry, user_id)
     state["farm"] = pets.farm_status(entry, user_id)
     state["quarry"] = pets.quarry_status(entry, user_id)
@@ -1353,6 +1354,11 @@ def _action_dungeon_fight(entry, user_id, xp, payload):
   return pets.dungeon_fight(entry, user_id, index)
 
 
+def _action_achievements_open(entry, user_id, xp, payload):
+  """Evaluate and return the whole list. The one place the expensive read belongs."""
+  return True, "", pets.achievements_view(entry, user_id)
+
+
 def _action_achievements_claim(entry, user_id, xp, payload):
   ok, note, _paid = pets.claim_achievements(entry, user_id)
   return ok, note
@@ -1446,6 +1452,7 @@ _ACTIONS = {
     "portrait_crop": _action_portrait_crop,
     "dungeon_enter": _action_dungeon_enter,
     "dungeon_fight": _action_dungeon_fight,
+    "achievements_open": _action_achievements_open,
     "achievements_claim": _action_achievements_claim,
     "dungeon_rest": _action_dungeon_rest,
     "dungeon_buy": _action_dungeon_buy,
@@ -1609,6 +1616,8 @@ async def handle_action(request: web.Request) -> web.Response:
     # clears the fight off the run, so the outcome screen can only be told about it here.
     if action_name in ("phoenix_start", "phoenix_action") and isinstance(extra, dict):
         response["phoenix"] = extra
+    if action_name == "achievements_open" and isinstance(extra, dict):
+        response["achievements"] = extra
     if str(body.get("action") or "") in ("dungeon_fight", "dungeon_chest") \
             and isinstance(extra, dict):
       result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
@@ -5954,6 +5963,10 @@ function dungeonShop(dungeon) {
 // the app to look at, and an unclaimed reward should be the next thing their eye lands on
 // rather than something found by scrolling.
 let ACH_OPEN = false;
+// The rows themselves, kept here rather than in S: working them out reads the chat's
+// whole recorded history, so the hero payload carries only the badge and the list is
+// asked for once, when somebody actually opens it.
+let ACH_ROWS = null;
 
 function achievementReward(row) {
   const bits = [];
@@ -5961,6 +5974,20 @@ function achievementReward(row) {
   if (Number(row.farm_tickets || 0)) bits.push("🎫 " + Number(row.farm_tickets));
   if (Number(row.dungeon_tickets || 0)) bits.push("🎟 " + Number(row.dungeon_tickets));
   return bits.join(" · ");
+}
+
+async function loadAchievements() {
+  try {
+    const data = await api("/api/action", { action: "achievements_open", view: TAB });
+    if (data && data.achievements) {
+      ACH_ROWS = data.achievements;
+      // The badge is recomputed by the same call, so a row earned since the app opened
+      // stops being invisible the moment the list is looked at.
+      if (S) S.achievements = { earned: ACH_ROWS.earned, total: ACH_ROWS.total,
+                                claimable: ACH_ROWS.claimable };
+    }
+  } catch (e) { toast(e.message); return; }
+  render();
 }
 
 function achievementsEntry() {
@@ -5977,7 +6004,10 @@ function achievementsEntry() {
       (pending ? " · " + pending + (reward ? " · " + reward : "") : "") + "</button>" +
     '<button class="go sec" style="margin-top:8px" data-ach="toggle">' +
       (ACH_OPEN ? "▲ Свернуть список" : "▼ Показать список") + "</button>" +
-    (ACH_OPEN ? achievementsList(box) : "") + "</div>";
+    (ACH_OPEN
+      ? (ACH_ROWS ? achievementsList(ACH_ROWS)
+                  : '<div class="empty" style="margin-top:10px">Загружаю…</div>')
+      : "") + "</div>";
 }
 
 function achievementsList(box) {
@@ -9672,8 +9702,18 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
 
 async function handleClick(event, target) {
   const d = target.dataset;
-  if (d.ach === "toggle") { ACH_OPEN = !ACH_OPEN; render(); return; }
-  if (d.ach === "claim") { await act("achievements_claim", {}); ACH_OPEN = true; return; }
+  if (d.ach === "toggle") {
+    ACH_OPEN = !ACH_OPEN;
+    render();
+    if (ACH_OPEN) await loadAchievements();
+    return;
+  }
+  if (d.ach === "claim") {
+    await act("achievements_claim", {});
+    ACH_OPEN = true;
+    await loadAchievements();
+    return;
+  }
   if (d.dungeon) {
     // Closing the Phoenix outcome is the one dungeon control that touches nothing on the
     // server: the fight is already settled, this only lets go of the screen showing it.

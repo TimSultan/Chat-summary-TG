@@ -5554,6 +5554,37 @@ def refresh_achievements(entry: str, user_id) -> list[str]:
     return fresh
 
 
+def achievements_summary(entry: str, user_id) -> dict:
+    """What the badge needs, read straight off what is already stored.
+
+    Deliberately evaluates NOTHING. The full profile reads the chat aggregate, which
+    parses one file per recorded day, and the quest history on top -- fine once, when
+    somebody opens the list, and ruinous on a payload that is rebuilt every time the app
+    is opened. Costing a page load an entire history scan is how the Mini App stops
+    loading at all.
+    """
+    record = _tamed_record(_load(entry), user_id)
+    if record is None:
+        return {"earned": 0, "total": 0, "claimable": {
+            "count": 0, "rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0,
+        }}
+    row = _achievement_row(record)
+    unlocked, claimed = set(row["unlocked"]), set(row["claimed"])
+    pending = [item for item in ACHIEVEMENTS.catalogue()
+               if item.code in unlocked and item.code not in claimed]
+    return {
+        "earned": len(unlocked),
+        "total": sum(1 for item in ACHIEVEMENTS.catalogue()
+                     if not item.hidden or item.code in unlocked),
+        "claimable": {
+            "count": len(pending),
+            "rubies": sum(item.rubies for item in pending),
+            "farm_tickets": sum(item.farm_tickets for item in pending),
+            "dungeon_tickets": sum(item.dungeon_tickets for item in pending),
+        },
+    }
+
+
 def achievements_view(entry: str, user_id) -> dict:
     """The whole screen: every row, its state, and what pressing the button would pay."""
     refresh_achievements(entry, user_id)
