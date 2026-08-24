@@ -676,6 +676,16 @@ QUESTS_PER_BOARD = {"paint": 3, "real": 1, "rune": 5, "gear": 5}
 BOARD_LIFETIME = timedelta(hours=24)
 EMPTY_BOARD_REFRESH = timedelta(hours=8)
 AUTO_REFRESH_KINDS = frozenset({"real"})
+# Painting boards are kept until the player rerolls them, which is the point -- a card
+# somebody is halfway through must not vanish overnight. The cost of that is that a board
+# dealt before the catalogue changed keeps its old cards for ever, and there is no amount
+# of waiting that fixes it: quests added, retired or moved to another kind simply never
+# reach anybody already holding a board.
+#
+# Bumping this retires every stored board at once. The next time a player looks, they are
+# dealt from the catalogue as it stands now -- and anything they have already sent to a
+# moderator is carried across rather than thrown away with the rest.
+BOARD_BUNDLE_VERSION = 2
 
 
 def _assignment_row(quest, moment: datetime) -> dict:
@@ -703,20 +713,40 @@ def _board_refresh_at(board: dict, moment: datetime, kind: str) -> datetime | No
     return expires
 
 
+def _kind_pool(kind: str) -> tuple:
+    """Every quest of one kind in the catalogue, disabled ones included."""
+    return (catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
+            if kind == "real" else catalog.GEAR_PAINT_QUESTS if kind == "gear"
+            else catalog.RUNE_QUESTS)
+
+
+def _board_pool_codes(kind: str) -> set[str]:
+    """Codes this board may hold: a quest that was retired or moved kind is not one.
+
+    Read off the catalogue rather than the moderator's rotation on purpose. Switching a
+    quest off stops it being DEALT; it does not reach into the board of somebody already
+    working on it and take the card away.
+    """
+    return {quest.code for quest in _kind_pool(kind)}
+
+
 def _make_board(
     entry: str, user_id, data: dict, kind: str, moment: datetime,
-    avoid: set[str] | None = None,
+    avoid: set[str] | None = None, keep: list[dict] | None = None,
 ) -> dict:
-    rows = []
-    excluded = set(avoid or ())
-    for _ in range(QUESTS_PER_BOARD[kind]):
+    # Anything already with a moderator is carried across. Replacing a card somebody is
+    # waiting on an answer for would strand the submission and lose them the reward.
+    rows = [dict(row) for row in (keep or ())]
+    excluded = set(avoid or ()) | {str(row.get("code") or "") for row in rows}
+    while len(rows) < QUESTS_PER_BOARD[kind]:
         quest = _pick(entry, user_id, data, excluded, kind=kind, moment=moment)
         if quest is None or quest.code in excluded:
             break
         rows.append(_assignment_row(quest, moment))
         excluded.add(quest.code)
     board = {
-        "bundle_version": 1, "kind": kind, "issued_at": moment.isoformat(),
+        "bundle_version": BOARD_BUNDLE_VERSION,
+        "kind": kind, "issued_at": moment.isoformat(),
         "expires_at": (moment + BOARD_LIFETIME).isoformat(), "quests": rows,
         "empty_since": moment.isoformat() if not rows else None,
     }
@@ -731,7 +761,8 @@ def _ensure_board(entry: str, user_id, data: dict, kind: str, moment: datetime) 
         # Preserve the old live quest as card one, then deal the missing cards.
         issued = _moment_like(stored.get("assigned_at"), moment) or moment
         stored = {
-            "bundle_version": 1, "kind": kind, "issued_at": issued.isoformat(),
+            "bundle_version": BOARD_BUNDLE_VERSION,
+            "kind": kind, "issued_at": issued.isoformat(),
             "expires_at": (issued + BOARD_LIFETIME).isoformat(),
             "quests": [stored], "empty_since": None,
         }
@@ -746,7 +777,21 @@ def _ensure_board(entry: str, user_id, data: dict, kind: str, moment: datetime) 
         changed = True
     if not isinstance(stored, dict) or "quests" not in stored:
         return _make_board(entry, user_id, data, kind, moment), True
-    cleaned = [row for row in _board_rows(stored) if catalog.find_quest(row.get("code"))]
+    # A board dealt before the catalogue moved is retired here rather than waiting for a
+    # reroll nobody knows they need. What is under review survives the swap.
+    if int(stored.get("bundle_version", 0) or 0) < BOARD_BUNDLE_VERSION:
+        return _make_board(
+            entry, user_id, data, kind, moment,
+            keep=[row for row in _board_rows(stored) if row.get("status") == "review"],
+        ), True
+    # A quest that has been retired, or moved to another kind, is no longer this board's
+    # to offer -- matching on "does the code exist anywhere" left cards sitting on the
+    # wrong board after the rune and gear quests were split out of painting.
+    pool = _board_pool_codes(kind)
+    cleaned = [
+        row for row in _board_rows(stored)
+        if str(row.get("code") or "") in pool or row.get("status") == "review"
+    ]
     if len(cleaned) != len(_board_rows(stored)):
         stored["quests"] = cleaned
         changed = True

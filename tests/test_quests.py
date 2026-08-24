@@ -868,6 +868,89 @@ class RewardTableTests(QuestsTestCase):
         self.assertFalse(ok)
 
 
+class BoardBundleTests(QuestsTestCase):
+    """Painting boards are kept until rerolled, which leaves one thing unanswered.
+
+    A board dealt before the catalogue changed keeps its old cards for ever: no amount of
+    waiting brings a newly added quest to somebody already holding one, because painting
+    boards deliberately never expire.
+    """
+
+    def _stored_board(self, entry, user_id="1"):
+        return quests._load(entry)[quests.SLOTS["paint"]][str(user_id)]
+
+    def test_a_board_from_an_older_catalogue_is_retired_on_sight(self):
+        entry = "chat"
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        data = quests._load(entry)
+        board = data[quests.SLOTS["paint"]]["1"]
+        board["bundle_version"] = quests.BOARD_BUNDLE_VERSION - 1
+        stale = [row["code"] for row in board["quests"]]
+        quests._save(entry, data)
+
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 5))
+
+        fresh = self._stored_board(entry)
+        self.assertEqual(fresh["bundle_version"], quests.BOARD_BUNDLE_VERSION)
+        self.assertEqual(len(fresh["quests"]), quests.QUESTS_PER_BOARD["paint"])
+        self.assertNotEqual([row["code"] for row in fresh["quests"]], stale)
+
+    def test_retiring_a_board_never_strands_a_submission_with_a_moderator(self):
+        """A card somebody is waiting on an answer for is theirs until answered.
+
+        Replacing it would lose them both the submission and its reward, which is a
+        worse outcome than an old card sitting on the board one day longer.
+        """
+        entry = "chat"
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        data = quests._load(entry)
+        board = data[quests.SLOTS["paint"]]["1"]
+        board["bundle_version"] = quests.BOARD_BUNDLE_VERSION - 1
+        board["quests"][0]["status"] = "review"
+        waiting = board["quests"][0]["code"]
+        quests._save(entry, data)
+
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 5))
+
+        fresh = self._stored_board(entry)
+        self.assertIn(waiting, [row["code"] for row in fresh["quests"]])
+        self.assertEqual(
+            "review",
+            next(r["status"] for r in fresh["quests"] if r["code"] == waiting),
+        )
+
+    def test_a_quest_that_moved_to_another_kind_leaves_the_painting_board(self):
+        """Rune and gear quests were split out of painting.
+
+        Matching on "does this code exist anywhere in the catalogue" left those cards
+        sitting on a board that can no longer offer them.
+        """
+        entry = "chat"
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        data = quests._load(entry)
+        board = data[quests.SLOTS["paint"]]["1"]
+        stranger = catalog.RUNE_QUESTS[0].code
+        board["quests"][0]["code"] = stranger
+        quests._save(entry, data)
+
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 5))
+
+        self.assertNotIn(
+            stranger, [row["code"] for row in self._stored_board(entry)["quests"]],
+        )
+
+    def test_a_quest_a_moderator_switched_off_stays_with_whoever_holds_it(self):
+        """Disabling stops a quest being DEALT; it does not take a card off a board."""
+        entry = "chat"
+        board = quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 0))
+        held = board["quests"][0]["code"]
+        self.assertTrue(quests.set_quest_enabled(entry, held, False)[0])
+
+        quests.quest_board(entry, "1", now=datetime(2026, 8, 9, 9, 5))
+
+        self.assertIn(held, [row["code"] for row in self._stored_board(entry)["quests"]])
+
+
 class QuestRotationTests(QuestsTestCase):
     def test_disabling_a_quest_removes_it_from_the_rotation(self):
         entry = "chat"
