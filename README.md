@@ -952,7 +952,8 @@ drain, balances only ever grew. This is the sink.
 whole reason chat activity funds the game rather than sitting beside it.
 
 The loop is: buy a **клетка** (100), **приручить** a creature by sending a photo and a name
-(50), spend coins on **Сила / Здоровье / Ловкость / Удача** (1–80 each), buy **оружие,
+(50), spend coins on **Сила / Здоровье / Ловкость / Удача / Магия** (no ceiling; the
+cost curve is the only limit), buy **оружие,
 амулет, перчатки, сапоги**, build the **Ферма**, then fight. Opponents are drawn uniformly from every attackable
 pet, with unlimited rerolls and no level or combat-power window. A win starts at 5–10 coins
 and 100 pet XP, then moves from 75% for farming a pet 3+ levels below to 125% for beating

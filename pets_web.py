@@ -674,6 +674,9 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
         "resale": C.resale_value(item),
         "source": item.source,
         "bonuses": dict(item.bonuses),
+        # Weapons only, and the most consequential line on a magic weapon's card: which
+        # stat its swing reads. "strength" for every other item in the game.
+        "scaling": C.weapon_scaling(item) if item.slot == "weapon" else "strength",
         "description": item.description,
         "effect": dict(item.effect or {}),
         "art": (personal_payload or {}).get("image_url") or f"{prefix}/img/{item.code}.svg",
@@ -763,11 +766,16 @@ def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dic
             "health": int(getattr(fighter, "health", 0) or 0),
             "agility": int(getattr(fighter, "agility", 0) or 0),
             "luck": int(getattr(fighter, "luck", 0) or 0),
+            "magic": int(getattr(fighter, "magic", 0) or 0),
             "armor": int(getattr(fighter, "armor", 0) or 0),
         },
         "derived": {
             "max_hp": round(derived.get("max_hp", 0)),
             "damage": round(derived.get("damage", 0)),
+            # A fight now has two damage lines driven by two different stats. Showing only
+            # the swing would leave a caster's transcript full of numbers the header
+            # cannot explain.
+            "spell_power": round(derived.get("spell_power", 0)),
             "dodge": derived.get("dodge", 0), "crit": derived.get("crit", 0),
             "reduction": derived.get("reduction", 0),
         },
@@ -831,7 +839,9 @@ def _combat_payload(entry: str, user_id, record: dict) -> dict:
         key="mirror", name="mirror",
         strength=effective["strength"], health=effective["health"],
         agility=effective["agility"], luck=effective["luck"],
-        armor=effective.get("armor", 0), level=int(record.get("level", 1)),
+        armor=effective.get("armor", 0), magic=effective.get("magic", 0),
+        attack_scaling=pets._weapon_scaling_for(record),
+        level=int(record.get("level", 1)),
         skills=pets._skill_loadout_for(record),
         shield=pets._combat_shield_for(record),
     )
@@ -839,6 +849,11 @@ def _combat_payload(entry: str, user_id, record: dict) -> dict:
     return {
         "max_hp": int(derived.get("max_hp", 0)),
         "damage": round(float(derived.get("damage", 0)), 1),
+        # What one point of a scroll's `amount` is actually worth right now. Printed
+        # beside the swing because the two are now different numbers driven by different
+        # stats, and a caster deciding between +1 Силы and +1 Магии can read neither off
+        # the stat levels alone.
+        "spell_power": round(float(derived.get("spell_power", 0)), 1),
         "dodge": round(float(derived.get("dodge", 0)) * 100, 1),
         "crit": round(float(derived.get("crit", 0)) * 100, 1),
         "reduction": round(float(derived.get("reduction", 0)) * 100, 1),
@@ -1905,7 +1920,8 @@ async def handle_attack(request: web.Request) -> web.Response:
             key=str(key), name=record.get("name") or "Существо",
             strength=effective["strength"], health=effective["health"],
             agility=effective["agility"], luck=effective["luck"],
-            armor=effective.get("armor", 0),
+            armor=effective.get("armor", 0), magic=effective.get("magic", 0),
+            attack_scaling=pets.combat_weapon_scaling(entry, key),
             effects=pets.equipped_combat_effects(entry, key),
             level=int(record.get("level", 1)),
             skills=pets.skill_loadout(entry, key),
@@ -3737,7 +3753,7 @@ function eventMark(event){const k=String(event||"");if(EVENT_MARKS.exact[k])retu
 async function api(id="",pet=""){status.textContent="Loading…";const q=new URLSearchParams();if(id)q.set("id",id);if(pet){q.set("pet_id",pet);q.set("limit","500")}const u="/audit/api/fights"+(q.size?"?"+q.toString():"");const r=await fetch(u);const d=await r.json();if(!r.ok)throw Error(d.message||d.error||r.status);return d}
 function auditFailure(e){status.textContent=e.message||"Could not load fights";out.innerHTML=""}
 function mechanics(v,skip=[]){if(!v||typeof v!=="object")return"";const rows=Object.entries(v).filter(([k,x])=>!skip.includes(k)&&x!==null&&x!==""&&!(Array.isArray(x)&&!x.length));return rows.length?`<div class="mechanics">${rows.map(([k,x])=>`${esc(k)}: ${esc(typeof x==="object"?JSON.stringify(x):x)}`).join(" · ")}</div>`:""}
-function bonuses(v){const labels={strength:"⚔️",health:"❤️",agility:"💨",luck:"🍀",armor:"🛡️",endurance:"🫁"};return Object.entries(v||{}).map(([k,x])=>`${labels[k]||esc(k)} ${Number(x)>0?"+":""}${esc(x)}`).join(" · ")}
+function bonuses(v){const labels={strength:"⚔️",health:"❤️",agility:"💨",luck:"🍀",armor:"🛡️",magic:"🔮",endurance:"🫁"};return Object.entries(v||{}).map(([k,x])=>`${labels[k]||esc(k)} ${Number(x)>0?"+":""}${esc(x)}`).join(" · ")}
 function auditItem(i){const e=i.effect||{};return `<div class="audit-item">${i.art?`<img src="${esc(i.art)}" alt="">`:""}<h4>${esc(i.name)} <span class="muted">${esc(i.rarity)} · ${esc(i.slot)} · ${esc(i.code)}</span></h4>${i.personal_paint?`<p>🎨 Personal paint · +30% safe power</p>`:""}${bonuses(i.bonuses)?`<p>${bonuses(i.bonuses)}</p>`:""}${i.description?`<p>${esc(i.description)}</p>`:""}${e.text?`<p class="effect-line"><b>Effect:</b> ${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
 function auditScroll(s){if(!s)return"";return `<div class="audit-item">${s.art?`<img src="${esc(s.art)}" alt="">`:""}<h4>${esc(s.icon||"📜")} ${esc(s.name)} <span class="muted">${esc(s.code)}</span></h4>${s.personal_paint?`<p>🎨 Personal paint · useful power ×${esc(s.personal_power_multiplier||1.3)}; chance and duration unchanged</p>`:""}${s.description?`<p>${esc(s.description)}</p>`:""}${(s.effects_text||[]).map(x=>`<p class="effect-line">${esc(x)}</p>`).join("")}${mechanics({element:s.element,uses:s.uses,dodgeable:s.dodgeable,ultimate:s.ultimate})}${(s.effects||[]).map(e=>mechanics(e)).join("")}</div>`}
 function auditEffect(e){if(typeof e==="string")return `<div class="audit-item">${esc(e)}</div>`;return `<div class="audit-item">${e.text?`<p class="effect-line">${esc(e.text)}</p>`:""}${mechanics(e,["text"])}</div>`}
@@ -5327,13 +5343,17 @@ function clock(seconds) {
   const h = Math.floor(minutes / 60), m = minutes % 60;
   return h ? h + " ч " + m + " мин" : m + " мин";
 }
-const STAT_ICON = { strength: "⚔️", health: "❤️", agility: "💨", luck: "🍀", endurance: "🫁", armor: "🛡" };
+const STAT_ICON = { strength: "⚔️", health: "❤️", agility: "💨", luck: "🍀", magic: "🔮", endurance: "🫁", armor: "🛡" };
 const STAT_NAME = { strength: "Сила", health: "Здоровье", agility: "Ловкость",
-                    luck: "Удача", endurance: "Выносливость", armor: "Броня" };
+                    luck: "Удача", magic: "Магия", endurance: "Выносливость", armor: "Броня" };
+// Which stat an equipped weapon makes the ordinary swing read. Mirrors
+// pets_config.WEAPON_SCALING_LABELS; a weapon without the field swings with Сила.
+const SCALING_LABEL = { magic: "🔮 урон от Магии · удар магический",
+                       hybrid: "🔮⚔️ урон от Магии и Силы поровну · удар наполовину магический" };
 
 function bonusText(bonuses) {
   const parts = [];
-  for (const key of ["strength", "health", "agility", "luck", "endurance", "armor"]) {
+  for (const key of ["strength", "health", "agility", "luck", "magic", "endurance", "armor"]) {
     const value = bonuses[key];
     if (!value) continue;
     parts.push((STAT_ICON[key] || key) + (value > 0 ? "+" : "") + value);
@@ -5517,6 +5537,10 @@ function renderHero() {
     '<div class="panel"><h2>В бою</h2><div class="grid4">' +
       tile("❤️ Здоровье", combat.max_hp) +
       tile("⚔️ Урон", combat.damage) +
+      // The scroll line is a second damage number driven by a second stat now. Beside
+      // the swing rather than buried in the loadout panel, because "+1 Силы or +1 Магии"
+      // is exactly the comparison this tile grid exists to answer.
+      tile("🔮 Сила свитков", combat.spell_power) +
       tile("💨 Уклонение", combat.dodge + "%") +
       tile("🎯 Крит", combat.crit + "%") +
       tile("🛡 Поглощение", combat.reduction + "%") +
@@ -6822,7 +6846,7 @@ async function setGrant(userId) {
 const PEEKED = {};                 // user_id -> loadout, so reopening never refetches
 
 function statLine(stats) {
-  return ["strength", "health", "agility", "luck", "armor"]
+  return ["strength", "health", "agility", "luck", "magic", "armor"]
     .filter((key) => Number(stats[key] || 0))
     .map((key) => (STAT_ICON[key] || key) + " " + Number(stats[key] || 0))
     .join("  ");
@@ -8244,7 +8268,7 @@ function openItem(code) {
 
   const wornHere = (S.equipment.find((s) => s.slot === item.slot) || {}).item;
   const deltas = [];
-  for (const key of ["strength", "health", "agility", "luck", "endurance", "armor"]) {
+  for (const key of ["strength", "health", "agility", "luck", "magic", "endurance", "armor"]) {
     const change = (item.bonuses[key] || 0) - ((wornHere && wornHere.bonuses[key]) || 0);
     if (change) deltas.push('<span class="' + (change > 0 ? "gain" : "loss") + '">' +
       (STAT_ICON[key] || key) + " " + (change > 0 ? "+" : "") + change + "</span>");
@@ -8273,7 +8297,10 @@ function openItem(code) {
     "<div><h3>" + (item.cursed ? "☠️ " : "") + esc(item.name) + "</h3>" +
     '<div class="small" style="color:var(--r-' + item.rarity + ')">' + esc(item.rarity_name) +
       (item.cursed ? " · проклятая" : "") + " · " + esc(item.slot_name) + "</div>" +
-    '<div class="small" style="margin-top:5px">' + bonusText(item.bonuses) + "</div></div></div>" +
+    '<div class="small" style="margin-top:5px">' + bonusText(item.bonuses) + "</div>" +
+    (SCALING_LABEL[item.scaling]
+      ? '<div class="small gain" style="margin-top:3px">' + esc(SCALING_LABEL[item.scaling]) + "</div>" : "") +
+    "</div></div>" +
     (item.description ? '<div class="small muted">' + esc(item.description) + "</div>" : "") +
     (item.effect && item.effect.text
       ? '<div class="small" style="margin-top:8px">✨ ' + esc(item.effect.text) + "</div>" : "") +
@@ -8301,7 +8328,10 @@ function openSlot(slotKey) {
   const delta = (item) => {
     // Against what is worn right now, because that is the actual trade being considered.
     const parts = [];
-    for (const key of ["strength", "health", "agility", "luck", "endurance", "armor"]) {
+    if (SCALING_LABEL[item.scaling] && item.scaling !== (worn || {}).scaling) {
+      parts.push('<span class="gain">' + esc(SCALING_LABEL[item.scaling]) + "</span>");
+    }
+    for (const key of ["strength", "health", "agility", "luck", "magic", "endurance", "armor"]) {
       const change = (item.bonuses[key] || 0) - ((worn && worn.bonuses[key]) || 0);
       if (change) parts.push('<span class="' + (change > 0 ? "gain" : "loss") + '">' +
         (STAT_ICON[key] || key) + (change > 0 ? "+" : "") + change + "</span>");
@@ -8780,7 +8810,7 @@ function openDuelPortrait(key) {
 function duelStats(fighter) {
   const stats = fighter.stats || {};
   return "⭐ " + Number(fighter.level || 1) + " · " +
-    ["strength", "health", "agility", "luck", "armor"]
+    ["strength", "health", "agility", "luck", "magic", "armor"]
       .map((key) => (STAT_ICON[key] || key) + " " + Number(stats[key] || 0)).join(" · ");
 }
 

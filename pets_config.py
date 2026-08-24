@@ -277,12 +277,13 @@ STAT_COST_BASE = 1.0
 STAT_COST_EXPONENT = 1.5
 STAT_RESPEC_RUBY_COST = 15
 
-STAT_KEYS = ("strength", "health", "agility", "luck", "endurance")
+STAT_KEYS = ("strength", "health", "agility", "luck", "magic", "endurance")
 STAT_NAMES = {
     "strength": "Сила",
     "health": "Здоровье",
     "agility": "Ловкость",
     "luck": "Удача",
+    "magic": "Магия",
     "endurance": "Выносливость",
 }
 STAT_EMOJI = {
@@ -290,6 +291,7 @@ STAT_EMOJI = {
     "health": "❤️",
     "agility": "💨",
     "luck": "🍀",
+    "magic": "🔮",
     "endurance": "🫁",
 }
 # Armor is NOT purchasable -- it exists only on equipment, which is what makes the
@@ -322,7 +324,11 @@ def total_stat_cost(target_level: int, from_level: int = STAT_MIN_LEVEL) -> int:
 # a once-per-fight scroll is diluted across a longer fight.
 #
 #   HP     = BASE_HP + health * HP_PER_POINT             (500 + 19/pt -> 2,020 at 80)
-#   damage = BASE_DAMAGE + strength * DAMAGE_PER_POINT  (49.5 + 2.42/pt -> 243 at 80)
+#   damage = BASE_DAMAGE + swing_stat * DAMAGE_PER_POINT  (49.5 + 2.42/pt -> 243 at 80)
+#
+# `swing_stat` is Strength for every weapon in the game bar the magic shelf, which reads
+# Магия or the average of the two instead; see WEAPON_SCALING_* below. The curve itself
+# is untouched by that -- a magic weapon changes which stat is read, never the rate.
 #
 # The ratio is what matters, not either number alone. Blows to drop somebody is
 # HP / (damage * (1 - their dodge) * (1 + their crit rate)), and since dodge and crit both
@@ -342,6 +348,61 @@ BASE_DAMAGE = 49.5
 DAMAGE_PER_POINT = 2.42
 # Every blow is nudged by +-15% so two identical pets do not play out identically.
 DAMAGE_VARIANCE = 0.15
+
+# ------------------------------------------------------------------------- magic
+# Scroll damage used to be written as a share of the OWNER'S PHYSICAL SWING: a 1.45x
+# scroll on a Strength-80 pet hit for 352, which is 145% of a punch it did not have to
+# throw with a stat it was already buying for the punches. Strength therefore paid twice
+# and there was no such thing as a caster -- a "mage" was a Strength build holding paper.
+#
+# Магия is that second damage stat, and scrolls read off it instead:
+#
+#     spell_power = max(BASE_SPELL_POWER + magic * SPELL_POWER_PER_POINT,
+#                       swing * SPELL_POWER_SWING_FLOOR)
+#
+# The numbers are chosen so that at magic == strength the two lines nearly meet
+# (magic 20 -> 74 against a 98 swing, magic 80 -> 230 against a 243 swing): a scroll is
+# worth about what a punch is worth when you actually paid for the stat behind it, and
+# a fraction of that when you did not. The floor is what keeps a scroll from becoming a
+# wasted turn for everyone who has not respecced yet -- a Strength build's scrolls are
+# cut to 45% of what they were, which is the whole point of the rework, but they still
+# beat standing still and the four-slot loadout is still worth filling.
+BASE_SPELL_POWER = 22.0
+SPELL_POWER_PER_POINT = 2.60
+SPELL_POWER_SWING_FLOOR = 0.45
+
+# A weapon declares which stat its ORDINARY SWING reads. Magic weapons are the other half
+# of the caster build: without one a mage buys scroll damage and punches like a level-one
+# pet, and with one every blow of the fight scales off the same stat the scrolls do.
+# Hybrids average the two stats, so they are the honest pick for a split build and the
+# worse pick for either pure one.
+# A hybrid reads the AVERAGE of the two stats, and an average of two stats bought at
+# level N is N -- against a specialist who put the same gold into one stat and reached
+# far past N. Measured over an equal-gold round robin, that left the hybrid dominated: it
+# collected roughly three quarters of the brawler's health AND three quarters of the
+# caster's spell power AND a swing a third smaller than either, which is not a trade-off,
+# it is a worse version of both. The two schools working together buy the swing back.
+HYBRID_SCALING_BONUS = 1.25
+WEAPON_SCALING_STRENGTH = "strength"
+WEAPON_SCALING_MAGIC = "magic"
+WEAPON_SCALING_HYBRID = "hybrid"
+WEAPON_SCALINGS = (WEAPON_SCALING_STRENGTH, WEAPON_SCALING_MAGIC, WEAPON_SCALING_HYBRID)
+WEAPON_SCALING_LABELS = {
+    WEAPON_SCALING_STRENGTH: "⚔️ урон от Силы",
+    # Both halves of the promise, because both bite: the swing reads Магия, and the swing
+    # IS magic -- it walks through anything that only resists steel, and it is exactly
+    # what a ward or an antimage is waiting for.
+    WEAPON_SCALING_MAGIC: "🔮 урон от Магии · удар магический",
+    WEAPON_SCALING_HYBRID: "🔮⚔️ урон от Магии и Силы поровну · удар наполовину магический",
+}
+
+
+def spell_power(magic: int, swing: float) -> float:
+    """Damage one scroll point of `amount` is worth, given a caster's Magic and swing."""
+    return max(
+        BASE_SPELL_POWER + max(0, magic) * SPELL_POWER_PER_POINT,
+        swing * SPELL_POWER_SWING_FLOOR,
+    )
 
 # Damage-over-time (fire, poison, venom, bleeding) and the retaliation bonus are written
 # in the catalogue as a PERCENTAGE OF THE OWNER'S OWN SWING, not as a number of hit points.
@@ -486,6 +547,10 @@ POWER_RATING_WEIGHTS = {
     "health": 4,
     "agility": 2,
     "luck": 2,
+    # Scroll damage and, with a magic weapon, every ordinary swing. Weighted below
+    # Strength because it buys no health: Strength quietly carries HP_PER_STRENGTH_WITH_SKILLS
+    # on top of the swing, and a caster pays for that difference in a shorter health bar.
+    "magic": 3,
     # Reserved for its future mechanic. Buying it must not distort matchmaking before
     # it changes an actual combat value.
     "endurance": 0,
@@ -848,12 +913,13 @@ class Item:
 
     __slots__ = (
         "code", "name", "slot", "price", "source", "bonuses", "description",
-        "rarity", "resale_price", "drop_weight", "effect", "cursed",
+        "rarity", "resale_price", "drop_weight", "effect", "cursed", "scaling",
     )
 
     def __init__(
         self, code, name, slot, price, source, bonuses, description="", rarity="common",
         resale_price=None, drop_weight=1, effect=None, cursed=False,
+        scaling=WEAPON_SCALING_STRENGTH,
     ):
         self.code = code
         self.name = name
@@ -877,6 +943,15 @@ class Item:
         # cursed) without teaching a sixth rarity to the drop tables, the badges, the
         # filters and both front ends.
         self.cursed = bool(cursed)
+        # Weapons only. Which stat the wearer's ordinary swing reads; every other slot
+        # leaves it at the default and `weapon_scaling` below never looks at them.
+        self.scaling = scaling if scaling in WEAPON_SCALINGS else WEAPON_SCALING_STRENGTH
+
+
+def weapon_scaling(item) -> str:
+    """The stat an equipped weapon's swing reads. Bare paws punch with Strength."""
+    scaling = getattr(item, "scaling", None) if item is not None else None
+    return scaling if scaling in WEAPON_SCALINGS else WEAPON_SCALING_STRENGTH
 
 
 # Starter catalogue. Six of these nine entries are the original hand-written items; the
@@ -976,7 +1051,7 @@ def _catalog_item(spec):
         spec.get("source", "shop"), spec.get("bonuses", {}),
         spec.get("description", ""), spec.get("rarity", "common"),
         spec.get("resale_price"), spec.get("drop_weight", 1), spec.get("effect"),
-        spec.get("cursed", False),
+        spec.get("cursed", False), spec.get("scaling", WEAPON_SCALING_STRENGTH),
     )
 
 

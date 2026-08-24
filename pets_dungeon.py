@@ -213,8 +213,10 @@ def _corridor_armor(floor: int, value: int, index: int) -> int:
     return max(0, value // divisor + max(0, int(index)) * 2)
 
 
-# The order the stat block is read in, and the only four a dungeon enemy has -- a mob
-# carries no endurance, so C.STAT_KEYS would print an empty fifth column.
+# The order the stat block is read in, and the only four a dungeon enemy has. C.STAT_KEYS
+# is six wide and a corridor mob carries neither endurance nor magic, so reading it here
+# would print two empty columns -- and the magic one would be a lie twice over, since a
+# dungeon enemy has no scroll loadout to spend it on either.
 STAT_LINE_KEYS: Final = ("strength", "health", "agility", "luck")
 
 

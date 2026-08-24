@@ -78,14 +78,24 @@ def solo_loadout(code: str) -> tuple:
     return (code, None, None, None)
 
 
-HERO_STATS = {"strength": 20, "health": 20, "agility": 20, "luck": 20, "armor": 5, "level": 10}
+# Магия sits at 20 with everything else on purpose. Scroll damage now reads that stat
+# (pets_config.spell_power), so a reference creature left at Магия 1 would be measuring
+# "what is a scroll worth to somebody who never bought the stat behind it" -- a real
+# question, but not the one this file asks. At 20 across the board the creature is the
+# ordinary mid-game pet it has always been, and the headline column keeps meaning "is
+# equipping this better than leaving the slot empty" for a player who spread their coins.
+HERO_STATS = {"strength": 20, "health": 20, "agility": 20, "luck": 20, "magic": 20,
+              "armor": 5, "level": 10}
 # Three shapes rather than one, so a scroll cannot look good purely because of the single
 # opponent it was measured against. A heal is worth more against a grinder than a glass
 # cannon; a stun is worth more against the cannon.
 OPPONENTS = {
-    "зеркало": {"strength": 20, "health": 20, "agility": 20, "luck": 20, "armor": 5, "level": 10},
-    "танк": {"strength": 15, "health": 30, "agility": 14, "luck": 14, "armor": 12, "level": 10},
-    "ловкач": {"strength": 22, "health": 14, "agility": 28, "luck": 26, "armor": 2, "level": 10},
+    "зеркало": {"strength": 20, "health": 20, "agility": 20, "luck": 20, "magic": 20,
+                "armor": 5, "level": 10},
+    "танк": {"strength": 15, "health": 30, "agility": 14, "luck": 14, "magic": 12,
+             "armor": 12, "level": 10},
+    "ловкач": {"strength": 22, "health": 14, "agility": 28, "luck": 26, "magic": 16,
+               "armor": 2, "level": 10},
 }
 
 
@@ -93,6 +103,7 @@ def _fighter(key: str, stats: dict, skills: tuple) -> combat.Fighter:
     return combat.Fighter(
         key=key, name=key, strength=stats["strength"], health=stats["health"],
         agility=stats["agility"], luck=stats["luck"], armor=stats["armor"],
+        magic=stats.get("magic", 0),
         level=stats["level"], effects=(), skills=skills, shield=None,
     )
 

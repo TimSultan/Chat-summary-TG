@@ -29,7 +29,11 @@ except ImportError:  # pragma: no cover - standalone import of the data module
 
 RARITIES: Final = ("cursed", "common", "uncommon", "rare", "legendary")
 SOURCES: Final = ("shop", "drop")
-STAT_KEYS: Final = ("strength", "health", "agility", "luck", "armor")
+STAT_KEYS: Final = ("strength", "health", "agility", "luck", "magic", "armor")
+# Which stat a weapon makes its wearer's ordinary swing read. The names match
+# pets_config.WEAPON_SCALING_*; they are repeated here rather than imported so this data
+# module stays importable on its own, exactly like EFFECT_HOOKS above.
+SCALINGS: Final = ("strength", "magic", "hybrid")
 
 # Shop prices follow the same relative combat weights as the arena power rating.  The
 # Five ordinary items can be forged into one rare item, so the ordinary price floor must
@@ -41,6 +45,9 @@ SHOP_PRICE_POWER_WEIGHTS: Final = {
     "health": 4,
     "agility": 2,
     "luck": 2,
+    # Same shelf price as Strength: on a magic weapon this stat is the swing AND the
+    # scroll line, so a magic shop weapon costs what an equivalent steel one costs.
+    "magic": 4,
     "armor": 3,
 }
 # The weakest shop weapon anchors the ordinary tier. Five of these cost 300 coins, well
@@ -74,6 +81,9 @@ class WeaponSpec:
     # resolver -- only this field and its place in ``raw_item``.  Empty means flat stats.
     effect: tuple[tuple[str, str | int | bool], ...] = ()
     slot: str = "weapon"
+    # "strength" for every weapon in the catalogue's first five hundred; the magic shelf
+    # (w527..w631) is what introduced the other two.
+    scaling: str = "strength"
     # See pets_config.Item: cursed is a property that rides alongside rarity, so the three
     # rungs of the cursed ladder can be `cursed`, `rare` and `legendary` without a sixth
     # rarity existing anywhere. Every entry of the `cursed` RARITY is also cursed by
@@ -125,6 +135,7 @@ class WeaponSpec:
             "drop_weight": self.drop_weight,
             "effect": self.effect_dict(),
             "cursed": self.cursed,
+            "scaling": self.scaling,
         }
 
 
@@ -701,6 +712,341 @@ _RARE_CURSED_WEAPONS: Final = (
 )
 
 
+# --------------------------------------------------------------------- волшебное оружие
+#
+# Магия arrived as a sixth stat with nothing to hold: scrolls read off it, and every one
+# of the five hundred weapons above makes its wearer's swing read Strength. A caster
+# could buy scroll damage and then punch like a level-one pet for the other nine turns of
+# the fight, which is not a build -- it is a handicap with a theme.
+#
+# These 105 are the other half. A magic weapon declares `scaling`, and `derive` reads the
+# named stat instead of Strength for the ORDINARY swing:
+#
+#   * 80 of them scale from Магия alone. One stat then buys the whole fight, which is
+#     exactly what makes the build worth its gold -- and exactly why it is fragile:
+#     Strength quietly carries HP_PER_STRENGTH_WITH_SKILLS, so a pure caster fights in a
+#     health bar four hundred points shorter than the equivalent brawler's.
+#   * 25 of them are hybrids and average the two stats. Half a swing from each is worth
+#     less than a full one from either, so the flat bonuses are correspondingly wider --
+#     and the stat cost curve (level ** 1.5) pays a split build back for the difference.
+#
+# Twenty-one per rarity, five of them hybrid, exactly as commissioned. Rares and
+# legendaries carry passives written against the scroll loadout rather than the swing:
+# every one of them is worth nothing at all to a fighter with four empty slots.
+_MAGIC_OBJECTS: Final = {
+    "cursed": (
+        ("Палочка из «всё по 50»", "Искрит ровно один раз и всегда не туда."),
+        ("Посох на чужих батарейках", "Заряда хватает до первого честного удара."),
+        ("Гримуар с вырванной серединой", "Начало бодрое, конец печальный."),
+        ("Кристалл из кальяна", "Светится и пахнет вишней."),
+        ("Жезл-указка", "Кот в восторге, соперник — нет."),
+        ("Оберег из пищевой фольги", "Ловит сигнал, но не магию."),
+        ("Свеча из морозилки", "Горит неохотно и с укором."),
+        ("Метла без прутьев", "Летает низко и недолго."),
+        ("Бубен с трещиной", "Ритм есть, смысла нет."),
+        ("Пробирка с «эликсиром»", "На дне что-то шевелится."),
+        ("Руна, нарисованная маркером", "Стирается от волнения."),
+        ("Шар из снежного шара", "Внутри вечная метель и пластик."),
+        ("Кадило из консервной банки", "Дым есть, благословения нет."),
+        ("Свиток из кассовой ленты", "Заклинание длинное, чек длиннее."),
+        ("Череп-говорун без челюсти", "Мычит пророчества."),
+        ("Пентаграмма на липучке", "Отклеивается на третьем ходу."),
+        ("Ржавый меч с рунной насечкой", "Руны стёрлись, зазубрины остались."),
+        ("Топор с приклеенным кристаллом", "Клей держится лучше, чем магия."),
+        ("Кочерга-жезл", "Одинаково плоха в обеих ролях."),
+        ("Лопата с пентаграммой", "Копает и немного проклинает."),
+        ("Молоток чародея-недоучки", "Бьёт по гвоздю и по реальности сразу."),
+    ),
+    "common": (
+        ("Учебная палочка", "Одна искра, зато честная."),
+        ("Посох подмастерья", "Держит вес хозяина и немного магии."),
+        ("Карманный гримуар", "Три заклинания и список покупок."),
+        ("Кварцевый брелок", "Слабо светится в темноте."),
+        ("Ученический жезл", "Выдают вместе с методичкой."),
+        ("Свеча первого круга", "Горит ровно и без сюрпризов."),
+        ("Мелок для рун", "Хватает на десяток кругов."),
+        ("Бубен начинающего", "Громкий и очень уверенный."),
+        ("Кисточка с ворсом единорога", "Продавец клялся, что единорога."),
+        ("Флакон со светлячками", "Светят по очереди, как договорились."),
+        ("Компас на четыре стихии", "Стрелка выбирает по настроению."),
+        ("Оберег из речного камня", "Тёплый и упрямый."),
+        ("Колокольчик тишины", "Звенит, чтобы стало тихо."),
+        ("Веер сквозняка", "Один взмах — один сквозняк."),
+        ("Мешочек с солью", "Против всего сразу и понемногу."),
+        ("Лупа для мелких чудес", "Чудо всё равно мелкое."),
+        ("Тренировочный меч с рунами", "Руны учебные, синяки настоящие."),
+        ("Посох с набалдашником", "Если магия не сработает, есть набалдашник."),
+        ("Серп заклинателя", "Жнёт траву и слухи."),
+        ("Молот с рунным клеймом", "Клеймо ставили на глаз."),
+        ("Копьё с кварцевым наконечником", "Колет и подсвечивает место укола."),
+    ),
+    "uncommon": (
+        ("Палочка с настоящим сердечником", "Внутри волос, и лучше не знать чей."),
+        ("Посох странника", "Прошёл больше, чем его хозяин."),
+        ("Гримуар в кожаном переплёте", "Переплёт держится, содержание пугает."),
+        ("Аметистовый фокус", "Собирает свет в одну злую точку."),
+        ("Жезл с тремя кольцами", "Каждое кольцо помнит своё заклинание."),
+        ("Свеча долгой ночи", "Не гаснет, пока не досказано."),
+        ("Резец по рунам", "Режет камень как масло, масло как камень."),
+        ("Бубен грозы", "После него всегда пахнет озоном."),
+        ("Кисть для боевой раскраски", "Красит соперника в цвет поражения."),
+        ("Фонарь болотных огней", "Ведёт куда надо. Кому надо — вопрос."),
+        ("Веер четырёх ветров", "Второй ветер обычно лишний."),
+        ("Клепсидра чародея", "Отмеряет ровно один удачный ход."),
+        ("Колокол сбора", "Созывает всё, что слышит."),
+        ("Хрустальный маятник", "Качается против ветра."),
+        ("Чернила из грозовой тучи", "Пишут с разрядом."),
+        ("Линза истинного зрения", "Показывает больше, чем хотелось."),
+        ("Рунный клинок", "Половина лезвия, половина строчки."),
+        ("Боевой посох с окованным концом", "Спорит словом и железом."),
+        ("Секира с вживлённым кристаллом", "Кристалл прижился, к сожалению."),
+        ("Цеп заклинателя", "Крутится и договаривает за хозяина."),
+        ("Алебарда с рунной кромкой", "Длинная во всех смыслах."),
+    ),
+}
+
+# Rares and legendaries are hand-written down to the last number: each is a name, a joke,
+# a stat line and the rule it exists for. The rare rung teaches a rule cheaply; the
+# legendary rung is that same rule at a size a build gets planned around.
+_MAGIC_RARE_WEAPONS: Final = (
+    ("Посох треснувшего рассвета", "Трещина светится ровно на рассвете и во время драки.",
+     "magic", (("magic", 22), ("luck", 4), ("agility", -2)),
+     _effect("arcane_surge", "Свитки бьют на 45% сильнее весь бой.", 45)),
+    ("Гримуар второго дыхания", "Открывается сам на нужной странице.",
+     "magic", (("magic", 21), ("health", 7), ("agility", -2)),
+     _effect("spell_siphon", "Каждый свиток возвращает 40% нанесённого урона здоровьем.", 40)),
+    ("Жезл встречного огня", "Отвечает раньше, чем успеваешь подумать.",
+     "magic", (("magic", 20), ("armor", 8), ("luck", -2)),
+     _effect("spell_thorns", "32% полученного магического урона возвращается отправителю.", 32)),
+    ("Кристалл долгой искры", "Копит весь день ради одной минуты.",
+     "magic", (("magic", 21), ("agility", 4), ("armor", -2)),
+     _effect("arcane_battery", "Каждый раунд: +9% к силе свитков, без потолка.", 9)),
+    ("Резец висящей руны", "Руна висит в воздухе и ждёт продолжения.",
+     "magic", (("magic", 20), ("strength", 5), ("agility", -2)),
+     _effect("runic_charge", "Каждое попадание: +15% к силе свитков, максимум +105%.", 15, cap=105)),
+    ("Линза точного слова", "Слово проходит там, где не проходит сталь.",
+     "magic", (("magic", 23), ("luck", 3), ("health", -5)),
+     _effect("spell_pierce", "Свитки игнорируют 40% брони и защиты соперника, а увернуться от них вдвое сложнее.", 40, dodge=50)),
+    ("Свеча чужого срока", "Горит быстро и не своим воском.",
+     "magic", (("magic", 24), ("agility", 3), ("health", -6)),
+     _effect("mana_burn", "Свитки сильнее на 90%, но каждое прочтение стоит 5% максимального HP.", 90, toll=5)),
+    ("Оберег холодной крови", "Чужая магия об него тупится.",
+     "magic", (("magic", 20), ("health", 8), ("agility", -3)),
+     _effect("ward", "Входящий магический урон ниже на 32%.", 32)),
+    ("Клепсидра лишнего хода", "Один песок падает вверх.",
+     "magic", (("magic", 21), ("agility", 5), ("armor", -3)),
+     _effect("focus_shift", "После свитка следующий обычный удар сильнее на 65%.", 65)),
+    ("Соляная печать", "Круг замыкается сам, если начать.",
+     "magic", (("magic", 20), ("armor", 9), ("luck", -2)),
+     _effect("spell_shield", "Каждый свиток поднимает щит на 6% максимального HP.", 6)),
+    ("Чернила проклятой строки", "Строка липнет к тому, о ком написана.",
+     "magic", (("magic", 22), ("luck", 4), ("armor", -2)),
+     _effect("hex", "После свитка следующий удар соперника слабее на 35%.", 35, turns=1)),
+    ("Бубен нарастающей грозы", "Каждый удар громче предыдущего.",
+     "magic", (("magic", 21), ("agility", 4), ("health", -4)),
+     _effect("burn", "Каждое попадание поджигает: 17% урона за ход, 3 хода, +25% за тик.", 17, turns=3, grow=25)),
+    ("Фонарь встречного морока", "Показывает сопернику то, чего нет.",
+     "magic", (("magic", 20), ("armor", 7), ("agility", 2), ("luck", -2)),
+     _effect("chill", "После первого попадания следующий удар соперника слабее на 45%.", 45)),
+    ("Колокол пустого поля", "После него на поле тише и просторнее.",
+     "magic", (("magic", 22), ("health", 6), ("agility", -3)),
+     _effect("tesla", "Каждый третий удар бьёт разрядом на 15% максимального HP соперника.", 15)),
+    ("Пыльца дрожащих пальцев", "От неё чужие руки трясутся.",
+     "magic", (("magic", 21), ("luck", 5), ("health", -4)),
+     _effect("crushing_grip", "После первого попадания урон соперника ниже на 11% до конца боя.", 11)),
+    ("Аркан на подкладке", "Пришит с изнанки и работает оттуда.",
+     "magic", (("magic", 20), ("agility", 6), ("armor", -3)),
+     _effect("precision", "Твои промахи режутся на 45%.", 45)),
+    ("Меч дважды сказанного", "Одно лезвие для стали, второе для слова.",
+     "hybrid", (("magic", 16), ("strength", 15), ("luck", 3), ("agility", -2)),
+     _effect("double_cast", "Первые два свитка за бой дочитываются второй раз на 70% урона.", 70, casts=2)),
+    ("Секира рунного эха", "Эхо доносится позже, но громче.",
+     "hybrid", (("magic", 15), ("strength", 16), ("health", 5), ("armor", -3)),
+     _effect("echo_strike", "Первое попадание повторяется эхом на 70% урона.", 70)),
+    ("Копьё двух школ", "Спорит само с собой и всегда побеждает.",
+     "hybrid", (("magic", 16), ("strength", 16), ("agility", 3), ("luck", -3)),
+     _effect("combo", "Каждое попадание подряд: +6% урона, максимум +18%.", 6, cap=18)),
+    ("Клевец наговорённый", "Наговор держится ровно до крови.",
+     "hybrid", (("magic", 15), ("strength", 15), ("armor", 6), ("agility", -2)),
+     _effect("venom_blade", "Каждое попадание отравляет на 18% урона и добавляет промах следующему удару соперника.", 18, weaken=15)),
+    ("Цеп грозового круга", "Круг замыкается на сопернике.",
+     "hybrid", (("magic", 17), ("strength", 14), ("health", 6), ("armor", -3)),
+     _effect("thorns", "Каждый полученный удар возвращает 12% урона шипами.", 12)),
+)
+
+_MAGIC_LEGENDARY_WEAPONS: Final = (
+    ("Посох Первого Слога", "Им сказали первое слово. Остальные подтянулись.",
+     "magic", (("magic", 30), ("luck", 5), ("agility", -3)),
+     _effect("arcane_surge", "Свитки бьют на 85% сильнее весь бой.", 85)),
+    ("Гримуар Незакрытой Скобки", "Заклинание всё ещё длится. И будет длиться.",
+     "magic", (("magic", 29), ("health", 9), ("agility", -3)),
+     _effect("arcane_battery", "Каждый раунд: +18% к силе свитков, без потолка.", 18)),
+    ("Жезл Вечной Отдачи", "Всё, что в него бьёт, возвращается с процентами.",
+     "magic", (("magic", 28), ("armor", 11), ("luck", -3)),
+     _effect("spell_thorns", "75% полученного магического урона возвращается отправителю.", 75)),
+    ("Сердце Кварцевой Бури", "Внутри до сих пор идёт та самая гроза.",
+     "magic", (("magic", 29), ("strength", 6), ("agility", -3)),
+     _effect("runic_charge", "Каждое попадание: +26% к силе свитков, максимум +260%.", 26, cap=260)),
+    ("Линза Безошибочного Слова", "Броня — это тоже просто чьё-то мнение.",
+     "magic", (("magic", 31), ("luck", 4), ("health", -6)),
+     _effect("spell_pierce", "Свитки игнорируют 90% брони и защиты соперника, и от них нельзя увернуться.", 90, dodge=100)),
+    ("Свеча, Горящая Чужим", "Фитиль твой, воск — уже нет.",
+     "magic", (("magic", 32), ("agility", 4), ("health", -8)),
+     _effect("mana_burn", "Свитки сильнее на 155%, но каждое прочтение стоит 7% максимального HP.", 155, toll=7)),
+    ("Оберег Стеклянной Крови", "Магия проходит насквозь и не находит, за что зацепиться.",
+     "magic", (("magic", 28), ("health", 11), ("agility", -3)),
+     _effect("ward", "Входящий магический урон ниже на 62%.", 62)),
+    ("Клепсидра Украденного Хода", "Ход был не твой. Теперь твой.",
+     "magic", (("magic", 29), ("agility", 6), ("armor", -3)),
+     _effect("focus_shift", "После свитка следующий обычный удар сильнее на 145%.", 145)),
+    ("Печать Соляного Моря", "Море высохло, круг остался.",
+     "magic", (("magic", 28), ("armor", 12), ("luck", -3)),
+     _effect("spell_shield", "Каждый свиток поднимает щит на 13% максимального HP.", 13)),
+    ("Чернила Последней Строки", "После неё соперник дописывает молча.",
+     "magic", (("magic", 30), ("luck", 5), ("armor", -3)),
+     _effect("hex", "После свитка два следующих удара соперника слабее на 60%.", 60, turns=2)),
+    ("Кисть, Что Красит Судьбу", "Один мазок — и биография переписана.",
+     "magic", (("magic", 31), ("agility", 3), ("luck", 3), ("health", -6)),
+     _effect("double_cast", "Каждый из трёх первых свитков дочитывается второй раз на 110% урона.", 110, casts=3)),
+    ("Сосуд Обратного Тока", "Всё выпитое возвращается вдвойне.",
+     "magic", (("magic", 29), ("health", 10), ("agility", -3)),
+     _effect("spell_siphon", "Каждый свиток возвращает 90% нанесённого урона здоровьем.", 90)),
+    ("Бубен Девятого Грома", "Восемь были репетицией.",
+     "magic", (("magic", 30), ("agility", 4), ("health", -5)),
+     _effect("burn", "Каждое попадание поджигает: 30% урона за ход, 3 хода, +40% за тик.", 30, turns=3, grow=40)),
+    ("Колокол Немого Поля", "Звонит один раз. Больше не нужно.",
+     "magic", (("magic", 30), ("health", 8), ("agility", -4)),
+     _effect("tesla", "Каждый третий удар бьёт разрядом на 24% максимального HP соперника.", 24)),
+    ("Фонарь Двух Теней", "Вторая тень чужая и очень занятая.",
+     "magic", (("magic", 29), ("luck", 6), ("armor", -3)),
+     _effect("shatter", "Каждое попадание оставляет осколок; на четвёртом все осколки взрываются на 190% урона.", 190, every=4)),
+    ("Аркан С Изнанки", "Смотрит на бой с другой стороны ткани.",
+     "magic", (("magic", 30), ("agility", 5), ("armor", -3)),
+     _effect("precision", "Твои промахи режутся на 70%.", 70)),
+    ("Меч Двойного Замаха", "Второй замах начинается раньше, чем кончился первый.",
+     "hybrid", (("magic", 22), ("strength", 22), ("luck", 4), ("agility", -3)),
+     _effect("double_strike", "Каждый ход бьёт дважды, по 62% урона за удар.", 62)),
+    ("Секира Девятого Эха", "Эхо считает до девяти и бьёт на каждом.",
+     "hybrid", (("magic", 21), ("strength", 23), ("health", 8), ("armor", -3)),
+     _effect("echo_strike", "Первое попадание повторяется эхом на 130% урона.", 130)),
+    ("Копьё Общей Раны", "Одна рана на двоих, но платит один.",
+     "hybrid", (("magic", 22), ("strength", 21), ("armor", 9), ("luck", -3)),
+     _effect("reap", "Каждое попадание забирает 18% недостающего здоровья соперника.", 18)),
+    ("Молот Немого Приговора", "Приговор не зачитывают. Его приводят.",
+     "hybrid", (("magic", 21), ("strength", 22), ("agility", 4), ("health", -4)),
+     _effect("chain_crit", "Критический удар открывает ещё одну атаку на 95% урона.", 95)),
+    ("Цеп Соборного Гула", "Гудит так, что соперник забывает защищаться.",
+     "hybrid", (("magic", 23), ("strength", 21), ("health", 7), ("armor", -4)),
+     _effect("pressure", "За каждый полученный удар: +11% урона, без потолка.", 11)),
+)
+
+
+def _magic_bonus_tuple(index: int, rarity: str, hybrid: bool) -> tuple[tuple[str, int], ...]:
+    """Bonuses for one generated magic weapon: the steel bands, rewritten in Магия.
+
+    A hybrid carries roughly 70% of the band in EACH of the two stats rather than half in
+    each. Averaging halves what the swing sees, so an even split would leave a hybrid
+    strictly worse than either pure weapon at everything; at 70/70 it swings a little
+    softer, casts a little softer, and gets back the health Strength quietly pays out --
+    plus a stat curve (level ** 1.5) that charges far less for two middling stats than
+    for one enormous one.
+    """
+    variant = index % 5
+    if rarity == "cursed":
+        if hybrid:
+            return (
+                (("magic", -3), ("strength", -2), ("luck", 3)),
+                (("magic", -2), ("strength", -3), ("armor", 6)),
+                (("magic", -4), ("strength", 3), ("health", -4)),
+                (("magic", 2), ("strength", -4), ("agility", -2)),
+                (("magic", -3), ("strength", -2), ("armor", 5)),
+            )[variant]
+        return (
+            (("magic", -4), ("luck", 2)),
+            (("agility", -3), ("armor", 5), ("magic", -1)),
+            (("health", -6), ("magic", 2)),
+            (("magic", -2), ("agility", -2), ("armor", 7)),
+            (("luck", -3), ("magic", 3)),
+        )[variant]
+    if rarity == "common":
+        if hybrid:
+            magic, strength = 5 + (index % 3), 4 + (index % 3)
+            return (
+                (("magic", magic), ("strength", strength)),
+                (("magic", magic), ("strength", strength), ("agility", 1)),
+                (("magic", magic), ("strength", strength), ("luck", 1)),
+                (("magic", magic), ("strength", strength), ("armor", 3)),
+                (("magic", magic), ("strength", strength), ("health", 2)),
+            )[variant]
+        magic = 6 + (index % 5)
+        return (
+            (("magic", magic),),
+            (("magic", magic), ("agility", 1)),
+            (("magic", magic), ("luck", 1)),
+            (("magic", magic), ("armor", 3)),
+            (("magic", magic), ("health", 2)),
+        )[variant]
+    if rarity == "uncommon":
+        if hybrid:
+            magic, strength = 9 + (index % 3), 8 + (index % 3)
+            return (
+                (("magic", magic), ("strength", strength), ("luck", 2)),
+                (("magic", magic), ("strength", strength), ("agility", 2)),
+                (("magic", magic), ("strength", strength), ("armor", 5), ("luck", -1)),
+                (("magic", magic), ("strength", strength), ("health", 4), ("agility", -1)),
+                (("magic", magic), ("strength", strength), ("agility", 3), ("armor", -2)),
+            )[variant]
+        magic = 12 + (index % 5)
+        return (
+            (("magic", magic), ("luck", 2)),
+            (("magic", magic), ("agility", 2)),
+            (("magic", magic), ("armor", 5), ("luck", -1)),
+            (("magic", magic), ("health", 4), ("agility", -1)),
+            (("magic", magic), ("agility", 3), ("armor", -2)),
+        )[variant]
+    raise ValueError(f"rare and legendary magic weapons are hand-written: {rarity}")
+
+
+# The magic shelf's own drop weights. A rare magic weapon is deliberately findable at 4
+# rather than the steel shelf's 10, and its legendaries stay at 1 in a pool that already
+# held twenty-two: at the ordinary weights, twenty-one more legendaries would roughly
+# have doubled how often a legendary weapon falls out of the arena -- an economy change
+# nobody asked for while adding a shelf.
+_MAGIC_DROP_WEIGHTS: Final = {"cursed": 1, "rare": 4, "legendary": 1}
+_MAGIC_FIRST_CODE: Final = 527
+# How many rare magic weapons are sold rather than found. Common and uncommon ones are
+# all shop stock, for the same reason their steel equivalents are: a new caster has to be
+# able to BUY the weapon their scrolls read, or the build stays unreachable until the
+# arena happens to hand one over.
+_MAGIC_SHOP_RARE_COUNT: Final = 5
+
+
+def _magic_weapon_rows() -> tuple[tuple, ...]:
+    """(code, name, description, rarity, scaling, bonuses, effect) for all 105."""
+    rows: list[tuple] = []
+    code_number = _MAGIC_FIRST_CODE
+    for rarity in RARITIES:
+        if rarity in ("rare", "legendary"):
+            table = _MAGIC_RARE_WEAPONS if rarity == "rare" else _MAGIC_LEGENDARY_WEAPONS
+            for name, description, scaling, bonuses, effect in table:
+                rows.append((f"w{code_number:03d}", name, description, rarity,
+                             scaling, bonuses, effect))
+                code_number += 1
+            continue
+        for index, (name, description) in enumerate(_MAGIC_OBJECTS[rarity]):
+            hybrid = index >= 16
+            rows.append((
+                f"w{code_number:03d}", name, description, rarity,
+                "hybrid" if hybrid else "magic",
+                _magic_bonus_tuple(index, rarity, hybrid), (),
+            ))
+            code_number += 1
+    return tuple(rows)
+
+
+MAGIC_WEAPON_ROWS: Final = _magic_weapon_rows()
+
+
 def _source_for(rarity: str, rarity_rank: int) -> str:
     # Cursed junk belongs to arena drops, never a shop shelf. The shop offers normal
     # entry/mid-game gear and a few rare aspirational purchases; stronger gear remains
@@ -867,6 +1213,32 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
             effect=effect,
             cursed=cursed,
         ))
+    # The magic shelf. Priced and sourced by its own rules rather than `_source_for` and
+    # `_drop_weight`: those two are keyed to a rarity's rank inside the generated five
+    # hundred, and w527 onwards is a separate shelf with its own shop/drop split.
+    magic_rare_rank = 0
+    for code, name, description, rarity, scaling, bonuses, effect in MAGIC_WEAPON_ROWS:
+        if rarity in ("common", "uncommon"):
+            source = "shop"
+        elif rarity == "rare":
+            magic_rare_rank += 1
+            source = "shop" if magic_rare_rank <= _MAGIC_SHOP_RARE_COUNT else "drop"
+        else:
+            source = "drop"
+        buy_price, resale_price = _prices(rarity, source, bonuses)
+        entries.append(WeaponSpec(
+            code=code,
+            name=name,
+            description=description,
+            rarity=rarity,
+            source=source,
+            buy_price=buy_price,
+            resale_price=resale_price,
+            drop_weight=0 if source == "shop" else _MAGIC_DROP_WEIGHTS[rarity],
+            bonuses=bonuses,
+            effect=effect,
+            scaling=scaling,
+        ))
     # Every entry of the `cursed` RARITY is cursed by definition -- the bottom rung of the
     # ladder. Set once here rather than repeated on seventy-five generated rows.
     return tuple(
@@ -884,6 +1256,9 @@ WEAPON_COUNT: Final = len(WEAPON_SPECS)
 # Published so the UI, the balance report and the tests can name the cursed shelf without
 # re-deriving it from a code list. These items are ordinary legendaries to every drop,
 # forge and inventory path -- the set exists to LABEL them, never to gate them.
+# The magic shelf, named once so the tests, the balance harness and both front ends can
+# talk about it without re-deriving it from a code range.
+MAGIC_WEAPON_CODES: Final = frozenset(row[0] for row in MAGIC_WEAPON_ROWS)
 CURSED_LEGENDARY_CODES: Final = frozenset(row[0] for row in _CURSED_LEGENDARIES)
 RARE_CURSED_CODES: Final = frozenset(row[0] for row in _RARE_CURSED_WEAPONS)
 # The whole cursed line, all three rungs. This is what the forge and both front ends read;
@@ -898,7 +1273,7 @@ PRE_REBALANCE_BUY_PRICES: Final = {
 
 def _validate_catalogue() -> None:
     """Fail immediately if a future catalogue edit violates its public contract."""
-    assert WEAPON_COUNT == 526
+    assert WEAPON_COUNT == 631
     assert len({item.code for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.name for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.description for item in WEAPON_SPECS}) == WEAPON_COUNT
@@ -914,12 +1289,41 @@ def _validate_catalogue() -> None:
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
     # The generated 500 carry 75/250/120/45/10; _NEW_BUILD_WEAPONS then adds two rare and
     # four legendary drops (w501..w506) and _CURSED_LEGENDARIES eight more (w507..w514).
-    assert RARITY_COUNTS == {"cursed": 75, "common": 250, "uncommon": 120, "rare": 59, "legendary": 22}
+    # +21 of every rarity is the magic shelf, exactly as commissioned.
+    assert RARITY_COUNTS == {"cursed": 96, "common": 271, "uncommon": 141, "rare": 80, "legendary": 43}
+    # The magic shelf's own contract: 105 weapons, 21 per rarity, 5 hybrids in each, and
+    # not one of them scaling from Strength -- that is what makes them a caster's shelf
+    # rather than 105 more steel weapons with a different noun in the name.
+    magic_shelf = [item for item in WEAPON_SPECS if item.scaling != "strength"]
+    assert len(magic_shelf) == 105
+    assert all(item.scaling in SCALINGS for item in WEAPON_SPECS)
+    assert all(item.code[1:].isdigit() and int(item.code[1:]) >= _MAGIC_FIRST_CODE
+               for item in magic_shelf)
+    for rarity in RARITIES:
+        shelf = [item for item in magic_shelf if item.rarity == rarity]
+        assert len(shelf) == 21, (rarity, len(shelf))
+        assert sum(item.scaling == "hybrid" for item in shelf) == 5, rarity
+    # A magic weapon that grants no Магия would make its own scaling a downgrade.
+    assert all(
+        any(key == "magic" for key, _value in item.bonuses) for item in magic_shelf
+    ), "every magic weapon must carry the stat its swing reads"
+    assert all(
+        any(key == "strength" for key, _value in item.bonuses)
+        for item in magic_shelf if item.scaling == "hybrid"
+    ), "a hybrid weapon must carry both halves of what it averages"
+    assert all(item.effect for item in magic_shelf
+               if item.rarity in ("rare", "legendary"))
+    assert not any(item.effect for item in magic_shelf
+                   if item.rarity in ("cursed", "common", "uncommon"))
     # The cursed ladder, all three rungs. 75 junk at the bottom, twelve rare in the middle,
     # eight legendary at the top -- and the middle rung is what the forge needed to exist
     # before "проклятое" could be a line a player climbs rather than a pile they melt.
+    # 96 junk at the bottom (75 steel + the magic shelf's 21), twelve rare in the middle,
+    # eight legendary at the top. The magic shelf's junk joins the ladder rather than
+    # sitting beside it: it is the same worthless drop and the same six-into-one recipe,
+    # and a second pile of unmeltable junk would have been a strictly worse reward.
     cursed_line = [item for item in WEAPON_SPECS if item.cursed]
-    assert len(cursed_line) == 95
+    assert len(cursed_line) == 116
     assert {item.rarity for item in cursed_line} == {"cursed", "rare", "legendary"}
     assert all(item.source == "drop" for item in cursed_line)
     assert sum(1 for item in cursed_line if item.rarity == "rare") == 12
@@ -936,6 +1340,7 @@ def _validate_catalogue() -> None:
     assert sum(
         1 for item in WEAPON_SPECS
         if item.rarity == "rare" and item.effect and not item.cursed
+        and item.scaling == "strength"
     ) == 22
     assert all(item.effect for item in WEAPON_SPECS if item.cursed and item.rarity != "cursed")
     # Guarded: EFFECT_HOOKS is empty when this data module is imported on its own, and
@@ -956,6 +1361,9 @@ def _validate_catalogue() -> None:
         if rarity == "legendary":
             expected |= {dict(data[3])["code"] for data in _ASCENDED_LEGENDARIES.values()}
             expected |= {dict(data[4])["code"] for data in _CURSED_LEGENDARIES}
+        expected |= {
+            dict(row[6])["code"] for row in MAGIC_WEAPON_ROWS if row[3] == rarity and row[6]
+        }
         assert used == expected if rarity == "legendary" else used <= expected
     starter_shop_items = [
         item for item in WEAPON_SPECS
@@ -971,4 +1379,5 @@ __all__ = [
     "RARITIES", "SOURCES", "STAT_KEYS", "WeaponSpec", "WEAPON_SPECS", "RAW_ITEMS", "WEAPON_COUNT",
     "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "STARTER_WEAPON_MAX_PRICE", "shop_price_for_bonuses",
     "CURSED_LEGENDARY_CODES", "RARE_CURSED_CODES", "CURSED_CODES",
+    "MAGIC_WEAPON_CODES", "MAGIC_WEAPON_ROWS", "SCALINGS",
 ]

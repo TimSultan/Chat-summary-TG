@@ -430,6 +430,16 @@ def _load(entry: str) -> dict:
         if not isinstance(purchased_stats, dict):
             purchased_stats = {}
             record["stats"] = purchased_stats
+        # A creature that already spent coins on a five-stat sheet did not get to decide
+        # whether any of it should have gone into Магия -- the stat did not exist. One
+        # free reset each, and only for those saves: it mints nothing (a reset refunds
+        # exactly the curve's price) and it is the difference between "there is a new
+        # stat" and "your build was silently rewritten by an update".
+        if "magic" not in purchased_stats and any(
+            int(purchased_stats.get(key, C.STAT_MIN_LEVEL) or 0) > C.STAT_MIN_LEVEL
+            for key in purchased_stats
+        ):
+            record["free_respec"] = True
         for key in C.STAT_KEYS:
             purchased_stats.setdefault(key, C.STAT_MIN_LEVEL)
         try:
@@ -3679,6 +3689,11 @@ def stat_level(entry, user_id, stat) -> int:
     return record.get("stats", {}).get(stat, C.STAT_MIN_LEVEL)
 
 
+def has_free_respec(record: dict | None) -> bool:
+    """Whether this pet still holds the one-off reset the Магия migration handed out."""
+    return bool((record or {}).get("free_respec"))
+
+
 def available_stat_points(record: dict | None) -> int:
     """Unspent respec points attached to one pet record."""
     try:
@@ -3721,6 +3736,10 @@ def respec_stats(entry, user_id, xp: int = 0) -> tuple[bool, str, int]:
     `xp` is needed because the refund goes through economy.refund, which reduces lifetime
     `spent` rather than paying a bonus -- an admin-granted stat therefore refunds nothing
     instead of turning a gift into cash.
+
+    A pet holding the one-off `free_respec` token spends that instead of diamonds. It is
+    handed out exactly once, by the migration that introduced Магия, to creatures whose
+    build was decided when there were only five stats to decide between.
     """
     with _farm_settlement_lock:
         data = _load(entry)
@@ -3734,19 +3753,27 @@ def respec_stats(entry, user_id, xp: int = 0) -> tuple[bool, str, int]:
         if levels <= 0:
             return False, "Сбрасывать пока нечего.", 0
         coins = stat_refund_value(record)
-        wallet = _ruby_row(data)
-        rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
-        if rubies < C.STAT_RESPEC_RUBY_COST:
-            return False, f"Нужно {C.STAT_RESPEC_RUBY_COST} 💎, у тебя {rubies}.", 0
-        wallet[str(user_id)] = rubies - C.STAT_RESPEC_RUBY_COST
+        free = bool(record.get("free_respec"))
+        if free:
+            record["free_respec"] = False
+        else:
+            wallet = _ruby_row(data)
+            rubies = max(0, int(wallet.get(str(user_id), 0) or 0))
+            if rubies < C.STAT_RESPEC_RUBY_COST:
+                return False, f"Нужно {C.STAT_RESPEC_RUBY_COST} 💎, у тебя {rubies}.", 0
+            wallet[str(user_id)] = rubies - C.STAT_RESPEC_RUBY_COST
         record["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
-        _append_ruby_log(entry, user_id, -C.STAT_RESPEC_RUBY_COST, "spend:respec",
-                         ref=str(levels))
+        if not free:
+            _append_ruby_log(entry, user_id, -C.STAT_RESPEC_RUBY_COST, "spend:respec",
+                             ref=str(levels))
         _save(entry, data)
     # Outside the store lock, like every other payout: the coin ledger is its own file
     # with its own lock, and holding both at once is how two locks become one deadlock.
     economy.refund(entry, user_id, xp, coins, "pet_respec")
-    return True, f"Статы сброшены. Возвращено {coins} монет.", coins
+    return True, (
+        ("Бесплатный сброс за появление Магии использован. " if free else "Статы сброшены. ")
+        + f"Возвращено {coins} монет."
+    ), coins
 
 
 def upgrade_stat(entry, user_id, xp, stat, times=1) -> tuple[bool, str, int]:
@@ -4338,6 +4365,17 @@ def combat_weapon_enchanted(entry, user_id) -> bool:
     return (record.get("weapon_enchantments") or {}).get(weapon) in RUNE_ELEMENTS
 
 
+def _weapon_scaling_for(record: dict) -> str:
+    """Which stat the record's equipped weapon makes its ordinary swing read."""
+    code = ((record or {}).get("equipped") or {}).get("weapon")
+    return C.weapon_scaling(C.find_item(code) if code else None)
+
+
+def combat_weapon_scaling(entry, user_id) -> str:
+    """Public spelling of the above for the two front ends and the arena."""
+    return _weapon_scaling_for(_tamed_record(_load(entry), user_id) or {})
+
+
 def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
     """Immutable item-effect snapshots for the pure combat engine.
 
@@ -4630,6 +4668,7 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
         key=str(key), name=record.get("name") or "Существо",
         strength=effective["strength"], health=effective["health"],
         agility=effective["agility"], luck=effective["luck"], armor=effective.get("armor", 0),
+        magic=effective.get("magic", 0), attack_scaling=_weapon_scaling_for(record),
         effects=tuple(effects), level=int(record.get("level", 1)),
         skills=_skill_loadout_for(record), personal_enchanted_scrolls=_personal_paint_scroll_codes(record),
         shield=_combat_shield_for(record),
@@ -7284,7 +7323,7 @@ def mob_fighter(block: dict):
         name=block.get("name") or "Моб",
         strength=stats.get("strength", 1), health=stats.get("health", 1),
         agility=stats.get("agility", 1), luck=stats.get("luck", 1),
-        armor=block.get("armor", 0),
+        armor=block.get("armor", 0), magic=stats.get("magic", 0),
         effects=(), level=int(block.get("level", 1) or 1),
     )
 

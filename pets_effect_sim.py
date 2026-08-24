@@ -45,17 +45,23 @@ CONTROL = "__none__"
 # The reference creature. Level 10 with 20s across the board is an ordinary mid-game pet:
 # 880 maximum health, 98 damage a swing, about ten swings each. Those two numbers are the
 # yardstick every flat "heals 6 HP" value in the catalogue has to be read against.
-HERO_STATS = {"strength": 20, "health": 20, "agility": 20, "luck": 20, "armor": 5, "level": 10}
+HERO_STATS = {"strength": 20, "health": 20, "agility": 20, "luck": 20, "magic": 20,
+              "armor": 5, "level": 10}
 OPPONENTS = {
-    "зеркало": {"strength": 20, "health": 20, "agility": 20, "luck": 20, "armor": 5, "level": 10},
-    "танк": {"strength": 15, "health": 30, "agility": 14, "luck": 14, "armor": 12, "level": 10},
-    "ловкач": {"strength": 22, "health": 14, "agility": 28, "luck": 26, "armor": 2, "level": 10},
-    "моб": {"strength": 20, "health": 22, "agility": 18, "luck": 16, "armor": 6, "level": 10},
+    "зеркало": {"strength": 20, "health": 20, "agility": 20, "luck": 20, "magic": 20,
+                "armor": 5, "level": 10},
+    "танк": {"strength": 15, "health": 30, "agility": 14, "luck": 14, "magic": 12,
+             "armor": 12, "level": 10},
+    "ловкач": {"strength": 22, "health": 14, "agility": 28, "luck": 26, "magic": 16,
+               "armor": 2, "level": 10},
+    "моб": {"strength": 20, "health": 22, "agility": 18, "luck": 16, "magic": 14,
+            "armor": 6, "level": 10},
     # A bigger opponent, so `giant_slayer` has somewhere to fire -- without this shape it
     # reads as an exact zero and looks broken when it is only situational. Deliberately
     # only one tier up: a hopeless fight contributes nothing to a paired difference and
     # would just dilute every other row's resolution.
-    "старший": {"strength": 23, "health": 23, "agility": 22, "luck": 21, "armor": 7, "level": 13},
+    "старший": {"strength": 23, "health": 23, "agility": 22, "luck": 21, "magic": 23,
+                "armor": 7, "level": 13},
 }
 # Only this shape is a mob: the key prefix is the whole of what makes a fighter a mob to
 # the engine (`hurt` checks `str(source_key).startswith("mob:")`), and mobs carry no slots.
@@ -65,14 +71,39 @@ MOB_SHAPE = "моб"
 # is not the same finding as "does nothing" and must not be reported as one.
 ECONOMY_CODES = frozenset({"coin_rake", "collector", "survivor", "trophy_compass"})
 
+# A magic weapon's passive reads spell power or the scroll loadout, so measuring one on
+# the ordinary reference creature -- four empty slots, a swing that reads Strength --
+# scores every last one of them an exact zero. That would not be a finding, it would be
+# the wrong instrument. Arms carrying one of these are run on a CASTER instead: same
+# stats, same seeds, but with a filled loadout and a magic weapon's scaling, and paired
+# against a caster control rather than the ordinary one.
+MAGIC_CODES = frozenset({
+    "arcane_surge", "runic_charge", "arcane_battery", "mana_burn", "spell_siphon",
+    "spell_pierce", "hex", "focus_shift", "spell_shield", "ward", "spell_thorns",
+    "double_cast",
+})
+# Three ordinary scrolls and one ultimate: the loadout the game itself hands a fighter,
+# and a mix of damage, damage-over-time and a barrier so a passive keyed to any of the
+# three has something to answer.
+CASTER_LOADOUT = (
+    "scroll_arcane_spark", "scroll_crimson_comet", "scroll_royal_barrier",
+    "ultimate_starfall",
+)
+CONTROL_CASTER = -2
 
-def _fighter(key: str, stats: dict, effects: tuple) -> combat.Fighter:
+
+def _fighter(key: str, stats: dict, effects: tuple, caster: bool = False) -> combat.Fighter:
     mob = key.startswith("mob:")
+    skills = ()
+    if not mob:
+        skills = SCROLLS.validate_loadout(CASTER_LOADOUT) if caster else SCROLLS.EMPTY_LOADOUT
     return combat.Fighter(
         key=key, name=key, strength=stats["strength"], health=stats["health"],
         agility=stats["agility"], luck=stats["luck"], armor=stats["armor"],
+        magic=stats.get("magic", 0),
+        attack_scaling="magic" if caster and not mob else "strength",
         level=stats["level"], effects=effects,
-        skills=() if mob else SCROLLS.EMPTY_LOADOUT, shield=None,
+        skills=skills, shield=None,
     )
 
 
@@ -112,10 +143,16 @@ def _arm_effects(row: dict | None) -> tuple:
 
 def run_arm(job: tuple) -> tuple:
     """One passive against one opponent shape: a score per seed, plus what it moved."""
-    index, effect, code, shape, fights = job
-    hero = _fighter("hero", HERO_STATS, effect)
+    index, effect, code, shape, fights, caster = job
+    hero = _fighter("hero", HERO_STATS, effect, caster=caster)
     foe_key = "mob:sim" if shape == MOB_SHAPE else "foe"
-    foe = _fighter(foe_key, OPPONENTS[shape], ())
+    # A caster arm fights a CASTER. Against the ordinary opponent -- four empty scroll
+    # slots -- the caster control already won 86-92% of the time, and a passive measured
+    # against a control that close to the ceiling has nowhere to show anything: every one
+    # of the twelve magic rules came back at a compressed +0 to +16 regardless of size.
+    # It is also the only way `ward` and `spell_thorns` are measurable at all, since a
+    # fighter with no scrolls and no rune never deals one point of magical damage.
+    foe = _fighter(foe_key, OPPONENTS[shape], (), caster=caster and shape != MOB_SHAPE)
     event = f"amulet_{code}" if code else None
     scores, procs, moved = [], 0, 0
     for seed in range(fights):
@@ -133,9 +170,10 @@ def run_arm(job: tuple) -> tuple:
 
 
 def simulate_all(rows: list[dict], fights: int, workers: int | None) -> dict:
-    jobs = [(-1, (), None, shape, fights) for shape in OPPONENTS]
+    jobs = [(-1, (), None, shape, fights, False) for shape in OPPONENTS]
+    jobs += [(CONTROL_CASTER, (), None, shape, fights, True) for shape in OPPONENTS]
     jobs += [
-        (index, _arm_effects(row), row["code"], shape, fights)
+        (index, _arm_effects(row), row["code"], shape, fights, row["code"] in MAGIC_CODES)
         for index, row in enumerate(rows) for shape in OPPONENTS
     ]
     results: dict[tuple[int, str], tuple] = {}
@@ -181,10 +219,14 @@ def reference() -> tuple[float, float]:
 def _row(index: int, spec: dict, results: dict, fights: int, max_hp: float) -> dict:
     pooled, control, procs, moved = [], [], 0, 0
     per_shape = {}
+    # Every arm is judged against the control it was actually run as. Comparing a caster
+    # arm to the ordinary control would fold "what does carrying scrolls do" into the
+    # passive's score, which is a different question and a much larger number.
+    control_index = CONTROL_CASTER if spec["code"] in MAGIC_CODES else -1
     for shape in OPPONENTS:
         scores, shape_procs, shape_moved = results[(index, shape)]
         pooled.extend(scores)
-        control.extend(results[(-1, shape)][0])
+        control.extend(results[(control_index, shape)][0])
         per_shape[shape] = statistics.fmean(scores) * 100
         procs += shape_procs
         moved += shape_moved

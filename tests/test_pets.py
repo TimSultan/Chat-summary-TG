@@ -1715,7 +1715,10 @@ class StorefrontAndCollectionTests(PetsTestCase):
         shop = [item for item in weapons if item.source == "shop"]
         prices = {rarity: [item.price for item in shop if item.rarity == rarity]
                   for rarity in ("common", "rare")}
-        self.assertEqual((min(prices["common"]), max(prices["common"])), (60, 105))
+        # Ceiling rose from 105 with the magic shelf: a hybrid magic weapon carries two
+        # stat lines instead of one (Магия AND Сила, since its swing averages them), and
+        # shop_price_for_bonuses charges for exactly the power on the card.
+        self.assertEqual((min(prices["common"]), max(prices["common"])), (60, 125))
         self.assertFalse(any(item.rarity == "uncommon" for item in weapons))
         self.assertEqual((min(prices["rare"]), max(prices["rare"])), (160, 195))
         self.assertTrue(all(item.resale_price <= item.price // 5 for item in shop))
@@ -1755,9 +1758,10 @@ class StorefrontAndCollectionTests(PetsTestCase):
         shop_items = [item for item in pets_config.ITEMS if item.source == "shop"]
         self.assertTrue(shop_items)
         # 6 accessories (bead/acorn/mittens/claws/slippers/springs), 3 shields and the
-        # weapon catalogue's 375 shop weapons (250 common + 120 uncommon + 5 rare),
+        # weapon catalogue's 422 shop weapons (271 common + 141 uncommon + 10 rare --
+        # the magic shelf added 21 common, 21 uncommon and 5 more rare to the counter),
         # plus the utility items below.
-        self.assertEqual(len(shop_items), 384 + len(UTILITY_SHOP_CODES))
+        self.assertEqual(len(shop_items), 431 + len(UTILITY_SHOP_CODES))
         for item in shop_items:
             if item.code in UTILITY_SHOP_CODES:
                 # Utility amulets are priced for their combat effect as well as their

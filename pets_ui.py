@@ -1977,6 +1977,26 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f"\n🍀 Удача сейчас даёт <b>+{luck_bonus * 100:.0f}%</b> к шансу найти вещь"
         " — и в бою, и на ферме."
     )
+    # Магия is invisible in the stat column for the same reason Удача was: its payoff is
+    # in the scroll lines of a fight log rather than in the swing. Both halves are spelled
+    # out where the points are actually bought, the floor included -- otherwise a player
+    # at Магия 1 reads "свитки бьют от Магии" and concludes their scrolls do nothing.
+    swing = C.BASE_DAMAGE + effective.get("strength", 1) * C.DAMAGE_PER_POINT
+    power = C.spell_power(effective.get("magic", C.STAT_MIN_LEVEL), swing)
+    lines.append(
+        f"🔮 Магия сейчас даёт <b>{power:.0f}</b> силы свитков"
+        f" — обычный удар бьёт на {swing:.0f}."
+    )
+    if power <= swing * C.SPELL_POWER_SWING_FLOOR + 0.01:
+        lines.append(
+            "<i>Это пол в 45% от удара: свитки начнут расти, как только Магия его догонит.</i>"
+        )
+    weapon = C.find_item((pet.get("equipped") or {}).get("weapon"))
+    scaling = C.weapon_scaling(weapon)
+    if scaling != C.WEAPON_SCALING_STRENGTH:
+        lines.append(
+            f"<i>Оружие «{escape(weapon.name)}»: {C.WEAPON_SCALING_LABELS[scaling]}.</i>"
+        )
     lines.append(f"\n🪙 Монеты: {_money(coins)}")
     points = pets.available_stat_points(pet)
     if points:
@@ -2893,6 +2913,12 @@ def _bonus_text(item) -> str:
     for key, value in item.bonuses.items():
         label = C.ARMOR_NAME if key == "armor" else C.STAT_NAMES.get(key, key)
         parts.append(f"{value:+d} {label}")
+    # Which stat the swing reads is the single most consequential fact about a magic
+    # weapon -- equipping one with Магия at 1 costs far more than any stat line on it
+    # gives back -- so it is printed with the stats rather than left to the description.
+    scaling = C.weapon_scaling(item)
+    if scaling != C.WEAPON_SCALING_STRENGTH:
+        parts.append(C.WEAPON_SCALING_LABELS[scaling])
     effect = getattr(item, "effect", None)
     effect_text = effect.get("text") if isinstance(effect, dict) else None
     if effect_text:
@@ -2906,6 +2932,9 @@ def _bonus_icon_text(item) -> str:
     for key, value in item.bonuses.items():
         emoji = C.ARMOR_EMOJI if key == "armor" else C.STAT_EMOJI.get(key, "•")
         parts.append(f"{emoji} {value:+d}")
+    scaling = C.weapon_scaling(item)
+    if scaling != C.WEAPON_SCALING_STRENGTH:
+        parts.append(C.WEAPON_SCALING_LABELS[scaling])
     if isinstance(getattr(item, "effect", None), dict) and item.effect.get("code"):
         effect_text = str(item.effect.get("text") or "").strip()
         parts.append(f"🧿 {escape(effect_text)}" if effect_text else "🧿")

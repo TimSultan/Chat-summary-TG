@@ -36,6 +36,12 @@ import pets_config as C
 import pets_flavor
 import pets_scroll_catalog as SCROLLS
 
+# The four stats the fight COMPARES: the gradual lead bonus, the two "слабое место"
+# penalties and the signature moments are all written against exactly these, and each
+# names its consequence per stat. Магия is deliberately not a fifth entry -- adding one
+# would silently crowd a named consequence out of every existing fight. Instead
+# `_compared` makes the "strength" slot mean "the stat you actually swing with", so a
+# caster and a brawler are compared on the same footing without a fifth rule.
 _STATS = ("strength", "health", "agility", "luck")
 _SIGNATURE_STATS = _STATS + ("armor",)
 PHYSICAL = "physical"
@@ -60,6 +66,14 @@ class Fighter:
     agility: int
     luck: int
     armor: int           # from equipment only, 0 for a bare pet
+    # Магия. Powers every scroll and shield spell, and -- with a magic weapon equipped --
+    # the ordinary swing as well. Defaults to 0 so a historic snapshot, a mob and a
+    # dungeon enemy all keep casting off the swing floor exactly as they used to.
+    magic: int = 0
+    # Which stat this fighter's ordinary attack reads: "strength", "magic" or "hybrid".
+    # Comes off the equipped weapon (pets_config.weapon_scaling), carried on the snapshot
+    # like every other item fact so a replay does not change after a catalogue edit.
+    attack_scaling: str = "strength"
     # Combat-only item metadata.  It is deliberately carried with the snapshot rather
     # than looked up here: replaying a saved fight must not change after a shop rotation.
     # Each entry may be ``"vampiric"`` or ``{"code": "vampiric", "value": .12}``.
@@ -172,6 +186,13 @@ _EFFECT_DEFAULTS = {
     # which is the entire point of the shelf.
     "charge_crit": 400, "wild_swing": 200, "blind_fury": 3, "glass_body": 90,
     "blood_price": 80, "hunger": 14, "soul_debt": 40, "recoil": 150,
+    # Магия. These read off `spell_power` and the scroll loadout rather than the swing,
+    # which is what makes them a shelf of their own rather than louder copies of the
+    # passives above: a weapon here is worth nothing to a fighter with empty scroll slots
+    # and worth a great deal to one who paid for the stat behind them.
+    "arcane_surge": 45, "runic_charge": 11, "arcane_battery": 9, "mana_burn": 90,
+    "spell_siphon": 40, "spell_pierce": 40, "hex": 35, "focus_shift": 65,
+    "spell_shield": 6, "ward": 32, "spell_thorns": 32, "double_cast": 70,
 }
 
 _EFFECT_TEXT = {
@@ -248,6 +269,18 @@ _EFFECT_TEXT = {
     "hunger": "голодает: −{amount} максимального HP, но урон растёт.",
     "soul_debt": "выкупает себя из смерти: +{amount} HP и вдвое хуже защита.",
     "recoil": "отдачей выбивает себя из следующего хода.",
+    "arcane_surge": "разгоняет ману: свитки бьют сильнее.",
+    "runic_charge": "накапливает руну с удара: свитки сильнее ещё на {amount}%.",
+    "arcane_battery": "копит заряд: с каждым раундом свитки злее.",
+    "mana_burn": "жжёт собственную ману: −{amount} HP за прочтение.",
+    "spell_siphon": "вытягивает из свитка {amount} HP обратно.",
+    "spell_pierce": "свиток проходит сквозь броню.",
+    "hex": "вешает порчу: следующий удар соперника слабее на {amount}%.",
+    "focus_shift": "переводит остаток заклинания в замах.",
+    "spell_shield": "сплетает из отката щит: +{amount}.",
+    "ward": "гасит чужую магию: −{amount} урона.",
+    "spell_thorns": "возвращает магию отправителю.",
+    "double_cast": "дочитывает свиток второй раз: {amount} урона.",
 }
 
 
@@ -268,6 +301,11 @@ def snapshot(fighter: "Fighter") -> dict:
         "agility": fighter.agility,
         "luck": fighter.luck,
         "armor": fighter.armor,
+        # Absent from every snapshot written before Магия existed, and `restore` defaults
+        # both to the pre-magic values -- so an old replay still casts off the swing floor
+        # and still punches with Strength, exactly as it did on the day it was fought.
+        "magic": fighter.magic,
+        "attack_scaling": fighter.attack_scaling,
         # Tuple -> list, and each effect copied: this goes through json, and a stored
         # effect must not stay a reference into the live catalogue.
         "effects": [
@@ -312,6 +350,23 @@ def normalize_attack_types(attack_types=()) -> tuple[str, ...]:
     return tuple(dict.fromkeys(rows))
 
 
+def _swing_attack_types(fighter: "Fighter") -> tuple[str, ...]:
+    """How this fighter's ORDINARY attack is classified.
+
+    A magic weapon's swing is a spell and nothing else; a hybrid's is half of each, the
+    same shape a runed blade already had; everything else is steel unless a rune says
+    otherwise. This is what makes the caster build legible against the dungeon's two
+    opposite bosses -- it walks through the ghost that eats plain steel, and it is the
+    worst possible build to bring to the antimage who returns magic to sender.
+    """
+    scaling = str(getattr(fighter, "attack_scaling", "strength") or "strength")
+    if scaling == C.WEAPON_SCALING_MAGIC:
+        return (MAGIC,)
+    if scaling == C.WEAPON_SCALING_HYBRID:
+        return (PHYSICAL, MAGIC)
+    return (PHYSICAL, MAGIC) if fighter.weapon_enchanted else (PHYSICAL,)
+
+
 def is_magic_attack(attack_types=()) -> bool:
     """Whether this attack belongs to magic, including elemental magic."""
     return bool(set(normalize_attack_types(attack_types)) & MAGICAL_ATTACK_TYPES)
@@ -344,6 +399,11 @@ def restore(data) -> "Fighter | None":
         agility=_stored_number(data.get("agility"), 1),
         luck=_stored_number(data.get("luck"), 1),
         armor=_stored_number(data.get("armor"), 0),
+        magic=_stored_number(data.get("magic"), 0),
+        attack_scaling=(
+            str(data.get("attack_scaling"))
+            if str(data.get("attack_scaling")) in C.WEAPON_SCALINGS else "strength"
+        ),
         effects=tuple(
             dict(effect) if isinstance(effect, Mapping) else str(effect)
             for effect in (data.get("effects") or ())
@@ -384,13 +444,18 @@ def _mirror(fighter: "Fighter", opponent: "Fighter", rng) -> "Fighter":
     Armour is mirrored too but never jittered upward past the opponent's, because armour
     is the one stat with a hard cap in derive() and a lucky roll there would quietly undo
     the whole point.
+
+    Магия comes down with the rest. It is not in `_STATS` (the deficit/signature contract
+    stays four stats wide), but leaving it out would have made the mirror the exact
+    exploit it exists to prevent: come down to a beginner's Strength and keep casting
+    level-80 scrolls at them.
     """
     effect = _effect(_effect_specs(fighter), "mirror_soul")
     if effect is None:
         return fighter
     spread = max(0.0, _fraction(effect.get("value", 20)))
     mirrored = {}
-    for stat in _STATS:
+    for stat in (*_STATS, "magic"):
         mine, theirs = getattr(fighter, stat), getattr(opponent, stat)
         if mine <= theirs:
             mirrored[stat] = mine
@@ -500,11 +565,35 @@ def _stat_lead_bonus(mine: float, theirs: float) -> float:
     return min(C.DOMINANCE_BONUS, mine / theirs - 1.0)
 
 
+def attack_stat(fighter: "Fighter") -> float:
+    """The stat this fighter's ordinary swing actually reads.
+
+    Everywhere the four-stat contract below says "strength" it means "the stat you hit
+    with", and for a fighter carrying a magic weapon that stat is Магия. Reading the word
+    literally instead made the two halves of the comparison asymmetric in the caster's
+    disfavour: a mage who skipped Strength collected the `strength` deficit (dodge cut to
+    65%) and handed the brawler a 3x `strength` signature, while the brawler's own Магия
+    of 1 cost him nothing at all, because Магия is not one of the four. Measured over an
+    equal-gold round robin that alone was most of a 40%-against-76% gap.
+    """
+    scaling = str(getattr(fighter, "attack_scaling", "strength") or "strength")
+    if scaling == C.WEAPON_SCALING_MAGIC:
+        return float(fighter.magic)
+    if scaling == C.WEAPON_SCALING_HYBRID:
+        return (float(fighter.strength) + float(fighter.magic)) / 2 * C.HYBRID_SCALING_BONUS
+    return float(fighter.strength)
+
+
+def _compared(fighter: "Fighter", stat: str) -> float:
+    """One side of a stat comparison, with `strength` standing for the swing stat."""
+    return attack_stat(fighter) if stat == "strength" else float(getattr(fighter, stat))
+
+
 def _signature(fighter: "Fighter", opponent: "Fighter") -> tuple[str, int] | None:
     """The single highest 2x/3x stat advantage that may create a signature move."""
     candidates = []
     for stat in _SIGNATURE_STATS:
-        mine, theirs = getattr(fighter, stat), getattr(opponent, stat)
+        mine, theirs = _compared(fighter, stat), _compared(opponent, stat)
         if mine <= 0 or theirs <= 0:
             continue
         ratio = mine / theirs
@@ -521,8 +610,8 @@ def _stat_deficits(fighter: "Fighter", opponent: "Fighter") -> tuple[str, ...]:
     """The two largest opponent-relative stat gaps that expose build weaknesses."""
     gaps = []
     for stat in _STATS:
-        mine = max(1, getattr(fighter, stat))
-        theirs = max(1, getattr(opponent, stat))
+        mine = max(1.0, _compared(fighter, stat))
+        theirs = max(1.0, _compared(opponent, stat))
         if mine / theirs <= C.STAT_DEFICIT_RATIO:
             gaps.append((mine / theirs, stat))
     return tuple(stat for _, stat in sorted(gaps)[:C.STAT_DEFICIT_MAX])
@@ -538,7 +627,7 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     or lose its own.
     """
     stat_bonus = {
-        stat: _stat_lead_bonus(getattr(fighter, stat), getattr(opponent, stat))
+        stat: _stat_lead_bonus(_compared(fighter, stat), _compared(opponent, stat))
         for stat in _STATS
     }
     deficits = _stat_deficits(fighter, opponent)
@@ -548,8 +637,19 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
 
     max_hp = C.BASE_HP + fighter.health * C.HP_PER_POINT * factor("health")
     if fighter.skills:
+        # Literally Strength, not the swing stat: this is the durability Strength quietly
+        # pays out, and it is exactly what a caster gives up by putting the gold into
+        # Магия instead. The lead factor beside it is the swing's, which costs a pure
+        # caster nothing -- their Strength term is ~0 either way.
         max_hp += fighter.strength * C.HP_PER_STRENGTH_WITH_SKILLS * factor("strength")
-    damage = C.BASE_DAMAGE + fighter.strength * C.DAMAGE_PER_POINT * factor("strength")
+    # `factor("strength")` is the lead bonus on the SWING stat -- see `_compared` -- so a
+    # magic weapon's swing needs no special case here: the same line reads Магия for a
+    # caster, Strength for a brawler and the average of the two for a hybrid.
+    damage = C.BASE_DAMAGE + attack_stat(fighter) * C.DAMAGE_PER_POINT * factor("strength")
+    # Магия's own lead, for the SCROLLS. Kept separate from the swing above because a
+    # brawler casts too, and their scrolls should answer to how much Магия they bought
+    # rather than to how hard they punch.
+    magic_factor = 1.0 + _stat_lead_bonus(fighter.magic, opponent.magic)
     dodge = _saturate(C.DODGE_MAX, C.DODGE_K, fighter.agility * factor("agility"))
     crit = C.CRIT_BASE + _saturate(C.CRIT_MAX, C.CRIT_K, fighter.luck * factor("luck"))
     signature = _signature(fighter, opponent)
@@ -598,9 +698,21 @@ def derive(fighter: "Fighter", opponent: "Fighter") -> dict:
     if "luck" in deficits:
         accuracy *= C.STAT_DEFICIT_ACCURACY_MULTIPLIER
 
+    # Read AFTER the fight-start passives above, so `ferocity` and a candle's gamble reach
+    # the swing floor too -- a scroll cast by a pet whose weapon just doubled its damage
+    # should not be the one number in the fight that pretends nothing happened.
+    spell = C.spell_power(fighter.magic * magic_factor, damage)
+    # Both are flat, fight-long multipliers on the spell line and nothing else, so they
+    # belong here rather than in the loop. `mana_burn` also charges its toll at every
+    # cast; that half lives in take_active_action, where the casts actually happen.
+    for code in ("arcane_surge", "mana_burn"):
+        if (value := _effect_value(effects, code)) is not None:
+            spell *= 1 + max(0.0, _fraction(value))
+
     return {
         "max_hp": max_hp,
         "damage": damage,
+        "spell_power": spell,
         "dodge": dodge,
         "crit": crit,
         "accuracy": accuracy,
@@ -850,6 +962,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     in_followup = {a.key: False, b.key: False}  # this strike is an earned extra attack
     heal_cut = {a.key: 0.0, b.key: 0.0}    # share of incoming healing bleeding denies
     poison_weaken = {a.key: 0.0, b.key: 0.0}  # poison sapping this fighter's next blow
+    # Магия. Everything a magic weapon builds up over a fight, and nothing that outlives
+    # it: charge_stacks counts landed swings for runic_charge, cast_bonus is the swing
+    # focus_shift owes, casts_made is how many scrolls have actually resolved.
+    charge_stacks = {a.key: 0, b.key: 0}
+    cast_bonus = {a.key: 0.0, b.key: 0.0}
+    casts_made = {a.key: 0, b.key: 0}
     stun_procs = {a.key: 0, b.key: 0}
     guards = {a.key: 0.0, b.key: 0.0}
     used_scrolls = {a.key: set() for a in (a, b)}
@@ -1154,6 +1272,16 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         recurse forever instead of producing a readable, deterministic combat log.
         """
         attack_types = normalize_attack_types(attack_types)
+        # A ward is charged before the blow reaches `hurt`, so it also shelters the guard,
+        # the barrier and the rescue effects underneath it rather than merely trimming the
+        # number printed afterwards. Physical steel walks straight past it.
+        if effectful and damage and source_key != target_key \
+                and is_magic_attack(attack_types) \
+                and (value := _effect_value(effects[target_key], "ward")) is not None:
+            before_ward = damage
+            damage = max(0, round(damage * max(.10, 1 - max(0.0, _fraction(value)))))
+            if before_ward - damage:
+                effect_round(number, target_key, source_key, "ward", before_ward - damage, attack_types)
         impact, knocked_out = hurt(
             source_key, target_key, damage, number, pierce_guard=pierce_guard,
             allow_shield_reactions=allow_shield_reactions,
@@ -1171,6 +1299,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             defender.magic_reflect_multiplier if is_magic_attack(attack_types) else 0.0,
             defender.enchant_reflect_multiplier if enchanted else 0.0,
         )
+        # Same return path as Антимаг's, on purpose: one reflected-magic line in the
+        # transcript, one rule about what can and cannot be reflected back again.
+        if effectful and is_magic_attack(attack_types) \
+                and (value := _effect_value(effects[target_key], "spell_thorns")) is not None:
+            reflect = max(reflect, max(0.0, _fraction(value)))
         if reflect <= 0:
             return impact, False, None
         reflected = max(1, round(impact * reflect))
@@ -1288,11 +1421,28 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         ))
         return antimagic_winner or (target_key if back_ko else None)
 
+    def spell_power_now(source_key: str, number: int) -> float:
+        """Spell power at this moment: the fight-start number plus everything charged.
+
+        `number` is the round, which is what `arcane_battery` grows against. Both stacking
+        passives are additive with each other and multiplicative on the base, so a weapon
+        that also carries `arcane_surge` compounds -- deliberately: the whole shelf is
+        meant to reward stacking Магия rather than spreading it.
+        """
+        bonus = 0.0
+        if (value := _effect_value(effects[source_key], "runic_charge")) is not None:
+            cap = max(0.0, _fraction(_param(effects[source_key], "runic_charge", "cap", 60)))
+            bonus += min(cap, max(0.0, _fraction(value)) * charge_stacks[source_key])
+        if (value := _effect_value(effects[source_key], "arcane_battery")) is not None:
+            bonus += max(0.0, _fraction(value)) * max(0, int(number) - 1)
+        return derived[source_key]["spell_power"] * (1 + bonus)
+
     def spell_damage(
         source_key: str, target_key: str, effect: Mapping, number: int,
-        attack_types=(MAGIC,),
+        attack_types=(MAGIC,), power: float | None = None,
     ) -> tuple[int, str | None]:
-        raw = (derived[source_key]["damage"] * fighters[source_key].damage_multiplier
+        raw = ((spell_power_now(source_key, number) if power is None else power)
+               * fighters[source_key].damage_multiplier
                * max(0.0, float(effect.get("amount", 1.0))))
         raw *= 1 + rng.uniform(-C.DAMAGE_VARIANCE, C.DAMAGE_VARIANCE)
         if rng.random() < derived[source_key]["crit"]:
@@ -1300,13 +1450,24 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         raw *= max(.10, 1.0 - skill_value(source_key, "weaken"))
         raw *= 1.0 + skill_value(source_key, "damage_boost")
         raw *= 1.0 + skill_value(target_key, "vulnerable")
-        armor = derived[target_key]["reduction"] * max(
-            0.0, 1.0 - min(1.0, float(effect.get("pierce_armor", 0) or 0)),
-        )
+        pierce = float(effect.get("pierce_armor", 0) or 0)
+        guard_pierce = max(0.0, float(effect.get("pierce_guard", 0) or 0))
+        if (value := _effect_value(effects[source_key], "spell_pierce")) is not None:
+            # The larger of the two, never the sum: a scroll that already promises to go
+            # through most of a guard must not become a scroll that ignores armour twice.
+            #
+            # It pierces the raised GUARD as well as armour, and that half is where the
+            # value is. Armour reduction saturates at ARMOR_K = 100, so an ordinary
+            # opponent carries 3-7% of it and piercing that was worth +0.5 win points --
+            # a legendary rule measurably indistinguishable from carrying nothing. A
+            # Defend blocks 40-80% of one attack, and walking through that is a rule.
+            pierce = max(pierce, max(0.0, _fraction(value)))
+            guard_pierce = max(guard_pierce, max(0.0, _fraction(value)))
+        armor = derived[target_key]["reduction"] * max(0.0, 1.0 - min(1.0, pierce))
         raw *= 1.0 - armor
         impact, knocked_out, reflection_winner = apply_attack(
             source_key, target_key, max(1, round(raw)), number,
-            pierce_guard=max(0.0, float(effect.get("pierce_guard", 0) or 0)),
+            pierce_guard=guard_pierce,
             attack_types=attack_types,
         )
         total_damage[source_key] += impact
@@ -1339,8 +1500,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         attack_types=(MAGIC,), origin: str = "scroll",
     ) -> tuple[int, str | None]:
         op = str(effect.get("op") or "")
+        # Магия powers SCROLLS. A shield's Defend hook is the shield's own doing and keeps
+        # reading its wearer's swing, which is what its catalogue numbers were tuned
+        # against -- a defensive item must not quietly become a caster item.
+        power = (spell_power_now(source_key, number) if origin.startswith("scroll:")
+                 else derived[source_key]["damage"])
         if op == "damage":
-            return spell_damage(source_key, target_key, effect, number, attack_types)
+            return spell_damage(source_key, target_key, effect, number, attack_types, power)
         if op in {"burn", "weaken", "blind", "vulnerable", "stun"} \
                 and not harmful_status_allowed(target_key):
             return 0, None
@@ -1360,7 +1526,7 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
         elif op == "burn":
             ignite(
                 target_key, source_key,
-                max(1, round(derived[source_key]["damage"] * max(0.0, float(effect.get("amount", 0))))),
+                max(1, round(power * max(0.0, float(effect.get("amount", 0))))),
                 max(1, int(effect.get("turns", 1))),
                 attack_types, origin,
             )
@@ -1461,6 +1627,65 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     text=f"💧 {fighters[key].name} восстанавливает {healed} HP.",
                     is_action=False,
                 ))
+
+    def resolve_cast_passives(
+        source_key: str, target_key: str, number: int, impact: int,
+    ) -> str | None:
+        """Everything a magic weapon does BECAUSE a scroll was read.
+
+        Kept out of the cast itself so the transcript keeps the shape it always had: the
+        scroll's own line first, then one row for each passive that answered it. A dodged
+        scroll still counts as read -- the toll was paid and the barrier was woven -- but
+        nothing keyed to damage fires, because none was dealt.
+        """
+        casts_made[source_key] += 1
+        if _effect_value(effects[source_key], "mana_burn") is not None:
+            toll = max(1, round(max_hp[source_key] * max(0.0, _fraction(
+                _param(effects[source_key], "mana_burn", "toll", 6),
+            ))))
+            hp[source_key] = max(0.0, hp[source_key] - toll)
+            effect_round(number, source_key, target_key, "mana_burn", toll)
+            if hp[source_key] <= 0:
+                return target_key
+        if (value := _effect_value(effects[source_key], "focus_shift")) is not None:
+            cast_bonus[source_key] = max(cast_bonus[source_key], max(0.0, _fraction(value)))
+        if (value := _effect_value(effects[source_key], "spell_shield")) is not None:
+            barrier = max(1, round(max_hp[source_key] * max(0.0, _fraction(value))))
+            shields[source_key] = min(max_hp[source_key], shields[source_key] + barrier)
+            effect_round(number, source_key, target_key, "spell_shield", barrier)
+        if not impact:
+            return None
+        if (value := _effect_value(effects[source_key], "spell_siphon")) is not None:
+            before = hp[source_key]
+            hp[source_key] = min(max_hp[source_key], hp[source_key] + healed_amount(
+                source_key, impact * max(0.0, _fraction(value)),
+            ))
+            healed = round(hp[source_key] - before)
+            if healed:
+                effect_round(number, source_key, target_key, "spell_siphon", healed)
+        if (value := _effect_value(effects[source_key], "hex")) is not None \
+                and harmful_status_allowed(target_key):
+            share = max(0.0, _fraction(value))
+            put_skill_status(target_key, "weaken", share, max(
+                1, round(_param(effects[source_key], "hex", "turns", 1)),
+            ))
+            effect_round(number, source_key, target_key, "hex", round(share * 100))
+        if (value := _effect_value(effects[source_key], "double_cast")) is not None \
+                and casts_made[source_key] <= max(1, round(
+                    _param(effects[source_key], "double_cast", "casts", 1),
+                )):
+            echo_impact, echo_ko, echo_reflection = apply_attack(
+                source_key, target_key,
+                max(1, round(impact * max(0.0, _fraction(value)))), number,
+                attack_types=(MAGIC,),
+            )
+            total_damage[source_key] += echo_impact
+            effect_round(number, source_key, target_key, "double_cast", echo_impact, (MAGIC,))
+            if echo_reflection:
+                return echo_reflection
+            if echo_ko:
+                return source_key
+        return None
 
     def take_active_action(
         source_key: str, target_key: str, action: str, number: int,
@@ -1564,6 +1789,14 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                     derived[target_key]["dodge"] * derived[source_key]["accuracy"]
                     + skill_value(source_key, "blind"),
                 )
+                # A pierced scroll is harder to slip: armour and a raised guard are only
+                # half of what stops one, and the other half is this roll. At `dodge` 100
+                # the legendary lens simply cannot be dodged, which is what "безошибочное
+                # слово" says on the card.
+                if _effect_value(effects[source_key], "spell_pierce") is not None:
+                    miss_chance *= max(0.0, 1.0 - _fraction(_param(
+                        effects[source_key], "spell_pierce", "dodge", 0,
+                    )))
                 dodged = rng.random() < miss_chance
         impact = 0
         winner = None
@@ -1586,6 +1819,8 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                        + (f" — {impact} урона." if impact else ".")),
             attack_types=spell_attack_types,
         ))
+        if not winner:
+            winner = resolve_cast_passives(source_key, target_key, number, impact)
         tick_skill_state(source_key)
         return winner
 
@@ -1971,7 +2206,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
 
         # Set before the modifier block because a dodge skips that block entirely and the
         # classification still has to be right for whatever reaches apply_attack below.
-        basic_attack_types = (PHYSICAL, MAGIC) if attacker.weapon_enchanted else (PHYSICAL,)
+        # A magic weapon does not swing steel. Its ordinary attack is a spell -- that is
+        # what the wand, the staff and the grimoire ARE -- so it is tagged accordingly and
+        # takes the consequences in both directions: it goes straight through the ghost
+        # that absorbs plain steel, and it is exactly what a ward, an antimage and every
+        # `spell_thorns` in the catalogue are waiting for. A hybrid is half of each, like
+        # a runed blade. Everything else stays steel unless a rune says otherwise.
+        basic_attack_types = _swing_attack_types(attacker)
         # Set alongside basic_attack_types for the same reason: a dodge must leave it at
         # its default (no heal) rather than skip past an undefined name.
         steel_heal = 0
@@ -2003,6 +2244,12 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
                 multiplier += afterimage_bonus[attacker_key]
                 afterimage_bonus[attacker_key] = 0.0
                 effect_round(round_number, attacker_key, defender_key, "afterimage")
+            # Spent on the first swing after a cast, whether that swing lands or not: the
+            # focus is the leftover of a finished spell, not a stored crit.
+            if cast_bonus[attacker_key]:
+                multiplier += cast_bonus[attacker_key]
+                cast_bonus[attacker_key] = 0.0
+                effect_round(round_number, attacker_key, defender_key, "focus_shift")
             if _effect_value(effects[attacker_key], "battle_cry") is not None and attack_no == 0:
                 multiplier += max(0, _fraction(_effect_value(effects[attacker_key], "battle_cry") or 0))
             # Initiative on its own is worth nothing measurable -- leadership alternates
@@ -2153,8 +2400,16 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             # physical resistance is then applied to the STEEL half alone -- which is the
             # whole point: a rune is what lets a blade hurt something physical damage
             # cannot touch at all (see the dungeon's spells_only boss).
-            if attacker.weapon_enchanted:
-                damage = max(1, round(damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
+            if MAGIC in basic_attack_types and PHYSICAL not in basic_attack_types:
+                # A pure spell swing: no steel in it at all, so the physical resistance
+                # this block exists to apply simply does not reach it.
+                pass
+            elif attacker.weapon_enchanted or MAGIC in basic_attack_types:
+                # A runed blade, or a hybrid weapon: half steel, half spell. Only the
+                # steel half meets the defender's physical resistance. The rune's power
+                # bonus is a rune's, so a hybrid weapon does not collect it.
+                if attacker.weapon_enchanted:
+                    damage = max(1, round(damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
                 magic_half = round(damage * C.RUNE_WEAPON_MAGIC_SHARE)
                 steel_half = damage - magic_half
                 damage = magic_half + max(0, round(
@@ -2282,6 +2537,11 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             # burn or bleed ticks: those arrive several times a round and would wind the
             # compressor far past anything the number on the item suggests.
             hits_taken[defender_key] += 1
+            # One rune per landed swing, on the same footing as pressure above and for the
+            # same reason: burn and bleed ticks arrive several times a round and would
+            # charge this far past the number printed on the weapon.
+            if _effect_value(effects[attacker_key], "runic_charge") is not None:
+                charge_stacks[attacker_key] += 1
             if (value := _effect_value(effects[attacker_key], "reap")) is not None:
                 # A share of what the opponent has already LOST, not of what this blow
                 # dealt: the drip pays nothing against a healthy enemy and pays enormously

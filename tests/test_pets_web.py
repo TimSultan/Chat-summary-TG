@@ -2485,7 +2485,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self._tame(OPPONENT, name="Соперник")
         # Freeze one effect-bearing item into the replay. Its explanatory copy is part of
         # the audit contract just as much as the stats and rounds are.
-        echo_item = next(i for i in C.ITEMS if dict(i.effect or {}).get("code") == "echo_strike")
+        echo_item = next(
+            i for i in C.ITEMS
+            if dict(i.effect or {}).get("code") == "echo_strike"
+            and dict(i.effect or {}).get("value") == 100
+        )
         stored = pets._load(CHAT)
         hero = stored["pets"][str(PLAYER["id"])]
         hero["inventory"].append(echo_item.code)
@@ -2508,7 +2512,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["max_hp"], live["max_hp"])
         self.assertEqual(again["fighters"], live["fighters"])
         hero_header = live["fighters"][str(PLAYER["id"])]
-        self.assertEqual(set(hero_header["stats"]), {"strength", "health", "agility", "luck", "armor"})
+        self.assertEqual(
+            set(hero_header["stats"]),
+            {"strength", "health", "agility", "luck", "magic", "armor"},
+        )
         self.assertTrue(hero_header["portrait"].endswith(f"/{PLAYER['id']}.jpg"))
         displayed = next(i for i in hero_header["items"] if i["code"] == echo_item.code)
         self.assertEqual(displayed["description"], echo_item.description)

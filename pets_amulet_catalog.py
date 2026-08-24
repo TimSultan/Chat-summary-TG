@@ -117,6 +117,20 @@ EFFECT_HOOKS: Final = {
     "hunger": "round_start: uncapped damage growth, paid in maximum health every turn",
     "soul_debt": "on_lethal_once: survive at a share of maximum health, then take double",
     "recoil": "on_critical: a far larger critical that costs the following turn",
+    # Magic weapons only. Every one of these reads the caster's spell power or their
+    # scroll loadout, so a fighter with four empty slots gets nothing from any of them.
+    "arcane_surge": "fight_start: multiply spell power for the whole fight",
+    "runic_charge": "after_hit: each landed swing raises spell power, up to a cap",
+    "arcane_battery": "on_cast: spell power grows every round, uncapped",
+    "mana_burn": "on_cast: much stronger spells, paid in own health per scroll",
+    "spell_siphon": "after_spell_damage: heal for a share of the spell's impact",
+    "spell_pierce": "on_spell: ignore a share of enemy armour reduction",
+    "hex": "after_spell_damage: weaken the opponent's next attack",
+    "focus_shift": "after_cast: the next ordinary attack gains damage",
+    "spell_shield": "after_cast: gain a barrier worth a share of maximum health",
+    "ward": "on_magic_damage_taken: reduce incoming magical damage",
+    "spell_thorns": "on_magic_damage_taken: reflect a share back at the caster",
+    "double_cast": "after_first_cast: read the scroll a second time for a share",
 }
 
 
