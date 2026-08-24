@@ -510,6 +510,58 @@ class PhoenixScrollTests(unittest.TestCase):
         state["phase_state"], state["vulnerable"] = phoenix.VULNERABLE, "full"
         self.assertNotIn(phoenix.MAGIC, offered(state))
 
+    def test_the_open_phoenix_is_a_moment_the_loadout_can_reach(self):
+        """✨ asks WHICH scroll everywhere it is offered, the window included.
+
+        It used to resolve on the press here, which made the button two different buttons
+        behind one label: the player learned which one they had pressed by watching a turn
+        leave. Worse, the best moment in the fight was the one moment a heal, a barrier or
+        a cleanse could not be spent -- so the shelf was unreachable exactly when it was
+        most worth reading.
+        """
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "wave")
+        state["phase_state"], state["vulnerable"] = phoenix.VULNERABLE, "full"
+        state["burn"], state["hero_hp"] = 3, 400
+        opened = phoenix.take(state, phoenix.MAGIC, seed=1)
+
+        self.assertEqual([row["code"] for row in phoenix.actions(opened)],
+                         ["spell_1", "spell_2", "spell_3", "spell_4", phoenix.CANCEL])
+        # Opening is still not a turn: the window is intact and nothing has been spent.
+        self.assertEqual(opened["phase_state"], phoenix.VULNERABLE)
+        self.assertEqual(opened["actions_taken"], state["actions_taken"])
+        self.assertEqual(opened["spent_spells"], [])
+
+        spark = phoenix.take(opened, "spell_1", seed=1)
+        self.assertEqual(spark["spent_spells"], [1])
+        self.assertLess(spark["boss_hp"], state["boss_hp"])
+
+        # And a scroll that heals rather than strikes does its own work here in full.
+        bandage = phoenix.take(opened, "spell_2", seed=1)
+        self.assertEqual(bandage["spent_spells"], [2])
+        self.assertGreater(bandage["hero_hp"], state["hero_hp"])
+        sand = phoenix.take(opened, "spell_3", seed=1)
+        self.assertEqual(sand["burn"], 0)
+
+    def test_the_first_wing_of_the_double_never_offers_a_scroll_to_throw_away(self):
+        """That press resolves nothing, so a scroll spent into it strikes no one.
+
+        The first wing only records whether the hero stepped clear; everything lands on the
+        mirrored second one. Weapon and shield can be wasted there for free and so they
+        stay on offer -- but a scroll is one of four for the whole encounter, and it would
+        have left the shelf having healed against no incoming hit and hit no boss.
+        """
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "double_wing", "right")
+        self.assertNotIn(phoenix.MAGIC, offered(state))
+        self.assertIn(phoenix.ATTACK, offered(state))
+        with self.assertRaises(ValueError):
+            phoenix.take(state, phoenix.MAGIC, seed=1)
+
+        # It comes straight back for the wing that actually answers.
+        second = phoenix.take(state, phoenix.LEFT, seed=1)
+        self.assertEqual(int(second["step"]), 2)
+        self.assertIn(phoenix.MAGIC, offered(second))
+        self.assertEqual(second["spent_spells"], [])
+
     def test_only_a_scroll_that_deals_damage_interrupts_a_charging_phoenix(self):
         """This is why the loadout is read next to the telegraph rather than after it.
 

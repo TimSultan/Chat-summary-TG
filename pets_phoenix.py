@@ -728,21 +728,15 @@ def _has_loadout(state: dict) -> bool:
 def _picker_opens(state: dict) -> bool:
     """Whether ✨ opens the shelf rather than resolving on its own.
 
-    Not in a vulnerability window: there the Phoenix is already open and ✨ is the hero
-    pouring raw power into the gap, not unrolling one of four scrolls.
+    It opens EVERYWHERE the button is offered, and that consistency is the rule rather
+    than a convenience. A button that usually asks which scroll and occasionally spends
+    the turn instead is the same button doing two different things behind one label, and
+    the player finds out which by losing a turn to it.
 
-    Not on the first wing of the double either. That step resolves nothing -- it only
-    remembers whether the player stepped clear -- so a scroll spent there would be spent
-    on no answer at all.
+    The only state where ✨ still resolves on its own is a fighter with no scrolls at all,
+    where there is nothing to choose between and the button is raw spell power.
     """
-    if not _has_loadout(state) or not _unspent(state):
-        return False
-    if str(state.get("phase_state") or "") == VULNERABLE:
-        return False
-    attack = _ATTACKS.get(str(state.get("attack") or "")) or {}
-    if attack.get("kind") == "double" and int(state.get("step", 1) or 1) == 1:
-        return False
-    return True
+    return bool(_has_loadout(state) and _unspent(state))
 
 
 def _magic_offered(state: dict) -> bool:
@@ -755,6 +749,16 @@ def _magic_offered(state: dict) -> bool:
     """
     hero = state.get("hero") or {}
     if not hero.get("has_magic"):
+        return False
+    # The first wing of the double is the one press that resolves nothing: it only records
+    # whether the hero stepped clear, and everything lands on the mirrored second wing. A
+    # scroll spent into it therefore struck no one and healed against no incoming hit --
+    # the shelf was one lighter and the fight had not moved. Weapon and shield can be
+    # thrown away there for free, so they stay; the scroll leaves and comes straight back
+    # for the wing that actually answers.
+    attack = _ATTACKS.get(str(state.get("attack") or "")) or {}
+    if (attack.get("kind") == "double" and int(state.get("step", 1) or 1) == 1
+            and str(state.get("phase_state") or "") == TELEGRAPH):
         return False
     return bool(_unspent(state)) if _has_loadout(state) else True
 
@@ -819,7 +823,7 @@ def take(state: dict, action: str, *, seed: int | None = None) -> dict:
     nxt["actions_taken"] = int(nxt.get("actions_taken", 0) or 0) + 1
     phase_state = str(nxt.get("phase_state") or "")
     if phase_state == VULNERABLE:
-        _resolve_window(nxt, code, rng)
+        _resolve_window(nxt, code, rng, spell)
     elif phase_state == REBIRTH:
         _resolve_rebirth(nxt, code, rng, spell)
     else:
@@ -1269,7 +1273,8 @@ def _resolve_telegraph(state: dict, action: str, rng: random.Random,
     _advance(state, _apply(state, row, action, rng, spell), rng)
 
 
-def _resolve_window(state: dict, action: str, rng: random.Random) -> None:
+def _resolve_window(state: dict, action: str, rng: random.Random,
+                    spell: dict | None = None) -> None:
     """A guaranteed blow at an open Phoenix, with no answer coming back.
 
     Burning does not tick here on purpose: a window is time stolen from the boss, not a
@@ -1279,9 +1284,25 @@ def _resolve_window(state: dict, action: str, rng: random.Random) -> None:
     multiplier = (VULNERABLE_FULL_MULTIPLIER if str(state.get("vulnerable")) == "full"
                   else VULNERABLE_SMALL_MULTIPLIER)
     kind = "magic" if action == MAGIC else "physical"
-    dealt = _hero_hit(state, rng, _hit(kind, 1.0), multiplier=multiplier)
-    state["boss_hp"] = max(0, int(state["boss_hp"]) - dealt)
-    state["log"].append(f"💥 Открытый удар: Феникс теряет {dealt} здоровья.")
+    # A scroll poured into an open Phoenix is that scroll: its own damage multiplier
+    # rides the window's, and everything else it does -- the heal, the barrier, the
+    # cleanse -- still happens. Spending one here used to be impossible, which quietly
+    # made the best moment in the fight the one moment the loadout could not reach.
+    share = float((spell or {}).get("damage", 0.0) or 0.0) if spell else 1.0
+    if spell is not None:
+        _cast_line(state, spell)
+        _spell_support(state, spell)
+        if spell.get("cleanse") and int(state.get("burn", 0) or 0):
+            state["log"].append(f"🔥 Горение снято (-{int(state['burn'])}).")
+            state["burn"] = 0
+    dealt = 0
+    if share > 0:
+        dealt = _hero_hit(state, rng, _hit(kind, share), multiplier=multiplier)
+        state["boss_hp"] = max(0, int(state["boss_hp"]) - dealt)
+    state["log"].append(
+        f"💥 Открытый удар: Феникс теряет {dealt} здоровья." if dealt
+        else "💥 Открытый ход: удара не было."
+    )
     state["vulnerable"] = ""
     _advance(state, "", rng)
 
