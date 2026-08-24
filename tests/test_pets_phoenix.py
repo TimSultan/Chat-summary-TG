@@ -38,6 +38,45 @@ def hero(**overrides) -> dict:
     return base
 
 
+def loadout(**swaps) -> list:
+    """A plausible four-slot loadout, in the shape pets.phoenix_hero_profile hands over.
+
+    One striker, one scroll that keeps the hero standing, one that puts the fire out and
+    one that buys an opening -- which is the spread the fight is balanced against.
+    """
+    rows = [
+        {"slot": 1, "code": "scroll_arcane_spark", "name": "Искра эфира", "icon": "⚡",
+         "ultimate": False, "damage": 1.45, "heal": 0.0, "shield": 0.0, "burn": 0.0,
+         "lifesteal": 0.0, "cleanse": False, "stun": False},
+        {"slot": 2, "code": "scroll_field_bandage", "name": "Полевая перевязка",
+         "icon": "🩹", "ultimate": False, "damage": 0.0, "heal": 0.30, "shield": 0.10,
+         "burn": 0.0, "lifesteal": 0.0, "cleanse": False, "stun": False},
+        {"slot": 3, "code": "scroll_time_sand", "name": "Песок времени", "icon": "⌛",
+         "ultimate": False, "damage": 0.0, "heal": 0.18, "shield": 0.0, "burn": 0.0,
+         "lifesteal": 0.0, "cleanse": True, "stun": False},
+        {"slot": 4, "code": "scroll_gravity_thread", "name": "Нить гравитации",
+         "icon": "🪐", "ultimate": False, "damage": 0.80, "heal": 0.0, "shield": 0.0,
+         "burn": 0.0, "lifesteal": 0.0, "cleanse": False, "stun": True},
+    ]
+    for slot, changes in swaps.items():
+        rows[int(slot.rsplit("_", 1)[-1]) - 1].update(changes)
+    return rows
+
+
+def armed(**overrides) -> dict:
+    """The same pet, carrying scrolls."""
+    return hero(spells=loadout(), **overrides)
+
+
+def at_telegraph(state: dict, code: str, side: str = "") -> dict:
+    """Park a fight on one named telegraph, so a move can be tested rather than rolled."""
+    state["phase_state"], state["attack"] = phoenix.TELEGRAPH, code
+    state["side"], state["step"] = side, 1
+    state["hero_hp"] = state["hero_max_hp"]
+    state["mistake_streak"] = 0
+    return state
+
+
 def boss(**overrides) -> dict:
     """The floor-5 encounter's real numbers, read once out of pets.phoenix_boss_profile."""
     base = {"name": "Феникс пепельных залов", "max_hp": 2552, "damage": 296,
@@ -376,6 +415,228 @@ class PhoenixFightTests(unittest.TestCase):
         self.assertEqual(phoenix.public(reborn)["boss_name"], phoenix.PHASE_2_NAME)
         self.assertTrue(phoenix.public(reborn)["won"])
         self.assertEqual(phoenix.public(reborn)["telegraph"], "")
+
+
+class PhoenixScrollTests(unittest.TestCase):
+    """The loadout the player assembled, spent one scroll at a time inside the fight."""
+
+    def test_the_spell_button_opens_the_loadout_instead_of_resolving_the_turn(self):
+        """✨ names a shelf, not a spell.
+
+        Resolving on the press would be the generic unlimited cast wearing a new label;
+        the point is that the player has to say WHICH scroll, and that saying so costs one
+        of four for the entire encounter.
+        """
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "wave")
+        opened = phoenix.take(state, phoenix.MAGIC, seed=1)
+
+        self.assertEqual([row["code"] for row in phoenix.actions(opened)],
+                         ["spell_1", "spell_2", "spell_3", "spell_4", phoenix.CANCEL])
+        self.assertEqual(phoenix.actions(opened)[0]["label"], "⚡ Искра эфира")
+        self.assertEqual(phoenix.actions(opened)[-1]["label"],
+                         phoenix.ACTION_LABELS[phoenix.CANCEL])
+        # Nothing about the fight moved: same telegraph, same health, same turn.
+        self.assertEqual(opened["telegraph"], state["telegraph"])
+        self.assertEqual(opened["hero_hp"], state["hero_hp"])
+        self.assertEqual(opened["boss_hp"], state["boss_hp"])
+        self.assertEqual(opened["actions_taken"], state["actions_taken"])
+        self.assertEqual(opened["spent_spells"], [])
+
+    def test_backing_out_of_the_loadout_spends_nothing_and_returns_to_the_telegraph(self):
+        """Opening the shelf must be free, or reading it becomes a trap.
+
+        A player who opens the list to remind themselves what they brought has not
+        answered the telegraph yet, and must not be charged a scroll for looking.
+        """
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "dive")
+        opened = phoenix.take(state, phoenix.MAGIC, seed=1)
+        back = phoenix.take(opened, phoenix.CANCEL, seed=1)
+
+        self.assertEqual([row["code"] for row in phoenix.actions(back)], offered(state))
+        self.assertEqual(back["spent_spells"], [])
+        self.assertEqual(back["hero_hp"], state["hero_hp"])
+        self.assertEqual(back["boss_hp"], state["boss_hp"])
+        self.assertEqual(back["actions_taken"], state["actions_taken"])
+
+    def test_a_scroll_is_spent_once_for_the_whole_encounter_including_the_rebirth(self):
+        """Four casts have to cover two lives, or the loadout is not a decision.
+
+        The seam is where a per-fight resource quietly becomes a per-phase one, so a
+        scroll spent against the first Phoenix has to still be missing from the shelf when
+        the reborn one telegraphs.
+        """
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "wave")
+        state = phoenix.take(state, phoenix.MAGIC, seed=1)
+        state = phoenix.take(state, "spell_1", seed=1)
+        self.assertEqual(state["spent_spells"], [1])
+
+        state.update({"phase_state": phoenix.VULNERABLE, "vulnerable": "full",
+                      "boss_hp": 1, "hero_hp": state["hero_max_hp"]})
+        state = phoenix.take(state, phoenix.ATTACK, seed=1)
+        self.assertEqual(state["phase_state"], phoenix.REBIRTH)
+        for step in range(phoenix.REBIRTH_STEPS):
+            state["hero_hp"] = state["hero_max_hp"]
+            state = phoenix.take(state, perfect_answer(state), seed=step)
+
+        self.assertEqual(state["phase"], 2)
+        self.assertEqual(state["spent_spells"], [1])
+        opened = phoenix.take(state, phoenix.MAGIC, seed=1)
+        self.assertEqual([row["code"] for row in phoenix.actions(opened)],
+                         ["spell_2", "spell_3", "spell_4", phoenix.CANCEL])
+
+    def test_the_spell_button_disappears_once_the_last_scroll_is_gone(self):
+        """An empty shelf is the same position as a pet that never had one.
+
+        A button that opens an empty list is a dead end, and every telegraph that wants
+        magic keeps a non-magical answer precisely so the button can leave without closing
+        off a move.
+        """
+        state = phoenix.start(armed(), boss(), seed=5)
+        for slot in (1, 2, 3, 4):
+            at_telegraph(state, "wave")
+            self.assertIn(phoenix.MAGIC, offered(state))
+            state = phoenix.take(state, phoenix.MAGIC, seed=slot)
+            state = phoenix.take(state, f"spell_{slot}", seed=slot)
+        self.assertEqual(state["spent_spells"], [1, 2, 3, 4])
+
+        at_telegraph(state, "wave")
+        self.assertNotIn(phoenix.MAGIC, offered(state))
+        self.assertTrue(offered(state))
+        with self.assertRaises(ValueError):
+            phoenix.take(state, phoenix.MAGIC, seed=1)
+        with self.assertRaises(ValueError):
+            phoenix.take(state, "spell_1", seed=1)
+        # Including inside a window, where the spell button was the spell-power option.
+        state["phase_state"], state["vulnerable"] = phoenix.VULNERABLE, "full"
+        self.assertNotIn(phoenix.MAGIC, offered(state))
+
+    def test_only_a_scroll_that_deals_damage_interrupts_a_charging_phoenix(self):
+        """This is why the loadout is read next to the telegraph rather than after it.
+
+        «Накопление огня» is not answered, it is BROKEN -- and a bandage thrown at a bird
+        winding up breaks nothing, however well the player read the prose. If a heal
+        interrupted, the spell button would still be one press that answers everything.
+        """
+        base = at_telegraph(phoenix.start(armed(), boss(), seed=5), "gather")
+        opened = phoenix.take(base, phoenix.MAGIC, seed=1)
+
+        spark = phoenix.take(opened, "spell_1", seed=1)
+        self.assertEqual(spark["grade"], phoenix.PERFECT)
+        self.assertEqual(spark["phase_state"], phoenix.VULNERABLE)
+        self.assertLess(spark["boss_hp"], base["boss_hp"])
+        self.assertEqual(spark["hero_hp"], base["hero_hp"])
+
+        bandage = phoenix.take(opened, "spell_2", seed=1)
+        self.assertEqual(bandage["grade"], phoenix.BAD)
+        self.assertNotEqual(bandage["phase_state"], phoenix.VULNERABLE)
+        self.assertEqual(bandage["boss_hp"], base["boss_hp"])
+        self.assertLess(bandage["hero_hp"], base["hero_hp"])
+        # And it really was spent on that: the shelf is one shorter either way.
+        self.assertEqual(bandage["spent_spells"], [2])
+
+    def test_a_heal_scroll_restores_health_and_never_past_the_maximum(self):
+        """The reason to hold a scroll back is that it can undo a bad exchange."""
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "stance")
+        state["hero_hp"] = 400
+        opened = phoenix.take(state, phoenix.MAGIC, seed=1)
+        healed = phoenix.take(opened, "spell_2", seed=1)
+        self.assertGreater(healed["hero_hp"], 400)
+
+        full = at_telegraph(phoenix.start(armed(), boss(), seed=5), "stance")
+        topped = phoenix.take(phoenix.take(full, phoenix.MAGIC, seed=1), "spell_2", seed=1)
+        self.assertEqual(topped["hero_hp"], topped["hero_max_hp"])
+
+    def test_a_barrier_scroll_takes_the_edge_off_the_hit_that_lands_this_turn(self):
+        """A barrier is not health gained but damage that never arrives.
+
+        «Пикирование» answered with magic always connects, so it is the clean place to read
+        the difference between a scroll that only strikes and one that also absorbs.
+        """
+        barrier = loadout(slot_1={"damage": 0.0, "shield": 0.30, "heal": 0.0})
+        naked = loadout(slot_1={"damage": 0.0, "shield": 0.0, "heal": 0.0})
+        losses = []
+        for spells in (naked, barrier):
+            state = at_telegraph(phoenix.start(hero(spells=spells), boss(), seed=5), "dive")
+            after = phoenix.take(phoenix.take(state, phoenix.MAGIC, seed=1), "spell_1", seed=1)
+            losses.append(state["hero_hp"] - after["hero_hp"])
+        self.assertGreater(losses[0], losses[1])
+        self.assertGreater(losses[0], 0)
+
+    def test_a_cleansing_scroll_puts_out_every_stack_of_burning(self):
+        """Горение is the memory of past mistakes, and a scroll is a way to buy it off."""
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "dive")
+        state["burn"] = phoenix.BURN_MAX_STACKS
+        cleaned = phoenix.take(phoenix.take(state, phoenix.MAGIC, seed=1), "spell_3", seed=1)
+        self.assertEqual(cleaned["burn"], 0)
+
+    def test_a_stunning_scroll_opens_a_window_out_of_a_move_that_had_none(self):
+        """A move the Phoenix never takes is an opening, and it is the SAME opening.
+
+        «Пепельное исчезновение» answered with magic opens nothing on its own, so a window
+        after it can only have come from the stun -- and it has to be the window the rest
+        of the fight already uses rather than a second kind of one.
+        """
+        state = at_telegraph(phoenix.start(armed(), boss(), seed=5), "vanish")
+        plain = phoenix.take(phoenix.take(state, phoenix.MAGIC, seed=1), "spell_1", seed=1)
+        self.assertNotEqual(plain["phase_state"], phoenix.VULNERABLE)
+
+        stunned = phoenix.take(phoenix.take(state, phoenix.MAGIC, seed=1), "spell_4", seed=1)
+        self.assertEqual(stunned["phase_state"], phoenix.VULNERABLE)
+        self.assertEqual(stunned["vulnerable"], phoenix.SPELL_STUN_WINDOW)
+        self.assertTrue(phoenix.public(stunned)["vulnerable"])
+        self.assertIn(phoenix.ATTACK, offered(stunned))
+
+    def test_a_hero_profile_without_a_loadout_keeps_the_plain_unlimited_spell(self):
+        """A fight already saved in somebody's run has no loadout on it.
+
+        Those states have to keep fighting exactly as they were: the spell button resolves
+        on the press, never opens a shelf, and never runs out mid-encounter.
+        """
+        state = phoenix.start(hero(), boss(), seed=4)
+        self.assertEqual(state["hero"]["spells"], [])
+        casts = 0
+        for press in range(200):
+            if phoenix.is_over(state):
+                break
+            if phoenix.MAGIC in offered(state):
+                casts += 1
+                after = phoenix.take(state, phoenix.MAGIC, seed=press)
+                self.assertFalse(after.get("picking"))
+                self.assertNotEqual(after["actions_taken"], state["actions_taken"])
+            state = phoenix.take(state, perfect_answer(state), seed=press)
+        self.assertGreater(casts, 4)
+        self.assertEqual(state["phase_state"], phoenix.VICTORY)
+
+    def test_a_spent_loadout_survives_the_trip_through_the_save_file(self):
+        """The shelf lives in the pet's saved run between two button presses.
+
+        A spent slot that came back as something json cannot express would hand the player
+        a scroll they had already cast.
+        """
+        state = phoenix.start(armed(), boss(), seed=6)
+        for step, slot in enumerate((1, 3)):
+            at_telegraph(state, "wave")
+            state = phoenix.take(state, phoenix.MAGIC, seed=step)
+            self.assertEqual(json.loads(json.dumps(state)), state)
+            state = phoenix.take(state, f"spell_{slot}", seed=step)
+            self.assertEqual(json.loads(json.dumps(state)), state)
+        self.assertEqual(state["spent_spells"], [1, 3])
+
+        revived = json.loads(json.dumps(state))
+        at_telegraph(revived, "wave")
+        opened = phoenix.take(revived, phoenix.MAGIC, seed=1)
+        self.assertEqual([row["code"] for row in phoenix.actions(opened)],
+                         ["spell_2", "spell_4", phoenix.CANCEL])
+
+    def test_an_armed_hero_still_has_to_read_the_telegraph(self):
+        """Scrolls are a loadout, not an answer key.
+
+        Four casts across twenty-odd turns cannot carry a player who ignores the prose, so
+        one button every turn has to keep losing exactly as it does bare-handed.
+        """
+        for seed in range(1, 6):
+            state, _ = play(armed(), boss(), always_attacks, seed=seed)
+            self.assertEqual(state["phase_state"], phoenix.DEFEAT, seed)
 
 
 if __name__ == "__main__":

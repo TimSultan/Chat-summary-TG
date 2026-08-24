@@ -40,6 +40,22 @@ Two damage channels, deliberately separate
 Nothing here scales to the hero. The Phoenix has the stats of its floor, so a strong pet
 genuinely does finish it faster -- but a per-window damage cap (`PHASE_DAMAGE_CAP_SHARE`)
 means it always takes several well-played windows rather than one enormous hit.
+
+Scrolls
+-------
+✨ is a shelf, not a spell. Pressing it opens the equipped loadout, and the scroll the
+player picks is what answers the telegraph. Each scroll is spendable ONCE across the whole
+encounter -- both lives and the rebirth between them -- so four casts have to cover a fight
+that runs twenty-odd turns, and "spend the heal now or save it" is a real question.
+
+The telegraph and the loadout are read together, never separately. The graded answer row
+says what the Phoenix does back and how well magic lands against this particular move; the
+scroll says what the hero actually did. That is why a barrier cast into a charging Phoenix
+does not interrupt it: the move asks for damage, and the loadout is what decides whether
+there was any.
+
+A hero profile with no `spells` at all keeps the plain, unlimited ✨ of a fight that was
+saved before a loadout was ever attached to it.
 """
 
 from __future__ import annotations
@@ -68,6 +84,12 @@ RIGHT: Final = "right"
 # The twin illusion is the one move that needs a target rather than a manner.
 ATTACK_LEFT: Final = "attack_left"
 ATTACK_RIGHT: Final = "attack_right"
+# ✨ names a shelf, not a spell: pressing it opens the loadout and one of the scrolls
+# below is the actual answer. `cancel` closes the shelf again.
+CANCEL: Final = "cancel"
+# Slot numbers rather than scroll codes, because these travel in a Telegram callback,
+# which is length-limited, and because a slot is stable while a saved fight is asleep.
+SPELL_PREFIX: Final = "spell_"
 
 ACTIONS: Final = (ATTACK, SHIELD, DODGE, MAGIC, LEFT, RIGHT, ATTACK_LEFT, ATTACK_RIGHT)
 
@@ -80,7 +102,13 @@ ACTION_LABELS: Final = {
     RIGHT: "Вправо →",
     ATTACK_LEFT: "⚔️ Бить левого",
     ATTACK_RIGHT: "⚔️ Бить правого",
+    CANCEL: "◀️ Назад",
 }
+
+
+def spell_code(slot: int) -> str:
+    return f"{SPELL_PREFIX}{int(slot)}"
+
 
 # --------------------------------------------------------------------------- grades
 # Three, not two. A fight where every telegraph has exactly one right button is a quiz;
@@ -149,6 +177,11 @@ FINAL_SUN_TRIGGER_SHARE: Final = 0.30
 REBIRTH_FLOOR_SHARE: Final = 0.45
 REBIRTH_STEPS: Final = 3
 
+# A scroll that stuns buys the largest opening the fight has. Those scrolls carry the
+# weakest damage in the catalogue, and a cast is one of four for the whole encounter, so
+# anything smaller would make the stun line strictly worse than a plain damage scroll.
+SPELL_STUN_WINDOW: Final = "full"
+
 LOG_LINES: Final = 6
 HISTORY_LINES: Final = 6
 
@@ -215,6 +248,11 @@ def _answer(
 #   directional -- the telegraph names the dangerous SIDE; the answer is the other one
 #   double      -- two directional telegraphs resolved together, the second always mirrored
 #   twins       -- pick a target rather than a manner
+#
+# `needs_damage` marks the moves that are being INTERRUPTED rather than merely answered.
+# Interrupting is a physical fact about the cast: a barrier or a bandage thrown at a
+# Phoenix that is winding up does not stop the wind-up, however well the player read the
+# telegraph. Those moves carry a `magic_soft` row for exactly that cast.
 _ATTACKS: Final = {
     "wave": {
         "name": "Ударная волна крыльями",
@@ -245,6 +283,7 @@ _ATTACKS: Final = {
         "phases": (1,),
         "weight": {1: 18},
         "buttons": (ATTACK, SHIELD, DODGE, MAGIC),
+        "needs_damage": True,
         "telegraph": "Пламя на перьях Феникса начинает тускнеть. Весь огонь словно "
                      "стягивается к его клюву.",
         "answers": {
@@ -254,6 +293,9 @@ _ATTACKS: Final = {
             MAGIC: _answer(PERFECT, hit=_hit("magic", 1.1), window="full",
                            note="Заклинание рвёт огонь у самого клюва. Феникс "
                                 "сбивается."),
+            "magic_soft": _answer(BAD, ordinary=1.05, mistake=MISTAKE_SMALL, burn=1,
+                                  note="Свиток раскрывается, но огня у клюва он не "
+                                       "трогает — пламя уходит в зал целиком."),
             SHIELD: _answer(FINE, ordinary=1.1, mistake=MISTAKE_SMALL,
                             note="Щит держит, но огонь заливает зал и прожигает "
                                  "всё вокруг."),
@@ -423,6 +465,7 @@ _ATTACKS: Final = {
         "phases": (2,),
         "weight": {2: 10},
         "buttons": (ATTACK, SHIELD, DODGE, MAGIC),
+        "needs_damage": True,
         "telegraph": "Феникс замирает. Угли вокруг его ран начинают разгораться "
                      "всё ярче.",
         "answers": {
@@ -431,6 +474,10 @@ _ATTACKS: Final = {
                                  "затянуть раны."),
             MAGIC: _answer(PERFECT, hit=_hit("magic", 1.25), window="small",
                            note="Заклинание гасит угли на ранах."),
+            "magic_soft": _answer(BAD, ordinary=0.3, mistake=MISTAKE_SMALL,
+                                  heal=DEVOUR_HEAL_SHARE,
+                                  note="Свиток не сбивает углей, и раны Феникса "
+                                       "спокойно затягиваются."),
             SHIELD: _answer(BAD, ordinary=0.3, mistake=MISTAKE_SMALL,
                             heal=DEVOUR_HEAL_SHARE,
                             note="Пока герой стоит за щитом, раны Феникса "
@@ -471,6 +518,7 @@ _ATTACKS: Final = {
         "phases": (),          # never rolled; scheduled by _pick_attack near the end
         "weight": {},
         "buttons": (ATTACK, SHIELD, DODGE, MAGIC),
+        "needs_damage": True,
         "telegraph": "Всё пламя в зале внезапно гаснет. Феникс опускает голову. "
                      "Даже пепел перестаёт двигаться.",
         "answers": {
@@ -480,6 +528,9 @@ _ATTACKS: Final = {
             MAGIC: _answer(PERFECT, hit=_hit("magic", 1.35), window="full",
                            note="Заклинание бьёт в темноту и сбивает то, что "
                                 "Феникс собирал."),
+            "magic_soft": _answer(BAD, ordinary=1.15, mistake=MISTAKE_SERIOUS, burn=1,
+                                  note="Свиток вспыхивает в темноте и гаснет впустую. "
+                                       "Свет возвращается разом."),
             SHIELD: _answer(FINE, ordinary=0.9, mistake=MISTAKE_SERIOUS, burn=1,
                             note="Свет возвращается разом. Щит выдерживает, "
                                  "рука за ним — нет."),
@@ -536,6 +587,45 @@ _REBIRTH_SEQUENCE: Final = ("core_vulnerable", "core_vulnerable", "core_burst")
 
 
 # ------------------------------------------------------------------------- профили
+def _spell_profile(row: dict, index: int) -> dict:
+    """One equipped scroll, clamped to the fields this engine spends.
+
+    Every share is read defensively: the catalogue grows, and a scroll effect this fight
+    has no answer for must land as "does nothing" rather than as a crash mid-encounter.
+    """
+    row = dict(row or {})
+    return {
+        "slot": max(1, int(row.get("slot", index) or index)),
+        "code": str(row.get("code") or ""),
+        "name": str(row.get("name") or "Свиток"),
+        "icon": str(row.get("icon") or "✨"),
+        "ultimate": bool(row.get("ultimate")),
+        "damage": max(0.0, float(row.get("damage", 0.0) or 0.0)),
+        "heal": max(0.0, float(row.get("heal", 0.0) or 0.0)),
+        "shield": max(0.0, float(row.get("shield", 0.0) or 0.0)),
+        "burn": max(0.0, float(row.get("burn", 0.0) or 0.0)),
+        "lifesteal": min(1.0, max(0.0, float(row.get("lifesteal", 0.0) or 0.0))),
+        "cleanse": bool(row.get("cleanse")),
+        "stun": bool(row.get("stun")),
+    }
+
+
+def _spell_list(rows) -> list[dict]:
+    """The loadout in slot order, one scroll per slot.
+
+    A duplicated slot number would mean two buttons that spend each other, so the first
+    row to claim a slot keeps it.
+    """
+    spells, seen = [], []
+    for index, row in enumerate(rows or (), start=1):
+        spell = _spell_profile(row, index)
+        if spell["slot"] in seen:
+            continue
+        seen.append(spell["slot"])
+        spells.append(spell)
+    return sorted(spells, key=lambda spell: spell["slot"])
+
+
 def _hero_profile(hero: dict) -> dict:
     """The hero's numbers, clamped into ranges the engine can reason about.
 
@@ -553,6 +643,11 @@ def _hero_profile(hero: dict) -> dict:
         "reduction": min(0.90, max(0.0, float(hero.get("reduction", 0.0) or 0.0))),
         "guard": min(0.80, max(0.10, float(hero.get("guard", 0.40) or 0.40))),
         "has_magic": bool(hero.get("has_magic", False)),
+        # Empty means the caller sent no loadout -- a fight saved before loadouts existed,
+        # or a harness that only cares about the numbers -- and that hero keeps the plain
+        # unlimited ✨ rather than losing the button mid-encounter. A pet with genuinely no
+        # scrolls is already covered by `has_magic`.
+        "spells": _spell_list(hero.get("spells")),
         "level": max(1, int(hero.get("level", 1) or 1)),
     }
 
@@ -602,6 +697,12 @@ def start(hero: dict, boss: dict, *, seed: int | None = None) -> dict:
         "pending": "",
         "history": [],
         "used": [],
+        # Slot numbers, not scroll codes: the loadout may hold the same scroll twice, and
+        # only the slot that was actually pressed is the one that burns.
+        "spent_spells": [],
+        # Whether the scroll shelf is open. It rides on the state rather than on the
+        # phase, so the telegraph stays on screen while the player reads their loadout.
+        "picking": False,
         "rebirth": {"step": 0, "core_damage": 0, "burst": ""},
         "telegraph": "",
         "scene": SCENE_INTRO,
@@ -613,25 +714,75 @@ def start(hero: dict, boss: dict, *, seed: int | None = None) -> dict:
     return state
 
 
+def _unspent(state: dict) -> list[dict]:
+    """The equipped scrolls still on the shelf, in slot order."""
+    spent = [int(slot) for slot in (state.get("spent_spells") or [])]
+    return [dict(spell) for spell in ((state.get("hero") or {}).get("spells") or [])
+            if int(spell.get("slot", 0) or 0) not in spent]
+
+
+def _has_loadout(state: dict) -> bool:
+    return bool(((state.get("hero") or {}).get("spells") or []))
+
+
+def _picker_opens(state: dict) -> bool:
+    """Whether ✨ opens the shelf rather than resolving on its own.
+
+    Not in a vulnerability window: there the Phoenix is already open and ✨ is the hero
+    pouring raw power into the gap, not unrolling one of four scrolls.
+
+    Not on the first wing of the double either. That step resolves nothing -- it only
+    remembers whether the player stepped clear -- so a scroll spent there would be spent
+    on no answer at all.
+    """
+    if not _has_loadout(state) or not _unspent(state):
+        return False
+    if str(state.get("phase_state") or "") == VULNERABLE:
+        return False
+    attack = _ATTACKS.get(str(state.get("attack") or "")) or {}
+    if attack.get("kind") == "double" and int(state.get("step", 1) or 1) == 1:
+        return False
+    return True
+
+
+def _magic_offered(state: dict) -> bool:
+    """Whether ✨ is on the table at all.
+
+    A pet with no scrolls has nothing to cast, and a pet that has spent every scroll is in
+    exactly the same position -- so the button leaves rather than becoming a dead end.
+    Every move that wants ✨ keeps a second answer that is at least safe, which is what
+    lets the button vanish without ever closing off a telegraph.
+    """
+    hero = state.get("hero") or {}
+    if not hero.get("has_magic"):
+        return False
+    return bool(_unspent(state)) if _has_loadout(state) else True
+
+
 def actions(state: dict) -> tuple[dict, ...]:
     """What the player may press right now, as {"code", "label"} rows.
 
     Direction buttons appear only for the moves that are about direction. Offering them
     every turn would turn a readable telegraph into a coin flip.
+
+    With the shelf open the rows are the unspent scrolls themselves. Both clients draw
+    whatever comes back here verbatim, so the picker needs nothing else to exist.
     """
     state = state or {}
     phase_state = str(state.get("phase_state") or "")
     if phase_state in (VICTORY, DEFEAT):
         return ()
+    if state.get("picking") and _picker_opens(state):
+        rows = [{"code": spell_code(spell["slot"]),
+                 "label": f"{spell['icon']} {spell['name']}"} for spell in _unspent(state)]
+        rows.append({"code": CANCEL, "label": ACTION_LABELS[CANCEL]})
+        return tuple(rows)
     if phase_state == VULNERABLE:
         codes = [ATTACK, MAGIC]
     else:
         attack = _ATTACKS.get(str(state.get("attack") or ""))
         codes = list(attack["buttons"]) if attack else [ATTACK, SHIELD, DODGE, MAGIC]
-    if not ((state.get("hero") or {}).get("has_magic")):
-        # A pet with no scrolls has no spell to cast, and every move that wants ✨ has a
-        # second answer that is at least safe -- so removing the button never removes the
-        # only way through a telegraph.
+    if not _magic_offered(state):
         codes = [code for code in codes if code != MAGIC]
     return tuple({"code": code, "label": ACTION_LABELS[code]} for code in codes)
 
@@ -646,6 +797,21 @@ def take(state: dict, action: str, *, seed: int | None = None) -> dict:
     code = str(action or "")
     if code not in {row["code"] for row in actions(nxt)}:
         raise ValueError("Это действие сейчас недоступно.")
+    # Opening and closing the shelf is navigation, not a turn: the Phoenix does not move,
+    # nothing burns, nothing is graded, and the previous outcome stays on screen under a
+    # telegraph the player is still answering.
+    if code == MAGIC and _picker_opens(nxt):
+        nxt["picking"] = True
+        return nxt
+    if code == CANCEL:
+        nxt["picking"] = False
+        return nxt
+    nxt["picking"] = False
+    spell = _spend_spell(nxt, code)
+    if spell is not None:
+        # From here the cast IS the ✨ answer. The whole telegraph, grading and window
+        # machinery reads it as such; only what the hero did differs.
+        code = MAGIC
     rng = random.Random(seed)
     nxt["log"] = []
     nxt["scene"] = ""
@@ -655,11 +821,24 @@ def take(state: dict, action: str, *, seed: int | None = None) -> dict:
     if phase_state == VULNERABLE:
         _resolve_window(nxt, code, rng)
     elif phase_state == REBIRTH:
-        _resolve_rebirth(nxt, code, rng)
+        _resolve_rebirth(nxt, code, rng, spell)
     else:
-        _resolve_telegraph(nxt, code, rng)
+        _resolve_telegraph(nxt, code, rng, spell)
     nxt["log"] = nxt["log"][-LOG_LINES:]
     return nxt
+
+
+def _spend_spell(state: dict, code: str) -> dict | None:
+    """Take the chosen scroll off the shelf for good, or None if this was not a cast."""
+    if not code.startswith(SPELL_PREFIX):
+        return None
+    wanted = code[len(SPELL_PREFIX):]
+    for spell in _unspent(state):
+        if str(spell["slot"]) == wanted:
+            state["spent_spells"] = [int(slot) for slot in (state.get("spent_spells") or [])]
+            state["spent_spells"].append(int(spell["slot"]))
+            return spell
+    raise ValueError("Этот свиток уже использован.")
 
 
 def public(state: dict) -> dict:
@@ -777,9 +956,26 @@ def _other_side(side: str) -> str:
 
 
 # --------------------------------------------------------------------------- оценка
-def _grade(state: dict, action: str) -> dict:
-    """The answer row for what the player just pressed."""
+def _bites(spell: dict | None) -> bool:
+    """Whether this cast actually hurts the Phoenix.
+
+    A cast with no loadout behind it is the plain ✨ of a fight saved before loadouts, and
+    that one has always bitten.
+    """
+    if spell is None:
+        return True
+    return float(spell.get("damage", 0) or 0) > 0 or float(spell.get("burn", 0) or 0) > 0
+
+
+def _grade(state: dict, action: str, spell: dict | None = None) -> dict:
+    """The answer row for what the player just pressed.
+
+    The loadout is read here, alongside the telegraph, because a move that is being
+    interrupted cares what the cast was made of and not how well it was timed.
+    """
     attack = _ATTACKS[str(state.get("attack") or "")]
+    if action == MAGIC and attack.get("needs_damage") and not _bites(spell):
+        return attack["answers"]["magic_soft"]
     kind = attack["kind"]
     answers = attack["answers"]
     side = str(state.get("side") or "")
@@ -807,11 +1003,15 @@ def _dodged(action: str, danger: str) -> bool:
 
 # --------------------------------------------------------------------------- урон
 def _hero_hit(state: dict, rng: random.Random, hit: dict, *, multiplier: float = 1.0,
-              cap_hp: int | None = None) -> int:
+              cap_hp: int | None = None, spent: int = 0) -> int:
     """One blow from the hero, capped at a share of the CURRENT phase's bar.
 
     The cap is what keeps "a strong pet finishes faster" from becoming "a strong pet
     deletes a phase in one press": gear buys fewer windows, never zero.
+
+    `spent` is what the same exchange has already removed. A scroll that strikes and then
+    burns is still ONE exchange, so the second half draws on what the first left of the
+    cap rather than getting a fresh one.
     """
     hero = state["hero"]
     base = hero["spell_power"] if hit.get("kind") == "magic" else hero["damage"]
@@ -819,8 +1019,10 @@ def _hero_hit(state: dict, rng: random.Random, hit: dict, *, multiplier: float =
     if rng.random() < hero["crit"]:
         raw *= hero["crit_power"]
         state["log"].append("Критический удар.")
-    ceiling = max(1, round((cap_hp or state["boss_max_hp"]) * PHASE_DAMAGE_CAP_SHARE))
-    return max(1, min(round(raw), ceiling))
+    ceiling = round((cap_hp or state["boss_max_hp"]) * PHASE_DAMAGE_CAP_SHARE) - max(0, spent)
+    if spent and ceiling <= 0:
+        return 0
+    return max(1, min(round(raw), max(1, ceiling)))
 
 
 def _ordinary_damage(state: dict, share: float, *, shielded: bool, pierces: bool) -> float:
@@ -856,6 +1058,87 @@ def _hurt_hero(state: dict, amount: float) -> int:
     return amount
 
 
+def _heal_hero(state: dict, amount: float) -> int:
+    before = int(state["hero_hp"])
+    state["hero_hp"] = min(int(state["hero_max_hp"]), before + max(0, round(amount)))
+    return int(state["hero_hp"]) - before
+
+
+def _spell_strike(state: dict, rng: random.Random, row: dict, spell: dict, *,
+                  core: bool = False) -> int:
+    """What the scroll does TO the Phoenix, and what that damage feeds back to the hero.
+
+    The two halves of the number come from different places on purpose. The answer row's
+    share says how well magic lands against this particular move -- a spell walks through
+    folded wings and barely finds a Phoenix that has already scattered into ash -- and the
+    scroll says how much magic there was. A scroll with no damage at all therefore does
+    nothing here however well the telegraph was read, which is the same fact the interrupt
+    rule is built on.
+    """
+    hit = row.get("hit") or {}
+    if not hit:
+        return 0
+    cap_hp = int(state["phase_2_max"]) if core else None
+    share = float(hit.get("share", 0.0) or 0.0)
+    dealt = 0
+
+    strike = share * float(spell.get("damage", 0.0) or 0.0)
+    if strike > 0:
+        dealt += _damage_boss(state, rng, strike, cap_hp=cap_hp, spent=dealt, core=core)
+
+    lifesteal = float(spell.get("lifesteal", 0.0) or 0.0)
+    if lifesteal > 0 and dealt > 0:
+        healed = _heal_hero(state, dealt * lifesteal)
+        if healed:
+            state["log"].append(f"🩸 Свиток возвращает {healed} здоровья.")
+
+    burn = float(spell.get("burn", 0.0) or 0.0)
+    if burn > 0:
+        burned = _damage_boss(state, rng, burn, cap_hp=cap_hp, spent=dealt, core=core,
+                              note="🔥 Пламя свитка догорает на Фениксе")
+        dealt += burned
+    return dealt
+
+
+def _damage_boss(state: dict, rng: random.Random, share: float, *, cap_hp: int | None,
+                 spent: int, core: bool, note: str = "") -> int:
+    """One magical blow, sent to whichever pool the Phoenix currently keeps its life in.
+
+    During the rebirth the bird has no bar: everything landed on the core is spent against
+    the SECOND life, which is why it is capped against that one.
+    """
+    if not core and int(state["boss_hp"]) <= 0:
+        return 0
+    dealt = _hero_hit(state, rng, _hit("magic", share), cap_hp=cap_hp, spent=spent)
+    if dealt <= 0:
+        return 0
+    if core:
+        rebirth = dict(state.get("rebirth") or {})
+        rebirth["core_damage"] = int(rebirth.get("core_damage", 0) or 0) + dealt
+        state["rebirth"] = rebirth
+        state["log"].append(f"Ядро тускнеет на {dealt}." if not note else f"{note}: {dealt}.")
+        return dealt
+    state["boss_hp"] = max(0, int(state["boss_hp"]) - dealt)
+    state["log"].append(f"Феникс теряет {dealt} здоровья." if not note else f"{note}: {dealt}.")
+    return dealt
+
+
+def _spell_support(state: dict, spell: dict | None) -> float:
+    """Everything the scroll does FOR the hero before the Phoenix's answer lands.
+
+    Returns the barrier, because that one is not a number the hero gains but a number the
+    incoming hit loses -- it has to be known before the hit is dealt, not after.
+    """
+    if not spell:
+        return 0.0
+    heal = float(spell.get("heal", 0.0) or 0.0)
+    if heal > 0:
+        healed = _heal_hero(state, state["hero"]["max_hp"] * heal)
+        if healed:
+            state["log"].append(f"💚 Свиток восстанавливает {healed} здоровья.")
+    return max(0.0, float(spell.get("shield", 0.0) or 0.0)) * state["hero"]["max_hp"]
+
+
 def _burn_tick(state: dict) -> None:
     """Burning bites at the top of the boss's turn, before the answer is graded.
 
@@ -869,19 +1152,41 @@ def _burn_tick(state: dict) -> None:
     state["log"].append(f"🔥 Горение (x{stacks}): -{dealt}")
 
 
-def _apply(state: dict, row: dict, action: str, rng: random.Random) -> None:
-    """Everything one graded answer does, in the order the player sees it happen."""
+def _cast_line(state: dict, spell: dict) -> None:
+    """The cast itself, and what it leaves on the shelf.
+
+    The count is in the log rather than on a button because it is a fact about the fight,
+    and the buttons already say which scrolls are left by simply not offering the rest.
+    """
+    left = len(_unspent(state))
+    tail = f"осталось свитков: {left}" if left else "свитки кончились"
+    state["log"].append(f"✨ {spell['icon']} {spell['name']} — {tail}.")
+
+
+def _apply(state: dict, row: dict, action: str, rng: random.Random,
+           spell: dict | None = None) -> str:
+    """Everything one graded answer does, in the order the player sees it happen.
+
+    Returns the vulnerability window this exchange opened, which a scroll can create out
+    of nothing: a stunned Phoenix loses its next move, and a lost move IS a window.
+    """
     attack = _ATTACKS.get(str(state.get("attack") or "")) or {}
     # Kept for the screen rather than for the maths: what the last answer was WORTH is
     # the one thing a player cannot work out from the numbers alone. A hero losing 2,073
     # health reads the same whether they mistimed a block or walked into the one move
     # that punishes blocking, and only the second is a lesson worth marking.
     state["grade"] = str(row.get("grade") or "")
+    # The cast is announced before the outcome: the player chose the scroll, and the note
+    # underneath is the Phoenix answering it.
+    if spell is not None:
+        _cast_line(state, spell)
     if row.get("note"):
         state["log"].append(str(row["note"]))
 
     hit = row.get("hit")
-    if hit and int(state["boss_hp"]) > 0:
+    if spell is not None:
+        _spell_strike(state, rng, row, spell)
+    elif hit and int(state["boss_hp"]) > 0:
         dealt = _hero_hit(state, rng, hit)
         state["boss_hp"] = max(0, int(state["boss_hp"]) - dealt)
         state["log"].append(f"Феникс теряет {dealt} здоровья.")
@@ -893,21 +1198,22 @@ def _apply(state: dict, row: dict, action: str, rng: random.Random) -> None:
         state["boss_hp"] = min(int(state["boss_max_hp"]), before + healed)
         state["log"].append(f"Феникс восстанавливает {state['boss_hp'] - before} здоровья.")
 
+    absorb = _spell_support(state, spell)
     ordinary = _ordinary_damage(
         state, float(row.get("ordinary", 0.0) or 0.0),
         shielded=(action == SHIELD), pierces=bool(attack.get("ignores_defence")),
     )
     mistake = _mistake_damage(state, float(row.get("mistake", 0.0) or 0.0))
     cap = state["hero"]["max_hp"] * SINGLE_HIT_HERO_CAP_SHARE
-    dealt = _hurt_hero(state, min(ordinary + mistake, cap))
+    incoming = min(ordinary + mistake, cap)
+    blocked = min(incoming, absorb)
+    if blocked >= 1:
+        state["log"].append(f"🛡 Барьер свитка гасит {round(blocked)} урона.")
+    dealt = _hurt_hero(state, incoming - blocked)
     if dealt:
         state["log"].append(f"Герой теряет {dealt} здоровья.")
 
-    if row.get("cleanse"):
-        cleared = min(int(state.get("burn", 0) or 0), int(row["cleanse"]))
-        if cleared:
-            state["burn"] = int(state["burn"]) - cleared
-            state["log"].append(f"🔥 Горение спадает (-{cleared}).")
+    _clear_burn(state, int(row.get("cleanse") or 0), spell)
     if row.get("burn"):
         state["burn"] = min(BURN_MAX_STACKS, int(state.get("burn", 0) or 0) + int(row["burn"]))
         state["log"].append(f"🔥 Горение: x{state['burn']}")
@@ -917,9 +1223,27 @@ def _apply(state: dict, row: dict, action: str, rng: random.Random) -> None:
     else:
         state["mistake_streak"] = 0
 
+    window = str(row.get("window") or "")
+    if spell and spell.get("stun"):
+        window = SPELL_STUN_WINDOW
+        state["log"].append("Феникс сбивается и пропускает движение.")
+    return window
+
+
+def _clear_burn(state: dict, rows_worth: int, spell: dict | None) -> None:
+    """Горение comes off. A scroll's cleanse takes all of it; an answer takes its share."""
+    stacks = int(state.get("burn", 0) or 0)
+    if not stacks:
+        return
+    cleared = stacks if (spell and spell.get("cleanse")) else min(stacks, max(0, rows_worth))
+    if cleared:
+        state["burn"] = stacks - cleared
+        state["log"].append(f"🔥 Горение спадает (-{cleared}).")
+
 
 # --------------------------------------------------------------------------- переходы
-def _resolve_telegraph(state: dict, action: str, rng: random.Random) -> None:
+def _resolve_telegraph(state: dict, action: str, rng: random.Random,
+                       spell: dict | None = None) -> None:
     _burn_tick(state)
     if int(state["hero_hp"]) <= 0:
         _defeat(state)
@@ -937,9 +1261,8 @@ def _resolve_telegraph(state: dict, action: str, rng: random.Random) -> None:
         state["log"].append("Второе крыло уже идёт следом.")
         return
 
-    row = _grade(state, action)
-    _apply(state, row, action, rng)
-    _advance(state, str(row.get("window") or ""), rng)
+    row = _grade(state, action, spell)
+    _advance(state, _apply(state, row, action, rng, spell), rng)
 
 
 def _resolve_window(state: dict, action: str, rng: random.Random) -> None:
@@ -1021,40 +1344,55 @@ def _set_core(state: dict) -> None:
     state["telegraph"] = str(_ATTACKS[state["attack"]]["telegraph"])
 
 
-def _resolve_rebirth(state: dict, action: str, rng: random.Random) -> None:
+def _resolve_rebirth(state: dict, action: str, rng: random.Random,
+                     spell: dict | None = None) -> None:
     _burn_tick(state)
     if int(state["hero_hp"]) <= 0:
         _defeat(state)
         return
 
-    rebirth = dict(state.get("rebirth") or {})
     code = str(state.get("attack") or "")
     row = _ATTACKS[code]["answers"][action]
+    if spell is not None:
+        _cast_line(state, spell)
     if row.get("note"):
         state["log"].append(str(row["note"]))
 
     hit = row.get("hit")
-    if hit:
+    if spell is not None:
+        _spell_strike(state, rng, row, spell, core=True)
+        if spell.get("stun"):
+            # The core does not move, so there is no movement to break. The scroll is
+            # still gone: the interlude is where a mistimed loadout gets punished.
+            state["log"].append("Ядро неподвижно — сбивать нечего.")
+    elif hit:
         # The core has no bar of its own; a hit here is spent on the SECOND life's health,
         # which is why it is capped against phase two rather than against phase one.
         dealt = _hero_hit(state, rng, hit, cap_hp=int(state["phase_2_max"]))
+        rebirth = dict(state.get("rebirth") or {})
         rebirth["core_damage"] = int(rebirth.get("core_damage", 0) or 0) + dealt
+        state["rebirth"] = rebirth
         state["log"].append(f"Ядро тускнеет на {dealt}.")
 
+    absorb = _spell_support(state, spell)
     ordinary = _ordinary_damage(state, float(row.get("ordinary", 0.0) or 0.0),
                                 shielded=(action == SHIELD), pierces=False)
     mistake = _mistake_damage(state, float(row.get("mistake", 0.0) or 0.0))
     cap = state["hero"]["max_hp"] * SINGLE_HIT_HERO_CAP_SHARE
-    dealt = _hurt_hero(state, min(ordinary + mistake, cap))
+    incoming = min(ordinary + mistake, cap)
+    blocked = min(incoming, absorb)
+    if blocked >= 1:
+        state["log"].append(f"🛡 Барьер свитка гасит {round(blocked)} урона.")
+    dealt = _hurt_hero(state, incoming - blocked)
     if dealt:
         state["log"].append(f"Герой теряет {dealt} здоровья.")
-    if row.get("cleanse") and int(state.get("burn", 0) or 0):
-        state["burn"] = max(0, int(state["burn"]) - int(row["cleanse"]))
+    _clear_burn(state, int(row.get("cleanse") or 0), spell)
     if row.get("burn"):
         state["burn"] = min(BURN_MAX_STACKS, int(state.get("burn", 0) or 0) + int(row["burn"]))
     state["mistake_streak"] = (int(state.get("mistake_streak", 0) or 0) + 1
                                if row.get("grade") == BAD else 0)
 
+    rebirth = dict(state.get("rebirth") or {})
     if code == "core_burst":
         rebirth["burst"] = str(row.get("grade") or "")
     rebirth["step"] = int(rebirth.get("step", 0) or 0) + 1

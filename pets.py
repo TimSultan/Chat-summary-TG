@@ -5163,6 +5163,50 @@ def is_phoenix(row: dict) -> bool:
     return bool(row) and row.get("boss") and row.get("gimmick") == PHOENIX_GIMMICK
 
 
+# The Phoenix fight takes a hero PROFILE rather than a pet record, so the scroll
+# catalogue is digested here and the state machine never learns what a scroll is. Each
+# slot is reduced to what the fight can actually spend: damage as a share of spell power,
+# healing and barriers as shares of the hero's own bar, and the two flags the boss cares
+# about. Everything else a scroll does in an ordinary fight -- blind, vulnerable, a damage
+# boost that lasts turns -- has no turn structure to live in here and is deliberately
+# dropped rather than half-implemented.
+_PHOENIX_SPELL_OPS = ("damage", "heal", "regen", "shield", "cleanse", "stun", "burn")
+
+
+def _phoenix_spell(slot: int, code: str) -> dict | None:
+    """One equipped scroll, reduced to what the Phoenix fight can spend."""
+    spell = SCROLLS.scroll(code) if code else None
+    if spell is None:
+        return None
+    row = {
+        "slot": int(slot), "code": str(code),
+        # The catalogue name is "Магический свиток: Искра эфира"; on a fight button only
+        # the half after the colon is worth the width.
+        "name": str(spell["name"]).split(": ", 1)[-1],
+        "icon": str(spell.get("icon") or "✨"),
+        "ultimate": bool(spell.get("ultimate")),
+        "damage": 0.0, "heal": 0.0, "shield": 0.0, "burn": 0.0,
+        "lifesteal": 0.0, "cleanse": False, "stun": False,
+    }
+    for effect in spell.get("effects", ()):
+        op = str(effect.get("op") or "")
+        if op == "damage":
+            row["damage"] += max(0.0, float(effect.get("amount", 0) or 0))
+            row["lifesteal"] = max(row["lifesteal"],
+                                   max(0.0, float(effect.get("lifesteal", 0) or 0)))
+        elif op == "burn":
+            row["burn"] += max(0.0, float(effect.get("amount", 0) or 0))
+        elif op in ("heal", "regen"):
+            row["heal"] += max(0.0, float(effect.get("percent", 0) or 0))
+        elif op == "shield":
+            row["shield"] += max(0.0, float(effect.get("percent", 0) or 0))
+        elif op == "cleanse":
+            row["cleanse"] = True
+        elif op == "stun":
+            row["stun"] = True
+    return row
+
+
 def phoenix_hero_profile(record: dict, row: dict) -> dict:
     """The hero as the Phoenix engine needs them: finished numbers, no pet record.
 
@@ -5185,6 +5229,15 @@ def phoenix_hero_profile(record: dict, row: dict) -> dict:
         # What a raised guard actually blocks for this pet, which is what makes a good
         # shield feel different from a bare one on a correctly-read telegraph.
         "guard": max(.10, min(.80, float(shield.get("guard", .40) or .40))),
+        # The loadout itself, not merely whether one exists. A scroll is once per fight
+        # here exactly as it is everywhere else, so four casts have to last both phases --
+        # which is what makes "spend the heal now or save it" a decision at all.
+        "spells": [
+            spell for spell in (
+                _phoenix_spell(slot, code)
+                for slot, code in enumerate(_skill_loadout_for(record), start=1)
+            ) if spell is not None
+        ],
         # Whether ✨ is on the table at all: a pet with no scrolls has no spell to cast,
         # and offering the button would be offering a dead end.
         "has_magic": any(_skill_loadout_for(record)),
