@@ -184,7 +184,7 @@ class DungeonTests(unittest.TestCase):
             with self.subTest(shut=action):
                 self.assertNotIn(action, pets_web._ALLOWED_IN_DUNGEON)
 
-    def test_the_corridor_compounds_past_the_ramp_and_nothing_before_it_moves(self):
+    def test_the_corridor_climbs_in_a_straight_line_and_nothing_shallow_moves(self):
         """The deep corridor had to start multiplying, and only the deep corridor.
 
         A flat +7 a floor was priced against a pet whose whole power was its stat block.
@@ -227,16 +227,49 @@ class DungeonTests(unittest.TestCase):
                     boss["stats"]["strength"], corridor["stats"]["strength"],
                     f"the floor {floor} boss is weaker than the corridor in front of it",
                 )
-        for floor, least in ((24, 1.3), (32, 1.6), (44, 2.2)):
-            with self.subTest(corridor=floor):
-                self.assertGreaterEqual(
-                    dungeon._scale(floor) / (22 + (floor - 1) * 7), least,
-                )
+        # Past the ramp the corridor is a STRAIGHT LINE, and the step between floors is
+        # the same one for ever. It used to compound, which is a different promise: every
+        # floor multiplied the last, so the stat level needed to win half the time ran 245
+        # at floor 10, 542 at 20 and 1790 at 45 -- and since a stat point costs
+        # `level ** 1.5`, the gold behind those ran 1.9M, 13.6M and 271M. The corridor was
+        # not getting harder, it was leaving.
+        steps = {
+            dungeon._scale(floor + 1) - dungeon._scale(floor)
+            for floor in range(dungeon.DEPTH_RAMP_START, 90)
+        }
+        self.assertEqual(steps, {dungeon.DEEP_CORRIDOR_STAT_SLOPE})
+        # Still meaningfully above the old flat step, which is what the ramp was for.
+        self.assertGreater(dungeon.DEEP_CORRIDOR_STAT_SLOPE, dungeon.CORRIDOR_STAT_SLOPE)
         # Thin armour is a short fight, and a short fight is one the enemy spends dying
         # rather than hitting back. Deep enemies carry the boss's share of it.
         shallow = dungeon.encounter(dungeon.DEPTH_RAMP_START - 1, 0)
         deep = dungeon.encounter(dungeon.DEPTH_RAMP_START, 0)
         self.assertGreater(deep["armor"], shallow["armor"])
+
+    def test_armour_never_climbs_towards_the_engine_ceiling(self):
+        """Armour is the one enemy stat that multiplies against everything a player brings.
+
+        Reduction saturates towards ARMOR_MAX, so an enemy that keeps accruing armour does
+        not get tougher -- it gets out of reach. Left uncapped it reached 55% absorbed by
+        floor 60 with thirty thousand health behind it, which is a wall rather than a
+        fight. Health and damage can climb instead: a player answers those with more of
+        their own.
+        """
+        worst = 0.0
+        for floor in range(1, 120):
+            for row in dungeon.encounters_for_floor(floor):
+                # A boss owns its floor and is allowed the thicker plate; everything
+                # walking the corridor in front of it is not.
+                cap = (dungeon.BOSS_ARMOR_CAP if row.get("boss")
+                       else dungeon.CORRIDOR_ARMOR_CAP)
+                self.assertLessEqual(row["armor"], cap, floor)
+                worst = max(worst, pets_config.ARMOR_MAX * row["armor"]
+                            / (row["armor"] + pets_config.ARMOR_K))
+            self.assertLessEqual(
+                dungeon.mimic(floor)["armor"], dungeon.BOSS_ARMOR_CAP, floor,
+            )
+        # Comfortably under the engine's own 60% ceiling, for ever.
+        self.assertLess(worst, .42)
 
     def test_every_enemy_shows_its_stat_block_to_both_clients(self):
         """The numbers a player is deciding against, on the floor screen itself.

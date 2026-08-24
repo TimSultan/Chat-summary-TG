@@ -233,8 +233,25 @@ def is_boss_floor(floor: int) -> bool:
 # Bosses are deliberately excluded. They were already the wall -- the same measurement had
 # every build's run ending on a boss floor and never in the corridor -- so the gap is
 # closed by lifting the corridor toward them rather than by moving the wall again.
+# The corridor grows by a STRAIGHT LINE, and the slope is the only knob.
+#
+# It used to compound: a flat +7 a floor multiplied by 1.03 for every floor past the
+# twelfth. The flat step really was too weak deep down -- a floor-24 mob was taking 2-11%
+# of a geared player's health bar -- but compounding overshot the fix and kept going.
+# Measured, the stat level needed to win a floor half the time ran 245 at floor 10, 542
+# at 20 and 1790 at 45; and because a stat point costs `level ** 1.5`, the GOLD behind
+# those runs 1.9M, 13.6M and 271M. The corridor was not getting harder, it was leaving.
+#
+# A line cannot do that. The slope below is chosen to sit near the old curve where it was
+# originally tuned (floors 12-15) and to keep climbing at the same pace for ever, so the
+# hundredth floor is harder than the fiftieth by exactly as much as the fiftieth is
+# harder than the twenty-fifth.
 DEPTH_RAMP_START: Final = 12
-DEPTH_RAMP_GROWTH: Final = 1.03
+# Two slopes, not one. The shallow floors were never the problem and are left exactly as
+# they were; only the part past DEPTH_RAMP_START changes, and it changes from a curve
+# into a steeper straight line.
+CORRIDOR_STAT_SLOPE: Final = 7
+DEEP_CORRIDOR_STAT_SLOPE: Final = 9
 # How much bigger the floor's owner is than the floor itself. Read against the room
 # multipliers in ROOMS: the elite room is 1.65, so a boss leads its own corridor by
 # roughly a fifth once both are on the ramp.
@@ -246,21 +263,31 @@ BOSS_STAT_MULTIPLIER: Final = 1.80
 # runner meets on the way to their first bosses changes at all.
 CORRIDOR_ARMOR_DIVISOR: Final = 5
 DEEP_CORRIDOR_ARMOR_DIVISOR: Final = 3
+# Armour is the one enemy stat that multiplies against everything the player brought:
+# reduction saturates towards ARMOR_MAX (60%), so an enemy that keeps accruing it does
+# not get tougher, it gets further out of reach -- a deep mob was absorbing half of every
+# blow and carrying 30,000 health behind it. The share of a swing an enemy may ever
+# refuse is capped here instead, well under the engine's own ceiling. Everything past the
+# cap has to come from health and damage, which the player can answer with more of their
+# own; a wall of armour is the one thing they cannot.
+CORRIDOR_ARMOR_CAP: Final = 120        # about 33% absorbed
+BOSS_ARMOR_CAP: Final = 190            # about 39%
 
 
 def _scale(floor: int, boss: bool = False) -> int:
     """Fixed stat value for a floor, independent of the challenger.
 
-    The ramp applies to bosses as well. It did not at first -- they were already the wall,
-    so lifting the corridor toward them was the whole point -- but two dozen floors of
-    compounding inverted that: by floor 25 the boss was 0.86x the elite two floors behind
-    it, by 45 it was 0.46x, and past the roster 0.20x. The owner of a floor had become the
-    easiest thing on it. Both curves move together now, so the wall stays a wall.
+    One line for the corridor and the same line for the boss, multiplied. Bosses share it
+    for a reason worth keeping: when only the corridor was lifted, two dozen floors of
+    compounding made the owner of a floor the easiest thing standing on it -- 0.86x the
+    elite behind it by floor 25, 0.46x by 45. Moving together is what keeps a wall a wall.
 
-    A boss reads this at `floor + tier_ahead`, ramp included, which is what keeps a plain
-    boss and the gimmick boss five floors later on an identical stat block -- see BOSSES.
+    A boss reads this at `floor + tier_ahead`, which is what keeps a plain boss and the
+    gimmick boss five floors later on an identical stat block -- see BOSSES.
     """
-    value = (22 + max(0, floor - 1) * 7) * DEPTH_RAMP_GROWTH ** max(0, floor - DEPTH_RAMP_START)
+    shallow = min(max(0, floor - 1), DEPTH_RAMP_START - 1)
+    deep = max(0, floor - DEPTH_RAMP_START)
+    value = 22 + shallow * CORRIDOR_STAT_SLOPE + deep * DEEP_CORRIDOR_STAT_SLOPE
     return round(value * (BOSS_STAT_MULTIPLIER if boss else 1.0))
 
 
@@ -268,7 +295,7 @@ def _corridor_armor(floor: int, value: int, index: int) -> int:
     """Armour for one ordinary enemy, thicker once the corridor is deep enough to need it."""
     divisor = (DEEP_CORRIDOR_ARMOR_DIVISOR if floor >= DEPTH_RAMP_START
                else CORRIDOR_ARMOR_DIVISOR)
-    return max(0, value // divisor + max(0, int(index)) * 2)
+    return max(0, min(CORRIDOR_ARMOR_CAP, value // divisor + max(0, int(index)) * 2))
 
 
 # The order the stat block is read in, and the only four a dungeon enemy has. C.STAT_KEYS
@@ -351,7 +378,8 @@ def encounter(floor: int, index: int) -> dict:
             "hint": hint, "weakness": weakness,
             "stats": {"strength": value + 12, "health": value + 18,
                       "agility": value - 4, "luck": value - 6},
-            "armor": max(0, value // 3), "level": floor + 8 + tier_ahead,
+            "armor": max(0, min(BOSS_ARMOR_CAP, value // 3)),
+            "level": floor + 8 + tier_ahead,
             "reward": reward_for(floor, boss=True),
         }
 
@@ -513,7 +541,11 @@ def mimic(floor: int) -> dict:
         # A mimic is the floor's elite, so it is never thinner-skinned than the corridor
         # mobs standing either side of it -- which //4 quietly became once deep ordinary
         # enemies moved to the boss's //3.
-        "armor": max(_corridor_armor(floor, value, 0), value // 4), "level": floor + 3,
+        # Under the boss's ceiling like every other elite: `value // 4` is a floor that
+        # keeps a mimic from being thinner-skinned than the corridor around it, not a
+        # licence to climb past what any enemy is allowed to refuse.
+        "armor": min(BOSS_ARMOR_CAP, max(_corridor_armor(floor, value, 0), value // 4)),
+        "level": floor + 3,
         "reward": reward_for(floor, boss=False),
     }
 
