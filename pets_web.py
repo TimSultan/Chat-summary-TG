@@ -5631,8 +5631,8 @@ const STAT_NAME = { strength: "Сила", health: "Здоровье", agility: "
                     luck: "Удача", magic: "Магия", endurance: "Выносливость", armor: "Броня" };
 // Which stat an equipped weapon makes the ordinary swing read. Mirrors
 // pets_config.WEAPON_SCALING_LABELS; a weapon without the field swings with Сила.
-const SCALING_LABEL = { magic: "🔮 урон от Магии · удар магический",
-                       hybrid: "🔮⚔️ урон от Магии и Силы поровну · удар наполовину магический" };
+const SCALING_LABEL = { magic: "🪄 урон от Магии · удар магический",
+                       hybrid: "🪄⚔️ урон от Магии и Силы поровну · удар наполовину магический" };
 
 function bonusText(bonuses) {
   const parts = [];

@@ -399,8 +399,11 @@ WEAPON_SCALING_LABELS = {
     # Both halves of the promise, because both bite: the swing reads Магия, and the swing
     # IS magic -- it walks through anything that only resists steel, and it is exactly
     # what a ward or an antimage is waiting for.
-    WEAPON_SCALING_MAGIC: "🔮 урон от Магии · удар магический",
-    WEAPON_SCALING_HYBRID: "🔮⚔️ урон от Магии и Силы поровну · удар наполовину магический",
+    # A wand, not the crystal ball: 🔮 is Магия's own stat badge, and a weapon wearing it
+    # reads as "this is the stat" rather than "this reads from it". A wand is a thing you
+    # hold, which is what a weapon is.
+    WEAPON_SCALING_MAGIC: "🪄 урон от Магии · удар магический",
+    WEAPON_SCALING_HYBRID: "🪄⚔️ урон от Магии и Силы поровну · удар наполовину магический",
 }
 
 
