@@ -1360,7 +1360,9 @@ def _action_achievements_open(entry, user_id, xp, payload):
 
 
 def _action_achievements_claim(entry, user_id, xp, payload):
-  ok, note, _paid = pets.claim_achievements(entry, user_id)
+  ok, note, _paid = pets.claim_achievement(
+      entry, user_id, str(payload.get("code") or ""),
+  )
   return ok, note
 
 
@@ -5987,15 +5989,10 @@ async function loadAchievements() {
 function achievementsEntry() {
   const box = S.achievements;
   if (!box) return "";
-  const pending = (box.claimable || {}).count || 0;
-  const reward = achievementReward(box.claimable || {});
   return '<div class="panel ach-entry">' +
     '<div class="row spread"><h2 style="margin:0">🏅 Ачивки</h2>' +
     '<span class="tiny muted">' + Number(box.earned || 0) + " из " +
       Number(box.total || 0) + "</span></div>" +
-    '<button class="go' + (pending ? "" : " sec") + '" style="margin-top:9px" ' +
-      'data-ach="claim"' + (pending ? "" : " disabled") + ">Забрать награды за Ачивки" +
-      (pending ? " · " + pending + (reward ? " · " + reward : "") : "") + "</button>" +
     '<button class="go sec" style="margin-top:8px" data-ach="toggle">' +
       (ACH_OPEN ? "▲ Свернуть список" : "▼ Показать список") + "</button>" +
     (ACH_OPEN
@@ -6026,6 +6023,10 @@ function achievementsList(box) {
         (row.claimed ? '<span class="tiny muted">✓</span>' : "") + "</div>" +
       '<div class="tiny muted">' + esc(row.description || "") + "</div>" +
       (reward ? '<div class="tiny ach-prize">' + reward + "</div>" : "") +
+      (row.earned && !row.claimed
+        ? '<button class="go" style="margin-top:7px" data-ach="claim" data-code="' +
+          esc(row.code) + '">Получить награду</button>'
+        : "") +
       "</div>";
   }).join("") + "</div>";
 }
@@ -9708,7 +9709,7 @@ async function handleClick(event, target) {
     return;
   }
   if (d.ach === "claim") {
-    await act("achievements_claim", {});
+    await act("achievements_claim", { code: d.code || "" });
     ACH_OPEN = true;
     await loadAchievements();
     return;

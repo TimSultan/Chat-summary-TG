@@ -2240,7 +2240,12 @@ def grant_rubies_once(entry, user_id, amount: int, source: str) -> int:
     with _farm_settlement_lock:
         data = _load(entry)
         wallet = _ruby_row(data)
-        sources = data.setdefault("ruby_sources", {})
+        sources = data.get("ruby_sources")
+        # A short-lived legacy build wrote this field as a list. Membership checks still
+        # worked, but assigning a string source then raised "list indices must be
+        # integers" exactly when an achievement tried to pay out.
+        if not isinstance(sources, dict):
+            sources = data["ruby_sources"] = {}
         if source in sources:
             return max(0, int(wallet.get(str(user_id), 0) or 0))
         credited = max(0, int(amount or 0))
@@ -5736,6 +5741,7 @@ def achievements_summary(entry: str, user_id) -> dict:
 
 def achievements_view(entry: str, user_id) -> dict:
     """The whole screen: every row, its state, and what pressing the button would pay."""
+    _repair_failed_achievement_claim(entry, user_id)
     refresh_achievements(entry, user_id)
     record = _tamed_record(_load(entry), user_id)
     if record is None:
@@ -5819,6 +5825,72 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
         parts.append(f"{paid['dungeon_tickets']} 🎟 в подземелье")
     reward = " · ".join(parts) or "ничего"
     return True, f"Забрано ачивок: {len(pending)}. Награда: {reward}.", paid
+
+
+def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
+    """Pay one earned achievement selected by the player."""
+    _repair_failed_achievement_claim(entry, user_id)
+    refresh_achievements(entry, user_id)
+    item = ACHIEVEMENTS.by_code(str(code or ""))
+    if item is None:
+        return False, "Такой ачивки нет.", {}
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо.", {}
+        row = _achievement_row(record)
+        if item.code not in set(row["unlocked"]):
+            return False, "Эта ачивка ещё не заработана.", {}
+        if item.code in set(row["claimed"]):
+            return False, "Награда за эту ачивку уже получена.", {}
+        # Reserve before minting. Every currency path below is idempotent where it can be;
+        # the claimed flag is the durable guard for dungeon tickets.
+        row["claimed"] = sorted(set(row["claimed"]) | {item.code})
+        _save(entry, data)
+    paid = {"rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0, "count": 1}
+    if item.rubies:
+        grant_rubies_once(entry, user_id, item.rubies, f"achievement:{item.code}")
+        paid["rubies"] = item.rubies
+    for _ in range(max(0, int(item.farm_tickets))):
+        if grant_farm_ticket(entry, user_id, f"achievement:{item.code}"):
+            paid["farm_tickets"] += 1
+    for _ in range(max(0, int(item.dungeon_tickets))):
+        grant_dungeon_ticket(entry, user_id)
+        paid["dungeon_tickets"] += 1
+    parts = []
+    if paid["rubies"]:
+        parts.append(f"{paid['rubies']} 💎")
+    if paid["farm_tickets"]:
+        parts.append(f"{paid['farm_tickets']} 🎫 на ферму")
+    if paid["dungeon_tickets"]:
+        parts.append(f"{paid['dungeon_tickets']} 🎟 в подземелье")
+    reward = " · ".join(parts) or "награда без предметов"
+    return True, f"{item.icon} «{item.name}»: получено {reward}.", paid
+
+
+def _repair_failed_achievement_claim(entry: str, user_id) -> bool:
+    """Re-open rewards reserved by the old bulk claim before its list-shaped ledger failed."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        if not isinstance(data.get("ruby_sources"), list):
+            return False
+        # The failing build reserved every row, then crashed on the first ruby grant and
+        # never saved a source. A list here is the durable fingerprint of that exact path.
+        # Repair every pet in this chat before replacing the shared fingerprint; otherwise
+        # the first player to open the page would hide it from everybody else.
+        repaired = False
+        for record in (data.get("pets") or {}).values():
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            row = _achievement_row(record)
+            if row["claimed"]:
+                row["claimed"] = []
+                repaired = True
+        data["ruby_sources"] = {}
+        data["achievement_bulk_claim_repaired"] = True
+        _save(entry, data)
+        return repaired
 
 
 def backfill_legacy_achievements(entry: str) -> int:

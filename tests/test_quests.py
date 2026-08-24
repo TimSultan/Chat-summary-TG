@@ -78,6 +78,26 @@ class QuestsTestCase(unittest.TestCase):
 
 
 class AssignmentTests(QuestsTestCase):
+    def test_expanded_catalogue_contains_varied_new_challenges(self):
+        paint_codes = {quest.code for quest in catalog.PAINT_QUESTS}
+        real_codes = {quest.code for quest in catalog.REAL_QUESTS}
+
+        self.assertTrue({
+            "limited_palette", "candle_osc", "underwater_light",
+            "transparent_wings", "micro_diorama_story",
+        } <= paint_codes)
+        self.assertTrue({
+            "finish_backlog_plan", "repair_mini", "paint_with_friend",
+            "teach_live_demo", "community_feedback",
+        } <= real_codes)
+        new_paints = [quest for quest in catalog.PAINT_QUESTS
+                      if quest.code in set(catalog.normalise_code(row[0])
+                                           for row in catalog._EXTRA_PAINT_DATA)]
+        self.assertEqual(len(new_paints), 15)
+        difficulties = {quest.difficulty for quest in new_paints}
+        self.assertIn(2, difficulties)
+        self.assertIn(5, difficulties)
+
     def test_paint_board_has_three_unique_cards_without_an_automatic_deadline(self):
         entry = "chat"
         first = quests.daily_quest(entry, "1", now=datetime(2026, 8, 9, 9, 0))

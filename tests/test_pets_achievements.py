@@ -248,6 +248,38 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertEqual(after["claimable"]["count"], 0)
         self.assertTrue(next(r for r in after["rows"] if r["code"] == row["code"])["claimed"])
 
+    def test_one_achievement_button_pays_only_the_selected_row(self):
+        self._win_a_fight()
+        view = pets.achievements_view(CHAT, USER)
+        pending = [row for row in view["rows"] if row["earned"] and not row["claimed"]]
+        self.assertTrue(pending)
+
+        ok, note, paid = pets.claim_achievement(CHAT, USER, pending[0]["code"])
+
+        self.assertTrue(ok, note)
+        self.assertEqual(paid["count"], 1)
+        after = pets.achievements_view(CHAT, USER)
+        claimed = {row["code"] for row in after["rows"] if row["claimed"]}
+        self.assertEqual(claimed, {pending[0]["code"]})
+
+    def test_list_shaped_ruby_sources_are_repaired_before_an_individual_claim(self):
+        self._win_a_fight()
+        view = pets.achievements_view(CHAT, USER)
+        code = next(row["code"] for row in view["rows"]
+                    if row["earned"] and not row["claimed"])
+        data = pets._load(CHAT)
+        record = data["pets"][str(USER)]
+        record["achievements"]["claimed"] = [code]
+        data["ruby_sources"] = ["legacy-broken-shape"]
+        pets._save(CHAT, data)
+
+        repaired = pets.achievements_view(CHAT, USER)
+
+        row = next(row for row in repaired["rows"] if row["code"] == code)
+        self.assertFalse(row["claimed"])
+        self.assertTrue(pets.claim_achievement(CHAT, USER, code)[0])
+        self.assertIsInstance(pets._load(CHAT)["ruby_sources"], dict)
+
     def test_a_second_press_pays_nothing_more(self):
         """The button is one press away from being pressed twice by a bad connection."""
         self._win_a_fight()

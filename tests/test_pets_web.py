@@ -2582,6 +2582,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data["achievements"]["rows"])
         self.assertIn("claimable", data["achievements"])
 
+    def test_achievement_ui_has_individual_claim_buttons_and_no_bulk_claim(self):
+        source = pets_web.PAGE_HTML
+        self.assertIn('data-ach="claim" data-code="', source)
+        self.assertNotIn("Забрать награды за Ачивки", source)
+
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):
         """Not "a fight like that one" -- that one. The stored seed and the two stored
         fighters go back through the same pure simulate(), so every round, every flavour
