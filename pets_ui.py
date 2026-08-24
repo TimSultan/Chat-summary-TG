@@ -576,16 +576,32 @@ def phoenix_view(entry: str, user_id, xp: int, state: dict | None = None) -> tup
     scene = str(state.get("scene") or "").strip()
     if scene:
         lines.extend(["", escape(scene)])
+    # What the LAST answer cost, above the next telegraph rather than below it. The two
+    # blocks are read in the order they happen: a player who has just lost 2,073 health
+    # needs to know that before being asked to read the next move, not after -- and a
+    # mistake is marked, because "герой теряет 2073" looks identical whether the block
+    # was mistimed or the move was the one that punishes blocking.
+    grade = str(state.get("grade") or "")
+    history = [str(line).strip() for line in (state.get("log") or ()) if str(line).strip()]
+    if history:
+        # Telegram has no colour, so a mistake is marked and its opening line carries the
+        # weight. Bolding every line of it would shout the arithmetic as loudly as the
+        # sentence explaining what went wrong, which is the half that teaches.
+        mark = "💢" if grade == "bad" else ("✅" if grade == "perfect" else "▫️")
+        lines.append("")
+        for index, line in enumerate(history[-PHOENIX_LOG_LINES:]):
+            body = escape(line)
+            if index == 0:
+                body = f"<b>{body}</b>" if grade == "bad" else f"<i>{body}</i>"
+                lines.append(f"{mark} {body}")
+            else:
+                lines.append(f"<i>{body}</i>")
     telegraph = str(state.get("telegraph") or "").strip()
     if telegraph:
         # The one block on this screen that has to be read rather than skimmed, so it
         # stands alone and in bold -- and deliberately with nothing under it, because any
         # line explaining it would answer the question the boss is asking.
         lines.extend(["", f"⚠️ <b>{escape(telegraph)}</b>"])
-    history = [str(line).strip() for line in (state.get("log") or ()) if str(line).strip()]
-    if history:
-        lines.append("")
-        lines.extend(f"<i>{escape(line)}</i>" for line in history[-PHOENIX_LOG_LINES:])
     rows = []
     if state.get("over"):
         lines.extend([

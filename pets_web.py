@@ -4479,7 +4479,15 @@ PAGE_HTML = """<!doctype html>
   .phoenix-burn { color: #ff9a5a; }
   .phoenix-moves { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .phoenix-moves .go { padding: 11px 8px; font-size: 14px; }
-  .phoenix-log { display: grid; gap: 3px; margin-top: 11px; }
+  .phoenix-log { display: grid; gap: 3px; margin: 0 0 11px; color: var(--muted); }
+  /* A mistake is the one outcome worth interrupting the reader for, so it is the only
+     one that gets a border and the damage colour. A perfect answer is confirmed quietly
+     -- it needs no explanation, and green on every good turn would drown the red. */
+  .phoenix-log.bad {
+    color: var(--hp); border-left: 3px solid var(--hp);
+    padding: 6px 0 6px 9px; font-weight: 600;
+  }
+  .phoenix-log.good { color: var(--gold); }
   .chip {
     border: 1px solid var(--line); background: transparent; border-radius: 999px;
     padding: 6px 12px; font-size: 13px; white-space: nowrap;
@@ -6039,11 +6047,16 @@ function phoenixBars(fight) {
     '</div>';
 }
 
+// What the LAST answer cost. Marked by how it read, because the numbers alone cannot
+// say it: losing 2,073 health looks identical whether the block was mistimed or the move
+// was the one that punishes blocking, and only the second is a lesson.
 function phoenixLog(fight) {
   const lines = (fight.log || []).slice(-6);
   if (!lines.length) return "";
-  return '<div class="phoenix-log">' + lines.map((line) =>
-    '<span class="tiny muted">' + esc(line) + '</span>').join("") + '</div>';
+  const grade = String(fight.grade || "");
+  const tone = grade === "bad" ? " bad" : (grade === "perfect" ? " good" : "");
+  return '<div class="phoenix-log' + tone + '">' + lines.map((line) =>
+    '<span class="tiny">' + esc(line) + '</span>').join("") + '</div>';
 }
 
 // Every button comes from the server, label and all. Deciding the set here would drift
@@ -6068,10 +6081,13 @@ function phoenixFight(dungeon, fight) {
     phoenixBars(fight) +
     (fight.vulnerable ? '<div class="phoenix-vuln">💥 УЯЗВИМ</div>' : '') +
     (fight.scene ? '<p class="phoenix-scene">' + esc(fight.scene) + '</p>' : '') +
+    // In the order the fight happens: what the last answer cost, and only then what is
+    // coming. Underneath the telegraph it was being read after the decision it should
+    // have informed.
+    phoenixLog(fight) +
     // No hint travels with it, ever. Reading the telegraph IS the fight.
     (fight.telegraph ? '<div class="phoenix-telegraph">' + esc(fight.telegraph) + '</div>' : '') +
     phoenixMoves(fight) +
-    phoenixLog(fight) +
     '</div></div>';
 }
 

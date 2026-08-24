@@ -359,14 +359,18 @@ class PhoenixFightTests(unittest.TestCase):
         self.assertEqual(
             set(view),
             {"boss_name", "phase", "phase_state", "boss_hp", "boss_max_hp", "hero_hp",
-             "hero_max_hp", "burn", "telegraph", "scene", "log", "actions", "vulnerable",
-             "over", "won"},
+             "hero_max_hp", "burn", "telegraph", "scene", "log", "grade", "actions",
+             "vulnerable", "over", "won"},
         )
         self.assertEqual(view["boss_name"], "Феникс пепельных залов")
         self.assertTrue(view["telegraph"])
         self.assertTrue(view["scene"])
         self.assertFalse(view["over"])
         self.assertEqual(view["actions"], [dict(row) for row in phoenix.actions(state)])
+        # No answer has been given yet, so there is nothing to grade and nothing to show
+        # above the telegraph -- the two travel together and empty together.
+        self.assertEqual(view["grade"], "")
+        self.assertEqual(view["log"], [])
 
         reborn = play(hero(), boss(), perfect_answer, seed=1)[0]
         self.assertEqual(phoenix.public(reborn)["boss_name"], phoenix.PHASE_2_NAME)

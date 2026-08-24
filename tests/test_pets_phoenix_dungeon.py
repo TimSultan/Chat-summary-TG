@@ -134,6 +134,38 @@ class PhoenixDungeonTests(unittest.TestCase):
         self.assertIsNone(state)
         self.assertIn("Феникс", message)
 
+    # ------------------------------------------------------------------- the screen
+    def test_the_last_answer_is_read_before_the_next_telegraph(self):
+        """Order is the lesson. What a choice cost has to arrive BEFORE the next move.
+
+        Under the telegraph it was being read after the decision it should have informed:
+        the player answers, scrolls past the new telegraph to find out what the last one
+        did, and then has to scroll back. Above it, the two blocks are read in the order
+        they happened.
+        """
+        import pets_ui
+
+        pets.phoenix_start(CHAT, USER)
+        for _ in range(12):
+            state = pets.phoenix_state(CHAT, USER)
+            if state is None or state.get("over"):
+                break
+            if state.get("grade") == "bad" and state.get("telegraph"):
+                text = pets_ui.phoenix_view(CHAT, USER, 0)[0]
+                first_log = text.index(state["log"][0])
+                self.assertLess(first_log, text.index(state["telegraph"]))
+                # And a mistake is marked, because the numbers cannot say it: losing 2,000
+                # health reads the same whether the block was mistimed or the move was the
+                # one that punishes blocking.
+                self.assertIn("💢", text)
+                return
+            offered = [row["code"] for row in state["actions"]]
+            pets.phoenix_action(
+                CHAT, USER,
+                pets_phoenix.ATTACK if pets_phoenix.ATTACK in offered else offered[0],
+            )
+        self.fail("нужен хотя бы один плохой ответ, чтобы проверить порядок")
+
     # ------------------------------------------------------------------ the payout
     def test_a_win_pays_through_the_ordinary_boss_path_and_clears_the_floor(self):
         """Same ledger reason, same haul, same cleared index as any other boss.

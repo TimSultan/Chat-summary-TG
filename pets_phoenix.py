@@ -649,6 +649,7 @@ def take(state: dict, action: str, *, seed: int | None = None) -> dict:
     rng = random.Random(seed)
     nxt["log"] = []
     nxt["scene"] = ""
+    nxt["grade"] = ""
     nxt["actions_taken"] = int(nxt.get("actions_taken", 0) or 0) + 1
     phase_state = str(nxt.get("phase_state") or "")
     if phase_state == VULNERABLE:
@@ -673,7 +674,8 @@ def public(state: dict) -> dict:
           "burn":        int,    # 0..BURN_MAX_STACKS
           "telegraph":   str,    # what the Phoenix is DOING; "" outside TELEGRAPH
           "scene":       str,    # narration for intro / rebirth / victory / defeat
-          "log":         [str],  # what just happened, newest last, short lines
+          "log":         [str],  # the LAST answer's outcome, newest last; empty on entry
+          "grade":       str,    # "perfect" | "fine" | "bad" | "" -- how that answer read
           "actions":     [{"code": str, "label": str}],
           "vulnerable":  bool,
           "over":        bool,
@@ -703,6 +705,7 @@ def public(state: dict) -> dict:
         "telegraph": str(state.get("telegraph") or "") if shows_telegraph else "",
         "scene": str(state.get("scene") or ""),
         "log": list(state.get("log") or []),
+        "grade": str(state.get("grade") or ""),
         "actions": [dict(row) for row in actions(state)],
         "vulnerable": phase_state == VULNERABLE,
         "over": phase_state in (VICTORY, DEFEAT),
@@ -869,6 +872,11 @@ def _burn_tick(state: dict) -> None:
 def _apply(state: dict, row: dict, action: str, rng: random.Random) -> None:
     """Everything one graded answer does, in the order the player sees it happen."""
     attack = _ATTACKS.get(str(state.get("attack") or "")) or {}
+    # Kept for the screen rather than for the maths: what the last answer was WORTH is
+    # the one thing a player cannot work out from the numbers alone. A hero losing 2,073
+    # health reads the same whether they mistimed a block or walked into the one move
+    # that punishes blocking, and only the second is a lesson worth marking.
+    state["grade"] = str(row.get("grade") or "")
     if row.get("note"):
         state["log"].append(str(row["note"]))
 
