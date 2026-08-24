@@ -24,24 +24,37 @@ RICH_XP = 10 ** 9
 # reachable. The rows it still misses are the deliberately exclusive ones -- you cannot
 # wear a full cursed set and a full legendary set at once.
 MAXED = {
-    "level": 40, "cage_level": 6, "farm_level": 12, "power": 5_000,
+    "level": 60, "cage_level": 6, "farm_level": 12, "power": 5_000,
     "stats": {"strength": 90, "health": 90, "agility": 90, "luck": 90, "magic": 90},
     "effective_stats": {"strength": 90, "health": 90, "agility": 90, "luck": 90,
                         "magic": 90, "armor": 60},
-    "wins": 500, "fights": 900, "pet_wins": 300, "mob_wins": 400, "boss_wins": 40,
-    "best_weapon_wins": 150, "deepest_floor": 45,
-    "phoenix_wins": 5, "phoenix_perfect": True,
+    "wins": 600, "fights": 1_200, "pet_wins": 300, "mob_wins": 600, "boss_wins": 40,
+    "best_weapon_wins": 300, "deepest_floor": 60,
+    "phoenix_wins": 10, "phoenix_perfect": True,
     "weapons_found": 632, "weapons_total": 632, "scrolls_owned": 40, "scrolls_total": 40,
     "equipped_slots": 5, "equipped_rarities": {"legendary": 5}, "equipped_cursed": 0,
     "equipped_magic": 1, "personal_paints": 9, "scroll_paints": 4, "runes": 30,
-    "gold_earned": 500_000, "gold_spent": 90_000, "rubies": 40,
+    "gold_earned": 1_500_000, "gold_spent": 300_000, "rubies": 40,
     "farm_tickets": 5, "dungeon_tickets": 5,
     "quests_done": 60, "quest_best_difficulty": 5,
-    "figurines_painted": 44, "messages": 9_000, "active_days": 300, "best_work_posts": 2,
+    "figurines_painted": 120, "messages": 12_000, "active_days": 400, "best_work_posts": 3,
 }
 
 
 class CatalogueContractTests(unittest.TestCase):
+    def test_expanded_catalogue_covers_arena_painting_and_long_term_goals(self):
+        rows = {row.code: row for row in achievements.catalogue()}
+        self.assertGreaterEqual(len(rows), 75)
+        self.assertTrue({
+            "arena_ten", "arena_five_hundred", "arena_veteran",
+            "five_figurines", "hundred_figurines", "painted_loadout",
+            "floor_sixty", "phoenix_ten", "millionaire", "year_in_chat",
+        } <= set(rows))
+        self.assertFalse(rows["arena_ten"].check({"wins": 9}))
+        self.assertTrue(rows["arena_ten"].check({"wins": 10}))
+        self.assertFalse(rows["hundred_figurines"].check({"figurines_painted": 99}))
+        self.assertTrue(rows["hundred_figurines"].check({"figurines_painted": 100}))
+
     def test_codes_are_unique_and_shaped_to_live_in_a_save_file_for_ever(self):
         """A code is persisted the moment somebody earns the row.
 

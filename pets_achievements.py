@@ -417,6 +417,187 @@ ACHIEVEMENTS: Final[tuple[Achievement, ...]] = (
         lambda p: p.get("gold_spent", 0) >= 50_000,
         rubies=2, farm_tickets=2,
     ),
+    # ---------------------------------------------------------- расширенная лестница
+    # Short, medium and genuinely long goals between the original milestones. They use
+    # counters already owned by the game, so progress is retroactive and auditable.
+    Achievement(
+        "arena_ten", "🥉", "Размялся",
+        "Выиграй 10 боёв на арене ⚔️",
+        lambda p: p.get("wins", 0) >= 10, farm_tickets=1,
+    ),
+    Achievement(
+        "arena_fifty", "🥈", "Знакомое лицо",
+        "Выиграй 50 боёв на арене 🛡",
+        lambda p: p.get("wins", 0) >= 50, rubies=1, farm_tickets=1,
+    ),
+    Achievement(
+        "arena_two_fifty", "🥇", "Арена помнит имя",
+        "Выиграй 250 боёв на арене 🏟",
+        lambda p: p.get("wins", 0) >= 250, rubies=2, farm_tickets=2,
+    ),
+    Achievement(
+        "arena_five_hundred", "🏆", "Полтысячи побед",
+        "Выиграй 500 боёв на арене ⚔️🔥",
+        lambda p: p.get("wins", 0) >= 500, rubies=3, dungeon_tickets=2,
+    ),
+    Achievement(
+        "arena_veteran", "🛡", "Тысяча выходов",
+        "Проведи 1000 боёв на арене — победы и поражения считаются 📜",
+        lambda p: p.get("fights", 0) >= 1000, rubies=2, farm_tickets=3,
+    ),
+    Achievement(
+        "weapon_twenty_five", "⚔️", "Привыкаю к рукояти",
+        "Возьми 25 побед одним оружием 🗡",
+        lambda p: p.get("best_weapon_wins", 0) >= 25, rubies=1,
+    ),
+    Achievement(
+        "weapon_two_fifty", "🗿", "Легенда одного клинка",
+        "Возьми 250 побед одним оружием ⚔️",
+        lambda p: p.get("best_weapon_wins", 0) >= 250, rubies=3, dungeon_tickets=3,
+    ),
+    Achievement(
+        "five_figurines", "🖌", "Первая витрина",
+        "Выложи 5 покрашенных миниатюр 📸",
+        lambda p: p.get("figurines_painted", 0) >= 5, rubies=1, farm_tickets=1,
+    ),
+    Achievement(
+        "fifty_figurines", "🖼", "Пятьдесят историй",
+        "Выложи 50 покрашенных миниатюр 🎨",
+        lambda p: p.get("figurines_painted", 0) >= 50, rubies=3, farm_tickets=3,
+    ),
+    Achievement(
+        "hundred_figurines", "🏛", "Личная выставка",
+        "Выложи 100 покрашенных миниатюр 🖼",
+        lambda p: p.get("figurines_painted", 0) >= 100,
+        rubies=3, farm_tickets=5, dungeon_tickets=2,
+    ),
+    Achievement(
+        "three_best_works", "🌟", "Стабильное качество",
+        "Трижды займи первое место в конкурсе работ 🥇",
+        lambda p: p.get("best_work_posts", 0) >= 3, rubies=3, farm_tickets=3,
+    ),
+    Achievement(
+        "five_quests", "📋", "Вошёл во вкус",
+        "Выполни 5 квестов на покрас ✅",
+        lambda p: p.get("quests_done", 0) >= 5, rubies=1, farm_tickets=2,
+    ),
+    Achievement(
+        "fifty_quests", "🎖", "Гильдия доверяет",
+        "Выполни 50 квестов любой сложности 📚",
+        lambda p: p.get("quests_done", 0) >= 50, rubies=3, farm_tickets=4,
+    ),
+    Achievement(
+        "three_personal_paints", "🎨", "Авторская серия",
+        "Нанеси персональный покрас на три предмета 🖌",
+        lambda p: p.get("personal_paints", 0) >= 3, rubies=2,
+    ),
+    Achievement(
+        "painted_loadout", "🌈", "Снаряжение с подписью",
+        "Собери пять предметов с персональными покрасами 🎒",
+        lambda p: p.get("personal_paints", 0) >= 5, rubies=3, dungeon_tickets=2,
+    ),
+    Achievement(
+        "floor_ten", "🕯", "Под землёй темнее",
+        "Дойди до 10-го этажа подземелья 🔦",
+        lambda p: p.get("deepest_floor", 1) >= 10, dungeon_tickets=2,
+    ),
+    Achievement(
+        "floor_thirty", "🧭", "Глубже карты",
+        "Дойди до 30-го этажа подземелья 🕳",
+        lambda p: p.get("deepest_floor", 1) >= 30, rubies=2, dungeon_tickets=3,
+    ),
+    Achievement(
+        "floor_sixty", "♾", "После самого дна",
+        "Спустись до 60-го этажа, где боссы уже идут по кругу ⛏",
+        lambda p: p.get("deepest_floor", 1) >= 60, rubies=3, dungeon_tickets=5,
+    ),
+    Achievement(
+        "bosses_twenty_five", "🐉", "Коллекционер корон",
+        "Победи 25 боссов подземелья 👑",
+        lambda p: p.get("boss_wins", 0) >= 25, rubies=3, dungeon_tickets=3,
+    ),
+    Achievement(
+        "mobs_five_hundred", "💀", "Коридоры опустели",
+        "Победи 500 обычных врагов подземелья 🕯",
+        lambda p: p.get("mob_wins", 0) >= 500, rubies=3, farm_tickets=3,
+    ),
+    Achievement(
+        "phoenix_ten", "🔥", "Пепел знает тебя",
+        "Победи Феникса 10 раз и открой автобой 🐦",
+        lambda p: p.get("phoenix_wins", 0) >= 10, rubies=3, dungeon_tickets=3,
+    ),
+    Achievement(
+        "level_ten", "⭐", "Характер проявился",
+        "Доведи существо до 10-го уровня 🐾",
+        lambda p: p.get("level", 1) >= 10, rubies=1,
+    ),
+    Achievement(
+        "level_fifty", "🦅", "Пятидесятый уровень",
+        "Доведи существо до 50-го уровня 🌠",
+        lambda p: p.get("level", 1) >= 50, rubies=3, dungeon_tickets=3,
+    ),
+    Achievement(
+        "power_two_five", "⚡", "Тяжёлая категория",
+        "Подними силу существа до 2500 💪",
+        lambda p: p.get("power", 0) >= 2500, rubies=2, farm_tickets=2,
+    ),
+    Achievement(
+        "ten_weapons", "🗡", "Оружейная стойка",
+        "Найди 10 разных видов оружия 🎁",
+        lambda p: p.get("weapons_found", 0) >= 10, rubies=1,
+    ),
+    Achievement(
+        "three_quarter_catalogue", "🗄", "Почти весь арсенал",
+        "Собери три четверти каталога оружия 🔍",
+        lambda p: p.get("weapons_total", 0) > 0
+        and p.get("weapons_found", 0) >= (p.get("weapons_total", 0) * 3 + 3) // 4,
+        rubies=3, dungeon_tickets=3,
+    ),
+    Achievement(
+        "ten_scrolls", "📜", "Малая библиотека",
+        "Открой 10 боевых свитков ✨",
+        lambda p: p.get("scrolls_owned", 0) >= 10, rubies=1,
+    ),
+    Achievement(
+        "thirty_scrolls", "📚", "Архив заклинаний",
+        "Открой 30 боевых свитков 🔮",
+        lambda p: p.get("scrolls_owned", 0) >= 30, rubies=2, dungeon_tickets=2,
+    ),
+    Achievement(
+        "runes_twenty_five", "🪄", "Запас на чёрный день",
+        "Скопи 25 рун для зачарования 💠",
+        lambda p: p.get("runes", 0) >= 25, rubies=2, dungeon_tickets=2,
+    ),
+    Achievement(
+        "millionaire", "💰", "Монетный водопад",
+        "Заработай 1 000 000 монет за всё время 🪙",
+        lambda p: p.get("gold_earned", 0) >= 1_000_000, rubies=3, farm_tickets=4,
+    ),
+    Achievement(
+        "big_spender", "💸", "Четверть миллиона",
+        "Потрать 250 000 монет на развитие и снаряжение 🔥",
+        lambda p: p.get("gold_spent", 0) >= 250_000, rubies=3, farm_tickets=3,
+    ),
+    Achievement(
+        "thousand_messages", "💬", "Всегда на связи",
+        "Напиши 1000 сообщений в чате 🗨",
+        lambda p: p.get("messages", 0) >= 1000, rubies=1, farm_tickets=2,
+    ),
+    Achievement(
+        "ten_thousand_messages", "📣", "Голос сообщества",
+        "Напиши 10 000 сообщений в чате 🎙",
+        lambda p: p.get("messages", 0) >= 10_000, rubies=3, farm_tickets=4,
+    ),
+    Achievement(
+        "thirty_days", "📅", "Месяц рядом",
+        "Отметься в чате в 30 разных дней ☀️",
+        lambda p: p.get("active_days", 0) >= 30, rubies=1, farm_tickets=2,
+    ),
+    Achievement(
+        "year_in_chat", "🎂", "Год вместе",
+        "Отметься в чате в 365 разных дней 🎉",
+        lambda p: p.get("active_days", 0) >= 365, rubies=3, farm_tickets=5,
+    ),
     # ---------------------------------------------------------------- скрытые
     # Hidden because naming them turns the joke into a checklist. Each one is a shape a
     # player falls into on purpose and then tells somebody about.
