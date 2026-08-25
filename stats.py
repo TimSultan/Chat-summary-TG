@@ -1219,14 +1219,20 @@ def parse_custom_badge_spec(text: str) -> tuple[str, str]:
     parts = (text or "").strip().split(maxsplit=1)
     if len(parts) != 2 or not _contains_emoji(parts[0]):
         raise ValueError("Отправьте эмодзи и название через пробел, например: 🎯 Меткий глаз")
-    emoji, name = parts[0], " ".join(parts[1].split())
+    emoji, name = parts[0], _normalise_custom_badge_name(parts[1])
     if len(emoji) > 16:
         raise ValueError("Эмодзи слишком длинный.")
+    return emoji, name
+
+
+def _normalise_custom_badge_name(name: str) -> str:
+    """One name contract for creation and the admin rename flow."""
+    name = " ".join(str(name or "").split())
     if not name:
         raise ValueError("У значка должно быть название.")
     if len(name) > CUSTOM_BADGE_NAME_MAX_CHARS:
         raise ValueError(f"Название должно быть не длиннее {CUSTOM_BADGE_NAME_MAX_CHARS} символов.")
-    return emoji, name
+    return name
 
 
 def custom_badge_holder_count(entry: str, badge_id: str) -> int:
@@ -1256,6 +1262,32 @@ def delete_custom_badge(entry: str, badge_id: str) -> Badge | None:
         return None
     for assigned in data["assignments"].values():
         assigned.pop(badge_id, None)
+    _save_custom_badge_data(entry, data)
+    return Badge(
+        badge_id=record["id"], emoji=record["emoji"], name=record["name"],
+        description="выдан администратором", custom=True,
+    )
+
+
+def rename_custom_badge(entry: str, badge_id: str, name: str) -> Badge | None:
+    """Rename a definition without replacing its id or any holder assignments."""
+    name = _normalise_custom_badge_name(name)
+    data = _load_custom_badge_data(entry)
+    record = data["badges"].get(str(badge_id))
+    if record is None:
+        return None
+    duplicate = next(
+        (
+            other for other_id, other in data["badges"].items()
+            if other_id != str(badge_id)
+            and other.get("emoji") == record.get("emoji")
+            and str(other.get("name") or "").casefold() == name.casefold()
+        ),
+        None,
+    )
+    if duplicate is not None:
+        raise ValueError("Значок с таким эмодзи и названием уже существует.")
+    record["name"] = name
     _save_custom_badge_data(entry, data)
     return Badge(
         badge_id=record["id"], emoji=record["emoji"], name=record["name"],

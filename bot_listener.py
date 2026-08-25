@@ -156,6 +156,7 @@ UPDATE_HANDLING_TIMEOUT_SECONDS = 180
 BADGE_CALLBACK_PREFIX = "badge"
 BADGE_FLOW_TTL_SECONDS = 10 * 60
 BADGE_CREATE_BUTTON_TEXT = "➕ Создать значок"
+BADGE_RENAME_BUTTON_TEXT = "✏️ Переименовать значок"
 BADGE_GIVE_BUTTON_TEXT = "🎁 Выдать значок"
 # Same award, minus the group announcement (see _award_badge_from_flow). A separate
 # button rather than a toggle on the menu: a toggle has a state the admin has to read
@@ -396,6 +397,7 @@ def _badge_menu_keyboard(flow_id: str) -> dict:
     return {
         "inline_keyboard": [
             [{"text": BADGE_CREATE_BUTTON_TEXT, "callback_data": _badge_callback_data("create", flow_id)}],
+            [{"text": BADGE_RENAME_BUTTON_TEXT, "callback_data": _badge_callback_data("renlist", flow_id)}],
             [{"text": BADGE_GIVE_BUTTON_TEXT, "callback_data": _badge_callback_data("list", flow_id)}],
             [{"text": BADGE_GIVE_QUIET_BUTTON_TEXT, "callback_data": _badge_callback_data("listq", flow_id)}],
             [{"text": BADGE_REVOKE_BUTTON_TEXT, "callback_data": _badge_callback_data("revlist", flow_id)}],
@@ -832,8 +834,8 @@ async def handle_badge_callback(
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
         return
 
-    # Pick a badge, for either of the two destructive actions.
-    if action in ("dellist", "revlist"):
+    # Pick a badge for renaming or either of the two destructive actions.
+    if action in ("renlist", "dellist", "revlist"):
         badges = stats.list_custom_badges(flow["entry"])
         if not badges:
             await api.send_message(
@@ -843,11 +845,12 @@ async def handle_badge_callback(
                 parse_mode=None,
             )
             return
-        next_action = "del" if action == "dellist" else "rev"
-        prompt_text = (
-            "Какой значок удалить совсем?" if action == "dellist"
-            else "Какой значок забрать у участника?"
-        )
+        next_action = {"renlist": "rename", "dellist": "del", "revlist": "rev"}[action]
+        prompt_text = {
+            "renlist": "Какой значок переименовать?",
+            "dellist": "Какой значок удалить совсем?",
+            "revlist": "Какой значок забрать у участника?",
+        }[action]
         await api.send_message(
             flow["chat_id"], prompt_text,
             reply_to_message_id=message.get("message_id"),
@@ -858,6 +861,33 @@ async def handle_badge_callback(
             ] + [_badge_back_row(flow_id)]},
             parse_mode=None,
         )
+        return
+
+    if action == "rename" and badge_id:
+        badge = next(
+            (item for item in stats.list_custom_badges(flow["entry"]) if item.badge_id == badge_id),
+            None,
+        )
+        if badge is None:
+            await api.send_message(
+                flow["chat_id"], "Этот значок уже удалён.",
+                reply_to_message_id=message.get("message_id"),
+                reply_markup={"inline_keyboard": [_badge_back_row(flow_id)]},
+                parse_mode=None,
+            )
+            return
+        flow["selected_badge_id"] = badge_id
+        flow["awaiting"] = "rename_name"
+        prompt = await api.send_message(
+            flow["chat_id"],
+            f"Текущее название: {badge.label}\n"
+            "Ответьте на это сообщение новым названием без эмодзи — эмодзи останется прежним."
+            f"\n\n{BADGE_BACK_HINT}",
+            reply_to_message_id=message.get("message_id"),
+            reply_markup={"force_reply": True, "selective": True},
+            parse_mode=None,
+        )
+        flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
         return
 
     if action == "del" and badge_id:
@@ -938,7 +968,7 @@ async def handle_badge_text_input(
             for flow_id, flow in badge_flows.items()
             if flow.get("chat_id") == chat_id
             and flow.get("admin_id") == actor_id
-            and flow.get("awaiting") in ("create_spec", "target", "revoke_target")
+            and flow.get("awaiting") in ("create_spec", "rename_name", "target", "revoke_target")
             and flow.get("prompt_message_id") == replied_message_id
             and time.monotonic() - flow["created_at"] <= BADGE_FLOW_TTL_SECONDS
         ),
@@ -992,6 +1022,32 @@ async def handle_badge_text_input(
         await api.send_message(
             chat_id,
             f"Создан значок {badge.label}. Теперь его можно выдать через /badge.",
+            reply_to_message_id=message["message_id"],
+            parse_mode=None,
+        )
+        return True
+
+    if flow["awaiting"] == "rename_name":
+        try:
+            badge = stats.rename_custom_badge(
+                flow["entry"], flow["selected_badge_id"], text
+            )
+            if badge is None:
+                raise ValueError("Этот значок уже удалён.")
+        except ValueError as e:
+            prompt = await api.send_message(
+                chat_id,
+                f"{e}\n\n{BADGE_BACK_HINT}",
+                reply_to_message_id=message["message_id"],
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+            flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
+            return True
+        badge_flows.pop(flow_id, None)
+        await api.send_message(
+            chat_id,
+            f"Значок переименован: {badge.label}.",
             reply_to_message_id=message["message_id"],
             parse_mode=None,
         )

@@ -716,6 +716,41 @@ class GamificationTests(unittest.TestCase):
                     [badge.badge_id],
                 )
 
+    def test_renaming_a_custom_badge_keeps_its_id_holders_and_stack_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                badge = stats.create_custom_badge("chat", "🏆", "Победитель", 10, "Admin")
+                for _ in range(3):
+                    stats.give_custom_badge(
+                        "chat", badge.badge_id, 20, "User", 10, "Admin", stack=True,
+                    )
+
+                renamed = stats.rename_custom_badge(
+                    "chat", badge.badge_id, "  Чемпион   недели  "
+                )
+
+                self.assertEqual(renamed.badge_id, badge.badge_id)
+                self.assertEqual(renamed.label, "🏆 Чемпион недели")
+                held = stats.custom_badges_for_user("chat", 20)
+                self.assertEqual(len(held), 1)
+                self.assertEqual(held[0].badge_id, badge.badge_id)
+                self.assertEqual(held[0].label, "🏆 Чемпион недели ×3")
+
+    def test_renaming_a_custom_badge_refuses_a_duplicate_label(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                first = stats.create_custom_badge("chat", "🏆", "Первый", 10, "Admin")
+                stats.create_custom_badge("chat", "🏆", "Второй", 10, "Admin")
+
+                with self.assertRaisesRegex(ValueError, "уже существует"):
+                    stats.rename_custom_badge("chat", first.badge_id, "второй")
+
+                self.assertEqual(
+                    next(item for item in stats.list_custom_badges("chat")
+                         if item.badge_id == first.badge_id).name,
+                    "Первый",
+                )
+
     def test_custom_badge_requires_an_emoji(self):
         with self.assertRaisesRegex(ValueError, "эмодзи"):
             stats.parse_custom_badge_spec("VIP Пользователь")
@@ -1421,13 +1456,44 @@ class BadgeBackButtonTests(unittest.IsolatedAsyncioTestCase):
                 flow_id = await self._menu(api, flows)
 
                 for action, badge_id in (
-                    ("list", None), ("listq", None), ("revlist", None),
+                    ("list", None), ("listq", None), ("renlist", None), ("revlist", None),
                     ("dellist", None), ("del", badge.badge_id),
                 ):
                     with self.subTest(action=action):
                         sent = await self._tap(api, flows, flow_id, action, badge_id)
                         labels = [b["text"] for b in self._buttons(sent)]
                         self.assertIn(bot_listener.BADGE_BACK_BUTTON_TEXT, labels)
+
+    async def test_admin_can_rename_a_badge_from_the_menu(self):
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                badge = stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                stats.give_custom_badge(
+                    "chat", badge.badge_id, 20, "User", 10, "Admin", stack=True,
+                )
+                flow_id = await self._menu(api, flows)
+                menu_labels = [b["text"] for b in self._buttons(api.sent[-1])]
+                self.assertIn(bot_listener.BADGE_RENAME_BUTTON_TEXT, menu_labels)
+
+                await self._tap(api, flows, flow_id, "renlist")
+                prompt = (await self._tap(api, flows, flow_id, "rename", badge.badge_id))[0]
+                self.assertIn("эмодзи останется прежним", prompt["text"])
+
+                consumed = await bot_listener.handle_badge_text_input(
+                    api, None,
+                    {"message_id": 6, "chat": {"id": 10, "type": "private"},
+                     "from": self.ADMIN, "text": "Снайпер", "reply_to_message": prompt},
+                    timezone.utc, flows,
+                )
+
+                self.assertTrue(consumed)
+                self.assertEqual(flows, {})
+                self.assertEqual(stats.list_custom_badges("chat")[0].label, "🎯 Снайпер")
+                self.assertEqual(
+                    stats.custom_badges_for_user("chat", 20)[0].label, "🎯 Снайпер"
+                )
+                self.assertIn("Значок переименован: 🎯 Снайпер", api.sent[-1][0]["text"])
 
     async def test_the_irreversible_delete_confirmation_can_be_backed_out_of(self):
         api, flows = FakeBotAPI(), {}
