@@ -1462,12 +1462,13 @@ class BadgeBackButtonTests(unittest.IsolatedAsyncioTestCase):
         )
         return next(iter(flows))
 
-    async def _tap(self, api, flows, flow_id, action, badge_id=None):
+    async def _tap(self, api, flows, flow_id, action, badge_id=None, **kwargs):
         await bot_listener.handle_badge_callback(
             api,
             {"id": "cb", "from": self.ADMIN, "message": api.sent[-1][0],
              "data": bot_listener._badge_callback_data(action, flow_id, badge_id)},
             flows,
+            **kwargs,
         )
         return api.sent[-1]
 
@@ -1505,7 +1506,7 @@ class BadgeBackButtonTests(unittest.IsolatedAsyncioTestCase):
 
                 await self._tap(api, flows, flow_id, "renlist")
                 prompt = (await self._tap(api, flows, flow_id, "rename", badge.badge_id))[0]
-                self.assertIn("эмодзи останется прежним", prompt["text"])
+                self.assertIn("вместе с эмодзи", prompt["text"])
 
                 consumed = await bot_listener.handle_badge_text_input(
                     api, None,
@@ -1515,12 +1516,84 @@ class BadgeBackButtonTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertTrue(consumed)
-                self.assertEqual(flows, {})
                 self.assertEqual(stats.list_custom_badges("chat")[0].label, "🎯 Снайпер")
                 self.assertEqual(
                     stats.custom_badges_for_user("chat", 20)[0].label, "🎯 Снайпер"
                 )
                 self.assertIn("Значок переименован: 🎯 Снайпер", api.sent[-1][0]["text"])
+                # The menu SURVIVES the action it was used for, with nothing half-chosen
+                # left on it. Deleting the flow here is what made the message the admin
+                # was still looking at answer "Меню устарело" to its own next button.
+                self.assertEqual(set(flows), {flow_id})
+                self.assertIsNone(flows[flow_id]["awaiting"])
+                self.assertIsNone(flows[flow_id]["selected_badge_id"])
+                back = await self._tap(api, flows, flow_id, "menu")
+                self.assertIn(
+                    bot_listener.BADGE_RENAME_BUTTON_TEXT,
+                    [button["text"] for button in self._buttons(back)],
+                )
+
+    async def test_a_menu_outlives_the_process_that_drew_it(self):
+        """The flow is in memory and nothing else, so a deploy wipes every open menu.
+
+        That is what "Меню устарело или принадлежит другому администратору" was really
+        saying most of the time: not that the menu belonged to somebody else, but that the
+        bot had restarted since it was drawn. The ten-minute TTL did the same to an admin
+        who stepped away. Neither is a reason to refuse -- the flow holds no permission,
+        only a half-finished step, and every press re-checks who is pressing. So the flow
+        is rebuilt under the id the buttons already carry, and the menu simply works.
+        """
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                flow_id = await self._menu(api, flows)
+
+                flows.clear()  # the deploy
+                sent = await self._tap(api, flows, flow_id, "renlist",
+                                       admin_chat_id=-1001, entry="chat")
+
+                self.assertEqual(set(flows), {flow_id})
+                self.assertIn("Меткий глаз",
+                              [b["text"] for b in self._buttons(sent)][0])
+                self.assertNotIn("устарел", sent[0]["text"])
+
+    async def test_a_menu_that_cannot_be_rebuilt_still_refuses_rather_than_guessing(self):
+        """Rebuilding needs the chat being managed. Without it, the old dead end stands.
+
+        This is the honest half of the revival: a flow carries no authority, but it does
+        carry WHICH chat the badges belong to, and that is not something to invent.
+        """
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                flow_id = await self._menu(api, flows)
+                flows.clear()
+
+                await self._tap(api, flows, flow_id, "renlist")
+
+                self.assertEqual(flows, {})
+                self.assertIn("другому администратору", api.callbacks[-1][1])
+
+    async def test_one_admins_menu_is_not_another_admins(self):
+        """The revival must not turn a live menu into a shared one."""
+        api, flows = FakeBotAPI(), {}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.create_custom_badge("chat", "🎯", "Меткий глаз", 10, "Admin")
+                flow_id = await self._menu(api, flows)
+
+                await bot_listener.handle_badge_callback(
+                    api,
+                    {"id": "cb", "from": {"id": 11, "first_name": "Другой"},
+                     "message": api.sent[-1][0],
+                     "data": bot_listener._badge_callback_data("renlist", flow_id)},
+                    flows, admin_chat_id=-1001, entry="chat",
+                )
+
+                self.assertIn("другому администратору", api.callbacks[-1][1])
+                self.assertEqual(flows[flow_id]["admin_id"], 10)
 
     async def test_the_irreversible_delete_confirmation_can_be_backed_out_of(self):
         api, flows = FakeBotAPI(), {}

@@ -456,18 +456,80 @@ def _parse_badge_callback(data: str) -> tuple[str, str, str | None] | None:
     return parts[1], parts[2], parts[3] if len(parts) == 4 else None
 
 
+def _new_badge_flow(chat_id, admin_chat_id, entry, admin, target=None) -> dict:
+    """The scratch space one badge menu works in. Carries no authority of its own.
+
+    Every callback and every force-reply re-checks `_can_manage_chat` against the chat
+    being managed, so nothing here decides who may do what -- it only remembers which
+    step the admin is on and what they have picked so far.
+    """
+    return {
+        "created_at": time.monotonic(),
+        "chat_id": chat_id,
+        "admin_chat_id": admin_chat_id,
+        "entry": entry,
+        "admin_id": (admin or {}).get("id"),
+        "admin_name": _display_name(admin or {}),
+        "target": target,
+        "awaiting": None,
+        "selected_badge_id": None,
+        "prompt_message_id": None,
+        # Set when the admin enters the give step, by which button they used. Defaults to
+        # announcing: a flow that somehow reached the award without passing through either
+        # button behaves the way it always did.
+        "silent": False,
+    }
+
+
+def _restart_badge_flow(flow: dict) -> None:
+    """Back to the root menu with nothing half-chosen, and the clock wound back.
+
+    Finishing an action used to DELETE the flow, which killed the menu it was reached
+    from: create a badge, then press anything on the same message, and the answer was
+    "Меню устарело или принадлежит другому администратору" -- for a menu the admin was
+    looking at, had just used, and owned. A menu is a place you do several things from.
+    """
+    flow["created_at"] = time.monotonic()
+    _reset_badge_flow_step(flow)
+    # The recipient goes too. It survives a plain Назад on purpose (see
+    # _reset_badge_flow_step), but an award that has already been handed over must not
+    # leave the next one silently aimed at the same person.
+    flow["target"] = None
+
+
 def _badge_flow(
     badge_flows: dict[str, dict],
     flow_id: str,
     chat_id: int,
     admin_id: int,
+    *,
+    admin: dict | None = None,
+    admin_chat_id=None,
+    entry: str | None = None,
 ) -> dict | None:
+    """The flow behind one menu, rebuilt in place when it is not there any more.
+
+    The state is in memory and nothing else, so it does not survive a restart -- and a
+    deploy therefore used to turn every badge menu anybody had open into a dead one. The
+    ten-minute TTL did the same to an admin who came back from lunch. Neither is a reason
+    to refuse: the flow holds no permission, only a half-finished step, and losing that
+    costs the admin one tap on the menu they are already looking at.
+
+    Reviving keeps the SAME flow_id, which is what the buttons on screen already say, so
+    an old message keeps working instead of having to be sent again. `admin_chat_id` and
+    `entry` are needed to rebuild one; without them a missing flow is still a dead end.
+    """
     flow = badge_flows.get(flow_id)
-    if not flow:
-        return None
-    if time.monotonic() - flow["created_at"] > BADGE_FLOW_TTL_SECONDS:
+    if flow is not None and time.monotonic() - flow["created_at"] > BADGE_FLOW_TTL_SECONDS:
         badge_flows.pop(flow_id, None)
-        return None
+        flow = None
+    if flow is None:
+        if admin_chat_id is None or entry is None or not admin_id:
+            return None
+        flow = badge_flows[flow_id] = _new_badge_flow(
+            chat_id, admin_chat_id, entry, admin or {"id": admin_id},
+        )
+        return flow
     if flow["chat_id"] != chat_id or flow["admin_id"] != admin_id:
         return None
     return flow
@@ -582,21 +644,7 @@ async def handle_badge_command(
         return
 
     flow_id = uuid.uuid4().hex[:10]
-    badge_flows[flow_id] = {
-        "created_at": time.monotonic(),
-        "chat_id": dm_chat_id,
-        "admin_chat_id": admin_chat_id,
-        "entry": entry,
-        "admin_id": admin_id,
-        "admin_name": _display_name(admin),
-        "target": None,
-        "awaiting": None,
-        "selected_badge_id": None,
-        # Set when the admin enters the give step, by which button they used. Defaults to
-        # announcing: a flow that somehow reached the award without passing through either
-        # button behaves the way it always did.
-        "silent": False,
-    }
+    badge_flows[flow_id] = _new_badge_flow(dm_chat_id, admin_chat_id, entry, admin)
     await api.send_message(
         dm_chat_id,
         "🏅 Управление значками\nРаботает только в этой личной переписке.",
@@ -737,6 +785,9 @@ async def handle_badge_callback(
     api: TelegramBotAPI,
     callback: dict,
     badge_flows: dict[str, dict],
+    *,
+    admin_chat_id=None,
+    entry: str | None = None,
 ) -> None:
     parsed = _parse_badge_callback(callback.get("data") or "")
     if parsed is None:
@@ -746,9 +797,12 @@ async def handle_badge_callback(
     message = callback.get("message") or {}
     chat = message.get("chat") or {}
     actor = callback.get("from") or {}
-    flow = _badge_flow(badge_flows, flow_id, chat.get("id"), actor.get("id"))
+    flow = _badge_flow(
+        badge_flows, flow_id, chat.get("id"), actor.get("id"),
+        admin=actor, admin_chat_id=admin_chat_id, entry=entry,
+    )
     if flow is None:
-        await api.answer_callback_query(callback_id, "Меню устарело или принадлежит другому администратору.")
+        await api.answer_callback_query(callback_id, "Это меню принадлежит другому администратору.")
         return
     if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         await api.answer_callback_query(callback_id, "Нужны права администратора.")
@@ -816,7 +870,7 @@ async def handle_badge_callback(
             await _award_badge_from_flow(
                 api, flow, badge_id, flow["target"], message.get("message_id")
             )
-            badge_flows.pop(flow_id, None)
+            _restart_badge_flow(flow)
         else:
             flow["selected_badge_id"] = badge_id
             flow["awaiting"] = "target"
@@ -931,9 +985,10 @@ async def handle_badge_callback(
         await api.send_message(
             flow["chat_id"],
             f"Значок {deleted.label} удалён." if deleted else "Этот значок уже удалён.",
-            reply_to_message_id=message.get("message_id"), parse_mode=None,
+            reply_to_message_id=message.get("message_id"),
+            reply_markup=_badge_menu_keyboard(flow_id), parse_mode=None,
         )
-        badge_flows.pop(flow_id, None)
+        _restart_badge_flow(flow)
         return
 
     if action == "rev" and badge_id:
@@ -1020,7 +1075,7 @@ async def handle_badge_text_input(
             )
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
             return True
-        badge_flows.pop(flow_id, None)
+        _restart_badge_flow(flow)
         await api.send_message(
             chat_id,
             f"Создан значок {badge.label}. Теперь его можно выдать через /badge.",
@@ -1046,7 +1101,7 @@ async def handle_badge_text_input(
             )
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
             return True
-        badge_flows.pop(flow_id, None)
+        _restart_badge_flow(flow)
         await api.send_message(
             chat_id,
             f"Значок переименован: {badge.label}.",
@@ -1069,7 +1124,7 @@ async def handle_badge_text_input(
             )
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
             return True
-        badge_flows.pop(flow_id, None)
+        _restart_badge_flow(flow)
         revoked = stats.revoke_custom_badge(
             flow["entry"], flow["selected_badge_id"], target.user_id
         )
@@ -1134,7 +1189,7 @@ async def handle_badge_text_input(
             log=log,
             missing=missing,
         )
-        badge_flows.pop(flow_id, None)
+        _restart_badge_flow(flow)
     except ValueError as e:
         prompt = await api.send_message(
             chat_id,
@@ -3132,6 +3187,10 @@ def _has_pending_flow(flows: dict[str, dict], chat_id, user_id, ttl_seconds: int
     return any(
         flow.get("chat_id") == chat_id
         and flow.get("user_id", flow.get("admin_id")) == user_id
+        # A flow that is merely OPEN is not a question. Badge menus now outlive the action
+        # they were used for, so without this an admin who created one badge would get no
+        # menu for the next ten minutes. Flow kinds that never carry the key are unchanged.
+        and ("awaiting" not in flow or flow.get("awaiting"))
         and time.monotonic() - flow["created_at"] <= ttl_seconds
         for flow in flows.values()
     )
@@ -8578,7 +8637,16 @@ async def _dispatch_update(
                 badge_flows=badge_flows, known_chat_ids=known_chat_ids, log=log,
             )
         elif callback_data.startswith(f"{BADGE_CALLBACK_PREFIX}:"):
-            await handle_badge_callback(api, callback, badge_flows)
+            # Resolved here rather than inside: a menu whose flow was lost to a restart is
+            # rebuilt from these two, and they are the same pair /badge itself starts from.
+            await handle_badge_callback(
+                api, callback, badge_flows,
+                admin_chat_id=(
+                    await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+                    if home_chat_ref else None
+                ),
+                entry=home_chat_ref,
+            )
         elif callback_data.startswith(f"{PLANT_CALLBACK_PREFIX}:"):
             await handle_plant_callback(api, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{button_builder.CALLBACK_PREFIX}:"):
