@@ -6348,7 +6348,9 @@ function gatekeeperMoves(fight) {
 function gatekeeperFight(dungeon, fight) {
   const locks = (fight.locks || []).map((open) => open ? "🔓" : "🔒").join(" ");
   const steps = (fight.steps || []).map((filled) => filled ? "●" : "○").join(" ");
-  const predictions = (fight.prediction_labels || []).map(esc).join(" · ");
+  // The evidence row, not the answer: what the Gatekeeper has WATCHED the player do.
+  // Printing the prediction here made the fight a reading exercise -- see pets_gatekeeper.
+  const observed = (fight.observed_icons || []).map(esc).join(" ");
   return '<div class="panel dungeon"><div class="dungeon-head boss">' +
     '<div class="dungeon-title">' + esc(fight.boss_name || "Стальной привратник") +
       '<small>Этаж ' + Number(dungeon.floor || 0) + ' · интерактивный бой</small></div>' +
@@ -6357,9 +6359,10 @@ function gatekeeperFight(dungeon, fight) {
     '<div class="panel" style="margin:0 0 10px;padding:11px">' +
       '<div class="row spread small"><b>🔐 Замки</b><span style="letter-spacing:4px">' + locks + '</span></div>' +
       '<div class="row spread small" style="margin-top:7px"><b>👣 Шаги</b><span style="letter-spacing:4px">' + steps + '</span></div>' +
-      (predictions
-        ? '<div class="tool-quest-note">🎯 Ожидает: <b>' + predictions + '</b></div>'
-        : '<div class="tiny muted" style="margin-top:7px">' + esc(fight.adaptation_hint || "Наблюдает за героем.") + '</div>') +
+      (observed
+        ? '<div class="row spread small" style="margin-top:7px"><b>🔍 Замки помнят</b><span style="letter-spacing:3px">' + observed + '</span></div>'
+        : '') +
+      '<div class="tiny muted" style="margin-top:7px">' + esc(fight.adaptation_hint || "Наблюдает за героем.") + '</div>' +
       (fight.shield_disrupted ? '<div class="tiny loss" style="margin-top:6px">💥 Щит дестабилизирован.</div>' : '') +
     '</div>' +
     (fight.is_core_open ? '<div class="phoenix-vuln">🔓 ЯДРО ОТКРЫТО</div>' : '') +

@@ -26,13 +26,71 @@ def _fight(*, hero_hp=4_000, damage=500, spell_power=500,
 
 
 class GatekeeperRulesTests(unittest.TestCase):
+    def test_the_payload_shows_the_evidence_and_never_the_conclusion(self):
+        """The screen used to print the answer, and the fight was a reading exercise.
+
+        Measured over 300 fights at the gear the floor is priced for: a policy that read
+        the "🎯 Ожидает: ⚔️ Оружие" line and pressed anything else won 100% of the time --
+        as often as a full engine search, and with no memory of its own play at all. What
+        the player is shown now is what the Gatekeeper WATCHED them do; turning that into
+        a prediction is the player's arithmetic, and the rule for it is printed on the
+        boss (pets_dungeon.BOSS_WEAKNESS["gatekeeper"]).
+        """
+        state = _fight()
+        state.update({
+            "current_prediction": gatekeeper.WEAPON,
+            "secondary_prediction": gatekeeper.MAGIC,
+            "player_action_history": [
+                gatekeeper.WEAPON, gatekeeper.DEFENCE, gatekeeper.WEAPON,
+            ],
+        })
+        shown = gatekeeper.public(state)
+
+        # The evidence is there, in the order it happened.
+        self.assertEqual(
+            shown["observed"],
+            [gatekeeper.WEAPON, gatekeeper.DEFENCE, gatekeeper.WEAPON],
+        )
+        self.assertEqual(shown["observed_icons"], ["⚔️", "🛡", "⚔️"])
+        # The conclusion is not, in any spelling, anywhere in the payload a client draws.
+        flat = repr(shown)
+        for banned in ("prediction_labels", "predictions", "current_prediction"):
+            self.assertNotIn(banned, shown, banned)
+        self.assertNotIn("Ожидает", flat)
+        for category in gatekeeper.CATEGORIES:
+            self.assertNotIn(gatekeeper.CATEGORY_LABELS[category], str(shown["scene"]))
+            self.assertNotIn(gatekeeper.CATEGORY_LABELS[category],
+                             str(shown["adaptation_hint"]))
+        # How MANY tracks are live is fair warning and stays.
+        self.assertEqual(shown["tracking_count"], 2)
+
+    def test_careless_play_stops_being_good_enough(self):
+        """Two tracked categories rather than one is what makes the choice a choice.
+
+        With one, three of four buttons were safe and picking one was a formality even
+        without reading anything. The second track is not the emergency escalation any
+        more -- it is the ordinary state, and emergency stops the machine forgetting.
+        """
+        state = _fight()
+        state.update({
+            "player_action_history": [gatekeeper.WEAPON] * 3 + [gatekeeper.MAGIC] * 2,
+            "adaptation": {
+                gatekeeper.WEAPON: 3.4, gatekeeper.MAGIC: 2.2,
+                gatekeeper.DEFENCE: 0.1, gatekeeper.MOVEMENT: 0.0,
+            },
+            "is_emergency_mode": False,
+        })
+        primary, secondary = gatekeeper._choose_predictions(state, random.Random(4))
+        self.assertEqual(primary, gatekeeper.WEAPON)
+        self.assertEqual(secondary, gatekeeper.MAGIC)
+
     def test_intro_has_configurable_locks_steps_and_contextual_actions(self):
         state = _fight(locks_total=5, step_limit=6)
         shown = gatekeeper.public(state)
 
         self.assertEqual(shown["locks"], [False] * 5)
         self.assertEqual(shown["steps"], [False] * 6)
-        self.assertEqual(shown["predictions"], [])
+        self.assertEqual(shown["observed"], [])
         self.assertTrue(shown["telegraph"])
         self.assertGreaterEqual(len(shown["actions"]), 3)
         self.assertTrue(all(row["category"] in gatekeeper.CATEGORIES
@@ -118,7 +176,7 @@ class GatekeeperRulesTests(unittest.TestCase):
         self.assertFalse(after["is_core_open"])
         self.assertEqual(after["cores_struck"], 1)
 
-    def test_emergency_mode_tracks_two_categories_and_a_feint_opens_two_locks(self):
+    def test_emergency_mode_stops_the_machine_forgetting_and_a_feint_opens_two_locks(self):
         state = _fight()
         state.update({
             "is_emergency_mode": True,
@@ -136,7 +194,15 @@ class GatekeeperRulesTests(unittest.TestCase):
 
         self.assertEqual(after["locks_open"], 2)
         self.assertEqual(after["systems_fooled"], 1)
-        self.assertEqual(len(gatekeeper.public(after)["predictions"]), 2)
+        # Two tracks are the ORDINARY state now, so emergency escalates elsewhere: the
+        # memory stops fading, and a category the player has stopped using keeps its
+        # weight instead of falling away at ADAPTATION_DECAY a turn.
+        self.assertGreater(gatekeeper.EMERGENCY_ADAPTATION_DECAY,
+                           gatekeeper.ADAPTATION_DECAY)
+        calm = dict(state, is_emergency_mode=False)
+        cooled = gatekeeper.take(calm, gatekeeper.DEFENCE, seed=13)
+        self.assertGreater(after["adaptation"][gatekeeper.WEAPON],
+                           cooled["adaptation"][gatekeeper.WEAPON])
 
     def test_attack_selection_never_covers_every_reasonable_answer(self):
         categories = gatekeeper.CATEGORIES

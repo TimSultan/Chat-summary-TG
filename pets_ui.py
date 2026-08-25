@@ -668,11 +668,13 @@ def gatekeeper_view(entry: str, user_id, xp: int,
         f"👣 Шаги: {steps}",
     ]
     if state.get("is_emergency_mode"):
-        lines.append("🚨 <b>АВАРИЙНЫЙ РЕЖИМ</b> · система отслеживает две категории")
-    predictions = list(state.get("prediction_labels") or [])
-    if predictions:
-        lines.append("🎯 Ожидает: <b>" + " · ".join(escape(str(row)) for row in predictions) + "</b>")
-    elif state.get("adaptation_hint"):
+        lines.append("🚨 <b>АВАРИЙНЫЙ РЕЖИМ</b> · система больше не забывает")
+    # The evidence, never the conclusion. This line used to read "🎯 Ожидает: ⚔️ Оружие",
+    # which is the whole answer -- see the pets_gatekeeper docstring for what that measured.
+    observed = [str(row) for row in (state.get("observed_icons") or [])]
+    if observed:
+        lines.append("🔍 Замки помнят: <b>" + " ".join(escape(row) for row in observed) + "</b>")
+    if state.get("adaptation_hint"):
         lines.append(f"<i>{escape(str(state['adaptation_hint']))}</i>")
     if state.get("shield_disrupted"):
         lines.append("💥 <b>Щит дестабилизирован:</b> следующий блок слабее.")

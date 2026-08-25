@@ -4,6 +4,24 @@ The Phoenix asks the player to read the boss.  This encounter deliberately rever
 direction: the Gatekeeper reads a short history of broad action categories and the player
 progresses by feeding it a pattern, then breaking that prediction.  The module is pure and
 JSON-safe; persistence and dungeon rewards live in :mod:`pets`.
+
+WHAT THE PLAYER IS SHOWN, AND WHY IT IS NOT THE ANSWER
+------------------------------------------------------
+This screen used to print the prediction in words before the choice -- "🎯 Ожидает:
+⚔️ Оружие" -- and then say the same thing twice more in prose.  Measured over 300 fights
+at the gear the floor is priced for, a policy that read that one line and pressed anything
+else won 100% of the time, exactly as often as a perfect engine search; only leftover
+health differed, and leftover health at the end of a fight buys nothing.  A fight whose
+whole solution is one line of text is a reading exercise.
+
+What is shown now is the EVIDENCE: the categories the player has actually been pressing,
+newest last.  The rule that turns evidence into a prediction is stated on the boss itself
+(pets_dungeon.BOSS_WEAKNESS) -- recent actions weigh more, a repeat weighs double -- so
+nothing is hidden and nothing is guessed.  The player has to do the arithmetic the machine
+does.  The history is capped at HISTORY_LIMIT and the memory decays by ADAPTATION_DECAY a
+turn, so what is on screen really is everything the machine is working from: after eight
+turns an older action is worth 0.72 ** 8 -- about 7% of one press -- and cannot change an
+answer on its own.
 """
 
 from __future__ import annotations
@@ -29,6 +47,20 @@ DEFEAT: Final = "defeat"
 LOCKS_TOTAL: Final = 3
 STEP_LIMIT: Final = 4
 EMERGENCY_HP_SHARE: Final = 0.30
+# How fast the machine forgets a category it is not being fed.  Emergency mode barely
+# forgets at all, which is its whole escalation: it used to be "now it tracks two
+# categories instead of one", but two is the ordinary state now.  A machine that stops
+# forgetting is worse to fight and, unlike a third tracked category, it cannot corner the
+# player -- see _reasonable_answers, where a third prediction would zero most of the
+# attack pool and leave Steel Wall on a loop.
+ADAPTATION_DECAY: Final = 0.72
+EMERGENCY_ADAPTATION_DECAY: Final = 0.92
+# The scores a category needs before the machine commits to tracking it at all.  The
+# second track is deliberately close behind the first: with two of four categories read,
+# choosing between the two that are left is a decision, where three safe buttons out of
+# four was a formality.
+PREDICTION_THRESHOLD: Final = 2.15
+SECONDARY_THRESHOLD: Final = 1.35
 CLOSED_WEAPON_SHARE: Final = 0.18
 CLOSED_MAGIC_SHARE: Final = 0.42
 CLOSED_DAMAGE_CAP_SHARE: Final = 0.08
@@ -46,6 +78,18 @@ CATEGORY_LABELS: Final = {
     MAGIC: "✨ Магия",
     MOVEMENT: "👣 Движение",
 }
+# The same four, stripped to the picture, for the row of evidence.  A row of names would
+# not be readable at a glance, and the whole point of the row is that it is read at a
+# glance and counted.
+CATEGORY_ICONS: Final = {
+    WEAPON: "⚔️",
+    DEFENCE: "🛡",
+    MAGIC: "✨",
+    MOVEMENT: "👣",
+}
+# How much of the history is on screen.  Shorter than HISTORY_LIMIT would hide evidence the
+# machine is still using; longer would show presses whose weight has decayed to nothing.
+OBSERVED_SHOWN: Final = 6
 
 ATTACKS: Final = {
     "sweep": {
@@ -197,13 +241,19 @@ def actions(state: dict) -> list[dict]:
     return offered
 
 
+def _observed(state: dict) -> list[str]:
+    """The categories the player has actually pressed, newest last.
+
+    This is the evidence, and deliberately not the conclusion: `current_prediction` stays
+    out of the payload entirely so that no client can put it back on screen.
+    """
+    return [value for value in (state.get("player_action_history") or [])
+            if value in CATEGORIES][-OBSERVED_SHOWN:]
+
+
 def public(state: dict) -> dict:
     state = state or {}
-    predictions = [
-        category for category in (
-            state.get("current_prediction"), state.get("secondary_prediction")
-        ) if category in CATEGORIES
-    ]
+    observed = _observed(state)
     locks_total = max(2, _safe_int(state.get("locks_total"), LOCKS_TOTAL))
     steps_total = max(3, _safe_int(state.get("step_limit"), STEP_LIMIT))
     status = str(state.get("status") or ACTIVE)
@@ -220,8 +270,15 @@ def public(state: dict) -> dict:
         "step_counter": max(0, min(steps_total, _safe_int(state.get("step_counter")))),
         "step_limit": steps_total,
         "steps": [index < _safe_int(state.get("step_counter")) for index in range(steps_total)],
-        "predictions": predictions,
-        "prediction_labels": [CATEGORY_LABELS[category] for category in predictions],
+        # What the machine has SEEN, for the player to draw their own conclusion from.
+        # The conclusion itself is not here on purpose -- see the module docstring.
+        "observed": observed,
+        "observed_icons": [CATEGORY_ICONS[category] for category in observed],
+        "tracking_count": len([
+            value for value in (state.get("current_prediction"),
+                                state.get("secondary_prediction"))
+            if value in CATEGORIES
+        ]),
         "adaptation_hint": _adaptation_hint(state),
         "boss_action": str(state.get("current_boss_action") or ""),
         "boss_action_name": str(ATTACKS.get(
@@ -502,8 +559,9 @@ def _remember(state: dict, category: str) -> None:
     history.append(category)
     state["player_action_history"] = history[-HISTORY_LIMIT:]
     adaptation = dict(state.get("adaptation") or {})
+    decay = EMERGENCY_ADAPTATION_DECAY if state.get("is_emergency_mode") else ADAPTATION_DECAY
     for key in CATEGORIES:
-        adaptation[key] = round(max(0.0, float(adaptation.get(key, 0) or 0)) * (1.0 if key == category else 0.72), 3)
+        adaptation[key] = round(max(0.0, float(adaptation.get(key, 0) or 0)) * (1.0 if key == category else decay), 3)
     adaptation[category] = round(adaptation[category] + 1.0 + (0.45 if repeated else 0.0), 3)
     state["adaptation"] = adaptation
 
@@ -528,12 +586,13 @@ def _choose_predictions(state: dict, rng: random.Random) -> tuple[str | None, st
     # Two identical actions are a deliberate bait and therefore always readable. Mixed
     # play needs a little more evidence before the machine commits to a prediction.
     repeated = len(history) >= 2 and history[-1] == history[-2]
-    primary = ordered[0] if repeated or scores[ordered[0]] >= 2.15 else None
+    primary = ordered[0] if repeated or scores[ordered[0]] >= PREDICTION_THRESHOLD else None
     if primary is None:
         return None, None
-    secondary = None
-    if state.get("is_emergency_mode"):
-        secondary = ordered[1]
+    # The second track is the ordinary state, not the emergency one.  With one category
+    # read, three of four buttons were safe and the choice made itself; with two, the
+    # player picks between the two that are left and that pick has consequences.
+    secondary = ordered[1] if scores[ordered[1]] >= SECONDARY_THRESHOLD else None
     return primary, secondary
 
 
@@ -616,36 +675,40 @@ def _prepare_next_turn(state: dict, rng: random.Random, *, preserve_scene: bool 
             state["scene"] = _adaptation_hint(state)
         elif secondary is None:
             state["scene"] = (
-                f"Голова Привратника поворачивается вслед за героем. "
-                f"{CATEGORY_LABELS[primary]} — именно это действие он теперь ждёт."
+                "Голова Привратника поворачивается вслед за героем. "
+                "Один из замков встаёт на предохранитель."
             )
         else:
             state["scene"] = (
-                "Аварийная система ведёт сразу две траектории: "
-                f"{CATEGORY_LABELS[primary]} и {CATEGORY_LABELS[secondary]}."
+                "Система наведения ведёт сразу две траектории. "
+                "Два замка встают на предохранитель."
             )
 
 
 def _adaptation_hint(state: dict) -> str:
-    prediction = state.get("current_prediction")
-    secondary = state.get("secondary_prediction")
-    if prediction in CATEGORIES and secondary in CATEGORIES:
-        return f"Отслеживаются: {CATEGORY_LABELS[prediction]} и {CATEGORY_LABELS[secondary]}."
-    if prediction in CATEGORIES:
-        return f"Привратник настроен против категории «{CATEGORY_LABELS[prediction]}»."
+    """How far the machine has got, never WHAT it has got to.
+
+    Every line here used to name the category out loud, which meant the fight could be
+    won without remembering a single thing the player had done.  Saying that the machine
+    has committed is fair warning; saying what it committed to is the answer.
+    """
+    tracked = len([
+        value for value in (state.get("current_prediction"), state.get("secondary_prediction"))
+        if value in CATEGORIES
+    ])
+    if tracked >= 2:
+        return "Ведутся две траектории. Обе перекрыты."
+    if tracked == 1:
+        return "Расчёт сошёлся. Одно из направлений перекрыто."
     adaptation = state.get("adaptation") or {}
-    strongest = max(
-        CATEGORIES, key=lambda key: float(adaptation.get(key, 0) or 0)
-    ) if adaptation else None
-    strength = float(adaptation.get(strongest, 0) or 0) if strongest else 0.0
+    strength = max(
+        (float(adaptation.get(key, 0) or 0) for key in CATEGORIES), default=0.0
+    )
     if strength < 0.75:
         return "Привратник наблюдает и пока не выбрал, какое действие ждать."
     if strength < 1.6:
-        return (
-            f"Замок на груди тихо щёлкает. Привратник запоминает: "
-            f"{CATEGORY_LABELS[strongest]}."
-        )
-    return f"Привратник внимательно следит за категорией «{CATEGORY_LABELS[strongest]}»."
+        return "Замок на груди тихо щёлкает. Привратник что-то запоминает."
+    return "Привратник почти уверен в том, что сейчас произойдёт."
 
 
 def _enter_emergency_if_needed(state: dict) -> None:
@@ -656,7 +719,7 @@ def _enter_emergency_if_needed(state: dict) -> None:
     state["is_emergency_mode"] = True
     state["scene"] = (
         "Механизм внутри груди вращается слишком быстро. Раздаётся металлический треск. "
-        "СИСТЕМА НАВЕДЕНИЯ ПЕРЕХОДИТ В АВАРИЙНЫЙ РЕЖИМ. Теперь она отслеживает две категории."
+        "СИСТЕМА НАВЕДЕНИЯ ПЕРЕХОДИТ В АВАРИЙНЫЙ РЕЖИМ. Она перестаёт забывать."
     )
     state["log"].append("Броня стала нестабильнее: обман системы открывает по два замка.")
 
