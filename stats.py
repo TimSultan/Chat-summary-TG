@@ -1214,6 +1214,26 @@ def _contains_emoji(text: str) -> bool:
     )
 
 
+def _is_only_emoji(text: str) -> bool:
+    """Whether `text` is a picture and nothing else -- no letters, digits or punctuation.
+
+    Variation selectors, zero-width joiners and skin-tone modifiers count as part of the
+    picture: a single emoji is routinely several code points, and splitting one down the
+    middle would read as "there is text here" when there is not.
+    """
+    stripped = "".join(str(text or "").split())
+    if not stripped:
+        return False
+    return all(
+        char in "‍️︎"
+        or unicodedata.category(char) in ("So", "Sk", "Mn", "Cf")
+        or 0x1F000 <= ord(char) <= 0x1FAFF
+        or 0x1F3FB <= ord(char) <= 0x1F3FF
+        or ord(char) in _EMOJI_CODEPOINTS
+        for char in stripped
+    )
+
+
 def parse_custom_badge_spec(text: str) -> tuple[str, str]:
     """Parses "<emoji> <name>" from the create-badge conversation."""
     parts = (text or "").strip().split(maxsplit=1)
@@ -1269,24 +1289,61 @@ def delete_custom_badge(entry: str, badge_id: str) -> Badge | None:
     )
 
 
-def rename_custom_badge(entry: str, badge_id: str, name: str) -> Badge | None:
-    """Rename a definition without replacing its id or any holder assignments."""
-    name = _normalise_custom_badge_name(name)
+def split_custom_badge_label(text: str, current_emoji: str) -> tuple[str, str]:
+    """One typed line into the (emoji, name) a badge is stored as.
+
+    Three spellings, and all three are what somebody would reasonably type:
+
+      "🎖 Майор запаса" -- the whole label, which becomes the whole label;
+      "Майор запаса"    -- the name alone, keeping the emoji the badge already has;
+      "🎖"              -- the emoji alone, keeping the name it already has.
+
+    The last one exists because without it a lone emoji would be stored as the NAME and
+    the badge would come out reading "⭐ 🎖" -- a state nobody typed and nobody wants.
+    """
+    stripped = " ".join(str(text or "").split())
+    if not stripped:
+        raise ValueError("У значка должно быть название.")
+    if _is_only_emoji(stripped):
+        # Nothing but emoji: this is a new picture, not a new name. "" says so.
+        if len(stripped) > 16:
+            raise ValueError("Эмодзи слишком длинный.")
+        return stripped, ""
+    parts = stripped.split(maxsplit=1)
+    if len(parts) == 2 and _contains_emoji(parts[0]) and len(parts[0]) <= 16:
+        return parts[0], _normalise_custom_badge_name(parts[1])
+    return str(current_emoji or ""), _normalise_custom_badge_name(stripped)
+
+
+def rename_custom_badge(entry: str, badge_id: str, text: str) -> Badge | None:
+    """Rename a definition without replacing its id or any holder assignments.
+
+    Takes the badge's WHOLE label, emoji included: what an admin types is what the badge
+    reads afterwards. It used to take the name on its own and keep the old emoji, which
+    made typing what you could see on the screen the one thing that did not work --
+    "🏆 Чемпион" was stored as the NAME, and the badge came out "⭐ 🏆 Чемпион", with the
+    old picture still stuck to the front of it. Sending the name alone still keeps the
+    current emoji, so nobody's habit breaks.
+    """
     data = _load_custom_badge_data(entry)
     record = data["badges"].get(str(badge_id))
     if record is None:
         return None
+    emoji, name = split_custom_badge_label(text, record.get("emoji") or "")
+    if not name:
+        name = str(record.get("name") or "")
     duplicate = next(
         (
             other for other_id, other in data["badges"].items()
             if other_id != str(badge_id)
-            and other.get("emoji") == record.get("emoji")
+            and other.get("emoji") == emoji
             and str(other.get("name") or "").casefold() == name.casefold()
         ),
         None,
     )
     if duplicate is not None:
         raise ValueError("Значок с таким эмодзи и названием уже существует.")
+    record["emoji"] = emoji
     record["name"] = name
     _save_custom_badge_data(entry, data)
     return Badge(

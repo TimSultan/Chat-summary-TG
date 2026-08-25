@@ -881,7 +881,9 @@ async def handle_badge_callback(
         prompt = await api.send_message(
             flow["chat_id"],
             f"Текущее название: {badge.label}\n"
-            "Ответьте на это сообщение новым названием без эмодзи — эмодзи останется прежним."
+            "Ответьте на это сообщение тем, как значок должен выглядеть целиком, "
+            "вместе с эмодзи — например: 🎖 Майор запаса.\n"
+            "Только название — эмодзи останется прежним. Только эмодзи — останется название."
             f"\n\n{BADGE_BACK_HINT}",
             reply_to_message_id=message.get("message_id"),
             reply_markup={"force_reply": True, "selective": True},

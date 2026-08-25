@@ -736,6 +736,33 @@ class GamificationTests(unittest.TestCase):
                 self.assertEqual(held[0].badge_id, badge.badge_id)
                 self.assertEqual(held[0].label, "🏆 Чемпион недели ×3")
 
+    def test_renaming_a_custom_badge_takes_the_whole_label_emoji_and_all(self):
+        """Typing what the badge should read is the one spelling that used to fail.
+
+        Rename took the NAME alone and kept the old emoji, so an admin who typed the label
+        they could see -- "🏆 Чемпион" -- stored the emoji as part of the name and got
+        "⭐ 🏆 Чемпион" back, with the old picture still stuck to the front. All three
+        readings work now, and each one is something somebody would reasonably type.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                badge = stats.create_custom_badge("chat", "⭐", "Майор", 10, "Admin")
+                stats.give_custom_badge("chat", badge.badge_id, 20, "User", 10, "Admin")
+
+                whole = stats.rename_custom_badge("chat", badge.badge_id, "🎖 Майор запаса")
+                self.assertEqual(whole.label, "🎖 Майор запаса")
+                # The name on its own still keeps the picture the badge already has.
+                name_only = stats.rename_custom_badge("chat", badge.badge_id, "Полковник")
+                self.assertEqual(name_only.label, "🎖 Полковник")
+                # And the picture on its own keeps the name, rather than becoming it.
+                emoji_only = stats.rename_custom_badge("chat", badge.badge_id, "🏆")
+                self.assertEqual(emoji_only.label, "🏆 Полковник")
+
+                # Through all of it: same id, same holder, still one badge.
+                self.assertEqual(emoji_only.badge_id, badge.badge_id)
+                held = stats.custom_badges_for_user("chat", 20)
+                self.assertEqual([item.label for item in held], ["🏆 Полковник"])
+
     def test_renaming_a_custom_badge_refuses_a_duplicate_label(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
