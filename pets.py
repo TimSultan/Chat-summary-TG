@@ -35,6 +35,7 @@ import random
 import secrets
 import threading
 import time
+from collections import Counter
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -437,8 +438,10 @@ def _load(entry: str) -> dict:
     data["storefront_sales"] = normalised_sales
     _economy_metrics(data)
     legal_scrolls = {row["code"] for row in SCROLLS.SCROLLS}
-    # Older saves used an append-only list.  Accept their duplicates while reading,
-    # then expose a canonical unique inventory to every game operation.
+    # Inventory is a multiset: repeat drops are deliberate forge material. Older builds
+    # collapsed this list to unique codes on every read, which silently destroyed those
+    # ingredients. Catalogue aliases still rewrite retired designs one physical copy at a
+    # time, so replacing several grey items never changes how many things the player owns.
     for record in data["pets"].values():
         if not isinstance(record, dict):
             continue
@@ -465,23 +468,22 @@ def _load(entry: str) -> dict:
         inventory = record.get("inventory")
         if not isinstance(inventory, list):
             inventory = []
-        seen = set()
-        unique = []
+        normalised_inventory = []
         for code in inventory:
             code = C.LEGACY_ITEM_CODES.get(code, code)
-            if isinstance(code, str) and code not in seen:
-                seen.add(code)
-                unique.append(code)
-        record["inventory"] = unique
+            if isinstance(code, str):
+                normalised_inventory.append(code)
+        record["inventory"] = normalised_inventory
         personal = record.get("personal_enchantments")
         if not isinstance(personal, dict):
             personal = {}
         # Only durable entries applied by this module are retained.  The code must
         # still be owned, which makes a sale/gift unable to carry someone's artwork.
         repaired_personal = {}
-        for code, row in personal.items():
-            if not isinstance(row, dict) or not isinstance(code, str):
+        for original_code, row in personal.items():
+            if not isinstance(row, dict) or not isinstance(original_code, str):
                 continue
+            code = C.LEGACY_ITEM_CODES.get(original_code, original_code)
             target = str(row.get("target") or "")
             if target == "scroll":
                 if code in legal_scrolls:
@@ -493,12 +495,42 @@ def _load(entry: str) -> dict:
                 and str((getattr(item, "effect", {}) or {}).get("code") or "")
                 in PERSONAL_PAINT_HEALING_EFFECTS
             )
-            if item is not None and code in unique and (
+            if item is not None and code in normalised_inventory and (
                 (item.slot == target and target in PERSONAL_PAINT_ITEM_SLOTS)
                 or healing_target
             ):
-                repaired_personal[code] = dict(row)
+                # Prefer data already stored under the surviving code when several
+                # retired designs converge on one replacement.
+                if code not in repaired_personal or original_code == code:
+                    repaired_personal[code] = dict(row)
         record["personal_enchantments"] = repaired_personal
+        # Weapon history and elemental runes are keyed by catalogue code as well. Move
+        # those keys with the physical item so a retired grey weapon does not lose its
+        # nameplate statistics or enchantment during replacement.
+        for field in ("weapon_records", "weapon_enchantments"):
+            raw_rows = record.get(field)
+            raw_rows = raw_rows if isinstance(raw_rows, dict) else {}
+            repaired_rows = {}
+            for original_code, row in raw_rows.items():
+                if not isinstance(original_code, str):
+                    continue
+                code = C.LEGACY_ITEM_CODES.get(original_code, original_code)
+                item = C.find_item(code)
+                if item is None or item.slot != "weapon":
+                    continue
+                if field == "weapon_records" and code in repaired_rows \
+                        and isinstance(row, dict) and isinstance(repaired_rows[code], dict):
+                    merged = dict(repaired_rows[code])
+                    for counter in ("pet_wins", "mob_wins", "boss_wins"):
+                        merged[counter] = _safe_nonnegative_int(merged.get(counter)) + \
+                            _safe_nonnegative_int(row.get(counter))
+                    if not merged.get("first_owner") and row.get("first_owner"):
+                        merged["first_owner"] = row.get("first_owner")
+                    repaired_rows[code] = merged
+                    continue
+                if code not in repaired_rows or original_code == code:
+                    repaired_rows[code] = row
+            record[field] = repaired_rows
         equipped = record.get("equipped")
         if not isinstance(equipped, dict):
             equipped = {}
@@ -507,10 +539,10 @@ def _load(entry: str) -> dict:
             equipped.setdefault(slot, None)
             code = C.LEGACY_ITEM_CODES.get(equipped.get(slot), equipped.get(slot))
             equipped[slot] = code
-            if code and code not in unique:
+            if code and code not in normalised_inventory:
                 # A historic equipped object is still owned; preserve it rather than
                 # stripping it as a side effect of a duplicate-data migration.
-                unique.append(code)
+                normalised_inventory.append(code)
         # Discovery is permanent: selling or gifting something should not erase it
         # from the collection book.  Older saves had no such field, so their current
         # bag and worn equipment are the complete historic collection we can infer.
@@ -519,7 +551,7 @@ def _load(entry: str) -> dict:
             discovered = []
         discovered_unique = []
         discovered_seen = set()
-        for code in discovered + unique:
+        for code in discovered + normalised_inventory:
             code = C.LEGACY_ITEM_CODES.get(code, code)
             if isinstance(code, str) and C.find_item(code) is not None and code not in discovered_seen:
                 discovered_seen.add(code)
@@ -533,7 +565,7 @@ def _load(entry: str) -> dict:
             locked = []
         record["locked_items"] = [
             code for code in dict.fromkeys(C.LEGACY_ITEM_CODES.get(code, code) for code in locked)
-            if code in unique
+            if code in normalised_inventory
         ]
         pending = record.get("pending_item_actions")
         # Confirmation secrets are only a short-lived UX/security handshake.  Bad or
@@ -1710,8 +1742,8 @@ def _farm_item_for(
 ):
     """Roll a farm find: rarity first (hours-scaled), then an eligible item of that rarity.
 
-    Loot is rolled at settlement time. Every item design may belong to more than one
-    player, while a winner's own inventory still prevents duplicate copies.
+    Loot is rolled at settlement time. Designs may repeat: spare copies are the raw
+    material the forge consumes, while discovery remains a separate unique collection.
     """
     if rng.random() >= chance:
         return None
@@ -1722,12 +1754,11 @@ def _farm_item_for(
     if not order:
         return None
     picked = rng.choices(order, weights=[weights[rarity] for rarity in order], k=1)[0]
-    owned = set(record.get("inventory", []))
     start = _FARM_RARITY_FALLBACK_ORDER.index(picked)
     for rarity in _FARM_RARITY_FALLBACK_ORDER[start:]:
         pool = [
             item for item in C.ITEMS
-            if item.source == "drop" and item.rarity == rarity and item.code not in owned
+            if item.source == "drop" and item.rarity == rarity
         ]
         if not pool:
             continue
@@ -2614,6 +2645,34 @@ def grant_dungeon_ticket_gift(entries, amount: int = 3) -> int:
             data[DUNGEON_TICKET_GIFT_FLAG] = True
             _save(entry, data)
     return granted
+
+
+def grant_player_ticket_gift(
+    entries, user_id, *, dungeon: int = 0, meadow: int = 0, source: str,
+) -> dict:
+    """Grant a named player's support gift once in whichever game chat owns their pet."""
+    uid = str(user_id)
+    dungeon = max(0, int(dungeon or 0))
+    meadow = max(0, int(meadow or 0))
+    result = {"players": 0, "dungeon_tickets": 0, "meadow_tickets": 0}
+    marker = f"player_ticket_gift:{source}:{uid}"
+    for entry in entries:
+        with _farm_settlement_lock:
+            data = _load(entry)
+            record = (data.get("pets") or {}).get(uid)
+            if data.get(marker) or not isinstance(record, dict) or not record.get("name"):
+                continue
+            wallet = data.setdefault("dungeon_tickets", {})
+            wallet[uid] = max(0, int(wallet.get(uid, 0) or 0)) + dungeon
+            meadow_row = _meadow_row(data, uid)
+            meadow_row["tickets"] += meadow
+            _metric_add(data, "meadow_tickets_granted", meadow)
+            data[marker] = True
+            _save(entry, data)
+            result["players"] += 1
+            result["dungeon_tickets"] += dungeon
+            result["meadow_tickets"] += meadow
+    return result
 
 
 def cap_existing_dungeon_tickets(entries, maximum: int = 10) -> dict:
@@ -5661,7 +5720,10 @@ def achievement_profile(entry: str, user_id, *, include_chat: bool = True) -> di
         "deepest_floor": max(1, int(record.get("dungeon_deepest", 1) or 1)),
         "phoenix_perfect": bool(phoenix.get("perfect")),
         "phoenix_wins": max(0, int(phoenix.get("wins", 0) or 0)),
-        "weapons_found": len(record.get("discovered") or ()),
+        "weapons_found": sum(
+            1 for code in set(record.get("discovered") or ())
+            if (item := C.find_item(code)) is not None and item.slot == "weapon"
+        ),
         "weapons_total": sum(1 for item in C.ITEMS if item.slot == "weapon"),
         "scrolls_owned": len(_owned_scroll_codes_for(record)),
         "scrolls_total": len(SCROLLS.SCROLLS),
@@ -5778,6 +5840,7 @@ def achievements_summary(entry: str, user_id) -> dict:
 def achievements_view(entry: str, user_id) -> dict:
     """The whole screen: every row, its state, and what pressing the button would pay."""
     _repair_failed_achievement_claim(entry, user_id)
+    _repair_shared_achievement_rewards(entry, user_id)
     refresh_achievements(entry, user_id)
     record = _tamed_record(_load(entry), user_id)
     if record is None:
@@ -5810,6 +5873,14 @@ def achievements_view(entry: str, user_id) -> dict:
     }
 
 
+def _achievement_ruby_source(user_id, code: str) -> str:
+    return f"achievement:{user_id}:{code}"
+
+
+def _achievement_farm_source(user_id, code: str, index: int) -> str:
+    return f"achievement:{user_id}:{code}:farm:{max(0, int(index))}"
+
+
 def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     """Pay for everything earned and not yet paid, in one press.
 
@@ -5821,6 +5892,8 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     # Evaluated here as well as when the list is drawn: pressing the button is allowed to
     # be the FIRST thing somebody does, and a claim that only paid for rows a screen had
     # already noticed would quietly pay nothing at all.
+    _repair_failed_achievement_claim(entry, user_id)
+    _repair_shared_achievement_rewards(entry, user_id)
     refresh_achievements(entry, user_id)
     with _farm_settlement_lock:
         data = _load(entry)
@@ -5844,10 +5917,10 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
             # though this one press had paid it. The source key is unique per achievement
             # and the claim was marked before any of this, so the row's own number is
             # exactly what was minted.
-            grant_rubies_once(entry, user_id, item.rubies, f"achievement:{item.code}")
+            grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
             paid["rubies"] += item.rubies
-        for _ in range(max(0, int(item.farm_tickets))):
-            if grant_farm_ticket(entry, user_id, f"achievement:{item.code}"):
+        for index in range(max(0, int(item.farm_tickets))):
+            if grant_farm_ticket(entry, user_id, _achievement_farm_source(user_id, item.code, index)):
                 paid["farm_tickets"] += 1
         for _ in range(max(0, int(item.dungeon_tickets))):
             grant_dungeon_ticket(entry, user_id)
@@ -5866,6 +5939,7 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
 def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
     """Pay one earned achievement selected by the player."""
     _repair_failed_achievement_claim(entry, user_id)
+    _repair_shared_achievement_rewards(entry, user_id)
     refresh_achievements(entry, user_id)
     item = ACHIEVEMENTS.by_code(str(code or ""))
     if item is None:
@@ -5886,10 +5960,10 @@ def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
         _save(entry, data)
     paid = {"rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0, "count": 1}
     if item.rubies:
-        grant_rubies_once(entry, user_id, item.rubies, f"achievement:{item.code}")
+        grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
         paid["rubies"] = item.rubies
-    for _ in range(max(0, int(item.farm_tickets))):
-        if grant_farm_ticket(entry, user_id, f"achievement:{item.code}"):
+    for index in range(max(0, int(item.farm_tickets))):
+        if grant_farm_ticket(entry, user_id, _achievement_farm_source(user_id, item.code, index)):
             paid["farm_tickets"] += 1
     for _ in range(max(0, int(item.dungeon_tickets))):
         grant_dungeon_ticket(entry, user_id)
@@ -5927,6 +6001,60 @@ def _repair_failed_achievement_claim(entry: str, user_id) -> bool:
         data["achievement_bulk_claim_repaired"] = True
         _save(entry, data)
         return repaired
+
+
+def _repair_shared_achievement_rewards(entry: str, user_id) -> bool:
+    """Restore rewards underpaid by the original chat-shared settlement keys."""
+    uid = str(user_id)
+    with _farm_settlement_lock:
+        data = _load(entry)
+        repaired_users = data.setdefault("achievement_rewards_v2", {})
+        if not isinstance(repaired_users, dict):
+            repaired_users = data["achievement_rewards_v2"] = {}
+        if repaired_users.get(uid):
+            return False
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False
+        claimed = set(_achievement_row(record)["claimed"])
+        ruby_sources = data.get("ruby_sources")
+        # The list-shaped failure is repaired separately, before this function runs.
+        if not isinstance(ruby_sources, dict):
+            return False
+
+        ruby_wallet = _ruby_row(data)
+        farm_row = _ticket_row(data, user_id)
+        changed = False
+        for item in ACHIEVEMENTS.catalogue():
+            if item.code not in claimed:
+                continue
+            old_source = f"achievement:{item.code}"
+            if item.rubies:
+                new_source = _achievement_ruby_source(uid, item.code)
+                if new_source not in ruby_sources:
+                    old_payment = ruby_sources.get(old_source)
+                    old_owner = str(old_payment.get("user_id")) if isinstance(old_payment, dict) else ""
+                    amount = max(0, int(item.rubies))
+                    if old_owner != uid:
+                        ruby_wallet[uid] = max(0, int(ruby_wallet.get(uid, 0) or 0)) + amount
+                        _metric_add(data, "rubies_minted", amount)
+                        if amount:
+                            _append_ruby_log(entry, user_id, amount, new_source)
+                    ruby_sources[new_source] = {"user_id": uid, "amount": amount}
+                    changed = True
+
+            # The old loop credited index zero, then rejected the rest as duplicates.
+            for index in range(1, max(0, int(item.farm_tickets))):
+                source = _achievement_farm_source(uid, item.code, index)
+                if source in farm_row["granted"]:
+                    continue
+                farm_row["count"] += 1
+                farm_row["granted"] = (farm_row["granted"] + [source])[-FARM_TICKET_GRANT_MEMORY:]
+                changed = True
+
+        repaired_users[uid] = True
+        _save(entry, data)
+        return changed
 
 
 def backfill_legacy_achievements(entry: str) -> int:
@@ -5972,7 +6100,10 @@ def _legacy_evidence(record: dict) -> dict:
     return {
         "deepest_floor": max(1, int(record.get("dungeon_deepest", 1) or 1)),
         "level": max(1, int(record.get("level", 1) or 1)),
-        "weapons_found": len(record.get("discovered") or ()),
+        "weapons_found": sum(
+            1 for code in set(record.get("discovered") or ())
+            if (item := C.find_item(code)) is not None and item.slot == "weapon"
+        ),
         "wins": max(0, int(record.get("wins", 0) or 0)),
     }
 
@@ -6469,14 +6600,24 @@ def _forge_ingredients(record: dict, rarity: str, slot: str, cursed: bool = Fals
     piles would let a player launder five ordinary rares into a legendary curse, or quietly
     spend a rare curse as filler for an ordinary recipe.
     """
-    equipped = set((record.get("equipped") or {}).values())
+    # Reserve one physical copy for every equipped slot. With repeat drops, excluding a
+    # code outright would make all six spare copies unusable merely because the seventh
+    # copy is worn.
+    equipped = Counter(
+        code for code in (record.get("equipped") or {}).values() if code
+    )
     locked = set(record.get("locked_items") or [])
-    items = [
-        item for item in (C.find_item(code) for code in record.get("inventory", []))
-        if item is not None and item.rarity == rarity and item.slot == slot
-        and bool(getattr(item, "cursed", False)) == bool(cursed)
-        and item.code not in equipped and item.code not in locked
-    ]
+    items = []
+    for code in record.get("inventory", []):
+        item = C.find_item(code)
+        if item is None or item.code in locked:
+            continue
+        if equipped[item.code] > 0:
+            equipped[item.code] -= 1
+            continue
+        if item.rarity == rarity and item.slot == slot \
+                and bool(getattr(item, "cursed", False)) == bool(cursed):
+            items.append(item)
     # Consume the least valuable candidates first.  The preview shows these exact items,
     # so a strong favourite never disappears merely because it shares a rarity.
     return sorted(items, key=lambda item: (
@@ -6590,12 +6731,16 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
         # thing that can come out.
         if rarity == "cursed":
             pool.append(C.find_item(FORGE_CURSED_RELIC))
-        pool = [item for item in pool if item is not None and item.code not in owned]
+        pool = [item for item in pool if item is not None]
         if not pool:
             return False, (
-                f"Новые предметы «{C.SLOT_NAMES[slot]}» этой редкости у тебя уже все есть."
+                f"Для «{C.SLOT_NAMES[slot]}» этой редкости пока нет результата."
             ), None
-        result = chooser.choice(pool)
+        # Discovery gets first priority, but a completed collection must not turn spare
+        # materials into a dead pile. Once every design is known, forging yields another
+        # higher-tier copy that can continue up the ladder, be sold or be gifted.
+        unseen_pool = [item for item in pool if item.code not in owned]
+        result = chooser.choice(unseen_pool or pool)
         inventory = record.setdefault("inventory", [])
         for item in consumed:
             inventory.remove(item.code)
@@ -6643,7 +6788,12 @@ def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tu
         return False, "Сначала приручи существо.", 0
     if item is None or item.code not in record.get("inventory", []):
         return False, "Этого предмета нет в сумке.", 0
-    if item.code in (record.get("equipped") or {}).values():
+    inventory = record.get("inventory", [])
+    equipped_copies = sum(
+        equipped_code == item.code
+        for equipped_code in (record.get("equipped") or {}).values()
+    )
+    if inventory.count(item.code) <= equipped_copies:
         return False, "Сначала сними этот предмет.", 0
     if is_item_locked(record, item.code):
         return False, "Предмет защищён. Сначала сними 🔒 в инвентаре.", 0
@@ -6653,12 +6803,13 @@ def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tu
         return False, "Редкий предмет нужно подтвердить отдельной кнопкой.", 0
     value = C.resale_value(item)
     record["inventory"].remove(item.code)
-    # Artwork buffs belong to the painter, not the catalogue object.  Selling destroys
-    # its applied instance instead of letting a future re-buy inherit it.
-    record.setdefault("personal_enchantments", {}).pop(item.code, None)
-    if item.slot == "weapon":
-        record.setdefault("weapon_enchantments", {}).pop(item.code, None)
-        record.setdefault("weapon_records", {}).pop(item.code, None)
+    # Code-keyed history/enchantments describe the retained design. Keep them while at
+    # least one physical copy remains; deleting one forge spare must not wipe the worn one.
+    if item.code not in record["inventory"]:
+        record.setdefault("personal_enchantments", {}).pop(item.code, None)
+        if item.slot == "weapon":
+            record.setdefault("weapon_enchantments", {}).pop(item.code, None)
+            record.setdefault("weapon_records", {}).pop(item.code, None)
     _metric_add(data, "item_sale_gold", value)
     _save(entry, data)
     economy.grant(entry, user_id, value, f"sell:pet_item:{item.code}")
@@ -6678,7 +6829,7 @@ def gift_item(
     entry, giver_id, receiver_id, code, confirmation_token: str | None = None,
     now: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Atomically transfer an unequipped unique item between tamed pets."""
+    """Atomically transfer one unequipped physical copy between tamed pets."""
     data = _load(entry)
     giver = _tamed_record(data, giver_id)
     receiver = _tamed_record(data, receiver_id)
@@ -6693,7 +6844,12 @@ def gift_item(
         return False, f"Дарить можно с {C.GIFT_MIN_PET_LEVEL} уровня питомца."
     if item is None or item.code not in giver.get("inventory", []):
         return False, "Этого предмета нет в сумке."
-    if item.code in (giver.get("equipped") or {}).values():
+    giver_inventory = giver.get("inventory", [])
+    equipped_copies = sum(
+        equipped_code == item.code
+        for equipped_code in (giver.get("equipped") or {}).values()
+    )
+    if giver_inventory.count(item.code) <= equipped_copies:
         return False, "Сначала сними этот предмет."
     if is_item_locked(giver, item.code):
         return False, "Предмет защищён. Сначала сними 🔒 в инвентаре."
@@ -6716,13 +6872,22 @@ def gift_item(
         return False, "У получателя уже есть такой предмет."
     weapon_record = dict(_weapon_record(giver, item.code)) if item.slot == "weapon" else None
     enchantment = (
-        giver.setdefault("weapon_enchantments", {}).pop(item.code, None)
+        giver.setdefault("weapon_enchantments", {}).get(item.code)
         if item.slot == "weapon" else None
     )
     # Personal paints are explicitly non-transferable; the recipient receives the base
     # item only, while the spent rune cannot be recovered or duplicated.
-    giver.setdefault("personal_enchantments", {}).pop(item.code, None)
+    # The base duplicate transfers; code-keyed personal artwork stays with the giver while
+    # another copy remains and is never copied to the recipient.
     giver["inventory"].remove(item.code)
+    if item.code not in giver["inventory"]:
+        giver.setdefault("personal_enchantments", {}).pop(item.code, None)
+        if item.slot == "weapon":
+            giver.setdefault("weapon_enchantments", {}).pop(item.code, None)
+    else:
+        # The enchanted design is still in the giver's bag; the transferred spare is the
+        # plain copy. Per-instance enchantments would require inventory instance IDs.
+        enchantment = None
     if item.code in giver.get("locked_items", []):
         giver["locked_items"].remove(item.code)
     receiver.setdefault("inventory", []).append(item.code)
@@ -7148,8 +7313,8 @@ def find_opponent(
 def legendary_pity_progress(entry: str, user_id) -> dict:
     """Progress toward the next guaranteed legendary drop for this pet.
 
-    Only wins while this player still has an unowned drop-only legendary design are
-    eligible. Other players owning the same design no longer exhaust the guarantee.
+    Repeat drops are forge material, so owning every legendary design no longer disables
+    the guarantee. Any active drop-only legendary weapon keeps the counter eligible.
     """
     data = _load(entry)
     record = _tamed_record(data, user_id)
@@ -7159,10 +7324,9 @@ def legendary_pity_progress(entry: str, user_id) -> dict:
             "eligible": False, "wins_without_legend": 0,
             "remaining_wins": threshold, "threshold": threshold,
         }
-    owned = set(record.get("inventory", []))
     eligible = any(
         item.slot == "weapon" and item.source == "drop"
-        and item.rarity == "legendary" and item.code not in owned
+        and item.rarity == "legendary"
         for item in C.ITEMS
     )
     wins = max(0, int(record.get("legendary_pity_wins", 0) or 0)) if eligible else 0
@@ -7621,12 +7785,11 @@ def record_fight(
             economy.grant(entry, loser_uid, consolation, "pet_fight_defender_consolation")
 
     dropped_code = None
-    # A player's bag never receives the same code twice, but item designs are shared
-    # between players. The pity counter is tied to wins, not merely successful rolls.
-    owned_codes = set(winner.get("inventory", []))
+    # Repeat designs are deliberate forge material. The pity counter is tied to wins,
+    # not merely successful rolls, and therefore never stalls on a completed collection.
     drop_pool = [
         item for item in C.ITEMS
-        if item.source == "drop" and item.code not in owned_codes
+        if item.source == "drop"
     ]
     # The 500-win pity contract is specifically for legendary weapons. New
     # legendary amulets/boots/gloves remain exciting normal rolls, not substitutes for
@@ -8414,17 +8577,16 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None,
     """Roll one loot drop outside a fight, and give it if it lands.
 
     For rewards that are not arena wins -- a completed quest today, whatever else later.
-    The pool rules are the arena's, not a second set: every code is unique inside its
-    owner's bag, while item designs may belong to multiple players. The roll is
-    rarity-weighted from the same catalogue.
+    The pool rules are the arena's, not a second set: designs may repeat inside a bag so
+    spare copies can be forged. Permanent discovery remains unique and therefore does not
+    inflate collection or achievement progress. The roll is rarity-weighted.
 
     Seeded when a caller passes `seed`, so the same reward paid twice by a retried
     settlement rolls the same item instead of two -- the same reproducibility trick
     _farm_reward uses.
 
     `rarity` narrows the pool to one tier -- what a chest full of cursed gear needs. It is
-    a strict filter: a caller that asks for cursed and finds the player already owns every
-    cursed item gets None, never a consolation legendary.
+    a strict filter and never falls back to another tier.
     """
     if chance <= 0:
         return None
@@ -8437,11 +8599,9 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None,
         rng = random.Random(seed) if seed else random
         if rng.random() >= min(1.0, float(chance)):
             return None
-        owned = set(record.get("inventory", []))
         pool = [
             item for item in C.ITEMS
-            if item.source == "drop" and item.code not in owned
-            and (rarity is None or item.rarity == rarity)
+            if item.source == "drop" and (rarity is None or item.rarity == rarity)
         ]
         if not pool:
             return None

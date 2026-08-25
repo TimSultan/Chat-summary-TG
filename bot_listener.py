@@ -9304,6 +9304,12 @@ async def run_bot_listener(
                 f"{capped_dungeon_tickets['players']} players; removed "
                 f"{capped_dungeon_tickets['tickets']} excess tickets"
             )
+        nataly_tickets = pets.grant_player_ticket_gift(
+            cfg.listener_allowed_chats, 396858669,
+            dungeon=5, meadow=15, source="nataly_support_20260825",
+        )
+        if nataly_tickets["players"]:
+            log("[pets] gave Nataly 5 dungeon tickets and 15 meadow tickets")
         ruby_gift = pets.grant_ruby_gift(cfg.listener_allowed_chats)
         if ruby_gift:
             log(f"[pets] gave {ruby_gift} players 10 rubies for the arena/levels update")
@@ -9647,6 +9653,11 @@ async def run_bot_listener(
                 caption="Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
             )
 
+        async def _fetch_vote_avatar(user_id: int) -> bytes | None:
+            """Current Telegram avatar for an author shown on the v1 collage."""
+            file_id = await api.get_user_profile_photo(user_id)
+            return await api.download_file(file_id) if file_id else None
+
         tasks = [
             _poll_loop(),
             _consume_summaries(),
@@ -9775,7 +9786,7 @@ async def run_bot_listener(
                 vote_web.run_web_server(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
-                    export=_deliver_vote_board,
+                    export=_deliver_vote_board, avatar=_fetch_vote_avatar,
                     attach=_attach_extra,
                 )
             )

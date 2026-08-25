@@ -7,11 +7,20 @@ import pytest
 import pets_weapon_catalog as catalogue
 
 
-def test_catalogue_has_exactly_631_unique_stable_weapons():
-    assert catalogue.WEAPON_COUNT == 631
-    assert len(catalogue.WEAPON_SPECS) == 631
-    assert len({weapon.code for weapon in catalogue.WEAPON_SPECS}) == 631
-    assert len({weapon.name for weapon in catalogue.WEAPON_SPECS}) == 631
+def test_catalogue_hides_redundant_grey_weapons_but_keeps_stable_migration_aliases():
+    assert len(catalogue.ALL_WEAPON_SPECS) == 631
+    assert catalogue.WEAPON_COUNT == 165
+    assert len(catalogue.WEAPON_SPECS) == 165
+    assert len({weapon.code for weapon in catalogue.WEAPON_SPECS}) == 165
+    assert len({weapon.name for weapon in catalogue.WEAPON_SPECS}) == 165
+    assert len(catalogue.ACTIVE_GREY_WEAPON_CODES) == 30
+    assert len(catalogue.RETIRED_WEAPON_REPLACEMENTS) == 466
+    assert set(catalogue.RETIRED_WEAPON_REPLACEMENTS.values()) <= (
+        catalogue.ACTIVE_CURSED_BASE_CODES | catalogue.ACTIVE_GREY_WEAPON_CODES
+    )
+    assert set(catalogue.RETIRED_WEAPON_REPLACEMENTS).isdisjoint(
+        weapon.code for weapon in catalogue.WEAPON_SPECS
+    )
     assert catalogue.WEAPON_SPECS[0].code == "w001"
     # w501-w506 are the hand-written build and legendary-only weapons, w507-w514 the
     # cursed legendaries, w515-w526 the rare cursed rung between the junk curses and
@@ -53,9 +62,9 @@ def test_first_three_ids_preserve_legacy_identity_and_descriptions():
 
 
 def test_rarity_distribution_has_bad_average_good_and_more_legendary_items():
-    # The magic shelf added exactly 21 of every rarity on top of the steel catalogue.
+    # Only the repetitive grey tier was cut; every progression tier remains unchanged.
     assert catalogue.RARITY_COUNTS == {
-        "cursed": 96, "common": 271, "uncommon": 141, "rare": 80, "legendary": 43,
+        "cursed": 12, "common": 18, "uncommon": 12, "rare": 80, "legendary": 43,
     }
     # Scoped to the steel shelf: the magic weapons are banded in Магия rather than
     # Strength, so a Strength floor read across both would be measuring the wrong stat.
@@ -83,7 +92,7 @@ def test_rarity_distribution_has_bad_average_good_and_more_legendary_items():
     )
 
 
-def test_the_magic_shelf_is_twenty_one_per_rarity_and_never_scales_from_strength():
+def test_the_magic_shelf_keeps_full_progression_tiers_and_a_compact_grey_rung():
     """The commission, pinned: 21 magic weapons in every rarity, five of them hybrids.
 
     A magic weapon's whole point is that `derive` reads Магия instead of Strength for the
@@ -95,7 +104,7 @@ def test_the_magic_shelf_is_twenty_one_per_rarity_and_never_scales_from_strength
         weapon for weapon in catalogue.WEAPON_SPECS
         if weapon.code in catalogue.MAGIC_WEAPON_CODES
     ]
-    assert len(shelf) == 105
+    assert len(shelf) == 59
     assert all(weapon.scaling in ("magic", "hybrid") for weapon in shelf)
     assert all(
         weapon.scaling == "strength" for weapon in catalogue.WEAPON_SPECS
@@ -103,8 +112,12 @@ def test_the_magic_shelf_is_twenty_one_per_rarity_and_never_scales_from_strength
     )
     for rarity in catalogue.RARITIES:
         tier = [weapon for weapon in shelf if weapon.rarity == rarity]
-        assert len(tier) == 21, rarity
-        assert sum(weapon.scaling == "hybrid" for weapon in tier) == 5, rarity
+        assert len(tier) == {
+            "cursed": 7, "common": 6, "uncommon": 4, "rare": 21, "legendary": 21,
+        }[rarity], rarity
+        assert sum(weapon.scaling == "hybrid" for weapon in tier) == {
+            "cursed": 2, "common": 2, "uncommon": 1, "rare": 5, "legendary": 5,
+        }[rarity], rarity
     assert all(dict(weapon.bonuses).get("magic") for weapon in shelf)
     assert all(
         dict(weapon.bonuses).get("strength") for weapon in shelf
@@ -198,7 +211,7 @@ def test_raw_items_expose_trade_schema_and_expanded_legendary_drop_weight():
         # ...and one more since the magic shelf: which stat the swing reads.
         "scaling",
     }
-    assert len(catalogue.RAW_ITEMS) == 631
+    assert len(catalogue.RAW_ITEMS) == 165
     assert all(required == set(record) for record in catalogue.RAW_ITEMS)
     drop_records = [record for record in catalogue.RAW_ITEMS if record["source"] == "drop"]
     legendary_weight = sum(record["drop_weight"] for record in drop_records if record["rarity"] == "legendary")
@@ -207,7 +220,7 @@ def test_raw_items_expose_trade_schema_and_expanded_legendary_drop_weight():
     # widened. Its rares are weighted 4 rather than the steel shelf's 10 precisely to hold
     # this ratio down: without that, 105 new weapons would have moved the legendary share
     # of a weapon drop from 4.1% to well past 6% as a side effect of adding a shelf.
-    assert legendary_weight / total_weight == pytest.approx(43 / 647)
+    assert legendary_weight / total_weight == pytest.approx(43 / 563)
     # The rare cursed rung drops at a fifth of an ordinary rare's weight. It is findable,
     # but the forge is the reliable route to it -- see _drop_weight.
     cursed_rare_weight = sum(
@@ -508,9 +521,8 @@ def test_the_cursed_ladder_has_three_rungs_and_the_forge_can_climb_it():
     for weapon in line:
         by_rarity.setdefault(weapon.rarity, []).append(weapon)
     assert sorted(by_rarity) == ["cursed", "legendary", "rare"]
-    # 75 steel junk curses plus the magic shelf's 21, which join the ladder rather than
-    # sitting beside it: same worthless drop, same six-into-one forge recipe.
-    assert len(by_rarity["cursed"]) == 96
+    # Twelve distinct junk designs remain; duplicates provide the six forge ingredients.
+    assert len(by_rarity["cursed"]) == 12
     assert len(by_rarity["rare"]) == 12
     assert len(by_rarity["legendary"]) == 8
     # Every rung above the junk one carries a rule, and every one of them is a weapon:

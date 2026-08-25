@@ -35,14 +35,17 @@ class LiveCombatTableTests(unittest.TestCase):
         # got a second shelf. What still has to hold is that every behaviour in the table
         # has a live item to sell or drop.
         self.assertGreaterEqual(len(scrolls.SHIELDS), 20)
-        self.assertEqual(len(C.items_for_slot("shield")), len(scrolls.SHIELDS))
+        # Six redundant grey designs are retired from loot, but their historic combat
+        # codes still resolve to live analogues for inventories and saved replays.
+        self.assertEqual(len(C.items_for_slot("shield")), len(scrolls.SHIELDS) - 6)
+        self.assertTrue(all(C.find_item(row["code"]) for row in scrolls.SHIELDS))
 
         shop = C.items_for_slot("shield", "shop")
         drops = [item for item in C.items_for_slot("shield") if item.source == "drop"]
         # The shop stays at three however many shields the loot table grows: a shield you
         # can always buy must not take a roll away from one you have to find.
         self.assertEqual(len(shop), 3)
-        self.assertEqual(len(drops), len(scrolls.SHIELDS) - len(shop))
+        self.assertEqual(len(drops), len(C.items_for_slot("shield")) - len(shop))
         self.assertEqual(sum(item.rarity == "legendary" for item in drops), 8)
         # The floors that make the slot playable: three ordinary offers a day that never
         # repeat what you own, and a forge recipe asking for four ordinary or five rare

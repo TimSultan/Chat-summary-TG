@@ -514,7 +514,7 @@ class EffectiveStatsAndEquipmentTests(PetsTestCase):
 
         item = next(
             weapon for weapon in pets.daily_storefront_weapons(entry, user_id="1")
-            if "strength" in weapon.bonuses
+            if "strength" in weapon.bonuses and "armor" not in weapon.bonuses
         )
         economy.grant(entry, "1", item.price, "test")
         ok, msg = pets.buy_item(entry, "1", 0, item.code)
@@ -1045,15 +1045,51 @@ class EquipmentTradingTests(PetsTestCase):
         data["pets"]["1"]["level"] = pets_config.GIFT_MIN_PET_LEVEL
         pets._save(entry, data)
 
-    def test_legacy_codes_and_duplicates_canonicalize_on_read(self):
+    def test_legacy_codes_canonicalize_and_physical_duplicates_survive_on_read(self):
         self._two_pets()
         data = pets._load("chat")
         data["pets"]["1"]["inventory"] = ["stick", "stick", "fork"]
         data["pets"]["1"]["equipped"]["weapon"] = "bone"
         pets._save("chat", data)
         pet = pets.get_pet("chat", "1")
-        self.assertEqual(pet["inventory"], ["w001", "w002", "w003"])
+        self.assertEqual(pet["inventory"], ["w001", "w001", "w002", "w003"])
         self.assertEqual(pet["equipped"]["weapon"], "w003")
+
+    def test_retired_grey_weapons_become_surviving_analogs_without_losing_copies(self):
+        self._two_pets()
+        retired, replacement = next(iter(pets_weapon_catalog.RETIRED_WEAPON_REPLACEMENTS.items()))
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [retired, retired]
+        data["pets"]["1"]["equipped"]["weapon"] = retired
+        data["pets"]["1"]["discovered"] = [retired]
+        data["pets"]["1"]["weapon_records"] = {retired: {"pet_wins": 7}}
+        pets._save("chat", data)
+
+        pet = pets.get_pet("chat", "1")
+
+        self.assertEqual(pet["inventory"], [replacement, replacement])
+        self.assertEqual(pet["equipped"]["weapon"], replacement)
+        self.assertEqual(pet["discovered"], [replacement])
+        self.assertEqual(pet["weapon_records"][replacement]["pet_wins"], 7)
+        self.assertNotIn(retired, {item.code for item in pets_config.ITEMS})
+
+    def test_retired_plain_gear_becomes_a_surviving_analog(self):
+        live_codes = {item.code for item in pets_config.ITEMS}
+        retired, replacement = next(
+            (old, new) for old, new in pets_config.LEGACY_ITEM_CODES.items()
+            if old.startswith(("bt", "gl", "shield_")) and old not in live_codes
+        )
+        slot = pets_config.find_item(replacement).slot
+        self._two_pets()
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [retired, retired]
+        data["pets"]["1"]["equipped"][slot] = retired
+        pets._save("chat", data)
+
+        pet = pets.get_pet("chat", "1")
+
+        self.assertEqual(pet["inventory"], [replacement, replacement])
+        self.assertEqual(pet["equipped"][slot], replacement)
 
     def test_new_drop_catalogues_are_integrated_into_all_three_equipment_slots(self):
         # 40 dropped amulets + 2 starter shop ones + the utility shelf + the vault.
@@ -1067,8 +1103,8 @@ class EquipmentTradingTests(PetsTestCase):
             42 + len(UTILITY_SHOP_CODES) + len(vaulted),
         )
         self.assertTrue(all(item.drop_weight == 0 for item in vaulted))
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 42)
-        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 42)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "boots"]), 25)
+        self.assertEqual(len([item for item in pets_config.ITEMS if item.slot == "gloves"]), 26)
         # The three DROP catalogues. Matched on source as well as prefix: the amulet
         # catalogue also sells a utility item now, and it shares the prefix without
         # belonging to the loot table this counts.
@@ -1076,7 +1112,7 @@ class EquipmentTradingTests(PetsTestCase):
             item for item in pets_config.ITEMS
             if item.code.startswith(("amulet_", "bt", "gl")) and item.source == "drop"
         ]
-        self.assertEqual(len(new_drops), 120)
+        self.assertEqual(len(new_drops), 87)
         self.assertTrue(all(item.source == "drop" and item.drop_weight > 0 for item in new_drops))
         self.assertEqual(len([item for item in new_drops if item.effect]), 62)
 
@@ -1196,6 +1232,31 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(first["code"], second["code"])
         self.assertIn(first["code"], pets.get_pet("chat", "1")["inventory"])
         self.assertIn(second["code"], pets.get_pet("chat", "2")["inventory"])
+
+    def test_same_drop_can_repeat_for_one_player_and_discovery_stays_unique(self):
+        self._two_pets()
+
+        first = pets.grant_random_drop("chat", "1", 1.0, seed="repeatable-drop")
+        second = pets.grant_random_drop("chat", "1", 1.0, seed="repeatable-drop")
+
+        self.assertEqual(first["code"], second["code"])
+        pet = pets.get_pet("chat", "1")
+        self.assertEqual(pet["inventory"].count(first["code"]), 2)
+        self.assertEqual(pet["discovered"].count(first["code"]), 1)
+
+    def test_owned_bag_groups_duplicate_copies_under_one_card(self):
+        self._two_pets()
+        item = next(row for row in pets_config.ITEMS if row.source == "drop")
+        data = pets._load("chat")
+        data["pets"]["1"]["inventory"] = [item.code] * 3
+        pets._save("chat", data)
+
+        text, keyboard = pets_ui.bag_items_view("chat", "1", 0, item.slot)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn("×3", text)
+        self.assertIn("3 предмет", text)
+        self.assertEqual(callbacks.count(pets_ui.callback_data("1", "sell", item.code)), 1)
 
     def test_weapon_catalogue_is_paginated_with_compact_callbacks(self):
         self._two_pets()
@@ -1526,6 +1587,44 @@ class ForgeTests(PetsTestCase):
         )[0])
         self.assertIn(pets.FORGE_CURSED_RELIC, seen["pool"])
 
+    def test_six_duplicate_curses_are_valid_material_while_one_copy_is_equipped(self):
+        self._tame("forge-repeat-cursed", "1")
+        cursed = self._drops("weapon", "cursed", 1)[0]
+        required = pets.FORGE_REQUIREMENTS["cursed"]
+        data = pets._load("forge-repeat-cursed")
+        data["pets"]["1"]["inventory"] = [cursed.code] * (required + 1)
+        data["pets"]["1"]["equipped"]["weapon"] = cursed.code
+        pets._save("forge-repeat-cursed", data)
+
+        recipe = self._recipe("forge-repeat-cursed", "cursed", "weapon")
+        self.assertEqual(recipe["ingredients"], [cursed.code] * required)
+        ok, message, result_code = pets.reforge_items(
+            "forge-repeat-cursed", "1", "cursed", "weapon", random.Random(4),
+        )
+
+        self.assertTrue(ok, message)
+        inventory = pets.get_pet("forge-repeat-cursed", "1")["inventory"]
+        self.assertEqual(inventory.count(cursed.code), 1)
+        self.assertIn(result_code, inventory)
+
+    def test_completed_result_collection_can_still_forge_a_higher_tier_duplicate(self):
+        self._tame("forge-complete", "1")
+        common = self._drops("gloves", "common", 1)[0]
+        rares = self._drops("gloves", "rare", 100)
+        data = pets._load("forge-complete")
+        data["pets"]["1"]["inventory"] = [
+            common.code,
+        ] * pets.FORGE_REQUIREMENTS["common"] + [item.code for item in rares]
+        pets._save("forge-complete", data)
+
+        ok, message, result_code = pets.reforge_items(
+            "forge-complete", "1", "common", "gloves", random.Random(2),
+        )
+
+        self.assertTrue(ok, message)
+        self.assertIn(result_code, {item.code for item in rares})
+        self.assertEqual(pets.get_pet("forge-complete", "1")["inventory"].count(result_code), 2)
+
     def test_an_empty_forge_screen_shows_no_blocks_and_no_grey_buttons(self):
         """What a player asked for, in the words they asked it in: if there is nothing to
         melt, do not print a list of things that cannot be melted."""
@@ -1709,7 +1808,7 @@ class StorefrontAndCollectionTests(PetsTestCase):
         # a weapon is added: what this is actually protecting is uniqueness of code and
         # name across the whole catalogue, not the size of it.
         weapons = pets_config.items_for_slot("weapon")
-        self.assertGreater(len(weapons), 500)
+        self.assertGreater(len(weapons), 150)
         self.assertEqual(len({item.code for item in weapons}), len(weapons))
         self.assertEqual(len({item.name for item in weapons}), len(weapons))
         shop = [item for item in weapons if item.source == "shop"]
@@ -1757,11 +1856,10 @@ class StorefrontAndCollectionTests(PetsTestCase):
         reintroduce a three-figure accessory."""
         shop_items = [item for item in pets_config.ITEMS if item.source == "shop"]
         self.assertTrue(shop_items)
-        # 6 accessories (bead/acorn/mittens/claws/slippers/springs), 3 shields and the
-        # weapon catalogue's 422 shop weapons (271 common + 141 uncommon + 10 rare --
-        # the magic shelf added 21 common, 21 uncommon and 5 more rare to the counter),
-        # plus the utility items below.
-        self.assertEqual(len(shop_items), 431 + len(UTILITY_SHOP_CODES))
+        # 6 starter accessories, 3 shields, 40 active shop weapons (30 common + 10 rare),
+        # plus the utility amulets below. Hundreds of retired grey aliases are deliberately
+        # absent from the live shop while old owned codes migrate to retained analogues.
+        self.assertEqual(len(shop_items), 49 + len(UTILITY_SHOP_CODES))
         for item in shop_items:
             if item.code in UTILITY_SHOP_CODES:
                 # Utility amulets are priced for their combat effect as well as their
@@ -2409,7 +2507,7 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(golds["defender_loses"], pets_config.WIN_GOLD_MAX)
         self.assertEqual(golds["defender_loses"], golds["attacker_loses"])
 
-    def test_drop_pool_excludes_accessory_already_owned_by_winner(self):
+    def test_drop_pool_includes_accessory_already_owned_as_forge_material(self):
         entry = "accessory-drop-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2428,7 +2526,7 @@ class RecordFightTests(PetsTestCase):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
         self.assertEqual(outcome["dropped_item"], second.code)
-        self.assertNotIn(first, choose.call_args.args[0])
+        self.assertIn(first, choose.call_args.args[0])
 
     def test_drop_auto_equips_empty_or_better_slot_but_keeps_stronger_item(self):
         weak = pets_config.find_item("bt01")
@@ -2461,14 +2559,8 @@ class RecordFightTests(PetsTestCase):
                 self.assertIn(dropped.code, pet["inventory"])
                 self.assertEqual(outcome["auto_equipped"], auto_equipped)
 
-    def test_drop_pool_only_excludes_what_the_winner_already_owns(self):
-        """Uniqueness is per BAG, not per chat.
-
-        An item design belongs to whoever finds it, and two players finding the same design
-        is fine -- what nobody gets is two copies of one code in their own bag. The rule
-        used to be chat-wide, which meant a big collection quietly shrank everybody else's
-        drop table.
-        """
+    def test_drop_pool_allows_duplicates_in_the_winners_own_bag(self):
+        """Both personal and chat-wide ownership leave a design available for forging."""
         entry = "chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2491,8 +2583,8 @@ class RecordFightTests(PetsTestCase):
         pool = {item.code for item in choose.call_args.args[0]}
         # Somebody else owning it changes nothing...
         self.assertIn(first.code, pool)
-        # ...but a second copy of your own never appears.
-        self.assertNotIn(second.code, pool)
+        # ...and neither does owning a copy yourself.
+        self.assertIn(second.code, pool)
         self.assertEqual(outcome["dropped_item"], first.code)
         winner_inventory = pets.get_pet(entry, "1")["inventory"]
         self.assertEqual(winner_inventory.count(first.code), 1)
@@ -2640,7 +2732,7 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         self.assertEqual(pets.legendary_pity_progress("chat", "1")["wins_without_legend"], 0)
         self.assertEqual(pets.economy_telemetry("chat")["drops_by_rarity"]["legendary"], 1)
 
-    def test_completed_legendary_set_keeps_normal_drops_and_clears_unreachable_pity(self):
+    def test_completed_legendary_set_keeps_normal_drops_and_live_pity_for_duplicates(self):
         self._two_pets()
         legends = [item for item in pets_config.ITEMS if item.source == "drop" and item.rarity == "legendary"]
         ordinary = next(item for item in pets_config.ITEMS if item.source == "drop" and item.rarity != "legendary")
@@ -2655,8 +2747,8 @@ class PityGiftAndTelemetryTests(PetsTestCase):
             outcome = pets.record_fight("chat", "1", "2", result, date(2026, 8, 1))
         self.assertEqual(outcome["dropped_item"], ordinary.code)
         progress = pets.legendary_pity_progress("chat", "1")
-        self.assertFalse(progress["eligible"])
-        self.assertEqual(progress["wins_without_legend"], 0)
+        self.assertTrue(progress["eligible"])
+        self.assertEqual(progress["wins_without_legend"], 124)
 
     def test_legendaries_owned_by_others_do_not_exhaust_a_players_pity_pool(self):
         self._two_pets()
@@ -3756,7 +3848,7 @@ class FarmTests(PetsTestCase):
         )
         self.assertTrue(legendary_seen, "no legendary rolled across 500 seeds at 8 hours")
 
-    def test_farm_legendary_can_repeat_across_players_but_not_inside_one_bag(self):
+    def test_farm_legendary_can_repeat_across_players_and_inside_one_bag(self):
         entry = "farm-weapon-loot"
         self._tame(entry, "1")
         self._tame(entry, "2")
@@ -3778,9 +3870,13 @@ class FarmTests(PetsTestCase):
                 break
         self.assertIsNotNone(repeated_legendary)
         record["inventory"] = [repeated_legendary.code]
+        repeated_inside_bag = False
         for seed in range(400):
             found = pets._farm_item_for(data, record, random.Random(seed), 8, 1.0)
-            self.assertTrue(found is None or found.code != repeated_legendary.code)
+            if found is not None and found.code == repeated_legendary.code:
+                repeated_inside_bag = True
+                break
+        self.assertTrue(repeated_inside_bag)
 
     # -------------------------------------------------------------------- cancelling early
 

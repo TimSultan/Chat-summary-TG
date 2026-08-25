@@ -221,7 +221,8 @@ class CatalogueTests(unittest.TestCase):
             item for item in WEAPONS.WEAPON_SPECS
             if item.code in WEAPONS.MAGIC_WEAPON_CODES
         ]
-        self.assertEqual(len(shelf), 105)
+        # Rare/legendary stay full; the repetitive grey shop tiers are compact samples.
+        self.assertEqual(len(shelf), 59)
         for item in shelf:
             with self.subTest(item.code):
                 bonuses = dict(item.bonuses)

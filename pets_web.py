@@ -43,6 +43,7 @@ import secrets
 import statistics
 import time
 import traceback
+from collections import Counter
 from dataclasses import replace
 from datetime import date, datetime
 from io import BytesIO
@@ -1094,11 +1095,18 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     # So it travels only to the screens that render items. `None` is not "empty": it means
     # "not sent", and the client must fetch before drawing rather than trust what it last
     # saw, because a fight it just won may well have put something new in there.
-    state["bag"] = [
-        _item_payload(item, prefix, record)
-        for item in (C.find_item(code) for code in record.get("inventory", []))
-        if item is not None
-    ] if _view_needs_bag(view) else None
+    if _view_needs_bag(view):
+        inventory_counts = Counter(record.get("inventory", []))
+        state["bag"] = []
+        for code, count in inventory_counts.items():
+            item = C.find_item(code)
+            if item is None:
+                continue
+            row = _item_payload(item, prefix, record)
+            row["count"] = count
+            state["bag"].append(row)
+    else:
+        state["bag"] = None
     state["arena"] = pets.fight_allowance_breakdown(entry, user_id)
     state["arena"]["farming"] = pets.is_farming(entry, user_id)
     state["arena"]["pity"] = pets.legendary_pity_progress(entry, user_id)
@@ -6286,7 +6294,9 @@ function renderBag() {
       S.equipment.map((s) => s.item ? itemCard(s.item, "равно") : "").join("") +
       (S.equipment.every((s) => !s.item) ? '<div class="empty">Пока ничего не надето.</div>' : "") +
     "</div></div>" +
-    '<div class="panel"><h2>В сумке · ' + items.length + "</h2>" +
+    '<div class="panel"><h2>В сумке · ' +
+      items.reduce((total, item) => total + Number(item.count || 1), 0) +
+      ' предметов · ' + items.length + " видов</h2>" +
       (items.length ? '<div class="items">' + items.map((i) => itemCard(i)).join("") + "</div>"
                     : '<div class="empty">Пусто. Загляни в лавку или выиграй в арене.</div>') +
     "</div>" + runesPanel() + forgePanel();
@@ -6548,6 +6558,8 @@ function itemCard(item, flag) {
     : '';
   const marks = (item.equipped ? '<span class="flag">надето</span>'
                                : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
+                (Number(item.count || 1) > 1
+                  ? '<span class="lockmark" title="Количество">×' + Number(item.count) + '</span>' : "") +
                 (item.locked ? '<span class="lockmark">🔒</span>' : "") +
                 (item.enchantment ? '<span class="lockmark" title="Руна">' +
                   ({ fire: '🔥', frost: '❄️', water: '💧', earth: '🪨', air: '💨', plants: '🌿' }[item.enchantment] || '🔮') + '</span>' : "") +
@@ -8866,14 +8878,15 @@ function openItem(code) {
   }
 
   const actions = [];
+  const spareCopies = Math.max(0, Number(item.count || 1) - (item.equipped ? 1 : 0));
   if (item.owned && !item.equipped) actions.push(btn("Надеть", "equip", item.code));
   if (item.equipped) actions.push(btn("Снять", "unequip", item.slot, "sec"));
   if (item.owned) {
     actions.push('<div class="pair">' +
       btn(item.locked ? "🔓 Разблокировать" : "🔒 Заблокировать", "lock", item.code, "sec") +
-      (item.locked || item.equipped ? ""
+      (item.locked || spareCopies < 1 ? ""
         : btn("💰 Продать · " + money(item.resale), "sell", item.code, "sec")) + "</div>");
-    if (!item.locked && !item.equipped) actions.push(btn("🎁 Подарить", "gift", item.code, "sec"));
+    if (!item.locked && spareCopies > 0) actions.push(btn("🎁 Подарить", "gift", item.code, "sec"));
   }
   if (!item.owned && item.source === "shop") {
     actions.push('<button class="go" data-act="buy" data-code="' + esc(item.code) + '"' +
@@ -8885,7 +8898,8 @@ function openItem(code) {
 
   sheet(
     '<div class="hd"><img src="' + esc(item.art) + '" alt="">' +
-    "<div><h3>" + (item.cursed ? "☠️ " : "") + esc(item.name) + "</h3>" +
+    "<div><h3>" + (item.cursed ? "☠️ " : "") + esc(item.name) +
+      (Number(item.count || 1) > 1 ? " ×" + Number(item.count) : "") + "</h3>" +
     '<div class="small" style="color:var(--r-' + item.rarity + ')">' + esc(item.rarity_name) +
       (item.cursed ? " · проклятая" : "") + " · " + esc(item.slot_name) + "</div>" +
     '<div class="small" style="margin-top:5px">' + bonusText(item.bonuses) + "</div>" +

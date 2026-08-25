@@ -319,6 +319,58 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertEqual(after[1] - before[1], paid["farm_tickets"])
         self.assertEqual(after[2] - before[2], paid["dungeon_tickets"])
 
+    def test_multi_ticket_reward_credits_every_ticket(self):
+        item = max(achievements.catalogue(), key=lambda row: row.farm_tickets)
+        self.assertGreater(item.farm_tickets, 1)
+        data = pets._load(CHAT)
+        data["pets"][str(USER)].setdefault("achievements", {})["unlocked"] = [item.code]
+        pets._save(CHAT, data)
+        before = pets.farm_tickets(CHAT, USER)
+
+        ok, note, paid = pets.claim_achievement(CHAT, USER, item.code)
+
+        self.assertTrue(ok, note)
+        self.assertEqual(paid["farm_tickets"], item.farm_tickets)
+        self.assertEqual(pets.farm_tickets(CHAT, USER) - before, item.farm_tickets)
+
+    def test_same_ruby_achievement_pays_each_player_in_the_chat(self):
+        other = USER + 1
+        self.assertTrue(pets.buy_cage(CHAT, other, RICH_XP)[0])
+        self.assertTrue(pets.tame(CHAT, other, RICH_XP, "Second", "m", "Owner")[0])
+        item = next(row for row in achievements.catalogue() if row.rubies)
+        data = pets._load(CHAT)
+        for uid in (USER, other):
+            data["pets"][str(uid)].setdefault("achievements", {})["unlocked"] = [item.code]
+        pets._save(CHAT, data)
+
+        for uid in (USER, other):
+            before = pets.ruby_balance(CHAT, uid)
+            ok, note, paid = pets.claim_achievement(CHAT, uid, item.code)
+            self.assertTrue(ok, note)
+            self.assertEqual(paid["rubies"], item.rubies)
+            self.assertEqual(pets.ruby_balance(CHAT, uid) - before, item.rubies)
+
+    def test_old_shared_rewards_are_restored_once(self):
+        item = next(row for row in achievements.catalogue() if row.rubies and row.farm_tickets > 1)
+        data = pets._load(CHAT)
+        record = data["pets"][str(USER)]
+        record["achievements"] = {"unlocked": [item.code], "claimed": [item.code]}
+        data["ruby_sources"] = {
+            f"achievement:{item.code}": {"user_id": "someone-else", "amount": item.rubies},
+        }
+        data.setdefault("farm_tickets", {})[str(USER)] = {
+            "count": 1, "granted": [f"achievement:{item.code}"],
+        }
+        pets._save(CHAT, data)
+
+        pets.achievements_view(CHAT, USER)
+        self.assertEqual(pets.ruby_balance(CHAT, USER), item.rubies)
+        self.assertEqual(pets.farm_tickets(CHAT, USER), item.farm_tickets)
+
+        pets.achievements_view(CHAT, USER)
+        self.assertEqual(pets.ruby_balance(CHAT, USER), item.rubies)
+        self.assertEqual(pets.farm_tickets(CHAT, USER), item.farm_tickets)
+
     def test_the_reported_reward_is_what_was_actually_minted(self):
         """The note is read next to the wallet, so the two have to agree.
 

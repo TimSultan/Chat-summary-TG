@@ -21,6 +21,7 @@ call site.
 
 from datetime import date, datetime, timedelta, timezone
 from html import escape
+from collections import Counter
 
 import economy
 import casino
@@ -2798,10 +2799,12 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
     if slot not in C.SLOT_KEYS:
         return bag_view(entry, user_id, xp)
 
-    owned = [
-        item for code in pet.get("inventory", [])
+    inventory = pet.get("inventory", [])
+    counts = Counter(
+        item.code for code in inventory
         if (item := C.find_item(code)) is not None and item.slot == slot
-    ]
+    )
+    owned = [C.find_item(code) for code in counts]
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
     personal_enchantments = pet.get("personal_enchantments") or {}
@@ -2810,21 +2813,27 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
     page = min(max(0, page), total_pages - 1)
     visible = owned[page * INVENTORY_PAGE_SIZE:(page + 1) * INVENTORY_PAGE_SIZE]
 
-    noun = _plural(len(owned), "предмет", "предмета", "предметов").split(" ", 1)[1]
+    copy_count = sum(counts.values())
+    noun = _plural(copy_count, "предмет", "предмета", "предметов").split(" ", 1)[1]
     lines = [
         f"🎒 <b>Моя сумка · {escape(C.SLOT_NAMES[slot])}</b>",
-        f"{len(owned)} {noun} · {page + 1}/{total_pages}",
+        f"{copy_count} {noun} · {len(owned)} видов · {page + 1}/{total_pages}",
     ]
     rows = []
     if not visible:
         lines.append("\nЗдесь пока пусто. Новое оружие появляется в магазине дня или после победы.")
     for number, item in enumerate(visible, start=page * INVENTORY_PAGE_SIZE + 1):
         is_worn = item.code == worn
+        copies = counts[item.code]
+        spare_copies = copies - int(is_worn)
         mark = " ✅ надето" if is_worn else ""
         lock_mark = " 🔒" if item.code in locked else ""
         paint_mark = " 🎨 +30%" if item.code in personal_enchantments else ""
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
-        lines.append(f"\n{number}. <b>{escape(item.name)}</b>{mark}{lock_mark}{paint_mark}")
+        count_mark = f" ×{copies}" if copies > 1 else ""
+        lines.append(
+            f"\n{number}. <b>{escape(item.name)}</b>{count_mark}{mark}{lock_mark}{paint_mark}"
+        )
         lines.append(f"{label} · {_bonus_text(item)}")
         if item.slot == "weapon":
             details = pets.weapon_details(entry, user_id, item.code)
@@ -2852,7 +2861,7 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         }])
         # A lock is a safety control, not merely a warning: keep destructive actions
         # out of the convenient page as well as enforcing the same rule in pets.py.
-        if not is_worn and item.code not in locked:
+        if spare_copies > 0 and item.code not in locked:
             rows.append([{
                 "text": "🎁 Подарить",
                 "callback_data": callback_data(user_id, "gift", item.code),

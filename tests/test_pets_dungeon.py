@@ -745,6 +745,23 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
 
+    def test_named_player_support_gift_is_exact_and_idempotent(self):
+        result = pets.grant_player_ticket_gift(
+            [self.entry], self.user_id, dungeon=5, meadow=15, source="support-test",
+        )
+        self.assertEqual(result, {"players": 1, "dungeon_tickets": 5, "meadow_tickets": 15})
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 5)
+        self.assertEqual(pets.meadow_tickets(self.entry, self.user_id), 15)
+
+        self.assertEqual(
+            pets.grant_player_ticket_gift(
+                [self.entry], self.user_id, dungeon=5, meadow=15, source="support-test",
+            ),
+            {"players": 0, "dungeon_tickets": 0, "meadow_tickets": 0},
+        )
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 5)
+        self.assertEqual(pets.meadow_tickets(self.entry, self.user_id), 15)
+
     def test_existing_dungeon_ticket_balances_are_capped_at_ten_once(self):
         for _ in range(14):
             pets.grant_dungeon_ticket(self.entry, self.user_id)

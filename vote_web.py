@@ -67,6 +67,11 @@ _ANNOUNCE_KEY = web.AppKey(
 # for the same split of concerns _ANNOUNCE_KEY draws. Failure is reported back to the page,
 # not raised: the file is written either way, and the page offers a link to it.
 _EXPORT_KEY = web.AppKey("export", Callable[[dict, voting.Poll, Path], Awaitable[None]])
+# Fetches one author's Telegram profile photo. bot_listener owns the live Bot API client,
+# so the web layer receives this as a callable just like announce/export rather than
+# opening a second HTTP session of its own.
+_AVATAR_KEY = web.AppKey("avatar", Callable[[int], Awaitable[bytes | None]])
+_AVATAR_CACHE_KEY = web.AppKey("avatar_cache", dict)
 _ROUTE_PREFIX_KEY = web.AppKey("route_prefix", str)
 _LOG_KEY = web.AppKey("log", Callable[..., None])
 
@@ -98,10 +103,21 @@ async def _authenticate(request: web.Request, body: dict | None = None) -> dict:
 
 
 def _entry_payload(entry: voting.Entry, poll: voting.Poll, base: str) -> dict:
+    username = str(entry.author_username or "").lstrip("@")
+    profile_url = (
+        f"https://t.me/{username}" if re.fullmatch(r"[A-Za-z0-9_]+", username)
+        else (f"tg://user?id={entry.author_id}" if entry.author_id is not None else None)
+    )
     return {
         "id": entry.entry_id,
+        "author_id": entry.author_id,
         "author": entry.author_name,
         "username": entry.author_username,
+        "profile_url": profile_url,
+        "avatar": (
+            f"{base}/avatar/{poll.poll_id}/{entry.author_id}"
+            if entry.author_id is not None else None
+        ),
         "text": entry.text,
         "posted_at": entry.posted_at,
         "photos": [f"{base}/media/{poll.poll_id}/{name}" for name in entry.media],
@@ -545,6 +561,43 @@ async def handle_media(request: web.Request) -> web.Response:
     return web.FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
 
 
+async def handle_avatar(request: web.Request) -> web.Response:
+    """Serves an author's current Telegram avatar for a card in this poll.
+
+    The route is public for the same reason as the nominated photos: an ``<img>`` cannot
+    attach Mini App initData. It is not an arbitrary Telegram-user lookup, though -- the
+    requested id must belong to an entry in the named poll. Successful downloads and
+    missing-photo results are cached for the process lifetime, keeping a three-column
+    board from asking Telegram for the same face for every viewer.
+    """
+    poll_id = request.match_info["poll_id"]
+    raw_user_id = request.match_info["user_id"]
+    if not _SAFE_MEDIA_NAME.match(poll_id or "") or not raw_user_id.isdigit():
+        raise web.HTTPNotFound()
+    user_id = int(raw_user_id)
+    poll = voting.load_poll(request.app[_ENTRY_KEY], poll_id)
+    if poll is None or not any(entry.author_id == user_id for entry in poll.entries):
+        raise web.HTTPNotFound()
+
+    cache = request.app[_AVATAR_CACHE_KEY]
+    if user_id not in cache:
+        try:
+            avatar = await request.app[_AVATAR_KEY](user_id)
+        except Exception as e:
+            # A transient Telegram failure is not cached as "this user has no photo": a
+            # later page load should be allowed to retry and recover on its own.
+            request.app[_LOG_KEY](f"[vote_web] could not fetch avatar for {user_id}: {e}")
+            raise web.HTTPServiceUnavailable()
+        cache[user_id] = bytes(avatar) if avatar else None
+    avatar = cache[user_id]
+    if not avatar:
+        raise web.HTTPNotFound()
+    return web.Response(
+        body=avatar, content_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 async def handle_page(request: web.Request) -> web.Response:
     return web.Response(
         text=PAGE_HTML.replace("__PREFIX__", request.app[_ROUTE_PREFIX_KEY]),
@@ -569,7 +622,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
-    is_member=None, export=None, attach=None,
+    is_member=None, export=None, avatar=None, attach=None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
     returning a bool; `announce` is an async callable taking (user, poll, standings) --
@@ -594,6 +647,10 @@ def create_app(
     Defaults to a no-op, which leaves the export working (the file is written, and the
     page links to it) minus the copy in the DM.
 
+    `avatar` takes one author id and returns their current Telegram profile photo bytes,
+    or None when they have no photo. The results are cached here and exposed only for
+    authors who actually belong to the requested poll.
+
     `attach` is called with the finished application, for mounting something else on the
     same server -- today the arena (arena_web.attach), the second voting system. It runs
     last, so it can only add to what this module has already registered, and this module
@@ -608,6 +665,9 @@ def create_app(
     async def _default_export(user, poll, path):
         return None
 
+    async def _default_avatar(user_id):
+        return None
+
     app = web.Application()
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
@@ -615,6 +675,8 @@ def create_app(
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
     app[_ANNOUNCE_KEY] = announce or _default_announce
     app[_EXPORT_KEY] = export or _default_export
+    app[_AVATAR_KEY] = avatar or _default_avatar
+    app[_AVATAR_CACHE_KEY] = {}
     app[_ROUTE_PREFIX_KEY] = route_prefix.rstrip("/")
     app[_LOG_KEY] = log
 
@@ -636,6 +698,7 @@ def create_app(
         web.post(f"{prefix}/api/announce", handle_announce),
         web.post(f"{prefix}/api/clear", handle_clear),
         web.get(prefix + "/media/{poll_id}/{name}", handle_media),
+        web.get(prefix + "/avatar/{poll_id}/{user_id}", handle_avatar),
         web.get(prefix + "/export/{name}", handle_export_image),
     ])
     if attach:
@@ -645,12 +708,12 @@ def create_app(
 
 async def run_web_server(
     cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None,
-    export=None, attach=None,
+    export=None, avatar=None, attach=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
     app = create_app(
         cfg, entry, is_admin, announce=announce, log=log, is_member=is_member, export=export,
-        attach=attach,
+        avatar=avatar, attach=attach,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -707,12 +770,25 @@ PAGE_HTML = """<!doctype html>
   .gcard { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
   .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; overflow: hidden;
            background: rgba(128,128,128,.2); }
-  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .thumb img.framed { position: absolute; max-width: none; max-height: none; object-fit: fill; }
+  .thumb > img.workPhoto { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb > img.workPhoto.framed { position: absolute; max-width: none; max-height: none; object-fit: fill; }
   .count { position: absolute; right: 4px; top: 4px; background: rgba(0,0,0,.6);
            color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 8px; }
   .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
            color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+  /* The face belongs on the work rather than in the caption: in the three-column collage
+     it stays visible while somebody scans photos, and it has its own hit target so a tap
+     opens the author instead of the full-size reel. */
+  .authorAvatar { position: relative; display: block; width: 34px; height: 34px;
+                  border-radius: 50%; overflow: hidden; flex: none; background: var(--card);
+                  border: 2px solid rgba(255,255,255,.92); color: #fff;
+                  text-decoration: none; box-shadow: 0 1px 5px rgba(0,0,0,.65); }
+  .authorAvatar img { position: absolute; inset: 0; width: 100%; height: 100%;
+                      object-fit: cover; display: block; }
+  .avatarFallback { position: absolute; inset: 0; display: flex; align-items: center;
+                    justify-content: center; background: var(--accent); color: #fff;
+                    font-size: 14px; font-weight: 700; }
+  .gcard .authorAvatar { position: absolute; left: 6px; bottom: 6px; z-index: 3; }
   .gcard .who { padding: 5px 6px 2px; font-size: 11px; overflow: hidden;
                 text-overflow: ellipsis; white-space: nowrap; }
   .pick { display: block; width: 100%; border: 0; padding: 7px 4px; font-size: 12px;
@@ -743,7 +819,12 @@ PAGE_HTML = """<!doctype html>
   .rcard { padding: 14px 0; border-bottom: 1px solid rgba(128,128,128,.2); }
   .rcard:last-child { border-bottom: 0; }
   .rcard .who { font-size: 13px; font-weight: 600; margin-bottom: 6px;
-                display: flex; align-items: center; }
+                display: flex; align-items: flex-start; gap: 6px; }
+  .rcard .identityText { min-width: 0; flex: 1; }
+  .rcard .authorName, .rcard .authorTag { overflow: hidden; text-overflow: ellipsis;
+                                         white-space: nowrap; }
+  .rcard .authorTag { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .rcard .reelAuthorAvatar { width: 46px; height: 46px; margin: 2px 0 10px; }
   .rcard .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
   .rcard .photos { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
   /* cursor, because tapping the picture is what closes the reel (see the #feed tap
@@ -963,6 +1044,41 @@ function who(entry) {
   return entry.username ? "@" + entry.username : entry.author;
 }
 
+function avatarInitial(entry) {
+  const value = String(entry.author || entry.username || "?").trim();
+  return value ? Array.from(value)[0].toUpperCase() : "?";
+}
+
+function avatarHtml(entry, extraClass) {
+  const classes = "authorAvatar" + (extraClass ? " " + extraClass : "");
+  const label = "Открыть профиль " + (entry.author || who(entry));
+  const picture =
+    '<span class="avatarFallback">' + esc(avatarInitial(entry)) + "</span>" +
+    (entry.avatar
+      ? '<img loading="lazy" src="' + esc(entry.avatar) + '" alt="" ' +
+        'onerror="this.hidden=true">'
+      : "");
+  if (!entry.profile_url) return '<span class="' + classes + '">' + picture + "</span>";
+  return '<a class="' + classes + '" href="' + esc(entry.profile_url) +
+    '" data-profile="' + esc(entry.profile_url) + '" aria-label="' + esc(label) + '">' +
+    picture + "</a>";
+}
+
+function authorIdentityHtml(entry) {
+  const tag = entry.username ? "@" + entry.username : "без @username";
+  return '<div class="identityText"><div class="authorName">' + esc(entry.author) +
+    '</div><div class="authorTag">' + esc(tag) + "</div></div>";
+}
+
+function openAuthorProfile(url) {
+  if (!url) return;
+  if (url.startsWith("https://t.me/") && tg && tg.openTelegramLink) {
+    tg.openTelegramLink(url);
+  } else {
+    window.location.href = url;
+  }
+}
+
 function renderWinnerBanner() {
   const banner = $("winnerBanner");
   if (!poll.winner) { banner.hidden = true; return; }
@@ -1103,7 +1219,7 @@ function applyEntryFrame(img, crop) {
 }
 
 window.addEventListener("resize", () => {
-  document.querySelectorAll(".thumb img.framed").forEach(applyFrame);
+  document.querySelectorAll(".thumb > img.workPhoto.framed").forEach(applyFrame);
 });
 
 function renderGrid() {
@@ -1127,17 +1243,17 @@ function renderGrid() {
       ? '<span class="count">+' + (entry.photos.length - 1) + "</span>" : "";
 
     card.innerHTML =
-      '<a class="thumb" href="#" data-open="' + esc(entry.id) + '">' +
-        '<img loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' +
-        more + votes +
-      "</a>" +
+      '<div class="thumb" data-open="' + esc(entry.id) + '" role="button">' +
+        '<img class="workPhoto" loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' +
+        more + votes + avatarHtml(entry) +
+      "</div>" +
       voteBarHtml(entry, maxCount) +
       '<div class="who">' + esc(who(entry)) + "</div>" +
       '<button class="pick" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
         pickLabel(entry.id, true) +
       "</button>";
     grid.appendChild(card);
-    applyEntryFrame(card.querySelector(".thumb img"), entry.crop);
+    applyEntryFrame(card.querySelector(".thumb > img.workPhoto"), entry.crop);
   }
 }
 
@@ -1158,7 +1274,8 @@ function renderReel() {
     const votes = count ? '<span class="votesBadge">' + count + "</span>" : "";
 
     card.innerHTML =
-      '<div class="who">' + esc(who(entry)) + votes + "</div>" +
+      '<div class="who">' + authorIdentityHtml(entry) + votes + "</div>" +
+      avatarHtml(entry, "reelAuthorAvatar") +
       (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
       '<div class="photos">' +
         entry.photos.map((p) =>
@@ -1514,6 +1631,9 @@ $("feed").addEventListener("pointerdown", (event) => {
 $("feed").addEventListener("pointercancel", () => { reelTap = { cancelled: true }; });
 
 $("feed").addEventListener("click", (event) => {
+  // An avatar is also an IMG, but its tap belongs to the profile link and must not close
+  // the expanded work as if the work photo itself had been tapped.
+  if (event.target.closest("[data-profile]")) { reelTap = null; return; }
   // The magnifier first: it sits ON the photo, and tapping a photo closes the reel.
   const zoom = event.target.closest("[data-zoom]");
   if (zoom) {
@@ -1603,6 +1723,12 @@ async function onPickTap(id) {
 }
 
 document.addEventListener("click", (event) => {
+  const profile = event.target.closest("[data-profile]");
+  if (profile) {
+    event.preventDefault();
+    openAuthorProfile(profile.dataset.profile);
+    return;
+  }
   const open = event.target.closest("[data-open]");
   if (open) { event.preventDefault(); openReel(open.dataset.open); return; }
   const pick = event.target.closest("[data-pick]");

@@ -54,6 +54,7 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.announced = []  # (user, poll, standings) tuples, in call order
         self.exported = []   # paths of rendered board pictures handed over for delivery
         self.export_fails = False
+        self.avatar_requests = []
         cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
 
         async def is_admin(user: dict) -> bool:
@@ -67,8 +68,13 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("bot could not DM this admin")
             self.exported.append(path)
 
+        async def avatar(user_id):
+            self.avatar_requests.append(user_id)
+            return b"telegram-avatar"
+
         app = vote_web.create_app(
-            cfg, CHAT, is_admin, announce=announce, export=export, log=lambda *_: None,
+            cfg, CHAT, is_admin, announce=announce, export=export, avatar=avatar,
+            log=lambda *_: None,
         )
         self.server = TestServer(app)
         self.client = TestClient(self.server)
@@ -120,6 +126,12 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(data["is_admin"])
         self.assertEqual([e["id"] for e in data["entries"]], ["a"])
         self.assertEqual(data["entries"][0]["crop"], {"x": 12.0, "y": 34.0, "size": 56.0})
+        self.assertEqual(data["entries"][0]["author_id"], 1)
+        self.assertEqual(data["entries"][0]["profile_url"], "https://t.me/author")
+        self.assertEqual(
+            data["entries"][0]["avatar"],
+            f"{vote_web.ROUTE_PREFIX}/avatar/2026-08-02/1",
+        )
         self.assertNotIn("counts", data)  # only the admin gets live counts
 
     async def test_an_unmoderated_poll_shows_a_voter_nothing(self):
@@ -130,6 +142,17 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         data = await response.json()
         self.assertEqual(data["entries"], [])
+
+    async def test_an_author_without_a_username_still_links_by_telegram_id(self):
+        poll = self._seed_poll(approved=("a",))
+        poll.entries[0].author_username = None
+        voting.save_poll(poll)
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        data = await response.json()
+        self.assertEqual(data["entries"][0]["profile_url"], "tg://user?id=1")
 
     # ---- moderation mode is opt-in, even for an admin -----------------------------------
 
@@ -880,6 +903,25 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get(f"{vote_web.ROUTE_PREFIX}/media/2026-08-02/nope.jpg")
         self.assertEqual(response.status, 404)
 
+    async def test_an_author_avatar_is_served_and_cached(self):
+        self._seed_poll()
+        url = f"{vote_web.ROUTE_PREFIX}/avatar/2026-08-02/1"
+        first = await self.client.get(url)
+        second = await self.client.get(url)
+        self.assertEqual(first.status, 200)
+        self.assertEqual(await first.read(), b"telegram-avatar")
+        self.assertEqual(second.status, 200)
+        self.assertEqual(self.avatar_requests, [1])
+        self.assertEqual(first.headers["Content-Type"], "image/jpeg")
+
+    async def test_the_avatar_route_cannot_lookup_somebody_outside_the_poll(self):
+        self._seed_poll()
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/avatar/2026-08-02/999"
+        )
+        self.assertEqual(response.status, 404)
+        self.assertEqual(self.avatar_requests, [])
+
     # ---- page + health --------------------------------------------------------------------
 
     async def test_the_health_check_needs_no_auth(self):
@@ -891,6 +933,15 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get(vote_web.ROUTE_PREFIX)
         self.assertEqual(response.status, 200)
         self.assertIn("telegram-web-app.js", await response.text())
+
+    async def test_collage_and_expanded_cards_show_clickable_author_avatars(self):
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn(".gcard .authorAvatar", page)
+        self.assertIn('data-profile="', page)
+        self.assertIn('avatarHtml(entry, "reelAuthorAvatar")', page)
+        self.assertIn('class="authorName"', page)
+        self.assertIn('class="authorTag"', page)
+        self.assertIn("tg.openTelegramLink(url)", page)
 
     async def test_the_standings_number_does_not_reuse_the_photo_badge_class(self):
         """`.count` is the grid thumbnail's absolutely positioned "+2 photos" badge. The

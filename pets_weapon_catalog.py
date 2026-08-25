@@ -1247,10 +1247,94 @@ def _build_catalogue() -> tuple[WeaponSpec, ...]:
     )
 
 
-WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = _build_catalogue()
-# Compatibility records for item/trade code.  Use only these 504 records when wiring
-# the equipment system: existing ``stick``, ``fork`` and ``bone`` are replacements,
-# not additions, if the total weapon count must remain exactly 504.
+ALL_WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = _build_catalogue()
+
+# The bottom cursed rung used to contain 96 grey weapons: many different names for only
+# a handful of stat shapes. Twelve keep every physical/magic/hybrid build represented;
+# repeat drops now provide the six ingredients the forge actually needs. Retired codes
+# remain aliases (below), so this catalogue cut never deletes an owned item.
+ACTIVE_CURSED_BASE_CODES: Final = frozenset({
+    # Five physical archetypes.
+    "w007", "w013", "w020", "w074", "w171",
+    # Five pure-magic archetypes and two hybrids.
+    "w527", "w528", "w529", "w530", "w531", "w543", "w545",
+})
+_active_cursed_base = tuple(
+    item for item in ALL_WEAPON_SPECS if item.code in ACTIVE_CURSED_BASE_CODES
+)
+
+
+def _spaced_codes(rows: list[WeaponSpec], count: int, required=()) -> frozenset[str]:
+    """Keep a stable sample spanning a whole stat/power band, including legacy IDs."""
+    ordered = sorted(rows, key=lambda item: item.code)
+    selected = [item for item in ordered if item.code in set(required)]
+    remaining = [item for item in ordered if item.code not in {row.code for row in selected}]
+    needed = max(0, count - len(selected))
+    if needed >= len(remaining):
+        selected.extend(remaining)
+    elif needed == 1:
+        selected.append(remaining[len(remaining) // 2])
+    elif needed > 1:
+        selected.extend(
+            remaining[round(index * (len(remaining) - 1) / (needed - 1))]
+            for index in range(needed)
+        )
+    return frozenset(item.code for item in selected)
+
+
+def _grey_rows(rarity: str, scaling: str) -> list[WeaponSpec]:
+    return [
+        item for item in ALL_WEAPON_SPECS
+        if item.rarity == rarity and item.scaling == scaling
+    ]
+
+
+# Common and the legacy green "uncommon" both render as the same grey Common tier in the
+# live game. Keep thirty varied shop weapons instead of 412 repeated catalogue entries:
+# twenty physical, seven pure-magic and three hybrids, split across both power bands.
+ACTIVE_GREY_WEAPON_CODES: Final = frozenset().union(
+    _spaced_codes(_grey_rows("common", "strength"), 12, {"w001", "w004", "w052", "w098"}),
+    _spaced_codes(_grey_rows("uncommon", "strength"), 8, {"w002", "w051"}),
+    _spaced_codes(_grey_rows("common", "magic"), 4),
+    _spaced_codes(_grey_rows("uncommon", "magic"), 3),
+    _spaced_codes(_grey_rows("common", "hybrid"), 2),
+    _spaced_codes(_grey_rows("uncommon", "hybrid"), 1, {"w586"}),
+)
+_active_replacement_rows = tuple(
+    item for item in ALL_WEAPON_SPECS
+    if item.code in ACTIVE_CURSED_BASE_CODES or item.code in ACTIVE_GREY_WEAPON_CODES
+)
+
+
+def _retired_weapon_replacement(item: WeaponSpec) -> str:
+    """Closest survivor in the same rarity/scaling band whenever one exists."""
+    candidates = [
+        row for row in _active_replacement_rows
+        if row.rarity == item.rarity and row.scaling == item.scaling
+    ]
+    if not candidates:
+        candidates = [row for row in _active_replacement_rows if row.scaling == item.scaling]
+    mine = dict(item.bonuses)
+    return min(candidates, key=lambda row: (
+        sum(abs(mine.get(key, 0) - dict(row.bonuses).get(key, 0)) for key in STAT_KEYS),
+        row.code,
+    )).code
+
+
+RETIRED_WEAPON_REPLACEMENTS: Final = {
+    item.code: _retired_weapon_replacement(item)
+    for item in ALL_WEAPON_SPECS
+    if (
+        item.rarity == "cursed" and item.code not in ACTIVE_CURSED_BASE_CODES
+    ) or (
+        item.rarity in {"common", "uncommon"} and item.code not in ACTIVE_GREY_WEAPON_CODES
+    )
+}
+WEAPON_SPECS: Final[tuple[WeaponSpec, ...]] = tuple(
+    item for item in ALL_WEAPON_SPECS if item.code not in RETIRED_WEAPON_REPLACEMENTS
+)
+# Retired grey rows are intentionally absent: no shop, loot table, collection or API can
+# expose them after migration. Their stable old codes resolve through the alias mapping.
 RAW_ITEMS: Final[tuple[dict[str, object], ...]] = tuple(item.raw_item() for item in WEAPON_SPECS)
 WEAPON_COUNT: Final = len(WEAPON_SPECS)
 # Published so the UI, the balance report and the tests can name the cursed shelf without
@@ -1273,7 +1357,8 @@ PRE_REBALANCE_BUY_PRICES: Final = {
 
 def _validate_catalogue() -> None:
     """Fail immediately if a future catalogue edit violates its public contract."""
-    assert WEAPON_COUNT == 631
+    assert len(ALL_WEAPON_SPECS) == 631
+    assert WEAPON_COUNT == 165
     assert len({item.code for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.name for item in WEAPON_SPECS}) == WEAPON_COUNT
     assert len({item.description for item in WEAPON_SPECS}) == WEAPON_COUNT
@@ -1287,22 +1372,30 @@ def _validate_catalogue() -> None:
                                    for key, value in item.bonuses) for item in WEAPON_SPECS)
     assert all(item.drop_weight == 0 for item in WEAPON_SPECS if item.source == "shop")
     assert all(item.drop_weight > 0 for item in WEAPON_SPECS if item.source == "drop")
-    # The generated 500 carry 75/250/120/45/10; _NEW_BUILD_WEAPONS then adds two rare and
-    # four legendary drops (w501..w506) and _CURSED_LEGENDARIES eight more (w507..w514).
-    # +21 of every rarity is the magic shelf, exactly as commissioned.
-    assert RARITY_COUNTS == {"cursed": 96, "common": 271, "uncommon": 141, "rare": 80, "legendary": 43}
-    # The magic shelf's own contract: 105 weapons, 21 per rarity, 5 hybrids in each, and
-    # not one of them scaling from Strength -- that is what makes them a caster's shelf
-    # rather than 105 more steel weapons with a different noun in the name.
+    assert RARITY_COUNTS == {"cursed": 12, "common": 18, "uncommon": 12, "rare": 80, "legendary": 43}
+    assert len(ACTIVE_GREY_WEAPON_CODES) == 30
+    assert len(RETIRED_WEAPON_REPLACEMENTS) == 466
+    assert set(RETIRED_WEAPON_REPLACEMENTS).isdisjoint(item.code for item in WEAPON_SPECS)
+    assert set(RETIRED_WEAPON_REPLACEMENTS.values()) <= (
+        ACTIVE_CURSED_BASE_CODES | ACTIVE_GREY_WEAPON_CODES
+    )
+    # Every full magic tier remains 21 strong. The deliberately compact grey rung keeps
+    # five pure casters and two hybrids instead of twenty-one near-identical names.
     magic_shelf = [item for item in WEAPON_SPECS if item.scaling != "strength"]
-    assert len(magic_shelf) == 105
+    assert len(magic_shelf) == 59
     assert all(item.scaling in SCALINGS for item in WEAPON_SPECS)
     assert all(item.code[1:].isdigit() and int(item.code[1:]) >= _MAGIC_FIRST_CODE
                for item in magic_shelf)
     for rarity in RARITIES:
         shelf = [item for item in magic_shelf if item.rarity == rarity]
-        assert len(shelf) == 21, (rarity, len(shelf))
-        assert sum(item.scaling == "hybrid" for item in shelf) == 5, rarity
+        expected_count = {
+            "cursed": 7, "common": 6, "uncommon": 4, "rare": 21, "legendary": 21,
+        }[rarity]
+        expected_hybrids = {
+            "cursed": 2, "common": 2, "uncommon": 1, "rare": 5, "legendary": 5,
+        }[rarity]
+        assert len(shelf) == expected_count, (rarity, len(shelf))
+        assert sum(item.scaling == "hybrid" for item in shelf) == expected_hybrids, rarity
     # A magic weapon that grants no Магия would make its own scaling a downgrade.
     assert all(
         any(key == "magic" for key, _value in item.bonuses) for item in magic_shelf
@@ -1315,15 +1408,10 @@ def _validate_catalogue() -> None:
                if item.rarity in ("rare", "legendary"))
     assert not any(item.effect for item in magic_shelf
                    if item.rarity in ("cursed", "common", "uncommon"))
-    # The cursed ladder, all three rungs. 75 junk at the bottom, twelve rare in the middle,
-    # eight legendary at the top -- and the middle rung is what the forge needed to exist
-    # before "проклятое" could be a line a player climbs rather than a pile they melt.
-    # 96 junk at the bottom (75 steel + the magic shelf's 21), twelve rare in the middle,
-    # eight legendary at the top. The magic shelf's junk joins the ladder rather than
-    # sitting beside it: it is the same worthless drop and the same six-into-one recipe,
-    # and a second pile of unmeltable junk would have been a strictly worse reward.
+    # The cursed ladder, all three rungs. Twelve varied junk designs at the bottom are
+    # repeatable forge material; twelve rares and eight legendaries remain above them.
     cursed_line = [item for item in WEAPON_SPECS if item.cursed]
-    assert len(cursed_line) == 116
+    assert len(cursed_line) == 32
     assert {item.rarity for item in cursed_line} == {"cursed", "rare", "legendary"}
     assert all(item.source == "drop" for item in cursed_line)
     assert sum(1 for item in cursed_line if item.rarity == "rare") == 12
@@ -1379,5 +1467,7 @@ __all__ = [
     "RARITIES", "SOURCES", "STAT_KEYS", "WeaponSpec", "WEAPON_SPECS", "RAW_ITEMS", "WEAPON_COUNT",
     "RARITY_COUNTS", "PRE_REBALANCE_BUY_PRICES", "STARTER_WEAPON_MAX_PRICE", "shop_price_for_bonuses",
     "CURSED_LEGENDARY_CODES", "RARE_CURSED_CODES", "CURSED_CODES",
+    "ALL_WEAPON_SPECS", "ACTIVE_CURSED_BASE_CODES", "ACTIVE_GREY_WEAPON_CODES",
+    "RETIRED_WEAPON_REPLACEMENTS",
     "MAGIC_WEAPON_CODES", "MAGIC_WEAPON_ROWS", "SCALINGS",
 ]

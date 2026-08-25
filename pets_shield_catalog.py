@@ -208,7 +208,9 @@ RAW_ITEMS = tuple(
 # offers three ordinary items and never repeats what you own, and the forge asks for four
 # ordinary or five rare shields of this slot alone. A catalogue that cannot cover both
 # leaves a shelf with holes in it and a recipe nobody can finish.
-MIN_ORDINARY_SHIELDS = 12
+# Three daily offers plus four distinct forge ingredients still leave one spare design;
+# more grey variants than that only dilute the interesting shield drops.
+MIN_ORDINARY_SHIELDS = 8
 MIN_RARE_SHIELDS = 10
 
 

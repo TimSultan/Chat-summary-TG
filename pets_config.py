@@ -1067,10 +1067,12 @@ try:
         MOB_HUNTER_WEAPON_CODE,
         PRE_REBALANCE_BUY_PRICES as PRE_REBALANCE_WEAPON_BUY_PRICES,
         RAW_ITEMS as _RAW_WEAPON_ITEMS,
+        RETIRED_WEAPON_REPLACEMENTS,
         STARTER_WEAPON_MAX_PRICE,
     )
 except ImportError:
     _RAW_WEAPON_ITEMS = ()
+    RETIRED_WEAPON_REPLACEMENTS = {}
     PRE_REBALANCE_WEAPON_BUY_PRICES = {}
     STARTER_WEAPON_MAX_PRICE = FARM_GOLD_PER_RUN[1]
     MOB_HUNTER_WEAPON_CODE = ""
@@ -1150,6 +1152,65 @@ if _RAW_SHIELD_ITEMS and (
     or sum(item.source == "shop" for item in _catalogue_shields) < 3
 ):
     raise ValueError("shield catalogue must hold only shields, at least three sold in shops")
+
+
+def _spread_items(rows, count):
+    """Keep a representative slice from a long, ordered stat-only progression."""
+    rows = tuple(rows)
+    count = min(len(rows), max(0, int(count)))
+    if count >= len(rows):
+        return rows
+    if count <= 1:
+        return rows[:count]
+    indices = {round(index * (len(rows) - 1) / (count - 1)) for index in range(count)}
+    return tuple(row for index, row in enumerate(rows) if index in indices)
+
+
+def _retire_plain_grey(rows, *, slot: str, target_total: int, permanent=()):
+    """Hide redundant grey stat sticks and map every owned copy to a close survivor."""
+    rows = tuple(rows)
+    plain = tuple(row for row in rows if row.rarity in ("common", "uncommon"))
+    permanent = tuple(row for row in permanent if row.slot == slot and row.rarity in ("common", "uncommon"))
+    permanent_codes = {row.code for row in permanent}
+    selectable = tuple(row for row in plain if row.code not in permanent_codes)
+    kept_plain = _spread_items(selectable, max(0, target_total - len(permanent)))
+    kept_codes = {row.code for row in kept_plain} | permanent_codes
+    kept = tuple(row for row in rows if row.rarity not in ("common", "uncommon") or row.code in kept_codes)
+    candidates = kept_plain + permanent
+    aliases = {}
+    for old in plain:
+        if old.code in kept_codes:
+            continue
+        def distance(new):
+            keys = set(old.bonuses) | set(new.bonuses)
+            stat_gap = sum(abs(int(old.bonuses.get(key, 0)) - int(new.bonuses.get(key, 0))) for key in keys)
+            old_effect = (old.effect or {}).get("code") if isinstance(old.effect, dict) else ""
+            new_effect = (new.effect or {}).get("code") if isinstance(new.effect, dict) else ""
+            return (old_effect != new_effect, old.rarity != new.rarity, stat_gap, new.code)
+        aliases[old.code] = min(candidates, key=distance).code
+    return kept, aliases
+
+
+# Grey boots/gloves are pure stat variations: ten live designs per slot are enough for
+# drops, duplicates and forging. Grey amulets stay because nearly every one has a distinct
+# combat hook. Shields retain eight ordinary designs, comfortably above a four-item forge.
+_starter_accessories = tuple(item for item in ITEMS if item.slot != "weapon")
+_boots = tuple(item for item in _catalogue_gear if item.slot == "boots")
+_gloves = tuple(item for item in _catalogue_gear if item.slot == "gloves")
+_boots, _retired_boots = _retire_plain_grey(
+    _boots, slot="boots", target_total=10, permanent=_starter_accessories,
+)
+_gloves, _retired_gloves = _retire_plain_grey(
+    _gloves, slot="gloves", target_total=10, permanent=_starter_accessories,
+)
+_catalogue_gear = _boots + _gloves
+_catalogue_shields, _retired_shields = _retire_plain_grey(
+    _catalogue_shields, slot="shield", target_total=8,
+    permanent=tuple(item for item in _catalogue_shields if item.source == "shop"),
+)
+_RETIRED_GREY_REPLACEMENTS = {
+    **_retired_boots, **_retired_gloves, **_retired_shields,
+}
 _new_catalogue_items = _catalogue_amulets + _catalogue_gear + _catalogue_shields
 if _new_catalogue_items:
     existing_codes = {item.code for item in ITEMS}
@@ -1176,8 +1237,16 @@ ITEMS = ITEMS + (
     ),
 )
 
-# Save files from the starter catalogue keep working after the 500-weapon replacement.
-LEGACY_ITEM_CODES = {"stick": "w001", "fork": "w002", "bone": "w003"} if _RAW_WEAPON_ITEMS else {}
+# Save files from both catalogue reductions keep working. The retired grey weapon aliases
+# are also the migration recipe: inventories retain every physical copy, merely under the
+# closest surviving design code.
+LEGACY_ITEM_CODES = (
+    {
+        "stick": "w001", "fork": "w002", "bone": "w003",
+        **RETIRED_WEAPON_REPLACEMENTS, **_RETIRED_GREY_REPLACEMENTS,
+    }
+    if _RAW_WEAPON_ITEMS else {}
+)
 
 
 # Shop gear pays back only 20%; drop-only trophies have an explicit salvage value in
