@@ -75,6 +75,11 @@ FARM_BUILD_REFUND_FLAG = "farm_build_refund_202608"
 # restart, forever.
 STARTER_WEAPON_GIFT_FLAG = "starter_weapon_gift_202608"
 DUNGEON_TICKET_GIFT_FLAG = "dungeon_ticket_gift_20260814"
+# One-off correction requested after the launch rewards accumulated: every balance that
+# already existed when this deploy first starts is reduced to ten.  This is deliberately
+# a migration, not a permanent wallet cap -- tickets earned after the correction remain
+# earned, and a restart must not keep confiscating them.
+DUNGEON_TICKET_CAP_FLAG = "dungeon_ticket_cap_10_20260825"
 # Dated, like the flag above: a future gift is a NEW flag, never a reset of this one.
 RUBY_GIFT_FLAG = "ruby_gift_20260817"
 # Reads as "grants" in the income audit (see ruby_source_of), which is what it is.
@@ -2609,6 +2614,37 @@ def grant_dungeon_ticket_gift(entries, amount: int = 3) -> int:
             data[DUNGEON_TICKET_GIFT_FLAG] = True
             _save(entry, data)
     return granted
+
+
+def cap_existing_dungeon_tickets(entries, maximum: int = 10) -> dict:
+    """Reduce every existing dungeon-ticket balance above *maximum* exactly once.
+
+    The per-chat marker makes this a deployment correction rather than a permanent cap:
+    rewards earned after the migration are never silently removed on a later restart.
+    The marker and corrected wallet share one atomic store save, so an interrupted boot
+    can safely retry any chat it did not finish.
+    """
+    maximum = max(0, int(maximum or 0))
+    capped_players = 0
+    removed_tickets = 0
+    for entry in entries:
+        with _farm_settlement_lock:
+            data = _load(entry)
+            if data.get(DUNGEON_TICKET_CAP_FLAG):
+                continue
+            wallet = data.setdefault("dungeon_tickets", {})
+            for user_id, raw_balance in list(wallet.items()):
+                try:
+                    balance = max(0, int(raw_balance or 0))
+                except (TypeError, ValueError):
+                    balance = 0
+                if balance > maximum:
+                    wallet[str(user_id)] = maximum
+                    capped_players += 1
+                    removed_tickets += balance - maximum
+            data[DUNGEON_TICKET_CAP_FLAG] = True
+            _save(entry, data)
+    return {"players": capped_players, "tickets": removed_tickets}
 
 
 def grant_ruby_gift(entries, amount: int = 10) -> int:

@@ -745,6 +745,26 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.grant_dungeon_ticket_gift([self.entry]), 0)
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 3)
 
+    def test_existing_dungeon_ticket_balances_are_capped_at_ten_once(self):
+        for _ in range(14):
+            pets.grant_dungeon_ticket(self.entry, self.user_id)
+        other = "99"
+        for _ in range(8):
+            pets.grant_dungeon_ticket(self.entry, other)
+
+        self.assertEqual(
+            pets.cap_existing_dungeon_tickets([self.entry]),
+            {"players": 1, "tickets": 4},
+        )
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 10)
+        self.assertEqual(pets.dungeon_tickets(self.entry, other), 8)
+
+        # It is a one-off correction, not a permanent cap on newly earned rewards.
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertEqual(pets.cap_existing_dungeon_tickets([self.entry]),
+                         {"players": 0, "tickets": 0})
+        self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 11)
+
     def _enter_pack_floor(self):
         """Stand a very strong hero on floor 2 -- the ten-enemy pack with two healers."""
         data = pets._load(self.entry)

@@ -9297,6 +9297,13 @@ async def run_bot_listener(
         dungeon_tickets = pets.grant_dungeon_ticket_gift(cfg.listener_allowed_chats)
         if dungeon_tickets:
             log(f"[pets] gave {dungeon_tickets} players 3 dungeon tickets")
+        capped_dungeon_tickets = pets.cap_existing_dungeon_tickets(cfg.listener_allowed_chats)
+        if capped_dungeon_tickets["players"]:
+            log(
+                f"[pets] capped dungeon tickets at 10 for "
+                f"{capped_dungeon_tickets['players']} players; removed "
+                f"{capped_dungeon_tickets['tickets']} excess tickets"
+            )
         ruby_gift = pets.grant_ruby_gift(cfg.listener_allowed_chats)
         if ruby_gift:
             log(f"[pets] gave {ruby_gift} players 10 rubies for the arena/levels update")
