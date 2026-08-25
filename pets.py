@@ -4922,7 +4922,7 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
 # What a revival says, in one place because five paths say it. Written as its own
 # BLOCK rather than a sentence: the totem is the reason the run still exists, and it
 # had been sharing a line with whatever the corridor did next.
-PHOENIX_TOTEM_NOTICE: Final = (
+PHOENIX_TOTEM_NOTICE = (
     "🔥 <b>ТОТЕМ ФЕНИКСА СГОРЕЛ</b>\n"
     "Он поднял тебя на ноги и рассыпался. Второй раз в этом забеге он не сработает."
 )
