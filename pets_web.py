@@ -4560,6 +4560,17 @@ PAGE_HTML = """<!doctype html>
     padding: 3px 11px; margin: 0 0 9px;
   }
   .phoenix-burn { color: #ff9a5a; }
+  /* The Gatekeeper's forecast. It gets a frame of its own because it is the one thing on
+     the panel the player has to read before every single choice, and it changes colour
+     when the machine stops watching and commits. */
+  .gk-forecast {
+    border: 1px solid var(--line); border-radius: 9px; background: var(--sunken);
+    padding: 9px 10px; margin-top: 8px;
+  }
+  .gk-forecast.sure { border-color: #e0484d; background: rgba(224,72,77,.13); }
+  .bar.gk-confidence { margin-top: 6px; }
+  .gk-covered { color: #ffb9ab; }
+  .warnline { color: var(--gold); }
   .phoenix-moves { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .phoenix-moves .go { padding: 11px 8px; font-size: 14px; }
   .ach-entry .ach-list, .ach-featured { display: grid; gap: 7px; margin-top: 11px; }
@@ -6405,6 +6416,26 @@ function gatekeeperMoves(fight) {
     esc(row.label || row.code) + '</button>').join("") + '</div>';
 }
 
+// What the machine expects, how sure it is, and what else it has already covered. All
+// three are on screen before the choice on purpose: the fight is meant to be hard to
+// solve, never hard to see -- a counter the player cannot read is a coin flip.
+function gatekeeperForecast(fight) {
+  if (!fight.prediction) return "";
+  const share = Math.max(0, Math.min(100, Math.round(Number(fight.confidence || 0) * 100)));
+  const sure = fight.confidence_band === "committed";
+  const rows = ['<div class="gk-forecast' + (sure ? " sure" : "") + '">' +
+    '<div class="row spread small"><b>' + (sure ? "🎯 Ожидает" : "👁 Присматривается") + " · " +
+      esc(fight.prediction_label || "") + "</b><span>" + share + "%</span></div>" +
+    '<div class="bar gk-confidence"><i class="' + (sure ? "crit" : "warn") +
+      '" style="width:' + share + '%"></i></div>'];
+  if (fight.covered) {
+    rows.push('<div class="small gk-covered" style="margin-top:6px">🛑 <b>' +
+      esc(fight.covered_label || "") + "</b> — перекрыто заранее</div>");
+  }
+  rows.push("</div>");
+  return rows.join("");
+}
+
 function gatekeeperFight(dungeon, fight) {
   const locks = (fight.locks || []).map((open) => open ? "🔓" : "🔒").join(" ");
   const steps = (fight.steps || []).map((filled) => filled ? "●" : "○").join(" ");
@@ -6422,7 +6453,11 @@ function gatekeeperFight(dungeon, fight) {
       (observed
         ? '<div class="row spread small" style="margin-top:7px"><b>🔍 Замки помнят</b><span style="letter-spacing:3px">' + observed + '</span></div>'
         : '') +
-      '<div class="tiny muted" style="margin-top:7px">' + esc(fight.adaptation_hint || "Наблюдает за героем.") + '</div>' +
+      gatekeeperForecast(fight) +
+      '<div class="tiny muted" style="margin-top:7px">' + esc(
+        (fight.prediction ? fight.prediction_hint : fight.adaptation_hint) || "Наблюдает за героем.") + '</div>' +
+      (fight.trick_hint ? '<div class="tiny warnline" style="margin-top:6px">' + esc(fight.trick_hint) + '</div>' : '') +
+      (fight.step_hint ? '<div class="tiny warnline" style="margin-top:6px">' + esc(fight.step_hint) + '</div>' : '') +
       (fight.shield_disrupted ? '<div class="tiny loss" style="margin-top:6px">💥 Щит дестабилизирован.</div>' : '') +
     '</div>' +
     (fight.is_core_open ? '<div class="phoenix-vuln">🔓 ЯДРО ОТКРЫТО</div>' : '') +

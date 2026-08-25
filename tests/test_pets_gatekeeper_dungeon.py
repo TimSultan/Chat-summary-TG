@@ -183,6 +183,58 @@ class GatekeeperDungeonTests(unittest.TestCase):
         self.assertIn('data-dungeon="gatekeepermove"', source)
         self.assertIn("gatekeeperFight(dungeon, dungeon.gatekeeper)", source)
 
+    def _committed_fight(self):
+        """Feed the machine a pattern until it commits, and hand back the live state."""
+        self.assertTrue(pets.gatekeeper_start(CHAT, USER)[0])
+        for index in range(24):
+            state = pets.gatekeeper_state(CHAT, USER)
+            if state.get("committed"):
+                return state
+            legal = {row["code"] for row in state["actions"]}
+            wanted = (pets_gatekeeper.WEAPON, pets_gatekeeper.DEFENCE)[index % 2]
+            pets.gatekeeper_action(
+                CHAT, USER, wanted if wanted in legal else sorted(legal)[0],
+            )
+        self.fail("the machine never committed to a prediction")
+
+    def test_both_clients_say_what_it_expects_and_how_sure_it_is(self):
+        """Hard is allowed; hidden is not.
+
+        The prediction is deliberately back on screen -- see the pets_gatekeeper module
+        docstring -- because the model underneath it changed. A player who loses has to be
+        able to say "I missed the warning", never "the game decided to punish me", and the
+        warning only exists if both clients actually print it.
+        """
+        state = self._committed_fight()
+        self.assertIn(state["prediction"], pets_gatekeeper.CATEGORIES)
+        self.assertGreaterEqual(state["confidence"], pets_gatekeeper.CONFIDENCE_COMMITTED)
+
+        text, _keys = pets_ui.gatekeeper_view(CHAT, USER, 0, state=state)
+        self.assertIn("Ожидает", text)
+        self.assertIn(state["prediction_label"], text)
+        self.assertIn(f"{round(state['confidence'] * 100)}%", text)
+
+        source = pets_web.PAGE_HTML
+        self.assertIn("gatekeeperForecast(fight)", source)
+        self.assertIn("fight.prediction_label", source)
+        self.assertIn("fight.covered_label", source)
+
+    def test_the_second_counter_is_named_on_both_clients_when_it_is_up(self):
+        """Two dangerous answers means two visible warnings, or it is a coin flip."""
+        state = self._committed_fight()
+        # Break the prediction once so the chest starts opening and the cover comes up.
+        blocked = {state["prediction"], state["covered"]}
+        escape = next(row["code"] for row in state["actions"]
+                      if row["code"] not in blocked and row["code"] != pets_gatekeeper.FALSE_STEP)
+        pets.gatekeeper_action(CHAT, USER, escape)
+        state = self._committed_fight()
+        if not state.get("covered"):
+            self.skipTest("the machine has not put up a second counter on this turn")
+
+        text, _keys = pets_ui.gatekeeper_view(CHAT, USER, 0, state=state)
+        self.assertIn(state["covered_label"], text)
+        self.assertIn("перекрыто", text)
+
 
 if __name__ == "__main__":
     unittest.main()

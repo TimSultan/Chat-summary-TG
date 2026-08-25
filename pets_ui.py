@@ -669,13 +669,34 @@ def gatekeeper_view(entry: str, user_id, xp: int,
     ]
     if state.get("is_emergency_mode"):
         lines.append("🚨 <b>АВАРИЙНЫЙ РЕЖИМ</b> · система больше не забывает")
-    # The evidence, never the conclusion. This line used to read "🎯 Ожидает: ⚔️ Оружие",
-    # which is the whole answer -- see the pets_gatekeeper docstring for what that measured.
+    # The working, then the conclusion. Both are shown: the conclusion is only worth
+    # trusting because the row above it is the evidence it was drawn from, and a counter
+    # the player cannot see would make this a coin flip -- see the pets_gatekeeper docstring.
     observed = [str(row) for row in (state.get("observed_icons") or [])]
     if observed:
         lines.append("🔍 Замки помнят: <b>" + " ".join(escape(row) for row in observed) + "</b>")
-    if state.get("adaptation_hint"):
-        lines.append(f"<i>{escape(str(state['adaptation_hint']))}</i>")
+    if state.get("prediction"):
+        band = str(state.get("confidence_band") or "")
+        share = round(max(0.0, min(1.0, float(state.get("confidence") or 0))) * 100)
+        label = escape(str(state.get("prediction_label") or ""))
+        if band == "committed":
+            lines.append(f"🎯 <b>Ожидает: {label}</b> · уверенность {share}%")
+        else:
+            lines.append(f"👁 Присматривается к: <b>{label}</b> · уверенность {share}%")
+    # The second thing it has ready, and never a hidden one. If two answers are dangerous
+    # the player has to be able to see both before choosing.
+    if state.get("covered"):
+        lines.append(
+            f"🛑 <b>{escape(str(state.get('covered_label') or ''))}</b> — перекрыто заранее"
+        )
+    hint = str(state.get("prediction_hint") if state.get("prediction")
+               else state.get("adaptation_hint") or "")
+    if hint:
+        lines.append(f"<i>{escape(hint)}</i>")
+    if state.get("trick_hint"):
+        lines.append(f"<i>{escape(str(state['trick_hint']))}</i>")
+    if state.get("step_hint"):
+        lines.append(f"<i>{escape(str(state['step_hint']))}</i>")
     if state.get("shield_disrupted"):
         lines.append("💥 <b>Щит дестабилизирован:</b> следующий блок слабее.")
     scene = str(state.get("scene") or "").strip()
