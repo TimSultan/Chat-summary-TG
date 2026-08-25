@@ -4401,8 +4401,6 @@ PAGE_HTML = """<!doctype html>
                   opacity: .75; background: transparent; border: 1px solid var(--hp);
                   color: var(--hp); }
   .go.warn.quit:hover { opacity: 1; }
-  /* A healer is the answer to the room, so it looks different from the wall around it. */
-  .dungeon-enemy.healer { border-color: var(--gold); }
   /* The rule of the fight, not flavour: it gets the warning colour and its own line. */
   .dungeon-enemy .weakness { color: var(--gold); }
   /* The stat block reads as data, not as prose: tabular figures so the columns line up
@@ -6478,7 +6476,7 @@ function dungeonPanel() {
     const gatekeeperLive = isGatekeeperRow(enemy) && !enemy.cleared;
     const live = phoenixLive || gatekeeperLive;
     const startAction = phoenixLive ? 'phoenix' : (gatekeeperLive ? 'gatekeeper' : 'fight');
-    const card = '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="' + startAction + '" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + (enemy.stat_line && !enemy.cleared ? '<br><span class="tiny statline">' + esc(enemy.stat_line) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>';
+    const card = '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + '" data-dungeon="' + startAction + '" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + (enemy.healer ? '✚ ' : '') + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + (enemy.stat_line && !enemy.cleared ? '<br><span class="tiny statline">' + esc(enemy.stat_line) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : '⚔️') + '</span></button>';
     return live
       ? '<div class="phoenix-entry">' + card +
         '<button class="go" data-dungeon="' + startAction + '">⚔️ В бой</button></div>'
