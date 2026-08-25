@@ -1540,6 +1540,40 @@ async def run_listener(
     await client.run_until_disconnected()
 
 
+# How long to wait before restarting a half that fell over, and how many times before
+# giving up on it. Short enough that a transient failure costs seconds, long enough that a
+# half which cannot start at all does not spin the CPU announcing it.
+HALF_RESTART_DELAY_SECONDS = 5
+HALF_RESTART_LIMIT = 20
+
+
+async def _supervise(name: str, start, log=print) -> None:
+    """Keep one half of the process alive without the other half depending on it.
+
+    The two halves are the personal account (summaries, quests, XP) and the bot account
+    (menus, the game, badges, votes). They used to sit in a bare `asyncio.gather`, which
+    is a promise that both live exactly as long as the shorter one: whichever raised first
+    took the other down with it, and the surviving half was cancelled mid-work.
+
+    A crash is now the crashing half's own problem. It is logged with its traceback and
+    restarted, up to HALF_RESTART_LIMIT times -- a bound rather than a loop, because a
+    half that fails on every start is a bug to read in the logs and not a thing to retry
+    for ever. Returning normally is respected: a half that finishes is finished.
+    """
+    for attempt in range(1, HALF_RESTART_LIMIT + 1):
+        try:
+            await start()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log(f"[supervisor] {name} died (attempt {attempt}/{HALF_RESTART_LIMIT}):"
+                + chr(10) + traceback.format_exc())
+            await asyncio.sleep(HALF_RESTART_DELAY_SECONDS)
+    log(f"[supervisor] {name} failed {HALF_RESTART_LIMIT} times and is being left down. "
+        f"The other half keeps running; read the tracebacks above.")
+
+
 async def main():
     cfg = load_config()
     tz = resolve_tz(None)
@@ -1598,20 +1632,20 @@ async def main():
         # ignored hashtag is indistinguishable from a broken bot, so they post it again.
         quest_refusal_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
-            run_listener(
+            _supervise("listener", lambda: run_listener(
                 client, cfg, tz,
                 figurine_ack_queue=figurine_ack_queue, quest_submission_queue=quest_submission_queue,
                 stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
                 quest_refusal_queue=quest_refusal_queue,
-            ),
-            bot_listener.run_bot_listener(
+            )),
+            _supervise("bot_listener", lambda: bot_listener.run_bot_listener(
                 cfg.telegram_bot_token, cfg, tz, client,
                 figurine_ack_queue=figurine_ack_queue, quest_submission_queue=quest_submission_queue,
                 stats_digest_queue=stats_digest_queue,
                 dismiss_queue=dismiss_queue, file_block_queue=file_block_queue,
                 quest_refusal_queue=quest_refusal_queue,
-            ),
+            )),
         )
     else:
         await run_listener(client, cfg, tz)

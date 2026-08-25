@@ -64,30 +64,126 @@ from pathlib import Path
 import aiohttp
 from telethon import utils as tl_utils
 
-import arena
-import arena_core
-import arena_web
 import cabinet
 import button_builder
-import casino
 import donations
 import economy
 import maintenance
 import history
-import pets
-import pets_combat
-import pets_config as C
-import pets_image
-import pets_ui
-import pets_updates
 import quests
-import pets_web
 import post_stats_web
 import preview
 import stats
 import vote_image
 import vote_web
 import voting
+
+# --------------------------------------------------------------------------- the game
+#
+# The pet game is half this repo and none of the chat. Imported behind a guard because the
+# two share one process and therefore one import: a NameError in any of the thirty-odd
+# game modules used to mean the WHOLE bot failed to boot -- no summaries, no stats, no
+# quests, no votes, no badges -- for a bug in a dungeon shop. That is not hypothetical; it
+# is how a stray `Final` annotation took the chat down.
+#
+# Nothing here is touched at module scope. Every one of the ~380 references to these
+# modules in this file sits inside a function (checked with an AST walk, and pinned by
+# tests/test_module_import_safety.py), so a failed import costs the game its commands and
+# costs the chat nothing at all.
+#
+# The traceback is printed rather than swallowed: an unavailable game must be loud in the
+# logs, or the first anyone hears of it is a player asking why a button does nothing.
+# Two groups, not one. The weekly duel vote (arena*) and the pet game (pets*) are separate
+# features that happen to share a process, and folding them together would mean a bug in a
+# dungeon shop closing the voting the chat runs its contest on.
+GAME_IMPORT_ERROR: str | None = None
+ARENA_IMPORT_ERROR: str | None = None
+try:
+    import pets
+    import pets_combat
+    import pets_config as C
+    import pets_image
+    import pets_ui
+    import pets_updates
+    import pets_web
+    import casino
+except Exception:  # noqa: BLE001 -- ANY failure here must still leave the chat running
+    GAME_IMPORT_ERROR = traceback.format_exc()
+    pets = pets_combat = C = pets_image = pets_ui = pets_updates = pets_web = None
+    casino = None
+try:
+    import arena
+    import arena_core
+    import arena_web
+except Exception:  # noqa: BLE001
+    ARENA_IMPORT_ERROR = traceback.format_exc()
+    arena = arena_core = arena_web = None
+
+
+def game_available() -> bool:
+    """Whether the pet game loaded. False means answer players, do not crash at them."""
+    return GAME_IMPORT_ERROR is None
+
+
+def arena_available() -> bool:
+    """The same for the weekly duel vote, which fails and recovers on its own."""
+    return ARENA_IMPORT_ERROR is None
+
+
+GAME_UNAVAILABLE_NOTICE = (
+    "Игра сейчас недоступна — чиню. Остальные команды чата работают как обычно."
+)
+ARENA_UNAVAILABLE_NOTICE = (
+    "Голосование сейчас недоступно — чиню. Остальные команды чата работают как обычно."
+)
+# The pet menu's callback prefix, spelled out instead of read from pets_ui. That module is
+# exactly what may be missing when this is needed, and a router that cannot route without
+# the thing it is routing around is no router. Pinned against the real value by a test.
+PETS_CALLBACK_PREFIX_LITERAL = "pet"
+
+
+async def _decline_game_command(
+    api: "TelegramBotAPI", message: dict, log=print, *, arena: bool = False,
+) -> bool:
+    """Say the feature is down, and say it once. True means the caller should stop.
+
+    Answering matters more than it looks: a handler that simply raises leaves the
+    player with a command that did nothing and no idea whether they typed it wrong.
+    The chat commands around it keep working, which is the whole point of the guard.
+    """
+    if arena_available() if arena else game_available():
+        return False
+    log("[bot_listener] refused a command, modules never loaded:\n"
+        + ((ARENA_IMPORT_ERROR if arena else GAME_IMPORT_ERROR) or ""))
+    try:
+        await api.send_message(
+            (message.get("chat") or {}).get("id"),
+            ARENA_UNAVAILABLE_NOTICE if arena else GAME_UNAVAILABLE_NOTICE,
+            reply_to_message_id=message.get("message_id"), parse_mode=None,
+        )
+    except Exception:
+        log("[bot_listener] could not even say it is down:\n" + traceback.format_exc())
+    return True
+
+
+async def _decline_game_callback(
+    api: "TelegramBotAPI", callback: dict, log=print, *, arena: bool = False,
+) -> bool:
+    """The same for a button. An unanswered callback spins on screen for ever."""
+    if arena_available() if arena else game_available():
+        return False
+    log("[bot_listener] refused a button, modules never loaded:\n"
+        + ((ARENA_IMPORT_ERROR if arena else GAME_IMPORT_ERROR) or ""))
+    try:
+        await api.answer_callback_query(
+            callback.get("id"),
+            ARENA_UNAVAILABLE_NOTICE if arena else GAME_UNAVAILABLE_NOTICE,
+        )
+    except Exception:
+        log("[bot_listener] could not answer a button:\n" + traceback.format_exc())
+    return True
+
+
 from bot_api import CAPTION_LIMIT, TelegramBotAPI
 from config import SUMMARY_COMMAND, build_session, load_config
 from critique import critique_work
@@ -4116,6 +4212,9 @@ async def handle_arena_action_callback(
     """The /vote2 menu's buttons, built the same way v1's are: the tap is answered first,
     then a synthetic message goes through handle_arena_command so the admin/DM gate and
     the work itself live in exactly one place."""
+    # Nothing below this line exists without the arena modules.
+    if await _decline_game_callback(api, callback, log=log, arena=True):
+        return
     parsed = _parse_arena_action_callback(callback.get("data"))
     if parsed is None:
         await api.answer_callback_query(callback["id"])
@@ -4178,6 +4277,9 @@ async def handle_arena_command(
       administrator. A voter who is not one gets a single button and no panel: every other
       button here is an administrator's, and one they cannot use is one that only lies.
     """
+    # Nothing below this line exists without the arena modules.
+    if await _decline_game_command(api, message, log=log, arena=True):
+        return
     chat = message["chat"]
     chat_id = chat["id"]
     is_private = chat.get("type") == "private"
@@ -6009,6 +6111,9 @@ async def handle_pets_command(
     people and offer buttons the other 189 cannot use. The group gets a pointer and a deep
     link instead (a web_app button is private-chat only; a url button is not).
     """
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_command(api, message, log=log):
+        return
     chat = message["chat"]
     chat_id = chat["id"]
     actor = message.get("from") or {}
@@ -6091,6 +6196,9 @@ async def handle_pet_card_command(
     back to a replied-to message, so "show me yours" works without anybody having to type
     a username exactly.
     """
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_command(api, message, log=log):
+        return
     chat = message["chat"]
     chat_id = chat["id"]
     actor = message.get("from") or {}
@@ -6163,6 +6271,9 @@ async def handle_duel_command(
     target_from_followup: bool = False,
 ) -> None:
     """Run a duel. The challenger alone spends a duel use and cooldown."""
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_command(api, message, log=log):
+        return
     chat = message["chat"]
     chat_id = chat["id"]
     group_chat = chat.get("type") != "private"
@@ -6463,6 +6574,9 @@ async def handle_pets_callback(
     leaves the button spinning on the client until it times out -- a bug this codebase has
     already been bitten by once.
     """
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_callback(api, callback, log=log):
+        return
     parsed = pets_ui.parse_callback(callback.get("data"))
     if parsed is None:
         return
@@ -7595,6 +7709,9 @@ async def handle_arena_news_command(
     whole point -- a balance change announced days after the release that caused it should
     not have to wait for the next one.
     """
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_command(api, message, log=log):
+        return
     source_chat = message["chat"]
     source_chat_id = source_chat["id"]
     actor = message.get("from") or {}
@@ -7656,6 +7773,9 @@ async def handle_test_fight_command(
     log=print,
 ) -> None:
     """Post a real combat simulation without changing any game or economy state."""
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_command(api, message, log=log):
+        return
     source_chat = message["chat"]
     source_chat_id = source_chat["id"]
     actor = message.get("from") or {}
@@ -8227,6 +8347,9 @@ async def handle_pets_rename_command(
     brackets that would break the HTML the card is sent with) are enforced in exactly one
     place no matter which way somebody asks.
     """
+    # Nothing below this line exists without the game modules.
+    if await _decline_game_command(api, message, log=log):
+        return
     chat_id = message["chat"]["id"]
     actor = message.get("from") or {}
     argument = ""
@@ -8270,6 +8393,10 @@ async def maybe_handle_pets_flow_message(
     Matched on the force-reply it answers, exactly as the cabinet and button-builder flows
     are, so two people naming creatures in their own DMs at the same time cannot collide.
     """
+    # A flow message is free text: without the game there is no flow to match it to,
+    # and False sends it on to the ordinary command router rather than swallowing it.
+    if not game_available():
+        return False
     chat_id = message["chat"]["id"]
     actor = message.get("from") or {}
     duel_pair = next(
@@ -8677,7 +8804,7 @@ async def _dispatch_update(
             await handle_vote_chat_destination_callback(
                 api, cfg, callback, vote_chat_flows, bot_username, log=log,
             )
-        elif callback_data.startswith(f"{pets_ui.CALLBACK_PREFIX}:"):
+        elif callback_data.startswith(f"{PETS_CALLBACK_PREFIX_LITERAL}:"):
             # The pet menu. No chat resolution in the argument list: every button carries
             # its owner's id, and the member lookup happens inside, AFTER the spinner is
             # stopped.
@@ -9828,10 +9955,14 @@ async def run_bot_listener(
                 # The arena rides on the same server, under its own prefix. It reuses
                 # the two questions that need a Bot API client and shares nothing else
                 # -- v1 keeps its own routes, its own storage and its own rules.
-                arena_web.attach(
-                    app, cfg, home_chat_ref or "", _is_vote_admin,
-                    is_member=_is_vote_member, log=log,
-                )
+                # Each page is mounted only if its own modules loaded. A missing one
+                # costs the voting page its routes, not the whole web server -- and the
+                # voting page is what /vote runs on.
+                if arena_available():
+                    arena_web.attach(
+                        app, cfg, home_chat_ref or "", _is_vote_admin,
+                        is_member=_is_vote_member, log=log,
+                    )
                 # The pet game's own page. It needs one thing the other two don't: the
                 # player's live chat XP, because the coin balance is derived from it and
                 # nothing in that game can be priced without it. Resolving that needs the
@@ -9899,23 +10030,27 @@ async def run_bot_listener(
                         api, telethon_client, pledge, known_chat_ids, log=log,
                     )
 
-                pets_web.attach(
-                    app, cfg, home_chat_ref or "",
-                    is_member=_is_vote_member,
-                    # Quest review only -- a WIDER gate than the voting page's, and
-                    # deliberately so: reviewing a painting is "does this look like NMM",
-                    # which any trusted painter can do, while closing a vote is not.
-                    is_admin=_is_quest_moderator,
-                    is_economy_admin=_is_economy_admin,
-                    resolve_player=_resolve_pet_player,
-                    fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
-                    quest_feedback=_send_quest_feedback,
-                    quest_completion=_send_web_quest_completion,
-                    birthday_notify=_send_birthday_greeting,
-                    support_notify=_send_web_support_pledge,
-                    quest_reviewed=_mark_web_quest_reviewed,
-                    log=log,
-                )
+                if not game_available():
+                    log("[bot_listener] the game's Mini App is not being served: "
+                        + (GAME_IMPORT_ERROR or ""))
+                else:
+                    pets_web.attach(
+                        app, cfg, home_chat_ref or "",
+                        is_member=_is_vote_member,
+                        # Quest review only -- a WIDER gate than the voting page's, and
+                        # deliberately so: reviewing a painting is "does this look like NMM",
+                        # which any trusted painter can do, while closing a vote is not.
+                        is_admin=_is_quest_moderator,
+                        is_economy_admin=_is_economy_admin,
+                        resolve_player=_resolve_pet_player,
+                        fetch_photo=_fetch_pet_photo, save_photo=_save_pet_photo,
+                        quest_feedback=_send_quest_feedback,
+                        quest_completion=_send_web_quest_completion,
+                        birthday_notify=_send_birthday_greeting,
+                        support_notify=_send_web_support_pledge,
+                        quest_reviewed=_mark_web_quest_reviewed,
+                        log=log,
+                    )
                 # /poststats too, but only when a token is actually configured -- see
                 # config.py's post_stats_access_token docstring for why an unset token
                 # means "don't mount the route" rather than "mount it wide open". Unlike
