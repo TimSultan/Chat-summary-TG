@@ -6182,6 +6182,9 @@ def _pets_fighter(entry: str, user_id, pet: dict, vs=None):
         personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, user_id),
         shield=pets.combat_shield(entry, user_id),
         weapon_enchanted=pets.combat_weapon_enchanted(entry, user_id),
+        character_element=(
+            pet.get("element") if pet.get("element") in C.CHARACTER_ELEMENTS else None
+        ),
     )
 
 
@@ -6318,6 +6321,7 @@ PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     # The forge, which is where a weapon is enchanted -- and every screen between it and
     # the rune that goes on the blade, so none of them is a button that refuses.
     "forge", "weaponforge", "reforge", "enchantmenu", "runemenu", "enchantrune", "enchant",
+    "elementmenu", "elementset",
     "noop",
 })
 
@@ -6438,6 +6442,19 @@ async def handle_pets_callback(
         return
 
     try:
+        if action == "elementmenu":
+            await _send_pets_view(
+                api, chat_id, pets_ui.character_element_view(entry, user_id),
+                message_id=message_id, log=log,
+            )
+            return
+        if action == "elementset":
+            ok, note = pets.set_character_element(entry, user_id, argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.main_view(entry, user_id, xp), log,
+            )
+            return
         # --- the two flows that need something back from the player ------------------
         if action in ("tame", "rename", "photo", "gift", "giftok"):
             if action == "gift" and pets_ui.valuable_item(C.find_item(argument)):

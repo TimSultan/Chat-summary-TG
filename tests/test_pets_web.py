@@ -360,6 +360,21 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("bag", full)
         self.assertIn("arena", full)
         self.assertIn("farm", full)
+        self.assertIsNone(full["character_element"]["selected"])
+        self.assertEqual(full["character_element"]["bonus_pct"], 10)
+        self.assertEqual(len(full["character_element"]["choices"]), 6)
+
+    async def test_character_element_action_is_one_time_and_returned_in_fresh_state(self):
+        self._tame(PLAYER)
+
+        chosen = await self._action(PLAYER, "set_character_element", element="frost")
+        self.assertTrue(chosen["ok"], chosen)
+        self.assertEqual(chosen["state"]["pet"]["element"], "frost")
+        self.assertEqual(chosen["state"]["character_element"]["selected"], "frost")
+
+        refused = await self._action(PLAYER, "set_character_element", element="fire")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["state"]["pet"]["element"], "frost")
 
     async def test_mob_replay_skip_preference_is_persistent_and_defaults_to_watching(self):
         self._tame(PLAYER)
@@ -1597,6 +1612,14 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         ids = {row["user_id"] for row in body["opponents"]}
         self.assertNotIn(str(PLAYER["id"]), ids)
         self.assertEqual(ids, {str(OPPONENT["id"]), str(THIRD["id"])})
+
+        pets.set_character_element(CHAT, PLAYER["id"], "water")
+        pets.set_character_element(CHAT, OPPONENT["id"], "fire")
+        body = await (await self._get("/api/opponents", PLAYER)).json()
+        rows = {row["user_id"]: row for row in body["opponents"]}
+        self.assertEqual(body["me_element"], "water")
+        self.assertEqual(rows[str(OPPONENT["id"])]["element"], "fire")
+        self.assertIsNone(rows[str(THIRD["id"])]["element"])
 
     async def test_a_repeatedly_fought_opponent_stays_attackable_and_is_counted(self):
         """Neither a cap nor a penalty any more -- the card just counts the rematches."""

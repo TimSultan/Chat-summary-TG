@@ -374,6 +374,33 @@ DAMAGE_VARIANCE = 0.15
 # a restriction the player has already accepted rather than handing out free damage.
 ELEMENTAL_RESONANCE_BONUS = 0.10
 
+# A creature chooses one permanent affinity. The six form one closed ring, so every
+# choice has exactly one favourable matchup, one unfavourable matchup and four neutral
+# ones -- no element is broadly better merely because it covers more opponents.
+CHARACTER_ELEMENT_DAMAGE_BONUS = 0.10
+CHARACTER_ELEMENTS = ("fire", "plants", "earth", "air", "frost", "water")
+CHARACTER_ELEMENT_NAMES = {
+    "fire": "Огонь", "plants": "Растения", "earth": "Земля",
+    "air": "Воздух", "frost": "Лёд", "water": "Вода",
+}
+CHARACTER_ELEMENT_ICONS = {
+    "fire": "🔥", "plants": "🌿", "earth": "🪨",
+    "air": "💨", "frost": "❄️", "water": "💧",
+}
+# Read as attacker -> defender: fire burns plants, plants overgrow earth, earth stops
+# air, air scatters frost, frost freezes water, water extinguishes fire.
+CHARACTER_ELEMENT_STRONG_AGAINST = {
+    "fire": "plants", "plants": "earth", "earth": "air",
+    "air": "frost", "frost": "water", "water": "fire",
+}
+
+
+def character_element_multiplier(attacker: str | None, defender: str | None) -> float:
+    """Outgoing damage multiplier for one permanent creature-element matchup."""
+    if CHARACTER_ELEMENT_STRONG_AGAINST.get(str(attacker or "")) == str(defender or ""):
+        return 1.0 + CHARACTER_ELEMENT_DAMAGE_BONUS
+    return 1.0
+
 BASE_SPELL_POWER = 22.0
 SPELL_POWER_PER_POINT = 2.60
 SPELL_POWER_SWING_FLOOR = 0.45

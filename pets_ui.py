@@ -203,6 +203,14 @@ def main_view(
         left = fights["available"]
         capacity = fights["capacity"]
         lines.append(f"🐾 {_name(pet)} — уровень {pet.get('level', 1)}")
+        element = pet.get("element")
+        if element in C.CHARACTER_ELEMENTS:
+            lines.append(
+                f"{C.CHARACTER_ELEMENT_ICONS[element]} Элемент: "
+                f"{escape(C.CHARACTER_ELEMENT_NAMES[element])}"
+            )
+        else:
+            lines.append("⚪ <b>Выбери элемент</b> — он даст +10% урона в выгодном матче.")
         # Announced before anything else about the creature: a level waiting to be bought
         # is the one thing on this screen the player can act on right now.
         ready = pets.level_up_status(entry, user_id)
@@ -218,6 +226,11 @@ def main_view(
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows = []
+    if pet and pet.get("element") not in C.CHARACTER_ELEMENTS:
+        rows.append([{
+            "text": "✨ Выбрать элемент персонажа",
+            "callback_data": callback_data(user_id, "elementmenu"),
+        }])
     # Above even «Открыть игру»: it is a reward the player has already earned and only has
     # to collect, and burying that under navigation is how it goes unnoticed for a week.
     if pet and pets.level_up_status(entry, user_id).get("pending"):
@@ -623,6 +636,37 @@ def phoenix_view(entry: str, user_id, xp: int, state: dict | None = None) -> tup
         # A live fight always offers something. If it somehow does not, the way out is a
         # button rather than a screen with no exit at all.
         rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def character_element_view(entry: str, user_id) -> tuple[str, dict]:
+    """One-time affinity choice with the complete strong/weak/neutral rule visible."""
+    state = pets.character_element_status(entry, user_id)
+    selected = state.get("selected")
+    lines = [
+        "✨ <b>Элемент персонажа</b>",
+        f"Сильный элемент наносит <b>+{state['bonus_pct']}% урона</b> слабому. "
+        "Против остальных элементов бонуса нет.",
+        "<i>Выбор постоянный: изменить элемент потом нельзя.</i>",
+        "",
+    ]
+    rows = []
+    for row in state["choices"]:
+        lines.append(
+            f"{row['icon']} <b>{escape(row['name'])}</b> → сильнее {escape(row['strong_name'])}; "
+            f"слабее {escape(row['weak_name'])}; остальные нейтральны."
+        )
+        if selected is None:
+            rows.append([{
+                "text": f"{row['icon']} Выбрать {row['name']}",
+                "callback_data": callback_data(user_id, "elementset", row["code"]),
+            }])
+    if selected in C.CHARACTER_ELEMENTS:
+        lines.append(
+            f"\nВыбрано: {C.CHARACTER_ELEMENT_ICONS[selected]} "
+            f"<b>{escape(C.CHARACTER_ELEMENT_NAMES[selected])}</b>."
+        )
+    rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -2415,11 +2459,22 @@ def enchant_weapon_view(entry: str, user_id, code: str) -> tuple[str, dict]:
         return forge_view(entry, user_id, 0)
     state = pets.rune_status(entry, user_id)
     names = {"fire": "🔥 Огонь", "frost": "❄️ Лёд", "water": "💧 Вода", "earth": "🪨 Земля", "air": "💨 Воздух", "plants": "🌿 Растения"}
-    lines = [f"🔮 <b>Зачаровать «{escape(item.name)}»</b>", f"Цена: {state['cost']} рубинов и 1 руна."]
+    existing = state["enchantments"].get(code)
+    painted = code in (pet.get("personal_enchantments") or {})
+    count = int(existing in pets.RUNE_ELEMENTS) + int(painted)
+    lines = [
+        f"🔮 <b>Зачаровать «{escape(item.name)}»</b>",
+        f"Зачарования: {count}/2 · максимум одна стихия и один персональный покрас.",
+    ]
+    if existing in pets.RUNE_ELEMENTS:
+        lines.append(f"Уже наложена стихия: {escape(pets.RUNE_NAMES.get(existing, existing))}.")
+    else:
+        lines.append(f"Цена стихии: {state['cost']} рубинов и 1 руна.")
     rows = []
     for element, label in names.items():
-        count = int(state["runes"].get(element, 0) or 0)
-        rows.append([{"text": f"{label} · {count}", "callback_data": callback_data(user_id, "enchant" if count else "noop", f"{code}:{element}")}])
+        owned = int(state["runes"].get(element, 0) or 0)
+        action = "enchant" if owned and existing not in pets.RUNE_ELEMENTS else "noop"
+        rows.append([{"text": f"{label} · {owned}", "callback_data": callback_data(user_id, action, f"{code}:{element}")}])
     rows.append([{"text": "◀️ К кузнице", "callback_data": callback_data(user_id, "forge")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -2442,12 +2497,19 @@ def rune_weapon_view(entry: str, user_id, element: str) -> tuple[str, dict]:
     pet = pets.get_pet(entry, user_id) or {}
     weapons = [C.find_item(code) for code in pet.get("inventory", [])]
     weapons = [item for item in weapons if item is not None and item.slot == "weapon"]
+    enchanted = pet.get("weapon_enchantments") or {}
     rows = [[{
-        "text": f"🔮 {item.name[:26]}",
-        "callback_data": callback_data(user_id, "enchant", f"{item.code}:{element}"),
+        "text": f"🔮 {item.name[:26]}" + (" · стихия уже есть" if enchanted.get(item.code) in pets.RUNE_ELEMENTS else ""),
+        "callback_data": callback_data(
+            user_id, "noop" if enchanted.get(item.code) in pets.RUNE_ELEMENTS else "enchant",
+            f"{item.code}:{element}",
+        ),
     }] for item in weapons]
     rows.append([{"text": "◀️ К рунам", "callback_data": callback_data(user_id, "runemenu")}])
-    return "🔮 <b>Выбери оружие для руны</b>", {"inline_keyboard": rows}
+    return (
+        "🔮 <b>Выбери оружие для руны</b>\n"
+        "На оружии помещаются два разных зачарования: одна стихия и один персональный покрас."
+    ), {"inline_keyboard": rows}
 
 
 def skills_view(entry: str, user_id) -> tuple[str, dict]:
@@ -2808,6 +2870,7 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
     locked = set(pet.get("locked_items", []))
     worn = (pet.get("equipped") or {}).get(slot)
     personal_enchantments = pet.get("personal_enchantments") or {}
+    elemental_enchantments = pet.get("weapon_enchantments") or {}
     owned.sort(key=lambda item: (item.code != worn, item.code))
     total_pages = max(1, (len(owned) + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
     page = min(max(0, page), total_pages - 1)
@@ -2829,10 +2892,16 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         mark = " ✅ надето" if is_worn else ""
         lock_mark = " 🔒" if item.code in locked else ""
         paint_mark = " 🎨 +30%" if item.code in personal_enchantments else ""
+        element = elemental_enchantments.get(item.code) if item.slot == "weapon" else None
+        element_mark = (
+            f" 🔮 {escape(pets.RUNE_NAMES.get(element, element))}"
+            if element in pets.RUNE_ELEMENTS else ""
+        )
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
         count_mark = f" ×{copies}" if copies > 1 else ""
         lines.append(
-            f"\n{number}. <b>{escape(item.name)}</b>{count_mark}{mark}{lock_mark}{paint_mark}"
+            f"\n{number}. <b>{escape(item.name)}</b>{count_mark}{mark}{lock_mark}"
+            f"{element_mark}{paint_mark}"
         )
         lines.append(f"{label} · {_bonus_text(item)}")
         if item.slot == "weapon":
@@ -3351,6 +3420,12 @@ def opponent_view(entry: str, user_id, opponent_id, xp: int) -> tuple[str, dict]
 
     lines = ["🔍 <b>Соперник найден</b>\n"]
     lines.append(f"🐾 <b>{_name(theirs)}</b> — уровень {theirs.get('level', 1)}")
+    their_element = theirs.get("element")
+    if their_element in C.CHARACTER_ELEMENTS:
+        lines.append(
+            f"Элемент: {C.CHARACTER_ELEMENT_ICONS[their_element]} "
+            f"{escape(C.CHARACTER_ELEMENT_NAMES[their_element])}"
+        )
     lines.append(f"Хозяин: {escape(theirs.get('owner_name') or 'кто-то')}")
     lines.append(
         f"Боёв: {theirs.get('fights', 0)} / побед: {theirs.get('wins', 0)}"

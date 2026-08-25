@@ -75,6 +75,65 @@ class PersonalPaintRuneTests(unittest.TestCase):
         self.assertIn("уже", message)
         self.assertEqual(len(pets.personal_paint_status(self.entry, self.user)["runes"]), 1)
 
+    def test_elemental_then_personal_gives_two_slots_and_third_enchantment_is_refused(self):
+        item = self._own_item("weapon")
+        data = pets._load(self.entry)
+        record = data["pets"][self.user]
+        record["runes"] = {"fire": 1, "frost": 1}
+        data["rubies"] = {self.user: pets.RUNE_ENCHANT_RUBY_COST * 2}
+        pets._save(self.entry, data)
+
+        ok, message = pets.enchant_weapon(self.entry, self.user, item.code, "fire")
+        self.assertTrue(ok, message)
+        self.assertIn("1/2", message)
+
+        paint = self._grant("rune_paint_weapon")
+        ok, message, _receipt = pets.apply_personal_paint_rune(
+            self.entry, self.user, paint["id"], item.code,
+        )
+        self.assertTrue(ok, message)
+        self.assertIn("2/2", message)
+
+        pet = pets.get_pet(self.entry, self.user)
+        self.assertEqual(pet["weapon_enchantments"][item.code], "fire")
+        self.assertIn(item.code, pet["personal_enchantments"])
+        payload = pets_web._item_payload(item, "/pets", pet)
+        self.assertEqual(payload["enchantment"], "fire")
+        self.assertIsNotNone(payload["personal_paint"])
+
+        rubies_before = pets.ruby_balance(self.entry, self.user)
+        frost_before = pets.rune_status(self.entry, self.user)["runes"]["frost"]
+        ok, message = pets.enchant_weapon(self.entry, self.user, item.code, "frost")
+        self.assertFalse(ok)
+        self.assertIn("2/2", message)
+        self.assertEqual(pets.ruby_balance(self.entry, self.user), rubies_before)
+        self.assertEqual(pets.rune_status(self.entry, self.user)["runes"]["frost"], frost_before)
+        self.assertEqual(pets.get_pet(self.entry, self.user)["weapon_enchantments"][item.code], "fire")
+
+    def test_personal_then_elemental_is_allowed_and_ui_disables_a_second_element(self):
+        item = self._own_item("weapon")
+        paint = self._grant("rune_paint_weapon")
+        self.assertTrue(pets.apply_personal_paint_rune(
+            self.entry, self.user, paint["id"], item.code,
+        )[0])
+        data = pets._load(self.entry)
+        data["pets"][self.user]["runes"] = {"water": 1}
+        data["rubies"] = {self.user: pets.RUNE_ENCHANT_RUBY_COST}
+        pets._save(self.entry, data)
+
+        ok, message = pets.enchant_weapon(self.entry, self.user, item.code, "water")
+        self.assertTrue(ok, message)
+        self.assertIn("2/2", message)
+
+        text, keyboard = pets_ui.enchant_weapon_view(self.entry, self.user, item.code)
+        self.assertIn("2/2", text)
+        rune_actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in keyboard["inline_keyboard"][:-1] for button in row
+        ]
+        self.assertTrue(rune_actions)
+        self.assertEqual(set(rune_actions), {"noop"})
+
     def test_type_owner_and_source_guards_cannot_be_bypassed(self):
         item = self._own_item("weapon")
         shield_rune = self._grant("rune_paint_shield")

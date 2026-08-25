@@ -596,6 +596,8 @@ def _load(entry: str) -> dict:
         record["fight_result_notifications"] = bool(
             record.get("fight_result_notifications", True)
         )
+        element = str(record.get("element") or "")
+        record["element"] = element if element in C.CHARACTER_ELEMENTS else None
         record["dungeon_run"] = _normalise_dungeon_run(record.get("dungeon_run"))
         record["dungeon_deepest"] = max(
             1, _safe_nonnegative_int(record.get("dungeon_deepest"), 1),
@@ -995,6 +997,8 @@ def _new_record() -> dict:
         "photo_file_id": None,
         "owner_name": None,
         "owner_username": None,
+        # Chosen once from the hero screen. None stays neutral until the player decides.
+        "element": None,
         # Kept for legacy-refund bookkeeping; zero marks a free post-migration cage.
         "cage_price_paid": 0,
         "cage_level": 1,
@@ -2281,6 +2285,68 @@ RUNE_ELEMENTS = ("fire", "frost", "water", "earth", "air", "plants")
 RUNE_ENCHANT_RUBY_COST = 15
 
 
+def character_element_status(entry: str, user_id) -> dict:
+    """Selected affinity and the complete, UI-ready matchup table."""
+    record = _tamed_record(_load(entry), user_id) or {}
+    selected = record.get("element")
+    selected = selected if selected in C.CHARACTER_ELEMENTS else None
+    weak_to = {
+        defender: attacker
+        for attacker, defender in C.CHARACTER_ELEMENT_STRONG_AGAINST.items()
+    }
+    return {
+        "selected": selected,
+        "bonus_pct": round(C.CHARACTER_ELEMENT_DAMAGE_BONUS * 100),
+        "choices": [
+            {
+                "code": element,
+                "name": C.CHARACTER_ELEMENT_NAMES[element],
+                "icon": C.CHARACTER_ELEMENT_ICONS[element],
+                "strong_against": C.CHARACTER_ELEMENT_STRONG_AGAINST[element],
+                "strong_name": C.CHARACTER_ELEMENT_NAMES[
+                    C.CHARACTER_ELEMENT_STRONG_AGAINST[element]
+                ],
+                "weak_against": weak_to[element],
+                "weak_name": C.CHARACTER_ELEMENT_NAMES[weak_to[element]],
+                "neutral_names": [
+                    C.CHARACTER_ELEMENT_NAMES[other]
+                    for other in C.CHARACTER_ELEMENTS
+                    if other not in {
+                        C.CHARACTER_ELEMENT_STRONG_AGAINST[element], weak_to[element]
+                    }
+                ],
+            }
+            for element in C.CHARACTER_ELEMENTS
+        ],
+    }
+
+
+def set_character_element(entry: str, user_id, element: str) -> tuple[bool, str]:
+    """Choose a creature affinity once; it cannot be rerolled after seeing opponents."""
+    element = str(element or "").strip()
+    if element not in C.CHARACTER_ELEMENTS:
+        return False, "Неизвестный элемент. Выбери его ещё раз."
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала создай существо."
+        existing = record.get("element")
+        if existing in C.CHARACTER_ELEMENTS:
+            return False, (
+                f"Элемент уже выбран: {C.CHARACTER_ELEMENT_ICONS[existing]} "
+                f"{C.CHARACTER_ELEMENT_NAMES[existing]}. Изменить его нельзя."
+            )
+        record["element"] = element
+        _save(entry, data)
+    strong = C.CHARACTER_ELEMENT_STRONG_AGAINST[element]
+    return True, (
+        f"Выбран элемент: {C.CHARACTER_ELEMENT_ICONS[element]} "
+        f"{C.CHARACTER_ELEMENT_NAMES[element]}. +{round(C.CHARACTER_ELEMENT_DAMAGE_BONUS * 100)}% "
+        f"урона против элемента «{C.CHARACTER_ELEMENT_NAMES[strong]}»."
+    )
+
+
 def grant_rubies_once(entry, user_id, amount: int, source: str) -> int:
     """Credit rubies once, using a durable source key for quest settlement retries."""
     with _farm_settlement_lock:
@@ -2559,6 +2625,19 @@ def enchant_weapon(entry: str, user_id, code: str, element: str) -> tuple[bool, 
         item = C.find_item(code)
         if record is None or item is None or item.slot != "weapon" or code not in record.get("inventory", []):
             return False, "Выбери оружие из своей сумки."
+        elemental = record.setdefault("weapon_enchantments", {})
+        existing = elemental.get(code)
+        if existing in RUNE_ELEMENTS:
+            if code in (record.get("personal_enchantments") or {}):
+                return False, (
+                    f"На «{item.name}» уже заняты оба зачарования: "
+                    f"{RUNE_NAMES.get(existing, existing)} и персональный покрас. "
+                    "Зачарования: 2/2, третье нельзя."
+                )
+            return False, (
+                f"На «{item.name}» уже есть стихия «{RUNE_NAMES.get(existing, existing)}». "
+                "Вторую стихию нельзя; свободен только отдельный слот персонального покраса."
+            )
         runes = record.setdefault("runes", {})
         if int(runes.get(element, 0) or 0) < 1:
             return False, "Не хватает этой руны."
@@ -2568,10 +2647,15 @@ def enchant_weapon(entry: str, user_id, code: str, element: str) -> tuple[bool, 
             return False, f"Зачарование стоит {RUNE_ENCHANT_RUBY_COST} рубинов."
         runes[element] -= 1
         wallet[str(user_id)] = rubies - RUNE_ENCHANT_RUBY_COST
-        record.setdefault("weapon_enchantments", {})[code] = element
+        elemental[code] = element
+        has_personal_paint = code in (record.get("personal_enchantments") or {})
         _append_ruby_log(entry, user_id, -RUNE_ENCHANT_RUBY_COST, "spend:enchant", ref=code)
         _save(entry, data)
-    return True, f"«{item.name}» зачаровано руной {element}."
+    slots = "2/2" if has_personal_paint else "1/2"
+    return True, (
+        f"«{item.name}» зачаровано: {RUNE_NAMES.get(element, element)}. "
+        f"Зачарования: {slots} (стихия + персональный покрас)."
+    )
 
 
 def farm_tickets(entry, user_id) -> int:
@@ -4321,8 +4405,8 @@ def apply_personal_paint_rune(entry: str, user_id, rune_id: str, target_code: st
     """Consume exactly one matching personal rune and bind it to one owned target.
 
     The function accepts identifiers only and performs every ownership/type/stack check
-    server-side.  This is intentionally separate from normal elemental weapon runes:
-    the artwork buff is an image-and-stat provenance record, not a second combat effect.
+    server-side. This occupies the personal-paint slot independently of the weapon's one
+    elemental slot: a weapon may carry both, but never two paints or two elements.
     """
     rune_id = str(rune_id or "").strip()
     target_code = str(target_code or "").strip()
@@ -4355,7 +4439,14 @@ def apply_personal_paint_rune(entry: str, user_id, rune_id: str, target_code: st
         _save(entry, data)
     label = (SCROLLS.scroll(target_code) or C.find_item(target_code))
     name = label.get("name") if isinstance(label, dict) else getattr(label, "name", target_code)
-    return True, f"Персональный покрас применён к «{name}»: боевые числа +30%.", {
+    is_weapon = getattr(C.find_item(target_code), "slot", None) == "weapon"
+    has_element = is_weapon and (
+        (record.get("weapon_enchantments") or {}).get(target_code) in RUNE_ELEMENTS
+    )
+    slot_note = " Зачарования оружия: 2/2." if has_element else (
+        " Зачарования оружия: 1/2 — можно добавить одну стихию." if is_weapon else ""
+    )
+    return True, f"Персональный покрас применён к «{name}»: боевые числа +30%.{slot_note}", {
         "code": target_code, **dict(enchantment), "stat_multiplier": PERSONAL_PAINT_STAT_MULTIPLIER,
     }
 
@@ -4814,6 +4905,9 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
         shield=_combat_shield_for(record),
         damage_multiplier=damage_multiplier,
         weapon_enchanted=element in RUNE_ELEMENTS,
+        character_element=(
+            record.get("element") if record.get("element") in C.CHARACTER_ELEMENTS else None
+        ),
     )
 
 

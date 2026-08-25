@@ -415,6 +415,7 @@ class PetsCommandTests(unittest.TestCase):
     def test_tamed_pet_menu_uses_two_button_rows_including_fight_notifications(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
+        pets.set_character_element(CHAT, PLAYER["id"], "fire")
 
         _, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
 
@@ -443,6 +444,24 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("📜 Квесты", labels[1][0])
         self.assertEqual(labels[1][1], "🎰 Казино")
         self.assertEqual(labels[2], ["🛒 Магазин", "🎒 Снаряжение"])
+
+    def test_unselected_character_element_is_the_first_full_width_action(self):
+        pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
+        pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
+
+        text, keyboard = pets_ui.main_view(CHAT, PLAYER["id"], RICH_XP)
+        first = keyboard["inline_keyboard"][0][0]
+        self.assertIn("Выбери элемент", text)
+        self.assertEqual(pets_ui.parse_callback(first["callback_data"])[1], "elementmenu")
+
+        detail, choices = pets_ui.character_element_view(CHAT, PLAYER["id"])
+        self.assertIn("+10% урона", detail)
+        self.assertIn("нейтральны", detail)
+        actions = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for row in choices["inline_keyboard"] for button in row
+        ]
+        self.assertEqual(actions.count("elementset"), len(C.CHARACTER_ELEMENTS))
 
     def test_financial_admin_gets_a_direct_private_button_to_the_audit_graph(self):
         _, keyboard = pets_ui.main_view(

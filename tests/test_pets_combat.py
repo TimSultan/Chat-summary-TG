@@ -206,7 +206,8 @@ class SnapshotTests(unittest.TestCase):
 
     def test_a_snapshot_survives_json_and_replays_the_identical_fight(self):
         a = Fighter(key="a", name="Альфа", strength=31, health=27, agility=14, luck=9,
-                    armor=4, effects=({"code": "vampiric", "value": 12}, "thorns"), level=7)
+                    armor=4, effects=({"code": "vampiric", "value": 12}, "thorns"), level=7,
+                    character_element="fire")
         b = _fighter("b", 22, armor=1, name="Бета")
 
         restored_a = combat.restore(json.loads(json.dumps(combat.snapshot(a))))
@@ -234,9 +235,40 @@ class SnapshotTests(unittest.TestCase):
         salvaged = combat.restore({"key": "a", "name": "Альфа"})
         self.assertEqual(salvaged.key, "a")
         self.assertEqual(salvaged.effects, ())
+        self.assertIsNone(salvaged.character_element)
 
 
 class SimulateTests(unittest.TestCase):
+    def test_favourable_character_element_adds_ten_percent_outgoing_damage_only(self):
+        class AttackerFirst:
+            def random(self):
+                return 0.0
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return values[0]
+
+        attacker = Fighter(
+            key="a", name="Fire", strength=10, health=200, agility=10, luck=1,
+            armor=0, character_element="fire",
+        )
+        target = Fighter(
+            key="b", name="Target", strength=10, health=200, agility=10, luck=1,
+            armor=0, character_element="plants",
+        )
+        with patch.object(combat, "_signature", return_value=None), \
+                patch.object(combat, "_resolve_blow", return_value=("hit", 100)):
+            strong = combat.simulate(attacker, target, rng=AttackerFirst(), max_actions=1)
+            neutral = combat.simulate(
+                attacker, replace(target, character_element="air"),
+                rng=AttackerFirst(), max_actions=1,
+            )
+
+        self.assertEqual(strong.total_damage["a"], 110)
+        self.assertEqual(neutral.total_damage["a"], 100)
+
     def test_echo_at_one_hundred_percent_repeats_actual_damage_once(self):
         class AttackerFirst:
             def random(self):

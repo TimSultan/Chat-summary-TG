@@ -716,6 +716,7 @@ def _fight_record_snapshot(record: dict | None, prefix: str) -> dict:
         "stats": dict(record.get("stats") or {}),
         "owner_name": record.get("owner_name"),
         "owner_username": record.get("owner_username"),
+        "element": record.get("element") if record.get("element") in C.CHARACTER_ELEMENTS else None,
     }
 
 
@@ -763,6 +764,10 @@ def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dic
     return {
         "user_id": str(key), "name": getattr(fighter, "name", "") or str(key),
         "level": int(getattr(fighter, "level", 1) or 1),
+        "element": (
+            getattr(fighter, "character_element", None)
+            if getattr(fighter, "character_element", None) in C.CHARACTER_ELEMENTS else None
+        ),
         "portrait": _portrait_url(prefix, key) if prefix and str(key).isdigit() else None,
         "crop": _jsonable(record.get("portrait_crop")),
         "stats": {
@@ -884,6 +889,9 @@ def _pet_payload(entry: str, user_id, record: dict, prefix: str) -> dict:
         "owner_name": record.get("owner_name"),
         "owner_username": record.get("owner_username"),
         "created_at": record.get("created_at"),
+        "element": (
+            record.get("element") if record.get("element") in C.CHARACTER_ELEMENTS else None
+        ),
         "notifications": bool(record.get("fight_result_notifications", True)),
         # Mob fights are watched by default.  This stays in the pet record rather than
         # local storage, so a player's choice follows them between Telegram Mini App
@@ -1061,6 +1069,7 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         ),
         "quest_attention": quests.has_available_quests(entry, user_id),
         "personal_paint": pets.personal_paint_status(entry, user_id),
+        "character_element": pets.character_element_status(entry, user_id),
     }
     # Opaque image URLs are usable by plain img tags and inside another player's replay.
     for row in [*state["personal_paint"].get("runes", []), *state["personal_paint"].get("applied", [])]:
@@ -1168,6 +1177,10 @@ def _action_upgrade_stat(entry, user_id, xp, payload):
 def _action_respec_stats(entry, user_id, xp, payload):
     ok, message, _coins = pets.respec_stats(entry, user_id, xp)
     return ok, message
+
+
+def _action_set_character_element(entry, user_id, xp, payload):
+    return pets.set_character_element(entry, user_id, str(payload.get("element") or ""))
 
 
 def _action_equip(entry, user_id, xp, payload):
@@ -1435,6 +1448,7 @@ def _action_phoenix_auto(entry, user_id, xp, payload):
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
   "respec_stats": _action_respec_stats,
+    "set_character_element": _action_set_character_element,
     "equip": _action_equip,
     "unequip": _action_unequip,
     "set_skill": _action_set_skill,
@@ -1495,6 +1509,7 @@ _ALLOWED_IN_DUNGEON = {
     "dungeon_fight", "dungeon_rest", "dungeon_buy", "dungeon_descend", "dungeon_quit",
     "dungeon_chest", "phoenix_start", "phoenix_action", "phoenix_auto",
     "equip", "unequip", "enchant_weapon", "reforge", "set_skill",
+    "set_character_element",
 }
 
 
@@ -2084,6 +2099,10 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
             "level": int(record.get("level", 1)),
             "fights": int(record.get("fights", 0)),
             "wins": int(record.get("wins", 0)),
+            "element": (
+                record.get("element")
+                if record.get("element") in C.CHARACTER_ELEMENTS else None
+            ),
             "stats": pets._effective_stats_for(record),
             # Carried per row so the roster can mark somebody quietly in place. The power
             # beside it is already the reduced one -- `_effective_stats_for` applied the
@@ -2122,6 +2141,11 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
     return {
         "me_power": mine, "opponents": opponents, "birthday": celebration,
         "my_debuff": pets.debuff_for(mine_record),
+        "me_element": (
+            mine_record.get("element")
+            if isinstance(mine_record, dict)
+            and mine_record.get("element") in C.CHARACTER_ELEMENTS else None
+        ),
     }
 
 
@@ -2176,6 +2200,10 @@ async def handle_attack(request: web.Request) -> web.Response:
             personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, key),
             shield=pets.combat_shield(entry, key),
             weapon_enchanted=pets.combat_weapon_enchanted(entry, key),
+            character_element=(
+                record.get("element")
+                if record.get("element") in C.CHARACTER_ELEMENTS else None
+            ),
         )
 
     attacker = fighter(me, mine, opponent_id)
@@ -5793,6 +5821,40 @@ function levelUpPanel() {
     '</div>';
 }
 
+function characterElementPanel() {
+  const state = (S && S.character_element) || {};
+  if (!S.pet || state.selected) return "";
+  return '<div class="panel levelup">' +
+    '<div class="levelup-head">✨ Выберите элемент персонажа</div>' +
+    '<div class="small muted" style="margin:7px 0 10px">Сильная стихия наносит +'+
+      Number(state.bonus_pct || 10) + '% урона слабой. Выбор постоянный.</div>' +
+    '<button class="go" data-do="element">Выбрать элемент</button></div>';
+}
+
+function openCharacterElement() {
+  const state = (S && S.character_element) || {};
+  const choices = state.choices || [];
+  const selected = state.selected || null;
+  const rows = choices.map((row) =>
+    '<div class="panel" style="margin:8px 0;padding:12px">' +
+      '<div><b>' + esc(row.icon || "") + ' ' + esc(row.name || row.code) + '</b></div>' +
+      '<div class="small" style="margin-top:5px">Сильнее: <b>' + esc(row.strong_name) +
+        '</b> · слабее: <b>' + esc(row.weak_name) + '</b></div>' +
+      '<div class="tiny muted" style="margin-top:4px">Нейтрально: ' +
+        (row.neutral_names || []).map(esc).join(', ') + '</div>' +
+      (selected ? '' : '<button class="go" style="margin-top:9px" data-elementset="' +
+        esc(row.code) + '">Выбрать ' + esc(row.name) + '</button>') +
+    '</div>'
+  ).join('');
+  const current = choices.find((row) => row.code === selected);
+  sheet('<h3>✨ Элемент персонажа</h3>' +
+    '<div class="small">В выгодной паре ваш персонаж наносит <b>+' +
+      Number(state.bonus_pct || 10) + '% урона</b>. В остальных парах урон обычный.</div>' +
+    '<div class="tool-quest-note">Выбор постоянный: изменить элемент потом нельзя.</div>' +
+    (current ? '<div class="tool-quest-note">Выбрано: <b>' + esc(current.icon) + ' ' +
+      esc(current.name) + '</b></div>' : '') + rows);
+}
+
 function renderHero() {
   const box = $("scr-hero");
   if (!S.pet) { box.innerHTML = renderOnboarding(); return; }
@@ -5818,6 +5880,7 @@ function renderHero() {
   });
 
   box.innerHTML =
+    characterElementPanel() +
     levelUpPanel() +
     '<div class="panel">' +
       '<div class="doll">' +
@@ -5833,7 +5896,12 @@ function renderHero() {
         "<div>" + slot(worn.amulet || emptySlot("amulet")) + "</div>" +
         "<div>" + slot(worn.boots || emptySlot("boots")) + "</div>" +
         '<div class="tiny muted pet-equipment-summary">' +
-          esc(pet.name) + " · ур. " + pet.level + "<br>" +
+          esc(pet.name) + " · ур. " + pet.level +
+          (pet.element ? "<br>" + esc((((S.character_element || {}).choices || []).find(
+            (row) => row.code === pet.element
+          ) || {}).icon || "") + " " + esc((((S.character_element || {}).choices || []).find(
+            (row) => row.code === pet.element
+          ) || {}).name || "") : "") + "<br>" +
           pet.xp + " / " + pet.xp_needed + " опыта<br>" +
           "боёв " + pet.fights + " · побед " + pet.wins +
         "</div>" +
@@ -6530,8 +6598,9 @@ function runesPanel() {
   }).join("");
 
   return '<div class="panel"><h2>🔮 Руны</h2>' +
-    '<div class="tiny muted" style="margin-bottom:9px">Руна навсегда зачаровывает одно ' +
-      'оружие и добавляет ему свою стихию. Зачарование стоит ' + Number(state.cost || 15) +
+    '<div class="tiny muted" style="margin-bottom:9px">На оружии может быть два разных зачарования: ' +
+      'одна элементальная руна и один персональный покрас с картинкой. Вторую стихию или второй покрас наложить нельзя. ' +
+      'Элементальное зачарование стоит ' + Number(state.cost || 15) +
       ' 💎 и одну руну. Руны падают в подземелье и с рунических квестов.</div>' +
     '<div class="rune-grid">' + cells + '</div>' +
     (total ? '<div class="tiny muted" style="margin-top:9px">Нажми руну, чтобы выбрать ' +
@@ -6545,9 +6614,11 @@ function runesPanel() {
 function openEnchantWeapons(element) {
   const names = { fire: "Огненная", frost: "Ледяная", water: "Водная", earth: "Земляная", air: "Воздушная", plants: "Руна растений" };
   const weapons = (S.bag || []).filter((item) => item.slot === "weapon");
-  sheet('<h3>' + esc(names[element]) + ' руна</h3><p class="tiny muted">Выбери оружие для зачарования.</p>' +
-    (weapons.length ? weapons.map((weapon) => '<button class="go sec" style="margin:5px 0" data-enchantapply="' + esc(weapon.code) + ':' + element + '">' +
-      esc(weapon.name) + (weapon.enchantment ? ' · уже зачаровано' : '') + '</button>').join('') : '<div class="empty">В сумке нет оружия.</div>'));
+  sheet('<h3>' + esc(names[element]) + ' руна</h3><p class="tiny muted">Выбери оружие. На каждом доступен один слот стихии и отдельный слот персонального покраса.</p>' +
+    (weapons.length ? weapons.map((weapon) => '<button class="go sec" style="margin:5px 0"' +
+      (weapon.enchantment ? ' disabled' : ' data-enchantapply="' + esc(weapon.code) + ':' + element + '"') + '>' +
+      esc(weapon.name) + (weapon.enchantment ? ' · стихия уже есть' : '') +
+      (weapon.personal_paint ? ' · 🎨 покрас' : '') + '</button>').join('') : '<div class="empty">В сумке нет оружия.</div>'));
 }
 
 // `skipAll` for the shop, where every equipment slot has its own personal rotation.
@@ -7562,11 +7633,15 @@ function repeatTag(mark) {
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
   const repeats = foe.repeat_fights;
+  const element = (((S.character_element || {}).choices || []).find(
+    (row) => row.code === foe.element
+  ) || {});
   return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
     (usable ? "" : " disabled") + '>' +
     '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
     "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
-      "</span> " + debuffTag(foe.debuff) + " " + repeatTag(repeats) +
+      "</span> " + (element.code ? esc(element.icon) + " " + esc(element.name) + " " : "") +
+      debuffTag(foe.debuff) + " " + repeatTag(repeats) +
       "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
       " · побед " + foe.wins + " из " + foe.fights + "</span></span>" +
     "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";
@@ -9473,10 +9548,15 @@ function duelFighter(fighter, fallbackArt) {
   const portrait = fighter.portrait ? shot(fighter.portrait, fighter.crop) : fallbackArt;
   const portraitKey = "fighter:" + Object.keys(DUEL_PORTRAITS).length;
   DUEL_PORTRAITS[portraitKey] = portrait || "👤";
+  const element = (((S.character_element || {}).choices || []).find(
+    (row) => row.code === fighter.element
+  ) || {});
   return '<article class="duel-fighter"><button type="button" class="duel-avatar" data-duel-portrait="' +
     portraitKey + '">' + (portrait || "👤") +
     '</button><b class="duel-name">' + esc(fighter.name || fighter.user_id || "Соперник") +
-    '</b><div class="duel-stats">' + duelStats(fighter) + "</div>" + duelLoadout(fighter) +
+    '</b>' + (element.code ? '<div class="tiny muted">' + esc(element.icon) + ' ' +
+      esc(element.name) + '</div>' : '') + '<div class="duel-stats">' +
+      duelStats(fighter) + "</div>" + duelLoadout(fighter) +
     "</article>";
 }
 
@@ -9729,6 +9809,7 @@ $("hudCreate").addEventListener("click", () => {
 // a bound listener, so a re-render (which replaces all of it) cannot leave a dead button
 // or a duplicated one behind.
 const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
+    "[data-elementset]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
@@ -9832,6 +9913,12 @@ async function handleClick(event, target) {
   if (d.personalapply) {
     closeSheet();
     await act("apply_personal_paint", { rune_id: d.personalapply, code: d.personalcode });
+    return;
+  }
+  if (d.elementset) {
+    closeSheet();
+    await act("set_character_element", { element: d.elementset });
+    FOES = null;
     return;
   }
   if (d.liveskillset) {
@@ -10001,6 +10088,7 @@ async function handleClick(event, target) {
   else if (d.quarrystart) { await act("quarry_start", {hours:Number(d.quarrystart)}); }
   else if (d.do === "meadowback") { MEADOW_OPEN = false; render(); }
   else if (d.do === "claimlevel") { await act("claim_level"); }
+  else if (d.do === "element") { openCharacterElement(); }
   else if (d.do === "portrait") { openPortrait(); }
   else if (d.do === "tame") { openPetCreation(); }
   else if (d.do === "tobot") { if (tg) tg.close(); }

@@ -135,6 +135,37 @@ class HeroGoldBalanceTests(unittest.TestCase):
 
 
 class CageAndTamingTests(PetsTestCase):
+    def test_character_element_is_permanent_and_every_choice_has_one_counter(self):
+        entry = "chat"
+        self._tame(entry, "1")
+
+        before = pets.character_element_status(entry, "1")
+        self.assertIsNone(before["selected"])
+        self.assertEqual(before["bonus_pct"], 10)
+        self.assertEqual(
+            {row["code"] for row in before["choices"]},
+            set(pets_config.CHARACTER_ELEMENTS),
+        )
+        self.assertTrue(all(len(row["neutral_names"]) == 4 for row in before["choices"]))
+
+        ok, message = pets.set_character_element(entry, "1", "fire")
+        self.assertTrue(ok, message)
+        self.assertEqual(pets.get_pet(entry, "1")["element"], "fire")
+
+        ok, message = pets.set_character_element(entry, "1", "water")
+        self.assertFalse(ok)
+        self.assertIn("нельзя", message)
+        self.assertEqual(pets.get_pet(entry, "1")["element"], "fire")
+
+        for element in pets_config.CHARACTER_ELEMENTS:
+            strong = pets_config.CHARACTER_ELEMENT_STRONG_AGAINST[element]
+            self.assertEqual(pets_config.character_element_multiplier(element, strong), 1.1)
+            neutral = next(
+                other for other in pets_config.CHARACTER_ELEMENTS
+                if other not in {strong}
+            )
+            self.assertEqual(pets_config.character_element_multiplier(element, neutral), 1.0)
+
     def test_everyone_starts_with_a_free_base_cage(self):
         entry = "chat"
         self.assertTrue(pets.has_cage(entry, "1"))

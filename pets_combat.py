@@ -100,6 +100,10 @@ class Fighter:
     enchant_reflect_multiplier: float = 0.0
     weapon_enchanted: bool = False
     starting_hp: int | None = None
+    # Permanent creature affinity. None is a pre-feature/unselected creature and is
+    # neutral against everything. Kept on snapshots so old fight replays never inherit a
+    # choice made after the original fight.
+    character_element: str | None = None
 
 
 @dataclass(frozen=True)
@@ -330,6 +334,10 @@ def snapshot(fighter: "Fighter") -> dict:
         "enchant_reflect_multiplier": fighter.enchant_reflect_multiplier,
         "weapon_enchanted": fighter.weapon_enchanted,
         "starting_hp": fighter.starting_hp,
+        "character_element": (
+            fighter.character_element
+            if fighter.character_element in C.CHARACTER_ELEMENTS else None
+        ),
     }
 
 
@@ -428,6 +436,10 @@ def restore(data) -> "Fighter | None":
         enchant_reflect_multiplier=_stored_number(data.get("enchant_reflect_multiplier"), 0.0),
         weapon_enchanted=bool(data.get("weapon_enchanted", False)),
         starting_hp=_stored_number(data.get("starting_hp"), None),
+        character_element=(
+            str(data.get("character_element"))
+            if str(data.get("character_element")) in C.CHARACTER_ELEMENTS else None
+        ),
     )
 
 
@@ -813,6 +825,19 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
     # four numbers everything else is computed from. Rolled off this rng like every other
     # decision here, so a stored seed still replays the fight exactly (see snapshot()).
     a, b = _mirror(a, b, rng), _mirror(b, a, rng)
+    # Affinity is a flat outgoing-damage edge, not another stat and not a resistance.
+    # Multiplying the existing fight-wide factor makes it reach punches, scrolls and item
+    # damage uniformly while leaving healing and shields untouched.
+    a = replace(a, damage_multiplier=(
+        a.damage_multiplier * C.character_element_multiplier(
+            a.character_element, b.character_element,
+        )
+    ))
+    b = replace(b, damage_multiplier=(
+        b.damage_multiplier * C.character_element_multiplier(
+            b.character_element, a.character_element,
+        )
+    ))
     derived = {a.key: derive(a, b), b.key: derive(b, a)}
     fighters = {a.key: a, b.key: b}
     max_hp = {a.key: derived[a.key]["max_hp"], b.key: derived[b.key]["max_hp"]}
