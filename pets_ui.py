@@ -774,19 +774,13 @@ def dungeon_shop_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     if not state.get("can_rest"):
         lines.append("<i>Лавка открывается, когда этаж зачищен.</i>")
     for item in stock:
-        # Already working, or already spent: neither is a thing to price. A totem the run
-        # is carrying shown at 💎 10 is an offer the buy handler would refuse anyway, and
-        # it tells the player nothing about whether they are protected.
-        if item.get("held") or item.get("spent"):
-            held = bool(item.get("held"))
-            lines.append(
-                f"{item['icon']} <b>{escape(str(item['name']))}</b> — "
-                + ("<b>активен</b>" if held else "уже сработал")
-            )
-            lines.append("<i>" + (
-                "Сработает один раз, когда здоровье кончится."
-                if held else "В этом забеге больше не воскресит."
-            ) + "</i>")
+        # Already working is not a thing to price: a totem the run is carrying shown at
+        # 💎 10 is an offer the buy handler would refuse anyway, and it tells the player
+        # nothing about whether they are protected. Once it has BURNED the row goes back
+        # to being an ordinary purchase -- that replacement is what the shelf is for.
+        if item.get("held"):
+            lines.append(f"{item['icon']} <b>{escape(str(item['name']))}</b> — <b>активен</b>")
+            lines.append("<i>Сработает один раз, когда здоровье кончится.</i>")
             continue
         left = item.get("left")
         ration = "" if left is None else f" · осталось {left}"

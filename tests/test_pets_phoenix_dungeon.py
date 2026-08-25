@@ -185,6 +185,20 @@ class PhoenixDungeonTests(unittest.TestCase):
         self.assertIn(0, run["cleared"])
         self.assertNotIn("phoenix", run)
 
+    def test_winning_the_fight_leaves_the_run_carrying_a_totem(self):
+        """The prize for the bird that comes back, wired to the fight rather than the shop.
+
+        Asserted through a whole played fight because the grant is asked for by the
+        settle, not decided inside the shared boss payout -- the Gatekeeper settles
+        through that same payout and must not come away with one.
+        """
+        state = self._play_to_the_end(win=True)
+        self.assertTrue(state["won"], state)
+
+        run = pets.get_pet(CHAT, USER)["dungeon_run"]
+        self.assertTrue(run["phoenix_totem"])
+        self.assertFalse(run.get("phoenix_totem_used"))
+
     def test_a_loss_ends_the_run_the_way_every_other_defeat_does(self):
         state = self._play_to_the_end(win=False)
         self.assertFalse(state["won"], state)

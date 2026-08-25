@@ -23,20 +23,25 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(item["price"], 10)
         self.assertEqual(item["currency"], "ruby")
         self.assertEqual(item["effect"], "resurrect")
-        self.assertIn("навсегда", item["description"])
+        # The shelf has to say what it is selling: not the first totem, the replacement.
+        self.assertIn("бесплатно за победу над Фениксом", item["description"])
+        self.assertIn("замена", item["description"])
+        self.assertIn("фигурку Феникса", item["description"])
         # Three field hospitals. A heal is health back; this is the run itself.
         self.assertGreater(item["price"], dungeon.SHOP_FULL_HEAL_RUBIES)
 
-    def test_the_shelf_stops_selling_a_totem_the_run_already_carries(self):
-        """A price tag on something you are holding tells you nothing about whether it is on.
+    def test_the_shelf_sells_the_replacement_totem_and_never_the_one_in_hand(self):
+        """Three states, and the middle one is the whole arrangement.
 
-        The totem arrives two ways -- bought here, or granted for the whole run by the
-        painted Phoenix figurine -- and `dungeon_buy` refuses the second purchase either
-        way. A shelf that still offers it is advertising a refusal.
+        A price tag on something you are already carrying tells the player nothing about
+        whether they are protected, and `dungeon_buy` refuses that purchase anyway. But
+        once it has burned, the shelf is exactly where the second one comes from: the
+        Phoenix hands over the first for being beaten, diamonds buy the replacement.
         """
         data = pets._load(self.entry)
-        run = {"floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1]}
-        data["pets"][self.user_id]["dungeon_run"] = run
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1],
+        }
         pets._save(self.entry, data)
 
         def totem():
@@ -46,22 +51,81 @@ class DungeonTests(unittest.TestCase):
         self.assertFalse(totem()["held"])
         self.assertFalse(totem()["spent"])
 
+        # Carrying one: not for sale, and the screen says it is on.
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"]["phoenix_totem"] = True
         pets._save(self.entry, data)
         self.assertTrue(totem()["held"])
         self.assertFalse(totem()["spent"])
+        text, _keys = pets_ui.dungeon_shop_view(self.entry, self.user_id, 0)
+        self.assertIn("активен", text)
+        self.assertNotIn(f"💎 {dungeon.PHOENIX_TOTEM_RUBIES}", text)
 
+        # Burned: on sale again, once, at its price.
+        run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
+        self.assertTrue(pets._dungeon_resurrect(run))
         data = pets._load(self.entry)
-        data["pets"][self.user_id]["dungeon_run"]["phoenix_totem_used"] = True
+        data["pets"][self.user_id]["dungeon_run"] = run
         pets._save(self.entry, data)
         self.assertFalse(totem()["held"])
         self.assertTrue(totem()["spent"])
-
-        # Both clients say so instead of quoting a price.
+        self.assertFalse(totem()["sold_out"])
         text, _keys = pets_ui.dungeon_shop_view(self.entry, self.user_id, 0)
-        self.assertIn("уже сработал", text)
-        self.assertNotIn(f"💎 {dungeon.PHOENIX_TOTEM_RUBIES}", text)
+        self.assertIn(f"💎 {dungeon.PHOENIX_TOTEM_RUBIES}", text)
+
+    def test_beating_the_phoenix_hands_over_the_first_totem_for_nothing(self):
+        """The one that matters is free; the shop sells the second.
+
+        A player who never reaches the Phoenix is not simply outbid on survival, and a
+        player who does is told about it rather than left to notice a changed shop row.
+        """
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 5, "hp": 10, "max_hp": 10, "cleared": [], "run_id": "r1",
+        }
+        pets._save(self.entry, data)
+
+        ok, note, _receipt = pets._phoenix_reward(
+            self.entry, self.user_id, 5, dungeon.encounter(5, 0), grant_totem=True,
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("Тотем Феникса", note)
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertTrue(run["phoenix_totem"])
+        self.assertFalse(run.get("phoenix_totem_used"))
+
+        # And it really works once: spending it leaves nothing in hand.
+        self.assertTrue(pets._dungeon_resurrect(run))
+        self.assertFalse(run["phoenix_totem"])
+        self.assertTrue(run["phoenix_totem_used"])
+        self.assertFalse(pets._dungeon_resurrect(run))
+
+    def test_the_gatekeeper_pays_the_boss_payout_and_not_the_phoenix_prize(self):
+        """One payout function, two hand-fought bosses, and only one of them owes a totem.
+
+        `_phoenix_reward` is named for where it started but the Gatekeeper settles through
+        it too, so a grant written into the shared body would quietly hand out a second
+        free totem on floor ten -- against what the shelf, the news post and the fight
+        itself all say the prize is.
+        """
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "floor": 10, "hp": 10, "max_hp": 10, "cleared": [], "run_id": "r2",
+        }
+        pets._save(self.entry, data)
+
+        row = dungeon.encounter(10, 0)
+        self.assertTrue(pets.is_gatekeeper(row))
+        ok, note, receipt = pets._phoenix_reward(self.entry, self.user_id, 10, row)
+
+        self.assertTrue(ok)
+        self.assertNotIn("Тотем", note)
+        self.assertFalse(receipt["phoenix_totem"])
+        run = pets.get_pet(self.entry, self.user_id)["dungeon_run"]
+        self.assertFalse(run.get("phoenix_totem"))
+        # It still got paid like any other boss.
+        self.assertTrue(receipt["reward"]["gold"])
 
     def test_the_fight_that_ends_a_run_keeps_its_transcript_id(self):
         """The last exchange is the one a player wants to see again and cannot.

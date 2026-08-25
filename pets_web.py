@@ -6081,16 +6081,13 @@ function dungeonShop(dungeon) {
   const stock = dungeon.shop || [];
   if (!stock.length || !dungeon.can_rest) return "";
   const rows = stock.map((item) => {
-    // Already carrying it, or already used it: neither is something to sell. A price tag
-    // on a totem the run is holding is an offer the buy handler would refuse anyway, and
-    // the player cannot tell from it whether they are protected.
+    // Already carrying it is not something to sell: a price tag on a totem the run is
+    // holding is an offer the buy handler would refuse anyway, and the player cannot tell
+    // from it whether they are protected. Once it has burned the row is an ordinary
+    // purchase again -- selling that replacement is what the shelf is here for.
     if (item.held) {
       return '<div class="dungeon-stock held"><b>' + esc(item.icon) + " " + esc(item.name) +
         " · активен</b><small>Сработает один раз, когда здоровье кончится.</small></div>";
-    }
-    if (item.spent) {
-      return '<div class="dungeon-stock held spent"><b>' + esc(item.icon) + " " + esc(item.name) +
-        " · уже сработал</b><small>В этом забеге больше не воскресит.</small></div>";
     }
     const coin = item.currency === "ruby" ? "💎" : "🪙";
     const ration = item.left === null || item.left === undefined ? "" : " · осталось " + item.left;
@@ -6276,7 +6273,7 @@ function totemBlock() {
   if (!TOTEM_FIRED) return "";
   return '<div class="panel totem-fired"><b>🔥 Тотем Феникса сгорел</b>' +
     '<div class="small" style="margin-top:5px">Он поднял тебя на ноги и рассыпался. ' +
-    "Второй раз в этом забеге он не сработает.</div></div>";
+    "Замена — одна за забег — лежит в лавке подземелья.</div></div>";
 }
 
 function dungeonReceipt(haul) {

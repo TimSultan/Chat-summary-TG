@@ -4924,7 +4924,8 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
 # had been sharing a line with whatever the corridor did next.
 PHOENIX_TOTEM_NOTICE = (
     "🔥 <b>ТОТЕМ ФЕНИКСА СГОРЕЛ</b>\n"
-    "Он поднял тебя на ноги и рассыпался. Второй раз в этом забеге он не сработает."
+    "Он поднял тебя на ноги и рассыпался. Замена — одна за забег — "
+    f"лежит в лавке подземелья за {D.PHOENIX_TOTEM_RUBIES} 💎."
 )
 
 
@@ -5070,9 +5071,18 @@ def _hp_after_fight(result, key: str) -> int:
 
 
 def _dungeon_resurrect(run: dict) -> bool:
-    """Spend this run's Phoenix Totem, restoring the hero for another attempt."""
-    if not run.get("phoenix_totem") or run.get("phoenix_totem_used"):
+    """Spend this run's Phoenix Totem, restoring the hero for another attempt.
+
+    Two fields, and they mean different things now that a run can hold more than one
+    totem: `phoenix_totem` is "am I carrying one", and it goes back to False here, while
+    `phoenix_totem_used` is "burned one and holding none", which `dungeon_buy` clears
+    again when it sells the replacement. The shelf reads the first to decide whether to
+    sell and the second to decide whether to reopen; what stops a stockpile is the row's
+    own ration of one purchase per run, not either flag.
+    """
+    if not run.get("phoenix_totem"):
         return False
+    run["phoenix_totem"] = False
     run["phoenix_totem_used"] = True
     run["hp"] = max(1, int(run.get("max_hp", 1) or 1))
     run.pop("phoenix", None)
@@ -5336,8 +5346,11 @@ def dungeon_shop(entry: str, user_id) -> list[dict]:
         # the three states this row is in; nothing else about the shelf changes.
         held = spent = False
         if item.get("effect") == "resurrect":
-            held = bool(run.get("phoenix_totem")) and not bool(run.get("phoenix_totem_used"))
-            spent = bool(run.get("phoenix_totem_used"))
+            held = bool(run.get("phoenix_totem"))
+            # Burned one and carrying none: the shelf opens again, once. That is the whole
+            # arrangement -- the Phoenix hands the first one over for beating it, and the
+            # replacement is the thing diamonds buy.
+            spent = bool(run.get("phoenix_totem_used")) and not held
         rows.append({
             **item,
             "left": left,
@@ -5383,7 +5396,7 @@ def dungeon_buy(entry: str, user_id, xp: int, code: str) -> tuple[bool, str]:
             )
         max_hp = max(1, int(run.get("max_hp", 1) or 1))
         if item.get("effect") == "resurrect" and run.get("phoenix_totem"):
-            return False, "Тотем Феникса в этом забеге уже получен."
+            return False, "Тотем Феникса уже с тобой — он сработает сам."
         if item["heal"] and int(run.get("hp", 0) or 0) >= max_hp:
             return False, "Здоровье и так полное."
         if item["currency"] == "ruby":
@@ -5545,7 +5558,8 @@ def phoenix_boss_profile(row: dict, hero: "pets_combat.Fighter | None" = None) -
     }
 
 
-def _phoenix_reward(entry: str, user_id, floor: int, row: dict) -> tuple[bool, str, dict]:
+def _phoenix_reward(entry: str, user_id, floor: int, row: dict,
+                    grant_totem: bool = False) -> tuple[bool, str, dict]:
     """Pay for a Phoenix kill through the ordinary dungeon payout.
 
     Every line of this is what `dungeon_fight` does for any other boss -- the same
@@ -5560,6 +5574,14 @@ def _phoenix_reward(entry: str, user_id, floor: int, row: dict) -> tuple[bool, s
         if record is None:
             return True, "Побеждён.", {}
         run = record.get("dungeon_run") or {}
+        # Beating the bird that comes back gives you the thing that brings YOU back. It is
+        # free and it is the first one: the shop sells the replacement, not the original,
+        # so a player who never reaches floor five is not simply outbid on survival. Asked
+        # for by the caller rather than decided here, because the Gatekeeper is paid through
+        # this same function and its prize is not the Phoenix's.
+        totem_granted = grant_totem and bool(run) and not run.get("phoenix_totem")
+        if totem_granted:
+            run["phoenix_totem"] = True
         loot_token = f"{run.get('run_id') or 'legacy'}:{floor}:{row['index']}:{run.get('kills', 0)}"
         reward = D.roll_reward(floor, True)
         reward["gold_base"] = int(reward.get("gold", 0) or 0)
@@ -5584,9 +5606,15 @@ def _phoenix_reward(entry: str, user_id, floor: int, row: dict) -> tuple[bool, s
         grant_rubies_once(entry, user_id, rubies, f"dungeon-ruby:boss:{loot_token}")
     receipt = {"encounter": row, "result": None, "hero": None, "enemy": None,
                "reward": reward, "dropped": dropped, "scroll": scroll, "rune": rune,
-               "rubies": rubies, "raised": ()}
+               "rubies": rubies, "raised": (), "phoenix_totem": totem_granted}
     receipt["haul"] = _record_dungeon_haul(entry, user_id, receipt)
-    return True, f"Побеждён: {row['name']}.", receipt
+    note = f"Побеждён: {row['name']}."
+    if totem_granted:
+        # Said here rather than left for the player to spot on the shop shelf: it is a
+        # reward for the fight they just had, and a reward nobody is told about is a
+        # number in a save file.
+        note += "\n🔥 <b>Тотем Феникса</b> — он воскресит тебя один раз в этом забеге."
+    return True, note, receipt
 
 
 def phoenix_state(entry: str, user_id) -> dict | None:
@@ -5726,7 +5754,7 @@ def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, 
         run["kills"] = int(run.get("kills", 0) or 0) + 1
         _record_weapon_win(record, "boss_wins")
         _save(entry, data)
-    ok, note, receipt = _phoenix_reward(entry, user_id, floor, row)
+    ok, note, receipt = _phoenix_reward(entry, user_id, floor, row, grant_totem=True)
     public = pets_phoenix.public(state)
     if isinstance(receipt, dict):
         public["reward"] = receipt.get("reward") or {}
