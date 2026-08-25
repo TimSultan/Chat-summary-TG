@@ -4842,7 +4842,7 @@ def dungeon_status(entry: str, user_id) -> dict:
         "shop": [
             {key: row[key] for key in
              ("code", "icon", "name", "description", "currency", "price", "left",
-              "sold_out", "affordable")}
+              "sold_out", "affordable", "held", "spent")}
             for row in dungeon_shop(entry, user_id)
         ],
         "boss_lives": int(run.get("boss_lives", 0) or 0),
@@ -4917,6 +4917,15 @@ def _dungeon_fighter(record: dict, key: str, *, damage_multiplier: float = 1.0) 
             record.get("element") if record.get("element") in C.CHARACTER_ELEMENTS else None
         ),
     )
+
+
+# What a revival says, in one place because five paths say it. Written as its own
+# BLOCK rather than a sentence: the totem is the reason the run still exists, and it
+# had been sharing a line with whatever the corridor did next.
+PHOENIX_TOTEM_NOTICE: Final = (
+    "🔥 <b>ТОТЕМ ФЕНИКСА СГОРЕЛ</b>\n"
+    "Он поднял тебя на ноги и рассыпался. Второй раз в этом забеге он не сработает."
+)
 
 
 def dungeon_enemy_fighter(row: dict, cleared=()) -> pets_combat.Fighter:
@@ -5172,11 +5181,13 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                 if run["hp"] <= 0:
                     if _dungeon_resurrect(run):
                         _save(entry, data)
-                        return True, "🔥 Тотем Феникса воскресил тебя. Попробуй снова.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "resurrected": True}
+                        return True, PHOENIX_TOTEM_NOTICE, {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "resurrected": True}
                     # Read the tally out BEFORE the run is discarded: the defeat screen is
                     # the last chance to tell somebody what the descent was worth.
                     final = dict(run.get("haul") or _new_haul())
-                    record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
+                    record["last_dungeon_haul"] = {
+                        **final, "floor": floor, "won": False, "fight_id": fight_id_,
+                    }
                     record["dungeon_run"] = None
                     _save(entry, data)
                     return False, f"{row['name']} победила. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "run_over": True, "haul": {"total": final}}
@@ -5215,9 +5226,11 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
             if not hydra_defeated and result.winner != str(user_id):
                 if _dungeon_resurrect(run):
                     _save(entry, data)
-                    return True, "🔥 Тотем Феникса воскресил тебя. Попробуй снова.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "resurrected": True}
+                    return True, PHOENIX_TOTEM_NOTICE, {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "resurrected": True}
                 final = dict(run.get("haul") or _new_haul())
-                record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
+                record["last_dungeon_haul"] = {
+                    **final, "floor": floor, "won": False, "fight_id": fight_id_,
+                }
                 record["dungeon_run"] = None
                 _save(entry, data)
                 return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", {"encounter": row, "result": result, "hero": hero, "enemy": enemy, "run_over": True, "haul": {"total": final}}
@@ -5316,10 +5329,21 @@ def dungeon_shop(entry: str, user_id) -> list[dict]:
         used = max(0, int(run.get(item["used_key"], 0) or 0))
         left = None if item["uses"] is None else max(0, item["uses"] - used)
         purse = rubies if item["currency"] == "ruby" else coins
+        # A row that is already WORKING is not a row to sell. The totem can arrive two
+        # ways -- bought here, or granted for the whole run by the painted figurine -- and
+        # a shelf that offers it for sale to somebody already carrying one is offering a
+        # purchase the buy handler would refuse anyway. `held` and `spent` say which of
+        # the three states this row is in; nothing else about the shelf changes.
+        held = spent = False
+        if item.get("effect") == "resurrect":
+            held = bool(run.get("phoenix_totem")) and not bool(run.get("phoenix_totem_used"))
+            spent = bool(run.get("phoenix_totem_used"))
         rows.append({
             **item,
             "left": left,
             "sold_out": left == 0,
+            "held": held,
+            "spent": spent,
             "affordable": purse >= item["price"],
         })
     return rows
@@ -5678,7 +5702,7 @@ def _phoenix_settle(entry: str, user_id, won: bool, state: dict) -> tuple[bool, 
         if not won:
             if _dungeon_resurrect(run):
                 _save(entry, data)
-                return True, "🔥 Тотем Феникса воскресил тебя. Попробуй бой снова.", pets_phoenix.public(state)
+                return True, PHOENIX_TOTEM_NOTICE, pets_phoenix.public(state)
             final = dict(run.get("haul") or _new_haul())
             record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
             record["dungeon_run"] = None
@@ -6091,7 +6115,7 @@ def _gatekeeper_settle(entry: str, user_id, won: bool,
         if not won:
             if _dungeon_resurrect(run):
                 _save(entry, data)
-                return True, "🔥 Тотем Феникса воскресил тебя. Попробуй бой снова.", \
+                return True, PHOENIX_TOTEM_NOTICE, \
                     pets_gatekeeper.public(state)
             final = dict(run.get("haul") or _new_haul())
             record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
@@ -6577,7 +6601,7 @@ def dungeon_chest_fight(entry: str, user_id) -> tuple[bool, str, dict | None]:
         if result.winner != str(user_id) or run["hp"] <= 0:
             if _dungeon_resurrect(run):
                 _save(entry, data)
-                return True, "🔥 Тотем Феникса воскресил тебя. Попробуй снова.", {
+                return True, PHOENIX_TOTEM_NOTICE, {
                     "encounter": row, "result": result, "hero": hero, "enemy": enemy,
                     "resurrected": True,
                 }

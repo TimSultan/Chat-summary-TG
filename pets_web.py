@@ -1661,6 +1661,11 @@ async def handle_action(request: web.Request) -> web.Response:
         response["gatekeeper"] = extra
     if action_name == "achievements_open" and isinstance(extra, dict):
         response["achievements"] = extra
+    # A revival is not a line of the fight log. It is the reason the player still has a
+    # run, and it gets a block of its own rather than a sentence sharing a toast with
+    # whatever the corridor did next.
+    if isinstance(extra, dict) and extra.get("resurrected"):
+        response["resurrected"] = True
     if str(body.get("action") or "") in ("dungeon_fight", "dungeon_chest") \
             and isinstance(extra, dict):
       result, hero, enemy = extra.get("result"), extra.get("hero"), extra.get("enemy")
@@ -1673,7 +1678,15 @@ async def handle_action(request: web.Request) -> web.Response:
       # Bosses and mimics both get the replay. A corridor mob deliberately does not --
       # a pack floor is ten kills and ten playbacks would bury the run -- but a mimic
       # happens once in a while and is the fight a player actually chose to take.
-      watchable = encounter.get("boss") or encounter.get("gimmick") == "mimic"
+      #
+      # And the fight that ENDS a run always gets one, whatever killed you. That is the
+      # one exchange a player wants to see again and the only one they cannot: the run is
+      # gone, the floor is gone, and "what actually happened there" has nowhere to be
+      # asked. It is offered as a button rather than played automatically -- the screen
+      # underneath is the death screen and the haul, and burying those under a two-minute
+      # animation answers a question nobody asked yet.
+      run_over = bool(extra.get("run_over"))
+      watchable = encounter.get("boss") or encounter.get("gimmick") == "mimic" or run_over
       if watchable and result is not None and hero is not None and enemy is not None:
         dropped = extra.get("dropped") or {}
         # A chest hands back a list; the replay card has room for one item, so it shows
@@ -1690,6 +1703,7 @@ async def handle_action(request: web.Request) -> web.Response:
               )},
           ),
           "dungeon": True, "enemy_art": {"boss": bool(encounter.get("boss"))},
+          "on_demand": run_over,
           "reward": extra.get("reward") or {},
           "dropped": _item_payload(dropped_item, request.app[_PREFIX_KEY], pets.get_pet(entry, user["id"])) if dropped_item else None,
         }
@@ -4396,6 +4410,13 @@ PAGE_HTML = """<!doctype html>
   .statline { color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: .2px; }
   .dungeon-stock { text-align: left; margin-bottom: 6px; }
   .dungeon-stock small { display: block; opacity: .75; font-weight: 400; }
+  /* A row that is working rather than for sale. Deliberately not a disabled button:
+     disabled reads as "you cannot have this", and the whole point is that you do. */
+  .dungeon-stock.held { padding: 9px 11px; border-radius: 12px; font-weight: 600;
+    border: 1px solid rgba(255,150,60,.45); background: rgba(255,150,60,.10); }
+  .dungeon-stock.held.spent { border-color: var(--line); background: transparent; opacity: .6; }
+  .totem-fired { margin: 0 0 10px; padding: 11px; border-radius: 12px;
+    border: 1px solid rgba(255,150,60,.55); background: rgba(255,150,60,.12); }
   .bosspick { text-align: left; margin-bottom: 8px; }
   .bosspick.on { outline: 2px solid var(--gold); outline-offset: -2px; }
   .rune-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
@@ -5656,6 +5677,9 @@ async function ensureBag() {
 
 async function act(action, payload) {
   try {
+    // The totem block belongs to the action that fired it and to no later one. Cleared
+    // here rather than after drawing, because render() runs more than once per action.
+    TOTEM_FIRED = false;
     const data = await api("/api/action",
       Object.assign({ action, view: TAB }, payload || {}));
     S = data.state;
@@ -5684,7 +5708,16 @@ async function act(action, payload) {
     // boss too -- it used to be honoured for mobs only, which left the player who asked
     // for speed sitting through the longest animation in the game. The transcript is not
     // lost: the reward line is toasted above and the fight stays in Историю боёв.
-    if (data.battle && !(S.pet && S.pet.skip_pve_replays)) playDuel(data.battle);
+    if (data.battle) {
+      if (data.battle.on_demand) {
+        // The run is over. The transcript is held for the button on the death screen and
+        // deliberately not played over the top of it -- see the server side for why.
+        DEATH_REPLAY = data.battle;
+      } else if (!(S.pet && S.pet.skip_pve_replays)) {
+        playDuel(data.battle);
+      }
+    }
+    if (data.resurrected) TOTEM_FIRED = true;
     return data.ok;
   } catch (e) {
     haptic("no");
@@ -6048,6 +6081,17 @@ function dungeonShop(dungeon) {
   const stock = dungeon.shop || [];
   if (!stock.length || !dungeon.can_rest) return "";
   const rows = stock.map((item) => {
+    // Already carrying it, or already used it: neither is something to sell. A price tag
+    // on a totem the run is holding is an offer the buy handler would refuse anyway, and
+    // the player cannot tell from it whether they are protected.
+    if (item.held) {
+      return '<div class="dungeon-stock held"><b>' + esc(item.icon) + " " + esc(item.name) +
+        " · активен</b><small>Сработает один раз, когда здоровье кончится.</small></div>";
+    }
+    if (item.spent) {
+      return '<div class="dungeon-stock held spent"><b>' + esc(item.icon) + " " + esc(item.name) +
+        " · уже сработал</b><small>В этом забеге больше не воскресит.</small></div>";
+    }
     const coin = item.currency === "ruby" ? "💎" : "🪙";
     const ration = item.left === null || item.left === undefined ? "" : " · осталось " + item.left;
     const blocked = item.sold_out || !item.affordable;
@@ -6214,6 +6258,27 @@ function dungeonChestCard(chest) {
 // What the last descent was worth, on the screen a finished run lands on. Dying with full
 // pockets is the best thing that happens down there and it used to be reported as nothing
 // at all.
+// The last fight of the last run, kept in memory for the death screen's own button.
+// It is not persisted: a replay is worth offering while the player is still looking at
+// the screen that made them ask, and a transcript is far too big to carry in the record
+// of every run anybody has ever died on.
+let DEATH_REPLAY = null;
+// Set by a response that says the totem fired, cleared when the block has been drawn.
+let TOTEM_FIRED = false;
+
+function deathReplayButton() {
+  if (!DEATH_REPLAY) return "";
+  return '<button class="go sec" data-deathreplay="1" style="margin:0 0 10px">' +
+    "▶ Посмотреть бой</button>";
+}
+
+function totemBlock() {
+  if (!TOTEM_FIRED) return "";
+  return '<div class="panel totem-fired"><b>🔥 Тотем Феникса сгорел</b>' +
+    '<div class="small" style="margin-top:5px">Он поднял тебя на ноги и рассыпался. ' +
+    "Второй раз в этом забеге он не сработает.</div></div>";
+}
+
 function dungeonReceipt(haul) {
   if (!haul) return "";
   const bits = [];
@@ -6404,7 +6469,7 @@ function dungeonPanel() {
     const eligible = Number(dungeon.power || 0) >= Number(dungeon.min_power || 1000);
     const ticket = Number(dungeon.tickets || 0);
     const entryLabel = ticket ? '⚔️ Войти · билет (' + ticket + ')' : '⚔️ Войти · ' + dungeon.entry_cost + ' 💎';
-    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body">' + dungeonReceipt(dungeon.last_haul) + '<p class="small muted" style="margin:0 0 10px">Состав этажей меняется. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button></div></div>';
+    return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье<small>Ниже этаж - опаснее добыча</small></div><div class="dungeon-stat">⚡ ' + money(dungeon.power) + ' / ' + money(dungeon.min_power) + '</div></div><div class="dungeon-body">' + deathReplayButton() + dungeonReceipt(dungeon.last_haul) + '<p class="small muted" style="margin:0 0 10px">Состав этажей меняется. Здоровье не восстанавливается после боя; отдых доступен после зачистки.</p><button class="go" data-dungeon="enter"' + (eligible ? '' : ' disabled') + '>' + entryLabel + '</button></div></div>';
   }
   const boss = dungeon.encounters && dungeon.encounters[0] && dungeon.encounters[0].boss;
   const revived = new Set(dungeon.revived || []);
@@ -6427,7 +6492,7 @@ function dungeonPanel() {
       Number(dungeon.healers_alive) + '. Пока они стоят, павшие поднимаются снова — и с ' +
       'поднятых уже ничего не падает.</p>'
     : '';
-  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body"><p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="dungeon-actions">' + descendButton(dungeon) + '</div>' + dungeonShop(dungeon) : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
+  return '<div class="panel dungeon"><div class="dungeon-head' + (boss ? ' boss' : '') + '"><div class="dungeon-title">' + esc(dungeon.theme) + '<small>Этаж ' + dungeon.floor + (boss ? ' · БОСС' : '') + '</small></div><div class="dungeon-stat">❤️ ' + dungeon.hp + ' / ' + dungeon.max_hp + '</div></div>' + dungeonHpBar(dungeon) + '<div class="dungeon-body">' + totemBlock() + '<p class="small muted" style="margin:0 0 10px">' + esc(dungeon.description || '') + '</p>' + dungeonChestCard(dungeon.chest) + healerNote + '<div class="dungeon-enemies">' + enemies + '</div>' + (dungeon.can_rest ? '<div class="dungeon-actions">' + descendButton(dungeon) + '</div>' + dungeonShop(dungeon) : '') + '<div class="dungeon-exit"><button class="go warn quit" data-dungeon="quit">🚪 Выйти</button></div></div></div>';
 }
 
 function renderOnboarding() {
@@ -9888,7 +9953,7 @@ $("hudCreate").addEventListener("click", () => {
 const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-elementset]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
-    "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay]," +
+    "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
     "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
@@ -10049,6 +10114,9 @@ async function handleClick(event, target) {
   if (d.more === "fightaudit") { window.location.href = "/audit"; return; }
   if (d.more) { moreView = d.more; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
+  // The death screen's own button. It plays the transcript already in hand rather than
+  // asking the server for one, and it ignores «Пропускать бои»: pressing it IS the ask.
+  if (d.deathreplay) { haptic(); if (DEATH_REPLAY) playDuel(DEATH_REPLAY); return; }
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "next") { nextMob(); return; }
   if (d.mobfight !== undefined) { haptic(); await fightMob(Number(d.mobfight)); return; }

@@ -199,6 +199,12 @@ DUNGEON_CLEARED_NOTICE: Final = (
 # literal repeated in four files is a rule nobody can change.
 BOSS_EVERY: Final = 5
 
+# One revival, for the price of three field hospitals. It is deliberately not cheap
+# relative to the heals it sits next to -- a heal is health back, this is the run itself
+# -- and deliberately not so dear that carrying one is a special occasion, because the
+# thing it protects against is the exchange nobody saw coming.
+PHOENIX_TOTEM_RUBIES: Final = 10
+
 
 # --------------------------------------------------------------------- лавка подземелья
 #
@@ -231,7 +237,7 @@ SHOP_STOCK: Final = (
     _stock("phoenix_totem", "🔥", "Тотем Феникса",
            "Один раз воскрешает в текущем забеге. Покрась фигурку Феникса в квестах, "
            "чтобы получать этот тотем навсегда.",
-           "ruby", 15, uses=1, effect="resurrect"),
+           "ruby", PHOENIX_TOTEM_RUBIES, uses=1, effect="resurrect"),
 )
 
 # Both rows keep the keys the old rest counters used, so a run already in progress when

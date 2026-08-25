@@ -920,10 +920,17 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("const DUEL_ROUND_MS = 300;", page)
         self.assertNotIn(": 520);", page)
         # One preference about watching replays, honoured for the dungeon boss too.
-        self.assertIn(
-            "if (data.battle && !(S.pet && S.pet.skip_pve_replays)) playDuel(data.battle);",
-            page,
-        )
+        self.assertIn("} else if (!(S.pet && S.pet.skip_pve_replays)) {", page)
+        self.assertIn("playDuel(data.battle);", page)
+        # The fight that ENDED the run is the exception, and deliberately so: it is held
+        # for the death screen's own button rather than played over the top of the haul.
+        self.assertIn("if (data.battle.on_demand) {", page)
+        self.assertIn("DEATH_REPLAY = data.battle;", page)
+        self.assertIn('data-deathreplay="1"', page)
+        self.assertIn("[data-deathreplay],", page)
+        self.assertIn("if (d.deathreplay)", page)
+        # Above the haul, which is where it was asked for.
+        self.assertIn("deathReplayButton() + dungeonReceipt(dungeon.last_haul)", page)
         self.assertIn("data.pve || data.dungeon ?", page)
 
     async def test_the_overview_screen_is_wired_into_the_page(self):

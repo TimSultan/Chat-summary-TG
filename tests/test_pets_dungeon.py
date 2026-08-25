@@ -17,12 +17,80 @@ import pets_ui
 
 
 class DungeonTests(unittest.TestCase):
-    def test_phoenix_totem_is_sold_for_fifteen_diamonds(self):
+    def test_phoenix_totem_is_sold_for_ten_diamonds(self):
         item = dungeon.shop_item("phoenix_totem")
-        self.assertEqual(item["price"], 15)
+        self.assertEqual(item["price"], dungeon.PHOENIX_TOTEM_RUBIES)
+        self.assertEqual(item["price"], 10)
         self.assertEqual(item["currency"], "ruby")
         self.assertEqual(item["effect"], "resurrect")
         self.assertIn("навсегда", item["description"])
+        # Three field hospitals. A heal is health back; this is the run itself.
+        self.assertGreater(item["price"], dungeon.SHOP_FULL_HEAL_RUBIES)
+
+    def test_the_shelf_stops_selling_a_totem_the_run_already_carries(self):
+        """A price tag on something you are holding tells you nothing about whether it is on.
+
+        The totem arrives two ways -- bought here, or granted for the whole run by the
+        painted Phoenix figurine -- and `dungeon_buy` refuses the second purchase either
+        way. A shelf that still offers it is advertising a refusal.
+        """
+        data = pets._load(self.entry)
+        run = {"floor": 1, "hp": 10, "max_hp": 10, "cleared": [0, 1]}
+        data["pets"][self.user_id]["dungeon_run"] = run
+        pets._save(self.entry, data)
+
+        def totem():
+            return next(row for row in pets.dungeon_shop(self.entry, self.user_id)
+                        if row["code"] == "phoenix_totem")
+
+        self.assertFalse(totem()["held"])
+        self.assertFalse(totem()["spent"])
+
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["phoenix_totem"] = True
+        pets._save(self.entry, data)
+        self.assertTrue(totem()["held"])
+        self.assertFalse(totem()["spent"])
+
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["phoenix_totem_used"] = True
+        pets._save(self.entry, data)
+        self.assertFalse(totem()["held"])
+        self.assertTrue(totem()["spent"])
+
+        # Both clients say so instead of quoting a price.
+        text, _keys = pets_ui.dungeon_shop_view(self.entry, self.user_id, 0)
+        self.assertIn("уже сработал", text)
+        self.assertNotIn(f"💎 {dungeon.PHOENIX_TOTEM_RUBIES}", text)
+
+    def test_the_fight_that_ends_a_run_keeps_its_transcript_id(self):
+        """The last exchange is the one a player wants to see again and cannot.
+
+        The run is gone, the floor is gone, and "what actually happened there" has nowhere
+        left to be asked. The audit id of the fatal fight rides the receipt so the death
+        screen can offer a replay of it.
+        """
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["dungeon_run"] = {"floor": 1, "hp": 1, "max_hp": 400, "cleared": []}
+        for key in ("strength", "health", "agility", "luck"):
+            record["stats"][key] = 1
+        record["level"] = 1
+        pets._save(self.entry, data)
+
+        for _ in range(40):
+            ok, _note, _extra = pets.dungeon_fight(self.entry, self.user_id, 0)
+            haul = pets.get_pet(self.entry, self.user_id).get("last_dungeon_haul")
+            if isinstance(haul, dict) and haul.get("won") is False:
+                break
+        else:
+            self.skipTest("этот герой почему-то не умер за сорок попыток")
+
+        self.assertTrue(haul.get("fight_id"), haul)
+        # And the id is a real one: the transcript is on disk to be replayed from.
+        self.assertIsNotNone(
+            pets.find_fight_audit(self.entry, str(haul["fight_id"])), haul["fight_id"],
+        )
 
     def test_final_hp_carries_combat_healing_back_into_the_dungeon(self):
         result = SimpleNamespace(final_hp={self.user_id: 375}, rounds=())
