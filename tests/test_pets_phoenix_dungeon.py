@@ -199,6 +199,45 @@ class PhoenixDungeonTests(unittest.TestCase):
         self.assertTrue(run["phoenix_totem"])
         self.assertFalse(run.get("phoenix_totem_used"))
 
+    def test_the_fight_spends_the_run_bar_and_never_a_pool_of_its_own(self):
+        """One creature, one health bar, on both halves of the screen.
+
+        `pets_combat.derive` sizes max_hp against the opponent, so the pool this boss
+        would otherwise get is not the pool the run was opened with -- for a strong pet it
+        is the LARGER of the two. Writing that back left the run bar pinned at 100% for
+        the whole fight however hard the boss hit, which is what a player sees as the
+        health bar being broken.
+        """
+        data = pets._load(CHAT)
+        run = data["pets"][str(USER)]["dungeon_run"]
+        # A pool the run actually owns, and a hero standing in it at a third of it.
+        hero = pets._dungeon_fighter(data["pets"][str(USER)], str(USER))
+        run["max_hp"] = round(pets.pets_combat.derive(hero, hero)["max_hp"])
+        run["hp"] = round(run["max_hp"] * 0.30)
+        pets._save(CHAT, data)
+        wounded = run["hp"]
+
+        _ok, _note, state = pets.phoenix_start(CHAT, USER)
+
+        # Same ceiling as the run, and standing where the run left them -- not healed up.
+        self.assertEqual(state["hero_max_hp"], run["max_hp"])
+        self.assertEqual(state["hero_hp"], wounded)
+
+        # And every turn writes back on that same scale, so the bar can be read.
+        for _ in range(4):
+            if state.get("over"):
+                break
+            moves = [row["code"] for row in state.get("actions") or [] if row.get("code")]
+            if not moves:
+                break
+            _ok, _note, state = pets.phoenix_action(CHAT, USER, moves[0])
+            live = pets.get_pet(CHAT, USER).get("dungeon_run")
+            if not live or not state:
+                break
+            self.assertLessEqual(live["hp"], live["max_hp"])
+            self.assertEqual(live["hp"], state["hero_hp"])
+            self.assertEqual(live["max_hp"], state["hero_max_hp"])
+
     def test_a_loss_ends_the_run_the_way_every_other_defeat_does(self):
         state = self._play_to_the_end(win=False)
         self.assertFalse(state["won"], state)

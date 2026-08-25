@@ -681,8 +681,13 @@ def start(hero: dict, boss: dict, *, seed: int | None = None) -> dict:
         "hero": hero_numbers,
         "boss": boss_numbers,
         # Duplicated at the top level because the dungeon run reads the hero's health
-        # straight off the saved state when the fight ends.
-        "hero_hp": hero_numbers["max_hp"],
+        # straight off the saved state when the fight ends. It starts at whatever health
+        # the caller carried in -- the Phoenix stands on floor five of a descent, not at
+        # the start of one, and opening it at full was handing back every point the four
+        # floors above had cost.
+        "hero_hp": max(1, min(hero_numbers["max_hp"],
+                              int(hero.get("hp", hero_numbers["max_hp"]) or 0)
+                              or hero_numbers["max_hp"])),
         "hero_max_hp": hero_numbers["max_hp"],
         "phase": 1,
         "phase_state": INTRO,

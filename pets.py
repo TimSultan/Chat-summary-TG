@@ -5545,6 +5545,38 @@ def phoenix_hero_profile(record: dict, row: dict) -> dict:
     }
 
 
+def _pin_hero_pool_to_run(hero: dict, run: dict) -> dict:
+    """Make a hand-fought boss spend the RUN's health bar rather than one of its own.
+
+    `pets_combat.derive` sizes max_hp against the opponent, because out-statting someone
+    is part of what makes you hard to kill -- so the pool it returns for the Phoenix is
+    not the pool the run was opened with (`derive(hero, hero)`, no lead either way). For
+    a simulated mob that difference stays inside one call and nobody sees it. These two
+    bosses are fought a button at a time with the run's own bar on screen throughout, so
+    two pools means the screen shows two different healths for one creature: the fight
+    printing 20 468 / 20 468 above a run bar pinned full at 15 860, unmoving however hard
+    the boss hit, because the number written back was on the wrong scale.
+
+    The stat lead still does everything else it does here -- damage, crit, the boss's own
+    numbers. Only the health bar is the run's, because the run is what it belongs to.
+    """
+    max_hp = max(1, int(run.get("max_hp", 0) or 0) or int(hero.get("max_hp", 1) or 1))
+    hero["max_hp"] = max_hp
+    hero["hp"] = max(1, min(max_hp, int(run.get("hp", max_hp) or 1)))
+    return hero
+
+
+def _run_hp_after_boss_turn(run: dict, state: dict) -> int:
+    """The health one interactive turn leaves the run with.
+
+    Clamped to the run's own ceiling rather than trusted outright: a fight already saved
+    when this shipped still carries the old, differently-sized pool, and a bar that reads
+    over 100% is exactly the bug this replaced.
+    """
+    ceiling = max(1, int(run.get("max_hp", 1) or 1))
+    return max(0, min(ceiling, int(state.get("hero_hp", run.get("hp", 0)) or 0)))
+
+
 def phoenix_boss_profile(row: dict, hero: "pets_combat.Fighter | None" = None) -> dict:
     """The Phoenix's own numbers, straight off its floor. Never scaled to the hero."""
     enemy = dungeon_enemy_fighter(row)
@@ -5646,8 +5678,9 @@ def phoenix_start(entry: str, user_id) -> tuple[bool, str, dict | None]:
             # the mistakes already made.
             return True, "", pets_phoenix.public(existing)
         hero = phoenix_hero_profile(record, row)
-        # The run's own health carries in, like every other dungeon fight.
-        hero["hp"] = max(1, min(hero["max_hp"], int(run.get("hp", hero["max_hp"]) or 1)))
+        # The run's own health carries in, like every other dungeon fight -- and it is the
+        # run's bar that is being spent, so the ceiling comes from there too.
+        _pin_hero_pool_to_run(hero, run)
         state = pets_phoenix.start(hero, phoenix_boss_profile(row), seed=secrets.randbits(63))
         run["phoenix"] = state
         _save(entry, data)
@@ -5676,7 +5709,7 @@ def phoenix_action(entry: str, user_id, action: str) -> tuple[bool, str, dict | 
         except ValueError as error:
             return False, str(error), pets_phoenix.public(run["phoenix"])
         run["phoenix"] = state
-        run["hp"] = max(0, int(state.get("hero_hp", run.get("hp", 0)) or 0))
+        run["hp"] = _run_hp_after_boss_turn(run, state)
         _save(entry, data)
         if not pets_phoenix.is_over(state):
             return True, "", pets_phoenix.public(state)
@@ -5707,7 +5740,7 @@ def phoenix_auto(entry: str, user_id) -> tuple[bool, str, dict | None]:
             return False, "Бой с Фениксом не найден.", state
         finished = pets_phoenix.autoplay(live, seed=secrets.randbits(63))
         run["phoenix"] = finished
-        run["hp"] = max(0, int(finished.get("hero_hp", run.get("hp", 0)) or 0))
+        run["hp"] = _run_hp_after_boss_turn(run, finished)
         _save(entry, data)
     return _phoenix_settle(
         entry, user_id,
@@ -6094,7 +6127,7 @@ def gatekeeper_start(entry: str, user_id) -> tuple[bool, str, dict | None]:
         shield = _combat_shield_for(record)
         hero["guard"] = max(.10, min(.85, float(shield.get("guard", .40) or .40))) \
             if shield else .10
-        hero["hp"] = max(1, min(hero["max_hp"], int(run.get("hp", hero["max_hp"]) or 1)))
+        _pin_hero_pool_to_run(hero, run)
         state = pets_gatekeeper.start(
             hero, phoenix_boss_profile(row), seed=secrets.randbits(63),
         )
@@ -6119,7 +6152,7 @@ def gatekeeper_action(entry: str, user_id, action: str) -> tuple[bool, str, dict
         except ValueError as error:
             return False, str(error), pets_gatekeeper.public(run["gatekeeper"])
         run["gatekeeper"] = state
-        run["hp"] = max(0, int(state.get("hero_hp", run.get("hp", 0)) or 0))
+        run["hp"] = _run_hp_after_boss_turn(run, state)
         _save(entry, data)
         if not pets_gatekeeper.is_over(state):
             return True, "", pets_gatekeeper.public(state)
