@@ -136,6 +136,97 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertTrue(pets.buy_cage(CHAT, USER, RICH_XP)[0])
         self.assertTrue(pets.tame(CHAT, USER, RICH_XP, "Пеструшка", "f", "Хозяин")[0])
 
+    def _ticket_payers(self):
+        return [row for row in pets.ACHIEVEMENTS.catalogue() if row.farm_tickets]
+
+    def _unlock(self, rows, *, claimed=False):
+        data = pets._load(CHAT)
+        row = pets._achievement_row(data["pets"][str(USER)])
+        row["unlocked"] = sorted(item.code for item in rows)
+        row["claimed"] = sorted(item.code for item in rows) if claimed else []
+        pets._save(CHAT, data)
+
+    def test_a_ticket_achievement_pays_the_meadow_as_well_as_the_farm(self):
+        """Two tickets, two wallets, and the screen has always promised the meadow one.
+
+        🎟 skips a farm shift; 🎫 digs the Поляна. Every achievement screen printed the
+        farm reward with the meadow's 🎫, so players claimed, read "🎫 5", walked to the
+        Поляна and found nothing there -- no achievement had ever credited that wallet.
+        What was shown is what is owed, so the reward now pays both.
+        """
+        payers = self._ticket_payers()
+        owed = sum(item.farm_tickets for item in payers)
+        self.assertGreater(owed, 0)
+        self._unlock(payers)
+
+        ok, message, paid = pets.claim_achievements(CHAT, USER)
+
+        self.assertTrue(ok)
+        self.assertEqual(paid["farm_tickets"], owed)
+        self.assertEqual(paid["meadow_tickets"], owed)
+        self.assertEqual(pets.farm_tickets(CHAT, USER), owed)
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), owed)
+        self.assertIn("на поляну", message)
+
+    def test_one_claimed_achievement_pays_the_meadow_too(self):
+        """The per-row button is the one most players actually press."""
+        item = next(row for row in self._ticket_payers())
+        self._unlock([item])
+
+        ok, _message, paid = pets.claim_achievement(CHAT, USER, item.code)
+
+        self.assertTrue(ok)
+        self.assertEqual(paid["meadow_tickets"], item.farm_tickets)
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), item.farm_tickets)
+
+    def test_everybody_who_claimed_before_gets_the_meadow_half_owed_to_them(self):
+        """The repair runs off the player's own next visit, not off a migration.
+
+        No deploy window, nothing that can half-finish over thousands of rows, and a
+        member who has not played since is paid the moment they come back.
+        """
+        payers = self._ticket_payers()
+        owed = sum(item.farm_tickets for item in payers)
+        self._unlock(payers, claimed=True)
+        # What the old code left behind: the farm wallet paid, the meadow one empty.
+        data = pets._load(CHAT)
+        pets._ticket_row(data, USER)["count"] = owed
+        pets._save(CHAT, data)
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), 0)
+
+        credited = pets._repair_achievement_meadow_tickets(CHAT, USER)
+
+        self.assertEqual(credited, owed)
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), owed)
+        # And nothing was taken back to pay for it.
+        self.assertEqual(pets.farm_tickets(CHAT, USER), owed)
+
+    def test_the_repair_never_pays_the_same_player_twice(self):
+        payers = self._ticket_payers()
+        self._unlock(payers, claimed=True)
+        pets._repair_achievement_meadow_tickets(CHAT, USER)
+        settled = pets.meadow_tickets(CHAT, USER)
+
+        for _ in range(3):
+            self.assertEqual(pets._repair_achievement_meadow_tickets(CHAT, USER), 0)
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), settled)
+
+    def test_the_repair_owes_nothing_to_somebody_who_never_claimed(self):
+        self._unlock(self._ticket_payers())  # earned, not claimed
+
+        self.assertEqual(pets._repair_achievement_meadow_tickets(CHAT, USER), 0)
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), 0)
+
+    def test_opening_the_screen_is_enough_to_be_paid_what_is_owed(self):
+        """The player does nothing but look, because they were never told to ask."""
+        payers = self._ticket_payers()
+        owed = sum(item.farm_tickets for item in payers)
+        self._unlock(payers, claimed=True)
+
+        pets.achievements_view(CHAT, USER)
+
+        self.assertEqual(pets.meadow_tickets(CHAT, USER), owed)
+
     def test_a_brand_new_pet_has_earned_nothing_at_all(self):
         """The feature must not ship pre-completed.
 
