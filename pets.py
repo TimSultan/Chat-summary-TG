@@ -85,14 +85,13 @@ DUNGEON_TICKET_CAP_FLAG = "dungeon_ticket_cap_10_20260825"
 RUBY_GIFT_FLAG = "ruby_gift_20260817"
 # Reads as "grants" in the income audit (see ruby_source_of), which is what it is.
 RUBY_GIFT_REASON = "grant:update_gift_20260817"
-# Зеркало души. Named here rather than looked up by effect code because two call sites
-# need the ITEM (equip it, check it is owned) and only combat needs the effect.
+# Legacy temporary-loadout identifiers remain so old interrupted fights can be repaired
+# on load. New fights never equip either item automatically.
 MIRROR_AMULET_CODE = "amulet_soul_mirror"
 # `mirror_restore` legitimately holds None (the slot was empty when the mirror went on),
 # so "absent" and "None" have to be told apart when recovering a stranded swap.
 _MISSING = object()
-# PVE counterparts to the mirror: when owned, they are temporarily worn for a mob fight
-# and the player's normal loadout is restored immediately afterwards.
+# Old PVE swaps used these exact slot/code pairs; they are migration data now.
 MOB_GEAR_CODES = {"weapon": "w009", "amulet": "amulet_mob_ward"}
 
 _NAME_MAX_LEN = 24
@@ -543,6 +542,20 @@ def _load(entry: str) -> dict:
                 # A historic equipped object is still owned; preserve it rather than
                 # stripping it as a side effect of a duplicate-data migration.
                 normalised_inventory.append(code)
+        # Older fight code could temporarily replace the player's chosen loadout and
+        # leave a restore marker behind if the fight was interrupted. Automatic gear
+        # changes are retired; repair any such stranded swap while loading the record.
+        previous_amulet = record.pop("mirror_restore", _MISSING)
+        if previous_amulet is not _MISSING and equipped.get("amulet") == MIRROR_AMULET_CODE:
+            equipped["amulet"] = (
+                previous_amulet if previous_amulet in normalised_inventory else None
+            )
+        mob_restore = record.pop("mob_gear_restore", None)
+        if isinstance(mob_restore, dict):
+            for slot, previous in mob_restore.items():
+                auto_code = MOB_GEAR_CODES.get(slot)
+                if auto_code and equipped.get(slot) == auto_code:
+                    equipped[slot] = previous if previous in normalised_inventory else None
         # Discovery is permanent: selling or gifting something should not erase it
         # from the collection book.  Older saves had no such field, so their current
         # bag and worn equipment are the complete historic collection we can infer.
@@ -1582,9 +1595,6 @@ def grant_starter_weapons(entries) -> int:
             gift = random.Random(f"{entry}:{user_id}:starter-weapon").choice(pool)
             owned.append(gift.code)
             _discover(record, gift.code)
-            # Their weapon slot is empty by definition, so there is nothing to compare
-            # against and nothing to displace.
-            record.setdefault("equipped", {})["weapon"] = gift.code
             granted += 1
         data[STARTER_WEAPON_GIFT_FLAG] = True
         _save(entry, data)
@@ -3544,11 +3554,6 @@ def settle_completed_farms(entry, now: datetime | None = None) -> list[dict]:
             if item is not None and item.code not in record.setdefault("inventory", []):
                 record["inventory"].append(item.code)
                 _discover(record, item.code)
-                equipped = record.setdefault("equipped", {})
-                current = C.find_item(equipped.get(item.slot))
-                if current is None or C.equipment_score(item) > C.equipment_score(current):
-                    equipped[item.slot] = item.code
-                    auto_equipped = True
                 _metric_add(data, "drops_by_rarity", rarity=item.rarity)
             else:
                 item_code = None
@@ -4748,6 +4753,15 @@ def dungeon_status(entry: str, user_id) -> dict:
             for row in dungeon_shop(entry, user_id)
         ],
         "boss_lives": int(run.get("boss_lives", 0) or 0),
+        # A manual Phoenix fight survives refreshes and reopened tabs. The action response
+        # also carries this row directly for an immediate redraw, while this copy is the
+        # durable fallback used by the ordinary state payload.
+        "phoenix": (
+            pets_phoenix.public(run["phoenix"])
+            if isinstance(run.get("phoenix"), dict)
+            and not pets_phoenix.is_over(run["phoenix"])
+            else None
+        ),
         "gold_multiplier": C.hero_gold_multiplier(hero_level, "dungeon"),
         "chest": _chest_payload(run.get("chest")),
     })
@@ -5041,7 +5055,14 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
                  "boss": bool(row.get("boss")), "gimmick": row.get("gimmick")},
             ))
             player_hp = _hp_after_fight(result, str(user_id))
-            run["hp"] = min(max(0, int(run.get("hp", 0))), max(0, int(player_hp)))
+            # Carry the combat engine's actual final health, including scrolls, bites,
+            # regeneration and other healing. The old min(previous, final) preserved
+            # damage but deliberately erased every point healed during the fight, which
+            # made a flawless victory at low HP look as if no healing ability had fired.
+            run["hp"] = min(
+                max(1, int(run.get("max_hp", 1) or 1)),
+                max(0, int(player_hp)),
+            )
             if row["gimmick"] == "three_heads":
                 final_hp = (result.final_hp or {}).get(enemy.key, max(0, int(hydra_head_hp[head_index])))
                 hydra_head_hp[head_index] = min(head_max_hp, max(0, int(final_hp)))
@@ -5817,7 +5838,7 @@ def achievements_summary(entry: str, user_id) -> dict:
     refresh_achievements(entry, user_id, include_chat=False)
     record = _tamed_record(_load(entry), user_id)
     if record is None:
-        return {"earned": 0, "total": 0, "claimable": {
+        return {"earned": 0, "total": 0, "featured": [], "claimable": {
             "count": 0, "rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0,
         }}
     row = _achievement_row(record)
@@ -5828,6 +5849,12 @@ def achievements_summary(entry: str, user_id) -> dict:
         "earned": len(unlocked),
         "total": sum(1 for item in ACHIEVEMENTS.catalogue()
                      if not item.hidden or item.code in unlocked),
+        # Enough detail for the hero screen to expose rewards immediately without the
+        # expensive full history scan. The expandable catalogue remains lazy.
+        "featured": [
+            {**item.payload(), "earned": True, "claimed": False}
+            for item in pending[:3]
+        ],
         "claimable": {
             "count": len(pending),
             "rubies": sum(item.rubies for item in pending),
@@ -7156,53 +7183,12 @@ def can_attack_in_arena(entry, attacker_id, defender_id, day: date | None = None
 
 
 def auto_equip_mirror(entry, attacker_id, defender_id) -> str | None:
-    """Put Зеркало души on before punching a long way down. Returns the code if it went on.
-
-    Commissioned as automatic, and it has to be: the whole item exists so a strong pet can
-    fight a weak one fairly, and an amulet you must remember to swap in beforehand would
-    be worn by the people who least need reminding. Anybody who owns it and attacks
-    somebody MIRROR_LEVEL_GAP or more levels below gets it equipped for them.
-
-    Whatever was in the amulet slot is remembered on the record and put back by
-    `restore_after_mirror` once the fight is recorded -- an automatic swap that silently
-    kept the player's real amulet off would be a bug that only shows up as lost fights
-    later. Nothing happens at all for a player who does not own the mirror.
-    """
-    with _farm_settlement_lock:
-        data = _load(entry)
-        attacker = _tamed_record(data, attacker_id)
-        defender = _tamed_record(data, defender_id)
-        if attacker is None or defender is None:
-            return None
-        gap = int(defender.get("level", 1) or 1) - int(attacker.get("level", 1) or 1)
-        if gap > -C.MIRROR_LEVEL_GAP:
-            return None
-        if MIRROR_AMULET_CODE not in attacker.get("inventory", []):
-            return None
-        equipped = attacker.setdefault("equipped", {})
-        if equipped.get("amulet") == MIRROR_AMULET_CODE:
-            # Already wearing it. If a restore slip is ALSO still on the record, this is
-            # not a deliberate choice -- it is a fight that died between the swap and the
-            # swap back, and the real amulet has been stranded ever since. Nothing else
-            # would ever put it back, because this early return is what a later fight
-            # hits too. Hand it over now and leave the mirror on for this fight, which
-            # is what the gap qualified for anyway.
-            stranded = attacker.pop("mirror_restore", _MISSING)
-            if stranded is not _MISSING:
-                if stranded in attacker.get("inventory", []):
-                    attacker["mirror_restore"] = stranded
-                    _save(entry, data)
-                    return MIRROR_AMULET_CODE
-                _save(entry, data)
-            return None
-        attacker["mirror_restore"] = equipped.get("amulet")
-        equipped["amulet"] = MIRROR_AMULET_CODE
-        _save(entry, data)
-    return MIRROR_AMULET_CODE
+    """Compatibility no-op: arena fights never change the player's chosen equipment."""
+    return None
 
 
 def restore_after_mirror(entry, user_id) -> bool:
-    """Put back whatever the automatic mirror swap displaced. True if something moved."""
+    """Compatibility cleanup for a mirror swap left by an older deployment."""
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
@@ -7219,35 +7205,12 @@ def restore_after_mirror(entry, user_id) -> bool:
 
 
 def auto_equip_mob_gear(entry, user_id) -> tuple[str, ...]:
-    """Temporarily wear every owned anti-mob item before a PVE fight.
-
-    This deliberately mirrors :func:`auto_equip_mirror`: PVE utility should work for a
-    player who bought the item, without making them remember an inventory swap, but it
-    must not silently replace their normal arena setup after the result is shown.
-    """
-    with _farm_settlement_lock:
-        data = _load(entry)
-        record = _tamed_record(data, user_id)
-        if record is None:
-            return ()
-        equipped = record.setdefault("equipped", {})
-        restore = {}
-        equipped_codes = []
-        for slot, code in MOB_GEAR_CODES.items():
-            if code not in record.get("inventory", []) or equipped.get(slot) == code:
-                continue
-            restore[slot] = equipped.get(slot)
-            equipped[slot] = code
-            equipped_codes.append(code)
-        if not restore:
-            return ()
-        record["mob_gear_restore"] = restore
-        _save(entry, data)
-    return tuple(equipped_codes)
+    """Compatibility no-op: PVE uses exactly the equipment selected by the player."""
+    return ()
 
 
 def restore_after_mob_gear(entry, user_id) -> bool:
-    """Restore the exact weapon/amulet displaced by :func:`auto_equip_mob_gear`."""
+    """Compatibility cleanup for anti-mob gear swapped by an older deployment."""
     with _farm_settlement_lock:
         data = _load(entry)
         record = _tamed_record(data, user_id)
@@ -7829,11 +7792,6 @@ def record_fight(
         winner.setdefault("inventory", []).append(dropped.code)
         _discover(winner, dropped.code)
         dropped_code = dropped.code
-        equipped = winner.setdefault("equipped", {})
-        current = C.find_item(equipped.get(dropped.slot))
-        if current is None or C.equipment_score(dropped) > C.equipment_score(current):
-            equipped[dropped.slot] = dropped.code
-            auto_equipped = True
         _metric_add(data, "drops_by_rarity", rarity=dropped.rarity)
     if not legendary_pool:
         # Do not carry an unreachable promise after the last legendary is collected.
@@ -8611,11 +8569,7 @@ def grant_random_drop(entry, user_id, chance: float, seed: str | None = None,
         _discover(record, dropped.code)
         if dropped.slot == "weapon":
             _weapon_record(record, dropped.code)
-        equipped = record.setdefault("equipped", {})
-        current = C.find_item(equipped.get(dropped.slot))
-        auto_equipped = current is None or C.equipment_score(dropped) > C.equipment_score(current)
-        if auto_equipped:
-            equipped[dropped.slot] = dropped.code
+        auto_equipped = False
         _metric_add(data, "drops_by_rarity", rarity=dropped.rarity)
         _save(entry, data)
     return {

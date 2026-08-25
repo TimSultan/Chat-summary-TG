@@ -184,6 +184,24 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertGreaterEqual(summary["earned"], 1)
         self.assertGreaterEqual(summary["claimable"]["count"], 1)
 
+    def test_summary_exposes_at_most_three_unclaimed_rewards(self):
+        items = list(achievements.catalogue())[:5]
+        data = pets._load(CHAT)
+        data["pets"][str(USER)]["achievements"] = {
+            "unlocked": [item.code for item in items], "claimed": [],
+        }
+        pets._save(CHAT, data)
+
+        summary = pets.achievements_summary(CHAT, USER)
+
+        self.assertEqual(len(summary["featured"]), 3)
+        self.assertEqual(
+            [row["code"] for row in summary["featured"]],
+            [item.code for item in items[:3]],
+        )
+        self.assertTrue(all(row["earned"] and not row["claimed"]
+                            for row in summary["featured"]))
+
     def test_an_old_malformed_weapon_ledger_does_not_break_every_achievement(self):
         data = pets._load(CHAT)
         record = data["pets"][str(USER)]

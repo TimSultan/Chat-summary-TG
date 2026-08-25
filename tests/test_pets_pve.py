@@ -59,7 +59,7 @@ class _NoJitter:
 
 
 class MobRollAndBlockTests(PetsTestCase):
-    def test_owned_mob_gear_auto_equips_for_one_fight_then_restores_loadout(self):
+    def test_owned_mob_gear_never_replaces_the_selected_loadout(self):
         entry = "chat"
         self._tame(entry, "1")
         data = pets._load(entry)
@@ -69,18 +69,28 @@ class MobRollAndBlockTests(PetsTestCase):
         record["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
         pets._save(entry, data)
 
-        self.assertEqual(
-            set(pets.auto_equip_mob_gear(entry, "1")), {"w009", "amulet_mob_ward"},
-        )
+        self.assertEqual(pets.auto_equip_mob_gear(entry, "1"), ())
         active = pets.get_pet(entry, "1")["equipped"]
-        self.assertEqual(active["weapon"], "w009")
-        self.assertEqual(active["amulet"], "amulet_mob_ward")
-
-        self.assertTrue(pets.restore_after_mob_gear(entry, "1"))
-        restored = pets.get_pet(entry, "1")["equipped"]
-        self.assertEqual(restored["weapon"], "w001")
-        self.assertEqual(restored["amulet"], pets.MIRROR_AMULET_CODE)
+        self.assertEqual(active["weapon"], "w001")
+        self.assertEqual(active["amulet"], pets.MIRROR_AMULET_CODE)
+        self.assertNotIn("mob_gear_restore", pets.get_pet(entry, "1"))
         self.assertFalse(pets.restore_after_mob_gear(entry, "1"))
+
+    def test_old_stranded_mob_loadout_is_repaired_while_loading(self):
+        entry = "stranded-mob-gear"
+        self._tame(entry, "1")
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        record["inventory"] = ["w001", "w009", "bead", "amulet_mob_ward"]
+        record["equipped"]["weapon"] = "w009"
+        record["equipped"]["amulet"] = "amulet_mob_ward"
+        record["mob_gear_restore"] = {"weapon": "w001", "amulet": "bead"}
+        pets._save(entry, data)
+
+        repaired = pets.get_pet(entry, "1")
+        self.assertEqual(repaired["equipped"]["weapon"], "w001")
+        self.assertEqual(repaired["equipped"]["amulet"], "bead")
+        self.assertNotIn("mob_gear_restore", repaired)
 
     def test_store_keeps_the_two_mob_items_available_and_their_effects_are_targeted(self):
         weapon = pets_config.find_item("w009")
@@ -598,19 +608,18 @@ class MirrorSoulCombatTests(unittest.TestCase):
 
 
 class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
-    def test_auto_equip_fires_only_for_the_level_gap_and_ownership_then_restore_undoes_it(self):
+    def test_mirror_ownership_and_level_gap_never_change_the_selected_amulet(self):
         entry = "chat"
         self._tame(entry, "attacker", "Attacker")
         self._tame(entry, "defender", "Defender")
         data = pets._load(entry)
         data["pets"]["attacker"]["level"] = 6
         data["pets"]["defender"]["level"] = 1  # gap of 5: exactly MIRROR_LEVEL_GAP
-        # A different amulet already worn, to prove restore_after_mirror puts it back.
+        # A different amulet is the player's explicit choice.
         data["pets"]["attacker"]["inventory"] = ["bead"]
         data["pets"]["attacker"]["equipped"]["amulet"] = "bead"
         pets._save(entry, data)
 
-        # The gap qualifies, but nothing is owned yet -- nothing is swapped.
         self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
         self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
 
@@ -618,15 +627,10 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
         data["pets"]["attacker"]["inventory"].append(pets.MIRROR_AMULET_CODE)
         pets._save(entry, data)
 
-        self.assertEqual(
-            pets.auto_equip_mirror(entry, "attacker", "defender"), pets.MIRROR_AMULET_CODE,
-        )
-        self.assertEqual(
-            pets.get_pet(entry, "attacker")["equipped"]["amulet"], pets.MIRROR_AMULET_CODE,
-        )
-
-        self.assertTrue(pets.restore_after_mirror(entry, "attacker"))
+        self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
         self.assertEqual(pets.get_pet(entry, "attacker")["equipped"]["amulet"], "bead")
+        self.assertNotIn("mirror_restore", pets.get_pet(entry, "attacker"))
+        self.assertFalse(pets.restore_after_mirror(entry, "attacker"))
 
         # One level short of the gap: owning the amulet is no longer enough.
         data = pets._load(entry)
@@ -696,13 +700,7 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
         # And it is on no shelf and in no loot pool, because both filter on an exact source.
         self.assertNotIn(item, [i for i in pets_config.ITEMS if i.source in ("shop", "drop")])
 
-    def test_a_swap_stranded_by_a_crashed_fight_is_handed_back_on_the_next_one(self):
-        """A fight that died between the swap and the swap back used to strand the amulet.
-
-        The stranded state is self-sustaining: auto_equip_mirror returns early when the
-        mirror is already worn, so no later fight would reach the restore either. The
-        player's own amulet sat in `mirror_restore` for good.
-        """
+    def test_a_swap_stranded_by_old_code_is_repaired_while_loading(self):
         entry = "chat"
         self._tame(entry, "attacker", "Attacker")
         self._tame(entry, "defender", "Defender")
@@ -714,13 +712,6 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
         data["pets"]["attacker"]["equipped"]["amulet"] = pets.MIRROR_AMULET_CODE
         data["pets"]["attacker"]["mirror_restore"] = "bead"
         pets._save(entry, data)
-
-        # The next fight recognises the strand and reports the swap, so its caller
-        # restores at the end instead of walking past it again.
-        self.assertEqual(
-            pets.auto_equip_mirror(entry, "attacker", "defender"), pets.MIRROR_AMULET_CODE,
-        )
-        self.assertTrue(pets.restore_after_mirror(entry, "attacker"))
 
         attacker = pets.get_pet(entry, "attacker")
         self.assertEqual(attacker["equipped"]["amulet"], "bead")
@@ -740,7 +731,9 @@ class MirrorSoulAutoEquipAndRewardTests(PetsTestCase):
         pets._save(entry, data)
 
         self.assertIsNone(pets.auto_equip_mirror(entry, "attacker", "defender"))
-        self.assertNotIn("mirror_restore", pets.get_pet(entry, "attacker"))
+        attacker = pets.get_pet(entry, "attacker")
+        self.assertNotIn("mirror_restore", attacker)
+        self.assertIsNone(attacker["equipped"]["amulet"])
 
     def test_winning_with_the_mirror_equipped_is_not_docked_by_the_level_multiplier(self):
         """«Награда за победу при этом не режется» -- the reward multiplier for a

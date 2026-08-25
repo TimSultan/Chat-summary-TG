@@ -98,6 +98,9 @@ class PhoenixDungeonTests(unittest.TestCase):
         action = first["actions"][0]["code"]
         ok, _note, after = pets.phoenix_action(CHAT, USER, action)
         self.assertTrue(ok)
+        live_status = pets.dungeon_status(CHAT, USER)["phoenix"]
+        self.assertEqual(live_status["boss_hp"], after["boss_hp"])
+        self.assertEqual(live_status["hero_hp"], after["hero_hp"])
 
         ok, _note, reopened = pets.phoenix_start(CHAT, USER)
         self.assertTrue(ok)

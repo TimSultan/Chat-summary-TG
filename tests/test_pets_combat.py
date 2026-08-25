@@ -1207,6 +1207,32 @@ class EffectKnobTests(unittest.TestCase):
 
 
 class AttackTypeTests(unittest.TestCase):
+    def test_a_wounded_fighter_can_automatically_use_a_healing_scroll(self):
+        class HealingRng:
+            def random(self):
+                return .99
+
+            def uniform(self, _low, _high):
+                return 0.0
+
+            def choice(self, values):
+                return "skill_1" if "skill_1" in values else values[0]
+
+        healer = Fighter(
+            key="healer", name="Healer", strength=20, health=200, agility=20, luck=1,
+            armor=0, skills=("scroll_healing_rain", None, None, None), starting_hp=1_000,
+        )
+        target = Fighter(
+            key="target", name="Target", strength=1, health=500, agility=1, luck=1,
+            armor=0, starting_hp=10_000,
+        )
+
+        with patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(healer, target, rng=HealingRng(), max_actions=1)
+
+        self.assertTrue(any(row.event == "skill_scroll_healing_rain" for row in result.rounds))
+        self.assertGreater(result.final_hp["healer"], 1_000)
+
     def test_predator_bite_heals_from_the_damage_it_lands(self):
         class SkillRng:
             def random(self):

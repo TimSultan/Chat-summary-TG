@@ -247,8 +247,7 @@ class CageAndTamingTests(PetsTestCase):
             ]
             self.assertEqual(len(weapons), 1, uid)
             self.assertEqual(weapons[0].rarity, "common")
-            # Nothing was in the slot, so the gift is worn rather than left in the bag.
-            self.assertEqual(pet["equipped"]["weapon"], weapons[0].code)
+            self.assertIsNone(pet["equipped"]["weapon"])
             self.assertIn(weapons[0].code, pet["discovered"])
 
         self.assertEqual(pets.get_pet(entry, "3")["inventory"], [armed.code])
@@ -260,8 +259,7 @@ class CageAndTamingTests(PetsTestCase):
         self._tame(entry, "1")
         self.assertEqual(pets.grant_starter_weapons([entry]), 1)
 
-        gift = pets.get_pet(entry, "1")["equipped"]["weapon"]
-        self.assertTrue(pets.unequip(entry, "1", "weapon")[0])
+        gift = pets.get_pet(entry, "1")["inventory"][0]
         self.assertTrue(pets.sell_item(entry, "1", gift)[0])
         self.assertEqual(pets.grant_starter_weapons([entry]), 0)
         self.assertEqual(pets.get_pet(entry, "1")["inventory"], [])
@@ -1232,6 +1230,8 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertEqual(first["code"], second["code"])
         self.assertIn(first["code"], pets.get_pet("chat", "1")["inventory"])
         self.assertIn(second["code"], pets.get_pet("chat", "2")["inventory"])
+        self.assertFalse(first["auto_equipped"])
+        self.assertIsNone(pets.get_pet("chat", "1")["equipped"][first["slot"]])
 
     def test_same_drop_can_repeat_for_one_player_and_discovery_stays_unique(self):
         self._two_pets()
@@ -2528,16 +2528,17 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(outcome["dropped_item"], second.code)
         self.assertIn(first, choose.call_args.args[0])
 
-    def test_drop_auto_equips_empty_or_better_slot_but_keeps_stronger_item(self):
-        weak = pets_config.find_item("bt01")
-        strong = pets_config.find_item("bt30")
-        self.assertGreater(pets_config.equipment_score(strong), pets_config.equipment_score(weak))
+    def test_drop_never_changes_equipment_regardless_of_rarity_or_score(self):
+        common = pets_config.find_item("bt01")
+        rare = pets_config.find_item("bt26")
+        legendary = pets_config.find_item("bt30")
+        self.assertGreater(pets_config.equipment_score(legendary), pets_config.equipment_score(rare))
         result = SimpleNamespace(winner="1", loser="2")
 
-        for entry, current, dropped, expected, auto_equipped in (
-            ("empty-slot", None, weak, weak, True),
-            ("better-drop", weak, strong, strong, True),
-            ("worse-drop", strong, weak, strong, False),
+        for entry, current, dropped in (
+            ("empty-slot", None, common),
+            ("legendary-drop", rare, legendary),
+            ("rare-after-legendary", legendary, rare),
         ):
             with self.subTest(entry=entry):
                 self._tame(entry, "1", "Attacker")
@@ -2555,9 +2556,9 @@ class RecordFightTests(PetsTestCase):
                     )
 
                 pet = pets.get_pet(entry, "1")
-                self.assertEqual(pet["equipped"]["boots"], expected.code)
+                self.assertEqual(pet["equipped"]["boots"], current.code if current else None)
                 self.assertIn(dropped.code, pet["inventory"])
-                self.assertEqual(outcome["auto_equipped"], auto_equipped)
+                self.assertFalse(outcome["auto_equipped"])
 
     def test_drop_pool_allows_duplicates_in_the_winners_own_bag(self):
         """Both personal and chat-wide ownership leave a design available for forging."""
@@ -3638,7 +3639,7 @@ class FarmTests(PetsTestCase):
         self.assertFalse(ok)
         self.assertIn(str(starter.price), message)
 
-    def test_farm_reward_is_snapshotted_and_auto_equips_a_found_item(self):
+    def test_farm_reward_is_snapshotted_and_leaves_a_found_item_in_the_bag(self):
         entry, start = "farm", datetime(2026, 8, 1, 10)
         self._build_farm(entry, level=1)
         self.assertTrue(pets.start_farm(entry, "1", now=start)[0])
@@ -3654,10 +3655,10 @@ class FarmTests(PetsTestCase):
         receipt = pets.settle_completed_farms(entry, start + timedelta(hours=6))[0]
         self.assertEqual(receipt["gold"], 17)
         self.assertEqual(receipt["item_code"], "bt01")
-        self.assertTrue(receipt["auto_equipped"])
+        self.assertFalse(receipt["auto_equipped"])
         pet = pets.get_pet(entry, "1")
         self.assertIn("bt01", pet["inventory"])
-        self.assertEqual(pet["equipped"]["boots"], "bt01")
+        self.assertIsNone(pet["equipped"]["boots"])
 
     def test_features_have_single_purchase_and_visible_effects(self):
         self._build_farm("farm")

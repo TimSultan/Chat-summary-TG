@@ -2585,7 +2585,20 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
     def test_achievement_ui_has_individual_claim_buttons_and_no_bulk_claim(self):
         source = pets_web.PAGE_HTML
         self.assertIn('data-ach="claim" data-code="', source)
+        self.assertIn("Новые награды", source)
+        self.assertIn(".slice(0, 3)", source)
+        self.assertIn("▼ Все ачивки", source)
+        self.assertIn("Забрать награду", source)
+        self.assertIn('.toast.reward {', source)
+        self.assertIn('placement === "reward"', source)
+        self.assertIn('hud.getBoundingClientRect().bottom + 8', source)
+        self.assertIn('action === "achievements_claim" && data.ok ? "reward"', source)
         self.assertNotIn("Забрать награды за Ачивки", source)
+
+    def test_live_phoenix_response_replaces_the_bars_state(self):
+        source = pets_web.PAGE_HTML
+        self.assertIn("S.dungeon.phoenix = data.phoenix", source)
+        self.assertIn("phoenixBar(fight.boss_hp, fight.boss_max_hp", source)
 
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):
         """Not "a fight like that one" -- that one. The stored seed and the two stored

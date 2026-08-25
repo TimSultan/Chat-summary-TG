@@ -6716,11 +6716,6 @@ async def handle_pets_callback(
                     message_id=message_id, log=log,
                 )
                 return
-            mob_gear = pets.auto_equip_mob_gear(entry, user_id)
-            if mob_gear:
-                # Gear stats are part of a player's current combat profile, so rebuild
-                # the server-side block after the temporary PVE loadout is in place.
-                block = pets.mob_block(entry, user_id, code, tier)
             mine = pets.get_pet(entry, user_id)
             hero = _pets_fighter(entry, user_id, mine)
             enemy = pets.mob_fighter(block)
@@ -6728,15 +6723,11 @@ async def handle_pets_callback(
             try:
                 reward = pets.record_mob_fight(entry, user_id, block, result)
             except ValueError as e:
-                if mob_gear:
-                    pets.restore_after_mob_gear(entry, user_id)
                 await _send_pets_view(
                     api, chat_id, pets_ui.notice_view(user_id, str(e)),
                     message_id=message_id, log=log,
                 )
                 return
-            if mob_gear:
-                pets.restore_after_mob_gear(entry, user_id)
             report = pets_ui.fight_report(
                 result, str(user_id),
                 {str(user_id): mine.get("name"), enemy.key: block["name"]}, None,
@@ -7721,9 +7712,6 @@ async def _pets_run_fight(
         await redraw_empty_fight_bank()
         return
 
-    # Зеркало души, if this is a long punch downward -- before the fighters are built,
-    # because it changes the stats they are built from (see pets.auto_equip_mirror).
-    mirrored = pets.auto_equip_mirror(entry, user_id, opponent_id)
     # Both sides carry their OWN history with the other: farming somebody all morning
     # leaves you shaky against them even in the fight where they hit back.
     attacker_fighter = _pets_fighter(entry, user_id, mine, vs=opponent_id)
@@ -7749,12 +7737,8 @@ async def _pets_run_fight(
     except ValueError:
         # record_fight is the authority on spending the bank, and a stale final tap
         # stays entirely in the attacker's private UI.
-        if mirrored:
-            pets.restore_after_mirror(entry, user_id)
         await redraw_empty_fight_bank()
         return
-    if mirrored:
-        pets.restore_after_mirror(entry, user_id)
     report = pets_ui.fight_report(
         result, str(user_id),
         {str(user_id): mine.get("name"), str(opponent_id): theirs.get("name")},

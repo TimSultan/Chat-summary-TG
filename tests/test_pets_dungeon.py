@@ -28,6 +28,24 @@ class DungeonTests(unittest.TestCase):
         result = SimpleNamespace(final_hp={self.user_id: 375}, rounds=())
         self.assertEqual(pets._hp_after_fight(result, self.user_id), 375)
 
+    def test_a_flawless_win_keeps_health_restored_by_combat(self):
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"] = {
+            "run_id": "healing-run", "kills": 0, "floor": 1,
+            "hp": 100, "max_hp": 500, "cleared": [],
+            "haul": pets._new_haul(), "floor_haul": pets._new_haul(),
+        }
+        pets._save(self.entry, data)
+        healed_result = SimpleNamespace(
+            winner=self.user_id, rounds=(), final_hp={self.user_id: 275},
+        )
+
+        with patch("pets.pets_combat.simulate", return_value=healed_result):
+            ok, message, _receipt = pets.dungeon_fight(self.entry, self.user_id, 0)
+
+        self.assertTrue(ok, message)
+        self.assertEqual(pets.dungeon_status(self.entry, self.user_id)["hp"], 275)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.patch = patch("stats._stats_dir", return_value=Path(self.temp.name))
@@ -667,15 +685,9 @@ class DungeonTests(unittest.TestCase):
     def _rekill(self, floor, index=0, times=1):
         """Kill the same encounter `times` over, resetting only what a re-entry resets.
 
-        The equipment is held still along with the health, and that is not tidiness: every
-        kill rolls a real drop, and a drop auto-equips itself when it scores better than
-        an empty slot -- which the first one always does. Over a long measurement the
-        runner therefore re-dresses itself mid-sample, and one item in the catalogue ends
-        the measurement outright. «Зеркало души» sets its wearer to the OPPONENT's stats,
-        so the moment it lands the runner stops being a runner with 4,000 in everything
-        and starts being an even match for the mob it is farming -- which it then loses
-        22 times out of 30, and `assertTrue(ok)` below fails on a fight that was supposed
-        to be a formality. Rare enough to pass alone and fail in a full suite.
+        The equipment is held still along with health so every repetition starts from the
+        exact same controlled combat state. Drops belong in the bag and must never change
+        this selected loadout between iterations.
         """
         payloads = []
         equipped = dict(pets._load(self.entry)["pets"][self.user_id].get("equipped") or {})

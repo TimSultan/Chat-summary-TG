@@ -1281,7 +1281,7 @@ AUTO_EQUIP_EFFECT_BONUS = {
 
 
 def equipment_score(item: Item | None) -> int:
-    """One deterministic comparison score for auto-equipping a same-slot drop."""
+    """One deterministic comparison score for sorting forge candidates."""
     if item is None:
         return -10_000
     score = sum(

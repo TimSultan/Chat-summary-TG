@@ -2178,10 +2178,6 @@ async def handle_attack(request: web.Request) -> web.Response:
             weapon_enchanted=pets.combat_weapon_enchanted(entry, key),
         )
 
-    # Зеркало души goes on BEFORE the fighters are built, or it would not be among the
-    # effects they carry. See pets.auto_equip_mirror: only fires on a big level gap, only
-    # for somebody who owns it, and is put back straight after the fight is recorded.
-    mirrored = pets.auto_equip_mirror(entry, me, opponent_id)
     attacker = fighter(me, mine, opponent_id)
     defender = fighter(opponent_id, theirs, me)
     prefix = request.app[_PREFIX_KEY]
@@ -2210,18 +2206,10 @@ async def handle_attack(request: web.Request) -> web.Response:
         # pressing the button. Nothing has been recorded -- say so and let the client
         # refresh rather than showing a fight that did not count.
         return _json_error(str(e), status=409, code="CANNOT_FIGHT")
-    finally:
-        # In a `finally`, not after the happy path. record_fight raises on exactly the
-        # races above, and returning from that except used to skip the restore entirely:
-        # the automatic mirror stayed equipped and the player's own amulet was stranded
-        # in `mirror_restore`. Worse, it was permanent -- auto_equip_mirror bails early
-        # when the mirror is already worn, so no later fight would ever put it back.
-        if mirrored:
-            pets.restore_after_mirror(entry, me)
     dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
     request.app[_LOG_KEY](
         f"[pets_web] fight {me} vs {opponent_id}"
-        + (" (зеркало души)" if mirrored else "") + ": "
+        + ": "
         f"{'draw' if result.is_draw else ('win' if result.winner == me else 'loss')}, "
         f"{len(result.rounds)} rounds, gold {reward.get('gold') or -reward.get('loss_gold', 0)}, "
         f"xp {reward.get('xp')}, drop {reward.get('dropped_item')}"
@@ -4514,7 +4502,9 @@ PAGE_HTML = """<!doctype html>
   .phoenix-burn { color: #ff9a5a; }
   .phoenix-moves { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .phoenix-moves .go { padding: 11px 8px; font-size: 14px; }
-  .ach-entry .ach-list { display: grid; gap: 7px; margin-top: 11px; }
+  .ach-entry .ach-list, .ach-featured { display: grid; gap: 7px; margin-top: 11px; }
+  .ach-featured-label { color: var(--gold); margin-top: 9px; }
+  .ach-featured .ach-row { box-shadow: 0 0 0 1px rgba(232,185,35,.08); }
   .ach-row { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; opacity: .55; }
   /* Earned and unpaid is the only state worth shouting: it is a thing the player can act
      on right now, and everything else on this list is either history or homework. */
@@ -4920,6 +4910,16 @@ PAGE_HTML = """<!doctype html>
     z-index: 60; background: rgba(0,0,0,.86); color: #fff; padding: 10px 16px;
     border-radius: 10px; font-size: 14px; max-width: 88vw; text-align: center;
     animation: rise .16s ease-out;
+  }
+  .toast.reward {
+    top: calc(var(--hud) + 8px); bottom: auto; z-index: 60;
+    border: 1px solid var(--gold); background: rgba(31,27,13,.96);
+    color: #ffe8a3; box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    animation: rewardDrop .18s ease-out;
+  }
+  @keyframes rewardDrop {
+    from { transform: translate(-50%, -8px); opacity: .45; }
+    to { transform: translate(-50%, 0); opacity: 1; }
   }
 
   /* ---------------------------------------------------- turn-based combat prototype */
@@ -5571,12 +5571,18 @@ async function api(path, body) {
   return data;
 }
 
-function toast(text, onTap) {
+function toast(text, onTap, placement) {
   const old = document.querySelector(".toast");
   if (old) old.remove();
   const node = document.createElement("div");
-  node.className = "toast";
+  node.className = "toast" + (placement === "reward" ? " reward" : "");
   node.textContent = text;
+  // The HUD can grow with Telegram's safe-area inset. Measure its real lower edge so an
+  // achievement reward always lands just beneath the HP bar instead of covering it.
+  if (placement === "reward") {
+    const hud = document.getElementById("hud");
+    if (hud) node.style.top = Math.round(hud.getBoundingClientRect().bottom + 8) + "px";
+  }
   // Optional: a toast that came with something worth a second look (a mob fight's own
   // replay) stays tappable to open it, instead of forcing a sheet the player has to
   // dismiss before their next tap can land.
@@ -5614,9 +5620,17 @@ async function act(action, payload) {
     S = data.state;
     // A Phoenix fight reports its own last state, because settling it wipes the fight off
     // the run: keep the ending, drop it again the moment a new fight is opened.
-    if (data.phoenix) PHOENIX_END = data.phoenix.over ? data.phoenix : null;
+    if (data.phoenix) {
+      PHOENIX_END = data.phoenix.over ? data.phoenix : null;
+      // Live turns are returned separately so the exact move result can be painted
+      // immediately. Ignoring this object left both Phoenix bars frozen until refresh.
+      if (!data.phoenix.over && S && S.dungeon) S.dungeon.phoenix = data.phoenix;
+    }
     haptic(data.ok ? "ok" : "no");
-    if (data.message) toast(data.message);
+    if (data.message) toast(
+      data.message, null,
+      action === "achievements_claim" && data.ok ? "reward" : "",
+    );
     render();
     if (!data.ok && !S.pet && String(data.message || "").includes("Сначала приручи существо")) {
       openPetCreation();
@@ -5997,20 +6011,44 @@ async function loadAchievements() {
 function achievementsEntry() {
   const box = S.achievements;
   if (!box) return "";
+  const sourceRows = ACH_ROWS ? (ACH_ROWS.rows || []) : (box.featured || []);
+  const featured = sourceRows.filter((row) => row.earned && !row.claimed).slice(0, 3);
+  const featuredCodes = new Set(featured.map((row) => row.code));
+  const featuredHtml = featured.length
+    ? '<div class="tiny ach-featured-label">Новые награды</div>' +
+      '<div class="ach-featured">' + featured.map(achievementRow).join("") + '</div>'
+    : "";
   return '<div class="panel ach-entry">' +
     '<div class="row spread"><h2 style="margin:0">🏅 Ачивки</h2>' +
     '<span class="tiny muted">' + Number(box.earned || 0) + " из " +
       Number(box.total || 0) + "</span></div>" +
+    featuredHtml +
     '<button class="go sec" style="margin-top:8px" data-ach="toggle">' +
-      (ACH_OPEN ? "▲ Свернуть список" : "▼ Показать список") + "</button>" +
+      (ACH_OPEN ? "▲ Свернуть все ачивки" : "▼ Все ачивки") + "</button>" +
     (ACH_OPEN
-      ? (ACH_ROWS ? achievementsList(ACH_ROWS)
+      ? (ACH_ROWS ? achievementsList(ACH_ROWS, featuredCodes)
                   : '<div class="empty" style="margin-top:10px">Загружаю…</div>')
       : "") + "</div>";
 }
 
-function achievementsList(box) {
-  const rows = (box.rows || []).slice();
+function achievementRow(row) {
+  const state = (row.earned && !row.claimed) ? " ready" : (row.claimed ? " done" : "");
+  const reward = achievementReward(row);
+  return '<div class="ach-row' + state + '">' +
+    '<div class="ach-head"><b>' + esc(row.icon || "") + " " + esc(row.name || "") +
+      "</b>" + (row.legacy ? '<span class="ach-old">былое</span>' : "") +
+      (row.claimed ? '<span class="tiny muted">✓</span>' : "") + "</div>" +
+    '<div class="tiny muted">' + esc(row.description || "") + "</div>" +
+    (reward ? '<div class="tiny ach-prize">' + reward + "</div>" : "") +
+    (row.earned && !row.claimed
+      ? '<button class="go" style="margin-top:7px" data-ach="claim" data-code="' +
+        esc(row.code) + '">Забрать награду</button>'
+      : "") +
+    "</div>";
+}
+
+function achievementsList(box, excludedCodes = new Set()) {
+  const rows = (box.rows || []).filter((row) => !excludedCodes.has(row.code));
   const error = box.error
     ? '<div class="empty" style="margin-top:10px">Не удалось пересчитать часть ачивок: ' +
       esc(box.error) + '</div>'
@@ -6022,21 +6060,7 @@ function achievementsList(box) {
   // and only then the finished ones -- a wall of ticks at the top would bury the rest.
   const weight = (row) => (row.earned && !row.claimed) ? 0 : (row.earned ? 2 : 1);
   rows.sort((a, b) => weight(a) - weight(b));
-  return error + '<div class="ach-list">' + rows.map((row) => {
-    const state = (row.earned && !row.claimed) ? " ready" : (row.claimed ? " done" : "");
-    const reward = achievementReward(row);
-    return '<div class="ach-row' + state + '">' +
-      '<div class="ach-head"><b>' + esc(row.icon || "") + " " + esc(row.name || "") +
-        "</b>" + (row.legacy ? '<span class="ach-old">былое</span>' : "") +
-        (row.claimed ? '<span class="tiny muted">✓</span>' : "") + "</div>" +
-      '<div class="tiny muted">' + esc(row.description || "") + "</div>" +
-      (reward ? '<div class="tiny ach-prize">' + reward + "</div>" : "") +
-      (row.earned && !row.claimed
-        ? '<button class="go" style="margin-top:7px" data-ach="claim" data-code="' +
-          esc(row.code) + '">Получить награду</button>'
-        : "") +
-      "</div>";
-  }).join("") + "</div>";
+  return error + '<div class="ach-list">' + rows.map(achievementRow).join("") + "</div>";
 }
 
 // ------------------------------------------------------------------- dungeon screen
@@ -9724,7 +9748,6 @@ async function handleClick(event, target) {
   }
   if (d.ach === "claim") {
     await act("achievements_claim", { code: d.code || "" });
-    ACH_OPEN = true;
     await loadAchievements();
     return;
   }
