@@ -5566,6 +5566,30 @@ def _pin_hero_pool_to_run(hero: dict, run: dict) -> dict:
     return hero
 
 
+def _rescale_live_boss_pool(run: dict, state: dict) -> None:
+    """Drag a fight saved on the OLD pool onto the run's, in place.
+
+    A fight already in progress when the shared pool shipped still carries the pool it was
+    opened with, and clamping the write-back only stops the bar going over 100% -- it does
+    not stop the fight panel printing 20 468 / 20 468 above a run bar that says 15 860.
+    That fight would keep both numbers, and the mismatch, until the boss was dead.
+
+    So it is converted the first time it is touched, by SHARE rather than by raw value: a
+    hero standing at three quarters of the old bar stands at three quarters of the new one.
+    Anything else would either heal or execute somebody mid-fight for the crime of being
+    logged in during a deploy.
+    """
+    ceiling = max(1, int(run.get("max_hp", 0) or 0))
+    live = max(1, int(state.get("hero_max_hp", 0) or 0))
+    if not ceiling or live == ceiling:
+        return
+    share = max(0.0, min(1.0, int(state.get("hero_hp", 0) or 0) / live))
+    state["hero_max_hp"] = ceiling
+    state["hero_hp"] = max(1, round(ceiling * share))
+    if isinstance(state.get("hero"), dict):
+        state["hero"]["max_hp"] = ceiling
+
+
 def _run_hp_after_boss_turn(run: dict, state: dict) -> int:
     """The health one interactive turn leaves the run with.
 
@@ -5704,6 +5728,7 @@ def phoenix_action(entry: str, user_id, action: str) -> tuple[bool, str, dict | 
         state = run.get("phoenix")
         if not isinstance(state, dict) or pets_phoenix.is_over(state):
             return False, "Этот бой уже закончен.", None
+        _rescale_live_boss_pool(run, state)
         try:
             state = pets_phoenix.take(state, str(action or ""), seed=secrets.randbits(63))
         except ValueError as error:
@@ -6147,6 +6172,7 @@ def gatekeeper_action(entry: str, user_id, action: str) -> tuple[bool, str, dict
         state = run.get("gatekeeper")
         if not isinstance(state, dict) or pets_gatekeeper.is_over(state):
             return False, "Этот бой уже закончен.", None
+        _rescale_live_boss_pool(run, state)
         try:
             state = pets_gatekeeper.take(state, str(action or ""), seed=secrets.randbits(63))
         except ValueError as error:
