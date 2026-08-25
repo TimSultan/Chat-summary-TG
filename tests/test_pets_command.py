@@ -1252,18 +1252,19 @@ class PetsCommandTests(unittest.TestCase):
             "result": result, "enemy": None, "reward": {"gold": 100, "xp": 50},
         }
 
-    def _stand_on_boss_floor(self, floor=10):
+    def _stand_on_boss_floor(self, floor=20):
         """A hero strong enough to finish a boss, standing on its floor.
 
-        Floor 10 rather than 5: the Phoenix is fought a turn at a time now (pets_phoenix)
-        and `dungeon_fight` refuses it outright, so the boss these tests need is the next
-        one down. What they are about is the transcript a boss kill sends, not which boss.
+        Floor 20 rather than 5 or 10: both the Phoenix and Steel Gatekeeper are fought a
+        turn at a time, so these transcript tests use the next ordinary boss. What they
+        are about is the transcript a boss kill sends, not which boss.
         """
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Кабанчик", "file_a", "Player")
         data = pets._load(CHAT)
         data["pets"][str(PLAYER["id"])]["stats"] = {
-            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+            "strength": 10_000, "health": 10_000, "agility": 10_000,
+            "luck": 10_000, "endurance": 1,
         }
         pets._save(CHAT, data)
         pets.grant_dungeon_ticket(CHAT, PLAYER["id"])

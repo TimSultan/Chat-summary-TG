@@ -42,6 +42,7 @@ from datetime import date, datetime, timedelta
 import economy
 import pets_achievements as ACHIEVEMENTS
 import pets_combat
+import pets_gatekeeper
 import pets_phoenix
 import pets_config as C
 import pets_mobs as M
@@ -234,6 +235,7 @@ def _normalise_dungeon_run(run) -> dict | None:
         # one thing that must never happen -- read a dangerous telegraph, close the screen,
         # come back knowing the answer. Absent for every other encounter.
         **({"phoenix": run["phoenix"]} if isinstance(run.get("phoenix"), dict) else {}),
+        **({"gatekeeper": run["gatekeeper"]} if isinstance(run.get("gatekeeper"), dict) else {}),
         # The loot tallies are per run too, and they are exactly the kind of field this
         # whitelist has silently eaten before: dropped here they would reset to zero on
         # every load and the summary would always read "nothing". A run that predates them
@@ -4853,6 +4855,12 @@ def dungeon_status(entry: str, user_id) -> dict:
             and not pets_phoenix.is_over(run["phoenix"])
             else None
         ),
+        "gatekeeper": (
+            pets_gatekeeper.public(run["gatekeeper"])
+            if isinstance(run.get("gatekeeper"), dict)
+            and not pets_gatekeeper.is_over(run["gatekeeper"])
+            else None
+        ),
         "gold_multiplier": C.hero_gold_multiplier(hero_level, "dungeon"),
         "chest": _chest_payload(run.get("chest")),
     })
@@ -5059,6 +5067,7 @@ def _dungeon_resurrect(run: dict) -> bool:
     run["phoenix_totem_used"] = True
     run["hp"] = max(1, int(run.get("max_hp", 1) or 1))
     run.pop("phoenix", None)
+    run.pop("gatekeeper", None)
     return True
 
 
@@ -5084,7 +5093,7 @@ def dungeon_fight(entry: str, user_id, index: int) -> tuple[bool, str, dict | No
         # The Phoenix is fought by hand. Refusing here rather than simulating is what
         # makes that true from every direction: an old client, a stale button or a
         # hand-made request cannot resolve it in one press behind the player's back.
-        if is_phoenix(row):
+        if is_phoenix(row) or is_gatekeeper(row):
             _save(entry, data)
             return False, "С этим противником дерутся вручную — начни бой.", None
         # Only a room that HAS healers can contain something they raised. Belt and braces
@@ -5397,18 +5406,24 @@ def dungeon_rest(entry: str, user_id, xp: int, amount: str = "full") -> tuple[bo
     return dungeon_buy(entry, user_id, xp, code)
 
 
-# ------------------------------------------------------------------------- Феникс
+# ------------------------------------------------------------ интерактивные боссы
 #
-# The Phoenix is the one encounter that is not a call to pets_combat.simulate. Its fight
-# is a state machine the player walks through (pets_phoenix), so what lives here is the
-# plumbing the pure engine deliberately does not have: reading the pet, persisting the
-# state on the run, and paying out through the same reward path every other kill uses.
+# These encounters are not calls to pets_combat.simulate. Their fights are state machines
+# the player walks through, so what lives here is the plumbing the pure engines deliberately
+# do not have: reading the pet, persisting each turn and paying through the ordinary boss
+# reward path.
 PHOENIX_GIMMICK = "reincarnate"
+GATEKEEPER_GIMMICK = "gatekeeper"
 
 
 def is_phoenix(row: dict) -> bool:
     """Whether this encounter is fought by hand rather than simulated."""
     return bool(row) and row.get("boss") and row.get("gimmick") == PHOENIX_GIMMICK
+
+
+def is_gatekeeper(row: dict) -> bool:
+    """Whether this is the prediction-and-lock boss fought one choice at a time."""
+    return bool(row) and row.get("boss") and row.get("gimmick") == GATEKEEPER_GIMMICK
 
 
 # The Phoenix fight takes a hero PROFILE rather than a pet record, so the scroll
@@ -5994,6 +6009,120 @@ def achievements_view(entry: str, user_id) -> dict:
     }
 
 
+def gatekeeper_state(entry: str, user_id) -> dict | None:
+    """The persisted Steel Gatekeeper turn as either client sees it."""
+    record = _tamed_record(_load(entry), user_id)
+    run = (record or {}).get("dungeon_run")
+    state = (run or {}).get("gatekeeper") if isinstance(run, dict) else None
+    return pets_gatekeeper.public(state) if isinstance(state, dict) else None
+
+
+def gatekeeper_start(entry: str, user_id) -> tuple[bool, str, dict | None]:
+    """Open or resume the Steel Gatekeeper without resolving a hidden auto-fight."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        floor = max(1, int(run.get("floor", 1) or 1))
+        row = D.encounter(floor, 0)
+        if not is_gatekeeper(row):
+            return False, "Здесь не Стальной привратник.", None
+        if int(row["index"]) in {int(v) for v in run.get("cleared", []) if str(v).isdigit()}:
+            return False, "Этот противник уже побеждён.", None
+        existing = run.get("gatekeeper")
+        if isinstance(existing, dict) and not pets_gatekeeper.is_over(existing):
+            return True, "", pets_gatekeeper.public(existing)
+        hero = phoenix_hero_profile(record, row)
+        # A defensive stance is still possible bare-handed, but it must not quietly act
+        # like the default 40% shield used by Phoenix timing. Here the player's actual
+        # equipped shield is one of the tactical answers, so no shield means only a
+        # minimal brace while a real shield contributes its own guard value.
+        shield = _combat_shield_for(record)
+        hero["guard"] = max(.10, min(.85, float(shield.get("guard", .40) or .40))) \
+            if shield else .10
+        hero["hp"] = max(1, min(hero["max_hp"], int(run.get("hp", hero["max_hp"]) or 1)))
+        state = pets_gatekeeper.start(
+            hero, phoenix_boss_profile(row), seed=secrets.randbits(63),
+        )
+        run["gatekeeper"] = state
+        _save(entry, data)
+        return True, "", pets_gatekeeper.public(state)
+
+
+def gatekeeper_action(entry: str, user_id, action: str) -> tuple[bool, str, dict | None]:
+    """Resolve one prediction, step or core-window choice and persist it immediately."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return False, "Сначала войди в подземелье.", None
+        state = run.get("gatekeeper")
+        if not isinstance(state, dict) or pets_gatekeeper.is_over(state):
+            return False, "Этот бой уже закончен.", None
+        try:
+            state = pets_gatekeeper.take(state, str(action or ""), seed=secrets.randbits(63))
+        except ValueError as error:
+            return False, str(error), pets_gatekeeper.public(run["gatekeeper"])
+        run["gatekeeper"] = state
+        run["hp"] = max(0, int(state.get("hero_hp", run.get("hp", 0)) or 0))
+        _save(entry, data)
+        if not pets_gatekeeper.is_over(state):
+            return True, "", pets_gatekeeper.public(state)
+    return _gatekeeper_settle(
+        entry, user_id, str(state.get("status")) == pets_gatekeeper.VICTORY, state,
+    )
+
+
+def _gatekeeper_settle(entry: str, user_id, won: bool,
+                       state: dict) -> tuple[bool, str, dict | None]:
+    """Settle the interactive fight with the same run, totem and economy rules."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = record.get("dungeon_run") if record else None
+        if not isinstance(run, dict):
+            return True, "", pets_gatekeeper.public(state)
+        floor = max(1, int(run.get("floor", 1) or 1))
+        row = D.encounter(floor, 0)
+        run.pop("gatekeeper", None)
+        if not won:
+            if _dungeon_resurrect(run):
+                _save(entry, data)
+                return True, "🔥 Тотем Феникса воскресил тебя. Попробуй бой снова.", \
+                    pets_gatekeeper.public(state)
+            final = dict(run.get("haul") or _new_haul())
+            record["last_dungeon_haul"] = {**final, "floor": floor, "won": False}
+            record["dungeon_run"] = None
+            _save(entry, data)
+            return False, f"{row['name']} победил. Забег окончен на этаже {floor}.", \
+                pets_gatekeeper.public(state)
+        record_row = record.setdefault("gatekeeper_record", {})
+        record_row["wins"] = max(0, int(record_row.get("wins", 0) or 0)) + 1
+        record_row["best_mistakes"] = min(
+            int(record_row.get("best_mistakes", 999) or 999),
+            int(state.get("mistakes", 0) or 0),
+        )
+        record_row["systems_fooled"] = max(
+            int(record_row.get("systems_fooled", 0) or 0),
+            int(state.get("systems_fooled", 0) or 0),
+        )
+        cleared = {int(v) for v in run.get("cleared", []) if str(v).isdigit()}
+        cleared.add(int(row["index"]))
+        run["cleared"] = sorted(cleared)
+        run.setdefault("dead_at", {})[str(row["index"])] = int(run.get("kills", 0) or 0)
+        run["kills"] = int(run.get("kills", 0) or 0) + 1
+        _record_weapon_win(record, "boss_wins")
+        _save(entry, data)
+    ok, note, receipt = _phoenix_reward(entry, user_id, floor, row)
+    public = pets_gatekeeper.public(state)
+    if isinstance(receipt, dict):
+        public["reward"] = receipt.get("reward") or {}
+    return ok, note, public
+
+
 def _achievement_ruby_source(user_id, code: str) -> str:
     return f"achievement:{user_id}:{code}"
 
@@ -6266,6 +6395,8 @@ def dungeon_descend(entry: str, user_id) -> tuple[bool, str]:
     run.pop("boss_lives", None)
     run.pop("hydra_head_hp", None)
     run.pop("hydra_moves", None)
+    run.pop("phoenix", None)
+    run.pop("gatekeeper", None)
     # One roll per descent, taken here and nowhere else -- this is the only moment the
     # game means by "between floors". An unresolved find from the last staircase is
     # replaced rather than stacked: the corridor behind you is gone.

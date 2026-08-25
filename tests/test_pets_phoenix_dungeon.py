@@ -72,14 +72,14 @@ class PhoenixDungeonTests(unittest.TestCase):
     def test_every_other_boss_is_still_simulated(self):
         """One boss changed how it is fought. The rest of the dungeon did not."""
         data = pets._load(CHAT)
-        data["pets"][str(USER)]["dungeon_run"]["floor"] = 10
+        data["pets"][str(USER)]["dungeon_run"]["floor"] = 20
         pets._save(CHAT, data)
-        self.assertFalse(pets.is_phoenix(dungeon.encounter(10, 0)))
+        self.assertFalse(pets.is_phoenix(dungeon.encounter(20, 0)))
 
         _ok, message, receipt = pets.dungeon_fight(CHAT, USER, 0)
 
         # Whether this hero WINS is beside the point and would make the test about the
-        # balance of floor 10. What matters is that the fight was resolved at all rather
+        # balance of floor 20. What matters is that the fight was resolved at all rather
         # than refused: a receipt exists either way, and the refusal message does not.
         self.assertIsNotNone(receipt)
         self.assertNotIn("вручную", message)

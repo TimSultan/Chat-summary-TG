@@ -1445,6 +1445,14 @@ def _action_phoenix_auto(entry, user_id, xp, payload):
     return pets.phoenix_auto(entry, user_id)
 
 
+def _action_gatekeeper_start(entry, user_id, xp, payload):
+    return pets.gatekeeper_start(entry, user_id)
+
+
+def _action_gatekeeper_action(entry, user_id, xp, payload):
+    return pets.gatekeeper_action(entry, user_id, str(payload.get("move") or ""))
+
+
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
   "respec_stats": _action_respec_stats,
@@ -1490,6 +1498,8 @@ _ACTIONS = {
     "phoenix_start": _action_phoenix_start,
     "phoenix_action": _action_phoenix_action,
     "phoenix_auto": _action_phoenix_auto,
+    "gatekeeper_start": _action_gatekeeper_start,
+    "gatekeeper_action": _action_gatekeeper_action,
 }
 
 # What the Mini App may still do while committed to a dungeon run -- the same rule
@@ -1508,6 +1518,7 @@ _ACTIONS = {
 _ALLOWED_IN_DUNGEON = {
     "dungeon_fight", "dungeon_rest", "dungeon_buy", "dungeon_descend", "dungeon_quit",
     "dungeon_chest", "phoenix_start", "phoenix_action", "phoenix_auto",
+    "gatekeeper_start", "gatekeeper_action",
     "equip", "unequip", "enchant_weapon", "reforge", "set_skill",
     "set_character_element",
 }
@@ -1646,6 +1657,8 @@ async def handle_action(request: web.Request) -> web.Response:
     # clears the fight off the run, so the outcome screen can only be told about it here.
     if action_name in ("phoenix_start", "phoenix_action", "phoenix_auto") and isinstance(extra, dict):
         response["phoenix"] = extra
+    if action_name in ("gatekeeper_start", "gatekeeper_action") and isinstance(extra, dict):
+        response["gatekeeper"] = extra
     if action_name == "achievements_open" and isinstance(extra, dict):
         response["achievements"] = extra
     if str(body.get("action") or "") in ("dungeon_fight", "dungeon_chest") \
@@ -5654,6 +5667,10 @@ async function act(action, payload) {
       // immediately. Ignoring this object left both Phoenix bars frozen until refresh.
       if (!data.phoenix.over && S && S.dungeon) S.dungeon.phoenix = data.phoenix;
     }
+    if (data.gatekeeper) {
+      GATEKEEPER_END = data.gatekeeper.over ? data.gatekeeper : null;
+      if (!data.gatekeeper.over && S && S.dungeon) S.dungeon.gatekeeper = data.gatekeeper;
+    }
     haptic(data.ok ? "ok" : "no");
     if (data.message) toast(
       data.message, null,
@@ -6228,10 +6245,15 @@ function isPhoenixRow(enemy) {
   return !!(enemy && enemy.boss && enemy.gimmick === "reincarnate");
 }
 
+function isGatekeeperRow(enemy) {
+  return !!(enemy && enemy.boss && enemy.gimmick === "gatekeeper");
+}
+
 // The last state of a finished Phoenix fight. It cannot live in S: settling the fight
 // clears it off the run, so the very state that says "won" or "lost" is the one the next
 // refresh no longer carries. Held until the player closes the outcome themselves.
 let PHOENIX_END = null;
+let GATEKEEPER_END = null;
 
 function phoenixBar(now, max, cls) {
   const total = Math.max(1, Number(max || 1));
@@ -6316,13 +6338,62 @@ function phoenixOutcome(fight) {
     '</div></div>';
 }
 
+function gatekeeperMoves(fight) {
+  const rows = (fight.actions || []).filter((row) => row && row.code);
+  return '<div class="phoenix-moves">' + rows.map((row) =>
+    '<button class="go" data-dungeon="gatekeepermove" data-code="' + esc(row.code) + '">' +
+    esc(row.label || row.code) + '</button>').join("") + '</div>';
+}
+
+function gatekeeperFight(dungeon, fight) {
+  const locks = (fight.locks || []).map((open) => open ? "🔓" : "🔒").join(" ");
+  const steps = (fight.steps || []).map((filled) => filled ? "●" : "○").join(" ");
+  const predictions = (fight.prediction_labels || []).map(esc).join(" · ");
+  return '<div class="panel dungeon"><div class="dungeon-head boss">' +
+    '<div class="dungeon-title">' + esc(fight.boss_name || "Стальной привратник") +
+      '<small>Этаж ' + Number(dungeon.floor || 0) + ' · интерактивный бой</small></div>' +
+    (fight.is_emergency_mode ? '<div class="dungeon-stat phoenix-burn">🚨 Аварийный режим</div>' : '') +
+    '</div><div class="dungeon-body">' + phoenixBars(fight) +
+    '<div class="panel" style="margin:0 0 10px;padding:11px">' +
+      '<div class="row spread small"><b>🔐 Замки</b><span style="letter-spacing:4px">' + locks + '</span></div>' +
+      '<div class="row spread small" style="margin-top:7px"><b>👣 Шаги</b><span style="letter-spacing:4px">' + steps + '</span></div>' +
+      (predictions
+        ? '<div class="tool-quest-note">🎯 Ожидает: <b>' + predictions + '</b></div>'
+        : '<div class="tiny muted" style="margin-top:7px">' + esc(fight.adaptation_hint || "Наблюдает за героем.") + '</div>') +
+      (fight.shield_disrupted ? '<div class="tiny loss" style="margin-top:6px">💥 Щит дестабилизирован.</div>' : '') +
+    '</div>' +
+    (fight.is_core_open ? '<div class="phoenix-vuln">🔓 ЯДРО ОТКРЫТО</div>' : '') +
+    (fight.scene ? '<p class="phoenix-scene">' + esc(fight.scene) + '</p>' : '') +
+    phoenixLog(fight) +
+    (fight.telegraph ? '<div class="phoenix-telegraph">' + esc(fight.telegraph) + '</div>' : '') +
+    gatekeeperMoves(fight) + '</div></div>';
+}
+
+function gatekeeperOutcome(fight) {
+  const reward = fight.reward || {};
+  const bits = [];
+  if (Number(reward.gold || 0)) bits.push("🪙 " + money(reward.gold));
+  if (Number(reward.xp || 0)) bits.push("✨ " + money(reward.xp));
+  return '<div class="panel dungeon"><div class="dungeon-head boss">' +
+    '<div class="dungeon-title">' + (fight.won ? "🏆 Привратник повержен" : "☠️ Расчёт завершён") +
+      '<small>' + esc(fight.boss_name || "Стальной привратник") + '</small></div></div>' +
+    '<div class="dungeon-body">' +
+    (fight.scene ? '<p class="phoenix-scene">' + esc(fight.scene) + '</p>' : '') +
+    phoenixLog(fight) +
+    (bits.length ? '<div class="small" style="margin-top:9px">🎒 ' + bits.join(" · ") + '</div>' : '') +
+    '<div class="dungeon-exit"><button class="go" data-dungeon="gatekeeperclose">Дальше</button></div>' +
+    '</div></div>';
+}
+
 function dungeonPanel() {
   const dungeon = S.dungeon || {};
   if (!S.pet) return "";
   // Before anything about the floor: a fight that has just ended took the floor with it
   // (a loss ends the whole run), so its result has to be read before the screen moves on.
   if (PHOENIX_END) return phoenixOutcome(PHOENIX_END);
+  if (GATEKEEPER_END) return gatekeeperOutcome(GATEKEEPER_END);
   if (dungeon.phoenix && !dungeon.phoenix.over) return phoenixFight(dungeon, dungeon.phoenix);
+  if (dungeon.gatekeeper && !dungeon.gatekeeper.over) return gatekeeperFight(dungeon, dungeon.gatekeeper);
   if (!dungeon.available) {
     return '<div class="panel dungeon"><div class="dungeon-head"><div class="dungeon-title">Подземелье закрыто<small>Экспедиция ведёт расследование</small></div></div><div class="dungeon-body"><p class="small muted" style="margin:0">' + esc(dungeon.closed_notice || 'Подземелье временно закрыто.') + '</p>' + (dungeon.active ? '<button class="go warn" style="margin-top:10px" data-dungeon="quit">Вернуться</button>' : '') + '</div></div>';
   }
@@ -6338,11 +6409,14 @@ function dungeonPanel() {
     // The Phoenix opens the turn-by-turn screen instead of resolving a simulation.
     // Its card is deliberately the ordinary one: what has to be read before pressing
     // -- the stats, and the warning that it gets back up -- has not changed.
-    const live = isPhoenixRow(enemy) && !enemy.cleared;
-    const card = '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="' + (live ? 'phoenix' : 'fight') + '" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + (enemy.stat_line && !enemy.cleared ? '<br><span class="tiny statline">' + esc(enemy.stat_line) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>';
+    const phoenixLive = isPhoenixRow(enemy) && !enemy.cleared;
+    const gatekeeperLive = isGatekeeperRow(enemy) && !enemy.cleared;
+    const live = phoenixLive || gatekeeperLive;
+    const startAction = phoenixLive ? 'phoenix' : (gatekeeperLive ? 'gatekeeper' : 'fight');
+    const card = '<button class="dungeon-enemy' + (enemy.cleared ? ' done' : '') + (enemy.healer ? ' healer' : '') + '" data-dungeon="' + startAction + '" data-index="' + enemy.index + '"' + (enemy.cleared ? ' disabled' : '') + '>' + dungeonArt(enemy) + '<span><b>' + esc(enemy.name) + '</b>' + (revived.has(enemy.index) && !enemy.cleared ? ' <span class="tiny muted">(поднят)</span>' : '') + '<br><span class="tiny muted">ур. ' + enemy.level + (enemy.hint ? ' · ' + esc(enemy.hint) : '') + '</span>' + (enemy.weakness && !enemy.cleared ? '<br><span class="tiny weakness">⚠️ ' + esc(enemy.weakness) + '</span>' : '') + (enemy.stat_line && !enemy.cleared ? '<br><span class="tiny statline">' + esc(enemy.stat_line) + '</span>' : '') + '</span><span>' + (enemy.cleared ? '✓' : (enemy.healer ? '✚' : '⚔️')) + '</span></button>';
     return live
       ? '<div class="phoenix-entry">' + card +
-        '<button class="go" data-dungeon="phoenix">⚔️ В бой</button></div>'
+        '<button class="go" data-dungeon="' + startAction + '">⚔️ В бой</button></div>'
       : card;
   }).join('');
   const healerNote = Number(dungeon.healers_alive || 0)
@@ -9836,8 +9910,9 @@ async function handleClick(event, target) {
     // Closing the Phoenix outcome is the one dungeon control that touches nothing on the
     // server: the fight is already settled, this only lets go of the screen showing it.
     if (d.dungeon === "phoenixclose") { PHOENIX_END = null; render(); return; }
-    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest", phoenix: "phoenix_start", phoenixmove: "phoenix_action", phoenixauto: "phoenix_auto" };
-    const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), buy: () => ({ code: d.code || "" }), chest: () => ({ choice: d.choice || "leave" }), phoenixmove: () => ({ move: d.code || "" }) };
+    if (d.dungeon === "gatekeeperclose") { GATEKEEPER_END = null; render(); return; }
+    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest", phoenix: "phoenix_start", phoenixmove: "phoenix_action", phoenixauto: "phoenix_auto", gatekeeper: "gatekeeper_start", gatekeepermove: "gatekeeper_action" };
+    const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), buy: () => ({ code: d.code || "" }), chest: () => ({ choice: d.choice || "leave" }), phoenixmove: () => ({ move: d.code || "" }), gatekeepermove: () => ({ move: d.code || "" }) };
     await act(actions[d.dungeon], (payload[d.dungeon] || (() => ({})))());
     return;
   }

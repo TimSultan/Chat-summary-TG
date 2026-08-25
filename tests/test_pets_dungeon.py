@@ -87,7 +87,7 @@ class DungeonTests(unittest.TestCase):
         not reached. Every boss reads its own floor now, and the same two steps are +24%
         and +26%.
         """
-        for plain, gimmick_floor in ((10, 15), (20, 25)):
+        for plain, gimmick_floor in ((20, 25),):
             with self.subTest(boss=plain):
                 plain_boss = dungeon.encounter(plain, 0)
                 deeper = dungeon.encounter(gimmick_floor, 0)
@@ -95,9 +95,10 @@ class DungeonTests(unittest.TestCase):
                 self.assertLess(plain_boss["stats"]["strength"],
                                 deeper["stats"]["strength"])
                 self.assertLess(plain_boss["level"], deeper["level"])
-                # And its own floor is what it reads: the plain boss on 10 is built from
-                # floor 10, not from floor 15.
+                # And its own floor is what it reads, rather than borrowing the next
+                # boss's numbers.
                 self.assertEqual(plain_boss["level"], plain + 8)
+        self.assertEqual(dungeon.encounter(10, 0)["gimmick"], "gatekeeper")
         self.assertEqual(dungeon.encounter(15, 0)["gimmick"], "fire_only")
         self.assertEqual(dungeon.encounter(25, 0)["gimmick"], "spells_only")
 
@@ -881,13 +882,13 @@ class DungeonTests(unittest.TestCase):
         self._enter_pack_floor()
         data = pets._load(self.entry)
         run = data["pets"][self.user_id]["dungeon_run"]
-        # Floor 10 rather than 5: the floor-5 Phoenix is fought by hand (pets_phoenix),
-        # and dungeon_fight refuses it outright. What this test is about -- a boss never
-        # being mistaken for something a healer raised -- is true of any boss floor.
-        run["floor"], run["cleared"] = 10, []
+        # Floor 20 rather than 5 or 10: Phoenix and Gatekeeper are fought by hand, while
+        # this test specifically exercises the ordinary simulated-boss settlement.
+        run["floor"], run["cleared"] = 20, []
         run["revived"] = list(range(5))           # exactly the leak that shipped
         data["pets"][self.user_id]["stats"] = {
-            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+            "strength": 10_000, "health": 10_000, "agility": 10_000,
+            "luck": 10_000, "endurance": 1,
         }
         pets._save(self.entry, data)
 
@@ -1035,10 +1036,11 @@ class DungeonTests(unittest.TestCase):
         """The boss flag only exists on the encounter row; if it is not written into the
         reason here it is gone by the time the audit reads the ledger back."""
         data = pets._load(self.entry)
-        # Comfortably above the floor-10 boss below, so this assertion is about the
+        # Comfortably above the floor-20 boss below, so this assertion is about the
         # REASON STRING and never about whether a simulated fight happened to be won.
         data["pets"][self.user_id]["stats"] = {
-            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+            "strength": 10_000, "health": 10_000, "agility": 10_000,
+            "luck": 10_000, "endurance": 1,
         }
         pets._save(self.entry, data)
         pets.grant_dungeon_ticket(self.entry, self.user_id)
@@ -1049,11 +1051,10 @@ class DungeonTests(unittest.TestCase):
         self.assertIn("pet_dungeon_mob_win", reasons)
         self.assertEqual(economy._audit_source("pet_dungeon_mob_win"), "dungeon_mobs")
 
-        # Floor 10 is the first boss the auto-battler still resolves -- floor 5 is the
-        # Phoenix, which is fought a turn at a time and pays out through its own path --
-        # and a boss win has to read differently in the ledger either way.
+        # Floor 20 is an ordinary boss; Phoenix and Gatekeeper on 5 and 10 are both
+        # interactive and pay through their own settlement wrappers.
         run = pets._load(self.entry)["pets"][self.user_id]["dungeon_run"]
-        run["floor"], run["cleared"] = 10, []
+        run["floor"], run["cleared"] = 20, []
         data = pets._load(self.entry)
         data["pets"][self.user_id]["dungeon_run"] = run
         pets._save(self.entry, data)
@@ -1771,7 +1772,7 @@ class BossWeaknessTests(unittest.TestCase):
         self.assertEqual(boss["weakness"], dungeon.boss_weakness("fire_only"))
         # The scene-setting line stays its own thing; the rule must not be buried in it.
         self.assertNotEqual(boss["hint"], boss["weakness"])
-        self.assertEqual(dungeon.encounter(10, 0)["weakness"], "")
+        self.assertIn("прогноз", dungeon.encounter(10, 0)["weakness"])
         # And an ordinary corridor mob has no rule at all.
         self.assertEqual(dungeon.encounter(2, 0).get("weakness", ""), "")
 

@@ -6369,7 +6369,7 @@ PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     "dungeondescend", "dungeonquit", "dungeonchest",
     # The hand-fought boss. Both halves belong here or the fight would bounce off this
     # gate on its own floor: starting it, and every turn of it afterwards.
-    "phoenixstart", "phoenixact", "phoenixauto",
+    "phoenixstart", "phoenixact", "phoenixauto", "gatekeeperstart", "gatekeeperact",
     # Reading the bag and changing what is worn.
     "bag", "bagitems", "equip", "unequip",
     # The scroll slots, and the picker screen that stands between them and a scroll.
@@ -6768,6 +6768,22 @@ async def handle_pets_callback(
             )
             # Most turns answer with nothing to say; the screen itself is the answer, and
             # a toast line prepended to it would just be a blank gap.
+            if note:
+                await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
+            else:
+                await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
+            return
+        if action in ("gatekeeperstart", "gatekeeperact"):
+            if action == "gatekeeperstart":
+                _, note, state = pets.gatekeeper_start(entry, user_id)
+            else:
+                _, note, state = pets.gatekeeper_action(entry, user_id, argument or "")
+            run_over = not pets.dungeon_status(entry, user_id).get("active")
+            rendered = (
+                pets_ui.dungeon_view(entry, user_id, xp)
+                if state is None or run_over
+                else pets_ui.gatekeeper_view(entry, user_id, xp, state=state)
+            )
             if note:
                 await _pets_toast_and_redraw(api, chat_id, message_id, note, rendered, log)
             else:

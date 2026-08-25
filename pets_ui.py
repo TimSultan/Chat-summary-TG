@@ -470,6 +470,8 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             # line -- is the same card as any other boss's.
             if enemy.get("boss") and enemy.get("gimmick") == "reincarnate":
                 rows.append([{"text": "⚔️ В бой", "callback_data": callback_data(user_id, "phoenixstart")}])
+            elif enemy.get("boss") and enemy.get("gimmick") == "gatekeeper":
+                rows.append([{"text": "⚔️ В бой", "callback_data": callback_data(user_id, "gatekeeperstart")}])
             else:
                 rows.append([{"text": f"⚔️ {enemy['name']}", "callback_data": callback_data(user_id, "dungeonfight", str(enemy['index']))}])
     lines.extend(dungeon_haul_block(state))
@@ -636,6 +638,81 @@ def phoenix_view(entry: str, user_id, xp: int, state: dict | None = None) -> tup
         # A live fight always offers something. If it somehow does not, the way out is a
         # button rather than a screen with no exit at all.
         rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def gatekeeper_view(entry: str, user_id, xp: int,
+                    state: dict | None = None) -> tuple[str, dict]:
+    """The prediction, locks and step clock of the hand-fought Steel Gatekeeper."""
+    if state is None:
+        state = pets.gatekeeper_state(entry, user_id)
+    if not isinstance(state, dict):
+        return (
+            "⚙️ <b>Бой со Стальным привратником не идёт.</b>\n\n"
+            "Вернись на этаж — оттуда бой можно начать заново.",
+            {"inline_keyboard": [[{
+                "text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon"),
+            }]]},
+        )
+    boss_hp = max(0, int(state.get("boss_hp", 0) or 0))
+    boss_max = max(1, int(state.get("boss_max_hp", 1) or 1))
+    hero_hp = max(0, int(state.get("hero_hp", 0) or 0))
+    hero_max = max(1, int(state.get("hero_max_hp", 1) or 1))
+    locks = " ".join("🔓" if opened else "🔒" for opened in state.get("locks", []))
+    steps = " ".join("●" if filled else "○" for filled in state.get("steps", []))
+    lines = [
+        f"⚙️ <b>{escape(str(state.get('boss_name') or 'Стальной привратник'))}</b>",
+        f"❤️ Герой: <b>{_money(hero_hp)} / {_money(hero_max)}</b>",
+        f"👹 Привратник: <b>{_money(boss_hp)} / {_money(boss_max)}</b>",
+        f"🔐 Замки: {locks}",
+        f"👣 Шаги: {steps}",
+    ]
+    if state.get("is_emergency_mode"):
+        lines.append("🚨 <b>АВАРИЙНЫЙ РЕЖИМ</b> · система отслеживает две категории")
+    predictions = list(state.get("prediction_labels") or [])
+    if predictions:
+        lines.append("🎯 Ожидает: <b>" + " · ".join(escape(str(row)) for row in predictions) + "</b>")
+    elif state.get("adaptation_hint"):
+        lines.append(f"<i>{escape(str(state['adaptation_hint']))}</i>")
+    if state.get("shield_disrupted"):
+        lines.append("💥 <b>Щит дестабилизирован:</b> следующий блок слабее.")
+    scene = str(state.get("scene") or "").strip()
+    if scene:
+        lines.extend(["", escape(scene)])
+    history = [str(row).strip() for row in state.get("log", []) if str(row).strip()]
+    if history:
+        lines.append("")
+        lines.extend(f"<i>{escape(row)}</i>" for row in history[-6:])
+    if state.get("is_core_open"):
+        lines.extend(["", "🔓 <b>ЯДРО ОТКРЫТО.</b> Выбери полноценный удар."])
+    elif state.get("telegraph"):
+        lines.extend(["", f"⚠️ <b>{escape(str(state['telegraph']))}</b>"])
+
+    rows = []
+    if state.get("over"):
+        lines.extend(["", "🏆 <b>Привратник повержен.</b>" if state.get("won")
+                      else "💀 <b>Привратник завершил расчёт.</b>"])
+        receipt_text = dungeon_reward_text({"reward": state.get("reward")})
+        if receipt_text:
+            lines.append(receipt_text)
+        rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
+    else:
+        pair = []
+        for action in state.get("actions") or []:
+            code = str(action.get("code") or "")
+            if not code:
+                continue
+            pair.append({
+                "text": str(action.get("label") or code),
+                "callback_data": callback_data(user_id, "gatekeeperact", code),
+            })
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+        if not rows:
+            rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
