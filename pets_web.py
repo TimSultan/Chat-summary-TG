@@ -720,7 +720,8 @@ def _fight_record_snapshot(record: dict | None, prefix: str) -> dict:
     }
 
 
-def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dict | None) -> dict:
+def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dict | None,
+                           derived: dict | None = None) -> dict:
     """Everything the replay header needs without consulting mutable live equipment."""
     record = record if isinstance(record, dict) else {}
     items = [dict(item) for item in record.get("items", ()) if isinstance(item, dict)]
@@ -760,7 +761,7 @@ def _playback_side_payload(fighter, opponent, key: str, prefix: str, record: dic
             }
         scrolls.append(scroll)
 
-    derived = pets_combat.derive(fighter, opponent)
+    derived = derived if isinstance(derived, dict) else pets_combat.derive(fighter, opponent)
     return {
         "user_id": str(key), "name": getattr(fighter, "name", "") or str(key),
         "level": int(getattr(fighter, "level", 1) or 1),
@@ -2176,6 +2177,82 @@ def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
     }
 
 
+def _arena_attack_payload(entry: str, me: str, opponent_id: str, xp: int,
+                          prefix: str) -> tuple[dict | None, tuple[str, int, str] | None]:
+    """Blocking arena work, kept together in one worker and one initial store read."""
+    data = pets._load(entry)
+    mine = pets._tamed_record(data, me)
+    theirs = pets._tamed_record(data, opponent_id) if opponent_id else None
+    if mine is None or theirs is None:
+        return None, ("Соперник больше не доступен.", 409, "NO_OPPONENT")
+    if pets._dungeon_active(mine):
+        return None, (
+            "Сначала закончи забег в подземелье или выйди из него.", 409, "DUNGEON_ACTIVE",
+        )
+    if pets._is_farming_record(mine):
+        return None, ("Существо сейчас занято и не может драться.", 409, "LIMIT")
+
+    # Build both immutable fighters from the one store snapshot. The former public-helper
+    # path parsed the complete store once per stat/equipment field for each side.
+    def fighter(key, record):
+        effective = pets._effective_stats_for(record)
+        return pets_combat.Fighter(
+            key=str(key), name=record.get("name") or "Существо",
+            strength=effective["strength"], health=effective["health"],
+            agility=effective["agility"], luck=effective["luck"],
+            armor=effective.get("armor", 0), magic=effective.get("magic", 0),
+            attack_scaling=pets._weapon_scaling_for(record),
+            effects=pets._equipped_combat_effects_for(record),
+            level=int(record.get("level", 1)),
+            skills=pets._skill_loadout_for(record),
+            personal_enchanted_scrolls=pets._personal_paint_scroll_codes(record),
+            shield=pets._combat_shield_for(record),
+            weapon_enchanted=pets._combat_weapon_enchanted_for(record),
+            character_element=(
+                record.get("element")
+                if record.get("element") in C.CHARACTER_ELEMENTS else None
+            ),
+        )
+
+    attacker = fighter(me, mine)
+    defender = fighter(opponent_id, theirs)
+    playback_records = {
+        me: _fight_record_snapshot(mine, prefix),
+        opponent_id: _fight_record_snapshot(theirs, prefix),
+    }
+    seed = secrets.randbits(63)
+    result = pets_combat.simulate(attacker, defender, seed=seed)
+    combat_snapshot = {
+        "seed": seed,
+        "fighters": {
+            me: pets_combat.snapshot(attacker),
+            opponent_id: pets_combat.snapshot(defender),
+        },
+        "records": playback_records,
+    }
+    try:
+        reward = pets.record_fight(
+            entry, me, opponent_id, result, pets.today(),
+            attacker_xp=xp, combat_snapshot=combat_snapshot,
+        )
+    except ValueError as error:
+        return None, (str(error), 409, "CANNOT_FIGHT")
+    dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
+    payload = {
+        "ok": True,
+        **_playback_payload(
+            result, me, attacker, opponent_id, defender, theirs.get("name"),
+            reward.get("fight_id"), prefix=prefix, records=playback_records,
+        ),
+        "reward": reward,
+        "dropped": _item_payload(dropped, prefix, mine) if dropped else None,
+        # This endpoint can only be called from the arena. Marking the view explicitly
+        # keeps the inventory catalogue out of every fight response.
+        "state": _state_payload(entry, me, xp, prefix, "arena"),
+    }
+    return payload, None
+
+
 async def handle_attack(request: web.Request) -> web.Response:
     """Run a fight and hand back the whole thing to be replayed.
 
@@ -2184,6 +2261,7 @@ async def handle_attack(request: web.Request) -> web.Response:
     because that is what a chat can do, but the interesting part of a fight is the order it
     happened in.
     """
+    started = time.monotonic()
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -2199,87 +2277,24 @@ async def handle_attack(request: web.Request) -> web.Response:
 
     me = str(user["id"])
     opponent_id = str(body.get("opponent_id") or "")
-    mine = pets.get_pet(entry, me)
-    theirs = pets.get_pet(entry, opponent_id) if opponent_id else None
-    if mine is None or theirs is None:
-        return _json_error("Соперник больше не доступен.", status=409, code="NO_OPPONENT")
-    if pets.is_in_dungeon(entry, me):
-      return _json_error(
-        "Сначала закончи забег в подземелье или выйди из него.",
-        status=409, code="DUNGEON_ACTIVE",
-      )
-    if not pets.can_attack_in_arena(entry, me, opponent_id):
-        return _json_error("Существо сейчас занято и не может драться.", status=409, code="LIMIT")
-
-    # Both sides carry their OWN history with the other: farming somebody all morning
-    # leaves you shaky against them even in the fight where they hit back.
-    def fighter(key, record, versus):
-        effective = pets.effective_stats(entry, key, vs=versus)
-        return pets_combat.Fighter(
-            key=str(key), name=record.get("name") or "Существо",
-            strength=effective["strength"], health=effective["health"],
-            agility=effective["agility"], luck=effective["luck"],
-            armor=effective.get("armor", 0), magic=effective.get("magic", 0),
-            attack_scaling=pets.combat_weapon_scaling(entry, key),
-            effects=pets.equipped_combat_effects(entry, key),
-            level=int(record.get("level", 1)),
-            skills=pets.skill_loadout(entry, key),
-            personal_enchanted_scrolls=pets.personal_enchanted_scrolls(entry, key),
-            shield=pets.combat_shield(entry, key),
-            weapon_enchanted=pets.combat_weapon_enchanted(entry, key),
-            character_element=(
-                record.get("element")
-                if record.get("element") in C.CHARACTER_ELEMENTS else None
-            ),
-        )
-
-    attacker = fighter(me, mine, opponent_id)
-    defender = fighter(opponent_id, theirs, me)
     prefix = request.app[_PREFIX_KEY]
-    playback_records = {
-        me: _fight_record_snapshot(pets.get_pet(entry, me), prefix),
-        opponent_id: _fight_record_snapshot(pets.get_pet(entry, opponent_id), prefix),
-    }
-    seed = secrets.randbits(63)
-    result = pets_combat.simulate(attacker, defender, seed=seed)
-    # The seed plus both fighters as they stood is the entire fight -- simulate() reads
-    # nothing else. Recorded so /api/replay can play this one back later; without it a
-    # fight fought from the page would be the one kind nobody could watch again.
-    combat_snapshot = {
-        "seed": seed,
-        "fighters": {
-            me: pets_combat.snapshot(attacker),
-            opponent_id: pets_combat.snapshot(defender),
-        },
-        "records": playback_records,
-    }
-    try:
-        reward = pets.record_fight(entry, me, opponent_id, result, pets.today(),
-                                   attacker_xp=xp, combat_snapshot=combat_snapshot)
-    except ValueError as e:
-        # The bank emptied, or the pet went to the farm, between drawing the page and
-        # pressing the button. Nothing has been recorded -- say so and let the client
-        # refresh rather than showing a fight that did not count.
-        return _json_error(str(e), status=409, code="CANNOT_FIGHT")
-    dropped = C.find_item(reward.get("dropped_item")) if reward.get("dropped_item") else None
+    payload, refusal = await asyncio.to_thread(
+        _arena_attack_payload, entry, me, opponent_id, xp, prefix,
+    )
+    if refusal is not None:
+        message, status, code = refusal
+        return _json_error(message, status=status, code=code)
+    assert payload is not None
+    result_rounds = payload.get("rounds") or ()
+    reward = payload.get("reward") or {}
     request.app[_LOG_KEY](
         f"[pets_web] fight {me} vs {opponent_id}"
         + ": "
-        f"{'draw' if result.is_draw else ('win' if result.winner == me else 'loss')}, "
-        f"{len(result.rounds)} rounds, gold {reward.get('gold') or -reward.get('loss_gold', 0)}, "
+        f"{'draw' if payload.get('draw') else ('win' if payload.get('winner') == me else 'loss')}, "
+        f"{len(result_rounds)} rounds, gold {reward.get('gold') or -reward.get('loss_gold', 0)}, "
         f"xp {reward.get('xp')}, drop {reward.get('dropped_item')}"
     )
-    return _ok({
-        "ok": True,
-        **_playback_payload(
-            result, me, attacker, opponent_id, defender, theirs.get("name"),
-            reward.get("fight_id"),
-            prefix=prefix, records=playback_records,
-        ),
-        "reward": reward,
-        "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
-        "state": _state_payload(entry, me, xp, prefix),
-    })
+    return _ok(payload, took=time.monotonic() - started)
 
 
 def _playback_payload(
@@ -2298,6 +2313,10 @@ def _playback_payload(
     tougher one it never emptied.
     """
     records = records if isinstance(records, dict) else {}
+    # One derivation per side feeds both the detailed header and the HP maximum. Before
+    # this cache the same immutable pair was derived twice per side for every response.
+    mine_derived = pets_combat.derive(mine, theirs)
+    theirs_derived = pets_combat.derive(theirs, mine)
     return {
         "fight_id": fight_id or getattr(result, "fight_id", None),
         "you": me,
@@ -2309,9 +2328,12 @@ def _playback_payload(
         "you_name": getattr(mine, "name", "") or "",
         "opponent": {"user_id": opponent_id, "name": opponent_name},
         "fighters": {
-            str(me): _playback_side_payload(mine, theirs, str(me), prefix, records.get(str(me))),
+            str(me): _playback_side_payload(
+                mine, theirs, str(me), prefix, records.get(str(me)), mine_derived,
+            ),
             str(opponent_id): _playback_side_payload(
                 theirs, mine, str(opponent_id), prefix, records.get(str(opponent_id)),
+                theirs_derived,
             ),
         },
         "winner": result.winner,
@@ -2320,8 +2342,8 @@ def _playback_payload(
         "opening": result.opening,
         "closing": result.closing,
         "max_hp": {
-            me: round(pets_combat.derive(mine, theirs)["max_hp"]),
-            opponent_id: round(pets_combat.derive(theirs, mine)["max_hp"]),
+            me: round(mine_derived["max_hp"]),
+            opponent_id: round(theirs_derived["max_hp"]),
         },
         "rounds": [
             {"number": r.number, "attacker": r.attacker, "event": r.event, "damage": r.damage,
@@ -4548,7 +4570,11 @@ PAGE_HTML = """<!doctype html>
   .phoenix-entry .go { padding: 9px 8px; font-size: 13px; }
   .phoenix-bars { display: grid; gap: 9px; margin: 0 0 11px; }
   .phoenix-bars .row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
-  .phoenix-bar.foe > i { background: linear-gradient(90deg, #e8631f, #ffb545); }
+  /* `.bar` is also used by the statistics page as a three-column grid. Reset that
+     layout here: otherwise the fill becomes a grid cell instead of occupying the HP
+     track, leaving Phoenix and Gatekeeper with what looks like an empty grey line. */
+  .bar.hp.phoenix-bar { display: block; grid-template-columns: none; gap: 0; }
+  .bar.hp.phoenix-bar.foe > i { background: #e0484d; }
   .phoenix-telegraph {
     border: 1px solid rgba(255,255,255,.16); border-radius: 9px; background: rgba(0,0,0,.3);
     padding: 13px; margin: 0 0 11px; font: 15px/1.5 Georgia, serif; color: #ffe8a3;

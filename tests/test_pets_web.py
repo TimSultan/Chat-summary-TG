@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -1583,14 +1584,78 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
 
-        response = await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
-            "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
-        })
+        original_simulate = pets_web.pets_combat.simulate
+        with patch.object(pets_web.pets_combat, "simulate", wraps=original_simulate) as simulate:
+            response = await self.client.post(pets_web.ROUTE_PREFIX + "/api/attack", json={
+                "init_data": _init_data(PLAYER["id"]), "opponent_id": str(OPPONENT["id"]),
+            })
         self.assertEqual(response.status, 200)
         body = await response.json()
+        self.assertEqual(simulate.call_count, 1)
         self.assertTrue(body["rounds"])
         self.assertIn("gold", body["reward"])
         self.assertIsNotNone(body["state"]["pet"])
+        self.assertIsNone(body["state"]["bag"])
+        self.assertIn("Server-Timing", response.headers)
+
+    async def test_a_slow_arena_fight_does_not_delay_another_web_request(self):
+        """A combat calculation may be slow; it must not stop the server answering others."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        entered = threading.Event()
+        release = threading.Event()
+        original_simulate = pets_web.pets_combat.simulate
+
+        def delayed_simulate(*args, **kwargs):
+            entered.set()
+            # The timeout makes a regression fail instead of deadlocking the suite when
+            # the calculation accidentally moves back onto the event-loop thread.
+            release.wait(0.8)
+            return original_simulate(*args, **kwargs)
+
+        with patch.object(pets_web.pets_combat, "simulate", side_effect=delayed_simulate):
+            attack = asyncio.create_task(self.client.post(
+                pets_web.ROUTE_PREFIX + "/api/attack",
+                json={
+                    "init_data": _init_data(PLAYER["id"]),
+                    "opponent_id": str(OPPONENT["id"]),
+                },
+            ))
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1.2))
+            self.assertFalse(attack.done(), "slow combat blocked the event loop")
+            try:
+                state = await asyncio.wait_for(
+                    self._get("/api/state?view=arena", THIRD), timeout=0.4,
+                )
+                self.assertEqual(state.status, 200)
+            finally:
+                release.set()
+            response = await attack
+        self.assertEqual(response.status, 200, await response.text())
+
+    def test_a_battle_payload_derives_each_fighter_only_once(self):
+        """The replay header and its HP bars must share the same two calculations."""
+        mine = pets_web.pets_combat.Fighter(
+            key="42", name="Герой", strength=10, health=10, agility=10, luck=10, armor=0,
+        )
+        theirs = pets_web.pets_combat.Fighter(
+            key="43", name="Соперник", strength=9, health=9, agility=9, luck=9, armor=0,
+        )
+        result = SimpleNamespace(
+            winner="42", is_draw=False, stopped_early=False, opening="", closing="",
+            rounds=(), fight_id="F-TEST",
+        )
+        original_derive = pets_web.pets_combat.derive
+        with patch.object(pets_web.pets_combat, "derive", wraps=original_derive) as derive:
+            payload = pets_web._playback_payload(
+                result, "42", mine, "43", theirs, "Соперник",
+            )
+
+        self.assertEqual(derive.call_count, 2)
+        self.assertEqual(payload["fighters"]["42"]["derived"]["max_hp"],
+                         payload["max_hp"]["42"])
+        self.assertEqual(payload["fighters"]["43"]["derived"]["max_hp"],
+                         payload["max_hp"]["43"])
 
     async def test_attacking_an_opponent_that_does_not_exist_is_409(self):
         """A card dealt by /api/opponents can go stale by the time it is tapped -- the
@@ -2629,6 +2694,10 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         source = pets_web.PAGE_HTML
         self.assertIn("S.dungeon.phoenix = data.phoenix", source)
         self.assertIn("phoenixBar(fight.boss_hp, fight.boss_max_hp", source)
+        # The analytics screen also owns `.bar` and makes it a three-column grid. Boss
+        # health tracks must explicitly undo that shared layout or their fill collapses.
+        self.assertIn(".bar.hp.phoenix-bar { display: block;", source)
+        self.assertIn(".bar.hp.phoenix-bar.foe > i { background: #e0484d; }", source)
 
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):
         """Not "a fight like that one" -- that one. The stored seed and the two stored

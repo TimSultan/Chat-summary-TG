@@ -4569,11 +4569,16 @@ def combat_shield(entry, user_id) -> dict | None:
     return _combat_shield_for(_tamed_record(_load(entry), user_id))
 
 
-def combat_weapon_enchanted(entry, user_id) -> bool:
-    """Whether the currently equipped weapon carries a valid elemental rune."""
-    record = _tamed_record(_load(entry), user_id) or {}
+def _combat_weapon_enchanted_for(record: dict | None) -> bool:
+    """Pure record half of :func:`combat_weapon_enchanted`."""
+    record = record or {}
     weapon = (record.get("equipped") or {}).get("weapon")
     return (record.get("weapon_enchantments") or {}).get(weapon) in RUNE_ELEMENTS
+
+
+def combat_weapon_enchanted(entry, user_id) -> bool:
+    """Whether the currently equipped weapon carries a valid elemental rune."""
+    return _combat_weapon_enchanted_for(_tamed_record(_load(entry), user_id))
 
 
 def _weapon_scaling_for(record: dict) -> str:
@@ -4587,14 +4592,13 @@ def combat_weapon_scaling(entry, user_id) -> str:
     return _weapon_scaling_for(_tamed_record(_load(entry), user_id) or {})
 
 
-def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
+def _equipped_combat_effects_for(record: dict | None) -> tuple[dict, ...]:
     """Immutable item-effect snapshots for the pure combat engine.
 
     Effects never participate in normal stat arithmetic or the power-rating shortcut;
     combat receives the catalogue metadata explicitly with its fighter snapshot instead.
     Returning copies prevents a caller from mutating the global item catalogue.
     """
-    record = _tamed_record(_load(entry), user_id)
     if record is None:
         return ()
     effects = []
@@ -4609,6 +4613,10 @@ def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
     if enchant_effect:
         effects.append(enchant_effect)
     return tuple(effects)
+
+
+def equipped_combat_effects(entry, user_id) -> tuple[dict, ...]:
+    return _equipped_combat_effects_for(_tamed_record(_load(entry), user_id))
 
 
 def _dungeon_active(record: dict | None) -> bool:
