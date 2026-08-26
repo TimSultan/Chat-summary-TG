@@ -6087,7 +6087,6 @@ def achievements_view(entry: str, user_id) -> dict:
     """The whole screen: every row, its state, and what pressing the button would pay."""
     _repair_failed_achievement_claim(entry, user_id)
     _repair_shared_achievement_rewards(entry, user_id)
-    _repair_achievement_meadow_tickets(entry, user_id)
     refresh_achievements(entry, user_id)
     record = _tamed_record(_load(entry), user_id)
     if record is None:
@@ -6243,35 +6242,6 @@ def _achievement_farm_source(user_id, code: str, index: int) -> str:
     return f"achievement:{user_id}:{code}:farm:{max(0, int(index))}"
 
 
-def _achievement_meadow_source(user_id, code: str) -> str:
-    return f"achievement:{user_id}:{code}:meadow"
-
-
-def _pay_achievement_tickets(entry: str, user_id, item, paid: dict) -> None:
-    """Pay one achievement's ticket reward into BOTH wallets.
-
-    There are two tickets in this game and they buy different things: 🎟 skips a farm
-    shift, 🎫 digs the meadow. Every achievement screen printed the farm reward with the
-    MEADOW's 🎫 -- so a player claimed, read "🎫 5", walked to the Поляна and found an
-    empty wallet, because no achievement has ever credited it.
-
-    The icons are fixed below, but a mislabel that stood this long is a promise: what was
-    shown is what is owed. So the reward pays both, and `_repair_achievement_meadow_tickets`
-    hands the meadow half to everybody who claimed before this. Nobody loses the farm
-    tickets they already have -- taking those back would be correcting our own mistake out
-    of somebody else's pocket.
-    """
-    tickets = max(0, int(item.farm_tickets))
-    for index in range(tickets):
-        if grant_farm_ticket(entry, user_id, _achievement_farm_source(user_id, item.code, index)):
-            paid["farm_tickets"] += 1
-    if tickets:
-        grant_meadow_tickets_once(
-            entry, user_id, tickets, _achievement_meadow_source(user_id, item.code),
-        )
-        paid["meadow_tickets"] = paid.get("meadow_tickets", 0) + tickets
-
-
 def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     """Pay for everything earned and not yet paid, in one press.
 
@@ -6285,7 +6255,6 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     # already noticed would quietly pay nothing at all.
     _repair_failed_achievement_claim(entry, user_id)
     _repair_shared_achievement_rewards(entry, user_id)
-    _repair_achievement_meadow_tickets(entry, user_id)
     refresh_achievements(entry, user_id)
     with _farm_settlement_lock:
         data = _load(entry)
@@ -6301,8 +6270,7 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
             return False, "Забирать пока нечего.", {}
         row["claimed"] = sorted(set(row["claimed"]) | {item.code for item in pending})
         _save(entry, data)
-    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0, "dungeon_tickets": 0,
-            "count": len(pending)}
+    paid = {"rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0, "count": len(pending)}
     for item in pending:
         if item.rubies:
             # Counted off the row rather than off the call: grant_rubies_once returns the
@@ -6312,7 +6280,9 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
             # exactly what was minted.
             grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
             paid["rubies"] += item.rubies
-        _pay_achievement_tickets(entry, user_id, item, paid)
+        for index in range(max(0, int(item.farm_tickets))):
+            if grant_farm_ticket(entry, user_id, _achievement_farm_source(user_id, item.code, index)):
+                paid["farm_tickets"] += 1
         for _ in range(max(0, int(item.dungeon_tickets))):
             grant_dungeon_ticket(entry, user_id)
             paid["dungeon_tickets"] += 1
@@ -6320,9 +6290,7 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     if paid["rubies"]:
         parts.append(f"{paid['rubies']} 💎")
     if paid["farm_tickets"]:
-        parts.append(f"{paid['farm_tickets']} 🎟 на ферму")
-    if paid.get("meadow_tickets"):
-        parts.append(f"{paid['meadow_tickets']} 🎫 на поляну")
+        parts.append(f"{paid['farm_tickets']} 🎫 на ферму")
     if paid["dungeon_tickets"]:
         parts.append(f"{paid['dungeon_tickets']} 🎟 в подземелье")
     reward = " · ".join(parts) or "ничего"
@@ -6333,7 +6301,6 @@ def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
     """Pay one earned achievement selected by the player."""
     _repair_failed_achievement_claim(entry, user_id)
     _repair_shared_achievement_rewards(entry, user_id)
-    _repair_achievement_meadow_tickets(entry, user_id)
     refresh_achievements(entry, user_id)
     item = ACHIEVEMENTS.by_code(str(code or ""))
     if item is None:
@@ -6352,11 +6319,13 @@ def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
         # the claimed flag is the durable guard for dungeon tickets.
         row["claimed"] = sorted(set(row["claimed"]) | {item.code})
         _save(entry, data)
-    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0, "dungeon_tickets": 0, "count": 1}
+    paid = {"rubies": 0, "farm_tickets": 0, "dungeon_tickets": 0, "count": 1}
     if item.rubies:
         grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
         paid["rubies"] = item.rubies
-    _pay_achievement_tickets(entry, user_id, item, paid)
+    for index in range(max(0, int(item.farm_tickets))):
+        if grant_farm_ticket(entry, user_id, _achievement_farm_source(user_id, item.code, index)):
+            paid["farm_tickets"] += 1
     for _ in range(max(0, int(item.dungeon_tickets))):
         grant_dungeon_ticket(entry, user_id)
         paid["dungeon_tickets"] += 1
@@ -6364,9 +6333,7 @@ def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
     if paid["rubies"]:
         parts.append(f"{paid['rubies']} 💎")
     if paid["farm_tickets"]:
-        parts.append(f"{paid['farm_tickets']} 🎟 на ферму")
-    if paid.get("meadow_tickets"):
-        parts.append(f"{paid['meadow_tickets']} 🎫 на поляну")
+        parts.append(f"{paid['farm_tickets']} 🎫 на ферму")
     if paid["dungeon_tickets"]:
         parts.append(f"{paid['dungeon_tickets']} 🎟 в подземелье")
     reward = " · ".join(parts) or "награда без предметов"
@@ -6395,49 +6362,6 @@ def _repair_failed_achievement_claim(entry: str, user_id) -> bool:
         data["achievement_bulk_claim_repaired"] = True
         _save(entry, data)
         return repaired
-
-
-def _repair_achievement_meadow_tickets(entry: str, user_id) -> int:
-    """Pay the meadow half of every achievement claimed before the two wallets were told apart.
-
-    The reward was always printed with the meadow's 🎫 and always paid into the farm's
-    wallet, so every player who ever claimed an achievement is owed what the screen said.
-    Runs per player off their own next visit rather than as a migration over the whole
-    store: it needs no deploy window, it cannot half-finish across thousands of rows, and
-    a member who has not played since is credited the moment they come back.
-
-    `grant_meadow_tickets_once` keys on the achievement, so this is safe to call on every
-    visit for ever -- the marker below only saves it the work of asking.
-    """
-    uid = str(user_id)
-    with _farm_settlement_lock:
-        data = _load(entry)
-        done = data.setdefault("achievement_meadow_tickets_v1", {})
-        if not isinstance(done, dict):
-            done = data["achievement_meadow_tickets_v1"] = {}
-        if done.get(uid):
-            return 0
-        record = _tamed_record(data, user_id)
-        claimed = set(_achievement_row(record)["claimed"]) if record else set()
-    owed = [
-        item for item in ACHIEVEMENTS.catalogue()
-        if item.code in claimed and int(item.farm_tickets)
-    ]
-    credited = 0
-    for item in owed:
-        tickets = max(0, int(item.farm_tickets))
-        before = meadow_tickets(entry, user_id)
-        grant_meadow_tickets_once(
-            entry, user_id, tickets, _achievement_meadow_source(uid, item.code),
-        )
-        credited += max(0, meadow_tickets(entry, user_id) - before)
-    with _farm_settlement_lock:
-        data = _load(entry)
-        marker = data.setdefault("achievement_meadow_tickets_v1", {})
-        if isinstance(marker, dict):
-            marker[uid] = True
-            _save(entry, data)
-    return credited
 
 
 def _repair_shared_achievement_rewards(entry: str, user_id) -> bool:

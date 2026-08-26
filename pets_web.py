@@ -6121,18 +6121,11 @@ let ACH_OPEN = false;
 // asked for once, when somebody actually opens it.
 let ACH_ROWS = null;
 
-// Three currencies, three icons, and the two tickets are NOT interchangeable: 🎟 skips a
-// farm shift, 🎫 digs the meadow. This row printed the farm reward with the meadow's 🎫,
-// which is why players kept arriving at the Поляна with an empty wallet. A ticket
-// achievement now pays -- and shows -- both.
 function achievementReward(row) {
   const bits = [];
   if (Number(row.rubies || 0)) bits.push("💎 " + Number(row.rubies));
-  // Named, not just pictured. Three tickets share two icons across this game's screens,
-  // and an unlabelled one is how the meadow reward went missing in the first place.
-  if (Number(row.farm_tickets || 0)) bits.push("🎟 " + Number(row.farm_tickets) + " ферма");
-  if (Number(row.farm_tickets || 0)) bits.push("🎫 " + Number(row.farm_tickets) + " поляна");
-  if (Number(row.dungeon_tickets || 0)) bits.push("🎟 " + Number(row.dungeon_tickets) + " подземелье");
+  if (Number(row.farm_tickets || 0)) bits.push("🎫 " + Number(row.farm_tickets));
+  if (Number(row.dungeon_tickets || 0)) bits.push("🎟 " + Number(row.dungeon_tickets));
   return bits.join(" · ");
 }
 
