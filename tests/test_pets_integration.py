@@ -159,12 +159,13 @@ class PetsIntegrationTests(unittest.TestCase):
             # what mobs and birthday greetings roll.
             self.assertGreaterEqual(reward["gold"], C.ARENA_WIN_GOLD_MIN)
             self.assertLessEqual(reward["gold"], round(C.ARENA_WIN_GOLD_MAX * 1.25))
-            self.assertEqual(self._balance(ALICE), purse_before + reward["gold"])
+            self.assertEqual(
+                self._balance(ALICE),
+                purse_before + reward["gold"] + reward["transfer_gold"],
+            )
         else:
-            # Losing now costs half of what the winner took -- and the attacker here is
-            # rich enough that the "pays what they have" clamp cannot be what is measured.
             self.assertEqual(reward["gold"], 0)
-            self.assertEqual(reward["loss_gold"], C.loss_gold_for(_won_gold(ENTRY)))
+            self.assertEqual(reward["loss_gold"], C.arena_loss_transfer(purse_before))
             self.assertEqual(self._balance(ALICE), purse_before - reward["loss_gold"])
 
         # The report renders, and reads from the winner's side either way.
@@ -186,7 +187,7 @@ class PetsIntegrationTests(unittest.TestCase):
             self.assertNotIn("None", text)
             self.assertNotIn("?", text.replace("Боёв пока не было.", ""))
 
-    def test_losing_costs_half_of_what_the_winner_took(self):
+    def test_losing_transfers_five_percent_of_the_current_wallet(self):
         """The seeded walkthrough above only exercises whichever side happens to win, so
         the losing branch is pinned here on a fight whose outcome is not left to chance."""
         self._found(ALICE, "Кабанчик", "Alice")
@@ -206,10 +207,10 @@ class PetsIntegrationTests(unittest.TestCase):
         won = _won_gold(ENTRY)
 
         self.assertGreater(won, 0)
-        self.assertEqual(reward["loss_gold"], C.loss_gold_for(won))
-        self.assertEqual(reward["loss_gold"], round(won * C.LOSS_GOLD_SHARE))
+        self.assertEqual(reward["loss_gold"], C.arena_loss_transfer(alice_before))
+        self.assertEqual(reward["loss_gold"], round(alice_before * 0.05))
         self.assertEqual(self._balance(ALICE), alice_before - reward["loss_gold"])
-        self.assertEqual(self._balance(BOB), bob_before + won)
+        self.assertEqual(self._balance(BOB), bob_before + won + reward["loss_gold"])
         # And the loser's own history line shows the debit, not the winner's credit.
         row = pets.history(ENTRY, ALICE)[0]
         self.assertEqual(row["gold"], 0)
@@ -229,9 +230,7 @@ class PetsIntegrationTests(unittest.TestCase):
 
         # Nothing can be taken from an empty wallet: the loss is capped by what was there.
         self.assertEqual(reward["loss_gold"], 0)
-        # The balance may have gone UP -- a beaten defender is paid a consolation now --
-        # but it can never go below zero, which is the invariant this test exists for.
-        self.assertGreaterEqual(economy.balance(ENTRY, loser, 0), 0)
+        self.assertEqual(economy.balance(ENTRY, loser, 0), 0)
 
     def test_ordinary_chatting_does_not_expand_the_fight_bank(self):
         # The fixed budget deliberately ignores ordinary chat-message volume.

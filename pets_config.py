@@ -22,8 +22,8 @@ members earned 60-233 coins/week, the p90 member ~55/week, the median ~3/week.
 
 Arena income is paced by one accumulated fight per hour and a five-fight base capacity.
 The cage, farm and recent painted miniatures expand that bank (see
-daily_fight_allowance); losing costs a share of what winning pays (LOSS_GOLD_SHARE), so
-part of every fight is paid by a player rather than minted.
+daily_fight_allowance); losing transfers a share of the loser's current wallets to the
+winner, so every duel has a stake beyond its minted purse.
 
 Against that, STAT_COST_EXPONENT = 1.5 puts one stat at 1 -> 80 at 22,557 gold and three
 at 67,671. Arena gold stays comparable to, rather than overpowering, coins earned from
@@ -652,33 +652,12 @@ WIN_GOLD_MAX = 75
 # birthday greeting. Doubling it in place would have quietly doubled two other faucets
 # nobody asked to change -- the exact kind of accident the income audit exists to catch.
 #
-# Everything derived from a duel's purse follows this number, not the base: the attacker's
-# loss penalty (LOSS_GOLD_SHARE) and the defender's consolation (DEFENDER_CONSOLATION_SHARE)
-# are shares of what the winner actually took, and that relationship is the design.
 ARENA_WIN_GOLD_MIN = 76
 ARENA_WIN_GOLD_MAX = 150
-# The loser pays 30% of what the winner just took. This replaces the original "проигравший
-# ничего не теряет": with a free loss, the best strategy was to press "напасть" without
-# reading anything, and a fight nobody can lose is not a fight.
-#
-# That reasoning is entirely about the ATTACKER's incentives -- it says nothing about a
-# defender, who never pressed anything and is simply dealt out of the power window. Charging
-# them for someone else's decision to fight is exactly the "free-for-the-house" cost this
-# constant exists to close, just aimed at the wrong person -- sharper now that a farming pet
-# can be picked too, so a passive player can be charged while away from the keyboard.
-# So LOSS_GOLD_SHARE is charged only when the LOSER IS THE ATTACKER. See
-# DEFENDER_CONSOLATION_SHARE below for what a losing defender gets instead.
-LOSS_GOLD_SHARE = 0.3
-# A debt is never created: somebody with less than this in their wallet simply pays what
-# they have. economy.balance clamps at zero anyway, and a member who cannot see why they
-# owe money is worse than one who got off lightly.
-
-# A losing DEFENDER pays nothing -- they never chose this fight -- and instead receives this
-# share of the winner's gold, minted onto their balance rather than taken from the winner
-# (the same way LOSS_GOLD_SHARE above is never paid TO the winner). Deliberately smaller
-# than LOSS_GOLD_SHARE: this only needs to turn an uninvited loss from a pure cost into a
-# wash, not to make getting attacked something worth hoping for.
-DEFENDER_CONSOLATION_SHARE = 0.20
+# Every non-draw arena loser transfers this share of BOTH current wallets to the winner:
+# coins and rubies. It applies equally to attacker and defender and is calculated from
+# what the loser owns when the fight settles, never from the randomly rolled win purse.
+ARENA_LOSS_TRANSFER_SHARE = 0.05
 
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
@@ -703,8 +682,7 @@ ARENA_LEVEL_REWARD_MULTIPLIERS = {
 MIRROR_LEVEL_GAP = 5
 
 # ------------------------------------------------------------------------------- PVE
-# A duel moves coins between two players -- part of the winner's purse is paid by the
-# loser (LOSS_GOLD_SHARE), so the arena mints far less than it appears to. A mob pays out
+# A duel moves coins between two players in addition to its winner's purse. A mob pays out
 # of nothing at all, with nobody on the other side to lose anything, so the identical
 # purse would be a faucet running at twice the arena's real rate. Half, then, as asked:
 # "мобы давали примерно в два раза меньше денег".
@@ -805,17 +783,11 @@ def daily_fight_allowance(
     )
 
 
-def loss_gold_for(won_gold: int) -> int:
-    """What an ATTACKER who loses pays, given what the winner took. Never charged to a
-    defender -- see defender_consolation_for for what they get instead."""
-    return max(0, round(won_gold * LOSS_GOLD_SHARE))
-
-
-def defender_consolation_for(won_gold: int) -> int:
-    """What a DEFENDER who loses receives, given what the winner took. Mirrors
-    loss_gold_for's rounding and floor, but this amount is minted onto the loser's
-    balance (economy.grant) rather than spent out of it (economy.spend)."""
-    return max(0, round(won_gold * DEFENDER_CONSOLATION_SHARE))
+def arena_loss_transfer(balance: int, retained_share: float = 0.0) -> int:
+    """Five percent of a loser's current wallet, after any explicit retention effect."""
+    share = ARENA_LOSS_TRANSFER_SHARE * (1 - min(1.0, max(0.0, retained_share)))
+    current = max(0, int(balance or 0))
+    return min(current, max(0, round(current * share + 1e-9)))
 
 
 def arena_level_reward_multiplier(winner_level: int, loser_level: int) -> float:

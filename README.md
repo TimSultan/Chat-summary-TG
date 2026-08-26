@@ -959,7 +959,8 @@ pet, with unlimited rerolls and no level or combat-power window. A win starts at
 and 100 pet XP, then moves from 75% for farming a pet 3+ levels below to 125% for beating
 one 3+ levels above. An attacker who is 7+ levels above the target is stopped by the guard
 instead: the attempt is spent, the attacker gets 5 pet XP, and no combat, gold, debit or
-drop occurs. **Losing costs 30% of what the winner took**, with no debt. Each creature level
+drop occurs. **A non-draw loss transfers 5% of the loser's current coins and diamonds to
+the winner**, with no debt. Each creature level
 gives **+1 to every stat**, on top of whatever was bought.
 
 The equipment catalogue contains **exactly 500 unique weapons** plus the other slot gear:

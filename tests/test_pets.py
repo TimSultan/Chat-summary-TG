@@ -2405,9 +2405,7 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "1", 0), expected)
 
     def test_survivor_amulet_preserves_thirty_percent_of_the_attackers_loss_penalty(self):
-        """Survivor only ever discounts a penalty, and only the ATTACKER pays one now (a
-        defender is paid a consolation instead, never a penalty -- see the tests below),
-        so this amulet only does anything when the ATTACKER is the one wearing and losing."""
+        """Survivor retains thirty percent of both wallet transfers."""
         entry = "survivor-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2420,21 +2418,22 @@ class RecordFightTests(PetsTestCase):
         data["pets"]["1"]["equipped"]["amulet"] = survivor.code
         pets._save(entry, data)
         economy.grant(entry, "1", 100, "test")
+        pets.grant_rubies(entry, "1", 20, "test")
         result = SimpleNamespace(winner="2", loser="1")  # attacker loses, wearing Survivor
 
-        with patch("random.randint", return_value=10), patch("random.random", return_value=1.0):
+        with patch("random.randint", return_value=10), patch("random.random", return_value=1.0), \
+             patch.object(pets_config, "ARENA_RUBY_CHANCE", 0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        self.assertEqual(pets_config.loss_gold_for(10), 3)
-        self.assertEqual(outcome["loss_gold"], 2)
+        self.assertEqual(outcome["loss_gold"], 4)
+        self.assertEqual(outcome["loss_rubies"], 1)
         self.assertEqual(outcome["consolation_gold"], 0)
-        self.assertEqual(economy.balance(entry, "1", 0), 98)
+        self.assertEqual(economy.balance(entry, "1", 0), 96)
+        self.assertEqual(economy.balance(entry, "2", 0), 14)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 19)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 1)
 
-    def test_survivor_amulet_does_not_touch_a_defenders_consolation(self):
-        """`_equipped_effect(loser, "survivor")` is only read inside the attacker-lost
-        branch of record_fight; a losing defender's consolation is a flat share of the
-        winner's gold with no equipment discount, because there is no penalty left on
-        that side for a piece of gear to shrink."""
+    def test_survivor_amulet_also_protects_a_losing_defender(self):
         entry = "survivor-defender-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2446,64 +2445,70 @@ class RecordFightTests(PetsTestCase):
         data["pets"]["2"]["inventory"] = [survivor.code]
         data["pets"]["2"]["equipped"]["amulet"] = survivor.code
         pets._save(entry, data)
+        economy.grant(entry, "2", 100, "test")
+        pets.grant_rubies(entry, "2", 20, "test")
         result = SimpleNamespace(winner="1", loser="2")  # defender loses, wearing Survivor
 
-        with patch("random.randint", return_value=10), patch("random.random", return_value=1.0):
+        with patch("random.randint", return_value=10), patch("random.random", return_value=1.0), \
+             patch.object(pets_config, "ARENA_RUBY_CHANCE", 0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        self.assertEqual(pets_config.defender_consolation_for(10), 2)
-        self.assertEqual(outcome["opponent_consolation_gold"], 2)
-        self.assertEqual(outcome["opponent_loss_gold"], 0)
-        self.assertEqual(economy.balance(entry, "2", 0), 2)
+        self.assertEqual(outcome["opponent_loss_gold"], 4)
+        self.assertEqual(outcome["opponent_loss_rubies"], 1)
+        self.assertEqual(outcome["opponent_consolation_gold"], 0)
+        self.assertEqual(economy.balance(entry, "2", 0), 96)
+        self.assertEqual(economy.balance(entry, "1", 0), 14)
 
-    def test_attacker_who_loses_pays_the_same_penalty_as_before_this_change(self):
-        """Regression pin: the attacker side of record_fight must be byte-for-byte
-        unchanged by adding the defender consolation."""
+    def test_attacker_who_loses_transfers_five_percent_of_both_wallets(self):
         entry = "attacker-pays-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
         economy.grant(entry, "1", 1000, "test")
+        pets.grant_rubies(entry, "1", 20, "test")
         before = economy.balance(entry, "1", 0)
         result = SimpleNamespace(winner="2", loser="1")
 
         with patch("random.randint", return_value=pets_config.WIN_GOLD_MAX), \
-             patch("random.random", return_value=1.0):
+             patch("random.random", return_value=1.0), \
+             patch.object(pets_config, "ARENA_RUBY_CHANCE", 0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        expected_penalty = pets_config.loss_gold_for(pets_config.WIN_GOLD_MAX)
-        self.assertGreater(expected_penalty, 0)
-        self.assertEqual(outcome["loss_gold"], expected_penalty)
+        expected_penalty = pets_config.arena_loss_transfer(before)
+        self.assertEqual(expected_penalty, 50)
+        self.assertEqual(outcome["loss_gold"], 50)
+        self.assertEqual(outcome["loss_rubies"], 1)
         self.assertEqual(outcome["consolation_gold"], 0)
         self.assertEqual(economy.balance(entry, "1", 0), before - expected_penalty)
+        self.assertEqual(economy.balance(entry, "2", 0), pets_config.WIN_GOLD_MAX + 50)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 19)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 1)
 
-    def test_defender_who_loses_pays_nothing_and_receives_a_consolation_instead(self):
-        """The core of this change: a defender never chose the fight, so a loss must not
-        cost them anything, and DEFENDER_CONSOLATION_SHARE mints a small amount onto their
-        balance instead -- persisted so history() can show the same story later."""
-        entry = "defender-consoled-chat"
+    def test_defender_who_loses_also_transfers_five_percent(self):
+        entry = "defender-transfer-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
-        self.assertEqual(economy.balance(entry, "2", 0), 0)
+        economy.grant(entry, "2", 200, "test")
+        pets.grant_rubies(entry, "2", 40, "test")
         result = SimpleNamespace(winner="1", loser="2")
 
         with patch("random.randint", return_value=pets_config.WIN_GOLD_MAX), \
-             patch("random.random", return_value=1.0):
+             patch("random.random", return_value=1.0), \
+             patch.object(pets_config, "ARENA_RUBY_CHANCE", 0):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
-        expected_consolation = pets_config.defender_consolation_for(pets_config.WIN_GOLD_MAX)
-        self.assertGreater(expected_consolation, 0)
-        self.assertEqual(outcome["opponent_loss_gold"], 0)
-        self.assertEqual(outcome["opponent_consolation_gold"], expected_consolation)
-        self.assertEqual(economy.balance(entry, "2", 0), expected_consolation)
+        self.assertEqual(outcome["opponent_loss_gold"], 10)
+        self.assertEqual(outcome["opponent_loss_rubies"], 2)
+        self.assertEqual(outcome["opponent_consolation_gold"], 0)
+        self.assertEqual(economy.balance(entry, "2", 0), 190)
+        self.assertEqual(economy.balance(entry, "1", 0), pets_config.WIN_GOLD_MAX + 10)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 38)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 2)
 
         row = pets.history(entry, "2")[0]
-        self.assertEqual(row["loss_gold"], 0)
-        self.assertEqual(row["consolation_gold"], expected_consolation)
+        self.assertEqual(row["loss_gold"], 10)
+        self.assertEqual(row["loss_rubies"], 2)
 
     def test_defender_with_zero_balance_is_never_driven_negative_by_a_loss(self):
-        """A losing defender is only ever credited (economy.grant), never debited, so an
-        empty wallet needs no clamp here -- unlike the attacker's penalty path, there is
-        nothing that could push the balance below zero."""
         entry = "defender-zero-balance-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2515,13 +2520,11 @@ class RecordFightTests(PetsTestCase):
             pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
         after = economy.balance(entry, "2", 0)
-        self.assertGreaterEqual(after, 0)
-        self.assertEqual(after, pets_config.defender_consolation_for(pets_config.WIN_GOLD_MIN))
+        self.assertEqual(after, 0)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 0)
 
-    def test_winners_gold_is_identical_whichever_side_loses(self):
-        """The consolation is minted, not carved out of the winner's reward -- same as the
-        attacker's penalty was never paid TO the winner either. Whether the loser is the
-        attacker or the defender, the winner's own payout must not move."""
+    def test_empty_loser_adds_no_transfer_whichever_side_loses(self):
+        """With empty loser wallets, either winner receives only the ordinary purse."""
         golds = {}
         for label, result, winner_uid in (
             ("defender_loses", SimpleNamespace(winner="1", loser="2"), "1"),
@@ -2926,15 +2929,16 @@ class MailTests(PetsTestCase):
         mine = pets.mail(entry, "1")[0]
         self.assertEqual(mine["kind"], "attack")
         self.assertLess(mine["coins"], 0)
-        self.assertEqual(pets.mail(entry, "2")[0]["coins"], pets.history(entry, "2")[0]["gold"])
+        won = pets.history(entry, "2")[0]
+        self.assertEqual(pets.mail(entry, "2")[0]["coins"],
+                         won["gold"] + won["transfer_gold"])
 
-        # 2 attacks and loses: 1 defended, lost, and is PAID a consolation rather than
-        # charged -- so their line has to read positive.
+        # 2 attacks and loses: 1 defended and still pays the same wallet share.
         self._fight(entry, "2", "1", "2", datetime(2026, 8, 9, 11, 0))
         defended = pets.mail(entry, "1")[-1]
         self.assertEqual(defended["kind"], "defense")
         self.assertEqual(defended["outcome"], "loss")
-        self.assertGreater(defended["coins"], 0)
+        self.assertLessEqual(defended["coins"], 0)
 
     def test_a_find_rides_on_the_winners_row_and_never_the_losers(self):
         entry = "chat"

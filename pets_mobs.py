@@ -5,11 +5,9 @@ that resolves a duel -- a mob is built into an ordinary Fighter and the transcri
 replay and the fight bank all behave identically. What is different is only what is on
 the other side of the ring and what it pays.
 
-WHY A MOB PAYS ABOUT HALF. A duel is player-versus-player: the coins the winner takes are
-partly paid BY the loser (see LOSS_GOLD_SHARE), so the arena mints far less than it moves
-around. A mob pays entirely out of thin air, and nobody is on the other end to lose
-anything, so the same payout would be a pure faucet running at double the rate. Halving it
-keeps PVE worth doing without making the arena the slow way to earn.
+WHY A MOB PAYS LESS. A duel is player-versus-player: besides the minted purse, five percent
+of the loser's wallets moves to the winner. A mob pays entirely out of thin air, and nobody
+is on the other end to lose anything, so the same payout would be a larger pure faucet.
 
 THREE TIERS, priced off the PLAYER rather than off a fixed stat block. A mob is generated
 relative to whoever picked the fight, so it stays a real opponent at every pet level

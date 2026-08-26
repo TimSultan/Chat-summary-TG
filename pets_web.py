@@ -2434,7 +2434,10 @@ async def handle_replay(request: web.Request) -> web.Response:
         "reward": {
             "gold": fight.get("gold", 0) if won else 0,
             "loss_gold": 0 if won else fight.get("loss_gold", 0),
-            "consolation_gold": 0 if won else fight.get("consolation_gold", 0),
+            "transfer_gold": fight.get("transfer_gold", 0) if won else 0,
+            "loss_rubies": 0 if won else fight.get("loss_rubies", 0),
+            "transfer_rubies": fight.get("transfer_rubies", 0) if won else 0,
+            "consolation_gold": 0,
             "auto_equipped": bool(fight.get("auto_equipped")) if won else False,
         },
         "dropped": _item_payload(dropped, prefix, pets.get_pet(entry, me)) if dropped else None,
@@ -2617,9 +2620,8 @@ async def handle_history(request: web.Request) -> web.Response:
         won = fight.get("winner_id") == me
         outcome = "Ничья" if not fight.get("winner_id") else ("Победа" if won else "Поражение")
         coins = (
-            fight.get("gold", 0)
+            (fight.get("gold", 0) + fight.get("transfer_gold", 0))
             or -fight.get("loss_gold", 0)
-            or fight.get("consolation_gold", 0)
         )
         rows.append({
             "attacked": attacked,
@@ -2627,6 +2629,10 @@ async def handle_history(request: web.Request) -> web.Response:
             "outcome": outcome,
             "won": won,
             "coins": coins,
+            "rubies": (
+                fight.get("transfer_rubies", 0)
+                or -fight.get("loss_rubies", 0)
+            ),
             "at": fight.get("ts"),
             # The timestamp is also the replay key (see pets.find_fight). `replayable`
             # spares the client a request that can only fail: a fight recorded before
@@ -9093,6 +9099,7 @@ function mailWho(row) {
 
 function mailRow(row) {
   const coins = Number(row.coins || 0);
+  const rubies = Number(row.rubies || 0);
   const meta = [];
   if (row.kind !== "farm" && row.kind.indexOf("quest") !== 0 && MAIL_VERDICTS[row.outcome]) {
     meta.push("<span class='verdict'>" + MAIL_VERDICTS[row.outcome] + "</span>");
@@ -9100,6 +9107,10 @@ function mailRow(row) {
   if (coins) {
     meta.push("<span class='" + (coins > 0 ? "gain" : "loss") + "'>" +
               (coins > 0 ? "+" : "−") + money(Math.abs(coins)) + " 💰</span>");
+  }
+  if (rubies) {
+    meta.push("<span class='" + (rubies > 0 ? "gain" : "loss") + "'>" +
+              (rubies > 0 ? "+" : "−") + money(Math.abs(rubies)) + " 💎</span>");
   }
   if (row.xp && (row.kind === "farm" || row.kind === "quest_ok")) {
     meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
@@ -9153,6 +9164,10 @@ function historyRow(row) {
     ? " · <span class='" + (row.coins > 0 ? "gain" : "loss") + "'>💰" +
       (row.coins > 0 ? "+" : "") + row.coins + "</span>"
     : "";
+  const rubies = row.rubies
+    ? " · <span class='" + (row.rubies > 0 ? "gain" : "loss") + "'>💎" +
+      (row.rubies > 0 ? "+" : "") + row.rubies + "</span>"
+    : "";
   // A replayable fight is a button; one from before snapshots were kept stays plain
   // text, because a control that can only apologise is worse than no control.
   const open = row.replayable
@@ -9160,7 +9175,7 @@ function historyRow(row) {
     : '<div class="row spread small" style="margin-bottom:7px">';
   return open + "<span>" +
     (row.attacked ? "Ты напал на " : "На тебя напал ") + "<b>" + esc(row.opponent) + "</b>" +
-    "<br><span class='tiny muted'>" + esc(row.id || "") + "</span></span><span class='tiny'>" + esc(row.outcome) + coins +
+    "<br><span class='tiny muted'>" + esc(row.id || "") + "</span></span><span class='tiny'>" + esc(row.outcome) + coins + rubies +
     (row.replayable ? " <span class='play'>▶</span>" : "") + "</span>" +
     (row.replayable ? "</button>" : "</div>");
 }
@@ -9824,8 +9839,10 @@ function playDuel(data) {
     const reward = data.reward || {};
     const bits = [];
     if (reward.gold) bits.push("💰 +" + reward.gold);
+    if (reward.transfer_gold) bits.push("💰 +" + reward.transfer_gold + " от соперника");
     if (reward.loss_gold) bits.push("💰 −" + reward.loss_gold);
-    if (reward.consolation_gold) bits.push("💰 +" + reward.consolation_gold);
+    if (reward.transfer_rubies) bits.push("💎 +" + reward.transfer_rubies + " от соперника");
+    if (reward.loss_rubies) bits.push("💎 −" + reward.loss_rubies);
     if (reward.xp) bits.push("✨ +" + reward.xp);
     if (reward.levels_gained) bits.push("⬆️ уровень " + reward.level);
     $("duelLog").insertAdjacentHTML("beforeend",

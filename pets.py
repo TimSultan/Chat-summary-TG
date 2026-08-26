@@ -2178,7 +2178,7 @@ def ruby_source_of(reason: str) -> str:
         return "dungeon_mobs"
     if value.startswith("dungeon-ruby:"):
         return "dungeon_legacy"
-    if value.startswith("arena-ruby:"):
+    if value.startswith(("arena-ruby:", "arena-transfer-")):
         return "pvp"
     if value.startswith("quest:"):
         return "quests"
@@ -2248,6 +2248,24 @@ def _append_ruby_log(entry: str, user_id, delta: int, reason: str, ref: str = ""
         "ref": str(ref or ""),
     })
     stats._write_json_atomic(_ruby_log_path(entry), rows[-RUBY_LOG_LIMIT:])
+
+
+def _stage_ruby_log(data: dict, user_id, delta: int, reason: str, ref: str = "") -> None:
+    """Queue a ledger row for the caller's already-planned pet-store save.
+
+    `_save` drains these rows to the sidecar in one batch. Arena transfers stage both
+    halves this way so one fight never reparses and rewrites the ruby ledger per player.
+    """
+    rows = data.setdefault("ruby_log", [])
+    if not isinstance(rows, list):
+        rows = data["ruby_log"] = []
+    rows.append({
+        "ts": app_now().isoformat(),
+        "user_id": str(user_id),
+        "delta": int(delta),
+        "reason": str(reason or ""),
+        "ref": str(ref or ""),
+    })
 
 
 def ruby_balance(entry, user_id) -> int:
@@ -8049,6 +8067,9 @@ def record_fight(
             "defender_owner": defender.get("owner_name"),
             "gold": 0,
             "loss_gold": 0,
+            "transfer_gold": 0,
+            "loss_rubies": 0,
+            "transfer_rubies": 0,
             "consolation_gold": 0,
             "dropped_item": None,
             "combat_seed": getattr(result, "seed", None),
@@ -8071,6 +8092,9 @@ def record_fight(
             "draw": True,
             "gold": 0,
             "loss_gold": 0,
+            "transfer_gold": 0,
+            "loss_rubies": 0,
+            "transfer_rubies": 0,
             "consolation_gold": 0,
             "xp": C.DRAW_XP,
             "levels_gained": attacker_levels_gained,
@@ -8104,9 +8128,9 @@ def record_fight(
         * (1 + bonus_pct / 100)
         * reward_multiplier
     )
-    # The coin-rake fantasy is "coins fly out on every hit", but directly charging an
-    # offline defender would break the arena's no-loss guarantee and invite farming one
-    # victim. The arena therefore adds the capped amount to the winner's purse. Only
+    # The coin-rake fantasy is "coins fly out on every hit". Its capped amount is minted
+    # into the ordinary purse; it must not become a second debit layered on top of the
+    # arena's explicit five-percent wallet stake. Only
     # ordinary landed attacks count; effect log rows and dodges do not.
     # `tax` is the legendary form: it bites in combat AND mints on a win, so it settles
     # here through exactly the same capped path rather than growing a second payout rule.
@@ -8127,55 +8151,34 @@ def record_fight(
         gold_base += min(cap, landed * per_hit)
     gold_multiplier = C.hero_gold_multiplier(winner.get("level", 1), "arena")
     gold = C.gold_for_hero(gold_base, winner.get("level", 1), "arena")
-    economy.grant(entry, winner_uid, gold, "pet_fight_win")
     _metric_add(data, "arena_reward_gold", gold)
 
-    # Only the ATTACKER pays a penalty for losing -- they are the one who pressed "напасть".
-    # A losing DEFENDER never chose this fight (opponents are dealt out of the power window,
-    # and a farming pet is now a valid target too), so they pay nothing and instead receive
-    # a small consolation minted onto their balance. See LOSS_GOLD_SHARE and
-    # DEFENDER_CONSOLATION_SHARE in pets_config.py for why the two are different numbers.
-    attacker_lost = loser_uid == attacker_uid
-    paid = 0
-    consolation = 0
-    if attacker_lost:
-        # Charged as a spend rather than a negative grant so it lands in the same ledger
-        # column as every other purchase -- and clamped to what they actually hold, because
-        # economy.balance floors at zero and a debt nobody can see the cause of is worse
-        # than a bill that got rounded down.
-        penalty = C.loss_gold_for(gold)
-        # «Последний чек» keeps part of the loser's coins. It changes only the amount paid;
-        # the winner's already-calculated reward is never reduced by somebody else's gear.
-        survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
-        if survivor_share:
-            penalty = max(0, round(penalty * (1 - min(1.0, survivor_share))))
-        if penalty > 0:
-            # Prefer the caller's own figure: it is the live, today-inclusive XP
-            # economy.balance wants, whereas _chat_xp_for can only see closed days. Only
-            # the attacker can reach this branch (loser_uid == attacker_uid was just
-            # checked above), so attacker_xp is always the right source when supplied; the
-            # fallback covers a caller that omitted it (most tests do).
-            loser_xp = attacker_xp if attacker_xp is not None else _chat_xp_for(entry, loser_uid)
-            affordable = min(penalty, economy.balance(entry, loser_uid, loser_xp))
-            if affordable > 0:
-                ok, _ = economy.spend(
-                    entry, loser_uid, loser_xp, affordable, "pet_fight_loss", ref=winner_uid
-                )
-                paid = affordable if ok else 0
-    else:
-        # The defender branch needs no XP lookup at all: economy.grant only credits a
-        # balance, unlike economy.spend/economy.balance it never has to read one first.
-        # That is also why this never needed the `_chat_xp_for` fallback the old shared
-        # penalty path carried for a defender it could not get live XP for.
-        # Scale this payout for the recipient, not for the winner. Otherwise a level-one
-        # defender could inherit a veteran attacker's economy multiplier simply by being
-        # selected as their target.
-        consolation_base = C.defender_consolation_for(gold_base)
-        consolation = C.gold_for_hero(
-            consolation_base, loser.get("level", 1), "arena",
-        )
-        if consolation > 0:
-            economy.grant(entry, loser_uid, consolation, "pet_fight_defender_consolation")
+    # Every loser stakes the same share of what they currently own, whichever side opened
+    # the fight. The winner's ordinary arena purse and this player-to-player transfer are
+    # settled in ONE economy write so a crash cannot debit without crediting.
+    loser_xp = (
+        int(attacker_xp) if loser_uid == attacker_uid and attacker_xp is not None
+        else _chat_xp_for(entry, loser_uid)
+    )
+    survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
+    transfer_share = C.ARENA_LOSS_TRANSFER_SHARE * (
+        1 - min(1.0, max(0.0, survivor_share))
+    )
+    paid = economy.settle_arena_reward(
+        entry, winner_uid, gold, loser_uid, loser_xp, transfer_share,
+    )
+
+    # Rubies live in the pet store already loaded for this settlement. Move them here so
+    # both wallets and the fight record land in the same save; this is a transfer, never
+    # part of the minted-ruby metric.
+    ruby_wallet = _ruby_row(data)
+    loser_rubies = max(0, int(ruby_wallet.get(loser_uid, 0) or 0))
+    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share)
+    if paid_rubies:
+        ruby_wallet[loser_uid] = loser_rubies - paid_rubies
+        ruby_wallet[winner_uid] = max(0, int(ruby_wallet.get(winner_uid, 0) or 0)) + paid_rubies
+        _stage_ruby_log(data, loser_uid, -paid_rubies, "arena-transfer-loss", winner_uid)
+        _stage_ruby_log(data, winner_uid, paid_rubies, "arena-transfer-win", loser_uid)
 
     dropped_code = None
     # Repeat designs are deliberate forge material. The pity counter is tied to wins,
@@ -8255,13 +8258,12 @@ def record_fight(
         "gold": gold,
         "gold_base": gold_base,
         "gold_multiplier": gold_multiplier,
-        # What the LOSER actually paid, which is not always C.loss_gold_for(gold): an
-        # empty wallet pays what it has. Stored so a history line can show the real
-        # number rather than recomputing an amount that was never charged. Exactly one of
-        # loss_gold/consolation_gold can be non-zero: an attacker-loser pays, a
-        # defender-loser is paid, never both on the same fight.
+        # Actual transfers, stored once and rewritten from each reader's side by history().
         "loss_gold": paid,
-        "consolation_gold": consolation,
+        "transfer_gold": paid,
+        "loss_rubies": paid_rubies,
+        "transfer_rubies": paid_rubies,
+        "consolation_gold": 0,
         "dropped_item": dropped_code,
         "auto_equipped": auto_equipped,
         "combat_seed": getattr(result, "seed", None),
@@ -8294,9 +8296,9 @@ def record_fight(
         "gold_base": gold_base if attacker_won else 0,
         "gold_multiplier": gold_multiplier,
         "loss_gold": 0 if attacker_won else paid,
-        # An attacker never gets a consolation -- only a losing defender does, below. Kept
-        # as an explicit field (not a sign-flipped loss_gold) so a reader can tell "paid a
-        # penalty" and "was minted a consolation" apart instead of inferring it from sign.
+        "transfer_gold": paid if attacker_won else 0,
+        "loss_rubies": 0 if attacker_won else paid_rubies,
+        "transfer_rubies": paid_rubies if attacker_won else 0,
         "consolation_gold": 0,
         "xp": winner_xp if attacker_won else C.LOSS_XP,
         "levels_gained": winner_levels_gained if attacker_won else loser_levels_gained,
@@ -8304,11 +8306,11 @@ def record_fight(
         "dropped_item": dropped_code if attacker_won else None,
         "auto_equipped": auto_equipped if attacker_won else False,
         "opponent_gold": gold if not attacker_won else 0,
-        # A losing defender never pays anymore -- see opponent_consolation_gold for what
-        # they receive instead. Left in place (rather than dropped) so any reader still
-        # asking "did the opponent lose money" gets a correct zero, not a missing key.
-        "opponent_loss_gold": 0,
-        "opponent_consolation_gold": consolation if attacker_won else 0,
+        "opponent_loss_gold": paid if attacker_won else 0,
+        "opponent_transfer_gold": paid if not attacker_won else 0,
+        "opponent_loss_rubies": paid_rubies if attacker_won else 0,
+        "opponent_transfer_rubies": paid_rubies if not attacker_won else 0,
+        "opponent_consolation_gold": 0,
         "opponent_xp": C.LOSS_XP if attacker_won else winner_xp,
         "opponent_levels_gained": loser_levels_gained if attacker_won else winner_levels_gained,
         "opponent_level": defender.get("level", 1),
@@ -8932,14 +8934,15 @@ def history(entry, user_id) -> list[dict]:
         if fight.get("attacker_id") != uid and fight.get("defender_id") != uid:
             continue
         row = dict(fight)
-        # Money columns are rewritten from the READER's side: "gold" is what the winner
-        # received, "loss_gold" what an attacker-loser paid and "consolation_gold" what a
-        # defender-loser was paid instead -- a fight has exactly one winner and one loser
-        # (or a draw), so at most one of the three is non-zero on any one person's line.
+        # Transfer columns are rewritten from the reader's side. The stored fight keeps
+        # one amount; the winner sees it incoming and the loser sees it outgoing.
         won = fight.get("winner_id") == uid
         row["gold"] = fight.get("gold", 0) if won else 0
         row["loss_gold"] = 0 if won else fight.get("loss_gold", 0)
-        row["consolation_gold"] = 0 if won else fight.get("consolation_gold", 0)
+        row["transfer_gold"] = fight.get("transfer_gold", 0) if won else 0
+        row["loss_rubies"] = 0 if won else fight.get("loss_rubies", 0)
+        row["transfer_rubies"] = fight.get("transfer_rubies", 0) if won else 0
+        row["consolation_gold"] = 0
         mine.append(row)
     mine.reverse()  # stored oldest -> newest, so reverse for "newest first"
     return mine[:C.HISTORY_LIMIT]
@@ -9110,18 +9113,21 @@ def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = No
         draw = bool(fight.get("draw"))
         won = str(fight.get("winner_id") or "") == uid
         if won:
-            coins = int(fight.get("gold", 0) or 0)
+            coins = int(fight.get("gold", 0) or 0) + int(fight.get("transfer_gold", 0) or 0)
         elif draw:
             coins = 0
         elif int(fight.get("loss_gold", 0) or 0):
-            # An attacker who lost paid this; a defender never does (see record_fight).
             coins = -int(fight.get("loss_gold", 0) or 0)
         else:
-            coins = int(fight.get("consolation_gold", 0) or 0)
+            coins = 0
         event = {
             "kind": "attack" if attacked else "defense",
             "outcome": "draw" if draw else ("win" if won else "loss"),
             "coins": coins,
+            "rubies": (
+                int(fight.get("transfer_rubies", 0) or 0) if won
+                else -int(fight.get("loss_rubies", 0) or 0)
+            ),
             # Derived from the RAW stored timestamp -- not from the normalised `ts` add()
             # writes below, which may have gained a timezone that find_fight would then
             # fail to match. Only a fight carrying a combat snapshot can be replayed; the

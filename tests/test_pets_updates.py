@@ -30,6 +30,12 @@ class PetUpdatesTests(unittest.TestCase):
         self.assertFalse(pets_updates.has_unread(entry, user_id))
         self.assertTrue(pets_updates.has_unread(entry, 43))
 
+    def test_latest_arena_stake_news_pays_five_diamonds(self):
+        newest = pets_updates.latest("chat")
+        self.assertEqual(newest.id, "202608-arena-five-percent-stake")
+        self.assertEqual(newest.reward_rubies, 5)
+        self.assertIn("5%", newest.text)
+
     def test_log_has_compact_owner_bound_arrow_buttons(self):
         entry = "chat"
         user_id = 1234567890123456789

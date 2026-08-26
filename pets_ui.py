@@ -3337,7 +3337,8 @@ def fight_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         f"Базовая награда за победу: {C.ARENA_WIN_GOLD_MIN}–{C.ARENA_WIN_GOLD_MAX} монет"
         f" и {C.WIN_XP} опыта;"
         f" за соперника ниже уровнем — меньше, выше — больше (до ±25%)."
-        f" Поражение: минус {round(C.LOSS_GOLD_SHARE * 100)}% от этого."
+        f" Поражение: {round(C.ARENA_LOSS_TRANSFER_SHARE * 100)}% текущих монет и алмазов "
+        "переходят победителю."
     )
     if farming:
         lines.append(
@@ -3590,12 +3591,14 @@ def fight_report(result, mine_key: str, names: dict, reward: dict | None) -> str
         else:
             if reward.get("gold"):
                 lines.append(f"🪙 +{_coins(reward['gold'])}")
+            if reward.get("transfer_gold"):
+                lines.append(f"🪙 +{_coins(reward['transfer_gold'])} от проигравшего")
             if reward.get("loss_gold"):
                 lines.append(f"🪙 −{_coins(reward['loss_gold'])}")
-            # A defender never chose this fight, so losing it pays a small consolation
-            # instead of taking coins. Only one of the two lines can ever appear.
-            if reward.get("consolation_gold"):
-                lines.append(f"🪙 +{_coins(reward['consolation_gold'])} за стойкость")
+            if reward.get("transfer_rubies"):
+                lines.append(f"💎 +{int(reward['transfer_rubies'])} от проигравшего")
+            if reward.get("loss_rubies"):
+                lines.append(f"💎 −{int(reward['loss_rubies'])}")
             if reward.get("xp"):
                 lines.append(f"✨ +{reward['xp']} опыта")
         if reward.get("levels_gained"):
@@ -3640,20 +3643,22 @@ def history_view(entry: str, user_id) -> tuple[str, dict]:
         who = f"{escape(owner or '?')} — {escape(other or '?')}"
         outcome = "Ничья" if draw else ("Победа" if won else "Поражение")
         gold = record.get("gold") or 0
+        transferred = record.get("transfer_gold") or 0
         lost = record.get("loss_gold") or 0
-        consolation = record.get("consolation_gold") or 0
+        transferred_rubies = record.get("transfer_rubies") or 0
+        lost_rubies = record.get("loss_rubies") or 0
         # Bare numbers here, with no noun to agree with -- the line is already dense and
         # "(Победа, +45)" reads fine next to a column of them.
         if draw:
             outcome += f", +{C.DRAW_XP} опыта"
-        elif won and gold:
-            outcome += f", +{_money(gold)}"
+        elif won and (gold or transferred):
+            outcome += f", +{_money(gold + transferred)}"
         elif lost:
             outcome += f", −{_money(lost)}"
-        elif consolation:
-            # A defeated defender is up, not down: showing nothing here used to make the
-            # line look like the fight simply cost them their time.
-            outcome += f", +{_money(consolation)}"
+        if transferred_rubies:
+            outcome += f", +{int(transferred_rubies)} 💎"
+        elif lost_rubies:
+            outcome += f", −{int(lost_rubies)} 💎"
         if attacked:
             lines.append(f"⚔️ Вы напали: {who} ({outcome})")
         else:

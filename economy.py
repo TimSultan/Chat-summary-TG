@@ -268,6 +268,38 @@ def grant(entry: str, user_id, amount: int, reason: str) -> None:
     _save(entry, data)
 
 
+def settle_arena_reward(entry: str, winner_id, reward: int, loser_id, loser_xp: int,
+                        transfer_share: float) -> int:
+    """Mint the arena purse and transfer a share of the loser's balance in one write.
+
+    Both movements must be atomic. Debiting first and crediting through a second helper
+    would let a crash keep the loser's money without delivering it to the winner; crediting
+    first would duplicate it. Returns the amount moved between players, excluding the
+    separately minted arena reward.
+    """
+    reward = max(0, int(reward or 0))
+    share = max(0.0, min(1.0, float(transfer_share or 0.0)))
+    data = _load(entry)
+    loser_balance = _balance_from(data, loser_id, int(loser_xp or 0))
+    # The tiny epsilon keeps decimal policy values such as 5% × 70% × 100 from becoming
+    # 3.4999999999999996 and rounding down solely because of binary floating point.
+    transferred = min(loser_balance, max(0, round(loser_balance * share + 1e-9)))
+
+    winner = _record(data, winner_id)
+    if reward:
+        winner["bonus"] = winner.get("bonus", 0) + reward
+        _append_log(data, winner_id, reward, "pet_fight_win")
+    if transferred:
+        loser = _record(data, loser_id)
+        loser["spent"] = loser.get("spent", 0) + transferred
+        winner["received"] = winner.get("received", 0) + transferred
+        _append_log(data, loser_id, -transferred, "pet_fight_loss", str(winner_id))
+        _append_log(data, winner_id, transferred, "pet_fight_transfer", str(loser_id))
+    if reward or transferred:
+        _save(entry, data)
+    return transferred
+
+
 def settle_wager(
     entry: str, user_id, xp: int, stake: int, won: bool, reason: str,
     *, draw: bool = False,

@@ -8021,9 +8021,10 @@ async def _pets_run_fight(
         "draw": reward.get("draw", False),
         "gold": reward.get("opponent_gold", 0),
         "loss_gold": reward.get("opponent_loss_gold", 0),
-        # The defender is the side that can be paid a consolation, so this is the report
-        # that actually needs it -- without it their DM shows a loss and no coins at all.
-        "consolation_gold": reward.get("opponent_consolation_gold", 0),
+        "transfer_gold": reward.get("opponent_transfer_gold", 0),
+        "loss_rubies": reward.get("opponent_loss_rubies", 0),
+        "transfer_rubies": reward.get("opponent_transfer_rubies", 0),
+        "consolation_gold": 0,
         "xp": reward.get("opponent_xp", reward.get("xp", 0) if reward.get("draw") else 0),
         "levels_gained": reward.get("opponent_levels_gained", 0),
         "level": reward.get("opponent_level", pets.get_pet(entry, opponent_id).get("level", 1)),
