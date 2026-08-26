@@ -128,6 +128,107 @@ class PetsIntegrationTests(unittest.TestCase):
         )
         self._render_every_screen(ALICE)
 
+    def _win_against(self, attacker, defender, attacker_name, defender_name):
+        """Settle a fight the attacker actually wins, and return what it moved."""
+        for seed in range(300):
+            result = pets_combat.simulate(
+                _fighter(attacker, attacker_name), _fighter(defender, defender_name),
+                rng=random.Random(seed),
+            )
+            if result.winner == str(attacker) and not result.is_draw:
+                break
+        else:
+            self.fail("no seed produced a win for the attacker")
+        return pets.record_fight(
+            ENTRY, attacker, defender, result, pets.today(), attacker_xp=RICH_XP,
+        )
+
+    def _purse(self, user_id):
+        """The balance the SETTLEMENT sees, which is not the one _balance reports.
+
+        _balance values a player at RICH_XP so the shop is affordable in these tests; the
+        transfer values the loser at their real chat XP, which here is none. Reading the
+        wrong one makes the share look wrong by the whole test rig.
+        """
+        return economy.balance(ENTRY, user_id, pets._chat_xp_for(ENTRY, str(user_id)))
+
+    def _make_unbeatable(self, user_id):
+        data = pets._load(ENTRY)
+        data["pets"][str(user_id)]["level"] = 40
+        for key in pets.C.STAT_KEYS:
+            data["pets"][str(user_id)]["stats"][key] = 200
+        pets._save(ENTRY, data)
+
+    def test_hitting_the_same_wallet_again_today_takes_less_from_it(self):
+        """A rival is a rival, not a renewable resource.
+
+        Without this, the best arena strategy is to find one rich, weak player and empty
+        their purse a fight at a time. The second visit of the day to the SAME defender,
+        and every one after it, moves a discounted share instead. The rule is deliberately
+        unannounced, so this test is the only place it is written down in words.
+        """
+        self._found(ALICE, "Кабанчик", "Alice")
+        self._found(BOB, "Тумблер", "Bob")
+        self._make_unbeatable(ALICE)
+        economy.grant(ENTRY, BOB, 100_000, "seed")
+
+        purse = self._purse(BOB)
+        first = self._win_against(ALICE, BOB, "Кабанчик", "Тумблер")["transfer_gold"]
+        first_share = first / purse
+        self.assertEqual(first, C.arena_loss_transfer(purse))
+
+        purse = self._purse(BOB)
+        second = self._win_against(ALICE, BOB, "Кабанчик", "Тумблер")["transfer_gold"]
+        second_share = second / purse
+        self.assertEqual(second, C.arena_loss_transfer(purse, 0.0, 1))
+        # Asserted as NUMBERS, not against the same constants the code reads: a helper
+        # compared with itself passes just as happily when the rule is switched off, which
+        # is exactly what the first version of this test did.
+        self.assertLess(second_share, first_share)
+        self.assertAlmostEqual(first_share, 0.05, places=4)
+        self.assertAlmostEqual(second_share, 0.035, places=4)
+
+        # And it does not compound: the third visit costs what the second did.
+        purse = self._purse(BOB)
+        third = self._win_against(ALICE, BOB, "Кабанчик", "Тумблер")["transfer_gold"]
+        self.assertAlmostEqual(third / purse, 0.035, places=4)
+
+    def test_a_fresh_opponent_is_still_worth_the_full_share(self):
+        """The discount is per target, so it must not punish a player for playing a lot."""
+        self._found(ALICE, "Кабанчик", "Alice")
+        self._found(BOB, "Тумблер", "Bob")
+        self._found(333, "Скрепка", "Carol")
+        self._make_unbeatable(ALICE)
+        economy.grant(ENTRY, BOB, 100_000, "seed")
+        economy.grant(ENTRY, 333, 100_000, "seed")
+
+        self._win_against(ALICE, BOB, "Кабанчик", "Тумблер")
+        purse = self._purse(333)
+
+        taken = self._win_against(ALICE, 333, "Кабанчик", "Скрепка")["transfer_gold"]
+
+        self.assertEqual(taken, C.arena_loss_transfer(purse))
+        self.assertAlmostEqual(taken / purse, 0.05, places=4)
+
+    def test_being_hit_repeatedly_does_not_shrink_what_the_defender_wins_back(self):
+        """Directional on purpose: you did not choose to be here twice, they did."""
+        self._found(ALICE, "Кабанчик", "Alice")
+        self._found(BOB, "Тумблер", "Bob")
+        self._make_unbeatable(ALICE)
+        economy.grant(ENTRY, BOB, 100_000, "seed")
+        economy.grant(ENTRY, ALICE, 100_000, "seed")
+        self._win_against(ALICE, BOB, "Кабанчик", "Тумблер")
+        self._win_against(ALICE, BOB, "Кабанчик", "Тумблер")
+
+        # Now Bob strikes back. Alice has attacked him twice today; that is her tally,
+        # not his, and it must not follow him into a fight he opened.
+        self._make_unbeatable(BOB)
+        purse = self._purse(ALICE)
+        taken = self._win_against(BOB, ALICE, "Тумблер", "Кабанчик")["transfer_gold"]
+
+        self.assertEqual(taken, C.arena_loss_transfer(purse))
+        self.assertAlmostEqual(taken / purse, 0.05, places=4)
+
     def test_a_fight_pays_out_and_shows_up_in_both_histories(self):
         self._found(ALICE, "Кабанчик", "Alice")
         self._found(BOB, "Тумблер", "Bob")

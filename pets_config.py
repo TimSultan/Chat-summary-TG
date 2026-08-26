@@ -658,6 +658,18 @@ ARENA_WIN_GOLD_MAX = 150
 # coins and rubies. It applies equally to attacker and defender and is calculated from
 # what the loser owns when the fight settles, never from the randomly rolled win purse.
 ARENA_LOSS_TRANSFER_SHARE = 0.05
+# Coming back for the same wallet on the same day pays less. A rival is a rival, not a
+# renewable resource: without this, the best arena strategy is to find one rich, weak
+# player and hit them until their purse is empty, which costs the attacker nothing but
+# fights and costs the target their whole day. The second attack on the SAME defender in
+# one day, and every one after it, moves 5% - 5% x 30% = 3.5% instead.
+#
+# Deliberately unannounced -- no release note, nothing on the arena screen. It only ever
+# reduces what the ATTACKER takes, so a player who never farms one target cannot be
+# harmed by a rule they were not told about, and a player who does farm sees their own
+# take shrink and can work out why. The counter it reads is the one already on screen as
+# «Знакомое лицо».
+ARENA_REPEAT_TARGET_DISCOUNT = 0.30
 
 WIN_XP = 100
 LOSS_XP = 35                # a loss still teaches something, so nobody dodges hard fights
@@ -783,9 +795,25 @@ def daily_fight_allowance(
     )
 
 
-def arena_loss_transfer(balance: int, retained_share: float = 0.0) -> int:
-    """Five percent of a loser's current wallet, after any explicit retention effect."""
+def arena_repeat_transfer_share(share: float, prior_attacks_today: int) -> float:
+    """The share left after the same-target discount.
+
+    `prior_attacks_today` is how many times this attacker has ALREADY picked this
+    defender today, so zero is the first fight of the day between them and pays in full.
+    The discount is a single step rather than a compounding one: the tenth visit takes the
+    same 3.5% as the second, which is enough to make a fresh target the better choice
+    without turning a long grudge into a rounding error.
+    """
+    if max(0, int(prior_attacks_today or 0)) <= 0:
+        return float(share)
+    return float(share) * (1.0 - min(1.0, max(0.0, ARENA_REPEAT_TARGET_DISCOUNT)))
+
+
+def arena_loss_transfer(balance: int, retained_share: float = 0.0,
+                        prior_attacks_today: int = 0) -> int:
+    """Five percent of a loser's current wallet, after retention and repeat discounts."""
     share = ARENA_LOSS_TRANSFER_SHARE * (1 - min(1.0, max(0.0, retained_share)))
+    share = arena_repeat_transfer_share(share, prior_attacks_today)
     current = max(0, int(balance or 0))
     return min(current, max(0, round(current * share + 1e-9)))
 

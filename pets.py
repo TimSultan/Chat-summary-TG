@@ -8171,6 +8171,15 @@ def record_fight(
     transfer_share = C.ARENA_LOSS_TRANSFER_SHARE * (
         1 - min(1.0, max(0.0, survivor_share))
     )
+    # Only when the ATTACKER is the one collecting. Being punched repeatedly does not make
+    # your own hand shake -- a defender who wins the rematch takes the full share, because
+    # they did not choose to be here twice. Read BEFORE this fight joins the log below, so
+    # the first attack of the day counts zero and pays in full.
+    prior_attacks = (
+        arena_attacks_against(entry, attacker_uid, defender_uid, today)
+        if winner_uid == attacker_uid else 0
+    )
+    transfer_share = C.arena_repeat_transfer_share(transfer_share, prior_attacks)
     paid = economy.settle_arena_reward(
         entry, winner_uid, gold, loser_uid, loser_xp, transfer_share,
     )
@@ -8180,7 +8189,7 @@ def record_fight(
     # part of the minted-ruby metric.
     ruby_wallet = _ruby_row(data)
     loser_rubies = max(0, int(ruby_wallet.get(loser_uid, 0) or 0))
-    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share)
+    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share, prior_attacks)
     if paid_rubies:
         ruby_wallet[loser_uid] = loser_rubies - paid_rubies
         ruby_wallet[winner_uid] = max(0, int(ruby_wallet.get(winner_uid, 0) or 0)) + paid_rubies
