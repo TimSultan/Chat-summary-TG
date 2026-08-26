@@ -6543,7 +6543,7 @@ PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     # gate on its own floor: starting it, and every turn of it afterwards.
     "phoenixstart", "phoenixact", "phoenixauto", "gatekeeperstart", "gatekeeperact",
     # Reading the bag and changing what is worn.
-    "bag", "bagitems", "equip", "unequip",
+    "bag", "bagitems", "equip", "unequip", "fav",
     # The scroll slots, and the picker screen that stands between them and a scroll.
     "skills", "skillpick", "skillclear", "setskill",
     # The forge, which is where a weapon is enchanted -- and every screen between it and
@@ -7162,6 +7162,17 @@ async def handle_pets_callback(
         if action == "lock":
             ok, note, _ = pets.toggle_item_lock(entry, user_id, argument)
             slot = pets_ui.slot_of(argument)
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.bag_items_view(entry, user_id, xp, slot), log
+            )
+            return
+        if action == "fav":
+            ok, note, pinned = pets.toggle_item_favourite(entry, user_id, argument)
+            # Redrawn where the player pressed it. Unpinning from the pinned page must
+            # stay on that page -- bouncing them into the weapon list to watch the item
+            # they just removed is a worse answer than an empty shelf.
+            slot = pets.FAVOURITE_SLOT if not pinned and ok else pets_ui.slot_of(argument)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
                 pets_ui.bag_items_view(entry, user_id, xp, slot), log

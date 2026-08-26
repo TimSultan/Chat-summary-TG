@@ -582,6 +582,17 @@ def _load(entry: str) -> dict:
             code for code in dict.fromkeys(C.LEGACY_ITEM_CODES.get(code, code) for code in locked)
             if code in normalised_inventory
         ]
+        # Same treatment, same reason: a pin is one player's shortcut to their own gear,
+        # not a property of the gear. Gifting a favourite must not arrive pinned for
+        # somebody who never chose it, and selling the last copy must not leave a pin
+        # pointing at nothing.
+        favourites = record.get("favourite_items")
+        if not isinstance(favourites, list):
+            favourites = []
+        record["favourite_items"] = [
+            code for code in dict.fromkeys(C.LEGACY_ITEM_CODES.get(code, code) for code in favourites)
+            if code in normalised_inventory
+        ]
         pending = record.get("pending_item_actions")
         # Confirmation secrets are only a short-lived UX/security handshake.  Bad or
         # historic values are dropped instead of letting malformed saves block gear.
@@ -1010,6 +1021,7 @@ def _new_record() -> dict:
         "inventory": [],
         "discovered": [],
         "locked_items": [],
+        "favourite_items": [],
         "pending_item_actions": {},
         "level": 1,
         "xp": 0,
@@ -7047,6 +7059,53 @@ def toggle_item_lock(entry, user_id, code) -> tuple[bool, str, bool]:
     return True, note, value
 
 
+# The bag's own pseudo-slot. Not in C.SLOT_KEYS on purpose -- no item HAS this slot, it
+# is a view across all of them -- so anything iterating real slots keeps working untouched
+# and only the two bag screens have to know the name.
+FAVOURITE_SLOT = "favourite"
+
+
+def is_item_favourite(record: dict, code: str) -> bool:
+    return code in (record.get("favourite_items") or [])
+
+
+def favourite_items(record: dict) -> list[str]:
+    """This player's pinned codes, in the order they pinned them, still in the bag."""
+    inventory = set(record.get("inventory") or [])
+    return [code for code in (record.get("favourite_items") or []) if code in inventory]
+
+
+def toggle_item_favourite(entry, user_id, code) -> tuple[bool, str, bool]:
+    """Pin or unpin an owned item so the bag lists it above every slot.
+
+    Deliberately NOT the same switch as the lock. A lock is a safety control -- it stops a
+    sale or a gift -- while this is only about where a thing appears on a screen. Folding
+    the two together would mean either that pinning your favourite sword quietly makes it
+    unsellable, or that protecting a spare drags it to the top of the bag; both are
+    surprises, and neither is what the player asked for by pressing one star.
+    """
+    data = _load(entry)
+    record = _tamed_record(data, user_id)
+    item = C.find_item(code)
+    if record is None:
+        return False, "Сначала приручи существо.", False
+    if item is None or item.code not in record.get("inventory", []):
+        return False, "Этого предмета нет в сумке.", False
+    favourites = record.setdefault("favourite_items", [])
+    if not isinstance(favourites, list):
+        favourites = record["favourite_items"] = []
+    if item.code in favourites:
+        favourites.remove(item.code)
+        value = False
+        note = f"Убрано из избранного: «{item.name}»."
+    else:
+        favourites.append(item.code)
+        value = True
+        note = f"В избранном: «{item.name}»."
+    _save(entry, data)
+    return True, note, value
+
+
 FORGE_NEXT_RARITY = {"cursed": "rare", "common": "rare", "rare": "legendary"}
 # Cut alongside the slot rule, because that rule multiplied the real cost of every recipe
 # by five: the same five commons that used to be "any five" are now five of ONE kind.
@@ -7372,6 +7431,11 @@ def gift_item(
         enchantment = None
     if item.code in giver.get("locked_items", []):
         giver["locked_items"].remove(item.code)
+    # Only when the last copy leaves. Giving away a spare should not unpin the one still
+    # in the bag -- the pin is about a design the player wants to find quickly, and they
+    # can still find this one.
+    if item.code not in giver["inventory"] and item.code in (giver.get("favourite_items") or []):
+        giver["favourite_items"].remove(item.code)
     receiver.setdefault("inventory", []).append(item.code)
     _discover(receiver, item.code)
     if weapon_record is not None:

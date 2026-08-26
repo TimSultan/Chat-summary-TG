@@ -2388,6 +2388,17 @@ def bag_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     lines.append(f"🪙 Монеты: {_money(coins)}")
 
     rows = []
+    # Above every slot, because that is the point of pinning: the two weapons a player
+    # actually rotates should not sit four taps deeper than the sixty they keep as forge
+    # material. Hidden while nothing is pinned -- an empty category teaches nothing.
+    pinned = pets.favourite_items(pet)
+    if pinned:
+        rows.append([{
+            "text": f"⭐ Избранное · {len(pinned)}",
+            "callback_data": callback_data(
+                user_id, "bagitems", slot_argument(pets.FAVOURITE_SLOT),
+            ),
+        }])
     for slot in C.SLOT_KEYS:
         slot_owned = sum(
             C.find_item(code) is not None and C.find_item(code).slot == slot
@@ -2966,39 +2977,56 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
-    if slot not in C.SLOT_KEYS:
+    pinned_view = slot == pets.FAVOURITE_SLOT
+    if slot not in C.SLOT_KEYS and not pinned_view:
         return bag_view(entry, user_id, xp)
 
     inventory = pet.get("inventory", [])
+    favourites = set(pets.favourite_items(pet))
     counts = Counter(
         item.code for code in inventory
-        if (item := C.find_item(code)) is not None and item.slot == slot
+        if (item := C.find_item(code)) is not None
+        and (item.code in favourites if pinned_view else item.slot == slot)
     )
     owned = [C.find_item(code) for code in counts]
     locked = set(pet.get("locked_items", []))
-    worn = (pet.get("equipped") or {}).get(slot)
+    equipped = pet.get("equipped") or {}
+    # The pinned page spans slots, so what is worn has to be asked per item: one code for
+    # the whole page cannot answer it once a sword and a shield share a screen.
+    worn_codes = {code for code in equipped.values() if code}
+    worn = equipped.get(slot)
     personal_enchantments = pet.get("personal_enchantments") or {}
     elemental_enchantments = pet.get("weapon_enchantments") or {}
-    owned.sort(key=lambda item: (item.code != worn, item.code))
+    owned.sort(key=lambda item: (item.code not in worn_codes, item.slot, item.code)
+               if pinned_view else (item.code != worn, item.code))
     total_pages = max(1, (len(owned) + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
     page = min(max(0, page), total_pages - 1)
     visible = owned[page * INVENTORY_PAGE_SIZE:(page + 1) * INVENTORY_PAGE_SIZE]
 
     copy_count = sum(counts.values())
     noun = _plural(copy_count, "предмет", "предмета", "предметов").split(" ", 1)[1]
+    title = ("⭐ Избранное" if pinned_view
+             else f"🎒 Моя сумка · {C.SLOT_NAMES[slot]}")
     lines = [
-        f"🎒 <b>Моя сумка · {escape(C.SLOT_NAMES[slot])}</b>",
+        f"<b>{escape(title)}</b>",
         f"{copy_count} {noun} · {len(owned)} видов · {page + 1}/{total_pages}",
     ]
     rows = []
     if not visible:
-        lines.append("\nЗдесь пока пусто. Новое оружие появляется в магазине дня или после победы.")
+        lines.append(
+            "\nЗдесь пока пусто. Отметь звездой то, что носишь чаще всего."
+            if pinned_view else
+            "\nЗдесь пока пусто. Новое оружие появляется в магазине дня или после победы."
+        )
     for number, item in enumerate(visible, start=page * INVENTORY_PAGE_SIZE + 1):
-        is_worn = item.code == worn
+        is_worn = item.code in worn_codes if pinned_view else item.code == worn
         copies = counts[item.code]
         spare_copies = copies - int(is_worn)
         mark = " ✅ надето" if is_worn else ""
         lock_mark = " 🔒" if item.code in locked else ""
+        star_mark = " ⭐" if item.code in favourites else ""
+        # On the pinned page the slot is the one thing the heading no longer says.
+        slot_mark = f" · {C.SLOT_NAMES[item.slot]}" if pinned_view else ""
         paint_mark = " 🎨 +30%" if item.code in personal_enchantments else ""
         element = elemental_enchantments.get(item.code) if item.slot == "weapon" else None
         element_mark = (
@@ -3008,10 +3036,10 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         label = C.RARITY_LABELS.get(item.rarity, item.rarity)
         count_mark = f" ×{copies}" if copies > 1 else ""
         lines.append(
-            f"\n{number}. <b>{escape(item.name)}</b>{count_mark}{mark}{lock_mark}"
+            f"\n{number}. <b>{escape(item.name)}</b>{count_mark}{mark}{lock_mark}{star_mark}"
             f"{element_mark}{paint_mark}"
         )
-        lines.append(f"{label} · {_bonus_text(item)}")
+        lines.append(f"{label}{slot_mark} · {_bonus_text(item)}")
         if item.slot == "weapon":
             details = pets.weapon_details(entry, user_id, item.code)
             lines.append(
@@ -3025,7 +3053,7 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         if is_worn:
             rows.append([{
                 "text": f"Снять · {item.name}",
-                "callback_data": callback_data(user_id, "unequip", slot),
+                "callback_data": callback_data(user_id, "unequip", item.slot),
             }])
         else:
             rows.append([{
@@ -3035,6 +3063,11 @@ def bag_items_view(entry: str, user_id, xp: int, slot: str, page: int = 0) -> tu
         rows.append([{
             "text": "🔓 Открепить" if item.code in locked else "🔒 Закрепить",
             "callback_data": callback_data(user_id, "lock", item.code),
+        }, {
+            "text": ("☆ Из избранного"
+                     if item.code in favourites
+                     else "⭐ В избранное"),
+            "callback_data": callback_data(user_id, "fav", item.code),
         }])
         # A lock is a safety control, not merely a warning: keep destructive actions
         # out of the convenient page as well as enforcing the same rule in pets.py.

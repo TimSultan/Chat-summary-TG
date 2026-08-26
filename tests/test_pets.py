@@ -1458,6 +1458,157 @@ class EquipmentTradingTests(PetsTestCase):
         self.assertNotIn(pets_ui.callback_data("1", "sell", item.code), callbacks)
 
 
+class FavouriteItemTests(PetsTestCase):
+    """⭐ Избранное: a per-player shortcut to the gear they actually use.
+
+    A full bag is mostly forge material. The two or three things a player rotates should
+    not sit at the same depth as the sixty they are hoarding, so pinned gear gets one
+    category above every slot.
+    """
+
+    def _stocked(self, entry="bag"):
+        self._tame(entry, "1")
+        picks = []
+        for slot in ("weapon", "shield", "boots"):
+            picks += [item.code for item in pets_config.ITEMS
+                      if item.slot == slot and item.source == "drop"][:2]
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"] = list(picks)
+        data["pets"]["1"]["equipped"]["weapon"] = picks[0]
+        pets._save(entry, data)
+        return picks
+
+    def test_pinning_is_not_the_same_switch_as_locking(self):
+        """One stops a sale, the other only moves a row. Folding them together surprises.
+
+        Pinning a favourite sword must not quietly make it unsellable, and protecting a
+        spare must not drag it to the top of the bag.
+        """
+        picks = self._stocked()
+
+        ok, _note, pinned = pets.toggle_item_favourite("bag", "1", picks[0])
+
+        self.assertTrue(ok)
+        self.assertTrue(pinned)
+        pet = pets.get_pet("bag", "1")
+        self.assertEqual(pet["favourite_items"], [picks[0]])
+        self.assertEqual(pet["locked_items"], [])
+        self.assertFalse(pets.is_item_locked(pet, picks[0]))
+
+    def test_the_star_toggles_and_refuses_what_is_not_in_the_bag(self):
+        picks = self._stocked()
+        pets.toggle_item_favourite("bag", "1", picks[0])
+
+        ok, _note, pinned = pets.toggle_item_favourite("bag", "1", picks[0])
+        self.assertTrue(ok)
+        self.assertFalse(pinned)
+        self.assertEqual(pets.get_pet("bag", "1")["favourite_items"], [])
+
+        ok, note, _ = pets.toggle_item_favourite("bag", "1", "nothing-like-this")
+        self.assertFalse(ok)
+        self.assertIn("нет в сумке", note)
+
+    def test_the_category_only_exists_once_something_is_pinned(self):
+        """An always-present filter that can only show an empty shelf teaches nothing."""
+        picks = self._stocked()
+
+        def hub_buttons():
+            _text, keyboard = pets_ui.bag_view("bag", "1", 0)
+            return [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertFalse([text for text in hub_buttons() if "Избранное" in text])
+
+        pets.toggle_item_favourite("bag", "1", picks[0])
+        top = hub_buttons()[0]
+        self.assertIn("Избранное", top)
+        self.assertIn("1", top)
+
+    def test_the_pinned_page_spans_slots_and_says_which_is_which(self):
+        """It is the one bag page where a sword and a shield share a screen."""
+        picks = self._stocked()
+        pets.toggle_item_favourite("bag", "1", picks[0])   # a worn weapon
+        pets.toggle_item_favourite("bag", "1", picks[2])   # a shield
+
+        text, keyboard = pets_ui.bag_items_view("bag", "1", 0, pets.FAVOURITE_SLOT)
+        buttons = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn("Избранное", text)
+        self.assertIn(pets_config.SLOT_NAMES["weapon"], text)
+        self.assertIn(pets_config.SLOT_NAMES["shield"], text)
+        # The worn one is still marked worn, and its button still takes off the right slot.
+        self.assertIn("надето", text)
+        self.assertTrue([b for b in buttons if b.startswith("Снять")])
+        self.assertTrue([b for b in buttons if "Из избранного" in b])
+
+    def test_unequipping_from_the_pinned_page_targets_the_item_own_slot(self):
+        """The page has no single slot of its own, so the button cannot borrow one."""
+        picks = self._stocked()
+        data = pets._load("bag")
+        data["pets"]["1"]["equipped"]["shield"] = picks[2]
+        pets._save("bag", data)
+        pets.toggle_item_favourite("bag", "1", picks[2])
+
+        _text, keyboard = pets_ui.bag_items_view("bag", "1", 0, pets.FAVOURITE_SLOT)
+        take_off = next(
+            button for row in keyboard["inline_keyboard"] for button in row
+            if button["text"].startswith("Снять")
+        )
+        _uid, _action, argument = pets_ui.parse_callback(take_off["callback_data"])
+
+        self.assertEqual(argument, "shield")
+
+    def _ready_to_gift(self, entry, code):
+        """Two players past the gift level gate, with `code` unequipped and pinned."""
+        self._tame(entry, "2")
+        data = pets._load(entry)
+        for uid in ("1", "2"):
+            data["pets"][uid]["level"] = max(5, pets_config.GIFT_MIN_PET_LEVEL)
+        pets._save(entry, data)
+        pets.toggle_item_favourite(entry, "1", code)
+
+    def test_a_pin_never_travels_to_the_person_you_gift_it_to(self):
+        """A pin is one player's shortcut, not a property of the gear."""
+        entry = "gift-away"
+        picks = self._stocked(entry)
+        spare = picks[1]                       # not the worn one; equipped cannot be gifted
+        self._ready_to_gift(entry, spare)
+
+        ok, note = pets.gift_item(entry, "1", "2", spare)
+
+        self.assertTrue(ok, note)
+        # Last copy left, so the giver's pin goes with it -- and never arrives pinned.
+        self.assertEqual(pets.get_pet(entry, "1")["favourite_items"], [])
+        self.assertEqual(pets.get_pet(entry, "2")["favourite_items"], [])
+
+    def test_giving_away_a_spare_keeps_the_pin_on_the_one_still_in_the_bag(self):
+        """The pin is about a design the player wants to find fast. They still can."""
+        entry = "gift-spare"
+        picks = self._stocked(entry)
+        spare = picks[1]
+        data = pets._load(entry)
+        data["pets"]["1"]["inventory"].append(spare)   # a second copy
+        pets._save(entry, data)
+        self._ready_to_gift(entry, spare)
+
+        ok, note = pets.gift_item(entry, "1", "2", spare)
+
+        self.assertTrue(ok, note)
+        self.assertIn(spare, pets.get_pet(entry, "1")["inventory"])
+        self.assertIn(spare, pets.get_pet(entry, "1")["favourite_items"])
+        self.assertEqual(pets.get_pet(entry, "2")["favourite_items"], [])
+
+    def test_the_mini_app_is_told_which_items_are_pinned(self):
+        picks = self._stocked()
+        pets.toggle_item_favourite("bag", "1", picks[0])
+
+        import pets_web                      # imported here: test_pets.py is pets-only
+        bag = pets_web._state_payload("bag", "1", 0, "/pets", "bag")["bag"]
+        pinned = {row["code"] for row in bag if row["favourite"]}
+
+        self.assertEqual(pinned, {picks[0]})
+        self.assertIn("favourite", pets_web._ACTIONS)
+
+
 class ForgeTests(PetsTestCase):
     """The forge takes one KIND of item and returns that kind, one rarity better.
 

@@ -687,6 +687,9 @@ def _item_payload(item, prefix: str, record: dict | None = None) -> dict:
         "owned": owned,
         "equipped": item.code in equipped_codes,
         "locked": item.code in set((record or {}).get("locked_items", [])),
+        # Separate from `locked` on purpose: one is a safety catch on selling, the other
+        # is only about where the bag lists it. See pets.toggle_item_favourite.
+        "favourite": item.code in set((record or {}).get("favourite_items", [])),
         "enchantment": ((record or {}).get("weapon_enchantments") or {}).get(item.code)
           if item.slot == "weapon" else None,
         "personal_paint": personal_payload,
@@ -1203,6 +1206,13 @@ def _action_lock(entry, user_id, xp, payload):
     return ok, message
 
 
+def _action_favourite(entry, user_id, xp, payload):
+    ok, message, _pinned = pets.toggle_item_favourite(
+        entry, user_id, str(payload.get("code") or ""),
+    )
+    return ok, message
+
+
 def _action_buy(entry, user_id, xp, payload):
     return pets.buy_item(entry, user_id, xp, str(payload.get("code") or ""))
 
@@ -1462,6 +1472,7 @@ _ACTIONS = {
     "unequip": _action_unequip,
     "set_skill": _action_set_skill,
     "lock": _action_lock,
+    "favourite": _action_favourite,
     "buy": _action_buy,
     "reforge": _action_reforge,
     "enchant_weapon": _action_enchant_weapon,
@@ -6581,7 +6592,8 @@ function renderBag() {
   // re-render. Drawing an empty bag here would say the player owns nothing.
   if (!S.bag) { box.innerHTML = '<div class="empty">Загружаю сумку…</div>'; return; }
   let items = S.bag.slice();
-  if (bagSlot !== "all") items = items.filter((i) => i.slot === bagSlot);
+  if (bagSlot === "favourite") items = items.filter((i) => i.favourite);
+  else if (bagSlot !== "all") items = items.filter((i) => i.slot === bagSlot);
   if (bagRarity !== "all") items = items.filter((i) => i.rarity === bagRarity);
   items.sort((a, b) => bagSort === "rarity"
     ? b.rarity_rank - a.rarity_rank || a.name.localeCompare(b.name)
@@ -6836,6 +6848,11 @@ function openEnchantWeapons(element) {
 function slotChips(active, key, skipAll) {
   const slots = [["all", "Всё"], ["weapon", "🗡 Оружие"], ["amulet", "📿 Амулеты"],
                  ["gloves", "🧤 Перчатки"], ["boots", "👢 Сапоги"], ["shield", "🛡 Щиты"]];
+  // First chip, ahead of «Всё», and only once something is pinned: an always-present
+  // filter that can only ever show an empty shelf is a control that teaches nothing.
+  if (key === "bagslot" && (S.bag || []).some((i) => i.favourite)) {
+    slots.unshift(["favourite", "⭐ Избранное"]);
+  }
   return slots.filter(([value]) => !(skipAll && value === "all")).map(([value, label]) =>
     '<button class="chip' + (active === value ? " on" : "") + '" data-' + key + '="' + value + '">' +
     label + "</button>").join("");
@@ -6866,6 +6883,7 @@ function itemCard(item, flag) {
                                : (flag ? '<span class="flag">' + flag + "</span>" : "")) +
                 (Number(item.count || 1) > 1
                   ? '<span class="lockmark" title="Количество">×' + Number(item.count) + '</span>' : "") +
+                (item.favourite ? '<span class="lockmark" title="Избранное">⭐</span>' : "") +
                 (item.locked ? '<span class="lockmark">🔒</span>' : "") +
                 (item.enchantment ? '<span class="lockmark" title="Руна">' +
                   ({ fire: '🔥', frost: '❄️', water: '💧', earth: '🪨', air: '💨', plants: '🌿' }[item.enchantment] || '🔮') + '</span>' : "") +
@@ -9201,6 +9219,8 @@ function openItem(code) {
   if (item.owned && !item.equipped) actions.push(btn("Надеть", "equip", item.code));
   if (item.equipped) actions.push(btn("Снять", "unequip", item.slot, "sec"));
   if (item.owned) {
+    actions.push(btn(item.favourite ? "☆ Убрать из избранного" : "⭐ В избранное",
+                     "favourite", item.code, "sec"));
     actions.push('<div class="pair">' +
       btn(item.locked ? "🔓 Разблокировать" : "🔒 Заблокировать", "lock", item.code, "sec") +
       (item.locked || spareCopies < 1 ? ""
@@ -10284,6 +10304,14 @@ async function handleClick(event, target) {
     if (d.act === "equip") { closeSheet(); await act("equip", { code }); SHOP = null; }
     else if (d.act === "unequip") { closeSheet(); await act("unequip", { slot: code }); }
     else if (d.act === "lock") { closeSheet(); await act("lock", { code }); }
+    else if (d.act === "favourite") {
+      // The bag payload carries the flag, so it has to be refetched rather than reused.
+      closeSheet();
+      await act("favourite", { code });
+      S.bag = null;
+      await ensureBag();
+      render();
+    }
     else if (d.act === "buy") { closeSheet(); const ok = await act("buy", { code });
                                 if (ok) SHOP = null; render(); }
     else if (d.act === "sell") {
