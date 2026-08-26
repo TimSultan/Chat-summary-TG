@@ -3068,6 +3068,59 @@ class MailTests(PetsTestCase):
         self.assertIn("Ты напал на", text)
         self.assertTrue(keyboard["inline_keyboard"])
 
+    def test_the_mailbox_says_what_the_diamonds_did(self):
+        """A currency that leaves a wallet has to be legible where players ask what they missed.
+
+        pets.mail has always signed the diamond movement and the web feed has always drawn
+        it; the Telegram line read `coins` alone and dropped it. The worst case is the one
+        asserted last: a defender who lost diamonds and no coins got a line with no number
+        in it at all.
+        """
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        self._tame(entry, "2", "Чужой")
+        moment = datetime(2026, 8, 9, 10, 5)
+        self._fight(entry, "1", "2", "1", moment)
+
+        # Give the stored fight a diamond movement from each side's point of view.
+        data = pets._load(entry)
+        pets._save(entry, data)
+        fights = pets.fight_log_rows(entry)
+        fights[-1]["loss_rubies"] = 4
+        fights[-1]["transfer_rubies"] = 4
+        stats._write_json_atomic(pets._fight_log_path(entry), fights)
+
+        winner_line = pets_ui._mail_line(pets.mail(entry, "1")[-1])
+        loser_line = pets_ui._mail_line(pets.mail(entry, "2")[-1])
+
+        self.assertIn("+4 💎", winner_line)
+        self.assertIn("−4 💎", loser_line)
+        self.assertNotIn("−4 💎", winner_line)
+
+        # Diamonds alone, no coins: the line must still carry a number.
+        bare = pets_ui._mail_line({
+            "kind": "defense", "outcome": "loss", "coins": 0, "rubies": -4,
+            "pet_name": "Чужой", "owner_name": "Кто-то",
+        })
+        self.assertIn("−4 💎", bare)
+
+    def test_a_farm_shift_reports_its_diamonds_too(self):
+        """The event never carried them, so NEITHER client could draw them."""
+        entry = "chat"
+        self._tame(entry, "1", "Мой")
+        data = pets._load(entry)
+        data["pets"]["1"]["farm_notifications"] = [{
+            "run_id": "r1", "pet_name": "Мой", "hours": 8, "gold": 1_200, "xp": 300,
+            "rubies": 2, "levels_gained": 0, "item_code": None, "auto_equipped": False,
+            "settled_at": datetime(2026, 8, 9, 12, 15).isoformat(), "notified_at": None,
+        }]
+        pets._save(entry, data)
+
+        event = next(row for row in pets.mail(entry, "1") if row["kind"] == "farm")
+
+        self.assertEqual(event["rubies"], 2)
+        self.assertIn("+2 💎", pets_ui._mail_line(event))
+
     def test_empty_mailbox_says_so_and_the_menu_links_to_it(self):
         entry = "chat"
         self._tame(entry, "1", "Мой")

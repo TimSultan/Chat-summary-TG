@@ -9168,6 +9168,9 @@ def mail(entry, user_id, limit: int | None = None, extra: list[dict] | None = No
                 "kind": "farm",
                 "outcome": "",
                 "coins": int(receipt.get("gold", 0) or 0),
+                # A shift can pay diamonds too. Missing here, the mailbox reported a
+                # shift's coins and quietly swallowed its diamonds on both clients.
+                "rubies": int(receipt.get("rubies", 0) or 0),
                 "xp": int(receipt.get("xp", 0) or 0),
                 "hours": int(receipt.get("hours", 0) or 0),
                 "levels_gained": int(receipt.get("levels_gained", 0) or 0),

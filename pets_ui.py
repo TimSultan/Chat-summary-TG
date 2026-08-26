@@ -3724,6 +3724,17 @@ def _mail_line(event: dict) -> str:
         money = f", +{_money(coins)} 🪙"
     elif coins < 0:
         money = f", −{_money(-coins)} 🪙"
+    # Diamonds ride in the same tail as coins and are signed the same way. They used to be
+    # dropped here entirely: `pets.mail` has always handed them over, the web feed has
+    # always drawn them, and this line read `coins` alone -- so a defender who lost four
+    # diamonds and no coins got a mailbox line with no number in it at all. A currency
+    # that leaves a wallet has to be legible in the place players go to ask what they
+    # missed.
+    rubies = int(event.get("rubies", 0) or 0)
+    if rubies > 0:
+        money += f", +{_money(rubies)} 💎"
+    elif rubies < 0:
+        money += f", −{_money(-rubies)} 💎"
     if kind == "farm":
         hours = int(event.get("hours", 0) or 0)
         xp = int(event.get("xp", 0) or 0)
