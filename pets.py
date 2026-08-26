@@ -7188,7 +7188,14 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
                 "редкости. Надетые и защищённые не считаются."
             ), None
         consumed = ingredients[:required]
-        owned = set(record.get("inventory", []))
+        # The COLLECTION BOOK, not the bag. These are different questions and the forge
+        # was asking the wrong one: "is this in your inventory right now" says yes to
+        # nothing you sold, gave away, or melted back down, so an item you found last week
+        # counted as undiscovered and the forge handed it to you again. Players forge, sell
+        # the result, forge again -- and got the same few things round and round while the
+        # collection never filled. `_discover` runs on every path that hands over an item,
+        # so this set already contains everything in the bag and then some.
+        found = set(record.get("discovered", []))
         # A curse comes out of a curse. This is the whole of the cursed ladder: melting
         # junk curses can only ever hand back a RARE CURSE, and melting rare curses can
         # only ever hand back a legendary one. Without it the two lines would collapse
@@ -7214,7 +7221,7 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
         # Discovery gets first priority, but a completed collection must not turn spare
         # materials into a dead pile. Once every design is known, forging yields another
         # higher-tier copy that can continue up the ladder, be sold or be gifted.
-        unseen_pool = [item for item in pool if item.code not in owned]
+        unseen_pool = [item for item in pool if item.code not in found]
         result = chooser.choice(unseen_pool or pool)
         inventory = record.setdefault("inventory", [])
         for item in consumed:

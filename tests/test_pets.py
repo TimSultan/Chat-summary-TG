@@ -1508,6 +1508,64 @@ class ForgeTests(PetsTestCase):
         self.assertIn(result.code, inventory)
         self.assertEqual(len(inventory), 2)
 
+    def test_the_forge_hands_over_a_design_the_collection_has_never_seen(self):
+        """The bag and the collection book are different questions.
+
+        The forge asked "is this in your inventory right now", which says no to everything
+        you have sold, gifted or melted back down -- so a design found last week counted as
+        undiscovered and came round again. Players forge, sell the result, forge again, and
+        got the same handful of items in circles while the collection never filled. Here
+        the whole rare shelf is emptied out one design at a time, with the result sold each
+        turn, which is exactly the loop that used to repeat itself.
+        """
+        entry = "forge-unseen"
+        self._tame(entry, "1")
+        pool = [item for item in pets_config.ITEMS
+                if item.source == "drop" and item.rarity == "rare"
+                and item.slot == "gloves" and not getattr(item, "cursed", False)]
+        self.assertGreater(len(pool), 3, "a shelf of three proves nothing about repeats")
+        needed = pets.FORGE_REQUIREMENTS["common"]
+        chooser = random.Random(11)
+
+        seen = []
+        for _ in range(len(pool)):
+            data = pets._load(entry)
+            record = data["pets"]["1"]
+            record["inventory"] = [item.code for item in self._drops("gloves", "common", needed)]
+            pets._save(entry, data)
+
+            ok, message, code = pets.reforge_items(entry, "1", "common", "gloves", chooser)
+            self.assertTrue(ok, message)
+            seen.append(code)
+
+            # The player does the ordinary thing with what came out.
+            data = pets._load(entry)
+            data["pets"]["1"]["inventory"].remove(code)
+            pets._save(entry, data)
+
+        self.assertEqual(len(set(seen)), len(pool), f"repeats before the shelf was empty: {seen}")
+
+    def test_a_finished_collection_still_forges_rather_than_refusing(self):
+        """Spare material must not become a dead pile once every design is known."""
+        entry = "forge-complete"
+        self._tame(entry, "1")
+        pool = [item for item in pets_config.ITEMS
+                if item.source == "drop" and item.rarity == "rare"
+                and item.slot == "gloves" and not getattr(item, "cursed", False)]
+        data = pets._load(entry)
+        record = data["pets"]["1"]
+        # Everything already in the book, nothing in the bag.
+        record["discovered"] = [item.code for item in pool]
+        record["inventory"] = [
+            item.code for item in self._drops("gloves", "common", pets.FORGE_REQUIREMENTS["common"])
+        ]
+        pets._save(entry, data)
+
+        ok, message, code = pets.reforge_items(entry, "1", "common", "gloves", random.Random(3))
+
+        self.assertTrue(ok, message)
+        self.assertIn(code, {item.code for item in pool})
+
     def test_a_pile_of_one_slot_cannot_be_melted_into_another(self):
         """Five common gloves are five common gloves. They are not five common anything,
         and they are certainly not a sword."""
