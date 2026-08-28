@@ -2526,7 +2526,13 @@ def simulate(a: "Fighter", b: "Fighter", rng=None, seed: int | None = None,
             if MAGIC in basic_attack_types and PHYSICAL not in basic_attack_types:
                 # A pure spell swing: no steel in it at all, so the physical resistance
                 # this block exists to apply simply does not reach it.
-                pass
+                #
+                # The rune's power bonus DOES reach it. It used to be skipped here purely
+                # because it shares this if/elif chain with the resistance, which meant a
+                # rune and a diamond spent on a magic weapon bought literally nothing: the
+                # swing was already pure magic, so there was no half to convert either.
+                if attacker.weapon_enchanted:
+                    damage = max(1, round(damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
             elif attacker.weapon_enchanted or MAGIC in basic_attack_types:
                 # A runed blade, or a hybrid weapon: half steel, half spell. Only the
                 # steel half meets the defender's physical resistance. The rune's power

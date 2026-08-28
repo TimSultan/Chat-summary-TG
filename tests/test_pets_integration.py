@@ -229,6 +229,87 @@ class PetsIntegrationTests(unittest.TestCase):
         self.assertEqual(taken, C.arena_loss_transfer(purse))
         self.assertAlmostEqual(taken / purse, 0.05, places=4)
 
+    def test_an_arena_fighter_carries_the_whole_elemental_kit(self):
+        """PvE builds its fighter in pets.py and PvP builds it in bot_listener.py.
+
+        Two builders for one creature is how a weapon that works in the dungeon quietly
+        does nothing in the arena. Everything the elemental rules read has to survive the
+        crossing: which stat the swing scales off, whether a rune is on the blade, the
+        rune's own passive, and the creature's permanent element.
+        """
+        import bot_listener
+
+        self._found(ALICE, "Кабанчик", "Alice")
+        magic = next(item for item in C.ITEMS
+                     if item.slot == "weapon"
+                     and C.weapon_scaling(item) == C.WEAPON_SCALING_MAGIC)
+        data = pets._load(ENTRY)
+        record = data["pets"][str(ALICE)]
+        record["inventory"] = [magic.code]
+        record["equipped"]["weapon"] = magic.code
+        record["weapon_enchantments"] = {magic.code: "fire"}
+        record["element"] = "fire"
+        pets._save(ENTRY, data)
+
+        fighter = bot_listener._pets_fighter(ENTRY, ALICE, pets.get_pet(ENTRY, ALICE))
+
+        self.assertEqual(fighter.attack_scaling, C.WEAPON_SCALING_MAGIC)
+        self.assertTrue(fighter.weapon_enchanted)
+        self.assertEqual(fighter.character_element, "fire")
+        # The fire rune's payload is a burn, and it must be on the ARENA fighter too.
+        self.assertIn("burn", [effect.get("code") for effect in fighter.effects])
+        self.assertEqual(pets_combat._swing_attack_types(fighter), (pets_combat.MAGIC,))
+
+    def test_being_strong_against_an_element_pays_off_in_an_arena_fight(self):
+        """Affinity is applied inside simulate, not inside derive -- so it is measured here.
+
+        Reading it off derive() alone reports no difference at all and looks like the rule
+        is dead, which is exactly the wrong conclusion.
+        """
+        def total(defender_element):
+            attacker = pets_combat.Fighter(
+                key="a", name="A", strength=60, health=60, agility=0, luck=0,
+                armor=0, magic=60, character_element="fire",
+            )
+            defender = pets_combat.Fighter(
+                key="b", name="B", strength=60, health=400, agility=0, luck=0,
+                armor=0, magic=60, character_element=defender_element,
+            )
+            return sum(
+                pets_combat.simulate(attacker, defender, seed=seed).total_damage.get("a", 0)
+                for seed in range(60)
+            )
+
+        strong = total("plants")     # fire beats plants
+        neutral = total("earth")     # fire has no edge here
+
+        self.assertGreater(strong, neutral)
+        self.assertAlmostEqual(
+            strong / neutral, 1 + C.CHARACTER_ELEMENT_DAMAGE_BONUS, places=1,
+        )
+
+    def test_a_magic_resist_answers_magic_swings_and_ignores_plain_steel(self):
+        """A resist has to read the damage TYPE, or a rune buys nothing defensively."""
+        def reflected(scaling, enchanted):
+            attacker = pets_combat.Fighter(
+                key="a", name="A", strength=60, health=60, agility=0, luck=0, armor=0,
+                magic=60, attack_scaling=scaling, weapon_enchanted=enchanted,
+            )
+            defender = pets_combat.Fighter(
+                key="b", name="B", strength=60, health=400, agility=0, luck=0, armor=0,
+                magic=60, effects=({"code": "spell_thorns", "value": 50},),
+            )
+            return sum(
+                row.damage
+                for seed in range(40)
+                for row in pets_combat.simulate(attacker, defender, seed=seed).rounds
+                if row.event == "antimagic_reflect"
+            )
+
+        self.assertEqual(reflected(C.WEAPON_SCALING_STRENGTH, False), 0)
+        self.assertGreater(reflected(C.WEAPON_SCALING_STRENGTH, True), 0)
+        self.assertGreater(reflected(C.WEAPON_SCALING_MAGIC, False), 0)
+
     def test_a_fight_pays_out_and_shows_up_in_both_histories(self):
         self._found(ALICE, "Кабанчик", "Alice")
         self._found(BOB, "Тумблер", "Bob")

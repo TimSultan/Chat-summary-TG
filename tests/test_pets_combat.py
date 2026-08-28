@@ -1485,6 +1485,52 @@ class EnchantedWeaponTests(unittest.TestCase):
         self.assertEqual(runed.attack_types, (combat.PHYSICAL, combat.MAGIC))
         self.assertEqual(runed.damage, round(plain.damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
 
+    def _magic_hit(self, *, enchanted, scaling=C.WEAPON_SCALING_MAGIC, physical_taken=1.0):
+        attacker = Fighter(
+            key="a", name="A", strength=40, health=200, agility=20, luck=20, armor=0,
+            magic=40, level=10, weapon_enchanted=enchanted, attack_scaling=scaling,
+        )
+        defender = Fighter(
+            key="b", name="B", strength=10, health=200, agility=20, luck=20, armor=0,
+            level=10, physical_damage_taken_multiplier=physical_taken,
+        )
+        with patch.object(combat, "_resolve_blow", return_value=("hit", 100)),                 patch.object(combat, "_signature", return_value=None):
+            result = combat.simulate(attacker, defender, seed=1, max_actions=1)
+        return next(row for row in result.rounds if row.attacker == "a" and row.is_action)
+
+    def test_a_rune_pays_the_same_ten_percent_on_a_magic_weapon(self):
+        """It used to pay nothing at all, and the swing was already pure magic.
+
+        The bonus lives in the same if/elif chain as the physical resistance, and a pure
+        spell swing skips that chain because there is no steel for the resistance to meet
+        -- so a rune and a diamond spent on a magic weapon bought literally nothing: no
+        extra damage, and no half to convert because the whole blow was magic already.
+        """
+        plain = self._magic_hit(enchanted=False)
+        runed = self._magic_hit(enchanted=True)
+
+        self.assertEqual(runed.damage, round(plain.damage * (1 + C.RUNE_WEAPON_POWER_BONUS)))
+        # Still pure magic: a rune has no steel to add to something that never had any.
+        self.assertEqual(plain.attack_types, (combat.MAGIC,))
+        self.assertEqual(runed.attack_types, (combat.MAGIC,))
+
+    def test_a_magic_swing_ignores_physical_resistance_with_or_without_a_rune(self):
+        """The reason the branch exists, and it must survive the bonus being added to it."""
+        for enchanted in (False, True):
+            self.assertEqual(
+                self._magic_hit(enchanted=enchanted, physical_taken=0.0).damage,
+                self._magic_hit(enchanted=enchanted).damage,
+                f"physical resistance reached a pure spell swing (enchanted={enchanted})",
+            )
+
+    def test_every_kind_of_weapon_collects_the_rune_bonus(self):
+        """Steel, hybrid and magic. Whoever paid the rune gets the same ten percent."""
+        for scaling in (C.WEAPON_SCALING_STRENGTH, C.WEAPON_SCALING_HYBRID,
+                        C.WEAPON_SCALING_MAGIC):
+            plain = self._magic_hit(enchanted=False, scaling=scaling).damage
+            runed = self._magic_hit(enchanted=True, scaling=scaling).damage
+            self.assertGreater(runed, plain, scaling)
+
     def test_half_the_swing_still_lands_on_something_immune_to_physical_damage(self):
         """The dungeon's spells_only boss takes no steel at all. A rune is the answer."""
         self.assertEqual(self._hit(enchanted=False, physical_taken=0.0).damage, 0)
