@@ -4821,6 +4821,7 @@ def dungeon_status(entry: str, user_id) -> dict:
         "entry_cost": D.ENTRY_RUBY_COST,
         "tickets": dungeon_tickets(entry, user_id),
         "phoenix_auto": max(0, int((record.get("phoenix_record") or {}).get("wins", 0) or 0)) >= 10,
+        "gatekeeper_auto": max(0, int((record.get("gatekeeper_record") or {}).get("wins", 0) or 0)) >= 10,
     }
     if not isinstance(run, dict):
         # The last descent's receipt outlives the run it describes, so the screen a player
@@ -6197,6 +6198,78 @@ def gatekeeper_action(entry: str, user_id, action: str) -> tuple[bool, str, dict
             return True, "", pets_gatekeeper.public(state)
     return _gatekeeper_settle(
         entry, user_id, str(state.get("status")) == pets_gatekeeper.VICTORY, state,
+    )
+
+
+def _gatekeeper_auto_choice(state: dict) -> str:
+    rows = [dict(row) for row in pets_gatekeeper.actions(state)]
+    if not rows:
+        raise ValueError("Этот бой уже закончен.")
+    codes = [str(row.get("code") or "") for row in rows]
+    if pets_gatekeeper.CORE_WEAPON in codes:
+        return pets_gatekeeper.CORE_WEAPON
+    if pets_gatekeeper.CORE_MAGIC in codes:
+        return pets_gatekeeper.CORE_MAGIC
+    blocked = {
+        value for value in (
+            state.get("current_prediction"),
+            state.get("covered_answer"),
+        ) if value in pets_gatekeeper.CATEGORIES
+    }
+    for row in rows:
+        code = str(row.get("code") or "")
+        category = str(row.get("category") or "")
+        if code != pets_gatekeeper.FALSE_STEP and category not in blocked:
+            return code
+    for code in codes:
+        if code != pets_gatekeeper.FALSE_STEP:
+            return code
+    return codes[0]
+
+
+def gatekeeper_auto(entry: str, user_id) -> tuple[bool, str, dict | None]:
+    """Resolve the Gatekeeper quickly after the player has proved mastery ten times."""
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        wins = max(0, int(((record or {}).get("gatekeeper_record") or {}).get("wins", 0) or 0))
+        if wins < 10:
+            live = ((record or {}).get("dungeon_run") or {}).get("gatekeeper")
+            return False, "Автобой откроется после 10 побед над Стальным привратником.", \
+                pets_gatekeeper.public(live) if isinstance(live, dict) else None
+    ok, note, state = gatekeeper_start(entry, user_id)
+    if not ok or not isinstance(state, dict):
+        return ok, note, state
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = (record or {}).get("dungeon_run")
+        live = (run or {}).get("gatekeeper") if isinstance(run, dict) else None
+        if not isinstance(live, dict):
+            return False, "Бой со Стальным привратником не найден.", state
+        base = dict(live)
+    finished = dict(base)
+    for _ in range(240):
+        if pets_gatekeeper.is_over(finished):
+            break
+        choice = _gatekeeper_auto_choice(finished)
+        finished = pets_gatekeeper.take(
+            finished, choice, seed=secrets.randbits(63),
+        )
+    if not pets_gatekeeper.is_over(finished):
+        return False, "Автобой не смог завершить бой.", pets_gatekeeper.public(finished)
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        run = (record or {}).get("dungeon_run")
+        live = (run or {}).get("gatekeeper") if isinstance(run, dict) else None
+        if not isinstance(live, dict) or pets_gatekeeper.is_over(live):
+            return False, "Бой со Стальным привратником уже завершён.", pets_gatekeeper.public(finished)
+        run["gatekeeper"] = finished
+        run["hp"] = _run_hp_after_boss_turn(run, finished)
+        _save(entry, data)
+    return _gatekeeper_settle(
+        entry, user_id, str(finished.get("status")) == pets_gatekeeper.VICTORY, finished,
     )
 
 

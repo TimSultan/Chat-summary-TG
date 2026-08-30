@@ -1464,6 +1464,10 @@ def _action_gatekeeper_action(entry, user_id, xp, payload):
     return pets.gatekeeper_action(entry, user_id, str(payload.get("move") or ""))
 
 
+def _action_gatekeeper_auto(entry, user_id, xp, payload):
+    return pets.gatekeeper_auto(entry, user_id)
+
+
 _ACTIONS = {
     "upgrade_stat": _action_upgrade_stat,
   "respec_stats": _action_respec_stats,
@@ -1512,6 +1516,7 @@ _ACTIONS = {
     "phoenix_auto": _action_phoenix_auto,
     "gatekeeper_start": _action_gatekeeper_start,
     "gatekeeper_action": _action_gatekeeper_action,
+    "gatekeeper_auto": _action_gatekeeper_auto,
 }
 
 # What the Mini App may still do while committed to a dungeon run -- the same rule
@@ -1530,7 +1535,7 @@ _ACTIONS = {
 _ALLOWED_IN_DUNGEON = {
     "dungeon_fight", "dungeon_rest", "dungeon_buy", "dungeon_descend", "dungeon_quit",
     "dungeon_chest", "phoenix_start", "phoenix_action", "phoenix_auto",
-    "gatekeeper_start", "gatekeeper_action",
+    "gatekeeper_start", "gatekeeper_action", "gatekeeper_auto",
     "equip", "unequip", "enchant_weapon", "reforge", "set_skill",
     "set_character_element",
 }
@@ -1669,7 +1674,7 @@ async def handle_action(request: web.Request) -> web.Response:
     # clears the fight off the run, so the outcome screen can only be told about it here.
     if action_name in ("phoenix_start", "phoenix_action", "phoenix_auto") and isinstance(extra, dict):
         response["phoenix"] = extra
-    if action_name in ("gatekeeper_start", "gatekeeper_action") and isinstance(extra, dict):
+    if action_name in ("gatekeeper_start", "gatekeeper_action", "gatekeeper_auto") and isinstance(extra, dict):
         response["gatekeeper"] = extra
     if action_name == "achievements_open" and isinstance(extra, dict):
         response["achievements"] = extra
@@ -6514,6 +6519,7 @@ function gatekeeperFight(dungeon, fight) {
     (fight.scene ? '<p class="phoenix-scene">' + esc(fight.scene) + '</p>' : '') +
     phoenixLog(fight) +
     (fight.telegraph ? '<div class="phoenix-telegraph">' + esc(fight.telegraph) + '</div>' : '') +
+    (dungeon.gatekeeper_auto ? '<button class="go" data-dungeon="gatekeeperauto">⚡ Автобой</button>' : '') +
     gatekeeperMoves(fight) + '</div></div>';
 }
 
@@ -10079,7 +10085,7 @@ async function handleClick(event, target) {
     // server: the fight is already settled, this only lets go of the screen showing it.
     if (d.dungeon === "phoenixclose") { PHOENIX_END = null; render(); return; }
     if (d.dungeon === "gatekeeperclose") { GATEKEEPER_END = null; render(); return; }
-    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest", phoenix: "phoenix_start", phoenixmove: "phoenix_action", phoenixauto: "phoenix_auto", gatekeeper: "gatekeeper_start", gatekeepermove: "gatekeeper_action" };
+    const actions = { enter: "dungeon_enter", fight: "dungeon_fight", rest: "dungeon_rest", buy: "dungeon_buy", descend: "dungeon_descend", quit: "dungeon_quit", chest: "dungeon_chest", phoenix: "phoenix_start", phoenixmove: "phoenix_action", phoenixauto: "phoenix_auto", gatekeeper: "gatekeeper_start", gatekeepermove: "gatekeeper_action", gatekeeperauto: "gatekeeper_auto" };
     const payload = { fight: () => ({ index: Number(d.index) }), rest: () => ({ amount: d.heal || "full" }), buy: () => ({ code: d.code || "" }), chest: () => ({ choice: d.choice || "leave" }), phoenixmove: () => ({ move: d.code || "" }), gatekeepermove: () => ({ move: d.code || "" }) };
     await act(actions[d.dungeon], (payload[d.dungeon] || (() => ({})))());
     return;

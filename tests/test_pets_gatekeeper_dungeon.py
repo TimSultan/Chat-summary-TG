@@ -160,6 +160,31 @@ class GatekeeperDungeonTests(unittest.TestCase):
         self.assertEqual(pets.get_pet(CHAT, USER)["gatekeeper_record"]["wins"], 1)
         self.assertIn("pet_dungeon_boss_win", [row["reason"] for row in economy._load(CHAT)["log"]])
 
+    def test_auto_fight_unlocks_after_ten_gatekeeper_wins(self):
+        self.assertFalse(pets.dungeon_status(CHAT, USER).get("gatekeeper_auto"))
+        ok, message, state = pets.gatekeeper_auto(CHAT, USER)
+        self.assertFalse(ok)
+        self.assertIn("10", message)
+        self.assertIsNone(state)
+
+        data = pets._load(CHAT)
+        data["pets"][str(USER)]["gatekeeper_record"] = {"wins": 10}
+        pets._save(CHAT, data)
+        self.assertTrue(pets.dungeon_status(CHAT, USER).get("gatekeeper_auto"))
+
+        _ok, _note, first = pets.gatekeeper_start(CHAT, USER)
+        finished = dict(pets.get_pet(CHAT, USER)["dungeon_run"]["gatekeeper"])
+        finished.update({"status": pets_gatekeeper.VICTORY, "boss_hp": 0})
+        with patch.object(pets_gatekeeper, "take", return_value=finished) as take:
+            ok, note, state = pets.gatekeeper_auto(CHAT, USER)
+
+        self.assertTrue(ok, note)
+        self.assertTrue(state["won"])
+        self.assertGreaterEqual(take.call_count, 1)
+        record = pets.get_pet(CHAT, USER)
+        self.assertEqual(record["gatekeeper_record"]["wins"], 11)
+        self.assertIn(0, record["dungeon_run"]["cleared"])
+
     def test_defeat_ends_the_run_through_the_normal_dungeon_path(self):
         pets.gatekeeper_start(CHAT, USER)
         live = pets.get_pet(CHAT, USER)["dungeon_run"]["gatekeeper"]
@@ -180,8 +205,24 @@ class GatekeeperDungeonTests(unittest.TestCase):
         self.assertIn("S.dungeon.gatekeeper = data.gatekeeper", source)
         self.assertIn('gatekeeper: "gatekeeper_start"', source)
         self.assertIn('gatekeepermove: "gatekeeper_action"', source)
+        self.assertIn('gatekeeperauto: "gatekeeper_auto"', source)
         self.assertIn('data-dungeon="gatekeepermove"', source)
+        self.assertIn('data-dungeon="gatekeeperauto"', source)
         self.assertIn("gatekeeperFight(dungeon, dungeon.gatekeeper)", source)
+
+    def test_telegram_gatekeeper_screen_shows_auto_after_ten_wins(self):
+        data = pets._load(CHAT)
+        data["pets"][str(USER)]["gatekeeper_record"] = {"wins": 10}
+        pets._save(CHAT, data)
+        _ok, _note, state = pets.gatekeeper_start(CHAT, USER)
+
+        _text, markup = pets_ui.gatekeeper_view(CHAT, USER, RICH_XP, state)
+        callbacks = [
+            pets_ui.parse_callback(button["callback_data"])[1]
+            for buttons in markup["inline_keyboard"] for button in buttons
+        ]
+
+        self.assertIn("gatekeeperauto", callbacks)
 
     def _committed_fight(self):
         """Feed the machine a pattern until it commits, and hand back the live state."""

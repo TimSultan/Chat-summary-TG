@@ -6542,6 +6542,7 @@ PET_ACTIONS_ALLOWED_IN_A_RUN = frozenset({
     # The hand-fought boss. Both halves belong here or the fight would bounce off this
     # gate on its own floor: starting it, and every turn of it afterwards.
     "phoenixstart", "phoenixact", "phoenixauto", "gatekeeperstart", "gatekeeperact",
+    "gatekeeperauto",
     # Reading the bag and changing what is worn.
     "bag", "bagitems", "equip", "unequip", "fav",
     # The scroll slots, and the picker screen that stands between them and a scroll.
@@ -6948,9 +6949,11 @@ async def handle_pets_callback(
             else:
                 await _send_pets_view(api, chat_id, rendered, message_id=message_id, log=log)
             return
-        if action in ("gatekeeperstart", "gatekeeperact"):
+        if action in ("gatekeeperstart", "gatekeeperact", "gatekeeperauto"):
             if action == "gatekeeperstart":
                 _, note, state = pets.gatekeeper_start(entry, user_id)
+            elif action == "gatekeeperauto":
+                _, note, state = pets.gatekeeper_auto(entry, user_id)
             else:
                 _, note, state = pets.gatekeeper_action(entry, user_id, argument or "")
             run_over = not pets.dungeon_status(entry, user_id).get("active")

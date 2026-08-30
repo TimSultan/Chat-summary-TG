@@ -720,6 +720,11 @@ def gatekeeper_view(entry: str, user_id, xp: int,
             lines.append(receipt_text)
         rows.append([{"text": "◀️ На этаж", "callback_data": callback_data(user_id, "dungeon")}])
     else:
+        if pets.dungeon_status(entry, user_id).get("gatekeeper_auto"):
+            rows.append([{
+                "text": "⚡ Автобой",
+                "callback_data": callback_data(user_id, "gatekeeperauto"),
+            }])
         pair = []
         for action in state.get("actions") or []:
             code = str(action.get("code") or "")
