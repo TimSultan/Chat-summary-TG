@@ -10574,10 +10574,10 @@ $("hudCreate").addEventListener("click", () => {
 // or a duplicated one behind.
 const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-elementset]," +
-    "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
+    "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-arenaretry],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
-    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
+    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardplay],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +

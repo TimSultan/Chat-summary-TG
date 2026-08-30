@@ -4193,6 +4193,65 @@ class AttachContractTests(unittest.TestCase):
                       [getattr(route.resource, "canonical", "") for route in app.router.routes()])
 
 
+
+class ClickableContractTests(unittest.TestCase):
+    """Every control in the Mini App is a data- attribute, and the ONE delegated click
+    listener finds it with `event.target.closest(CLICKABLE)`. An attribute handleClick
+    branches on but CLICKABLE does not list is a dead button: the listener returns before
+    the handler runs, so the tap produces no action, no error and no toast -- there is
+    nothing on screen or in the console to notice.
+
+    That shipped twice. The arena's "Повторить" button was inert from the day it was
+    added, and every button of the card duel was inert on its first run. Both were one
+    missing selector, and nothing else in this suite reads the two halves together.
+    """
+
+    #: Attributes that ride ALONG with a trigger rather than being one. They live on the
+    #: same element as a registered attribute and only ever supply that branch a value
+    #: (data-times on a data-up button, data-floor on a data-bosstest button), so they are
+    #: read out of the dataset without ever being matched against CLICKABLE. A new name
+    #: here has to be a genuine parameter -- if a tap is supposed to START from it, it
+    #: belongs in CLICKABLE instead.
+    PARAMETERS = frozenset({
+        "choice", "code", "enabled", "fights", "floor", "forgecursed", "forgeslot",
+        "heal", "index", "personalcode", "times", "user",
+    })
+
+    def _page(self):
+        return pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+
+    def _halves(self):
+        script = re.findall(r"<script>(.*?)</script>", self._page(), re.S)[-1]
+        listed = re.search(
+            r"const CLICKABLE = (.*?);\r?\n\r?\nasync function handleClick", script, re.S,
+        )
+        self.assertIsNotNone(listed, "CLICKABLE is no longer declared before handleClick")
+        registered = set(re.findall(r"\[data-([a-z]+)\]", listed.group(1)))
+        body = script.split("async function handleClick(event, target) {", 1)[1]
+        referenced = set(re.findall(r"\bd\.([A-Za-z]+)", body))
+        return registered, referenced
+
+    def test_every_attribute_the_handler_branches_on_can_actually_be_tapped(self):
+        registered, referenced = self._halves()
+        dead = sorted((referenced - registered) - self.PARAMETERS)
+        self.assertEqual(dead, [], "handleClick reads these, but no tap can ever reach "
+                                   "them -- add each to CLICKABLE: " + ", ".join(dead))
+
+    def test_the_card_duel_controls_are_registered(self):
+        """Named outright, because these are the ones that shipped dead."""
+        registered, _ = self._halves()
+        for name in ("cardfoe", "cardplay", "cardbattle", "arenaretry"):
+            self.assertIn(name, registered, "data-" + name + " cannot be tapped")
+
+    def test_nothing_is_listed_as_clickable_that_no_branch_answers(self):
+        """The other direction: a selector kept after its handler was deleted makes a
+        button that presses, spins its `.pressed` state and then does nothing."""
+        registered, referenced = self._halves()
+        orphans = sorted(registered - referenced)
+        self.assertEqual(orphans, [], "CLICKABLE lists these, but handleClick answers "
+                                      "none of them: " + ", ".join(orphans))
+
+
 class PageScriptSyntaxTests(unittest.TestCase):
     """The page is one <script>. A single broken string literal in it does not degrade
     anything -- it stops the whole file parsing, and the Mini App opens as a blank screen.
