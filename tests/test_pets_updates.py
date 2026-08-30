@@ -30,11 +30,24 @@ class PetUpdatesTests(unittest.TestCase):
         self.assertFalse(pets_updates.has_unread(entry, user_id))
         self.assertTrue(pets_updates.has_unread(entry, 43))
 
-    def test_latest_arena_stake_news_pays_five_diamonds(self):
+    def test_latest_card_duel_news_pays_ten_diamonds(self):
         newest = pets_updates.latest("chat")
-        self.assertEqual(newest.id, "202608-arena-five-percent-stake")
-        self.assertEqual(newest.reward_rubies, 5)
+        self.assertEqual(newest.id, "202608-card-duels")
+        self.assertEqual(newest.reward_rubies, 10)
+        # The two numbers the note exists to announce.
+        self.assertIn("втрое", newest.text)
         self.assertIn("5%", newest.text)
+
+    def test_the_card_duel_note_corrects_the_arena_stake_note_above_it(self):
+        """The older note still tells players an arena win takes 5% of the loser's
+        diamonds, and that stopped being true when the card duel took that stake over.
+        A shipped note is never rewritten, so the correction has to live IN the newer
+        one -- otherwise the log's own history would read as a contradiction."""
+        notes = {row.id: row for row in pets_updates.UPDATES}
+        self.assertIn("5% алмазов",
+                      notes["202608-arena-five-percent-stake"].text)
+        self.assertIn("алмазы больше не забирают",
+                      notes["202608-card-duels"].text)
 
     def test_log_has_compact_owner_bound_arrow_buttons(self):
         entry = "chat"
