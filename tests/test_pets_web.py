@@ -4252,6 +4252,64 @@ class ClickableContractTests(unittest.TestCase):
                                       "none of them: " + ", ".join(orphans))
 
 
+
+class VerticalSwipeContractTests(unittest.TestCase):
+    """Telegram treats a vertical drag inside the web view as "collapse the Mini App".
+    Anything on screen that owns a scroller of its own has to borrow that gesture while
+    it is open and hand it back afterwards -- and because two such things can overlap, the
+    borrowing is counted rather than toggled.
+
+    The card duel is the case that made this necessary: its hand and its intent row are
+    sideways scrollers, so a finger that starts on a card and drags down scrolls neither
+    of them, and the whole swipe reached Telegram, which dragged the window down instead
+    of the page.
+    """
+
+    def _script(self):
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        return re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+
+    def test_only_the_counted_helpers_touch_telegrams_swipe_methods(self):
+        """The whole pairing rests on this. One stray enableVerticalSwipes() elsewhere
+        would hand the gesture back while a duel or a sheet was still holding it, and the
+        symptom -- a window that drags away under a finger -- is not one a reader would
+        trace back to the call."""
+        script = self._script()
+        for method in ("disableVerticalSwipes", "enableVerticalSwipes"):
+            sites = [line.strip() for line in script.splitlines()
+                     if "tg." + method in line]
+            self.assertEqual(len(sites), 1,
+                             method + " is called from " + str(len(sites)) +
+                             " places; it belongs only in lockSwipes/unlockSwipes")
+        # ...and those single call sites really are the two helpers.
+        lock = script.split("function lockSwipes(reason) {", 1)[1].split("\n}", 1)[0]
+        unlock = script.split("function unlockSwipes(reason) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("tg.disableVerticalSwipes()", lock)
+        self.assertIn("tg.enableVerticalSwipes()", unlock)
+        # The count is what makes overlapping holders safe.
+        self.assertIn("SWIPE_LOCKS.add(reason)", lock)
+        self.assertIn("if (SWIPE_LOCKS.size) return;", unlock)
+
+    def test_the_duel_and_the_sheet_each_take_and_return_the_gesture(self):
+        script = self._script()
+        for opener, closer, reason in (
+            ("function sheet(html, extraClass) {", "function closeSheet() {", "sheet"),
+            ("async function openCardBattle(opponentId) {",
+             "function closeCardBattle() {", "cardduel"),
+        ):
+            body = script.split(opener, 1)[1].split("\n}", 1)[0]
+            self.assertIn('lockSwipes("' + reason + '")', body, opener)
+            shut = script.split(closer, 1)[1].split("\n}", 1)[0]
+            self.assertIn('unlockSwipes("' + reason + '")', shut, closer)
+
+    def test_the_sideways_scrollers_do_not_chain_their_overscroll(self):
+        """The fallback for a client older than Bot API 7.7, which has no
+        disableVerticalSwipes to borrow in the first place."""
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        row = page.split(".cardrow {", 1)[1].split("}", 1)[0]
+        self.assertIn("overscroll-behavior: contain", row)
+
+
 class PageScriptSyntaxTests(unittest.TestCase):
     """The page is one <script>. A single broken string literal in it does not degrade
     anything -- it stops the whole file parsing, and the Mini App opens as a blank screen.

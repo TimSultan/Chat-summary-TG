@@ -5208,7 +5208,7 @@ PAGE_HTML = """<!doctype html>
   /* An announced turn scrolls sideways on its own rather than widening the page: the
      opponent can commit to three cards, and three cards do not fit across a phone. */
   .cardrow { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
-             scrollbar-width: thin; }
+             scrollbar-width: thin; overscroll-behavior: contain; }
   .cardrow::-webkit-scrollbar { height: 5px; }
   .cardrow::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
 
@@ -8369,6 +8369,7 @@ async function openCardBattle(opponentId) {
   try {
     cardBattleState(await api("/api/card-battle/start", { opponent_id: opponentId }));
     CARD_LAST_FOE = opponentId;
+    lockSwipes("cardduel");
     render();
   } catch (e) { haptic("no"); toast(e.message); }
   finally { CARD_BUSY = false; }
@@ -8395,6 +8396,7 @@ async function cardBattleAction(action, card) {
 
 function closeCardBattle() {
   CARD_BATTLE = null; CARD_SESSION = null; CARD_FACES = null; CARD_INFO = null;
+  unlockSwipes("cardduel");
   render();
 }
 
@@ -9835,6 +9837,29 @@ function btn(label, action, argument, kind) {
     esc(argument) + '">' + label + "</button>";
 }
 
+// Telegram reads a vertical drag inside the web view as "collapse the Mini App", and
+// two things here need that gesture for themselves: a bottom sheet's own scroller, and
+// the card duel, whose hand and intent row are sideways scrollers -- a finger that starts
+// on a card and moves down never scrolls them, so without this the whole swipe goes
+// straight to Telegram and drags the window down instead of the page.
+//
+// Counted by reason rather than toggled on and off, because the two can overlap: a sheet
+// opened during a duel and then closed must not hand the gesture back while the duel is
+// still on screen. Nothing outside these two functions may call the Telegram methods
+// directly -- that is what the pairing depends on, and a test enforces it.
+const SWIPE_LOCKS = new Set();
+
+function lockSwipes(reason) {
+  SWIPE_LOCKS.add(reason);
+  try { if (tg && tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+}
+
+function unlockSwipes(reason) {
+  SWIPE_LOCKS.delete(reason);
+  if (SWIPE_LOCKS.size) return;         // something else still wants the gesture
+  try { if (tg && tg.enableVerticalSwipes) tg.enableVerticalSwipes(); } catch (e) {}
+}
+
 function sheet(html, extraClass) {
   closeSheet();
   const veil = document.createElement("div");
@@ -9844,14 +9869,13 @@ function sheet(html, extraClass) {
   veil.innerHTML = '<div class="sheet' + sheetClass + '">' + html + "</div>";
   veil.addEventListener("click", (event) => { if (event.target === veil) closeSheet(); });
   document.body.appendChild(veil);
-  // Telegram otherwise treats an upward drag on a long bottom sheet as an attempt to
-  // collapse the Mini App. While a sheet is open, the drag belongs to its own scroller.
-  try { if (tg && tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+  // While a sheet is open the drag belongs to its own scroller, not to Telegram.
+  lockSwipes("sheet");
 }
 function closeSheet() {
   const v = $("veil");
   if (v) v.remove();
-  try { if (tg && tg.enableVerticalSwipes) tg.enableVerticalSwipes(); } catch (e) {}
+  unlockSwipes("sheet");
 }
 
 // A rare item is worth a second look before it is gone -- the same rule pets.py enforces
