@@ -3964,6 +3964,54 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True),
                          before)
 
+
+    async def test_the_turn_reports_the_cards_the_opponent_really_played(self):
+        """The screen animates this list card by card, so it has to be what HAPPENED and
+        not what was announced -- a stun cancels the turn outright and a killing blow cuts
+        it short. Each entry carries both fighters as they stood right after that card, so
+        a health bar can drop as the card lands instead of everything settling at once."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        self.assertEqual(opened["battle"]["enemy_played"], [],
+                         "nothing has been played on the opening screen")
+        announced = opened["battle"]["enemy_intent"]
+
+        response = await self._duel_action(PLAYER, opened["session"], "end_turn")
+        self.assertEqual(response.status, 200, await response.text())
+        played = (await response.json())["battle"]["enemy_played"]
+
+        self.assertTrue(played)
+        self.assertLessEqual(len(played), len(announced))
+        for index, row in enumerate(played):
+            self.assertEqual(row["card"]["name"], announced[index]["name"])
+            self.assertTrue(row["card"]["tags"], "an animated card still needs its numbers")
+            for side in ("player", "enemy"):
+                fighter = row["fighters"][side]
+                self.assertIn("hp", fighter)
+                self.assertIn("max_hp", fighter)
+        # The last snapshot is where the turn actually left the two of them.
+        final = (await response.json())["battle"]["fighters"]
+        self.assertEqual(played[-1]["fighters"]["player"]["hp"], final["player"]["hp"])
+
+    async def test_playing_a_card_clears_last_turns_playback(self):
+        """Otherwise the screen would replay the opponent's cards on top of the player's
+        own, every time a card is tapped."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        ended = await (await self._duel_action(
+            PLAYER, opened["session"], "end_turn")).json()
+        self.assertTrue(ended["battle"]["enemy_played"])
+
+        card = next(row for row in ended["battle"]["hand"]
+                    if row["cost"] <= ended["battle"]["energy"])
+        played = await (await self._duel_action(
+            PLAYER, opened["session"], "play", card["uid"])).json()
+        self.assertEqual(played["battle"]["enemy_played"], [])
+
     async def test_a_finished_duel_pays_nothing_and_spends_no_arena_fight(self):
         """It is a sandbox: the fight bank, the win/loss record and the purse are all
         exactly where they were."""
@@ -4308,6 +4356,68 @@ class VerticalSwipeContractTests(unittest.TestCase):
         page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
         row = page.split(".cardrow {", 1)[1].split("}", 1)[0]
         self.assertIn("overscroll-behavior: contain", row)
+
+
+
+class CardAnimationContractTests(unittest.TestCase):
+    """The duel screen's layout and its one animation, checked as source because neither
+    is reachable from an HTTP response: the hand has to sit where a thumb and a short
+    flight path both want it, and a flight that never resolves would leave the duel
+    refusing taps forever."""
+
+    def _script(self):
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        return re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+
+    def _render(self):
+        body = self._script().split("function renderCardBattle(box) {", 1)[1]
+        return body.split("\n}", 1)[0]
+
+    def test_the_hand_sits_under_the_faces_and_over_the_announced_turn(self):
+        render = self._render()
+        stage = render.index('id="cardStage"')
+        hand = render.index('id="cardHand"')
+        intent = render.index('class="cardintent"')
+        self.assertLess(stage, hand, "the hand must come after the two fighters")
+        self.assertLess(hand, intent,
+                        "the hand must come before the opponent's announced turn")
+
+    def test_a_flight_always_resolves_even_if_the_browser_goes_quiet(self):
+        """`finish` can fail to arrive -- a backgrounded tab, a cancelled animation. The
+        duel awaits every flight, so one that never resolved would wedge it: no further
+        card could be played and no turn ended, with nothing on screen to say why."""
+        fly = self._script().split("function flyCard(fromEl, targetEl, card) {", 1)[1]
+        fly = fly.split("\n}", 1)[0]
+        self.assertIn("setTimeout(finish, total + 400)", fly)
+        self.assertIn("if (settled) return;", fly)
+        # And it never even starts when the player has asked for less motion.
+        self.assertIn("reducedMotion()", fly)
+
+    def test_the_card_block_keeps_its_height_when_the_hand_empties(self):
+        """The hand is discarded the moment a turn ends, which is exactly when the
+        opponent's cards start flying across that part of the screen."""
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        row = page.split(".cardrow {", 1)[1].split("}", 1)[0]
+        self.assertIn("min-height", row)
+        self.assertIn("function showOpponentTurn()", page)
+
+    def test_the_opponents_cards_are_played_back_one_at_a_time(self):
+        end = self._script().split("async function endCardTurn() {", 1)[1].split("\n}", 1)[0]
+        # Driven by what the server said happened, not by the announced plan.
+        self.assertIn("enemy_played", end)
+        # Awaited in turn, with the pause between them, and the bars moved as each lands.
+        self.assertIn("await flyCard(", end)
+        self.assertIn("await wait(CARD_PAUSE_MS)", end)
+        self.assertIn('paintCardSide("player"', end)
+        self.assertIn('paintCardSide("enemy"', end)
+
+    def test_a_played_card_flies_at_the_face_it_is_aimed_at(self):
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        target = page.split("function cardTargetSide(card, caster) {", 1)[1].split("\n}", 1)[0]
+        # Damage crosses to the other side; anything else stays with whoever played it.
+        self.assertIn("Number(card.damage || 0) > 0 ? other : caster", target)
+        play = page.split("async function playCard(uid) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('cardTargetSide(card, "player")', play)
 
 
 class PageScriptSyntaxTests(unittest.TestCase):

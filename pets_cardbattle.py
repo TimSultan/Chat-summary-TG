@@ -436,6 +436,12 @@ def start(player: dict, enemy: dict, player_cards: list[dict], enemy_cards: list
         "enemy_exhaust": [],
         "enemy_hand": [],
         "enemy_intent": None,
+        # What the opponent actually resolved on their last turn, in order, each with the
+        # state of both fighters immediately afterwards. The screen plays this back one
+        # card at a time; it is recorded rather than re-derived because the announced plan
+        # and the turn that happens are not always the same thing -- a stun cancels it
+        # outright, and a fighter who dies halfway through cuts it short.
+        "enemy_played": [],
         "log": [],
     }
     rng = _rng(state)
@@ -464,6 +470,9 @@ def play(state: dict, card_uid: str) -> dict:
     nxt["hand"] = hand
     nxt["energy"] = int(nxt.get("energy", 0) or 0) - cost
     nxt["log"] = []
+    # Last turn's playback is spent. Leaving it here would have the screen replay the
+    # opponent's cards again on top of the player's own.
+    nxt["enemy_played"] = []
     _resolve(nxt, "player", "enemy", card, rng)
     if card.get("exhaust"):
         nxt.setdefault("player_exhaust", []).append(card)
@@ -479,6 +488,7 @@ def end_turn(state: dict) -> dict:
     _assert_live(nxt)
     rng = _rng(nxt)
     nxt["log"] = []
+    nxt["enemy_played"] = []
 
     nxt.setdefault("player_discard", []).extend(nxt.get("hand") or [])
     nxt["hand"] = []
@@ -498,6 +508,15 @@ def end_turn(state: dict) -> dict:
         # would make the intent panel a lie.
         for card in list(nxt.get("enemy_intent") or ()):
             _resolve(nxt, "enemy", "player", dict(card), rng)
+            # Snapshot after each one, so the screen can drop the health bar as that card
+            # lands rather than settling everything at the end of the turn.
+            nxt["enemy_played"].append({
+                "card": dict(card),
+                "fighters": {
+                    "player": _public_fighter(nxt["fighters"]["player"]),
+                    "enemy": _public_fighter(nxt["fighters"]["enemy"]),
+                },
+            })
             if int(nxt["fighters"]["player"].get("hp", 0) or 0) <= 0:
                 break
     _tick(nxt, "enemy")
@@ -548,6 +567,12 @@ def public(state: dict) -> dict:
         "hand": [_public_card(row) for row in state.get("hand") or ()],
         # The opponent's whole announced turn, in the order it will be played.
         "enemy_intent": [_public_card(row) for row in state.get("enemy_intent") or ()],
+        # ...and the turn they just finished, for the screen to play back card by card.
+        "enemy_played": [
+            {"card": _public_card(row.get("card") or {}),
+             "fighters": dict(row.get("fighters") or {})}
+            for row in state.get("enemy_played") or ()
+        ],
         "deck": {
             "draw": len(state.get("player_draw") or ()),
             "discard": len(state.get("player_discard") or ()),
