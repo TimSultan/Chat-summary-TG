@@ -4592,6 +4592,8 @@ PAGE_HTML = """<!doctype html>
   .phoenix-entry .go { padding: 9px 8px; font-size: 13px; }
   .phoenix-bars { display: grid; gap: 9px; margin: 0 0 11px; }
   .phoenix-bars .row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+  .phoenix-bars .row b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .phoenix-bars .row span { flex: none; margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
   /* `.bar` is also used by the statistics page as a three-column grid. Reset that
      layout here: otherwise the fill becomes a grid cell instead of occupying the HP
      track, leaving Phoenix and Gatekeeper with what looks like an empty grey line. */

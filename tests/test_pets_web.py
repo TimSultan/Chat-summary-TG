@@ -2698,6 +2698,11 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # health tracks must explicitly undo that shared layout or their fill collapses.
         self.assertIn(".bar.hp.phoenix-bar { display: block;", source)
         self.assertIn(".bar.hp.phoenix-bar.foe > i { background: #e0484d; }", source)
+        # Steel Gatekeeper has a long visible name; the label may shrink, but the live HP
+        # number must not be pushed out of the row.
+        self.assertIn(".phoenix-bars .row b { min-width: 0;", source)
+        self.assertIn(".phoenix-bars .row span { flex: none;", source)
+        self.assertIn("font-variant-numeric: tabular-nums;", source)
 
     async def test_a_replay_is_the_same_fight_blow_for_blow(self):
         """Not "a fight like that one" -- that one. The stored seed and the two stored
