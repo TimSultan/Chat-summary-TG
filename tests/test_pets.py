@@ -2614,7 +2614,11 @@ class RecordFightTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "1", 0), expected)
 
     def test_survivor_amulet_preserves_thirty_percent_of_the_attackers_loss_penalty(self):
-        """Survivor retains thirty percent of both wallet transfers."""
+        """Survivor retains thirty percent of the coin transfer.
+
+        Diamonds are not part of it any more: an arena fight stopped moving them when the
+        card duel took that stake over, so the amulet has only the one wallet to protect.
+        """
         entry = "survivor-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2635,12 +2639,12 @@ class RecordFightTests(PetsTestCase):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
         self.assertEqual(outcome["loss_gold"], 4)
-        self.assertEqual(outcome["loss_rubies"], 1)
+        self.assertEqual(outcome["loss_rubies"], 0)
         self.assertEqual(outcome["consolation_gold"], 0)
         self.assertEqual(economy.balance(entry, "1", 0), 96)
         self.assertEqual(economy.balance(entry, "2", 0), 14)
-        self.assertEqual(pets.ruby_balance(entry, "1"), 19)
-        self.assertEqual(pets.ruby_balance(entry, "2"), 1)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 20)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 0)
 
     def test_survivor_amulet_also_protects_a_losing_defender(self):
         entry = "survivor-defender-chat"
@@ -2663,12 +2667,13 @@ class RecordFightTests(PetsTestCase):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
         self.assertEqual(outcome["opponent_loss_gold"], 4)
-        self.assertEqual(outcome["opponent_loss_rubies"], 1)
+        self.assertEqual(outcome["opponent_loss_rubies"], 0)
         self.assertEqual(outcome["opponent_consolation_gold"], 0)
         self.assertEqual(economy.balance(entry, "2", 0), 96)
         self.assertEqual(economy.balance(entry, "1", 0), 14)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 20)
 
-    def test_attacker_who_loses_transfers_five_percent_of_both_wallets(self):
+    def test_attacker_who_loses_transfers_five_percent_of_their_coins_only(self):
         entry = "attacker-pays-chat"
         self._tame(entry, "1", "Attacker")
         self._tame(entry, "2", "Defender")
@@ -2685,12 +2690,15 @@ class RecordFightTests(PetsTestCase):
         expected_penalty = pets_config.arena_loss_transfer(before)
         self.assertEqual(expected_penalty, 50)
         self.assertEqual(outcome["loss_gold"], 50)
-        self.assertEqual(outcome["loss_rubies"], 1)
         self.assertEqual(outcome["consolation_gold"], 0)
         self.assertEqual(economy.balance(entry, "1", 0), before - expected_penalty)
         self.assertEqual(economy.balance(entry, "2", 0), pets_config.WIN_GOLD_MAX + 50)
-        self.assertEqual(pets.ruby_balance(entry, "1"), 19)
-        self.assertEqual(pets.ruby_balance(entry, "2"), 1)
+        # The diamonds stay exactly where they were: losing an arena fight has not cost
+        # anybody a diamond since that stake moved to the card duel.
+        self.assertEqual(outcome["loss_rubies"], 0)
+        self.assertEqual(outcome["transfer_rubies"], 0)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 20)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 0)
 
     def test_defender_who_loses_also_transfers_five_percent(self):
         entry = "defender-transfer-chat"
@@ -2706,16 +2714,16 @@ class RecordFightTests(PetsTestCase):
             outcome = pets.record_fight(entry, "1", "2", result, date(2026, 8, 1))
 
         self.assertEqual(outcome["opponent_loss_gold"], 10)
-        self.assertEqual(outcome["opponent_loss_rubies"], 2)
+        self.assertEqual(outcome["opponent_loss_rubies"], 0)
         self.assertEqual(outcome["opponent_consolation_gold"], 0)
         self.assertEqual(economy.balance(entry, "2", 0), 190)
         self.assertEqual(economy.balance(entry, "1", 0), pets_config.WIN_GOLD_MAX + 10)
-        self.assertEqual(pets.ruby_balance(entry, "2"), 38)
-        self.assertEqual(pets.ruby_balance(entry, "1"), 2)
+        self.assertEqual(pets.ruby_balance(entry, "2"), 40)
+        self.assertEqual(pets.ruby_balance(entry, "1"), 0)
 
         row = pets.history(entry, "2")[0]
         self.assertEqual(row["loss_gold"], 10)
-        self.assertEqual(row["loss_rubies"], 2)
+        self.assertEqual(row["loss_rubies"], 0)
 
     def test_defender_with_zero_balance_is_never_driven_negative_by_a_loss(self):
         entry = "defender-zero-balance-chat"

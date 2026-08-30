@@ -658,6 +658,17 @@ ARENA_WIN_GOLD_MAX = 150
 # coins and rubies. It applies equally to attacker and defender and is calculated from
 # what the loser owns when the fight settles, never from the randomly rolled win purse.
 ARENA_LOSS_TRANSFER_SHARE = 0.05
+
+# A card duel costs the same arena fight an ordinary attack does, and pays this much more
+# for it. Three, because the mode asks for a dozen turns of decisions where the arena asks
+# for one tap -- the multiplier is what makes that trade worth taking rather than a slower
+# way to earn the same purse.
+#
+# It is also the ONLY fight in the game that moves diamonds between wallets: ordinary
+# arena fights used to take a five-percent bite out of the loser's diamonds and no longer
+# do. The share itself is unchanged (ARENA_LOSS_TRANSFER_SHARE above, the same five
+# percent that moves coins) -- the mechanic was relocated, not retuned.
+CARD_DUEL_GOLD_MULTIPLIER = 3.0
 # Coming back for the same wallet on the same day pays less. A rival is a rival, not a
 # renewable resource: without this, the best arena strategy is to find one rich, weak
 # player and hit them until their purse is empty, which costs the attacker nothing but

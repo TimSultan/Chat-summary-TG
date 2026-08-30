@@ -8154,6 +8154,183 @@ def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
     return row
 
 
+def spend_card_duel(entry, attacker_id, defender_id, now: datetime | None = None) -> None:
+    """Take the arena fight a card duel costs, at the moment the duel opens.
+
+    Charged up front on purpose, and this is the one place it can be. Settling the cost at
+    the end would let a player walk out of a duel they were losing and open another for
+    free until one went their way -- and since this is the mode that pays triple and takes
+    the loser's diamonds, that loop would quickly become the only way anybody played.
+
+    Raises ValueError with the line to show the player; the duel does not open.
+    """
+    moment = now or app_now()
+    data = _load(entry)
+    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
+    attacker = _tamed_record(data, attacker_uid)
+    defender = _tamed_record(data, defender_uid)
+    if attacker is None:
+        raise ValueError("Сначала приручи существо.")
+    if defender is None:
+        raise ValueError("Соперник больше не доступен.")
+    if _is_farming_record(attacker, moment):
+        raise ValueError("Существо сейчас занято и не может драться.")
+    if _dungeon_active(attacker):
+        raise ValueError("Сначала закончи забег в подземелье или выйди из него.")
+
+    capacity, *_ = _fight_bank_components(entry, attacker_uid, attacker, moment)
+    try:
+        _spend_arena_fight(attacker, capacity, moment)
+    except ValueError:
+        raise ValueError("Бои кончились — подожди, пока накопится следующий.") from None
+    _save(entry, data)
+
+
+def record_card_duel(entry, attacker_id, defender_id, winner_id, *,
+                     draw: bool = False, now: datetime | None = None) -> dict:
+    """Settle a finished card duel and return the result from the ATTACKER's side.
+
+    The arena fight was already taken when the duel opened (spend_card_duel), so nothing
+    here touches the bank. What is left differs from an ordinary arena win in exactly the
+    two ways this mode was asked for: the purse is CARD_DUEL_GOLD_MULTIPLIER times an
+    arena win, and the loser's diamonds move alongside their coins -- the only fight in
+    the game that now does that.
+
+    Deliberately NOT here: item drops and the legendary pity ladder. Those are the arena's
+    faucet and are tuned against the arena's win count, so feeding them from a second mode
+    would quietly raise the rate at which every collection fills. Card wins are kept in
+    their own pair of fields for the same reason, and the gold is added to the audit's
+    existing arena_reward_gold so the income page cannot under-report the faucet.
+    """
+    moment = now or app_now()
+    day = moment.date()
+    data = _load(entry)
+    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
+    attacker = _tamed_record(data, attacker_uid)
+    defender = _tamed_record(data, defender_uid)
+    if attacker is None or defender is None:
+        raise ValueError("Соперник больше не доступен.")
+
+    fight_id_ = _new_fight_id(moment)
+    attacker["card_fights"] = int(attacker.get("card_fights", 0) or 0) + 1
+    defender["card_fights"] = int(defender.get("card_fights", 0) or 0) + 1
+
+    log_row = {
+        "fight_id": fight_id_,
+        "ts": moment.isoformat(),
+        "date": day.isoformat(),
+        # The mode is on the row so the fight audit can tell a card duel from an arena
+        # attack. Readers that predate it simply do not look.
+        "fight_mode": "card",
+        "attacker_id": attacker_uid,
+        "defender_id": defender_uid,
+        "attacker_name": attacker.get("name"),
+        "defender_name": defender.get("name"),
+        "attacker_owner": attacker.get("owner_name"),
+        "defender_owner": defender.get("owner_name"),
+        "dropped_item": None,
+        "combat_snapshot": None,
+    }
+
+    if draw or not winner_id:
+        _, attacker_levels = _apply_xp(attacker, C.DRAW_XP)
+        _, defender_levels = _apply_xp(defender, C.DRAW_XP)
+        _save(entry, data)
+        _append_fight(entry, {
+            **log_row, "winner_id": None, "loser_id": None, "draw": True,
+            "gold": 0, "loss_gold": 0, "transfer_gold": 0,
+            "loss_rubies": 0, "transfer_rubies": 0, "consolation_gold": 0,
+        })
+        return {
+            "fight_id": fight_id_, "draw": True, "won": False,
+            "gold": 0, "loss_gold": 0, "transfer_gold": 0,
+            "loss_rubies": 0, "transfer_rubies": 0,
+            "xp": C.DRAW_XP, "levels_gained": attacker_levels,
+            "level": attacker.get("level", 1),
+            "opponent_levels_gained": defender_levels,
+        }
+
+    winner_uid = str(winner_id)
+    loser_uid = defender_uid if winner_uid == attacker_uid else attacker_uid
+    winner = data["pets"][winner_uid]
+    loser = data["pets"][loser_uid]
+    winner["card_wins"] = int(winner.get("card_wins", 0) or 0) + 1
+
+    bonus_pct = C.CAGE_GOLD_BONUS_PCT[min(max(winner.get("cage_level", 1), 1),
+                                          C.CAGE_MAX_LEVEL) - 1]
+    reward_multiplier = C.arena_level_reward_multiplier(
+        winner.get("level", 1), loser.get("level", 1)
+    )
+    # Зеркало души removes the level-gap penalty here exactly as it does in the arena.
+    if _equipped_effect(winner, "mirror_soul"):
+        reward_multiplier = max(1.0, reward_multiplier)
+    gold_base = round(
+        random.randint(C.ARENA_WIN_GOLD_MIN, C.ARENA_WIN_GOLD_MAX)
+        * (1 + bonus_pct / 100)
+        * reward_multiplier
+        * C.CARD_DUEL_GOLD_MULTIPLIER
+    )
+    gold_multiplier = C.hero_gold_multiplier(winner.get("level", 1), "arena")
+    gold = C.gold_for_hero(gold_base, winner.get("level", 1), "arena")
+    _metric_add(data, "arena_reward_gold", gold)
+
+    # Both wallet stakes read the same five percent and the same two discounts the arena
+    # applies -- Выживший on the loser, and the repeat discount for coming back to the
+    # same opponent today. Only the coins are minted; both transfers are moves.
+    loser_xp = _chat_xp_for(entry, loser_uid)
+    survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
+    prior_attacks = (
+        arena_attacks_against(entry, attacker_uid, defender_uid, day)
+        if winner_uid == attacker_uid else 0
+    )
+    transfer_share = C.arena_repeat_transfer_share(
+        C.ARENA_LOSS_TRANSFER_SHARE * (1 - min(1.0, max(0.0, survivor_share))),
+        prior_attacks,
+    )
+    paid = economy.settle_arena_reward(
+        entry, winner_uid, gold, loser_uid, loser_xp, transfer_share,
+    )
+
+    ruby_wallet = _ruby_row(data)
+    loser_rubies = max(0, int(ruby_wallet.get(loser_uid, 0) or 0))
+    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share, prior_attacks)
+    if paid_rubies:
+        ruby_wallet[loser_uid] = loser_rubies - paid_rubies
+        ruby_wallet[winner_uid] = max(0, int(ruby_wallet.get(winner_uid, 0) or 0)) + paid_rubies
+        _stage_ruby_log(data, loser_uid, -paid_rubies, "card-transfer-loss", winner_uid)
+        _stage_ruby_log(data, winner_uid, paid_rubies, "card-transfer-win", loser_uid)
+
+    winner_xp = max(1, round(C.WIN_XP * reward_multiplier))
+    _, winner_levels = _apply_xp(winner, winner_xp)
+    _, loser_levels = _apply_xp(loser, C.LOSS_XP)
+
+    _save(entry, data)
+    _append_fight(entry, {
+        **log_row,
+        "winner_id": winner_uid, "loser_id": loser_uid, "draw": False,
+        "gold": gold, "gold_base": gold_base, "gold_multiplier": gold_multiplier,
+        "loss_gold": paid, "transfer_gold": paid,
+        "loss_rubies": paid_rubies, "transfer_rubies": paid_rubies,
+        "consolation_gold": 0,
+    })
+
+    won = winner_uid == attacker_uid
+    return {
+        "fight_id": fight_id_,
+        "draw": False,
+        "won": won,
+        "gold": gold if won else 0,
+        "loss_gold": 0 if won else paid,
+        "transfer_gold": paid if won else 0,
+        "loss_rubies": 0 if won else paid_rubies,
+        "transfer_rubies": paid_rubies if won else 0,
+        "xp": winner_xp if won else C.LOSS_XP,
+        "levels_gained": winner_levels if won else loser_levels,
+        "level": attacker.get("level", 1),
+        "opponent_levels_gained": loser_levels if won else winner_levels,
+    }
+
+
 def record_fight(
     entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
     now: datetime | None = None,
@@ -8321,17 +8498,13 @@ def record_fight(
         entry, winner_uid, gold, loser_uid, loser_xp, transfer_share,
     )
 
-    # Rubies live in the pet store already loaded for this settlement. Move them here so
-    # both wallets and the fight record land in the same save; this is a transfer, never
-    # part of the minted-ruby metric.
-    ruby_wallet = _ruby_row(data)
-    loser_rubies = max(0, int(ruby_wallet.get(loser_uid, 0) or 0))
-    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share, prior_attacks)
-    if paid_rubies:
-        ruby_wallet[loser_uid] = loser_rubies - paid_rubies
-        ruby_wallet[winner_uid] = max(0, int(ruby_wallet.get(winner_uid, 0) or 0)) + paid_rubies
-        _stage_ruby_log(data, loser_uid, -paid_rubies, "arena-transfer-loss", winner_uid)
-        _stage_ruby_log(data, winner_uid, paid_rubies, "arena-transfer-win", loser_uid)
+    # An ordinary arena fight takes coins and nothing else. Diamonds used to move here on
+    # the same five-percent share, and now move only in a card duel (record_card_duel) --
+    # a fight somebody chose to sit through rather than one they were handed by a tap.
+    # The field stays in the log row and the return below at zero rather than being
+    # removed, because history() and the audit already read it for every fight ever
+    # recorded, and those fights really did move diamonds.
+    paid_rubies = 0
 
     dropped_code = None
     # Repeat designs are deliberate forge material. The pity counter is tied to wins,

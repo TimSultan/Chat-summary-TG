@@ -3918,26 +3918,35 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opened["legendaries"], len(codes))
         self.assertEqual(opened["deck_size"]["player"], base + len(codes))
 
-    async def test_a_whole_duel_reads_the_store_once_and_writes_nothing(self):
-        """The sandbox promise and the performance rule in one: opening a duel is a
-        single store read, every later turn is none at all, and the game the duel was
-        played out of is byte-identical afterwards."""
+    async def test_the_turns_of_a_duel_never_touch_the_store(self):
+        """The performance rule for this mode. Opening a duel writes (it takes the arena
+        fight) and finishing one writes (it settles the stake), but everything in between
+        is dictionary work on a session already in memory -- so a twenty-turn duel costs
+        the store exactly as much as a two-turn one."""
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
         self._give(PLAYER, self._legendary_codes(3))
-        before = json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 60
+        pets._save(CHAT, data)
 
-        real_load, loads = pets._load, []
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session, battle = opened["session"], opened["battle"]
+
+        real_load, real_save = pets._load, pets._save
+        loads, saves = [], []
+
         def counting_load(entry, *args, **kwargs):
             loads.append(entry)
             return real_load(entry, *args, **kwargs)
 
-        with patch.object(pets, "_load", counting_load), \
-             patch.object(pets, "_save", side_effect=AssertionError("a card duel wrote")):
-            opened = await self._open_duel(PLAYER, OPPONENT)
-            self.assertEqual(len(loads), 1, "opening a duel must read the store once")
+        def counting_save(entry, *args, **kwargs):
+            saves.append(entry)
+            return real_save(entry, *args, **kwargs)
 
-            session, battle = opened["session"], opened["battle"]
+        during_turns = {"loads": 0, "saves": 0}
+        with patch.object(pets, "_load", counting_load), \
+             patch.object(pets, "_save", counting_save):
             turns = 0
             while not battle["finished"] and turns < pets_cardbattle.TURN_LIMIT + 2:
                 played = True
@@ -3957,12 +3966,30 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status, 200, await response.text())
                 battle = (await response.json())["battle"]
                 turns += 1
+                if not battle["finished"]:
+                    # Fold this turn into the running total and start the next one clean,
+                    # so whatever is left at the end belongs to the settlement alone.
+                    during_turns["loads"] += len(loads)
+                    during_turns["saves"] += len(saves)
+                    loads.clear()
+                    saves.clear()
 
             self.assertTrue(battle["finished"], "the duel never resolved")
-            self.assertEqual(len(loads), 1, "a turn re-read the store")
 
-        self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True),
-                         before)
+        # Everything counted above belongs to the ONE turn that ended the duel; the
+        # counters were reset after each turn that did not, and `during_turns` is what
+        # they came to. A settlement that crept into every turn would show up here as a
+        # multiple of the turn count rather than as a single fight's worth of work.
+        self.assertGreater(turns, 3, "the duel was too short to prove anything")
+        self.assertEqual(during_turns["loads"], 0,
+                         f"an ordinary turn read the store {during_turns['loads']} times")
+        self.assertEqual(during_turns["saves"], 0,
+                         f"an ordinary turn wrote {during_turns['saves']} times")
+        # The finishing turn settles, and settling costs about what an ordinary arena
+        # attack costs -- both build the same state payload on the way out. Bounded as a
+        # number rather than left open, so a second settlement path could not slip in.
+        self.assertLessEqual(len(saves), 4, f"the settlement wrote {len(saves)} times")
+        self.assertLessEqual(len(loads), 60, f"the settlement read {len(loads)} times")
 
 
     async def test_the_turn_reports_the_cards_the_opponent_really_played(self):
@@ -4012,23 +4039,178 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             PLAYER, opened["session"], "play", card["uid"])).json()
         self.assertEqual(played["battle"]["enemy_played"], [])
 
-    async def test_a_finished_duel_pays_nothing_and_spends_no_arena_fight(self):
-        """It is a sandbox: the fight bank, the win/loss record and the purse are all
-        exactly where they were."""
+    async def test_a_lost_duel_settles_too_and_hands_back_fresh_state(self):
+        """Standing still until the opponent wins is still a settled fight: the loser pays
+        their share, and the screen gets the wallet it has to draw next without asking a
+        second time."""
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
-        before = (await (await self._get("/api/state", PLAYER)).json())["arena"]
+        economy.grant(CHAT, PLAYER["id"], 800, "test-purse")
+        pets.grant_rubies_once(CHAT, PLAYER["id"], 60, "lost-duel-seed")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 60
+        pets._save(CHAT, data)
 
         opened = await self._open_duel(PLAYER, OPPONENT)
         session, battle = opened["session"], opened["battle"]
+        body = None
         while not battle["finished"]:
             response = await self._duel_action(PLAYER, session, "end_turn")
             self.assertEqual(response.status, 200, await response.text())
-            battle = (await response.json())["battle"]
+            body = await response.json()
+            battle = body["battle"]
 
-        after = (await (await self._get("/api/state", PLAYER)).json())["arena"]
-        self.assertEqual(after["available"], before["available"])
-        self.assertEqual(after["capacity"], before["capacity"])
+        self.assertEqual(battle["winner"], "enemy")
+        reward = body["reward"]
+        self.assertIsNotNone(reward)
+        self.assertFalse(reward["won"])
+        self.assertEqual(reward["gold"], 0)
+        # The loser pays on both wallets, which is what makes this mode the only place a
+        # diamond changes hands.
+        self.assertGreater(reward["loss_gold"], 0)
+        self.assertGreater(reward["loss_rubies"], 0)
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 60 - reward["loss_rubies"])
+        self.assertIsNotNone(body.get("state"))
+
+
+    async def test_an_ordinary_arena_fight_no_longer_takes_diamonds(self):
+        """Coins still move on the same five percent. Diamonds do not move at all -- that
+        stake belongs to the card duel now, and to nothing else in the game."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        pets.grant_rubies_once(CHAT, OPPONENT["id"], 100, "test-seed")
+        pets.grant_rubies_once(CHAT, PLAYER["id"], 10, "test-seed-2")
+        before = pets.ruby_balance(CHAT, OPPONENT["id"])
+        self.assertEqual(before, 100)
+
+        for _ in range(6):
+            data = pets._load(CHAT)
+            data["pets"][str(PLAYER["id"])]["fight_bank"] = 99
+            pets._save(CHAT, data)
+            response = await self._post("/api/attack", PLAYER,
+                                        {"opponent_id": str(OPPONENT["id"])})
+            self.assertEqual(response.status, 200, await response.text())
+            body = await response.json()
+            self.assertEqual(body["reward"]["transfer_rubies"], 0)
+            self.assertEqual(body["reward"]["loss_rubies"], 0)
+            self.assertEqual(body["reward"]["opponent_loss_rubies"], 0)
+
+        self.assertEqual(pets.ruby_balance(CHAT, OPPONENT["id"]), before,
+                         "an arena fight moved diamonds")
+
+    async def test_a_card_duel_costs_a_fight_the_moment_it_opens(self):
+        """Charged up front, so walking out of a duel that is going badly is not free.
+        With triple pay on the line, settling the cost at the end would make abandon and
+        retry the whole game."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 2
+        pets._save(CHAT, data)
+
+        before = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        after = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
+        self.assertEqual(after, before - 1)
+
+        # Walking away without finishing does not give it back.
+        self.assertTrue(opened["session"])
+        again = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
+        self.assertEqual(again, before - 1)
+
+    async def test_a_card_duel_with_an_empty_bank_is_refused(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 0
+        data["pets"][str(PLAYER["id"])]["fight_bank_at"] = pets.app_now().isoformat()
+        pets._save(CHAT, data)
+
+        refused = await self._post("/api/card-battle/start", PLAYER,
+                                   {"opponent_id": str(OPPONENT["id"])})
+        self.assertEqual(refused.status, 409, await refused.text())
+        self.assertEqual((await refused.json())["error"], "CANNOT_FIGHT")
+
+    async def test_a_won_card_duel_pays_triple_and_takes_the_losers_diamonds(self):
+        """The two things this mode was asked for, measured against an ordinary arena win
+        rather than against a hard-coded number, so a later retune of the arena purse
+        cannot quietly leave this test asserting the old economy."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        pets.grant_rubies_once(CHAT, OPPONENT["id"], 200, "duel-seed")
+        # A real purse to take a bite out of. The test fixture gives nobody recorded chat
+        # statistics, so a defender's derived balance is otherwise zero and the coin half
+        # of the stake would assert nothing.
+        economy.grant(CHAT, OPPONENT["id"], 1000, "test-purse")
+        loser_xp = pets._chat_xp_for(CHAT, str(OPPONENT["id"]))
+        loser_purse = economy.balance(CHAT, OPPONENT["id"], loser_xp)
+        self.assertGreaterEqual(loser_purse, 1000)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 50
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session = opened["session"]
+        battle = opened["battle"]
+        # Force the win rather than playing it out: the engine's own rules are covered
+        # elsewhere, and what is under test here is the settlement.
+        store = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY]
+        store[session]["battle"]["fighters"]["enemy"]["hp"] = 1
+
+        card = next(row for row in battle["hand"] if row["damage"] and row["cost"] <= battle["energy"])
+        response = await self._duel_action(PLAYER, session, "play", card["uid"])
+        self.assertEqual(response.status, 200, await response.text())
+        body = await response.json()
+        self.assertTrue(body["battle"]["finished"])
+        self.assertEqual(body["battle"]["winner"], "player")
+
+        reward = body["reward"]
+        self.assertIsNotNone(reward, "a finished duel must settle")
+        self.assertTrue(reward["won"])
+        # Triple an arena win, before the level and cage modifiers this pet has none of.
+        floor = round(C.ARENA_WIN_GOLD_MIN * C.CARD_DUEL_GOLD_MULTIPLIER)
+        ceiling = round(C.ARENA_WIN_GOLD_MAX * C.CARD_DUEL_GOLD_MULTIPLIER * 1.5)
+        self.assertGreaterEqual(reward["gold"], floor)
+        self.assertLessEqual(reward["gold"], ceiling)
+        # Five percent of the loser's 200 diamonds.
+        self.assertEqual(reward["transfer_rubies"],
+                         C.arena_loss_transfer(200))
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), reward["transfer_rubies"])
+        self.assertEqual(pets.ruby_balance(CHAT, OPPONENT["id"]),
+                         200 - reward["transfer_rubies"])
+        # Coins moved on the same five percent share an arena fight uses, and came out of
+        # the loser rather than being minted.
+        self.assertEqual(reward["transfer_gold"], C.arena_loss_transfer(loser_purse))
+        self.assertEqual(economy.balance(CHAT, OPPONENT["id"], loser_xp),
+                         loser_purse - reward["transfer_gold"])
+        # And the screen gets a fresh wallet without asking a second time.
+        self.assertIsNotNone(body.get("state"))
+
+    async def test_a_finished_duel_can_only_be_settled_once(self):
+        """The session is dropped in the same breath as the payout, so a replayed or
+        double-tapped request finds nothing rather than paying twice."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 50
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session = opened["session"]
+        store = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY]
+        store[session]["battle"]["fighters"]["enemy"]["hp"] = 1
+        card = next(row for row in opened["battle"]["hand"]
+                    if row["damage"] and row["cost"] <= opened["battle"]["energy"])
+
+        first = await self._duel_action(PLAYER, session, "play", card["uid"])
+        self.assertEqual(first.status, 200)
+        paid = (await first.json())["reward"]["gold"]
+        self.assertGreater(paid, 0)
+        purse = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+
+        replay = await self._duel_action(PLAYER, session, "play", card["uid"])
+        self.assertEqual(replay.status, 404, await replay.text())
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), purse)
 
     async def test_the_opponents_draw_pile_never_reaches_the_client(self):
         """Only the turn they have announced. A duel where the other deck can be read out
@@ -4146,10 +4328,105 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
                              before["battle"]["fighters"][side]["max_hp"])
         self.assertEqual(after["deck_size"], before["deck_size"])
 
-    async def test_the_duel_banner_says_the_two_bodies_are_identical(self):
+    async def test_the_duel_screen_still_says_the_two_bodies_are_identical(self):
+        """The fact survived the banner that used to carry it: it is one muted line under
+        the log now, because it is true for the whole duel and worth a glance once."""
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
-        self.assertIn("Характеристики у обоих ", page)
-        self.assertIn("Решает только колода.", page)
+        self.assertIn("у обоих ", page)
+        self.assertIn("HP и удар ", page)
+        # ...and the purple block above the fighters really is gone.
+        self.assertNotIn("cardbanner", page)
+        self.assertNotIn("Бои арены не тратятся", page)
+
+
+    async def test_the_duel_screen_gives_up_the_hud_and_takes_the_whole_page(self):
+        """The HUD's wallet, level and fight counter are not spent on this board, and it
+        costs the same strip of height on every turn of every duel."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("body.induel { --hud: 0px; }", page)
+        self.assertIn("body.induel .hud { display: none; }", page)
+        # Put on when a duel opens and taken off again when it closes -- an unbalanced
+        # pair would leave the rest of the game with no HUD at all.
+        opened = page.split("async function openCardBattle(opponentId) {", 1)[1]
+        self.assertIn('document.body.classList.add("induel")', opened.split("\n}", 1)[0])
+        closed = page.split("function closeCardBattle() {", 1)[1]
+        self.assertIn('document.body.classList.remove("induel")', closed.split("\n}", 1)[0])
+
+    async def test_a_new_hand_is_dealt_face_up_once_per_turn(self):
+        """Every played card re-renders the same turn. Without the guard the whole hand
+        would flip itself back over on every tap."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("@keyframes carddeal", page)
+        self.assertIn("rotateY(", page)
+        render = page.split("function renderCardBattle(box) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("const dealing = battle.turn !== CARD_DEALT_TURN;", render)
+        self.assertIn("dealing ? index : -1", render)
+        self.assertIn("CARD_DEALT_TURN = battle.turn;", render)
+        # The stagger is what makes it a deal rather than five cards arriving at once.
+        self.assertIn("animation-delay:' + Number(deal) * 60", page)
+
+    async def test_every_scroll_in_the_collection_becomes_a_card(self):
+        """Magic joins the deck the same way legendaries did -- the whole collection, not
+        the four equipped slots. A duel has no loadout to build first, and a collection
+        that could only ever play four of its spells would be worse than none."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        record = data["pets"][str(PLAYER["id"])]
+        codes = [row["code"] for row in SCROLLS.REGULAR_SCROLLS[:3]]
+        codes.append(SCROLLS.ULTIMATE_SCROLLS[0]["code"])
+        record["owned_scrolls"] = list(codes)
+        record["fight_bank"] = 40
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        self.assertEqual(opened["scrolls"], len(codes))
+        base = len(pets_cardbattle.base_deck(pets_web.CARD_ATTACK, pets_web.CARD_MAX_HP))
+        self.assertEqual(opened["deck_size"]["player"], base + len(codes))
+
+    async def test_a_spell_card_states_its_numbers_like_any_other(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 40
+        pets._save(CHAT, data)
+
+        for row in SCROLLS.SCROLLS:
+            card = pets_cardbattle.card_from_scroll(
+                {"code": row["code"], "name": row["name"], "icon": row.get("icon"),
+                 "short": row.get("short"), "ultimate": row.get("ultimate"),
+                 "effects": row.get("effects")},
+                pets_web.CARD_ATTACK, pets_web.CARD_MAX_HP,
+            )
+            self.assertTrue(card["tags"] if "tags" in card
+                            else pets_cardbattle.tags(card), row["code"])
+            self.assertTrue(card["effect"], row["code"])
+            self.assertGreaterEqual(card["cost"], 1)
+            self.assertLessEqual(card["cost"], 3)
+            # The catalogue's shared prefix is dead weight on a card 132 pixels wide.
+            self.assertNotIn("Магический свиток:", card["name"])
+            # An ultimate is a once-a-fight finisher in the arena and stays one here.
+            self.assertEqual(card["exhaust"], bool(row.get("ultimate")), row["code"])
+
+    async def test_a_cleansing_spell_lifts_the_harm_and_leaves_the_help(self):
+        """Regen decays like a curse does, so a cleanse written as "everything that ticks
+        down" would punish the player for casting it."""
+        battle = pets_cardbattle.start(
+            {"id": "a", "name": "A", "max_hp": 200, "attack": 20},
+            {"id": "b", "name": "B", "max_hp": 200, "attack": 20},
+            [pets_cardbattle.CardTemplate("purge", "Очищение", 1, cleanse=True).public()],
+            [], seed=5,
+        )
+        status = battle["fighters"]["player"]["status"]
+        status.update({"burn": 4, "poison": 3, "weak": 2, "vulnerable": 2,
+                       "regen": 5, "strength": 3})
+        battle = pets_cardbattle.play(battle, battle["hand"][0]["uid"])
+
+        after = battle["fighters"]["player"]["status"]
+        for harmful in ("burn", "poison", "weak", "vulnerable"):
+            self.assertEqual(after[harmful], 0, harmful)
+        self.assertEqual(after["regen"], 5, "a cleanse must not burn off regeneration")
+        self.assertEqual(after["strength"], 3, "a cleanse must not undo a buff")
 
     async def test_the_arena_row_puts_power_above_the_name_and_a_card_button_beside_it(self):
         """The opponent row carries two fights now. The power rating moved to the left,
@@ -4171,7 +4448,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_duel_screen_draws_the_cost_the_numbers_and_the_rules_text(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
-        self.assertIn("function cardMarkup(card, playable, affordable)", page)
+        self.assertIn("function cardMarkup(card, playable, affordable, deal)", page)
         self.assertIn('class="cardcost"', page)
         self.assertIn('class="cardtags"', page)
         self.assertIn('class="cardtext"', page)

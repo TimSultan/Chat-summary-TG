@@ -84,6 +84,10 @@ STATUS_META: Final = {
 
 STATUS_KEYS: Final = tuple(STATUS_META)
 
+# What a cleanse strips. Listed rather than derived from `decays`, because regen decays as
+# well and burning that off would turn the card into a punishment for playing it.
+HARMFUL_STATUSES: Final = ("burn", "poison", "vulnerable", "weak", "stun")
+
 
 @dataclass(frozen=True)
 class CardTemplate:
@@ -108,6 +112,7 @@ class CardTemplate:
     execute: int = 0               # extra percent against a target under 40% HP
     apply: dict = field(default_factory=dict)    # statuses forced onto the target
     boost: dict = field(default_factory=dict)    # statuses granted to whoever played it
+    cleanse: bool = False          # strips every harmful status off whoever played it
     exhaust: bool = False
     effect: str = ""
     rarity: str = "common"
@@ -133,6 +138,7 @@ class CardTemplate:
             "execute": max(0, int(self.execute)),
             "apply": {k: int(v) for k, v in (self.apply or {}).items() if v},
             "boost": {k: int(v) for k, v in (self.boost or {}).items() if v},
+            "cleanse": bool(self.cleanse),
             "exhaust": bool(self.exhaust),
             "effect": self.effect,
             "rarity": self.rarity,
@@ -175,6 +181,8 @@ def tags(card: dict) -> list[str]:
     for key, value in (card.get("boost") or {}).items():
         meta = STATUS_META.get(key) or {}
         rows.append(f"{meta.get('icon', '•')} себе +{int(value)} {meta.get('name', key)}")
+    if card.get("cleanse"):
+        rows.append("🫧 снимает эффекты")
     if int(card.get("self_damage", 0) or 0):
         rows.append("💢 −" + str(int(card["self_damage"])) + " HP себе")
     if card.get("exhaust"):
@@ -400,16 +408,136 @@ def card_from_item(item: dict, attack: int, max_hp: int) -> dict:
     return template.public()
 
 
-def build_deck(items: list[dict], attack: int, max_hp: int) -> list[dict]:
+# One handler per op the scroll catalogue uses. A scroll is written for the auto-battler,
+# where "уклонение от следующего удара" and "ослепление на 2 хода" are real distinct
+# rules; a card board has neither dodging nor accuracy, so each op is re-expressed as the
+# nearest thing this engine does have -- a dodge is a blow prevented, so it becomes block,
+# and blindness is an attack that lands for less, so it becomes weakness.
+#
+# The numbers are NOT reinterpreted: `damage` stays a multiple of the owner's attack and
+# `shield`/`heal` stay fractions of maximum health, exactly as the catalogue means them.
+# Only the over-time effects are re-scaled, because this engine spends a status down by
+# one a turn instead of running it for a fixed count.
+_SCROLL_OPS: Final = frozenset({
+    "damage", "shield", "heal", "self_damage", "burn", "vulnerable", "weaken", "blind",
+    "stun", "regen", "damage_boost", "reflect_next", "dodge_next", "negative_ward",
+    "break_shield", "cleanse",
+})
+
+
+def _scroll_spec(effects, attack: int, max_hp: int) -> dict:
+    """Fold a scroll's effect list into the flat card fields this engine understands."""
+    spec: dict = {"damage": 0, "block": 0, "heal": 0, "self_damage": 0,
+                  "apply": {}, "boost": {}, "pierce": False, "cleanse": False}
+
+    def bump(bag: dict, key: str, value: int) -> None:
+        bag[key] = max(int(bag.get(key, 0) or 0), int(value))
+
+    for effect in effects or ():
+        op = str((effect or {}).get("op") or "")
+        amount = float(effect.get("amount", 0) or 0)
+        percent = float(effect.get("percent", 0) or 0)
+        value = float(effect.get("value", 0) or 0)
+        turns = max(1, int(effect.get("turns", 1) or 1))
+        if op == "damage":
+            spec["damage"] += round(attack * amount)
+        elif op == "shield":
+            spec["block"] += round(max_hp * percent)
+        elif op == "heal":
+            spec["heal"] += round(max_hp * percent)
+        elif op == "self_damage":
+            spec["self_damage"] += max(1, round(max_hp * percent))
+        elif op == "burn":
+            # A stack burns for its own size and loses one a turn, so a flat "45% of a hit
+            # for two turns" has to become a stack whose decay adds up to about the same.
+            bump(spec["apply"], "burn", max(2, min(9, round(attack * amount))))
+        elif op == "vulnerable":
+            bump(spec["apply"], "vulnerable", turns + 1)
+        elif op in ("weaken", "blind"):
+            bump(spec["apply"], "weak", turns + 1)
+        elif op == "stun":
+            bump(spec["apply"], "stun", turns)
+        elif op == "regen":
+            bump(spec["boost"], "regen", max(2, min(8, round(max_hp * percent / 3))))
+        elif op == "damage_boost":
+            bump(spec["boost"], "strength", max(1, min(6, round(attack * value / 3))))
+        elif op == "reflect_next":
+            bump(spec["boost"], "thorns", max(2, min(9, round(attack * value / 4))))
+        elif op == "dodge_next":
+            spec["block"] += round(attack * 1.1)        # a blow dodged is a blow stopped
+        elif op == "negative_ward":
+            spec["cleanse"] = True
+            spec["block"] += round(attack * 0.6)
+        elif op == "break_shield":
+            spec["pierce"] = True
+        elif op == "cleanse":
+            spec["cleanse"] = True
+    return spec
+
+
+def card_from_scroll(scroll: dict, attack: int, max_hp: int) -> dict:
+    """One scroll from the creature's collection, as one card.
+
+    `scroll` is the flat dict the web layer builds from a catalogue row: code, name, icon,
+    short, ultimate, effects. As with `card_from_item`, nothing is imported from the
+    catalogue here so the engine stays testable against a literal.
+    """
+    attack = max(3, int(attack))
+    max_hp = max(10, int(max_hp))
+    spec = _scroll_spec(scroll.get("effects"), attack, max_hp)
+    ultimate = bool(scroll.get("ultimate"))
+
+    # An ultimate is a once-a-fight finisher in the arena and stays one here: it exhausts,
+    # so drawing it is an event rather than a rotation. Ordinary scrolls come round again
+    # with the rest of the discard, which is the deck's own limit on them.
+    if ultimate:
+        cost = 3
+    elif spec["damage"] > attack * 1.35 or spec["block"] > max_hp * 0.18:
+        cost = 2
+    else:
+        cost = 1
+
+    name = str(scroll.get("name") or "Свиток")
+    # The catalogue prefixes every one of them with "Магический свиток: ". On a card 132
+    # pixels wide that prefix is most of the line and says nothing the 📜 does not.
+    name = name.split(": ", 1)[1] if ": " in name else name
+
+    template = CardTemplate(
+        code=f"scroll:{scroll.get('code') or 'scroll'}",
+        name=name,
+        cost=cost,
+        icon=str(scroll.get("icon") or "📜"),
+        damage=spec["damage"],
+        block=spec["block"],
+        heal=spec["heal"],
+        self_damage=spec["self_damage"],
+        pierce=spec["pierce"],
+        apply=spec["apply"],
+        boost=spec["boost"],
+        cleanse=spec["cleanse"],
+        exhaust=ultimate,
+        effect=str(scroll.get("short") or "").strip() or "Магия из коллекции существа.",
+        rarity="ultimate" if ultimate else "magic",
+        source="scroll",
+        item_code=str(scroll.get("code") or ""),
+    )
+    return template.public()
+
+
+def build_deck(items: list[dict], attack: int, max_hp: int,
+               scrolls: list[dict] | None = None) -> list[dict]:
     """Base cards plus one card per legendary owned.
 
-    Order does not matter -- `start` shuffles. The deck is rebuilt from the bag at the
-    opening of every duel rather than stored, which is what makes selling a legendary
-    take its card away with it and finding one put a card in without any migration.
+    Order does not matter -- `start` shuffles. The deck is rebuilt from the bag and the
+    scroll collection at the opening of every duel rather than stored, which is what makes
+    selling a legendary take its card away with it, and finding either a legendary or a
+    scroll put one in, without any migration.
     """
     deck = base_deck(attack, max_hp)
     for item in items or ():
         deck.append(card_from_item(item, attack, max_hp))
+    for scroll in scrolls or ():
+        deck.append(card_from_scroll(scroll, attack, max_hp))
     return deck
 
 
@@ -753,6 +881,17 @@ def _resolve(state: dict, source: str, target: str, card: dict,
         state["log"].append(
             f"{actor['name']}: {meta['icon']} {meta['name']} +{int(value)}."
         )
+
+    if card.get("cleanse"):
+        lifted = [key for key in HARMFUL_STATUSES
+                  if int(actor["status"].get(key, 0) or 0) > 0]
+        for key in lifted:
+            actor["status"][key] = 0
+        if lifted:
+            names = ", ".join(STATUS_META[key]["name"].lower() for key in lifted)
+            state["log"].append(f"{actor['name']}: {name} снимает {names}.")
+        else:
+            state["log"].append(f"{actor['name']}: {name} — снимать нечего.")
 
     self_damage = max(0, int(card.get("self_damage", 0) or 0))
     if self_damage:
