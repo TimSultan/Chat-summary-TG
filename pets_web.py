@@ -56,6 +56,7 @@ import donations
 import economy
 import maintenance
 import pets
+import pets_cardbattle
 import pets_combat
 import pets_config as C
 import pets_dungeon as D
@@ -107,10 +108,15 @@ _QUEST_COMPLETION_KEY = web.AppKey("pets_quest_completion")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
 _TEST_BATTLE_SESSIONS_KEY = web.AppKey("pets_test_battle_sessions", dict)
+_CARD_BATTLE_SESSIONS_KEY = web.AppKey("pets_card_battle_sessions", dict)
 _SPRITE_JOBS_KEY = web.AppKey("pets_sprite_jobs", set)
 
 TEST_BATTLE_SESSION_TTL = 30 * 60
 TEST_BATTLE_SESSION_LIMIT = 1000
+# A card duel is played a tap at a time over several minutes and holds a whole shuffled
+# deck, so it is given the same half hour and the same ceiling as the turn-based test.
+CARD_BATTLE_SESSION_TTL = 30 * 60
+CARD_BATTLE_SESSION_LIMIT = 1000
 
 # Item codes are ASCII and short by construction (w001, amulet_red_button, bt01). Anything
 # else never reaches the filesystem -- same two-step guard vote_web.handle_media uses.
@@ -2110,6 +2116,246 @@ async def handle_test_battle_action(request: web.Request) -> web.Response:
     })
 
 
+# ------------------------------------------------------------------- card duel (test)
+# A card duel is a sandbox exactly like the turn-based test above: it reads the two pets
+# and their bags, and writes nothing. No arena fight is spent, no gold or XP moves, and
+# neither a win nor a loss reaches the record -- which is why nothing here calls
+# pets.record_fight, and why the start payload does one _load and then never touches the
+# store again for the rest of the duel, however many turns it runs.
+
+# The card game's own scale. Deliberately NOT pets_combat's: that model is built around a
+# 500-point health bar and ~50-point swings, and a "49" printed on a card that gets played
+# three times a turn reads as noise. The two numbers below put a duel at roughly a dozen
+# turns for any pair of pets, because attack and HP both grow linearly in the stats and
+# the constant offsets are in proportion -- so a big pet and a small one play the same
+# LENGTH of game, and the advantage between them shows up where it should: in which of
+# the two runs out of health first.
+# Both fighters start from the same body, and the pet's stats are not consulted at all.
+# This is the whole design of the mode: strength, health, armour and level already decide
+# the arena, and letting them decide here too would make a card duel a second reading of
+# the same power rating with more taps. What differs between two players is their deck --
+# which base cards they draw, and which legendaries their bag put in among them.
+#
+# Fixing the numbers also fixes the CARD TEXT. Every card's damage is a multiple of
+# CARD_ATTACK, so "Удар 20" is 20 for everybody, on both sides of every duel: the deck can
+# be learned once instead of re-read against whoever is sitting opposite. That is worth
+# more to a card game than any amount of stat fidelity.
+#
+# 20 and 360 are measured, not picked: they hold a duel at about twelve turns between two
+# base decks (nine when both sides are deep in legendaries), which leaves a wide margin
+# under the engine's 40-turn limit. Health is 18 Strikes -- change one of these and the
+# other has to move with it, or the pacing goes with it.
+CARD_ATTACK = 20
+CARD_MAX_HP = 360
+
+
+def _card_items_for(record: dict) -> list[dict]:
+    """Every legendary in this pet's bag, flattened to what the engine needs.
+
+    The BAG, not the equipped slots: a card duel is the one place a legendary that lost
+    its slot to a better roll still gets to do something, and a deck built out of six
+    equipment slots would be four cards long for nearly everybody.
+
+    What is worn does not matter in either direction -- the stats behind `attack` and
+    `max_hp` already carry the equipment, so a legendary never counts twice.
+    """
+    rows = []
+    seen: set[str] = set()
+    for code in record.get("inventory") or ():
+        # One card per distinct legendary. Two copies of the same weapon in a bag are one
+        # card, or a duplicate-heavy collection would keep dealing itself the same
+        # finisher while the rest of the deck never came up.
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        item = C.find_item(code)
+        if item is None or item.rarity != "legendary":
+            continue
+        effect = item.effect if isinstance(item.effect, dict) else {}
+        rows.append({
+            "code": item.code,
+            "name": item.name,
+            "slot": item.slot,
+            "effect_code": str(effect.get("code") or ""),
+            "effect_text": str(effect.get("text") or item.description or ""),
+        })
+    rows.sort(key=lambda row: row["code"])
+    return rows
+
+
+def _card_side(record: dict, key: str) -> tuple[dict, list[dict]]:
+    """The fighter header and the deck for one side, from one already-loaded record.
+
+    The header is the same numbers for everyone (see CARD_ATTACK/CARD_MAX_HP); the record
+    supplies only the name on the health bar and the legendaries in the bag.
+    """
+    fighter = {
+        "id": str(key),
+        "name": record.get("name") or "Существо",
+        "max_hp": CARD_MAX_HP,
+        "hp": CARD_MAX_HP,
+        "attack": CARD_ATTACK,
+    }
+    deck = pets_cardbattle.build_deck(
+        _card_items_for(record), CARD_ATTACK, CARD_MAX_HP,
+    )
+    return fighter, deck
+
+
+def _card_portrait(record: dict, key: str, prefix: str) -> dict:
+    """What the duel screen draws above a health bar. The same portrait contract the
+    arena replay uses, so a face that works there works here."""
+    return {
+        "name": record.get("name") or "Существо",
+        "portrait": _portrait_url(prefix, key),
+        "crop": record.get("portrait_crop"),
+        "owner_name": record.get("owner_name"),
+        "kind": pets_sprite.cached_archetype(record) or pets_sprite.DEFAULT_ARCHETYPE,
+        "owner_id": str(key),
+    }
+
+
+def _card_battle_start_payload(
+    entry: str, me: str, opponent_id: str, prefix: str, seed: int,
+) -> tuple[dict | None, tuple[str, int, str] | None]:
+    """The whole blocking half of opening a duel: one store read, two decks, no writes."""
+    data = pets._load(entry)
+    mine = pets._tamed_record(data, me)
+    theirs = pets._tamed_record(data, opponent_id) if opponent_id else None
+    if mine is None:
+        return None, ("Сначала приручи существо.", 409, "NO_PET")
+    if theirs is None:
+        return None, ("Соперник больше не доступен.", 409, "NO_OPPONENT")
+
+    player, player_deck = _card_side(mine, me)
+    enemy, enemy_deck = _card_side(theirs, opponent_id)
+    state = pets_cardbattle.start(player, enemy, player_deck, enemy_deck, seed=seed)
+    return {
+        "state": state,
+        "faces": {
+            "player": _card_portrait(mine, me, prefix),
+            "enemy": _card_portrait(theirs, opponent_id, prefix),
+        },
+        "deck_size": {"player": len(player_deck), "enemy": len(enemy_deck)},
+        "legendaries": sum(1 for card in player_deck if card.get("source") == "item"),
+        "attack": CARD_ATTACK,
+        "max_hp": CARD_MAX_HP,
+    }, None
+
+
+def _prune_card_battles(app: web.Application) -> None:
+    sessions = app[_CARD_BATTLE_SESSIONS_KEY]
+    now = time.monotonic()
+    expired = [token for token, row in sessions.items()
+               if now - float(row.get("last_used", 0)) > CARD_BATTLE_SESSION_TTL]
+    for token in expired:
+        sessions.pop(token, None)
+    if len(sessions) > CARD_BATTLE_SESSION_LIMIT:
+        oldest = sorted(sessions, key=lambda token: sessions[token].get("last_used", 0))
+        for token in oldest[:len(sessions) - CARD_BATTLE_SESSION_LIMIT]:
+            sessions.pop(token, None)
+
+
+def _card_battle_response(session: dict, token: str) -> dict:
+    """One duel as the screen sees it. `pets_cardbattle.public` is what decides how much
+    of the opponent's deck goes out -- their announced turn, and nothing else."""
+    return {
+        "ok": True,
+        "session": token,
+        "battle": pets_cardbattle.public(session["battle"]),
+        "faces": session.get("faces") or {},
+        "deck_size": session.get("deck_size") or {},
+        "legendaries": session.get("legendaries", 0),
+        "attack": CARD_ATTACK,
+        "max_hp": CARD_MAX_HP,
+    }
+
+
+async def handle_card_battle_start(request: web.Request) -> web.Response:
+    """Open a card duel against one opponent from the arena roster."""
+    started = time.monotonic()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await _is_member(request, user):
+        return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    paused = _paused_response()
+    if paused is not None:
+        return paused
+
+    me = str(user["id"])
+    opponent_id = str(body.get("opponent_id") or "")
+    if not opponent_id or opponent_id == me:
+        return _json_error("Выбери соперника.", status=409, code="NO_OPPONENT")
+
+    payload, refusal = await asyncio.to_thread(
+        _card_battle_start_payload, request.app[_ENTRY_KEY], me, opponent_id,
+        request.app[_PREFIX_KEY], secrets.randbits(63),
+    )
+    if refusal is not None:
+        message, status, code = refusal
+        return _json_error(message, status=status, code=code)
+    assert payload is not None
+
+    _prune_card_battles(request.app)
+    token = secrets.token_urlsafe(18)
+    session = {
+        "owner": me, "entry": request.app[_ENTRY_KEY], "opponent": opponent_id,
+        "last_used": time.monotonic(), "battle": payload["state"],
+        "faces": payload["faces"], "deck_size": payload["deck_size"],
+        "legendaries": payload["legendaries"],
+    }
+    request.app[_CARD_BATTLE_SESSIONS_KEY][token] = session
+    return _ok(_card_battle_response(session, token), took=time.monotonic() - started)
+
+
+async def handle_card_battle_action(request: web.Request) -> web.Response:
+    """Play one card, or hand the turn over.
+
+    Both are pure dictionary work on a session already in memory, so neither reads the
+    store and neither needs a worker thread -- the duel's one store read happened when it
+    opened.
+    """
+    started = time.monotonic()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await _is_member(request, user):
+        return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    _prune_card_battles(request.app)
+    token = str(body.get("session") or "")
+    session = request.app[_CARD_BATTLE_SESSIONS_KEY].get(token)
+    if session is None:
+        return _json_error("Карточный бой закончился или устарел.", status=404, code="NO_CARD_SESSION")
+    if session.get("owner") != str(user["id"]) or session.get("entry") != request.app[_ENTRY_KEY]:
+        return _json_error("Это чужой карточный бой.", status=403, code="WRONG_CARD_OWNER")
+
+    action = str(body.get("action") or "")
+    try:
+        if action == "play":
+            battle = pets_cardbattle.play(session["battle"], str(body.get("card") or ""))
+        elif action == "end_turn":
+            battle = pets_cardbattle.end_turn(session["battle"])
+        else:
+            return _json_error("Неизвестный ход.", status=409, code="BAD_CARD_ACTION")
+    except ValueError as error:
+        return _json_error(str(error), status=409, code="BAD_CARD_ACTION")
+
+    session["battle"] = battle
+    session["last_used"] = time.monotonic()
+    response = _card_battle_response(session, token)
+    # A finished duel is dropped as soon as its result has been handed back: it writes
+    # nothing, so there is nothing to come back to, and keeping it would hold a whole
+    # shuffled deck in memory for the half hour of the TTL for no reason.
+    if battle.get("finished"):
+        request.app[_CARD_BATTLE_SESSIONS_KEY].pop(token, None)
+    return _ok(response, took=time.monotonic() - started)
+
+
 def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
     data = pets._load(entry)
     mine_record = pets._tamed_record(data, me)
@@ -3913,6 +4159,7 @@ def attach(
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
     # the real pet store. Opaque tokens and ownership checks isolate simultaneous users.
     app[_TEST_BATTLE_SESSIONS_KEY] = {}
+    app[_CARD_BATTLE_SESSIONS_KEY] = {}
     # Strong references to in-flight sprite jobs. The event loop only holds a task
     # weakly, so without this the garbage collector is free to cancel a generation
     # halfway through and nothing would ever say why.
@@ -3945,6 +4192,8 @@ def attach(
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
         web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
         web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
+        web.post(prefix + "/api/card-battle/start", handle_card_battle_start),
+        web.post(prefix + "/api/card-battle/action", handle_card_battle_action),
         web.get(prefix + "/api/mob", handle_mob),
         web.post(prefix + "/api/mob", handle_mob_attack),
         web.get(prefix + "/api/shop", handle_shop),
@@ -4905,6 +5154,95 @@ PAGE_HTML = """<!doctype html>
   .tierchip.loss { color: var(--hp); }
   .pw { color: var(--gold); font-weight: 700; }
 
+  /* An arena row is now two buttons, not one: the whole left side opens the ordinary
+     duel, and the card button on the right opens the card one. They are wrapped rather
+     than nested because a <button> inside a <button> is not valid HTML -- the browser
+     closes the outer one early and the row falls apart. `.foe` itself keeps working
+     unchanged for the leaderboard and the boss picker, which still use it as a button. */
+  .foewrap { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: stretch; }
+  .foewrap + .foewrap { margin-top: 8px; }
+  .foewrap .foe { grid-template-columns: auto 1fr; height: 100%; }
+  /* The opponent's power, moved off the right edge to above their name. The same gold it
+     has always been, two sizes down: it is the number you glance at before choosing, not
+     one of the things you are choosing between. */
+  .foewrap .pw.above { display: block; font-size: 11px; line-height: 1.3; margin-bottom: 1px; }
+  .cardfight {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; width: 62px; padding: 8px 4px; border: 1px solid var(--r-legendary);
+    border-radius: 12px; background: rgba(176,107,224,.12); color: var(--r-legendary);
+    font-size: 10px; font-weight: 700; line-height: 1.15; text-align: center;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  .cardfight .ic { font-size: 19px; }
+  .cardfight:active:not(:disabled) { transform: scale(.96); filter: brightness(1.25); }
+  .cardfight:disabled { opacity: .4; }
+
+  /* ------------------------------------------------------------------- card duel */
+  .cardbanner { border: 1px solid var(--r-legendary); background: rgba(176,107,224,.10);
+                border-radius: 12px; padding: 10px 12px; font-size: 13px; }
+  .cardstage { display: grid; gap: 8px; margin-top: 9px; }
+  .cardside { display: grid; grid-template-columns: auto 1fr; gap: 10px;
+              align-items: center; background: var(--sunken); border-radius: 12px;
+              padding: 10px; }
+  .cardside.enemy { border: 1px solid rgba(224,72,77,.35); }
+  .cardside .av { width: 44px; height: 44px; border-radius: 11px; overflow: hidden;
+                  background: var(--card); flex: none; }
+  .cardside .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cardside .who { font-weight: 700; font-size: 14px; }
+  .cardhp { height: 9px; border-radius: 999px; background: var(--track);
+            overflow: hidden; margin-top: 5px; }
+  .cardhp > i { display: block; height: 100%; background: var(--hp); border-radius: 999px;
+                transition: width .25s ease-out; }
+  /* Block is not a status -- it is gone again at the start of the next turn -- so it sits
+     with the health numbers rather than in the badge row, which is for what survives. */
+  .cardnums { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .cardnums b { color: var(--fg); }
+  .cardblock { color: var(--r-rare); font-weight: 700; }
+  .cardstatus { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+  .cardstatus span { font-size: 11px; font-weight: 700; border-radius: 999px;
+                     padding: 1px 7px; border: 1px solid var(--line); background: var(--card); }
+
+  .cardintent { border: 1px solid rgba(224,72,77,.4); background: rgba(224,72,77,.07);
+                border-radius: 12px; padding: 9px 10px; }
+  .cardintent h3 { margin: 0 0 7px; font-size: 13px; }
+  /* An announced turn scrolls sideways on its own rather than widening the page: the
+     opponent can commit to three cards, and three cards do not fit across a phone. */
+  .cardrow { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
+             scrollbar-width: thin; }
+  .cardrow::-webkit-scrollbar { height: 5px; }
+  .cardrow::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+
+  .card { flex: 0 0 auto; width: 132px; display: flex; flex-direction: column; gap: 4px;
+          text-align: left; background: var(--card); border: 1px solid var(--line);
+          border-radius: 12px; padding: 30px 9px 9px; position: relative; color: var(--fg);
+          touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+  .card.r-legendary { border-color: var(--r-legendary);
+                      box-shadow: 0 0 12px rgba(176,107,224,.28); }
+  .card:active:not(:disabled) { transform: translateY(-3px); filter: brightness(1.2); }
+  .card:disabled { opacity: .45; }
+  /* The cost sits in the corner the eye checks first, because it is the one number that
+     decides whether the rest of the card is an option at all this turn. */
+  .cardcost { position: absolute; top: 7px; left: 8px; width: 21px; height: 21px;
+              border-radius: 50%; background: var(--xp); color: #0f1720;
+              font-size: 12px; font-weight: 800; display: flex; align-items: center;
+              justify-content: center; }
+  .cardicon { position: absolute; top: 7px; right: 8px; font-size: 15px; }
+  .cardname { font-size: 12px; font-weight: 700; line-height: 1.25; }
+  .cardtags { display: flex; flex-wrap: wrap; gap: 3px; }
+  .cardtags i { font-style: normal; font-size: 10px; font-weight: 700; line-height: 1.4;
+                border-radius: 5px; padding: 1px 5px; background: var(--sunken);
+                color: var(--accent); }
+  .cardtext { font-size: 10px; line-height: 1.35; color: var(--muted); }
+  .cardhand { margin-top: 9px; }
+  .cardhand .card { width: 138px; }
+  .cardbar { display: grid; grid-template-columns: auto 1fr auto; gap: 9px;
+             align-items: center; margin-top: 9px; }
+  .cardenergy { font-size: 15px; font-weight: 800; color: var(--xp); white-space: nowrap; }
+  .cardpiles { font-size: 11px; color: var(--muted); text-align: right; white-space: nowrap; }
+  .cardlog { max-height: 168px; overflow-y: auto; font-size: 12px; line-height: 1.5; }
+  .cardlog div { padding: 2px 0; border-bottom: 1px solid var(--line); }
+  .cardlog div:last-child { border-bottom: 0; }
+
   /* ----------------------------------------------------------------------- quests
      A quest card is read once and then acted on in the real world hours later, so it is
      laid out as a brief rather than a list row: what the technique is, what to paint,
@@ -5648,6 +5986,12 @@ let S = null;            // the server's state, verbatim -- never edited on the 
 let TAB = "hero";
 let SHOP = null, FOES = null, ROSTER = null;
 let TEST_SETUP = null, TEST_BATTLE = null, TEST_SESSION = null, TEST_MODE = null, TEST_BUSY = false;
+// The card duel, held exactly the way the turn-based test above is: the server owns
+// the deck, the shuffle and every rule, and these are only the last answer it gave.
+// CARD_LAST_FOE is who a rematch goes back to, so the result screen's second button
+// does not have to send the player to the roster to find the same name again.
+let CARD_BATTLE = null, CARD_SESSION = null, CARD_FACES = null, CARD_INFO = null,
+    CARD_BUSY = false, CARD_LAST_FOE = null;
 // Whether the farm tab is showing the meadow board instead of the farm/quarry panels.
 // Not derived from S.meadow.round alone: a FINISHED round stays in the store until the
 // next one starts, and that must read as "last result, still on screen" only while this
@@ -6941,6 +7285,7 @@ async function renderArena() {
   const box = $("scr-arena");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
   if (TEST_SETUP || TEST_BATTLE) { renderTestBattle(box); return; }
+  if (CARD_BATTLE) { renderCardBattle(box); return; }
   const arena = S.arena;
   if (!FOES || !MOBS) {
     box.innerHTML = '<div class="empty">Ищу соперников…</div>';
@@ -7867,21 +8212,190 @@ function repeatTag(mark) {
     esc(mark.emoji || "") + " ×" + Number(mark.count) + "</span>";
 }
 
+// Two buttons on one row. The left one is the arena duel it has always been; the one on
+// the right opens a card duel against the same opponent. The power rating moved off the
+// right edge to sit above the name, small and still gold, to free that edge for the
+// second button -- a row that has to offer two fights cannot spend its widest column on
+// a number nobody taps.
+//
+// `canFight` gates the arena button only. A card duel spends nothing from the fight bank
+// and writes nothing, so an emptied bank and an opponent already fought today both leave
+// it open; the farm is the one thing that closes both, because a creature that is away
+// is away.
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
   const repeats = foe.repeat_fights;
   const element = (((S.character_element || {}).choices || []).find(
     (row) => row.code === foe.element
   ) || {});
-  return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
-    (usable ? "" : " disabled") + '>' +
-    '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
-    "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
-      "</span> " + (element.code ? esc(element.icon) + " " + esc(element.name) + " " : "") +
-      debuffTag(foe.debuff) + " " + repeatTag(repeats) +
-      "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
-      " · побед " + foe.wins + " из " + foe.fights + "</span></span>" +
-    "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";
+  const cards = !((S.arena || {}).farming);
+  return '<div class="foewrap">' +
+    '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
+      (usable ? "" : " disabled") + '>' +
+      '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
+      "<span><span class='pw above'>\u26a1 " + money(foe.power) + "</span>" +
+        "<b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
+        "</span> " + (element.code ? esc(element.icon) + " " + esc(element.name) + " " : "") +
+        debuffTag(foe.debuff) + " " + repeatTag(repeats) +
+        "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
+        " · побед " + foe.wins + " из " + foe.fights + "</span></span></button>" +
+    '<button class="cardfight" data-cardfoe="' + esc(foe.user_id) + '"' +
+      (cards ? "" : " disabled") + ' title="Карточный бой">' +
+      '<span class="ic">🃏</span>Карты</button></div>';
+}
+
+// ------------------------------------------------------------------------- card duel
+// A second way to fight the same opponent: played out of a hand instead of watched. The
+// server owns the deck, the shuffle and every rule (pets_cardbattle); everything here
+// draws the last state it sent back and posts one action at a time.
+
+// One card, either in the hand or in the opponent's announced turn. `playable` is what
+// turns it into a button -- an intent card is the same markup with nothing to tap.
+function cardMarkup(card, playable, affordable) {
+  const rows = (card.tags || []).map((row) => "<i>" + esc(row) + "</i>").join("");
+  const body =
+    '<span class="cardcost">' + Number(card.cost || 0) + "</span>" +
+    '<span class="cardicon">' + esc(card.icon || "🂠") + "</span>" +
+    '<span class="cardname">' + esc(card.name || "") + "</span>" +
+    (rows ? '<span class="cardtags">' + rows + "</span>" : "") +
+    (card.effect ? '<span class="cardtext">' + esc(card.effect) + "</span>" : "");
+  const kind = card.rarity === "legendary" ? " r-legendary" : "";
+  if (!playable) return '<div class="card' + kind + '">' + body + "</div>";
+  return '<button class="card' + kind + '" data-cardplay="' + esc(card.uid || "") + '"' +
+    (affordable ? "" : " disabled") + ">" + body + "</button>";
+}
+
+// One fighter's corner: face, name, health bar, block, and whatever is stuck to them.
+function cardSide(fighter, face, side) {
+  const meta = CARD_BATTLE.statuses || {};
+  const max = Math.max(1, fighter.max_hp || 1);
+  const pct = Math.max(0, Math.min(100, (100 * (fighter.hp || 0)) / max));
+  const badges = Object.keys(fighter.status || {}).map((key) => {
+    const row = meta[key] || {};
+    return "<span title='" + esc(row.hint || "") + "'>" + esc(row.icon || "•") + " " +
+      esc(row.name || key) + " " + Number(fighter.status[key]) + "</span>";
+  }).join("");
+  return '<div class="cardside' + (side === "enemy" ? " enemy" : "") + '">' +
+    '<span class="av">' + shot((face || {}).portrait, (face || {}).crop) + "</span>" +
+    "<div><div class='who'>" + esc(fighter.name || "—") + "</div>" +
+      '<div class="cardhp"><i style="width:' + pct + '%"></i></div>' +
+      "<div class='cardnums'><b>" + Number(fighter.hp || 0) + "</b> / " + max +
+        (fighter.block ? " · <span class='cardblock'>🛡 " + Number(fighter.block) +
+          "</span>" : "") + "</div>" +
+      (badges ? '<div class="cardstatus">' + badges + "</div>" : "") +
+    "</div></div>";
+}
+
+function renderCardBattle(box) {
+  const battle = CARD_BATTLE;
+  const faces = CARD_FACES || {};
+  const info = CARD_INFO || {};
+  const mine = battle.fighters.player;
+  const foe = battle.fighters.enemy;
+  const over = battle.finished;
+  const verdict = over
+    ? (battle.draw ? "Ничья" : battle.winner === "player" ? "Победа" : "Поражение")
+    : "Ход " + battle.turn;
+  const intent = battle.enemy_intent || [];
+
+  box.innerHTML =
+    '<div class="cardbanner"><b>🃏 Карточный бой.</b> ' +
+      'Бои арены не тратятся, наград нет, результат никуда не пишется.' +
+      '<div class="tiny muted" style="margin-top:5px">Характеристики у обоих ' +
+        'одинаковые — ' + Number(info.max_hp || 0) + ' HP и удар ' +
+        Number(info.attack || 0) + '. Решает только колода.</div>' +
+      (info.legendaries
+        ? '<div class="tiny muted" style="margin-top:5px">Легендарок в колоде: ' +
+          Number(info.legendaries) + " · всего карт: " +
+          Number((info.deck_size || {}).player || 0) + "</div>"
+        : '<div class="tiny muted" style="margin-top:5px">Легендарных предметов в сумке ' +
+          'нет — колода пока только из базовых карт.</div>') +
+    "</div>" +
+    '<div class="cardstage">' + cardSide(foe, faces.enemy, "enemy") +
+      cardSide(mine, faces.player, "player") + "</div>" +
+    // What the opponent has already committed to, above the hand -- because it is the
+    // thing the hand is being played against.
+    '<div class="cardintent" style="margin-top:9px"><h3>👁 Соперник в следующий ход</h3>' +
+      (over
+        ? '<div class="tiny muted">Бой окончен.</div>'
+        : (intent.length
+          ? '<div class="cardrow">' +
+            intent.map((card) => cardMarkup(card, false, false)).join("") + "</div>"
+          : '<div class="tiny muted">Ничего не сыграет — карт не осталось.</div>')) +
+    "</div>" +
+    '<div class="cardbar">' +
+      '<span class="cardenergy">⚡ ' + Number(battle.energy) + " / " +
+        Number(battle.max_energy) + "</span>" +
+      "<span class='small' style='text-align:center'>" + esc(verdict) + "</span>" +
+      '<span class="cardpiles">🃏 ' + Number(battle.deck.draw) + " · ♻️ " +
+        Number(battle.deck.discard) + "</span>" +
+    "</div>" +
+    (over
+      ? '<div class="test-actions" style="margin-top:9px">' +
+        '<button class="go test-action" data-cardbattle="again" style="grid-column:span 2">' +
+          '<span class="ic">🃏</span>Ещё раз</button>' +
+        '<button class="go sec test-action" data-cardbattle="close" style="grid-column:span 2">' +
+          '<span class="ic">◀️</span>На арену</button></div>'
+      : '<div class="cardhand"><div class="cardrow">' +
+          (battle.hand.length
+            ? battle.hand.map(
+                (card) => cardMarkup(card, true, card.cost <= battle.energy)).join("")
+            : "<div class='tiny muted'>Рука пуста.</div>") +
+        "</div></div>" +
+        '<div class="test-actions" style="margin-top:9px">' +
+          '<button class="go test-action" data-cardbattle="end" style="grid-column:span 3">' +
+            '<span class="ic">⏭</span>Закончить ход</button>' +
+          '<button class="go sec test-action" data-cardbattle="close">' +
+            '<span class="ic">◀️</span>Выход</button></div>') +
+    '<div class="panel" style="margin-top:9px"><h2>Ход боя</h2>' +
+      '<div class="cardlog" id="cardLog">' +
+        (battle.log || []).map((row) => "<div>" + esc(row) + "</div>").join("") +
+      "</div></div>";
+  paintShots(box);
+  const log = $("cardLog"); if (log) log.scrollTop = log.scrollHeight;
+}
+
+function cardBattleState(data) {
+  CARD_BATTLE = data.battle;
+  CARD_SESSION = data.session;
+  CARD_FACES = data.faces || null;
+  CARD_INFO = { deck_size: data.deck_size, legendaries: data.legendaries,
+                attack: data.attack, max_hp: data.max_hp };
+}
+
+async function openCardBattle(opponentId) {
+  if (CARD_BUSY) return;
+  CARD_BUSY = true;
+  try {
+    cardBattleState(await api("/api/card-battle/start", { opponent_id: opponentId }));
+    CARD_LAST_FOE = opponentId;
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+  finally { CARD_BUSY = false; }
+}
+
+// One tap, one action, one response -- the state that comes back IS the new screen, so
+// nothing here refetches anything afterwards.
+async function cardBattleAction(action, card) {
+  if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
+  CARD_BUSY = true;
+  try {
+    cardBattleState(await api("/api/card-battle/action",
+                              { session: CARD_SESSION, action, card: card || "" }));
+    if (CARD_BATTLE.finished) {
+      haptic(CARD_BATTLE.winner === "player" ? "ok" : "no");
+      // The server drops the session the moment a duel ends, so keeping its token here
+      // would only earn a 404 on the next tap.
+      CARD_SESSION = null;
+    } else haptic();
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+  finally { CARD_BUSY = false; }
+}
+
+function closeCardBattle() {
+  CARD_BATTLE = null; CARD_SESSION = null; CARD_FACES = null; CARD_INFO = null;
+  render();
 }
 
 // ------------------------------------------------------------------------ farm screen
@@ -10159,6 +10673,16 @@ async function handleClick(event, target) {
   if (d.testmode) { await startTestBattle(d.testmode); return; }
   if (d.testaction) { await testBattleAction(d.testaction); return; }
   if (d.testcatalog !== undefined) { showTestCatalog(); return; }
+  if (d.cardfoe) { haptic(); await openCardBattle(d.cardfoe); return; }
+  if (d.cardplay) { await cardBattleAction("play", d.cardplay); return; }
+  if (d.cardbattle === "end") { await cardBattleAction("end_turn"); return; }
+  if (d.cardbattle === "close") { closeCardBattle(); return; }
+  if (d.cardbattle === "again") {
+    const foe = CARD_LAST_FOE;
+    closeCardBattle();
+    if (foe) await openCardBattle(foe);
+    return;
+  }
   if (d.liveskill) { openLiveSkillPicker(d.liveskill); return; }
   if (d.personalrune) { openPersonalPaintRune(d.personalrune); return; }
   if (d.personalapply) {
@@ -10468,7 +10992,10 @@ function tick() {
   if (S.pve && S.pve.seconds_until_reset) {
     S.pve.seconds_until_reset = Math.max(0, S.pve.seconds_until_reset - TIMER_TICK_SECONDS);
     if (!S.pve.seconds_until_reset) dirty = true;
-    else if (TAB === "arena") renderArena();
+    // A card duel covers the arena tab and shows none of these counters, so a
+    // minute passing must not repaint it: that would throw away the hand's
+    // sideways scroll position in the middle of somebody's turn.
+    else if (TAB === "arena" && !CARD_BATTLE) renderArena();
   }
   if (S.farm && S.farm.seconds_left) {
     S.farm.seconds_left = Math.max(0, S.farm.seconds_left - TIMER_TICK_SECONDS);

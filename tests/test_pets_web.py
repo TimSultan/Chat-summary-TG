@@ -40,6 +40,7 @@ import donations
 import economy
 import maintenance
 import pets
+import pets_cardbattle
 import pets_config as C
 import pets_mobs
 import pets_scroll_catalog as SCROLLS
@@ -312,6 +313,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             ("post", "/api/action"), ("post", "/api/attack"),
             ("post", "/api/updates/claim"),
             ("post", "/api/test-battle/start"), ("post", "/api/test-battle/action"),
+            ("post", "/api/card-battle/start"), ("post", "/api/card-battle/action"),
         ):
             response = await getattr(self.client, method)(pets_web.ROUTE_PREFIX + path, json={})
             self.assertEqual(response.status, 401, f"{method} {path} let an unsigned caller in")
@@ -3836,6 +3838,298 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         celebrant_view = await (await self._get("/api/opponents", THIRD)).json()
         self.assertTrue(celebrant_view["birthday"]["is_me"])
+
+
+    # ---- card duel -------------------------------------------------------------------
+
+    def _legendary_codes(self, count):
+        return [item.code for item in C.ITEMS if item.rarity == "legendary"][:count]
+
+    def _give(self, user, codes):
+        """Drop item codes straight into the bag. The routes that grant items are proven
+        elsewhere; this only needs a bag with known contents in it."""
+        data = pets._load(CHAT)
+        record = data["pets"][str(user["id"])]
+        record.setdefault("inventory", []).extend(codes)
+        pets._save(CHAT, data)
+
+    async def _open_duel(self, user, opponent):
+        response = await self._post("/api/card-battle/start", user,
+                                    {"opponent_id": str(opponent["id"])})
+        self.assertEqual(response.status, 200, await response.text())
+        return await response.json()
+
+    async def _duel_action(self, user, session, action, card=""):
+        return await self._post("/api/card-battle/action", user,
+                                {"session": session, "action": action, "card": card})
+
+    async def test_a_card_duel_deals_a_hand_energy_and_the_opponents_whole_next_turn(self):
+        """The four things the mode promises on the first screen: five cards, three
+        energy, both fighters at full health, and what the opponent has already committed
+        to for the turn after this one."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        battle = opened["battle"]
+
+        self.assertTrue(opened["session"])
+        self.assertEqual(len(battle["hand"]), pets_cardbattle.HAND_SIZE)
+        self.assertEqual(battle["energy"], pets_cardbattle.ENERGY_PER_TURN)
+        self.assertEqual(battle["turn"], 1)
+        self.assertFalse(battle["finished"])
+        for side in ("player", "enemy"):
+            fighter = battle["fighters"][side]
+            self.assertEqual(fighter["hp"], fighter["max_hp"])
+            self.assertGreater(fighter["max_hp"], 0)
+        # The intent is a whole announced turn, and every card in it is one the opponent
+        # can actually afford -- the panel would be a lie otherwise.
+        self.assertTrue(battle["enemy_intent"])
+        self.assertLessEqual(
+            sum(max(0, card["cost"]) for card in battle["enemy_intent"])
+            - sum(card["energy"] for card in battle["enemy_intent"]),
+            pets_cardbattle.ENERGY_PER_TURN,
+        )
+
+    async def test_every_card_states_its_damage_and_its_effect(self):
+        """A card the player is asked to spend energy on has to say what it does before
+        the tap, not after: a number for everything it changes, and a sentence."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._give(PLAYER, self._legendary_codes(6))
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        for card in opened["battle"]["hand"] + opened["battle"]["enemy_intent"]:
+            self.assertTrue(card["name"])
+            self.assertTrue(card["effect"], card["name"])
+            self.assertTrue(card["tags"], card["name"])
+            self.assertIsInstance(card["cost"], int)
+
+    async def test_every_legendary_in_the_bag_becomes_exactly_one_card(self):
+        """All of them, not the equipped ones -- and a duplicate is still one card."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        codes = self._legendary_codes(4)
+        # A duplicate legendary, and two commons that must not become cards at all.
+        self._give(PLAYER, codes + [codes[0], "stick", "bead"])
+
+        base = len(pets_cardbattle.base_deck(10, 200))
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        self.assertEqual(opened["legendaries"], len(codes))
+        self.assertEqual(opened["deck_size"]["player"], base + len(codes))
+
+    async def test_a_whole_duel_reads_the_store_once_and_writes_nothing(self):
+        """The sandbox promise and the performance rule in one: opening a duel is a
+        single store read, every later turn is none at all, and the game the duel was
+        played out of is byte-identical afterwards."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._give(PLAYER, self._legendary_codes(3))
+        before = json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True)
+
+        real_load, loads = pets._load, []
+        def counting_load(entry, *args, **kwargs):
+            loads.append(entry)
+            return real_load(entry, *args, **kwargs)
+
+        with patch.object(pets, "_load", counting_load), \
+             patch.object(pets, "_save", side_effect=AssertionError("a card duel wrote")):
+            opened = await self._open_duel(PLAYER, OPPONENT)
+            self.assertEqual(len(loads), 1, "opening a duel must read the store once")
+
+            session, battle = opened["session"], opened["battle"]
+            turns = 0
+            while not battle["finished"] and turns < pets_cardbattle.TURN_LIMIT + 2:
+                played = True
+                while played and not battle["finished"]:
+                    played = False
+                    for card in list(battle["hand"]):
+                        if card["cost"] <= battle["energy"]:
+                            response = await self._duel_action(
+                                PLAYER, session, "play", card["uid"])
+                            self.assertEqual(response.status, 200, await response.text())
+                            battle = (await response.json())["battle"]
+                            played = True
+                            break
+                if battle["finished"]:
+                    break
+                response = await self._duel_action(PLAYER, session, "end_turn")
+                self.assertEqual(response.status, 200, await response.text())
+                battle = (await response.json())["battle"]
+                turns += 1
+
+            self.assertTrue(battle["finished"], "the duel never resolved")
+            self.assertEqual(len(loads), 1, "a turn re-read the store")
+
+        self.assertEqual(json.dumps(pets._load(CHAT), ensure_ascii=False, sort_keys=True),
+                         before)
+
+    async def test_a_finished_duel_pays_nothing_and_spends_no_arena_fight(self):
+        """It is a sandbox: the fight bank, the win/loss record and the purse are all
+        exactly where they were."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        before = (await (await self._get("/api/state", PLAYER)).json())["arena"]
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session, battle = opened["session"], opened["battle"]
+        while not battle["finished"]:
+            response = await self._duel_action(PLAYER, session, "end_turn")
+            self.assertEqual(response.status, 200, await response.text())
+            battle = (await response.json())["battle"]
+
+        after = (await (await self._get("/api/state", PLAYER)).json())["arena"]
+        self.assertEqual(after["available"], before["available"])
+        self.assertEqual(after["capacity"], before["capacity"])
+
+    async def test_the_opponents_draw_pile_never_reaches_the_client(self):
+        """Only the turn they have announced. A duel where the other deck can be read out
+        of the response is not the game this screen is playing."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._give(OPPONENT, self._legendary_codes(5))
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        battle = opened["battle"]
+        self.assertNotIn("enemy_draw", battle)
+        self.assertNotIn("enemy_hand", battle)
+        self.assertNotIn("player_draw", battle)
+        # Sizes are fine to know; contents are not.
+        self.assertIn("enemy_draw", battle["deck"])
+        self.assertIsInstance(battle["deck"]["enemy_draw"], int)
+
+    async def test_the_announced_turn_is_the_turn_that_gets_played(self):
+        """The intent panel is the whole feature. Whatever it showed has to be what lands
+        -- an opponent that re-picks after seeing the player's turn would make it a lie."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        announced = opened["battle"]["enemy_intent"]
+        response = await self._duel_action(PLAYER, opened["session"], "end_turn")
+        self.assertEqual(response.status, 200, await response.text())
+        log = "\n".join((await response.json())["battle"]["log"])
+        for card in announced:
+            if card["damage"] or card["block"] or card["heal"]:
+                self.assertIn(card["name"], log, card["name"])
+
+    async def test_a_card_nobody_can_pay_for_is_refused(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session, battle = opened["session"], opened["battle"]
+        # Spend the turn down to nothing, then try the cheapest card still in hand.
+        for card in list(battle["hand"]):
+            if card["cost"] and card["cost"] <= battle["energy"]:
+                battle = (await (await self._duel_action(
+                    PLAYER, session, "play", card["uid"])).json())["battle"]
+        stuck = next((card for card in battle["hand"] if card["cost"] > battle["energy"]),
+                     None)
+        if stuck is not None:
+            refused = await self._duel_action(PLAYER, session, "play", stuck["uid"])
+            self.assertEqual(refused.status, 409, await refused.text())
+            self.assertEqual((await refused.json())["error"], "BAD_CARD_ACTION")
+
+        missing = await self._duel_action(PLAYER, session, "play", "no-such-card")
+        self.assertEqual(missing.status, 409, await missing.text())
+
+    async def test_a_duel_belongs_to_the_player_who_opened_it(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        stolen = await self._duel_action(OPPONENT, opened["session"], "end_turn")
+        self.assertEqual(stolen.status, 403, await stolen.text())
+        self.assertEqual((await stolen.json())["error"], "WRONG_CARD_OWNER")
+
+        gone = await self._duel_action(PLAYER, "not-a-session", "end_turn")
+        self.assertEqual(gone.status, 404, await gone.text())
+        self.assertEqual((await gone.json())["error"], "NO_CARD_SESSION")
+
+
+    async def test_both_sides_of_a_card_duel_get_the_same_body(self):
+        """The mode's whole design: stats decide the arena, cards decide here. A pet
+        loaded with gear and levels and one that has never been touched sit down to the
+        same health and the same Strike, and only their decks differ."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        data = pets._load(CHAT)
+        strong = data["pets"][str(PLAYER["id"])]
+        strong["level"] = 40
+        strong["stats"] = {key: 60 for key in C.STAT_KEYS}
+        weak = data["pets"][str(OPPONENT["id"])]
+        weak["level"] = 1
+        weak["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
+        pets._save(CHAT, data)
+        # The two really are far apart everywhere else.
+        self.assertGreater(pets._power_rating_for(strong), pets._power_rating_for(weak) * 3)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        mine = opened["battle"]["fighters"]["player"]
+        theirs = opened["battle"]["fighters"]["enemy"]
+        self.assertEqual(mine["max_hp"], theirs["max_hp"])
+        self.assertEqual(mine["max_hp"], pets_web.CARD_MAX_HP)
+        self.assertEqual(opened["attack"], pets_web.CARD_ATTACK)
+
+        # And the numbers on the cards are the fixed ones, not stat-derived: a Strike is
+        # a Strike for everybody, which is what lets a deck be learned once.
+        strike = next(card for card in opened["battle"]["hand"] + [
+            card for card in opened["battle"]["enemy_intent"]
+        ] if card["code"] == "strike")
+        self.assertEqual(strike["damage"], pets_web.CARD_ATTACK)
+
+    async def test_levelling_up_changes_nothing_about_a_card_duel(self):
+        """Same player, same opponent, before and after a large stat gain."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        before = await self._open_duel(PLAYER, OPPONENT)
+
+        data = pets._load(CHAT)
+        record = data["pets"][str(PLAYER["id"])]
+        record["level"] = 50
+        record["stats"] = {key: 99 for key in C.STAT_KEYS}
+        pets._save(CHAT, data)
+
+        after = await self._open_duel(PLAYER, OPPONENT)
+        for side in ("player", "enemy"):
+            self.assertEqual(after["battle"]["fighters"][side]["max_hp"],
+                             before["battle"]["fighters"][side]["max_hp"])
+        self.assertEqual(after["deck_size"], before["deck_size"])
+
+    async def test_the_duel_banner_says_the_two_bodies_are_identical(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("Характеристики у обоих ", page)
+        self.assertIn("Решает только колода.", page)
+
+    async def test_the_arena_row_puts_power_above_the_name_and_a_card_button_beside_it(self):
+        """The opponent row carries two fights now. The power rating moved to the left,
+        above the name and smaller, and the right-hand column it vacated is the card
+        button -- which must be a SIBLING of the arena button, never nested inside it."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        row = page.split("function foeRow(foe, canFight)", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn("<div class=\"foewrap\">", row)
+        self.assertIn("class='pw above'", row)
+        self.assertIn("data-cardfoe=", row)
+        # The power is printed before the name, not after the fight counts.
+        self.assertLess(row.index("pw above"), row.index("esc(foe.name"))
+        # The arena button is closed before the card button opens.
+        self.assertLess(row.index("</button>"), row.index("data-cardfoe="))
+        # Smaller, same gold: the size is set in CSS, the colour is still .pw's.
+        self.assertIn(".foewrap .pw.above { display: block; font-size: 11px;", page)
+        self.assertIn(".pw { color: var(--gold); font-weight: 700; }", page)
+
+    async def test_the_duel_screen_draws_the_cost_the_numbers_and_the_rules_text(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function cardMarkup(card, playable, affordable)", page)
+        self.assertIn('class="cardcost"', page)
+        self.assertIn('class="cardtags"', page)
+        self.assertIn('class="cardtext"', page)
+        self.assertIn("Соперник в следующий ход", page)
+        self.assertIn('data-cardplay="', page)
+        self.assertIn('data-cardbattle="end"', page)
 
     async def test_clearing_takes_the_celebration_out_of_the_roster(self):
         self._tame(PLAYER)
