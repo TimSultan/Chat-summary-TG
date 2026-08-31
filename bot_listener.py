@@ -9855,6 +9855,21 @@ async def run_bot_listener(
                 return False
             return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
 
+        async def _is_vote_stats_admin(user: dict) -> bool:
+            """Who may inspect the private subscriber/non-subscriber vote split.
+
+            Unlike normal v1 moderation, delegated badge managers are intentionally
+            excluded: this is limited to real chat administrators and Sultan.
+            """
+            if not home_chat_ref:
+                return False
+            admin_chat_id = await _resolve_chat_id(
+                telethon_client, home_chat_ref, known_chat_ids, log=log,
+            )
+            if admin_chat_id is None:
+                return False
+            return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
+
         async def _is_quest_moderator(user: dict) -> bool:
             """Who may accept or reject a quest submission.
 
@@ -9884,15 +9899,15 @@ async def run_bot_listener(
             return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
 
         async def _is_vote_member(user: dict) -> bool:
-            """The "голосовать могут только подписчики" gate: only members of the home
-            chat may cast a ballot. Fails closed -- an unresolvable home chat blocks
-            voting entirely rather than letting a stranger through, the same tradeoff
-            _is_vote_admin makes above."""
+            """Subscription snapshot for v1's post-vote join invitation and statistics.
+
+            A failed lookup returns False, but is no longer a reason to reject a ballot.
+            """
             if not home_chat_ref:
                 return False
             admin_chat_id = await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
             if admin_chat_id is None:
-                log("[bot_listener] /vote membership check: could not resolve the home chat -- denying the vote.")
+                log("[bot_listener] /vote membership check: could not resolve the home chat.")
                 return False
             user_id = user.get("id")
             if user_id is None:
@@ -10079,6 +10094,7 @@ async def run_bot_listener(
                 vote_web.run_web_server(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
+                    is_stats_admin=_is_vote_stats_admin,
                     export=_deliver_vote_board, avatar=_fetch_vote_avatar,
                     attach=_attach_extra,
                 )

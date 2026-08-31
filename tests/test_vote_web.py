@@ -225,7 +225,7 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
             [(r["id"], r["votes"]) for r in data["results"]], [("a", 1), ("b", 0)]
         )
 
-    # ---- the membership gate -------------------------------------------------------------
+    # ---- subscription tracking -----------------------------------------------------------
 
     async def test_create_app_is_still_constructible_without_is_member(self):
         """The default (create_app called with no is_member, as in asyncSetUp) must be
@@ -237,9 +237,9 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
             headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
         )
         data = await response.json()
-        self.assertTrue(data["is_member"])
+        self.assertTrue(data["is_subscriber"])
 
-    async def test_a_non_member_is_refused_by_ballot_and_nothing_is_recorded(self):
+    async def test_a_non_subscriber_can_vote_and_is_recorded_as_such(self):
         async def is_admin(user: dict) -> bool:
             return user.get("id") == self.admin_id
 
@@ -256,18 +256,72 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
             )
             data = await response.json()
 
-        self.assertEqual(response.status, 403)
-        self.assertNotIn("ok", data)
-        self.assertIsNone(voting.load_poll(CHAT, "2026-08-02").votes.get(str(self.voter_id)))
+        self.assertEqual(response.status, 200)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["is_subscriber"])
+        poll = voting.load_poll(CHAT, "2026-08-02")
+        self.assertEqual(poll.votes[str(self.voter_id)], ["a"])
+        self.assertFalse(poll.subscriber_votes[str(self.voter_id)])
 
-    async def test_the_poll_payload_reports_is_member(self):
+    async def test_the_poll_payload_reports_subscription_status(self):
         self._seed_poll(approved=("a",))
         response = await self.client.get(
             f"{vote_web.ROUTE_PREFIX}/api/poll",
             headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
         )
         data = await response.json()
-        self.assertIn("is_member", data)
+        self.assertIn("is_subscriber", data)
+
+    async def test_weekly_subscription_stats_are_admin_only(self):
+        poll = self._seed_poll(approved=("a",))
+        voting.record_vote(poll, self.admin_id, ["a"], subscriber=True)
+        voting.record_vote(poll, self.voter_id, ["a"], subscriber=False)
+        voting.save_poll(poll)
+
+        denied = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/stats",
+            headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+        )
+        self.assertEqual(denied.status, 403)
+
+        response = await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/stats",
+            headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+        )
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data["weeks"], [{
+            "week": "2026-08-02", "voters": 2, "subscribers": 1, "non_subscribers": 1,
+        }])
+
+    async def test_vote_stats_exclude_a_regular_moderation_delegate(self):
+        delegate_id = 77
+
+        async def is_admin(user: dict) -> bool:
+            return user.get("id") in {self.admin_id, delegate_id}
+
+        async def is_stats_admin(user: dict) -> bool:
+            return user.get("id") == self.admin_id
+
+        cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
+        app = vote_web.create_app(
+            cfg, CHAT, is_admin, is_stats_admin=is_stats_admin, log=lambda *_: None,
+        )
+        async with TestClient(TestServer(app)) as client:
+            self._seed_poll(approved=("a",))
+            poll_response = await client.get(
+                f"{vote_web.ROUTE_PREFIX}/api/poll?mode=admin",
+                headers={"X-Telegram-Init-Data": _init_data(delegate_id)},
+            )
+            payload = await poll_response.json()
+            stats_response = await client.get(
+                f"{vote_web.ROUTE_PREFIX}/api/stats",
+                headers={"X-Telegram-Init-Data": _init_data(delegate_id)},
+            )
+
+        self.assertTrue(payload["is_admin"])
+        self.assertFalse(payload["can_view_vote_stats"])
+        self.assertEqual(stats_response.status, 403)
 
     # ---- results are gated on having earned the right to see them -------------------------
 

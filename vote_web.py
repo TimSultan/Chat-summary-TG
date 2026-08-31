@@ -46,9 +46,11 @@ _ENTRY_KEY = web.AppKey("entry", str)
 # _can_manage_chat also honors a hardcoded username allowlist (PRIVILEGED_MANAGEMENT_
 # USERNAMES), which needs the username, not only the id, to check.
 _IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[dict], Awaitable[bool]])
-# Same shape as _IS_ADMIN_KEY, for a different question: is this Telegram user a member of
-# the chat the poll belongs to at all. bot_listener.py's real implementation checks
-# Telegram chat membership; see create_app's docstring for why the default is permissive.
+# The subscription split is more sensitive than normal vote moderation. In production it
+# is restricted to actual chat administrators and the owner (Sultan), excluding delegates.
+_IS_STATS_ADMIN_KEY = web.AppKey("is_stats_admin", Callable[[dict], Awaitable[bool]])
+# Same shape as _IS_ADMIN_KEY: whether this Telegram user currently subscribes to the
+# artists' channel. It is a prompt/statistic attribute, never a ballot permission.
 _IS_MEMBER_KEY = web.AppKey("is_member", Callable[[dict], Awaitable[bool]])
 # Delivers the results of a closed vote. Takes the admin's user dict, the poll, and the
 # FULL standings -- every admitted entry as an (Entry, votes) pair, ranked highest-first,
@@ -183,7 +185,8 @@ async def handle_poll(request: web.Request) -> web.Response:
 
     can_moderate = await request.app[_IS_ADMIN_KEY](user)
     admin_mode = can_moderate and request.query.get("mode") == "admin"
-    is_member = await request.app[_IS_MEMBER_KEY](user)
+    can_view_vote_stats = admin_mode and await request.app[_IS_STATS_ADMIN_KEY](user)
+    is_subscriber = await request.app[_IS_MEMBER_KEY](user)
     base = request.app[_ROUTE_PREFIX_KEY]
     visible = poll.entries if admin_mode else poll.approved_entries()
     winner = poll.winner()
@@ -195,7 +198,8 @@ async def handle_poll(request: web.Request) -> web.Response:
         "open": poll.open,
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
-        "is_member": is_member,
+        "can_view_vote_stats": can_view_vote_stats,
+        "is_subscriber": is_subscriber,
         "me": voting.display_name(user),
         "my_vote": poll.votes.get(str(user["id"]), []),
         "voter_count": len(poll.votes),
@@ -225,10 +229,8 @@ async def handle_ballot(request: web.Request) -> web.Response:
     than silently truncated in voting.record_vote -- a voter should know their ballot
     didn't count as sent, not have it quietly reshaped.
 
-    Also refuses anyone the membership gate (_IS_MEMBER_KEY) doesn't recognize as still
-    in the chat -- checked here rather than in voting.record_vote so the rule lives with
-    the rest of the request-boundary validation, and so a rejected ballot never touches
-    the poll at all."""
+    The membership check is deliberately a snapshot rather than a gate: everybody's
+    ballot counts, while non-subscribers receive an invitation after it is saved."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -236,18 +238,17 @@ async def handle_ballot(request: web.Request) -> web.Response:
 
     user = await _authenticate(request, body)
     entry_name = request.app[_ENTRY_KEY]
-    # Everything from here to save_poll is under voting.poll_lock: the membership check is
-    # an await, so two ballots arriving together would otherwise interleave between the
-    # load and the save and one of them would be erased. See the lock's own comment.
+    # A Telegram failure simply means we cannot confirm a subscription right now; the
+    # ballot must still be accepted, and the client may invite the voter to join.
+    is_subscriber = await request.app[_IS_MEMBER_KEY](user)
+    # Everything from here to save_poll is under voting.poll_lock so two ballots cannot
+    # interleave between the load and the save and erase one another.
     async with voting.poll_lock:
         poll = voting.latest_poll(entry_name)
         if poll is None:
             return _json_error("голосование ещё не создано", status=404)
         if not poll.open:
             return _json_error("голосование закрыто", status=409)
-        if not await request.app[_IS_MEMBER_KEY](user):
-            return _json_error("голосовать могут только участники чата", status=403)
-
         choices = body.get("choices")
         if not isinstance(choices, list) or not all(isinstance(c, str) for c in choices):
             return _json_error("choices must be a list of entry ids")
@@ -262,7 +263,7 @@ async def handle_ballot(request: web.Request) -> web.Response:
         if poll.max_choices and distinct > poll.max_choices:
             return _json_error(f"можно выбрать не более {poll.max_choices}", status=400)
 
-        voting.record_vote(poll, user["id"], choices)
+        voting.record_vote(poll, user["id"], choices, subscriber=is_subscriber)
         voting.save_poll(poll)
     request.app[_LOG_KEY](f"[vote_web] ballot from {voting.display_name(user)}: {len(choices)} choice(s)")
     return web.json_response({
@@ -273,7 +274,20 @@ async def handle_ballot(request: web.Request) -> web.Response:
         # handle_poll's docstring for the gating rule these mirror).
         "results": _results_payload(poll, request.app[_ROUTE_PREFIX_KEY]),
         "voter_count": len(poll.votes),
+        "is_subscriber": is_subscriber,
     })
+
+
+async def handle_vote_stats(request: web.Request) -> web.Response:
+    """Weekly v1 ballot figures, including the private subscription split.
+
+    The route does not trust the button being hidden: its owner/chat-admin check guards
+    every request, so a copied URL cannot disclose voting behaviour.
+    """
+    user = await _authenticate(request)
+    if not await request.app[_IS_STATS_ADMIN_KEY](user):
+        return _json_error("статистика голосования доступна только администраторам", status=403)
+    return web.json_response({"weeks": voting.weekly_vote_stats(request.app[_ENTRY_KEY])})
 
 
 async def handle_moderate(request: web.Request) -> web.Response:
@@ -622,7 +636,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
-    is_member=None, export=None, avatar=None, attach=None,
+    is_member=None, is_stats_admin=None, export=None, avatar=None, attach=None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
     returning a bool; `announce` is an async callable taking (user, poll, standings) --
@@ -634,12 +648,10 @@ def create_app(
     `announce` defaults to a no-op so the app is still constructible (e.g. in tests that
     don't exercise closing a vote) without a bot_listener.py running alongside it.
 
-    `is_member` is an async callable, same shape as `is_admin`, answering "is this
-    Telegram user still in the chat". bot_listener.py supplies the real one, backed by a
-    Telegram chat-membership check. It defaults to a permissive stand-in that always
-    returns True -- not a security stance, just what keeps this module constructible
-    standalone (tests, or running the page without the bot alongside it) instead of
-    refusing every voter for want of a Bot API client to ask.
+    `is_member` is an async callable, same shape as `is_admin`, answering whether the
+    voter currently subscribes. Its result is stored with a ballot and may prompt them to
+    join; it never denies a vote. `is_stats_admin` is the narrower owner/chat-admin gate
+    for the subscription breakdown and defaults to `is_admin` for standalone callers.
 
     `export` is an async callable taking (user, poll, path) that delivers a rendered board
     picture to the administrator who asked for it -- same arrangement as `announce`: this
@@ -672,6 +684,7 @@ def create_app(
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_ADMIN_KEY] = is_admin
+    app[_IS_STATS_ADMIN_KEY] = is_stats_admin or is_admin
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
     app[_ANNOUNCE_KEY] = announce or _default_announce
     app[_EXPORT_KEY] = export or _default_export
@@ -692,6 +705,7 @@ def create_app(
         web.get(f"{prefix}/board/", handle_board_page),
         web.get(f"{prefix}/api/poll", handle_poll),
         web.post(f"{prefix}/api/ballot", handle_ballot),
+        web.get(f"{prefix}/api/stats", handle_vote_stats),
         web.post(f"{prefix}/api/moderate", handle_moderate),
         web.post(f"{prefix}/api/crops", handle_crops),
         web.post(f"{prefix}/api/export", handle_export),
@@ -708,11 +722,12 @@ def create_app(
 
 async def run_web_server(
     cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None,
-    export=None, avatar=None, attach=None,
+    is_stats_admin=None, export=None, avatar=None, attach=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
     app = create_app(
-        cfg, entry, is_admin, announce=announce, log=log, is_member=is_member, export=export,
+        cfg, entry, is_admin, announce=announce, log=log, is_member=is_member,
+        is_stats_admin=is_stats_admin, export=export,
         avatar=avatar, attach=attach,
     )
     runner = web.AppRunner(app)
@@ -899,8 +914,8 @@ PAGE_HTML = """<!doctype html>
               border: 1px solid rgba(128,128,128,.4); background: var(--bg);
               color: var(--fg); padding: 4px; font-size: 13px; }
   .settings input[type="checkbox"] { width: 18px; height: 18px; }
-  /* Stands in for whatever reason the vote controls are replaced with a sentence instead
-     of a button: locked-in ballot, closed poll, or (see is_member) not a chat member. */
+  /* Stands in when the vote controls are replaced with a sentence: a locked ballot or a
+     closed poll. */
   .notice { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
             background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
   /* The acceptance confirmation for an immediate (allow_revote) vote -- fades on its own
@@ -946,6 +961,26 @@ PAGE_HTML = """<!doctype html>
   .results .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
   .results .num { text-align: right; font-size: 12px; color: var(--muted);
                    font-variant-numeric: tabular-nums; }
+  .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
+           justify-content: center; padding: 20px; background: rgba(0,0,0,.68); }
+  .modalCard { width: min(100%, 420px); max-height: calc(100vh - 40px); overflow-y: auto;
+               padding: 20px; border-radius: 14px; background: var(--card); }
+  .modalCard h2 { margin: 0 0 10px; font-size: 18px; }
+  .modalCard p { margin: 0 0 16px; white-space: pre-line; }
+  .modalActions { display: flex; gap: 8px; }
+  .modalActions button, .modalActions a { flex: 1; border: 0; border-radius: 9px; padding: 11px;
+      text-align: center; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer;
+      background: var(--accent); color: var(--accent-fg); }
+  .modalActions .cancel { background: transparent; border: 1px solid rgba(128,128,128,.5); color: var(--fg); }
+  .chart { margin: 16px 0; }
+  .chart h3 { margin: 0 0 8px; font-size: 14px; }
+  .chartRow { display: grid; grid-template-columns: 84px minmax(0, 1fr) auto; gap: 8px;
+              align-items: center; margin: 6px 0; font-size: 12px; }
+  .chartLabel { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chartTrack { height: 12px; overflow: hidden; border-radius: 6px; background: rgba(128,128,128,.25); }
+  .chartFill { display: block; height: 100%; border-radius: 6px; background: var(--accent); }
+  .chart.subscribers .chartFill { background: #46b96b; }
+  .chart.nonSubscribers .chartFill { background: #e2a23a; }
 </style>
 </head>
 <body>
@@ -970,6 +1005,7 @@ PAGE_HTML = """<!doctype html>
 <div class="msg" id="msg" hidden></div>
 <div class="results" id="results" hidden></div>
 <div class="bar" id="bar">
+  <button class="go secondary" id="statsButton" hidden>📊 Статистика</button>
   <button class="go danger" id="clear" hidden>🗑 Очистить голосование</button>
   <button class="go secondary" id="announce" hidden>Подвести итоги</button>
   <button class="go" id="go" disabled>Загружаю…</button>
@@ -984,6 +1020,25 @@ PAGE_HTML = """<!doctype html>
   <div class="lensStage" id="lensStage"><img id="lensImg" alt=""></div>
   <button class="reelClose" id="lensClose" aria-label="Закрыть">✕</button>
   <div class="lensHint" id="lensHint">Щипок или двойное касание — приблизить</div>
+</div>
+
+<div class="modal" id="subscribePrompt" hidden>
+  <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="subscribeTitle">
+    <h2 id="subscribeTitle">Подпишитесь, чтобы подтвердить голос</h2>
+    <p>С нами уже 500 художников по миниатюрам и не только</p>
+    <div class="modalActions">
+      <button class="cancel" id="subscribeClose">Позже</button>
+      <a id="subscribeLink" href="https://t.me/papkahudojnicov">Подписаться</a>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="voteStats" hidden>
+  <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="voteStatsTitle">
+    <h2 id="voteStatsTitle">Статистика голосования</h2>
+    <div id="voteStatsCharts"></div>
+    <div class="modalActions"><button class="cancel" id="voteStatsClose">Закрыть</button></div>
+  </div>
 </div>
 
 <script>
@@ -1079,6 +1134,34 @@ function openAuthorProfile(url) {
   }
 }
 
+function showSubscribePrompt() {
+  $("subscribePrompt").hidden = false;
+}
+
+function renderVoteChart(title, className, weeks, field) {
+  const max = Math.max(1, ...weeks.map((week) => week[field] || 0));
+  return '<section class="chart ' + className + '"><h3>' + esc(title) + '</h3>' +
+    weeks.map((week) => {
+      const value = week[field] || 0;
+      return '<div class="chartRow"><span class="chartLabel">' + esc(week.week) +
+        '</span><span class="chartTrack"><span class="chartFill" style="width:' +
+        Math.round(100 * value / max) + '%"></span></span><span>' + value + '</span></div>';
+    }).join('') + '</section>';
+}
+
+async function showVoteStats() {
+  const response = await api('/api/stats');
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Не удалось загрузить статистику');
+  const weeks = data.weeks || [];
+  $("voteStatsCharts").innerHTML = weeks.length
+    ? renderVoteChart('Все голоса по неделям', 'allVotes', weeks, 'voters') +
+      renderVoteChart('Голоса подписчиков', 'subscribers', weeks, 'subscribers') +
+      renderVoteChart('Голоса не-подписчиков', 'nonSubscribers', weeks, 'non_subscribers')
+    : '<p>Пока нет сохранённых голосов.</p>';
+  $("voteStats").hidden = false;
+}
+
 function renderWinnerBanner() {
   const banner = $("winnerBanner");
   if (!poll.winner) { banner.hidden = true; return; }
@@ -1131,7 +1214,15 @@ function renderResults() {
 function updateAdminButtons() {
   const announce = $("announce");
   const clear = $("clear");
-  if (!poll.is_admin) { announce.hidden = true; clear.hidden = true; return; }
+  const statsButton = $("statsButton");
+  if (!poll.is_admin) {
+    announce.hidden = true;
+    clear.hidden = true;
+    statsButton.hidden = true;
+    return;
+  }
+  statsButton.hidden = !poll.can_view_vote_stats;
+  statsButton.disabled = !poll.can_view_vote_stats;
   announce.hidden = false;
   announce.disabled = false;
   announce.textContent = poll.open ? "Закрыть голосование и объявить победителя" : "Пересчитать победителя";
@@ -1176,10 +1267,8 @@ function pickLabel(id, short) {
   return short ? "выбрать" : "Выбрать";
 }
 
-// A voter who isn't a chat member gets a disabled button on every card, plus the notice
-// updateButton() shows in place of the bar's own button. Admins are unaffected.
 function picksDisabled() {
-  return !poll.is_admin && poll.is_member === false;
+  return false;
 }
 
 // The admin's vote bar is relative to the currently leading entry, not to the voter
@@ -1347,12 +1436,6 @@ function updateButton() {
     go.textContent = "Сохранить: допущено " + admitted.size + " из " + poll.entries.length;
     return;
   }
-  if (poll.is_member === false) {
-    go.hidden = true;
-    notice.hidden = false;
-    notice.textContent = "Голосовать могут только участники чата";
-    return;
-  }
   if (ballotLocked()) {
     go.hidden = true;
     notice.hidden = false;
@@ -1401,8 +1484,10 @@ async function submitBallot(choices) {
   poll.my_vote = data.my_vote;
   poll.results = data.results;
   poll.voter_count = data.voter_count;
+  poll.is_subscriber = data.is_subscriber;
   if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
   showConfirmBanner();
+  if (data.is_subscriber === false && data.my_vote.length) showSubscribePrompt();
 }
 
 // Opens the reel at the tapped work. Every entry is in it, so from here the rest of the
@@ -1707,10 +1792,6 @@ async function toggleAndSubmit(id) {
 
 async function onPickTap(id) {
   if (poll.is_admin) { toggleAdmitted(id); return; }
-  if (poll.is_member === false) {
-    alert("Голосовать могут только участники чата");
-    return;
-  }
   if (ballotLocked()) {
     alert(poll.open ? "Голос уже зафиксирован, менять нельзя." : "Голосование закрыто.");
     return;
@@ -1789,6 +1870,22 @@ $("go").addEventListener("click", async () => {
   await finalizeBallot();
 });
 
+$("subscribeClose").addEventListener("click", () => { $("subscribePrompt").hidden = true; });
+$("subscribeLink").addEventListener("click", (event) => {
+  event.preventDefault();
+  const url = event.currentTarget.href;
+  if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
+  else window.location.href = url;
+});
+$("voteStatsClose").addEventListener("click", () => { $("voteStats").hidden = true; });
+$("statsButton").addEventListener("click", async () => {
+  try {
+    await showVoteStats();
+  } catch (e) {
+    alert(String(e.message || e));
+  }
+});
+
 $("announce").addEventListener("click", async () => {
   const button = $("announce");
   if (!confirm(
@@ -1838,7 +1935,7 @@ $("clear").addEventListener("click", async () => {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
-    poll = { poll_id: null, entries: [], is_admin: true, can_moderate: true, open: false, is_member: true };
+    poll = { poll_id: null, entries: [], is_admin: true, can_moderate: true, open: false, is_subscriber: true };
     picked = new Set();
     admitted = new Set();
     $("winnerBanner").hidden = true;
@@ -1886,8 +1983,6 @@ $("clear").addEventListener("click", async () => {
         "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
       $("maxChoices").value = poll.max_choices || "";
       $("allowRevote").checked = poll.allow_revote !== false;
-    } else if (poll.is_member === false) {
-      $("sub").textContent = "Голосовать могут только участники чата";
     } else {
       const voted = poll.my_vote && poll.my_vote.length;
       if (voted && !poll.allow_revote) {

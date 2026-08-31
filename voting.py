@@ -385,6 +385,9 @@ class Poll:
     approved: list[str] = field(default_factory=list)
     # user_id (as a string, since JSON keys are strings) -> list of entry_ids.
     votes: dict[str, list[str]] = field(default_factory=dict)
+    # Whether the voter was subscribed when their latest ballot was accepted.  Keep the
+    # snapshot instead of inferring it later: the weekly figures need historical status.
+    subscriber_votes: dict[str, bool] = field(default_factory=dict)
     open: bool = True
     # Set once by close_and_announce, kept alongside the poll so a reloaded page (or a
     # second look days later) can still show who won without recomputing it from votes
@@ -416,6 +419,7 @@ class Poll:
             "entries": [e.to_dict() for e in self.entries],
             "approved": list(self.approved),
             "votes": {k: list(v) for k, v in self.votes.items()},
+            "subscriber_votes": {k: bool(v) for k, v in self.subscriber_votes.items()},
             "open": self.open,
             "winner_entry_id": self.winner_entry_id,
             "max_choices": self.max_choices,
@@ -432,6 +436,7 @@ class Poll:
             entries=[Entry.from_dict(e) for e in raw.get("entries") or []],
             approved=[str(e) for e in raw.get("approved") or []],
             votes={str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()},
+            subscriber_votes={str(k): bool(v) for k, v in (raw.get("subscriber_votes") or {}).items()},
             open=bool(raw.get("open", True)),
             winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
             max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
@@ -678,6 +683,11 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
         user_id: [e for e in choices if e in known]
         for user_id, choices in existing.votes.items()
     }
+    poll.subscriber_votes = {
+        user_id: subscribed
+        for user_id, subscribed in existing.subscriber_votes.items()
+        if user_id in poll.votes
+    }
     poll.open = existing.open
     if existing.winner_entry_id in known:
         poll.winner_entry_id = existing.winner_entry_id
@@ -705,14 +715,51 @@ def set_approved(poll: Poll, entry_ids: list[str]) -> Poll:
     return poll
 
 
-def record_vote(poll: Poll, user_id: int | str, entry_ids: list[str]) -> Poll:
+def record_vote(
+    poll: Poll, user_id: int | str, entry_ids: list[str], subscriber: bool | None = None,
+) -> Poll:
     """One ballot per user, replacing whatever they chose before -- voting again is
     changing your mind, not stuffing the box. Choices outside the admitted set are dropped
     rather than rejecting the whole ballot, so a page left open across a moderation change
     still records the choices that are still valid."""
     allowed = set(poll.approved)
-    poll.votes[str(user_id)] = [e for e in dict.fromkeys(entry_ids) if e in allowed]
+    voter_id = str(user_id)
+    poll.votes[voter_id] = [e for e in dict.fromkeys(entry_ids) if e in allowed]
+    if subscriber is not None:
+        poll.subscriber_votes[voter_id] = bool(subscriber)
     return poll
+
+
+def weekly_vote_stats(entry: str) -> list[dict]:
+    """Unique-ballot totals for every saved weekly v1 poll, oldest first.
+
+    Clearing a vote archives its JSON, so the reporting view reads both the live and
+    archived files. Older files contain no subscription snapshot; they remain in the
+    overall total but are excluded from the split rather than guessed at retrospectively.
+    """
+    directory = _voting_dir()
+    if not directory.exists():
+        return []
+    prefix = f"{_poll_key(entry)}_"
+    paths = list(directory.glob(f"{prefix}*.json"))
+    archive = archive_dir()
+    if archive.exists():
+        paths.extend(archive.glob(f"{prefix}*.json"))
+
+    weeks: list[dict] = []
+    for path in paths:
+        try:
+            poll = Poll.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            continue
+        voter_ids = set(poll.votes)
+        weeks.append({
+            "week": poll.poll_id,
+            "voters": len(voter_ids),
+            "subscribers": sum(poll.subscriber_votes.get(voter_id) is True for voter_id in voter_ids),
+            "non_subscribers": sum(poll.subscriber_votes.get(voter_id) is False for voter_id in voter_ids),
+        })
+    return sorted(weeks, key=lambda row: row["week"])
 
 
 # -------------------------------------------------------------------- announced results

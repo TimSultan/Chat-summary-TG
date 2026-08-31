@@ -456,13 +456,14 @@ class PollTests(unittest.TestCase):
     def test_dict_round_trip_preserves_everything(self):
         poll = self._poll()
         voting.set_approved(poll, ["a"])
-        voting.record_vote(poll, 7, ["a"])
+        voting.record_vote(poll, 7, ["a"], subscriber=True)
         voting.close_and_announce(poll)
         poll.max_choices = 2
         poll.allow_revote = False
         restored = voting.Poll.from_dict(json.loads(json.dumps(poll.to_dict())))
         self.assertEqual(restored.approved, poll.approved)
         self.assertEqual(restored.votes, poll.votes)
+        self.assertEqual(restored.subscriber_votes, {"7": True})
         self.assertEqual(restored.open, poll.open)
         self.assertEqual(restored.winner_entry_id, poll.winner_entry_id)
         self.assertEqual(restored.max_choices, 2)
@@ -546,6 +547,23 @@ class StorageTests(unittest.TestCase):
 
     def test_loading_a_poll_that_was_never_saved_returns_none(self):
         self.assertIsNone(voting.load_poll("Chat", "nope"))
+
+    def test_weekly_vote_stats_include_archived_polls(self):
+        first = voting.Poll(poll_id="2026-08-02", entry="Chat", created_at="t0", entries=[])
+        first.votes = {"1": ["a"], "2": ["a"]}
+        first.subscriber_votes = {"1": True, "2": False}
+        voting.save_poll(first)
+        voting.archive_all_polls("Chat")
+
+        current = voting.Poll(poll_id="2026-08-09", entry="Chat", created_at="t1", entries=[])
+        current.votes = {"3": ["a"]}
+        current.subscriber_votes = {"3": True}
+        voting.save_poll(current)
+
+        self.assertEqual(voting.weekly_vote_stats("Chat"), [
+            {"week": "2026-08-02", "voters": 2, "subscribers": 1, "non_subscribers": 1},
+            {"week": "2026-08-09", "voters": 1, "subscribers": 1, "non_subscribers": 0},
+        ])
 
     def test_latest_poll_picks_the_newest_by_created_at(self):
         older = voting.Poll(poll_id="2026-08-01", entry="Chat", created_at="2026-08-01T00:00:00+00:00", entries=[])
