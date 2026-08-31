@@ -287,7 +287,34 @@ async def handle_vote_stats(request: web.Request) -> web.Response:
     user = await _authenticate(request)
     if not await request.app[_IS_STATS_ADMIN_KEY](user):
         return _json_error("статистика голосования доступна только администраторам", status=403)
-    return web.json_response({"weeks": voting.weekly_vote_stats(request.app[_ENTRY_KEY])})
+    records = voting.weekly_vote_records(request.app[_ENTRY_KEY])
+    # Only voters who were non-subscribers at the moment of voting need a fresh lookup:
+    # it distinguishes "joined after" from "has not joined" without spending 59 Bot API
+    # requests re-checking the historic ballots that the old membership gate guaranteed.
+    to_check = set().union(*(record["non_subscriber_ids"] for record in records)) if records else set()
+    semaphore = asyncio.Semaphore(8)
+
+    async def is_current_subscriber(voter_id: str) -> tuple[str, bool] | None:
+        try:
+            async with semaphore:
+                subscribed = await request.app[_IS_MEMBER_KEY]({"id": int(voter_id)})
+        except Exception:
+            # A failed Telegram lookup must not mislabel somebody as "did not join".
+            return None
+        return voter_id, bool(subscribed)
+
+    checked = await asyncio.gather(*(is_current_subscriber(voter_id) for voter_id in to_check))
+    checked_statuses = {result[0]: result[1] for result in checked if result is not None}
+    current_subscriber_ids = {voter_id for voter_id, subscribed in checked_statuses.items() if subscribed}
+    # Unavailable checks have no "after"/"not" classification yet; the next opening of
+    # this private screen retries them rather than permanently recording an API failure.
+    return web.json_response({
+        "weeks": voting.weekly_vote_stats(
+            request.app[_ENTRY_KEY], current_subscriber_ids=current_subscriber_ids,
+            checked_voter_ids=set(checked_statuses), records=records,
+        ),
+        "checked_voters": len(checked_statuses),
+    })
 
 
 async def handle_moderate(request: web.Request) -> web.Response:
@@ -900,6 +927,13 @@ PAGE_HTML = """<!doctype html>
   .go.danger { background: transparent; color: #e5534b;
                border: 1px solid #e5534b; margin-bottom: 8px;
                font-size: 13px; padding: 10px; font-weight: 500; }
+  /* Moderation has four independent actions. Keep them compact and two-across so they
+     do not cover half the last work on a phone; voter controls retain the full-width
+     primary action above. */
+  .bar.adminActions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .bar.adminActions .go { min-height: 44px; margin: 0; padding: 9px 7px;
+                          font-size: 13px; line-height: 1.2; }
+  .bar.adminActions .go.danger { font-size: 12px; }
   .msg { padding: 24px 16px; color: var(--muted); text-align: center; }
   .winner { margin: 0 12px 4px; padding: 10px 12px; border-radius: 10px;
             background: var(--card); display: flex; gap: 10px; align-items: center; }
@@ -981,6 +1015,9 @@ PAGE_HTML = """<!doctype html>
   .chartFill { display: block; height: 100%; border-radius: 6px; background: var(--accent); }
   .chart.subscribers .chartFill { background: #46b96b; }
   .chart.nonSubscribers .chartFill { background: #e2a23a; }
+  .statsWeek { display: block; width: 100%; margin: 0 0 8px; padding: 9px 10px;
+               border: 1px solid rgba(128,128,128,.45); border-radius: 8px;
+               background: var(--bg); color: var(--fg); font: inherit; }
 </style>
 </head>
 <body>
@@ -1036,6 +1073,7 @@ PAGE_HTML = """<!doctype html>
 <div class="modal" id="voteStats" hidden>
   <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="voteStatsTitle">
     <h2 id="voteStatsTitle">Статистика голосования</h2>
+    <select class="statsWeek" id="voteStatsWeek" aria-label="Неделя голосования"></select>
     <div id="voteStatsCharts"></div>
     <div class="modalActions"><button class="cancel" id="voteStatsClose">Закрыть</button></div>
   </div>
@@ -1149,16 +1187,35 @@ function renderVoteChart(title, className, weeks, field) {
     }).join('') + '</section>';
 }
 
+let voteStatsWeeks = [];
+
+function renderSelectedVoteStats() {
+  const selectedWeek = $("voteStatsWeek").value;
+  const week = voteStatsWeeks.find((item) => item.week === selectedWeek);
+  if (!week) return;
+  $("voteStatsCharts").innerHTML =
+    renderVoteChart('Все голоса', 'allVotes', [week], 'voters') +
+    renderVoteChart('Голоса подписчиков на момент голосования', 'subscribers', [week], 'subscribers') +
+    renderVoteChart('Подписались после голосования', 'subscribers', [week], 'subscribed_after') +
+    renderVoteChart('Не подписались', 'nonSubscribers', [week], 'not_subscribed');
+}
+
 async function showVoteStats() {
   const response = await api('/api/stats');
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Не удалось загрузить статистику');
-  const weeks = data.weeks || [];
-  $("voteStatsCharts").innerHTML = weeks.length
-    ? renderVoteChart('Все голоса по неделям', 'allVotes', weeks, 'voters') +
-      renderVoteChart('Голоса подписчиков', 'subscribers', weeks, 'subscribers') +
-      renderVoteChart('Голоса не-подписчиков', 'nonSubscribers', weeks, 'non_subscribers')
-    : '<p>Пока нет сохранённых голосов.</p>';
+  voteStatsWeeks = data.weeks || [];
+  const selector = $("voteStatsWeek");
+  selector.hidden = voteStatsWeeks.length === 0;
+  selector.innerHTML = voteStatsWeeks.map((week) =>
+    '<option value="' + esc(week.week) + '">' + esc(week.week) + '</option>'
+  ).join('');
+  if (voteStatsWeeks.length) {
+    selector.value = voteStatsWeeks[voteStatsWeeks.length - 1].week;
+    renderSelectedVoteStats();
+  } else {
+    $("voteStatsCharts").innerHTML = '<p>Пока нет сохранённых голосов.</p>';
+  }
   $("voteStats").hidden = false;
 }
 
@@ -1215,6 +1272,7 @@ function updateAdminButtons() {
   const announce = $("announce");
   const clear = $("clear");
   const statsButton = $("statsButton");
+  $("bar").classList.toggle("adminActions", !!poll.is_admin);
   if (!poll.is_admin) {
     announce.hidden = true;
     clear.hidden = true;

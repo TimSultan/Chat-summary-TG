@@ -429,14 +429,24 @@ class Poll:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Poll":
+        votes = {str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()}
+        raw_subscribers = raw.get("subscriber_votes")
+        # Before non-subscribers were allowed to vote, the web handler rejected them.
+        # Therefore every old recorded ballot was necessarily from a subscriber at the
+        # time; preserve that fact when adding the new snapshot field retroactively.
+        subscriber_votes = (
+            {str(k): bool(v) for k, v in raw_subscribers.items()}
+            if isinstance(raw_subscribers, dict)
+            else {voter_id: True for voter_id in votes}
+        )
         return cls(
             poll_id=str(raw.get("poll_id") or ""),
             entry=raw.get("entry") or "",
             created_at=raw.get("created_at") or "",
             entries=[Entry.from_dict(e) for e in raw.get("entries") or []],
             approved=[str(e) for e in raw.get("approved") or []],
-            votes={str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()},
-            subscriber_votes={str(k): bool(v) for k, v in (raw.get("subscriber_votes") or {}).items()},
+            votes=votes,
+            subscriber_votes=subscriber_votes,
             open=bool(raw.get("open", True)),
             winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
             max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
@@ -730,12 +740,12 @@ def record_vote(
     return poll
 
 
-def weekly_vote_stats(entry: str) -> list[dict]:
-    """Unique-ballot totals for every saved weekly v1 poll, oldest first.
+def weekly_vote_records(entry: str) -> list[dict]:
+    """Private voter-id sets for the weekly vote-report renderer, oldest first.
 
     Clearing a vote archives its JSON, so the reporting view reads both the live and
-    archived files. Older files contain no subscription snapshot; they remain in the
-    overall total but are excluded from the split rather than guessed at retrospectively.
+    archived files. Polls created before the subscription prompt are restored as
+    subscriber ballots because the old API rejected anybody else.
     """
     directory = _voting_dir()
     if not directory.exists():
@@ -755,11 +765,48 @@ def weekly_vote_stats(entry: str) -> list[dict]:
         voter_ids = set(poll.votes)
         weeks.append({
             "week": poll.poll_id,
-            "voters": len(voter_ids),
-            "subscribers": sum(poll.subscriber_votes.get(voter_id) is True for voter_id in voter_ids),
-            "non_subscribers": sum(poll.subscriber_votes.get(voter_id) is False for voter_id in voter_ids),
+            "voter_ids": voter_ids,
+            "subscriber_ids": {
+                voter_id for voter_id in voter_ids if poll.subscriber_votes.get(voter_id) is True
+            },
+            "non_subscriber_ids": {
+                voter_id for voter_id in voter_ids if poll.subscriber_votes.get(voter_id) is False
+            },
         })
     return sorted(weeks, key=lambda row: row["week"])
+
+
+def weekly_vote_stats(
+    entry: str, current_subscriber_ids: set[str] | None = None,
+    checked_voter_ids: set[str] | None = None, records: list[dict] | None = None,
+) -> list[dict]:
+    """Public weekly vote totals, without exposing voter identities.
+
+    ``subscribers`` is the subscription snapshot at vote time. ``subscribed_after`` and
+    ``not_subscribed`` use a fresh channel-membership lookup only for people who voted
+    while not subscribed, so they show conversion without reclassifying past ballots.
+    """
+    records = weekly_vote_records(entry) if records is None else records
+    weeks = []
+    for record in records:
+        non_subscriber_ids = record["non_subscriber_ids"]
+        if current_subscriber_ids is None:
+            subscribed_after = 0
+            not_subscribed = len(non_subscriber_ids)
+        else:
+            subscribed_after = len(non_subscriber_ids & current_subscriber_ids)
+            checked_ids = non_subscriber_ids if checked_voter_ids is None else checked_voter_ids
+            not_subscribed = len((non_subscriber_ids & checked_ids) - current_subscriber_ids)
+        weeks.append({
+            "week": record["week"],
+            "voters": len(record["voter_ids"]),
+            "subscribers": len(record["subscriber_ids"]),
+            # Kept for API compatibility with the first subscription-split view.
+            "non_subscribers": len(non_subscriber_ids),
+            "subscribed_after": subscribed_after,
+            "not_subscribed": not_subscribed,
+        })
+    return weeks
 
 
 # -------------------------------------------------------------------- announced results
