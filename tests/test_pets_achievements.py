@@ -486,6 +486,50 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertEqual(after[1] - before[1], paid["farm_tickets"])
         self.assertEqual(after[2] - before[2], paid["dungeon_tickets"])
 
+    def test_every_catalogue_reward_credits_its_promised_wallets(self):
+        """The catalogue is the source of truth: every row must pay exactly its payload."""
+        rows = list(achievements.catalogue())
+        self._unlock(rows)
+        before = (pets.ruby_balance(CHAT, USER), pets.farm_tickets(CHAT, USER),
+                  pets.meadow_tickets(CHAT, USER), pets.dungeon_tickets(CHAT, USER))
+
+        ok, note, paid = pets.claim_achievements(CHAT, USER)
+
+        expected = {
+            "rubies": sum(row.rubies for row in rows),
+            "farm_tickets": sum(row.farm_tickets for row in rows),
+            "dungeon_tickets": sum(row.dungeon_tickets for row in rows),
+        }
+        self.assertTrue(ok, note)
+        self.assertEqual(paid["count"], len(rows))
+        self.assertEqual(paid["rubies"], expected["rubies"])
+        self.assertEqual(paid["farm_tickets"], expected["farm_tickets"])
+        self.assertEqual(paid["meadow_tickets"], expected["farm_tickets"])
+        self.assertEqual(paid["dungeon_tickets"], expected["dungeon_tickets"])
+        self.assertEqual(pets.ruby_balance(CHAT, USER) - before[0], expected["rubies"])
+        self.assertEqual(pets.farm_tickets(CHAT, USER) - before[1], expected["farm_tickets"])
+        self.assertEqual(pets.meadow_tickets(CHAT, USER) - before[2], expected["farm_tickets"])
+        self.assertEqual(pets.dungeon_tickets(CHAT, USER) - before[3], expected["dungeon_tickets"])
+
+    def test_a_failed_claim_write_does_not_consume_a_dungeon_reward(self):
+        """A crash must not mark the row claimed before its non-idempotent ticket lands."""
+        item = achievements.by_code("descent")
+        self.assertIsNotNone(item)
+        pets.achievements_view(CHAT, USER)  # settle one-time compatibility repairs first
+        self._unlock([item])
+
+        with patch.object(pets, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                pets.claim_achievement(CHAT, USER, item.code)
+
+        record = pets.get_pet(CHAT, USER)
+        self.assertNotIn(item.code, record["achievements"]["claimed"])
+        self.assertEqual(pets.dungeon_tickets(CHAT, USER), 0)
+        ok, note, paid = pets.claim_achievement(CHAT, USER, item.code)
+        self.assertTrue(ok, note)
+        self.assertEqual(paid["dungeon_tickets"], item.dungeon_tickets)
+        self.assertEqual(pets.dungeon_tickets(CHAT, USER), item.dungeon_tickets)
+
     def test_multi_ticket_reward_credits_every_ticket(self):
         item = max(achievements.catalogue(), key=lambda row: row.farm_tickets)
         self.assertGreater(item.farm_tickets, 1)

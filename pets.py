@@ -6403,13 +6403,72 @@ def _pay_achievement_tickets(entry: str, user_id, items, paid: dict) -> None:
     paid["meadow_tickets"] = paid.get("meadow_tickets", 0) + meadow
 
 
+def _settle_achievement_claim(entry: str, user_id, candidates, *, individual: bool = False) \
+        -> tuple[bool, str, dict, list]:
+    """Commit achievement rewards and their claimed marker in one store write.
+
+    Dungeon tickets have no independent replay key.  Reserving an achievement before
+    paying those tickets could therefore leave a crashed request permanently underpaid.
+    Store every wallet change and the marker together instead.
+    """
+    uid = str(user_id)
+    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0,
+            "dungeon_tickets": 0, "count": 0}
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо.", paid, []
+        row = _achievement_row(record)
+        unlocked, claimed = set(row["unlocked"]), set(row["claimed"])
+        if individual:
+            item = candidates[0]
+            if item.code not in unlocked:
+                return False, "Эта ачивка ещё не заработана.", paid, []
+            if item.code in claimed:
+                return False, "Награда за эту ачивку уже получена.", paid, []
+        items = [item for item in candidates
+                 if item.code in unlocked and item.code not in claimed]
+        if not items:
+            return False, "Забирать пока нечего.", paid, []
+
+        ruby_wallet = _ruby_row(data)
+        ruby_sources = data.get("ruby_sources")
+        if not isinstance(ruby_sources, dict):
+            ruby_sources = data["ruby_sources"] = {}
+        for item in items:
+            amount = max(0, int(item.rubies))
+            source = _achievement_ruby_source(uid, item.code)
+            if not amount or source in ruby_sources:
+                continue
+            ruby_wallet[uid] = max(0, int(ruby_wallet.get(uid, 0) or 0)) + amount
+            ruby_sources[source] = {"user_id": uid, "amount": amount}
+            _metric_add(data, "rubies_minted", amount)
+            _stage_ruby_log(data, user_id, amount, source)
+            paid["rubies"] += amount
+
+        farm, meadow = _credit_achievement_tickets(data, uid, items)
+        paid["farm_tickets"] = farm
+        paid["meadow_tickets"] = meadow
+        dungeon = sum(max(0, int(item.dungeon_tickets)) for item in items)
+        if dungeon:
+            wallet = data.setdefault("dungeon_tickets", {})
+            if not isinstance(wallet, dict):
+                wallet = data["dungeon_tickets"] = {}
+            wallet[uid] = max(0, int(wallet.get(uid, 0) or 0)) + dungeon
+            paid["dungeon_tickets"] = dungeon
+
+        row["claimed"] = sorted(claimed | {item.code for item in items})
+        paid["count"] = len(items)
+        _save(entry, data)
+    return True, "", paid, items
+
+
 def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     """Pay for everything earned and not yet paid, in one press.
 
-    The claim list is written BEFORE the payouts and each payout is keyed on the row's
-    own code, so a crash halfway cannot pay twice -- grant_rubies_once and
-    grant_farm_ticket are both idempotent on their reason string, and the marking is what
-    stops a retry from starting over.
+    Wallets and the claimed marker are committed together, so an interrupted request
+    cannot leave any part of an achievement reward behind.
     """
     # Evaluated here as well as when the list is drawn: pressing the button is allowed to
     # be the FIRST thing somebody does, and a claim that only paid for rows a screen had
@@ -6418,35 +6477,11 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     _repair_shared_achievement_rewards(entry, user_id)
     _repair_achievement_meadow_tickets(entry, user_id)
     refresh_achievements(entry, user_id)
-    with _farm_settlement_lock:
-        data = _load(entry)
-        record = _tamed_record(data, user_id)
-        if record is None:
-            return False, "Сначала приручи существо.", {}
-        row = _achievement_row(record)
-        pending = [
-            item for item in ACHIEVEMENTS.catalogue()
-            if item.code in set(row["unlocked"]) and item.code not in set(row["claimed"])
-        ]
-        if not pending:
-            return False, "Забирать пока нечего.", {}
-        row["claimed"] = sorted(set(row["claimed"]) | {item.code for item in pending})
-        _save(entry, data)
-    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0, "dungeon_tickets": 0,
-            "count": len(pending)}
-    for item in pending:
-        if item.rubies:
-            # Counted off the row rather than off the call: grant_rubies_once returns the
-            # resulting BALANCE, so summing its answers reports somebody's whole purse as
-            # though this one press had paid it. The source key is unique per achievement
-            # and the claim was marked before any of this, so the row's own number is
-            # exactly what was minted.
-            grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
-            paid["rubies"] += item.rubies
-        for _ in range(max(0, int(item.dungeon_tickets))):
-            grant_dungeon_ticket(entry, user_id)
-            paid["dungeon_tickets"] += 1
-    _pay_achievement_tickets(entry, user_id, pending, paid)
+    ok, error, paid, pending = _settle_achievement_claim(
+        entry, user_id, ACHIEVEMENTS.catalogue(),
+    )
+    if not ok:
+        return False, error, {}
     parts = []
     if paid["rubies"]:
         parts.append(f"{paid['rubies']} 💎")
@@ -6469,28 +6504,11 @@ def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
     item = ACHIEVEMENTS.by_code(str(code or ""))
     if item is None:
         return False, "Такой ачивки нет.", {}
-    with _farm_settlement_lock:
-        data = _load(entry)
-        record = _tamed_record(data, user_id)
-        if record is None:
-            return False, "Сначала приручи существо.", {}
-        row = _achievement_row(record)
-        if item.code not in set(row["unlocked"]):
-            return False, "Эта ачивка ещё не заработана.", {}
-        if item.code in set(row["claimed"]):
-            return False, "Награда за эту ачивку уже получена.", {}
-        # Reserve before minting. Every currency path below is idempotent where it can be;
-        # the claimed flag is the durable guard for dungeon tickets.
-        row["claimed"] = sorted(set(row["claimed"]) | {item.code})
-        _save(entry, data)
-    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0, "dungeon_tickets": 0, "count": 1}
-    if item.rubies:
-        grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
-        paid["rubies"] = item.rubies
-    _pay_achievement_tickets(entry, user_id, [item], paid)
-    for _ in range(max(0, int(item.dungeon_tickets))):
-        grant_dungeon_ticket(entry, user_id)
-        paid["dungeon_tickets"] += 1
+    ok, error, paid, _settled = _settle_achievement_claim(
+        entry, user_id, [item], individual=True,
+    )
+    if not ok:
+        return False, error, {}
     parts = []
     if paid["rubies"]:
         parts.append(f"{paid['rubies']} 💎")
