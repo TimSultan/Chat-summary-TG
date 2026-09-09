@@ -100,6 +100,44 @@ import voting
 # dungeon shop closing the voting the chat runs its contest on.
 GAME_IMPORT_ERROR: str | None = None
 ARENA_IMPORT_ERROR: str | None = None
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# GAME_ENABLED=0 closes the pet game without removing a line of it (see game_open below).
+#
+# WHY AN ENVIRONMENT VARIABLE AND NOT THE PAUSE FILE. maintenance.py argues, correctly,
+# that a pause belongs on the volume because flipping an env var IS a restart. This is the
+# opposite case: the whole point of this switch is to NOT IMPORT pets_web, and a module
+# cannot be un-imported. Closing the game this way is a restart however it is spelled, so
+# it may as well be spelled the way the host already restarts things.
+#
+# WHAT IT SAVES. Measured with tracemalloc against this tree: the process holds ~91 MB of
+# Python objects with everything loaded and ~70 MB with the game off. Effectively ALL of
+# that difference is pets_web, which builds the Mini App's entire HTML/CSS/JS as
+# module-level strings. Every other game module is either already pulled in by quests
+# (pets, pets_combat, pets_dungeon, the catalogues) or free once pets_ui is there (casino,
+# pets_updates), so skipping those would buy nothing measurable and cost a dozen
+# None-checks on paths quest moderation still runs through.
+#
+# WHAT STAYS RUNNING. Quests, in full: the hashtag submission, the moderator alerts, and
+# review inside Telegram (see QUEST_MODERATION_ACTIONS). Only the WEB review surface goes,
+# because that surface IS pets_web. Figurine farm tickets and painting scrolls keep being
+# granted as well -- they cost one small write, and dropping them would quietly rob
+# everybody who paints while the game is shut.
+# Defaults to ON, and the default is the deployment's business rather than the
+# repository's -- same as STATS_ENABLED. It was briefly flipped to off here to express
+# "the game is closed" in the code, and that was wrong twice over: seventy-odd tests
+# exercise play surfaces and would have had to be told to open the game first, and
+# somebody running a single test file directly would have got a closed game with no
+# obvious reason why. Closing the game is one variable on the host, where every other
+# operational choice this bot makes already lives.
+GAME_ENABLED = _env_flag("GAME_ENABLED", True)
 try:
     import pets
     import pets_combat
@@ -107,8 +145,13 @@ try:
     import pets_image
     import pets_ui
     import pets_updates
-    import pets_web
     import casino
+
+    if GAME_ENABLED:
+        import pets_web
+    else:
+        # The one import actually worth skipping, and the only reason this switch exists.
+        pets_web = None
 except Exception:  # noqa: BLE001 -- ANY failure here must still leave the chat running
     GAME_IMPORT_ERROR = traceback.format_exc()
     pets = pets_combat = C = pets_image = pets_ui = pets_updates = pets_web = None
@@ -123,8 +166,22 @@ except Exception:  # noqa: BLE001
 
 
 def game_available() -> bool:
-    """Whether the pet game loaded. False means answer players, do not crash at them."""
+    """Whether the pet game's modules loaded.
+
+    Deliberately NOT the same question as "may people play" (see game_open). This one asks
+    whether the code is here at all, and it is what quest moderation depends on: reviewing
+    a painting draws pets_ui screens and reads the pets store, so it needs the modules
+    present -- but it does not need the game to be OPEN, and closing the game must not
+    close the review queue.
+    """
     return GAME_IMPORT_ERROR is None
+
+
+def game_open() -> bool:
+    """Whether anybody may play right now: the modules are here AND the owner has not
+    switched the game off. Every play surface asks this; the quest surfaces ask
+    game_available instead."""
+    return GAME_IMPORT_ERROR is None and GAME_ENABLED
 
 
 def arena_available() -> bool:
@@ -135,6 +192,14 @@ def arena_available() -> bool:
 GAME_UNAVAILABLE_NOTICE = (
     "Игра сейчас недоступна — чиню. Остальные команды чата работают как обычно."
 )
+# Said instead when the game is CLOSED rather than broken (GAME_ENABLED=0). Two
+# wordings because they are two different situations and a player deserves to know
+# which one they are in: "чиню" promises it is coming back today, and a game switched
+# off deliberately makes no such promise. Quests are named because they are the one
+# thing that keeps working, and the people who care are the ones still painting.
+GAME_CLOSED_NOTICE = (
+    "Арена сейчас закрыта. Квесты работают как обычно — присылайте покрасы с хештегом квеста, их по-прежнему проверяют."
+)
 ARENA_UNAVAILABLE_NOTICE = (
     "Голосование сейчас недоступно — чиню. Остальные команды чата работают как обычно."
 )
@@ -142,6 +207,29 @@ ARENA_UNAVAILABLE_NOTICE = (
 # exactly what may be missing when this is needed, and a router that cannot route without
 # the thing it is routing around is no router. Pinned against the real value by a test.
 PETS_CALLBACK_PREFIX_LITERAL = "pet"
+
+
+def _game_down_notice(arena: bool) -> str:
+    """What to tell somebody whose command or button just bounced.
+
+    A game that is switched off and a game that failed to import look identical from the
+    outside and are nothing alike: one is a decision, the other is a bug, and telling a
+    player "чиню" about a decision is a promise nobody is going to keep.
+    """
+    if arena:
+        return ARENA_UNAVAILABLE_NOTICE
+    if GAME_IMPORT_ERROR is not None:
+        return GAME_UNAVAILABLE_NOTICE
+    return GAME_CLOSED_NOTICE
+
+
+def _game_down_reason(arena: bool) -> str:
+    """The same distinction for the log, where it decides whether anybody is paged."""
+    if arena:
+        return "the weekly vote's modules never loaded:\n" + (ARENA_IMPORT_ERROR or "")
+    if GAME_IMPORT_ERROR is not None:
+        return "the game's modules never loaded:\n" + GAME_IMPORT_ERROR
+    return "the game is switched off (GAME_ENABLED=0)"
 
 
 async def _decline_game_command(
@@ -153,14 +241,13 @@ async def _decline_game_command(
     player with a command that did nothing and no idea whether they typed it wrong.
     The chat commands around it keep working, which is the whole point of the guard.
     """
-    if arena_available() if arena else game_available():
+    if arena_available() if arena else game_open():
         return False
-    log("[bot_listener] refused a command, modules never loaded:\n"
-        + ((ARENA_IMPORT_ERROR if arena else GAME_IMPORT_ERROR) or ""))
+    notice = _game_down_notice(arena)
+    log(f"[bot_listener] refused a command: {_game_down_reason(arena)}")
     try:
         await api.send_message(
-            (message.get("chat") or {}).get("id"),
-            ARENA_UNAVAILABLE_NOTICE if arena else GAME_UNAVAILABLE_NOTICE,
+            (message.get("chat") or {}).get("id"), notice,
             reply_to_message_id=message.get("message_id"), parse_mode=None,
         )
     except Exception:
@@ -172,15 +259,11 @@ async def _decline_game_callback(
     api: "TelegramBotAPI", callback: dict, log=print, *, arena: bool = False,
 ) -> bool:
     """The same for a button. An unanswered callback spins on screen for ever."""
-    if arena_available() if arena else game_available():
+    if arena_available() if arena else game_open():
         return False
-    log("[bot_listener] refused a button, modules never loaded:\n"
-        + ((ARENA_IMPORT_ERROR if arena else GAME_IMPORT_ERROR) or ""))
+    log(f"[bot_listener] refused a button: {_game_down_reason(arena)}")
     try:
-        await api.answer_callback_query(
-            callback.get("id"),
-            ARENA_UNAVAILABLE_NOTICE if arena else GAME_UNAVAILABLE_NOTICE,
-        )
+        await api.answer_callback_query(callback.get("id"), _game_down_notice(arena))
     except Exception:
         log("[bot_listener] could not answer a button:\n" + traceback.format_exc())
     return True
@@ -4245,8 +4328,16 @@ async def handle_tree_command(
 
 def _pets_page_url(cfg) -> str | None:
     """The pet game's Mini App (pets_web.py), or None when no public URL is configured --
-    in which case the menu simply doesn't offer it and the buttons remain the whole game."""
-    return f"{cfg.webapp_public_url}{pets_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
+    in which case the menu simply doesn't offer it and the buttons remain the whole game.
+
+    Also None when the game is closed: pets_web was never imported and nothing is serving
+    that route, so offering the button would hand somebody a link to a 404. This is why
+    the quest alert's "Проверить в вебе" button disappears while "Проверить в Telegram"
+    stays -- see _send_quest_submission_notifications.
+    """
+    if pets_web is None or not cfg.webapp_public_url:
+        return None
+    return f"{cfg.webapp_public_url}{pets_web.ROUTE_PREFIX}"
 
 
 def _vote_page_url(cfg) -> str | None:
@@ -7002,6 +7093,26 @@ async def _pets_start_flow(
 #
 # Navigation stays open so a player who opens the menu mid-update reads the notice on a
 # working screen rather than meeting a wall of refusals.
+# What still works while the game is CLOSED (GAME_ENABLED=0), as opposed to paused.
+#
+# Far narrower than PAUSE_SAFE_PET_ACTIONS below, and for a different reason: a pause is a
+# few minutes during a deploy, so navigation stays open and only writes are held; a close
+# is indefinite, so nothing that reads as "come and play" may answer at all. What is left
+# is exactly quest moderation, which is not play -- somebody painted a model and is waiting
+# to hear whether it counted, and that queue must not stop because the arena did.
+#
+# `main` is NOT here on purpose. It draws the arena menu -- cage, fights, farm, shop -- and
+# a closed game must not advertise itself. A moderator does not need it: their route in is
+# the "Проверить в Telegram" button on the alert they were sent, which lands directly on
+# the review screen.
+QUEST_MODERATION_ACTIONS = frozenset({
+    "questreview", "questaccept", "questreject",
+    "questmods", "questmodadd", "questmoddel",
+    # A dead button on those same screens. Refusing it would answer a tap that asked for
+    # nothing with a notice about a game the moderator did not mention.
+    "noop",
+})
+
 PAUSE_SAFE_PET_ACTIONS = frozenset({
     "main", "info", "noop", "pet", "bag", "bagitems", "cage", "farm", "train", "fight",
     "history", "mail", "updates", "leaderboard", "slot", "shopslot", "skills", "skillpick",
@@ -7070,13 +7181,22 @@ async def handle_pets_callback(
     leaves the button spinning on the client until it times out -- a bug this codebase has
     already been bitten by once.
     """
-    # Nothing below this line exists without the game modules.
-    if await _decline_game_callback(api, callback, log=log):
+    # Nothing below this line exists without the game modules. Note the gate: modules
+    # LOADED, not game open -- a closed game still has to answer quest moderators.
+    if not game_available() and await _decline_game_callback(api, callback, log=log):
         return
     parsed = pets_ui.parse_callback(callback.get("data"))
     if parsed is None:
         return
     owner_id, action, argument = parsed
+    # The close is applied per action rather than at the door, because quest review lives
+    # in this same menu and is the one thing GAME_ENABLED=0 is meant to keep (see
+    # QUEST_MODERATION_ACTIONS). A no-op while the game is open.
+    if (
+        action not in QUEST_MODERATION_ACTIONS
+        and await _decline_game_callback(api, callback, log=log)
+    ):
+        return
     callback_id = callback.get("id")
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -10580,13 +10700,21 @@ async def run_bot_listener(
         tasks = [
             _poll_loop(),
             _consume_summaries(),
-            _farm_returns_loop(),
-            _daily_chatter_prize_loop(),
             _button_counter_refresh_loop(api, home_chat_ref, log=log),
             # Unconditional, unlike the queue consumers below: its work comes off disk, so
             # it also has a restart's worth of overdue deletions to clear on the way up.
             _via_cleaner_loop(),
         ]
+        if game_open():
+            # Both settle and announce the game's own clocks -- farm expeditions coming
+            # home, yesterday's chatter prizes. With the game closed there is nothing for
+            # them to settle and nobody who could spend what they paid out, so they are
+            # left off rather than left spinning: an hourly scan of every tracked chat is
+            # not free, and paying prizes into a shut game is worse than not paying them.
+            tasks.append(_farm_returns_loop())
+            tasks.append(_daily_chatter_prize_loop())
+        else:
+            log("[bot_listener] the game is closed: farm returns and chatter prizes are off")
         if figurine_ack_queue is not None:
             tasks.append(_consume_figurine_acks())
         if quest_submission_queue is not None:
@@ -10682,9 +10810,9 @@ async def run_bot_listener(
                         api, telethon_client, pledge, known_chat_ids, log=log,
                     )
 
-                if not game_available():
+                if pets_web is None:
                     log("[bot_listener] the game's Mini App is not being served: "
-                        + (GAME_IMPORT_ERROR or ""))
+                        + (GAME_IMPORT_ERROR or _game_down_reason(False)))
                 else:
                     pets_web.attach(
                         app, cfg, home_chat_ref or "",

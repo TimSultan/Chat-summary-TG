@@ -196,6 +196,64 @@ Details worth knowing:
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
 
+### Turning the game off (`GAME_ENABLED`)
+
+The pet game and the chat share one process, so the game's code sits in the chat's memory
+whether or not anybody plays. `GAME_ENABLED` closes the game without deleting a line of it,
+and **quests keep running in full**.
+
+```
+GAME_ENABLED=0     # on the host, then restart
+```
+
+It defaults to **on**, because the default here is the deployment's business rather than
+the repository's — the same call `STATS_ENABLED` makes. Nothing touches the stores, so
+switching back returns every creature, coin, ticket and scroll exactly where its owner
+left it.
+
+What it costs and what it saves, measured with `tracemalloc` against this tree:
+
+| | Python objects held |
+|---|---|
+| everything loaded | ~91 MB |
+| `GAME_ENABLED=0` | ~74 MB |
+
+Effectively **all** of that difference is `pets_web.py`, which builds the Mini App's entire
+HTML/CSS/JS as module-level strings. Nothing else is worth skipping: `pets`, `pets_combat`,
+`pets_dungeon` and the catalogues are pulled in by `quests` regardless, and `casino` and
+`pets_updates` come free with `pets_ui`. So the switch does exactly one structural thing —
+it does not import `pets_web` — and everything else it does is behaviour.
+
+What still works with the game closed:
+
+- **Quest submission.** A painted post with `#quest_…` is recorded exactly as before.
+- **Moderator alerts.** They still arrive; the «🖥 Проверить в вебе» button is simply not
+  offered, because nothing is serving that route. «📲 Проверить в Telegram» stays.
+- **Review, accept, reject, and the moderator list** — `QUEST_MODERATION_ACTIONS` in
+  `bot_listener.py` is the exact allow-list, and it is deliberately much narrower than the
+  pause's `PAUSE_SAFE_PET_ACTIONS`: a pause lasts a deploy and keeps navigation open, a
+  close is indefinite and must not advertise a game nobody can open.
+- **Farm tickets and painting scrolls** are still granted for `#япокрасил` posts. They cost
+  one small write, and dropping them would quietly rob everybody who paints while the game
+  is shut.
+
+What stops:
+
+- `/arena`, `/pet`, `/duel`, `/testfight`, `/arenanews` and every play button answer
+  «Арена сейчас закрыта. Квесты работают как обычно…» — a different message from the
+  «чиню» one a genuinely broken game gives, because one is a decision and the other is a
+  bug (`GAME_CLOSED_NOTICE` vs `GAME_UNAVAILABLE_NOTICE`).
+- The Mini App is not served at all.
+- The farm-returns and daily-chatter-prize loops do not run — there is nothing to settle
+  and nobody who could spend what they paid out.
+
+Two things it deliberately does **not** touch: the weekly `#итогинедели` vote (`/vote`,
+`/vote2`) is a separate feature behind its own guard, and none of the stored progress is
+altered, so switching it back on returns everybody's creature, gold and tickets untouched.
+
+`tests/test_game_switch.py` pins the saving itself (in a fresh interpreter — a module
+cannot be un-imported) and the promise that came with it: quest moderation survives.
+
 ### `/admin` — every management command in one panel
 
 The management commands are deliberately missing from Telegram's ☰ menu: publishing
