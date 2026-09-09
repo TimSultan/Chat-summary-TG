@@ -196,6 +196,60 @@ Details worth knowing:
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
 
+### ViaCleaner — inline-bot posts are swept up after a delay
+
+A message posted through an inline bot — the ones Telegram labels **«via @…»** — is useful
+for about as long as it takes to look at it, and a chat that collects them stops being
+readable to anybody scrolling back. ViaCleaner (`via_cleaner.py`) leaves each one standing
+for a set time and then deletes it.
+
+Settings live in a menu, in the bot's DM:
+
+```
+/viacleaner          (or /via)
+```
+
+> 🧹 **ViaCleaner**
+>
+> Удаляет сообщения, отправленные через инлайн-ботов — те, что помечены «via …». Обычные
+> сообщения, ответы и пересылки не трогает.
+>
+> Чат: **Единый Чат Художников**
+> Сейчас: **включён**
+> Удаляет через: **5 минут**
+>
+> ⏹ Выключить · ⏱ Задержка: 5 минут
+
+Details worth knowing:
+
+- **It is off until somebody turns it on.** A bot that silently starts deleting messages
+  the day it is deployed is a bot that gets removed from the chat.
+- **The delay is the feature.** Deleting instantly reads as censorship — the person who
+  sent it never sees their own result. «Сразу» is on the menu (`DELAY_CHOICES`: сразу,
+  1 минута, 5 минут, 15 минут, 1 час, 3 часа, 24 часа) but the default is five minutes.
+- **DM-only, administrators only**, like `/badge` and `/badgeadmin`. The menu is not
+  published in the ☰ menu for the same reason those aren't.
+- **Pending deletions survive a restart.** They live in `via_cleaner.json` on the
+  persistent volume, not in an in-memory timer — a deploy is exactly when a batch of them
+  is most likely to be waiting, and losing those would mean via-messages surviving for
+  ever purely because they were lucky about their timing.
+- **Two observers, one queue.** Your personal session sees every via-message; the bot sees
+  them too whenever its privacy mode is off. Both call `via_cleaner.remember`, which
+  de-duplicates on (chat, message id), so one of the two halves being down doesn't stop
+  the cleaning. The deletion itself is always the bot's.
+- **The bot must be an admin with delete rights** — `deleteMessage` fails silently
+  without them, and the menu says so while the cleaner is on.
+- **Switching it off cancels what was already queued**, and shortening the delay re-times
+  it. Somebody who turns this off is asking for messages to stop disappearing, not for a
+  few more to go five minutes later.
+- **Anything Telegram will no longer delete is given up on.** Past roughly 48 hours
+  (`PENDING_EXPIRY_SECONDS`) there is nothing to retry, so the entry is dropped instead of
+  failing on every sweep for ever.
+
+`tests/test_via_cleaner.py` pins the detection (and, more importantly, that an ordinary
+message never matches), that a scheduled deletion survives a restart and is never queued
+twice, and that every button in the menu changes what it says it changes.
+
 ### XP, levels, coins, and badges
 
 `/top today|week|month|year|all` ranks tracked members by XP. The existing activity

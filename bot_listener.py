@@ -74,6 +74,7 @@ import quests
 import post_stats_web
 import preview
 import stats
+import via_cleaner
 import vote_image
 import vote_web
 import voting
@@ -281,6 +282,15 @@ SEND_COMMAND = "/send"
 PREVIEW_COMMAND = "/preview"
 BUTTON_BUILDER_COMMAND = button_builder.COMMAND
 BUTTON_BUILDER_FLOW_TTL_SECONDS = button_builder.FLOW_TTL_SECONDS
+
+# The ViaCleaner settings menu. DM-only and unadvertised, exactly like /badgeadmin and
+# /preview: it switches on message deletion in a chat of 190 people, so it belongs in
+# front of the administrators who can already do that by hand and nobody else.
+VIA_CLEANER_COMMANDS = via_cleaner.COMMANDS
+# How long the sweeper backs off after a pass that found work it could not do -- the only
+# case being a chat whose id would not resolve. Without it those items stay permanently
+# due and the loop spins on them at full speed.
+VIA_CLEANER_STUCK_BACKOFF_SECONDS = 60
 
 # Opens the planting ceremony. Two spellings for one action: Telegram only treats
 # [a-zA-Z0-9_] after a slash as a command, so "/посадить_семечко" is never highlighted,
@@ -2834,6 +2844,141 @@ async def handle_badge_admin_command(
         if granted
         else f"{target.display_name} уже мог это делать."
     )
+
+
+async def handle_via_cleaner_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/viacleaner -- the ViaCleaner settings menu (see via_cleaner.py).
+
+    DM-only, and gated on being an administrator of the home chat, exactly like every
+    other management command here. The menu itself carries the whole feature: there are no
+    sub-commands and no arguments to remember, because the one thing an administrator ever
+    does with this is switch it on and pick how long a via-message may stand.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /viacleaner:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Настройками ViaCleaner управляют только администраторы чата.")
+        return
+
+    try:
+        await api.send_message(
+            dm_chat_id,
+            via_cleaner.menu_text(entry),
+            reply_to_message_id=reply_to,
+            parse_mode="HTML",
+            reply_markup=via_cleaner.menu_keyboard(entry),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to open the ViaCleaner menu:\n{traceback.format_exc()}")
+        await reply("Не удалось открыть настройки. Попробуй ещё раз.")
+
+
+async def _edit_via_cleaner_screen(
+    api: TelegramBotAPI, chat_id, message_id: int, entry: str, screen: str, log=print,
+) -> None:
+    """Redraw the open menu in place -- one definition, so every button that changes
+    something ends on a screen that already reflects the change."""
+    text = via_cleaner.delay_text(entry) if screen == "delays" else via_cleaner.menu_text(entry)
+    keyboard = via_cleaner.delay_keyboard(entry) if screen == "delays" else via_cleaner.menu_keyboard(entry)
+    try:
+        await api.edit_message_text(chat_id, message_id, text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        log(f"[bot_listener] failed to redraw the ViaCleaner menu:\n{traceback.format_exc()}")
+
+
+async def handle_via_cleaner_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    callback: dict,
+    entry: str | None,
+    known_chat_ids: dict[str, int],
+    log=print,
+) -> None:
+    """The ViaCleaner menu's buttons.
+
+    The spinner is stopped FIRST, before anything that can wait: the administrator check
+    below needs the home chat's id, and resolving one goes through the Telethon session,
+    which -- when unwell -- waits rather than failing, leaving a button spinning for ever.
+    Nothing here needs a toast to explain itself; every button's effect is visible in the
+    screen it redraws.
+    """
+    callback_id = callback["id"]
+    await api.answer_callback_query(callback_id)
+
+    parsed = via_cleaner.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    action, argument = parsed
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    presser = callback.get("from") or {}
+    if entry is None or chat_id is None or message_id is None:
+        return
+
+    # Re-checked rather than trusted: the menu only ever exists in the DM of somebody who
+    # was an administrator when it was opened, so this can only differ if they have since
+    # stopped being one -- in which case the buttons must stop working, not keep working
+    # because the message is still on their screen.
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+        try:
+            await api.edit_message_text(
+                chat_id, message_id,
+                "Настройками ViaCleaner управляют только администраторы чата.",
+                parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to close the ViaCleaner menu:\n{traceback.format_exc()}")
+        return
+
+    by = _display_name(presser)
+    if action == "toggle":
+        current = via_cleaner.settings(entry)
+        updated = via_cleaner.set_enabled(entry, not current["enabled"], by=by)
+        log(
+            f"[bot_listener] ViaCleaner in '{entry}' turned "
+            + ("on" if updated["enabled"] else "off")
+            + f" by {by}"
+        )
+        await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
+        return
+    if action == "delays":
+        await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "delays", log=log)
+        return
+    if action == "delay":
+        try:
+            seconds = int(argument)
+        except (TypeError, ValueError):
+            return
+        updated = via_cleaner.set_delay(entry, seconds, by=by)
+        log(
+            f"[bot_listener] ViaCleaner delay in '{entry}' set to "
+            f"{updated['delay_seconds']}s by {by}"
+        )
+        # Back to the root screen rather than staying here: it names the chosen delay in a
+        # sentence, which is a better confirmation than a tick beside a button, and it is
+        # the screen somebody who is finished wants to be on.
+        await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
+        return
+    await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
 
 
 def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
@@ -8829,6 +8974,12 @@ async def _dispatch_update(
                 pets_flows, background_tasks, bot_username=bot_username,
                 known_chat_ids=known_chat_ids, log=log,
             )
+        elif callback_data.startswith(f"{via_cleaner.CALLBACK_PREFIX}:"):
+            # The menu is DM-only, so the chat it is about is always the home chat -- the
+            # DM this button was pressed in has no chat history of its own to clean.
+            await handle_via_cleaner_callback(
+                api, telethon_client, callback, home_chat_ref, known_chat_ids, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_RESULT_CALLBACK_PREFIX}:"):
             # No chat resolution here either: the draft already carries the main chat's id
             # (resolved when the vote was closed), so pressing Отправить never waits on the
@@ -8855,6 +9006,26 @@ async def _dispatch_update(
     matched_entry = _match_allowed_chat(chat, cfg.listener_allowed_chats)
     if matched_entry is not None:
         known_chat_ids[matched_entry] = chat["id"]
+        # ViaCleaner's second pair of eyes. listener.py's Telethon session sees every
+        # via-message and is the primary observer; this one only sees them while the bot's
+        # privacy mode is off, but it keeps the chat clean during the times that session is
+        # the half that is down. via_cleaner.remember de-duplicates on (chat, message id),
+        # so both observers reporting the same message costs one store read and nothing
+        # else, and it is a no-op entirely for a chat with the cleaner switched off.
+        # Never our own posts: this bot has no inline mode, so a `via_bot` that is us could
+        # only be a Telegram-side surprise, and deleting our own menus would be a bad one.
+        via_bot = message.get("via_bot") or {}
+        if via_bot and via_bot.get("id") != bot_user_id:
+            try:
+                # Same shape listener.inline_bot_ref produces, so the two observers write
+                # the same label for the same bot: "@name", or the bare id without one.
+                username = via_bot.get("username")
+                via_cleaner.remember(
+                    matched_entry, message["message_id"],
+                    via=f"@{username}" if username else str(via_bot.get("id") or ""),
+                )
+            except Exception:
+                log(f"[bot_listener] via_cleaner could not schedule a message:\n{traceback.format_exc()}")
         # The Bot API gives us the reusable file_id that Telethon's user-session update
         # cannot. Preserve it for personal-paint quest rewards before the ordinary
         # command router ignores this non-command group post. quests.py handles either
@@ -9004,6 +9175,19 @@ async def _dispatch_update(
         await handle_button_builder_command(
             api, message, home_chat_ref, admin_chat_id, button_builder_flows
         )
+        return
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in VIA_CLEANER_COMMANDS
+    ):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_via_cleaner_command(api, message, home_chat_ref, admin_chat_id, log=log)
         return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
@@ -9749,6 +9933,56 @@ async def run_bot_listener(
                 except Exception:
                     log(f"[bot_listener] failed to handle a blocked file in '{entry}':\n{traceback.format_exc()}")
 
+        async def _via_cleaner_loop():
+            """Deletes via-messages whose delay has run out (see via_cleaner.py).
+
+            Not a queue consumer, and deliberately so: the hand-off between the half that
+            SEES a via-message and this half is a file, because the delay routinely
+            outlives the process and a queue would drop every pending deletion on each
+            deploy. So this loop reads the store, sleeps until the earliest thing in it is
+            due, and is woken early by via_cleaner.wake() whenever something new is
+            remembered -- which is what makes a chat set to "сразу" actually feel immediate.
+
+            Guarded like every other loop here: they share one asyncio.gather with the poll
+            loop, so an escaping exception takes the whole bot down rather than costing one
+            pass.
+            """
+            while True:
+                try:
+                    await via_cleaner.wait_for_work(via_cleaner.seconds_until_next())
+                    ready = via_cleaner.due()
+                    handled = []
+                    for item in ready:
+                        entry = item.get("entry") or ""
+                        chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                        if chat_id is None:
+                            # Left in the queue rather than counted as done: the message is
+                            # still standing. It cannot pile up for ever -- via_cleaner
+                            # drops anything Telegram would refuse to delete anyway.
+                            log(f"[bot_listener] ViaCleaner cannot resolve a chat_id for '{entry}' yet")
+                            continue
+                        # Best-effort inside api.delete_message: no rights, already gone,
+                        # or too old all fail silently, and none of them is a reason to
+                        # keep retrying the same message on every pass.
+                        await api.delete_message(chat_id, item["message_id"])
+                        handled.append(item)
+                    if handled:
+                        via_cleaner.settle(handled)
+                        log(f"[bot_listener] ViaCleaner deleted {len(handled)} via-message(s)")
+                    else:
+                        # Still called with nothing handled: settle is where the queue
+                        # sheds entries that have aged out of Telegram's delete window.
+                        via_cleaner.settle([])
+                        if ready:
+                            # Everything due was unresolvable, so the store still says
+                            # "due now" and the wait above would return instantly.
+                            await asyncio.sleep(VIA_CLEANER_STUCK_BACKOFF_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log(f"[bot_listener] ViaCleaner sweep failed:\n{traceback.format_exc()}")
+                    await asyncio.sleep(VIA_CLEANER_STUCK_BACKOFF_SECONDS)
+
         async def _consume_quest_refusals():
             while True:
                 item = await quest_refusal_queue.get()
@@ -9964,6 +10198,9 @@ async def run_bot_listener(
             _farm_returns_loop(),
             _daily_chatter_prize_loop(),
             _button_counter_refresh_loop(api, home_chat_ref, log=log),
+            # Unconditional, unlike the queue consumers below: its work comes off disk, so
+            # it also has a restart's worth of overdue deletions to clear on the way up.
+            _via_cleaner_loop(),
         ]
         if figurine_ack_queue is not None:
             tasks.append(_consume_figurine_acks())
