@@ -196,6 +196,53 @@ Details worth knowing:
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
 
+### `/admin` — every management command in one panel
+
+The management commands are deliberately missing from Telegram's ☰ menu: publishing
+`/badge` and `/deletepokras` to all 190 members invites a wave of «нужны права
+администратора». The cost of that is that they are invisible to the people who *are*
+allowed to use them. `/admin` (`admin_menu.py`) is the other half — unadvertised,
+DM-only, and gated on being an administrator of the home chat or a hardcoded delegate
+(`PRIVILEGED_MANAGEMENT_USERNAMES`).
+
+```
+/admin
+```
+
+> 🛠 **Панель администратора**
+>
+> **Чат и посты** — `/send` · `/preview` · `/buttons` · `/viacleaner`
+> **Голосования** — `/vote` · `/vote2`
+> **Участники** — `/badge` · `/badgeadmin` · `/weekwinner` · `/deletepokras`
+> **Дерево** — `/plant` · `/plantreminder` · `/replant`
+> **Игра** — `/arenanews`
+
+Details worth knowing:
+
+- **It is an index, not a new permission.** Every button ends in the very handler the
+  typed command runs, and that handler checks the same rights again on its own. Nothing
+  here has its own copy of «post to the chat», which is what keeps the panel from
+  drifting from the commands within two releases.
+- **The legend names every command in full**, not just the buttons. These all still work
+  typed, and an admin who learns the spelling here stops needing the panel — a better
+  outcome than a panel nobody can work without.
+- **Three kinds of button, and the kind is not a style choice.**
+  - `open` presses straight through, and is reserved for actions whose whole effect is a
+    screen in the admin's own DM. A misclick costs them one message on their own screen.
+  - `ask` sends a force-reply and runs the command with whatever comes back — `/send`,
+    `/weekwinner`, `/deletepokras`, `/arenanews`. The prompt is consumed once, so a second
+    reply to it cannot post to the chat twice.
+  - `confirm` asks «точно?» first. Everything that writes into the group or resets
+    something shared is one of these: `/plant`, `/plantreminder`, `/replant`. One stray tap
+    may not post an invitation to 190 people or start the tree over.
+- **Adding an action is one entry** in `admin_menu.ACTIONS` plus one branch in
+  `bot_listener._run_admin_action`; `tests/test_admin_menu.py` fails if you add the first
+  without the second, and asserts by name which actions must stay behind a confirmation.
+
+`tests/test_admin_menu.py` pins the catalogue, the gate, that an `open` button reaches its
+handler, that a `confirm` button does *not* on the first press, and that an `ask` prompt is
+answered exactly once and only by the person it was asked of.
+
 ### ViaCleaner — inline-bot posts are swept up after a delay
 
 A message posted through an inline bot — the ones Telegram labels **«via @…»** — is useful

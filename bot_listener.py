@@ -64,6 +64,7 @@ from pathlib import Path
 import aiohttp
 from telethon import utils as tl_utils
 
+import admin_menu
 import cabinet
 import button_builder
 import donations
@@ -282,6 +283,12 @@ SEND_COMMAND = "/send"
 PREVIEW_COMMAND = "/preview"
 BUTTON_BUILDER_COMMAND = button_builder.COMMAND
 BUTTON_BUILDER_FLOW_TTL_SECONDS = button_builder.FLOW_TTL_SECONDS
+
+# The management panel. Deliberately absent from PRIVATE_CHAT_COMMANDS for the same
+# reason every command it contains is: Telegram's menu is published to all 190 members,
+# and advertising the panel would advertise the commands inside it.
+ADMIN_MENU_COMMAND = admin_menu.COMMAND
+ADMIN_PANEL_REFUSAL = "Панель доступна только администраторам чата."
 
 # The ViaCleaner settings menu. DM-only and unadvertised, exactly like /badgeadmin and
 # /preview: it switches on message deletion in a chat of 190 people, so it belongs in
@@ -2981,6 +2988,346 @@ async def handle_via_cleaner_callback(
     await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
 
 
+async def handle_admin_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/admin -- the management panel (see admin_menu.py).
+
+    DM-only and administrator-gated, like every command it contains. It is the index for
+    them, not a new permission: each button ends in the same handler the typed command
+    runs, and that handler checks the same rights again on its own.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /admin:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply(ADMIN_PANEL_REFUSAL)
+        return
+
+    try:
+        await api.send_message(
+            dm_chat_id,
+            admin_menu.menu_text(),
+            reply_to_message_id=reply_to,
+            parse_mode="HTML",
+            reply_markup=admin_menu.menu_keyboard(),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to open the admin panel:\n{traceback.format_exc()}")
+        await reply("Не удалось открыть панель. Попробуй ещё раз.")
+
+
+async def _run_admin_action(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    item: dict,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    bot_username: str | None,
+    background_tasks: set,
+    known_chat_ids: dict[str, int],
+    badge_flows: dict[str, dict],
+    button_builder_flows: dict[str, dict],
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """Hand one panel action to the very handler its typed command uses.
+
+    `message` is either the administrator's real reply (for an `ask`) or one built from
+    the button press (for `open` and `confirm`) -- the handlers read only `chat`,
+    `message_id` and `from`, all of which a callback carries. Going through them rather
+    than around them is the whole design: the permission check, the argument parsing and
+    the wording all stay in one place, and the panel cannot drift from the command.
+    """
+    action_id = item["id"]
+    if action_id == "send":
+        await handle_send_command(api, message, command_text, entry, admin_chat_id, log=log)
+    elif action_id == "preview":
+        await handle_preview_command(
+            api, telethon_client, message, command_text, entry, known_chat_ids, log=log,
+        )
+    elif action_id == "buttons":
+        await handle_button_builder_command(
+            api, message, entry, admin_chat_id, button_builder_flows,
+        )
+    elif action_id == "via":
+        await handle_via_cleaner_command(api, message, entry, admin_chat_id, log=log)
+    elif action_id == "vote":
+        await handle_vote_command(
+            api, telethon_client, cfg, tz, message, entry, bot_username,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+        )
+    elif action_id == "vote2":
+        await handle_arena_command(
+            api, telethon_client, cfg, tz, message, entry, bot_username,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+        )
+    elif action_id == "badge":
+        await handle_badge_command(api, message, entry, admin_chat_id, badge_flows)
+    elif action_id == "badgeadmin":
+        await handle_badge_admin_command(
+            api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "weekwinner":
+        await handle_week_winner_command(
+            api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "deletepokras":
+        await handle_delete_pokras_command(
+            api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "plant":
+        await handle_plant_command(api, message, entry, admin_chat_id, log=log)
+    elif action_id == "plantreminder":
+        await handle_plant_reminder_command(api, message, entry, admin_chat_id, log=log)
+    elif action_id == "replant":
+        await handle_replant_command(
+            api, telethon_client, message, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "arenanews":
+        await handle_arena_news_command(
+            api, telethon_client, message, entry or "", command_text, entry,
+            known_chat_ids, log=log,
+        )
+    else:  # pragma: no cover -- an action in the catalogue with nothing wired to it
+        log(f"[bot_listener] admin panel has no handler for {action_id!r}")
+
+
+def _admin_message_from_callback(callback: dict, command_text: str) -> dict:
+    """The button press, shaped like the command message a handler expects.
+
+    Carries `text` as well as the three obvious fields, because /vote and /vote2 read it
+    to find their sub-command: they would still open their root panel without it, but a
+    stand-in that is only accidentally right is one bad afternoon away from being wrong.
+    Replies thread onto the panel itself, which is what an administrator who pressed a
+    button on it is looking at anyway.
+    """
+    message = callback.get("message") or {}
+    return {
+        "chat": message.get("chat") or {},
+        "message_id": message.get("message_id"),
+        "from": callback.get("from") or {},
+        "text": command_text,
+    }
+
+
+async def handle_admin_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    admin_flows: dict[str, dict],
+    bot_username: str | None,
+    background_tasks: set,
+    known_chat_ids: dict[str, int],
+    badge_flows: dict[str, dict],
+    button_builder_flows: dict[str, dict],
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """The panel's buttons.
+
+    The spinner is stopped first, before the home chat is resolved: resolving goes through
+    the Telethon session, which when unwell waits rather than failing, and a button that
+    never reaches answerCallbackQuery spins on screen for ever.
+    """
+    callback_id = callback["id"]
+    await api.answer_callback_query(callback_id)
+
+    parsed = admin_menu.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    step, action_id = parsed
+    source = callback.get("message") or {}
+    chat = source.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = source.get("message_id")
+    presser = callback.get("from") or {}
+    if chat_id is None or message_id is None:
+        return
+
+    async def redraw(text: str, keyboard: dict | None, parse_mode: str | None) -> None:
+        try:
+            await api.edit_message_text(
+                chat_id, message_id, text, reply_markup=keyboard, parse_mode=parse_mode,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to redraw the admin panel:\n{traceback.format_exc()}")
+
+    admin_chat_id = (
+        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+        if entry
+        else None
+    )
+    if entry is None or admin_chat_id is None:
+        await redraw("Основной чат не настроен.", None, None)
+        return
+    # Re-checked rather than trusted: the panel only ever exists in the DM of somebody who
+    # was an administrator when it was opened, so this differs only if they have stopped
+    # being one -- in which case the buttons must stop working, not keep working because
+    # the message is still on their screen. Every handler below checks again anyway; this
+    # one is here so a stranger never even reaches a force-reply prompt.
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+        await redraw(ADMIN_PANEL_REFUSAL, None, None)
+        return
+
+    if step == "menu":
+        await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+        return
+
+    item = admin_menu.action(action_id)
+    if item is None:
+        await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+        return
+
+    if step == "run" and item["kind"] == "confirm":
+        # Everything that writes into the group, or resets something shared, asks first.
+        # One stray tap must not be able to post to 190 people or start the tree over.
+        await redraw(admin_menu.confirm_text(item), admin_menu.confirm_keyboard(item), None)
+        return
+
+    if step == "run" and item["kind"] == "ask":
+        try:
+            prompt = await api.send_message(
+                chat_id, admin_menu.prompt_text(item),
+                reply_to_message_id=message_id,
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to ask for {action_id!r}:\n{traceback.format_exc()}")
+            return
+        admin_flows[uuid.uuid4().hex] = {
+            "chat_id": chat_id,
+            "user_id": presser.get("id"),
+            "action_id": action_id,
+            "awaiting": "argument",
+            "prompt_message_id": (prompt or {}).get("message_id"),
+            "created_at": time.monotonic(),
+        }
+        return
+
+    log(f"[bot_listener] admin panel: {_display_name(presser)} ran {item['command']}")
+    await _run_admin_action(
+        api, telethon_client, cfg, tz, item,
+        _admin_message_from_callback(callback, item["command"]),
+        item["command"], entry, admin_chat_id, bot_username, background_tasks,
+        known_chat_ids, badge_flows, button_builder_flows, vote_chat_flows, log=log,
+    )
+    if step == "go":
+        # A confirmed action leaves the confirmation screen behind; the panel is what the
+        # administrator wants back, not the question they have already answered.
+        await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+
+
+async def handle_admin_text_input(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str | None,
+    admin_flows: dict[str, dict],
+    bot_username: str | None,
+    background_tasks: set,
+    known_chat_ids: dict[str, int],
+    badge_flows: dict[str, dict],
+    button_builder_flows: dict[str, dict],
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consumes the reply to an `ask` button's force-reply and runs the command with it.
+
+    Correlated on the prompt's own message id, like every other force-reply flow here, so
+    an administrator with several prompts open answers whichever one they replied to
+    rather than the most recent one.
+    """
+    chat_id = (message.get("chat") or {}).get("id")
+    actor = message.get("from") or {}
+    replied_message_id = (message.get("reply_to_message") or {}).get("message_id")
+    if replied_message_id is None:
+        return False
+    flow_pair = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in admin_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") == replied_message_id
+            and time.monotonic() - flow["created_at"] <= admin_menu.FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if flow_pair is None:
+        return False
+    flow_id, flow = flow_pair
+    # Dropped whatever happens next: this prompt asked one question and now has its
+    # answer. Leaving it open would let a later reply to the same message run the command
+    # a second time -- which for /send is a second post to the chat.
+    admin_flows.pop(flow_id, None)
+
+    item = admin_menu.action(flow.get("action_id") or "")
+    if item is None:
+        return True
+    text = (message.get("text") or message.get("caption") or "").strip()
+    if not text or admin_menu.is_cancel(text):
+        try:
+            await api.send_message(
+                chat_id, "Отменено.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to confirm an admin cancel:\n{traceback.format_exc()}")
+        return True
+
+    admin_chat_id = (
+        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+        if entry
+        else None
+    )
+    log(f"[bot_listener] admin panel: {_display_name(actor)} ran {item['command']}")
+    try:
+        # No permission check here on purpose: the handler about to run has its own, and
+        # it is the one that has always decided this. A second gate would be a second
+        # answer to the same question, and the two would eventually disagree.
+        await _run_admin_action(
+            api, telethon_client, cfg, tz, item, message, f"{item['command']} {text}",
+            entry, admin_chat_id, bot_username, background_tasks, known_chat_ids,
+            badge_flows, button_builder_flows, vote_chat_flows, log=log,
+        )
+    except Exception:
+        log(f"[bot_listener] admin panel action {item['id']!r} failed:\n{traceback.format_exc()}")
+        try:
+            await api.send_message(
+                chat_id,
+                "Не получилось. Попробуй ещё раз или набери команду вручную.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+        except Exception:
+            pass
+    return True
+
+
 def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
     # A private chat (DM) with the bot itself is always a legitimate input channel,
     # regardless of the group allowlist -- see _home_chat_ref: it's how you ask about the
@@ -3447,6 +3794,7 @@ async def maybe_send_menu(
     badge_flows: dict[str, dict],
     menu_last_sent: dict,
     button_builder_flows: dict[str, dict] | None = None,
+    admin_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Answer an otherwise-unhandled DM with the cabinet menu.
@@ -3474,6 +3822,8 @@ async def maybe_send_menu(
     if _has_pending_flow(
         button_builder_flows or {}, chat_id, user_id, BUTTON_BUILDER_FLOW_TTL_SECONDS
     ):
+        return
+    if _has_pending_flow(admin_flows or {}, chat_id, user_id, admin_menu.FLOW_TTL_SECONDS):
         return
 
     now = time.monotonic()
@@ -8897,6 +9247,7 @@ async def _dispatch_update(
     cabinet_flows: dict[str, dict],
     menu_last_sent: dict,
     button_builder_flows: dict[str, dict] | None = None,
+    admin_flows: dict[str, dict] | None = None,
     vote_chat_flows: dict[str, dict] | None = None,
     vote_result_flows: dict[str, dict] | None = None,
     pets_flows: dict[str, dict] | None = None,
@@ -8912,6 +9263,7 @@ async def _dispatch_update(
     can't take the rest of the process down with it -- run_bot_listener's own try/except
     around this call is strictly a last-resort backstop, not the primary safety net."""
     button_builder_flows = button_builder_flows if button_builder_flows is not None else {}
+    admin_flows = admin_flows if admin_flows is not None else {}
     vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
     vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
     pets_flows = pets_flows if pets_flows is not None else {}
@@ -8973,6 +9325,14 @@ async def _dispatch_update(
                 _stats_entry_for(callback.get("message", {}).get("chat", {}), None, home_chat_ref),
                 pets_flows, background_tasks, bot_username=bot_username,
                 known_chat_ids=known_chat_ids, log=log,
+            )
+        elif callback_data.startswith(f"{admin_menu.CALLBACK_PREFIX}:"):
+            # DM-only like the panel itself, so the chat every action is about is the home
+            # chat -- the DM the button was pressed in has nothing to manage.
+            await handle_admin_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, admin_flows,
+                bot_username, background_tasks, known_chat_ids, badge_flows,
+                button_builder_flows, vote_chat_flows, log=log,
             )
         elif callback_data.startswith(f"{via_cleaner.CALLBACK_PREFIX}:"):
             # The menu is DM-only, so the chat it is about is always the home chat -- the
@@ -9176,6 +9536,16 @@ async def _dispatch_update(
             api, message, home_chat_ref, admin_chat_id, button_builder_flows
         )
         return
+    if re.match(rf"^{re.escape(ADMIN_MENU_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_admin_command(api, message, home_chat_ref, admin_chat_id, log=log)
+        return
     if any(
         re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
         for spelling in VIA_CLEANER_COMMANDS
@@ -9254,6 +9624,16 @@ async def _dispatch_update(
             tz,
             log=log,
         )
+        return
+
+    # First among the force-reply consumers: an admin panel prompt is the only one that
+    # can end in somebody else's handler, and correlating on the prompt's own message id
+    # means it claims nothing that was not an answer to it.
+    if await handle_admin_text_input(
+        api, telethon_client, cfg, tz, message, home_chat_ref, admin_flows,
+        bot_username, background_tasks, known_chat_ids, badge_flows,
+        button_builder_flows, vote_chat_flows, log=log,
+    ):
         return
 
     if await handle_button_builder_text_input(
@@ -9572,7 +9952,7 @@ async def _dispatch_update(
         await maybe_send_menu(
             api, telethon_client, tz, message, home_chat_ref,
             cabinet_flows, badge_flows, menu_last_sent,
-            button_builder_flows=button_builder_flows, log=log,
+            button_builder_flows=button_builder_flows, admin_flows=admin_flows, log=log,
         )
         return
 
@@ -9690,6 +10070,10 @@ async def run_bot_listener(
     # Short-lived /buttons conversations. Published posts and their counters are
     # persisted separately by stats.py; only the unfinished constructor lives here.
     button_builder_flows: dict[str, dict] = {}
+    # Short-lived /admin prompts -- the one question an `ask` button asked, and nothing
+    # else. Panel navigation keeps no state at all (every button carries its own action
+    # id), so a restart costs an administrator a half-typed answer and never a permission.
+    admin_flows: dict[str, dict] = {}
     # Short-lived "/vote chat" draft-text prompts. The finished announcement itself is
     # just sent, not persisted anywhere -- losing this on a restart costs the admin one
     # re-press, same as every other force-reply flow here.
@@ -9809,7 +10193,8 @@ async def run_bot_listener(
                             summary_queue, background_tasks, home_chat_ref,
                             known_chat_ids, badge_flows,
                             cabinet_flows, menu_last_sent,
-                            button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows,
+                            button_builder_flows=button_builder_flows, admin_flows=admin_flows,
+                            vote_chat_flows=vote_chat_flows,
                             vote_result_flows=vote_result_flows, pets_flows=pets_flows, log=log,
                         ),
                         update.get("update_id"),
