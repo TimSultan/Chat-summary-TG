@@ -10105,6 +10105,21 @@ async def _dispatch_update(
     )
 
 
+async def _supervise_service_tasks(tasks) -> None:
+    """Run long-lived sibling services and always drain them on the way out.
+
+    One crashed loop must not leave the others briefly alive against resources the caller
+    is about to tear down, such as the shared Bot API ClientSession.
+    """
+    running = [asyncio.create_task(task) for task in tasks]
+    try:
+        await asyncio.gather(*running)
+    finally:
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+
+
 async def run_bot_listener(
     bot_token: str,
     cfg,
@@ -10851,7 +10866,7 @@ async def run_bot_listener(
             )
         else:
             log("[bot_listener] PORT is not set -- the voting page is not being served.")
-        await asyncio.gather(*tasks)
+        await _supervise_service_tasks(tasks)
 
 
 async def main():
