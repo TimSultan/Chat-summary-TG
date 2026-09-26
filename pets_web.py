@@ -5295,7 +5295,11 @@ PAGE_HTML = """<!doctype html>
                     display: flex; align-items: center; justify-content: center; }
   .cardtop button:last-child { justify-self: end; }
   .cardturn { text-align: center; font-size: 12px; font-weight: 800; color: var(--muted);
-              letter-spacing: .08em; text-transform: uppercase; }
+              letter-spacing: .08em; text-transform: uppercase; line-height: 1.25; }
+  /* The two piles, under the turn number: counted once a turn, so they share the top
+     bar instead of costing the player's panel a row the hand needs. */
+  .cardturn small { display: block; font-size: 10px; font-weight: 600; letter-spacing: 0;
+                    text-transform: none; }
 
   /* The stage grows into whatever height the phone has, and the gap it grows is the
      middle of the table: where a played card is held up before it is thrown. */
@@ -5329,7 +5333,7 @@ PAGE_HTML = """<!doctype html>
   /* Bigger faces where the phone has the height: the portraits are the players' own
      painted miniatures, and a tall screen has nothing better to spend the room on. */
   @media (min-height: 720px) {
-    .cardside .av { width: 58px; height: 58px; border-radius: 14px; }
+    .cardside .av { width: 54px; height: 54px; border-radius: 13px; }
   }
   .cardwho { min-width: 0; }
   .cardhead { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -5381,19 +5385,19 @@ PAGE_HTML = """<!doctype html>
   /* The opponent's whole announced turn, as a row of tiles along the bottom of their own
      panel: what each card mainly does and by how much. The whole card is one tap away;
      the tiles are for reading a turn in the same glance as the bar it will cut into. */
-  .cardintent { grid-column: 1 / -1; margin-top: 3px; padding-top: 7px;
+  .cardintent { grid-column: 1 / -1; margin-top: 3px; padding-top: 6px;
                 border-top: 1px dashed rgba(217,138,90,.3); }
-  .cardintent h3 { margin: 0 0 6px; font-size: 11px; font-weight: 700; color: var(--muted); }
+  .cardintent h3 { margin: 0 0 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
   .cardintent.stunned .cardtiles { opacity: .4; }
   .cardtiles { display: flex; flex-wrap: wrap; gap: 6px; }
-  .cardtile { position: relative; width: 52px; height: 50px; padding: 0; color: var(--fg);
+  .cardtile { position: relative; width: 52px; height: 44px; padding: 0; color: var(--fg);
               display: flex; flex-direction: column; align-items: center; justify-content: center;
               gap: 2px; border-radius: 11px; border: 1px solid rgba(217,138,90,.5);
               background: rgba(217,138,90,.10); touch-action: manipulation; }
   .cardtile.r-legendary { border-color: var(--r-legendary); background: rgba(176,107,224,.14); }
   .cardtile.r-magic { border-color: var(--r-rare); background: rgba(51,144,236,.12); }
   .cardtile.r-ultimate { border-color: var(--xp); background: rgba(76,175,114,.12); }
-  .cardtile .ti { font-size: 17px; line-height: 1; }
+  .cardtile .ti { font-size: 16px; line-height: 1; }
   .cardtile .tn { font-size: 12px; font-weight: 800; line-height: 1.1;
                   font-variant-numeric: tabular-nums; }
   .cardtile .tx { position: absolute; top: -6px; right: -6px; font-size: 10px; line-height: 1;
@@ -5401,32 +5405,31 @@ PAGE_HTML = """<!doctype html>
                   border: 1px solid var(--line); }
 
   /* Energy as orbs rather than "2 / 3": a count read in the same glance as the cost
-     bubbles it is spent on, and green like them. */
-  .cardmeta { grid-column: 1 / -1; display: flex; justify-content: space-between;
-              align-items: center; gap: 8px; margin-top: 3px; }
-  .cardenergy { display: flex; align-items: center; gap: 4px; font-size: 14px;
+     bubbles it is spent on, and green like them. On the player's name line, so it takes
+     no row of its own away from the hand. */
+  .cardenergy { flex: none; display: flex; align-items: center; gap: 3px; font-size: 13px;
                 font-weight: 800; color: var(--xp); }
-  .cardenergy i { width: 13px; height: 13px; border-radius: 50%;
+  .cardenergy i { width: 12px; height: 12px; border-radius: 50%;
                   border: 2px solid var(--xp); opacity: .45; }
   .cardenergy i.on { background: var(--xp); opacity: 1; box-shadow: 0 0 7px rgba(76,175,114,.55); }
-  .cardpiles { font-size: 11px; color: var(--muted); text-align: right; white-space: nowrap; }
 
   /* The whole hand at once, three to a row -- never a sideways scroller that hides half
-     of it. The top padding is room for a picked-up card to lift into. min-height, so the
-     block keeps its size when the hand empties at the end of a turn: without it the page
-     jumps at exactly the moment the opponent's cards start flying. */
+     of it. No height cap of its own: with every card's rules printed on it, a hand can
+     be taller than a short phone, and then the whole table scrolls under the pinned
+     button rather than the hand scrolling inside it. min-height, so the block keeps its
+     size when the hand empties at the end of a turn: without it the page jumps at
+     exactly the moment the opponent's cards start flying. */
   .cardhand { flex: none; display: flex; flex-direction: column; }
   .cardrow { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px;
-             padding: 8px 3px 2px; min-height: 96px; max-height: 44vh; overflow-y: auto;
-             overscroll-behavior: contain; }
+             padding: 4px 3px 2px; min-height: 96px; overscroll-behavior: contain; }
   .cardwait { flex: 1; align-items: center; justify-content: center; text-align: center;
               color: var(--muted); font-size: 13px; font-style: italic; }
   .cardempty { align-self: center; }
 
   .card { flex: 0 0 calc((100% - 12px) / 3); max-width: 132px; min-height: 94px;
-          display: flex; flex-direction: column; gap: 4px; text-align: left;
+          display: flex; flex-direction: column; gap: 3px; text-align: left;
           background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-          padding: 29px 8px 8px; position: relative; color: var(--fg);
+          padding: 27px 7px 7px; position: relative; color: var(--fg);
           touch-action: manipulation; -webkit-tap-highlight-color: transparent;
           transition: transform .14s ease-out, box-shadow .14s ease-out, opacity .14s; }
   .card.r-legendary { border-color: var(--r-legendary); box-shadow: 0 0 12px rgba(176,107,224,.28);
@@ -5437,15 +5440,12 @@ PAGE_HTML = """<!doctype html>
                   background: linear-gradient(180deg, rgba(51,144,236,.14), var(--card) 55%); }
   .card.r-ultimate { border-color: var(--xp); box-shadow: 0 0 13px rgba(120,200,120,.26);
                      background: linear-gradient(180deg, rgba(76,175,114,.16), var(--card) 55%); }
-  /* A card the turn cannot pay for is dimmed and its cost goes red, but it is never
-     disabled: a disabled button cannot be tapped to find out what the card does. */
-  .card.poor { opacity: .5; }
+  /* A card the turn cannot pay for is dimmed -- not so far that its rules stop being
+     readable -- and its cost goes red. Never disabled: a tap on it says why it will not
+     play, where a disabled button would just ignore the finger. */
+  .card.poor { opacity: .55; }
   .card.poor .cardcost { background: var(--hp); color: #fff; }
-  /* Picked up: lifted out of the row and ringed, while its rules text is read over the
-     button. A second tap on it plays it. */
-  .card.picked { opacity: 1; transform: translateY(-7px); border-color: var(--accent);
-                 box-shadow: 0 0 0 2px var(--accent), 0 10px 20px rgba(0,0,0,.4); z-index: 1; }
-  .card:active:not(.picked) { transform: translateY(-3px); filter: brightness(1.2); }
+  .card:active:not(.poor) { transform: translateY(-3px); filter: brightness(1.2); }
   /* Dealing a new hand. Each card turns face-up in place, a beat after the one before it,
      so a turn opens with something to watch instead of five cards appearing at once. */
   @keyframes carddeal {
@@ -5467,15 +5467,13 @@ PAGE_HTML = """<!doctype html>
   .cardtags i { font-style: normal; font-size: 10px; font-weight: 700; line-height: 1.4;
                 border-radius: 5px; padding: 1px 5px; background: var(--sunken);
                 color: var(--accent); }
-  /* The rules text is read once a card is picked up, in the panel over the button at a
-     size that can be read. In a row of five cards it was ten pixels high and mostly off
-     the edge of the screen. */
-  .cardtext { font-size: 10px; line-height: 1.35; color: var(--muted); display: none; }
+  /* The rules text lives on the card itself, always: one tap plays a card, so what it
+     does has to be readable before that tap, not after it. */
+  .cardtext { font-size: 10px; line-height: 1.28; color: var(--muted); }
 
-  /* Over the button: the picked card's rules, or -- with nothing picked -- what ending
-     the turn now would cost. Fixed height, so picking a card never moves the button. */
-  /* Pinned to the bottom edge: on a phone too short for the whole table the hand scrolls
-     under it, and the button a turn ends with never leaves the screen. */
+  /* Over the button: what ending the turn now would cost. Pinned to the bottom edge: on
+     a phone too short for the whole table the hand scrolls under it, and the button a
+     turn ends with never leaves the screen. */
   .cardbar { flex: none; display: grid; gap: 8px; position: sticky; bottom: 0; z-index: 2;
              background: var(--bg); padding-top: 4px; }
   /* ...with a short fade over its top edge, so a hand scrolled under it looks like it
@@ -5483,15 +5481,11 @@ PAGE_HTML = """<!doctype html>
   .cardbar::before { content: ""; position: absolute; left: 0; right: 0; top: -10px;
                      height: 10px; pointer-events: none;
                      background: linear-gradient(rgba(23,33,43,0), var(--bg)); }
-  .carddetail { min-height: 40px; font-size: 13px; line-height: 1.35; }
-  .carddetail .hd { font-weight: 700; }
-  .carddetail .tx { font-size: 12px; color: var(--muted); overflow: hidden;
-                    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
-  .carddetail.forecast { display: flex; flex-direction: column; align-items: center;
-                         justify-content: center; text-align: center; color: var(--muted); }
+  .carddetail { min-height: 20px; font-size: 13px; line-height: 1.35; text-align: center;
+                color: var(--muted); }
   .carddetail .harm { color: var(--hp); }
   .carddetail .safe { color: var(--xp); }
-  .cardbtns { display: grid; grid-template-columns: 1fr 52px; gap: 8px; }
+  .cardbtns { display: grid; gap: 8px; }
   .cardbtns.one { grid-template-columns: 1fr; }
   .cardbtns.two { grid-template-columns: 1fr 1fr; }
   .cardbtns .go { min-height: 48px; font-size: 15px; }
@@ -5528,7 +5522,6 @@ PAGE_HTML = """<!doctype html>
              transform-origin: 50% 50%; will-change: transform, opacity; }
   .cardfly .card { width: 132px; max-width: none; min-height: 0; overflow: hidden;
                    box-shadow: 0 14px 30px rgba(0,0,0,.5); }
-  .cardfly .cardtext { display: block; }
   /* What a card just did, said over the face it did it to. */
   .cardfloat { position: fixed; z-index: 96; pointer-events: none; white-space: nowrap;
                font-size: 19px; font-weight: 800; text-shadow: 0 2px 5px rgba(0,0,0,.8);
@@ -5564,10 +5557,9 @@ PAGE_HTML = """<!doctype html>
     .cardintent { padding-top: 5px; }
     .cardintent h3 { margin-bottom: 4px; }
     .cardtiles { gap: 5px; }
-    .cardtile { width: 48px; height: 42px; }
+    .cardtile { width: 48px; height: 40px; }
     .cardtile .ti { font-size: 15px; }
     .card { min-height: 84px; padding-top: 27px; }
-    .carddetail { min-height: 34px; }
     .cardbtns .go { min-height: 44px; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -5580,7 +5572,7 @@ PAGE_HTML = """<!doctype html>
   .cardpeek .card { flex: none; width: 220px; max-width: none; padding: 34px 12px 12px; }
   .cardpeek .cardname { font-size: 15px; -webkit-line-clamp: 3; }
   .cardpeek .cardtags i { font-size: 12px; }
-  .cardpeek .cardtext { display: block; font-size: 12px; }
+  .cardpeek .cardtext { font-size: 12px; }
   .cardlog { max-height: 55vh; overflow-y: auto; font-size: 12px; line-height: 1.5; }
   .cardlog div { padding: 2px 0; border-bottom: 1px solid var(--line); }
   .cardlog div:last-child { border-bottom: 0; }
@@ -6341,13 +6333,10 @@ let CARD_BATTLE = null, CARD_SESSION = null, CARD_FACES = null, CARD_INFO = null
 // Which turn's hand has already been dealt on screen. Playing a card re-renders the same
 // turn, and re-running the deal on every tap would flip the whole hand back over.
 let CARD_DEALT_TURN = 0;
-// The card picked up out of the hand (its uid) -- lifted, with its rules over the button.
 // CARD_SHOWN is both fighters as last painted, which is what a hit is measured against.
-// CARD_PLAYS counts cards played since the page opened: the how-to line over the button
-// is there until the first one, once, rather than again in every duel.
 // CARD_LOG is the running record the server sends one action's worth of at a time.
 // CARD_PLAYBACK/CARD_SKIP/CARD_FLIGHT let a tap fast-forward the opponent's turn.
-let CARD_PICK = null, CARD_SHOWN = null, CARD_PLAYS = 0, CARD_LOG = [], CARD_LOG_TURN = 1,
+let CARD_SHOWN = null, CARD_LOG = [], CARD_LOG_TURN = 1,
     CARD_PLAYBACK = false, CARD_SKIP = false, CARD_FLIGHT = null;
 // Whether the farm tab is showing the meadow board instead of the farm/quarry panels.
 // Not derived from S.meadow.round alone: a FINISHED round stays in the store until the
@@ -8687,11 +8676,10 @@ function cardMarkup(card, playable, affordable, deal) {
     ? ' dealt" style="animation-delay:' + Number(deal) * 60 + 'ms'
     : "";
   if (!playable) return '<div class="card' + kind + flip + '">' + body + "</div>";
-  // Dimmed when the turn cannot pay for it, never disabled: every card in the hand can be
-  // picked up and read, and a disabled button cannot be tapped to find out what it does.
-  const state = (affordable ? "" : " poor") + (card.uid === CARD_PICK ? " picked" : "");
-  return '<button class="card' + kind + state + flip + '" data-cardpick="' +
-    esc(card.uid || "") + '">' + body + "</button>";
+  // One tap plays it. Dimmed when the turn cannot pay for it, but never disabled: the tap
+  // then says why nothing happened, where a disabled button would just ignore the finger.
+  return '<button class="card' + kind + (affordable ? "" : " poor") + flip +
+    '" data-cardplay="' + esc(card.uid || "") + '">' + body + "</button>";
 }
 
 // The one thing an announced card is mainly about, for the tile it is announced on: the
@@ -8750,17 +8738,18 @@ function cardBadges(fighter) {
 }
 
 // One fighter's panel: face, name, block, health bar, and whatever is stuck to them.
-// `extra` is what spans the panel's foot -- the opponent's announced turn on theirs, the
-// energy and the piles on the player's. The bars are drawn where they stood on screen
-// before this render, so paintCardSide can slide them to where they stand now.
-function cardSide(fighter, face, side, extra, acting) {
+// `extra` is what spans the panel's foot -- the opponent's announced turn on theirs --
+// and `badge` goes at the end of the name line: the player's energy. The bars are drawn
+// where they stood on screen before this render, so paintCardSide can slide them to
+// where they stand now.
+function cardSide(fighter, face, side, extra, acting, badge) {
   const shown = cardHpPct((CARD_SHOWN && CARD_SHOWN[side]) || fighter);
   return '<div class="cardside ' + esc(side) + (acting ? " acting" : "") +
     (fighter.block ? " blocked" : "") + '" data-side="' + esc(side) + '">' +
     '<span class="av">' + shot((face || {}).portrait, (face || {}).crop) + "</span>" +
     '<div class="cardwho"><div class="cardhead"><span class="who">' +
       esc(fighter.name || "—") + '</span><span class="cardblock">' + cardBlock(fighter) +
-      "</span></div>" +
+      "</span>" + (badge || "") + "</div>" +
       '<div class="cardhp"><i class="trail" style="width:' + shown + '%"></i>' +
         '<i class="fill" style="width:' + shown + '%"></i><i class="ghost"></i>' +
         '<span class="cardnums">' + cardNums(fighter) + "</span></div>" +
@@ -8850,8 +8839,8 @@ function paintForecast() {
   }
 }
 
-// The line over the end-turn button while no card is picked up: what ending the turn now
-// would cost, in the words the decision needs.
+// The line over the end-turn button: what ending the turn now would cost, in the words
+// the decision needs.
 function cardForecastLine(battle) {
   const future = battle.forecast;
   if (!future) return "";
@@ -8864,40 +8853,20 @@ function cardForecastLine(battle) {
   return 'Если закончить ход: <b class="safe">без потерь</b>';
 }
 
-// The energy left, and the two piles. The piles are only counted: the order of the draw
-// pile is the server's.
-function cardMeta(battle) {
+// The energy left this turn, one orb per point.
+function cardEnergy(battle) {
   const energy = Number(battle.energy || 0);
   const orbs = Math.min(8, Math.max(energy, Number(battle.max_energy || 0)));
   let marks = "";
   for (let i = 0; i < orbs; i++) marks += '<i class="' + (i < energy ? "on" : "") + '"></i>';
-  return '<div class="cardmeta"><span class="cardenergy" aria-label="Энергия ' + energy +
-    '">⚡' + marks + (energy > 8 ? " " + energy : "") + "</span>" +
-    '<span class="cardpiles">Колода ' + Number(battle.deck.draw) + " · Сброс " +
-    Number(battle.deck.discard) + "</span></div>";
+  return '<span class="cardenergy" aria-label="Энергия ' + energy + '">⚡' + marks +
+    (energy > 8 ? " " + energy : "") + "</span>";
 }
 
-// Over the button: the picked card's rules and the button that plays it, or -- with
-// nothing picked up -- the forecast and the button that ends the turn.
-function cardActions(battle, picked) {
-  if (picked) {
-    const cost = Number(picked.cost || 0);
-    const affordable = cost <= Number(battle.energy || 0);
-    return '<div class="cardbar"><div class="carddetail"><div class="hd">' +
-        esc(picked.icon || "") + " " + esc(picked.name || "") + '</div><div class="tx">' +
-        esc(picked.effect || "") + "</div></div>" +
-      '<div class="cardbtns"><button class="go" data-cardplay="' + esc(picked.uid || "") + '"' +
-        (affordable ? "" : " disabled") + ">" +
-        (affordable ? "Сыграть · ⚡" + cost : "Нужно ⚡" + cost + " — осталось " +
-          Number(battle.energy || 0)) + "</button>" +
-      '<button class="go sec" data-cardbattle="unpick" aria-label="Положить обратно">✕</button>' +
-      "</div></div>";
-  }
+// Under the hand: the forecast, and the button that ends the turn.
+function cardActions(battle) {
   const payable = battle.hand.some((card) => Number(card.cost || 0) <= Number(battle.energy || 0));
-  return '<div class="cardbar"><div class="carddetail forecast"><div>' +
-      cardForecastLine(battle) + "</div>" +
-      (CARD_PLAYS ? "" : '<div class="tiny">Нажми на карту, чтобы прочитать её, ещё раз — сыграть.</div>') +
-    "</div>" +
+  return '<div class="cardbar"><div class="carddetail">' + cardForecastLine(battle) + "</div>" +
     '<div class="cardbtns one"><button class="go' + (payable ? "" : " pulse") +
       '" data-cardbattle="end">⏭ Закончить ход</button></div></div>';
 }
@@ -9065,8 +9034,6 @@ function renderCardBattle(box) {
   // A hand is dealt once per turn. Re-rendering the same turn (which every played card
   // does) must not flip the remaining cards back over.
   const dealing = battle.turn !== CARD_DEALT_TURN;
-  if (over || !battle.hand.some((card) => card.uid === CARD_PICK)) CARD_PICK = null;
-  const picked = battle.hand.find((card) => card.uid === CARD_PICK) || null;
   const stunned = Number((foe.status || {}).stun || 0) > 0;
 
   // The opponent's whole announced turn sits on the opponent's own panel -- where the
@@ -9087,13 +9054,16 @@ function renderCardBattle(box) {
   box.innerHTML = '<div class="cardduel" id="cardDuel">' +
     '<div class="cardtop">' +
       '<button data-cardbattle="' + (over ? "close" : "leave") + '" aria-label="Выйти">✕</button>' +
-      '<span class="cardturn">' + (over ? "Бой окончен" : "Ход " + Number(battle.turn)) + "</span>" +
+      '<span class="cardturn">' + (over ? "Бой окончен" : "Ход " + Number(battle.turn) +
+        // Only counted: the order of the draw pile is the server's.
+        "<small>Колода " + Number(battle.deck.draw) + " · Сброс " +
+        Number(battle.deck.discard) + "</small>") + "</span>" +
       '<button data-cardbattle="log" aria-label="Ход боя">📜</button>' +
     "</div>" +
     '<div class="cardstage" id="cardStage">' +
       cardSide(foe, faces.enemy, "enemy", plan, false) +
       '<div class="cardmid" id="cardMid"><span>⚔️</span></div>' +
-      cardSide(mine, faces.player, "player", over ? "" : cardMeta(battle), !over) +
+      cardSide(mine, faces.player, "player", "", !over, over ? "" : cardEnergy(battle)) +
     "</div>" +
     (over
       ? cardResult(battle)
@@ -9102,7 +9072,7 @@ function renderCardBattle(box) {
             ? battle.hand.map((card, index) => cardMarkup(
                 card, true, card.cost <= battle.energy, dealing ? index : -1)).join("")
             : "<div class='tiny muted cardempty'>Рука пуста.</div>") +
-        "</div></div>" + cardActions(battle, picked)) +
+        "</div></div>" + cardActions(battle)) +
     "</div>";
   paintShots(box);
   paintCardSide("enemy", foe);
@@ -9223,7 +9193,7 @@ async function openCardBattle(opponentId) {
   if (CARD_BUSY) return;
   CARD_BUSY = true;
   try {
-    CARD_REWARD = null; CARD_PICK = null; CARD_SHOWN = null;
+    CARD_REWARD = null; CARD_SHOWN = null;
     CARD_LOG = []; CARD_LOG_TURN = 1;
     CARD_DEALT_TURN = 0;                    // the opening hand deals itself
     cardBattleState(await api("/api/card-battle/start", { opponent_id: opponentId }));
@@ -9235,33 +9205,17 @@ async function openCardBattle(opponentId) {
   finally { CARD_BUSY = false; }
 }
 
-// The first tap on a card picks it up: it lifts out of the row and its rules take the
-// place of the forecast over the button, which becomes the button that plays it. A second
-// tap on the same card plays it too, so a player who knows the deck spends one extra tap,
-// not a trip down to another button. One tap used to play the card outright, from a row
-// where most of the hand and every card's rules text were off the edge of the screen.
-async function pickCard(uid) {
-  if (!CARD_BATTLE || CARD_BATTLE.finished || CARD_BUSY) return;
-  if (CARD_PICK === uid) {
-    const card = (CARD_BATTLE.hand || []).find((row) => row.uid === uid);
-    if (card && Number(card.cost || 0) > Number(CARD_BATTLE.energy || 0)) {
-      haptic("no"); toast("Не хватает энергии на эту карту."); return;
-    }
-    await playCard(uid);
-    return;
-  }
-  CARD_PICK = uid;
-  haptic();
-  render();
-}
-
+// One tap plays the card: its rules are printed on it, so there is nothing left to read
+// first. A card the turn cannot pay for says so instead of silently doing nothing.
 async function playCard(uid) {
   if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
   const card = (CARD_BATTLE.hand || []).find((row) => row.uid === uid);
-  if (!card || Number(card.cost || 0) > Number(CARD_BATTLE.energy || 0)) return;
+  if (!card) return;
+  if (Number(card.cost || 0) > Number(CARD_BATTLE.energy || 0)) {
+    haptic("no"); toast("Не хватает энергии на эту карту."); return;
+  }
   CARD_BUSY = true;
-  CARD_PICK = null;
-  const el = document.querySelector('[data-cardpick="' + uid + '"]');
+  const el = document.querySelector('.cardhand [data-cardplay="' + uid + '"]');
   try {
     // The flight and the request run together rather than one after the other, so the
     // animation is what the wait for the server is spent on instead of being added to it.
@@ -9269,7 +9223,6 @@ async function playCard(uid) {
       api("/api/card-battle/action", { session: CARD_SESSION, action: "play", card: uid }),
       flyCard(el, cardAvatar(cardTargetSide(card, "player")), card),
     ]);
-    CARD_PLAYS += 1;
     settleCardBattle(answers[0]);
   } catch (e) {
     if (el) el.style.visibility = "";        // the card never left: put it back
@@ -9290,7 +9243,6 @@ function cardActionFailed(error) {
 async function endCardTurn() {
   if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
   CARD_BUSY = true;
-  CARD_PICK = null;
   try {
     const data = await api("/api/card-battle/action",
                            { session: CARD_SESSION, action: "end_turn" });
@@ -9328,7 +9280,7 @@ document.addEventListener("click", (event) => {
 
 function closeCardBattle() {
   CARD_BATTLE = null; CARD_SESSION = null; CARD_FACES = null; CARD_INFO = null;
-  CARD_REWARD = null; CARD_DEALT_TURN = 0; CARD_PICK = null; CARD_SHOWN = null;
+  CARD_REWARD = null; CARD_DEALT_TURN = 0; CARD_SHOWN = null;
   CARD_LOG = [];
   closeSheet();
   unlockSwipes("cardduel");
@@ -11552,7 +11504,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-arenaretry],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
-    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardpick],[data-cardplay],[data-cardpeek],[data-cardstatus],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
+    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardplay],[data-cardpeek],[data-cardstatus],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply],[data-personalremove]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
@@ -11649,12 +11601,10 @@ async function handleClick(event, target) {
   if (d.testaction) { await testBattleAction(d.testaction); return; }
   if (d.testcatalog !== undefined) { showTestCatalog(); return; }
   if (d.cardfoe) { haptic(); await openCardBattle(d.cardfoe); return; }
-  if (d.cardpick) { await pickCard(d.cardpick); return; }
   if (d.cardplay) { await playCard(d.cardplay); return; }
   if (d.cardpeek !== undefined) { peekEnemyCard(Number(d.cardpeek)); return; }
   if (d.cardstatus) { cardStatusHint(d.cardstatus); return; }
   if (d.cardbattle === "end") { await endCardTurn(); return; }
-  if (d.cardbattle === "unpick") { CARD_PICK = null; render(); return; }
   if (d.cardbattle === "leave") { confirmCardLeave(); return; }
   if (d.cardbattle === "log") { showCardLog(); return; }
   if (d.cardbattle === "shut") { closeSheet(); return; }

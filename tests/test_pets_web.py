@@ -4827,27 +4827,31 @@ class CardAnimationContractTests(unittest.TestCase):
         stage = render.index('id="cardStage"')
         hand = render.index('id="cardHand"')
         self.assertLess(stage, hand, "the hand must come after the two fighters")
-        self.assertLess(hand, render.index("cardActions(battle, picked)"),
+        self.assertLess(hand, render.index("cardActions(battle)"),
                         "the button goes under the hand, where the thumb is")
         # Tiles in the markup, and the playback flies out of those tiles.
         self.assertIn("intent.map(cardTile)", render)
         self.assertIn('".cardintent .cardtile"', self._function("async function endCardTurn() {"))
 
-    def test_a_first_tap_picks_a_card_up_and_only_a_second_one_plays_it(self):
-        """One tap used to spend the energy, from a row where most of the hand and every
-        card's rules were off the edge of the screen."""
+    def test_one_tap_plays_a_card_whose_rules_are_printed_on_it(self):
+        """A tap plays the card outright, with nothing to confirm -- which is only fair
+        because every card in the hand carries its own rules text, readable before it."""
         markup = self._function("function cardMarkup(card, playable, affordable, deal) {")
-        self.assertIn("data-cardpick=", markup)
-        self.assertNotIn("data-cardplay", markup)
-        # Dimmed when unaffordable, never disabled -- a disabled card cannot be read.
+        self.assertIn('data-cardplay="', markup)
+        self.assertIn('class="cardtext"', markup)
+        # Dimmed when unaffordable but never disabled, so the tap can say why.
         self.assertNotIn('" disabled"', markup)
         self.assertIn('" poor"', markup)
-        pick = self._function("async function pickCard(uid) {")
-        self.assertIn("if (CARD_PICK === uid) {", pick)
-        self.assertIn("await playCard(uid);", pick)
-        actions = self._function("function cardActions(battle, picked) {")
-        self.assertIn('data-cardplay="', actions)
+        page = pets_web.PAGE_HTML
+        text = page.split("  .cardtext {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("display: none", text, "the rules must show on the card itself")
+        play = self._function("async function playCard(uid) {")
+        self.assertIn('toast("Не хватает энергии на эту карту.")', play)
+        self.assertNotIn("pickCard", self._script())
+        self.assertNotIn("data-cardpick", self._script())
+        actions = self._function("function cardActions(battle) {")
         self.assertIn('data-cardbattle="end"', actions)
+        self.assertNotIn("data-cardplay", actions)
 
     def test_leaving_a_paid_duel_asks_first(self):
         """The duel is paid for when it opens; walking out of it pays nothing back."""
