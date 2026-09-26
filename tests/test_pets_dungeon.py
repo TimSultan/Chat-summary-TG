@@ -16,7 +16,81 @@ import pets_scroll_catalog as SCROLLS
 import pets_ui
 
 
-class DungeonTests(unittest.TestCase):
+class DungeonTestCase(unittest.TestCase):
+    """A tamed hero in a throwaway store, plus the run helpers the suites share.
+
+    Holds no tests on purpose. The themed suites below used to subclass DungeonTests
+    itself to reach these helpers, which re-ran every one of its tests once per
+    subclass -- six copies of the same 58 tests.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.patch = patch("stats._stats_dir", return_value=Path(self.temp.name))
+        self.patch.start()
+        self.entry, self.user_id = "dungeon-test", "42"
+        pets.buy_cage(self.entry, self.user_id, 100_000)
+        pets.tame(self.entry, self.user_id, 100_000, "Hero", None, "Tester")
+
+    def tearDown(self):
+        self.patch.stop()
+        self.temp.cleanup()
+
+    def _unstoppable_runner(self, floor):
+        """A runner that always wins, parked on `floor` with a fresh run.
+
+        Unstoppable by STATS, which is only half of a fighter -- see `_rekill`, which
+        keeps the other half still.
+        """
+        data = pets._load(self.entry)
+        record = data["pets"][self.user_id]
+        record["level"] = 200
+        for key in pets_config.STAT_KEYS:
+            record["stats"][key] = 4_000
+        record["dungeon_run"] = {
+            "run_id": "run-a", "kills": 0, "floor": floor,
+            "hp": 99_999, "max_hp": 99_999, "cleared": [],
+        }
+        pets._save(self.entry, data)
+
+    def _rekill(self, floor, index=0, times=1):
+        """Kill the same encounter `times` over, resetting only what a re-entry resets.
+
+        The equipment is held still along with health so every repetition starts from the
+        exact same controlled combat state. Drops belong in the bag and must never change
+        this selected loadout between iterations.
+        """
+        payloads = []
+        equipped = dict(pets._load(self.entry)["pets"][self.user_id].get("equipped") or {})
+        for _ in range(times):
+            data = pets._load(self.entry)
+            data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
+            data["pets"][self.user_id]["dungeon_run"]["hp"] = 99_999
+            data["pets"][self.user_id]["equipped"] = dict(equipped)
+            pets._save(self.entry, data)
+            ok, _message, payload = pets.dungeon_fight(self.entry, self.user_id, index)
+            self.assertTrue(ok)
+            payloads.append(payload)
+        return payloads
+
+    def _enter_pack_floor(self):
+        """Stand a very strong hero on floor 2 -- the ten-enemy pack with two healers."""
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["stats"] = {
+            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
+        }
+        pets._save(self.entry, data)
+        pets.grant_dungeon_ticket(self.entry, self.user_id)
+        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
+        data = pets._load(self.entry)
+        data["pets"][self.user_id]["dungeon_run"]["floor"] = 2
+        data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
+        pets._save(self.entry, data)
+        return [row["index"] for row in dungeon.encounters_for_floor(2)
+                if row.get("healer")]
+
+
+class DungeonTests(DungeonTestCase):
     def test_phoenix_totem_is_sold_for_ten_diamonds(self):
         item = dungeon.shop_item("phoenix_totem")
         self.assertEqual(item["price"], dungeon.PHOENIX_TOTEM_RUBIES)
@@ -177,18 +251,6 @@ class DungeonTests(unittest.TestCase):
 
         self.assertTrue(ok, message)
         self.assertEqual(pets.dungeon_status(self.entry, self.user_id)["hp"], 275)
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.patch = patch("stats._stats_dir", return_value=Path(self.temp.name))
-        self.patch.start()
-        self.entry, self.user_id = "dungeon-test", "42"
-        pets.buy_cage(self.entry, self.user_id, 100_000)
-        pets.tame(self.entry, self.user_id, 100_000, "Hero", None, "Tester")
-
-    def tearDown(self):
-        self.patch.stop()
-        self.temp.cleanup()
 
     def test_floors_have_variable_story_driven_mob_counts_and_bosses(self):
         first = dungeon.encounters_for_floor(1)
@@ -798,43 +860,6 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(run["run_id"], "abc123")
         self.assertEqual(run["kills"], 7)
 
-    def _unstoppable_runner(self, floor):
-        """A runner that always wins, parked on `floor` with a fresh run.
-
-        Unstoppable by STATS, which is only half of a fighter -- see `_rekill`, which
-        keeps the other half still.
-        """
-        data = pets._load(self.entry)
-        record = data["pets"][self.user_id]
-        record["level"] = 200
-        for key in pets_config.STAT_KEYS:
-            record["stats"][key] = 4_000
-        record["dungeon_run"] = {
-            "run_id": "run-a", "kills": 0, "floor": floor,
-            "hp": 99_999, "max_hp": 99_999, "cleared": [],
-        }
-        pets._save(self.entry, data)
-
-    def _rekill(self, floor, index=0, times=1):
-        """Kill the same encounter `times` over, resetting only what a re-entry resets.
-
-        The equipment is held still along with health so every repetition starts from the
-        exact same controlled combat state. Drops belong in the bag and must never change
-        this selected loadout between iterations.
-        """
-        payloads = []
-        equipped = dict(pets._load(self.entry)["pets"][self.user_id].get("equipped") or {})
-        for _ in range(times):
-            data = pets._load(self.entry)
-            data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
-            data["pets"][self.user_id]["dungeon_run"]["hp"] = 99_999
-            data["pets"][self.user_id]["equipped"] = dict(equipped)
-            pets._save(self.entry, data)
-            ok, _message, payload = pets.dungeon_fight(self.entry, self.user_id, index)
-            self.assertTrue(ok)
-            payloads.append(payload)
-        return payloads
-
     def test_killing_the_same_mob_twice_does_not_replay_the_first_kills_loot(self):
         """The bug this guards: loot was keyed on floor+index alone.
 
@@ -926,22 +951,6 @@ class DungeonTests(unittest.TestCase):
         self.assertEqual(pets.cap_existing_dungeon_tickets([self.entry]),
                          {"players": 0, "tickets": 0})
         self.assertEqual(pets.dungeon_tickets(self.entry, self.user_id), 11)
-
-    def _enter_pack_floor(self):
-        """Stand a very strong hero on floor 2 -- the ten-enemy pack with two healers."""
-        data = pets._load(self.entry)
-        data["pets"][self.user_id]["stats"] = {
-            "strength": 900, "health": 900, "agility": 900, "luck": 900, "endurance": 1,
-        }
-        pets._save(self.entry, data)
-        pets.grant_dungeon_ticket(self.entry, self.user_id)
-        self.assertTrue(pets.enter_dungeon(self.entry, self.user_id)[0])
-        data = pets._load(self.entry)
-        data["pets"][self.user_id]["dungeon_run"]["floor"] = 2
-        data["pets"][self.user_id]["dungeon_run"]["cleared"] = []
-        pets._save(self.entry, data)
-        return [row["index"] for row in dungeon.encounters_for_floor(2)
-                if row.get("healer")]
 
     def test_the_pack_healers_raise_the_fallen_until_they_are_dead_themselves(self):
         healers = self._enter_pack_floor()
@@ -1242,7 +1251,7 @@ class DungeonTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(simulate.call_args.args[0].damage_multiplier, 5)
 
-class DungeonEndTests(DungeonTests):
+class DungeonEndTests(DungeonTestCase):
     """The descent has a bottom now.
 
     BOSSES is indexed modulo its own length, so floor 50 served the floor-5 boss again and
@@ -1328,7 +1337,7 @@ class DungeonEndTests(DungeonTests):
         self.assertIn("⬇️ Спуститься", labels)
 
 
-class DungeonRestTests(DungeonTests):
+class DungeonRestTests(DungeonTestCase):
     """Rests are rationed per run, and the ration is printed on the button that spends it."""
 
     def _cleared_floor(self, gold=100_000, rubies=50):
@@ -1466,7 +1475,7 @@ class DungeonRestTests(DungeonTests):
         self.assertEqual(run["full_heals_used"], 1)
 
 
-class HydraTests(DungeonTests):
+class HydraTests(DungeonTestCase):
     """The three-headed boss, which used to be mathematically unwinnable.
 
     Every head carried a FULL boss's health pool, each press resolved a single action, and
@@ -1629,7 +1638,7 @@ class ChestAndMimicModelTests(unittest.TestCase):
         )
 
 
-class ChestBetweenFloorsTests(DungeonTests):
+class ChestBetweenFloorsTests(DungeonTestCase):
     """The half the model was missing: the chest has to actually turn up, survive a
     reload, pay out, and above all leave the rest of the floor alone."""
 
@@ -1836,7 +1845,7 @@ class ChestBetweenFloorsTests(DungeonTests):
         self.assertEqual(state["last_haul"]["gold"], 640)
 
 
-class RunSummaryOnTheDefeatScreenTests(DungeonTests):
+class RunSummaryOnTheDefeatScreenTests(DungeonTestCase):
     """What a dead run was worth, on the screen the player is standing on when it dies.
 
     dungeon_finished_text existed and was tested, and no screen in the game ever called

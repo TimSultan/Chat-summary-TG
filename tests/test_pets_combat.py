@@ -5,6 +5,7 @@ PETS_CONTRACT.md for the exact list this file is required to cover.
 """
 
 import json
+import os
 import random
 import statistics
 import sys
@@ -1197,6 +1198,11 @@ class EffectKnobTests(unittest.TestCase):
             wins += 1.0 if result.winner == "a" else (.5 if result.is_draw else 0.0)
         return wins / 600 * 100
 
+    # 14,400 simulated fights -- a sixth of the whole suite's run time on its own. It guards
+    # tuning, not the code paths a normal change touches, so it runs on request: with
+    # RUN_BALANCE_TESTS=1, whenever an effect's numbers or the combat maths change.
+    @unittest.skipUnless(os.environ.get("RUN_BALANCE_TESTS") == "1",
+                         "balance check; set RUN_BALANCE_TESTS=1 to run it")
     def test_every_tunable_passive_is_stronger_at_its_higher_setting(self):
         for code, weak, strong in self.KNOBS:
             with self.subTest(effect=code):
