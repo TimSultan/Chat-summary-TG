@@ -112,19 +112,21 @@ CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
 # longer a separate passive-income building or any way to buy these levels.
 LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 
-# ------------------------------------------------------------------- closed features
-# Closed on 2026-09-26 to put the game's weight on quests, the arena and the dungeon.
-# The code stays: flipping a switch back reopens the feature with every player's farm
-# level, buildings and tools where they left them.
+# ----------------------------------------------------------------- feature switches
+# Both were closed on 2026-09-26 to put the game's weight on quests, the arena and the
+# dungeon; the farm and the quarry reopened later that day. Flipping a switch either way
+# keeps every player's farm level, buildings and tools where they left them.
 #
 # FARM_OPEN covers the quarry too. They share one screen and one pair of painted
 # figurines, and neither makes sense as the only job left. While closed, no shift can
 # start, farm levels pay no passive income, every ticket the game still hands out is a
 # meadow ticket, and the quests that only upgrade farm or quarry tools leave the deal.
-# The meadow itself stays open and lives in the dungeon now.
-FARM_OPEN = False
+# Closing is one-way for the tickets: pets.settle_closed_farm turns every held farm
+# ticket into a meadow ticket, and reopening does not turn them back (players may have
+# spent them). The meadow stays open either way and lives in the dungeon.
+FARM_OPEN = True
 FARM_CLOSED_NOTICE = "Ферма и карьер закрыты: игра теперь про квесты, арену и подземелье."
-CARD_DUEL_OPEN = False
+CARD_DUEL_OPEN = True
 CARD_DUEL_CLOSED_NOTICE = "Карточные бои отключены."
 
 # ------------------------------------------------------------------------------ farm

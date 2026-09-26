@@ -3063,17 +3063,21 @@ def meadow_tickets(entry, user_id) -> int:
     return _meadow_row(_load(entry), user_id)["tickets"]
 
 
-# How a "ticket" reward is labelled: a farm ticket while the farm is open, a meadow ticket
-# while it is closed (see grant_farm_ticket). Named in words as well as by icon, because
-# 🎫 also marks dungeon tickets in places.
-REWARD_TICKET_ICON = "🎟" if C.FARM_OPEN else "🎫"
-REWARD_TICKET_PLACE = "ферма" if C.FARM_OPEN else "поляна"
-REWARD_TICKET_TO = "на ферму" if C.FARM_OPEN else "на поляну"
+def reward_ticket() -> dict[str, str]:
+    """How a "ticket" reward is labelled: a farm ticket while the farm is open, a meadow
+    ticket while it is closed (see grant_farm_ticket). Named in words as well as by icon,
+    because 🎫 also marks dungeon tickets in places. The Mini App's rewardTicket() mirrors
+    it. Read at call time, not import time, so the switch can be flipped either way.
+    """
+    if C.FARM_OPEN:
+        return {"icon": "🎟", "place": "ферма", "to": "на ферму"}
+    return {"icon": "🎫", "place": "поляна", "to": "на поляну"}
 
-MEADOW_TICKET_SOURCES = (
-    "Билеты падают со смен на ферме и из подземелья." if C.FARM_OPEN
-    else "Билеты дают за квесты, покрас #япокрасил, мобов и подземелье."
-)
+
+def meadow_ticket_sources() -> str:
+    if C.FARM_OPEN:
+        return "Билеты падают со смен на ферме и из подземелья."
+    return "Билеты дают за квесты, покрас #япокрасил, мобов и подземелье."
 
 
 def grant_meadow_ticket(entry, user_id, count: int = 1, reason: str = "") -> int:
@@ -3170,7 +3174,7 @@ def start_meadow(entry, user_id, size: str) -> tuple[bool, str]:
             need = rules.tickets - row["tickets"]
             return False, (
                 f"Нужно {rules.tickets} 🎫 на {rules.title.lower()}, не хватает {need}. "
-                + MEADOW_TICKET_SOURCES
+                + meadow_ticket_sources()
             )
         row["tickets"] -= rules.tickets
         round_id = secrets.token_hex(8)

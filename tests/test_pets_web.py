@@ -3066,6 +3066,8 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;", page)
         self.assertNotIn("repeat(8, 1fr)", page.split("<nav", 1)[0].split(".tabs {", 1)[1][:400])
 
+    @patch("pets_config.FARM_OPEN", False)
+    @patch("pets_config.CARD_DUEL_OPEN", False)
     async def test_the_closed_farm_and_card_duel_leave_no_door_open(self):
         """Closed on the server, not just hidden: an old button or a crafted request is
         refused, the itemless screen still gets no bag, and the page draws neither."""
@@ -3094,6 +3096,18 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("renderMeadowScreen(box, meadow)", dungeon)
         farm = page.split("function renderFarm()", 1)[1].split("\n}", 1)[0]
         self.assertNotIn("meadow", farm.lower())
+
+    @patch("pets_config.FARM_OPEN", True)
+    async def test_a_reopened_farm_shows_its_tab_and_names_its_tickets(self):
+        """The switch is read per request: flipping it back shows the tab again and the
+        meadow stops telling players that quests pay its tickets."""
+        self._tame(PLAYER)
+        state = await (await self._get("/api/state", PLAYER)).json()
+        self.assertTrue(state["features"]["farm"])
+        self.assertIn("ферм", state["meadow"]["ticket_sources"])
+        body = await self._action(PLAYER, "farm_start", hours=4, view="farm")
+        self.assertNotEqual(body["message"], C.FARM_CLOSED_NOTICE)
+        self.assertIsNone(body["state"]["bag"])
 
     @patch("pets_config.FARM_OPEN", True)
     async def test_the_quarry_offers_the_same_early_recall_the_farm_does(self):

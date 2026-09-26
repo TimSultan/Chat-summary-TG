@@ -30,13 +30,22 @@ class PetUpdatesTests(unittest.TestCase):
         self.assertFalse(pets_updates.has_unread(entry, user_id))
         self.assertTrue(pets_updates.has_unread(entry, 43))
 
-    def test_latest_news_says_what_closed_and_where_the_meadow_went(self):
-        newest = pets_updates.latest("chat")
-        self.assertEqual(newest.id, "202609-quests-arena-dungeon")
+    def test_the_closing_note_says_what_closed_and_where_the_meadow_went(self):
+        note = {row.id: row for row in pets_updates.UPDATES}["202609-quests-arena-dungeon"]
         for closed in ("Ферма", "карьер", "карточные бои"):
-            self.assertIn(closed, newest.text)
-        self.assertIn("оплачены полностью", newest.text)
-        self.assertIn("Поляна переехала в подземелье", newest.text)
+            self.assertIn(closed, note.text)
+        self.assertIn("оплачены полностью", note.text)
+        self.assertIn("Поляна переехала в подземелье", note.text)
+
+    def test_latest_news_brings_the_farm_back_and_keeps_converted_tickets(self):
+        """Players read the closing note first, so this one has to take back its farm
+        half -- and say plainly that the tickets it converted are not converted back."""
+        newest = pets_updates.latest("chat")
+        self.assertEqual(newest.id, "202609-farm-and-quarry-return")
+        self.assertIn("Ферма и карьер", newest.title)
+        self.assertIn("билеты фермы", newest.text)
+        self.assertIn("такими и остаются", newest.text)
+        self.assertEqual((newest.reward_rubies, newest.reward_tickets), (0, 0))
 
     def test_card_duel_news_pays_ten_diamonds(self):
         note = {row.id: row for row in pets_updates.UPDATES}["202608-card-duels"]

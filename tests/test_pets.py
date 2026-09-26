@@ -4469,7 +4469,9 @@ class ClosedFarmTests(PetsTestCase):
 
     def setUp(self):
         super().setUp()
-        self.assertFalse(pets_config.FARM_OPEN, "these tests describe the closed farm")
+        closed = patch.object(pets_config, "FARM_OPEN", False)
+        closed.start()
+        self.addCleanup(closed.stop)
         self.entry = "closed-farm"
         self._tame(self.entry, "1")
 
@@ -4601,6 +4603,19 @@ class ClosedFarmTests(PetsTestCase):
         text, keyboard = pets_ui.meadow_view(self.entry, "1", 0)
         self.assertIn("dungeon", self._actions(keyboard))
         self.assertNotIn("ферм", text)
+        text, _keyboard = pets_ui.info_view("1")
+        self.assertNotIn("ферм", text)
+
+    def test_ticket_labels_follow_the_switch_both_ways(self):
+        """Read when drawn, not when the module loaded: the switch has been flipped both
+        ways in production, and a label frozen at import would name the wrong ticket."""
+        self.assertEqual(pets.reward_ticket()["place"], "поляна")
+        self.assertNotIn("ферм", pets.meadow_ticket_sources())
+        with patch.object(pets_config, "FARM_OPEN", True):
+            self.assertEqual(pets.reward_ticket()["place"], "ферма")
+            self.assertIn("ферм", pets.meadow_ticket_sources())
+            text, _keyboard = pets_ui.meadow_view(self.entry, "1", 0)
+            self.assertIn(pets.meadow_ticket_sources(), text)
 
 
 if __name__ == "__main__":

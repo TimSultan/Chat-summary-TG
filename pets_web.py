@@ -1152,7 +1152,7 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     # this is the one call standing between that and the browser, so it must never be
     # swapped for something that reads the round's raw `cells` list instead.
     state["meadow"] = pets.meadow_status(entry, user_id)
-    state["meadow"]["ticket_sources"] = pets.MEADOW_TICKET_SOURCES
+    state["meadow"]["ticket_sources"] = pets.meadow_ticket_sources()
     state["forge"] = pets.forge_status(entry, user_id)
     return state
 

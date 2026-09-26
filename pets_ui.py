@@ -1336,10 +1336,11 @@ def _legacy_quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, 
     )
     lines.append(escape(quest["technique"]))
     lines.append(f"\n💡 {escape(quest['hint'])}")
+    ticket = pets.reward_ticket()
     lines.append(
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · "
-        f"✨ {int(reward.get('xp', 0))} опыта · {pets.REWARD_TICKET_ICON} "
-        f"{int(reward.get('tickets', 0))} билет {pets.REWARD_TICKET_TO}"
+        f"✨ {int(reward.get('xp', 0))} опыта · {ticket['icon']} "
+        f"{int(reward.get('tickets', 0))} билет {ticket['to']}"
         f" · 🎁 шанс находки {round(float(reward.get('drop_chance', 0)) * 100)}%"
     )
     if reward.get("scroll_chance"):
@@ -1506,6 +1507,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
     )
     benefit = _quest_benefit_text(card)
     specialist_paint = str(card.get("code") or "").startswith("rune_paint_")
+    ticket = pets.reward_ticket()
     if specialist_paint:
         how_lines = [
             "1. Возьми новую, ещё не опубликованную работу и выполни три шага из блока «Техника».",
@@ -1529,7 +1531,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"\n<b>{'Как сдать' if specialist_paint else 'Как выполнить'}:</b>",
         *how_lines,
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
-        f"{pets.REWARD_TICKET_ICON} {int(reward.get('tickets', 0))} {pets.REWARD_TICKET_TO} · "
+        f"{ticket['icon']} {int(reward.get('tickets', 0))} {ticket['to']} · "
         f"🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
         scroll_reward,
         (f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>"
@@ -2223,7 +2225,7 @@ def meadow_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     rows = []
     if not active:
-        lines.append(f"\n<i>Копай клетки и ищи алмазы. {pets.MEADOW_TICKET_SOURCES}</i>")
+        lines.append(f"\n<i>Копай клетки и ищи алмазы. {pets.meadow_ticket_sources()}</i>")
         for option in status.get("meadows", []):
             title = escape(str(option.get("title") or ""))
             side = int(option.get("side", 0) or 0)
@@ -3590,7 +3592,8 @@ def mob_result_text(reward: dict, report: str) -> str:
     if rune.get("granted"):
         bits.append(f"🔮 {escape(str(rune.get('element') or 'руна'))} +{int(rune['granted'])}")
     if reward.get("farm_ticket"):
-        bits.append(f"{pets.REWARD_TICKET_ICON} {pets.REWARD_TICKET_PLACE} +1")
+        ticket = pets.reward_ticket()
+        bits.append(f"{ticket['icon']} {ticket['place']} +1")
     if reward.get("dungeon_ticket"):
         bits.append("🎫 подземелье +1")
     if bits:

@@ -412,6 +412,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("pet", actions)
         self.assertIn("info", actions)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_tamed_pet_menu_uses_two_button_rows_including_fight_notifications(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
@@ -425,9 +426,9 @@ class PetsCommandTests(unittest.TestCase):
             pets_ui.parse_callback(row[0]["callback_data"])[1]
             for row in keyboard["inline_keyboard"] if len(row) == 1
         ]
-        # The dungeon took the farm's slot when the farm closed, so it no longer needs a
-        # row of its own.
-        self.assertEqual(wide, ["dailybonus"])
+        # With the farm open, the farm has its slot beside the casino and the dungeon keeps
+        # a row of its own. (Closed, the dungeon takes that slot: see ClosedFarmTests.)
+        self.assertEqual(wide, ["dailybonus", "dungeon"])
         last = [pets_ui.parse_callback(b["callback_data"])[1]
                 for b in keyboard["inline_keyboard"][-1]]
         self.assertEqual(last, ["info", "main", "support"])
@@ -440,13 +441,13 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("quests", actions)
         self.assertNotIn("cage", actions)
         self.assertNotIn("collection", actions)
-        self.assertNotIn("farm", actions)
+        self.assertIn("farm", actions)
 
         labels = [[button["text"] for button in row] for row in keyboard["inline_keyboard"]]
-        # Quests lead the menu; the fights sit beside and below them.
+        # Quests lead the menu; the fights sit beside them.
         self.assertIn("📜 Квесты", labels[0][0])
         self.assertEqual(labels[0][1], "⚔️ Арена")
-        self.assertEqual(labels[1], ["🕳 Подземелье", "🎰 Казино"])
+        self.assertEqual(labels[1], ["🌾 Ферма", "🎰 Казино"])
         self.assertEqual(labels[2], ["🛒 Магазин", "🎒 Снаряжение"])
 
     def test_unselected_character_element_is_the_first_full_width_action(self):
@@ -582,13 +583,14 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(len(api.sent), 1)
         self.assertEqual(deletions, [])
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_how_to_play_button_opens_the_arena_rules(self):
         api = self._tap("info")
         self.assertIn("Как играть", api.edits[0]["text"])
         self.assertIn("/arena в личке бота", api.edits[0]["text"])
         self.assertIn("твой собственный покрас", api.edits[0]["text"])
-        self.assertIn("сражайся с игроками и мобами", api.edits[0]["text"])
-        self.assertNotIn("ферм", api.edits[0]["text"])
+        self.assertIn("Сражайся с игроками и мобами", api.edits[0]["text"])
+        self.assertIn("на ферму", api.edits[0]["text"])
         self.assertNotIn("Особые преимущества", api.edits[0]["text"])
 
     def test_creature_screen_owns_the_picture_and_cage_controls(self):
