@@ -1471,6 +1471,10 @@ def _farm_passive_terms(record: dict | None) -> tuple[int, int, int]:
     level = min(
         max(0, int((record or {}).get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL,
     )
+    if not C.FARM_OPEN:
+        # A closed farm produces nothing. The ledger still advances its checkpoint at a
+        # zero rate, so reopening later does not back-pay the closed months.
+        return level, 0, 0
     hero_level = max(1, int((record or {}).get("level", 1) or 1))
     return (
         level,
@@ -2096,6 +2100,8 @@ def start_farm(
     pet level, plus features, here rather than reading them live at settlement guarantees
     that progress made while the pet is away affects only the NEXT trip.
     """
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     moment = now or app_now()
     # Finish both due runs first so a user who opens the menu after a shift ends is not
     # stuck waiting for the background poller -- and, since the quarry now blocks the farm,
@@ -2758,7 +2764,15 @@ def grant_farm_ticket(entry, user_id, reason: str = "") -> bool:
         key = str(reason or "")
         if key and key in row["granted"]:
             return False
-        row["count"] += 1
+        if C.FARM_OPEN:
+            row["count"] += 1
+        else:
+            # With the farm closed, a ticket that only shortens a shift is worth nothing,
+            # so every source that still pays one -- quests, #япокрасил posts, mob drops
+            # -- pays a meadow ticket instead. The replay key stays in this row, so a
+            # replayed event is refused exactly as before.
+            _meadow_row(data, user_id)["tickets"] += 1
+            _metric_add(data, "meadow_tickets_granted", 1)
         if key:
             row["granted"] = (row["granted"] + [key])[-FARM_TICKET_GRANT_MEMORY:]
         _save(entry, data)
@@ -2907,6 +2921,19 @@ RUNE_TOOL_MASTERWORKS = {
     "rune_paint_miner": "miner",
     "rune_paint_phoenix": "phoenix_totem",
 }
+# The masterworks that only do anything on the farm or in the quarry.
+FARM_TOOLS = frozenset({"pickaxe", "shovel", "farmer", "miner"})
+
+
+def closed_quest_codes() -> frozenset:
+    """Quests kept out of the deal because all they upgrade is a closed farm or quarry.
+
+    Out of the deal only, like a moderator's switch: a card already on somebody's board
+    stays, so nobody halfway through a painting has it taken away.
+    """
+    if C.FARM_OPEN:
+        return frozenset()
+    return frozenset(code for code, tool in RUNE_TOOL_MASTERWORKS.items() if tool in FARM_TOOLS)
 
 
 def _tool_masterworks(data: dict, user_id) -> dict[str, bool]:
@@ -3036,6 +3063,19 @@ def meadow_tickets(entry, user_id) -> int:
     return _meadow_row(_load(entry), user_id)["tickets"]
 
 
+# How a "ticket" reward is labelled: a farm ticket while the farm is open, a meadow ticket
+# while it is closed (see grant_farm_ticket). Named in words as well as by icon, because
+# 🎫 also marks dungeon tickets in places.
+REWARD_TICKET_ICON = "🎟" if C.FARM_OPEN else "🎫"
+REWARD_TICKET_PLACE = "ферма" if C.FARM_OPEN else "поляна"
+REWARD_TICKET_TO = "на ферму" if C.FARM_OPEN else "на поляну"
+
+MEADOW_TICKET_SOURCES = (
+    "Билеты падают со смен на ферме и из подземелья." if C.FARM_OPEN
+    else "Билеты дают за квесты, покрас #япокрасил, мобов и подземелье."
+)
+
+
 def grant_meadow_ticket(entry, user_id, count: int = 1, reason: str = "") -> int:
     """Hand over meadow tickets and return the new total.
 
@@ -3130,7 +3170,7 @@ def start_meadow(entry, user_id, size: str) -> tuple[bool, str]:
             need = rules.tickets - row["tickets"]
             return False, (
                 f"Нужно {rules.tickets} 🎫 на {rules.title.lower()}, не хватает {need}. "
-                "Билеты падают со смен на ферме и из подземелья."
+                + MEADOW_TICKET_SOURCES
             )
         row["tickets"] -= rules.tickets
         round_id = secrets.token_hex(8)
@@ -3288,6 +3328,8 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
 
 
 def buy_pickaxe(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -3306,6 +3348,8 @@ def unlock_nmm_pickaxe(entry: str, user_id) -> bool:
 
 
 def buy_shovel(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -3321,6 +3365,8 @@ def buy_shovel(entry: str, user_id, xp: int) -> tuple[bool, str]:
 
 
 def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> tuple[bool, str]:
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     try:
         hours = int(hours)
     except (TypeError, ValueError):
@@ -3468,6 +3514,74 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
     }
 
 
+def settle_closed_farm(entries, now: datetime | None = None) -> dict:
+    """While the farm is closed, pay out everything it still owes, once.
+
+    Run at startup, and does two things in one write per store:
+
+    * Every farm and quarry shift ends and is paid in full. A running shift ends the way
+      a ticket ends it: only `ready_at` moves, so the payout is for the whole planned
+      length. That matters beyond fairness -- a pet on a farm shift cannot fight, and
+      with the farm's screen gone there would be no button left to call it back. Farms
+      settle through the ordinary bulk path, which also queues the usual "back from the
+      farm" message. The quarry only ever settles when its owner opens the Mini App, so
+      finished-but-uncollected quarry runs are paid here too, or a Telegram-only player
+      would never see them.
+    * Every farm ticket still held becomes a meadow ticket, one for one: a ticket that
+      only shortens a shift buys nothing now.
+
+    Idempotent: while closed nothing can start a shift or add a farm ticket (see
+    grant_farm_ticket), so a later start reads the store once and writes nothing.
+    """
+    ended = {"farm": 0, "quarry": 0, "tickets": 0, "ticket_holders": 0}
+    if C.FARM_OPEN:
+        return ended
+    moment = now or app_now()
+    for entry in entries:
+        farms = 0
+        quarries = []
+        with _farm_settlement_lock:
+            data = _load(entry)
+            changed = False
+            wallet = data.get("farm_tickets")
+            converted = 0
+            for user_id, row in (wallet.items() if isinstance(wallet, dict) else ()):
+                count = _safe_nonnegative_int(row.get("count")) if isinstance(row, dict) else 0
+                if not count:
+                    continue
+                _meadow_row(data, user_id)["tickets"] += count
+                row["count"] = 0
+                converted += count
+                ended["ticket_holders"] += 1
+            if converted:
+                _metric_add(data, "meadow_tickets_granted", converted)
+                ended["tickets"] += converted
+                changed = True
+            for user_id, record in data.get("pets", {}).items():
+                if not isinstance(record, dict):
+                    continue
+                farm = record.get("farm_run")
+                if isinstance(farm, dict):
+                    farms += 1
+                    if not _farm_run_ready(farm, moment):
+                        farm["ready_at"] = moment.isoformat()
+                        changed = True
+                if isinstance(record.get("quarry_run"), dict):
+                    quarries.append(str(user_id))
+                    if not _farm_run_ready(record["quarry_run"], moment):
+                        record["quarry_run"]["ready_at"] = moment.isoformat()
+                        changed = True
+            if changed:
+                _save(entry, data)
+        if farms:
+            settle_completed_farms(entry, now=moment)
+        for user_id in quarries:
+            settle_quarry(entry, user_id, now=moment)
+        ended["farm"] += farms
+        ended["quarry"] += len(quarries)
+    return ended
+
+
 def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
     """Spend a ticket to end the running shift right now, paid at its full planned length.
 
@@ -3557,6 +3671,8 @@ def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]
 
 def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
     """Upgrade the farm after banking passive gold at the old level's rate."""
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     moment = now or app_now()
     data = _load(entry)
     record = _tamed_record(data, user_id)
@@ -3588,6 +3704,8 @@ def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool,
 
 def upgrade_farm_feature(entry, user_id, xp, feature: str) -> tuple[bool, str]:
     """Buy one permanent farm feature (well, sprinkler, beds or tractor)."""
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     key = str(feature or "").strip().lower()
     spec = C.FARM_FEATURES.get(key)
     if spec is None:
@@ -6652,7 +6770,9 @@ def _credit_achievement_tickets(data: dict, user_id, items, *,
         # ago the farm key is simply gone and this loop would happily pay it a second time.
         # The farm half of an old claim was paid when it was claimed; only the meadow half
         # was ever missing.
-        for index in range(tickets if farm else 0):
+        # The farm half is skipped while the farm is closed: the meadow half below already
+        # pays the same count in the ticket that still buys something.
+        for index in range(tickets if farm and C.FARM_OPEN else 0):
             key = _achievement_farm_source(uid, item.code, index)
             if key in farm_row["granted"]:
                 continue
@@ -6910,7 +7030,8 @@ def _repair_shared_achievement_rewards(entry: str, user_id) -> bool:
                     changed = True
 
             # The old loop credited index zero, then rejected the rest as duplicates.
-            for index in range(1, max(0, int(item.farm_tickets))):
+            # Nothing to top up while the farm is closed: a farm ticket buys nothing.
+            for index in range(1, max(0, int(item.farm_tickets)) if C.FARM_OPEN else 1):
                 source = _achievement_farm_source(uid, item.code, index)
                 if source in farm_row["granted"]:
                     continue

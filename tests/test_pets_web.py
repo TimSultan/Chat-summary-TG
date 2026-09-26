@@ -434,6 +434,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["ok"], body["message"])
         self.assertTrue(body["state"]["has_cage"])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_the_state_survives_a_running_farm_and_its_live_timestamps(self):
         """Everything in the state is forwarded straight from pets.py, and some of what it
         returns is a live datetime rather than a string -- passive_income_status's
@@ -451,6 +452,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(state["farm"]["passive"]["next_hour"], (str, type(None)))
         self.assertTrue(state["farm"]["running"])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_quarry_exposes_four_reward_cards_and_starts_the_selected_duration(self):
         self._tame(PLAYER)
         data = pets._load(CHAT)
@@ -2390,6 +2392,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(refused.status, 403, f"{method} {path} let a player moderate")
             self.assertEqual((await refused.json())["error"], "NOT_AN_ADMIN")
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_a_moderator_accepts_a_quest_and_the_reward_lands_exactly_once(self):
         """Accept is a web button on a slow connection, so it will be double-tapped. The
         second press must find the row already decided and move no money at all."""
@@ -2526,6 +2529,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- the farm ticket ----------------------------------------------------------------
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_a_farm_ticket_ends_the_shift_immediately_without_touching_the_payout(self):
         """The ticket buys the waiting, not the work: the eight-hour reward has to survive
         being collected eight hours early, or the button is just a worse «Забрать сейчас»."""
@@ -2556,6 +2560,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         again = await self._action(PLAYER, "farm_ticket")
         self.assertFalse(again["ok"])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_the_farm_screen_only_offers_a_ticket_that_would_do_something(self):
         self._tame(PLAYER)
         self.assertTrue(pets.upgrade_farm(CHAT, PLAYER["id"], RICH_XP)[0])
@@ -3056,10 +3061,41 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(tabs.index('data-tab="dungeon"'), tabs.index('data-tab="farm"'))
         hero = page.split("function renderHero()", 1)[1].split("function tile(", 1)[0]
         self.assertNotIn("dungeonPanel()", hero)
-        # The grid has to grow with the row, or the new tab overflows the bar.
-        self.assertIn("grid-template-columns: repeat(8, 1fr);", page)
-        self.assertIn(".tabs.has-review { grid-template-columns: repeat(9, 1fr); }", page)
+        # One column per VISIBLE tab: the admin review tab and a closed feature's tab come
+        # and go, and a fixed column count would leave holes in the bar.
+        self.assertIn("display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;", page)
+        self.assertNotIn("repeat(8, 1fr)", page.split("<nav", 1)[0].split(".tabs {", 1)[1][:400])
 
+    async def test_the_closed_farm_and_card_duel_leave_no_door_open(self):
+        """Closed on the server, not just hidden: an old button or a crafted request is
+        refused, the itemless screen still gets no bag, and the page draws neither."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        body = await self._action(PLAYER, "farm_start", hours=4, view="dungeon")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["message"], C.FARM_CLOSED_NOTICE)
+        self.assertIsNone(body["state"]["bag"])
+        self.assertEqual(body["state"]["features"], {"farm": False, "card_duel": False})
+        self.assertIn("подземелье", body["state"]["meadow"]["ticket_sources"])
+
+        duel = await self._post("/api/card-battle/start", PLAYER,
+                                {"opponent_id": str(OPPONENT["id"])})
+        self.assertEqual(duel.status, 409, await duel.text())
+        self.assertEqual((await duel.json())["error"], "CARD_DUEL_CLOSED")
+
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        # The farm tab starts hidden and only the server's `features` can show it.
+        self.assertIn('<button id="farmTab" data-tab="farm" hidden>', page)
+        self.assertIn('$("farmTab").hidden = !farmOpen;', page)
+        # The meadow is drawn by the dungeon screen, and no longer by the farm's.
+        dungeon = page.split("function renderDungeon()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("meadowPanel(meadow)", dungeon)
+        self.assertIn("renderMeadowScreen(box, meadow)", dungeon)
+        farm = page.split("function renderFarm()", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("meadow", farm.lower())
+
+    @patch("pets_config.FARM_OPEN", True)
     async def test_the_quarry_offers_the_same_early_recall_the_farm_does(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn('data-do="quarrycancel"', page)
@@ -3625,6 +3661,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(str(PLAYER["id"]), [row["user_id"] for row in body["candidates"]])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_granting_each_resource_moves_the_real_balance(self):
         self._tame(PLAYER)
         before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
@@ -3863,6 +3900,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         return await self._post("/api/card-battle/action", user,
                                 {"session": session, "action": action, "card": card})
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_card_duel_deals_a_hand_energy_and_the_opponents_whole_next_turn(self):
         """The four things the mode promises on the first screen: five cards, three
         energy, both fighters at full health, and what the opponent has already committed
@@ -3891,6 +3929,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             pets_cardbattle.ENERGY_PER_TURN,
         )
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_every_card_states_its_damage_and_its_effect(self):
         """A card the player is asked to spend energy on has to say what it does before
         the tap, not after: a number for everything it changes, and a sentence."""
@@ -3905,6 +3944,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(card["tags"], card["name"])
             self.assertIsInstance(card["cost"], int)
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_every_legendary_in_the_bag_becomes_exactly_one_card(self):
         """All of them, not the equipped ones -- and a duplicate is still one card."""
         self._tame(PLAYER)
@@ -3918,6 +3958,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opened["legendaries"], len(codes))
         self.assertEqual(opened["deck_size"]["player"], base + len(codes))
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_the_turns_of_a_duel_never_touch_the_store(self):
         """The performance rule for this mode. Opening a duel writes (it takes the arena
         fight) and finishing one writes (it settles the stake), but everything in between
@@ -3992,6 +4033,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(loads), 60, f"the settlement read {len(loads)} times")
 
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_the_turn_reports_the_cards_the_opponent_really_played(self):
         """The screen animates this list card by card, so it has to be what HAPPENED and
         not what was announced -- a stun cancels the turn outright and a killing blow cuts
@@ -4022,6 +4064,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         final = (await response.json())["battle"]["fighters"]
         self.assertEqual(played[-1]["fighters"]["player"]["hp"], final["player"]["hp"])
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_playing_a_card_clears_last_turns_playback(self):
         """Otherwise the screen would replay the opponent's cards on top of the player's
         own, every time a card is tapped."""
@@ -4039,6 +4082,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             PLAYER, opened["session"], "play", card["uid"])).json()
         self.assertEqual(played["battle"]["enemy_played"], [])
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_lost_duel_settles_too_and_hands_back_fresh_state(self):
         """Standing still until the opponent wins is still a settled fight: the loser pays
         their share, and the screen gets the wallet it has to draw next without asking a
@@ -4098,6 +4142,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pets.ruby_balance(CHAT, OPPONENT["id"]), before,
                          "an arena fight moved diamonds")
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_card_duel_costs_a_fight_the_moment_it_opens(self):
         """Charged up front, so walking out of a duel that is going badly is not free.
         With triple pay on the line, settling the cost at the end would make abandon and
@@ -4118,6 +4163,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         again = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
         self.assertEqual(again, before - 1)
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_card_duel_with_an_empty_bank_is_refused(self):
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
@@ -4131,6 +4177,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refused.status, 409, await refused.text())
         self.assertEqual((await refused.json())["error"], "CANNOT_FIGHT")
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_won_card_duel_pays_triple_and_takes_the_losers_diamonds(self):
         """The two things this mode was asked for, measured against an ordinary arena win
         rather than against a hard-coded number, so a later retune of the arena purse
@@ -4186,6 +4233,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # And the screen gets a fresh wallet without asking a second time.
         self.assertIsNotNone(body.get("state"))
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_finished_duel_can_only_be_settled_once(self):
         """The session is dropped in the same breath as the payout, so a replayed or
         double-tapped request finds nothing rather than paying twice."""
@@ -4212,6 +4260,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay.status, 404, await replay.text())
         self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), purse)
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_the_opponents_draw_pile_never_reaches_the_client(self):
         """Only the turn they have announced. A duel where the other deck can be read out
         of the response is not the game this screen is playing."""
@@ -4228,6 +4277,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("enemy_draw", battle["deck"])
         self.assertIsInstance(battle["deck"]["enemy_draw"], int)
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_the_announced_turn_is_the_turn_that_gets_played(self):
         """The intent panel is the whole feature. Whatever it showed has to be what lands
         -- an opponent that re-picks after seeing the player's turn would make it a lie."""
@@ -4243,6 +4293,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             if card["damage"] or card["block"] or card["heal"]:
                 self.assertIn(card["name"], log, card["name"])
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_card_nobody_can_pay_for_is_refused(self):
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
@@ -4264,6 +4315,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         missing = await self._duel_action(PLAYER, session, "play", "no-such-card")
         self.assertEqual(missing.status, 409, await missing.text())
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_duel_belongs_to_the_player_who_opened_it(self):
         self._tame(PLAYER)
         self._tame(OPPONENT, name="Соперник")
@@ -4278,6 +4330,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await gone.json())["error"], "NO_CARD_SESSION")
 
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_both_sides_of_a_card_duel_get_the_same_body(self):
         """The mode's whole design: stats decide the arena, cards decide here. A pet
         loaded with gear and levels and one that has never been touched sit down to the
@@ -4310,6 +4363,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         ] if card["code"] == "strike")
         self.assertEqual(strike["damage"], pets_web.CARD_ATTACK)
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_levelling_up_changes_nothing_about_a_card_duel(self):
         """Same player, same opponent, before and after a large stat gain."""
         self._tame(PLAYER)
@@ -4365,6 +4419,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         # The stagger is what makes it a deal rather than five cards arriving at once.
         self.assertIn("animation-delay:' + Number(deal) * 60", page)
 
+    @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_every_scroll_in_the_collection_becomes_a_card(self):
         """Magic joins the deck the same way legendaries did -- the whole collection, not
         the four equipped slots. A duel has no loadout to build first, and a collection
@@ -4435,9 +4490,13 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         row = page.split("function foeRow(foe, canFight)", 1)[1].split("\n}", 1)[0]
 
-        self.assertIn("<div class=\"foewrap\">", row)
+        self.assertIn("<div class=\"foewrap' + (cardDuel ? \"\" : \" solo\")", row)
         self.assertIn("class='pw above'", row)
         self.assertIn("data-cardfoe=", row)
+        # Drawn only while the card duel is open; closed, the arena button spans the row.
+        self.assertIn("const cardDuel = Boolean((S.features || {}).card_duel);", row)
+        self.assertLess(row.index("(cardDuel\n"), row.index("data-cardfoe="))
+        self.assertIn(".foewrap.solo { grid-template-columns: 1fr; }", page)
         # The power is printed before the name, not after the fight counts.
         self.assertLess(row.index("pw above"), row.index("esc(foe.name"))
         # The arena button is closed before the card button opens.

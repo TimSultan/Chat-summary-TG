@@ -64,6 +64,7 @@ class DryRunTests(AdminGrantTestCase):
 
 
 class GrantLandingTests(AdminGrantTestCase):
+    @patch("pets_config.FARM_OPEN", True)
     def test_all_four_currencies_land_through_the_real_wallets(self):
         self._tame("chat", "1", "Кломбик")
         code = admin_grant.main([
@@ -96,6 +97,7 @@ class GrantLandingTests(AdminGrantTestCase):
 
 
 class ReplayTests(AdminGrantTestCase):
+    @patch("pets_config.FARM_OPEN", True)
     def test_replaying_the_same_reason_does_not_double_pay(self):
         self._tame("chat", "1", "Кломбик")
         argv = [

@@ -1065,6 +1065,9 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         # discover it one refusal at a time.
         "level_up": pets.level_up_status(entry, user_id),
         "maintenance": maintenance.status(),
+        # What is switched on at all (see pets_config's closed features). The client hides
+        # a closed feature's tab and buttons from this rather than keeping its own list.
+        "features": {"farm": C.FARM_OPEN, "card_duel": C.CARD_DUEL_OPEN},
         "unread_updates": pets_updates.has_unread(entry, user_id),
         # Separate from "unread": a reward stays owed after the note has been read, so a
         # player who opened the log and got distracted still sees the gift waiting.
@@ -1149,6 +1152,7 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     # this is the one call standing between that and the browser, so it must never be
     # swapped for something that reads the round's raw `cells` list instead.
     state["meadow"] = pets.meadow_status(entry, user_id)
+    state["meadow"]["ticket_sources"] = pets.MEADOW_TICKET_SOURCES
     state["forge"] = pets.forge_status(entry, user_id)
     return state
 
@@ -2357,6 +2361,10 @@ async def handle_card_battle_start(request: web.Request) -> web.Response:
     paused = _paused_response()
     if paused is not None:
         return paused
+    # Only starting is refused: a duel already open when the switch flipped can still be
+    # played to its end and settled by the action route.
+    if not C.CARD_DUEL_OPEN:
+        return _json_error(C.CARD_DUEL_CLOSED_NOTICE, status=409, code="CARD_DUEL_CLOSED")
 
     me = str(user["id"])
     opponent_id = str(body.get("opponent_id") or "")
@@ -4817,11 +4825,12 @@ PAGE_HTML = """<!doctype html>
   /* --------------------------------------------------------------- the tab bar */
   .tabs {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-    display: grid; grid-template-columns: repeat(8, 1fr);
+    /* One equal column per VISIBLE tab: the review tab is admin-only and a closed
+       feature's tab is hidden, so a fixed count would leave empty slots. */
+    display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
     background: var(--card); border-top: 1px solid var(--line);
     padding-bottom: env(safe-area-inset-bottom);
   }
-  .tabs.has-review { grid-template-columns: repeat(9, 1fr); }
   /* Nine tabs on a narrow phone leave each label about 36px wide. Shrinking the label
      rather than the icon keeps the row scannable: the glyph is what a thumb aims at. */
   @media (max-width: 400px) {
@@ -5240,6 +5249,7 @@ PAGE_HTML = """<!doctype html>
      closes the outer one early and the row falls apart. `.foe` itself keeps working
      unchanged for the leaderboard and the boss picker, which still use it as a button. */
   .foewrap { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: stretch; }
+  .foewrap.solo { grid-template-columns: 1fr; }
   .foewrap + .foewrap { margin-top: 8px; }
   .foewrap .foe { grid-template-columns: auto 1fr; height: 100%; }
   /* The opponent's power, moved off the right edge to above their name. The same gold it
@@ -6057,15 +6067,17 @@ PAGE_HTML = """<!doctype html>
   <section class="screen" id="scr-more" hidden></section>
 </main>
 
+<!-- Quests lead the bar: painting is the game's main thread, and the moderators' review
+     tab rides beside it. The page still opens on the hero, where a creature is made. -->
 <nav class="tabs" id="tabs">
+  <button data-tab="quests"><span class="ic">📜</span>Квесты</button>
+  <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
   <button data-tab="hero" class="on"><span class="ic">🛡</span>Герой</button>
   <button data-tab="bag"><span class="ic">🎒</span>Сумка</button>
   <button data-tab="shop"><span class="ic">🛒</span>Лавка</button>
   <button data-tab="arena"><span class="ic">⚔️</span>Арена</button>
   <button data-tab="dungeon"><span class="ic">🏰</span>Данж</button>
-  <button data-tab="farm"><span class="ic">🌾</span>Ферма</button>
-  <button data-tab="quests"><span class="ic">📜</span>Квесты</button>
-  <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
+  <button id="farmTab" data-tab="farm" hidden><span class="ic">🌾</span>Ферма</button>
   <button data-tab="more"><span class="ic">☰</span>Ещё</button>
 </nav>
 
@@ -6383,7 +6395,9 @@ function levelUpPanel() {
       (short ? 'Нужно ' + up.cost + ' 💎 · есть ' + up.rubies
              : 'Поднять уровень · ' + up.cost + ' 💎') + '</button>' +
     (short ? "<div class='tiny muted' style='margin-top:7px;text-align:center'>" +
-             "Алмазы падают с мобов и добываются в карьере.</div>" : "") +
+             ((S.features || {}).farm ? "Алмазы падают с мобов и добываются в карьере."
+                                       : "Алмазы падают с мобов, с поляны и за квесты.") +
+             "</div>" : "") +
     '</div>';
 }
 
@@ -6632,12 +6646,23 @@ let ACH_ROWS = null;
 // farm shift, 🎫 digs the meadow. This row printed the farm reward with the meadow's 🎫,
 // which is why players kept arriving at the Поляна with an empty wallet. A ticket
 // achievement now pays -- and shows -- both.
+// How a "ticket" reward reads (quests, mobs): a farm ticket while the farm is open, a
+// meadow ticket while it is closed -- the server pays whichever (pets.grant_farm_ticket).
+function rewardTicket() {
+  return (S && (S.features || {}).farm)
+    ? { icon: "🎟", place: "ферма", to: "на ферму" }
+    : { icon: "🎫", place: "поляна", to: "на поляну" };
+}
+
 function achievementReward(row) {
   const bits = [];
   if (Number(row.rubies || 0)) bits.push("💎 " + Number(row.rubies));
   // Named, not just pictured. Three tickets share two icons across this game's screens,
   // and an unlabelled one is how the meadow reward went missing in the first place.
-  if (Number(row.farm_tickets || 0)) bits.push("🎟 " + Number(row.farm_tickets) + " ферма");
+  // The farm half is not paid while the farm is closed, so it is not promised either.
+  if (Number(row.farm_tickets || 0) && (S.features || {}).farm) {
+    bits.push("🎟 " + Number(row.farm_tickets) + " ферма");
+  }
   if (Number(row.farm_tickets || 0)) bits.push("🎫 " + Number(row.farm_tickets) + " поляна");
   if (Number(row.dungeon_tickets || 0)) bits.push("🎟 " + Number(row.dungeon_tickets) + " подземелье");
   return bits.join(" · ");
@@ -6724,7 +6749,16 @@ function renderDungeon() {
     box.innerHTML = '<div class="empty">Сначала нужно существо.</div>';
     return;
   }
-  box.innerHTML = dungeonPanel();
+  // The meadow lives here, below the entrance: its tickets drop in the dungeon, and it
+  // cannot be played during a run. A round with picks left keeps the whole screen, as it
+  // did on the old farm tab, so a spent ticket never goes unaccounted for.
+  const idle = !(S.dungeon || {}).active && !PHOENIX_END && !GATEKEEPER_END;
+  const meadow = S.meadow || {};
+  if (idle && (MEADOW_OPEN || (meadow.round && !meadow.round.finished))) {
+    renderMeadowScreen(box, meadow);
+    return;
+  }
+  box.innerHTML = dungeonPanel() + (idle ? meadowPanel(meadow) : "");
   paintShots(box);
 }
 
@@ -7948,7 +7982,7 @@ function showMobResult(data) {
                  "🪙" + money(reward.gold || 0), "✨" + Number(reward.xp || 0)];
   if (reward.rubies) parts.push("💎" + Number(reward.rubies));
   if (reward.rune && reward.rune.granted) parts.push("🔮" + reward.rune.element + " +" + Number(reward.rune.granted));
-  if (reward.farm_ticket) parts.push("🎟️ ферма +1");
+  if (reward.farm_ticket) parts.push(rewardTicket().icon + " " + rewardTicket().place + " +1");
   if (reward.dungeon_ticket) parts.push("🎫 подземелье +1");
   toast(parts.join(" · "), () => playDuel(data));
 }
@@ -8356,7 +8390,9 @@ function foeRow(foe, canFight) {
     (row) => row.code === foe.element
   ) || {});
   const cards = !((S.arena || {}).farming);
-  return '<div class="foewrap">' +
+  // Off entirely while the card duel is closed: no button, not a disabled one.
+  const cardDuel = Boolean((S.features || {}).card_duel);
+  return '<div class="foewrap' + (cardDuel ? "" : " solo") + '">' +
     '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
       (usable ? "" : " disabled") + '>' +
       '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
@@ -8366,9 +8402,11 @@ function foeRow(foe, canFight) {
         debuffTag(foe.debuff) + " " + repeatTag(repeats) +
         "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
         " · побед " + foe.wins + " из " + foe.fights + "</span></span></button>" +
-    '<button class="cardfight" data-cardfoe="' + esc(foe.user_id) + '"' +
-      (cards ? "" : " disabled") + ' title="Карточный бой">' +
-      '<span class="ic">🃏</span>Карты</button></div>';
+    (cardDuel
+      ? '<button class="cardfight" data-cardfoe="' + esc(foe.user_id) + '"' +
+        (cards ? "" : " disabled") + ' title="Карточный бой">' +
+        '<span class="ic">🃏</span>Карты</button>'
+      : "") + "</div>";
 }
 
 // ------------------------------------------------------------------------- card duel
@@ -8556,9 +8594,13 @@ function renderCardBattle(box) {
     "</div>" +
     (over
       ? '<div class="test-actions" style="margin-top:9px">' +
-        '<button class="go test-action" data-cardbattle="again" style="grid-column:span 2">' +
-          '<span class="ic">🃏</span>Ещё раз</button>' +
-        '<button class="go sec test-action" data-cardbattle="close" style="grid-column:span 2">' +
+        // A duel still open when the mode was closed plays to its end, but cannot rematch.
+        ((S.features || {}).card_duel
+          ? '<button class="go test-action" data-cardbattle="again" style="grid-column:span 2">' +
+            '<span class="ic">🃏</span>Ещё раз</button>'
+          : "") +
+        '<button class="go sec test-action" data-cardbattle="close" style="grid-column:' +
+          ((S.features || {}).card_duel ? "span 2" : "1 / -1") + '">' +
           '<span class="ic">◀️</span>На арену</button></div>'
       : '<div class="cardhand" id="cardHand"><div class="cardrow">' +
           (battle.hand.length
@@ -8740,12 +8782,6 @@ function figurinePanel(farm) {
 function renderFarm() {
   const box = $("scr-farm");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
-  const meadow = S.meadow || {};
-  // A round with picks left has no cancel action -- on purpose, so it keeps covering the
-  // whole farm tab across a re-render, a tab switch, or a reload rather than letting a
-  // ticket already spent quietly go unaccounted for. A FINISHED round does not force this
-  // open by itself: that would trap a fresh page load on last round's result forever.
-  if (MEADOW_OPEN || (meadow.round && !meadow.round.finished)) { renderMeadowScreen(box, meadow); return; }
   const farm = S.farm;
   if (!farm.level) {
     box.innerHTML = '<div class="panel"><h2>Ферма</h2>' +
@@ -8842,18 +8878,7 @@ function renderFarm() {
       'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
       (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
       pickaxeQuestNote + quarryControls + '</div>';
-  const meadowPanel = '<div class="panel"><h2>🌼 Поляна</h2>' +
-    '<div class="small muted">Копай клетки: под ними алмазы, суперприз или пусто. ' +
-    'Билеты падают со смен на ферме и из подземелья.</div>' +
-    '<div class="small muted" style="margin-top:4px">🎫 Билетов на поляну: ' + (meadow.tickets || 0) + '</div>' +
-    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">' +
-    (meadow.meadows || []).map((row) =>
-      '<button class="go sec" style="font-size:13px;padding:10px 6px" data-meadowstart="' + row.size + '"' +
-      (row.can_start ? '' : ' disabled') + '>' + esc(row.title) + '<br><span class="tiny muted">' +
-      row.side + '×' + row.side + ' · 💎' + row.diamonds + ' · ' + row.picks + ' попыток<br>🎫 ' +
-      row.tickets + '</span></button>'
-    ).join('') + '</div></div>';
-  box.innerHTML = shift + quarryPanel + meadowPanel +
+  box.innerHTML = shift + quarryPanel +
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
         money(passive.stored || 0) + " из " + money(passive.cap || 0) + "</div>" +
@@ -8887,9 +8912,27 @@ function featureName(key) { return FEATURE_NAMES[key] || key; }
 // and the layout, per pets_meadow.public_state.
 const MEADOW_CELL_ICON = { empty: "▪️", diamond: "💎", jackpot: "🏆", refill: "🔄" };
 
+// The meadow's entry panel on the dungeon screen. A round with picks left has no cancel
+// action -- on purpose, so it keeps covering the screen across a re-render, a tab switch,
+// or a reload. A FINISHED round does not force it open by itself: that would trap a fresh
+// page load on last round's result forever.
+function meadowPanel(meadow) {
+  return '<div class="panel"><h2>🌼 Поляна</h2>' +
+    '<div class="small muted">Копай клетки: под ними алмазы, суперприз или пусто. ' +
+    esc(meadow.ticket_sources || "") + '</div>' +
+    '<div class="small muted" style="margin-top:4px">🎫 Билетов на поляну: ' + (meadow.tickets || 0) + '</div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">' +
+    (meadow.meadows || []).map((row) =>
+      '<button class="go sec" style="font-size:13px;padding:10px 6px" data-meadowstart="' + row.size + '"' +
+      (row.can_start ? '' : ' disabled') + '>' + esc(row.title) + '<br><span class="tiny muted">' +
+      row.side + '×' + row.side + ' · 💎' + row.diamonds + ' · ' + row.picks + ' попыток<br>🎫 ' +
+      row.tickets + '</span></button>'
+    ).join('') + '</div></div>';
+}
+
 function renderMeadowScreen(box, meadow) {
   const round = meadow.round;
-  if (!round) { MEADOW_OPEN = false; renderFarm(); return; }
+  if (!round) { MEADOW_OPEN = false; renderDungeon(); return; }
   const board = round.finished ? (round.board || []) : null;
   const cells = [];
   for (let index = 0; index < round.cells; index++) {
@@ -8921,7 +8964,7 @@ function renderMeadowScreen(box, meadow) {
 async function meadowStart(size) {
   const ok = await act("meadow_start", { size });
   // Opened only on success: a refusal (not enough tickets, a round still in progress)
-  // must land the player back on the ordinary farm screen with its message, not on an
+  // must land the player back on the ordinary dungeon screen with its message, not on an
   // empty board.
   if (ok) MEADOW_OPEN = true;
   render();
@@ -9590,8 +9633,8 @@ function rewardLine(reward) {
       "-м принятом квесте сложности 4–5</span>"
     : "";
   return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
-    "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
-    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic +
+    "<span class='gain'>✨ " + money(reward.xp) + "</span> · " + rewardTicket().icon + " " +
+    (reward.tickets || 0) + " " + rewardTicket().to + " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic +
     personalPaint + toolMasterwork + scroll;
 }
 
@@ -9874,7 +9917,7 @@ function reviewQueue(data) {
     (data.rewards || []).map((row) =>
       '<div class="rwrow"><span class="small">' + pips(row.difficulty) + "</span>" +
       ["gold", "xp", "tickets", "drop_chance"].map((field) =>
-        '<label class="tiny muted">' + ({ gold: "💰", xp: "✨", tickets: "🎟", drop_chance: "🎁" })[field] +
+        '<label class="tiny muted">' + ({ gold: "💰", xp: "✨", tickets: rewardTicket().icon, drop_chance: "🎁" })[field] +
         '<input class="rwin" type="number" step="' + (field === "drop_chance" ? "0.01" : "1") +
         '" value="' + row[field] + '" data-reward="' + field + '" data-level="' + row.difficulty +
         '"></label>').join("") + "</div>").join("") + "</div>";
@@ -9920,7 +9963,7 @@ const MAIL_TONES = { win: "win", loss: "loss", draw: "" };
 
 function mailFeed(rows) {
   if (!rows.length) {
-    return '<div class="empty">Пока пусто.<br>Здесь будут бои, смены на ферме и подарки.</div>';
+    return '<div class="empty">Пока пусто.<br>Здесь будут бои, квесты и подарки.</div>';
   }
   let out = "", day = null;
   for (const row of rows) {
@@ -9967,7 +10010,9 @@ function mailRow(row) {
   if (row.xp && (row.kind === "farm" || row.kind === "quest_ok")) {
     meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
   }
-  if (row.kind === "quest_ok" && row.tickets) meta.push("<span class='gain'>+" + row.tickets + " 🎟</span>");
+  if (row.kind === "quest_ok" && row.tickets) {
+    meta.push("<span class='gain'>+" + row.tickets + " " + rewardTicket().icon + "</span>");
+  }
   if (row.scroll_name && row.kind !== "scroll") {
     meta.push("<span class='find'>📜 " + esc(row.scroll_name) + "</span>");
   }
@@ -10067,7 +10112,8 @@ function openItem(code) {
       (affordable(item.price) ? "" : " disabled") + ">Купить · " + money(item.price) + "</button>");
   }
   if (!item.owned && item.source === "drop") {
-    actions.push('<div class="small muted">Такое не продаётся — только выпадает в бою или на ферме.</div>');
+    actions.push('<div class="small muted">Такое не продаётся — только выпадает в бою' +
+      ((S.features || {}).farm ? ' или на ферме' : ' или за квесты') + '.</div>');
   }
 
   sheet(
@@ -10821,6 +10867,11 @@ function render() {
   } else if (bar) {
     bar.remove();
   }
+  // A closed farm has no tab. Somebody who was standing on it when the switch flipped
+  // lands on the dungeon, which is where the meadow moved to.
+  const farmOpen = Boolean(S && (S.features || {}).farm);
+  $("farmTab").hidden = !farmOpen;
+  if (TAB === "farm" && !farmOpen && S) TAB = "dungeon";
   for (const name of ["hero", "bag", "shop", "arena", "dungeon", "farm", "quests", "more"]) {
     $("scr-" + name).hidden = name !== TAB;
   }

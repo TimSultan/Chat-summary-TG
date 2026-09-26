@@ -77,6 +77,7 @@ class PausedGameStillKeepsItsPromisesTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.addCleanup(self._temporary.cleanup)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_a_farm_shift_running_through_a_pause_is_paid_in_full(self):
         """Shifts are settled from timestamps whenever they are next read, so a pause
         neither pays them early nor loses them. This is the promise the notice makes."""

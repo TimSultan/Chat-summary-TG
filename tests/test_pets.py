@@ -13,9 +13,11 @@ import economy
 import pets
 import pets_combat
 import pets_config
+import pets_achievements
 import pets_meadow
 import pets_ui
 import pets_weapon_catalog
+import quests
 import stats
 
 
@@ -230,6 +232,7 @@ class CageAndTamingTests(PetsTestCase):
         self.assertEqual(pets.refund_cage_upgrades([entry]), 0)
         self.assertEqual(economy.balance(entry, "1", 0), 0)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_farm_builders_are_refunded_the_gap_exactly_once(self):
         entry = "chat"
         self._tame(entry, "1")
@@ -243,6 +246,7 @@ class CageAndTamingTests(PetsTestCase):
         self.assertEqual(economy.balance(entry, "1", 0), pets_config.FARM_BUILD_REFUND)
         self.assertEqual(economy.balance(entry, "2", 0), 0)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_farms_built_after_the_refund_do_not_print_coins(self):
         """The window has to close at the first run: the payout (65) is larger than the
         new build price (10), so a still-open window would make building profitable."""
@@ -672,6 +676,7 @@ class RepeatFightCounterTests(PetsTestCase):
             pets.repeat_fights(entry, "1", "2", day=pets.today() - timedelta(days=1)),
         )
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_the_cap_is_gone_and_a_tenth_fight_is_allowed(self):
         entry = self._pair("familiar-nocap")
         self._beat(entry, "1", "2", 9)
@@ -956,6 +961,7 @@ class FightBankAndOpponentTests(PetsTestCase):
         self.assertIsNone(pets.find_opponent(entry, "1", rng=random.Random(1)))
 
 
+@patch("pets_config.FARM_OPEN", True)
 class FarmPassiveIncomeTests(PetsTestCase):
     def _build_farm(self, entry="chat", user_id="1", level=1, now=None):
         self._tame(entry, user_id)
@@ -3066,6 +3072,7 @@ class PityGiftAndTelemetryTests(PetsTestCase):
         self.assertEqual(metrics["item_sale_gold"], pets_config.resale_value(item))
         self.assertEqual(metrics["arena_reward_gold"], outcome["gold"])
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_passive_telemetry_credits_once_per_settled_hour(self):
         start = datetime(2026, 8, 8, 10)
         self._tame("chat", "1")
@@ -3304,6 +3311,7 @@ class MailTests(PetsTestCase):
         self.assertIn("history", fight_actions)
 
 
+@patch("pets_config.FARM_OPEN", True)
 class FarmTicketTests(PetsTestCase):
     """A ticket buys the WAITING, not the work: it moves the finish line and nothing else,
     so the payout has to come out of settlement exactly as if the pet had stayed."""
@@ -3498,6 +3506,7 @@ class FightLookupTests(PetsTestCase):
         self.assertIsNone(pets.find_fight(entry, "1", "2020-01-01T00:00:00"))
 
 
+@patch("pets_config.FARM_OPEN", True)
 class QuarryTests(PetsTestCase):
     def _give_pickaxe_charge(self, entry="quarry", uid="1"):
         self._tame(entry, uid)
@@ -3658,6 +3667,7 @@ class QuarryTests(PetsTestCase):
         self.assertNotIn("quarrystart", actions())
 
 
+@patch("pets_config.FARM_OPEN", True)
 class ToolMasterworkTests(PetsTestCase):
     def test_rune_pickaxe_is_unlimited_and_scales_every_quarry_reward(self):
         entry, uid = "masterwork-pickaxe", "1"
@@ -3722,6 +3732,7 @@ class ToolMasterworkTests(PetsTestCase):
         self.assertEqual(pets.farm_status(entry, uid, start + timedelta(hours=7))["shovel_runs"], before)
 
 
+@patch("pets_config.FARM_OPEN", True)
 class WorkplaceFigurineTests(PetsTestCase):
     """One creature, one place -- and the pair of figurines that lifts the rule."""
 
@@ -3823,6 +3834,7 @@ class WorkplaceFigurineTests(PetsTestCase):
         self.assertEqual(pets.farm_status(entry, uid, start)["reward"]["xp"], promised["xp"])
 
 
+@patch("pets_config.FARM_OPEN", True)
 class FarmTests(PetsTestCase):
     def _build_farm(self, entry="farm", uid="1", level=1):
         self._tame(entry, uid)
@@ -4449,6 +4461,146 @@ class MeadowTests(PetsTestCase):
         status = pets.meadow_status(entry, uid)
         self.assertTrue(status["round"]["finished"])
         self.assertEqual(len(status["round"]["board"]), 9)
+
+
+class ClosedFarmTests(PetsTestCase):
+    """The farm and the quarry are switched off (pets_config.FARM_OPEN). Nothing can start
+    or be bought, nothing keeps paying, and nothing a player earned is stranded."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertFalse(pets_config.FARM_OPEN, "these tests describe the closed farm")
+        self.entry = "closed-farm"
+        self._tame(self.entry, "1")
+
+    def _rich(self, uid="1"):
+        economy.grant(self.entry, uid, 1_000_000, "test")
+
+    def _actions(self, keyboard):
+        return [pets_ui.parse_callback(button["callback_data"])[1]
+                for row in keyboard["inline_keyboard"] for button in row]
+
+    def test_nothing_can_start_or_be_bought_and_nothing_is_charged(self):
+        self._rich()
+        before = economy.balance(self.entry, "1", 0)
+        for ok, message in (
+            pets.start_farm(self.entry, "1", 4),
+            pets.start_quarry(self.entry, "1", 4),
+            pets.buy_pickaxe(self.entry, "1", 0),
+            pets.buy_shovel(self.entry, "1", 0),
+            pets.upgrade_farm(self.entry, "1", 0),
+            pets.upgrade_farm_feature(self.entry, "1", 0, "well"),
+        ):
+            self.assertFalse(ok)
+            self.assertEqual(message, pets_config.FARM_CLOSED_NOTICE)
+        self.assertEqual(economy.balance(self.entry, "1", 0), before)
+
+    def test_a_built_farm_stops_paying_passive_income(self):
+        data = pets._load(self.entry)
+        data["pets"]["1"]["farm_level"] = 5
+        pets._save(self.entry, data)
+        start = app_time.now()
+        pets.settle_passive_income(self.entry, "1", now=start)
+        later = pets.settle_passive_income(self.entry, "1", now=start + timedelta(hours=10))
+        self.assertEqual((later["credited"], later["rate"], later["hours"]), (0, 0, 10))
+
+    def test_every_ticket_the_game_still_pays_is_a_meadow_ticket(self):
+        # A #япокрасил post, and its replay.
+        self.assertTrue(pets.grant_farm_ticket(self.entry, "1", "figurine:7"))
+        self.assertFalse(pets.grant_farm_ticket(self.entry, "1", "figurine:7"))
+        self.assertEqual((pets.farm_tickets(self.entry, "1"), pets.meadow_tickets(self.entry, "1")),
+                         (0, 1))
+        # An accepted quest.
+        paid = quests._pay(self.entry, {
+            "user_id": "1", "code": quests.catalog.PAINT_QUESTS[0].code, "kind": "paint",
+            "difficulty": 1, "gold": 0, "xp": 0, "tickets": 1, "drop_chance": 0,
+        }, "closed-farm-quest")
+        self.assertEqual(paid["tickets"], 1)
+        self.assertEqual(pets.meadow_tickets(self.entry, "1"), 2)
+        # An achievement: the meadow half only, never a dead farm ticket.
+        item = next(row for row in pets_achievements.catalogue() if row.farm_tickets)
+        data = pets._load(self.entry)
+        farm, meadow = pets._credit_achievement_tickets(data, "1", [item])
+        self.assertEqual((farm, meadow), (0, item.farm_tickets))
+        self.assertEqual(pets.farm_tickets(self.entry, "1"), 0)
+
+    def test_farm_tool_quests_leave_the_deal_but_still_resolve(self):
+        closed = pets.closed_quest_codes()
+        self.assertTrue({"rune_paint_pickaxe", "rune_paint_shovel", "rune_paint_farmer",
+                         "rune_paint_miner"} <= closed)
+        self.assertNotIn("rune_paint_phoenix", closed)
+        rune_pool = {quest.code for quest in quests.available_quests(self.entry, kind="rune")}
+        self.assertFalse(rune_pool & closed)
+        self.assertIn("rune_paint_phoenix", rune_pool)
+        self.assertFalse({row["code"] for row in quests.catalog_entries(self.entry)} & closed)
+        # A submission already in review still finds its quest.
+        self.assertIsNotNone(quests.catalog.find_quest("rune_paint_shovel"))
+
+    def test_startup_pays_live_shifts_in_full_and_converts_held_tickets_once(self):
+        self._tame(self.entry, "2")
+        self._rich("1")
+        self._rich("2")
+        with patch.object(pets_config, "FARM_OPEN", True):
+            self.assertTrue(pets.upgrade_farm(self.entry, "1", 0)[0])
+            self.assertTrue(pets.start_farm(self.entry, "1", 8)[0])
+            self.assertTrue(pets.buy_pickaxe(self.entry, "2", 0)[0])
+            self.assertTrue(pets.start_quarry(self.entry, "2", 4)[0])
+            # Farm tickets held from before the closure -- one by somebody who has never
+            # tamed a creature, since a ticket is earned by painting, not by owning a pet.
+            for key in ("paint:1", "paint:2"):
+                self.assertTrue(pets.grant_farm_ticket(self.entry, "2", key))
+            self.assertTrue(pets.grant_farm_ticket(self.entry, "9", "paint:3"))
+        self.assertTrue(pets.is_farming(self.entry, "1"))
+        quarry = pets.get_pet(self.entry, "2")["quarry_run"]
+        gold_before = economy.balance(self.entry, "2", 0)
+        rubies_before = pets.ruby_balance(self.entry, "2")
+
+        self.assertEqual(pets.settle_closed_farm([self.entry]),
+                         {"farm": 1, "quarry": 1, "tickets": 3, "ticket_holders": 2})
+        self.assertEqual((pets.farm_tickets(self.entry, "2"), pets.meadow_tickets(self.entry, "2")),
+                         (0, 2))
+        self.assertEqual((pets.farm_tickets(self.entry, "9"), pets.meadow_tickets(self.entry, "9")),
+                         (0, 1))
+
+        # The farming pet is free to fight, and its shift paid all eight planned hours.
+        self.assertFalse(pets.is_farming(self.entry, "1"))
+        self.assertIsNone(pets.get_pet(self.entry, "1")["farm_run"])
+        receipt = next(row for row in pets.pending_farm_notifications(self.entry)
+                       if str(row.get("user_id")) == "1")
+        self.assertEqual(receipt["hours"], 8)
+        # The quarry paid its full four-hour table row.
+        self.assertIsNone(pets.get_pet(self.entry, "2")["quarry_run"])
+        expected_gold = max(1, round(pets_config.QUARRY_GOLD_BY_HOURS[4]
+                                     * float(quarry["hero_gold_multiplier"])))
+        self.assertEqual(economy.balance(self.entry, "2", 0) - gold_before, expected_gold)
+        self.assertGreaterEqual(pets.ruby_balance(self.entry, "2") - rubies_before,
+                                pets_config.QUARRY_RUBIES_BY_HOURS[4][0])
+
+        # Every later start: one read of the store, no write, nothing paid again.
+        loads, saves = [], []
+        real_load, real_save = pets._load, pets._save
+        with patch("pets._load", side_effect=lambda *a, **k: loads.append(1) or real_load(*a, **k)), \
+                patch("pets._save", side_effect=lambda *a, **k: saves.append(1) or real_save(*a, **k)):
+            self.assertEqual(pets.settle_closed_farm([self.entry]),
+                             {"farm": 0, "quarry": 0, "tickets": 0, "ticket_holders": 0})
+        self.assertEqual((len(loads), len(saves)), (1, 0))
+        self.assertEqual(economy.balance(self.entry, "2", 0) - gold_before, expected_gold)
+        self.assertEqual(pets.meadow_tickets(self.entry, "2"), 2)
+
+    def test_telegram_points_at_the_dungeon_and_meadow_instead_of_the_farm(self):
+        _text, keyboard = pets_ui.main_view(self.entry, "1", 0)
+        self.assertNotIn("farm", self._actions(keyboard))
+        self.assertIn("dungeon", self._actions(keyboard))
+        # Old 🌾 buttons in chat history land on a notice, not on a farm.
+        text, keyboard = pets_ui.farm_view(self.entry, "1", 0)
+        self.assertIn(pets_config.FARM_CLOSED_NOTICE, text)
+        self.assertEqual(self._actions(keyboard), ["meadow", "dungeon", "main"])
+        # The meadow lives in the dungeon now, both ways round.
+        _text, keyboard = pets_ui.dungeon_view(self.entry, "1", 0)
+        self.assertIn("meadow", self._actions(keyboard))
+        text, keyboard = pets_ui.meadow_view(self.entry, "1", 0)
+        self.assertIn("dungeon", self._actions(keyboard))
+        self.assertNotIn("ферм", text)
 
 
 if __name__ == "__main__":

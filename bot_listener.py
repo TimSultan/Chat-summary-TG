@@ -10301,6 +10301,19 @@ async def run_bot_listener(
                 f"[pets] kept personal paint rune {row['rune_id']} ({row['target']}) of "
                 f"user {row['user_id']} @{row['username'] or '?'} spent: it left with a gift"
             )
+        closed_farm = await asyncio.to_thread(
+            pets.settle_closed_farm, cfg.listener_allowed_chats,
+        )
+        if closed_farm["farm"] or closed_farm["quarry"]:
+            log(
+                f"[pets] farm and quarry are closed: paid out {closed_farm['farm']} farm "
+                f"and {closed_farm['quarry']} quarry shifts in full"
+            )
+        if closed_farm["tickets"]:
+            log(
+                f"[pets] turned {closed_farm['tickets']} held farm tickets of "
+                f"{closed_farm['ticket_holders']} players into meadow tickets"
+            )
         if lost_paints["unrecoverable"]:
             log(
                 f"[pets] {lost_paints['unrecoverable']} lost personal paint runes have no "

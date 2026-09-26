@@ -506,8 +506,11 @@ def catalog_entries(entry: str) -> list[dict]:
     """The complete editable catalogue for the moderation page."""
     data = _load(entry)
     disabled = set(data.get("disabled", []))
+    closed = pets.closed_quest_codes()
     rows = []
     for quest in catalog.QUESTS:
+        if quest.code in closed:
+            continue
         rows.append({
             "code": quest.code, "difficulty": quest.difficulty, "tool": quest.tool,
             "kind": quest.kind, "hashtag": catalog.hashtag(quest.code),
@@ -521,9 +524,15 @@ def available_quests(entry: str, data: dict | None = None, kind: str = "paint") 
     """Quests of one kind still in a moderator's rotation."""
     data = data if data is not None else _load(entry)
     disabled = set(data.get("disabled", []))
-    everything = (catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
-                  if kind == "real" else catalog.GEAR_PAINT_QUESTS if kind == "gear"
-                  else catalog.RUNE_QUESTS)
+    # Closed by the game rather than by a moderator (the farm tools while the farm is
+    # shut), so not even the empty-rotation fallback below brings them back.
+    closed = pets.closed_quest_codes()
+    everything = tuple(
+        quest for quest in (catalog.PAINT_QUESTS if kind == "paint" else catalog.REAL_QUESTS
+                            if kind == "real" else catalog.GEAR_PAINT_QUESTS if kind == "gear"
+                            else catalog.RUNE_QUESTS)
+        if quest.code not in closed
+    )
     pool = tuple(quest for quest in everything if quest.code not in disabled)
     return pool or everything
 

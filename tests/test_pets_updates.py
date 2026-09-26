@@ -30,13 +30,20 @@ class PetUpdatesTests(unittest.TestCase):
         self.assertFalse(pets_updates.has_unread(entry, user_id))
         self.assertTrue(pets_updates.has_unread(entry, 43))
 
-    def test_latest_card_duel_news_pays_ten_diamonds(self):
+    def test_latest_news_says_what_closed_and_where_the_meadow_went(self):
         newest = pets_updates.latest("chat")
-        self.assertEqual(newest.id, "202608-card-duels")
-        self.assertEqual(newest.reward_rubies, 10)
+        self.assertEqual(newest.id, "202609-quests-arena-dungeon")
+        for closed in ("Ферма", "карьер", "карточные бои"):
+            self.assertIn(closed, newest.text)
+        self.assertIn("оплачены полностью", newest.text)
+        self.assertIn("Поляна переехала в подземелье", newest.text)
+
+    def test_card_duel_news_pays_ten_diamonds(self):
+        note = {row.id: row for row in pets_updates.UPDATES}["202608-card-duels"]
+        self.assertEqual(note.reward_rubies, 10)
         # The two numbers the note exists to announce.
-        self.assertIn("втрое", newest.text)
-        self.assertIn("5%", newest.text)
+        self.assertIn("втрое", note.text)
+        self.assertIn("5%", note.text)
 
     def test_the_card_duel_note_corrects_the_arena_stake_note_above_it(self):
         """The older note still tells players an arena win takes 5% of the loser's

@@ -146,6 +146,7 @@ class LiveAchievementTests(unittest.TestCase):
         row["claimed"] = sorted(item.code for item in rows) if claimed else []
         pets._save(CHAT, data)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_a_ticket_achievement_pays_the_meadow_as_well_as_the_farm(self):
         """Two tickets, two wallets, and the screen has always promised the meadow one.
 
@@ -486,6 +487,7 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertEqual(after[1] - before[1], paid["farm_tickets"])
         self.assertEqual(after[2] - before[2], paid["dungeon_tickets"])
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_every_catalogue_reward_credits_its_promised_wallets(self):
         """The catalogue is the source of truth: every row must pay exactly its payload."""
         rows = list(achievements.catalogue())
@@ -530,6 +532,7 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertEqual(paid["dungeon_tickets"], item.dungeon_tickets)
         self.assertEqual(pets.dungeon_tickets(CHAT, USER), item.dungeon_tickets)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_multi_ticket_reward_credits_every_ticket(self):
         item = max(achievements.catalogue(), key=lambda row: row.farm_tickets)
         self.assertGreater(item.farm_tickets, 1)
@@ -561,6 +564,7 @@ class LiveAchievementTests(unittest.TestCase):
             self.assertEqual(paid["rubies"], item.rubies)
             self.assertEqual(pets.ruby_balance(CHAT, uid) - before, item.rubies)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_old_shared_rewards_are_restored_once(self):
         item = next(row for row in achievements.catalogue() if row.rubies and row.farm_tickets > 1)
         data = pets._load(CHAT)

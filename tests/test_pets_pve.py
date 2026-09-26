@@ -511,6 +511,7 @@ class RubyWalletTests(PetsTestCase):
                 )
             self.assertGreaterEqual(win["rubies"], pets_config.PVE_RUBY_MIN, tier)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_a_farm_shift_can_drop_a_ruby_seeded_on_the_run_id_exactly_once(self):
         """Seeded on the run id (like the rest of the payout) rather than rolled fresh,
         so a settlement that runs twice for the same finished shift cannot mint rubies

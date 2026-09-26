@@ -265,16 +265,22 @@ def main_view(
     else:
         updates_button = "📰 Обновления"
 
-    # Play first, account utilities second. These four rows remain in the same order for
+    # Play first, account utilities second. These rows remain in the same order for
     # newcomers and established players, so muscle memory survives taming a creature.
-    rows.append([
-        {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
-        {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")},
-    ])
+    # Quests lead: painting is the game's main thread, with the arena beside it.
     rows.append([
         {"text": quest_button, "callback_data": callback_data(user_id, "quests")},
-        {"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")},
+        {"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
     ])
+    # The farm's slot goes to the dungeon while the farm is closed. Without a creature
+    # there is no dungeon to enter, so the casino stands alone then.
+    second = []
+    if C.FARM_OPEN:
+        second.append({"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")})
+    elif pet:
+        second.append({"text": "🕳 Подземелье", "callback_data": callback_data(user_id, "dungeon")})
+    second.append({"text": "🎰 Казино", "callback_data": callback_data(user_id, "casino")})
+    rows.append(second)
     rows.append([
         {"text": "🛒 Магазин", "callback_data": callback_data(user_id, "store")},
         {"text": "🎒 Снаряжение", "callback_data": callback_data(user_id, "bag")},
@@ -296,9 +302,10 @@ def main_view(
             {"text": "📬 Почта", "callback_data": callback_data(user_id, "mail")},
             {"text": "🏆 Существа сервера", "callback_data": callback_data(user_id, "leaderboard")},
         ])
-        rows.append([{
-            "text": "🕳 Подземелье", "callback_data": callback_data(user_id, "dungeon"),
-        }])
+        if C.FARM_OPEN:
+            rows.append([{
+                "text": "🕳 Подземелье", "callback_data": callback_data(user_id, "dungeon"),
+            }])
         notifications_enabled = pets.fight_result_notifications_enabled(entry, user_id)
         rows.append([
             {
@@ -402,13 +409,26 @@ def info_view(user_id) -> tuple[str, dict]:
         "\n<b>2. Развивай его</b>",
         "Прокачивай характеристики, находи оружие и экипировку, собирай подходящий комплект.",
         "\n<b>3. Играй</b>",
-        "Сражайся с игроками и мобами, выполняй квесты, отправляй существо на ферму "
-        "и рискуй монетами в казино.",
+        (
+            "Сражайся с игроками и мобами, выполняй квесты, отправляй существо на ферму "
+            "и рискуй монетами в казино." if C.FARM_OPEN else
+            "Выполняй квесты на покрас, сражайся с игроками и мобами, спускайся в "
+            "подземелье и рискуй монетами в казино."
+        ),
         "\n<b>4. Получай награды</b>",
-        "Монеты, опыт и вещи приходят за активность в чате, победы, квесты и ферму. "
-        "Каждый экран сам подскажет, что можно сделать дальше.",
+        (
+            "Монеты, опыт и вещи приходят за активность в чате, победы, квесты и ферму. "
+            if C.FARM_OPEN else
+            "Монеты, опыт, алмазы и вещи приходят за квесты, победы, подземелье и "
+            "активность в чате. "
+        ) + "Каждый экран сам подскажет, что можно сделать дальше.",
     ]
     return "\n".join(lines), {"inline_keyboard": [_back_row(user_id)]}
+
+
+def _meadow_button(user_id) -> dict:
+    """The meadow lives in the dungeon: its tickets drop down there."""
+    return {"text": "🌼 Поляна", "callback_data": callback_data(user_id, "meadow")}
 
 
 def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
@@ -417,6 +437,8 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
         rows = []
         if state.get("active"):
             rows.append([{"text": "🚪 Вернуться", "callback_data": callback_data(user_id, "dungeonquit")}])
+        else:
+            rows.append([_meadow_button(user_id)])
         rows.append(_back_row(user_id))
         return (
             "🕳 <b>Подземелье закрыто</b>\n\n"
@@ -438,6 +460,7 @@ def dungeon_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
              (f"🎫 Билетов в подземелье: <b>{tickets}</b>" if tickets else f"Вход: <b>{state.get('entry_cost', 15)} 💎</b>"),
                  "Состав этажей меняется, боссы каждые пять этажей. Здоровье не восстанавливается после боя."])
         rows = [[{"text": (f"⚔️ Войти · билет ({tickets})" if tickets else f"⚔️ Войти · {state.get('entry_cost', 15)} 💎"), "callback_data": callback_data(user_id, "dungeonenter")}]]
+        rows.append([_meadow_button(user_id)])
         rows.append(_back_row(user_id))
         return "\n".join(lines), {"inline_keyboard": rows}
     lines = [f"🕳 <b>{escape(str(state['theme']))}</b>", f"Этаж {state['floor']} · ❤️ {state['hp']} / {state['max_hp']}", escape(str(state.get('description') or '')), ""]
@@ -1315,7 +1338,8 @@ def _legacy_quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, 
     lines.append(f"\n💡 {escape(quest['hint'])}")
     lines.append(
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · "
-        f"✨ {int(reward.get('xp', 0))} опыта · 🎟 {int(reward.get('tickets', 0))} билет"
+        f"✨ {int(reward.get('xp', 0))} опыта · {pets.REWARD_TICKET_ICON} "
+        f"{int(reward.get('tickets', 0))} билет {pets.REWARD_TICKET_TO}"
         f" · 🎁 шанс находки {round(float(reward.get('drop_chance', 0)) * 100)}%"
     )
     if reward.get("scroll_chance"):
@@ -1505,7 +1529,8 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         f"\n<b>{'Как сдать' if specialist_paint else 'Как выполнить'}:</b>",
         *how_lines,
         f"\n<b>Награда:</b> 🪙 {_money(int(reward.get('gold', 0)))} · ✨ {int(reward.get('xp', 0))} опыта · "
-        f"🎟 {int(reward.get('tickets', 0))} · 🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
+        f"{pets.REWARD_TICKET_ICON} {int(reward.get('tickets', 0))} {pets.REWARD_TICKET_TO} · "
+        f"🎁 {round(float(reward.get('drop_chance', 0)) * 100)}%",
         scroll_reward,
         (f"\n⏳ До обновления: <b>{_quest_timer(board.get('seconds_until_refresh', 0))}</b>"
          if board.get("auto_refresh") else "\n🕰 Дедлайна нет — квест останется здесь."),
@@ -1945,6 +1970,17 @@ def farm_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     screen. Opening the menu therefore cannot pay a run twice or make a DM notification
     disappear after a restart.
     """
+    if not C.FARM_OPEN:
+        # Old 🌾 buttons stay in chat history, so this screen is still reachable. It says
+        # what happened and points at the meadow, the one thing that used to live here.
+        return (
+            f"🌾 <b>{escape(C.FARM_CLOSED_NOTICE)}</b>\n\n🌼 Поляна переехала в подземелье.",
+            {"inline_keyboard": [
+                [{"text": "🌼 Поляна", "callback_data": callback_data(user_id, "meadow")},
+                 {"text": "🕳 Подземелье", "callback_data": callback_data(user_id, "dungeon")}],
+                _back_row(user_id),
+            ]},
+        )
     pet = pets.get_pet(entry, user_id)
     if not pet:
         return no_pet_view(user_id)
@@ -2187,10 +2223,7 @@ def meadow_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
 
     rows = []
     if not active:
-        lines.append(
-            "\n<i>Копай клетки и ищи алмазы. Билеты падают со смен на ферме и из "
-            "подземелья.</i>"
-        )
+        lines.append(f"\n<i>Копай клетки и ищи алмазы. {pets.MEADOW_TICKET_SOURCES}</i>")
         for option in status.get("meadows", []):
             title = escape(str(option.get("title") or ""))
             side = int(option.get("side", 0) or 0)
@@ -2261,6 +2294,7 @@ def meadow_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
                 "callback_data": callback_data(user_id, "meadow", str(active.get("size") or "")),
             }])
 
+    rows.append([{"text": "🕳 К подземелью", "callback_data": callback_data(user_id, "dungeon")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -2297,7 +2331,7 @@ def train_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
     luck_bonus = C.luck_drop_multiplier(effective.get("luck", levels.get("luck", C.STAT_MIN_LEVEL))) - 1
     lines.append(
         f"\n🍀 Удача сейчас даёт <b>+{luck_bonus * 100:.0f}%</b> к шансу найти вещь"
-        " — и в бою, и на ферме."
+        + (" — и в бою, и на ферме." if C.FARM_OPEN else " в бою.")
     )
     # Магия is invisible in the stat column for the same reason Удача was: its payoff is
     # in the scroll lines of a fight log rather than in the swing. Both halves are spelled
@@ -3556,7 +3590,7 @@ def mob_result_text(reward: dict, report: str) -> str:
     if rune.get("granted"):
         bits.append(f"🔮 {escape(str(rune.get('element') or 'руна'))} +{int(rune['granted'])}")
     if reward.get("farm_ticket"):
-        bits.append("🎟️ ферма +1")
+        bits.append(f"{pets.REWARD_TICKET_ICON} {pets.REWARD_TICKET_PLACE} +1")
     if reward.get("dungeon_ticket"):
         bits.append("🎫 подземелье +1")
     if bits:
@@ -3850,7 +3884,7 @@ def mail_view(entry: str, user_id) -> tuple[str, dict]:
         if trimmed:
             lines.append("<i>…старые события скрыты.</i>\n")
         if not visible:
-            lines.append("Пока пусто. Здесь будут бои, смены на ферме и подарки.")
+            lines.append("Пока пусто. Здесь будут бои, квесты и подарки.")
         current_day = None
         for event in visible:
             day = event.get("day") or ""
@@ -3870,7 +3904,8 @@ def mail_view(entry: str, user_id) -> tuple[str, dict]:
         text = render(visible, trimmed=True)
     rows = [
         [{"text": "⚔️ Арена", "callback_data": callback_data(user_id, "fight")},
-         {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")}],
+         {"text": "🌾 Ферма", "callback_data": callback_data(user_id, "farm")} if C.FARM_OPEN
+         else {"text": "🕳 Подземелье", "callback_data": callback_data(user_id, "dungeon")}],
         _back_row(user_id),
     ]
     return text, {"inline_keyboard": rows}
