@@ -5273,53 +5273,179 @@ PAGE_HTML = """<!doctype html>
      shows anyway -- both were height charged to every turn of every duel. */
   body.induel { --hud: 0px; }
   body.induel .hud { display: none; }
-  .cardstage { display: grid; gap: 8px; }
-  .cardside { display: grid; grid-template-columns: auto 1fr; gap: 10px;
-              align-items: center; background: var(--sunken); border-radius: 12px;
-              padding: 10px; }
-  .cardside.enemy { border: 1px solid rgba(224,72,77,.35); }
-  .cardside .av { width: 44px; height: 44px; border-radius: 11px; overflow: hidden;
-                  background: var(--card); flex: none; }
-  .cardside .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .cardside .who { font-weight: 700; font-size: 14px; }
-  .cardhp { height: 9px; border-radius: 999px; background: var(--track);
-            overflow: hidden; margin-top: 5px; }
-  .cardhp > i { display: block; height: 100%; background: var(--hp); border-radius: 999px;
-                transition: width .25s ease-out; }
+  /* The tab bar goes with it. A duel is paid for the moment it opens, so a stray tap on a
+     tab must not be the way out of one; the exit in the top bar asks first. */
+  body.induel .tabs { display: none; }
+
+  /* One table, laid out the way the genre lays it out: the opponent and the turn they have
+     announced at the top, the player under them, the hand and the button under the thumb.
+     Fixed to the viewport rather than scrolled as a page, so nothing a turn is decided on
+     sits below the fold -- the stacked panels this replaced put the announced turn there,
+     under two and a half cards of a five-card hand. It still scrolls as a whole on a phone
+     too short to hold it, rather than clipping the button. */
+  .cardduel { position: fixed; inset: 0; z-index: 30; background: var(--bg);
+              display: flex; flex-direction: column; gap: 8px;
+              padding: calc(8px + env(safe-area-inset-top)) 12px
+                       calc(10px + env(safe-area-inset-bottom));
+              overflow-y: auto; overscroll-behavior: contain; }
+  .cardtop { flex: none; display: grid; grid-template-columns: 38px 1fr 38px;
+             align-items: center; }
+  .cardtop button { width: 36px; height: 36px; padding: 0; border-radius: 10px;
+                    border: 1px solid var(--line); background: var(--sunken); font-size: 15px;
+                    display: flex; align-items: center; justify-content: center; }
+  .cardtop button:last-child { justify-self: end; }
+  .cardturn { text-align: center; font-size: 12px; font-weight: 800; color: var(--muted);
+              letter-spacing: .08em; text-transform: uppercase; }
+
+  /* The stage grows into whatever height the phone has, and the gap it grows is the
+     middle of the table: where a played card is held up before it is thrown. */
+  .cardstage { flex: 1 0 auto; display: flex; flex-direction: column; gap: 8px; }
+  /* A faint line with crossed swords across the middle, so the space a tall phone leaves
+     there reads as the ground between two fighters rather than as a gap in the layout. It
+     is simply clipped away on a phone too short to leave any. */
+  .cardmid { flex: 1 1 0; min-height: 6px; overflow: hidden; display: flex;
+             align-items: center; gap: 10px; color: var(--muted); opacity: .45; }
+  .cardmid::before, .cardmid::after { content: ""; flex: 1; height: 1px;
+                                      background: linear-gradient(90deg, transparent, var(--line)); }
+  .cardmid::after { background: linear-gradient(90deg, var(--line), transparent); }
+  .cardmid span { font-size: 14px; line-height: 1; }
+  .cardmid.tight > span, .cardmid.tight::before, .cardmid.tight::after { display: none; }
+  .cardside { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px;
+              align-items: center; background: var(--card); border: 1px solid var(--line);
+              border-radius: 14px; padding: 9px 10px;
+              transition: border-color .25s, box-shadow .25s; }
+  /* Whose turn it is is said by the frame, in the colours every other fight in the game
+     already uses for the two sides -- not by a label somebody has to read. */
+  .cardside.player .who { color: var(--mine); }
+  .cardside.enemy .who { color: var(--foe); }
+  .cardside.player.acting { border-color: rgba(98,174,240,.6);
+                            box-shadow: 0 0 14px rgba(98,174,240,.16); }
+  .cardside.enemy.acting { border-color: rgba(217,138,90,.65);
+                           box-shadow: 0 0 14px rgba(217,138,90,.18); }
+  .cardside .av { width: 48px; height: 48px; border-radius: 12px; overflow: hidden;
+                  background: var(--sunken); flex: none; }
+  .cardside .av .shot, .cardside .av img { display: block; width: 100%; height: 100%;
+                                           object-fit: cover; }
+  /* Bigger faces where the phone has the height: the portraits are the players' own
+     painted miniatures, and a tall screen has nothing better to spend the room on. */
+  @media (min-height: 720px) {
+    .cardside .av { width: 58px; height: 58px; border-radius: 14px; }
+  }
+  .cardwho { min-width: 0; }
+  .cardhead { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .cardside .who { flex: 1; min-width: 0; font-weight: 700; font-size: 14px;
+                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   /* Block is not a status -- it is gone again at the start of the next turn -- so it sits
-     with the health numbers rather than in the badge row, which is for what survives. */
-  .cardnums { font-size: 12px; color: var(--muted); margin-top: 3px; }
-  .cardnums b { color: var(--fg); }
-  .cardblock { color: var(--r-rare); font-weight: 700; }
+     on the health bar's own line rather than in the badge row, which is for what
+     survives. The bar grows a blue rim while it is up, the way a shield reads in the
+     genre: the hit lands on the rim first. */
+  .cardblock { flex: none; font-size: 12px; font-weight: 800; color: #fff; line-height: 1.5;
+               background: var(--r-rare); border-radius: 999px; padding: 0 8px; }
+  .cardblock:empty { display: none; }
+  .cardhp { position: relative; height: 16px; border-radius: 999px; margin-top: 5px;
+            background: rgba(0,0,0,.38); overflow: hidden; transition: box-shadow .2s; }
+  .cardside.blocked .cardhp { box-shadow: 0 0 0 2px var(--r-rare); }
+  .cardhp > i { position: absolute; top: 0; bottom: 0; left: 0; border-radius: inherit; }
+  /* Two layers: the red drops the moment a hit lands, and the pale one under it follows
+     a beat later -- so the size of a hit stays on screen long enough to be seen. */
+  .cardhp .trail { background: #f2b8be; transition: width .45s ease-in .32s; }
+  .cardhp .fill { background: var(--hp); transition: width .3s ease-out; }
+  /* The slice the forecast says goes if the turn ends now. Striped over the red rather
+     than cut out of it: it is a warning about the bar, not a change to it. */
+  .cardhp .ghost { width: 0; border-radius: 0;
+                   background: repeating-linear-gradient(135deg, rgba(255,255,255,.62) 0 3px,
+                                                         rgba(255,255,255,.08) 3px 7px);
+                   animation: cardghost 1.1s ease-in-out infinite alternate; }
+  @keyframes cardghost { from { opacity: .45; } to { opacity: 1; } }
+  /* Block layout on purpose: as a flex box the " / 360" after the bold number becomes its
+     own item, and a flex item drops its leading space. */
+  .cardnums { position: absolute; inset: 0; text-align: center; line-height: 16px;
+              font-size: 11px; font-weight: 700; color: #fff;
+              text-shadow: 0 1px 2px rgba(0,0,0,.8); font-variant-numeric: tabular-nums; }
+  .cardnums b { font-weight: 800; }
   .cardstatus { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
-  .cardstatus span { font-size: 11px; font-weight: 700; border-radius: 999px;
-                     padding: 1px 7px; border: 1px solid var(--line); background: var(--card); }
+  .cardstatus:empty { display: none; }
+  .cardstatus button { font-size: 11px; font-weight: 700; line-height: 1.45; color: var(--fg);
+                       border-radius: 999px; padding: 0 7px; border: 1px solid var(--line);
+                       background: var(--sunken); }
+  .cardside .av.hit { animation: cardhit .34s ease-out; }
+  @keyframes cardhit {
+    0%, 100% { transform: translateX(0); filter: none; }
+    20% { transform: translateX(-5px); filter: brightness(1.7) saturate(.4); }
+    45% { transform: translateX(4px); }
+    70% { transform: translateX(-2px); }
+  }
+  .cardside .av.ko { filter: grayscale(.85) brightness(.5); transform: rotate(-8deg);
+                     transition: filter .5s, transform .5s; }
 
-  .cardintent { border: 1px solid rgba(224,72,77,.4); background: rgba(224,72,77,.07);
-                border-radius: 12px; padding: 9px 10px; }
-  .cardintent h3 { margin: 0 0 7px; font-size: 13px; }
-  /* An announced turn scrolls sideways on its own rather than widening the page: the
-     opponent can commit to three cards, and three cards do not fit across a phone. */
-  /* min-height, so the block keeps its size when the hand empties at the end of a turn.
-     Without it the page jumps a card's worth of height at exactly the moment the
-     opponent's cards start flying out of the panel below it. */
-  .cardrow { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
-             scrollbar-width: thin; overscroll-behavior: contain; min-height: 132px; }
-  .cardwait { align-items: center; justify-content: center; color: var(--muted);
-              font-size: 13px; font-style: italic; }
-  .cardrow::-webkit-scrollbar { height: 5px; }
-  .cardrow::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+  /* The opponent's whole announced turn, as a row of tiles along the bottom of their own
+     panel: what each card mainly does and by how much. The whole card is one tap away;
+     the tiles are for reading a turn in the same glance as the bar it will cut into. */
+  .cardintent { grid-column: 1 / -1; margin-top: 3px; padding-top: 7px;
+                border-top: 1px dashed rgba(217,138,90,.3); }
+  .cardintent h3 { margin: 0 0 6px; font-size: 11px; font-weight: 700; color: var(--muted); }
+  .cardintent.stunned .cardtiles { opacity: .4; }
+  .cardtiles { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cardtile { position: relative; width: 52px; height: 50px; padding: 0; color: var(--fg);
+              display: flex; flex-direction: column; align-items: center; justify-content: center;
+              gap: 2px; border-radius: 11px; border: 1px solid rgba(217,138,90,.5);
+              background: rgba(217,138,90,.10); touch-action: manipulation; }
+  .cardtile.r-legendary { border-color: var(--r-legendary); background: rgba(176,107,224,.14); }
+  .cardtile.r-magic { border-color: var(--r-rare); background: rgba(51,144,236,.12); }
+  .cardtile.r-ultimate { border-color: var(--xp); background: rgba(76,175,114,.12); }
+  .cardtile .ti { font-size: 17px; line-height: 1; }
+  .cardtile .tn { font-size: 12px; font-weight: 800; line-height: 1.1;
+                  font-variant-numeric: tabular-nums; }
+  .cardtile .tx { position: absolute; top: -6px; right: -6px; font-size: 10px; line-height: 1;
+                  padding: 2px 3px; border-radius: 999px; background: var(--bg);
+                  border: 1px solid var(--line); }
 
-  .card { flex: 0 0 auto; width: 132px; display: flex; flex-direction: column; gap: 4px;
-          text-align: left; background: var(--card); border: 1px solid var(--line);
-          border-radius: 12px; padding: 30px 9px 9px; position: relative; color: var(--fg);
-          touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-  .card.r-legendary { border-color: var(--r-legendary);
-                      box-shadow: 0 0 12px rgba(176,107,224,.28); }
+  /* Energy as orbs rather than "2 / 3": a count read in the same glance as the cost
+     bubbles it is spent on, and green like them. */
+  .cardmeta { grid-column: 1 / -1; display: flex; justify-content: space-between;
+              align-items: center; gap: 8px; margin-top: 3px; }
+  .cardenergy { display: flex; align-items: center; gap: 4px; font-size: 14px;
+                font-weight: 800; color: var(--xp); }
+  .cardenergy i { width: 13px; height: 13px; border-radius: 50%;
+                  border: 2px solid var(--xp); opacity: .45; }
+  .cardenergy i.on { background: var(--xp); opacity: 1; box-shadow: 0 0 7px rgba(76,175,114,.55); }
+  .cardpiles { font-size: 11px; color: var(--muted); text-align: right; white-space: nowrap; }
+
+  /* The whole hand at once, three to a row -- never a sideways scroller that hides half
+     of it. The top padding is room for a picked-up card to lift into. min-height, so the
+     block keeps its size when the hand empties at the end of a turn: without it the page
+     jumps at exactly the moment the opponent's cards start flying. */
+  .cardhand { flex: none; display: flex; flex-direction: column; }
+  .cardrow { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px;
+             padding: 8px 3px 2px; min-height: 96px; max-height: 44vh; overflow-y: auto;
+             overscroll-behavior: contain; }
+  .cardwait { flex: 1; align-items: center; justify-content: center; text-align: center;
+              color: var(--muted); font-size: 13px; font-style: italic; }
+  .cardempty { align-self: center; }
+
+  .card { flex: 0 0 calc((100% - 12px) / 3); max-width: 132px; min-height: 94px;
+          display: flex; flex-direction: column; gap: 4px; text-align: left;
+          background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 29px 8px 8px; position: relative; color: var(--fg);
+          touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+          transition: transform .14s ease-out, box-shadow .14s ease-out, opacity .14s; }
+  .card.r-legendary { border-color: var(--r-legendary); box-shadow: 0 0 12px rgba(176,107,224,.28);
+                      background: linear-gradient(180deg, rgba(176,107,224,.16), var(--card) 55%); }
   /* Magic reads as its own tier rather than borrowing the legendary purple: a scroll and
      a legendary weapon are different things to hold and should not look alike. */
-  .card.r-magic { border-color: var(--r-rare); box-shadow: 0 0 10px rgba(51,144,236,.22); }
-  .card.r-ultimate { border-color: var(--xp); box-shadow: 0 0 13px rgba(120,200,120,.26); }
+  .card.r-magic { border-color: var(--r-rare); box-shadow: 0 0 10px rgba(51,144,236,.22);
+                  background: linear-gradient(180deg, rgba(51,144,236,.14), var(--card) 55%); }
+  .card.r-ultimate { border-color: var(--xp); box-shadow: 0 0 13px rgba(120,200,120,.26);
+                     background: linear-gradient(180deg, rgba(76,175,114,.16), var(--card) 55%); }
+  /* A card the turn cannot pay for is dimmed and its cost goes red, but it is never
+     disabled: a disabled button cannot be tapped to find out what the card does. */
+  .card.poor { opacity: .5; }
+  .card.poor .cardcost { background: var(--hp); color: #fff; }
+  /* Picked up: lifted out of the row and ringed, while its rules text is read over the
+     button. A second tap on it plays it. */
+  .card.picked { opacity: 1; transform: translateY(-7px); border-color: var(--accent);
+                 box-shadow: 0 0 0 2px var(--accent), 0 10px 20px rgba(0,0,0,.4); z-index: 1; }
+  .card:active:not(.picked) { transform: translateY(-3px); filter: brightness(1.2); }
   /* Dealing a new hand. Each card turns face-up in place, a beat after the one before it,
      so a turn opens with something to watch instead of five cards appearing at once. */
   @keyframes carddeal {
@@ -5328,40 +5454,138 @@ PAGE_HTML = """<!doctype html>
   }
   .card.dealt { animation: carddeal .34s cubic-bezier(.2,.75,.35,1) backwards;
                 transform-origin: 50% 60%; }
-  .cardreward { border: 1px solid var(--gold); background: rgba(201,133,0,.10);
-                border-radius: 12px; padding: 10px 12px; margin-top: 9px; }
-  .cardreward .row { display: flex; justify-content: space-between; font-size: 13px;
-                     padding: 2px 0; }
-  .card:active:not(:disabled) { transform: translateY(-3px); filter: brightness(1.2); }
-  .card:disabled { opacity: .45; }
   /* The cost sits in the corner the eye checks first, because it is the one number that
      decides whether the rest of the card is an option at all this turn. */
-  .cardcost { position: absolute; top: 7px; left: 8px; width: 21px; height: 21px;
+  .cardcost { position: absolute; top: 7px; left: 7px; width: 21px; height: 21px;
               border-radius: 50%; background: var(--xp); color: #0f1720;
               font-size: 12px; font-weight: 800; display: flex; align-items: center;
               justify-content: center; }
   .cardicon { position: absolute; top: 7px; right: 8px; font-size: 15px; }
-  .cardname { font-size: 12px; font-weight: 700; line-height: 1.25; }
+  .cardname { font-size: 12px; font-weight: 700; line-height: 1.2; overflow: hidden;
+              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .cardtags { display: flex; flex-wrap: wrap; gap: 3px; }
   .cardtags i { font-style: normal; font-size: 10px; font-weight: 700; line-height: 1.4;
                 border-radius: 5px; padding: 1px 5px; background: var(--sunken);
                 color: var(--accent); }
-  .cardtext { font-size: 10px; line-height: 1.35; color: var(--muted); }
-  .cardhand { margin-top: 9px; }
-  .cardhand .card { width: 138px; }
-  .cardbar { display: grid; grid-template-columns: auto 1fr auto; gap: 9px;
-             align-items: center; margin-top: 9px; }
-  .cardenergy { font-size: 15px; font-weight: 800; color: var(--xp); white-space: nowrap; }
-  .cardpiles { font-size: 11px; color: var(--muted); text-align: right; white-space: nowrap; }
+  /* The rules text is read once a card is picked up, in the panel over the button at a
+     size that can be read. In a row of five cards it was ten pixels high and mostly off
+     the edge of the screen. */
+  .cardtext { font-size: 10px; line-height: 1.35; color: var(--muted); display: none; }
+
+  /* Over the button: the picked card's rules, or -- with nothing picked -- what ending
+     the turn now would cost. Fixed height, so picking a card never moves the button. */
+  /* Pinned to the bottom edge: on a phone too short for the whole table the hand scrolls
+     under it, and the button a turn ends with never leaves the screen. */
+  .cardbar { flex: none; display: grid; gap: 8px; position: sticky; bottom: 0; z-index: 2;
+             background: var(--bg); padding-top: 4px; }
+  /* ...with a short fade over its top edge, so a hand scrolled under it looks like it
+     carries on rather than like it was cut off. */
+  .cardbar::before { content: ""; position: absolute; left: 0; right: 0; top: -10px;
+                     height: 10px; pointer-events: none;
+                     background: linear-gradient(rgba(23,33,43,0), var(--bg)); }
+  .carddetail { min-height: 40px; font-size: 13px; line-height: 1.35; }
+  .carddetail .hd { font-weight: 700; }
+  .carddetail .tx { font-size: 12px; color: var(--muted); overflow: hidden;
+                    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+  .carddetail.forecast { display: flex; flex-direction: column; align-items: center;
+                         justify-content: center; text-align: center; color: var(--muted); }
+  .carddetail .harm { color: var(--hp); }
+  .carddetail .safe { color: var(--xp); }
+  .cardbtns { display: grid; grid-template-columns: 1fr 52px; gap: 8px; }
+  .cardbtns.one { grid-template-columns: 1fr; }
+  .cardbtns.two { grid-template-columns: 1fr 1fr; }
+  .cardbtns .go { min-height: 48px; font-size: 15px; }
+  /* Nothing left in the hand the turn can pay for: the button says so by breathing. */
+  .go.pulse { animation: cardpulse 1.3s ease-in-out infinite; }
+  @keyframes cardpulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(51,144,236,0); }
+    50%      { box-shadow: 0 0 0 5px rgba(51,144,236,.38); }
+  }
+
+  /* The end of a duel is the one moment worth a big word: it cost a fight and moved money. */
+  .cardresult { flex: none; border-radius: 14px; padding: 14px 12px 12px; text-align: center;
+                border: 1px solid var(--line); background: var(--card);
+                animation: rise .25s ease-out; }
+  .cardresult.win { border-color: var(--gold);
+                    background: linear-gradient(180deg, rgba(232,185,35,.18), var(--card) 70%); }
+  .cardresult.loss { border-color: rgba(224,82,96,.6);
+                     background: linear-gradient(180deg, rgba(224,82,96,.15), var(--card) 70%); }
+  .cardresult h2 { margin: 0; font-size: 24px; line-height: 1.2; }
+  .cardresult.win h2 { color: var(--gold); }
+  .cardresult .sub { font-size: 12px; color: var(--muted); margin: 3px 0 10px; }
+  .cardresult .note { font-size: 11px; color: var(--muted); margin-top: 7px; }
+  .cardreward { text-align: left; border-radius: 10px; background: var(--sunken);
+                padding: 7px 12px; margin-bottom: 12px; }
+  .cardreward .row { display: flex; justify-content: space-between; font-size: 13px;
+                     padding: 2px 0; }
+
   /* The travelling copy of a played card. Fixed to the viewport rather than parented to
      the row it came from, so it flies over the panels between it and the face it is aimed
-     at instead of being clipped by the first scroller it meets. */
-  .cardfly { position: fixed; z-index: 95; pointer-events: none;
+     at instead of being clipped by the first scroller it meets. Card-sized whatever it
+     came out of, with its rules text showing: the opponent's cards come out of tiles and
+     this is the one moment their text is on the table. */
+  .cardfly { position: fixed; left: 0; top: 0; z-index: 95; pointer-events: none;
              transform-origin: 50% 50%; will-change: transform, opacity; }
-  .cardfly .card { width: 100%; height: 100%; overflow: hidden; }
-  .cardlog { max-height: 168px; overflow-y: auto; font-size: 12px; line-height: 1.5; }
+  .cardfly .card { width: 132px; max-width: none; min-height: 0; overflow: hidden;
+                   box-shadow: 0 14px 30px rgba(0,0,0,.5); }
+  .cardfly .cardtext { display: block; }
+  /* What a card just did, said over the face it did it to. */
+  .cardfloat { position: fixed; z-index: 96; pointer-events: none; white-space: nowrap;
+               font-size: 19px; font-weight: 800; text-shadow: 0 2px 5px rgba(0,0,0,.8);
+               transform: translate(-50%, -50%); animation: cardfloat 1s ease-out both; }
+  .cardfloat.harm { color: #ff6b78; }
+  .cardfloat.heal { color: #6fdc92; }
+  .cardfloat.block { color: #8cc4ff; font-size: 16px; }
+  .cardfloat.status { color: var(--fg); font-size: 14px; }
+  @keyframes cardfloat {
+    0%   { opacity: 0; transform: translate(-50%, -30%) scale(.7); }
+    15%  { opacity: 1; transform: translate(-50%, -65%) scale(1.15); }
+    100% { opacity: 0; transform: translate(-50%, -190%) scale(1); }
+  }
+  /* A word in the middle of the table when the turn comes back to the player. */
+  .turnflash { position: fixed; left: 50%; z-index: 94; pointer-events: none;
+               transform: translate(-50%, -50%); padding: 7px 18px; border-radius: 999px;
+               background: rgba(0,0,0,.72); color: var(--mine); font-size: 14px;
+               font-weight: 800; letter-spacing: .05em; text-transform: uppercase;
+               animation: turnflash 1.1s ease-out both; }
+  @keyframes turnflash {
+    0%   { opacity: 0; transform: translate(-50%, -50%) scale(.85); }
+    18%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    70%  { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  /* A short phone: every part of the table a notch smaller, so a five-card hand and the
+     button under it still fit without scrolling. */
+  @media (max-height: 700px) {
+    .cardduel { gap: 6px; padding-top: calc(6px + env(safe-area-inset-top)); }
+    .cardtop button { width: 32px; height: 32px; }
+    .cardside { padding: 7px 9px; }
+    .cardside .av { width: 40px; height: 40px; border-radius: 10px; }
+    .cardintent { padding-top: 5px; }
+    .cardintent h3 { margin-bottom: 4px; }
+    .cardtiles { gap: 5px; }
+    .cardtile { width: 48px; height: 42px; }
+    .cardtile .ti { font-size: 15px; }
+    .card { min-height: 84px; padding-top: 27px; }
+    .carddetail { min-height: 34px; }
+    .cardbtns .go { min-height: 44px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cardhp .ghost, .go.pulse, .cardside .av.hit { animation: none; }
+    .cardhp .trail, .cardhp .fill { transition: none; }
+  }
+
+  /* One card, read in full: an announced card tapped on its tile. */
+  .cardpeek { display: flex; justify-content: center; padding: 4px 0 2px; }
+  .cardpeek .card { flex: none; width: 220px; max-width: none; padding: 34px 12px 12px; }
+  .cardpeek .cardname { font-size: 15px; -webkit-line-clamp: 3; }
+  .cardpeek .cardtags i { font-size: 12px; }
+  .cardpeek .cardtext { display: block; font-size: 12px; }
+  .cardlog { max-height: 55vh; overflow-y: auto; font-size: 12px; line-height: 1.5; }
   .cardlog div { padding: 2px 0; border-bottom: 1px solid var(--line); }
   .cardlog div:last-child { border-bottom: 0; }
+  .cardlog .head { padding-top: 9px; border-bottom: 0; color: var(--muted); font-size: 10px;
+                   font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 
   /* ----------------------------------------------------------------------- quests
      A quest card is read once and then acted on in the real world hours later, so it is
@@ -6117,6 +6341,14 @@ let CARD_BATTLE = null, CARD_SESSION = null, CARD_FACES = null, CARD_INFO = null
 // Which turn's hand has already been dealt on screen. Playing a card re-renders the same
 // turn, and re-running the deal on every tap would flip the whole hand back over.
 let CARD_DEALT_TURN = 0;
+// The card picked up out of the hand (its uid) -- lifted, with its rules over the button.
+// CARD_SHOWN is both fighters as last painted, which is what a hit is measured against.
+// CARD_PLAYS counts cards played since the page opened: the how-to line over the button
+// is there until the first one, once, rather than again in every duel.
+// CARD_LOG is the running record the server sends one action's worth of at a time.
+// CARD_PLAYBACK/CARD_SKIP/CARD_FLIGHT let a tap fast-forward the opponent's turn.
+let CARD_PICK = null, CARD_SHOWN = null, CARD_PLAYS = 0, CARD_LOG = [], CARD_LOG_TURN = 1,
+    CARD_PLAYBACK = false, CARD_SKIP = false, CARD_FLIGHT = null;
 // Whether the farm tab is showing the meadow board instead of the farm/quarry panels.
 // Not derived from S.meadow.round alone: a FINISHED round stays in the store until the
 // next one starts, and that must read as "last result, still on screen" only while this
@@ -6185,6 +6417,7 @@ function haptic(kind) {
   if (!tg || !tg.HapticFeedback) return;
   if (kind === "ok") tg.HapticFeedback.notificationOccurred("success");
   else if (kind === "no") tg.HapticFeedback.notificationOccurred("error");
+  else if (kind === "hit") tg.HapticFeedback.impactOccurred("medium");
   else tg.HapticFeedback.selectionChanged();
 }
 
@@ -8414,20 +8647,30 @@ function foeRow(foe, canFight) {
 // server owns the deck, the shuffle and every rule (pets_cardbattle); everything here
 // draws the last state it sent back and posts one action at a time.
 
-// How a played card leaves the table: it swells where it lies, then flies at the face it
-// is aimed at, shrinking as it goes. The pause afterwards is what makes a three-card turn
-// read as three separate blows instead of one blur.
-const CARD_GROW_MS = 200, CARD_FLY_MS = 460, CARD_PAUSE_MS = 500;
+// How a played card leaves the table. The player's own card lifts out of the hand into the
+// middle of the table and is thrown at the face it is aimed at. The opponent's is turned
+// over there first and HELD, because until then the player has only seen it as a tile.
+// The pause afterwards is what makes a three-card turn read as three separate blows
+// instead of one blur.
+const CARD_GROW_MS = 220, CARD_FLY_MS = 330, CARD_PAUSE_MS = 300;
+const CARD_REVEAL_MS = 260, CARD_HOLD_MS = 460;
 
 function reducedMotion() {
   try { return window.matchMedia("(prefers-reduced-motion: reduce)").matches; }
   catch (e) { return false; }
 }
 
-function wait(ms) { return new Promise((done) => setTimeout(done, ms)); }
+// A wait the player can cut short. The opponent's turn is several of these in a row, and a
+// player who has already read the plan should not have to sit through it (see CARD_SKIP).
+function wait(ms) {
+  return new Promise((done) => {
+    if (CARD_SKIP) { done(); return; }
+    setTimeout(done, ms);
+  });
+}
 
-// One card, either in the hand or in the opponent's announced turn. `playable` is what
-// turns it into a button -- an intent card is the same markup with nothing to tap.
+// One card, either in the hand, in a flight, or read in full on its own. `playable` is
+// what turns it into a button -- a card in flight is the same markup with nothing to tap.
 // `deal` is the card's place in a freshly dealt hand, or -1 for a card that is already
 // on the table and must not flip again.
 function cardMarkup(card, playable, affordable, deal) {
@@ -8444,54 +8687,249 @@ function cardMarkup(card, playable, affordable, deal) {
     ? ' dealt" style="animation-delay:' + Number(deal) * 60 + 'ms'
     : "";
   if (!playable) return '<div class="card' + kind + flip + '">' + body + "</div>";
-  return '<button class="card' + kind + flip + '" data-cardplay="' +
-    esc(card.uid || "") + '"' + (affordable ? "" : " disabled") + ">" + body + "</button>";
+  // Dimmed when the turn cannot pay for it, never disabled: every card in the hand can be
+  // picked up and read, and a disabled button cannot be tapped to find out what it does.
+  const state = (affordable ? "" : " poor") + (card.uid === CARD_PICK ? " picked" : "");
+  return '<button class="card' + kind + state + flip + '" data-cardpick="' +
+    esc(card.uid || "") + '">' + body + "</button>";
 }
 
-// The two parts of a fighter panel that change during a turn, kept as their own functions
-// so the flight animation can repaint just these without rebuilding the panel -- which
-// would throw away the health bar's width transition in the middle of a hit landing.
+// The one thing an announced card is mainly about, for the tile it is announced on: the
+// hit if it hits, otherwise the block, the heal or the first thing it puts on somebody.
+// Anything else it does is a small mark in the corner. The whole card is a tap away; the
+// tile is for reading the opponent's turn at a glance.
+function cardTile(card, index) {
+  const meta = (CARD_BATTLE && CARD_BATTLE.statuses) || {};
+  const icon = (key) => (meta[key] || {}).icon || "•";
+  const apply = Object.entries(card.apply || {});
+  const boost = Object.entries(card.boost || {});
+  let main = [card.icon || "🂠", ""];
+  const extra = apply.map((row) => icon(row[0])).concat(boost.map((row) => icon(row[0])));
+  if (card.damage) {
+    main = ["⚔️", card.damage + (card.hits > 1 ? "×" + card.hits : "")];
+    if (card.block) extra.unshift("🛡");
+  } else if (card.block) main = ["🛡", String(card.block)];
+  else if (card.heal) main = ["❤️", String(card.heal)];
+  else if (apply.length) { main = [icon(apply[0][0]), String(apply[0][1])]; extra.shift(); }
+  else if (boost.length) { main = [icon(boost[0][0]), "+" + boost[0][1]]; extra.shift(); }
+  else if (card.energy) main = ["⚡", (card.energy > 0 ? "+" : "") + card.energy];
+  else if (card.draw) main = ["🃏", "+" + card.draw];
+  const tier = { legendary: " r-legendary", magic: " r-magic", ultimate: " r-ultimate" };
+  return '<button class="cardtile' + (tier[card.rarity] || "") + '" data-cardpeek="' +
+    Number(index) + '" aria-label="' + esc(card.name || "") + '">' +
+    '<span class="ti">' + esc(main[0]) + '</span><span class="tn">' + esc(main[1]) + "</span>" +
+    (extra.length ? '<span class="tx">' + esc(extra.slice(0, 2).join("")) + "</span>" : "") +
+    "</button>";
+}
+
+// The parts of a fighter panel that change during a turn, kept as their own functions so
+// the flight animation can repaint just these without rebuilding the panel -- which would
+// throw away the health bar's width transition in the middle of a hit landing.
 function cardNums(fighter) {
-  return "<b>" + Number(fighter.hp || 0) + "</b> / " + Math.max(1, fighter.max_hp || 1) +
-    (fighter.block ? " · <span class='cardblock'>🛡 " + Number(fighter.block) +
-      "</span>" : "");
+  return "<b>" + Number(fighter.hp || 0) + "</b> / " + Math.max(1, fighter.max_hp || 1);
 }
 
+function cardBlock(fighter) {
+  return fighter.block ? "🛡 " + Number(fighter.block) : "";
+}
+
+function cardHpPct(fighter) {
+  return Math.max(0, Math.min(100,
+    (100 * Number(fighter.hp || 0)) / Math.max(1, fighter.max_hp || 1)));
+}
+
+// Tappable, because the only other way to learn what 💔 means on a phone was a `title`
+// tooltip, and a touch screen never shows one.
 function cardBadges(fighter) {
   const meta = (CARD_BATTLE && CARD_BATTLE.statuses) || {};
   return Object.keys(fighter.status || {}).map((key) => {
     const row = meta[key] || {};
-    return "<span title='" + esc(row.hint || "") + "'>" + esc(row.icon || "•") + " " +
-      esc(row.name || key) + " " + Number(fighter.status[key]) + "</span>";
+    return '<button data-cardstatus="' + esc(key) + '">' + esc(row.icon || "•") + " " +
+      esc(row.name || key) + " " + Number(fighter.status[key]) + "</button>";
   }).join("");
 }
 
-// One fighter's corner: face, name, health bar, block, and whatever is stuck to them.
-function cardSide(fighter, face, side) {
-  const max = Math.max(1, fighter.max_hp || 1);
-  const pct = Math.max(0, Math.min(100, (100 * (fighter.hp || 0)) / max));
-  return '<div class="cardside' + (side === "enemy" ? " enemy" : "") +
-    '" data-side="' + esc(side) + '">' +
+// One fighter's panel: face, name, block, health bar, and whatever is stuck to them.
+// `extra` is what spans the panel's foot -- the opponent's announced turn on theirs, the
+// energy and the piles on the player's. The bars are drawn where they stood on screen
+// before this render, so paintCardSide can slide them to where they stand now.
+function cardSide(fighter, face, side, extra, acting) {
+  const shown = cardHpPct((CARD_SHOWN && CARD_SHOWN[side]) || fighter);
+  return '<div class="cardside ' + esc(side) + (acting ? " acting" : "") +
+    (fighter.block ? " blocked" : "") + '" data-side="' + esc(side) + '">' +
     '<span class="av">' + shot((face || {}).portrait, (face || {}).crop) + "</span>" +
-    "<div><div class='who'>" + esc(fighter.name || "—") + "</div>" +
-      '<div class="cardhp"><i style="width:' + pct + '%"></i></div>' +
-      '<div class="cardnums">' + cardNums(fighter) + "</div>" +
+    '<div class="cardwho"><div class="cardhead"><span class="who">' +
+      esc(fighter.name || "—") + '</span><span class="cardblock">' + cardBlock(fighter) +
+      "</span></div>" +
+      '<div class="cardhp"><i class="trail" style="width:' + shown + '%"></i>' +
+        '<i class="fill" style="width:' + shown + '%"></i><i class="ghost"></i>' +
+        '<span class="cardnums">' + cardNums(fighter) + "</span></div>" +
       '<div class="cardstatus">' + cardBadges(fighter) + "</div>" +
-    "</div></div>";
+    "</div>" + (extra || "") + "</div>";
 }
 
+// Bring one panel up to `fighter`, and say over the face what changed since it was last
+// painted. Called after every render and after each of the opponent's cards lands, so the
+// difference is always exactly one card's worth (or one turn change's).
 function paintCardSide(side, fighter) {
   const root = document.querySelector('.cardside[data-side="' + side + '"]');
   if (!root || !fighter) return;
-  const bar = root.querySelector(".cardhp > i");
-  if (bar) {
-    bar.style.width = Math.max(0, Math.min(100,
-      (100 * (fighter.hp || 0)) / Math.max(1, fighter.max_hp || 1))) + "%";
+  const before = CARD_SHOWN && CARD_SHOWN[side];
+  const width = cardHpPct(fighter) + "%";
+  for (const bar of root.querySelectorAll(".cardhp .fill, .cardhp .trail")) {
+    void bar.offsetWidth;       // commit the old width first, or there is nothing to animate
+    bar.style.width = width;
   }
   const nums = root.querySelector(".cardnums");
   if (nums) nums.innerHTML = cardNums(fighter);
+  const block = root.querySelector(".cardblock");
+  if (block) block.textContent = cardBlock(fighter);
+  root.classList.toggle("blocked", Number(fighter.block || 0) > 0);
   const status = root.querySelector(".cardstatus");
   if (status) status.innerHTML = cardBadges(fighter);
+  if (before) cardImpact(root, before, fighter, side);
+  CARD_SHOWN = Object.assign({}, CARD_SHOWN || {});
+  CARD_SHOWN[side] = fighter;
+}
+
+// What a card just did to one fighter, over their face: the hit in red, healing in green,
+// block gained in blue, and each status that went up. Worked out from the two snapshots
+// either side of it, so it can only ever show what the server says happened. Block and
+// statuses running down are not announced -- that is the turn changing, not a card.
+function cardImpact(root, before, after, side) {
+  const floats = [];
+  const hp = Number(after.hp || 0) - Number(before.hp || 0);
+  const block = Number(after.block || 0) - Number(before.block || 0);
+  if (hp < 0) floats.push(["harm", "−" + (-hp)]);
+  else if (hp > 0) floats.push(["heal", "+" + hp]);
+  if (block > 0) floats.push(["block", "🛡 +" + block]);
+  const meta = (CARD_BATTLE && CARD_BATTLE.statuses) || {};
+  for (const key of Object.keys(after.status || {})) {
+    const grew = Number(after.status[key] || 0) - Number((before.status || {})[key] || 0);
+    if (grew > 0) floats.push(["status", ((meta[key] || {}).icon || "•") + " +" + grew]);
+  }
+  const face = root.querySelector(".av");
+  if (!face || !floats.length) return;
+  if (hp < 0) {
+    face.classList.remove("hit");
+    void face.offsetWidth;          // restart the shake if the last one is still running
+    face.classList.add("hit");
+    if (side === "player") haptic("hit");
+  }
+  if (reducedMotion()) return;
+  const box = face.getBoundingClientRect();
+  // Stacked one above the other rather than side by side: "🛡 +79" is wider than the face
+  // it rises from, and two of them next to each other overprint.
+  floats.forEach((row, index) => {
+    const node = document.createElement("div");
+    node.className = "cardfloat " + row[0];
+    node.textContent = row[1];
+    node.style.left = (box.left + box.width / 2) + "px";
+    node.style.top = (box.top + box.height / 2 + 12 - index * 24) + "px";
+    node.style.animationDelay = index * 90 + "ms";
+    document.body.appendChild(node);
+    setTimeout(() => node.remove(), 1150 + index * 90);
+  });
+}
+
+// The slice of each health bar that goes if the turn ends now, from the server's own dry
+// run of the opponent's turn (pets_cardbattle.forecast). It shrinks as block goes up.
+function paintForecast() {
+  const battle = CARD_BATTLE;
+  const future = battle && !battle.finished ? battle.forecast : null;
+  for (const side of ["player", "enemy"]) {
+    const ghost = document.querySelector('.cardside[data-side="' + side + '"] .cardhp .ghost');
+    if (!ghost) continue;
+    const fighter = battle.fighters[side] || {};
+    const after = future ? Number(future[side + "_hp"]) : NaN;
+    const lost = Number(fighter.hp || 0) - after;
+    if (!(lost > 0)) { ghost.style.width = "0"; continue; }
+    const max = Math.max(1, fighter.max_hp || 1);
+    ghost.style.left = (100 * Math.max(0, after)) / max + "%";
+    ghost.style.width = (100 * lost) / max + "%";
+  }
+}
+
+// The line over the end-turn button while no card is picked up: what ending the turn now
+// would cost, in the words the decision needs.
+function cardForecastLine(battle) {
+  const future = battle.forecast;
+  if (!future) return "";
+  const lost = Number(battle.fighters.player.hp || 0) - Number(future.player_hp || 0);
+  if (future.outcome === "loss") return '<b class="harm">Этот ход тебя добьёт</b> — нужен блок или лечение';
+  if (future.outcome === "draw") return "Если закончить ход — ничья";
+  if (future.outcome === "win") return '<b class="safe">Соперник не переживёт свой ход</b>';
+  if (lost > 0) return 'Если закончить ход: <b class="harm">−' + lost + " HP</b>";
+  if (lost < 0) return 'Если закончить ход: <b class="safe">+' + (-lost) + " HP</b>";
+  return 'Если закончить ход: <b class="safe">без потерь</b>';
+}
+
+// The energy left, and the two piles. The piles are only counted: the order of the draw
+// pile is the server's.
+function cardMeta(battle) {
+  const energy = Number(battle.energy || 0);
+  const orbs = Math.min(8, Math.max(energy, Number(battle.max_energy || 0)));
+  let marks = "";
+  for (let i = 0; i < orbs; i++) marks += '<i class="' + (i < energy ? "on" : "") + '"></i>';
+  return '<div class="cardmeta"><span class="cardenergy" aria-label="Энергия ' + energy +
+    '">⚡' + marks + (energy > 8 ? " " + energy : "") + "</span>" +
+    '<span class="cardpiles">Колода ' + Number(battle.deck.draw) + " · Сброс " +
+    Number(battle.deck.discard) + "</span></div>";
+}
+
+// Over the button: the picked card's rules and the button that plays it, or -- with
+// nothing picked up -- the forecast and the button that ends the turn.
+function cardActions(battle, picked) {
+  if (picked) {
+    const cost = Number(picked.cost || 0);
+    const affordable = cost <= Number(battle.energy || 0);
+    return '<div class="cardbar"><div class="carddetail"><div class="hd">' +
+        esc(picked.icon || "") + " " + esc(picked.name || "") + '</div><div class="tx">' +
+        esc(picked.effect || "") + "</div></div>" +
+      '<div class="cardbtns"><button class="go" data-cardplay="' + esc(picked.uid || "") + '"' +
+        (affordable ? "" : " disabled") + ">" +
+        (affordable ? "Сыграть · ⚡" + cost : "Нужно ⚡" + cost + " — осталось " +
+          Number(battle.energy || 0)) + "</button>" +
+      '<button class="go sec" data-cardbattle="unpick" aria-label="Положить обратно">✕</button>' +
+      "</div></div>";
+  }
+  const payable = battle.hand.some((card) => Number(card.cost || 0) <= Number(battle.energy || 0));
+  return '<div class="cardbar"><div class="carddetail forecast"><div>' +
+      cardForecastLine(battle) + "</div>" +
+      (CARD_PLAYS ? "" : '<div class="tiny">Нажми на карту, чтобы прочитать её, ещё раз — сыграть.</div>') +
+    "</div>" +
+    '<div class="cardbtns one"><button class="go' + (payable ? "" : " pulse") +
+      '" data-cardbattle="end">⏭ Закончить ход</button></div></div>';
+}
+
+// What the duel came to, in place of the hand once it is over.
+function cardResult(battle) {
+  const won = battle.winner === "player";
+  const kind = battle.draw ? "draw" : won ? "win" : "loss";
+  const title = battle.draw ? "🤝 Ничья" : won ? "🏆 Победа" : "💀 Поражение";
+  const mine = battle.fighters.player, foe = battle.fighters.enemy;
+  const standing = battle.draw ? null : won ? mine : foe;
+  const sub = (standing
+    ? esc(standing.name || "") + ": " + Number(standing.hp || 0) + " / " +
+      Number(standing.max_hp || 0) + " HP · "
+    : "") + "ходов: " + Number(battle.turn || 0);
+  // A rematch is a new duel and costs a new arena fight, so the button says so and does
+  // not offer one the bank cannot pay for. A duel still open when the mode was closed
+  // plays to its end, but cannot rematch at all.
+  const arena = (S && S.arena) || {};
+  const left = arena.available == null ? null : Number(arena.available);
+  const again = Boolean((S.features || {}).card_duel);
+  return '<div class="cardresult ' + kind + '"><h2>' + title + '</h2><div class="sub">' +
+    sub + "</div>" + cardRewardPanel() +
+    '<div class="cardbtns ' + (again ? "two" : "one") + '">' +
+      (again
+        ? '<button class="go" data-cardbattle="again"' + (left === 0 ? " disabled" : "") +
+          ">🃏 Ещё раз</button>"
+        : "") +
+      '<button class="go sec" data-cardbattle="close">◀ На арену</button></div>' +
+    (again ? '<div class="note">' + (left === 0 ? "Бои арены кончились — подожди следующий."
+      : "Реванш стоит 1 бой арены" + (left == null ? "" : " · осталось " + left)) + "</div>" : "") +
+    "</div>";
 }
 
 // Which face a card is aimed at. Anything that deals damage travels to the other side;
@@ -8506,50 +8944,91 @@ function cardAvatar(side) {
   return document.querySelector('.cardside[data-side="' + side + '"] .av');
 }
 
+// The middle of the table, where a card is held up before it is thrown.
+function cardStagePoint() {
+  const mid = $("cardMid");
+  const box = mid ? mid.getBoundingClientRect() : null;
+  if (box && box.width) return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+  return { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+}
+
 // The flight itself. Resolves when the card has landed -- and resolves anyway if the
 // browser never reports the animation finished, because a duel that stops taking taps
 // over a missing animation event is far worse than one that skips a flourish.
 function flyCard(fromEl, targetEl, card) {
   return new Promise((resolve) => {
-    if (!fromEl || !targetEl || reducedMotion()) { resolve(); return; }
+    if (!fromEl || !targetEl || reducedMotion() || CARD_SKIP) { resolve(); return; }
     const from = fromEl.getBoundingClientRect();
     const to = targetEl.getBoundingClientRect();
     if (!from.width || !to.width) { resolve(); return; }
+    // The opponent's cards come out of the tiles under their name, and are turned over and
+    // held before they are thrown; the player's own, already read in the hand, only lift.
+    const reveal = Boolean(fromEl.closest(".cardintent"));
 
     const ghost = document.createElement("div");
     ghost.className = "cardfly";
-    ghost.style.left = from.left + "px";
-    ghost.style.top = from.top + "px";
-    ghost.style.width = from.width + "px";
-    ghost.style.height = from.height + "px";
+    ghost.style.opacity = "0";
     ghost.innerHTML = cardMarkup(card, false, false);
     document.body.appendChild(ghost);
+    const w = ghost.offsetWidth, h = ghost.offsetHeight;
     // The original stays where it is but goes invisible, so the row it left does not
     // reflow and shuffle every other card sideways in the middle of the flight.
     fromEl.style.visibility = "hidden";
 
-    const dx = (to.left + to.width / 2) - (from.left + from.width / 2);
-    const dy = (to.top + to.height / 2) - (from.top + from.height / 2);
-    const total = CARD_GROW_MS + CARD_FLY_MS;
-    let settled = false;
+    const stage = cardStagePoint();
+    const at = (x, y, scale, opacity, easing) => ({
+      transform: "translate(" + (x - w / 2) + "px," + (y - h / 2) + "px) scale(" + scale + ")",
+      opacity, easing,
+    });
+    const fx = from.left + from.width / 2, fy = from.top + from.height / 2;
+    const tx = to.left + to.width / 2, ty = to.top + to.height / 2;
+    const lift = reveal ? CARD_REVEAL_MS : CARD_GROW_MS;
+    const hold = reveal ? CARD_HOLD_MS : 0;
+    const total = lift + hold + CARD_FLY_MS;
+    const frames = [
+      Object.assign(at(fx, fy, from.width / w, reveal ? .5 : 1, "cubic-bezier(.2,.8,.3,1)"),
+                    { offset: 0 }),
+      Object.assign(at(stage.x, stage.y, 1.12, 1, "linear"), { offset: lift / total }),
+    ];
+    if (hold) {
+      frames.push(Object.assign(at(stage.x, stage.y, 1.12, 1, "cubic-bezier(.5,0,.8,.3)"),
+                                { offset: (lift + hold) / total }));
+    } else {
+      frames[1].easing = "cubic-bezier(.5,0,.8,.3)";
+    }
+    frames.push(Object.assign(at(tx, ty, .2, .15), { offset: 1 }));
+
+    let settled = false, run = null;
     const finish = () => {
       if (settled) return;
       settled = true;
+      if (CARD_FLIGHT === run) CARD_FLIGHT = null;
       ghost.remove();
       resolve();
     };
     try {
-      const run = ghost.animate([
-        { transform: "translate(0px,0px) scale(1)", opacity: 1, offset: 0 },
-        { transform: "translate(0px,0px) scale(1.3)", opacity: 1,
-          offset: CARD_GROW_MS / total },
-        { transform: "translate(" + dx + "px," + dy + "px) scale(.16)",
-          opacity: .1, offset: 1 },
-      ], { duration: total, easing: "cubic-bezier(.34,.01,.42,1)", fill: "forwards" });
+      run = ghost.animate(frames, { duration: total, fill: "forwards" });
+      ghost.style.opacity = "";
+      CARD_FLIGHT = run;
       run.addEventListener("finish", finish, { once: true });
     } catch (e) { finish(); return; }
     setTimeout(finish, total + 400);          // backstop, see above
   });
+}
+
+// A word in the middle of the table when the turn comes back to the player. The deal says
+// it too, but only to somebody looking at the hand; this is for somebody looking at the
+// faces, where the opponent's turn has just been playing out.
+function turnFlash(text) {
+  if (reducedMotion()) return;
+  const old = document.querySelector(".turnflash");
+  if (old) old.remove();
+  const node = document.createElement("div");
+  node.className = "turnflash";
+  node.textContent = text;
+  node.style.top = cardStagePoint().y + "px";
+  document.body.appendChild(node);
+  setTimeout(() => node.remove(), 1200);
 }
 
 // The hand's own block, kept at its height and relabelled while the opponent acts. It is
@@ -8557,82 +9036,85 @@ function flyCard(fromEl, targetEl, card) {
 // would jump the page at exactly the wrong moment.
 function showOpponentTurn() {
   const hand = $("cardHand");
-  if (hand) hand.innerHTML = '<div class="cardrow cardwait">Ход соперника…</div>';
+  if (hand) {
+    hand.style.minHeight = hand.offsetHeight + "px";
+    hand.innerHTML = '<div class="cardrow cardwait">Ход соперника… нажми, чтобы ускорить</div>';
+  }
+  // Disabled, and without the in-flight spinner the tap put on it: the wait from here on
+  // is the opponent's cards, which are on screen, not a request.
   const end = document.querySelector('[data-cardbattle="end"]');
-  if (end) end.disabled = true;
+  if (end) { end.disabled = true; end.classList.remove("pulse", "pressed"); }
+  const line = document.querySelector(".carddetail");
+  if (line) line.innerHTML = "";
+  // The forecast is about the turn now playing out, so it gives way to the real thing.
+  for (const ghost of document.querySelectorAll(".cardhp .ghost")) ghost.style.width = "0";
+  // Said by the frame moving to the opponent's panel, not by a word in the middle: the
+  // middle of the table is where their first card is about to be turned over.
+  for (const side of document.querySelectorAll(".cardside")) {
+    side.classList.toggle("acting", side.dataset.side === "enemy");
+  }
 }
 
 function renderCardBattle(box) {
   const battle = CARD_BATTLE;
   const faces = CARD_FACES || {};
-  const info = CARD_INFO || {};
   const mine = battle.fighters.player;
   const foe = battle.fighters.enemy;
   const over = battle.finished;
-  const verdict = over
-    ? (battle.draw ? "Ничья" : battle.winner === "player" ? "Победа" : "Поражение")
-    : "Ход " + battle.turn;
   const intent = battle.enemy_intent || [];
-
-  // Order matters here: the hand sits directly under the two faces, because that is both
-  // where it is reachable without scrolling and where the flight to an avatar is short
-  // enough to stay on screen end to end. The opponent's announced turn goes below it --
-  // that is read once a turn, while the hand is touched every few seconds.
   // A hand is dealt once per turn. Re-rendering the same turn (which every played card
   // does) must not flip the remaining cards back over.
   const dealing = battle.turn !== CARD_DEALT_TURN;
+  if (over || !battle.hand.some((card) => card.uid === CARD_PICK)) CARD_PICK = null;
+  const picked = battle.hand.find((card) => card.uid === CARD_PICK) || null;
+  const stunned = Number((foe.status || {}).stun || 0) > 0;
 
-  box.innerHTML =
-    '<div class="cardstage" id="cardStage">' + cardSide(foe, faces.enemy, "enemy") +
-      cardSide(mine, faces.player, "player") + "</div>" +
-    '<div class="cardbar">' +
-      '<span class="cardenergy">⚡ ' + Number(battle.energy) + " / " +
-        Number(battle.max_energy) + "</span>" +
-      "<span class='small' style='text-align:center'>" + esc(verdict) + "</span>" +
-      '<span class="cardpiles">🃏 ' + Number(battle.deck.draw) + " · ♻️ " +
-        Number(battle.deck.discard) + "</span>" +
+  // The opponent's whole announced turn sits on the opponent's own panel -- where the
+  // genre puts it, and in the same glance as the bar it is about to cut into. As a row of
+  // small tiles it no longer pushes the hand down, which was the reason it used to go
+  // below the hand and, with it, below the fold.
+  const plan = over ? "" :
+    '<div class="cardintent' + (stunned ? " stunned" : "") + '"><h3>Соперник в следующий ход' +
+      (stunned ? " · 💫 оглушён, пропустит" : "") + "</h3>" +
+      (intent.length
+        ? '<div class="cardtiles">' + intent.map(cardTile).join("") + "</div>"
+        : '<div class="tiny muted">Ничего не сыграет — карт не осталось.</div>') +
+    "</div>";
+
+  // Order matters here: the hand sits directly under the player's panel, because that is
+  // both where it is reachable without scrolling and where the flight to either face is
+  // short enough to stay on screen end to end.
+  box.innerHTML = '<div class="cardduel" id="cardDuel">' +
+    '<div class="cardtop">' +
+      '<button data-cardbattle="' + (over ? "close" : "leave") + '" aria-label="Выйти">✕</button>' +
+      '<span class="cardturn">' + (over ? "Бой окончен" : "Ход " + Number(battle.turn)) + "</span>" +
+      '<button data-cardbattle="log" aria-label="Ход боя">📜</button>' +
+    "</div>" +
+    '<div class="cardstage" id="cardStage">' +
+      cardSide(foe, faces.enemy, "enemy", plan, false) +
+      '<div class="cardmid" id="cardMid"><span>⚔️</span></div>' +
+      cardSide(mine, faces.player, "player", over ? "" : cardMeta(battle), !over) +
     "</div>" +
     (over
-      ? '<div class="test-actions" style="margin-top:9px">' +
-        // A duel still open when the mode was closed plays to its end, but cannot rematch.
-        ((S.features || {}).card_duel
-          ? '<button class="go test-action" data-cardbattle="again" style="grid-column:span 2">' +
-            '<span class="ic">🃏</span>Ещё раз</button>'
-          : "") +
-        '<button class="go sec test-action" data-cardbattle="close" style="grid-column:' +
-          ((S.features || {}).card_duel ? "span 2" : "1 / -1") + '">' +
-          '<span class="ic">◀️</span>На арену</button></div>'
+      ? cardResult(battle)
       : '<div class="cardhand" id="cardHand"><div class="cardrow">' +
           (battle.hand.length
             ? battle.hand.map((card, index) => cardMarkup(
                 card, true, card.cost <= battle.energy, dealing ? index : -1)).join("")
-            : "<div class='tiny muted'>Рука пуста.</div>") +
-        "</div></div>" +
-        '<div class="test-actions" style="margin-top:9px">' +
-          '<button class="go test-action" data-cardbattle="end" style="grid-column:span 3">' +
-            '<span class="ic">⏭</span>Закончить ход</button>' +
-          '<button class="go sec test-action" data-cardbattle="close">' +
-            '<span class="ic">◀️</span>Выход</button></div>') +
-    '<div class="cardintent" style="margin-top:9px"><h3>👁 Соперник в следующий ход</h3>' +
-      (over
-        ? '<div class="tiny muted">Бой окончен.</div>'
-        : (intent.length
-          ? '<div class="cardrow">' +
-            intent.map((card) => cardMarkup(card, false, false, -1)).join("") + "</div>"
-          : '<div class="tiny muted">Ничего не сыграет — карт не осталось.</div>')) +
-    "</div>" +
-    cardRewardPanel() +
-    '<div class="panel" style="margin-top:9px"><h2>Ход боя</h2>' +
-      '<div class="cardlog" id="cardLog">' +
-        (battle.log || []).map((row) => "<div>" + esc(row) + "</div>").join("") +
-      "</div></div>" +
-    "<div class='tiny muted' style='margin-top:9px;text-align:center'>" +
-      "Колода: " + Number((info.deck_size || {}).player || 0) + " карт · 🟣 " +
-      Number(info.legendaries || 0) + " · 📜 " + Number(info.scrolls || 0) +
-      " · у обоих " + Number(info.max_hp || 0) + " HP и удар " +
-      Number(info.attack || 0) + "</div>";
+            : "<div class='tiny muted cardempty'>Рука пуста.</div>") +
+        "</div></div>" + cardActions(battle, picked)) +
+    "</div>";
   paintShots(box);
-  const log = $("cardLog"); if (log) log.scrollTop = log.scrollHeight;
+  paintCardSide("enemy", foe);
+  paintCardSide("player", mine);
+  paintForecast();
+  const mid = $("cardMid");
+  if (mid) mid.classList.toggle("tight", mid.offsetHeight < 30);
+  if (over && !battle.draw) {
+    const fallen = cardAvatar(battle.winner === "player" ? "enemy" : "player");
+    if (fallen) fallen.classList.add("ko");
+  }
+  if (dealing && !over) turnFlash("Ход " + Number(battle.turn));
   CARD_DEALT_TURN = battle.turn;
 }
 
@@ -8656,6 +9138,62 @@ function cardRewardPanel() {
   return '<div class="cardreward">' + rows.join("") + "</div>";
 }
 
+// The server answers each action with that action's lines only. Kept here as one running
+// record, a heading per turn, for the log sheet.
+function cardLogAdd(battle) {
+  for (const text of battle.log || []) CARD_LOG.push({ text });
+  const turn = Number(battle.turn || 1);
+  if (turn > CARD_LOG_TURN && !battle.finished) CARD_LOG.push({ head: "Ход " + turn });
+  CARD_LOG_TURN = Math.max(CARD_LOG_TURN, turn);
+  if (CARD_LOG.length > 300) CARD_LOG.splice(0, CARD_LOG.length - 300);
+}
+
+function showCardLog() {
+  const info = CARD_INFO || {};
+  sheet('<h3>📜 Ход боя</h3><div class="cardlog" id="cardLog">' +
+      (CARD_LOG.map((row) => row.head
+        ? '<div class="head">' + esc(row.head) + "</div>"
+        : "<div>" + esc(row.text) + "</div>").join("") ||
+        "<div class='muted'>Пока ничего не произошло.</div>") +
+    "</div>" +
+    "<div class='tiny muted' style='margin-top:9px;text-align:center'>" +
+      "Колода: " + Number((info.deck_size || {}).player || 0) + " карт · 🟣 " +
+      Number(info.legendaries || 0) + " · 📜 " + Number(info.scrolls || 0) +
+      " · у обоих " + Number(info.max_hp || 0) + " HP и удар " +
+      Number(info.attack || 0) + "</div>" +
+    '<div class="acts"><button class="go sec" data-cardbattle="shut">Закрыть</button></div>');
+  const log = $("cardLog"); if (log) log.scrollTop = log.scrollHeight;
+}
+
+// One announced card, in full.
+function peekEnemyCard(index) {
+  const intent = (CARD_BATTLE && CARD_BATTLE.enemy_intent) || [];
+  const card = intent[index];
+  if (!card) return;
+  sheet('<div class="cardpeek">' + cardMarkup(card, false, false, -1) + "</div>" +
+    "<div class='small muted' style='text-align:center;margin-top:8px'>Соперник сыграет её " +
+      (intent.length > 1 ? (index + 1) + "-й из " + intent.length + " " : "") +
+      "в свой ход, по порядку.</div>" +
+    '<div class="acts"><button class="go sec" data-cardbattle="shut">Понятно</button></div>');
+}
+
+function cardStatusHint(key) {
+  const row = ((CARD_BATTLE && CARD_BATTLE.statuses) || {})[key];
+  if (row) toast(row.icon + " " + row.name + ": " + row.hint);
+}
+
+// Leaving a duel in the middle throws away the arena fight it was paid with and pays
+// nothing, and the button for it sits a thumb's width from the end-turn button's old
+// place -- so it asks first. A finished duel has nothing left to lose and just closes.
+function confirmCardLeave() {
+  if (!CARD_BATTLE || CARD_BATTLE.finished) { closeCardBattle(); return; }
+  sheet("<h3>Выйти из боя?</h3>" +
+    "<p class='small muted' style='margin:6px 0 0'>Бой уже оплачен боем арены: выход его не " +
+      "вернёт, а за брошенный бой ничего не платят.</p>" +
+    '<div class="acts"><button class="go warn" data-cardbattle="close">Выйти</button>' +
+      '<button class="go sec" data-cardbattle="shut">Остаться в бою</button></div>');
+}
+
 function cardBattleState(data) {
   CARD_BATTLE = data.battle;
   CARD_SESSION = data.session;
@@ -8663,6 +9201,7 @@ function cardBattleState(data) {
   CARD_INFO = { deck_size: data.deck_size, legendaries: data.legendaries,
                 scrolls: data.scrolls, attack: data.attack, max_hp: data.max_hp };
   if (data.reward !== undefined) CARD_REWARD = data.reward;
+  cardLogAdd(CARD_BATTLE);
   // The duel spent a fight and moved money, so the wallet and the fight counter behind
   // this screen are both stale until the settlement hands back fresh state.
   if (data.state) { S = data.state; FOES = null; }
@@ -8684,7 +9223,8 @@ async function openCardBattle(opponentId) {
   if (CARD_BUSY) return;
   CARD_BUSY = true;
   try {
-    CARD_REWARD = null;
+    CARD_REWARD = null; CARD_PICK = null; CARD_SHOWN = null;
+    CARD_LOG = []; CARD_LOG_TURN = 1;
     CARD_DEALT_TURN = 0;                    // the opening hand deals itself
     cardBattleState(await api("/api/card-battle/start", { opponent_id: opponentId }));
     CARD_LAST_FOE = opponentId;
@@ -8695,12 +9235,33 @@ async function openCardBattle(opponentId) {
   finally { CARD_BUSY = false; }
 }
 
+// The first tap on a card picks it up: it lifts out of the row and its rules take the
+// place of the forecast over the button, which becomes the button that plays it. A second
+// tap on the same card plays it too, so a player who knows the deck spends one extra tap,
+// not a trip down to another button. One tap used to play the card outright, from a row
+// where most of the hand and every card's rules text were off the edge of the screen.
+async function pickCard(uid) {
+  if (!CARD_BATTLE || CARD_BATTLE.finished || CARD_BUSY) return;
+  if (CARD_PICK === uid) {
+    const card = (CARD_BATTLE.hand || []).find((row) => row.uid === uid);
+    if (card && Number(card.cost || 0) > Number(CARD_BATTLE.energy || 0)) {
+      haptic("no"); toast("Не хватает энергии на эту карту."); return;
+    }
+    await playCard(uid);
+    return;
+  }
+  CARD_PICK = uid;
+  haptic();
+  render();
+}
+
 async function playCard(uid) {
   if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
   const card = (CARD_BATTLE.hand || []).find((row) => row.uid === uid);
   if (!card || Number(card.cost || 0) > Number(CARD_BATTLE.energy || 0)) return;
   CARD_BUSY = true;
-  const el = document.querySelector('[data-cardplay="' + uid + '"]');
+  CARD_PICK = null;
+  const el = document.querySelector('[data-cardpick="' + uid + '"]');
   try {
     // The flight and the request run together rather than one after the other, so the
     // animation is what the wait for the server is spent on instead of being added to it.
@@ -8708,17 +9269,28 @@ async function playCard(uid) {
       api("/api/card-battle/action", { session: CARD_SESSION, action: "play", card: uid }),
       flyCard(el, cardAvatar(cardTargetSide(card, "player")), card),
     ]);
+    CARD_PLAYS += 1;
     settleCardBattle(answers[0]);
   } catch (e) {
-    haptic("no"); toast(e.message);
     if (el) el.style.visibility = "";        // the card never left: put it back
-    render();
+    cardActionFailed(e);
   } finally { CARD_BUSY = false; }
+}
+
+// A refused action. When what was refused is the duel itself -- its session ran out of
+// time, or a deploy restarted the server that held it -- there is no table left to play
+// on, so the screen closes instead of taking taps that can only fail the same way again.
+function cardActionFailed(error) {
+  haptic("no");
+  toast(error.message);
+  if (error.code === "NO_CARD_SESSION") closeCardBattle();
+  else render();
 }
 
 async function endCardTurn() {
   if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
   CARD_BUSY = true;
+  CARD_PICK = null;
   try {
     const data = await api("/api/card-battle/action",
                            { session: CARD_SESSION, action: "end_turn" });
@@ -8728,8 +9300,9 @@ async function endCardTurn() {
     // card lands rather than everything settling at once when the turn is over.
     const played = (data.battle && data.battle.enemy_played) || [];
     if (played.length && !reducedMotion()) {
+      CARD_PLAYBACK = true;
       showOpponentTurn();
-      const announced = document.querySelectorAll(".cardintent .cardrow > *");
+      const announced = document.querySelectorAll(".cardintent .cardtile");
       for (let i = 0; i < played.length; i++) {
         const row = played[i] || {};
         await flyCard(announced[i], cardAvatar(cardTargetSide(row.card || {}, "enemy")),
@@ -8740,13 +9313,24 @@ async function endCardTurn() {
       }
     }
     settleCardBattle(data);
-  } catch (e) { haptic("no"); toast(e.message); render(); }
-  finally { CARD_BUSY = false; }
+  } catch (e) { cardActionFailed(e); }
+  finally { CARD_BUSY = false; CARD_PLAYBACK = false; CARD_SKIP = false; }
 }
+
+// A tap anywhere on the table while the opponent's turn plays out fast-forwards it: the
+// card in the air lands at once and the pauses after it are skipped. Capturing, so it runs
+// before the delegated handler and whatever was under the finger still gets its tap.
+document.addEventListener("click", (event) => {
+  if (!CARD_PLAYBACK || !event.target.closest(".cardduel")) return;
+  CARD_SKIP = true;
+  if (CARD_FLIGHT) { try { CARD_FLIGHT.finish(); } catch (e) {} }
+}, true);
 
 function closeCardBattle() {
   CARD_BATTLE = null; CARD_SESSION = null; CARD_FACES = null; CARD_INFO = null;
-  CARD_REWARD = null; CARD_DEALT_TURN = 0;
+  CARD_REWARD = null; CARD_DEALT_TURN = 0; CARD_PICK = null; CARD_SHOWN = null;
+  CARD_LOG = [];
+  closeSheet();
   unlockSwipes("cardduel");
   document.body.classList.remove("induel");
   render();
@@ -10968,7 +11552,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-arenaretry],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
-    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardplay],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
+    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardpick],[data-cardplay],[data-cardpeek],[data-cardstatus],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply],[data-personalremove]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
@@ -11065,8 +11649,15 @@ async function handleClick(event, target) {
   if (d.testaction) { await testBattleAction(d.testaction); return; }
   if (d.testcatalog !== undefined) { showTestCatalog(); return; }
   if (d.cardfoe) { haptic(); await openCardBattle(d.cardfoe); return; }
+  if (d.cardpick) { await pickCard(d.cardpick); return; }
   if (d.cardplay) { await playCard(d.cardplay); return; }
+  if (d.cardpeek !== undefined) { peekEnemyCard(Number(d.cardpeek)); return; }
+  if (d.cardstatus) { cardStatusHint(d.cardstatus); return; }
   if (d.cardbattle === "end") { await endCardTurn(); return; }
+  if (d.cardbattle === "unpick") { CARD_PICK = null; render(); return; }
+  if (d.cardbattle === "leave") { confirmCardLeave(); return; }
+  if (d.cardbattle === "log") { showCardLog(); return; }
+  if (d.cardbattle === "shut") { closeSheet(); return; }
   if (d.cardbattle === "close") { closeCardBattle(); return; }
   if (d.cardbattle === "again") {
     const foe = CARD_LAST_FOE;

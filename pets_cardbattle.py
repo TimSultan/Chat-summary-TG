@@ -672,7 +672,8 @@ def end_turn(state: dict) -> dict:
 
 def public(state: dict) -> dict:
     """What the screen is allowed to know: its own hand, both fighters, the sizes of the
-    piles, and the one enemy card that has already been announced.
+    piles, the enemy turn that has already been announced, and what ending the turn now
+    would leave both fighters with (see `forecast`).
 
     The rest of the opponent's deck stays on the server. A duel where the player can read
     the other draw pile out of the response is not the game this shows.
@@ -710,6 +711,39 @@ def public(state: dict) -> dict:
         },
         "log": list(state.get("log") or ()),
         "statuses": {key: dict(meta) for key, meta in STATUS_META.items()},
+        "forecast": forecast(state),
+    }
+
+
+def forecast(state: dict) -> dict | None:
+    """What handing the turn over RIGHT NOW would leave both fighters with.
+
+    The screen draws this as the part of the player's health bar that is about to go, and
+    as the line over the end-turn button, so the player sees how much damage their block
+    stops before they spend the energy on it.
+
+    Worked out by running the real `end_turn`, which copies before it touches anything,
+    rather than by re-deriving the rules in the page: block, weakness, vulnerability,
+    strength gained halfway through the opponent's plan, thorns and the burn that ticks at
+    the end of the player's own turn all already live there. A second copy of that
+    arithmetic in JavaScript is how a health preview starts to disagree with the fight.
+
+    Nothing hidden leaks through it. The opponent's plan is already on screen, and only the
+    two health totals and the outcome are read back, never the hand the dry run deals
+    or the plan it picks for the turn after.
+    """
+    if not state or state.get("finished"):
+        return None
+    after = end_turn(state)
+    fighters = after.get("fighters") or {}
+    outcome = None
+    if after.get("finished"):
+        outcome = ("draw" if after.get("draw")
+                   else "win" if after.get("winner") == "player" else "loss")
+    return {
+        "player_hp": max(0, int((fighters.get("player") or {}).get("hp", 0) or 0)),
+        "enemy_hp": max(0, int((fighters.get("enemy") or {}).get("hp", 0) or 0)),
+        "outcome": outcome,
     }
 
 

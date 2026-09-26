@@ -8,6 +8,7 @@ bot_listener's _attach_extra mounts it in production -- so these also prove pets
 coexists with the rest of the server without colliding.
 """
 
+import copy
 import hashlib
 import hmac
 import asyncio
@@ -4497,6 +4498,95 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after["regen"], 5, "a cleanse must not burn off regeneration")
         self.assertEqual(after["strength"], 3, "a cleanse must not undo a buff")
 
+    # ---- the end-of-turn forecast -------------------------------------------------------
+
+    def _forecast_duel(self, enemy_cards, player_cards=None, seed=11):
+        strike = pets_cardbattle.CardTemplate("strike", "Удар", 1, damage=20).public()
+        guard = pets_cardbattle.CardTemplate("guard", "Защита", 1, block=17).public()
+        return pets_cardbattle.start(
+            {"id": "a", "name": "A", "max_hp": 360, "attack": 20},
+            {"id": "b", "name": "B", "max_hp": 360, "attack": 20},
+            player_cards or [guard] * 6, enemy_cards or [strike] * 6, seed=seed,
+        )
+
+    async def test_the_forecast_is_the_real_end_of_turn_and_changes_nothing(self):
+        """The screen draws the forecast as the slice of the health bar about to go, so it
+        has to be exactly what ending the turn does -- and working it out must not move the
+        duel on, deal a card or advance the shuffle."""
+        battle = self._forecast_duel(None)
+        # A burn on the player too, which ticks at the end of their own turn: the forecast
+        # has to count it along with the opponent's cards.
+        battle["fighters"]["player"]["status"]["burn"] = 4
+        before = copy.deepcopy(battle)
+
+        forecast = pets_cardbattle.forecast(battle)
+        self.assertEqual(battle, before, "a forecast must not touch the duel")
+
+        ended = pets_cardbattle.end_turn(battle)
+        self.assertEqual(forecast["player_hp"], ended["fighters"]["player"]["hp"])
+        self.assertEqual(forecast["enemy_hp"], ended["fighters"]["enemy"]["hp"])
+        self.assertIsNone(forecast["outcome"])
+        self.assertLess(forecast["player_hp"], 360 - 4, "three Strikes and a burn land")
+        # And the screen gets it with every state, recomputed as the turn changes.
+        self.assertEqual(pets_cardbattle.public(battle)["forecast"], forecast)
+
+    async def test_block_played_this_turn_shrinks_the_forecast_loss(self):
+        battle = self._forecast_duel(None)
+        bare = pets_cardbattle.forecast(battle)["player_hp"]
+        guarded = pets_cardbattle.play(battle, battle["hand"][0]["uid"])
+        self.assertEqual(guarded["fighters"]["player"]["block"], 17)
+        self.assertEqual(pets_cardbattle.forecast(guarded)["player_hp"], bare + 17)
+
+    async def test_the_forecast_names_a_killing_turn_and_is_absent_once_it_is_over(self):
+        battle = self._forecast_duel(None)
+        battle["fighters"]["player"]["hp"] = 15
+        self.assertEqual(pets_cardbattle.forecast(battle)["outcome"], "loss")
+        self.assertEqual(pets_cardbattle.forecast(battle)["player_hp"], 0)
+
+        battle["fighters"]["enemy"]["hp"] = 1
+        battle["fighters"]["enemy"]["status"]["burn"] = 3
+        battle["fighters"]["player"]["hp"] = 360
+        # The opponent's own burn ticks after their cards: they fall on their own turn.
+        self.assertEqual(pets_cardbattle.forecast(battle)["outcome"], "win")
+
+        battle["finished"] = True
+        self.assertIsNone(pets_cardbattle.forecast(battle))
+        self.assertIsNone(pets_cardbattle.public(battle)["forecast"])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_every_duel_response_forecasts_the_turn_it_leaves_on_screen(self):
+        """Over HTTP, on the opening deal and after a turn: the forecast a response carries
+        is what the NEXT end_turn really leaves the player with."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        forecast = opened["battle"]["forecast"]
+        self.assertEqual(set(forecast), {"player_hp", "enemy_hp", "outcome"})
+
+        ended = await (await self._duel_action(PLAYER, opened["session"], "end_turn")).json()
+        if not ended["battle"]["finished"]:
+            self.assertEqual(ended["battle"]["fighters"]["player"]["hp"], forecast["player_hp"])
+            self.assertEqual(ended["battle"]["fighters"]["enemy"]["hp"], forecast["enemy_hp"])
+            self.assertIsNotNone(ended["battle"]["forecast"])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_settled_duel_hands_back_the_arena_state_without_the_bag(self):
+        """The result screen reads the fight bank off this state to say what a rematch
+        costs, and draws no item -- so the inventory stays on the server."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session = opened["session"]
+        self.app[pets_web._CARD_BATTLE_SESSIONS_KEY][session]["battle"]["fighters"]["enemy"]["hp"] = 1
+        card = next(row for row in opened["battle"]["hand"]
+                    if row["damage"] and row["cost"] <= opened["battle"]["energy"])
+        body = await (await self._duel_action(PLAYER, session, "play", card["uid"])).json()
+
+        self.assertTrue(body["battle"]["finished"])
+        self.assertIsNone(body["battle"]["forecast"])
+        self.assertIsNone(body["state"]["bag"])
+        self.assertIn("available", body["state"]["arena"])
+
     async def test_the_arena_row_puts_power_above_the_name_and_a_card_button_beside_it(self):
         """The opponent row carries two fights now. The power rating moved to the left,
         above the name and smaller, and the right-hand column it vacated is the card
@@ -4723,14 +4813,92 @@ class CardAnimationContractTests(unittest.TestCase):
         body = self._script().split("function renderCardBattle(box) {", 1)[1]
         return body.split("\n}", 1)[0]
 
-    def test_the_hand_sits_under_the_faces_and_over_the_announced_turn(self):
+    def _function(self, signature):
+        return self._script().split(signature, 1)[1].split("\n}", 1)[0]
+
+    def test_the_announced_turn_sits_on_the_opponents_panel_above_the_hand(self):
+        """The announced turn used to go under the hand, and with it under the fold: as
+        full-size cards it was the one thing that would not fit. As tiles it sits on the
+        opponent's own panel, and the whole table -- their plan, both faces, the hand and
+        the button -- fits one screen."""
         render = self._render()
+        self.assertIn("'<div class=\"cardintent'", render)
+        self.assertIn('cardSide(foe, faces.enemy, "enemy", plan', render)
         stage = render.index('id="cardStage"')
         hand = render.index('id="cardHand"')
-        intent = render.index('class="cardintent"')
         self.assertLess(stage, hand, "the hand must come after the two fighters")
-        self.assertLess(hand, intent,
-                        "the hand must come before the opponent's announced turn")
+        self.assertLess(hand, render.index("cardActions(battle, picked)"),
+                        "the button goes under the hand, where the thumb is")
+        # Tiles in the markup, and the playback flies out of those tiles.
+        self.assertIn("intent.map(cardTile)", render)
+        self.assertIn('".cardintent .cardtile"', self._function("async function endCardTurn() {"))
+
+    def test_a_first_tap_picks_a_card_up_and_only_a_second_one_plays_it(self):
+        """One tap used to spend the energy, from a row where most of the hand and every
+        card's rules were off the edge of the screen."""
+        markup = self._function("function cardMarkup(card, playable, affordable, deal) {")
+        self.assertIn("data-cardpick=", markup)
+        self.assertNotIn("data-cardplay", markup)
+        # Dimmed when unaffordable, never disabled -- a disabled card cannot be read.
+        self.assertNotIn('" disabled"', markup)
+        self.assertIn('" poor"', markup)
+        pick = self._function("async function pickCard(uid) {")
+        self.assertIn("if (CARD_PICK === uid) {", pick)
+        self.assertIn("await playCard(uid);", pick)
+        actions = self._function("function cardActions(battle, picked) {")
+        self.assertIn('data-cardplay="', actions)
+        self.assertIn('data-cardbattle="end"', actions)
+
+    def test_leaving_a_paid_duel_asks_first(self):
+        """The duel is paid for when it opens; walking out of it pays nothing back."""
+        render = self._render()
+        self.assertIn('(over ? "close" : "leave")', render)
+        leave = self._function("function confirmCardLeave() {")
+        self.assertIn("if (!CARD_BATTLE || CARD_BATTLE.finished) { closeCardBattle(); return; }",
+                      leave)
+        self.assertIn("sheet(", leave)
+        self.assertIn('data-cardbattle="close"', leave)
+        self.assertIn('if (d.cardbattle === "leave") { confirmCardLeave(); return; }',
+                      self._script())
+        # ...and no tab is a way out of it either.
+        page = pets_web.PAGE_HTML
+        self.assertIn("body.induel .tabs { display: none; }", page)
+
+    def test_the_health_preview_is_the_servers_forecast_not_a_second_copy_of_the_rules(self):
+        paint = self._function("function paintForecast() {")
+        self.assertIn("battle.forecast", paint)
+        line = self._function("function cardForecastLine(battle) {")
+        self.assertIn("battle.forecast", line)
+        for rule in ("VULNERABLE", "WEAK", "vulnerable", "* 1.5", "* .67"):
+            self.assertNotIn(rule, paint + line)
+
+    def test_the_opponents_turn_can_be_fast_forwarded_and_always_ends(self):
+        """A tap lands the card in the air and skips the pauses; the flag is let go in a
+        `finally`, or one failed request would leave every later animation skipped."""
+        wait = self._function("function wait(ms) {")
+        self.assertIn("if (CARD_SKIP) { done(); return; }", wait)
+        fly = self._function("function flyCard(fromEl, targetEl, card) {")
+        self.assertIn("CARD_SKIP", fly)
+        self.assertIn("CARD_FLIGHT = run;", fly)
+        script = self._script()
+        self.assertIn("if (!CARD_PLAYBACK || !event.target.closest(\".cardduel\")) return;",
+                      script)
+        end = self._function("async function endCardTurn() {")
+        self.assertIn("finally { CARD_BUSY = false; CARD_PLAYBACK = false; CARD_SKIP = false; }",
+                      end)
+
+    def test_a_duel_whose_session_is_gone_closes_instead_of_failing_every_tap(self):
+        """Sessions live in the server's memory, so every deploy ends the duels in play.
+        The next tap is refused with NO_CARD_SESSION, and it must be the last one."""
+        failed = self._function("function cardActionFailed(error) {")
+        self.assertIn('if (error.code === "NO_CARD_SESSION") closeCardBattle();', failed)
+        for signature in ("async function playCard(uid) {", "async function endCardTurn() {"):
+            self.assertIn("cardActionFailed(e);", self._function(signature), signature)
+
+    def test_a_rematch_the_bank_cannot_pay_for_is_not_offered(self):
+        result = self._function("function cardResult(battle) {")
+        self.assertIn("arena.available", result)
+        self.assertIn('(left === 0 ? " disabled" : "")', result)
 
     def test_a_flight_always_resolves_even_if_the_browser_goes_quiet(self):
         """`finish` can fail to arrive -- a backgrounded tab, a cancelled animation. The
