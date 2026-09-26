@@ -55,6 +55,11 @@ PERSONAL_PAINT_TARGET_NAMES = {
     "weapon": "оружие", "shield": "щит", "boots": "ботинки",
     "amulet": "амулет", "vial": "лечебный пузырёк", "scroll": "свиток",
 }
+# Melting or selling a painted item hands its rune back; gifting it does not.
+GIFT_SPENDS_PAINT_NOTE = (
+    "🎨 На этой вещи твой персональный покрас. При подарке он пропадёт — руна не вернётся. "
+    "Чтобы сохранить руну, сначала сними покрас в «Персональных рунах»."
+)
 
 
 def _personal_paint_bonus_text(target: str) -> str:
@@ -2450,10 +2455,12 @@ def personal_paint_runes_view(entry: str, user_id) -> tuple[str, dict]:
     applied = state.get("applied", [])
     lines = [
         "🎨 <b>Персональные руны</b>",
-        "Руна хранит фотографию твоего покраса. Применяется один раз к предмету "
-        "того же типа: изображение становится его аватаркой, положительные боевые "
-        "параметры усиливаются на 30%.",
+        "Руна хранит фотографию твоего покраса и ставится на предмет того же типа: "
+        "изображение становится его аватаркой, положительные боевые параметры "
+        "усиливаются на 30%.",
         "<i>Шансы срабатывания, длительность и отрицательные параметры не растут.</i>",
+        "Покрас можно снять — руна вернётся. При перековке или продаже вещи "
+        "руна тоже возвращается сама, а при подарке пропадёт вместе с покрасом.",
     ]
     rows = []
     if runes:
@@ -2468,7 +2475,16 @@ def personal_paint_runes_view(entry: str, user_id) -> tuple[str, dict]:
     if not runes:
         lines.append("\nПока нет свободных персональных рун. Они выдаются после принятия отдельного рунического квеста.")
     if applied:
-        lines.append(f"\n<i>Уже применено: {len(applied)}. Снять или сложить два покраса нельзя.</i>")
+        lines.append(f"\n<b>Наложено: {len(applied)}</b> · два покраса на одну вещь не ставятся.")
+    for row in applied:
+        name = str(row.get("name") or row.get("code") or "")
+        lines.append(f"🎨 {escape(name)}")
+        # Keyed by rune id rather than item code: it is unique, fixed-length and always
+        # fits Telegram's 64-byte callback, where a long item code might not.
+        rows.append([{
+            "text": f"↩️ Снять с «{name[:34]}»",
+            "callback_data": callback_data(user_id, "paintremove", str(row.get("rune_id") or "")),
+        }])
     rows.append([{"text": "🎒 К снаряжению", "callback_data": callback_data(user_id, "bag")}])
     rows.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": rows}
@@ -2483,8 +2499,9 @@ def personal_paint_targets_view(entry: str, user_id, rune_id: str) -> tuple[str,
     candidates = pets.personal_paint_candidates(entry, user_id, rune_id)
     lines = [
         f"🎨 <b>Выбери {escape(target)}</b>",
-        "Руна расходуется навсегда. У выбранной вещи появится твоя картинка, "
-        f"а {_personal_paint_bonus_text(str(rune.get('target') or ''))}.",
+        "У выбранной вещи появится твоя картинка, "
+        f"а {_personal_paint_bonus_text(str(rune.get('target') or ''))}. "
+        "Покрас можно снять позже — руна вернётся.",
     ]
     rows = []
     for index, row in enumerate(candidates):
@@ -2547,6 +2564,11 @@ def forge_view(entry: str, user_id, xp: int) -> tuple[str, dict]:
             lines.append("Будут использованы: " + ", ".join(
                 f"«{escape(item.name)}»" for item in ingredients if item is not None
             ))
+        returned = [C.find_item(code) for code in recipe.get("returned_paints", [])]
+        if any(returned):
+            lines.append("🎨 Покрас с " + ", ".join(
+                f"«{escape(item.name)}»" for item in returned if item is not None
+            ) + " вернётся в персональные руны.")
         # No disabled state: forge_status only returns recipes that are ready, so every
         # button on this screen forges.
         rows.append([{

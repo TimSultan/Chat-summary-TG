@@ -443,7 +443,7 @@ def _load(entry: str) -> dict:
     # collapsed this list to unique codes on every read, which silently destroyed those
     # ingredients. Catalogue aliases still rewrite retired designs one physical copy at a
     # time, so replacing several grey items never changes how many things the player owns.
-    for record in data["pets"].values():
+    for pet_user_id, record in data["pets"].items():
         if not isinstance(record, dict):
             continue
         purchased_stats = record.get("stats")
@@ -475,36 +475,6 @@ def _load(entry: str) -> dict:
             if isinstance(code, str):
                 normalised_inventory.append(code)
         record["inventory"] = normalised_inventory
-        personal = record.get("personal_enchantments")
-        if not isinstance(personal, dict):
-            personal = {}
-        # Only durable entries applied by this module are retained.  The code must
-        # still be owned, which makes a sale/gift unable to carry someone's artwork.
-        repaired_personal = {}
-        for original_code, row in personal.items():
-            if not isinstance(row, dict) or not isinstance(original_code, str):
-                continue
-            code = C.LEGACY_ITEM_CODES.get(original_code, original_code)
-            target = str(row.get("target") or "")
-            if target == "scroll":
-                if code in legal_scrolls:
-                    repaired_personal[code] = dict(row)
-                continue
-            item = C.find_item(code)
-            healing_target = bool(
-                target == "vial" and item is not None
-                and str((getattr(item, "effect", {}) or {}).get("code") or "")
-                in PERSONAL_PAINT_HEALING_EFFECTS
-            )
-            if item is not None and code in normalised_inventory and (
-                (item.slot == target and target in PERSONAL_PAINT_ITEM_SLOTS)
-                or healing_target
-            ):
-                # Prefer data already stored under the surviving code when several
-                # retired designs converge on one replacement.
-                if code not in repaired_personal or original_code == code:
-                    repaired_personal[code] = dict(row)
-        record["personal_enchantments"] = repaired_personal
         # Weapon history and elemental runes are keyed by catalogue code as well. Move
         # those keys with the physical item so a retired grey weapon does not lose its
         # nameplate statistics or enchantment during replacement.
@@ -544,6 +514,56 @@ def _load(entry: str) -> dict:
                 # A historic equipped object is still owned; preserve it rather than
                 # stripping it as a side effect of a duplicate-data migration.
                 normalised_inventory.append(code)
+        # After the equipped fold-in above, so a worn item missing from an old bag list
+        # still counts as owned. Only durable entries applied by this module stay on an
+        # item, and the code must still be owned, which makes a sale/gift unable to carry
+        # someone's artwork. A paint that can no longer stay is NOT dropped: it goes back
+        # to its owner's wallet as the same rune. Dropping it here is how a melted item
+        # used to take somebody's painted miniature with it.
+        personal = record.get("personal_enchantments")
+        if not isinstance(personal, dict):
+            personal = {}
+        repaired_personal = {}
+        unplaced = []
+        for original_code, row in personal.items():
+            if not isinstance(row, dict) or not isinstance(original_code, str):
+                continue
+            code = C.LEGACY_ITEM_CODES.get(original_code, original_code)
+            target = str(row.get("target") or "")
+            if target == "scroll":
+                if code in legal_scrolls:
+                    repaired_personal[code] = dict(row)
+                else:
+                    unplaced.append(row)
+                continue
+            item = C.find_item(code)
+            healing_target = bool(
+                target == "vial" and item is not None
+                and str((getattr(item, "effect", {}) or {}).get("code") or "")
+                in PERSONAL_PAINT_HEALING_EFFECTS
+            )
+            if item is not None and code in normalised_inventory and (
+                (item.slot == target and target in PERSONAL_PAINT_ITEM_SLOTS)
+                or healing_target
+            ):
+                # Prefer data already stored under the surviving code when several
+                # retired designs converge on one replacement; the other one's rune
+                # goes back to the wallet rather than vanishing.
+                if code not in repaired_personal:
+                    repaired_personal[code] = dict(row)
+                elif original_code == code:
+                    unplaced.append(repaired_personal[code])
+                    repaired_personal[code] = dict(row)
+                else:
+                    unplaced.append(row)
+            else:
+                unplaced.append(row)
+        record["personal_enchantments"] = repaired_personal
+        if unplaced:
+            applied_ids = {str(row.get("rune_id") or "") for row in repaired_personal.values()}
+            for row in unplaced:
+                if str(row.get("rune_id") or "") not in applied_ids:
+                    _return_personal_paint_rune(data, pet_user_id, row)
         # Older fight code could temporarily replace the player's chosen loadout and
         # leave a restore marker behind if the fight was interrupted. Automatic gear
         # changes are retired; repair any such stranded swap while loading the record.
@@ -660,14 +680,21 @@ def _load(entry: str) -> dict:
             record["owned_scrolls"] = list(dict.fromkeys([
                 *record.get("owned_scrolls", []), *wallet["unlocked"],
             ]))
-    # A personal rune is a single-use owner-bound receipt.  Do not try to infer or
-    # recreate historic ones: missing image/source data must never become a free buff.
+    # A personal rune is an owner-bound receipt, either in the wallet or on one item.
+    # Do not try to infer or recreate historic ones here: missing image/source data must
+    # never become a free buff (restore_lost_personal_paint_runes rebuilds from evidence).
     valid_targets = set(PERSONAL_PAINT_RUNE_QUEST_TARGETS.values())
     for user_id, rows in list(data["personal_paint_runes"].items()):
         if not isinstance(rows, list):
             data["personal_paint_runes"][str(user_id)] = []
             continue
-        seen_ids = set()
+        # A rune already on one of its owner's items is not also spendable: whichever way
+        # a copy got into both places, the item keeps it and the wallet one goes.
+        owner = data["pets"].get(str(user_id))
+        painted = owner.get("personal_enchantments") if isinstance(owner, dict) else None
+        seen_ids = {
+            str(row.get("rune_id") or "") for row in painted.values() if isinstance(row, dict)
+        } if isinstance(painted, dict) else set()
         repaired = []
         for row in rows:
             if not isinstance(row, dict):
@@ -4314,6 +4341,259 @@ def _public_personal_paint_rune(row: dict) -> dict:
     }
 
 
+def _personal_paint_rune_source(data: dict, user_id, rune_id: str) -> str:
+    """The grant ledger's source for one rune id, or "" when it predates the ledger."""
+    for source, row in (data.get("personal_paint_rune_sources") or {}).items():
+        if isinstance(row, dict) and str(row.get("rune_id") or "") == rune_id \
+                and str(row.get("user_id") or "") == str(user_id):
+            return str(source)
+    return ""
+
+
+def _return_personal_paint_rune(data: dict, user_id, painted: dict) -> dict | None:
+    """Put the rune behind one applied paint back into its owner's wallet.
+
+    A paint is somebody's own painted miniature, so it is never destroyed along with the
+    item carrying it: melting, selling, gifting or simply taking it off all hand back the
+    same rune (same id, same photo) to be put on something else. Idempotent by rune id,
+    so a replayed removal cannot mint a second copy. Returns the wallet row, or None for
+    an applied row too damaged to be a rune again (no id, target or photo).
+    """
+    rune_id = str(painted.get("rune_id") or "")
+    target = str(painted.get("target") or "")
+    image = painted.get("photo_file_id")
+    if not rune_id or target not in PERSONAL_PAINT_RUNE_QUEST_TARGETS.values() \
+            or not isinstance(image, str) or not image:
+        return None
+    wallet = _personal_paint_rune_wallet(data, user_id)
+    existing = next((row for row in wallet if str(row.get("id") or "") == rune_id), None)
+    if isinstance(existing, dict):
+        return existing
+    row = {
+        "id": rune_id, "target": target,
+        "source": str(painted.get("source") or "")
+        or _personal_paint_rune_source(data, user_id, rune_id) or f"returned:{rune_id}",
+        "quest_code": str(painted.get("quest_code") or ""), "photo_file_id": image,
+        # Stable across repeated loads: the loader calls this too, and a store that is
+        # read several times before its next save must rebuild the identical row.
+        "earned_at": str(painted.get("earned_at") or painted.get("applied_at") or ""),
+    }
+    wallet.append(row)
+    del wallet[:-100]
+    return row
+
+
+def _personal_paint_target_name(code: str) -> str:
+    label = SCROLLS.scroll(code) or C.find_item(code)
+    return str(label.get("name") if isinstance(label, dict) else getattr(label, "name", code))
+
+
+def remove_personal_paint_rune(entry: str, user_id, code: str) -> tuple[bool, str]:
+    """Take the paint off one item or scroll and return its rune to the wallet.
+
+    Free and unlimited: the rune is the player's own work, and the only thing a removal
+    changes is which of their things carries it. The +30% leaves with it.
+    """
+    code = str(code or "").strip()
+    if not code:
+        return False, "Выбери предмет с покрасом."
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        enchantments = record.get("personal_enchantments")
+        painted = enchantments.get(code) if isinstance(enchantments, dict) else None
+        if not isinstance(painted, dict):
+            return False, "На этом предмете нет персонального покраса."
+        if _return_personal_paint_rune(data, user_id, painted) is None:
+            return False, "Этот покрас повреждён: снять его в руну нельзя."
+        enchantments.pop(code, None)
+        _save(entry, data)
+    return True, (
+        f"Покрас снят с «{_personal_paint_target_name(code)}». Руна с картинкой "
+        "вернулась в персональные руны — её можно наложить снова."
+    )
+
+
+def _spend_personal_paint_rune(data: dict, user_id, rune_id: str | None, reason: str,
+                               moment: datetime) -> None:
+    """Mark a rune in the grant ledger as deliberately gone, not lost."""
+    for row in (data.get("personal_paint_rune_sources") or {}).values():
+        if isinstance(row, dict) and rune_id and str(row.get("rune_id") or "") == rune_id \
+                and str(row.get("user_id") or "") == str(user_id):
+            row["spent"] = reason
+            row["spent_at"] = moment.isoformat()
+
+
+def _paint_returns_note(names: list[str]) -> str:
+    if not names:
+        return ""
+    listed = ", ".join(f"«{name}»" for name in names)
+    return f" 🎨 Покрас с {listed} вернулся руной — его можно наложить снова."
+
+
+def restore_lost_personal_paint_runes(entries) -> dict:
+    """Give back every minted paint rune the current rules say its owner should still hold.
+
+    Before paints came back off melted and sold items, those paths deleted them, and the
+    store's loader quietly dropped any paint whose item had left the bag. The grant ledger
+    (`personal_paint_rune_sources`) still names every rune ever minted, and the accepted
+    quest submission still holds its photo, so a lost rune can be rebuilt exactly -- same
+    id, same picture -- rather than guessed. Fight-log snapshots are the fallback photo
+    source for a submission that has scrolled out of the quest store.
+
+    Gifting still spends a paint, so a rune that left with a gift stays gone. Gifts from
+    now on mark the ledger; older ones are recognised from the gift log, and a loss the
+    evidence cannot tell apart from a gift is reported rather than paid out.
+
+    Idempotent: a restored rune is in the wallet, so the next start finds nothing.
+    """
+    import quests
+
+    restored = []
+    gifted = []
+    unrecoverable = 0
+    for entry in entries:
+        data = _load(entry)
+        lost = _lost_personal_paint_runes(data)
+        if not lost:
+            continue
+        # Evidence is read outside the settlement lock: two whole-store parses have no
+        # business holding up a farm payout.
+        submissions = {
+            str(row.get("id")): row
+            for row in quests._load(entry).get("submissions", []) if isinstance(row, dict)
+        }
+        snapshots = None
+        rebuilt = {}
+        for source, user_id, rune_id in lost:
+            row = None
+            submission_id = source.partition("quest-personal-paint:")[2]
+            submission = submissions.get(submission_id) if submission_id else None
+            if isinstance(submission, dict):
+                code = quests.catalog.normalise_code(str(submission.get("code") or ""))
+                target = personal_paint_target_for_quest(code)
+                image = str(submission.get("photo_file_id") or "")
+                if target and image and str(submission.get("user_id")) == user_id:
+                    row = {"rune_id": rune_id, "target": target, "quest_code": code,
+                           "photo_file_id": image}
+            gifts = [
+                gift for gift in data.get("gift_history", [])
+                if isinstance(gift, dict) and str(gift.get("giver_id") or "") == user_id
+            ]
+            if (row is None or gifts) and snapshots is None:
+                snapshots = _personal_paint_snapshots(entry, data)
+            seen = (snapshots or {}).get((user_id, rune_id))
+            row = row or seen
+            if row is None:
+                unrecoverable += 1
+                continue
+            owner = data["pets"].get(user_id) if isinstance(data["pets"].get(user_id), dict) else {}
+            receipt = {"entry": entry, "user_id": user_id, "rune_id": rune_id,
+                       "target": row["target"], "username": owner.get("owner_username")}
+            if gifts and _lost_to_a_gift(gifts, row["target"], seen, submission):
+                gifted.append(receipt)
+                continue
+            rebuilt[(user_id, rune_id)] = ({**row, "source": source}, receipt)
+        if not rebuilt:
+            continue
+        with _farm_settlement_lock:
+            data = _load(entry)
+            still_lost = {(user_id, rune_id) for _source, user_id, rune_id in _lost_personal_paint_runes(data)}
+            returned = [
+                receipt for key, (row, receipt) in rebuilt.items()
+                if key in still_lost and _return_personal_paint_rune(data, key[0], row) is not None
+            ]
+            if returned:
+                _save(entry, data)
+        restored.extend(returned)
+    return {"restored": restored, "gifted": gifted, "unrecoverable": unrecoverable}
+
+
+def _iso_moment(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return None
+
+
+def _lost_to_a_gift(gifts: list[dict], target: str, seen: dict | None,
+                    submission: dict | None) -> bool:
+    """Whether one of the owner's recorded gifts could have taken this paint with it.
+
+    Only gifts made after the paint went on count: the replay snapshot's applied_at when
+    there is one, otherwise the moment the quest was accepted. With the painted item's
+    code known from a replay, only a gift of that exact design matches; without it, any
+    gift of an item the rune fits does -- a doubtful rune stays spent, not paid twice.
+    """
+    since = _iso_moment((seen or {}).get("applied_at")) \
+        or _iso_moment((submission or {}).get("reviewed_at"))
+    code = str((seen or {}).get("code") or "")
+    for gift in gifts:
+        moment = _iso_moment(gift.get("ts"))
+        try:
+            if since is not None and moment is not None and moment < since:
+                continue
+        except TypeError:          # one naive, one aware: no usable ordering, so count it
+            pass
+        gifted_code = str(gift.get("item_code") or "")
+        gifted_code = C.LEGACY_ITEM_CODES.get(gifted_code, gifted_code)
+        if code:
+            if gifted_code == code:
+                return True
+        elif _personal_paint_fits(target, C.find_item(gifted_code)):
+            return True
+    return False
+
+
+def _lost_personal_paint_runes(data: dict) -> list[tuple[str, str, str]]:
+    """(source, user_id, rune_id) for every ledger rune its owner no longer holds.
+
+    A rune the ledger marks as spent (given away with the item it was on) is not lost.
+    """
+    held: dict[str, set] = {}
+    for user_id, wallet in (data.get("personal_paint_runes") or {}).items():
+        if isinstance(wallet, list):
+            held.setdefault(str(user_id), set()).update(
+                str(row.get("id") or "") for row in wallet if isinstance(row, dict)
+            )
+    for user_id, record in (data.get("pets") or {}).items():
+        painted = record.get("personal_enchantments") if isinstance(record, dict) else None
+        if isinstance(painted, dict):
+            held.setdefault(str(user_id), set()).update(
+                str(row.get("rune_id") or "") for row in painted.values() if isinstance(row, dict)
+            )
+    lost = []
+    for source, row in (data.get("personal_paint_rune_sources") or {}).items():
+        if not isinstance(row, dict) or row.get("spent"):
+            continue
+        user_id, rune_id = str(row.get("user_id") or ""), str(row.get("rune_id") or "")
+        if user_id and rune_id and rune_id not in held.get(user_id, ()):
+            lost.append((str(source), user_id, rune_id))
+    return lost
+
+
+def _personal_paint_snapshots(entry: str, data: dict) -> dict:
+    """(user_id, rune_id) -> applied-paint row plus the `code` it was on, from replays.
+
+    The log is oldest first, so the latest sighting wins. Takes the already-loaded store
+    for the legacy inline log rather than calling fight_log_rows, which would parse the
+    whole store a second time.
+    """
+    legacy = data.get("fights") if isinstance(data.get("fights"), list) else []
+    found = {}
+    for fight in [*legacy, *_fight_sidecar_rows(entry)]:
+        snapshot = fight.get("combat_snapshot") if isinstance(fight, dict) else None
+        records = snapshot.get("records") if isinstance(snapshot, dict) else None
+        for user_id, record in (records.items() if isinstance(records, dict) else ()):
+            painted = record.get("personal_enchantments") if isinstance(record, dict) else None
+            for code, row in (painted.items() if isinstance(painted, dict) else ()):
+                if isinstance(row, dict) and row.get("rune_id") and row.get("photo_file_id"):
+                    found[(str(user_id), str(row["rune_id"]))] = {**row, "code": str(code)}
+    return found
+
+
 def grant_personal_paint_rune(
     entry: str, user_id, quest_code: str, submission_id: str, photo_file_id: str | None,
 ) -> dict:
@@ -4374,6 +4654,7 @@ def personal_paint_status(entry: str, user_id) -> dict:
                 continue
             applied.append({
                 "code": str(code), "target": str(row.get("target") or ""),
+                "name": _personal_paint_target_name(str(code)),
                 "rune_id": str(row.get("rune_id") or ""),
                 "photo_file_id": str(row.get("photo_file_id") or ""),
                 "quest_code": str(row.get("quest_code") or ""),
@@ -4421,8 +4702,14 @@ def personal_paint_candidates(entry: str, user_id, rune_id: str) -> list[dict]:
 def _personal_paint_target_is_owned(record: dict, target: str, code: str) -> bool:
     if target == "scroll":
         return code in _owned_scroll_codes_for(record) and SCROLLS.scroll(code) is not None
-    item = C.find_item(code)
-    if item is None or code not in record.get("inventory", []):
+    if code not in record.get("inventory", []):
+        return False
+    return _personal_paint_fits(target, C.find_item(code))
+
+
+def _personal_paint_fits(target: str, item) -> bool:
+    """Whether a rune of this target type can go on this catalogue item at all."""
+    if item is None:
         return False
     if target == "vial":
         # A healing vial uses the existing healing-equipment family rather than a sixth
@@ -4462,9 +4749,12 @@ def apply_personal_paint_rune(entry: str, user_id, rune_id: str, target_code: st
         enchantments = record.setdefault("personal_enchantments", {})
         if target_code in enchantments:
             return False, "Этот предмет уже несёт персональный покрас; второй нельзя наложить.", {}
+        # Source and earned_at ride along so taking the paint off later hands back the
+        # very rune that went on, not a lookalike.
         enchantment = {
             "target": target, "rune_id": rune["id"], "quest_code": rune.get("quest_code"),
             "photo_file_id": rune["photo_file_id"], "applied_at": app_now().isoformat(),
+            "source": str(rune.get("source") or ""), "earned_at": str(rune.get("earned_at") or ""),
         }
         enchantments[target_code] = enchantment
         wallet.pop(index)
@@ -7283,6 +7573,8 @@ def forge_status(entry: str, user_id) -> dict:
         # make" has to be the whole screen, not a needle in it.
         if len(ingredients) < required:
             continue
+        consumed = Counter(item.code for item in ingredients[:required])
+        paints = record.get("personal_enchantments") or {}
         recipes.append({
             "rarity": rarity,
             "slot": slot,
@@ -7293,6 +7585,12 @@ def forge_status(entry: str, user_id) -> dict:
             "available": len(ingredients),
             "required": required,
             "ingredients": [item.code for item in ingredients[:required]],
+            # Painted designs whose last copy this recipe melts: their runes come back to
+            # the wallet, and the preview says so before the button is pressed.
+            "returned_paints": [
+                code for code, count in consumed.items()
+                if code in paints and record.get("inventory", []).count(code) <= count
+            ],
             # Always true, and kept so a client that reads it keeps working. The list
             # itself is now the answer: if a recipe is on it, it is ready.
             "can_forge": True,
@@ -7376,12 +7674,26 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
         inventory = record.setdefault("inventory", [])
         for item in consumed:
             inventory.remove(item.code)
+        # A painted ingredient's rune comes back rather than melting with it. Paints are
+        # keyed by design, so only a design whose LAST copy went in gives one back; a
+        # spare melted beside a painted twin leaves the twin's paint where it is.
+        returned_paints = []
+        paints = record.get("personal_enchantments")
+        for code in dict.fromkeys(item.code for item in consumed):
+            painted = paints.get(code) if isinstance(paints, dict) else None
+            if code not in inventory and isinstance(painted, dict):
+                if _return_personal_paint_rune(data, user_id, painted) is not None:
+                    returned_paints.append(C.find_item(code).name)
+                paints.pop(code, None)
         inventory.append(result.code)
         _discover(record, result.code)
         _metric_add(data, "forges")
         _save(entry, data)
     names = ", ".join(f"«{item.name}»" for item in consumed)
-    return True, f"Перековано: {names}. Получено: «{result.name}»!", result.code
+    return True, (
+        f"Перековано: {names}. Получено: «{result.name}»!"
+        + _paint_returns_note(returned_paints)
+    ), result.code
 
 
 def begin_item_confirmation(entry, user_id, action: str, code: str) -> tuple[bool, str, str]:
@@ -7437,15 +7749,20 @@ def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tu
     record["inventory"].remove(item.code)
     # Code-keyed history/enchantments describe the retained design. Keep them while at
     # least one physical copy remains; deleting one forge spare must not wipe the worn one.
+    returned_paints = []
     if item.code not in record["inventory"]:
-        record.setdefault("personal_enchantments", {}).pop(item.code, None)
+        painted = record.setdefault("personal_enchantments", {}).pop(item.code, None)
+        if isinstance(painted, dict) and _return_personal_paint_rune(data, user_id, painted):
+            returned_paints.append(item.name)
         if item.slot == "weapon":
             record.setdefault("weapon_enchantments", {}).pop(item.code, None)
             record.setdefault("weapon_records", {}).pop(item.code, None)
     _metric_add(data, "item_sale_gold", value)
     _save(entry, data)
     economy.grant(entry, user_id, value, f"sell:pet_item:{item.code}")
-    return True, f"Продано: «{item.name}» за {value} монет.", value
+    return True, (
+        f"Продано: «{item.name}» за {value} монет." + _paint_returns_note(returned_paints)
+    ), value
 
 
 def _gift_cooldown_message(seconds: float) -> str:
@@ -7455,6 +7772,13 @@ def _gift_cooldown_message(seconds: float) -> str:
     if hours:
         return f"Следующий подарок можно отправить через {hours} ч. {minutes} мин."
     return f"Следующий подарок можно отправить через {minutes} мин."
+
+
+def gift_spends_paint(entry, user_id, code) -> bool:
+    """Whether giving this item away now would take its personal paint with it."""
+    record = _tamed_record(_load(entry), user_id) or {}
+    return code in (record.get("personal_enchantments") or {}) \
+        and record.get("inventory", []).count(code) <= 1
 
 
 def gift_item(
@@ -7508,12 +7832,17 @@ def gift_item(
         if item.slot == "weapon" else None
     )
     # Personal paints are explicitly non-transferable; the recipient receives the base
-    # item only, while the spent rune cannot be recovered or duplicated.
-    # The base duplicate transfers; code-keyed personal artwork stays with the giver while
-    # another copy remains and is never copied to the recipient.
+    # item only. The base duplicate transfers; code-keyed personal artwork stays with the
+    # giver while another copy remains. Giving away the LAST copy spends the paint: unlike
+    # melting or selling, it does not come back as a rune -- the painting went with the
+    # gift. The ledger is told, so the startup repair never mistakes it for a lost one.
     giver["inventory"].remove(item.code)
+    gifted_paint = None
     if item.code not in giver["inventory"]:
-        giver.setdefault("personal_enchantments", {}).pop(item.code, None)
+        painted = giver.setdefault("personal_enchantments", {}).pop(item.code, None)
+        if isinstance(painted, dict):
+            gifted_paint = str(painted.get("rune_id") or "") or None
+            _spend_personal_paint_rune(data, giver_id, gifted_paint, "gift", moment)
         if item.slot == "weapon":
             giver.setdefault("weapon_enchantments", {}).pop(item.code, None)
     else:
@@ -7538,6 +7867,7 @@ def gift_item(
     audit.append({
         "ts": moment.isoformat(), "giver_id": str(giver_id),
         "receiver_id": str(receiver_id), "item_code": item.code,
+        **({"personal_paint_rune_id": gifted_paint} if gifted_paint else {}),
     })
     if len(audit) > C.GIFT_AUDIT_LIMIT:
         del audit[:-C.GIFT_AUDIT_LIMIT]

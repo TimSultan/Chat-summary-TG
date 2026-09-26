@@ -1380,6 +1380,10 @@ def _action_apply_personal_paint(entry, user_id, xp, payload):
     return ok, message
 
 
+def _action_remove_personal_paint(entry, user_id, xp, payload):
+    return pets.remove_personal_paint_rune(entry, user_id, str(payload.get("code") or ""))
+
+
 def _action_dungeon_enter(entry, user_id, xp, payload):
     return pets.enter_dungeon(entry, user_id)
 
@@ -1487,6 +1491,7 @@ _ACTIONS = {
     "reforge": _action_reforge,
     "enchant_weapon": _action_enchant_weapon,
     "apply_personal_paint": _action_apply_personal_paint,
+    "remove_personal_paint": _action_remove_personal_paint,
     "sell": _action_sell,
     "gift": _action_gift,
     "buy_cage": _action_buy_cage,
@@ -7093,15 +7098,24 @@ function personalPaintBonusText(target) {
 
 function personalPaintPanel() {
   const rows = (S.personal_paint && S.personal_paint.runes) || [];
-  if (!rows.length) return "";
+  const applied = (S.personal_paint && S.personal_paint.applied) || [];
+  if (!rows.length && !applied.length) return "";
   return '<div class="panel"><h2>🎨 Персональные руны · ' + rows.length + '</h2>' +
-    '<div class="small muted" style="margin-bottom:10px">Каждая хранит фото принятого покраса и применяется один раз только к своему типу. Для экипировки растут положительные статы, для хилки — лечение, для свитка — сила полезных чисел. Шансы и длительность не увеличиваются.</div>' +
-    '<div class="items">' + rows.map((rune) =>
+    '<div class="small muted" style="margin-bottom:10px">Каждая хранит фото принятого покраса и ставится только на свой тип. Для экипировки растут положительные статы, для хилки — лечение, для свитка — сила полезных чисел. Шансы и длительность не увеличиваются. Покрас можно снять, а при перековке или продаже вещи руна сама возвращается сюда. При подарке покрас пропадает — сначала сними его.</div>' +
+    (rows.length ? '<div class="items">' + rows.map((rune) =>
       '<button class="item r-rare" data-personalrune="' + esc(rune.id) + '">' +
       '<span class="art"><img src="' + esc(rune.image_url || "") + '" alt="" loading="lazy"><span class="flag">+30%</span></span>' +
       '<span class="nm">Руна · ' + esc(PERSONAL_TARGET_NAMES[rune.target] || rune.target) + '</span>' +
       '<span class="meta">Выбрать цель</span></button>'
-    ).join("") + '</div></div>';
+    ).join("") + '</div>' : '<div class="small muted">Свободных рун нет — все на вещах.</div>') +
+    (applied.length ? '<div style="margin-top:11px"><b class="small">Наложено · ' + applied.length + '</b>' +
+      applied.map((row) =>
+        '<div class="row spread" style="margin-top:6px;gap:8px">' +
+        '<span class="small"><img src="' + esc(row.image_url || "") + '" alt="" loading="lazy" style="width:28px;height:28px;object-fit:cover;border-radius:6px;vertical-align:middle"> ' +
+        esc(row.name || row.code) + '</span>' +
+        '<button class="go sec" style="width:auto;margin:0;padding:6px 10px" data-personalremove="' + esc(row.code) + '">↩️ Снять</button></div>'
+      ).join("") + '</div>' : '') +
+    '</div>';
 }
 
 function personalPaintCandidates(target) {
@@ -7126,7 +7140,7 @@ function openPersonalPaintRune(runeId) {
   const candidates = personalPaintCandidates(rune.target);
   sheet('<div class="hd"><img src="' + esc(rune.image_url || "") + '" alt=""><div><h3>🎨 Персональная руна</h3>' +
     '<div class="small muted">Цель: ' + esc(PERSONAL_TARGET_NAMES[rune.target] || rune.target) + '</div></div></div>' +
-    '<p class="small">После применения фото станет аватаркой цели; ' + esc(personalPaintBonusText(rune.target)) + '. Руна исчезнет; второй персональный покрас на ту же цель наложить нельзя.</p>' +
+    '<p class="small">После применения фото станет аватаркой цели; ' + esc(personalPaintBonusText(rune.target)) + '. Второй персональный покрас на ту же цель наложить нельзя. Покрас можно снять в любой момент — руна вернётся.</p>' +
     (candidates.length ? '<div class="items">' + candidates.map((target) => {
       const scroll = rune.target === "scroll";
       const art = scroll
@@ -7240,6 +7254,11 @@ function forgePanel() {
         '</b> · в сумке ' + recipe.available + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
+        ((recipe.returned_paints || []).length ? '<div class="tiny gain" style="margin:5px 0">🎨 Покрас с ' +
+          recipe.returned_paints.map((code) => {
+            const item = (S.bag || []).find((row) => row.code === code);
+            return '«' + esc(item ? item.name : code) + '»';
+          }).join(', ') + ' вернётся в персональные руны.</div>' : '') +
         // Never disabled: the server only sends recipes that are ready to go. data-forgecursed
         // rides along so a tap on this exact recipe can't be mistaken for its ordinary twin.
         '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '" data-forgecursed="' + (recipe.cursed ? '1' : '') + '">' +
@@ -10041,6 +10060,7 @@ function openItem(code) {
       (item.locked || spareCopies < 1 ? ""
         : btn("💰 Продать · " + money(item.resale), "sell", item.code, "sec")) + "</div>");
     if (!item.locked && spareCopies > 0) actions.push(btn("🎁 Подарить", "gift", item.code, "sec"));
+    if (item.personal_paint) actions.push(btn("↩️ Снять покрас · руна вернётся", "unpaint", item.code, "sec"));
   }
   if (!item.owned && item.source === "shop") {
     actions.push('<button class="go" data-act="buy" data-code="' + esc(item.code) + '"' +
@@ -10183,7 +10203,12 @@ async function giftPicker(code) {
   if (!ROSTER) ROSTER = await api("/api/leaderboard");
   const others = ROSTER.rows.filter((row) => row.user_id !== ROSTER.me);
   if (!others.length) { toast("Некому дарить — больше ни у кого нет существа."); return; }
-  sheet("<h3>Кому подарить?</h3>" + others.map((row) =>
+  // Melting or selling hands a paint's rune back; a gift of the last copy does not.
+  const item = (S.bag || []).find((row) => row.code === code);
+  const losesPaint = item && item.personal_paint && Number(item.count || 1) <= 1;
+  sheet("<h3>Кому подарить?</h3>" +
+    (losesPaint ? '<p class="small loss">🎨 На этой вещи твой персональный покрас. При подарке он пропадёт — руна не вернётся. Чтобы сохранить руну, сначала сними покрас.</p>' : "") +
+    others.map((row) =>
     '<button class="go sec" style="margin-bottom:8px" data-gift="' + esc(row.user_id) + '" ' +
     'data-code="' + esc(code) + '">' + esc(row.owner_name || row.name) + "</button>").join(""));
 }
@@ -10893,7 +10918,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
     "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardplay],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
-    "[data-personalrune],[data-personalapply]," +
+    "[data-personalrune],[data-personalapply],[data-personalremove]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
     "[data-grantpick],[data-grantset],[data-grantsign],[data-support],[data-maint],[data-claim]";
@@ -11005,6 +11030,7 @@ async function handleClick(event, target) {
     await act("apply_personal_paint", { rune_id: d.personalapply, code: d.personalcode });
     return;
   }
+  if (d.personalremove) { await act("remove_personal_paint", { code: d.personalremove }); return; }
   if (d.elementset) {
     closeSheet();
     await act("set_character_element", { element: d.elementset });
@@ -11167,6 +11193,7 @@ async function handleClick(event, target) {
                   () => act("sell", { code, confirm: true }));
     }
     else if (d.act === "gift") { closeSheet(); giftPicker(code); }
+    else if (d.act === "unpaint") { closeSheet(); await act("remove_personal_paint", { code }); }
     return;
   }
 

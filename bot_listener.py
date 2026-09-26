@@ -7324,9 +7324,12 @@ async def handle_pets_callback(
                         message_id=message_id, log=log,
                     )
                     return
+                prompt = "Ответь на это сообщение @username получателя."
+                if pets.gift_spends_paint(entry, user_id, item_code):
+                    prompt += "\n\n" + pets_ui.GIFT_SPENDS_PAINT_NOTE
                 gift_flow = await _pets_start_flow(
                     api, pets_flows, chat_id, actor.get("id"), entry, "gift_target",
-                    "Ответь на это сообщение @username получателя.", message_id, actor.get("username"),
+                    prompt, message_id, actor.get("username"),
                 )
                 # The item code is server-side only; callbacks remain compact and cannot
                 # be replayed by another menu owner.
@@ -7673,6 +7676,21 @@ async def handle_pets_callback(
                 ok, note, _receipt = pets.apply_personal_paint_rune(
                     entry, user_id, rune_id, candidates[int(raw_index)]["code"],
                 )
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.personal_paint_runes_view(entry, user_id), log,
+            )
+            return
+        if action == "paintremove":
+            applied = pets.personal_paint_status(entry, user_id).get("applied", [])
+            code = next(
+                (row["code"] for row in applied if row.get("rune_id") == str(argument or "")),
+                None,
+            )
+            if code is None:
+                note = "Этот покрас уже снят."
+            else:
+                ok, note = pets.remove_personal_paint_rune(entry, user_id, code)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
                 pets_ui.personal_paint_runes_view(entry, user_id), log,
@@ -10269,6 +10287,24 @@ async def run_bot_listener(
                 f"[pets] vaulted Зеркало души: refunded {vaulted_mirror['gold']} gold to "
                 f"{vaulted_mirror['players']} players, returned {vaulted_mirror['runes']} "
                 "personal paint runes"
+            )
+        lost_paints = await asyncio.to_thread(
+            pets.restore_lost_personal_paint_runes, cfg.listener_allowed_chats,
+        )
+        for row in lost_paints["restored"]:
+            log(
+                f"[pets] returned lost personal paint rune {row['rune_id']} "
+                f"({row['target']}) to user {row['user_id']} @{row['username'] or '?'}"
+            )
+        for row in lost_paints["gifted"]:
+            log(
+                f"[pets] kept personal paint rune {row['rune_id']} ({row['target']}) of "
+                f"user {row['user_id']} @{row['username'] or '?'} spent: it left with a gift"
+            )
+        if lost_paints["unrecoverable"]:
+            log(
+                f"[pets] {lost_paints['unrecoverable']} lost personal paint runes have no "
+                "surviving photo and were not restored"
             )
         scroll_reset = pets.reset_scroll_collections(cfg.listener_allowed_chats)
         if scroll_reset["players"]:
