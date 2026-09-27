@@ -786,7 +786,7 @@ page that changes shape depending on who opens it:
   many voted, the top 3 so far) and a button per command — the written-out list of the same
   commands used to sit above them and is gone, since every line of it was a slower way to
   press the button underneath. "Открыть голосование"/"Модерация" open the Mini App directly, while
-  "Заявки за эту неделю"/"За прошлую неделю"/"Объявление"/"Картинка итогов"/"Очистить" run the exact
+  "Собрать заявки"/"Объявление"/"Картинка итогов"/"Очистить" run the exact
   same code path as typing the
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
@@ -803,19 +803,23 @@ page that changes shape depending on who opens it:
   "close the reel". Same ⛶ and the same reasoning as the arena's duel view
   (`arena_web.py`), so the bot's two voting systems agree on what "look closer" looks like.
   Telegram's back arrow steps out of the lens first and the reel second.
-- **`/vote собрать`** (DM, administrators only) scans the contest week for `#итогинедели`
-  posts and adds any that aren't already in the poll.
+- **`/vote собрать`** (DM, administrators only) scans the **previous and the current
+  contest week** for `#итогинедели` posts — Monday 00:00 a week ago through now
+  (`VOTE_COLLECT_WEEKS = 2`) — and adds any that aren't already in the current week's
+  poll. Everything it finds arrives **pending** and goes to moderation; nothing reaches
+  voters until an administrator admits it.
 
-  **Which week is a choice, and it is two buttons rather than a picker** — "Заявки за эту
-  неделю" and "За прошлую неделю" (`/vote собрать` and `/vote собрать прошлая`,
-  `_vote_collect_weeks_ago` parses both). The vote for a week is run once that week is
-  over, so on a Monday the default window is a few hours old and empty while every work
-  worth voting on sits in the week just ended. The previous week's window is closed at
-  **both** ends — Monday 00:00 through the following Monday 00:00 — so collecting it never
-  drags in what has been posted since; each week's works stay in that week's own poll.
-  Collecting also makes the week it collected **the newest** poll (`voting.make_current`),
-  which is how `latest_poll` breaks a tie — without it an untouched poll for the week that
-  has only just begun would outrank the week just filled.
+  **Both weeks in one pass, one button** ("Собрать заявки (прошлая + эта неделя)"). The
+  vote is run around the turn of the week: on a Monday the works are all in the week just
+  ended, on a Sunday in the week still running. It used to be two buttons, one per week,
+  each into that week's own poll; that made the moderator guess which week a work was in.
+  Now the moderator sees both weeks and admits what belongs. The flip side: a work that was
+  already in last week's poll can be found again — it comes in pending, and last week's
+  poll keeps its own admissions and votes. The old "За прошлую неделю" button on status
+  messages sent before the change runs the same two-week collect.
+  Collecting also makes the poll it collected **the newest** (`voting.make_current`),
+  which is how `latest_poll` breaks a tie — without it an older unmoderated poll still on
+  disk could outrank the one just filled.
 
   **Which week the page opens is a rank, not a timestamp** (`voting.latest_poll`,
   `_ballot_rank`): a poll with **admitted** works outranks one that is merely collected,
@@ -824,7 +828,7 @@ page that changes shape depending on who opens it:
   that week's file — and on a Monday that is the normal state of the week in progress. The
   rank is what stops a collect from taking the page away from a vote that is running: on
   2026-08-10 last week's poll was open with 15 admitted works and 34 ballots cast when a
-  routine "за эту неделю" found one new nomination, and that single pending work moved the
+  routine collect found one new nomination, and that single pending work moved the
   ballot to a poll with nothing admitted in it. No vote was lost (each week's are in its
   own file), but the ballot showed no candidates until the ordering was fixed. The
   consequence to know about: while a vote is running, a week you collect **stays behind

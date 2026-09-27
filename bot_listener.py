@@ -36,8 +36,8 @@ for rollback/comparison -- see intent_v2.py's module docstring.
 page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
 and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for everyone,
 including an admin (also a status/control panel for one); "/vote выбрать" (DM, admin-only)
-is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans
-#итогинедели posts into the poll, this week's or -- with "прошлая" -- the week before's;
+is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans the
+previous and the current week's #итогинедели posts into the poll;
 "/vote очистить" (DM, admin-only, tap-to-confirm)
 deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement and posts it to
 the chats the admin picks; "/vote картинка" (DM, admin-only) renders the standings as one
@@ -408,21 +408,20 @@ CABINET_COMMAND = "/cabinet"
 # the same reason /plant has two: "/голосование" is what people type, "/vote" is what
 # Telegram can highlight and register in the menu.
 VOTE_COMMANDS = ("/vote", "/голосование")
-# Rebuilds the entry list from this contest week's #итогинедели posts -- Monday 00:00
-# through now, never the week before. Admin-only and
+# Adds to the entry list the #итогинедели posts of the previous and the current contest
+# week -- Monday 00:00 a week ago through now. Admin-only and
 # separate from opening the page: collecting downloads every photo in every nomination,
 # which is slow enough that it must be something somebody asks for, not something that
 # happens each time a voter taps a button.
 VOTE_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
-# "/vote собрать прошлая" -- the same collection, one calendar week back. The voting for a
-# week happens once that week is over, so on Monday the default window ("this week", a few
-# hours old) is empty and the works people came to vote on are all in the week before.
-# Written as a modifier on собрать rather than as its own command word, the way the column
-# count rides on картинка -- see _vote_collect_weeks_ago.
-VOTE_PREVIOUS_WEEK_WORDS = frozenset({
-    "прошлая", "прошлую", "прошлой", "прошлая неделя", "прошлую неделю",
-    "за прошлую неделю", "previous", "prev", "last",
-})
+# How many calendar weeks "/vote собрать" reads, ending with the week in progress. Two,
+# because the vote is run around the turn of the week: on a Monday the works are all in
+# the week just ended, on a Sunday in the week still running, and a work posted late on
+# Sunday or early on Monday belongs to whichever vote is being put together. One window
+# over both means the moderator sees everything and admits what belongs, instead of
+# having to know which week to ask for. Everything collected arrives pending (see
+# voting.Poll.approved), so the wider window can never put a work in front of voters.
+VOTE_COLLECT_WEEKS = 2
 # Opens the moderation screen (admit toggles, live counts, closing the vote) explicitly,
 # as opposed to bare "/vote" -- which now always opens the plain ballot, even for an
 # administrator, so admitting entries never blocks an admin from casting their own vote.
@@ -495,10 +494,9 @@ ARENA_ACTIONS = {
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
     "collect": "/vote собрать",
-    # Two buttons rather than one that asks which week: on Monday the answer is always
-    # "the previous one", on Saturday always "this one", so a picker would be a tap that
-    # never tells anybody anything.
-    "collectprev": "/vote собрать прошлая",
+    # The "за прошлую неделю" button of status messages sent before собрать read both weeks
+    # at once. Kept so tapping one of those still collects, rather than doing nothing.
+    "collectprev": "/vote собрать",
     "chat": "/vote chat",
     "image": "/vote картинка",
     # Same command with the column count on the end -- see _vote_image_columns. A separate
@@ -4398,16 +4396,13 @@ def _vote_status_text(entry: str) -> str:
     return "\n".join(lines)
 
 
-def _current_vote_poll_id(tz, weeks_ago: int = 0) -> str:
+def _current_vote_poll_id(tz) -> str:
     """Keyed by ISO week, not by today's date: собрать/выбрать/очистить all need to agree
     on which poll "this week" refers to regardless of which day of the week they're run,
     and a date-keyed id would silently point at a different poll once the day rolls over
-    mid-week.
-
-    `weeks_ago` names an earlier week (1 is the previous one). Computed by shifting the
-    moment rather than by subtracting from the week number, so the last week of a year
-    lands on the right year instead of "-W00"."""
-    iso_year, iso_week, _ = (datetime.now(tz) - timedelta(weeks=weeks_ago)).isocalendar()
+    mid-week. The poll is named after the week it was collected in, even though its
+    collection window also covers the week before (VOTE_COLLECT_WEEKS)."""
+    iso_year, iso_week, _ = datetime.now(tz).isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
 
 
@@ -4557,23 +4552,6 @@ async def _archive_vote_boards(entry: str, log=print) -> int:
         except Exception:
             log(f"[bot_listener] could not archive vote board for {poll_id}:\n{traceback.format_exc()}")
     return saved
-
-
-def _vote_collect_weeks_ago(argument: str) -> int | None:
-    """Which week "/vote собрать" was asked for -- 0 for the week in progress, 1 for the
-    one before it -- or None if this isn't the собрать command at all.
-
-    The window rides on the same command word rather than getting its own (as with
-    картинка's column count) so that both menu buttons go through the one collect branch:
-    the admin/DM gate, the in-progress lock and the merge with what's already collected are
-    the same work either way, and only the window differs."""
-    normalized = " ".join((argument or "").lower().split())
-    if normalized in VOTE_COLLECT_WORDS:
-        return 0
-    word, _, rest = normalized.partition(" ")
-    if word in VOTE_COLLECT_WORDS and rest in VOTE_PREVIOUS_WEEK_WORDS:
-        return 1
-    return None
 
 
 def _vote_image_columns(argument: str) -> int | None:
@@ -5129,11 +5107,10 @@ async def handle_vote_command(
     page that changes shape depending who opens it:
 
     - "/vote собрать" (DM, admin-only) adds newly posted #итогинедели entries to the
-      list -- already-known ones are left alone, not re-fetched or re-processed. It
-      collects the week in progress; "/vote собрать прошлая" collects the week before it
-      instead, into that week's own poll, and makes that poll the one the page opens. The
-      vote for a week is run once the week is over, so on a Monday the previous week is
-      the one that has the works in it.
+      list -- already-known ones are left alone, not re-fetched or re-processed. It reads
+      the previous and the current contest week together (VOTE_COLLECT_WEEKS) into the
+      current week's poll, and makes that poll the one the page opens; everything found
+      waits in moderation until an administrator admits it.
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
@@ -5190,7 +5167,6 @@ async def handle_vote_command(
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
     image_columns = vote_image.COLUMNS
-    collect_weeks_ago = 0
     if forced_mode == "moderate":
         wants_moderate = True
     elif forced_mode == "clear":
@@ -5206,10 +5182,7 @@ async def handle_vote_command(
                 argument = argument[len(spelling):]
                 break
         normalized = argument.strip().lower()
-        requested_weeks_ago = _vote_collect_weeks_ago(normalized)
-        wants_collect = requested_weeks_ago is not None
-        if requested_weeks_ago is not None:
-            collect_weeks_ago = requested_weeks_ago
+        wants_collect = normalized in VOTE_COLLECT_WORDS
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
@@ -5256,21 +5229,17 @@ async def handle_vote_command(
             )
             return
 
-        week_label = "за прошлую неделю" if collect_weeks_ago else "за эту неделю"
-        window_label = (
-            "за прошлую неделю (с прошлого понедельника по этот)" if collect_weeks_ago
-            else "за эту неделю (с понедельника)"
-        )
+        week_label = "за прошлую и эту неделю"
         status = await reply(
-            f"Собираю заявки с #итогинедели {window_label}. "
+            f"Собираю заявки с #итогинедели {week_label} (с понедельника прошлой недели). "
             "Это может занять несколько минут -- буду показывать прогресс здесь."
         )
-        poll_id = _current_vote_poll_id(tz, collect_weeks_ago)
+        poll_id = _current_vote_poll_id(tz)
         existing_poll = voting.load_poll(entry, poll_id)
 
-        # Nothing is carried over from last week. A poll holds exactly what was nominated
-        # in its own Monday-to-Sunday window, which is what makes "очистить, then собрать"
-        # actually start from empty instead of immediately refilling with last week.
+        # Nothing is copied out of another poll: this one holds exactly what the chat scan
+        # finds in its window. A work that was already in last week's poll is found again
+        # if it was posted inside the window, and arrives here pending like any other.
         known_ids = {e.entry_id for e in existing_poll.entries} if existing_poll else set()
         _VOTE_COLLECTIONS_IN_PROGRESS.add(lock_key)
         try:
@@ -5280,7 +5249,7 @@ async def handle_vote_command(
                 tz=tz,
                 media_dir=voting.media_path(entry, poll_id),
                 skip_entry_ids=known_ids,
-                weeks_ago=collect_weeks_ago,
+                weeks=VOTE_COLLECT_WEEKS,
                 progress=_vote_progress_reporter(
                     api, chat_id, (status or {}).get("message_id"), week_label, log=log,
                 ),
@@ -5299,11 +5268,11 @@ async def handle_vote_command(
         # their admitted/vote state survives untouched.
         all_entries = (existing_poll.entries if existing_poll else []) + new_entries
         poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll)
-        # The week just collected is the week being worked on, so it becomes what the page
-        # and the status message open -- otherwise collecting the previous week would hand
-        # the moderator the empty poll of the week that has only just started (see
-        # voting.make_current). Only if it actually holds something: a week that turned out
-        # to have no nominations must not push aside a week that has them.
+        # The poll just collected is the one being worked on, so it becomes what the page
+        # and the status message open -- otherwise an older unmoderated poll still on disk
+        # (one the old "за прошлую неделю" button wrote, say) could be handed to the
+        # moderator instead (see voting.make_current). Only if it actually holds something:
+        # a collection that found no nominations must not push aside a poll that has them.
         if all_entries:
             voting.make_current(poll)
         voting.save_poll(poll)
@@ -5329,7 +5298,7 @@ async def handle_vote_command(
             "чтобы перейти к этой неделе -- заявки уже собраны и никуда не денутся."
         )
         await reply(
-            f"{summary} Неделя: {poll_id} ({week_label}). "
+            f"{summary} Неделя: {poll_id} (заявки {week_label}). "
             f"Открой модерацию и отметь, какие работы допустить.{elsewhere}",
             reply_markup={"inline_keyboard": [[
                 {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
@@ -5452,18 +5421,12 @@ async def handle_vote_command(
                         {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
                         {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
                     ],
-                    # Собрать заявки is two buttons, one per week: the collection window is
-                    # a calendar week, and which week you want depends on the day you press
-                    # it. On Monday -- when the vote for the week just finished is actually
-                    # run -- "this week" is a few hours old and has nothing in it.
+                    # One button for both weeks (VOTE_COLLECT_WEEKS): which week the works
+                    # are in depends on the day it is pressed, and the moderator filters.
                     [
                         {
-                            "text": "🔄 Заявки за эту неделю",
+                            "text": "🔄 Собрать заявки (прошлая + эта неделя)",
                             "callback_data": _vote_action_callback_data("collect", chat_id, admin_user_id),
-                        },
-                        {
-                            "text": "🔄 За прошлую неделю",
-                            "callback_data": _vote_action_callback_data("collectprev", chat_id, admin_user_id),
                         },
                     ],
                     [

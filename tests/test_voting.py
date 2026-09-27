@@ -157,7 +157,8 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.downloads, [3])
 
     async def test_posts_from_before_this_monday_are_left_in_their_own_week(self):
-        """The contest window is Monday..now, so last week's posts must not be pulled in.
+        """The default window is one contest week, Monday..now (the arena collects that),
+        so last week's posts must not be pulled in.
 
         Anchored to the real week start rather than a frozen clock: one message a second
         before Monday 00:00 and one exactly on it, newest first the way iter_messages
@@ -178,11 +179,10 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e.entry_id for e in entries], ["2"])
         self.assertEqual(self.resolved, [2])
 
-    async def test_the_previous_week_option_collects_that_week_and_nothing_else(self):
-        """The Monday case: the vote for a week is run once the week is over, so the works
-        are all in the week before. That window is closed at BOTH ends -- anything posted
-        since Monday belongs to the week in progress and to its own poll, and anything
-        older than the Monday before belongs to the week before that.
+    async def test_two_weeks_reach_back_to_the_previous_monday_and_up_to_now(self):
+        """What /vote собрать asks for: the week just ended and the one in progress, in one
+        pass. Everything since the previous Monday 00:00 is in -- both sides of this
+        Monday's boundary -- and nothing from the week before that.
         """
         week_start = voting.contest_week_start(datetime.now(timezone.utc))
         previous_start = week_start - timedelta(weeks=1)
@@ -198,12 +198,13 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         entries = await voting.collect_entries(
-            client, object(), timezone.utc, self.media_dir, weeks_ago=1,
+            client, object(), timezone.utc, self.media_dir, weeks=2,
             log=lambda *_: None,
         )
 
-        self.assertEqual({e.entry_id for e in entries}, {"2", "3"})
-        self.assertEqual(sorted(self.resolved), [2, 3])
+        self.assertEqual({e.entry_id for e in entries}, {"2", "3", "4"})
+        self.assertEqual(sorted(self.resolved), [2, 3, 4])
+        self.assertEqual(sorted(client.downloads), [2, 3, 4])
 
     async def test_the_whole_week_is_collected_not_just_the_last_day_or_two(self):
         """Collecting happens on Sunday; everything posted since Monday has to be found."""
@@ -610,9 +611,9 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(voting.latest_poll("Chat").poll_id, "2026-W33")
 
     def test_latest_poll_skips_an_empty_week_in_favour_of_one_with_works(self):
-        """Monday: collecting the week just begun writes an empty poll for it, which is
-        the newest file on disk. Opening THAT rather than the week people are voting in is
-        the whole reason собрать grew a "за прошлую неделю" button."""
+        """Monday: collecting the week just begun can write an empty poll for it, which is
+        the newest file on disk. Opening THAT rather than the week people are voting in
+        would show voters no candidates at all."""
         voted_in = voting.Poll(poll_id="2026-W32", entry="Chat",
                                created_at="2026-08-03T00:00:00+00:00",
                                entries=[voting.Entry(entry_id="1", message_id=1, author_id=1,

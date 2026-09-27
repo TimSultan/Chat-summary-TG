@@ -1,9 +1,10 @@
 """What a week's poll is allowed to contain.
 
-The rule: a poll holds exactly the works nominated in its own Monday-to-Sunday window.
-Nothing rolls over from the previous week -- an earlier version pre-filled a new poll with
-last week's runners-up, which made "очистить, then собрать" impossible to express because
-the collect immediately put last week back.
+The rule: a poll holds exactly the works the chat scan found in its collection window --
+the previous and the current contest week -- and nothing copied out of another poll's
+file. An earlier version pre-filled a new poll with last week's runners-up straight from
+last week's poll, which made "очистить, then собрать" impossible to express because the
+collect immediately put the cleared poll back.
 
 This file replaces the old test_vote_carryover.py. The two rules that survived that
 feature -- re-collecting must not undo moderation, and must not lose votes -- are kept
@@ -29,11 +30,10 @@ LAST_WEEK = "2026-W30"
 THIS_WEEK = "2026-W31"
 
 
-def _fake_poll_id(tz, weeks_ago=0):
+def _fake_poll_id(tz):
     """Stands in for bot_listener._current_vote_poll_id so the tests don't depend on which
-    ISO week they happen to run in -- and, since собрать now takes a window, on which week
-    the command asked for."""
-    return LAST_WEEK if weeks_ago else THIS_WEEK
+    ISO week they happen to run in."""
+    return THIS_WEEK
 
 
 def _entry(entry_id, name=None, media=("a.jpg",)):
@@ -118,8 +118,9 @@ class CollectWindowTests(unittest.TestCase):
         self.assertEqual(poll.approved, [])
         self.assertIn("не нашлось", " ".join(self.api.sent))
 
-    def test_clearing_then_collecting_does_not_bring_the_previous_week_back(self):
-        """The reported bug: очистить leaves the week empty, and собрать refilled it."""
+    def test_clearing_then_collecting_copies_nothing_out_of_an_older_poll(self):
+        """The reported bug: очистить left the week empty, and собрать refilled it from
+        the previous poll's file rather than from the chat."""
         self._collect(new_entries=[_entry("90", media=["90.jpg"])])
         self.assertEqual(len(voting.load_poll(CHAT, THIS_WEEK).entries), 1)
 
@@ -130,11 +131,12 @@ class CollectWindowTests(unittest.TestCase):
         last_week = voting.load_poll(CHAT, LAST_WEEK)
         self.assertEqual(len(last_week.entries), 5)  # untouched, still its own week
 
-    def test_only_this_weeks_nominations_land_in_the_poll_and_stay_pending(self):
+    def test_collected_nominations_land_in_this_weeks_poll_and_stay_pending(self):
         poll = self._collect(new_entries=[_entry("90"), _entry("91")])
 
         self.assertEqual([e.entry_id for e in poll.entries], ["90", "91"])
         self.assertEqual(poll.approved, [])  # every work still needs a human
+        self.assertIn("за прошлую и эту неделю", " ".join(self.api.sent))
 
     def test_the_scan_is_told_only_about_works_already_in_this_weeks_poll(self):
         self._collect(new_entries=[_entry("90")])
@@ -154,34 +156,33 @@ class CollectWindowTests(unittest.TestCase):
         self.assertEqual(again.approved, ["90"])
         self.assertEqual([e.entry_id for e in again.entries], ["90", "91"])
 
-    def test_the_default_collect_still_asks_for_the_week_in_progress(self):
+    def test_collect_reads_the_previous_and_the_current_week_in_one_pass(self):
+        """On a Monday the works are in the week just ended, on a Sunday in the week still
+        running; one collection over both finds them whichever day it is pressed."""
         self._collect()
 
-        self.assertEqual(self.collect_kwargs["weeks_ago"], 0)
+        self.assertEqual(self.collect_kwargs["weeks"], 2)
+        self.assertNotIn("weeks_ago", self.collect_kwargs)
 
-    def test_the_previous_week_button_collects_into_the_previous_weeks_poll(self):
-        """It is Monday: the works people have to vote on are all in the week just ended,
-        and "this week" is a few hours old and empty."""
-        poll = self._collect(
-            new_entries=[_entry("90", media=["90.jpg"])],
-            text="/vote собрать прошлая", poll_id=LAST_WEEK,
-        )
+    def test_a_work_already_in_last_weeks_poll_arrives_pending_and_leaves_that_poll_alone(self):
+        """The window reaches into last week, so a work that was already in last week's
+        poll can be found again. It comes in pending -- whether it runs a second time is
+        the moderator's call -- and last week's poll keeps its admissions and its votes."""
+        poll = self._collect(new_entries=[_entry("4", media=["4.jpg"]), _entry("90", media=["90.jpg"])])
 
-        self.assertEqual(self.collect_kwargs["weeks_ago"], 1)
-        self.assertIn("90", [e.entry_id for e in poll.entries])
-        # ...merged into that week rather than replacing it: what it already held is still
-        # there, still admitted, and its votes are still counted.
-        self.assertEqual(len(poll.entries), 6)
-        self.assertEqual(sorted(poll.approved), ["0", "1", "2", "3", "4"])
-        self.assertEqual(len(poll.votes), 10)
-        self.assertIsNone(voting.load_poll(CHAT, THIS_WEEK))  # untouched, not created
+        self.assertEqual([e.entry_id for e in poll.entries], ["4", "90"])
+        self.assertEqual(poll.approved, [])
+        self.assertEqual(poll.votes, {})
+        last_week = voting.load_poll(CHAT, LAST_WEEK)
+        self.assertEqual(sorted(last_week.approved), ["0", "1", "2", "3", "4"])
+        self.assertEqual(len(last_week.votes), 10)
 
-    def test_collecting_the_previous_week_makes_it_the_poll_the_page_opens(self):
-        """Monday morning, nothing moderated yet: the week just collected is the week the
-        moderator is working on, so it has to be the one the page opens even though the
-        week in progress has works of its own and is the newer poll.
+    def test_a_collect_takes_the_page_from_an_older_unmoderated_poll(self):
+        """A poll the old "за прошлую неделю" button wrote can still be on disk and newer
+        than this week's. The poll just collected is the one being worked on, so it is the
+        one the moderation page opens.
 
-        Both weeks are left unmoderated on purpose. A week with admitted works is a live
+        Last week is left unmoderated on purpose. A poll with admitted works is a live
         ballot and outranks both regardless of when it was collected -- that is
         latest_poll's own rule, tested separately, and it would mask the tie-break here.
         """
@@ -189,52 +190,36 @@ class CollectWindowTests(unittest.TestCase):
         voting.set_approved(finished, [])
         finished.votes = {}
         voting.save_poll(finished)
-
         self._collect(new_entries=[_entry("80", media=["80.jpg"])])
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, THIS_WEEK)
-
-        self._collect(
-            new_entries=[_entry("90", media=["90.jpg"])],
-            text="/vote собрать прошлая", poll_id=LAST_WEEK,
-        )
-
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
-
-    def test_a_collect_mid_vote_does_not_move_the_ballot_off_the_running_week(self):
-        """Production, 2026-08-10: the previous week's vote was running -- 15 works
-        admitted, 34 ballots cast -- when "за эту неделю" was pressed. It found one new
-        nomination, and that single pending work took the page away from the live vote,
-        which then showed no candidates at all."""
-        self._collect(
-            new_entries=[_entry("90", media=["90.jpg"])],
-            text="/vote собрать прошлая", poll_id=LAST_WEEK,
-        )
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
-
-        self._collect(new_entries=[_entry("80", media=["80.jpg"])])  # one post today
-
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
-        # ...and the work found today is still collected, waiting in its own week.
-        self.assertEqual(len(voting.load_poll(CHAT, THIS_WEEK).entries), 1)
-
-    def test_the_empty_week_just_begun_does_not_hide_the_week_being_voted_in(self):
-        """Monday, the other way round: the previous week is collected and open, and then
-        somebody presses "за эту неделю". Nothing has been posted yet, and the empty poll
-        that writes must not become what the ballot opens."""
-        self._collect(
-            new_entries=[_entry("90", media=["90.jpg"])],
-            text="/vote собрать прошлая", poll_id=LAST_WEEK,
-        )
+        this_week = voting.load_poll(CHAT, THIS_WEEK)
+        this_week.created_at = "2026-07-01"  # older than last week's "2026-07-20"
+        voting.save_poll(this_week)
         self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
 
         self._collect()
 
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, THIS_WEEK)
+
+    def test_a_collect_mid_vote_does_not_move_the_ballot_off_the_running_week(self):
+        """Production, 2026-08-10: the previous week's vote was running -- 15 works
+        admitted, 34 ballots cast -- when a collect found one new nomination, and that
+        single pending work took the page away from the live vote, which then showed no
+        candidates at all."""
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)  # admitted, 10 ballots
+
+        self._collect(new_entries=[_entry("80", media=["80.jpg"])])
+
         self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
+        # ...the work found is still collected, waiting in this week's poll...
+        self.assertEqual(len(voting.load_poll(CHAT, THIS_WEEK).entries), 1)
+        # ...and the reply says outright why the page still shows the other week.
+        self.assertIn("открыта пока другая неделя", " ".join(self.api.sent))
 
-    def test_the_previous_week_scan_is_told_what_that_week_already_holds(self):
-        self._collect(text="/vote собрать прошлая", poll_id=LAST_WEEK)
+    def test_a_collect_that_finds_nothing_does_not_hide_the_week_being_voted_in(self):
+        """The empty poll such a collect writes must not become what the ballot opens."""
+        self._collect()
 
-        self.assertEqual(self.collect_kwargs["skip_entry_ids"], {"0", "1", "2", "3", "4"})
+        self.assertEqual(voting.latest_poll(CHAT).poll_id, LAST_WEEK)
 
     def test_votes_already_cast_this_week_survive_a_second_collect(self):
         self._collect(new_entries=[_entry("90")])
