@@ -151,6 +151,7 @@ async def collect_entries(
     hashtag: str = CONTEST_HASHTAG,
     skip_entry_ids=frozenset(),
     weeks: int = 1,
+    stop_at_known: bool = True,
     progress=None,
     log=print,
 ) -> list[Entry]:
@@ -169,20 +170,24 @@ async def collect_entries(
     drop the oldest day's works instead of finding the same set.
 
     `skip_entry_ids` -- entry ids (message ids, as strings) already known from a previous
-    collection -- do two things. They are never resolved further (no get_sender() round
-    trip, no photo download, no Entry built), and, more importantly, THE SCAN STOPS at the
+    collection -- are never resolved further: no get_sender() round trip, no photo
+    download, no Entry built. With `stop_at_known` (the default) THE SCAN ALSO STOPS at the
     first one it meets. The listing is newest-first, so everything past a work that was
-    already collected was already collected too; a re-collect that only wants today's
-    additions has no reason to read back to Monday. A first collection (no skip ids) still
-    reads the whole window.
+    already collected was collected too -- as long as the earlier collection read the same
+    window. A re-collect that only wants today's additions has no reason to read back to
+    Monday. A first collection (no skip ids) reads the whole window either way.
+
+    That "as long as" is why stopping is optional. It is wrong whenever the earlier
+    collection read LESS than this one: a poll collected for the week in progress holds
+    only this week's works, so a two-week collect that stops at the newest of them never
+    reaches the week before -- which is exactly how the first two-week collect in
+    production (2026-09-27) found two works from this week and none from last. It also
+    misses a post that gained the hashtag after it was first passed over (edited days
+    later). `stop_at_known=False` reads the whole window regardless and still skips the
+    known works, so it costs only the scan, never a second download.
 
     The caller is responsible for keeping those already-known entries around (see
     bot_listener.handle_vote_command) -- this function only ever reports what's new.
-
-    The cost of stopping early: a post that gained the hashtag AFTER it was first passed
-    over -- edited days later -- sits below the newest known work and is not picked up.
-    Clearing and collecting again finds it, and that is rarer than adding a few late
-    entries to a poll, which is the case this is for.
 
     Uses the Telethon session directly rather than telegram_fetch's cache: that cache
     stores plain text dicts, and this needs the media and the grouped_id, neither of which
@@ -232,14 +237,14 @@ async def collect_entries(
         # Reaching a nomination that was already collected means everything below it was
         # too: the listing is newest-first, so a re-collect only has to walk back as far
         # as the first thing it recognises. Without this, adding one late entry re-read
-        # the whole week every time.
+        # the whole window every time. Only when asked -- see stop_at_known.
         #
         # The known message is kept rather than dropped, and the break happens after
         # appending it: in an album the entry id is the FIRST message's, which arrives
         # last here, so stopping before it would leave the album's other messages behind
         # as a headless group -- which reads as a brand-new nomination and gets collected
         # a second time.
-        if skip_entry_ids and str(message.id) in skip_entry_ids:
+        if stop_at_known and skip_entry_ids and str(message.id) in skip_entry_ids:
             stopped_at_known = True
             break
 

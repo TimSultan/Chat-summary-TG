@@ -375,6 +375,7 @@ class VoteImageButtonTests(unittest.TestCase):
     # the column count rides on the same command word.
     WORD_SET_ACTIONS = {
         "collect": "VOTE_COLLECT_WORDS",
+        "collectnew": "VOTE_ADD_NEW_WORDS",
         "collectprev": "VOTE_COLLECT_WORDS",
         "chat": "VOTE_CHAT_WORDS",
         "clear": "VOTE_CLEAR_WORDS",

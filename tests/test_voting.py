@@ -230,6 +230,53 @@ class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(entries), len(client._messages))
         self.assertGreaterEqual(len(entries), 1)
 
+    async def test_a_full_collect_reads_past_known_works_to_the_start_of_the_window(self):
+        """Production, 2026-09-27: this week's poll held two works collected with the old
+        one-week window, and the first two-week collect stopped at the newer of them -- so
+        nothing from last week came in. A full collect walks the whole window, and still
+        never re-resolves or re-downloads the two it already has."""
+        week_start = voting.contest_week_start(datetime.now(timezone.utc))
+        client = _FakeClient([
+            _FakeMessage(5, text="новая #итогинедели", date=week_start,
+                         resolved=self.resolved),
+            _FakeMessage(4, text="уже собрана #итогинедели", date=week_start,
+                         resolved=self.resolved),
+            _FakeMessage(3, text="уже собрана #итогинедели", date=week_start,
+                         resolved=self.resolved),
+            _FakeMessage(2, text="прошлая неделя #итогинедели",
+                         date=week_start - timedelta(days=2), resolved=self.resolved),
+            _FakeMessage(1, text="позапрошлая #итогинедели",
+                         date=week_start - timedelta(days=8), resolved=self.resolved),
+        ])
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir,
+            skip_entry_ids={"4", "3"}, weeks=2, stop_at_known=False, log=lambda *_: None,
+        )
+
+        self.assertEqual([e.entry_id for e in entries], ["5", "2"])
+        self.assertEqual(self.resolved, [5, 2])
+        self.assertEqual(client.downloads, [5, 2])
+
+    async def test_adding_new_ones_stops_at_the_newest_known_work_even_in_a_two_week_window(self):
+        """The quick button keeps its shortcut -- which is why the full one exists."""
+        week_start = voting.contest_week_start(datetime.now(timezone.utc))
+        client = _FakeClient([
+            _FakeMessage(5, text="новая #итогинедели", date=week_start,
+                         resolved=self.resolved),
+            _FakeMessage(4, text="уже собрана #итогинедели", date=week_start,
+                         resolved=self.resolved),
+            _FakeMessage(2, text="прошлая неделя #итогинедели",
+                         date=week_start - timedelta(days=2), resolved=self.resolved),
+        ])
+
+        entries = await voting.collect_entries(
+            client, object(), timezone.utc, self.media_dir,
+            skip_entry_ids={"4"}, weeks=2, log=lambda *_: None,
+        )
+
+        self.assertEqual([e.entry_id for e in entries], ["5"])
+
     async def test_a_recollect_stops_at_the_first_work_it_already_has(self):
         """Adding a late entry must not re-read the week. Newest-first, so everything
         past an already-collected work was already collected too."""

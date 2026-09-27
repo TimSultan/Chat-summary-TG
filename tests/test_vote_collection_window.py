@@ -164,6 +164,61 @@ class CollectWindowTests(unittest.TestCase):
         self.assertEqual(self.collect_kwargs["weeks"], 2)
         self.assertNotIn("weeks_ago", self.collect_kwargs)
 
+    def test_collect_all_reads_the_whole_window_past_works_already_collected(self):
+        """Production, 2026-09-27: this week's poll already held two works, and a collect
+        that stopped at them never reached last week."""
+        self._collect(new_entries=[_entry("90")])
+
+        self._collect(text="/vote собрать")
+
+        self.assertIs(self.collect_kwargs["stop_at_known"], False)
+        self.assertEqual(self.collect_kwargs["skip_entry_ids"], {"90"})  # still no re-download
+        self.assertIn("все заявки", " ".join(self.api.sent))
+
+    def test_add_new_stops_at_the_newest_work_already_collected(self):
+        self._collect(new_entries=[_entry("90")])
+
+        poll = self._collect(new_entries=[_entry("91")], text="/vote добавить")
+
+        self.assertIs(self.collect_kwargs["stop_at_known"], True)
+        self.assertEqual(self.collect_kwargs["weeks"], 2)
+        self.assertEqual([e.entry_id for e in poll.entries], ["90", "91"])
+        self.assertEqual(poll.approved, [])
+
+    def test_the_status_panel_offers_both_collect_buttons(self):
+        """Bare /vote from an administrator: the two buttons must carry the two actions."""
+        async def resolve(*args, **kwargs):
+            return -100
+
+        async def can_manage(*args, **kwargs):
+            return True
+
+        markups = []
+
+        async def send_message(chat_id, text, reply_to_message_id=None, reply_markup=None,
+                               parse_mode=None, disable_notification=False):
+            markups.append(reply_markup)
+            return {"message_id": 1}
+
+        self.api.send_message = send_message
+        message = {"message_id": 1, "chat": {"id": 5, "type": "private"},
+                   "from": {"id": 7, "username": "admin"}, "text": "/vote"}
+        cfg = SimpleNamespace(webapp_public_url="https://example.com",
+                              vote_miniapp_short_name=None, vote_announce_extra_chat=None)
+        with patch.object(bot_listener, "_resolve_chat_id", resolve), \
+             patch.object(bot_listener, "_can_manage_chat", can_manage):
+            asyncio.run(bot_listener.handle_vote_command(
+                self.api, None, cfg, None, message, CHAT, "testbot", set(),
+                log=lambda *_: None,
+            ))
+
+        buttons = {
+            button["text"]: button.get("callback_data", "")
+            for row in markups[-1]["inline_keyboard"] for button in row
+        }
+        self.assertIn(":collect:", buttons["🔄 Собрать все заявки"])
+        self.assertIn(":collectnew:", buttons["➕ Добавить новые"])
+
     def test_a_work_already_in_last_weeks_poll_arrives_pending_and_leaves_that_poll_alone(self):
         """The window reaches into last week, so a work that was already in last week's
         poll can be found again. It comes in pending -- whether it runs a second time is

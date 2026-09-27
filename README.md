@@ -809,14 +809,21 @@ page that changes shape depending on who opens it:
   poll. Everything it finds arrives **pending** and goes to moderation; nothing reaches
   voters until an administrator admits it.
 
-  **Both weeks in one pass, one button** ("Собрать заявки (прошлая + эта неделя)"). The
-  vote is run around the turn of the week: on a Monday the works are all in the week just
-  ended, on a Sunday in the week still running. It used to be two buttons, one per week,
-  each into that week's own poll; that made the moderator guess which week a work was in.
-  Now the moderator sees both weeks and admits what belongs. The flip side: a work that was
-  already in last week's poll can be found again — it comes in pending, and last week's
-  poll keeps its own admissions and votes. The old "За прошлую неделю" button on status
-  messages sent before the change runs the same two-week collect.
+  **Both weeks in one pass.** The vote is run around the turn of the week: on a Monday the
+  works are all in the week just ended, on a Sunday in the week still running. It used to
+  be one button per week, each into that week's own poll, which made the moderator guess
+  which week a work was in. Now the moderator sees both weeks and admits what belongs. The
+  flip side: a work that was already in last week's poll can be found again — it comes in
+  pending, and last week's poll keeps its own admissions and votes.
+
+  **Two buttons, differing only in where the scan stops.** "Собрать все заявки"
+  (`/vote собрать`) reads the whole two-week window every time. "Добавить новые"
+  (`/vote добавить`) stops at the newest work the poll already has, which is quick but
+  only right when the poll was filled from the same window: on 2026-09-27 this week's poll
+  held two works from the old one-week collect, the first two-week collect stopped at them,
+  and nothing from last week came in. Neither re-downloads a work already collected
+  (`voting.collect_entries`, `stop_at_known`). The old "За прошлую неделю" button on
+  status messages sent before the change runs the full collect.
   Collecting also makes the poll it collected **the newest** (`voting.make_current`),
   which is how `latest_poll` breaks a tie — without it an older unmoderated poll still on
   disk could outrank the one just filled.

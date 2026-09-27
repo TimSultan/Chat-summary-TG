@@ -413,7 +413,14 @@ VOTE_COMMANDS = ("/vote", "/голосование")
 # separate from opening the page: collecting downloads every photo in every nomination,
 # which is slow enough that it must be something somebody asks for, not something that
 # happens each time a voter taps a button.
-VOTE_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
+#
+# Two spellings of it, one button each. "Собрать все заявки" reads the whole window every
+# time; "Добавить новые" stops at the newest work the poll already has, which is quick but
+# only right when the poll was filled from the same window -- a poll holding just this
+# week's works makes it stop before it ever reaches last week (see
+# voting.collect_entries' stop_at_known). Neither re-downloads a work already collected.
+VOTE_COLLECT_WORDS = frozenset({"собрать", "собрать все", "collect", "collect all"})
+VOTE_ADD_NEW_WORDS = frozenset({"добавить", "добавить новые", "новые", "обновить", "refresh", "add", "new"})
 # How many calendar weeks "/vote собрать" reads, ending with the week in progress. Two,
 # because the vote is run around the turn of the week: on a Monday the works are all in
 # the week just ended, on a Sunday in the week still running, and a work posted late on
@@ -494,6 +501,7 @@ ARENA_ACTIONS = {
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
     "collect": "/vote собрать",
+    "collectnew": "/vote добавить",
     # The "за прошлую неделю" button of status messages sent before собрать read both weeks
     # at once. Kept so tapping one of those still collects, rather than doing nothing.
     "collectprev": "/vote собрать",
@@ -5110,7 +5118,8 @@ async def handle_vote_command(
       list -- already-known ones are left alone, not re-fetched or re-processed. It reads
       the previous and the current contest week together (VOTE_COLLECT_WEEKS) into the
       current week's poll, and makes that poll the one the page opens; everything found
-      waits in moderation until an administrator admits it.
+      waits in moderation until an administrator admits it. "/vote добавить" is the quick
+      variant that stops at the newest work already collected (VOTE_ADD_NEW_WORDS).
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
@@ -5166,6 +5175,7 @@ async def handle_vote_command(
         return
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
+    collect_only_new = False
     image_columns = vote_image.COLUMNS
     if forced_mode == "moderate":
         wants_moderate = True
@@ -5181,8 +5191,9 @@ async def handle_vote_command(
             if argument.lower().startswith(spelling):
                 argument = argument[len(spelling):]
                 break
-        normalized = argument.strip().lower()
-        wants_collect = normalized in VOTE_COLLECT_WORDS
+        normalized = " ".join(argument.lower().split())
+        collect_only_new = normalized in VOTE_ADD_NEW_WORDS
+        wants_collect = collect_only_new or normalized in VOTE_COLLECT_WORDS
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
@@ -5231,8 +5242,15 @@ async def handle_vote_command(
 
         week_label = "за прошлую и эту неделю"
         status = await reply(
-            f"Собираю заявки с #итогинедели {week_label} (с понедельника прошлой недели). "
-            "Это может занять несколько минут -- буду показывать прогресс здесь."
+            (
+                f"Добавляю новые заявки с #итогинедели {week_label}: читаю чат до последней "
+                "уже собранной работы. Если не хватает работ за прошлую неделю -- нажми "
+                "«Собрать все заявки»."
+            ) if collect_only_new else (
+                f"Собираю все заявки с #итогинедели {week_label} (с понедельника прошлой "
+                "недели). Уже собранные не скачиваю заново. Это может занять несколько "
+                "минут -- буду показывать прогресс здесь."
+            )
         )
         poll_id = _current_vote_poll_id(tz)
         existing_poll = voting.load_poll(entry, poll_id)
@@ -5250,6 +5268,7 @@ async def handle_vote_command(
                 media_dir=voting.media_path(entry, poll_id),
                 skip_entry_ids=known_ids,
                 weeks=VOTE_COLLECT_WEEKS,
+                stop_at_known=collect_only_new,
                 progress=_vote_progress_reporter(
                     api, chat_id, (status or {}).get("message_id"), week_label, log=log,
                 ),
@@ -5421,12 +5440,17 @@ async def handle_vote_command(
                         {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
                         {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
                     ],
-                    # One button for both weeks (VOTE_COLLECT_WEEKS): which week the works
-                    # are in depends on the day it is pressed, and the moderator filters.
+                    # Both read the previous and the current week (VOTE_COLLECT_WEEKS); they
+                    # differ in whether the scan stops at the newest work already collected
+                    # (see VOTE_ADD_NEW_WORDS).
                     [
                         {
-                            "text": "🔄 Собрать заявки (прошлая + эта неделя)",
+                            "text": "🔄 Собрать все заявки",
                             "callback_data": _vote_action_callback_data("collect", chat_id, admin_user_id),
+                        },
+                        {
+                            "text": "➕ Добавить новые",
+                            "callback_data": _vote_action_callback_data("collectnew", chat_id, admin_user_id),
                         },
                     ],
                     [
