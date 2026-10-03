@@ -16,7 +16,6 @@ Every view is rendered with Telegram's HTML parse mode, so anything user-control
 display name, a bought title, another member's name) must go through html.escape.
 """
 
-from datetime import date
 from html import escape
 
 import economy
@@ -29,8 +28,8 @@ MAX_CALLBACK_BYTES = 64
 
 BACK_BUTTON = "◀️ Назад"
 
-# Works are linked as compact numbers (see stats.format_stat); a DM view can afford more
-# of them than a group reply, but not an unbounded wall.
+# One line per work, so a page of them stays readable on a phone. Every work is reachable:
+# the screen pages through the whole list rather than stopping at the first page.
 WORKS_SHOWN = 30
 
 
@@ -59,17 +58,12 @@ def _money(amount: int) -> str:
 
 def main_view(
     entry: str, user: stats.UserStats, xp: int, rank: int, total: int, streak: int,
-    season_xp: int | None = None, can_manage_badges: bool = False,
+    can_manage_badges: bool = False,
 ) -> tuple[str, dict]:
-    """The landing screen: a compact identity card plus the section buttons.
-
-    The level is scored on SEASON XP (see stats.season_bounds); `xp` remains the
-    all-time total that rank and coins come from. `season_xp` defaults to `xp` so
-    callers that have not been updated still render a coherent card.
-    """
-    level_xp = xp if season_xp is None else season_xp
-    level = stats.chat_level(level_xp)
-    bar = stats.progress_bar(stats.chat_level_progress(level_xp))
+    """The landing screen: a compact identity card plus the section buttons. The level,
+    rank and coins all come from the same all-time `xp`, exactly as in /stat."""
+    level = stats.chat_level(xp)
+    bar = stats.progress_bar(stats.chat_level_progress(xp))
     coins = economy.balance(entry, user.user_id, xp)
     title = economy.active_title(entry, user.user_id)
     freezes = economy.streak_freezes(entry, user.user_id)
@@ -79,7 +73,6 @@ def main_view(
         lines.append(f"«{escape(title)}»")
     lines.append("")
     lines.append(f"🧩 {escape(level.label)}  {bar}")
-    lines.append(f"🗓️ {escape(stats.season_label(date.today()))}")
     lines.append(f"🪙 Монеты: {_money(coins)}")
     lines.append(f"📈 Место в рейтинге: {rank} из {total}")
     if streak > 0:
@@ -121,7 +114,6 @@ def stats_view(
     custom_badges: list,
     best_work_link: str | None,
     workplace_link: str | None,
-    season_xp: int | None = None,
 ) -> tuple[str, dict]:
     """The same /stat card the group sees -- deliberately identical, so the cabinet never
     becomes a second, subtly different source of truth for somebody's numbers."""
@@ -131,7 +123,6 @@ def stats_view(
         custom_badges=custom_badges,
         best_work_link=best_work_link,
         workplace_link=workplace_link,
-        season_xp=season_xp,
         work_names=stats.work_name_list(entry, user),
         **economy.stat_extras(entry, user.user_id, xp, user),
     )
@@ -175,8 +166,10 @@ def works_view(
     best_work_link: str | None,
     workplace_link: str | None,
     notice: str = "",
+    page: int | str = 1,
 ) -> tuple[str, dict]:
-    """One line per work, so the position stays visible next to its name.
+    """One line per work, so the position stays visible next to its name, WORKS_SHOWN to
+    a page. Every work a member ever posted is here -- /stat shows only the newest few.
 
     A member renames by position ("3 Дредноут"), but the name is stored against that
     work's message_id (see stats.set_work_name) -- positions shift when a work is
@@ -197,13 +190,33 @@ def works_view(
 
     rows = []
     if figurine_links:
-        for index, link in enumerate(figurine_links[:WORKS_SHOWN], start=1):
+        pages = max(1, -(-len(figurine_links) // WORKS_SHOWN))
+        try:
+            current = min(max(1, int(page)), pages)
+        except (TypeError, ValueError):
+            current = 1
+        first = (current - 1) * WORKS_SHOWN
+        for index, link in enumerate(
+            figurine_links[first:first + WORKS_SHOWN], start=first + 1,
+        ):
             message_id = message_id_for_position(user, index)
             name = names.get(str(message_id)) if message_id is not None else None
             label = escape(name) if name else "<i>без названия</i>"
             lines.append(f'{index}. <a href="{escape(link, quote=True)}">{label}</a>')
-        if len(figurine_links) > WORKS_SHOWN:
-            lines.append(f"\n…и ещё {len(figurine_links) - WORKS_SHOWN}.")
+        if pages > 1:
+            lines.append(f"\nСтраница {current} из {pages}")
+            navigation = []
+            if current > 1:
+                navigation.append({
+                    "text": "⬅️ Новее",
+                    "callback_data": callback_data(user.user_id, "works", str(current - 1)),
+                })
+            if current < pages:
+                navigation.append({
+                    "text": "Старее ➡️",
+                    "callback_data": callback_data(user.user_id, "works", str(current + 1)),
+                })
+            rows.append(navigation)
         lines.append(f"\nНазвание — до {stats.WORK_NAME_MAX_CHARS} символов.")
         rows.append([
             {"text": "✏️ Переименовать",
@@ -221,10 +234,11 @@ def works_view(
 def message_id_for_position(user: stats.UserStats, position: int) -> int | None:
     """The message_id behind the 1-based position this view and /stat display.
 
-    recent_figurine_posts is newest-first and already has deleted works removed
-    (_apply_deleted_figurines), so position N here is the same work /stat calls N.
+    Read from stats.numbered_figurine_posts -- newest first, deleted works already removed
+    (_apply_deleted_figurines), unlinkable posts skipped -- so position N here is the
+    same work /stat, /работы and /deletepokras call N.
     """
-    posts = user.recent_figurine_posts
+    posts = stats.numbered_figurine_posts(user)
     if 1 <= position <= len(posts):
         return posts[position - 1][1]
     return None
@@ -247,7 +261,7 @@ def parse_rename_request(text: str) -> tuple[int, str] | None:
 def confirm_work_delete_view(owner_id, position: int, name: str | None, message_id: int):
     """Ask before deleting. Removing a work is irreversible -- it writes a permanent
     tombstone so a stale transcript cannot restore it -- and costs the member 200 XP,
-    which can drop their level and a painting badge with it. That is far too much to
+    which can drop their level and painter rank with it. That is far too much to
     hang off a single mistaken tap, so the number they typed is read back to them first.
 
     The message_id, not the position, rides in the confirm button: positions renumber
@@ -270,20 +284,20 @@ def confirm_work_delete_view(owner_id, position: int, name: str | None, message_
 def badges_view(
     entry: str,
     user: stats.UserStats,
+    xp: int,
     custom_badges: list,
     chat_custom_badge_total: int = 0,
-    casino_winnings: int = 0,
 ) -> tuple[str, dict]:
     """Hand-made badges first, then earned ones, then a completion counter.
 
-    They lead because they are the only ones somebody chose to give this person; buried
-    among a dozen automatic counters that is exactly what gets lost. The split is on
-    Badge.custom, which is what that flag exists for -- a weekly-contest win is assigned
-    by an administrator but is still earned, so it stays below.
+    They lead because they are the only ones somebody chose to give this person. The
+    split is on Badge.custom, which is what that flag exists for -- a weekly-contest win
+    is assigned by an administrator but is still earned, so it stays below with the two
+    automatic badges.
     """
     given = [badge for badge in (custom_badges or []) if getattr(badge, "custom", False)]
     other_awarded = [badge for badge in (custom_badges or []) if not getattr(badge, "custom", False)]
-    earned = stats.earned_badges(user, casino_winnings=casino_winnings) + other_awarded
+    earned = stats.earned_badges(user) + other_awarded
 
     lines = ["🏅 <b>Значки</b>"]
     if given:
@@ -297,10 +311,15 @@ def badges_view(
             lines.append(f"{escape(badge.label)}{description}")
     if not given and not earned:
         lines.append("\nПока ни одного.")
+    lines.append(
+        f"\n<i>{stats.ACTIVE_DAYS_BADGE[1]} {stats.ACTIVE_DAYS_BADGE[2]} — уровень за каждые "
+        f"{stats.ACTIVE_DAYS_PER_BADGE_LEVEL} активных дней, "
+        f"{stats.MESSAGES_BADGE[1]} {stats.MESSAGES_BADGE[2]} — за каждые "
+        f"{stats._thousands(stats.MESSAGES_PER_BADGE_LEVEL)} сообщений.</i>"
+    )
 
     unlocked, total = stats.badge_collection_progress(
-        user, custom_badges=custom_badges, chat_custom_badge_total=chat_custom_badge_total,
-        casino_winnings=casino_winnings,
+        user, xp, custom_badges=custom_badges, chat_custom_badge_total=chat_custom_badge_total,
     )
     lines.append(f"\n📦 Открыто: {unlocked} из {total}")
     lines.append("<i>считая уровни чата и звания художника</i>")

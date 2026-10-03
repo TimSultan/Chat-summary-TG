@@ -259,6 +259,31 @@ def grant_once(entry: str, user_id, amount: int, reason: str) -> bool:
     return True
 
 
+def retire_xp_grant(entry: str, user_id, key: str) -> int:
+    """Turn one XP grant that was really a payment into the coins it stood for.
+
+    XP is the chat's own score -- what /top, /stat and the chat level read -- and coins
+    are derived from it, so money handed out as XP used to put the recipient at the top
+    of the chat's leaderboard. This takes the XP out and pays the same value as `bonus`
+    coins, so the wallet is unchanged and the leaderboard is honest again.
+
+    Coins are paid first and keyed on the grant itself, the same key admin_xp.py has
+    always used, so a crash between the two steps, a second run, or a grant that was
+    already compensated once by hand can never pay twice. Only the part of the grant
+    still in effect is paid for (see stats.xp_grant_in_effect): one an administrator
+    already cancelled with a negative adjustment took its coins away with it.
+
+    Returns the coins paid; 0 once the grant is gone.
+    """
+    granted, live = stats.xp_grant_in_effect(entry, user_id, key)
+    if not granted:
+        return 0
+    coins = live // stats.XP_PER_COIN
+    paid = grant_once(entry, user_id, coins, f"xp_grant_revert:{user_id}:{granted}") if coins else False
+    stats.retire_xp_grant(entry, user_id, key)
+    return coins if paid else 0
+
+
 def grant(entry: str, user_id, amount: int, reason: str) -> None:
     """Credit coins that did not come from XP (an administrator award, a contest prize)."""
     data = _load(entry)
@@ -727,7 +752,7 @@ def reputation_for(entry: str, user_id, user=None) -> int:
         stats.weekly_wins_for_user(entry, user_id),
         len(stats.custom_badges_for_user(entry, user_id)),
         record.get("received", 0),
-        stats.medal_levels(user, casino_winnings_for_user(entry, user_id)) if user is not None else 0,
+        stats.medal_levels(user) if user is not None else 0,
     )
 
 
@@ -1252,7 +1277,6 @@ def stat_extras(entry: str, user_id, xp: int, user=None) -> dict:
             "coins": balance(entry, user_id, xp),
             "reputation": reputation_for(entry, user_id, user),
             "custom_title": active_title(entry, user_id),
-            "casino_winnings": casino_winnings_for_user(entry, user_id),
         }
     except (OSError, ValueError):
         return {}

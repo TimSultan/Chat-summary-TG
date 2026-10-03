@@ -437,6 +437,7 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "testfight", "description": "Тестовый случайный бой"},
     {"command": "cabinet", "description": "Личный кабинет"},
     {"command": "stat", "description": "Моя статистика"},
+    {"command": "works", "description": "Все мои работы (#япокрасил)"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
@@ -447,6 +448,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
     {"command": "testfight", "description": "Тестовый случайный бой"},
     {"command": "stat", "description": "Моя статистика"},
+    {"command": "works", "description": "Все мои работы (#япокрасил)"},
     {"command": "top", "description": "Рейтинг чата"},
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
@@ -1207,7 +1209,7 @@ async def handle_badge_text_input(
         return True
 
     if flow["awaiting"] == "revoke_target":
-        target, _, _, _, _, _ = await stats.resolve_stat_target(
+        target, _, _, _, _ = await stats.resolve_stat_target(
             telethon_client, flow["entry"], flow["entry"], text, None, "", tz, log=log
         )
         if target is None:
@@ -1246,7 +1248,7 @@ async def handle_badge_text_input(
         resolved, missing = [], []
         seen_ids = set()
         for name in names:
-            target, _, _, _, _, _ = await stats.resolve_stat_target(
+            target, _, _, _, _ = await stats.resolve_stat_target(
                 telethon_client,
                 flow["entry"],
                 flow["entry"],
@@ -1343,7 +1345,7 @@ async def handle_week_winner_command(
         return
     contest_week = int(parts[1])
 
-    tracked, _, _, _, _, _ = await stats.resolve_stat_target(
+    tracked, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client,
         entry,
         entry,
@@ -1441,7 +1443,7 @@ async def handle_delete_pokras_command(
         )
         return
     work_number = int(parts[2])
-    tracked, _, _, _, _, _ = await stats.resolve_stat_target(
+    tracked, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client,
         entry,
         entry,
@@ -2808,7 +2810,7 @@ async def handle_badge_admin_command(
         await reply(f"Формат: {BADGE_ADMIN_COMMAND} - @username")
         return
 
-    target, _, _, _, _, _ = await stats.resolve_stat_target(
+    target, _, _, _, _ = await stats.resolve_stat_target(
         telethon_client, entry, entry, target_name, None, "", tz, log=log
     )
     if target is None:
@@ -3111,7 +3113,7 @@ async def _cabinet_chat_ref(telethon_client, entry: str, known_chat_ids: dict, l
 
 
 async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log=print):
-    """(user, xp, rank, total, streak, season_xp) for whoever is using the cabinet, or None.
+    """(user, xp, rank, total, streak) for whoever is using the cabinet, or None.
 
     Every cabinet view needs the same resolved identity, and resolve_stat_target is also
     what applies any bought streak freeze, so this is the one place that call is made.
@@ -3132,11 +3134,12 @@ async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log
         # and a session that cannot connect waits rather than failing. Unbounded, that is
         # what made "магазин не открывается" a symptom -- the callback had already been
         # answered, so the spinner stopped and the screen simply never arrived.
-        user, rank, total, xp, streak, season_xp = await asyncio.wait_for(
+        user, rank, total, xp, streak = await asyncio.wait_for(
             stats.resolve_stat_target(
                 telethon_client, entry, entry, "",
                 from_user.get("username"), _display_name(from_user), tz, log=log,
                 frozen_days_for=economy.streak_freeze_lookup(entry),
+                requester_id=from_user.get("id"),
             ),
             timeout=CABINET_CONTEXT_TIMEOUT_SECONDS,
         )
@@ -3148,7 +3151,7 @@ async def _cabinet_context(telethon_client, entry: str, tz, from_user: dict, log
         return None
     if user is None:
         return None
-    context = (user, xp, rank, total, streak, season_xp)
+    context = (user, xp, rank, total, streak)
     _CABINET_CONTEXT_CACHE[cache_key] = (time.monotonic() + CABINET_CONTEXT_TTL_SECONDS, context)
     return context
 
@@ -3161,7 +3164,7 @@ async def _render_cabinet_section(
     context = await _cabinet_context(telethon_client, entry, tz, from_user, log=log)
     if context is None:
         return None
-    user, xp, rank, total, streak, season_xp = context
+    user, xp, rank, total, streak = context
 
     async def links():
         """Resolved lazily and only by the two screens that show links -- every other
@@ -3183,18 +3186,16 @@ async def _render_cabinet_section(
         figurines, best, workplace = await links()
         return cabinet.stats_view(
             entry, user, xp, rank, total, streak, figurines, badges(), best, workplace,
-            season_xp=season_xp,
         )
     if action == "shop":
         return cabinet.shop_view(entry, user, xp)
     if action == "works":
         figurines, best, workplace = await links()
-        return cabinet.works_view(entry, user, figurines, best, workplace)
+        return cabinet.works_view(entry, user, figurines, best, workplace, page=argument or 1)
     if action == "badges":
         return cabinet.badges_view(
-            entry, user, badges(),
+            entry, user, xp, badges(),
             chat_custom_badge_total=len(stats.list_custom_badges(entry)),
-            casino_winnings=economy.casino_winnings_for_user(entry, user.user_id),
         )
     if action == "title":
         return cabinet.title_view(entry, user, xp)
@@ -3203,7 +3204,7 @@ async def _render_cabinet_section(
             api, telethon_client, cfg, entry, tz, user, xp, argument, from_user, chat_id, log=log
         )
     return cabinet.main_view(
-        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        entry, user, xp, rank, total, streak,
         can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
     )
 
@@ -3254,6 +3255,20 @@ def _shows_badge_admin_button(entry: str | None, user_id, username: str | None) 
     if (username or "").strip().lstrip("@").lower() in PRIVILEGED_MANAGEMENT_USERNAMES:
         return True
     return stats.is_badge_manager(entry, user_id)
+
+
+async def _stat_link_chat(telethon_client, chat: dict, entry: str, known_chat_ids: dict, log=print):
+    """(username, chat_id) to build work links from for a /stat or /работы reply.
+
+    The works live in the tracked group, so links must point there. In the group itself
+    that is the chat being answered; in a DM it is the home chat, resolved the way the
+    cabinet resolves it. Building them from the DM's own id produced no links at all --
+    a private chat has no t.me/c/ address -- so /stat in a DM showed no works.
+    """
+    if chat.get("type") != "private":
+        return chat.get("username"), chat.get("id")
+    chat_id, username = await _cabinet_chat_ref(telethon_client, entry, known_chat_ids, log=log)
+    return username, chat_id
 
 
 def _stats_entry_for(chat: dict, matched_entry: str | None, home_chat_ref: str | None) -> str | None:
@@ -3345,11 +3360,11 @@ async def maybe_send_menu(
             if context is None:
                 text, keyboard = cabinet.welcome_view(user_id)
             else:
-                user, xp, rank, total, streak, season_xp = context
+                user, xp, rank, total, streak = context
                 text, keyboard = cabinet.main_view(
-        entry, user, xp, rank, total, streak, season_xp=season_xp,
-        can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
-    )
+                    entry, user, xp, rank, total, streak,
+                    can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+                )
         await api.send_message(
             chat_id, text, reply_to_message_id=message.get("message_id"),
             reply_markup=keyboard, parse_mode="HTML",
@@ -3442,9 +3457,9 @@ async def handle_cabinet_command(
             reply_to_message_id=reply_to, parse_mode=None,
         )
         return
-    user, xp, rank, total, streak, season_xp = context
+    user, xp, rank, total, streak = context
     text, keyboard = cabinet.main_view(
-        entry, user, xp, rank, total, streak, season_xp=season_xp,
+        entry, user, xp, rank, total, streak,
         can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
     )
     await api.send_message(
@@ -5524,9 +5539,10 @@ async def handle_shop_command(
         except Exception:
             log(f"[bot_listener] failed to answer a shop command:\n{traceback.format_exc()}")
 
-    user, _, _, xp, _, _ = await stats.resolve_stat_target(
+    user, _, _, xp, _ = await stats.resolve_stat_target(
         telethon_client, entry, entry, "",
         from_user.get("username"), _display_name(from_user), tz, log=log,
+        requester_id=from_user.get("id"),
     )
     if user is None:
         await reply("Ты ещё не отслеживаешься -- напиши что-нибудь в чат и попробуй снова.")
@@ -5895,9 +5911,10 @@ async def _pets_context(telethon_client, entry: str, tz, actor: dict, log=print)
     somebody who has never written in the chat from farming the arena.
     """
     try:
-        user, _, _, xp, _, _ = await stats.resolve_stat_target(
+        user, _, _, xp, _ = await stats.resolve_stat_target(
             telethon_client, entry, entry, "",
             actor.get("username"), _display_name(actor), tz, log=log,
+            requester_id=actor.get("id"),
         )
     except Exception:
         log(f"[pets] failed to resolve the player:\n{traceback.format_exc()}")
@@ -6240,9 +6257,10 @@ async def handle_pet_card_command(
             )
 
     try:
-        user, _, _, _, _, _ = await stats.resolve_stat_target(
+        user, _, _, _, _ = await stats.resolve_stat_target(
             telethon_client, entry, entry, argument,
             actor.get("username"), _display_name(actor), tz, log=log,
+            requester_id=actor.get("id"),
         )
     except Exception:
         log(f"[pets] failed to resolve a /pet target:\n{traceback.format_exc()}")
@@ -6337,7 +6355,7 @@ async def handle_duel_command(
         await notice("Ты ещё не отслеживаешься в этом чате.")
         return
     try:
-        target, _, _, _, _, _ = await stats.resolve_stat_target(
+        target, _, _, _, _ = await stats.resolve_stat_target(
             telethon_client, entry, entry, argument,
             actor.get("username"), _display_name(actor), tz, log=log,
         )
@@ -8569,7 +8587,7 @@ async def maybe_handle_pets_flow_message(
                 )
                 return True
             try:
-                target, _, _, _, _, _ = await stats.resolve_stat_target(
+                target, _, _, _, _ = await stats.resolve_stat_target(
                     telethon_client, entry, entry, raw,
                     actor.get("username"), _display_name(actor), tz, log=log,
                 )
@@ -8600,7 +8618,7 @@ async def maybe_handle_pets_flow_message(
                 await api.send_message(chat_id, "Нужен @username получателя.", parse_mode=None)
                 return True
             try:
-                target, _, _, _, _, _ = await stats.resolve_stat_target(
+                target, _, _, _, _ = await stats.resolve_stat_target(
                     telethon_client, entry, entry, raw,
                     actor.get("username"), _display_name(actor), tz, log=log,
                 )
@@ -9264,10 +9282,14 @@ async def _dispatch_update(
         task.add_done_callback(background_tasks.discard)
         return
 
-    # "/top today|week|month|all" and "/stat [username]" (stats.py) -- plain lookups over
-    # already-computed daily files, so they bypass the OpenAI summary queue. Reuses matched_entry
-    # from the known_chat_ids learning above rather than re-matching the chat.
-    if cfg.stats_enabled and (text_lower.startswith("/top") or text_lower.startswith("/stat")):
+    # "/top today|week|month|all", "/stat [username]" and "/работы [username]" (stats.py)
+    # -- plain lookups over already-computed daily files, so they bypass the OpenAI summary
+    # queue. Reuses matched_entry from the known_chat_ids learning above rather than
+    # re-matching the chat.
+    works_arg = stats.parse_works_command(command_text)
+    if cfg.stats_enabled and (
+        text_lower.startswith("/top") or text_lower.startswith("/stat") or works_arg is not None
+    ):
         chat_key = chat["id"]
         # In a DM this resolves to the configured home chat, so /stat and /top work from
         # the published menu instead of reporting themselves unavailable.
@@ -9293,7 +9315,29 @@ async def _dispatch_update(
         try:
             level_announcements = []
             reply_parse_mode = None
-            if text_lower.startswith("/top"):
+            # /работы can need more than one message for a prolific painter; every part
+            # self-deletes with the first.
+            follow_up_texts: list[str] = []
+            if works_arg is not None:
+                reply_parse_mode = "HTML"
+                from_user = message.get("from") or {}
+                user, _, _, _, _ = await stats.resolve_stat_target(
+                    telethon_client, matched_entry, matched_entry, works_arg,
+                    from_user.get("username"), _display_name(from_user), tz, log=log,
+                    requester_id=from_user.get("id"),
+                )
+                if user:
+                    link_username, link_chat_id = await _stat_link_chat(
+                        telethon_client, chat, matched_entry, known_chat_ids, log=log
+                    )
+                    reply_text, *follow_up_texts = stats.format_works(
+                        user,
+                        stats.figurine_message_links(link_username, link_chat_id, user),
+                        stats.work_name_list(matched_entry, user),
+                    )
+                else:
+                    reply_text = "Статистика не найдена -- пользователь ещё не отслеживается."
+            elif text_lower.startswith("/top"):
                 top_arg = stats_text[len("/top"):].strip()
                 # "/top pokras" reads the same way "/stat pokras" always has, so both
                 # spellings reach the procrastinator list instead of one of them
@@ -9319,15 +9363,19 @@ async def _dispatch_update(
                     )
                 else:
                     from_user = message.get("from") or {}
-                    user, rank, total, xp, streak, season_xp = await stats.resolve_stat_target(
+                    user, rank, total, xp, streak = await stats.resolve_stat_target(
                         telethon_client, matched_entry, matched_entry, arg,
                         from_user.get("username"), _display_name(from_user), tz, log=log,
                         frozen_days_for=economy.streak_freeze_lookup(matched_entry),
+                        requester_id=from_user.get("id"),
                     )
                     if user:
-                        figurine_links = stats.figurine_message_links(chat.get("username"), chat_key, user)
+                        link_username, link_chat_id = await _stat_link_chat(
+                            telethon_client, chat, matched_entry, known_chat_ids, log=log
+                        )
+                        figurine_links = stats.figurine_message_links(link_username, link_chat_id, user)
                         best_work_link, workplace_link = stats.showcase_message_links(
-                            chat.get("username"), chat_key, user
+                            link_username, link_chat_id, user
                         )
                         custom_badges = (
                             stats.custom_badges_for_user(matched_entry, user.user_id)
@@ -9336,7 +9384,7 @@ async def _dispatch_update(
                         reply_text = stats.format_stat(
                             user, rank, total, xp, streak, figurine_links, custom_badges,
                             best_work_link=best_work_link, workplace_link=workplace_link,
-                            season_xp=season_xp, bot_username=bot_username,
+                            bot_username=bot_username,
                             work_names=stats.work_name_list(matched_entry, user),
                             **economy.stat_extras(matched_entry, user.user_id, xp, user),
                         )
@@ -9349,6 +9397,7 @@ async def _dispatch_update(
             # Direct /stat output is safely HTML-escaped by stats.format_stat so its
             # numbered work links can be clickable. Leaderboards/digests remain plain
             # text because they can contain uncontrolled display names.
+            sent_ids = []
             sent = await api.send_message(
                 chat_key,
                 reply_text,
@@ -9356,8 +9405,14 @@ async def _dispatch_update(
                 parse_mode=reply_parse_mode,
             )
             if sent and "message_id" in sent:
+                sent_ids.append(sent["message_id"])
+            for follow_up in follow_up_texts:
+                sent = await api.send_message(chat_key, follow_up, parse_mode=reply_parse_mode)
+                if sent and "message_id" in sent:
+                    sent_ids.append(sent["message_id"])
+            if sent_ids:
                 schedule_bot_delete(
-                    api, chat_key, [sent["message_id"]], STATS_DELETE_AFTER, log, background_tasks,
+                    api, chat_key, sent_ids, STATS_DELETE_AFTER, log, background_tasks,
                     trigger_message_id=message["message_id"],
                 )
             for announcement in level_announcements:
@@ -9544,16 +9599,17 @@ async def run_bot_listener(
         me = await api.get_me()
         bot_username = me.get("username")
         await register_bot_menu(api, log=log)
-        xp_grants = sum(
-            stats.grant_xp_once(
-                entry, 6755921717, 10_000_000,
-                "admin_london_leads_10000000_20260814",
-                username="london_leads", display_name="london_leads",
+        # london_leads was paid 10,000,000 XP here on every start -- money handed out as
+        # chat XP, which put them at the top of /top and /stat and, because the grant
+        # came back on the next start, could not even be undone with admin_xp.py. It is
+        # now converted once into the 2,000,000 coins it stood for: the wallet keeps its
+        # value, the chat's XP and levels go back to measuring the chat. Idempotent.
+        for entry in cfg.listener_allowed_chats:
+            paid = economy.retire_xp_grant(
+                entry, 6755921717, "admin_london_leads_10000000_20260814",
             )
-            for entry in cfg.listener_allowed_chats
-        )
-        if xp_grants:
-            log("[stats] granted london_leads 10,000,000 XP")
+            if paid:
+                log(f"[stats] converted london_leads' XP grant into {paid} coins in '{entry}'")
         refunded_cages = pets.refund_legacy_cages(cfg.listener_allowed_chats)
         if refunded_cages:
             log(f"[pets] refunded {refunded_cages} legacy cage purchases")
