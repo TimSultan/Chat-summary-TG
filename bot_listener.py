@@ -299,6 +299,15 @@ PLANT_CALLBACK_PREFIX = "plant"
 # Usernames are compared case-insensitively and without a leading @.
 PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
 
+# A one-tap delete for a moderator: when one of these members puts REACTION_DELETE_EMOJI on
+# any message in a tracked chat, the bot deletes that message. Kept apart from
+# PRIVILEGED_MANAGEMENT_USERNAMES on purpose -- being trusted with the badge menu and being
+# able to delete anybody's message are different powers, granted one name at a time.
+# Telegram sends the reaction as the bare ✍ (U+270D); the variant with the emoji selector
+# is accepted too, so the check never depends on which form a client happens to send.
+REACTION_DELETE_USERNAMES = frozenset({"sultan_kembayev"})
+REACTION_DELETE_EMOJI = frozenset({"✍", "✍️"})
+
 
 SHOP_COMMANDS = ("/shop", "/buy", "/coins")
 
@@ -8736,6 +8745,43 @@ async def maybe_handle_pets_flow_message(
     return False
 
 
+async def handle_moderator_reaction(api: TelegramBotAPI, cfg, reaction: dict, log=print) -> bool:
+    """Delete a message a moderator has just reacted ✍️ to. True when it was deleted.
+
+    Only a reaction that is being ADDED counts -- Telegram sends the full new set, so a
+    ✍️ already present in old_reaction means this update is about some other change, and
+    taking one away must never delete anything. Only in a tracked chat, so the same tap in
+    any other group the bot sits in does nothing. An anonymous admin reacts as the chat
+    (no `user` in the update) and cannot be told apart from any other admin, so it is
+    ignored. The bot needs delete rights, and Telegram refuses deletions older than 48
+    hours; delete_message swallows both, and the log line says it was attempted.
+    """
+    user = reaction.get("user") or {}
+    username = str(user.get("username") or "").lstrip("@").lower()
+    if username not in REACTION_DELETE_USERNAMES:
+        return False
+
+    def _emoji(entries) -> set[str]:
+        return {
+            str(entry.get("emoji") or "")
+            for entry in entries or []
+            if isinstance(entry, dict) and entry.get("type") == "emoji"
+        }
+
+    added = _emoji(reaction.get("new_reaction")) - _emoji(reaction.get("old_reaction"))
+    if not added & REACTION_DELETE_EMOJI:
+        return False
+    chat = reaction.get("chat") or {}
+    if _match_allowed_chat(chat, list(getattr(cfg, "listener_allowed_chats", None) or [])) is None:
+        return False
+    chat_id, message_id = chat.get("id"), reaction.get("message_id")
+    if chat_id is None or message_id is None:
+        return False
+    log(f"[bot_listener] @{username} reacted ✍️ -- deleting message {message_id} in chat {chat_id}")
+    await api.delete_message(chat_id, message_id)
+    return True
+
+
 async def _handle_one_update(dispatch, update_id, log=print) -> None:
     """Await one update's handling, and never let it stop the poll loop.
 
@@ -8794,6 +8840,10 @@ async def _dispatch_update(
     vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
     vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
     pets_flows = pets_flows if pets_flows is not None else {}
+    reaction = update.get("message_reaction")
+    if reaction is not None:
+        await handle_moderator_reaction(api, cfg, reaction, log=log)
+        return
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""

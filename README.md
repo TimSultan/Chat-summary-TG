@@ -196,6 +196,24 @@ Details worth knowing:
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
 
+### ✍️ deletes a message, for the moderator
+
+When **@sultan_kembayev** reacts **✍️** to any message in a chat named in
+`LISTENER_ALLOWED_CHATS`, the bot deletes that message (`handle_moderator_reaction`). Who
+may do it is `REACTION_DELETE_USERNAMES`, kept separate from the badge-menu delegates on
+purpose — deleting anybody's message is its own power.
+
+- Only **adding** ✍️ counts. Telegram resends the whole reaction set on every change, so a
+  ✍️ that was already there, or one being taken away, deletes nothing.
+- Nobody else's ✍️, and no other emoji, ever deletes anything. An anonymous admin reacts
+  as the chat rather than as a person, so it is ignored too.
+- It runs on the bot account: the bot must be an **admin with delete rights**, because
+  Telegram only sends reaction updates (`message_reaction`, requested in `getUpdates`'
+  `allowed_updates`) to a bot that administers the chat. Telegram also refuses to let a bot
+  delete messages older than 48 hours; that failure is swallowed like every other delete.
+- Deleting a `#япокрасил` post this way does not take its figurine credit back — use
+  `/deletepokras` for that, as before.
+
 ### XP, levels, coins, and badges
 
 `/top today|week|month|year|all` ranks tracked members by XP. The existing activity
