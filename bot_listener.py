@@ -8104,18 +8104,24 @@ async def _pets_run_fight(
                     pass
 
 
-def _pets_fighter_snapshot(fighter: pets_combat.Fighter) -> dict:
+def _pets_fighter_snapshot(fighter: "pets_combat.Fighter") -> dict:
     # Defined in pets_combat next to the Fighter it records and the simulate() that reads
     # it back, so the writer here and the replay in pets_web cannot drift apart.
     return pets_combat.snapshot(fighter)
 
 
 def _pets_fight_hp(
-    result: pets_combat.FightResult,
-    fighter: pets_combat.Fighter,
-    opponent: pets_combat.Fighter,
+    result: "pets_combat.FightResult",
+    fighter: "pets_combat.Fighter",
+    opponent: "pets_combat.Fighter",
 ) -> dict[str, int]:
-    """Recover one fighter's final HP from the immutable combat transcript."""
+    """Recover one fighter's final HP from the immutable combat transcript.
+
+    The annotations are strings on purpose, here and on _pets_fighter_snapshot: a bare
+    annotation is evaluated when the `def` runs, which is while this file is imported,
+    so a game module that failed to import (pets_combat is None) used to take the whole
+    chat bot down with it instead of only the game.
+    """
     maximum = round(pets_combat.derive(fighter, opponent)["max_hp"])
     remaining = maximum
     for round_result in result.rounds:

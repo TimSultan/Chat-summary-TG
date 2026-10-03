@@ -73,6 +73,44 @@ class GuardedImportTests(unittest.TestCase):
                             f"and defeats the guard around it"
                         )
 
+    def test_no_signature_names_a_game_type_at_import_time(self):
+        """Annotations, defaults and decorators run when the `def` does -- at import.
+
+        The module-scope check above skips every `def`, so `fighter: pets_combat.Fighter`
+        slipped past it and made a broken game module take the chat down with it on any
+        Python that still evaluates annotations eagerly. Such names must be strings.
+        """
+        def signature_parts(node):
+            arguments = node.args
+            every = arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+            yield from (argument.annotation for argument in every)
+            yield from (arguments.vararg, arguments.kwarg)
+            yield from (
+                getattr(extra, "annotation", None) for extra in (arguments.vararg, arguments.kwarg)
+            )
+            yield node.returns
+            yield from arguments.defaults
+            yield from arguments.kw_defaults
+            yield from node.decorator_list
+
+        for name in ("bot_listener.py", "listener.py", "quests.py"):
+            tree = ast.parse((ROOT / name).read_text(encoding="utf-8"), filename=name)
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for part in signature_parts(node):
+                    if part is None or isinstance(part, ast.arg):
+                        continue
+                    for inner in ast.walk(part):
+                        if (isinstance(inner, ast.Attribute)
+                                and isinstance(inner.value, ast.Name)
+                                and inner.value.id in GAME_MODULES):
+                            self.fail(
+                                f"{name}:{inner.lineno} names {inner.value.id}."
+                                f"{inner.attr} in the signature of {node.name}, which "
+                                f"is evaluated at import time -- quote it"
+                            )
+
     def test_the_router_knows_the_pet_prefix_without_the_module_that_defines_it(self):
         """The literal is a deliberate duplication, and this is what keeps it honest.
 
