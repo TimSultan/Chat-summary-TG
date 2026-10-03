@@ -5894,7 +5894,9 @@ def _achievement_chat_stats(entry: str, user_id) -> dict:
         "figurines_painted": int(getattr(row, "figurines_painted", 0) or 0),
         "messages": int(getattr(row, "messages", 0) or 0),
         "active_days": int(getattr(row, "active_days", 0) or 0),
-        "best_work_posts": int(getattr(row, "best_work_posts", 0) or 0),
+        # A LIST of [ts, message_id] refs on UserStats, not a count: int() of a non-empty
+        # list raised, so every member with a #моялучшая post lost the whole profile.
+        "best_work_posts": len(getattr(row, "best_work_posts", None) or []),
         "quests_done": int((quest_stats or {}).get("done", 0) or 0),
         "quest_best_difficulty": int((quest_stats or {}).get("best_difficulty", 0) or 0),
     }
