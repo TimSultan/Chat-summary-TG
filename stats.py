@@ -131,6 +131,12 @@ XP_DAILY_REPLY_CAP = 100
 # ladder, gated on XP *and* figurines at once, which froze both a constant talker who
 # never painted and a constant painter who rarely posted at the bottom forever. Talking
 # now has its own track (chat_level), so the old XP half of each step is gone.
+#
+# The ladder used to stop at 50 figurines, which a steady painter reaches within a year
+# and then never moves again. The six ranks above it are spaced wider and wider, so the
+# top is a career rather than a season. Everything up to 50 is exactly as it was, so
+# nobody's rank went down when they were added -- a painter already past 75 is simply
+# announced once, the next time their rank is observed.
 PAINTER_RANKS = (
     (0, "🩶", "Серый новичок"),
     (3, "⚪", "Ученик грунта"),
@@ -139,6 +145,12 @@ PAINTER_RANKS = (
     (20, "💧", "Повелитель проливок"),
     (35, "🏛️", "Мастер витрины"),
     (50, "👑", "Легенда покраса"),
+    (75, "✨", "Магистр лессировок"),
+    (100, "🪞", "Чародей NMM"),
+    (150, "🔆", "Заклинатель свечения"),
+    (200, "🏆", "Гроссмейстер кисти"),
+    (300, "🐉", "Живой классик"),
+    (500, "♾️", "Бессмертная кисть"),
 )
 
 # --- chat level -------------------------------------------------------------------
@@ -161,18 +173,40 @@ PAINTER_RANKS = (
 CHAT_LEVEL_CURVE_BASE = 25
 CHAT_LEVEL_CURVE_EXPONENT = 1.6
 
-# One name per five levels, so the number moves often while the title still means
-# something. Index 0 covers levels 1-5, index 1 covers 6-10, and so on; the last name
-# carries on above level 40, where the number alone keeps counting.
+# (first level, emoji, name), lowest first. The name changes every five levels up to 40,
+# where a newcomer needs the frequent milestones, and then the bands widen: measured on
+# this chat, the top 5% of members reached level 36 in about two and a half months, and
+# when that was the last name the whole core of the chat sat on it for good. Now:
+#
+#     after          1 month  3 months  6 months  1 year  2 years  3 years
+#     busiest (299/d)   39       78       121       188     290      374
+#     p95     (103/d)   20       40        62        96     149      192
+#     p90      (68/d)   15       31        47        74     115      148
+#     p75      (12/d)    5       10        16        25      38       50
+#     median  (2.8/d)    2        4         6        10      15       20
+#
+# so the busiest member reaches the last name in about two years and a p95 member in
+# about five, while everybody below keeps passing a new one every few months. The first
+# eight bands are exactly what they were, so nobody's name went down when the rest were
+# added. The level NUMBER has no top either way (see chat_level).
 CHAT_LEVEL_TIERS = (
-    ("🌱", "Новенький"),
-    ("💬", "Болтун"),
-    ("🗣️", "Голос чата"),
-    ("📣", "Заводила"),
-    ("🎙️", "Старожил"),
-    ("🔥", "Душа чата"),
-    ("⚡", "Легенда общения"),
-    ("🌟", "Хранитель чата"),
+    (1, "🌱", "Новенький"),
+    (6, "💬", "Болтун"),
+    (11, "🗣️", "Голос чата"),
+    (16, "📣", "Заводила"),
+    (21, "🎙️", "Старожил"),
+    (26, "🔥", "Душа чата"),
+    (31, "⚡", "Легенда общения"),
+    (36, "🌟", "Хранитель чата"),
+    (46, "🏛️", "Столп чата"),
+    (58, "📜", "Летописец"),
+    (72, "🧙", "Аксакал"),
+    (90, "🐉", "Древний дух чата"),
+    (112, "🌌", "Живая история"),
+    (140, "👑", "Патриарх ЕПХ"),
+    (175, "🗿", "Монумент ЕПХ"),
+    (220, "🌋", "Титан чата"),
+    (280, "♾️", "Вечный"),
 )
 
 # --- automatic badges ---------------------------------------------------------------
@@ -371,7 +405,7 @@ def chat_level(xp: int) -> ChatLevel:
         number -= 1
     while chat_level_threshold(number + 1) <= xp:
         number += 1
-    emoji, tier_name = CHAT_LEVEL_TIERS[_chat_tier_index(number)]
+    _, emoji, tier_name = CHAT_LEVEL_TIERS[_chat_tier_index(number)]
     return ChatLevel(
         number, emoji, tier_name, chat_level_threshold(number), chat_level_threshold(number + 1)
     )
@@ -1568,11 +1602,14 @@ def weekly_winner_badges_for_user(entry: str, user_id: int | str) -> list[Badge]
 
 
 def _chat_tier_index(level_number: int) -> int:
-    """Which CHAT_LEVEL_TIERS band a level falls in. Levels 1-5 are band 0, 6-10 band 1,
-    and so on; a level of 0 (never observed) sits below every band."""
-    if level_number < 1:
-        return -1
-    return min((level_number - 1) // 5, len(CHAT_LEVEL_TIERS) - 1)
+    """Which CHAT_LEVEL_TIERS band a level falls in: the last one whose first level it
+    has reached. A level of 0 (never observed) sits below every band, at -1."""
+    index = -1
+    for position, (first_level, _, _) in enumerate(CHAT_LEVEL_TIERS):
+        if level_number < first_level:
+            break
+        index = position
+    return index
 
 
 def _load_level_state(entry: str) -> dict:

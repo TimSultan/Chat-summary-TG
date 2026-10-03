@@ -56,9 +56,12 @@ class GamificationTests(unittest.TestCase):
         ):
             with self.subTest(figurines=figurines):
                 self.assertEqual(stats.painter_rank(figurines)[0].label, label)
-        final_rank, next_rank = stats.painter_rank(50)
-        self.assertEqual(final_rank.label, "👑 Легенда покраса")
-        self.assertIsNone(next_rank)
+        legend, next_rank = stats.painter_rank(50)
+        self.assertEqual(legend.label, "👑 Легенда покраса")
+        self.assertEqual(next_rank.label, "✨ Магистр лессировок")
+        final_rank, no_more = stats.painter_rank(500)
+        self.assertEqual(final_rank.label, "♾️ Бессмертная кисть")
+        self.assertIsNone(no_more)
 
     def test_only_two_automatic_badges_exist(self):
         """Everything else the old dozen read is still recorded, just no longer shown."""

@@ -273,7 +273,7 @@ class BadgeSectionTests(unittest.TestCase):
         # Every rank below the current one counts, and each automatic badge counts once
         # however high its level -- the levels never run out, the total must not.
         veteran = stats.UserStats(
-            user_id="20", figurines_painted=50, active_days=300, messages=40_000,
+            user_id="20", figurines_painted=500, active_days=300, messages=40_000,
         )
         more_unlocked, same_total = stats.badge_collection_progress(veteran, 10**6)
         self.assertEqual(same_total, total)

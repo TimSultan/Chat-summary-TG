@@ -225,12 +225,40 @@ but rarely posted, were both frozen at the bottom forever. Now everybody always 
 least one bar moving.
 
 **🧩 Уровень — chat level.** Scored on **all-time XP** and **never reset**, with no figurine
-requirement. A `25 × n^1.6` curve with **no top**, renamed every five levels (🌱 Новенький
-→ 💬 Болтун → 🗣️ Голос чата → 📣 Заводила → 🎙️ Старожил → 🔥 Душа чата → ⚡ Легенда общения
-→ 🌟 Хранитель чата; the last name carries on past level 40 while the number keeps counting).
-A progress bar shows position inside the current level **without** printing the target, so
-the old "don't reveal the next requirement" rule still holds. Rank, coins and the level all
-read the same all-time XP number.
+requirement. A `25 × n^1.6` curve with **no top**. A progress bar shows position inside the
+current level **without** printing the target, so the old "don't reveal the next requirement"
+rule still holds. Rank, coins and the level all read the same all-time XP number.
+
+Seventeen names (`CHAT_LEVEL_TIERS`). Every five levels up to 40, where newcomers need
+frequent milestones, then in widening bands:
+
+| from level | name | from level | name |
+|---|---|---|---|
+| 1 | 🌱 Новенький | 46 | 🏛️ Столп чата |
+| 6 | 💬 Болтун | 58 | 📜 Летописец |
+| 11 | 🗣️ Голос чата | 72 | 🧙 Аксакал |
+| 16 | 📣 Заводила | 90 | 🐉 Древний дух чата |
+| 21 | 🎙️ Старожил | 112 | 🌌 Живая история |
+| 26 | 🔥 Душа чата | 140 | 👑 Патриарх ЕПХ |
+| 31 | ⚡ Легенда общения | 175 | 🗿 Монумент ЕПХ |
+| 36 | 🌟 Хранитель чата | 220 | 🌋 Титан чата |
+| | | 280 | ♾️ Вечный |
+
+The names used to stop at 🌟 Хранитель чата (level 36), which the top 5% of members reached
+in about two and a half months — after that the whole core of the chat read the same name
+for good. Measured on this chat's rates, the level after a given time is:
+
+| | 1 month | 3 months | 6 months | 1 year | 2 years | 3 years |
+|---|---|---|---|---|---|---|
+| busiest (299 XP/day) | 39 | 78 | 121 | 188 | 290 | 374 |
+| p95 (103) | 20 | 40 | 62 | 96 | 149 | 192 |
+| p90 (68) | 15 | 31 | 47 | 74 | 115 | 148 |
+| p75 (12) | 5 | 10 | 16 | 25 | 38 | 50 |
+| median (2.8) | 2 | 4 | 6 | 10 | 15 | 20 |
+
+so the busiest member reaches ♾️ Вечный in about two years and a p95 member in about five,
+while everyone keeps passing a new name every few months. The first eight bands are exactly
+what they were, so nobody's name went down when the rest were added.
 
 The level used to be scored on a calendar-quarter **season**. The first quarter boundary
 (1 October 2026) dropped every member back to level 1–3 overnight with nothing in the chat
@@ -244,7 +272,10 @@ the climb slows down on its own.
 Only a **tier** change (every five levels) is tracked as a milestone, not each level, and
 chat-level promotions are not announced at all (see below).
 
-**🎨 Звание — painter rank.** The original seven names, now gated on figurines alone:
+**🎨 Звание — painter rank.** Gated on figurines alone. The original seven stop at 50, which
+a steady painter reaches within a year; six more continue in wider steps so the top is a
+career rather than a season. The first seven are unchanged, so nobody's rank went down — a
+painter already past 75 is announced once, the next time their rank is observed:
 
 - 🩶 Серый новичок — 0 figurines
 - ⚪ Ученик грунта — 3
@@ -253,6 +284,12 @@ chat-level promotions are not announced at all (see below).
 - 💧 Повелитель проливок — 20
 - 🏛️ Мастер витрины — 35
 - 👑 Легенда покраса — 50
+- ✨ Магистр лессировок — 75
+- 🪞 Чародей NMM — 100
+- 🔆 Заклинатель свечения — 150
+- 🏆 Гроссмейстер кисти — 200
+- 🐉 Живой классик — 300
+- ♾️ Бессмертная кисть — 500
 
 **Репутация — standing.** Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
 🏅 Легенда сообщества. Four inputs:
@@ -1313,8 +1350,8 @@ coins — open a force-reply prompt and only debit once the reply arrives.
   somebody else's work.
 - 🏅 **Значки** — admin-granted badges in their own section **first** (split on
   `Badge.custom`, since those are the only ones somebody chose to give you), then earned
-  ones, then how the two levelled badges are earned, then `📦 Открыто: N из M`: the 8
-  chat-level names, the 7 painting ranks, the two automatic badges (once each — their
+  ones, then how the two levelled badges are earned, then `📦 Открыто: N из M`: the 17
+  chat-level names, the 13 painting ranks, the two automatic badges (once each — their
   levels never run out), and however many custom badges the chat has defined.
 - ✏️ **Титул** — the one force-reply purchase flow
 

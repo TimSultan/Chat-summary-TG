@@ -284,8 +284,8 @@ class PermanentLevelTests(unittest.TestCase):
         self.assertGreater(top.number, 40)
         self.assertGreater(top.next_threshold, 10**7)
         self.assertLess(stats.chat_level_progress(10**7), 100)
-        # Past forty the last name carries on; the number keeps counting.
-        self.assertIn("Хранитель чата", top.label)
+        # The last name is reached eventually; the number keeps counting past it.
+        self.assertIn("Вечный", top.label)
 
     def test_the_solved_level_matches_walking_the_ladder(self):
         def walked(xp):
@@ -335,7 +335,7 @@ class LevelTrackTests(unittest.TestCase):
         # The exact case the split exists for: a prolific talker who has never painted.
         talker = stats.chat_level(11_648)
         self.assertGreaterEqual(talker.number, 40)
-        self.assertIn("Хранитель чата", talker.label)
+        self.assertIn("Столп чата", talker.label)
 
         # ...and a prolific painter who barely talks still ranks on the craft track.
         rank, _ = stats.painter_rank(50)
@@ -345,6 +345,62 @@ class LevelTrackTests(unittest.TestCase):
         thresholds = [stats.chat_level_threshold(n) for n in range(1, 500)]
         self.assertEqual(thresholds[0], 0)
         self.assertTrue(all(a < b for a, b in zip(thresholds, thresholds[1:])))
+
+    def test_the_first_eight_names_keep_their_old_bands(self):
+        """The ladder was extended upward only: up to level 45 every member reads the
+        same name they read before, so adding names lowered nobody's."""
+        old_names = [name for _, _, name in stats.CHAT_LEVEL_TIERS[:8]]
+        for number in range(1, 46):
+            with self.subTest(level=number):
+                expected = old_names[min((number - 1) // 5, 7)]
+                self.assertEqual(
+                    stats.chat_level(stats.chat_level_threshold(number)).tier_name, expected
+                )
+
+    def test_names_widen_and_never_repeat(self):
+        starts = [first for first, _, _ in stats.CHAT_LEVEL_TIERS]
+        self.assertEqual(starts[0], 1)
+        self.assertEqual(starts, sorted(set(starts)))
+        gaps = [b - a for a, b in zip(starts[7:], starts[8:])]
+        self.assertEqual(gaps, sorted(gaps), "bands above 36 must only get wider")
+        names = [name for _, _, name in stats.CHAT_LEVEL_TIERS]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_veterans_still_have_names_ahead_of_them(self):
+        """The reason for the extension: at the p95 rate (~103 XP/day) the last name
+        used to arrive within three months and never change again."""
+        a_year = stats.chat_level(103 * 365)
+        self.assertLess(
+            stats._chat_tier_index(a_year.number), len(stats.CHAT_LEVEL_TIERS) - 3,
+        )
+        # ...while the busiest member in the chat gets there in about two years.
+        self.assertIn("Вечный", stats.chat_level(299 * 730).label)
+
+    def test_painter_ranks_keep_their_old_steps_and_continue_past_fifty(self):
+        old = [(0, "Серый новичок"), (3, "Ученик грунта"), (5, "Подмастерье кисти"),
+               (10, "Укротитель аэрографа"), (20, "Повелитель проливок"),
+               (35, "Мастер витрины"), (50, "Легенда покраса")]
+        self.assertEqual([(m, n) for m, _, n in stats.PAINTER_RANKS[:7]], old)
+        rank, next_rank = stats.painter_rank(50)
+        self.assertEqual(next_rank.name, "Магистр лессировок")
+        top, nothing = stats.painter_rank(10_000)
+        self.assertEqual(top.name, "Бессмертная кисть")
+        self.assertIsNone(nothing)
+
+    def test_a_painter_already_past_the_old_top_is_announced_once(self):
+        user = stats.UserStats(
+            user_id="20", username="user", display_name="User", figurines_painted=80,
+        )
+        stored = {"version": stats.LEVEL_STATE_VERSION,
+                  "users": {"20": {"chat_level": 1, "painter_figurines": 50}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats._write_json_atomic(stats._level_state_path("chat"), stored)
+                first = stats.record_level_observations("chat", [(user, 0)])
+                again = stats.record_level_observations("chat", [(user, 0)])
+
+        self.assertEqual(first, ["@user получил новое звание «✨ Магистр лессировок»! 🎉🎊🥳"])
+        self.assertEqual(again, [])
 
     def test_progress_bar_shows_position_without_revealing_the_target(self):
         xp = (stats.chat_level_threshold(5) + stats.chat_level_threshold(6)) // 2
