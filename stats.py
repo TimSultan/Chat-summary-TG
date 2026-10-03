@@ -224,16 +224,19 @@ MESSAGES_BADGE = ("messages", "💬", "Собеседник")
 
 # --- reputation -------------------------------------------------------------------
 #
-# Mostly the anti-grind track: the three peer-granted components below cannot be moved by
+# Mostly the anti-grind track: the two peer-granted components below cannot be moved by
 # posting at all. Every point of them comes from somebody else choosing to give it, which
 # is the one thing a farming script cannot do.
+#
+# There used to be a third, a point per 20 coins RECEIVED from other members. Member
+# transfers lived for one afternoon in July 2026; the arena later began writing the 5% it
+# takes from a duel's loser into the same ledger field, so that point became "coins won
+# in the game" -- one win over a rich player was worth thousands of reputation. Coins
+# taken in a fight are not standing anybody granted, so the component is gone.
 REPUTATION_PER_CONTEST_WIN = 10
 REPUTATION_PER_BADGE_RECEIVED = 5
-# Coins RECEIVED from other members (see economy.transfer), divided down so a single
-# wealthy friend cannot mint somebody a reputation.
-REPUTATION_PER_COINS_RECEIVED = 20
 # The one self-earned component: a point per automatic badge LEVEL held (see
-# medal_levels). It IS grindable, unlike the three above -- deliberately, so that a
+# medal_levels). It IS grindable, unlike the two above -- deliberately, so that a
 # member with no peers handing them anything still has a reputation that moves. The
 # badges themselves have no top, so the points are capped one short of two contest wins:
 # grinding can never outrank being valued by the chat.
@@ -500,16 +503,14 @@ def medal_levels(user: "UserStats") -> int:
     return min(levels, REPUTATION_MEDAL_LEVEL_CAP)
 
 
-def reputation_score(
-    contest_wins: int, badges_received: int, coins_received: int, medals: int = 0
-) -> int:
-    """Standing: three peer-granted components nobody can move by posting, plus the
-    earned-badge levels from medal_levels. `medals` defaults to 0 so a caller with no
-    UserStats to hand (and every pre-existing test) still scores the peer-granted half."""
+def reputation_score(contest_wins: int, badges_received: int, medals: int = 0) -> int:
+    """Standing: two peer-granted components nobody can move by posting -- weekly contest
+    wins and hand-given badges -- plus the earned-badge levels from medal_levels. Nothing
+    from the game counts: coins, rubies and fights are the game's own. `medals` defaults
+    to 0 so a caller with no UserStats to hand still scores the peer-granted half."""
     return (
         max(0, contest_wins) * REPUTATION_PER_CONTEST_WIN
         + max(0, badges_received) * REPUTATION_PER_BADGE_RECEIVED
-        + max(0, coins_received) // REPUTATION_PER_COINS_RECEIVED
         + max(0, medals) * REPUTATION_PER_MEDAL_LEVEL
     )
 

@@ -44,9 +44,10 @@ AUDIT_WINDOW_HOURS = (24, 72, 168)
 FLOW_WINDOW_DAYS = (7, 30, 90)
 FIGURINE_COIN_REWARD = 500
 
-# Member-to-member transfers were removed. `received` is still read by balance() and
-# reputation_for() so that any ledger written while they existed keeps computing exactly
-# the same numbers; nothing can add to it any more.
+# Member-to-member transfers were removed (they existed for one afternoon in July 2026).
+# `received` is still part of balance(), and since the arena started taking a share of a
+# duel loser's coins it is where the winner's share lands (settle_arena_reward). It is
+# money and nothing else: reputation stopped reading it once it meant "won in a fight".
 
 # A 30-day rented title, priced so it stays a recurring decision rather than a one-off
 # purchase. See the price note on SHOP_ITEMS.
@@ -740,18 +741,17 @@ def streak_freeze_lookup(entry: str):
 def reputation_for(entry: str, user_id, user=None) -> int:
     """This member's reputation (see stats.reputation_score).
 
-    Lives here rather than in stats because the coins-received half is ledger data, and
-    stats must not import this module (the dependency runs the other way).
+    It reads nothing from this ledger any more -- the coins-received component had come
+    to count arena winnings (see the reputation note in stats.py) -- but stays here so
+    every caller keeps one entry point.
 
     `user` is the UserStats the earned-badge levels are read off. It is optional because
     the ledger knows a user_id but has no way to load stats for it; callers that already
     hold a UserStats (every /stat path) pass it, and one that does not scores the
     peer-granted half alone rather than failing."""
-    record = _load(entry)["users"].get(str(user_id)) or {}
     return stats.reputation_score(
         stats.weekly_wins_for_user(entry, user_id),
         len(stats.custom_badges_for_user(entry, user_id)),
-        record.get("received", 0),
         stats.medal_levels(user) if user is not None else 0,
     )
 

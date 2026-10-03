@@ -292,18 +292,24 @@ painter already past 75 is announced once, the next time their rank is observed:
 - ♾️ Бессмертная кисть — 500
 
 **Репутация — standing.** Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
-🏅 Легенда сообщества. Four inputs:
+🏅 Легенда сообщества. Three inputs:
 
 | source | rate |
 | --- | --- |
 | weekly contest win | **10** each |
 | administrator-awarded custom badge | **5** each |
-| coins *received* from another member | **1** per 20 |
 | automatic badge **level** held | **1** each, capped at **19** |
 
-The first three are peer-granted and cannot be moved by posting — that is the anti-grind
-core, and it still is. The fourth is the one self-earned input, added so a member nobody
-has handed anything yet still has a reputation that moves.
+The first two are peer-granted and cannot be moved by posting — that is the anti-grind
+core, and it still is. The third is the one self-earned input, added so a member nobody
+has handed anything yet still has a reputation that moves. **Nothing from the game counts.**
+
+There used to be a fourth input, a point per 20 coins *received* from another member.
+Member transfers existed for one afternoon in July 2026; from 26 August the arena wrote the
+5% it takes from a duel's loser into the same `received` field, so the point quietly became
+"coins won in fights". One win over a rich player was worth thousands of reputation, which
+is why a few arena regulars sat far above everybody else. The input is gone; the coins stay
+in the winner's balance.
 
 A badge is worth **one point per level**: `📅 Завсегдатай 3` is three points, `💬 Собеседник 5`
 five. Those levels never run out, so the medal total is capped at **19**
@@ -1389,8 +1395,8 @@ follows.
 Member-to-member transfers were removed too. **That took the economy's only always-on
 sink with it**: transfers used to burn 10% of every gift, and now the sole drain is a
 400-coin title every 30 days against ~1,000 coins a month for an active member. Balances
-will grow. `received` is still read by `balance()` so any ledger written while transfers
-existed keeps computing the same number; nothing can add to it any more.
+will grow. `received` is still read by `balance()`; it is now where the arena puts the
+share it takes from a duel's loser, and it is money only — reputation no longer reads it.
 
 If delivery of a purchase fails the coins are refunded, so a debit and its effect are
 never left half-applied.

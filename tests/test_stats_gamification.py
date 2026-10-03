@@ -1138,19 +1138,18 @@ class MedalReputationTests(unittest.TestCase):
 
     def test_reputation_score_adds_medals_to_the_peer_granted_half(self):
         self.assertEqual(
-            stats.reputation_score(1, 1, 40, 7),
+            stats.reputation_score(1, 1, 7),
             stats.REPUTATION_PER_CONTEST_WIN
             + stats.REPUTATION_PER_BADGE_RECEIVED
-            + 2
             + 7 * stats.REPUTATION_PER_MEDAL_LEVEL,
         )
 
     def test_medals_default_to_zero_for_a_caller_without_userstats(self):
         """economy.reputation_for is reachable from the ledger, which has no UserStats."""
-        self.assertEqual(stats.reputation_score(1, 0, 0), stats.REPUTATION_PER_CONTEST_WIN)
+        self.assertEqual(stats.reputation_score(1, 0), stats.REPUTATION_PER_CONTEST_WIN)
 
     def test_a_negative_medal_count_cannot_subtract_reputation(self):
-        self.assertEqual(stats.reputation_score(0, 0, 0, -5), 0)
+        self.assertEqual(stats.reputation_score(0, 0, -5), 0)
 
 
 class FakeBotAPI:

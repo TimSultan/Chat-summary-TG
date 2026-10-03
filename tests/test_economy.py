@@ -199,6 +199,22 @@ class EffectTests(unittest.TestCase):
             stats.REPUTATION_PER_BADGE_RECEIVED + stats.REPUTATION_PER_CONTEST_WIN,
         )
 
+    def test_coins_won_in_the_arena_are_not_reputation(self):
+        """A duel win moves 5% of the loser's coins into the winner's `received`. That
+        field used to be read as "coins given by other members", so beating one rich
+        player was worth thousands of reputation. It is money, and only money."""
+        user = stats.UserStats(user_id="1")
+        before = economy.reputation_for("chat", "1", user)
+        moved = economy.settle_arena_reward(
+            "chat", "1", 0, "2", 10_000_000, transfer_share=0.05,
+        )
+
+        self.assertGreater(moved, 0)
+        self.assertEqual(economy.lifetime("chat", "1")["received"], moved)
+        self.assertEqual(economy.reputation_for("chat", "1", user), before)
+        # ...while it still spends like any other coin.
+        self.assertEqual(economy.balance("chat", "1", 0), moved)
+
     def test_earned_badges_add_reputation_once_a_userstats_is_passed(self):
         """The /stat paths all hold a UserStats, so this is what members actually see."""
         user = stats.UserStats(user_id="1", active_days=65, messages=2_400)
