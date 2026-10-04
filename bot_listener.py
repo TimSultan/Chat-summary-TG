@@ -4261,7 +4261,7 @@ async def handle_cabinet_text_input(
     context = await _cabinet_context(telethon_client, entry, tz, actor, log=log)
     if context is None:
         return True
-    user, xp, _, _, _, _ = context
+    user, xp, _, _, _ = context
 
     if flow["awaiting"] == "title":
         item = economy.find_item("title")

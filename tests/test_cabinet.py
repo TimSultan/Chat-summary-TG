@@ -749,6 +749,80 @@ class CallbackTests(unittest.TestCase):
         self.assertEqual(flow["user_id"], 20)
         self.assertTrue(self.api.sent[0]["reply_markup"]["force_reply"])
 
+    def _answer_prompt(self, action, text):
+        """Press a cabinet text-entry button, then reply to its prompt, end to end.
+
+        stats.resolve_stat_target is faked rather than _cabinet_context, so the context
+        tuple is the real one: when /stat lost its season XP, every reply here unpacked
+        six values from a five-value context and died after the flow was consumed.
+        """
+        painter = _user(
+            figurines_painted=3,
+            recent_figurine_posts=[
+                ["2026-07-05T12:00:00", 105],
+                ["2026-07-04T12:00:00", 104],
+                ["2026-07-03T12:00:00", 103],
+            ],
+        )
+
+        async def fake_resolve(*args, **kwargs):
+            return painter, 3, 190, 5_000, 4
+
+        async def fake_chat_ref(client, entry, cache, log=print):
+            return -1001234567890, "testchat"
+
+        bot_listener._CABINET_CONTEXT_CACHE.clear()
+        self.addCleanup(bot_listener._CABINET_CONTEXT_CACHE.clear)
+        flows = {}
+        with patch("stats.resolve_stat_target", fake_resolve), \
+             patch("bot_listener._cabinet_chat_ref", fake_chat_ref):
+            self._run(
+                bot_listener.handle_cabinet_callback(
+                    self.api, None, None, None,
+                    self._callback(owner_id=20, action=action, actor_id=20),
+                    "chat", flows, log=lambda *_: None,
+                )
+            )
+            prompt_id = next(iter(flows.values()))["prompt_message_id"]
+            handled = self._run(
+                bot_listener.handle_cabinet_text_input(
+                    self.api, None, None,
+                    {"chat": {"id": 999, "type": "private"},
+                     "from": {"id": 20, "username": "user", "first_name": "Tester"},
+                     "message_id": 7, "text": text,
+                     "reply_to_message": {"message_id": prompt_id}},
+                    flows, log=lambda *_: None,
+                )
+            )
+        self.assertTrue(handled)
+        self.assertEqual(flows, {})
+        return painter
+
+    def test_replying_to_the_rename_prompt_names_the_work(self):
+        painter = self._answer_prompt("work_rename", "2 Дредноут")
+
+        self.assertEqual(
+            stats.work_names_for_user("chat", painter.user_id), {"104": "Дредноут"}
+        )
+        reply = self.api.sent[-1]["text"]
+        self.assertIn("✅ Работа №2: «Дредноут»", reply)
+        self.assertIn("Дредноут</a>", reply)
+
+    def test_replying_to_the_delete_prompt_asks_for_confirmation(self):
+        self._answer_prompt("work_delete", "2")
+
+        reply = self.api.sent[-1]
+        self.assertIn("Удалить работу №2", reply["text"])
+        confirm = reply["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(
+            cabinet.parse_callback(confirm["callback_data"]), ("20", "work_delete_ok", "104")
+        )
+
+    def test_replying_to_the_title_prompt_sets_the_title(self):
+        self._answer_prompt("title_set", "Мастер кисти")
+
+        self.assertIn("Титул «Мастер кисти» активен", self.api.sent[-1]["text"])
+
     def test_a_reply_that_matches_no_flow_is_left_alone(self):
         handled = self._run(
             bot_listener.handle_cabinet_text_input(
