@@ -290,9 +290,14 @@ class VoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         data = await response.json()
         self.assertEqual(response.status, 200)
+        # The default membership lookup says everybody is in the channel now, so the one
+        # ballot cast from outside it counts as joined since -- and only that voter is
+        # looked up; the subscriber's ballot needs no fresh check.
         self.assertEqual(data["weeks"], [{
             "week": "2026-08-02", "voters": 2, "subscribers": 1, "non_subscribers": 1,
+            "subscribed_after": 1, "not_subscribed": 0,
         }])
+        self.assertEqual(data["checked_voters"], 1)
 
     async def test_vote_stats_exclude_a_regular_moderation_delegate(self):
         delegate_id = 77

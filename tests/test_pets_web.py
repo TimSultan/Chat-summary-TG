@@ -4132,6 +4132,9 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(body.get("state"))
 
 
+    # The winner's 3% minted diamond is a faucet, not a move off the loser; left on, it
+    # lands on the defender in about one run in six and reads as a transfer.
+    @patch("pets_config.ARENA_RUBY_CHANCE", 0)
     async def test_an_ordinary_arena_fight_no_longer_takes_diamonds(self):
         """Coins still move on the same five percent. Diamonds do not move at all -- that
         stake belongs to the card duel now, and to nothing else in the game."""
@@ -4372,11 +4375,16 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opened["attack"], pets_web.CARD_ATTACK)
 
         # And the numbers on the cards are the fixed ones, not stat-derived: a Strike is
-        # a Strike for everybody, which is what lets a deck be learned once.
-        strike = next(card for card in opened["battle"]["hand"] + [
-            card for card in opened["battle"]["enemy_intent"]
-        ] if card["code"] == "strike")
-        self.assertEqual(strike["damage"], pets_web.CARD_ATTACK)
+        # a Strike for everybody, which is what lets a deck be learned once. Read off both
+        # whole decks rather than the opening hand -- that is dealt from a random seed and
+        # holds no Strike at all often enough to fail one run in a few.
+        data = pets._load(CHAT)
+        for user in (PLAYER, OPPONENT):
+            key = str(user["id"])
+            _fighter, deck = pets_web._card_side(data, pets._tamed_record(data, key), key)
+            strikes = [card["damage"] for card in deck if card["code"] == "strike"]
+            self.assertTrue(strikes, f"no Strike in {key}'s deck")
+            self.assertEqual(set(strikes), {pets_web.CARD_ATTACK})
 
     @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_levelling_up_changes_nothing_about_a_card_duel(self):

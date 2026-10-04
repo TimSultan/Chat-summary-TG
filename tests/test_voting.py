@@ -608,9 +608,13 @@ class StorageTests(unittest.TestCase):
         current.subscriber_votes = {"3": True}
         voting.save_poll(current)
 
+        # With no fresh membership lookup, nobody counts as joined since: every ballot cast
+        # from outside the channel is still "not subscribed".
         self.assertEqual(voting.weekly_vote_stats("Chat"), [
-            {"week": "2026-08-02", "voters": 2, "subscribers": 1, "non_subscribers": 1},
-            {"week": "2026-08-09", "voters": 1, "subscribers": 1, "non_subscribers": 0},
+            {"week": "2026-08-02", "voters": 2, "subscribers": 1, "non_subscribers": 1,
+             "subscribed_after": 0, "not_subscribed": 1},
+            {"week": "2026-08-09", "voters": 1, "subscribers": 1, "non_subscribers": 0,
+             "subscribed_after": 0, "not_subscribed": 0},
         ])
 
     def test_latest_poll_picks_the_newest_by_created_at(self):
