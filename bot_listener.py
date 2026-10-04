@@ -42,6 +42,9 @@ previous and the current week's #итогинедели posts into the poll;
 deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement and posts it to
 the chats the admin picks; "/vote картинка" (DM, admin-only) renders the standings as one
 picture (vote_image.py) and sends it back as a file. See handle_vote_command's docstring.
+/vote2 (the arena) and /vote3 (nominations, a test) are separate systems on the same
+server that share none of /vote's data -- see handle_arena_command and
+handle_nominations_command.
 
 Run with: python bot_listener.py (standalone, using load_config()'s own Telethon
 session) -- or, more commonly, let listener.py's main() start this automatically
@@ -100,6 +103,9 @@ import voting
 # dungeon shop closing the voting the chat runs its contest on.
 GAME_IMPORT_ERROR: str | None = None
 ARENA_IMPORT_ERROR: str | None = None
+# Vote v3, the nominations test (nominations*), on a guard of its own for the same
+# reason: it is new, and nothing new may be able to take /vote down with it.
+NOMINATIONS_IMPORT_ERROR: str | None = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -163,6 +169,12 @@ try:
 except Exception:  # noqa: BLE001
     ARENA_IMPORT_ERROR = traceback.format_exc()
     arena = arena_core = arena_web = None
+try:
+    import nominations
+    import nominations_web
+except Exception:  # noqa: BLE001
+    NOMINATIONS_IMPORT_ERROR = traceback.format_exc()
+    nominations = nominations_web = None
 
 
 def game_available() -> bool:
@@ -187,6 +199,11 @@ def game_open() -> bool:
 def arena_available() -> bool:
     """The same for the weekly duel vote, which fails and recovers on its own."""
     return ARENA_IMPORT_ERROR is None
+
+
+def nominations_available() -> bool:
+    """The same for vote v3 (/vote3, the nominations test)."""
+    return NOMINATIONS_IMPORT_ERROR is None
 
 
 GAME_UNAVAILABLE_NOTICE = (
@@ -505,6 +522,38 @@ ARENA_ACTIONS = {
     "chat": "/vote2 chat",
     "results": "/vote2 итоги",
     "clear": "/vote2 очистить",
+}
+
+# ------------------------------------------------------------- nominations (v3, a test)
+#
+# The week's works voted on in named nominations, one tab each (nominations.py,
+# nominations_web.py). Separated from /vote exactly as the arena is: its own storage, its
+# own photos, its own lock, routes and commands. It READS v1 in one place only --
+# "/vote3 импорт" copies the works /vote collected -- and writes nothing of v1's.
+#
+# Spelled "/vote3" for the same reason "/vote2" is spelled that way. It must be routed
+# BEFORE VOTE_COMMANDS: "/vote3" starts with "/vote", and the v1 handler would take it.
+NOMINATIONS_COMMANDS = ("/vote3", "/голосование3")
+NOMINATIONS_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
+NOMINATIONS_IMPORT_WORDS = frozenset({"импорт", "import", "взять", "изv1"})
+NOMINATIONS_MODERATE_WORDS = frozenset({"выбрать", "настроить", "модерация", "moderate", "admin"})
+NOMINATIONS_RESULTS_WORDS = frozenset({"итоги", "результаты", "standings", "results"})
+NOMINATIONS_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
+# The confirmation is a word on the end rather than a separate callback flow: clearing
+# archives the contest and deletes its photos, so it is asked first, and the button that
+# answers simply replays the command with the confirmation spelled out.
+NOMINATIONS_CLEAR_CONFIRM_WORDS = frozenset({"очистить да", "clear yes"})
+NOMINATIONS_OPEN_BUTTON_TEXT = "🏷 Открыть номинации"
+NOMINATIONS_UNAVAILABLE_NOTICE = (
+    "Номинации сейчас недоступны — чиню. Основное голосование (/vote) работает как обычно."
+)
+NOMINATIONS_ACTION_CALLBACK_PREFIX = "nomaction"
+NOMINATIONS_ACTIONS = {
+    "collect": "/vote3 собрать",
+    "import": "/vote3 импорт",
+    "results": "/vote3 итоги",
+    "clear": "/vote3 очистить",
+    "clearyes": "/vote3 очистить да",
 }
 
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
@@ -3182,6 +3231,11 @@ async def _run_admin_action(
             api, telethon_client, cfg, tz, message, entry, bot_username,
             background_tasks, log=log, vote_chat_flows=vote_chat_flows,
         )
+    elif action_id == "vote3":
+        await handle_nominations_command(
+            api, telethon_client, cfg, tz, message, entry, bot_username,
+            background_tasks, log=log,
+        )
     elif action_id == "badge":
         await handle_badge_command(api, message, entry, admin_chat_id, badge_flows)
     elif action_id == "badgeadmin":
@@ -5121,6 +5175,356 @@ async def handle_arena_command(
     await reply(
         "Арена открывается в личке с ботом:",
         reply_markup=({"inline_keyboard": [[{"text": ARENA_OPEN_BUTTON_TEXT, "url": url}]]} if url else None),
+    )
+
+
+def _nominations_page_url(cfg) -> str | None:
+    return f"{cfg.webapp_public_url}{nominations_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
+
+
+def _nominations_group_button_url(bot_username: str | None) -> str | None:
+    """The deep link a group /vote3 leaves behind -- a web_app button is private-chat
+    only. No Direct Link Mini App branch, for the arena's reason: the short name in
+    BotFather points at v1's page."""
+    return f"https://t.me/{bot_username}?start=vote3" if bot_username else None
+
+
+def _nominations_status_text(contest) -> str:
+    """v3's own status block for its /vote3 panel -- never v1's numbers, so the two votes
+    cannot be mistaken for one another in the DM."""
+    if contest is None:
+        return (
+            "Номинации (v3, тестовая версия) ещё не созданы.\n\n"
+            "Возьми работы из основного голосования или собери их заново, потом открой "
+            "настройку и добавь номинации. Основное голосование (/vote) это не трогает."
+        )
+    lines = [
+        "Номинации (v3, тестовая версия)",
+        f"Работ собрано: {len(contest.entries)} · номинаций: {len(contest.nominations)} · "
+        f"{'голосование открыто' if contest.open else 'голосование закрыто'}",
+    ]
+    if contest.nominations:
+        lines.append("")
+        for nomination in contest.nominations:
+            lines.append(
+                f"• {nomination.name} — работ {len(contest.members(nomination))}, "
+                f"проголосовало {contest.voter_count(nomination)}"
+            )
+    else:
+        lines.append("Номинаций пока нет -- добавь их в настройке.")
+    return "\n".join(lines)
+
+
+def _nominations_action_callback_data(action: str, chat_id, user_id) -> str:
+    return f"{NOMINATIONS_ACTION_CALLBACK_PREFIX}:{action}:{chat_id}:{user_id}"
+
+
+def _parse_nominations_action_callback(data: str) -> tuple[str, int, int] | None:
+    parts = (data or "").split(":")
+    if (len(parts) != 4 or parts[0] != NOMINATIONS_ACTION_CALLBACK_PREFIX
+            or parts[1] not in NOMINATIONS_ACTIONS):
+        return None
+    try:
+        return parts[1], int(parts[2]), int(parts[3])
+    except ValueError:
+        return None
+
+
+async def handle_nominations_action_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """The /vote3 panel's buttons, built the way v1's and the arena's are: the tap is
+    answered first, then a synthetic message goes through handle_nominations_command so
+    the admin/DM gate and the work live in exactly one place."""
+    if not nominations_available():
+        log("[bot_listener] refused a /vote3 button: the nominations modules never loaded:\n"
+            + (NOMINATIONS_IMPORT_ERROR or ""))
+        await api.answer_callback_query(callback["id"], text=NOMINATIONS_UNAVAILABLE_NOTICE)
+        return
+    parsed = _parse_nominations_action_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, chat_id, target_user_id = parsed
+
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    # Answered before any of the slow work, or the button spins until Telegram gives up.
+    await api.answer_callback_query(callback["id"])
+
+    trigger = callback.get("message") or {}
+    synthetic_message = {
+        "message_id": trigger.get("message_id"),
+        "chat": {"id": chat_id, "type": "private"},
+        "from": clicker,
+        "text": NOMINATIONS_ACTIONS[action],
+    }
+    task = asyncio.create_task(
+        handle_nominations_command(
+            api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
+            background_tasks, log=log,
+        )
+    )
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def handle_nominations_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/vote3 -- vote v3, the nominations test. The same shape as /vote and /vote2 so an
+    administrator who knows those knows this one:
+
+    - "/vote3 импорт" (DM, admin) copies every work /vote has COLLECTED, photos and all,
+      into v3's pool. One way and by copy: the poll is read and left exactly as it was.
+    - "/vote3 собрать" (DM, admin) scans #итогинедели for the previous and the current
+      week into v3's pool on its own, for when /vote has not collected anything.
+    - "/vote3 выбрать" (DM, admin) opens the editing view: add nominations, name them, and
+      pick which pool works play in each.
+    - "/vote3 итоги" (DM, admin) prints every nomination's standings.
+    - "/vote3 очистить" (DM, admin) asks, then archives the contest and deletes v3's photos.
+    - bare "/vote3" opens the tabs for everyone, and is the control panel for an
+      administrator -- which is what the /admin panel's button opens.
+
+    Nothing here reads or writes a poll except the import's read.
+    """
+    chat = message["chat"]
+    chat_id = chat["id"]
+    is_private = chat.get("type") == "private"
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            return await api.send_message(
+                chat_id, text, reply_to_message_id=message["message_id"],
+                parse_mode=None, reply_markup=reply_markup,
+            )
+        except Exception as e:
+            log(f"[nominations] failed to send the reply: {e}")
+            return None
+
+    if not nominations_available():
+        log("[bot_listener] refused /vote3: the nominations modules never loaded:\n"
+            + (NOMINATIONS_IMPORT_ERROR or ""))
+        await reply(NOMINATIONS_UNAVAILABLE_NOTICE)
+        return
+    page_url = _nominations_page_url(cfg)
+    if not page_url:
+        await reply("Номинации не настроены: не задан WEBAPP_PUBLIC_URL.")
+        return
+    if not entry:
+        await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS).")
+        return
+
+    argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
+    for spelling in NOMINATIONS_COMMANDS:
+        if argument.lower().startswith(spelling):
+            argument = argument[len(spelling):]
+            break
+    normalized = " ".join(argument.lower().split())
+    wants_collect = normalized in NOMINATIONS_COLLECT_WORDS
+    wants_import = normalized in NOMINATIONS_IMPORT_WORDS
+    wants_moderate = normalized in NOMINATIONS_MODERATE_WORDS
+    wants_results = normalized in NOMINATIONS_RESULTS_WORDS
+    confirms_clear = normalized in NOMINATIONS_CLEAR_CONFIRM_WORDS
+    wants_clear = confirms_clear or normalized in NOMINATIONS_CLEAR_WORDS
+
+    async def require_admin_in_dm(denial: str) -> bool:
+        if not is_private:
+            url = f"https://t.me/{bot_username}" if bot_username else None
+            await reply(
+                "Это только в личке с ботом.",
+                reply_markup=({"inline_keyboard": [[{"text": "Открыть в личке", "url": url}]]} if url else None),
+            )
+            return False
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
+            await reply(denial)
+            return False
+        return True
+
+    settings_markup = {"inline_keyboard": [[
+        {"text": "🛠 Настроить номинации", "web_app": {"url": f"{page_url}?mode=admin"}}
+    ]]}
+
+    if wants_import:
+        if not await require_admin_in_dm("Брать работы могут только администраторы."):
+            return
+        # Read-only on v1's side: latest_poll and the photo copy only read its files.
+        poll = await asyncio.to_thread(voting.latest_poll, entry)
+        if poll is None or not poll.entries:
+            await reply(
+                "В основном голосовании пока нет собранных работ -- брать нечего. "
+                "Можно собрать отдельно: /vote3 собрать"
+            )
+            return
+        works = await asyncio.to_thread(nominations.copy_poll_works, poll, entry)
+        contest, added = await asyncio.to_thread(
+            nominations.update_contest, entry, lambda c: nominations.add_entries(c, works), True,
+        )
+        log(f"[nominations] imported {added} work(s) from poll {poll.poll_id}")
+        await reply(
+            (f"Взял из основного голосования: {added} работ (всего в номинациях "
+             f"{len(contest.entries)}). Само голосование /vote не изменилось. "
+             "Открой настройку и разложи работы по номинациям."
+             if added else
+             f"Все работы из основного голосования уже здесь (всего {len(contest.entries)})."),
+            reply_markup=settings_markup,
+        )
+        return
+
+    if wants_collect:
+        if not await require_admin_in_dm("Собирать работы могут только администраторы."):
+            return
+        lock_key = ("nominations", entry)
+        if lock_key in _VOTE_COLLECTIONS_IN_PROGRESS:
+            await reply(
+                "Уже собираю -- подожди, пожалуйста. Второй запуск только замедлит первый: "
+                "он полез бы качать те же фотографии заново."
+            )
+            return
+        week_label = "за прошлую и эту неделю"
+        status = await reply(
+            f"Собираю работы с #итогинедели {week_label} в номинации. Основное голосование "
+            "не трогаю. Это может занять несколько минут -- буду показывать прогресс здесь."
+        )
+        existing = await asyncio.to_thread(nominations.load_contest, entry)
+        known = {e.entry_id for e in existing.entries} if existing else set()
+        _VOTE_COLLECTIONS_IN_PROGRESS.add(lock_key)
+        try:
+            new_entries = await voting.collect_entries(
+                client=telethon_client,
+                chat_ref=entry,
+                tz=tz,
+                # v3's OWN media directory, so neither system's clear can delete the
+                # other's pictures.
+                media_dir=nominations.media_path(entry),
+                skip_entry_ids=known,
+                weeks=VOTE_COLLECT_WEEKS,
+                # The whole window every time: the pool may have come from an import that
+                # held only part of it, and stopping at the first known work would never
+                # reach the rest (voting.collect_entries' stop_at_known).
+                stop_at_known=False,
+                progress=_vote_progress_reporter(
+                    api, chat_id, (status or {}).get("message_id"), week_label, log=log,
+                ),
+                log=log,
+            )
+        except Exception:
+            log(f"[nominations] collecting failed:\n{traceback.format_exc()}")
+            await reply("Не получилось собрать работы -- смотри логи.")
+            return
+        finally:
+            _VOTE_COLLECTIONS_IN_PROGRESS.discard(lock_key)
+        # Merged at the end, under the write lock, rather than saved over whatever was
+        # loaded minutes ago: nominations edited during the scan must survive it.
+        contest, added = await asyncio.to_thread(
+            nominations.update_contest, entry, lambda c: nominations.add_entries(c, new_entries), True,
+        )
+        if not contest.entries:
+            await reply(f"{week_label.capitalize()} постов с #итогинедели не нашлось.")
+            return
+        await reply(
+            f"Новых работ: {added} (всего {len(contest.entries)}). "
+            "Открой настройку и разложи работы по номинациям.",
+            reply_markup=settings_markup,
+        )
+        return
+
+    if wants_moderate:
+        if not await require_admin_in_dm("Настраивать номинации могут только администраторы."):
+            return
+        await reply(
+            "Настройка номинаций: «＋ Номинация» добавляет вкладку, а касание работы "
+            "добавляет её в открытую номинацию или убирает из неё.",
+            reply_markup=settings_markup,
+        )
+        return
+
+    if wants_results:
+        if not await require_admin_in_dm("Смотреть итоги могут только администраторы."):
+            return
+        contest = await asyncio.to_thread(nominations.load_contest, entry)
+        await reply(nominations.results_text(contest) if contest else "Номинации ещё не созданы.")
+        return
+
+    if wants_clear:
+        if not await require_admin_in_dm("Очищать номинации могут только администраторы."):
+            return
+        if not confirms_clear:
+            await reply(
+                "Точно очистить номинации? Номинации, голоса в них и собранные для них "
+                "фото уйдут из показа (сам файл с голосами останется в архиве). "
+                "Основное голосование /vote не тронется.",
+                reply_markup={"inline_keyboard": [[{
+                    "text": "🗑 Да, очистить",
+                    "callback_data": _nominations_action_callback_data("clearyes", chat_id, user.get("id")),
+                }]]},
+            )
+            return
+        cleared = await asyncio.to_thread(nominations.archive_contest, entry)
+        log(f"[nominations] {user.get('username') or user.get('id')} cleared the contest ({cleared})")
+        await reply(
+            "Номинации очищены и убраны в архив. Основное голосование не тронуто."
+            if cleared else "Номинаций и так нет."
+        )
+        return
+
+    # Bare "/vote3": the tabs for everyone, plus the control panel for an administrator.
+    if is_private:
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
+        if is_manager:
+            admin_user_id = user.get("id")
+            contest = await asyncio.to_thread(nominations.load_contest, entry)
+            await reply(
+                _nominations_status_text(contest),
+                reply_markup={"inline_keyboard": [
+                    [
+                        {"text": NOMINATIONS_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
+                        {"text": "🛠 Настроить", "web_app": {"url": f"{page_url}?mode=admin"}},
+                    ],
+                    [
+                        {"text": "⬇️ Взять из /vote", "callback_data": _nominations_action_callback_data("import", chat_id, admin_user_id)},
+                        {"text": "🔄 Собрать заново", "callback_data": _nominations_action_callback_data("collect", chat_id, admin_user_id)},
+                    ],
+                    [
+                        {"text": "📊 Итоги", "callback_data": _nominations_action_callback_data("results", chat_id, admin_user_id)},
+                        {"text": "🗑 Очистить", "callback_data": _nominations_action_callback_data("clear", chat_id, admin_user_id)},
+                    ],
+                ]},
+            )
+        else:
+            # A voter is shown none of the administrator's buttons -- each of them would
+            # only ever answer "не для тебя" (the arena's rule).
+            await reply(
+                "Голосование по номинациям:",
+                reply_markup={"inline_keyboard": [[{"text": NOMINATIONS_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+            )
+        return
+
+    url = _nominations_group_button_url(bot_username)
+    await reply(
+        "Голосование по номинациям открывается в личке с ботом:",
+        reply_markup=({"inline_keyboard": [[{"text": NOMINATIONS_OPEN_BUTTON_TEXT, "url": url}]]} if url else None),
     )
 
 
@@ -9574,6 +9978,11 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
                 background_tasks, vote_chat_flows, log=log,
             )
+        elif callback_data.startswith(f"{NOMINATIONS_ACTION_CALLBACK_PREFIX}:"):
+            await handle_nominations_action_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
+                background_tasks, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_ACTION_CALLBACK_PREFIX}:"):
             await handle_vote_action_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
@@ -9704,6 +10113,13 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
                 background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+            )
+            return
+        if start_payload == "vote3":
+            await handle_nominations_command(
+                api, telethon_client, cfg, tz, message,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username,
+                background_tasks, log=log,
             )
             return
         if start_payload in ("vote", "vote_admin", "vote_clear", "vote_chat", "vote_image"):
@@ -10063,6 +10479,22 @@ async def _dispatch_update(
         await handle_pets_rename_command(
             api, telethon_client, tz, message, pets_entry, command_text, log=log,
         )
+        return
+
+    # "/vote3" -- the nominations test. Ahead of VOTE_COMMANDS below, which would otherwise
+    # match it by prefix and open v1's ballot with "3" for an argument.
+    if any(command_text.lower().startswith(c) for c in NOMINATIONS_COMMANDS):
+        nominations_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if nominations_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_nominations_command(
+                api, telethon_client, cfg, tz, message, nominations_entry, bot_username,
+                background_tasks, log=log,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
         return
 
     if any(command_text.lower().startswith(c) for c in ARENA_COMMANDS):
@@ -10995,6 +11427,16 @@ async def run_bot_listener(
                         app, cfg, home_chat_ref or "", _is_vote_admin,
                         is_member=_is_vote_member, log=log,
                     )
+                # Vote v3 (the nominations test), under the voting page's own admin
+                # check. Caught here as well as guarded at import: this runs inside
+                # vote_web.create_app, and an exception escaping it would take the server
+                # -- and /vote with it -- down, where a missing /vote3 page costs nothing.
+                if nominations_available():
+                    try:
+                        nominations_web.attach(app, cfg, home_chat_ref or "", _is_vote_admin, log=log)
+                    except Exception:  # noqa: BLE001
+                        log("[bot_listener] the nominations page (/vote3) was not mounted; "
+                            "/vote is unaffected:\n" + traceback.format_exc())
                 # The pet game's own page. It needs one thing the other two don't: the
                 # player's live chat XP, because the coin balance is derived from it and
                 # nothing in that game can be priced without it. Resolving that needs the

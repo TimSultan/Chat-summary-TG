@@ -24,7 +24,7 @@ import pets_ui
 
 GAME_MODULES = (
     "pets", "pets_combat", "pets_image", "pets_ui", "pets_updates", "pets_web",
-    "casino", "arena", "arena_core", "arena_web",
+    "casino", "arena", "arena_core", "arena_web", "nominations", "nominations_web",
 )
 
 

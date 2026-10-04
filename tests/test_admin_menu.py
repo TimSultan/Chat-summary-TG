@@ -127,6 +127,7 @@ HANDLER_FOR_ACTION = {
     "via": "handle_via_cleaner_command",
     "vote": "handle_vote_command",
     "vote2": "handle_arena_command",
+    "vote3": "handle_nominations_command",
     "badge": "handle_badge_command",
     "badgeadmin": "handle_badge_admin_command",
     "weekwinner": "handle_week_winner_command",
@@ -191,6 +192,7 @@ class CatalogueTests(unittest.TestCase):
         self.assertIn(admin_menu.action("arenanews")["command"], bot_listener.ARENA_NEWS_COMMANDS)
         self.assertIn(admin_menu.action("vote")["command"], bot_listener.VOTE_COMMANDS)
         self.assertIn(admin_menu.action("vote2")["command"], bot_listener.ARENA_COMMANDS)
+        self.assertIn(admin_menu.action("vote3")["command"], bot_listener.NOMINATIONS_COMMANDS)
 
 
 class RenderingTests(unittest.TestCase):
