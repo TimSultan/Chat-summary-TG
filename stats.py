@@ -2365,7 +2365,14 @@ def compute_day_stats(messages: list) -> dict:
             if m.is_reply:
                 u["replies"] = min(XP_DAILY_REPLY_CAP, u["replies"] + 1)
         ts = m.dt_local.isoformat()
-        if m.text.startswith(MEDIA_TAG_PREFIXES) and is_figurine_caption(m.text):
+        # A forward carries the original caption, hashtag and all, so it must be refused
+        # here as well as in listener.py's live counter -- otherwise the day's recount
+        # from the transcript would hand the reposter the figurine back at midnight.
+        if (
+            m.text.startswith(MEDIA_TAG_PREFIXES)
+            and is_figurine_caption(m.text)
+            and not getattr(m, "is_forward", False)
+        ):
             u["figurines"] += 1
             u["figurine_posts"].append([ts, m.message_id])
         # Showcase tags, media-gated for the same reason FIGURINE_HASHTAG is: /stat

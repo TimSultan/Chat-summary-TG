@@ -45,6 +45,7 @@ from summarizer import summarize_transcript
 from telegram_fetch import (
     fetch_range_messages_cached,
     format_transcript_lines,
+    is_forwarded,
     is_image_message,
     is_video_message,
     resolve_chat,
@@ -208,6 +209,22 @@ def blocked_file_name(msg) -> str | None:
         if name and name.lower().endswith(BLOCKED_FILE_EXTENSIONS):
             return name
     return None
+
+
+def is_figurine_post(msg, text: str) -> bool:
+    """Whether this message earns a figurine: #япокрасил with a photo or video attached,
+    sent by the member themselves.
+
+    A forward is refused even though it carries the hashtag -- its caption is the original
+    author's, so counting it credited whoever reposted the work (see
+    telegram_fetch.is_forwarded). stats.compute_day_stats applies the same rule when the
+    day is recounted from the transcript, so the two never disagree.
+    """
+    return (
+        (is_image_message(msg) or is_video_message(msg))
+        and stats.is_figurine_caption(text)
+        and not is_forwarded(msg)
+    )
 
 
 def inline_bot_ref(msg) -> str | None:
@@ -1278,8 +1295,8 @@ async def run_listener(
         # -- so /stat and /top pick it up immediately instead of waiting on the
         # transcript cache's own TTL. Reacting is the one part that has to defer to the
         # bot account once bot_takeover is on, same as every other reply (see
-        # figurine_ack_queue).
-        if cfg.stats_enabled and (is_image_message(msg) or is_video_message(msg)) and stats.is_figurine_caption(text):
+        # figurine_ack_queue). A forwarded post earns nothing: see is_figurine_post.
+        if cfg.stats_enabled and is_figurine_post(msg, text):
             chat = await event.get_chat()
             entry = matched_allowed_chat(chat)
             if entry is not None:

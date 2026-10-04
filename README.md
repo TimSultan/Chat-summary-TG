@@ -1618,6 +1618,14 @@ The activity block stays compact and uses dot-separated thousands:
 
 The streak note is hidden when the current streak is zero.
 
+A `#япокрасил` post counts only when the member **sent it themselves**. A forwarded message
+carries the original caption, hashtag included, so it earns no figurine, XP, coins, farm
+ticket or scroll — whether it is somebody else's work or the member's own post from a
+channel (`telegram_fetch.is_forwarded`). The live counter (`listener.is_figurine_post`) and
+the day's recount from the transcript (`stats.compute_day_stats`) both refuse it; the
+forward still counts as an ordinary message. Telegram gives no sign of a forward sent with
+"hide sender name", so that one still reads as an original.
+
 The two showcase lines link straight to the person's own post and sit immediately above
 `Фигурок:`:
 

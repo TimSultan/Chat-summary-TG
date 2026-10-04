@@ -23,6 +23,25 @@ class ChatMessage:
     sender_id: Optional[int]
     text: str
     is_reply: bool
+    # Forwarded into the chat rather than written there. Only figurine credit reads it:
+    # a forward is still a message somebody chose to post, so it keeps counting as chat
+    # activity, but it is never their own painted work (see is_forwarded).
+    is_forward: bool = False
+
+
+def is_forwarded(msg) -> bool:
+    """True for a message forwarded into the chat, whoever wrote the original.
+
+    A #япокрасил post earns a figurine only when the member sent it themselves: a forward
+    carries the original caption, hashtag included, so without this check reposting
+    somebody else's work credited the reposter with it. A forward of the member's own
+    earlier post (from their channel, say) is refused too -- the original was either
+    counted where it was posted or was never a post in this chat at all.
+
+    Telegram cannot tell us about a forward sent with "hide sender name": that arrives as
+    a fresh message with no forward header and is indistinguishable here from an original.
+    """
+    return getattr(msg, "fwd_from", None) is not None
 
 
 def is_image_message(msg) -> bool:
@@ -227,6 +246,7 @@ async def fetch_range_messages(
                     sender_id=sender_id,
                     text=body,
                     is_reply=bool(msg.is_reply),
+                    is_forward=is_forwarded(msg),
                 )
             )
     except RPCError as e:
@@ -281,6 +301,7 @@ async def fetch_new_messages(client: TelegramClient, chat_ref, tz, min_id: int):
                     sender_id=sender_id,
                     text=body,
                     is_reply=bool(msg.is_reply),
+                    is_forward=is_forwarded(msg),
                 )
             )
     except RPCError as e:
@@ -330,6 +351,7 @@ def _message_to_dict(m: ChatMessage) -> dict:
         "sender_id": m.sender_id,
         "text": m.text,
         "is_reply": m.is_reply,
+        "is_forward": m.is_forward,
     }
 
 
@@ -345,6 +367,9 @@ def _message_from_dict(d: dict) -> ChatMessage:
         sender_id=d["sender_id"],
         text=d["text"],
         is_reply=d["is_reply"],
+        # Cached before forwards were tracked: read as an original, which is what every
+        # message was taken to be when that cache was written.
+        is_forward=d.get("is_forward", False),
     )
 
 
