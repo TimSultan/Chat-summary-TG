@@ -549,6 +549,7 @@ VOTE_RESULT_FLOW_TTL_SECONDS = 60 * 60
 # advertising them to all 190 members would invite a wave of "нужны права администратора".
 PRIVATE_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
+    {"command": "quests", "description": "Квесты: задания на покрас и награды"},
     {"command": "testfight", "description": "Тестовый случайный бой"},
     {"command": "cabinet", "description": "Личный кабинет"},
     {"command": "stat", "description": "Моя статистика"},
@@ -561,6 +562,7 @@ PRIVATE_CHAT_COMMANDS = (
 )
 GROUP_CHAT_COMMANDS = (
     {"command": "arena", "description": "Арена: клетка, существо, бои"},
+    {"command": "quests", "description": "Квесты: задания на покрас и награды"},
     {"command": "testfight", "description": "Тестовый случайный бой"},
     {"command": "stat", "description": "Моя статистика"},
     {"command": "works", "description": "Все мои работы (#япокрасил)"},
@@ -6461,6 +6463,9 @@ PETS_COMMANDS = ("/arena", "/арена")
 # Works in the group as well as the DM -- it is the one screen meant to be shown off, so
 # refusing it in front of everybody would defeat the point.
 PET_CARD_COMMANDS = ("/pet", "/пет", "/питомец")
+# The quest board straight from the ☰ menu, without going through /arena first.
+QUESTS_COMMANDS = ("/quests", "/квесты")
+QUESTS_DM_ONLY_NOTICE = "Квесты открываются в личке с ботом."
 PETS_RENAME_COMMANDS = ("/переименовать", "/rename")
 DUEL_COMMANDS = ("/duel", "/дуэль")
 TEST_FIGHT_COMMAND = "/testfight"
@@ -6775,6 +6780,65 @@ async def handle_pets_command(
             finance_admin=is_finance_admin,
         ),
         reply_to_message_id=message["message_id"], log=log,
+    )
+
+
+async def handle_quests_command(
+    api: TelegramBotAPI,
+    cfg,
+    message: dict,
+    entry: str,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """"/quests" -- the quest board itself, the screen /arena's «Квесты» button opens.
+
+    DM-only like /arena: the board's buttons belong to one player and the web button is
+    private-chat only. The group gets a pointer and a deep link (?start=quests) instead.
+    No stats lookup is needed -- the board is keyed on the Telegram id alone -- so this
+    opens without the Telethon round trip /arena pays.
+    """
+    if await _decline_game_command(api, message, log=log):
+        return
+    chat = message["chat"]
+    chat_id = chat["id"]
+    actor = message.get("from") or {}
+
+    if chat.get("type") != "private":
+        schedule_bot_delete(
+            api, chat_id, [], GROUP_PETS_DELETE_AFTER, log, background_tasks,
+            trigger_message_id=message["message_id"],
+        )
+        try:
+            sent = await api.send_message(
+                chat_id, QUESTS_DM_ONLY_NOTICE,
+                reply_to_message_id=message["message_id"], parse_mode=None,
+                reply_markup=(
+                    {"inline_keyboard": [[{
+                        "text": "📜 Открыть квесты",
+                        "url": f"https://t.me/{bot_username}?start=quests",
+                    }]]} if bot_username else None
+                ),
+            )
+            if sent and "message_id" in sent:
+                schedule_bot_delete(
+                    api, chat_id, [sent["message_id"]], GROUP_PETS_DELETE_AFTER, log,
+                    background_tasks,
+                )
+        except Exception:
+            log(f"[pets] failed to point a group at the quests DM:\n{traceback.format_exc()}")
+        return
+
+    try:
+        rendered = pets_ui.quests_view(
+            entry, str(actor.get("id")), "paint", webapp_url=_pets_page_url(cfg),
+        )
+    except Exception:
+        log(f"[pets] /quests failed:\n{traceback.format_exc()}")
+        rendered = pets_ui.notice_view(actor.get("id"), "Что-то сломалось. Попробуй ещё раз: /quests")
+    await _send_pets_view(
+        api, chat_id, rendered, reply_to_message_id=message["message_id"], log=log,
     )
 
 
@@ -7648,7 +7712,7 @@ async def handle_pets_callback(
             ok, note = quests.reroll(entry, user_id, kind=kind)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
-                pets_ui.quests_view(entry, user_id, kind), log,
+                pets_ui.quests_view(entry, user_id, kind, webapp_url=pets_webapp_url), log,
             )
             return
         if action == "farmticket":
@@ -8164,12 +8228,15 @@ async def handle_pets_callback(
             "quests": lambda: pets_ui.quests_view(
                 entry, user_id,
                 argument if argument in {"paint", "real", "rune", "gear"} else "paint",
+                webapp_url=pets_webapp_url,
             ),
             "questdetail": lambda: pets_ui.quest_detail_view(
                 entry, user_id, *(str(argument or "paint:").split(":", 1)),
+                webapp_url=pets_webapp_url,
             ),
             "questsdone": lambda: pets_ui.quests_done_view(
                 entry, user_id, int(argument) if argument.isdigit() else 1,
+                webapp_url=pets_webapp_url,
             ),
             "dailybonus": lambda: pets_ui.daily_bonus_view(entry, user_id, xp),
             "bagitems": lambda: pets_ui.bag_items_view(
@@ -9625,6 +9692,13 @@ async def _dispatch_update(
                     background_tasks, pets_flows, known_chat_ids=known_chat_ids, log=log,
                 )
             return
+        if start_payload == "quests":
+            pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+            if pets_entry is not None:
+                await handle_quests_command(
+                    api, cfg, message, pets_entry, bot_username, background_tasks, log=log,
+                )
+            return
         if start_payload in ("vote2", "arena"):
             await handle_arena_command(
                 api, telethon_client, cfg, tz, message,
@@ -9932,6 +10006,18 @@ async def _dispatch_update(
         await handle_pets_command(
             api, telethon_client, cfg, tz, message, pets_entry, bot_username,
             background_tasks, pets_flows, log=log,
+        )
+        return
+
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in QUESTS_COMMANDS
+    ):
+        pets_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if pets_entry is None:
+            return
+        await handle_quests_command(
+            api, cfg, message, pets_entry, bot_username, background_tasks, log=log,
         )
         return
 

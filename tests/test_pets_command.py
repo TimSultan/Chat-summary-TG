@@ -781,6 +781,71 @@ class PetsCommandTests(unittest.TestCase):
         self.assertTrue(all(args[3] == bot_listener.GROUP_PETS_DELETE_AFTER for args, _ in deletions))
         self.assertTrue(any(kwargs.get("trigger_message_id") == 5 for _, kwargs in deletions))
 
+    def _quests(self, chat_type="private", text="/quests"):
+        api = FakeApi()
+        _run(bot_listener.handle_quests_command(
+            api, _cfg(), _message(PLAYER, text, chat_type), CHAT, BOT, set(),
+            log=lambda *_: None,
+        ))
+        return api
+
+    def test_quests_command_opens_the_board_with_the_web_button_first(self):
+        api = self._quests()
+        self.assertEqual(len(api.sent), 1)
+        sent = api.sent[0]
+        self.assertIn("Квесты на покрас", sent["text"])
+        buttons = _buttons(sent)
+        self.assertEqual(buttons[0]["text"], "🌐 Открыть в вебе")
+        self.assertEqual(buttons[0]["web_app"]["url"], "https://example.com/pets?view=quests")
+        actions = [pets_ui.parse_callback(b["callback_data"])[1]
+                   for b in buttons if "callback_data" in b]
+        self.assertEqual(actions.count("questdetail"), 3)
+        self.assertIn("questsdone", actions)
+
+    def test_quests_command_in_a_group_points_to_the_dm(self):
+        api = self._quests(chat_type="group")
+        self.assertEqual(api.sent[0]["text"], bot_listener.QUESTS_DM_ONLY_NOTICE)
+        button = _buttons(api.sent[0])[0]
+        self.assertEqual(button["url"], f"https://t.me/{BOT}?start=quests")
+        # A web_app button is private-chat only; Telegram would reject the whole message.
+        self.assertNotIn("web_app", button)
+
+    def test_every_quest_screen_offers_the_web_version(self):
+        card = quests.daily_quest(CHAT, PLAYER["id"])["quests"][0]["code"]
+        for action, argument, view in (
+            ("quests", "gear", "quests"),
+            ("questdetail", f"paint:{card}", "quests"),
+            ("questdetail", "paint:no-longer-on-the-board", "quests"),
+            ("questsdone", "1", "questsdone"),
+        ):
+            with self.subTest(action=action, argument=argument):
+                api = self._tap(action, argument)
+                screen = (api.edits or api.sent)[-1]
+                urls = [b["web_app"]["url"] for b in _buttons(screen) if "web_app" in b]
+                self.assertEqual(urls, [f"https://example.com/pets?view={view}"])
+
+    def test_quests_and_its_deep_link_reach_the_quests_handler(self):
+        handled = []
+
+        async def handle(api, cfg, message, entry, *args, **kwargs):
+            handled.append((message["text"], entry))
+
+        for text in ("/quests", "/квесты", "/quests@testbot", "/start quests"):
+            update = {"message": {
+                "message_id": 5, "chat": {"id": DM_CHAT_ID, "type": "private"},
+                "from": PLAYER, "text": text,
+            }}
+            with patch.object(bot_listener, "handle_quests_command", handle):
+                cfg = SimpleNamespace(
+                    webapp_public_url="https://example.com", listener_allowed_chats=[],
+                    stats_enabled=True, stats_top_limit=10,
+                )
+                _run(bot_listener._dispatch_update(
+                    update, FakeApi(), None, cfg, None, BOT, 1, set(), asyncio.Queue(),
+                    set(), CHAT, {}, {}, {}, {}, log=lambda *_: None,
+                ))
+        self.assertEqual([entry for _text, entry in handled], [CHAT] * 4)
+
     def test_pet_commands_are_advertised_in_the_group_command_menu(self):
         commands = {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS}
         self.assertTrue({"arena", "pet", "duel", "testfight"} <= commands)

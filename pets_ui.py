@@ -1414,7 +1414,17 @@ def quest_board_for(entry: str, user_id, kind: str):
     return quests.daily_quest(entry, user_id)
 
 
-def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
+def _quests_web_row(webapp_url: str | None, view: str) -> list:
+    """The Mini App's own quest screen, one tap away. web_app buttons only work in a
+    private chat, so the caller passes the URL only there and gets no row otherwise."""
+    if not webapp_url:
+        return []
+    return [[{"text": "🌐 Открыть в вебе", "web_app": {"url": f"{webapp_url}?view={view}"}}]]
+
+
+def quests_view(
+    entry: str, user_id, kind: str = "paint", webapp_url: str | None = None,
+) -> tuple[str, dict]:
     """Compact quest shelf: three readable cards and three matching buttons."""
     kind = kind if kind in QUEST_KINDS else "paint"
     board = quest_board_for(entry, user_id, kind)
@@ -1443,7 +1453,7 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
             "в бой: фотография твоей работы на предмете и +30% к его полезным "
             "характеристикам. Это единственные квесты, которые меняют исход боя."
         )
-    buttons = []
+    buttons = _quests_web_row(webapp_url, "quests")
     for index, card in enumerate(cards, 1):
         status = card.get("status", "open")
         marker = "❗" if status == "open" else ("⏳" if status == "review" else "✅")
@@ -1510,7 +1520,9 @@ def _times_word(times: int) -> str:
     return "раза" if times % 10 in (2, 3, 4) else "раз"
 
 
-def quests_done_view(entry: str, user_id, page: int = 1) -> tuple[str, dict]:
+def quests_done_view(
+    entry: str, user_id, page: int = 1, webapp_url: str | None = None,
+) -> tuple[str, dict]:
     """«Выполненные квесты»: every quest this player has finished, newest first.
 
     The board only ever shows what is still to do, so this is where a finished quest goes
@@ -1561,7 +1573,7 @@ def quests_done_view(entry: str, user_id, page: int = 1) -> tuple[str, dict]:
             lines.append(" · ".join(paid))
         if extra:
             lines.append(" · ".join(extra))
-    rows_kb = []
+    rows_kb = _quests_web_row(webapp_url, "questsdone")
     if pages > 1:
         lines.append(f"\nСтраница {page} из {pages}")
         navigation = []
@@ -1577,13 +1589,15 @@ def quests_done_view(entry: str, user_id, page: int = 1) -> tuple[str, dict]:
     return "\n".join(lines), {"inline_keyboard": rows_kb}
 
 
-def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, dict]:
+def quest_detail_view(
+    entry: str, user_id, kind: str, code: str, webapp_url: str | None = None,
+) -> tuple[str, dict]:
     """Full brief and a practical step-by-step tutorial for one selected card."""
     kind = kind if kind in QUEST_KINDS else "paint"
     board = quest_board_for(entry, user_id, kind)
     card = next((row for row in board.get("quests", []) if row.get("code") == code), None)
     if card is None:
-        return quests_view(entry, user_id, kind)
+        return quests_view(entry, user_id, kind, webapp_url=webapp_url)
     paint = kind != "real"
     reward = card.get("reward") or {}
     difficulty = int(card.get("difficulty", 1) or 1)
@@ -1630,7 +1644,7 @@ def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, d
         lines.append("\n⏳ Работа уже на проверке у модератора.")
     elif status == "done":
         lines.append("\n✅ Квест принят и завершён.")
-    rows = []
+    rows = _quests_web_row(webapp_url, "quests")
     rows.append([{
         "text": "◀️ К карточкам",
         "callback_data": callback_data(user_id, "quests", kind),

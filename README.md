@@ -1431,7 +1431,11 @@ back only after its own cooldown. Finished quests have a page of their own: the
 **✅ Выполненные квесты** button at the top of the tab opens `GET /api/quests/done`
 (`quests.completed`), one card per quest with the day it was accepted, what it paid and a
 link to the post that proved it. In Telegram it is the **✅ Выполненные** button under the
-board (`pets_ui.quests_done_view`). The list is read from the per-player `done` map, so the
+board (`pets_ui.quests_done_view`). `/quests` (or `/квесты`) opens the board straight from
+the ☰ menu; like `/arena` it is DM-only, so in a group it answers with a link to the DM
+(`?start=quests`). Every Telegram quest screen starts with **🌐 Открыть в вебе**, which opens
+the Mini App on the same screen (`?view=quests`, `?view=questsdone`). The list is read from
+the per-player `done` map, so the
 chat-wide caps on history and submissions never drop a card. Arena paints are rune quests
 in the catalogue but live on the `gear` board, so every board lookup goes through
 `quests._board_kind`.
@@ -1482,8 +1486,9 @@ Administrator commands, none of them advertised in the menu:
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
 client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
-command exists. `/arena` is first in both scopes. DMs then get `/cabinet /stat /works /top
-/shop /tree /vote /pet`; groups then get `/stat /works /top /shop /tree /vote /pet /duel`.
+command exists. `/arena` is first in both scopes and `/quests` right below it. DMs then get
+`/cabinet /stat /works /top /shop /tree /vote /pet`; groups then get `/stat /works /top /shop
+/tree /vote /pet /duel`.
 `/works` is the menu spelling of `/работы`, for the same reason as `/plant`. Wallet actions
 belong in the DM where a balance isn't public,
 and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a

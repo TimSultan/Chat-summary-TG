@@ -12056,8 +12056,9 @@ async function refresh() {
 }
 
 refresh().then(() => {
-  if (START_VIEW === "quests") {
+  if (START_VIEW === "quests" || START_VIEW === "questsdone") {
     TAB = "quests";
+    QUEST_PAGE = START_VIEW === "questsdone" ? "done" : "board";
     render();
   }
   if (START_VIEW === "review" && S && S.is_admin) {
