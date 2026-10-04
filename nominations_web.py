@@ -33,6 +33,10 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _CFG_KEY = web.AppKey("nominations_cfg")
 _ENTRY_KEY = web.AppKey("nominations_entry", str)
 _IS_ADMIN_KEY = web.AppKey("nominations_is_admin", Callable[[dict], Awaitable[bool]])
+# Fetches one author's Telegram profile photo; bot_listener owns the Bot API client, so it
+# arrives as a callable, as v1's does. Its own cache: v3 must not lean on v1's app state.
+_AVATAR_KEY = web.AppKey("nominations_avatar", Callable[[int], Awaitable[bytes | None]])
+_AVATAR_CACHE_KEY = web.AppKey("nominations_avatar_cache", dict)
 _PREFIX_KEY = web.AppKey("nominations_prefix", str)
 _LOG_KEY = web.AppKey("nominations_log", Callable[..., None])
 
@@ -76,6 +80,7 @@ def _entry_payload(entry: voting.Entry, base: str) -> dict:
         "username": entry.author_username,
         "text": entry.text,
         "photos": [f"{base}/media/{name}" for name in entry.media],
+        "avatar": f"{base}/avatar/{entry.author_id}" if entry.author_id is not None else None,
     }
 
 
@@ -99,19 +104,28 @@ def _nomination_payload(contest: nominations.Contest, nomination, user_id, admin
     return payload
 
 
-def _state_payload(contest, user_id, admin_mode: bool, can_moderate: bool, base: str) -> dict:
+def _state_payload(contest, user_id, admin_mode: bool, can_moderate: bool, base: str,
+                   vote_admitted: set[str] | None = None) -> dict:
     """Everything the page draws, and only that.
 
     A voter gets the nominations that have works in them and the works those name -- not
     the pool, which is the administrator's raw material and would be sent to every voter
     for nothing. The administrator gets the whole pool, since adding works to a nomination
-    is choosing from it."""
+    is choosing from it.
+
+    `vote_admitted` -- which pool works /vote has admitted to its own ballot -- is sent
+    only when it was just read (the administrator's state load, which syncs from /vote);
+    the page keeps the last one it got. Re-reading v1 on every edit would be a read of
+    another system's files per tap, for a filter that changes once a week."""
     if contest is None:
-        return {
+        payload = {
             "exists": False, "open": False, "max_choices": None,
             "is_admin": admin_mode, "can_moderate": can_moderate,
             "nominations": [], "entries": [],
         }
+        if vote_admitted is not None:
+            payload["vote_admitted"] = []
+        return payload
     if admin_mode:
         shown = list(contest.nominations)
         entries = contest.entries
@@ -119,7 +133,7 @@ def _state_payload(contest, user_id, admin_mode: bool, can_moderate: bool, base:
         shown = [n for n in contest.nominations if contest.members(n)]
         used = {entry_id for n in shown for entry_id in n.entry_ids}
         entries = [e for e in contest.entries if e.entry_id in used]
-    return {
+    payload = {
         "exists": True,
         "open": contest.open,
         "max_choices": contest.max_choices,
@@ -128,6 +142,9 @@ def _state_payload(contest, user_id, admin_mode: bool, can_moderate: bool, base:
         "nominations": [_nomination_payload(contest, n, user_id, admin_mode) for n in shown],
         "entries": [_entry_payload(e, base) for e in entries],
     }
+    if vote_admitted is not None:
+        payload["vote_admitted"] = [e.entry_id for e in entries if e.entry_id in vote_admitted]
+    return payload
 
 
 # ----------------------------------------------------------------------------- handlers
@@ -142,10 +159,22 @@ async def handle_state(request: web.Request) -> web.Response:
     admin_mode = can_moderate and request.query.get("mode") == "admin"
     entry = request.app[_ENTRY_KEY]
     base = request.app[_PREFIX_KEY]
+    log = request.app[_LOG_KEY]
 
     def build() -> dict:
-        contest = nominations.load_contest(entry)
-        return _state_payload(contest, user["id"], admin_mode, can_moderate, base)
+        if not admin_mode:
+            contest = nominations.load_contest(entry)
+            return _state_payload(contest, user["id"], False, can_moderate, base)
+        # The editing view is where the pool is chosen from, so it is brought up to date
+        # with /vote first -- there is no import step for anybody to forget.
+        try:
+            contest, added, admitted = nominations.sync_from_v1(entry)
+            if added:
+                log(f"[nominations] {added} new work(s) from /vote")
+        except nominations.ContestError as e:
+            log(f"[nominations] could not sync from /vote: {e.message}")
+            contest, admitted = nominations.load_contest(entry), None
+        return _state_payload(contest, user["id"], True, can_moderate, base, admitted)
 
     return web.json_response(await asyncio.to_thread(build))
 
@@ -248,6 +277,34 @@ async def handle_media(request: web.Request) -> web.Response:
     return web.FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
 
 
+async def handle_avatar(request: web.Request) -> web.Response:
+    """An author's current Telegram avatar, for a card in this contest.
+
+    Public for the photos' reason (an <img> cannot sign itself), but not an arbitrary
+    Telegram-user lookup: the id must be the author of a work in the pool. Found photos and
+    "has no photo" are both cached for the process; a failed fetch is not, so it can retry.
+    """
+    raw_user_id = request.match_info["user_id"]
+    if not raw_user_id.isdigit():
+        raise web.HTTPNotFound()
+    user_id = int(raw_user_id)
+    cache = request.app[_AVATAR_CACHE_KEY]
+    if user_id not in cache:
+        contest = await asyncio.to_thread(nominations.load_contest, request.app[_ENTRY_KEY])
+        if contest is None or not any(work.author_id == user_id for work in contest.entries):
+            raise web.HTTPNotFound()
+        try:
+            avatar = await request.app[_AVATAR_KEY](user_id)
+        except Exception as e:
+            request.app[_LOG_KEY](f"[nominations] could not fetch avatar for {user_id}: {e}")
+            raise web.HTTPServiceUnavailable()
+        cache[user_id] = bytes(avatar) if avatar else None
+    if not cache[user_id]:
+        raise web.HTTPNotFound()
+    return web.Response(body=cache[user_id], content_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 async def handle_page(request: web.Request) -> web.Response:
     return web.Response(
         text=PAGE_HTML.replace("__PREFIX__", request.app[_PREFIX_KEY]),
@@ -256,13 +313,20 @@ async def handle_page(request: web.Request) -> web.Response:
 
 
 def attach(app: web.Application, cfg, entry: str, is_admin, log=print,
-           route_prefix: str = ROUTE_PREFIX) -> web.Application:
+           route_prefix: str = ROUTE_PREFIX, avatar=None) -> web.Application:
     """Adds v3 to the application vote_web.create_app builds. Its own AppKeys throughout
-    (nominations_*), so nothing it stores can collide with v1's or the arena's."""
+    (nominations_*), so nothing it stores can collide with v1's or the arena's. `avatar`
+    takes an author id and returns their profile photo bytes or None; without it every
+    card shows the author's initial instead."""
+    async def _no_avatar(user_id):
+        return None
+
     prefix = route_prefix.rstrip("/")
     app[_CFG_KEY] = cfg
     app[_ENTRY_KEY] = entry
     app[_IS_ADMIN_KEY] = is_admin
+    app[_AVATAR_KEY] = avatar or _no_avatar
+    app[_AVATAR_CACHE_KEY] = {}
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     app.add_routes([
@@ -275,6 +339,7 @@ def attach(app: web.Application, cfg, entry: str, is_admin, log=print,
         web.post(f"{prefix}/api/nominations/delete", handle_delete),
         web.post(f"{prefix}/api/settings", handle_settings),
         web.get(prefix + "/media/{name}", handle_media),
+        web.get(prefix + "/avatar/{user_id}", handle_avatar),
     ])
     log(f"[nominations] mounted at {prefix}")
     return app
@@ -293,160 +358,258 @@ PAGE_HTML = """<!doctype html>
   :root {
     color-scheme: dark;
     --bg: #17212b;
+    --surface: #1d2834;
+    --card: #232e3c;
+    --line: rgba(255,255,255,.08);
     --fg: #f5f5f5;
     --muted: #8a9aa9;
-    --card: #232e3c;
     --accent: #3390ec;
+    --accent-soft: rgba(51,144,236,.16);
     --accent-fg: #fff;
+    --good: #4fbf77;
+    --good-soft: rgba(79,191,119,.16);
     --danger: #e5534b;
+    --radius: 14px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   [hidden] { display: none !important; }
+  html, body { overflow-x: hidden; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
-    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    padding-bottom: 96px;
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding-bottom: 110px;
   }
-  header { padding: 14px 12px 4px; }
-  h1 { font-size: 17px; margin: 0 0 2px; }
-  .sub { color: var(--muted); font-size: 13px; }
+  button { font: inherit; color: inherit; }
 
-  /* The tabs stay on screen while the grid scrolls under them: switching nomination is
-     the thing this page exists for, and it should never need a scroll back up. */
+  /* ------------------------------------------------------------------ header */
+  .hero { padding: 18px 16px 10px; }
+  .eyebrow { color: var(--muted); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+  .hero h1 { font-size: 22px; line-height: 1.2; margin: 4px 0 12px; }
+  .progress { display: flex; gap: 4px; }
+  .progress span { flex: 1; height: 5px; border-radius: 3px; background: rgba(255,255,255,.1);
+                   transition: background .3s; }
+  .progress span.done { background: var(--good); }
+  .progress span.here { background: var(--accent); }
+  .progressText { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .progressText.complete { color: var(--good); font-weight: 600; }
+  .adminStats { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px;
+          font-size: 12px; font-weight: 600; }
+  .pill.open { background: var(--good-soft); color: var(--good); }
+  .pill.closed { background: rgba(229,83,75,.15); color: var(--danger); }
+
+  /* -------------------------------------------------------------------- tabs */
+  /* Sticky: switching nomination is what this page is for, and it should never need a
+     scroll back up. */
+  /* Opaque, not frosted: a photo sliding under a translucent strip shows its captions
+     through it, and that reads as text bleeding into the controls. */
   .tabs { position: sticky; top: 0; z-index: 5; background: var(--bg);
-          display: flex; gap: 6px; overflow-x: auto; padding: 8px 12px;
-          scrollbar-width: none; border-bottom: 1px solid rgba(128,128,128,.2); }
+          display: flex; gap: 8px; overflow-x: auto; padding: 10px 16px;
+          scrollbar-width: none; border-bottom: 1px solid var(--line); }
   .tabs::-webkit-scrollbar { display: none; }
-  .tab { flex: none; border: 1px solid rgba(128,128,128,.4); border-radius: 16px;
-         background: transparent; color: var(--fg); padding: 6px 12px; font: inherit;
-         font-size: 14px; cursor: pointer; white-space: nowrap; }
-  .tab.active { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-  .tab .tick { margin-left: 4px; font-size: 12px; }
-  .tab.add { border-style: dashed; color: var(--accent); }
+  .tab { flex: none; display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+         border: 1px solid rgba(255,255,255,.14); border-radius: 999px; background: transparent;
+         padding: 6px 14px 6px 6px; font-size: 14px; white-space: nowrap;
+         transition: background .2s, border-color .2s; }
+  .tab .tabNum { width: 24px; height: 24px; border-radius: 50%; display: inline-flex;
+                 align-items: center; justify-content: center; font-size: 12px; font-weight: 700;
+                 background: rgba(255,255,255,.1); }
+  .tab.voted .tabNum { background: var(--good); color: #fff; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+  .tab.active .tabNum { background: rgba(255,255,255,.25); }
+  .tab.active.voted .tabNum { background: #fff; color: var(--accent); }
+  .tab .tabCount { font-size: 12px; opacity: .75; }
+  .tab.add { padding: 6px 14px; border-style: dashed; color: var(--accent); border-color: var(--accent); }
 
-  .nomHead { margin: 8px 12px 0; display: flex; align-items: center; gap: 8px; }
-  .nomHead .info { flex: 1; min-width: 0; color: var(--muted); font-size: 13px; }
-  .nomHead .info b { color: var(--fg); font-size: 15px; display: block;
-                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .iconBtn { flex: none; border: 1px solid rgba(128,128,128,.4); border-radius: 8px;
-             background: transparent; color: var(--fg); padding: 6px 10px; font: inherit;
-             font-size: 13px; cursor: pointer; }
-  .iconBtn.danger { color: var(--danger); border-color: var(--danger); }
+  /* ---------------------------------------------------------- nomination head */
+  .nomHero { padding: 16px 16px 4px; display: flex; gap: 10px; align-items: flex-start; }
+  .nomHero .text { flex: 1; min-width: 0; }
+  .nomIndex { color: var(--muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+  .nomName { font-size: 24px; font-weight: 800; line-height: 1.15; margin: 2px 0 4px;
+             overflow-wrap: anywhere; }
+  .nomHint { color: var(--muted); font-size: 13px; }
+  .iconBtn { flex: none; width: 40px; height: 40px; border-radius: 12px; cursor: pointer;
+             border: 1px solid rgba(255,255,255,.14); background: transparent; font-size: 16px; }
+  .iconBtn.danger { border-color: rgba(229,83,75,.6); }
 
-  .panel { margin: 8px 12px 0; padding: 10px 12px; border-radius: 10px;
-           background: var(--card); font-size: 13px; }
-  .panel .row { display: flex; align-items: center; justify-content: space-between;
-                gap: 8px; padding: 4px 0; }
-  .panel input[type="number"] { width: 56px; text-align: center; border-radius: 6px;
-              border: 1px solid rgba(128,128,128,.4); background: var(--bg);
-              color: var(--fg); padding: 4px; font-size: 13px; }
-  .nomForm { display: flex; gap: 6px; }
-  .nomForm input { flex: 1; min-width: 0; border-radius: 8px; padding: 9px 10px;
-                   border: 1px solid rgba(128,128,128,.4); background: var(--bg);
-                   color: var(--fg); font: inherit; }
-  .nomForm button { border: 0; border-radius: 8px; padding: 9px 12px; font: inherit;
-                    font-weight: 600; background: var(--accent); color: var(--accent-fg);
-                    cursor: pointer; }
+  .panel { margin: 10px 16px 0; padding: 12px 14px; border-radius: var(--radius); background: var(--card); }
+  .panel .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+  .panel input[type="number"] { width: 64px; text-align: center; border-radius: 10px;
+              border: 1px solid rgba(255,255,255,.18); background: var(--bg);
+              color: var(--fg); padding: 7px; font-size: 14px; }
+  .formTitle { margin-bottom: 8px; color: var(--muted); font-size: 13px; }
+  .nomForm { display: flex; gap: 8px; }
+  .nomForm input { flex: 1; min-width: 0; border-radius: 10px; padding: 10px 12px;
+                   border: 1px solid rgba(255,255,255,.18); background: var(--bg); color: var(--fg); font: inherit; }
+  .nomForm input:focus { outline: none; border-color: var(--accent); }
+  .nomForm button { border: 0; border-radius: 10px; padding: 10px 14px; font-weight: 600;
+                    background: var(--accent); color: var(--accent-fg); cursor: pointer; }
   .nomForm button.cancel { background: transparent; color: var(--muted);
-                           border: 1px solid rgba(128,128,128,.4); font-weight: 400; }
-  .formTitle { margin-bottom: 6px; color: var(--muted); }
+                           border: 1px solid rgba(255,255,255,.18); font-weight: 400; }
 
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 12px; }
-  .gcard { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
-  .thumb { position: relative; width: 100%; aspect-ratio: 1; display: block; overflow: hidden;
-           background: rgba(128,128,128,.2); cursor: pointer; }
-  .thumb > img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .count { position: absolute; right: 4px; top: 4px; background: rgba(0,0,0,.6);
-           color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 8px; }
-  .votes { position: absolute; left: 4px; top: 4px; background: var(--accent);
-           color: var(--accent-fg); font-size: 11px; padding: 1px 6px; border-radius: 8px; }
-  .gcard .who { padding: 5px 6px 2px; font-size: 11px; overflow: hidden;
-                text-overflow: ellipsis; white-space: nowrap; }
-  .pick { display: block; width: 100%; border: 0; padding: 7px 4px; font-size: 12px;
-          background: transparent; color: var(--muted); cursor: pointer;
-          border-top: 1px solid rgba(128,128,128,.25); }
-  .gcard.on { outline: 2px solid var(--accent); }
-  .gcard.on .pick { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
-  .gcard.out { opacity: .5; }
-  .pick[disabled], .pickBtn[disabled] { opacity: .5; cursor: default; }
+  /* Administrator's filter over the pool. */
+  .segments { display: flex; margin: 12px 16px 0; padding: 3px; border-radius: 12px; background: var(--card); gap: 3px; }
+  .segments button { flex: 1; border: 0; border-radius: 9px; padding: 7px 4px; background: transparent;
+                     color: var(--muted); font-size: 12px; cursor: pointer; }
+  .segments button b { color: var(--fg); font-weight: 600; margin-left: 3px; }
+  .segments button.on { background: var(--accent); color: var(--accent-fg); }
+  .segments button.on b { color: var(--accent-fg); }
+  .adminHint { margin: 8px 16px 0; color: var(--muted); font-size: 12px; }
 
-  .reel { position: fixed; inset: 0; z-index: 10; background: var(--bg);
-          overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  /* -------------------------------------------------------------------- works */
+  /* Two across for voters: few works per nomination, and judging a painting wants a
+     picture bigger than a thumbnail. The administrator's pool is denser, three across. */
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 14px 16px; }
+  .grid.dense { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  @media (min-width: 640px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                              .grid.dense { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+  .gcard { position: relative; background: var(--card); border-radius: var(--radius); overflow: hidden;
+           box-shadow: 0 0 0 1px var(--line); transition: box-shadow .2s, transform .15s, opacity .2s; }
+  .gcard.on { box-shadow: 0 0 0 2px var(--accent), 0 6px 18px rgba(51,144,236,.25); }
+  .gcard.out { opacity: .45; }
+  .gcard:active { transform: scale(.985); }
+  .thumb { position: relative; display: block; width: 100%; aspect-ratio: 1; overflow: hidden;
+           background: rgba(255,255,255,.05); cursor: zoom-in; }
+  .thumb > img.photo { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .badge { position: absolute; top: 8px; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+           font-weight: 600; background: rgba(0,0,0,.55); color: #fff; }
+  .badge.more { right: 8px; }
+  .badge.votes { left: 8px; background: var(--accent); }
+  .mark { position: absolute; right: 8px; bottom: 8px; width: 30px; height: 30px; border-radius: 50%;
+          background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center;
+          font-weight: 800; font-size: 15px; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+          transform: scale(0); transition: transform .25s cubic-bezier(.3,1.6,.6,1); }
+  .gcard.on .mark { transform: scale(1); }
+  .meta { display: flex; align-items: center; gap: 7px; padding: 8px 10px 0; min-width: 0; }
+  .grid.dense .meta { padding: 6px 7px 0; }
+  .name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .grid.dense .name { font-size: 11px; font-weight: 500; }
+  .ava { position: relative; flex: none; width: 24px; height: 24px; border-radius: 50%; overflow: hidden;
+         background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700;
+         display: inline-flex; align-items: center; justify-content: center; }
+  .ava img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .grid.dense .ava { width: 18px; height: 18px; font-size: 9px; }
+  .ava.big { width: 40px; height: 40px; font-size: 16px; }
+  .pick { display: block; width: calc(100% - 16px); margin: 8px; border-radius: 10px; cursor: pointer;
+          border: 1px solid var(--accent); background: transparent; color: var(--accent);
+          padding: 9px 4px; font-size: 14px; font-weight: 600; transition: background .2s, color .2s; }
+  .grid.dense .pick { width: calc(100% - 10px); margin: 6px 5px; padding: 6px 2px; font-size: 11px;
+                      border-color: rgba(255,255,255,.18); color: var(--muted); font-weight: 500; }
+  .gcard.on .pick, .grid.dense .gcard.on .pick { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  .pick[disabled], .pickBtn[disabled] { opacity: .45; cursor: default; }
+
+  .empty { margin: 28px 24px; text-align: center; color: var(--muted); }
+  .empty .icon { font-size: 40px; margin-bottom: 8px; }
+  .empty b { display: block; color: var(--fg); font-size: 16px; margin-bottom: 4px; }
+  .notice { margin: 12px 16px 0; padding: 12px 14px; border-radius: var(--radius);
+            background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
+
+  /* ------------------------------------------------------------------ results */
+  .results { margin: 4px 16px 16px; padding: 14px; border-radius: var(--radius); background: var(--card); }
+  .results h3 { margin: 0; font-size: 15px; }
+  .results .sub { color: var(--muted); font-size: 12px; margin: 2px 0 12px; }
+  /* One grid for the whole table so every bar starts at the same x (v1's lesson). */
+  .results .table { display: grid; align-items: center; column-gap: 8px; row-gap: 8px;
+                    grid-template-columns: auto 26px minmax(0, 40%) minmax(0, 1fr) auto; }
+  .results .rank { color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .results .mini { width: 26px; height: 26px; border-radius: 6px; object-fit: cover; display: block;
+                   background: rgba(255,255,255,.06); }
+  .results .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .results .who.mine { color: var(--accent); font-weight: 600; }
+  .results .track { height: 8px; border-radius: 4px; background: rgba(255,255,255,.08); overflow: hidden; }
+  .results .fill { display: block; height: 100%; border-radius: 4px; background: var(--accent);
+                   transition: width .5s ease; }
+  .results .num { text-align: right; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* ---------------------------------------------------------------------- bar */
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; display: flex; gap: 8px;
+         padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+         background: var(--bg); border-top: 1px solid var(--line); }
+  .go { flex: 1; border: 0; border-radius: 12px; padding: 14px; cursor: pointer;
+        font-size: 15px; font-weight: 700; background: var(--accent); color: var(--accent-fg);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .go.ghost { background: transparent; color: var(--fg); border: 1px solid rgba(255,255,255,.18); font-weight: 600; }
+  .go.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+  .go.square { flex: none; width: 52px; padding: 0; font-size: 20px; }
+  .go[disabled] { opacity: .4; cursor: default; }
+  .doneNote { flex: 1; text-align: center; padding: 13px; color: var(--good); font-weight: 600; }
+
+  /* -------------------------------------------------------------------- toast */
+  .toast { position: fixed; left: 50%; bottom: calc(86px + env(safe-area-inset-bottom)); z-index: 40;
+           transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+           padding: 9px 16px; border-radius: 999px; background: #0e161e; color: var(--fg);
+           font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.4); white-space: nowrap;
+           transition: opacity .25s, transform .25s; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.bad { background: var(--danger); color: #fff; }
+
+  /* ------------------------------------------------------------ thank-you popup */
+  .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+           padding: 24px; background: rgba(5,10,15,.72); animation: fade .2s ease; }
+  .sheet { width: min(100%, 360px); padding: 26px 22px 18px; border-radius: 22px; background: var(--card);
+           text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,.5); animation: pop .32s cubic-bezier(.2,1.3,.5,1); }
+  .okIcon { width: 56px; height: 56px; margin: 0 auto 12px; border-radius: 50%; background: var(--good);
+            color: #fff; font-size: 30px; font-weight: 800; display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 0 0 8px var(--good-soft); }
+  .sheet h2 { margin: 0 0 4px; font-size: 21px; }
+  .sheet .where { margin: 0; color: var(--muted); font-size: 14px; }
+  .nextBlock { margin: 20px 0 18px; }
+  .nextLabel { color: var(--muted); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+  /* The big number: which nomination is next, in the same numbering the tabs carry. */
+  .bigNum { width: 112px; height: 112px; margin: 10px auto 6px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 60px; font-weight: 800; line-height: 1; color: var(--accent);
+            background: var(--accent-soft); box-shadow: inset 0 0 0 3px var(--accent);
+            font-variant-numeric: tabular-nums; }
+  .bigNum.complete { color: var(--good); background: var(--good-soft); box-shadow: inset 0 0 0 3px var(--good); }
+  .bigOf { color: var(--muted); font-size: 13px; }
+  .nextName { margin-top: 6px; font-size: 18px; font-weight: 700; overflow-wrap: anywhere; }
+  .sheet .go { display: block; width: 100%; white-space: normal; line-height: 1.3; }
+  .sheet .go + .go { margin-top: 8px; }
+  @keyframes pop { from { transform: scale(.86); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+
+  /* ----------------------------------------------------------- reel and lens */
+  .reel { position: fixed; inset: 0; z-index: 10; background: var(--bg); overflow-y: auto;
+          -webkit-overflow-scrolling: touch; }
   body.reelOpen { overflow: hidden; }
-  .reelClose { position: fixed; top: 10px; right: 10px; z-index: 12;
-               border: 0; border-radius: 50%; width: 36px; height: 36px;
-               background: rgba(0,0,0,.55); color: #fff; font-size: 17px;
+  .reelClose { position: fixed; top: 10px; right: 10px; z-index: 12; border: 0; border-radius: 50%;
+               width: 38px; height: 38px; background: rgba(0,0,0,.55); color: #fff; font-size: 17px;
                line-height: 1; cursor: pointer; }
-  .feed { padding: 12px 12px calc(var(--barH, 96px) + 16px); }
-  .rcard { padding: 14px 0; border-bottom: 1px solid rgba(128,128,128,.2); }
+  .feed { padding: 12px 16px calc(var(--barH, 96px) + 16px); }
+  .rcard { padding: 16px 0; border-bottom: 1px solid var(--line); }
   .rcard:last-child { border-bottom: 0; }
-  .rcard .who { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
-  .rcard .who .tag { color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .rhead { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding-right: 44px; }
+  .rhead .text { min-width: 0; }
+  .rhead .name { font-size: 15px; }
+  .rhead .tag { color: var(--muted); font-size: 12px; }
   .rcard .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
-  .rcard .photos { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
-  .rcard .photos img { width: 100%; border-radius: 10px; display: block; cursor: pointer; }
+  .rcard .photos { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .rcard .photos img { width: 100%; border-radius: 12px; display: block; cursor: pointer; }
   .rcard.out { opacity: .6; }
   .shot { position: relative; }
-  .zoomBtn { position: absolute; right: 8px; bottom: 8px; z-index: 2;
-             border: 0; border-radius: 50%; width: 36px; height: 36px;
-             background: rgba(0,0,0,.55); color: #fff; font-size: 16px; line-height: 1;
-             display: flex; align-items: center; justify-content: center; cursor: pointer; }
-  .votesBadge { margin-left: 6px; background: var(--accent); color: var(--accent-fg);
-                font-size: 11px; padding: 1px 6px; border-radius: 8px; }
-  .pickBtn { display: block; width: 100%; border: 1px solid rgba(128,128,128,.35);
-             border-radius: 8px; padding: 10px; font-size: 14px; font-weight: 600;
-             background: transparent; color: var(--fg); cursor: pointer; }
-  .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-
-  .lens { position: fixed; inset: 0; z-index: 30; background: #000;
-          touch-action: none; overscroll-behavior: contain; }
+  .zoomBtn { position: absolute; right: 10px; bottom: 10px; z-index: 2; border: 0; border-radius: 50%;
+             width: 38px; height: 38px; background: rgba(0,0,0,.55); color: #fff; font-size: 16px;
+             line-height: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .pickBtn { display: block; width: 100%; border-radius: 12px; padding: 12px; cursor: pointer;
+             font-size: 15px; font-weight: 700; border: 1px solid var(--accent); background: transparent;
+             color: var(--accent); }
+  .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); }
+  .lens { position: fixed; inset: 0; z-index: 30; background: #000; touch-action: none; overscroll-behavior: contain; }
   .lensStage { position: absolute; inset: 0; overflow: hidden; touch-action: none; }
-  .lensStage img { position: absolute; left: 0; top: 0; transform-origin: 0 0;
-                   max-width: none; display: block; user-select: none;
-                   -webkit-user-drag: none; -webkit-user-select: none; }
-
-  .bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
-         padding-bottom: calc(10px + env(safe-area-inset-bottom));
-         background: var(--bg); border-top: 1px solid rgba(128,128,128,.25); z-index: 20; }
-  .go { width: 100%; border: 0; border-radius: 10px; padding: 14px;
-        font-size: 16px; font-weight: 600; background: var(--accent);
-        color: var(--accent-fg); cursor: pointer; }
-  .go[disabled] { opacity: .5; }
-  .go.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
-  .go.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
-  .msg { padding: 24px 16px; color: var(--muted); text-align: center; }
-  .notice { padding: 10px 12px; margin: 8px 12px 0; border-radius: 10px;
-            background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
-  .confirmBanner { margin: 8px 12px 0; padding: 8px 12px; border-radius: 8px;
-                   background: var(--accent); color: var(--accent-fg); font-size: 13px;
-                   text-align: center; opacity: 1; transition: opacity .6s ease; }
-  .confirmBanner.fade { opacity: 0; }
-
-  .results { margin: 4px 12px 12px; padding: 10px 12px; border-radius: 10px;
-             background: var(--card); font-size: 13px; }
-  .results h2 { margin: 0 0 4px; font-size: 14px; }
-  .results .voterCount { color: var(--muted); margin-bottom: 8px; }
-  /* One grid for the whole table so every bar starts at the same x (v1's lesson). */
-  .results .table { display: grid; align-items: center; column-gap: 8px; row-gap: 6px;
-                    grid-template-columns: auto minmax(0, 38%) auto minmax(0, 1fr) auto; }
-  .results .rank { color: var(--muted); font-size: 12px; text-align: right;
-                   font-variant-numeric: tabular-nums; }
-  .results .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .results .mini { width: 22px; height: 22px; border-radius: 4px; display: block;
-                   object-fit: cover; background: rgba(128,128,128,.2); }
-  .results .track { height: 8px; border-radius: 4px; background: rgba(128,128,128,.2); overflow: hidden; }
-  .results .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
-  .results .num { text-align: right; font-size: 12px; color: var(--muted);
-                  font-variant-numeric: tabular-nums; }
+  .lensStage img { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; display: block;
+                   user-select: none; -webkit-user-drag: none; -webkit-user-select: none; }
 </style>
 </head>
 <body>
-<header>
+<header class="hero">
+  <div class="eyebrow" id="eyebrow">Голосование</div>
   <h1 id="title">Номинации</h1>
-  <div class="sub" id="sub">Загружаю…</div>
+  <div id="heroBody"><div class="progressText">Загружаю…</div></div>
 </header>
-<!-- Above the tabs, because it is one setting for every nomination, not a property of
-     the one whose tab is open. -->
 <div class="panel" id="settings" hidden>
   <div class="row">
     <span>Сколько работ можно выбрать в каждой номинации</span>
@@ -459,21 +622,41 @@ PAGE_HTML = """<!doctype html>
   <form class="nomForm" id="nomForm">
     <input id="nomName" maxlength="40" autocomplete="off" placeholder="Например: Аниме">
     <button type="submit" id="nomSubmit">Создать</button>
-    <button type="button" class="cancel" id="nomCancel">✕</button>
+    <button type="button" class="cancel" id="nomCancel" aria-label="Отмена">✕</button>
   </form>
 </div>
-<div class="nomHead" id="nomHead" hidden>
-  <div class="info" id="nomInfo"></div>
-  <button class="iconBtn" id="renameBtn" hidden>✏️</button>
-  <button class="iconBtn danger" id="deleteBtn" hidden>🗑</button>
-</div>
-<div class="confirmBanner" id="confirmBanner" hidden>Голос учтён</div>
+<section class="nomHero" id="nomHero" hidden>
+  <div class="text">
+    <div class="nomIndex" id="nomIndex"></div>
+    <div class="nomName" id="nomTitle"></div>
+    <div class="nomHint" id="nomHint"></div>
+  </div>
+  <button class="iconBtn" id="renameBtn" aria-label="Переименовать" hidden>✏️</button>
+  <button class="iconBtn danger" id="deleteBtn" aria-label="Удалить" hidden>🗑</button>
+</section>
+<div class="segments" id="segments" hidden></div>
+<div class="adminHint" id="adminHint" hidden>Нажмите «Добавить» под работой, чтобы включить её в номинацию, или ещё раз — чтобы убрать. «Допущены» — работы, допущенные в основном голосовании /vote.</div>
 <div class="notice" id="notice" hidden></div>
 <div class="grid" id="grid"></div>
-<div class="msg" id="msg" hidden></div>
+<div class="empty" id="empty" hidden></div>
 <div class="results" id="results" hidden></div>
-<div class="bar" id="bar" hidden>
-  <button class="go" id="go"></button>
+<div class="bar" id="bar" hidden></div>
+<div class="toast" id="toast"></div>
+
+<div class="modal" id="thanks" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="thanksTitle">
+    <div class="okIcon">✓</div>
+    <h2 id="thanksTitle">Спасибо за ваш голос!</h2>
+    <p class="where" id="thanksWhere"></p>
+    <div class="nextBlock">
+      <div class="nextLabel" id="thanksLabel"></div>
+      <div class="bigNum" id="thanksNum"></div>
+      <div class="bigOf" id="thanksOf"></div>
+      <div class="nextName" id="thanksNext"></div>
+    </div>
+    <button class="go" id="thanksGo"></button>
+    <button class="go ghost" id="thanksStay"></button>
+  </div>
 </div>
 
 <div class="reel" id="reel" hidden>
@@ -496,7 +679,7 @@ if (tg) {
   };
   ask("setBackgroundColor", "#17212b", "6.1");
   ask("setHeaderColor", "#17212b", "6.9");
-  ask("setBottomBarColor", "#232e3c", "7.10");
+  ask("setBottomBarColor", "#17212b", "7.10");
 }
 const initData = (tg && tg.initData) || "";
 const MODE = new URLSearchParams(location.search).get("mode");
@@ -504,9 +687,12 @@ const MODE = new URLSearchParams(location.search).get("mode");
 let state = null;          // the server's state, see nominations_web._state_payload
 let active = null;         // id of the nomination whose tab is open
 let works = new Map();     // entry id -> entry payload
+let inVote = new Set();    // administrator: pool works /vote has admitted (kept between edits)
+let filter = "all";        // administrator: "all" | "vote" | "members"
 let formMode = null;       // "create" | "rename" while the name form is open
 let ballotInFlight = false;
-let confirmTimers = [];
+let thanksTarget = null;   // nomination the thank-you popup's main button leads to
+let toastTimer = null;
 // Administrator only: nomination id -> {inFlight, dirty}. Membership taps apply at once
 // on screen and are sent in the background; a tap made while a save is in flight marks
 // it dirty, and the save loop sends the latest set again, so the last tap always wins.
@@ -516,9 +702,9 @@ const $ = (id) => document.getElementById(id);
 
 if (window.ResizeObserver) {
   new ResizeObserver((entries) => {
-    const height = entries[0].contentRect.height;
+    const height = $("bar").hidden ? 0 : entries[0].contentRect.height;
     document.documentElement.style.setProperty("--barH", height + "px");
-    document.body.style.paddingBottom = (height + 16) + "px";
+    document.body.style.paddingBottom = (height + 24) + "px";
   }).observe($("bar"));
 }
 
@@ -528,12 +714,30 @@ function esc(s) {
   ));
 }
 
-function who(entry) { return entry.username ? "@" + entry.username : entry.author; }
+function displayName(entry) { return entry.author || (entry.username ? "@" + entry.username : "Автор"); }
+
+function avatarHtml(entry, extra) {
+  const initial = Array.from(String(entry.author || entry.username || "?").trim())[0] || "?";
+  return '<span class="ava' + (extra ? " " + extra : "") + '">' + esc(initial.toUpperCase()) +
+    (entry.avatar ? '<img loading="lazy" src="' + esc(entry.avatar) + '" alt="" onerror="this.remove()">' : "") +
+    "</span>";
+}
 
 function haptic(kind) {
   if (!tg || !tg.HapticFeedback) return;
-  if (kind === "select") tg.HapticFeedback.selectionChanged();
-  else tg.HapticFeedback.notificationOccurred(kind);
+  try {
+    if (kind === "select") tg.HapticFeedback.selectionChanged();
+    else tg.HapticFeedback.notificationOccurred(kind);
+  } catch (e) {}
+}
+
+function toast(text, bad) {
+  const box = $("toast");
+  box.textContent = text;
+  box.classList.toggle("bad", !!bad);
+  box.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => box.classList.remove("show"), bad ? 3200 : 1800);
 }
 
 async function call(path, body) {
@@ -544,53 +748,90 @@ async function call(path, body) {
     options.body = JSON.stringify(Object.assign({ init_data: initData }, body));
   }
   const response = await fetch(PREFIX + path, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "не получилось");
+  let data = {};
+  try { data = await response.json(); } catch (e) {}
+  if (!response.ok) throw new Error(data.error || "Не получилось — попробуйте ещё раз");
   return data;
 }
 
 function nom(id) { return state.nominations.find((n) => n.id === id) || null; }
 function current() { return nom(active); }
-
-// The works the grid and the reel show: the whole pool for the administrator (choosing
-// from it is the job), the open nomination's works for everybody else.
-function shownWorks() {
-  if (state.is_admin) return state.entries;
-  const n = current();
-  return n ? n.entry_ids.map((id) => works.get(id)).filter(Boolean) : [];
-}
-
+function position(n) { return state.nominations.indexOf(n) + 1; }
 function voted(n) { return n.my_vote && n.my_vote.length > 0; }
+function allVoted() { return state.nominations.length > 0 && state.nominations.every(voted); }
+
+// The works the grid and the reel show: the open nomination's for a voter; for the
+// administrator, the pool through the chosen filter.
+function shownWorks() {
+  const n = current();
+  if (!state.is_admin) return n ? n.entry_ids.map((id) => works.get(id)).filter(Boolean) : [];
+  if (filter === "vote") return state.entries.filter((e) => inVote.has(e.id));
+  if (filter === "members") return n ? state.entries.filter((e) => n.entry_ids.includes(e.id)) : [];
+  return state.entries;
+}
 
 function applyState(data) {
   state = data;
   works = new Map(state.entries.map((e) => [e.id, e]));
+  if (Array.isArray(data.vote_admitted)) inVote = new Set(data.vote_admitted);
   if (!current()) {
-    // A voter lands on the first nomination they have not voted in yet: that is where
-    // the next thing for them to do is.
+    // A voter lands on the first nomination they have not voted in: that is where the
+    // next thing for them to do is.
     const fresh = state.is_admin ? null : state.nominations.find((n) => !voted(n));
     active = (fresh || state.nominations[0] || {}).id || null;
   }
 }
 
+// The next nomination still waiting for this voter's vote, looking forward from the open
+// one and wrapping round; null once they have voted everywhere.
+function nextUnvoted() {
+  const list = state.nominations;
+  const at = list.findIndex((n) => n.id === active);
+  const order = list.slice(at + 1).concat(list.slice(0, Math.max(at, 0)));
+  return order.find((n) => !voted(n)) || null;
+}
+
 // ------------------------------------------------------------------------- rendering
+
+function renderHero() {
+  const list = state.nominations;
+  if (state.is_admin) {
+    $("eyebrow").textContent = "Настройка · тестовая версия";
+    $("title").textContent = "Номинации";
+    $("heroBody").innerHTML = '<div class="adminStats">' +
+      '<span class="pill ' + (state.open ? "open" : "closed") + '">' +
+        (state.open ? "● Голосование открыто" : "● Голосование закрыто") + "</span>" +
+      "<span>Работ из /vote: " + state.entries.length + " · номинаций: " + list.length + "</span></div>";
+    return;
+  }
+  $("eyebrow").textContent = "Голосование";
+  $("title").textContent = "Номинации";
+  if (!list.length) { $("heroBody").innerHTML = ""; return; }
+  const done = list.filter(voted).length;
+  const segments = list.map((n) =>
+    '<span class="' + (voted(n) ? "done" : (n.id === active ? "here" : "")) + '"></span>').join("");
+  const text = !state.open ? "Голосование закрыто — смотрите итоги в каждой номинации"
+    : (allVoted() ? "Спасибо! Вы проголосовали во всех номинациях"
+                  : "Вы проголосовали в " + done + " из " + list.length + " номинаций");
+  $("heroBody").innerHTML = '<div class="progress">' + segments + "</div>" +
+    '<div class="progressText' + (allVoted() && state.open ? " complete" : "") + '">' + esc(text) + "</div>" +
+    (state.can_moderate ? '<div class="progressText">Вы администратор — настройка: /vote3 выбрать</div>' : "");
+}
 
 function renderTabs() {
   const tabs = $("tabs");
-  const items = state.nominations.map((n) =>
-    '<button class="tab' + (n.id === active ? " active" : "") + '" data-tab="' + esc(n.id) + '">' +
-      esc(n.name) +
-      (state.is_admin
-        ? ' <span class="tick">' + n.entry_ids.length + "</span>"
-        : (voted(n) ? ' <span class="tick">✓</span>' : "")) +
-    "</button>"
-  );
+  const items = state.nominations.map((n, i) => {
+    const classes = "tab" + (n.id === active ? " active" : "") + (!state.is_admin && voted(n) ? " voted" : "");
+    const badge = !state.is_admin && voted(n) ? "✓" : String(i + 1);
+    return '<button class="' + classes + '" data-tab="' + esc(n.id) + '">' +
+      '<span class="tabNum">' + badge + "</span>" + esc(n.name) +
+      (state.is_admin ? ' <span class="tabCount">' + n.entry_ids.length + "</span>" : "") + "</button>";
+  });
   // First, not last: at the end of a long strip it scrolls out of sight, and adding a
   // nomination is the one thing an administrator has to be able to find.
   if (state.is_admin) items.unshift('<button class="tab add" data-add="1">＋ Номинация</button>');
-  // The strip is redrawn on every membership tap, so it keeps its own scroll and only
-  // slides sideways to the open tab -- scrollIntoView could move the PAGE as well, and
-  // throw an administrator out of their place halfway down the pool.
+  // The strip is redrawn on every tap, so it keeps its own scroll and only slides
+  // sideways to the open tab -- scrollIntoView could move the PAGE as well.
   const keep = tabs.scrollLeft;
   tabs.innerHTML = items.join("");
   tabs.hidden = items.length === 0;
@@ -598,38 +839,45 @@ function renderTabs() {
   const on = tabs.querySelector(".tab.active");
   if (on) {
     const left = on.offsetLeft, right = left + on.offsetWidth;
-    if (left < tabs.scrollLeft) tabs.scrollLeft = left - 12;
-    else if (right > tabs.scrollLeft + tabs.clientWidth) tabs.scrollLeft = right - tabs.clientWidth + 12;
+    if (left < tabs.scrollLeft + 16) tabs.scrollLeft = left - 16;
+    else if (right > tabs.scrollLeft + tabs.clientWidth - 16) tabs.scrollLeft = right - tabs.clientWidth + 16;
   }
 }
 
-function renderSub() {
-  const sub = $("sub");
-  if (!state.exists && !state.is_admin) { sub.textContent = ""; return; }
-  if (state.is_admin) {
-    sub.textContent = "Настройка номинаций · работ собрано " + state.entries.length +
-      " · " + (state.open ? "голосование открыто" : "голосование закрыто");
-    return;
-  }
-  const total = state.nominations.length;
-  const done = state.nominations.filter(voted).length;
-  sub.textContent = !state.open ? "Голосование закрыто"
-    : (total ? "Проголосовано в " + done + " из " + total + " номинаций" : "");
-  if (state.can_moderate) sub.textContent += " · настройка: /vote3 выбрать";
-}
-
-function renderHead() {
-  const n = current();
-  const head = $("nomHead");
-  if (!n) { head.hidden = true; return; }
-  head.hidden = false;
+function hintFor() {
   const cap = state.max_choices;
-  $("nomInfo").innerHTML = "<b>" + esc(n.name) + "</b>" + (state.is_admin
-    ? "работ в номинации " + n.entry_ids.length + " из " + state.entries.length +
-      " · проголосовало " + n.voter_count
-    : (cap === 1 ? "Выбери одну работу" : cap ? "Выбери до " + cap + " работ" : "Выбери понравившиеся работы"));
+  if (!state.open) return "Голосование закрыто";
+  const pick = cap === 1 ? "Выберите одну работу" : cap ? "Выберите до " + cap + " работ" : "Выберите понравившиеся работы";
+  return pick + " · нажмите на фото, чтобы рассмотреть";
+}
+
+function renderNomHero() {
+  const n = current();
+  $("nomHero").hidden = !n;
+  if (!n) return;
+  $("nomIndex").textContent = "Номинация " + position(n) + " из " + state.nominations.length;
+  $("nomTitle").textContent = n.name;
+  $("nomHint").textContent = state.is_admin
+    ? "В номинации работ: " + n.entry_ids.length + " · проголосовало: " + n.voter_count
+    : hintFor();
   $("renameBtn").hidden = !state.is_admin;
   $("deleteBtn").hidden = !state.is_admin;
+}
+
+function renderSegments() {
+  const box = $("segments");
+  const n = current();
+  box.hidden = !state.is_admin || !n || !state.entries.length;
+  $("adminHint").hidden = box.hidden;
+  if (box.hidden) return;
+  const options = [
+    ["all", "Все", state.entries.length],
+    ["vote", "Допущены", state.entries.filter((e) => inVote.has(e.id)).length],
+    ["members", "В номинации", n.entry_ids.length],
+  ];
+  box.innerHTML = options.map(([key, label, count]) =>
+    '<button data-filter="' + key + '" class="' + (filter === key ? "on" : "") + '">' +
+    esc(label) + "<b>" + count + "</b></button>").join("");
 }
 
 function isChosen(id) {
@@ -639,42 +887,38 @@ function isChosen(id) {
 }
 
 function pickLabel(id, short) {
-  if (state.is_admin) {
-    if (isChosen(id)) return short ? "✓ в номинации" : "В номинации ✓ (убрать)";
-    return short ? "добавить" : "Добавить в номинацию";
-  }
-  if (isChosen(id)) return short ? "✓ учтён" : "Голос учтён ✓";
-  return short ? "выбрать" : "Выбрать";
+  if (state.is_admin) return isChosen(id) ? "✓ В номинации" : "＋ Добавить";
+  if (isChosen(id)) return short ? "✓ Ваш голос" : "✓ Ваш голос — отменить";
+  return short ? "Голосовать" : "Голосовать за эту работу";
 }
 
 function picksDisabled() { return !state.is_admin && !state.open; }
 
 function countFor(id) {
   const n = current();
-  if (!n || !n.results) return 0;
-  const row = n.results.find((r) => r.id === id);
+  const row = n && n.results ? n.results.find((r) => r.id === id) : null;
   return row ? row.votes : 0;
 }
 
 function renderGrid() {
   const grid = $("grid");
+  grid.className = "grid" + (state.is_admin ? " dense" : "");
   grid.innerHTML = "";
   const disabled = picksDisabled() ? " disabled" : "";
-  const showCounts = state.is_admin;
   for (const entry of shownWorks()) {
     const card = document.createElement("div");
     card.className = "card gcard";
     card.dataset.entry = entry.id;
-    const count = showCounts && isChosen(entry.id) ? countFor(entry.id) : 0;
-    const more = entry.photos.length > 1 ? '<span class="count">+' + (entry.photos.length - 1) + "</span>" : "";
+    const count = state.is_admin && isChosen(entry.id) ? countFor(entry.id) : 0;
     card.innerHTML =
-      '<div class="thumb" data-open="' + esc(entry.id) + '" role="button">' +
-        (entry.photos[0] ? '<img loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' : "") +
-        more + (count ? '<span class="votes">' + count + "</span>" : "") +
+      '<div class="thumb" data-open="' + esc(entry.id) + '" role="button" aria-label="Рассмотреть работу">' +
+        (entry.photos[0] ? '<img class="photo" loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">' : "") +
+        (entry.photos.length > 1 ? '<span class="badge more">+' + (entry.photos.length - 1) + "</span>" : "") +
+        (count ? '<span class="badge votes">' + count + "</span>" : "") +
+        '<span class="mark">✓</span>' +
       "</div>" +
-      '<div class="who">' + esc(who(entry)) + "</div>" +
-      '<button class="pick" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
-        pickLabel(entry.id, true) + "</button>";
+      '<div class="meta">' + avatarHtml(entry) + '<span class="name">' + esc(displayName(entry)) + "</span></div>" +
+      '<button class="pick" data-pick="' + esc(entry.id) + '"' + disabled + ">" + pickLabel(entry.id, true) + "</button>";
     grid.appendChild(card);
   }
 }
@@ -687,18 +931,16 @@ function renderReel() {
     const card = document.createElement("div");
     card.className = "card rcard";
     card.dataset.entry = entry.id;
-    const count = state.is_admin && isChosen(entry.id) ? countFor(entry.id) : 0;
     card.innerHTML =
-      '<div class="who">' + esc(entry.author) +
-        (entry.username ? '<span class="tag">@' + esc(entry.username) + "</span>" : "") +
-        (count ? '<span class="votesBadge">' + count + "</span>" : "") + "</div>" +
+      '<div class="rhead">' + avatarHtml(entry, "big") + '<div class="text"><div class="name">' +
+        esc(displayName(entry)) + "</div>" +
+        (entry.username ? '<div class="tag">@' + esc(entry.username) + "</div>" : "") + "</div></div>" +
       (entry.text ? '<div class="cap">' + esc(entry.text) + "</div>" : "") +
       '<div class="photos">' + entry.photos.map((p) =>
         '<div class="shot"><img loading="lazy" src="' + esc(p) + '" alt="">' +
         '<button type="button" class="zoomBtn" aria-label="Увеличить" data-zoom="' + esc(p) + '">⛶</button></div>'
       ).join("") + "</div>" +
-      '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' + disabled + ">" +
-        pickLabel(entry.id) + "</button>";
+      '<button class="pickBtn" data-pick="' + esc(entry.id) + '"' + disabled + ">" + pickLabel(entry.id) + "</button>";
     feed.appendChild(card);
   }
 }
@@ -724,153 +966,206 @@ function renderResults() {
   if (!n || !n.results || !n.results.length) { box.hidden = true; return; }
   box.hidden = false;
   const max = Math.max(1, ...n.results.map((r) => r.votes));
+  const mine = new Set(n.my_vote || []);
   box.innerHTML =
-    "<h2>Голоса · " + esc(n.name) + "</h2>" +
-    '<div class="voterCount">Проголосовало: ' + (n.voter_count || 0) + "</div>" +
+    "<h3>Голоса в номинации «" + esc(n.name) + "»</h3>" +
+    '<div class="sub">Проголосовало: ' + (n.voter_count || 0) + "</div>" +
     '<div class="table">' + n.results.map((r, i) => {
       const entry = works.get(r.id) || { author: "?", photos: [] };
       return '<span class="rank">' + (i + 1) + "</span>" +
-        '<span class="name">' + esc(who(entry)) + "</span>" +
         (entry.photos[0] ? '<img class="mini" loading="lazy" src="' + esc(entry.photos[0]) + '" alt="">'
                          : '<span class="mini"></span>') +
+        '<span class="who' + (mine.has(r.id) ? " mine" : "") + '">' + esc(displayName(entry)) +
+          (mine.has(r.id) ? " · ваш голос" : "") + "</span>" +
         '<span class="track"><span class="fill" style="width:' + Math.round(100 * r.votes / max) + '%"></span></span>' +
         '<span class="num">' + r.votes + "</span>";
     }).join("") + "</div>";
 }
 
-// The voter's way through the tabs: the next nomination they have not voted in, or
-// simply the next one once they have voted everywhere.
-function nextNomination() {
-  const list = state.nominations;
-  const at = list.findIndex((n) => n.id === active);
-  const order = list.slice(at + 1).concat(list.slice(0, Math.max(at, 0)));
-  return order.find((n) => !voted(n)) || order[0] || null;
-}
-
-function updateBar() {
+function renderBar() {
   const bar = $("bar");
-  const go = $("go");
-  go.className = "go";
-  go.disabled = false;
   if (state.is_admin) {
     bar.hidden = !state.exists;
-    go.textContent = state.open ? "Закрыть голосование" : "Открыть голосование";
-    if (state.open) go.classList.add("danger");
+    bar.innerHTML = '<button class="go ' + (state.open ? "danger" : "") + '" data-bar="toggle">' +
+      (state.open ? "Закрыть голосование" : "Открыть голосование") + "</button>";
     return;
   }
-  const next = state.nominations.length > 1 ? nextNomination() : null;
-  bar.hidden = !next;
-  if (next) {
-    go.classList.add("secondary");
-    go.textContent = "Дальше: " + next.name + " →";
+  const list = state.nominations;
+  const n = current();
+  if (list.length < 2 || !n) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const at = list.indexOf(n);
+  const target = nextUnvoted() || list[at + 1] || null;
+  const prev = '<button class="go ghost square" data-bar="prev" aria-label="Предыдущая номинация"' +
+    (at > 0 ? "" : " disabled") + ">‹</button>";
+  bar.innerHTML = prev + (target
+    ? '<button class="go" data-bar="next" data-target="' + esc(target.id) + '">Дальше: ' +
+        position(target) + ". " + esc(target.name) + " →</button>"
+    : '<div class="doneNote">✓ Все номинации пройдены</div>');
+}
+
+function renderEmpty() {
+  const box = $("empty");
+  let icon = "", title = "", text = "";
+  if (state.is_admin && !state.entries.length) {
+    icon = "🖼"; title = "Работ пока нет";
+    text = "Работы берутся из основного голосования. Соберите их там: /vote собрать — и они появятся здесь сами.";
+  } else if (state.is_admin && !state.nominations.length) {
+    icon = "🏷"; title = "Создайте первую номинацию";
+    text = "Нажмите «＋ Номинация», дайте ей название и отметьте работы, которые в ней участвуют.";
+  } else if (!state.is_admin && !state.nominations.length) {
+    icon = "⏳"; title = "Номинации ещё готовятся";
+    text = "Загляните чуть позже — здесь появятся вкладки с номинациями.";
+  } else if (!shownWorks().length) {
+    icon = "∅";
+    title = state.is_admin && filter !== "all" ? "Под этот фильтр ничего не подходит" : "В этой номинации пока нет работ";
+    text = state.is_admin ? "Переключите фильтр на «Все», чтобы добавить работы." : "";
   }
+  box.hidden = !title;
+  box.innerHTML = title ? '<div class="icon">' + icon + "</div><b>" + esc(title) + "</b>" + esc(text) : "";
 }
 
 function renderNotice() {
   const notice = $("notice");
   notice.hidden = state.is_admin || state.open || !state.nominations.length;
-  notice.textContent = "Голосование закрыто — смотри итоги в каждой номинации.";
+  notice.textContent = "Голосование закрыто. Итоги — под работами в каждой номинации.";
 }
 
-function render() {
-  renderSub();
-  renderTabs();
-  renderHead();
-  renderNotice();
-  $("settings").hidden = !state.is_admin || !state.exists;
-  $("maxChoices").value = state.max_choices || "";
-  const msg = $("msg");
-  const list = shownWorks();
-  let empty = "";
-  if (state.is_admin && !state.entries.length) {
-    empty = "Работ пока нет. Собери их: /vote3 собрать — или возьми из основного голосования: /vote3 импорт.";
-  } else if (state.is_admin && !state.nominations.length) {
-    empty = "Создай первую номинацию кнопкой «＋ Номинация» и отметь, какие работы в ней участвуют.";
-  } else if (!state.is_admin && !state.nominations.length) {
-    empty = "Номинации ещё не готовы. Загляни позже.";
-  } else if (!list.length) {
-    empty = "В этой номинации пока нет работ.";
-  }
-  msg.hidden = !empty;
-  msg.textContent = empty;
+function renderWorks() {
   // A full render can happen with the reel open (an admin save); keep the reader's place.
   const reelScroll = $("reel").scrollTop;
   renderGrid();
   renderReel();
   $("reel").scrollTop = reelScroll;
   syncPicks();
-  renderResults();
-  updateBar();
 }
 
-function showConfirmBanner(text) {
-  const banner = $("confirmBanner");
-  confirmTimers.forEach(clearTimeout);
-  confirmTimers = [];
-  banner.textContent = text;
-  banner.hidden = false;
-  banner.classList.remove("fade");
-  confirmTimers.push(setTimeout(() => banner.classList.add("fade"), 1600));
-  confirmTimers.push(setTimeout(() => { banner.hidden = true; }, 2300));
+function render() {
+  renderHero();
+  renderTabs();
+  renderNomHero();
+  renderSegments();
+  renderNotice();
+  $("settings").hidden = !state.is_admin || !state.exists;
+  $("maxChoices").value = state.max_choices || "";
+  renderWorks();
+  renderEmpty();
+  renderResults();
+  renderBar();
 }
 
 function switchTab(id) {
-  if (id === active) return;
+  if (!id || id === active) return;
   active = id;
-  // The banner names the nomination it confirmed, which is no longer the one on screen.
-  confirmTimers.forEach(clearTimeout);
-  confirmTimers = [];
-  $("confirmBanner").hidden = true;
   closeForm();
   closeReel();
   render();
-  window.scrollTo({ top: 0 });
+  window.scrollTo({ top: 0, behavior: "smooth" });
   haptic("select");
 }
 
+// ---------------------------------------------------------------- the thank-you popup
+
+// After the vote that counts: the first choice in a nomination, or the one that fills
+// its cap. Every further tap in the same nomination only gets the small toast -- a popup
+// on each of several picks would be a popup to dismiss on each of them.
+function showThanks(n) {
+  const list = state.nominations;
+  const next = nextUnvoted();
+  const cap = state.max_choices;
+  const canPickMore = state.open && cap !== 1 && (!cap || n.my_vote.length < cap);
+  $("thanksWhere").textContent = "Голос в номинации «" + n.name + "» учтён";
+  const big = $("thanksNum");
+  if (next) {
+    thanksTarget = next.id;
+    $("thanksLabel").textContent = "Следующая номинация";
+    big.textContent = String(position(next));
+    big.classList.remove("complete");
+    $("thanksOf").textContent = "из " + list.length;
+    $("thanksNext").textContent = "«" + next.name + "»";
+    $("thanksGo").textContent = "Перейти к голосованию номинации «" + next.name + "»";
+    $("thanksStay").textContent = canPickMore ? "Выбрать ещё работы здесь" : "Остаться здесь";
+  } else {
+    thanksTarget = null;
+    $("thanksLabel").textContent = list.length > 1 ? "Вы проголосовали во всех номинациях" : "Номинация пройдена";
+    big.textContent = String(list.filter(voted).length);
+    big.classList.add("complete");
+    $("thanksOf").textContent = "из " + list.length;
+    $("thanksNext").textContent = "";
+    $("thanksGo").textContent = "Посмотреть результаты";
+    $("thanksStay").textContent = canPickMore ? "Выбрать ещё работы" : "Закрыть";
+  }
+  $("thanks").hidden = false;
+  if (tg && tg.BackButton) tg.BackButton.show();
+  $("thanksGo").focus({ preventScroll: true });
+}
+
+function closeThanks() {
+  $("thanks").hidden = true;
+  if ($("reel").hidden && $("lens").hidden && tg && tg.BackButton) tg.BackButton.hide();
+}
+
+$("thanksGo").addEventListener("click", () => {
+  closeThanks();
+  if (thanksTarget) { switchTab(thanksTarget); return; }
+  closeReel();
+  const results = $("results");
+  if (!results.hidden) results.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+$("thanksStay").addEventListener("click", closeThanks);
+$("thanks").addEventListener("click", (event) => { if (event.target === $("thanks")) closeThanks(); });
+
 // --------------------------------------------------------------------------- voting
 
-// The tap IS the vote, as in v1's default mode; tapping a chosen work takes it back.
-// One ballot at a time: a second tap computed from a `my_vote` the first request has not
-// updated yet could otherwise quietly drop a choice.
+// The tap IS the vote; tapping a chosen work takes it back. One ballot at a time: a
+// second tap computed from a `my_vote` the first request has not updated yet could
+// otherwise quietly drop a choice.
 async function vote(id) {
   if (ballotInFlight) return;
   const n = current();
   if (!n) return;
-  const has = n.my_vote.includes(id);
+  const before = n.my_vote.slice();
+  const has = before.includes(id);
   const cap = state.max_choices;
   let next;
   if (cap === 1) {
     next = has ? [] : [id];   // a single-choice nomination behaves like a radio button
   } else {
-    if (!has && cap && n.my_vote.length >= cap) {
-      alert("В номинации можно выбрать не более " + cap + ".");
+    if (!has && cap && before.length >= cap) {
+      toast("В номинации можно выбрать не более " + cap, true);
+      haptic("error");
       return;
     }
-    next = has ? n.my_vote.filter((x) => x !== id) : n.my_vote.concat([id]);
+    next = has ? before.filter((x) => x !== id) : before.concat([id]);
   }
   haptic("select");
   ballotInFlight = true;
   try {
     const data = await call("/api/ballot", { nomination_id: n.id, choices: next });
     Object.assign(n, data.nomination);
-    haptic("success");
-    showConfirmBanner(next.length ? "Голос учтён · " + n.name : "Голос снят · " + n.name);
   } catch (e) {
-    alert(String(e.message || e));
+    ballotInFlight = false;
+    toast(String(e.message || e), true);
     // Most refusals mean the page is out of date (the vote closed, the nomination was
     // edited or deleted), so it is brought up to date rather than left showing a lie.
-    ballotInFlight = false;
     await reload().catch(() => {});
     return;
   } finally {
     ballotInFlight = false;
   }
   syncPicks();
-  renderSub();
+  renderHero();
   renderTabs();
   renderResults();
-  updateBar();
+  renderBar();
+  const after = n.my_vote.length;
+  const counts = after > 0 && (before.length === 0 || (cap && cap > 1 && after >= cap && before.length < cap));
+  if (counts) {
+    haptic("success");
+    showThanks(n);
+  } else {
+    toast(after ? (before.length ? "Голос обновлён" : "Голос учтён") : "Голос снят");
+  }
 }
 
 // ------------------------------------------------------------------- administration
@@ -883,9 +1178,11 @@ function toggleMember(id) {
   // Pool order, the order the server stores and the voter will see.
   n.entry_ids = state.entries.map((e) => e.id).filter((x) => members.has(x));
   haptic("select");
-  syncPicks();
+  // Under "В номинации" a removed work leaves the view, so that one redraws.
+  if (filter === "members") { renderWorks(); renderEmpty(); } else syncPicks();
   renderTabs();
-  renderHead();
+  renderNomHero();
+  renderSegments();
   saveMembers(n.id);
 }
 
@@ -908,10 +1205,10 @@ async function saveMembers(nominationId) {
     if (fresh && n) {
       n.results = fresh.results;
       n.voter_count = fresh.voter_count;
-      if (nominationId === active) { renderResults(); renderHead(); }
+      if (nominationId === active) { renderResults(); renderNomHero(); }
     }
   } catch (e) {
-    alert("Не сохранилось: " + String(e.message || e));
+    toast("Не сохранилось: " + String(e.message || e), true);
     await reload();
   } finally {
     slot.inFlight = false;
@@ -936,13 +1233,13 @@ async function adminChange(path, body, success) {
   try {
     const data = await call(path, body);
     applyState(data.state);
-    if (data.nomination_id && path.endsWith("/create")) active = data.nomination_id;
+    if (data.nomination_id && path.endsWith("/create")) { active = data.nomination_id; filter = "all"; }
     render();
     haptic("success");
-    if (success) showConfirmBanner(success);
+    if (success) toast(success);
     return true;
   } catch (e) {
-    alert(String(e.message || e));
+    toast(String(e.message || e), true);
     return false;
   }
 }
@@ -955,7 +1252,7 @@ $("nomForm").addEventListener("submit", async (event) => {
   button.disabled = true;
   const ok = formMode === "rename"
     ? await adminChange("/api/nominations/update", { nomination_id: active, name }, "Переименовано")
-    : await adminChange("/api/nominations/create", { name }, "Номинация создана — отметь её работы");
+    : await adminChange("/api/nominations/create", { name }, "Номинация создана — отметьте её работы");
   button.disabled = false;
   if (ok) closeForm();
 });
@@ -975,16 +1272,21 @@ $("maxChoices").addEventListener("change", async () => {
   await adminChange("/api/settings", { max_choices: value }, "Сохранено");
 });
 
-$("go").addEventListener("click", async () => {
-  if (state.is_admin) {
+$("bar").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-bar]");
+  if (!button || button.disabled) return;
+  const action = button.dataset.bar;
+  if (action === "toggle") {
     const opening = !state.open;
-    if (!opening && !confirm("Закрыть голосование во всех номинациях? Голосовать будет нельзя, пока не откроешь снова.")) return;
-    await adminChange("/api/settings", { open: opening },
-                      opening ? "Голосование открыто" : "Голосование закрыто");
-    return;
+    if (!opening && !confirm("Закрыть голосование во всех номинациях? Голосовать будет нельзя, пока не откроете снова.")) return;
+    await adminChange("/api/settings", { open: opening }, opening ? "Голосование открыто" : "Голосование закрыто");
+  } else if (action === "next") {
+    switchTab(button.dataset.target);
+  } else if (action === "prev") {
+    const list = state.nominations;
+    const at = list.findIndex((n) => n.id === active);
+    if (at > 0) switchTab(list[at - 1].id);
   }
-  const next = nextNomination();
-  if (next) switchTab(next.id);
 });
 
 // ------------------------------------------------------------------- reel and lens
@@ -1003,7 +1305,7 @@ function closeReel() {
   if (!$("lens").hidden) closeLens();
   $("reel").hidden = true;
   document.body.classList.remove("reelOpen");
-  if (tg && tg.BackButton) tg.BackButton.hide();
+  if ($("thanks").hidden && tg && tg.BackButton) tg.BackButton.hide();
 }
 
 function closeReelAt(entryId) {
@@ -1068,7 +1370,7 @@ function closeLens() {
   lensPinch = null;
   if (!$("reel").hidden) return;
   document.body.classList.remove("reelOpen");
-  if (tg && tg.BackButton) tg.BackButton.hide();
+  if ($("thanks").hidden && tg && tg.BackButton) tg.BackButton.hide();
 }
 
 const lensStageEl = $("lensStage");
@@ -1127,8 +1429,13 @@ lensStageEl.addEventListener("wheel", (event) => {
 window.addEventListener("resize", () => { if (!$("lens").hidden) lensFit(); });
 $("lensClose").addEventListener("click", closeLens);
 
+// Telegram's back arrow steps back one layer: the popup, then the lens, then the reel.
 if (tg && tg.BackButton) {
-  tg.BackButton.onClick(() => { if (!$("lens").hidden) closeLens(); else closeReel(); });
+  tg.BackButton.onClick(() => {
+    if (!$("thanks").hidden) closeThanks();
+    else if (!$("lens").hidden) closeLens();
+    else closeReel();
+  });
 }
 $("reelClose").addEventListener("click", closeReel);
 
@@ -1136,14 +1443,14 @@ $("reelClose").addEventListener("click", closeReel);
 // on one must not (measured from pointerdown, as v1 does).
 let reelTap = null;
 $("feed").addEventListener("pointerdown", (event) => {
-  reelTap = event.target.tagName === "IMG"
+  reelTap = event.target.tagName === "IMG" && !event.target.closest(".ava")
     ? { x: event.clientX, y: event.clientY, at: Date.now(), target: event.target } : null;
 });
 $("feed").addEventListener("pointercancel", () => { reelTap = { cancelled: true }; });
 $("feed").addEventListener("click", (event) => {
   const zoom = event.target.closest("[data-zoom]");
   if (zoom) { event.preventDefault(); reelTap = null; openLens(zoom.dataset.zoom); return; }
-  if (event.target.tagName !== "IMG") return;
+  if (event.target.tagName !== "IMG" || event.target.closest(".ava")) return;
   const start = reelTap;
   reelTap = null;
   if (start) {
@@ -1159,6 +1466,8 @@ document.addEventListener("click", (event) => {
   const tab = event.target.closest("[data-tab]");
   if (tab) { switchTab(tab.dataset.tab); return; }
   if (event.target.closest("[data-add]")) { openForm("create"); return; }
+  const chip = event.target.closest("[data-filter]");
+  if (chip) { filter = chip.dataset.filter; renderSegments(); renderWorks(); renderEmpty(); return; }
   const open = event.target.closest("[data-open]");
   if (open) { event.preventDefault(); openReel(open.dataset.open); return; }
   const pick = event.target.closest("[data-pick]");
@@ -1175,9 +1484,10 @@ async function reload() {
 }
 
 reload().catch((e) => {
-  $("sub").textContent = "";
-  $("msg").hidden = false;
-  $("msg").textContent = String(e.message || e);
+  $("heroBody").innerHTML = "";
+  const box = $("empty");
+  box.hidden = false;
+  box.innerHTML = '<div class="icon">⚠️</div><b>Не получилось открыть</b>' + esc(String(e.message || e));
 });
 </script>
 </body>

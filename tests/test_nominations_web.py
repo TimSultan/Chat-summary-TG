@@ -75,9 +75,17 @@ class NominationsApiTests(AsyncTestCase):
         async def is_admin(user):
             return user.get("id") == ADMIN
 
+        self.avatar_requests = []
+
+        async def avatar(user_id):
+            self.avatar_requests.append(user_id)
+            return b"face" if user_id != 3 else None  # author 3 has no profile photo
+
         app = vote_web.create_app(
             cfg, CHAT, is_admin, log=lambda *_: None,
-            attach=lambda a: nominations_web.attach(a, cfg, CHAT, is_admin, log=lambda *_: None),
+            attach=lambda a: nominations_web.attach(
+                a, cfg, CHAT, is_admin, log=lambda *_: None, avatar=avatar,
+            ),
         )
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -90,11 +98,35 @@ class NominationsApiTests(AsyncTestCase):
 
     # ---- helpers ------------------------------------------------------------------------
 
+    def _seed_v1(self):
+        """/vote's collection, which is where v3's works come from: works 4, 3, 2, 1
+        (newest first), each with a photo on disk; /vote has admitted 1 and 2."""
+        path = voting.poll_path(CHAT, "2026-W40")
+        if path.exists():
+            return path
+        poll = voting.Poll(
+            poll_id="2026-W40", entry=CHAT, created_at="2026-10-01T00:00:00+00:00",
+            entries=[_entry(i) for i in (4, 3, 2, 1)],
+        )
+        voting.set_approved(poll, ["1", "2"])
+        voting.save_poll(poll)
+        media = voting.media_path(CHAT, poll.poll_id)
+        media.mkdir(parents=True, exist_ok=True)
+        for i in (4, 3, 2, 1):
+            (media / f"{i}_0.jpg").write_bytes(b"photo")
+        return path
+
+    def _v1_files(self):
+        root = voting._voting_dir()
+        return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
     def _seed(self):
-        """A pool of four works; "Аниме" plays 1 and 2, "Фэнтези" plays 2 and 3, and
-        "Пустая" has none. Work 4 is in the pool and in no nomination."""
+        """The pool synced from /vote (works 4, 3, 2, 1); "Аниме" plays 1 and 2, "Фэнтези"
+        plays 2 and 3, and "Пустая" has none. Work 4 is in the pool and in no nomination."""
+        self._seed_v1()
+        nominations.sync_from_v1(CHAT)
+
         def build(contest):
-            nominations.add_entries(contest, [_entry(i) for i in (4, 3, 2, 1)])
             ids = {}
             for name, members in (("Аниме", ["1", "2"]), ("Фэнтези", ["2", "3"]), ("Пустая", [])):
                 nomination = nominations.add_nomination(contest, name)
@@ -102,7 +134,7 @@ class NominationsApiTests(AsyncTestCase):
                 ids[name] = nomination.nomination_id
             return ids
 
-        _, ids = nominations.update_contest(CHAT, build, create=True)
+        _, ids = nominations.update_contest(CHAT, build)
         return ids
 
     async def _get(self, user, mode=None):
@@ -218,6 +250,63 @@ class NominationsApiTests(AsyncTestCase):
         self.assertEqual(list(by_name), ["Аниме", "Фэнтези", "Пустая"])
         self.assertEqual(by_name["Фэнтези"]["results"][0], {"id": "3", "votes": 1})
         self.assertEqual(by_name["Фэнтези"]["voter_count"], 1)
+        # What /vote admitted, for the editing view's filter, in pool order.
+        self.assertEqual(data["vote_admitted"], ["2", "1"])
+
+    # ---- the works are /vote's ----------------------------------------------------------
+
+    async def test_opening_the_editing_view_brings_in_what_v1_collected(self):
+        """No import step to remember: the first look already has /vote's works."""
+        self._seed_v1()
+        before = self._v1_files()
+        data = await (await self._get(ADMIN, mode="admin")).json()
+        self.assertTrue(data["exists"])
+        self.assertEqual([e["id"] for e in data["entries"]], ["4", "3", "2", "1"])
+        self.assertEqual(data["entries"][0]["photos"], ["/nominations/media/4_0.jpg"])
+        self.assertTrue((nominations.media_path(CHAT) / "4_0.jpg").is_file())
+        self.assertEqual(self._v1_files(), before)
+
+    async def test_a_voter_never_triggers_the_sync(self):
+        """Syncing is the administrator's view's job; a voter's request only reads v3."""
+        self._seed_v1()
+        data = await (await self._get(VOTER)).json()
+        self.assertFalse(data["exists"])
+        self.assertNotIn("vote_admitted", data)
+        self.assertFalse(nominations.contest_path(CHAT).exists())
+
+    async def test_an_edit_does_not_reread_v1(self):
+        ids = self._seed()
+        with patch("nominations.v1_collection", side_effect=AssertionError("v1 read on an edit")):
+            response = await self._post("nominations/update", ADMIN, nomination_id=ids["Аниме"], name="А")
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("vote_admitted", (await response.json())["state"])
+
+    # ---- avatars --------------------------------------------------------------------------
+
+    async def test_an_authors_avatar_is_fetched_once_and_cached(self):
+        self._seed()
+        data = await (await self._get(VOTER)).json()
+        self.assertEqual(data["entries"][0]["avatar"], "/nominations/avatar/3")
+        for _ in range(2):
+            response = await self.client.get(f"{nominations_web.ROUTE_PREFIX}/avatar/2")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), b"face")
+        self.assertEqual(self.avatar_requests, [2])
+
+    async def test_an_avatar_is_only_served_for_an_author_in_the_contest(self):
+        self._seed()
+        for user_id in ("999", "abc"):
+            with self.subTest(user_id=user_id):
+                response = await self.client.get(f"{nominations_web.ROUTE_PREFIX}/avatar/{user_id}")
+                self.assertEqual(response.status, 404)
+        self.assertEqual(self.avatar_requests, [])
+
+    async def test_an_author_without_a_photo_is_a_404_and_is_not_asked_twice(self):
+        self._seed()
+        for _ in range(2):
+            response = await self.client.get(f"{nominations_web.ROUTE_PREFIX}/avatar/3")
+            self.assertEqual(response.status, 404)
+        self.assertEqual(self.avatar_requests, [3])
 
     async def test_an_administrator_can_build_a_nomination_from_nothing(self):
         # Before anything is collected: the nomination is named now, filled later.
@@ -287,28 +376,22 @@ class NominationsApiTests(AsyncTestCase):
 
     # ---- /vote is not affected ----------------------------------------------------------
 
-    def _seed_v1(self):
-        poll = voting.Poll(
-            poll_id="2026-W40", entry=CHAT, created_at="2026-10-01T00:00:00+00:00",
-            entries=[_entry(1), _entry(2)],
-        )
-        voting.set_approved(poll, ["1", "2"])
-        voting.save_poll(poll)
-        return voting.poll_path(CHAT, poll.poll_id)
-
-    async def test_everything_v3_does_leaves_v1s_poll_byte_for_byte(self):
+    async def test_everything_v3_does_leaves_every_v1_file_byte_for_byte(self):
         poll_file = self._seed_v1()
-        before = poll_file.read_bytes()
+        before = self._v1_files()
 
         ids = self._seed()
+        await self._get(ADMIN, mode="admin")
         await self._post("ballot", VOTER, nomination_id=ids["Аниме"], choices=["1"])
         await self._post("nominations/create", ADMIN, name="Новая")
         await self._post("nominations/update", ADMIN, nomination_id=ids["Аниме"], entry_ids=["1"])
         await self._post("nominations/delete", ADMIN, nomination_id=ids["Пустая"])
         await self._post("settings", ADMIN, open=False, max_choices=2)
 
-        self.assertEqual(poll_file.read_bytes(), before)
-        self.assertEqual(sorted(p.name for p in poll_file.parent.glob("*.json")), [poll_file.name])
+        # The poll, its photos, everything under v1's directory: not a byte changed, and
+        # nothing added beside them.
+        self.assertEqual(self._v1_files(), before)
+        self.assertTrue(poll_file.exists())
 
     async def test_v1_still_takes_ballots_with_v3_mounted_beside_it(self):
         poll_file = self._seed_v1()
@@ -381,6 +464,15 @@ class PageScriptSyntaxTests(unittest.TestCase):
 
     def test_the_name_field_holds_exactly_what_the_server_accepts(self):
         self.assertIn(f'maxlength="{nominations.NAME_MAX_LENGTH}"', nominations_web.PAGE_HTML)
+
+    def test_a_vote_is_thanked_and_points_at_the_next_nomination_by_its_number(self):
+        """The wording the owner asked for: thanks, the way to the next nomination by name,
+        and that nomination's number shown big -- the same number its tab carries."""
+        page = nominations_web.PAGE_HTML
+        self.assertIn("Спасибо за ваш голос!", page)
+        self.assertIn('"Перейти к голосованию номинации «" + next.name + "»"', page)
+        self.assertIn('big.textContent = String(position(next))', page)
+        self.assertIn('class="bigNum"', page)
 
 
 if __name__ == "__main__":

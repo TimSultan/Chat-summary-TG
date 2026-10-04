@@ -527,9 +527,9 @@ ARENA_ACTIONS = {
 # ------------------------------------------------------------- nominations (v3, a test)
 #
 # The week's works voted on in named nominations, one tab each (nominations.py,
-# nominations_web.py). Separated from /vote exactly as the arena is: its own storage, its
-# own photos, its own lock, routes and commands. It READS v1 in one place only --
-# "/vote3 импорт" copies the works /vote collected -- and writes nothing of v1's.
+# nominations_web.py). It votes apart from /vote -- its own storage, its own copies of the
+# photos, its own lock, routes and commands -- but offers the works /vote COLLECTED: one
+# collection for both, synced read-only (nominations.sync_from_v1). It writes nothing of v1's.
 #
 # Spelled "/vote3" for the same reason "/vote2" is spelled that way. It must be routed
 # BEFORE VOTE_COMMANDS: "/vote3" starts with "/vote", and the v1 handler would take it.
@@ -5194,13 +5194,14 @@ def _nominations_status_text(contest) -> str:
     cannot be mistaken for one another in the DM."""
     if contest is None:
         return (
-            "Номинации (v3, тестовая версия) ещё не созданы.\n\n"
-            "Возьми работы из основного голосования или собери их заново, потом открой "
-            "настройку и добавь номинации. Основное голосование (/vote) это не трогает."
+            "Номинации (v3, тестовая версия)\n\n"
+            "Работы берутся из основного голосования, а там пока ничего не собрано. "
+            "Собери их через /vote -- они появятся здесь сами."
         )
     lines = [
         "Номинации (v3, тестовая версия)",
-        f"Работ собрано: {len(contest.entries)} · номинаций: {len(contest.nominations)} · "
+        "Работы берутся из /vote автоматически.",
+        f"Работ: {len(contest.entries)} · номинаций: {len(contest.nominations)} · "
         f"{'голосование открыто' if contest.open else 'голосование закрыто'}",
     ]
     if contest.nominations:
@@ -5293,10 +5294,10 @@ async def handle_nominations_command(
     """/vote3 -- vote v3, the nominations test. The same shape as /vote and /vote2 so an
     administrator who knows those knows this one:
 
-    - "/vote3 импорт" (DM, admin) copies every work /vote has COLLECTED, photos and all,
-      into v3's pool. One way and by copy: the poll is read and left exactly as it was.
-    - "/vote3 собрать" (DM, admin) scans #итогинедели for the previous and the current
-      week into v3's pool on its own, for when /vote has not collected anything.
+    - The works are the ones /vote COLLECTED -- there is no second collection. The pool
+      follows /vote by itself every time an administrator opens the panel or the editing
+      view (nominations.sync_from_v1); "/vote3 обновить" (also "импорт"/"собрать", DM,
+      admin) does the same on demand and says what changed. Read-only on v1's side.
     - "/vote3 выбрать" (DM, admin) opens the editing view: add nominations, name them, and
       pick which pool works play in each.
     - "/vote3 итоги" (DM, admin) prints every nomination's standings.
@@ -5304,7 +5305,7 @@ async def handle_nominations_command(
     - bare "/vote3" opens the tabs for everyone, and is the control panel for an
       administrator -- which is what the /admin panel's button opens.
 
-    Nothing here reads or writes a poll except the import's read.
+    Nothing here writes a poll; the sync only reads them.
     """
     chat = message["chat"]
     chat_id = chat["id"]
@@ -5365,86 +5366,22 @@ async def handle_nominations_command(
         {"text": "🛠 Настроить номинации", "web_app": {"url": f"{page_url}?mode=admin"}}
     ]]}
 
-    if wants_import:
-        if not await require_admin_in_dm("Брать работы могут только администраторы."):
+    if wants_import or wants_collect:
+        if not await require_admin_in_dm("Обновлять работы могут только администраторы."):
             return
-        # Read-only on v1's side: latest_poll and the photo copy only read its files.
-        poll = await asyncio.to_thread(voting.latest_poll, entry)
-        if poll is None or not poll.entries:
+        contest, added, _ = await asyncio.to_thread(nominations.sync_from_v1, entry)
+        total = len(contest.entries) if contest else 0
+        log(f"[nominations] synced from /vote: {added} new, {total} in the pool")
+        if not total:
             await reply(
-                "В основном голосовании пока нет собранных работ -- брать нечего. "
-                "Можно собрать отдельно: /vote3 собрать"
+                "В основном голосовании пока нет собранных работ. Собери их там -- "
+                "/vote собрать -- и они появятся здесь сами."
             )
-            return
-        works = await asyncio.to_thread(nominations.copy_poll_works, poll, entry)
-        contest, added = await asyncio.to_thread(
-            nominations.update_contest, entry, lambda c: nominations.add_entries(c, works), True,
-        )
-        log(f"[nominations] imported {added} work(s) from poll {poll.poll_id}")
-        await reply(
-            (f"Взял из основного голосования: {added} работ (всего в номинациях "
-             f"{len(contest.entries)}). Само голосование /vote не изменилось. "
-             "Открой настройку и разложи работы по номинациям."
-             if added else
-             f"Все работы из основного голосования уже здесь (всего {len(contest.entries)})."),
-            reply_markup=settings_markup,
-        )
-        return
-
-    if wants_collect:
-        if not await require_admin_in_dm("Собирать работы могут только администраторы."):
-            return
-        lock_key = ("nominations", entry)
-        if lock_key in _VOTE_COLLECTIONS_IN_PROGRESS:
-            await reply(
-                "Уже собираю -- подожди, пожалуйста. Второй запуск только замедлит первый: "
-                "он полез бы качать те же фотографии заново."
-            )
-            return
-        week_label = "за прошлую и эту неделю"
-        status = await reply(
-            f"Собираю работы с #итогинедели {week_label} в номинации. Основное голосование "
-            "не трогаю. Это может занять несколько минут -- буду показывать прогресс здесь."
-        )
-        existing = await asyncio.to_thread(nominations.load_contest, entry)
-        known = {e.entry_id for e in existing.entries} if existing else set()
-        _VOTE_COLLECTIONS_IN_PROGRESS.add(lock_key)
-        try:
-            new_entries = await voting.collect_entries(
-                client=telethon_client,
-                chat_ref=entry,
-                tz=tz,
-                # v3's OWN media directory, so neither system's clear can delete the
-                # other's pictures.
-                media_dir=nominations.media_path(entry),
-                skip_entry_ids=known,
-                weeks=VOTE_COLLECT_WEEKS,
-                # The whole window every time: the pool may have come from an import that
-                # held only part of it, and stopping at the first known work would never
-                # reach the rest (voting.collect_entries' stop_at_known).
-                stop_at_known=False,
-                progress=_vote_progress_reporter(
-                    api, chat_id, (status or {}).get("message_id"), week_label, log=log,
-                ),
-                log=log,
-            )
-        except Exception:
-            log(f"[nominations] collecting failed:\n{traceback.format_exc()}")
-            await reply("Не получилось собрать работы -- смотри логи.")
-            return
-        finally:
-            _VOTE_COLLECTIONS_IN_PROGRESS.discard(lock_key)
-        # Merged at the end, under the write lock, rather than saved over whatever was
-        # loaded minutes ago: nominations edited during the scan must survive it.
-        contest, added = await asyncio.to_thread(
-            nominations.update_contest, entry, lambda c: nominations.add_entries(c, new_entries), True,
-        )
-        if not contest.entries:
-            await reply(f"{week_label.capitalize()} постов с #итогинедели не нашлось.")
             return
         await reply(
-            f"Новых работ: {added} (всего {len(contest.entries)}). "
-            "Открой настройку и разложи работы по номинациям.",
+            (f"Работы взяты из основного голосования: новых {added}, всего {total}. "
+             if added else f"Работы и так совпадают с основным голосованием (всего {total}). ")
+            + "Голосование /vote не изменилось.",
             reply_markup=settings_markup,
         )
         return
@@ -5471,9 +5408,9 @@ async def handle_nominations_command(
             return
         if not confirms_clear:
             await reply(
-                "Точно очистить номинации? Номинации, голоса в них и собранные для них "
-                "фото уйдут из показа (сам файл с голосами останется в архиве). "
-                "Основное голосование /vote не тронется.",
+                "Точно очистить номинации? Все номинации и голоса в них уйдут из показа "
+                "(сам файл с голосами останется в архиве). Работы вернутся сами -- они "
+                "берутся из /vote. Основное голосование не тронется.",
                 reply_markup={"inline_keyboard": [[{
                     "text": "🗑 Да, очистить",
                     "callback_data": _nominations_action_callback_data("clearyes", chat_id, user.get("id")),
@@ -5494,17 +5431,18 @@ async def handle_nominations_command(
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
         if is_manager:
             admin_user_id = user.get("id")
-            contest = await asyncio.to_thread(nominations.load_contest, entry)
+            # Synced first, so the numbers below are the pool the editing view will show.
+            try:
+                contest, _, _ = await asyncio.to_thread(nominations.sync_from_v1, entry)
+            except nominations.ContestError as e:
+                log(f"[nominations] could not sync from /vote: {e.message}")
+                contest = await asyncio.to_thread(nominations.load_contest, entry)
             await reply(
                 _nominations_status_text(contest),
                 reply_markup={"inline_keyboard": [
                     [
                         {"text": NOMINATIONS_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
                         {"text": "🛠 Настроить", "web_app": {"url": f"{page_url}?mode=admin"}},
-                    ],
-                    [
-                        {"text": "⬇️ Взять из /vote", "callback_data": _nominations_action_callback_data("import", chat_id, admin_user_id)},
-                        {"text": "🔄 Собрать заново", "callback_data": _nominations_action_callback_data("collect", chat_id, admin_user_id)},
                     ],
                     [
                         {"text": "📊 Итоги", "callback_data": _nominations_action_callback_data("results", chat_id, admin_user_id)},
@@ -11433,7 +11371,10 @@ async def run_bot_listener(
                 # -- and /vote with it -- down, where a missing /vote3 page costs nothing.
                 if nominations_available():
                     try:
-                        nominations_web.attach(app, cfg, home_chat_ref or "", _is_vote_admin, log=log)
+                        nominations_web.attach(
+                            app, cfg, home_chat_ref or "", _is_vote_admin, log=log,
+                            avatar=_fetch_vote_avatar,
+                        )
                     except Exception:  # noqa: BLE001
                         log("[bot_listener] the nominations page (/vote3) was not mounted; "
                             "/vote is unaffected:\n" + traceback.format_exc())

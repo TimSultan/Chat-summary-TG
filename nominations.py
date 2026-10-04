@@ -2,18 +2,22 @@
 "Фэнтези") that an administrator makes up, each its own small ballot, shown as tabs in one
 Mini App (nominations_web.py, opened by /vote3).
 
-A third system beside /vote (voting.py) and /vote2 (arena.py), kept apart from both the
-way the arena is kept apart from v1: its own storage tree, its own copies of the photos,
-its own lock, its own command and its own routes. What it borrows from voting.py is the
-shape of a collected work (voting.Entry) and the code that finds works in the chat
-(voting.collect_entries) -- both of which only READ. Nothing here writes a poll, and
-nothing in voting.py reads anything here, so v1 cannot tell that this exists.
+A third system beside /vote (voting.py) and /vote2 (arena.py). It VOTES apart from v1 --
+its own storage tree, its own lock, its own command and routes -- but it does not COLLECT
+apart from it: the works it offers are the works /vote has collected (sync_from_v1), so
+there is one collection and nobody has to gather the week twice. That link only ever
+reads: nothing here writes a poll or a v1 photo, and nothing in voting.py reads anything
+here, so v1 cannot tell that this exists.
 
-THE MODEL. One live contest per chat: a POOL of collected works and a list of
-nominations. The pool is the administrator's raw material and is never shown to voters as
-such -- a voter sees each nomination's works and nothing else. A nomination is a name, the
-ids of the pool works playing in it, and its own ballots. The same work may play in several
-nominations, and a ballot in one is not a ballot in another.
+THE MODEL. One live contest per chat: a POOL of works and a list of nominations. The pool
+mirrors /vote's collection, and is the administrator's raw material -- never shown to
+voters as such; a voter sees each nomination's works and nothing else. A nomination is a
+name, the ids of the pool works playing in it, and its own ballots. The same work may play
+in several nominations, and a ballot in one is not a ballot in another.
+
+The photos are COPIED into v3's own directory rather than served out of v1's, which is
+the one thing the two do not share: v1's "очистить" deletes its photos, and a nominations
+vote still running at that moment must not lose its pictures.
 
 One contest rather than one per ISO week (a poll's and a tournament's key): nominations are
 built by hand, and a week key would hide all of them behind a fresh empty week the first
@@ -259,7 +263,7 @@ def archive_contest(entry: str) -> bool:
 
 def add_entries(contest: Contest, entries: list[voting.Entry]) -> int:
     """Adds works the pool does not have yet, and returns how many. Known ones are left as
-    they are, so collecting twice or importing twice is harmless."""
+    they are, so adding twice is harmless. (The pool's normal source is sync_from_v1.)"""
     known = {e.entry_id for e in contest.entries}
     incoming = [e for e in entries if e.entry_id not in known]
     # Newest post first, matching how collect_entries hands them over and how v1 lists them.
@@ -267,38 +271,99 @@ def add_entries(contest: Contest, entries: list[voting.Entry]) -> int:
     return len(incoming)
 
 
-def copy_poll_works(poll: "voting.Poll", entry: str) -> list[voting.Entry]:
-    """Every work v1 has COLLECTED into `poll`, with its photos copied into v3's own media
-    directory -- the only bridge from v1, and one way: the poll is read and left exactly as
-    it was.
+def v1_collection(entry: str) -> tuple[list[tuple[voting.Entry, "voting.Poll"]], set[str]]:
+    """What /vote has collected right now: every work in every LIVE poll (cleared weeks are
+    archived and no longer count), newest poll first, each with the poll it came from; and
+    the ids /vote has admitted to its own ballot.
 
-    All collected works rather than only the admitted ones: the pool is never shown to
-    voters, so there is nothing to protect them from, and a work v1 left out of its ballot
-    may be exactly the one a nomination wants. A work whose every photo failed to copy is
-    dropped, since a card with no picture has nothing to vote on.
-
-    No lock: this only writes picture files, which nothing else in v3 writes. The caller
-    then adds the works under update_contest.
+    Every live poll rather than only latest_poll: v1 can hold two weeks at once -- the one
+    being voted in and a newer one collected but not yet moderated -- and both are works
+    somebody posted for the contest. Read-only, like everything here that touches v1.
     """
+    polls = [poll for poll in (voting.load_poll(entry, poll_id) for poll_id in voting.poll_ids(entry))
+             if poll is not None]
+    polls.sort(key=lambda poll: poll.created_at, reverse=True)
+    works, seen, admitted = [], set(), set()
+    for poll in polls:
+        admitted.update(poll.approved)
+        for work in poll.entries:
+            if work.entry_id not in seen:
+                seen.add(work.entry_id)
+                works.append((work, poll))
+    return works, admitted
+
+
+def _copy_photos(work: voting.Entry, poll: "voting.Poll", target: Path) -> voting.Entry | None:
+    """`work` with its photos copied out of v1's media directory into v3's, or None if not
+    one of them could be -- a card with no picture has nothing to vote on. No lock: these
+    are picture files, which nothing else in v3 writes."""
     source = voting.media_path(poll.entry, poll.poll_id)
+    copied = []
+    for name in work.media:
+        origin, destination = source / name, target / name
+        if not destination.exists():
+            if not origin.is_file():
+                continue
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(origin, destination)
+            except OSError:
+                continue  # one unreadable photo costs that card a picture, not the sync
+        copied.append(name)
+    return replace(work, media=copied) if copied else None
+
+
+def _mirrored(pool: list[voting.Entry], live: list[voting.Entry], used: set[str]) -> list[voting.Entry]:
+    """The pool /vote's collection implies: its works in its order, then whatever has left
+    /vote but still plays in a nomination. A work /vote dropped (a cleared week, a deleted
+    post) leaves the pool unless a nomination is using it -- pulling a candidate out from
+    under a running vote is what must never happen."""
+    live_ids = {work.entry_id for work in live}
+    return live + [work for work in pool if work.entry_id not in live_ids and work.entry_id in used]
+
+
+def sync_from_v1(entry: str) -> tuple[Contest | None, int, set[str]]:
+    """Brings the pool in line with what /vote has collected, and returns (contest, how
+    many works are new to the pool, the ids /vote has admitted).
+
+    Run whenever an administrator looks at v3, so the pool is never older than the screen
+    showing it and there is no "import" to remember. Writes only when the pool would
+    actually change, so opening the editing view twice does not save twice; and creates the
+    contest if there is none yet but /vote has works, so the first look already has them.
+    A work already in the pool keeps the copy it has: only new works are copied.
+    """
+    collected, admitted = v1_collection(entry)
+    contest = load_contest(entry)
+    pool = contest.entries if contest else []
+    known = {work.entry_id for work in pool}
     target = media_path(entry)
-    target.mkdir(parents=True, exist_ok=True)
-    works = []
-    for work in poll.entries:
-        copied = []
-        for name in work.media:
-            origin, destination = source / name, target / name
-            if not destination.exists():
-                if not origin.is_file():
-                    continue
-                try:
-                    shutil.copy2(origin, destination)
-                except OSError:
-                    continue  # one unreadable photo costs that card a picture, not the import
-            copied.append(name)
-        if copied:
-            works.append(replace(work, media=copied))
-    return works
+    fresh = {}
+    for work, poll in collected:
+        if work.entry_id not in known:
+            copy = _copy_photos(work, poll, target)
+            if copy is not None:
+                fresh[copy.entry_id] = copy
+
+    def live_from(current: dict[str, voting.Entry]) -> list[voting.Entry]:
+        return [current.get(work.entry_id) or fresh[work.entry_id]
+                for work, _ in collected if work.entry_id in current or work.entry_id in fresh]
+
+    def used_by(contest_: Contest | None) -> set[str]:
+        return {e for n in (contest_.nominations if contest_ else []) for e in n.entry_ids}
+
+    planned = _mirrored(pool, live_from({w.entry_id: w for w in pool}), used_by(contest))
+    if [w.entry_id for w in planned] == [w.entry_id for w in pool]:
+        return contest, 0, admitted
+
+    def mutate(contest_: Contest) -> int:
+        # Recomputed under the lock from what is on disk NOW, not from the read above: an
+        # administrator may have put a work into a nomination in between.
+        current = contest_.entry_map()
+        contest_.entries = _mirrored(contest_.entries, live_from(current), used_by(contest_))
+        return sum(1 for work in contest_.entries if work.entry_id not in current)
+
+    contest, added = update_contest(entry, mutate, create=True)
+    return contest, added, admitted
 
 
 # ------------------------------------------------------------------------- nominations

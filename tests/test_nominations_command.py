@@ -2,8 +2,9 @@
 
 "/vote3" starts with "/vote", so the router has to look for it first or v1 would open its
 ballot with a stray "3" for an argument -- the trap "/vote2" already fell into once. The
-rest pins the panel (an administrator's controls, a voter's single button), the import
-from v1 being a read, and a broken v3 saying so instead of going silent.
+rest pins the panel (an administrator's controls, a voter's single button), the works
+coming from /vote by a sync that only reads it, and a broken v3 saying so instead of
+going silent.
 """
 
 import asyncio
@@ -188,8 +189,22 @@ class PanelTests(_Storage):
                                 "https://example.com/nominations?mode=admin"])
         actions = [bot_listener._parse_nominations_action_callback(b["callback_data"])
                    for b in buttons if "callback_data" in b]
-        self.assertEqual(sorted(a[0] for a in actions), ["clear", "collect", "import", "results"])
+        # No import or collect button: the works come from /vote by themselves.
+        self.assertEqual(sorted(a[0] for a in actions), ["clear", "results"])
         self.assertTrue(all(a[2] == ADMIN["id"] for a in actions))
+
+    def test_the_panel_counts_v1s_works_without_being_asked_to_import_them(self):
+        _seed_v1_poll()
+        text = self._type(ADMIN, manager=True).sent[0]["text"]
+        self.assertIn("Работы берутся из /vote автоматически", text)
+        self.assertIn("Работ: 2 · номинаций: 0", text)
+
+    def test_buttons_on_an_older_panel_still_do_something(self):
+        """Panels sent before the sync existed carry import/collect buttons; a tap on one
+        must refresh, not fall through to a dead parse."""
+        for action in ("import", "collect"):
+            with self.subTest(action=action):
+                self.assertIn(action, bot_listener.NOMINATIONS_ACTIONS)
 
     def test_the_panel_reports_v3s_numbers_not_v1s(self):
         def build(contest):
@@ -200,7 +215,8 @@ class PanelTests(_Storage):
 
         nominations.update_contest(CHAT, build, create=True)
         text = self._type(ADMIN, manager=True).sent[0]["text"]
-        self.assertIn("Работ собрано: 1 · номинаций: 1", text)
+        # Work 1 is not in /vote any more, but it plays in a nomination, so it stays.
+        self.assertIn("Работ: 1 · номинаций: 1", text)
         self.assertIn("• Аниме — работ 1, проголосовало 1", text)
 
     def test_in_a_group_everybody_gets_the_deep_link(self):
@@ -232,32 +248,43 @@ class PanelTests(_Storage):
         self.assertIn("Аниме (проголосовало: 0)", text)
 
 
-class ImportTests(_Storage):
-    def test_importing_reads_v1_and_writes_nothing_of_it(self):
-        poll = voting.Poll(
-            poll_id="2026-W40", entry=CHAT, created_at="2026-10-01T00:00:00+00:00",
-            entries=[voting.Entry("1", 1, 1, "A", "a", "", ["1_0.jpg"])],
-        )
-        voting.save_poll(poll)
-        media = voting.media_path(CHAT, poll.poll_id)
-        media.mkdir(parents=True)
-        (media / "1_0.jpg").write_bytes(b"photo")
-        before = voting.poll_path(CHAT, poll.poll_id).read_bytes()
+def _seed_v1_poll():
+    """/vote has collected two works, photos on disk. Returns its media directory."""
+    poll = voting.Poll(
+        poll_id="2026-W40", entry=CHAT, created_at="2026-10-01T00:00:00+00:00",
+        entries=[voting.Entry("2", 2, 2, "B", "b", "", ["2_0.jpg"]),
+                 voting.Entry("1", 1, 1, "A", "a", "", ["1_0.jpg"])],
+    )
+    voting.save_poll(poll)
+    media = voting.media_path(CHAT, poll.poll_id)
+    media.mkdir(parents=True)
+    for name in ("1_0.jpg", "2_0.jpg"):
+        (media / name).write_bytes(b"photo")
+    return media
 
-        api = self._type(ADMIN, manager=True, text="/vote3 импорт")
 
-        self.assertIn("Взял из основного голосования: 1", api.sent[0]["text"])
-        self.assertEqual([e.entry_id for e in nominations.load_contest(CHAT).entries], ["1"])
-        self.assertEqual(voting.poll_path(CHAT, poll.poll_id).read_bytes(), before)
+class RefreshTests(_Storage):
+    def test_every_refresh_spelling_syncs_from_v1_and_writes_nothing_of_it(self):
+        media = _seed_v1_poll()
+        poll_file = voting.poll_path(CHAT, "2026-W40")
+        before = poll_file.read_bytes()
+
+        api = self._type(ADMIN, manager=True, text="/vote3 обновить")
+
+        self.assertIn("новых 2, всего 2", api.sent[0]["text"])
+        self.assertEqual([e.entry_id for e in nominations.load_contest(CHAT).entries], ["2", "1"])
+        self.assertEqual(poll_file.read_bytes(), before)
         self.assertEqual((media / "1_0.jpg").read_bytes(), b"photo")
         self.assertEqual((nominations.media_path(CHAT) / "1_0.jpg").read_bytes(), b"photo")
 
-        again = self._type(ADMIN, manager=True, text="/vote3 импорт")
-        self.assertIn("уже здесь", again.sent[0]["text"])
+        for text in ("/vote3 импорт", "/vote3 собрать"):
+            with self.subTest(text=text):
+                again = self._type(ADMIN, manager=True, text=text)
+                self.assertIn("и так совпадают", again.sent[0]["text"])
 
-    def test_with_nothing_collected_in_v1_it_says_how_else_to_fill_the_pool(self):
-        api = self._type(ADMIN, manager=True, text="/vote3 импорт")
-        self.assertIn("/vote3 собрать", api.sent[0]["text"])
+    def test_with_nothing_collected_in_v1_it_points_at_v1s_collect(self):
+        api = self._type(ADMIN, manager=True, text="/vote3 обновить")
+        self.assertIn("/vote собрать", api.sent[0]["text"])
         self.assertIsNone(nominations.load_contest(CHAT))
 
 

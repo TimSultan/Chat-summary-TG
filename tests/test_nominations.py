@@ -2,8 +2,8 @@
 
 Ballots are per nomination and independent; a work taken out of a nomination stops
 counting and counts again when it is put back; a refused change is never saved; and the
-one bridge from v1 (copying its collected works) reads the poll and its photos without
-changing either.
+pool, which mirrors what /vote collected, is synced by reading v1's polls and photos
+without changing either.
 """
 
 import json
@@ -223,48 +223,98 @@ class StorageTests(_Storage):
         self.assertEqual(voting.poll_ids(CHAT), [])
 
 
-class ImportFromV1Tests(_Storage):
-    def _seed_poll(self):
-        poll = voting.Poll(
-            poll_id="2026-W40", entry=CHAT, created_at="2026-10-01T00:00:00+00:00",
-            entries=[_entry(1), _entry(2, media=["2_0.jpg", "2_1.jpg"]), _entry(3)],
-        )
-        voting.set_approved(poll, ["1"])
-        voting.record_vote(poll, 9, ["1"])
+class SyncFromV1Tests(_Storage):
+    """v3 offers the works /vote collected -- one collection for both -- and only reads it."""
+
+    def _seed_poll(self, poll_id="2026-W40", works=None, created_at="2026-10-01T00:00:00+00:00",
+                   approved=("1",)):
+        works = works or [_entry(1), _entry(2, media=["2_0.jpg", "2_1.jpg"]), _entry(3)]
+        poll = voting.Poll(poll_id=poll_id, entry=CHAT, created_at=created_at, entries=works)
+        voting.set_approved(poll, list(approved))
+        voting.record_vote(poll, 9, list(approved)[:1])
         voting.save_poll(poll)
-        media = voting.media_path(CHAT, poll.poll_id)
-        media.mkdir(parents=True)
-        for name in ("1_0.jpg", "2_0.jpg", "2_1.jpg"):  # work 3 has no photo on disk
-            (media / name).write_bytes(name.encode())
+        media = voting.media_path(CHAT, poll_id)
+        media.mkdir(parents=True, exist_ok=True)
+        for work in works:
+            if work.entry_id == "3":
+                continue  # work 3 never got a photo on disk
+            for name in work.media:
+                (media / name).write_bytes(name.encode())
         return poll, media
 
-    def _snapshot(self, poll, media):
-        return (
-            voting.poll_path(CHAT, poll.poll_id).read_bytes(),
-            {path.name: path.read_bytes() for path in media.iterdir()},
-        )
+    def _snapshot(self):
+        root = voting._voting_dir()
+        return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
-    def test_importing_copies_every_collected_work_and_leaves_v1_exactly_as_it_was(self):
-        poll, media = self._seed_poll()
-        before = self._snapshot(poll, media)
+    def _pool(self):
+        contest = nominations.load_contest(CHAT)
+        return [e.entry_id for e in contest.entries] if contest else None
 
-        works = nominations.copy_poll_works(voting.load_poll(CHAT, poll.poll_id), CHAT)
-        contest, added = nominations.update_contest(
-            CHAT, lambda c: nominations.add_entries(c, works), create=True,
-        )
+    def test_the_pool_is_what_v1_collected_and_v1_is_left_exactly_as_it_was(self):
+        self._seed_poll()
+        before = self._snapshot()
+
+        contest, added, admitted = nominations.sync_from_v1(CHAT)
 
         # Every COLLECTED work with a picture, admitted in v1 or not; work 3 had none.
         self.assertEqual(added, 2)
-        self.assertEqual({e.entry_id for e in contest.entries}, {"1", "2"})
-        copied = nominations.media_path(CHAT)
-        self.assertEqual(sorted(p.name for p in copied.iterdir()), ["1_0.jpg", "2_0.jpg", "2_1.jpg"])
-        self.assertEqual(self._snapshot(poll, media), before)
+        self.assertEqual(self._pool(), ["1", "2"])
+        self.assertEqual(admitted, {"1"})
+        self.assertEqual(sorted(p.name for p in nominations.media_path(CHAT).iterdir()),
+                         ["1_0.jpg", "2_0.jpg", "2_1.jpg"])
+        self.assertEqual(self._snapshot(), before)
+
+    def test_every_live_week_counts_newest_first(self):
+        self._seed_poll("2026-W39", [_entry(5)], created_at="2026-09-24T00:00:00+00:00", approved=("5",))
+        self._seed_poll("2026-W40", [_entry(1)], created_at="2026-10-01T00:00:00+00:00")
+        nominations.sync_from_v1(CHAT)
+        self.assertEqual(self._pool(), ["1", "5"])
+
+    def test_with_nothing_collected_there_is_nothing_to_create(self):
+        self.assertEqual(nominations.sync_from_v1(CHAT), (None, 0, set()))
+        self.assertFalse(nominations.contest_path(CHAT).exists())
+
+    def test_syncing_twice_writes_once(self):
+        self._seed_poll()
+        nominations.sync_from_v1(CHAT)
+        with patch("nominations.save_contest", side_effect=AssertionError("must not save")):
+            contest, added, _ = nominations.sync_from_v1(CHAT)
+        self.assertEqual(added, 0)
+        self.assertEqual([e.entry_id for e in contest.entries], ["1", "2"])
+
+    def test_a_work_collected_later_joins_and_keeps_the_nominations_intact(self):
+        self._seed_poll(works=[_entry(1)])
+        nominations.sync_from_v1(CHAT)
+        _, anime = nominations.update_contest(CHAT, lambda c: nominations.add_nomination(c, "Аниме"))
+        nominations.update_contest(
+            CHAT, lambda c: nominations.set_nomination_entries(c, anime.nomination_id, ["1"]))
+
+        self._seed_poll(works=[_entry(7), _entry(1)])  # /vote collected one more
+        _, added, _ = nominations.sync_from_v1(CHAT)
+
+        self.assertEqual(added, 1)
+        self.assertEqual(self._pool(), ["7", "1"])
+        self.assertEqual(nominations.load_contest(CHAT).nomination(anime.nomination_id).entry_ids, ["1"])
+
+    def test_a_work_v1_drops_leaves_the_pool_unless_a_nomination_plays_it(self):
+        self._seed_poll(works=[_entry(1), _entry(2)])
+        nominations.sync_from_v1(CHAT)
+        _, anime = nominations.update_contest(CHAT, lambda c: nominations.add_nomination(c, "Аниме"))
+        nominations.update_contest(
+            CHAT, lambda c: nominations.set_nomination_entries(c, anime.nomination_id, ["2"]))
+
+        voting.archive_all_polls(CHAT)  # /vote очистить: its photos are deleted too
+        nominations.sync_from_v1(CHAT)
+
+        # Work 1 was only raw material and goes; work 2 is a candidate in a running vote
+        # and stays, picture and all, because v3 kept its own copy.
+        self.assertEqual(self._pool(), ["2"])
+        self.assertTrue((nominations.media_path(CHAT) / "2_0.jpg").is_file())
 
     def test_clearing_v3_deletes_its_own_photos_and_never_v1s(self):
-        poll, media = self._seed_poll()
-        before = self._snapshot(poll, media)
-        works = nominations.copy_poll_works(poll, CHAT)
-        nominations.update_contest(CHAT, lambda c: nominations.add_entries(c, works), create=True)
+        self._seed_poll()
+        nominations.sync_from_v1(CHAT)
+        before = self._snapshot()
 
         self.assertTrue(nominations.archive_contest(CHAT))
 
@@ -273,7 +323,7 @@ class ImportFromV1Tests(_Storage):
         archived = list(nominations.archive_dir().glob("*.json"))
         self.assertEqual(len(archived), 1)
         self.assertEqual(len(json.loads(archived[0].read_text(encoding="utf-8"))["entries"]), 2)
-        self.assertEqual(self._snapshot(poll, media), before)
+        self.assertEqual(self._snapshot(), before)
         self.assertEqual(voting.latest_poll(CHAT).votes, {"9": ["1"]})
 
     def test_clearing_nothing_says_so(self):
