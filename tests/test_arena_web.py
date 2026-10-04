@@ -25,6 +25,7 @@ import arena
 import arena_web
 import voting
 import vote_web
+from tests.async_case import AsyncTestCase
 
 BOT_TOKEN = "123456:FAKE-TOKEN-FOR-TESTS"
 CHAT = "Chat"
@@ -54,7 +55,7 @@ def _entry(entry_id):
     )
 
 
-class ArenaApiTests(unittest.IsolatedAsyncioTestCase):
+class ArenaApiTests(AsyncTestCase):
     async def asyncSetUp(self):
         self._temporary = tempfile.TemporaryDirectory()
         root = Path(self._temporary.name)

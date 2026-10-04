@@ -239,6 +239,12 @@ class PhoenixDungeonTests(unittest.TestCase):
             self.assertEqual(live["max_hp"], state["hero_max_hp"])
 
     def test_a_loss_ends_the_run_the_way_every_other_defeat_does(self):
+        # Walked in wounded. At full health, pressing ⚔️ forever still beat the Phoenix
+        # about one run in twenty -- its last phase has under 2,000 HP -- and this test
+        # failed whenever it did.
+        data = pets._load(CHAT)
+        data["pets"][str(USER)]["dungeon_run"]["hp"] = 5_000
+        pets._save(CHAT, data)
         state = self._play_to_the_end(win=False)
         self.assertFalse(state["won"], state)
 

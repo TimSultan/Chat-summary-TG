@@ -16,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import vote_web
 import voting
+from tests.async_case import AsyncTestCase
 
 BOT_TOKEN = "123456:FAKE-TOKEN-FOR-TESTS"
 CHAT = "Chat"
@@ -43,7 +44,7 @@ def _entry(entry_id: str) -> voting.Entry:
     )
 
 
-class VoteApiTests(unittest.IsolatedAsyncioTestCase):
+class VoteApiTests(AsyncTestCase):
     async def asyncSetUp(self):
         self._temporary = tempfile.TemporaryDirectory()
         self._patcher = patch("voting._voting_dir", return_value=Path(self._temporary.name))

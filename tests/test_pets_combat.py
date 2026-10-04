@@ -390,7 +390,9 @@ class SimulateTests(unittest.TestCase):
         for shield in (None, scrolls.shield("shield_lantern")):
             a, b = fighter("a", shield), fighter("b", shield)
             defends = 0
-            for seed in range(400):
+            # 100 seeds a side: the bug hit about one fight in three, and these still
+            # see over a thousand Defends between them.
+            for seed in range(100):
                 previous_actor = previous_event = None
                 for row in combat.simulate(a, b, seed=seed).rounds:
                     if not (row.event in acting or row.event.startswith("skill_")):
@@ -750,10 +752,12 @@ class SimulateTests(unittest.TestCase):
         """
         for level in (1, 40, 80):
             a, b = _fighter("a", level, name="A"), _fighter("b", level, name="B")
+            # 200 seeds a level: every one of the first 1,000 ends in a knockout, so a
+            # longer sample bought nothing but run time.
             rate = sum(
                 not combat.simulate(a, b, seed=seed).stopped_early
-                for seed in range(1_000)
-            ) / 1_000
+                for seed in range(200)
+            ) / 200
             self.assertGreaterEqual(rate, 0.95, f"level {level}: knockout rate {rate}")
 
     def test_a_vastly_stronger_fighter_wins_at_least_90_percent_of_the_time(self):
@@ -1005,10 +1009,11 @@ class AmuletEffectTests(unittest.TestCase):
                     )
                     continue
                 if code == "first_strike":
+                    # 100 seeds: the wearer leads 95 of them against 58 bare.
                     def leads(who):
                         return sum(
                             combat.simulate(who, opponent, seed=seed).rounds[0].attacker == "a"
-                            for seed in range(300)
+                            for seed in range(100)
                         )
                     self.assertGreater(leads(fighter), leads(bare))
                     continue

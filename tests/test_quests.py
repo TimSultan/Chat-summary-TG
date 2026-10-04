@@ -12,6 +12,7 @@ import pets_ui
 import pets_quest_catalog as catalog
 import stats
 import quests
+from tests.async_case import AsyncTestCase
 
 
 def _a_real_quest(*, repeatable):
@@ -1426,7 +1427,7 @@ class SupportButtonTests(unittest.TestCase):
                 )
 
 
-class ReviewedSubmissionIsMarkedTests(unittest.IsolatedAsyncioTestCase):
+class ReviewedSubmissionIsMarkedTests(AsyncTestCase):
     """A verdict has to be visible where people are looking, not only in the database.
 
     Two audiences: the chat sees a reaction on the photo, and every moderator's private

@@ -899,14 +899,27 @@ class DungeonTests(DungeonTestCase):
         floor = 41
         self.assertFalse(dungeon.is_boss_floor(floor))
         self._unstoppable_runner(floor)
-        # The floor caps at a 12.5% baseline (halved from the old 25%), so the sample is
-        # doubled to 240 to keep the same margin of safety the old 120-kill/25% pair had.
+        # Rolled at certainty instead of sampling the real 12.5% over 240 kills, which
+        # spent nine seconds of fights to count ~30 drops. The wrapper still records the
+        # chance each real kill asked for, so a floor that stopped offering scrolls fails
+        # here just as surely as a roll that stopped paying.
+        real = pets.grant_scroll_reward
+        asked = []
+
+        def certain(*args, **kwargs):
+            asked.append(kwargs["chance"])
+            return real(*args, **{**kwargs, "chance": 1.0})
+
+        with patch("pets.grant_scroll_reward", side_effect=certain):
+            payloads = self._rekill(floor, times=12)
+        self.assertEqual(len(asked), 12, "every kill on this floor must roll for a scroll")
+        self.assertTrue(all(chance > 0 for chance in asked), asked)
         granted = [
             payload["scroll"]["code"]
-            for payload in self._rekill(floor, times=240)
+            for payload in payloads
             if payload.get("scroll") and payload["scroll"].get("granted")
         ]
-        self.assertGreater(len(granted), 3, "a 12.5% baseline over 240 kills must pay out")
+        self.assertEqual(len(granted), 12, "a won roll must pay out")
         self.assertGreater(len(set(granted)), 1, "the same scroll every time is the bug")
 
     def test_existing_pet_owners_receive_three_dungeon_tickets_once(self):

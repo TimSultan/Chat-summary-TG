@@ -152,25 +152,25 @@ class GuardedImportTests(unittest.TestCase):
 class BrokenGameModuleTests(unittest.TestCase):
     """The whole promise, tested the only way it can be: by actually breaking one.
 
-    Run in a subprocess against a copy of the tree, because the guard runs once at import
-    and cannot be re-run inside a process that has already imported everything cleanly.
+    Run in a subprocess, because the guard runs once at import and cannot be re-run inside
+    a process that has already imported everything cleanly. Only the broken module is
+    written out: its directory goes first on the path and the real tree second, so every
+    other module still loads from its compiled cache instead of a fresh copy of the whole
+    tree being compiled from source (6s down to 3s).
     """
 
     def test_a_broken_game_module_leaves_the_chat_importable(self):
         with tempfile.TemporaryDirectory() as temporary:
-            copy = Path(temporary) / "app"
-            copy.mkdir()
-            for path in ROOT.glob("*.py"):
-                (copy / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            shadow = Path(temporary)
             # A failure every Python version notices, unlike an annotation: 3.14 defers
             # those and would import the "broken" module without complaint.
-            broken = copy / "pets_ui.py"
-            broken.write_text(
+            (shadow / "pets_ui.py").write_text(
                 "raise RuntimeError('deliberately broken by the test')\n"
-                + broken.read_text(encoding="utf-8"),
+                + (ROOT / "pets_ui.py").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-            probe = textwrap.dedent("""
+            # `python -c` puts the working directory first, so the broken copy wins.
+            probe = f"import sys; sys.path.insert(1, {str(ROOT)!r})\n" + textwrap.dedent("""
                 import bot_listener, listener
                 assert listener is not None
                 assert bot_listener.game_available() is False
@@ -179,7 +179,7 @@ class BrokenGameModuleTests(unittest.TestCase):
                 print("OK")
             """)
             result = subprocess.run(
-                [sys.executable, "-c", probe], cwd=copy, capture_output=True, text=True,
+                [sys.executable, "-c", probe], cwd=shadow, capture_output=True, text=True,
                 timeout=180,
             )
             self.assertEqual(

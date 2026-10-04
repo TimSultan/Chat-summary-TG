@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import post_stats_web
 from errors import ChatSummaryError
+from tests.async_case import AsyncTestCase
 
 TOKEN = "secret123"
 
@@ -51,7 +52,7 @@ def _fake_post(message_id, thumbnail_path=None):
     )
 
 
-class PostStatsWebTests(unittest.IsolatedAsyncioTestCase):
+class PostStatsWebTests(AsyncTestCase):
     async def asyncSetUp(self):
         self._temporary = tempfile.TemporaryDirectory()
         self._thumb_base = Path(self._temporary.name) / "thumbs"

@@ -55,6 +55,7 @@ import pets_web
 import stats
 import vote_web
 from pets_ui import valuable_item  # the same "needs confirming" rarity rule pets_web uses
+from tests.async_case import AsyncTestCase
 
 BOT_TOKEN = "123456:FAKE-TOKEN-FOR-TESTS"
 CHAT = "Chat"
@@ -108,7 +109,7 @@ def _large_jpeg_bytes(edge: int = 2000, quality: int = 95) -> bytes:
     return buffer.getvalue()
 
 
-class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
+class PetsWebApiTests(AsyncTestCase):
     async def asyncSetUp(self):
         # Both are module-level and keyed on (entry, user id), which every test here
         # shares -- a resolution held from the previous test would otherwise stand in for
@@ -3942,6 +3943,23 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         return await self._post("/api/card-battle/action", user,
                                 {"session": session, "action": action, "card": card})
 
+    def _attack_in_hand(self, session):
+        """An attack the player can pay for this turn, swapped in from the draw pile when
+        the deal left none in hand -- the opening hand comes from a random seed and holds
+        no affordable attack often enough to fail a test that only needs to play one."""
+        battle = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY][session]["battle"]
+
+        def fits(card):
+            return card["damage"] and card["cost"] <= battle["energy"]
+
+        card = next((row for row in battle["hand"] if fits(row)), None)
+        if card is None:
+            card = next(row for row in battle["player_draw"] if fits(row))
+            battle["player_draw"].remove(card)
+            battle["player_draw"].append(battle["hand"][0])
+            battle["hand"][0] = card
+        return card
+
     @patch("pets_config.CARD_DUEL_OPEN", True)
     async def test_a_card_duel_deals_a_hand_energy_and_the_opponents_whole_next_turn(self):
         """The four things the mode promises on the first screen: five cards, three
@@ -4243,13 +4261,12 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
         opened = await self._open_duel(PLAYER, OPPONENT)
         session = opened["session"]
-        battle = opened["battle"]
         # Force the win rather than playing it out: the engine's own rules are covered
         # elsewhere, and what is under test here is the settlement.
         store = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY]
         store[session]["battle"]["fighters"]["enemy"]["hp"] = 1
 
-        card = next(row for row in battle["hand"] if row["damage"] and row["cost"] <= battle["energy"])
+        card = self._attack_in_hand(session)
         response = await self._duel_action(PLAYER, session, "play", card["uid"])
         self.assertEqual(response.status, 200, await response.text())
         body = await response.json()
@@ -4292,8 +4309,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         session = opened["session"]
         store = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY]
         store[session]["battle"]["fighters"]["enemy"]["hp"] = 1
-        card = next(row for row in opened["battle"]["hand"]
-                    if row["damage"] and row["cost"] <= opened["battle"]["energy"])
+        card = self._attack_in_hand(session)
 
         first = await self._duel_action(PLAYER, session, "play", card["uid"])
         self.assertEqual(first.status, 200)
@@ -4613,8 +4629,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         opened = await self._open_duel(PLAYER, OPPONENT)
         session = opened["session"]
         self.app[pets_web._CARD_BATTLE_SESSIONS_KEY][session]["battle"]["fighters"]["enemy"]["hp"] = 1
-        card = next(row for row in opened["battle"]["hand"]
-                    if row["damage"] and row["cost"] <= opened["battle"]["energy"])
+        card = self._attack_in_hand(session)
         body = await (await self._duel_action(PLAYER, session, "play", card["uid"])).json()
 
         self.assertTrue(body["battle"]["finished"])

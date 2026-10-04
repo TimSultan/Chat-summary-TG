@@ -26,6 +26,9 @@ MODULES = sorted(
 )
 
 
+_MAYBE_ANNOTATED = re.compile(r"^[^\W\d][\w.\[\]'\"]*\s*:", re.MULTILINE)
+
+
 def _future_annotations(tree: ast.Module) -> bool:
     return any(
         isinstance(node, ast.ImportFrom) and node.module == "__future__"
@@ -74,7 +77,13 @@ class ModuleLevelAnnotationTests(unittest.TestCase):
 
     def test_every_module_level_annotation_names_something_that_exists(self):
         for path in MODULES:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            source = path.read_text(encoding="utf-8")
+            # A module-level annotation starts at column 0 as `name:` (or `a.b:`, `a[0]:`).
+            # Lines like `try:` match too, which only costs a parse; a module with no such
+            # line cannot hold one, and skipping its parse is most of this test's time.
+            if not _MAYBE_ANNOTATED.search(source):
+                continue
+            tree = ast.parse(source, filename=str(path))
             if _future_annotations(tree):
                 # `from __future__ import annotations` makes every annotation a string on
                 # every version, so nothing here can be evaluated and nothing can fail.

@@ -62,6 +62,11 @@ item passive's numbers or the combat maths change:
 $env:RUN_BALANCE_TESTS = '1'; python -m unittest tests.test_pets_combat.EffectKnobTests -q
 ```
 
+The whole suite runs on every core with `python tests/run_parallel.py` (about 18s against
+about 35s serially); it takes the same module or test names as `unittest`. Async test
+classes inherit `tests.async_case.AsyncTestCase`, not `unittest.IsolatedAsyncioTestCase`,
+whose forced asyncio debug mode tripled the web suites' run time.
+
 For a focused web change, run the affected test by its full `unittest` name first, then
 the full command above before handoff. Avoid fragile absolute latency limits for normal
 local work: test concurrency with a deliberately blocked worker and events, so a slow CI

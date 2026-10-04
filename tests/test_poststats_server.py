@@ -8,9 +8,10 @@ from unittest.mock import patch
 from aiohttp.test_utils import TestClient, TestServer
 
 import poststats_server
+from tests.async_case import AsyncTestCase
 
 
-class StandalonePostStatsTests(unittest.IsolatedAsyncioTestCase):
+class StandalonePostStatsTests(AsyncTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.owner_path = Path(self.temporary.name) / "poststats_owner.json"

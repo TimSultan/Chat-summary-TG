@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot_listener
 import stats
+from tests.async_case import AsyncTestCase
 
 
 class GamificationTests(unittest.TestCase):
@@ -1211,7 +1212,7 @@ class BadgeRecipientParsingTests(unittest.TestCase):
                 self.assertEqual(bot_listener._parse_badge_recipients(text), [])
 
 
-class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
+class BadgeFlowTests(AsyncTestCase):
     async def test_admin_can_create_and_give_a_badge_in_bot_dm(self):
         api = FakeBotAPI()
         flows = {}
@@ -1634,7 +1635,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flows, {})
 
 
-class BadgeBackButtonTests(unittest.IsolatedAsyncioTestCase):
+class BadgeBackButtonTests(AsyncTestCase):
     """Every screen below the badge menu has a way back to it.
 
     Reported from the chat, 2026-08-10 ("не везде есть кнопка Назад"): the flow had none

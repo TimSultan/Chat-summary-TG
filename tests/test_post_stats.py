@@ -16,6 +16,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from post_stats import PostStat, _message_to_post_stat, post_link
+from tests.async_case import AsyncTestCase
 
 
 def _msg(**kwargs):
@@ -180,7 +181,7 @@ class MessageToPostStatTests(unittest.TestCase):
         self.assertEqual(stat.thumbnail_path, thumb)
 
 
-class FetchPostStatsTests(unittest.IsolatedAsyncioTestCase):
+class FetchPostStatsTests(AsyncTestCase):
     """Optional light coverage of fetch_post_stats using a minimal fake client --
     _message_to_post_stat above is the important pure-mapper coverage."""
 

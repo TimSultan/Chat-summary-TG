@@ -12,6 +12,7 @@ different thing from wanting to fight in an arena.
 """
 
 import inspect
+import json
 import subprocess
 import sys
 import unittest
@@ -25,36 +26,58 @@ import bot_listener
 import pets_ui
 
 
-def _in_fresh_process(flag: str | None, body: str) -> str:
-    """Import the bot with GAME_ENABLED set to `flag` (or removed, for None), then print
-    whatever `body` asks. A fresh interpreter because a module cannot be un-imported."""
+# Everything the import tests ask of a fresh interpreter, printed in one go so that each
+# GAME_ENABLED setting costs one bot import rather than one per question.
+_FACTS = (
+    "import json; print(json.dumps({"
+    "'pets_web': 'pets_web' in sys.modules,"
+    " 'enabled': bot_listener.GAME_ENABLED,"
+    " 'open': bot_listener.game_open(),"
+    " 'available': bot_listener.game_available(),"
+    " 'pets': bot_listener.pets is not None,"
+    " 'pets_ui': bot_listener.pets_ui is not None}))"
+)
+
+
+def _start_fresh_process(flag: str | None) -> subprocess.Popen:
+    """Import the bot with GAME_ENABLED set to `flag` (or removed, for None) and print
+    _FACTS. A fresh interpreter because a module cannot be un-imported."""
     lines = ["import os, sys"]
     if flag is None:
         lines.append("os.environ.pop('GAME_ENABLED', None)")
     else:
         lines.append(f"os.environ['GAME_ENABLED'] = {flag!r}")
-    lines += [f"sys.path.insert(0, {str(ROOT)!r})", "import bot_listener", body]
-    result = subprocess.run(
+    lines += [f"sys.path.insert(0, {str(ROOT)!r})", "import bot_listener", _FACTS]
+    return subprocess.Popen(
         [sys.executable, "-c", chr(10).join(lines)],
-        capture_output=True, text=True, cwd=str(ROOT),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(ROOT),
     )
-    if result.returncode != 0:
-        raise AssertionError(result.stderr.strip()[-800:])
-    return result.stdout.strip()
 
 
 class ImportTests(unittest.TestCase):
     """The saving itself. Everything else here is about not breaking quests while taking it."""
 
+    @classmethod
+    def setUpClass(cls):
+        # The three interpreters run side by side: each spends seconds importing the bot,
+        # and none of them depends on another.
+        started = {flag: _start_fresh_process(flag) for flag in ("0", "1", None)}
+        cls.facts = {}
+        for flag, process in started.items():
+            out, err = process.communicate()
+            cls.facts[flag] = (process.returncode, out, err)
+
+    def _facts(self, flag: str | None) -> dict:
+        returncode, out, err = self.facts[flag]
+        if returncode != 0:
+            raise AssertionError(err.strip()[-800:])
+        return json.loads(out)
+
     def test_the_mini_app_is_not_imported_when_the_game_is_off(self):
-        self.assertEqual(
-            _in_fresh_process("0", "print('pets_web' in sys.modules)"), "False",
-        )
+        self.assertFalse(self._facts("0")["pets_web"])
 
     def test_it_is_imported_when_the_game_is_on(self):
-        self.assertEqual(
-            _in_fresh_process("1", "print('pets_web' in sys.modules)"), "True",
-        )
+        self.assertTrue(self._facts("1")["pets_web"])
 
     def test_the_default_is_on(self):
         """An unset variable leaves the game exactly as it was.
@@ -64,27 +87,22 @@ class ImportTests(unittest.TestCase):
         environment rather than by reading the module's flag, so this passes whatever the
         developer running it has in their own shell.
         """
-        self.assertEqual(
-            _in_fresh_process(None, "print(bot_listener.GAME_ENABLED, bot_listener.game_open())"),
-            "True True",
-        )
+        facts = self._facts(None)
+        self.assertIs(facts["enabled"], True)
+        self.assertIs(facts["open"], True)
 
     def test_one_variable_closes_it(self):
-        self.assertEqual(
-            _in_fresh_process("0", "print(bot_listener.GAME_ENABLED, bot_listener.game_open())"),
-            "False False",
-        )
+        facts = self._facts("0")
+        self.assertIs(facts["enabled"], False)
+        self.assertIs(facts["open"], False)
 
     def test_quests_still_have_the_modules_they_need(self):
         """`quests` imports `pets`, and review draws `pets_ui` screens. Closing the game
         may not take those away -- only the Mini App goes."""
+        facts = self._facts("0")
         self.assertEqual(
-            _in_fresh_process(
-                "0",
-                "print(bot_listener.game_available(), bot_listener.game_open(),"
-                " bot_listener.pets is not None, bot_listener.pets_ui is not None)",
-            ),
-            "True False True True",
+            (facts["available"], facts["open"], facts["pets"], facts["pets_ui"]),
+            (True, False, True, True),
         )
 
     def test_the_flag_reads_the_spellings_people_actually_use(self):

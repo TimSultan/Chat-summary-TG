@@ -14,6 +14,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 import voting
+from tests.async_case import AsyncTestCase
 
 BOT_TOKEN = "123456:FAKE-TOKEN-FOR-TESTS"
 
@@ -115,7 +116,7 @@ class GroupIntoEntriesTests(unittest.TestCase):
         self.assertEqual(voting._clean_caption(group), "моя работа на этой неделе")
 
 
-class CollectEntriesTests(unittest.IsolatedAsyncioTestCase):
+class CollectEntriesTests(AsyncTestCase):
     """collect_entries against a fake Telethon client -- in particular, that
     skip_entry_ids actually skips resolving/downloading already-known entries rather
     than just filtering the result afterwards."""
