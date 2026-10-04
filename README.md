@@ -1423,6 +1423,19 @@ the stream against its own 8 MB ceiling rather than through `request.read()`: th
 application-wide `client_max_size` is 1 MB, and an ordinary phone photo is two or three
 times that.
 
+**Quests: the board and «Выполненные».** The board (`GET /api/quests`) lists only what is
+still to do. A quest leaves it as soon as a moderator accepts it and is never dealt again:
+painting, rune and arena quests are once ever (a cooldown of 0, see
+`quests._cooldown_until`, which `submit` already enforced), and a real-life quest comes
+back only after its own cooldown. Finished quests have a page of their own: the
+**✅ Выполненные квесты** button at the top of the tab opens `GET /api/quests/done`
+(`quests.completed`), one card per quest with the day it was accepted, what it paid and a
+link to the post that proved it. In Telegram it is the **✅ Выполненные** button under the
+board (`pets_ui.quests_done_view`). The list is read from the per-player `done` map, so the
+chat-wide caps on history and submissions never drop a card. Arena paints are rune quests
+in the catalogue but live on the `gear` board, so every board lookup goes through
+`quests._board_kind`.
+
 **What is deliberately not there:** taming (it needs a photo *and* a name in one flow, and
 the chat already has it), and casino/quests, which are stubs in `pets_ui.py` too — absent
 rather than reproduced as dead ends.

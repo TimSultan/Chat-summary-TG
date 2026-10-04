@@ -2437,6 +2437,33 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.quest_completions), 1)
         self.assertEqual((await (await self._get("/api/quests/review", MODERATOR)).json())["rows"], [])
 
+    async def test_a_finished_quest_moves_from_the_board_to_its_own_page(self):
+        """The board only shows what is still to do; «Выполненные» is fetched on its own
+        when opened, so the board stopped carrying a history it no longer draws."""
+        self._tame(PLAYER)
+        board = await (await self._get("/api/quests", PLAYER)).json()
+        self.assertNotIn("history", board)
+        self.assertEqual(board["stats"]["completed"], 0)
+        code = board["quest"]["code"]
+        self.assertTrue(quests.submit(
+            CHAT, PLAYER["id"], code, chat_id=-1001234567890, message_id=777,
+            photo_file_id="quest-photo", author_name="Player")[0])
+        row = quests.pending(CHAT)[0]
+        self.assertTrue(quests.review(CHAT, row["id"], MODERATOR["id"], True)[0])
+
+        board = await (await self._get("/api/quests", PLAYER)).json()
+        self.assertNotIn(code, [card["code"] for card in board["quests"]])
+        self.assertEqual(board["stats"]["completed"], 1)
+
+        done = await (await self._get("/api/quests/done", PLAYER)).json()
+        self.assertEqual(done["total"], 1)
+        self.assertEqual(done["rows"][0]["code"], code)
+        self.assertEqual(done["rows"][0]["kind"], "paint")
+        self.assertEqual(done["rows"][0]["link"], "https://t.me/c/1234567890/777")
+        self.assertNotIn("chat_id", done["rows"][0])
+        self.assertNotIn("bag", done)
+        self.assertEqual((await (await self._get("/api/quests/done", MODERATOR)).json())["rows"], [])
+
     async def test_rejection_needs_a_reason_sends_it_to_the_player_and_ideas_reach_review(self):
         self._tame(PLAYER)
         code = (await (await self._get("/api/quests", PLAYER)).json())["quest"]["code"]

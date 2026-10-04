@@ -1462,7 +1462,10 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
             "callback_data": callback_data(user_id, "questdetail", f"{kind}:{card.get('code')}"),
         }])
     if not cards:
-        lines.append("\nПока доступных заданий нет.")
+        lines.append(
+            "\nВсе квесты этой группы выполнены 🎉 Они собраны в «Выполненных»."
+            if board.get("status") == "exhausted" else "\nПока доступных заданий нет."
+        )
     if board.get("reroll_available"):
         lines.append("\n🎲 Можно обновить всю эту группу сейчас.")
         reroll_label = "🎲 Реролл группы"
@@ -1478,6 +1481,12 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
         "text": reroll_label,
         "callback_data": callback_data(user_id, "questreroll", kind),
     }])
+    # Finished quests have a screen of their own, so this one only lists what is left.
+    completed = quests.stats_for(entry, user_id).get("completed", 0)
+    buttons.append([{
+        "text": f"✅ Выполненные ({completed})",
+        "callback_data": callback_data(user_id, "questsdone", "1"),
+    }])
     for other in QUEST_KINDS:
         if other != kind:
             buttons.append([{
@@ -1486,6 +1495,86 @@ def quests_view(entry: str, user_id, kind: str = "paint") -> tuple[str, dict]:
             }])
     buttons.append(_back_row(user_id))
     return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+QUESTS_DONE_PER_PAGE = 8
+QUEST_KIND_SHORT = {
+    "paint": "🎯 покрас", "real": "🌍 в реале", "gear": "⚔️ для арены", "rune": "🔮 магия подземелья",
+}
+
+
+def _times_word(times: int) -> str:
+    tail = times % 100
+    if 11 <= tail <= 14:
+        return "раз"
+    return "раза" if times % 10 in (2, 3, 4) else "раз"
+
+
+def quests_done_view(entry: str, user_id, page: int = 1) -> tuple[str, dict]:
+    """«Выполненные квесты»: every quest this player has finished, newest first.
+
+    The board only ever shows what is still to do, so this is where a finished quest goes
+    -- with the day it was accepted, what it paid and a link to the post that proved it.
+    """
+    rows = quests.completed(entry, user_id)
+    pages = max(1, -(-len(rows) // QUESTS_DONE_PER_PAGE))
+    page = min(max(1, int(page or 1)), pages)
+    lines = [f"✅ <b>Выполненные квесты · {len(rows)}</b>"]
+    if not rows:
+        lines.append(
+            "\nПока ни одного. Выбери квест на доске и выложи фото с его хештегом — "
+            "после проверки он появится здесь."
+        )
+    first = (page - 1) * QUESTS_DONE_PER_PAGE
+    for row in rows[first:first + QUESTS_DONE_PER_PAGE]:
+        finished = str(row.get("finished_at") or "")[:10].split("-")
+        day = ".".join(reversed(finished)) if len(finished) == 3 else ""
+        lines.append(f"\n✅ <b>{escape(row['title'])}</b>")
+        lines.append(
+            f"{quest_pips(row.get('difficulty', 1))} · "
+            f"{QUEST_KIND_SHORT.get(row.get('kind'), QUEST_KIND_SHORT['paint'])}"
+            + (f" · {day}" if day else "")
+        )
+        reward = row.get("reward") or {}
+        paid = []
+        if reward.get("gold"):
+            paid.append(f"🪙 {_money(int(reward['gold']))}")
+        if reward.get("xp"):
+            paid.append(f"✨ {int(reward['xp'])}")
+        if reward.get("item_name"):
+            paid.append(f"🎁 {escape(str(reward['item_name']))}")
+        if reward.get("scroll_name"):
+            paid.append(f"{escape(str(reward.get('scroll_icon') or '📜'))} "
+                        f"{escape(str(reward['scroll_name']))}")
+        extra = []
+        times = int(row.get("times", 1) or 1)
+        if times > 1:
+            extra.append(f"сдан {times} {_times_word(times)}")
+        if row.get("badge"):
+            extra.append(f"🏅 {escape(str(row['badge']))}")
+        if row.get("again"):
+            extra.append(f"🔁 {escape(str(row['again']))}")
+        link = stats.figurine_message_link(None, row.get("chat_id"), row.get("message_id"))
+        if link:
+            extra.append(f'<a href="{escape(link, quote=True)}">📷 работа</a>')
+        if paid:
+            lines.append(" · ".join(paid))
+        if extra:
+            lines.append(" · ".join(extra))
+    rows_kb = []
+    if pages > 1:
+        lines.append(f"\nСтраница {page} из {pages}")
+        navigation = []
+        if page > 1:
+            navigation.append({"text": "⬅️ Новее",
+                               "callback_data": callback_data(user_id, "questsdone", str(page - 1))})
+        if page < pages:
+            navigation.append({"text": "Старее ➡️",
+                               "callback_data": callback_data(user_id, "questsdone", str(page + 1))})
+        rows_kb.append(navigation)
+    rows_kb.append([{"text": "◀️ К квестам", "callback_data": callback_data(user_id, "quests", "paint")}])
+    rows_kb.append(_back_row(user_id))
+    return "\n".join(lines), {"inline_keyboard": rows_kb}
 
 
 def quest_detail_view(entry: str, user_id, kind: str, code: str) -> tuple[str, dict]:

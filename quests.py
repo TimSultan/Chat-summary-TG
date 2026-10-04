@@ -593,16 +593,17 @@ def _pick(
     If nothing is left at that level it widens upward rather than failing: a harder quest
     than asked for is still a quest, an exception is a broken button.
 
-    Returns None only when the whole eligible pool is empty, which a painting challenge
-    can never be but a real quest can -- every real quest carries a cooldown, and somebody
-    who has cleared the board has to be told so rather than handed a repeat.
+    Only quests this player can still hand in are dealt. A cooldown is what keeps a real
+    quest from being farmed, and a cooldown of 0 -- every painting, rune and arena quest --
+    means once ever (see _cooldown_until). submit refuses both, so dealing either put a
+    card on the board that could never be completed: the "выполненный квест опять в
+    новых" report. Returns None once nothing of this kind is left to offer.
     """
     moment = moment or app_now()
-    pool = [quest for quest in available_quests(entry, data, kind) if quest.code not in exclude]
-    if kind == "real":
-        # A cooldown is what keeps a real quest from being farmed. Applied at the DEAL
-        # now rather than at a shelf, so the slot simply never offers one that is resting.
-        pool = [quest for quest in pool if _is_offerable(quest, data, user_id, moment)]
+    pool = [
+        quest for quest in available_quests(entry, data, kind)
+        if quest.code not in exclude and _is_offerable(quest, data, user_id, moment)
+    ]
     if difficulty is not None:
         at_level = [quest for quest in pool if quest.difficulty == difficulty]
         if at_level:
@@ -611,11 +612,10 @@ def _pick(
         if harder:
             return random.choice(harder)
     if not pool:
-        # Widening past the exclusion is safe for painting challenges (there are 60 and
-        # none of them expire), but never past a cooldown -- see above.
+        # Widening past the exclusion is safe, but never past a cooldown -- see above.
         wider = [
             quest for quest in available_quests(entry, data, kind)
-            if kind != "real" or _is_offerable(quest, data, user_id, moment)
+            if _is_offerable(quest, data, user_id, moment)
         ]
         if not wider:
             return None
@@ -695,6 +695,27 @@ AUTO_REFRESH_KINDS = frozenset({"real"})
 # dealt from the catalogue as it stands now -- and anything they have already sent to a
 # moderator is carried across rather than thrown away with the rest.
 BOARD_BUNDLE_VERSION = 4
+
+
+# The arena paints are rune quests in the catalogue -- that is what decides what they pay
+# (see _pay) -- but they are dealt from a board of their own. Every board lookup goes
+# through _board_kind, never quest.kind: submit and review used to look for an arena card
+# on the rune board, so it never went to review, never finished, and stayed "доступен"
+# on the arena board after a moderator had accepted it.
+_GEAR_CODES = frozenset(quest.code for quest in catalog.GEAR_PAINT_QUESTS)
+
+
+def _board_kind(quest) -> str:
+    """Which board (a SLOTS key) deals this quest."""
+    return "gear" if quest.code in _GEAR_CODES else quest.kind
+
+
+def _has_offerable(entry: str, user_id, data: dict, kind: str, moment: datetime) -> bool:
+    """Whether anything of this kind is left for this player to be dealt."""
+    return any(
+        _is_offerable(quest, data, user_id, moment)
+        for quest in available_quests(entry, data, kind)
+    )
 
 
 def _assignment_row(quest, moment: datetime) -> dict:
@@ -804,6 +825,21 @@ def _ensure_board(entry: str, user_id, data: dict, kind: str, moment: datetime) 
     if len(cleaned) != len(_board_rows(stored)):
         stored["quests"] = cleaned
         changed = True
+    # A finished card leaves the board: it is on the «Выполненные» page now, and a board
+    # that kept it showed the same quest twice. So does a card the player can no longer
+    # hand in -- finished from somewhere else, or dealt before the deal checked. What is
+    # under review always stays. The board is not topped up here: a painting board still
+    # waits for its explicit group reroll, and the real-life one for its timer.
+    live = [
+        row for row in _board_rows(stored)
+        if row.get("status") == "review"
+        or (row.get("status") != "done" and _row_offerable(row, data, user_id, moment))
+    ]
+    if len(live) != len(_board_rows(stored)):
+        stored["quests"] = live
+        if not live and not stored.get("empty_since"):
+            stored["empty_since"] = moment.isoformat()
+        changed = True
     refresh_at = _board_refresh_at(stored, moment, kind)
     if refresh_at is not None and moment >= refresh_at:
         return _make_board(
@@ -811,6 +847,11 @@ def _ensure_board(entry: str, user_id, data: dict, kind: str, moment: datetime) 
             avoid={row.get("code") for row in _board_rows(stored)},
         ), True
     return stored, changed
+
+
+def _row_offerable(row: dict, data: dict, user_id, moment: datetime) -> bool:
+    quest = catalog.find_quest(row.get("code"))
+    return quest is not None and _is_offerable(quest, data, user_id, moment)
 
 
 def _live_assignment(
@@ -864,8 +905,13 @@ def quest_board(entry: str, user_id, kind: str = "paint", now: datetime | None =
         )
         for card in cards:
             card["rerolls_left"] = 1 if reroll_available else 0
+        # "exhausted" only when nothing of this kind is left to deal this player; an
+        # emptied board that a reroll or its timer can refill is merely resting.
         status = "open" if open_cards else (
-            "review" if reviewing else ("resting" if cards else "exhausted")
+            "review" if reviewing else (
+                "resting" if cards or _has_offerable(entry, user_id, data, kind, moment)
+                else "exhausted"
+            )
         )
         # A just-submitted card remains the compatibility headline while it is under
         # review; the new UIs use the full `quests` list and are not constrained by it.
@@ -963,8 +1009,7 @@ def reroll(
         while len(fresh) < QUESTS_PER_BOARD[kind]:
             candidates = [
                 quest for quest in available_quests(entry, data, kind)
-                if quest.code not in chosen
-                and (kind != "real" or _is_offerable(quest, data, user_id, moment))
+                if quest.code not in chosen and _is_offerable(quest, data, user_id, moment)
             ]
             if not candidates:
                 break
@@ -973,7 +1018,7 @@ def reroll(
             fresh.append(_assignment_row(quest, moment))
             chosen.add(quest.code)
         if len(fresh) == len(protected):
-            return False, "Больше нечего предложить — все квесты этого вида на отдыхе."
+            return False, "Больше нечего предложить — все квесты этой группы выполнены или отдыхают."
         board.update({
             "issued_at": moment.isoformat(),
             "expires_at": (moment + BOARD_LIFETIME).isoformat(),
@@ -1140,8 +1185,8 @@ def submit(
         data = _load(entry)
         # Still dealt, so the board stays live and a submitted card can be marked done --
         # it is just no longer a gate on what may be handed in.
-        _board, _changed = _ensure_board(entry, user_id, data, quest.kind, moment)
-        live = _live_assignment(data, user_id, quest.kind, code=quest.code)
+        _board, _changed = _ensure_board(entry, user_id, data, _board_kind(quest), moment)
+        live = _live_assignment(data, user_id, _board_kind(quest), code=quest.code)
         if _pending_submission(data, user_id, quest.code) is not None:
             return False, "Работа по этому квесту уже на проверке."
         if not _is_offerable(quest, data, user_id, moment):
@@ -1296,6 +1341,73 @@ def history(entry: str, user_id=None, limit: int = 50) -> list[dict]:
     return rows
 
 
+COMPLETED_REWARD_FIELDS = (
+    "gold", "xp", "tickets", "rubies", "item_name", "item_rarity", "scroll_name", "scroll_icon",
+)
+
+
+def completed(entry: str, user_id, now: datetime | None = None) -> list[dict]:
+    """Every quest this player has finished, newest first, one card per quest.
+
+    Read from the per-player `done` map rather than from `history`: history is capped
+    chat-wide (HISTORY_LIMIT), and this page must not lose a quest because the chat has
+    been busy. What it paid and the post that proved it come from the newest accepted
+    submission still on record; a completion old enough to have left the audit trail keeps
+    its card, just without those lines. A retired quest has no title left to show.
+    """
+    moment = now or app_now()
+    uid = str(user_id)
+    data = _load(entry)
+    finished = data.get("done", {}).get(uid, {})
+    times: dict[str, int] = {}
+    paid_by_history: dict[str, dict] = {}
+    for row in data.get("history", []):
+        if str(row.get("user_id")) != uid or row.get("outcome") != "accepted":
+            continue
+        code = catalog.normalise_code(row.get("code"))
+        times[code] = times.get(code, 0) + 1
+        paid_by_history[code] = row
+    proof_by_code: dict[str, dict] = {}
+    for row in reversed(data.get("submissions", [])):
+        if str(row.get("user_id")) == uid and row.get("status") == "accepted":
+            proof_by_code.setdefault(catalog.normalise_code(row.get("code")), row)
+
+    rows = []
+    for code, when in finished.items():
+        quest = catalog.find_quest(code)
+        if quest is None:
+            continue
+        text = _quest_text(quest, data)
+        proof = proof_by_code.get(quest.code) or {}
+        paid = proof.get("paid") or paid_by_history.get(quest.code) or {}
+        until = _cooldown_until(quest, data, uid, moment)
+        if until == "never":
+            again = ""
+        elif isinstance(until, datetime) and moment < until:
+            again = f"Повтор с {until.strftime('%d.%m.%Y')}"
+        else:
+            again = "Можно пройти снова"
+        rows.append({
+            "code": quest.code,
+            "title": text["title"],
+            "subject": text["subject"],
+            "technique": text["technique"],
+            "difficulty": quest.difficulty,
+            "kind": _board_kind(quest),
+            "badge": quest.badge,
+            "finished_at": str(when),
+            "times": max(1, times.get(quest.code, 0)),
+            "reward": {field: paid.get(field) for field in COMPLETED_REWARD_FIELDS
+                       if paid.get(field) not in (None, "", 0)},
+            "reviewed_by_name": proof.get("reviewed_by_name") or "",
+            "chat_id": proof.get("chat_id"),
+            "message_id": proof.get("message_id"),
+            "again": again,
+        })
+    rows.sort(key=lambda row: row["finished_at"], reverse=True)
+    return rows
+
+
 # --- review ---------------------------------------------------------------------------
 
 
@@ -1341,7 +1453,7 @@ def review(
         row["note"] = note[:300]
 
         live = _live_assignment(
-            data, row["user_id"], quest.kind, submission_id=str(row["id"]),
+            data, row["user_id"], _board_kind(quest), submission_id=str(row["id"]),
         )
         if accept:
             reward = rewards_for_player(entry, row["user_id"], quest.difficulty, data)
@@ -1367,7 +1479,7 @@ def review(
                 live["status"] = "done"
                 live["finished_day"] = moment.date().isoformat()
                 live["finished_at"] = moment.isoformat()
-                board = data.get(SLOTS[quest.kind], {}).get(str(row["user_id"]))
+                board = data.get(SLOTS[_board_kind(quest)], {}).get(str(row["user_id"]))
                 if _board_rows(board) and all(
                     item.get("status") == "done" for item in _board_rows(board)
                 ):
@@ -1572,11 +1684,19 @@ def mail_events(entry: str, user_id, limit: int = 30) -> list[dict]:
 
 
 def stats_for(entry: str, user_id) -> dict:
-    """How many this player has finished, and the hardest one they have cleared."""
-    rows = [row for row in _load(entry).get("history", [])
+    """How many this player has finished, and the hardest one they have cleared.
+
+    `completed` counts distinct quests from the durable `done` map -- the number on the
+    «Выполненные» button, which must match the cards behind it; `done` counts accepted
+    submissions still in the capped chat-wide history.
+    """
+    data = _load(entry)
+    rows = [row for row in data.get("history", [])
             if str(row.get("user_id")) == str(user_id) and row.get("outcome") == "accepted"]
+    finished = data.get("done", {}).get(str(user_id), {})
     return {
         "done": len(rows),
+        "completed": sum(1 for code in finished if catalog.find_quest(code) is not None),
         "best_difficulty": max((int(row.get("difficulty", 1) or 1) for row in rows), default=0),
         "gold": sum(int(row.get("gold", 0) or 0) for row in rows),
     }

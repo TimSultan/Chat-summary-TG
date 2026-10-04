@@ -3725,9 +3725,29 @@ def _quest_board_payload(entry: str, me: str) -> dict:
         # The arena-upgrade paint quests: their own shelf, because they are the only
         # quests whose reward changes a fight.
         "gear": quests.gear_quest(entry, me),
+        # Only the count: the finished cards live on their own page (/api/quests/done),
+        # so the board no longer carries a history it does not draw.
         "stats": quests.stats_for(entry, me),
-        "history": quests.history(entry, me, limit=20),
     })
+
+
+async def handle_quests_done(request: web.Request) -> web.Response:
+    """The «Выполненные» page: one card per quest this player has finished."""
+    user, _xp = await _player(request)
+    entry = request.app[_ENTRY_KEY]
+    payload = await asyncio.to_thread(_quests_done_payload, entry, str(user["id"]))
+    return _ok(payload)
+
+
+def _quests_done_payload(entry: str, me: str) -> dict:
+    rows = quests.completed(entry, me)
+    for row in rows:
+        row["link"] = _submission_link(row)
+        # Only the link leaves the server; the raw ids would be one more thing to keep
+        # private for no gain.
+        row.pop("chat_id", None)
+        row.pop("message_id", None)
+    return _jsonable({"rows": rows, "total": len(rows)})
 
 
 
@@ -4294,6 +4314,7 @@ def attach(
         web.get(prefix + "/api/mail", handle_mail),
         web.get(prefix + "/api/replay", handle_replay),
         web.get(prefix + "/api/quests", handle_quests),
+        web.get(prefix + "/api/quests/done", handle_quests_done),
         web.post(prefix + "/api/quests/reroll", handle_quest_reroll),
         web.post(prefix + "/api/quests/ideas", handle_quest_idea),
         # Moderator-only, all three (see _quest_admin).
@@ -5600,6 +5621,57 @@ PAGE_HTML = """<!doctype html>
           padding: 8px 10px; font-size: 12px; text-align: center; }
   .qtag b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .qtag.review { border-style: solid; border-color: var(--gold); color: var(--gold); }
+  /* «Выполненные квесты»: a page of its own, so the board above only ever shows what is
+     still to do. The entry button is green like every "done" mark in the game. */
+  .quest-done-open { display: flex; align-items: center; justify-content: space-between;
+                     margin-bottom: 10px; text-align: left; color: var(--fg);
+                     background: linear-gradient(135deg, rgba(76,175,114,.24), rgba(76,175,114,.06));
+                     border: 1px solid rgba(76,175,114,.55); }
+  .quest-done-open .qcount { min-width: 30px; padding: 2px 9px; border-radius: 999px;
+                             background: var(--xp); color: #0e1a12; font-weight: 800;
+                             text-align: center; }
+  .qdone-head { display: flex; gap: 12px; align-items: center; margin: 10px 0;
+                background: linear-gradient(135deg, rgba(232,185,35,.17), rgba(232,185,35,.03));
+                border-color: rgba(232,185,35,.45); }
+  .qdone-trophy { font-size: 36px; line-height: 1; }
+  .qdone-headline { font-size: 18px; font-weight: 800; margin-bottom: 7px;
+                    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .qdone-headline .qcount { padding: 1px 9px; border-radius: 999px; font-size: 13px;
+                            background: var(--gold); color: #1d1606; }
+  .qdone-head .qdone-chips { margin-top: 0; }
+  .qdone { position: relative; display: flex; gap: 11px; overflow: hidden;
+           background: var(--card); border: 1px solid var(--line);
+           border-left: 4px solid var(--xp); border-radius: 14px;
+           padding: 12px 12px 11px; margin-bottom: 10px; }
+  .qdone.d3 { border-left-color: var(--gold); }
+  .qdone.d4, .qdone.d5 { border-left-color: var(--hp); }
+  .qdone::after { content: "✓"; position: absolute; right: -4px; bottom: -30px;
+                  font-size: 104px; font-weight: 900; line-height: 1;
+                  color: rgba(76,175,114,.07); pointer-events: none; }
+  .qdone-seal { flex: none; width: 34px; height: 34px; border-radius: 50%;
+                display: grid; place-items: center; font-weight: 900; color: var(--xp);
+                background: rgba(76,175,114,.15); border: 1.5px solid var(--xp); }
+  .qdone-body { flex: 1; min-width: 0; position: relative; z-index: 1; }
+  .qdone-top { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+               font-size: 11px; color: var(--muted); }
+  .qdone-kind { text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+  .qdone-title { font-size: 16px; font-weight: 700; margin: 3px 0 2px; }
+  .qdone-subject { margin-top: 6px; font-size: 12px; line-height: 1.35; color: var(--muted);
+                   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+                   overflow: hidden; }
+  .qdone-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .qchip { font-size: 11px; white-space: nowrap; border: 1px solid var(--line);
+           background: var(--sunken); border-radius: 999px; padding: 2px 8px; }
+  .qchip.gold { color: var(--gold); border-color: rgba(232,185,35,.45); }
+  .qchip.xp { color: var(--xp); border-color: rgba(76,175,114,.45); }
+  .qchip.r-uncommon { color: var(--r-uncommon); }
+  .qchip.r-rare { color: var(--r-rare); }
+  .qchip.r-legendary { color: var(--r-legendary); }
+  .qchip.r-cursed { color: var(--r-cursed); }
+  .qdone-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
+                margin-top: 9px; font-size: 11px; color: var(--muted); }
+  .qdone-foot a { margin-left: auto; color: var(--accent); text-decoration: none; font-weight: 600; }
+  .qdone-times { color: var(--fg); font-weight: 800; }
   /* The reroll trade-off, said next to the button rather than discovered after it: a
      reroll climbs a difficulty, so it is a choice and not a free respin. */
   /* Pinned above everything while the game is closed for an update. Loud enough not to
@@ -9998,7 +10070,7 @@ async function renderMore() {
         ? '<div class="items">' + data.rows.map((i) => itemCard(i)).join("") + "</div>"
         : '<div class="empty">Ещё ничего не найдено.</div>') + "</div>";
   } else if (moreView === "quests") {
-    body = questBoard(await api("/api/quests"));
+    body = await questScreen();
   } else if (moreView === "review") {
     body = reviewQueue(await api("/api/quests/review"));
   } else if (moreView === "moneyaudit") {
@@ -10136,7 +10208,6 @@ function bossWorkshopResult(data) {
 
 // ---------------------------------------------------------------------------- quests
 const DIFF_NAMES = ["", "новичок", "просто", "средне", "сложно", "жёстко"];
-const TOOL_NAMES = { brush: "кисть", airbrush: "аэрограф", any: "кисть или аэрограф" };
 
 function pips(level) {
   let out = "";
@@ -10194,75 +10265,6 @@ async function questCall(path, payload) {
     toast(e.message);
     return false;
   }
-}
-
-// Legacy single-card renderer retained for old embedded clients.
-// only thing that differs here is the heading and what the quest asks you to photograph.
-function legacyQuestCard(board, kind) {
-  const paint = kind === "paint";
-  const heading = paint ? "🎯 Челлендж дня · покрас" : "🌍 Квест в реале";
-  const quest = board && board.quest;
-  if (!quest) {
-    const message = (board && board.status) === "exhausted"
-      ? "Все квесты в реале пройдены — новые откроются, когда отдохнут старые."
-      : "На сегодня всё — сдано. Новый придёт завтра.";
-    return '<div class="panel"><h2>' + heading + "</h2><div class='empty'>" +
-      message + "</div></div>";
-  }
-  const reviewing = board.status === "review";
-  const asks = paint
-    ? "<p class='small' style='margin:10px 0 4px'><b>Что красим:</b> " + esc(quest.subject) + "</p>"
-    : "<p class='small' style='margin:10px 0 4px'><b>Что делаем:</b> " + esc(quest.subject) + "</p>";
-  return '<div class="panel"><h2>' + heading + "</h2>" +
-    '<div class="qtitle">' + esc(quest.title) + "</div>" +
-    '<div class="row spread tiny muted" style="margin-top:2px"><span>' +
-      pips(quest.difficulty) + " " + esc(DIFF_NAMES[quest.difficulty] || "") + "</span>" +
-      (paint ? "<span>" + esc(TOOL_NAMES[quest.tool] || quest.tool) + "</span>"
-             : (quest.badge ? "<span class='qbadge'>🧽 " + esc(quest.badge) + "</span>" : "")) +
-    "</div>" +
-    asks +
-    "<p class='small muted' style='margin:0 0 8px'>" + esc(quest.technique) + "</p>" +
-    "<p class='tiny muted' style='margin:0 0 10px'>💡 " + esc(quest.hint) + "</p>" +
-    '<div class="qreward">' + rewardLine(quest.reward) + "</div>" +
-    (board.has_pet === false
-      ? "<div class='tiny muted' style='margin-top:6px;text-align:center'>" +
-        "Опыт и предмет снаряжения начислить некуда — сначала приручи существо. " +
-        "Монеты, билет и найденный свиток сохранятся в любом случае.</div>"
-      : "") +
-    (reviewing
-      ? "<div class='qtag review'>Работа на проверке у модератора</div>"
-      : '<div class="qtag">' +
-        (paint ? "Выложи фото" : "Нужно: " + esc(quest.proof) + ". Выложи") +
-        " в чат с хештегом <b>" + esc(quest.hashtag) + "</b></div>") +
-    '<div class="row" style="margin-top:10px">' +
-      '<button class="go sec" data-quest="' + kind + '"' +
-        (board.rerolls_left && !reviewing ? "" : " disabled") + ">🎲 Реролл · " +
-        (board.rerolls_left || 0) + " из " + (board.rerolls_total || 0) + "</button>" +
-    "</div>" +
-    (board.rerolls_left && !reviewing
-      ? "<div class='warn-note'>⚠️ Реролл даёт квест на ступень сложнее" +
-        (quest.difficulty >= 5 ? " — но выше пятой ступени уже некуда, придёт другой такой же."
-                               : " — и награда тоже вырастет.") + "</div>"
-      : "") +
-    "</div>";
-}
-
-function legacyQuestBoard(data) {
-  const board = data || {};
-  const done = (board.stats || {}).done || 0;
-  const head = questCard(board, "paint") +
-    questCard(board.real || {}, "real");
-
-  const rows = board.history || [];
-  return head +
-    '<button class="go sec" data-questidea>💡 Предложить идею</button>' +
-    '<div class="panel"><h2>Сдано квестов · ' + done + "</h2>" + (rows.length
-      ? rows.map((row) =>
-          '<div class="row spread small" style="margin-bottom:7px"><span>' +
-          pips(row.difficulty) + " " + esc(row.title) + "</span>" +
-          "<span class='tiny gain'>💰" + money(row.gold || 0) +
-          (row.item_name ? " · 🎁" : "") + "</span></div>").join("")
-      : "<div class='empty'>Пока ни одного.</div>") + "</div>";
 }
 
 let ACTIVE_QUEST_BOARD = null;
@@ -10335,7 +10337,9 @@ function questCard(board, kind) {
   return '<div class="panel"><h2>' + heading + '</h2>' + blurb +
     '<div class="tiny muted" style="margin-bottom:9px">' + schedule + '</div>' +
     (cards.length ? cards.map((card, index) => questCompactCard(card, kind, index + 1)).join("")
-                  : '<div class="empty">Доступных заданий пока нет.</div>') +
+                  : '<div class="empty">' + (board.status === "exhausted"
+                      ? 'Все квесты этой группы выполнены 🎉'
+                      : 'Доступных заданий пока нет.') + '</div>') +
     '<button class="go sec" style="margin-top:8px" data-questgroup="' + kind + '"' +
       (board.reroll_available ? '' : ' disabled') + '>🎲 Реролл группы</button>' +
     '<div class="tiny muted" style="margin-top:5px">' + rerollNote + '</div>' +
@@ -10352,18 +10356,97 @@ function questBoard(data) {
       || (((ACTIVE_QUEST_BOARD.gear || {}).quests || []).some((row) => row.status === "open"))
     );
   }
-  const done = (ACTIVE_QUEST_BOARD.stats || {}).done || 0;
-  const rows = ACTIVE_QUEST_BOARD.history || [];
-  return questCard(ACTIVE_QUEST_BOARD, "paint") +
+  const completed = Number((ACTIVE_QUEST_BOARD.stats || {}).completed || 0);
+  return '<button class="go quest-done-open" data-questpage="done">' +
+      '<span>✅ Выполненные квесты</span><span class="qcount">' + completed + '</span></button>' +
+    questCard(ACTIVE_QUEST_BOARD, "paint") +
     questCard(ACTIVE_QUEST_BOARD.real || {}, "real") +
     questCard(ACTIVE_QUEST_BOARD.gear || {}, "gear") +
     questCard(ACTIVE_QUEST_BOARD.rune || {}, "rune") +
-    '<button class="go sec" data-questidea>💡 Предложить идею</button>' +
-    '<div class="panel"><h2>Сдано квестов · ' + done + '</h2>' + (rows.length
-      ? rows.map((row) => '<div class="row spread small" style="margin-bottom:7px"><span>' +
-          pips(row.difficulty) + ' ' + esc(row.title) + '</span><span class="tiny gain">🪙' +
-          money(row.gold || 0) + (row.item_name ? ' · 🎁' : '') + '</span></div>').join("")
-      : '<div class="empty">Пока ни одного.</div>') + '</div>';
+    '<button class="go sec" data-questidea>💡 Предложить идею</button>';
+}
+
+// The quest screen has two pages: the board (what is still to do) and «Выполненные».
+// Each is fetched when it is opened, so the board never carries cards it does not draw.
+let QUEST_PAGE = "board";
+const QUEST_KIND_LABELS = {
+  paint: ["🎯", "Покрас"], real: ["🌍", "В реале"],
+  gear: ["⚔️", "Для арены"], rune: ["🔮", "Магия подземелья"],
+};
+
+async function questScreen() {
+  if (QUEST_PAGE === "done") return questDonePage(await api("/api/quests/done"));
+  return questBoard(await api("/api/quests"));
+}
+
+function questDate(value) {
+  const parts = String(value || "").slice(0, 10).split("-");
+  return parts.length === 3 ? parts[2] + "." + parts[1] + "." + parts[0] : "";
+}
+
+function questDoneCard(row) {
+  const kind = QUEST_KIND_LABELS[row.kind] || QUEST_KIND_LABELS.paint;
+  const level = Math.min(5, Math.max(1, Number(row.difficulty || 1)));
+  const reward = row.reward || {};
+  const chips = [];
+  if (reward.gold) chips.push('<span class="qchip gold">💰 ' + money(reward.gold) + '</span>');
+  if (reward.xp) chips.push('<span class="qchip xp">✨ ' + money(reward.xp) + '</span>');
+  if (reward.tickets) {
+    chips.push('<span class="qchip">' + rewardTicket().icon + ' ' + Number(reward.tickets) + '</span>');
+  }
+  if (reward.rubies) chips.push('<span class="qchip">💎 ' + Number(reward.rubies) + '</span>');
+  if (reward.item_name) {
+    chips.push('<span class="qchip r-' + esc(reward.item_rarity || "common") + '">🎁 ' +
+      esc(reward.item_name) + '</span>');
+  }
+  if (reward.scroll_name) {
+    chips.push('<span class="qchip">' + esc(reward.scroll_icon || "📜") + ' ' +
+      esc(reward.scroll_name) + '</span>');
+  }
+  const foot = [];
+  const times = Number(row.times || 1);
+  if (times > 1) {
+    const tail = times % 100 >= 11 && times % 100 <= 14 ? "раз"
+      : ([2, 3, 4].includes(times % 10) ? "раза" : "раз");
+    foot.push('<span class="qdone-times">Сдан ' + times + ' ' + tail + '</span>');
+  }
+  if (row.badge) foot.push('<span>🏅 ' + esc(row.badge) + '</span>');
+  if (row.again) foot.push('<span>🔁 ' + esc(row.again) + '</span>');
+  if (row.reviewed_by_name) foot.push('<span>принял ' + esc(row.reviewed_by_name) + '</span>');
+  if (row.link) {
+    foot.push('<a target="_blank" rel="noreferrer" href="' + esc(row.link) + '">📷 Работа ↗</a>');
+  }
+  return '<div class="qdone d' + level + '">' +
+    '<div class="qdone-seal">✓</div>' +
+    '<div class="qdone-body">' +
+      '<div class="qdone-top"><span class="qdone-kind">' + kind[0] + ' ' + kind[1] + '</span>' +
+        '<span>' + questDate(row.finished_at) + '</span></div>' +
+      '<div class="qdone-title">' + esc(row.title) + '</div>' +
+      '<div class="tiny muted">' + pips(level) + ' ' + esc(DIFF_NAMES[level] || "") + '</div>' +
+      (row.subject ? '<div class="qdone-subject">' + esc(row.subject) + '</div>' : '') +
+      (chips.length ? '<div class="qdone-chips">' + chips.join("") + '</div>' : '') +
+      (foot.length ? '<div class="qdone-foot">' + foot.join("") + '</div>' : '') +
+    '</div></div>';
+}
+
+function questDonePage(data) {
+  const rows = (data && data.rows) || [];
+  const counts = {};
+  for (const row of rows) counts[row.kind] = (counts[row.kind] || 0) + 1;
+  const byKind = ["paint", "real", "gear", "rune"].filter((kind) => counts[kind])
+    .map((kind) => '<span class="qchip">' + QUEST_KIND_LABELS[kind][0] + ' ' +
+      QUEST_KIND_LABELS[kind][1] + ' · ' + counts[kind] + '</span>').join("");
+  return '<button class="go sec" data-questpage="board">◀️ К квестам</button>' +
+    '<div class="panel qdone-head"><div class="qdone-trophy">🏆</div><div>' +
+      '<div class="qdone-headline">Выполненные квесты<span class="qcount">' + rows.length +
+        '</span></div>' +
+      (byKind ? '<div class="qdone-chips">' + byKind + '</div>' : '') +
+      '<div class="tiny muted" style="margin-top:6px">Сданные квесты собираются здесь, ' +
+        'а на доске остаются только новые.</div>' +
+    '</div></div>' +
+    (rows.length ? rows.map(questDoneCard).join("")
+      : '<div class="empty">Пока ни одного. Выбери квест на доске и выложи фото с его ' +
+        'хештегом — после проверки он появится здесь.</div>');
 }
 
 function openQuestDetail(kind, code) {
@@ -11381,7 +11464,7 @@ function playDuel(data) {
 async function renderQuests() {
   const box = $("scr-quests");
   box.innerHTML = '<div class="empty">Загружаю квесты…</div>';
-  try { box.innerHTML = questBoard(await api("/api/quests")); }
+  try { box.innerHTML = await questScreen(); }
   catch (e) { box.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
 }
 
@@ -11434,6 +11517,7 @@ $("tabs").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-tab]");
   if (!button) return;
   TAB = button.dataset.tab === "review" ? "more" : button.dataset.tab;
+  if (TAB === "quests") QUEST_PAGE = "board";
   if (button.dataset.tab === "review") moreView = "review";
   else if (TAB === "more") moreView = "menu";
   haptic();
@@ -11503,7 +11587,7 @@ const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-elementset]," +
     "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-arenaretry],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
-    "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
+    "[data-quest],[data-questopen],[data-questpage],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
     "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardplay],[data-cardpeek],[data-cardstatus],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
     "[data-personalrune],[data-personalapply],[data-personalremove]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
@@ -11677,7 +11761,7 @@ async function handleClick(event, target) {
     return;
   }
   if (d.more === "fightaudit") { window.location.href = "/audit"; return; }
-  if (d.more) { moreView = d.more; render(); return; }
+  if (d.more) { moreView = d.more; if (d.more === "quests") QUEST_PAGE = "board"; render(); return; }
   if (d.replay) { haptic(); replay(d.replay); return; }
   // The death screen's own button. It plays the transcript already in hand rather than
   // asking the server for one, and it ignores «Пропускать бои»: pressing it IS the ask.
@@ -11685,6 +11769,13 @@ async function handleClick(event, target) {
   if (d.mob === "roll") { await rollMob(); return; }
   if (d.mob === "next") { nextMob(); return; }
   if (d.mobfight !== undefined) { haptic(); await fightMob(Number(d.mobfight)); return; }
+  if (d.questpage) {
+    QUEST_PAGE = d.questpage === "done" ? "done" : "board";
+    haptic();
+    render();
+    window.scrollTo(0, 0);
+    return;
+  }
   if (d.questopen) {
     const [kind, code] = d.questopen.split(":", 2);
     openQuestDetail(kind, code);

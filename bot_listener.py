@@ -7130,7 +7130,7 @@ QUEST_MODERATION_ACTIONS = frozenset({
 PAUSE_SAFE_PET_ACTIONS = frozenset({
     "main", "info", "noop", "pet", "bag", "bagitems", "cage", "farm", "train", "fight",
     "history", "mail", "updates", "leaderboard", "slot", "shopslot", "skills", "skillpick",
-    "forge", "weaponforge", "quests", "questdetail", "questmods", "dailybonus",
+    "forge", "weaponforge", "quests", "questdetail", "questsdone", "questmods", "dailybonus",
     "paintrune", "paintrunes", "casino", "ccombos", "cpokerstyles",
     # Reviewing is moderation, not play: it changes quest state but touches nothing a
     # restart can catch mid-write, and holding up the queue during an update helps nobody.
@@ -8167,6 +8167,9 @@ async def handle_pets_callback(
             ),
             "questdetail": lambda: pets_ui.quest_detail_view(
                 entry, user_id, *(str(argument or "paint:").split(":", 1)),
+            ),
+            "questsdone": lambda: pets_ui.quests_done_view(
+                entry, user_id, int(argument) if argument.isdigit() else 1,
             ),
             "dailybonus": lambda: pets_ui.daily_bonus_view(entry, user_id, xp),
             "bagitems": lambda: pets_ui.bag_items_view(

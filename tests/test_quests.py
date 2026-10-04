@@ -125,8 +125,13 @@ class AssignmentTests(QuestsTestCase):
         board = quests.daily_quest(entry, "1", now=day + timedelta(hours=6))
         self.assertEqual(board["status"], "open")
         self.assertEqual(board["available_count"], 2)
-        completed = next(card for card in board["quests"] if card["code"] == quest["code"])
-        self.assertEqual(completed["status"], "done")
+        # The finished card leaves the board for the «Выполненные» page rather than
+        # sitting next to the open ones as the same quest a second time.
+        self.assertNotIn(quest["code"], [card["code"] for card in board["quests"]])
+        self.assertEqual(len(board["quests"]), 2)
+        self.assertEqual(
+            [row["code"] for row in quests.completed(entry, "1")], [quest["code"]]
+        )
 
     def test_empty_paint_board_waits_for_an_explicit_group_reroll(self):
         entry = "chat"
@@ -1044,6 +1049,177 @@ class HistoryAndStatsTests(QuestsTestCase):
             stats_row["best_difficulty"], max(quest1["difficulty"], quest2["difficulty"])
         )
         self.assertEqual(stats_row["gold"], receipt1["gold"] + receipt2["gold"])
+
+
+class CompletedQuestTests(QuestsTestCase):
+    """A finished quest leaves the board for the «Выполненные» page and is never dealt
+    again. Painting, rune and arena quests have a cooldown of 0, which is once ever: submit
+    already refused them a second time, so every re-deal was a card nobody could finish."""
+
+    def _accept(self, entry, code, when, user_id="1"):
+        ok, message = quests.submit(
+            entry, user_id, code, chat_id=-1001234567890, message_id=700,
+            photo_file_id="photo", now=when,
+        )
+        self.assertTrue(ok, message)
+        row = next(r for r in quests.pending(entry) if r["code"] == code)
+        ok, message, receipt = quests.review(
+            entry, row["id"], "mod1", True, reviewer_name="Аня", now=when,
+        )
+        self.assertTrue(ok, message)
+        return receipt
+
+    def test_a_finished_painting_quest_is_never_dealt_again(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        code = quests.daily_quest(entry, "1", now=day)["quests"][0]["code"]
+        self._accept(entry, code, day)
+
+        self.assertNotIn(code, [c["code"] for c in quests.daily_quest(entry, "1", now=day)["quests"]])
+        for step in range(1, 41):
+            moment = day + timedelta(hours=13 * step)
+            self.assertTrue(quests.reroll(entry, "1", now=moment)[0])
+            board = quests.daily_quest(entry, "1", now=moment)
+            self.assertNotIn(code, [c["code"] for c in board["quests"]])
+
+    def test_an_arena_card_goes_to_review_on_its_own_board_and_leaves_it_when_accepted(self):
+        """Arena paints are rune quests in the catalogue but have their own board; submit
+        and review used to look on the rune board, so the arena card stayed «доступен»
+        after it had been accepted."""
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        code = quests.gear_quest(entry, "1", now=day)["quests"][0]["code"]
+        self.assertTrue(quests.submit(entry, "1", code, photo_file_id="photo", now=day)[0])
+        card = next(c for c in quests.gear_quest(entry, "1", now=day)["quests"] if c["code"] == code)
+        self.assertEqual(card["status"], "review")
+
+        row = quests.pending(entry)[0]
+        self.assertTrue(quests.review(entry, row["id"], "mod1", True, now=day)[0])
+        board = quests.gear_quest(entry, "1", now=day)
+        self.assertNotIn(code, [c["code"] for c in board["quests"]])
+        self.assertEqual(len(board["quests"]), quests.QUESTS_PER_BOARD["gear"] - 1)
+        for step in range(1, 21):
+            moment = day + timedelta(hours=13 * step)
+            quests.reroll(entry, "1", now=moment, kind="gear")
+            self.assertNotIn(
+                code, [c["code"] for c in quests.gear_quest(entry, "1", now=moment)["quests"]]
+            )
+
+    def test_a_board_saved_with_finished_cards_drops_them_on_the_next_look(self):
+        """Boards dealt before this fix still hold a done card, or an open copy of a quest
+        already finished. Both go the next time the board is read; open work stays."""
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        codes = [c["code"] for c in quests.daily_quest(entry, "1", now=day)["quests"]]
+        data = quests._load(entry)
+        rows = data["assignments"]["1"]["quests"]
+        rows[0]["status"] = "done"
+        data["done"] = {"1": {codes[0]: day.isoformat(), codes[1]: day.isoformat()}}
+        quests._save(entry, data)
+
+        board = quests.daily_quest(entry, "1", now=day + timedelta(hours=1))
+        self.assertEqual([c["code"] for c in board["quests"]], [codes[2]])
+        self.assertEqual(board["status"], "open")
+
+    def test_a_group_with_everything_finished_says_so(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        data = quests._load(entry)
+        data["done"] = {"1": {q.code: day.isoformat() for q in catalog.GEAR_PAINT_QUESTS}}
+        quests._save(entry, data)
+
+        board = quests.gear_quest(entry, "1", now=day)
+        self.assertEqual(board["quests"], [])
+        self.assertEqual(board["status"], "exhausted")
+        ok, message = quests.reroll(entry, "1", now=day, kind="gear")
+        self.assertFalse(ok)
+        self.assertIn("выполнены", message)
+
+    def test_completed_lists_each_quest_once_newest_first_with_what_it_paid(self):
+        entry = "chat"
+        self._tame(entry, "1")
+        day = datetime(2026, 8, 9, 9, 0)
+        first = quests.daily_quest(entry, "1", now=day)["quests"][0]["code"]
+        first_receipt = self._accept(entry, first, day)
+        second = quests.gear_quest(entry, "1", now=day)["quests"][0]["code"]
+        self._accept(entry, second, day + timedelta(days=1))
+
+        rows = quests.completed(entry, "1", now=day + timedelta(days=2))
+        self.assertEqual([row["code"] for row in rows], [second, first])
+        self.assertEqual(rows[0]["kind"], "gear")
+        self.assertEqual(rows[1]["kind"], "paint")
+        self.assertEqual(rows[1]["title"], catalog.find_quest(first).title)
+        self.assertEqual(rows[1]["reward"]["gold"], first_receipt["gold"])
+        self.assertEqual(rows[1]["times"], 1)
+        self.assertEqual(rows[1]["reviewed_by_name"], "Аня")
+        self.assertEqual((rows[1]["chat_id"], rows[1]["message_id"]), (-1001234567890, 700))
+        # Once ever: nothing to promise about doing it again.
+        self.assertEqual(rows[1]["again"], "")
+        self.assertEqual(quests.stats_for(entry, "1")["completed"], 2)
+        # Another player's list is their own.
+        self.assertEqual(quests.completed(entry, "2"), [])
+
+    def test_a_repeatable_real_quest_says_when_it_comes_back(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        self._accept(entry, _REPEATABLE.code, day)
+
+        row = quests.completed(entry, "1", now=day + timedelta(days=1))[0]
+        back = day + timedelta(days=_REPEATABLE.cooldown_days)
+        self.assertEqual(row["again"], f"Повтор с {back.strftime('%d.%m.%Y')}")
+        later = quests.completed(entry, "1", now=back + timedelta(days=1))[0]
+        self.assertEqual(later["again"], "Можно пройти снова")
+
+    def test_a_completion_older_than_the_audit_trail_keeps_its_card(self):
+        """History and submissions are capped chat-wide; the per-player done map is not,
+        so a busy chat must not make somebody's old quest vanish from the page."""
+        entry = "chat"
+        quest = catalog.PAINT_QUESTS[0]
+        data = quests._load(entry)
+        data["done"] = {"1": {quest.code: "2026-07-01T10:00:00", "retired_code": "2026-07-02T10:00:00"}}
+        quests._save(entry, data)
+
+        rows = quests.completed(entry, "1", now=datetime(2026, 8, 1))
+        self.assertEqual([row["code"] for row in rows], [quest.code])
+        self.assertEqual(rows[0]["reward"], {})
+        self.assertIsNone(rows[0]["message_id"])
+        self.assertEqual(quests.stats_for(entry, "1")["completed"], 1)
+
+    def test_the_telegram_board_links_to_the_completed_screen(self):
+        entry = "chat"
+        day = datetime(2026, 8, 9, 9, 0)
+        code = quests.daily_quest(entry, "1", now=day)["quests"][0]["code"]
+        self._accept(entry, code, day)
+
+        _text, markup = pets_ui.quests_view(entry, "1", "paint")
+        buttons = [b for row in markup["inline_keyboard"] for b in row]
+        done_button = next(b for b in buttons if b["text"].startswith("✅ Выполненные"))
+        self.assertEqual(done_button["text"], "✅ Выполненные (1)")
+        self.assertEqual(pets_ui.parse_callback(done_button["callback_data"])[1], "questsdone")
+
+        text, _markup = pets_ui.quests_done_view(entry, "1")
+        self.assertIn("Выполненные квесты · 1", text)
+        self.assertIn(catalog.find_quest(code).title, text)
+        self.assertIn('href="https://t.me/c/1234567890/700"', text)
+        # Read-only navigation: allowed during a pause, and actually routed.
+        self.assertIn("questsdone", bot_listener.PAUSE_SAFE_PET_ACTIONS)
+
+    def test_the_telegram_completed_screen_pages(self):
+        entry = "chat"
+        data = quests._load(entry)
+        data["done"] = {"1": {
+            quest.code: f"2026-07-{index + 1:02d}T10:00:00"
+            for index, quest in enumerate(catalog.PAINT_QUESTS[:pets_ui.QUESTS_DONE_PER_PAGE + 2])
+        }}
+        quests._save(entry, data)
+
+        first, markup = pets_ui.quests_done_view(entry, "1", 1)
+        self.assertIn("Страница 1 из 2", first)
+        nav = [pets_ui.parse_callback(b["callback_data"]) for b in markup["inline_keyboard"][0]]
+        self.assertEqual(nav, [("1", "questsdone", "2")])
+        second, _markup = pets_ui.quests_done_view(entry, "1", 2)
+        self.assertIn("Страница 2 из 2", second)
+        self.assertEqual(second.count("\n✅ <b>"), 2)
 
 
 class StorageRobustnessTests(QuestsTestCase):
